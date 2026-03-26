@@ -8,20 +8,30 @@ private[ming] object SchemeEvaluatorSupport:
   final case class DoBinding(name: String, initExpr: Expr, stepExpr: Option[Expr])
 
   def parseBindings(bindingsExpr: Expr): List[(String, Expr)] =
+    parseBindingPairs(bindingsExpr, "let", requireDistinctNames = true)
+
+  def parseLetStarBindings(bindingsExpr: Expr): List[(String, Expr)] =
+    parseBindingPairs(bindingsExpr, "let*", requireDistinctNames = false)
+
+  private def parseBindingPairs(
+    bindingsExpr: Expr,
+    formName: String,
+    requireDistinctNames: Boolean
+  ): List[(String, Expr)] =
     bindingsExpr match
       case Expr.ListExpr(bindings, _) =>
         val parsed = bindings.map {
           case Expr.ListExpr(List(Expr.Symbol(name, _), valueExpr), _) =>
             (name, valueExpr)
           case Expr.ListExpr(List(_, _), _) =>
-            throw new EvalError("let bindings must have symbol names")
+            throw new EvalError(s"$formName bindings must have symbol names")
           case _ =>
-            throw new EvalError("let bindings must contain (name value) pairs")
+            throw new EvalError(s"$formName bindings must contain (name value) pairs")
         }
-        ensureDistinct(parsed.map(_._1), "let bindings")
+        if requireDistinctNames then ensureDistinct(parsed.map(_._1), s"$formName bindings")
         parsed
       case _ =>
-        throw new EvalError("let bindings must be a list")
+        throw new EvalError(s"$formName bindings must be a list")
 
   def buildClosure(
     paramsExpr: List[Expr],

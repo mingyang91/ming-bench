@@ -94,7 +94,7 @@ private[ming] object SchemeModel:
     case CharValue(codePoint: Int)
     case SymbolValue(name: String)
     case NilValue
-    case PairValue(car: Value, cdr: Value)
+    case PairValue(var car: Value, var cdr: Value)
     case RecordValue(recordType: RecordType, fields: Vector[Value])
     case VectorValue(elements: mutable.ArrayBuffer[Value])
     case Builtin(name: String, implementation: List[Value] => Value)

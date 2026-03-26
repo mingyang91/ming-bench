@@ -10,7 +10,8 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### is_proper_list (src/scheme/mod.rs:852) — Detect proper lists without looping on circular pair structures
+### apply_pair_accessors (src/scheme/mod.rs:870) — Evaluate composed `car`/`cdr` accessors like `cddr` against mutable pairs
 
 ## Python Helpers (scripts/)
 

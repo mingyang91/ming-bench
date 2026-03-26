@@ -1,5 +1,7 @@
 package ming
 
+import java.util.IdentityHashMap
+
 import scala.annotation.tailrec
 import scala.collection.mutable
 import scala.util.{Failure, Success, Try}
@@ -9,6 +11,11 @@ import SchemeNumbers.*
 import SchemeRuntime.*
 
 private[ming] object SchemeBuiltinSupport:
+
+  private enum ListShape:
+    case Proper
+    case Improper
+    case Circular
 
   def requireMinArgCount(name: String, args: List[Value], minimum: Int): Unit =
     if args.length < minimum then
@@ -70,14 +77,7 @@ private[ming] object SchemeBuiltinSupport:
         throw new EvalError(s"$name expected a vector, got ${SchemeRuntime.render(other)}")
 
   def isProperList(value: Value): Boolean =
-    @tailrec
-    def loop(current: Value): Boolean =
-      current match
-        case Value.NilValue          => true
-        case Value.PairValue(_, cdr) => loop(cdr)
-        case _                       => false
-
-    loop(value)
+    listShape(value) == ListShape.Proper
 
   def eqValues(left: Value, right: Value): Boolean =
     (left, right) match
@@ -106,22 +106,43 @@ private[ming] object SchemeBuiltinSupport:
       case _                                              => left.asInstanceOf[AnyRef] eq right.asInstanceOf[AnyRef]
 
   def equalValues(left: Value, right: Value): Boolean =
-    (left, right) match
-      case (leftNumber, rightNumber) if isNumber(leftNumber) && isNumber(rightNumber) =>
-        SchemeNumbers.equal(leftNumber, rightNumber)
-      case (Value.BooleanValue(a), Value.BooleanValue(b)) => a == b
-      case (Value.StringValue(a), Value.StringValue(b))   => a.text == b.text
-      case (Value.CharValue(a), Value.CharValue(b))       => a == b
-      case (Value.SymbolValue(a), Value.SymbolValue(b))   => a == b
-      case (Value.NilValue, Value.NilValue)               => true
-      case (Value.VoidValue, Value.VoidValue)             => true
-      case (Value.PairValue(leftCar, leftCdr), Value.PairValue(rightCar, rightCdr)) =>
-        equalValues(leftCar, rightCar) && equalValues(leftCdr, rightCdr)
-      case (Value.VectorValue(leftElements), Value.VectorValue(rightElements)) =>
-        leftElements.length == rightElements.length &&
-        leftElements.iterator.zip(rightElements.iterator).forall(equalValues)
-      case _ =>
-        eqValues(left, right)
+    val seen = new IdentityHashMap[AnyRef, IdentityHashMap[AnyRef, java.lang.Boolean]]()
+
+    def alreadySeen(leftRef: AnyRef, rightRef: AnyRef): Boolean =
+      var rightRefs = seen.get(leftRef)
+      if rightRefs == null then
+        rightRefs = new IdentityHashMap[AnyRef, java.lang.Boolean]()
+        seen.put(leftRef, rightRefs)
+      val wasSeen = rightRefs.containsKey(rightRef)
+      if !wasSeen then rightRefs.put(rightRef, java.lang.Boolean.TRUE)
+      wasSeen
+
+    def loop(leftValue: Value, rightValue: Value): Boolean =
+      (leftValue, rightValue) match
+        case (leftNumber, rightNumber) if isNumber(leftNumber) && isNumber(rightNumber) =>
+          SchemeNumbers.equal(leftNumber, rightNumber)
+        case (Value.BooleanValue(a), Value.BooleanValue(b)) => a == b
+        case (Value.StringValue(a), Value.StringValue(b))   => a.text == b.text
+        case (Value.CharValue(a), Value.CharValue(b))       => a == b
+        case (Value.SymbolValue(a), Value.SymbolValue(b))   => a == b
+        case (Value.NilValue, Value.NilValue)               => true
+        case (Value.VoidValue, Value.VoidValue)             => true
+        case (leftPair: Value.PairValue, rightPair: Value.PairValue) =>
+          if alreadySeen(leftPair.asInstanceOf[AnyRef], rightPair.asInstanceOf[AnyRef]) then true
+          else loop(leftPair.car, rightPair.car) && loop(leftPair.cdr, rightPair.cdr)
+        case (Value.VectorValue(leftElements), Value.VectorValue(rightElements)) =>
+          leftElements.length == rightElements.length &&
+          (
+            if alreadySeen(leftElements.asInstanceOf[AnyRef], rightElements.asInstanceOf[AnyRef]) then true
+            else
+              leftElements.iterator.zip(rightElements.iterator).forall { case (leftItem, rightItem) =>
+                loop(leftItem, rightItem)
+              }
+          )
+        case _ =>
+          eqValues(leftValue, rightValue)
+
+    loop(left, right)
 
   def requireIndex(
     name: String,
@@ -144,6 +165,9 @@ private[ming] object SchemeBuiltinSupport:
     text.codePointsArray
 
   def properListLength(name: String, value: Value): Int =
+    if listShape(value) == ListShape.Circular then
+      throw new EvalError(s"$name expected a proper list, got a circular list")
+
     @tailrec
     def loop(current: Value, length: Int): Int =
       current match
@@ -157,6 +181,9 @@ private[ming] object SchemeBuiltinSupport:
     loop(value, 0)
 
   def properListElements(name: String, value: Value): List[Value] =
+    if listShape(value) == ListShape.Circular then
+      throw new EvalError(s"$name expected a proper list, got a circular list")
+
     @tailrec
     def loop(current: Value, reversedElements: List[Value]): List[Value] =
       current match
@@ -220,3 +247,34 @@ private[ming] object SchemeBuiltinSupport:
     SchemeNumbers.parseStringNumber(text.text) match
       case Some(number) => number
       case None         => Value.BooleanValue(false)
+
+  private def listShape(value: Value): ListShape =
+    var slow: Value = value
+    var fast: Value = value
+
+    while true do
+      fast match
+        case Value.NilValue =>
+          return ListShape.Proper
+        case pair: Value.PairValue =>
+          fast = pair.cdr
+        case _ =>
+          return ListShape.Improper
+
+      fast match
+        case Value.NilValue =>
+          return ListShape.Proper
+        case pair: Value.PairValue =>
+          fast = pair.cdr
+        case _ =>
+          return ListShape.Improper
+
+      slow match
+        case pair: Value.PairValue =>
+          slow = pair.cdr
+        case _ =>
+          return ListShape.Improper
+
+      if slow.asInstanceOf[AnyRef] eq fast.asInstanceOf[AnyRef] then return ListShape.Circular
+
+    ListShape.Improper

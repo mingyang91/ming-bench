@@ -1,11 +1,20 @@
 package ming
 
+import java.util.IdentityHashMap
+
 import scala.annotation.tailrec
+import scala.collection.mutable
 
 import SchemeModel.*
 import SchemeNumbers.*
 
 private[ming] object SchemeRuntime:
+
+  final private case class PairRenderState(partsReversed: List[String], current: Value, first: Boolean)
+
+  private enum RenderMode:
+    case Write
+    case Display
 
   def baseEnv(output: StringBuilder = new StringBuilder): Env =
     val env = new Env(None)
@@ -28,37 +37,10 @@ private[ming] object SchemeRuntime:
       case _                    => false
 
   def render(value: Value): String =
-    value match
-      case number @ (Value.IntegerValue(_) | Value.RationalValue(_, _) | Value.InexactValue(_)) =>
-        SchemeNumbers.render(number)
-      case Value.BooleanValue(flag)   => if flag then "#t" else "#f"
-      case Value.StringValue(text)    => s""""${escapeString(text.text)}""""
-      case Value.CharValue(codePoint) => renderChar(codePoint)
-      case Value.SymbolValue(name)    => name
-      case Value.NilValue             => "()"
-      case pair: Value.PairValue      => renderPair(pair, render)
-      case Value.RecordValue(recordType, _) =>
-        s"#<record ${recordType.name}>"
-      case Value.VectorValue(elements) =>
-        elements.iterator.map(render).mkString("#(", " ", ")")
-      case Value.Builtin(name, _) => s"#<procedure:$name>"
-      case Value.Closure(Some(name), _, _, _, _) =>
-        s"#<procedure:$name>"
-      case Value.Closure(None, _, _, _, _) =>
-        "#<procedure>"
-      case Value.CaseClosure(_) =>
-        "#<procedure>"
-      case Value.UninitializedValue(name) =>
-        s"#<uninitialized:$name>"
-      case Value.VoidValue =>
-        "#<void>"
+    renderValue(value, RenderMode.Write, new IdentityHashMap[AnyRef, java.lang.Boolean]())
 
   def renderForDisplay(value: Value): String =
-    value match
-      case Value.StringValue(text)    => text.text
-      case Value.CharValue(codePoint) => codePointToString(codePoint)
-      case pair: Value.PairValue      => renderPair(pair, renderForDisplay)
-      case other                      => render(other)
+    renderValue(value, RenderMode.Display, new IdentityHashMap[AnyRef, java.lang.Boolean]())
 
   def makeList(values: List[Value]): Value =
     values.foldRight(Value.NilValue: Value) { (car, cdr) =>
@@ -71,19 +53,120 @@ private[ming] object SchemeRuntime:
   def requireArgCount(name: String, args: List[Value], exact: Int): Unit =
     if args.length != exact then throw new EvalError(s"$name expected $exact argument(s), got ${args.length}")
 
-  private def renderPair(pair: Value.PairValue, renderValue: Value => String): String =
-    @tailrec
-    def loop(current: Value, reversedParts: List[String]): String =
-      current match
-        case Value.PairValue(car, cdr) =>
-          loop(cdr, renderValue(car) :: reversedParts)
-        case Value.NilValue =>
-          reversedParts.reverse.mkString("(", " ", ")")
-        case other =>
-          val prefix = reversedParts.reverse.mkString("(", " ", "")
-          s"$prefix . ${renderValue(other)})"
+  private def renderValue(
+    value: Value,
+    mode: RenderMode,
+    active: IdentityHashMap[AnyRef, java.lang.Boolean]
+  ): String =
+    value match
+      case number @ (Value.IntegerValue(_) | Value.RationalValue(_, _) | Value.InexactValue(_)) =>
+        SchemeNumbers.render(number)
+      case Value.BooleanValue(flag) =>
+        if flag then "#t" else "#f"
+      case Value.StringValue(text) =>
+        mode match
+          case RenderMode.Write   => s""""${escapeString(text.text)}""""
+          case RenderMode.Display => text.text
+      case Value.CharValue(codePoint) =>
+        mode match
+          case RenderMode.Write   => renderChar(codePoint)
+          case RenderMode.Display => codePointToString(codePoint)
+      case Value.SymbolValue(name) =>
+        name
+      case Value.NilValue =>
+        "()"
+      case pair: Value.PairValue =>
+        renderPair(pair, mode, active)
+      case Value.RecordValue(recordType, _) =>
+        s"#<record ${recordType.name}>"
+      case Value.VectorValue(elements) =>
+        renderVector(elements, mode, active)
+      case Value.Builtin(name, _) =>
+        s"#<procedure:$name>"
+      case Value.Closure(Some(name), _, _, _, _) =>
+        s"#<procedure:$name>"
+      case Value.Closure(None, _, _, _, _) =>
+        "#<procedure>"
+      case Value.CaseClosure(_) =>
+        "#<procedure>"
+      case Value.UninitializedValue(name) =>
+        s"#<uninitialized:$name>"
+      case Value.VoidValue =>
+        "#<void>"
 
-    loop(pair, Nil)
+  private def renderPair(
+    pair: Value.PairValue,
+    mode: RenderMode,
+    active: IdentityHashMap[AnyRef, java.lang.Boolean]
+  ): String =
+    val rootRef: AnyRef = pair
+    if active.containsKey(rootRef) then "#<cycle>"
+    else
+      val added = mutable.ArrayBuffer[AnyRef](rootRef)
+      active.put(rootRef, java.lang.Boolean.TRUE)
+
+      try
+        renderPairLoop(PairRenderState(Nil, pair, first = true), mode, active, added)
+      finally
+        added.foreach(ref => active.remove(ref))
+
+  @tailrec
+  private def renderPairLoop(
+    state: PairRenderState,
+    mode: RenderMode,
+    active: IdentityHashMap[AnyRef, java.lang.Boolean],
+    added: mutable.ArrayBuffer[AnyRef]
+  ): String =
+    state.current match
+      case currentPair: Value.PairValue =>
+        registerPair(currentPair, state.first, active, added) match
+          case Some(cycleMarker) =>
+            pairText(state.partsReversed, s" . $cycleMarker")
+          case None =>
+            renderPairLoop(
+              PairRenderState(
+                renderValue(currentPair.car, mode, active) :: state.partsReversed,
+                currentPair.cdr,
+                first = false
+              ),
+              mode,
+              active,
+              added
+            )
+      case Value.NilValue =>
+        pairText(state.partsReversed, "")
+      case other =>
+        pairText(state.partsReversed, s" . ${renderValue(other, mode, active)}")
+
+  private def registerPair(
+    pair: Value.PairValue,
+    first: Boolean,
+    active: IdentityHashMap[AnyRef, java.lang.Boolean],
+    added: mutable.ArrayBuffer[AnyRef]
+  ): Option[String] =
+    if first then None
+    else
+      val ref: AnyRef = pair
+      if active.containsKey(ref) then Some("#<cycle>")
+      else
+        active.put(ref, java.lang.Boolean.TRUE)
+        added += ref
+        None
+
+  private def pairText(partsReversed: List[String], tail: String): String =
+    partsReversed.reverse.mkString("(", " ", s"$tail)")
+
+  private def renderVector(
+    elements: mutable.ArrayBuffer[Value],
+    mode: RenderMode,
+    active: IdentityHashMap[AnyRef, java.lang.Boolean]
+  ): String =
+    val ref: AnyRef = elements
+    if active.containsKey(ref) then "#<cycle>"
+    else
+      active.put(ref, java.lang.Boolean.TRUE)
+      try elements.iterator.map(renderValue(_, mode, active)).mkString("#(", " ", ")")
+      finally active.remove(ref)
 
   private def escapeString(text: String): String =
     text.flatMap {

@@ -149,6 +149,8 @@ private[ming] object SchemeEvaluator extends SchemeEvaluatorSpecialForms:
         evalCond(args, env)
       case Expr.Symbol("let", _) =>
         evalLet(args, env, callPos)
+      case Expr.Symbol("let*", _) =>
+        evalLetStar(args, env)
       case Expr.Symbol("letrec", _) =>
         evalLetRec(args, env, sequential = false)
       case Expr.Symbol("letrec*", _) =>

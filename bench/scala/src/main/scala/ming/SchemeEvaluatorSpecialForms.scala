@@ -122,6 +122,20 @@ abstract private[ming] class SchemeEvaluatorSpecialForms:
       case _ =>
         throw new EvalError("invalid let form")
 
+  protected def evalLetStar(args: List[Expr], env: Env): StepResult =
+    args match
+      case bindingsExpr :: body if body.nonEmpty =>
+        val bindings = parseLetStarBindings(bindingsExpr)
+        val letEnv   = new Env(Some(env))
+
+        bindings.foreach { case (name, valueExpr) =>
+          letEnv.define(name, eval(valueExpr, letEnv))
+        }
+
+        continueSequence(body, letEnv)
+      case _ =>
+        throw new EvalError("invalid let* form")
+
   protected def evalLetRec(args: List[Expr], env: Env, sequential: Boolean): StepResult =
     args match
       case bindingsExpr :: body if body.nonEmpty =>

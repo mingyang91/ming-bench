@@ -10,6 +10,21 @@ import SchemeRuntime.*
 private[ming] object SchemeTextBuiltins:
 
   val bindings: List[(String, Value)] = List(
+    "make-string" -> Value.Builtin(
+      "make-string",
+      args =>
+        args match
+          case lengthArg :: Nil =>
+            makeString("make-string", lengthArg, Value.CharValue(32))
+          case lengthArg :: fillArg :: Nil =>
+            makeString("make-string", lengthArg, fillArg)
+          case _ =>
+            throw new EvalError(s"make-string expected 1 or 2 argument(s), got ${args.length}")
+    ),
+    "string" -> Value.Builtin(
+      "string",
+      args => Value.StringValue(SchemeString.fromCodePoints(args.map(arg => requireChar("string", arg)).toArray))
+    ),
     "string-append" -> Value.Builtin(
       "string-append",
       args =>
@@ -82,8 +97,11 @@ private[ming] object SchemeTextBuiltins:
         requireArgCount("string-copy", args, 1)
         Value.StringValue(requireString("string-copy", args.head).copyString())
     ),
-    "string=?" -> stringComparator("string=?")(_ == _),
-    "string<?" -> stringComparator("string<?")(_ < _),
+    "string=?"  -> stringComparator("string=?")(_ == _),
+    "string<?"  -> stringComparator("string<?")(_ < _),
+    "string>?"  -> stringComparator("string>?")(_ > _),
+    "string<=?" -> stringComparator("string<=?")(_ <= _),
+    "string>=?" -> stringComparator("string>=?")(_ >= _),
     "string-ci=?" ->
       stringComparator("string-ci=?", _.toLowerCase(Locale.ROOT))(_ == _),
     "string-upcase" -> unaryStringBuiltin("string-upcase") { text =>
@@ -151,6 +169,12 @@ private[ming] object SchemeTextBuiltins:
         val chars = args.map(arg => requireChar(name, arg))
         Value.BooleanValue(chars.zip(chars.tail).forall(predicate.tupled))
     )
+
+  private def makeString(name: String, lengthArg: Value, fillArg: Value): Value =
+    val length = requireExactInteger(name, lengthArg)
+    if !length.isValidInt || length.signum < 0 then throw new EvalError(s"$name expected a non-negative length")
+    val fill = requireChar(name, fillArg)
+    Value.StringValue(SchemeString.fromCodePoints(Array.fill(length.toInt)(fill)))
 
   private def isScalarValue(codePoint: Int): Boolean =
     Character.isValidCodePoint(codePoint) &&

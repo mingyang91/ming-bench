@@ -33,6 +33,28 @@ private[ming] object SchemeCoreBuiltins:
         requireArgCount("cdr", args, 1)
         requirePair("cdr", args.head).cdr
     ),
+    "cddr" -> Value.Builtin(
+      "cddr",
+      args =>
+        requireArgCount("cddr", args, 1)
+        requirePair("cddr", requirePair("cddr", args.head).cdr).cdr
+    ),
+    "set-car!" -> Value.Builtin(
+      "set-car!",
+      args =>
+        requireArgCount("set-car!", args, 2)
+        val pair = requirePair("set-car!", args.head)
+        pair.car = args(1)
+        Value.VoidValue
+    ),
+    "set-cdr!" -> Value.Builtin(
+      "set-cdr!",
+      args =>
+        requireArgCount("set-cdr!", args, 2)
+        val pair = requirePair("set-cdr!", args.head)
+        pair.cdr = args(1)
+        Value.VoidValue
+    ),
     "null?" -> predicateBuiltin("null?") {
       case Value.NilValue => true
       case _              => false
@@ -50,6 +72,12 @@ private[ming] object SchemeCoreBuiltins:
     "append" -> Value.Builtin(
       "append",
       args => appendValues(args)
+    ),
+    "reverse" -> Value.Builtin(
+      "reverse",
+      args =>
+        requireArgCount("reverse", args, 1)
+        makeList(properListElements("reverse", args.head).reverse)
     ),
     "apply" -> Value.Builtin(
       "apply",
@@ -90,17 +118,53 @@ private[ming] object SchemeCoreBuiltins:
         requireArgCount("list-tail", args, 2)
         listTail(args.head, requireNonNegativeIndex("list-tail", args(1)))
     ),
+    "memq" -> Value.Builtin(
+      "memq",
+      args =>
+        requireArgCount("memq", args, 2)
+        member(args.head, args(1), eqValues, "memq")
+    ),
+    "memv" -> Value.Builtin(
+      "memv",
+      args =>
+        requireArgCount("memv", args, 2)
+        member(args.head, args(1), eqvValues, "memv")
+    ),
+    "member" -> Value.Builtin(
+      "member",
+      args =>
+        requireArgCount("member", args, 2)
+        member(args.head, args(1), equalValues, "member")
+    ),
+    "assq" -> Value.Builtin(
+      "assq",
+      args =>
+        requireArgCount("assq", args, 2)
+        assoc(args.head, args(1), eqValues, "assq")
+    ),
+    "assv" -> Value.Builtin(
+      "assv",
+      args =>
+        requireArgCount("assv", args, 2)
+        assoc(args.head, args(1), eqvValues, "assv")
+    ),
     "assoc" -> Value.Builtin(
       "assoc",
       args =>
         requireArgCount("assoc", args, 2)
-        assoc(args.head, args(1))
+        assoc(args.head, args(1), equalValues, "assoc")
     ),
     "map" -> Value.Builtin(
       "map",
       args =>
         requireMinArgCount("map", args, 2)
         mapValues(args.head, args.tail)
+    ),
+    "for-each" -> Value.Builtin(
+      "for-each",
+      args =>
+        requireMinArgCount("for-each", args, 2)
+        forEachValues(args.head, args.tail)
     )
   )
 
@@ -126,7 +190,30 @@ private[ming] object SchemeCoreBuiltins:
 
     loop(list, index)
 
-  private def assoc(key: Value, alist: Value): Value =
+  private def member(
+    key: Value,
+    list: Value,
+    predicate: (Value, Value) => Boolean,
+    name: String
+  ): Value =
+    @tailrec
+    def loop(current: Value): Value =
+      current match
+        case Value.NilValue =>
+          Value.BooleanValue(false)
+        case pair @ Value.PairValue(car, cdr) =>
+          if predicate(key, car) then pair else loop(cdr)
+        case _ =>
+          throw new EvalError(s"$name expected a proper list")
+
+    loop(list)
+
+  private def assoc(
+    key: Value,
+    alist: Value,
+    predicate: (Value, Value) => Boolean,
+    name: String
+  ): Value =
     @tailrec
     def loop(current: Value): Value =
       current match
@@ -135,11 +222,11 @@ private[ming] object SchemeCoreBuiltins:
         case Value.PairValue(entry, rest) =>
           entry match
             case pair @ Value.PairValue(car, _) =>
-              if equalValues(key, car) then pair else loop(rest)
+              if predicate(key, car) then pair else loop(rest)
             case _ =>
-              throw new EvalError("assoc expected an association list")
+              throw new EvalError(s"$name expected an association list")
         case _ =>
-          throw new EvalError("assoc expected an association list")
+          throw new EvalError(s"$name expected an association list")
 
     loop(alist)
 
@@ -157,3 +244,18 @@ private[ming] object SchemeCoreBuiltins:
         loop(nextCursors, mapped :: reversedResults)
 
     loop(lists, Nil)
+
+  private def forEachValues(procedure: Value, lists: List[Value]): Value =
+    @tailrec
+    def loop(cursors: List[Value]): Value =
+      if cursors.forall(_ == Value.NilValue) then Value.VoidValue
+      else if cursors.exists(_ == Value.NilValue) then throw new EvalError("for-each expected lists of equal length")
+      else
+        val (callArgs, nextCursors) = cursors.map {
+          case Value.PairValue(car, cdr) => (car, cdr)
+          case _                         => throw new EvalError("for-each expected a proper list")
+        }.unzip
+        SchemeInterpreter.applyProcedure(procedure, callArgs)
+        loop(nextCursors)
+
+    loop(lists)

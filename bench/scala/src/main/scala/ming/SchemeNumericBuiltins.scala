@@ -1,5 +1,7 @@
 package ming
 
+import java.math.RoundingMode
+
 import scala.annotation.tailrec
 
 import SchemeBuiltinSupport.*
@@ -40,6 +42,19 @@ private[ming] object SchemeNumericBuiltins:
       args =>
         requireArgCount("abs", args, 1)
         SchemeNumbers.abs(requireNumber("abs", args.head))
+    ),
+    "gcd" -> Value.Builtin(
+      "gcd",
+      args => Value.IntegerValue(args.map(arg => requireInteger("gcd", arg).abs).foldLeft(BigInt(0))(_.gcd(_)))
+    ),
+    "lcm" -> Value.Builtin(
+      "lcm",
+      args =>
+        val integers = args.map(arg => requireInteger("lcm", arg).abs)
+        Value.IntegerValue(integers.foldLeft(BigInt(1)) { (acc, value) =>
+          if acc == 0 || value == 0 then BigInt(0)
+          else (acc / acc.gcd(value)) * value
+        })
     ),
     "modulo" -> Value.Builtin(
       "modulo",
@@ -92,6 +107,18 @@ private[ming] object SchemeNumericBuiltins:
         val exponent = requireExactInteger("expt", args(1))
         if exponent.signum < 0 then throw new EvalError("expt expected a non-negative exponent")
         integerPower(base, exponent)
+    ),
+    "truncate" -> Value.Builtin(
+      "truncate",
+      args =>
+        requireArgCount("truncate", args, 1)
+        truncateNumber("truncate", args.head)
+    ),
+    "round" -> Value.Builtin(
+      "round",
+      args =>
+        requireArgCount("round", args, 1)
+        roundNumber("round", args.head)
     ),
     "zero?"     -> unaryNumericPredicate("zero?")(value => SchemeNumbers.compare(value, Value.IntegerValue(0)) == 0),
     "positive?" -> unaryNumericPredicate("positive?")(value => SchemeNumbers.compare(value, Value.IntegerValue(0)) > 0),
@@ -155,3 +182,40 @@ private[ming] object SchemeNumericBuiltins:
 
     val power = loop(base, exponent, Value.IntegerValue(1))
     if SchemeNumbers.isInexact(base) then SchemeNumbers.exactToInexact(power) else power
+
+  private def truncateNumber(name: String, value: Value): Value =
+    requireNumber(name, value) match
+      case integer @ Value.IntegerValue(_) =>
+        integer
+      case Value.RationalValue(numerator, denominator) =>
+        Value.IntegerValue(numerator / denominator)
+      case Value.InexactValue(number) =>
+        Value.InexactValue(BigDecimal(number.bigDecimal.setScale(0, RoundingMode.DOWN)))
+      case _ =>
+        throw new IllegalStateException("unreachable")
+
+  private def roundNumber(name: String, value: Value): Value =
+    requireNumber(name, value) match
+      case integer @ Value.IntegerValue(_) =>
+        integer
+      case Value.RationalValue(numerator, denominator) =>
+        Value.IntegerValue(roundExactRational(numerator, denominator))
+      case Value.InexactValue(number) =>
+        Value.InexactValue(BigDecimal(number.bigDecimal.setScale(0, RoundingMode.HALF_EVEN)))
+      case _ =>
+        throw new IllegalStateException("unreachable")
+
+  private def roundExactRational(numerator: BigInt, denominator: BigInt): BigInt =
+    val sign      = numerator.signum
+    val absNum    = numerator.abs
+    val quotient  = absNum / denominator
+    val remainder = absNum % denominator
+    val doubled   = remainder * 2
+
+    val roundedAbs =
+      if doubled < denominator then quotient
+      else if doubled > denominator then quotient + 1
+      else if (quotient % 2) == 0 then quotient
+      else quotient + 1
+
+    if sign < 0 then -roundedAbs else roundedAbs
