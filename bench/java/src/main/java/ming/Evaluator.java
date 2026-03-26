@@ -693,6 +693,22 @@ public class Evaluator {
             int idx = (int) requireLong(args.get(1), "string-ref");
             return new SchemeChar(s.value.charAt(idx));
         }));
+        // L06: Mutable strings
+        env.define("string-copy", new BuiltinProc("string-copy", args -> {
+            requireArgCount("string-copy", args, 1);
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: not a string");
+            return new SchemeString(s.value);
+        }));
+        env.define("string-set!", new BuiltinProc("string-set!", args -> {
+            if (args.size() != 3) throw new EvalError("string-set!: expected 3 arguments, got " + args.size());
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: not a string");
+            int idx = (int) requireLong(args.get(1), "string-set!");
+            if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: not a character");
+            char[] chars = s.value.toCharArray();
+            chars[idx] = c.value;
+            s.value = new String(chars);
+            return null; // void
+        }));
         env.define("char?", new BuiltinProc("char?", args -> {
             requireArgCount("char?", args, 1);
             return args.get(0) instanceof SchemeChar;
@@ -778,7 +794,12 @@ public class Evaluator {
     // --- Data types ---
 
     record SchemeSymbol(String name, int line, int col) {}
-    record SchemeString(String value) {}
+    static class SchemeString {
+        String value;
+        SchemeString(String value) { this.value = value; }
+        @Override public boolean equals(Object o) { return o instanceof SchemeString s && value.equals(s.value); }
+        @Override public int hashCode() { return value.hashCode(); }
+    }
     record SchemeList(List<Object> elems, int line, int col) {}
     record SchemeChar(char value) {}
 }
