@@ -8,7 +8,26 @@ type SchemeVal =
   | { tag: 'string'; value: string }
   | { tag: 'symbol'; value: string }
   | { tag: 'list'; value: SchemeVal[] }
+  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env }
   | { tag: 'void' };
+
+// ── Environment ───────────────────────────────────────────────────
+
+class Env {
+  private bindings: Map<string, SchemeVal> = new Map();
+  constructor(private parent?: Env) {}
+
+  get(name: string): SchemeVal {
+    const v = this.bindings.get(name);
+    if (v !== undefined) return v;
+    if (this.parent) return this.parent.get(name);
+    throw new EvalError(`unbound variable: ${name}`);
+  }
+
+  set(name: string, val: SchemeVal): void {
+    this.bindings.set(name, val);
+  }
+}
 
 // ── Tokenizer ──────────────────────────────────────────────────────
 
@@ -17,13 +36,10 @@ function tokenize(input: string): string[] {
   let i = 0;
   while (i < input.length) {
     const ch = input[i];
-    // whitespace
     if (/\s/.test(ch)) { i++; continue; }
-    // comment
     if (ch === ';') { while (i < input.length && input[i] !== '\n') i++; continue; }
-    // parens
     if (ch === '(' || ch === ')') { tokens.push(ch); i++; continue; }
-    // string literal
+    if (ch === '\'') { tokens.push("'"); i++; continue; }
     if (ch === '"') {
       let s = '"';
       i++;
@@ -35,7 +51,6 @@ function tokenize(input: string): string[] {
       tokens.push(s);
       continue;
     }
-    // #t, #f
     if (ch === '#') {
       if (i + 1 < input.length && (input[i + 1] === 't' || input[i + 1] === 'f')) {
         tokens.push(input.substring(i, i + 2));
@@ -43,7 +58,6 @@ function tokenize(input: string): string[] {
         continue;
       }
     }
-    // atom (symbol / number)
     let atom = '';
     while (i < input.length && !/[\s()";]/.test(input[i])) {
       atom += input[i++];
@@ -61,25 +75,25 @@ function parse(tokens: string[]): SchemeVal[] {
   function parseExpr(): SchemeVal {
     if (pos >= tokens.length) throw new EvalError('unexpected end of input');
     const tok = tokens[pos++];
+    if (tok === "'") {
+      const datum = parseExpr();
+      return { tag: 'list', value: [{ tag: 'symbol', value: 'quote' }, datum] };
+    }
     if (tok === '(') {
       const elems: SchemeVal[] = [];
       while (pos < tokens.length && tokens[pos] !== ')') {
         elems.push(parseExpr());
       }
       if (pos >= tokens.length) throw new EvalError('missing closing paren');
-      pos++; // skip ')'
+      pos++;
       return { tag: 'list', value: elems };
     }
     if (tok === ')') throw new EvalError('unexpected )');
-    // boolean
     if (tok === '#t') return { tag: 'boolean', value: true };
     if (tok === '#f') return { tag: 'boolean', value: false };
-    // string
     if (tok.startsWith('"')) return { tag: 'string', value: tok.slice(1, -1) };
-    // number
     const num = Number(tok);
     if (!isNaN(num) && tok !== '') return { tag: 'number', value: num };
-    // symbol
     return { tag: 'symbol', value: tok };
   }
 
@@ -101,53 +115,7 @@ function toNumber(v: SchemeVal, op: string): number {
   return v.value;
 }
 
-function evalExpr(expr: SchemeVal): SchemeVal {
-  if (expr.tag !== 'list') {
-    // self-evaluating
-    if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') return expr;
-    if (expr.tag === 'symbol') throw new EvalError(`unbound variable: ${expr.value}`);
-    return expr;
-  }
-
-  const elems = expr.value;
-  if (elems.length === 0) throw new EvalError('empty application');
-
-  const head = elems[0];
-
-  // Special forms: and, or, not
-  if (head.tag === 'symbol') {
-    if (head.value === 'and') {
-      if (elems.length === 1) return { tag: 'boolean', value: true };
-      let result: SchemeVal = { tag: 'boolean', value: true };
-      for (let i = 1; i < elems.length; i++) {
-        result = evalExpr(elems[i]);
-        if (!isTruthy(result)) return result;
-      }
-      return result;
-    }
-    if (head.value === 'or') {
-      if (elems.length === 1) return { tag: 'boolean', value: false };
-      let result: SchemeVal = { tag: 'boolean', value: false };
-      for (let i = 1; i < elems.length; i++) {
-        result = evalExpr(elems[i]);
-        if (isTruthy(result)) return result;
-      }
-      return result;
-    }
-    if (head.value === 'not') {
-      if (elems.length !== 2) throw new EvalError('not: wrong number of arguments');
-      const val = evalExpr(elems[1]);
-      return { tag: 'boolean', value: !isTruthy(val) };
-    }
-  }
-
-  // Function application
-  const op = evalExpr(head);
-  if (op.tag !== 'symbol') throw new EvalError('not a procedure');
-  // This shouldn't happen at L1 since symbols would error above.
-  // For builtins, head is a symbol - handle directly:
-  throw new EvalError(`not a procedure: ${display(op)}`);
-}
+const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=']);
 
 function evalBuiltin(name: string, args: SchemeVal[]): SchemeVal {
   switch (name) {
@@ -194,56 +162,122 @@ function evalBuiltin(name: string, args: SchemeVal[]): SchemeVal {
       if (args.length !== 2) throw new EvalError('<=: need 2 arguments');
       return { tag: 'boolean', value: toNumber(args[0], '<=') <= toNumber(args[1], '<=') };
     }
+    case '>=': {
+      if (args.length !== 2) throw new EvalError('>=: need 2 arguments');
+      return { tag: 'boolean', value: toNumber(args[0], '>=') >= toNumber(args[1], '>=') };
+    }
     default:
       throw new EvalError(`unbound variable: ${name}`);
   }
 }
 
-// Revise evalExpr to handle builtins properly
-function evaluate(expr: SchemeVal): SchemeVal {
-  if (expr.tag !== 'list') {
-    if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') return expr;
-    if (expr.tag === 'symbol') throw new EvalError(`unbound variable: ${expr.value}`);
-    return expr;
+function evaluate(expr: SchemeVal, env: Env): SchemeVal {
+  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') return expr;
+
+  if (expr.tag === 'symbol') {
+    if (BUILTINS.has(expr.value)) return expr; // builtins resolve to themselves for now
+    return env.get(expr.value);
   }
+
+  if (expr.tag !== 'list') return expr;
 
   const elems = expr.value;
   if (elems.length === 0) throw new EvalError('empty application');
 
   const head = elems[0];
 
-  // Special forms
   if (head.tag === 'symbol') {
-    if (head.value === 'and') {
-      if (elems.length === 1) return { tag: 'boolean', value: true };
-      let result: SchemeVal = { tag: 'boolean', value: true };
-      for (let i = 1; i < elems.length; i++) {
-        result = evaluate(elems[i]);
-        if (!isTruthy(result)) return result;
+    switch (head.value) {
+      case 'quote': {
+        if (elems.length !== 2) throw new EvalError('quote: wrong number of arguments');
+        return elems[1];
       }
-      return result;
-    }
-    if (head.value === 'or') {
-      if (elems.length === 1) return { tag: 'boolean', value: false };
-      let result: SchemeVal = { tag: 'boolean', value: false };
-      for (let i = 1; i < elems.length; i++) {
-        result = evaluate(elems[i]);
-        if (isTruthy(result)) return result;
+      case 'if': {
+        if (elems.length < 3 || elems.length > 4) throw new EvalError('if: wrong number of arguments');
+        const cond = evaluate(elems[1], env);
+        if (isTruthy(cond)) return evaluate(elems[2], env);
+        if (elems.length === 4) return evaluate(elems[3], env);
+        return { tag: 'void' };
       }
-      return result;
+      case 'define': {
+        if (elems.length < 3) throw new EvalError('define: wrong number of arguments');
+        const target = elems[1];
+        if (target.tag === 'symbol') {
+          const val = evaluate(elems[2], env);
+          env.set(target.value, val);
+          return { tag: 'void' };
+        }
+        // (define (f params...) body...)
+        if (target.tag === 'list' && target.value.length > 0 && target.value[0].tag === 'symbol') {
+          const name = target.value[0].value;
+          const params = target.value.slice(1).map(p => {
+            if (p.tag !== 'symbol') throw new EvalError('define: parameter must be a symbol');
+            return p.value;
+          });
+          const body = elems.slice(2);
+          env.set(name, { tag: 'lambda', params, body, env });
+          return { tag: 'void' };
+        }
+        throw new EvalError('define: invalid syntax');
+      }
+      case 'lambda': {
+        if (elems.length < 3) throw new EvalError('lambda: wrong number of arguments');
+        const paramList = elems[1];
+        if (paramList.tag !== 'list') throw new EvalError('lambda: parameters must be a list');
+        const params = paramList.value.map(p => {
+          if (p.tag !== 'symbol') throw new EvalError('lambda: parameter must be a symbol');
+          return p.value;
+        });
+        const body = elems.slice(2);
+        return { tag: 'lambda', params, body, env };
+      }
+      case 'and': {
+        if (elems.length === 1) return { tag: 'boolean', value: true };
+        let result: SchemeVal = { tag: 'boolean', value: true };
+        for (let i = 1; i < elems.length; i++) {
+          result = evaluate(elems[i], env);
+          if (!isTruthy(result)) return result;
+        }
+        return result;
+      }
+      case 'or': {
+        if (elems.length === 1) return { tag: 'boolean', value: false };
+        let result: SchemeVal = { tag: 'boolean', value: false };
+        for (let i = 1; i < elems.length; i++) {
+          result = evaluate(elems[i], env);
+          if (isTruthy(result)) return result;
+        }
+        return result;
+      }
+      case 'not': {
+        if (elems.length !== 2) throw new EvalError('not: wrong number of arguments');
+        const val = evaluate(elems[1], env);
+        return { tag: 'boolean', value: !isTruthy(val) };
+      }
     }
-    if (head.value === 'not') {
-      if (elems.length !== 2) throw new EvalError('not: wrong number of arguments');
-      const val = evaluate(elems[1]);
-      return { tag: 'boolean', value: !isTruthy(val) };
-    }
+  }
 
-    // Builtin function call
-    const builtins = new Set(['+', '-', '*', '/', '<', '>', '=', '<=']);
-    if (builtins.has(head.value)) {
-      const args = elems.slice(1).map(e => evaluate(e));
-      return evalBuiltin(head.value, args);
+  // Function application
+  const proc = evaluate(head, env);
+  const args = elems.slice(1).map(e => evaluate(e, env));
+
+  if (proc.tag === 'symbol' && BUILTINS.has(proc.value)) {
+    return evalBuiltin(proc.value, args);
+  }
+
+  if (proc.tag === 'lambda') {
+    if (args.length !== proc.params.length) {
+      throw new EvalError(`lambda: expected ${proc.params.length} arguments, got ${args.length}`);
     }
+    const callEnv = new Env(proc.env);
+    for (let i = 0; i < proc.params.length; i++) {
+      callEnv.set(proc.params[i], args[i]);
+    }
+    let result: SchemeVal = { tag: 'void' };
+    for (const bodyExpr of proc.body) {
+      result = evaluate(bodyExpr, callEnv);
+    }
+    return result;
   }
 
   throw new EvalError(`not a procedure`);
@@ -259,6 +293,7 @@ function display(val: SchemeVal): string {
     case 'symbol': return val.value;
     case 'void': return '';
     case 'list': return `(${val.value.map(display).join(' ')})`;
+    case 'lambda': return '#<procedure>';
   }
 }
 
@@ -268,9 +303,10 @@ export function evalStr(input: string): string {
   const tokens = tokenize(input);
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  const globalEnv = new Env();
   let result: SchemeVal = { tag: 'void' };
   for (const expr of exprs) {
-    result = evaluate(expr);
+    result = evaluate(expr, globalEnv);
   }
   return display(result);
 }
