@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::{ApplyFn, Pos, Value};
 use crate::scheme::EvalError;
@@ -1006,6 +1007,123 @@ pub(super) fn apply_list_builtin(
     }
 }
 
+// --- Vector builtins ---
+
+fn apply_vector_builtin(
+    name: &str,
+    args: &[Value],
+    call_pos: Pos,
+) -> Result<Value, EvalError> {
+    match name {
+        "vector" => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: make-vector requires 1 or 2 arguments"
+                )));
+            }
+            let len = expect_int(&args[0], call_pos)? as usize;
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: vector-ref requires 2 arguments"
+                )));
+            }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = expect_int(&args[1], call_pos)? as usize;
+                    let v = v.borrow();
+                    if idx >= v.len() {
+                        return Err(EvalError::Type(format!(
+                            "{call_pos}: vector-ref: index out of range"
+                        )));
+                    }
+                    Ok(v[idx].clone())
+                }
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: vector-ref: expected vector"
+                ))),
+            }
+        }
+        "vector-set!" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: vector-set! requires 3 arguments"
+                )));
+            }
+            match &args[0] {
+                Value::Vector(v) => {
+                    let idx = expect_int(&args[1], call_pos)? as usize;
+                    let mut v = v.borrow_mut();
+                    if idx >= v.len() {
+                        return Err(EvalError::Type(format!(
+                            "{call_pos}: vector-set!: index out of range"
+                        )));
+                    }
+                    v[idx] = args[2].clone();
+                    Ok(Value::Void)
+                }
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: vector-set!: expected vector"
+                ))),
+            }
+        }
+        "vector-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: vector-length requires 1 argument"
+                )));
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: vector-length: expected vector"
+                ))),
+            }
+        }
+        "vector?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: vector? requires 1 argument"
+                )));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
+        }
+        "vector->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: vector->list requires 1 argument"
+                )));
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: vector->list: expected vector"
+                ))),
+            }
+        }
+        "list->vector" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: list->vector requires 1 argument"
+                )));
+            }
+            match &args[0] {
+                Value::List(items) => Ok(Value::Vector(Rc::new(RefCell::new(items.clone())))),
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: list->vector: expected list"
+                ))),
+            }
+        }
+        _ => Err(EvalError::Type(format!(
+            "{call_pos}: unknown vector builtin: {name}"
+        ))),
+    }
+}
+
 // --- Main dispatch ---
 
 pub(super) fn apply_builtin_by_name(
@@ -1214,10 +1332,10 @@ pub(super) fn apply_builtin_by_name(
             }
             Ok(Value::Boolean(args[0] == args[1]))
         }
-        "eq?" => {
+        "eq?" | "eqv?" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity(format!(
-                    "{call_pos}: eq? requires 2 arguments"
+                    "{call_pos}: {name} requires 2 arguments"
                 )));
             }
             let result = match (&args[0], &args[1]) {
@@ -1229,10 +1347,13 @@ pub(super) fn apply_builtin_by_name(
                 (Value::Symbol(a), Value::Symbol(b)) => a == b,
                 (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
                 (Value::Void, Value::Void) => true,
+                (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
                 _ => false,
             };
             Ok(Value::Boolean(result))
         }
+        "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" | "vector?"
+        | "vector->list" | "list->vector" => apply_vector_builtin(name, args, call_pos),
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
     }
 }
