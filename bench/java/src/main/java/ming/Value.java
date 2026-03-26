@@ -3,7 +3,7 @@ package ming;
 import java.util.List;
 
 sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue, ListValue,
-        VoidValue, ProcedureValue {
+        CharValue, VoidValue, ProcedureValue {
     String render();
 
     default boolean isTruthy() {
@@ -55,6 +55,17 @@ record SymbolValue(String name) implements Value {
     @Override
     public String render() {
         return name;
+    }
+}
+
+record CharValue(char value) implements Value {
+    @Override
+    public String render() {
+        return switch (value) {
+            case ' ' -> "#\\space";
+            case '\n' -> "#\\newline";
+            default -> "#\\" + value;
+        };
     }
 }
 

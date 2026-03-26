@@ -11,6 +11,8 @@ public class Evaluator {
     private record Binding(String name, Expr valueExpression) {
     }
 
+    private StringBuilder outputBuffer;
+
     /**
      * Evaluate one or more Scheme expressions and return the string
      * representation of the last result.
@@ -24,18 +26,24 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        List<Expr> expressions = new Parser(input).parseProgram();
-        if (expressions.isEmpty()) {
-            throw new EvalError("expected at least one expression");
-        }
+        StringBuilder previousOutputBuffer = outputBuffer;
+        outputBuffer = new StringBuilder();
+        try {
+            List<Expr> expressions = new Parser(input).parseProgram();
+            if (expressions.isEmpty()) {
+                throw new EvalError("expected at least one expression");
+            }
 
-        Environment environment = createGlobalEnvironment();
-        Value lastValue = VoidValue.INSTANCE;
-        for (Expr expression : expressions) {
-            lastValue = eval(expression, environment);
-        }
+            Environment environment = createGlobalEnvironment();
+            Value lastValue = VoidValue.INSTANCE;
+            for (Expr expression : expressions) {
+                lastValue = eval(expression, environment);
+            }
 
-        return new EvalResult(lastValue.render(), "");
+            return new EvalResult(lastValue.render(), outputBuffer.toString());
+        } finally {
+            outputBuffer = previousOutputBuffer;
+        }
     }
 
     Value evalSequence(List<Expr> expressions, Environment environment) throws EvalError {
@@ -69,6 +77,18 @@ public class Evaluator {
         environment.define("string?", new PrimitiveProcedureValue("string?", this::applyStringPredicate));
         environment.define("boolean?", new PrimitiveProcedureValue("boolean?", this::applyBooleanPredicate));
         environment.define("symbol?", new PrimitiveProcedureValue("symbol?", this::applySymbolPredicate));
+        environment.define("display", new PrimitiveProcedureValue("display", this::applyDisplay));
+        environment.define("write", new PrimitiveProcedureValue("write", this::applyWrite));
+        environment.define("newline", new PrimitiveProcedureValue("newline", this::applyNewline));
+        environment.define("string-append", new PrimitiveProcedureValue("string-append", this::applyStringAppend));
+        environment.define("string-length", new PrimitiveProcedureValue("string-length", this::applyStringLength));
+        environment.define("substring", new PrimitiveProcedureValue("substring", this::applySubstring));
+        environment.define("string->number", new PrimitiveProcedureValue("string->number", this::applyStringToNumber));
+        environment.define("number->string", new PrimitiveProcedureValue("number->string", this::applyNumberToString));
+        environment.define("symbol->string", new PrimitiveProcedureValue("symbol->string", this::applySymbolToString));
+        environment.define("string->symbol", new PrimitiveProcedureValue("string->symbol", this::applyStringToSymbol));
+        environment.define("string-ref", new PrimitiveProcedureValue("string-ref", this::applyStringRef));
+        environment.define("char?", new PrimitiveProcedureValue("char?", this::applyCharPredicate));
         return environment;
     }
 
@@ -439,6 +459,91 @@ public class Evaluator {
         return new BoolValue(arguments.getFirst() instanceof SymbolValue);
     }
 
+    private Value applyDisplay(List<Value> arguments) throws EvalError {
+        requireExactArity("display", arguments.size(), 1);
+        appendOutput(renderForDisplay(arguments.getFirst()));
+        return VoidValue.INSTANCE;
+    }
+
+    private Value applyWrite(List<Value> arguments) throws EvalError {
+        requireExactArity("write", arguments.size(), 1);
+        appendOutput(arguments.getFirst().render());
+        return VoidValue.INSTANCE;
+    }
+
+    private Value applyNewline(List<Value> arguments) throws EvalError {
+        requireExactArity("newline", arguments.size(), 0);
+        appendOutput("\n");
+        return VoidValue.INSTANCE;
+    }
+
+    private Value applyStringAppend(List<Value> arguments) throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (Value argument : arguments) {
+            builder.append(expectString(argument, "string-append"));
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private Value applyStringLength(List<Value> arguments) throws EvalError {
+        requireExactArity("string-length", arguments.size(), 1);
+        return new IntValue(expectString(arguments.getFirst(), "string-length").length());
+    }
+
+    private Value applySubstring(List<Value> arguments) throws EvalError {
+        requireExactArity("substring", arguments.size(), 3);
+        String value = expectString(arguments.getFirst(), "substring");
+        int start = expectIndex(arguments.get(1), "substring");
+        int end = expectIndex(arguments.get(2), "substring");
+        if (start > end || end > value.length()) {
+            throw new EvalError("substring indices out of range");
+        }
+        return new StringValue(value.substring(start, end));
+    }
+
+    private Value applyStringToNumber(List<Value> arguments) throws EvalError {
+        requireExactArity("string->number", arguments.size(), 1);
+        String value = expectString(arguments.getFirst(), "string->number");
+        try {
+            return new IntValue(Long.parseLong(value));
+        } catch (NumberFormatException error) {
+            return new BoolValue(false);
+        }
+    }
+
+    private Value applyNumberToString(List<Value> arguments) throws EvalError {
+        requireExactArity("number->string", arguments.size(), 1);
+        return new StringValue(Long.toString(expectInt(arguments.getFirst(), "number->string")));
+    }
+
+    private Value applySymbolToString(List<Value> arguments) throws EvalError {
+        requireExactArity("symbol->string", arguments.size(), 1);
+        if (arguments.getFirst() instanceof SymbolValue symbolValue) {
+            return new StringValue(symbolValue.name());
+        }
+        throw new EvalError("symbol->string expects symbol arguments");
+    }
+
+    private Value applyStringToSymbol(List<Value> arguments) throws EvalError {
+        requireExactArity("string->symbol", arguments.size(), 1);
+        return new SymbolValue(expectString(arguments.getFirst(), "string->symbol"));
+    }
+
+    private Value applyStringRef(List<Value> arguments) throws EvalError {
+        requireExactArity("string-ref", arguments.size(), 2);
+        String value = expectString(arguments.getFirst(), "string-ref");
+        int index = expectIndex(arguments.get(1), "string-ref");
+        if (index >= value.length()) {
+            throw new EvalError("string-ref index out of range");
+        }
+        return new CharValue(value.charAt(index));
+    }
+
+    private Value applyCharPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("char?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof CharValue);
+    }
+
     private Value applyAdd(List<Value> arguments) throws EvalError {
         long total = 0L;
         for (Value argument : arguments) {
@@ -513,11 +618,54 @@ public class Evaluator {
         throw new EvalError(operator + " expects integer arguments");
     }
 
+    private int expectIndex(Value value, String operator) throws EvalError {
+        long index = expectInt(value, operator);
+        if (index < 0L || index > Integer.MAX_VALUE) {
+            throw new EvalError(operator + " index out of range");
+        }
+        return (int) index;
+    }
+
+    private String expectString(Value value, String operator) throws EvalError {
+        if (value instanceof StringValue stringValue) {
+            return stringValue.value();
+        }
+        throw new EvalError(operator + " expects string arguments");
+    }
+
     private List<Value> expectList(Value value, String operator) throws EvalError {
         if (value instanceof ListValue listValue) {
             return listValue.elements();
         }
         throw new EvalError(operator + " expects list arguments");
+    }
+
+    private void appendOutput(String output) {
+        if (outputBuffer != null) {
+            outputBuffer.append(output);
+        }
+    }
+
+    private String renderForDisplay(Value value) {
+        return switch (value) {
+            case StringValue stringValue -> stringValue.value();
+            case CharValue charValue -> Character.toString(charValue.value());
+            case ListValue listValue -> renderListForDisplay(listValue.elements());
+            default -> value.render();
+        };
+    }
+
+    private String renderListForDisplay(List<Value> elements) {
+        StringBuilder builder = new StringBuilder();
+        builder.append('(');
+        for (int i = 0; i < elements.size(); i++) {
+            if (i > 0) {
+                builder.append(' ');
+            }
+            builder.append(renderForDisplay(elements.get(i)));
+        }
+        builder.append(')');
+        return builder.toString();
     }
 
     private List<Value> expectNonEmptyList(Value value, String operator) throws EvalError {
