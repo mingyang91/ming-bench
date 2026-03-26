@@ -81,13 +81,17 @@ public class Evaluator {
     }
 
     private Value eval(Expr expr, Env env) throws EvalError {
-        return switch (expr) {
-            case IntExpr intExpr -> new IntValue(intExpr.value());
-            case BoolExpr boolExpr -> boolValue(boolExpr.value());
-            case StringExpr stringExpr -> new StringValue(stringExpr.value());
-            case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
-            case ListExpr listExpr -> evalList(listExpr, env);
-        };
+        try {
+            return switch (expr) {
+                case IntExpr intExpr -> new IntValue(intExpr.value());
+                case BoolExpr boolExpr -> boolValue(boolExpr.value());
+                case StringExpr stringExpr -> new StringValue(stringExpr.value());
+                case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
+                case ListExpr listExpr -> evalList(listExpr, env);
+            };
+        } catch (EvalError error) {
+            throw error.withPosition(expr.line(), expr.column());
+        }
     }
 
     private Value evalList(ListExpr listExpr, Env env) throws EvalError {
@@ -611,6 +615,9 @@ public class Evaluator {
 
     private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, SymbolExpr,
             ListExpr {
+        int line();
+
+        int column();
     }
 
     private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
@@ -618,19 +625,19 @@ public class Evaluator {
             UninitializedValue {
     }
 
-    private record IntExpr(long value) implements Expr {
+    private record IntExpr(long value, int line, int column) implements Expr {
     }
 
-    private record BoolExpr(boolean value) implements Expr {
+    private record BoolExpr(boolean value, int line, int column) implements Expr {
     }
 
-    private record StringExpr(String value) implements Expr {
+    private record StringExpr(String value, int line, int column) implements Expr {
     }
 
-    private record SymbolExpr(String name) implements Expr {
+    private record SymbolExpr(String name, int line, int column) implements Expr {
     }
 
-    private record ListExpr(List<Expr> elements) implements Expr {
+    private record ListExpr(List<Expr> elements, int line, int column) implements Expr {
     }
 
     private record IntValue(long value) implements Value {
@@ -743,24 +750,30 @@ public class Evaluator {
                 throw error("unexpected end of input");
             }
 
+            int startLine = line;
+            int startColumn = column;
             char current = currentChar();
             if (current == '(') {
-                return parseList();
+                return parseList(startLine, startColumn);
             }
             if (current == '\'') {
                 advance();
-                return new ListExpr(List.of(new SymbolExpr("quote"), parseExpression()));
+                Expr quoted = parseExpression();
+                return new ListExpr(
+                        List.of(new SymbolExpr("quote", startLine, startColumn), quoted),
+                        startLine,
+                        startColumn);
             }
             if (current == '"') {
-                return parseString();
+                return parseString(startLine, startColumn);
             }
             if (current == ')') {
                 throw error("unexpected ')'");
             }
-            return parseAtom();
+            return parseAtom(startLine, startColumn);
         }
 
-        private Expr parseList() throws EvalError {
+        private Expr parseList(int startLine, int startColumn) throws EvalError {
             consume('(');
             List<Expr> elements = new ArrayList<>();
             skipTrivia();
@@ -774,16 +787,16 @@ public class Evaluator {
             }
 
             consume(')');
-            return new ListExpr(List.copyOf(elements));
+            return new ListExpr(List.copyOf(elements), startLine, startColumn);
         }
 
-        private Expr parseString() throws EvalError {
+        private Expr parseString(int startLine, int startColumn) throws EvalError {
             consume('"');
             StringBuilder builder = new StringBuilder();
             while (!isAtEnd()) {
                 char current = advance();
                 if (current == '"') {
-                    return new StringExpr(builder.toString());
+                    return new StringExpr(builder.toString(), startLine, startColumn);
                 }
                 if (current == '\\') {
                     if (isAtEnd()) {
@@ -808,28 +821,28 @@ public class Evaluator {
             };
         }
 
-        private Expr parseAtom() {
+        private Expr parseAtom(int startLine, int startColumn) {
             int start = index;
             while (!isAtEnd() && !isDelimiter(currentChar())) {
                 advance();
             }
             String token = input.substring(start, index);
-            return parseAtomToken(token);
+            return parseAtomToken(token, startLine, startColumn);
         }
 
-        private Expr parseAtomToken(String token) {
+        private Expr parseAtomToken(String token, int startLine, int startColumn) {
             return switch (token) {
-                case "#t" -> new BoolExpr(true);
-                case "#f" -> new BoolExpr(false);
-                default -> parseNumberOrSymbol(token);
+                case "#t" -> new BoolExpr(true, startLine, startColumn);
+                case "#f" -> new BoolExpr(false, startLine, startColumn);
+                default -> parseNumberOrSymbol(token, startLine, startColumn);
             };
         }
 
-        private Expr parseNumberOrSymbol(String token) {
+        private Expr parseNumberOrSymbol(String token, int startLine, int startColumn) {
             if (isIntegerToken(token)) {
-                return new IntExpr(Long.parseLong(token));
+                return new IntExpr(Long.parseLong(token), startLine, startColumn);
             }
-            return new SymbolExpr(token);
+            return new SymbolExpr(token, startLine, startColumn);
         }
 
         private boolean isIntegerToken(String token) {
@@ -908,7 +921,7 @@ public class Evaluator {
         }
 
         private EvalError error(String message) {
-            return new EvalError(message + " at " + line + ":" + column);
+            return new EvalError(message, line, column);
         }
     }
 }
