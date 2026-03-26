@@ -76,8 +76,30 @@ public class Evaluator {
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "define", "if", "quote", "lambda", "and", "or", "set!", "begin", "let", "cond",
-        "define-syntax", "syntax-rules"
+        "define-syntax", "syntax-rules", "define-record-type"
     );
+
+    // --- Record type ---
+
+    private static class RecordType {
+        final String name;
+        final List<String> fieldNames;
+
+        RecordType(String name, List<String> fieldNames) {
+            this.name = name;
+            this.fieldNames = fieldNames;
+        }
+    }
+
+    private static class SchemeRecord {
+        final RecordType type;
+        final Object[] fields;
+
+        SchemeRecord(RecordType type, Object[] fields) {
+            this.type = type;
+            this.fields = fields;
+        }
+    }
 
     // --- Pair (cons cell) ---
 
@@ -344,6 +366,7 @@ public class Evaluator {
                         case "let" -> { return evalLet(list.elems, env); }
                         case "cond" -> { return evalCond(list.elems, env); }
                         case "define-syntax" -> { return evalDefineSyntax(list.elems, env); }
+                        case "define-record-type" -> { return evalDefineRecordType(list.elems, env); }
                     }
                 } catch (EvalError e) {
                     throw addPosition(e, list.line, list.col);
@@ -1190,6 +1213,73 @@ public class Evaluator {
         return null;
     }
 
+    // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+    private Object evalDefineRecordType(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() < 4) throw new EvalError("define-record-type: bad syntax");
+        // elems: [define-record-type, <name>, (constructor field...), predicate, (field accessor)...]
+        SchemeList ctorSpec = (SchemeList) elems.get(2);
+        String ctorName = ((SchemeSymbol) ctorSpec.elems.get(0)).name;
+        List<String> ctorFields = new ArrayList<>();
+        for (int i = 1; i < ctorSpec.elems.size(); i++) {
+            ctorFields.add(((SchemeSymbol) ctorSpec.elems.get(i)).name);
+        }
+        String predName = ((SchemeSymbol) elems.get(3)).name;
+
+        // Collect field specs: (field accessor)
+        List<String> allFieldNames = new ArrayList<>();
+        List<String> accessorNames = new ArrayList<>();
+        for (int i = 4; i < elems.size(); i++) {
+            SchemeList fieldSpec = (SchemeList) elems.get(i);
+            String fieldName = ((SchemeSymbol) fieldSpec.elems.get(0)).name;
+            String accessorName = ((SchemeSymbol) fieldSpec.elems.get(1)).name;
+            allFieldNames.add(fieldName);
+            accessorNames.add(accessorName);
+        }
+
+        RecordType recordType = new RecordType(ctorName, allFieldNames);
+
+        // Map constructor arg names to field indices
+        int[] ctorFieldIndices = new int[ctorFields.size()];
+        for (int i = 0; i < ctorFields.size(); i++) {
+            int idx = allFieldNames.indexOf(ctorFields.get(i));
+            if (idx < 0) throw new EvalError("define-record-type: unknown field " + ctorFields.get(i));
+            ctorFieldIndices[i] = idx;
+        }
+
+        // Define constructor
+        env.define(ctorName, new BuiltinProc(ctorName, args -> {
+            if (args.size() != ctorFields.size()) {
+                throw new EvalError(ctorName + ": expected " + ctorFields.size() + " arguments, got " + args.size());
+            }
+            Object[] fields = new Object[allFieldNames.size()];
+            for (int i = 0; i < ctorFields.size(); i++) {
+                fields[ctorFieldIndices[i]] = args.get(i);
+            }
+            return new SchemeRecord(recordType, fields);
+        }));
+
+        // Define predicate
+        env.define(predName, new BuiltinProc(predName, args -> {
+            if (args.size() != 1) throw new EvalError(predName + ": expected 1 argument");
+            return (args.get(0) instanceof SchemeRecord r) && r.type == recordType;
+        }));
+
+        // Define accessors
+        for (int i = 0; i < allFieldNames.size(); i++) {
+            final int fieldIdx = i;
+            String accName = accessorNames.get(i);
+            env.define(accName, new BuiltinProc(accName, args -> {
+                if (args.size() != 1) throw new EvalError(accName + ": expected 1 argument");
+                if (!(args.get(0) instanceof SchemeRecord r) || r.type != recordType) {
+                    throw new EvalError(accName + ": not a " + recordType.name);
+                }
+                return r.fields[fieldIdx];
+            }));
+        }
+
+        return null;
+    }
+
     private Object expandMacro(SyntaxRulesMacro macro, SchemeList form, Env useEnv) throws EvalError {
         for (Object[] clause : macro.clauses) {
             SchemeList pattern = (SchemeList) clause[0];
@@ -1424,6 +1514,7 @@ public class Evaluator {
         }
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
+        if (val instanceof SchemeRecord r) return "#<record:" + r.type.name + ">";
         return val.toString();
     }
 
