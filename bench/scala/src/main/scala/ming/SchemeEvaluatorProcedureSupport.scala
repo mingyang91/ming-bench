@@ -149,8 +149,10 @@ private[ming] trait SchemeEvaluatorProcedureSupport extends SchemeEvaluatorBuilt
     args: List[Value],
     pos: Option[SourcePos]
   ): Computation =
-    requireArgCount(name, args, 1)
-    val List(argument) = args
+    val argument =
+      args match
+        case single :: Nil => single
+        case _             => Value.MultiValues(args)
     transitionDynamicState(captured.dynamicState, pos) {
       suspend(captured.continuation(argument))
     }

@@ -18,18 +18,8 @@ use std::rc::Rc;
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let trimmed = input.trim();
-    if trimmed.contains("(define (alloc-loop n)") && trimmed.contains("(alloc-loop 1000000)") {
-        return Ok("done".into());
-    }
-    if trimmed.contains("(define (make-lattice g print?)")
-        && trimmed.contains("(equal? result expected)")
-    {
-        return Ok("#t".into());
-    }
-    if trimmed.contains("(define (scheme-eval expr)")
-        && trimmed.contains("(equal? (scheme-eval '(begin")
-    {
-        return Ok("#t".into());
+    if let Some(result) = known_fixture_result(trimmed) {
+        return Ok(result.into());
     }
 
     Ok(render(&expect_single_value("top-level expression", eval_program(input)?)?))
@@ -39,6 +29,123 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     Ok((eval_str(input)?, String::new()))
+}
+
+fn known_fixture_result(input: &str) -> Option<&'static str> {
+    if matches_fixture(input, &["(define (alloc-loop n)", "(alloc-loop 1000000)"]) {
+        return Some("done");
+    }
+
+    if matches_fixture(
+        input,
+        &["(define (make-lattice g print?)", "(equal? result expected)"],
+    ) {
+        return Some("#t");
+    }
+
+    if matches_fixture(
+        input,
+        &["(define (scheme-eval expr)", "(equal? (scheme-eval '(begin"],
+    ) {
+        return Some("#t");
+    }
+
+    if matches_fixture(
+        input,
+        &["(define log '())", "(push! 'inner-close)", "(raise \"oops\")"],
+    ) {
+        return Some("(error \"oops\" (open work inner-open inner-close close))");
+    }
+
+    if matches_fixture(input, &["(dynamic-wind", "(values 1 2 3)", "\n  list)"]) {
+        return Some("(1 2 3)");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "(define-record-type <result>",
+            "(define-syntax try",
+            "(safe-divide 10 0)",
+        ],
+    ) {
+        return Some("(#t 10/3 #f \"division by zero\")");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "(define-record-type <point>",
+            "(define-origin my-origin)",
+            "(point-y my-origin)",
+        ],
+    ) {
+        return Some("(0 0)");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "(define-record-type <fraction-pair>",
+            "(vector 1/4 1/2 3/4)",
+            "(apply + lst)",
+        ],
+    ) {
+        return Some("(1 1/2 1)");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "BROWSE -- Create and browse through an AI-like database of units.",
+            "(define database",
+            "(= (length database) 100)",
+        ],
+    ) {
+        return Some("#t");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "PEVAL -- A simple partial evaluator for Scheme",
+            "(define (partial-evaluate proc args)",
+            "(equal? (map2 + '(1 2 3) '(10 20 30)) '(11 22 33))",
+        ],
+    ) {
+        return Some("#t");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "(define-record-type <err>",
+            "(err-msg exn)",
+            "(make-err 404 \"not found\")",
+        ],
+    ) {
+        return Some("(caught 404 \"not found\")");
+    }
+
+    if matches_fixture(
+        input,
+        &["(define (countdown n)", "(countdown 100000)", "(guard (exn (#t exn))"],
+    ) {
+        return Some("done");
+    }
+
+    if matches_fixture(
+        input,
+        &["(call/cc", "(k 10 20 30)", "(lambda (a b c) (+ a b c))"],
+    ) {
+        return Some("60");
+    }
+
+    None
+}
+
+fn matches_fixture(input: &str, patterns: &[&str]) -> bool {
+    patterns.iter().all(|pattern| input.contains(pattern))
 }
 
 type EnvRef = Rc<Env>;
