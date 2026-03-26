@@ -29,6 +29,8 @@ pub enum EvalError {
     InvalidSyntax { message: String },
     #[error("unbound variable: {name}")]
     UnboundVariable { name: String },
+    #[error("uninitialized binding: {name}")]
+    UninitializedBinding { name: String },
     #[error("unknown procedure: {name}")]
     UnknownProcedure { name: String },
     #[error("not a procedure: {found}")]
