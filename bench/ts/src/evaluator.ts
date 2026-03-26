@@ -5,7 +5,8 @@ import { EvalError } from './evalError.js';
 interface Pos { line: number; col: number }
 
 type SchemeVal =
-  | { tag: 'number'; value: number; pos?: Pos }
+  | { tag: 'number'; value: number; exact?: boolean; pos?: Pos }
+  | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
   | { tag: 'char'; value: string; pos?: Pos }
@@ -34,6 +35,101 @@ function errAt(msg: string, pos?: Pos): EvalError {
 const SCM_NIL: SchemeVal = { tag: 'nil' };
 const SCM_TRUE: SchemeVal = { tag: 'boolean', value: true };
 const SCM_FALSE: SchemeVal = { tag: 'boolean', value: false };
+
+// ── Rational number helpers ──────────────────────────────────────────
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function makeRational(num: number, den: number): SchemeVal {
+  if (den === 0) throw new EvalError('division by zero');
+  if (den < 0) { num = -num; den = -den; }
+  const g = gcd(Math.abs(num), den);
+  num = num / g; den = den / g;
+  if (den === 1) return { tag: 'number', value: num, exact: true };
+  return { tag: 'rational', num, den };
+}
+
+function isExact(val: SchemeVal): boolean {
+  if (val.tag === 'rational') return true;
+  if (val.tag === 'number') return val.exact ?? Number.isInteger(val.value);
+  return false;
+}
+
+function isNumeric(val: SchemeVal): boolean {
+  return val.tag === 'number' || val.tag === 'rational';
+}
+
+function toFloat(val: SchemeVal): number {
+  if (val.tag === 'number') return val.value;
+  if (val.tag === 'rational') return val.num / val.den;
+  throw new EvalError('expected number');
+}
+
+// Convert to rational representation (num, den) — returns [num, den]
+function toRational(val: SchemeVal): [number, number] {
+  if (val.tag === 'rational') return [val.num, val.den];
+  if (val.tag === 'number' && isExact(val)) return [val.value, 1];
+  throw new EvalError('expected exact number');
+}
+
+function numericAdd(a: SchemeVal, b: SchemeVal): SchemeVal {
+  if (isExact(a) && isExact(b)) {
+    const [an, ad] = toRational(a);
+    const [bn, bd] = toRational(b);
+    return makeRational(an * bd + bn * ad, ad * bd);
+  }
+  return { tag: 'number', value: toFloat(a) + toFloat(b), exact: false };
+}
+
+function numericSub(a: SchemeVal, b: SchemeVal): SchemeVal {
+  if (isExact(a) && isExact(b)) {
+    const [an, ad] = toRational(a);
+    const [bn, bd] = toRational(b);
+    return makeRational(an * bd - bn * ad, ad * bd);
+  }
+  return { tag: 'number', value: toFloat(a) - toFloat(b), exact: false };
+}
+
+function numericMul(a: SchemeVal, b: SchemeVal): SchemeVal {
+  if (isExact(a) && isExact(b)) {
+    const [an, ad] = toRational(a);
+    const [bn, bd] = toRational(b);
+    return makeRational(an * bn, ad * bd);
+  }
+  return { tag: 'number', value: toFloat(a) * toFloat(b), exact: false };
+}
+
+function numericDiv(a: SchemeVal, b: SchemeVal, pos?: Pos): SchemeVal {
+  if (isExact(a) && isExact(b)) {
+    const [an, ad] = toRational(a);
+    const [bn, bd] = toRational(b);
+    if (bn === 0) throw errAt('division by zero', pos);
+    return makeRational(an * bd, ad * bn);
+  }
+  const bv = toFloat(b);
+  if (bv === 0) throw errAt('division by zero', pos);
+  return { tag: 'number', value: toFloat(a) / bv, exact: false };
+}
+
+function numericCompare(a: SchemeVal, b: SchemeVal): number {
+  // Use exact comparison when both are exact
+  if (isExact(a) && isExact(b)) {
+    const [an, ad] = toRational(a);
+    const [bn, bd] = toRational(b);
+    return an * bd - bn * ad;
+  }
+  return toFloat(a) - toFloat(b);
+}
+
+function requireNumeric(name: string, args: SchemeVal[], pos?: Pos): void {
+  for (const a of args) {
+    if (!isNumeric(a)) throw errAt(`${name}: expected number`, pos);
+  }
+}
 
 function makePair(car: SchemeVal, cdr: SchemeVal): SchemeVal {
   return { tag: 'pair', car, cdr };
@@ -185,9 +281,20 @@ function parse(tokens: Token[]): SchemeVal[] {
     if (tok.text.startsWith('"') && tok.text.endsWith('"')) {
       return { tag: 'string', value: tok.text.slice(1, -1), pos: tok.pos };
     }
+    // Rational literal: n/d (e.g. 1/3, -5/2)
+    const ratMatch = /^(-?\d+)\/(\d+)$/.exec(tok.text);
+    if (ratMatch) {
+      const rn = parseInt(ratMatch[1], 10);
+      const rd = parseInt(ratMatch[2], 10);
+      const rv = makeRational(rn, rd);
+      if (rv.pos === undefined) rv.pos = tok.pos;
+      else rv.pos = tok.pos;
+      return rv;
+    }
     const num = Number(tok.text);
     if (!isNaN(num) && tok.text !== '') {
-      return { tag: 'number', value: num, pos: tok.pos };
+      const hasDecimal = tok.text.includes('.') || tok.text.includes('e') || tok.text.includes('E');
+      return { tag: 'number', value: num, exact: !hasDecimal, pos: tok.pos };
     }
     return { tag: 'symbol', value: tok.text, pos: tok.pos };
   }
@@ -375,6 +482,7 @@ function expandAndEvalMacro(
 function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
   switch (expr.tag) {
     case 'number':
+    case 'rational':
     case 'boolean':
     case 'string':
     case 'char':
@@ -630,6 +738,7 @@ function applyProc(proc: SchemeVal, args: SchemeVal[], pos?: Pos): SchemeVal {
 }
 
 function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
+  if (isNumeric(a) && isNumeric(b)) return numericCompare(a, b) === 0;
   if (a.tag !== b.tag) return false;
   switch (a.tag) {
     case 'number': return a.value === (b as typeof a).value;
@@ -644,6 +753,7 @@ function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
 }
 
 function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+  if (isNumeric(a) && isNumeric(b)) return numericCompare(a, b) === 0;
   if (a.tag !== b.tag) return false;
   switch (a.tag) {
     case 'number': return a.value === (b as typeof a).value;
@@ -684,6 +794,8 @@ const BUILTINS = new Set([
   'char=?', 'char<?',
   'string=?', 'string<?', 'string-ci=?',
   'string-upcase', 'string-downcase',
+  'exact?', 'inexact?', 'exact->inexact', 'inexact->exact',
+  'numerator', 'denominator', 'integer?', 'rational?',
 ]);
 
 function isBuiltin(name: string): boolean {
@@ -693,44 +805,58 @@ function isBuiltin(name: string): boolean {
 function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
   switch (name) {
     case '+': {
-      const nums = requireNumbers('+', args, pos);
-      return { tag: 'number', value: nums.reduce((a, b) => a + b, 0) };
+      requireNumeric('+', args, pos);
+      if (args.length === 0) return { tag: 'number', value: 0, exact: true };
+      let result: SchemeVal = args[0];
+      for (let i = 1; i < args.length; i++) result = numericAdd(result, args[i]);
+      return result;
     }
     case '-': {
       if (args.length === 0) throw errAt('-: expected at least 1 argument', pos);
-      const nums = requireNumbers('-', args, pos);
-      if (nums.length === 1) return { tag: 'number', value: -nums[0] };
-      return { tag: 'number', value: nums.slice(1).reduce((a, b) => a - b, nums[0]) };
+      requireNumeric('-', args, pos);
+      if (args.length === 1) {
+        const a0 = args[0];
+        if (a0.tag === 'rational') return makeRational(-a0.num, a0.den);
+        if (a0.tag === 'number') return { tag: 'number', value: -a0.value, exact: a0.exact };
+        throw errAt('-: expected number', pos);
+      }
+      let result: SchemeVal = args[0];
+      for (let i = 1; i < args.length; i++) result = numericSub(result, args[i]);
+      return result;
     }
     case '*': {
-      const nums = requireNumbers('*', args, pos);
-      return { tag: 'number', value: nums.reduce((a, b) => a * b, 1) };
+      requireNumeric('*', args, pos);
+      if (args.length === 0) return { tag: 'number', value: 1, exact: true };
+      let result: SchemeVal = args[0];
+      for (let i = 1; i < args.length; i++) result = numericMul(result, args[i]);
+      return result;
     }
     case '/': {
       if (args.length < 2) throw errAt('/: expected at least 2 arguments', pos);
-      const nums = requireNumbers('/', args, pos);
-      if (nums[1] === 0) throw errAt('division by zero', pos);
-      return { tag: 'number', value: Math.trunc(nums[0] / nums[1]) };
+      requireNumeric('/', args, pos);
+      let result: SchemeVal = args[0];
+      for (let i = 1; i < args.length; i++) result = numericDiv(result, args[i], pos);
+      return result;
     }
     case '<': {
-      const nums = requireNumbers('<', args, pos);
-      return { tag: 'boolean', value: nums[0] < nums[1] };
+      requireNumeric('<', args, pos);
+      return numericCompare(args[0], args[1]) < 0 ? SCM_TRUE : SCM_FALSE;
     }
     case '>': {
-      const nums = requireNumbers('>', args, pos);
-      return { tag: 'boolean', value: nums[0] > nums[1] };
+      requireNumeric('>', args, pos);
+      return numericCompare(args[0], args[1]) > 0 ? SCM_TRUE : SCM_FALSE;
     }
     case '=': {
-      const nums = requireNumbers('=', args, pos);
-      return { tag: 'boolean', value: nums[0] === nums[1] };
+      requireNumeric('=', args, pos);
+      return numericCompare(args[0], args[1]) === 0 ? SCM_TRUE : SCM_FALSE;
     }
     case '<=': {
-      const nums = requireNumbers('<=', args, pos);
-      return { tag: 'boolean', value: nums[0] <= nums[1] };
+      requireNumeric('<=', args, pos);
+      return numericCompare(args[0], args[1]) <= 0 ? SCM_TRUE : SCM_FALSE;
     }
     case '>=': {
-      const nums = requireNumbers('>=', args, pos);
-      return { tag: 'boolean', value: nums[0] >= nums[1] };
+      requireNumeric('>=', args, pos);
+      return numericCompare(args[0], args[1]) >= 0 ? SCM_TRUE : SCM_FALSE;
     }
     case 'cons': {
       if (args.length !== 2) throw errAt('cons: expected 2 arguments', pos);
@@ -779,7 +905,7 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
     }
     case 'number?':
       if (args.length !== 1) throw errAt('number?: expected 1 argument', pos);
-      return args[0].tag === 'number' ? SCM_TRUE : SCM_FALSE;
+      return isNumeric(args[0]) ? SCM_TRUE : SCM_FALSE;
     case 'string?':
       if (args.length !== 1) throw errAt('string?: expected 1 argument', pos);
       return args[0].tag === 'string' ? SCM_TRUE : SCM_FALSE;
@@ -834,9 +960,9 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       return { tag: 'number', value: n };
     }
     case 'number->string': {
-      if (args.length !== 1 || args[0].tag !== 'number')
+      if (args.length !== 1 || !isNumeric(args[0]))
         throw errAt('number->string: expected number', pos);
-      return { tag: 'string', value: String(args[0].value) };
+      return { tag: 'string', value: display(args[0]) };
     }
     case 'symbol->string': {
       if (args.length !== 1 || args[0].tag !== 'symbol')
@@ -883,22 +1009,23 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
     }
     case 'abs': {
       if (args.length !== 1) throw errAt('abs: expected 1 argument', pos);
-      const nums = requireNumbers('abs', args, pos);
-      return { tag: 'number', value: Math.abs(nums[0]) };
+      requireNumeric('abs', args, pos);
+      const a0abs = args[0];
+      if (a0abs.tag === 'rational') return makeRational(Math.abs(a0abs.num), a0abs.den);
+      if (a0abs.tag === 'number') return { tag: 'number', value: Math.abs(a0abs.value), exact: a0abs.exact };
+      throw errAt('abs: expected number', pos);
     }
     case 'modulo': {
       if (args.length !== 2) throw errAt('modulo: expected 2 arguments', pos);
       const nums = requireNumbers('modulo', args, pos);
       if (nums[1] === 0) throw errAt('modulo: division by zero', pos);
       const r = nums[0] % nums[1];
-      // modulo takes the sign of the divisor
       return { tag: 'number', value: (r !== 0 && Math.sign(r) !== Math.sign(nums[1])) ? r + nums[1] : r };
     }
     case 'remainder': {
       if (args.length !== 2) throw errAt('remainder: expected 2 arguments', pos);
       const nums = requireNumbers('remainder', args, pos);
       if (nums[1] === 0) throw errAt('remainder: division by zero', pos);
-      // remainder takes the sign of the dividend (JS % does this)
       return { tag: 'number', value: nums[0] % nums[1] };
     }
     case 'quotient': {
@@ -909,33 +1036,41 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
     }
     case 'min': {
       if (args.length === 0) throw errAt('min: expected at least 1 argument', pos);
-      const nums = requireNumbers('min', args, pos);
-      return { tag: 'number', value: Math.min(...nums) };
+      requireNumeric('min', args, pos);
+      let minVal = args[0];
+      for (let i = 1; i < args.length; i++) {
+        if (numericCompare(args[i], minVal) < 0) minVal = args[i];
+      }
+      return minVal;
     }
     case 'max': {
       if (args.length === 0) throw errAt('max: expected at least 1 argument', pos);
-      const nums = requireNumbers('max', args, pos);
-      return { tag: 'number', value: Math.max(...nums) };
+      requireNumeric('max', args, pos);
+      let maxVal = args[0];
+      for (let i = 1; i < args.length; i++) {
+        if (numericCompare(args[i], maxVal) > 0) maxVal = args[i];
+      }
+      return maxVal;
     }
     case 'expt': {
       if (args.length !== 2) throw errAt('expt: expected 2 arguments', pos);
-      const nums = requireNumbers('expt', args, pos);
-      return { tag: 'number', value: Math.pow(nums[0], nums[1]) };
+      requireNumeric('expt', args, pos);
+      return { tag: 'number', value: Math.pow(toFloat(args[0]), toFloat(args[1])) };
     }
     case 'zero?': {
       if (args.length !== 1) throw errAt('zero?: expected 1 argument', pos);
-      if (args[0].tag !== 'number') throw errAt('zero?: expected number', pos);
-      return args[0].value === 0 ? SCM_TRUE : SCM_FALSE;
+      if (!isNumeric(args[0])) throw errAt('zero?: expected number', pos);
+      return toFloat(args[0]) === 0 ? SCM_TRUE : SCM_FALSE;
     }
     case 'positive?': {
       if (args.length !== 1) throw errAt('positive?: expected 1 argument', pos);
-      if (args[0].tag !== 'number') throw errAt('positive?: expected number', pos);
-      return args[0].value > 0 ? SCM_TRUE : SCM_FALSE;
+      if (!isNumeric(args[0])) throw errAt('positive?: expected number', pos);
+      return toFloat(args[0]) > 0 ? SCM_TRUE : SCM_FALSE;
     }
     case 'negative?': {
       if (args.length !== 1) throw errAt('negative?: expected 1 argument', pos);
-      if (args[0].tag !== 'number') throw errAt('negative?: expected number', pos);
-      return args[0].value < 0 ? SCM_TRUE : SCM_FALSE;
+      if (!isNumeric(args[0])) throw errAt('negative?: expected number', pos);
+      return toFloat(args[0]) < 0 ? SCM_TRUE : SCM_FALSE;
     }
     case 'odd?': {
       if (args.length !== 1) throw errAt('odd?: expected 1 argument', pos);
@@ -1072,6 +1207,62 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
         throw errAt('string-downcase: expected string', pos);
       return { tag: 'string', value: args[0].value.toLowerCase() };
     }
+    case 'exact?': {
+      if (args.length !== 1) throw errAt('exact?: expected 1 argument', pos);
+      if (!isNumeric(args[0])) throw errAt('exact?: expected number', pos);
+      return isExact(args[0]) ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'inexact?': {
+      if (args.length !== 1) throw errAt('inexact?: expected 1 argument', pos);
+      if (!isNumeric(args[0])) throw errAt('inexact?: expected number', pos);
+      return isExact(args[0]) ? SCM_FALSE : SCM_TRUE;
+    }
+    case 'exact->inexact': {
+      if (args.length !== 1) throw errAt('exact->inexact: expected 1 argument', pos);
+      if (!isNumeric(args[0])) throw errAt('exact->inexact: expected number', pos);
+      return { tag: 'number', value: toFloat(args[0]), exact: false };
+    }
+    case 'inexact->exact': {
+      if (args.length !== 1) throw errAt('inexact->exact: expected 1 argument', pos);
+      if (!isNumeric(args[0])) throw errAt('inexact->exact: expected number', pos);
+      if (isExact(args[0])) return args[0];
+      // Convert float to rational: find closest fraction
+      const v = toFloat(args[0]);
+      if (Number.isInteger(v)) return { tag: 'number', value: v, exact: true };
+      // Use continued fraction approximation
+      const sign = v < 0 ? -1 : 1;
+      const av = Math.abs(v);
+      // Express as p/q by multiplying out the decimal
+      const scale = Math.pow(10, 15);
+      const p = Math.round(av * scale);
+      const q = scale;
+      const g = gcd(p, q);
+      return makeRational(sign * p / g, q / g);
+    }
+    case 'numerator': {
+      if (args.length !== 1) throw errAt('numerator: expected 1 argument', pos);
+      const a0n = args[0];
+      if (a0n.tag === 'rational') return { tag: 'number', value: a0n.num, exact: true };
+      if (a0n.tag === 'number') return { tag: 'number', value: a0n.value, exact: a0n.exact };
+      throw errAt('numerator: expected number', pos);
+    }
+    case 'denominator': {
+      if (args.length !== 1) throw errAt('denominator: expected 1 argument', pos);
+      const a0d = args[0];
+      if (a0d.tag === 'rational') return { tag: 'number', value: a0d.den, exact: true };
+      if (a0d.tag === 'number') return { tag: 'number', value: 1, exact: a0d.exact };
+      throw errAt('denominator: expected number', pos);
+    }
+    case 'integer?': {
+      if (args.length !== 1) throw errAt('integer?: expected 1 argument', pos);
+      if (args[0].tag === 'rational') return SCM_FALSE; // rationals that simplify to integers become numbers
+      if (args[0].tag === 'number') return Number.isInteger(args[0].value) ? SCM_TRUE : SCM_FALSE;
+      return SCM_FALSE;
+    }
+    case 'rational?': {
+      if (args.length !== 1) throw errAt('rational?: expected 1 argument', pos);
+      return isNumeric(args[0]) && isExact(args[0]) ? SCM_TRUE : SCM_FALSE;
+    }
     default:
       throw errAt(`unbound variable: ${name}`, pos);
   }
@@ -1086,7 +1277,13 @@ let outputBuffer: string[] = [];
 // write format: strings quoted
 function display(val: SchemeVal): string {
   switch (val.tag) {
-    case 'number': return String(val.value);
+    case 'number': {
+      const s = String(val.value);
+      // Inexact numbers should show decimal point
+      if (val.exact === false && Number.isInteger(val.value) && !s.includes('.')) return s + '.0';
+      return s;
+    }
+    case 'rational': return `${val.num}/${val.den}`;
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
