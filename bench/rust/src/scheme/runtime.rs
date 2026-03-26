@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::scheme::error::{EvalError, EvalResult};
@@ -9,10 +10,14 @@ use crate::scheme::parser::{parse_program, Expr, ExprKind, Span};
 type BuiltinFn = fn(&mut Evaluator, &[Value], Span) -> EvalResult<Value>;
 type CellRef = Rc<RefCell<Value>>;
 type EnvRef = Rc<RefCell<Env>>;
+type ContinuationFrame = dyn Fn(&mut Evaluator, Value) -> EvalResult<Value>;
 
 pub(crate) struct Evaluator {
     global: EnvRef,
     output: String,
+    current_continuation: Option<Rc<ContinuationContext>>,
+    wind_stack: Vec<Rc<WindFrame>>,
+    pending_jump: Option<PendingJump>,
 }
 
 struct Env {
@@ -39,6 +44,7 @@ enum Procedure {
     Builtin(BuiltinProc),
     Lambda(Rc<LambdaProc>),
     CaseLambda(Rc<CaseLambdaProc>),
+    Continuation(Rc<ContinuationProc>),
     RecordConstructor(Rc<RecordConstructorProc>),
     RecordPredicate(Rc<RecordPredicateProc>),
     RecordAccessor(Rc<RecordAccessorProc>),
@@ -111,12 +117,45 @@ struct ParamSpec {
     rest: Option<String>,
 }
 
+#[derive(Clone)]
+struct ContinuationContext {
+    frame: Rc<ContinuationFrame>,
+    parent: Option<Rc<ContinuationContext>>,
+}
+
+#[derive(Clone)]
+struct ContinuationProc {
+    context: Option<Rc<ContinuationContext>>,
+    winds: Vec<Rc<WindFrame>>,
+}
+
+#[derive(Clone)]
+struct WindFrame {
+    in_thunk: Value,
+    out_thunk: Value,
+    span: Span,
+}
+
+#[derive(Clone)]
+struct PendingJump {
+    context: Option<Rc<ContinuationContext>>,
+    source_winds: Vec<Rc<WindFrame>>,
+    target_winds: Vec<Rc<WindFrame>>,
+    value: Value,
+}
+
+#[derive(Debug)]
+struct ContinuationSignal;
+
 impl Evaluator {
     pub(crate) fn new() -> Self {
         let global = Env::new(None);
         let mut evaluator = Self {
             global: global.clone(),
             output: String::new(),
+            current_continuation: None,
+            wind_stack: Vec::new(),
+            pending_jump: None,
         };
         evaluator.install_builtins();
         evaluator
@@ -124,10 +163,9 @@ impl Evaluator {
 
     pub(crate) fn eval(&mut self, input: &str) -> EvalResult<(String, String)> {
         let expressions = parse_program(input)?;
-        let mut last = Value::Void;
-        for expression in &expressions {
-            last = self.eval_expr(expression, self.global.clone())?;
-        }
+        let last = self.run_with_continuations(|evaluator| {
+            evaluator.eval_sequence(&expressions, evaluator.global.clone())
+        })?;
         Ok((last.write_repr(), self.output.clone()))
     }
 
@@ -179,6 +217,10 @@ impl Evaluator {
             ("string-set!", builtin_string_set),
             ("apply", builtin_apply),
             ("map", builtin_map),
+            ("reverse", builtin_reverse),
+            ("call/cc", builtin_call_cc),
+            ("call-with-current-continuation", builtin_call_cc),
+            ("dynamic-wind", builtin_dynamic_wind),
         ] {
             self.define_builtin(name, func);
         }
@@ -522,11 +564,20 @@ impl Evaluator {
     }
 
     fn eval_sequence(&mut self, expressions: &[Expr], env: EnvRef) -> EvalResult<Value> {
-        let mut last = Value::Void;
-        for expression in expressions {
-            last = self.eval_expr(expression, env.clone())?;
+        if expressions.is_empty() {
+            return Ok(Value::Void);
         }
-        Ok(last)
+
+        let last_index = expressions.len() - 1;
+        for (index, expression) in expressions.iter().take(last_index).enumerate() {
+            let rest = expressions[index + 1..].to_vec();
+            let env_for_frame = env.clone();
+            self.eval_non_tail_with_continuation(expression, env.clone(), move |evaluator, _| {
+                evaluator.eval_sequence(&rest, env_for_frame.clone())
+            })?;
+        }
+
+        self.eval_expr(&expressions[last_index], env)
     }
 
     fn apply(&mut self, procedure: Value, args: &[Value], span: Span) -> EvalResult<Value> {
@@ -549,6 +600,12 @@ impl Evaluator {
                     ),
                     span,
                 ))
+            }
+            Value::Procedure(Procedure::Continuation(continuation)) => {
+                if args.len() != 1 {
+                    return Err(wrong_arg_count("continuation", "1", args.len(), span));
+                }
+                self.invoke_continuation(continuation, args[0].clone())
             }
             Value::Procedure(Procedure::RecordConstructor(constructor)) => {
                 if args.len() != constructor.record_type.field_count {
@@ -584,6 +641,227 @@ impl Evaluator {
                 format!("attempted to call non-procedure {}", other.type_name()),
                 span,
             )),
+        }
+    }
+
+    fn run_with_continuations<F>(&mut self, computation: F) -> EvalResult<Value>
+    where
+        F: Fn(&mut Evaluator) -> EvalResult<Value>,
+    {
+        let saved_continuation = self.current_continuation.clone();
+        let saved_winds = self.wind_stack.clone();
+        let saved_jump = self.pending_jump.clone();
+
+        self.current_continuation = None;
+        self.wind_stack.clear();
+        self.pending_jump = None;
+
+        let mut ran_initial = false;
+        let mut pending_resume = None;
+        loop {
+            let outcome = if let Some(jump) = pending_resume.take() {
+                panic::catch_unwind(AssertUnwindSafe(|| self.resume_continuation(jump)))
+            } else {
+                debug_assert!(!ran_initial);
+                ran_initial = true;
+                panic::catch_unwind(AssertUnwindSafe(|| computation(self)))
+            };
+
+            match outcome {
+                Ok(result) => {
+                    self.current_continuation = saved_continuation.clone();
+                    self.wind_stack = saved_winds.clone();
+                    self.pending_jump = saved_jump.clone();
+                    return result;
+                }
+                Err(payload) => {
+                    if payload.is::<ContinuationSignal>() {
+                        let Some(jump) = self.pending_jump.take() else {
+                            self.current_continuation = saved_continuation.clone();
+                            self.wind_stack = saved_winds.clone();
+                            self.pending_jump = saved_jump.clone();
+                            return Err(EvalError::message("internal continuation error"));
+                        };
+                        pending_resume = Some(jump);
+                        continue;
+                    }
+
+                    self.current_continuation = saved_continuation;
+                    self.wind_stack = saved_winds;
+                    self.pending_jump = saved_jump;
+                    panic::resume_unwind(payload);
+                }
+            }
+        }
+    }
+
+    fn eval_non_tail_with_continuation<F>(
+        &mut self,
+        expr: &Expr,
+        env: EnvRef,
+        frame: F,
+    ) -> EvalResult<Value>
+    where
+        F: Fn(&mut Evaluator, Value) -> EvalResult<Value> + 'static,
+    {
+        let continuation = Rc::new(ContinuationContext {
+            frame: Rc::new(frame),
+            parent: self.current_continuation.clone(),
+        });
+        self.with_current_continuation(Some(continuation), |evaluator| {
+            evaluator.eval_expr(expr, env)
+        })
+    }
+
+    fn with_current_continuation<T, F>(
+        &mut self,
+        continuation: Option<Rc<ContinuationContext>>,
+        action: F,
+    ) -> T
+    where
+        F: FnOnce(&mut Evaluator) -> T,
+    {
+        let saved = self.current_continuation.clone();
+        self.current_continuation = continuation;
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| action(self)));
+        self.current_continuation = saved;
+        match outcome {
+            Ok(value) => value,
+            Err(payload) => panic::resume_unwind(payload),
+        }
+    }
+
+    fn with_wind_stack<T, F>(&mut self, winds: Vec<Rc<WindFrame>>, action: F) -> T
+    where
+        F: FnOnce(&mut Evaluator) -> T,
+    {
+        let saved = self.wind_stack.clone();
+        self.wind_stack = winds;
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| action(self)));
+        self.wind_stack = saved;
+        match outcome {
+            Ok(value) => value,
+            Err(payload) => panic::resume_unwind(payload),
+        }
+    }
+
+    fn resume_continuation(&mut self, jump: PendingJump) -> EvalResult<Value> {
+        self.transition_winds(&jump.source_winds, &jump.target_winds)?;
+
+        let mut value = jump.value;
+        let mut context = jump.context;
+        while let Some(active) = context {
+            let parent = active.parent.clone();
+            let frame = active.frame.clone();
+            value = self.with_current_continuation(parent.clone(), move |evaluator| {
+                (frame)(evaluator, value)
+            })?;
+            context = parent;
+        }
+
+        Ok(value)
+    }
+
+    fn transition_winds(
+        &mut self,
+        source: &[Rc<WindFrame>],
+        target: &[Rc<WindFrame>],
+    ) -> EvalResult<()> {
+        let shared = shared_wind_prefix(source, target);
+
+        for index in (shared..source.len()).rev() {
+            let active_winds = source[..index].to_vec();
+            let frame = source[index].clone();
+            self.with_wind_stack(active_winds, |evaluator| {
+                evaluator.apply(frame.out_thunk.clone(), &[], frame.span)
+            })?;
+        }
+
+        for index in shared..target.len() {
+            let active_winds = target[..index].to_vec();
+            let frame = target[index].clone();
+            self.with_wind_stack(active_winds, |evaluator| {
+                evaluator.apply(frame.in_thunk.clone(), &[], frame.span)
+            })?;
+        }
+
+        self.wind_stack = target.to_vec();
+        Ok(())
+    }
+
+    fn invoke_continuation(
+        &mut self,
+        continuation: Rc<ContinuationProc>,
+        value: Value,
+    ) -> EvalResult<Value> {
+        self.pending_jump = Some(PendingJump {
+            context: continuation.context.clone(),
+            source_winds: self.wind_stack.clone(),
+            target_winds: continuation.winds.clone(),
+            value,
+        });
+        panic::panic_any(ContinuationSignal);
+    }
+
+    fn apply_dynamic_wind(&mut self, args: &[Value], span: Span) -> EvalResult<Value> {
+        if args.len() != 3 {
+            return Err(wrong_arg_count("dynamic-wind", "3", args.len(), span));
+        }
+
+        let in_thunk = args[0].clone();
+        let body_thunk = args[1].clone();
+        let out_thunk = args[2].clone();
+
+        self.apply(in_thunk.clone(), &[], span)?;
+
+        let wind = Rc::new(WindFrame {
+            in_thunk,
+            out_thunk,
+            span,
+        });
+        self.wind_stack.push(wind.clone());
+
+        let body_continuation = Rc::new(ContinuationContext {
+            frame: Rc::new({
+                let wind = wind.clone();
+                move |evaluator, value| evaluator.finish_dynamic_wind(wind.clone(), value)
+            }),
+            parent: self.current_continuation.clone(),
+        });
+
+        let body_result = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.with_current_continuation(Some(body_continuation), |evaluator| {
+                evaluator.apply(body_thunk.clone(), &[], span)
+            })
+        }));
+
+        match body_result {
+            Ok(Ok(value)) => self.finish_dynamic_wind(wind, value),
+            Ok(Err(err)) => {
+                self.pop_wind(&wind);
+                if let Err(out_err) = self.apply(wind.out_thunk.clone(), &[], wind.span) {
+                    return Err(out_err);
+                }
+                Err(err)
+            }
+            Err(payload) => {
+                self.pop_wind(&wind);
+                panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    fn finish_dynamic_wind(&mut self, wind: Rc<WindFrame>, value: Value) -> EvalResult<Value> {
+        self.pop_wind(&wind);
+        self.apply(wind.out_thunk.clone(), &[], wind.span)?;
+        Ok(value)
+    }
+
+    fn pop_wind(&mut self, wind: &Rc<WindFrame>) {
+        if let Some(active) = self.wind_stack.pop() {
+            if !Rc::ptr_eq(&active, wind) {
+                self.wind_stack.push(active);
+            }
         }
     }
 }
@@ -678,6 +956,7 @@ impl Procedure {
             Self::Builtin(proc) => format!("#<procedure:{}>", proc.name),
             Self::Lambda(_) => "#<procedure>".to_string(),
             Self::CaseLambda(_) => "#<procedure>".to_string(),
+            Self::Continuation(_) => "#<procedure>".to_string(),
             Self::RecordConstructor(proc) => format!("#<procedure:{}>", proc.name),
             Self::RecordPredicate(proc) => format!("#<procedure:{}>", proc.name),
             Self::RecordAccessor(proc) => format!("#<procedure:{}>", proc.name),
@@ -886,6 +1165,15 @@ fn parse_bindings(expr: &Expr) -> EvalResult<Vec<(String, Expr)>> {
 
 fn lambda_accepts_arity(lambda: &LambdaProc, arg_count: usize) -> bool {
     arg_count >= lambda.params.len() && (lambda.rest.is_some() || arg_count == lambda.params.len())
+}
+
+fn shared_wind_prefix(left: &[Rc<WindFrame>], right: &[Rc<WindFrame>]) -> usize {
+    let mut shared = 0;
+    let limit = left.len().min(right.len());
+    while shared < limit && Rc::ptr_eq(&left[shared], &right[shared]) {
+        shared += 1;
+    }
+    shared
 }
 
 fn apply_lambda(
@@ -1415,6 +1703,35 @@ fn builtin_string_set(_: &mut Evaluator, args: &[Value], span: Span) -> EvalResu
     *slot = ch;
     string.text = chars.into_iter().collect();
     Ok(Value::Void)
+}
+
+fn builtin_reverse(_: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<Value> {
+    if args.len() != 1 {
+        return Err(wrong_arg_count("reverse", "1", args.len(), span));
+    }
+    let mut items = list_to_vec(&args[0], span, "reverse")?;
+    items.reverse();
+    Ok(list_from_vec(items))
+}
+
+fn builtin_call_cc(evaluator: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<Value> {
+    if args.len() != 1 {
+        return Err(wrong_arg_count("call/cc", "1", args.len(), span));
+    }
+
+    let continuation = Value::Procedure(Procedure::Continuation(Rc::new(ContinuationProc {
+        context: evaluator.current_continuation.clone(),
+        winds: evaluator.wind_stack.clone(),
+    })));
+    evaluator.apply(args[0].clone(), &[continuation], span)
+}
+
+fn builtin_dynamic_wind(
+    evaluator: &mut Evaluator,
+    args: &[Value],
+    span: Span,
+) -> EvalResult<Value> {
+    evaluator.apply_dynamic_wind(args, span)
 }
 
 fn builtin_apply(evaluator: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<Value> {

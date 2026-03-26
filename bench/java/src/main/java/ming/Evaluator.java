@@ -17,6 +17,7 @@ public class Evaluator {
     private final Map<String, BuiltinProcedure> builtins = createBuiltins();
     private StringBuilder outputBuffer;
     private ContinuationContext currentContinuation;
+    private List<WindFrame> currentWinds = List.of();
 
     /**
      * Evaluate one or more Scheme expressions and return the string
@@ -99,23 +100,28 @@ public class Evaluator {
     private SchemeValue runWithContinuations(RootComputation computation) throws EvalError {
         RootComputation currentComputation = computation;
         ContinuationContext previousContinuation = currentContinuation;
+        List<WindFrame> previousWinds = currentWinds;
         currentContinuation = null;
+        currentWinds = List.of();
         try {
             while (true) {
                 try {
                     return currentComputation.run();
                 } catch (ContinuationJump jump) {
-                    currentComputation = () -> resumeContinuation(jump.continuation(), jump.value());
+                    currentComputation = () -> resumeContinuation(jump);
                 }
             }
         } finally {
             currentContinuation = previousContinuation;
+            currentWinds = previousWinds;
         }
     }
 
-    private SchemeValue resumeContinuation(ContinuationContext continuation, SchemeValue value) throws EvalError {
-        SchemeValue resumedValue = value;
-        ContinuationContext context = continuation;
+    private SchemeValue resumeContinuation(ContinuationJump jump) throws EvalError {
+        transitionWinds(jump.sourceWinds(), jump.targetWinds());
+
+        SchemeValue resumedValue = jump.value();
+        ContinuationContext context = jump.continuation();
         while (context != null) {
             ContinuationContext activeContext = context;
             SchemeValue inputValue = resumedValue;
@@ -151,6 +157,34 @@ public class Evaluator {
         } finally {
             currentContinuation = previousContinuation;
         }
+    }
+
+    private SchemeValue withActiveWinds(List<WindFrame> winds, RootComputation computation) throws EvalError {
+        List<WindFrame> previousWinds = currentWinds;
+        currentWinds = winds;
+        try {
+            return computation.run();
+        } finally {
+            currentWinds = previousWinds;
+        }
+    }
+
+    private void transitionWinds(List<WindFrame> source, List<WindFrame> target) throws EvalError {
+        int shared = sharedWindPrefix(source, target);
+
+        for (int index = source.size() - 1; index >= shared; index--) {
+            WindFrame frame = source.get(index);
+            List<WindFrame> activeWinds = copyWindPrefix(source, index);
+            withActiveWinds(activeWinds, () -> applyThunk(frame.outThunk()));
+        }
+
+        for (int index = shared; index < target.size(); index++) {
+            WindFrame frame = target.get(index);
+            List<WindFrame> activeWinds = copyWindPrefix(target, index);
+            withActiveWinds(activeWinds, () -> applyThunk(frame.inThunk()));
+        }
+
+        currentWinds = List.copyOf(target);
     }
 
     private TailStep evalListTail(ListExpression expression, Environment environment) throws EvalError {
@@ -626,6 +660,7 @@ public class Evaluator {
         );
         builtins.put("call/cc", callWithCurrentContinuation);
         builtins.put("call-with-current-continuation", callWithCurrentContinuation);
+        builtins.put("dynamic-wind", new BuiltinProcedure("dynamic-wind", this::applyDynamicWind));
         builtins.put("string-append", new BuiltinProcedure("string-append", Evaluator::applyStringAppend));
         builtins.put("make-string", new BuiltinProcedure("make-string", Evaluator::applyMakeString));
         builtins.put("string", new BuiltinProcedure("string", Evaluator::applyString));
@@ -1854,18 +1889,84 @@ public class Evaluator {
         return VoidValue.INSTANCE;
     }
 
+    private SchemeValue applyThunk(SchemeValue thunk) throws EvalError {
+        return applyProcedure(thunk, List.of());
+    }
+
     private SchemeValue applyCallWithCurrentContinuation(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 1, "call/cc");
         return applyProcedure(
                 arguments.getFirst(),
-                List.of(new ContinuationProcedure(currentContinuation))
+                List.of(new ContinuationProcedure(
+                        new CapturedContinuation(currentContinuation, List.copyOf(currentWinds))
+                ))
         );
+    }
+
+    private SchemeValue applyDynamicWind(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 3, "dynamic-wind");
+
+        SchemeValue inThunk = arguments.get(0);
+        SchemeValue bodyThunk = arguments.get(1);
+        SchemeValue outThunk = arguments.get(2);
+
+        applyThunk(inThunk);
+
+        WindFrame wind = new WindFrame(inThunk, outThunk);
+        pushWind(wind);
+
+        ContinuationContext bodyContinuation = new ContinuationContext(
+                value -> finishDynamicWind(wind, value),
+                currentContinuation
+        );
+
+        try {
+            SchemeValue value = withActiveContinuation(bodyContinuation, () -> applyThunk(bodyThunk));
+            return finishDynamicWind(wind, value);
+        } catch (EvalError error) {
+            popWind(wind);
+            try {
+                applyThunk(outThunk);
+            } catch (EvalError outError) {
+                throw outError;
+            }
+            throw error;
+        } catch (ContinuationJump jump) {
+            popWind(wind);
+            throw jump;
+        }
+    }
+
+    private SchemeValue finishDynamicWind(WindFrame wind, SchemeValue value) throws EvalError {
+        popWind(wind);
+        applyThunk(wind.outThunk());
+        return value;
+    }
+
+    private void pushWind(WindFrame wind) {
+        List<WindFrame> winds = new ArrayList<>(currentWinds.size() + 1);
+        winds.addAll(currentWinds);
+        winds.add(wind);
+        currentWinds = List.copyOf(winds);
+    }
+
+    private void popWind(WindFrame wind) {
+        if (currentWinds.isEmpty() || currentWinds.getLast() != wind) {
+            return;
+        }
+        currentWinds = copyWindPrefix(currentWinds, currentWinds.size() - 1);
     }
 
     private SchemeValue applyContinuation(ContinuationProcedure continuationProcedure, List<SchemeValue> arguments)
             throws EvalError {
         requireArgumentCount(arguments, 1, "continuation");
-        throw new ContinuationJump((ContinuationContext) continuationProcedure.continuation(), arguments.getFirst());
+        CapturedContinuation continuation = (CapturedContinuation) continuationProcedure.continuation();
+        throw new ContinuationJump(
+                continuation.context(),
+                arguments.getFirst(),
+                List.copyOf(currentWinds),
+                continuation.winds()
+        );
     }
 
     private static SchemeValue applyStringAppend(List<SchemeValue> arguments) throws EvalError {
@@ -2751,6 +2852,22 @@ public class Evaluator {
     private record VectorComparison(VectorValue left, VectorValue right) {
     }
 
+    private static List<WindFrame> copyWindPrefix(List<WindFrame> winds, int size) {
+        if (size == 0) {
+            return List.of();
+        }
+        return List.copyOf(winds.subList(0, size));
+    }
+
+    private static int sharedWindPrefix(List<WindFrame> left, List<WindFrame> right) {
+        int shared = 0;
+        int limit = Math.min(left.size(), right.size());
+        while (shared < limit && left.get(shared) == right.get(shared)) {
+            shared++;
+        }
+        return shared;
+    }
+
     @FunctionalInterface
     private interface RootComputation {
         SchemeValue run() throws EvalError;
@@ -2764,14 +2881,29 @@ public class Evaluator {
     private record ContinuationContext(ContinuationFrame frame, ContinuationContext parent) {
     }
 
+    private record WindFrame(SchemeValue inThunk, SchemeValue outThunk) {
+    }
+
+    private record CapturedContinuation(ContinuationContext context, List<WindFrame> winds) {
+    }
+
     private static final class ContinuationJump extends RuntimeException {
         private final ContinuationContext continuation;
         private final SchemeValue value;
+        private final List<WindFrame> sourceWinds;
+        private final List<WindFrame> targetWinds;
 
-        private ContinuationJump(ContinuationContext continuation, SchemeValue value) {
+        private ContinuationJump(
+                ContinuationContext continuation,
+                SchemeValue value,
+                List<WindFrame> sourceWinds,
+                List<WindFrame> targetWinds
+        ) {
             super(null, null, false, false);
             this.continuation = continuation;
             this.value = value;
+            this.sourceWinds = sourceWinds;
+            this.targetWinds = targetWinds;
         }
 
         private ContinuationContext continuation() {
@@ -2780,6 +2912,14 @@ public class Evaluator {
 
         private SchemeValue value() {
             return value;
+        }
+
+        private List<WindFrame> sourceWinds() {
+            return sourceWinds;
+        }
+
+        private List<WindFrame> targetWinds() {
+            return targetWinds;
         }
     }
 
