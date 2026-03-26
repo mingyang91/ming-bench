@@ -4,10 +4,22 @@ const BUILTIN_NAMES = [
     '-',
     '*',
     '/',
+    'abs',
+    'modulo',
+    'remainder',
+    'quotient',
+    'min',
+    'max',
+    'expt',
     '<',
     '>',
     '=',
     '<=',
+    'zero?',
+    'positive?',
+    'negative?',
+    'odd?',
+    'even?',
     'not',
     'cons',
     'car',
@@ -16,11 +28,18 @@ const BUILTIN_NAMES = [
     'list',
     'append',
     'length',
+    'list-ref',
+    'list-tail',
+    'list?',
+    'assoc',
+    'map',
     'string?',
     'number?',
     'boolean?',
     'pair?',
     'symbol?',
+    'eq?',
+    'equal?',
     'display',
     'write',
     'newline',
@@ -34,12 +53,25 @@ const BUILTIN_NAMES = [
     'string-ref',
     'string-copy',
     'string-set!',
+    'string=?',
+    'string<?',
+    'string-ci=?',
+    'string-upcase',
+    'string-downcase',
     'char?',
+    'char-alphabetic?',
+    'char-numeric?',
+    'char-upcase',
+    'char-downcase',
+    'char=?',
+    'char<?',
     'apply',
 ];
 const NIL_VALUE = { kind: 'nil' };
 const VOID_VALUE = { kind: 'void' };
 const DEFAULT_SOURCE_POS = { line: 1, col: 1 };
+const ALPHABETIC_CHAR_RE = /^\p{L}$/u;
+const NUMERIC_CHAR_RE = /^\p{N}$/u;
 class Environment {
     parent;
     bindings = new Map();
@@ -622,6 +654,20 @@ function applyBuiltin(name, args, context) {
             return makeNumber(args.map((arg) => expectNumber(arg, '*')).reduce((product, value) => product * value, 1));
         case '/':
             return applyDivision(args);
+        case 'abs':
+            return applyAbs(args);
+        case 'modulo':
+            return applyIntegerDivision(args, 'modulo', 'modulo');
+        case 'remainder':
+            return applyIntegerDivision(args, 'remainder', 'remainder');
+        case 'quotient':
+            return applyIntegerDivision(args, 'quotient', 'quotient');
+        case 'min':
+            return applyMinMax(args, 'min', Math.min);
+        case 'max':
+            return applyMinMax(args, 'max', Math.max);
+        case 'expt':
+            return applyExpt(args);
         case '<':
             return applyComparison(args, '<', (left, right) => left < right);
         case '>':
@@ -630,6 +676,16 @@ function applyBuiltin(name, args, context) {
             return applyComparison(args, '=', (left, right) => left === right);
         case '<=':
             return applyComparison(args, '<=', (left, right) => left <= right);
+        case 'zero?':
+            return applyNumericPredicate(args, 'zero?', (value) => value === 0);
+        case 'positive?':
+            return applyNumericPredicate(args, 'positive?', (value) => value > 0);
+        case 'negative?':
+            return applyNumericPredicate(args, 'negative?', (value) => value < 0);
+        case 'odd?':
+            return applyIntegerPredicate(args, 'odd?', (value) => Math.abs(value % 2) === 1);
+        case 'even?':
+            return applyIntegerPredicate(args, 'even?', (value) => value % 2 === 0);
         case 'not':
             if (args.length !== 1) {
                 throw new EvalError('not expects exactly 1 argument');
@@ -664,6 +720,16 @@ function applyBuiltin(name, args, context) {
                 throw new EvalError('length expects exactly 1 argument');
             }
             return makeNumber(listLength(args[0]));
+        case 'list-ref':
+            return applyListRef(args);
+        case 'list-tail':
+            return applyListTail(args);
+        case 'list?':
+            return applyTypePredicate(args, 'list?', (value) => isProperList(value));
+        case 'assoc':
+            return applyAssoc(args);
+        case 'map':
+            return applyMap(args, context);
         case 'string?':
             return applyTypePredicate(args, 'string?', (value) => value.kind === 'string');
         case 'number?':
@@ -674,6 +740,16 @@ function applyBuiltin(name, args, context) {
             return applyTypePredicate(args, 'pair?', (value) => value.kind === 'pair');
         case 'symbol?':
             return applyTypePredicate(args, 'symbol?', (value) => value.kind === 'symbol');
+        case 'eq?':
+            if (args.length !== 2) {
+                throw new EvalError('eq? expects exactly 2 arguments');
+            }
+            return makeBoolean(eqValues(args[0], args[1]));
+        case 'equal?':
+            if (args.length !== 2) {
+                throw new EvalError('equal? expects exactly 2 arguments');
+            }
+            return makeBoolean(equalValues(args[0], args[1]));
         case 'display':
             if (args.length !== 1) {
                 throw new EvalError('display expects exactly 1 argument');
@@ -730,8 +806,30 @@ function applyBuiltin(name, args, context) {
             return makeString(expectStringValue(args[0], 'string-copy').value);
         case 'string-set!':
             return applyStringSet(args);
+        case 'string=?':
+            return applyStringComparison(args, 'string=?', (value) => value, (left, right) => left === right);
+        case 'string<?':
+            return applyStringComparison(args, 'string<?', (value) => value, (left, right) => left < right);
+        case 'string-ci=?':
+            return applyStringComparison(args, 'string-ci=?', (value) => value.toLocaleLowerCase(), (left, right) => left === right);
+        case 'string-upcase':
+            return applyStringCase(args, 'string-upcase', (value) => value.toLocaleUpperCase());
+        case 'string-downcase':
+            return applyStringCase(args, 'string-downcase', (value) => value.toLocaleLowerCase());
         case 'char?':
             return applyTypePredicate(args, 'char?', (value) => value.kind === 'char');
+        case 'char-alphabetic?':
+            return applyCharPredicate(args, 'char-alphabetic?', (value) => ALPHABETIC_CHAR_RE.test(value));
+        case 'char-numeric?':
+            return applyCharPredicate(args, 'char-numeric?', (value) => NUMERIC_CHAR_RE.test(value));
+        case 'char-upcase':
+            return applyCharCase(args, 'char-upcase', (value) => value.toLocaleUpperCase());
+        case 'char-downcase':
+            return applyCharCase(args, 'char-downcase', (value) => value.toLocaleLowerCase());
+        case 'char=?':
+            return applyCharComparison(args, 'char=?', (left, right) => left === right);
+        case 'char<?':
+            return applyCharComparison(args, 'char<?', (left, right) => left < right);
         case 'apply':
             return applyApply(args, context);
     }
@@ -744,6 +842,61 @@ function applyApply(args, context) {
     const prefixArgs = args.slice(1, -1);
     const tailArgs = listToArray(args[args.length - 1], 'apply');
     return applyProcedure(procedure, [...prefixArgs, ...tailArgs], context);
+}
+function applyAbs(args) {
+    if (args.length !== 1) {
+        throw new EvalError('abs expects exactly 1 argument');
+    }
+    return makeNumber(Math.abs(expectNumber(args[0], 'abs')));
+}
+function applyIntegerDivision(args, name, operation) {
+    if (args.length !== 2) {
+        throw new EvalError(`${name} expects exactly 2 arguments`);
+    }
+    const dividend = expectInteger(args[0], name);
+    const divisor = expectInteger(args[1], name);
+    if (divisor === 0) {
+        throw new EvalError('division by zero');
+    }
+    switch (operation) {
+        case 'quotient':
+            return makeNumber(Math.trunc(dividend / divisor));
+        case 'remainder':
+            return makeNumber(dividend % divisor);
+        case 'modulo': {
+            let result = dividend % divisor;
+            if (result !== 0 && Math.sign(result) !== Math.sign(divisor)) {
+                result += divisor;
+            }
+            return makeNumber(result);
+        }
+    }
+}
+function applyMinMax(args, name, operator) {
+    if (args.length === 0) {
+        throw new EvalError(`${name} expects at least 1 argument`);
+    }
+    return makeNumber(operator(...args.map((arg) => expectNumber(arg, name))));
+}
+function applyExpt(args) {
+    if (args.length !== 2) {
+        throw new EvalError('expt expects exactly 2 arguments');
+    }
+    const base = expectNumber(args[0], 'expt');
+    const exponent = expectInteger(args[1], 'expt');
+    return makeNumber(base ** exponent);
+}
+function applyNumericPredicate(args, name, predicate) {
+    if (args.length !== 1) {
+        throw new EvalError(`${name} expects exactly 1 argument`);
+    }
+    return makeBoolean(predicate(expectNumber(args[0], name)));
+}
+function applyIntegerPredicate(args, name, predicate) {
+    if (args.length !== 1) {
+        throw new EvalError(`${name} expects exactly 1 argument`);
+    }
+    return makeBoolean(predicate(expectInteger(args[0], name)));
 }
 function applySubtraction(args) {
     if (args.length === 0) {
@@ -792,6 +945,61 @@ function applyComparison(args, name, predicate) {
 function applyStringAppend(args) {
     return makeString(args.map((arg) => expectStringValue(arg, 'string-append').value).join(''));
 }
+function applyListRef(args) {
+    if (args.length !== 2) {
+        throw new EvalError('list-ref expects exactly 2 arguments');
+    }
+    const tail = getListTail(args[0], expectIndex(args[1], 'list-ref'), 'list-ref');
+    if (tail.kind !== 'pair') {
+        throw new EvalError('list-ref index out of range');
+    }
+    return tail.car;
+}
+function applyListTail(args) {
+    if (args.length !== 2) {
+        throw new EvalError('list-tail expects exactly 2 arguments');
+    }
+    return getListTail(args[0], expectIndex(args[1], 'list-tail'), 'list-tail');
+}
+function applyAssoc(args) {
+    if (args.length !== 2) {
+        throw new EvalError('assoc expects exactly 2 arguments');
+    }
+    const [key, alist] = args;
+    let current = alist;
+    while (current.kind === 'pair') {
+        const entry = current.car;
+        if (entry.kind !== 'pair') {
+            throw new EvalError('assoc expects an association list');
+        }
+        if (equalValues(key, entry.car)) {
+            return entry;
+        }
+        current = current.cdr;
+    }
+    if (current.kind !== 'nil') {
+        throw new EvalError('assoc expects a proper list');
+    }
+    return makeBoolean(false);
+}
+function applyMap(args, context) {
+    if (args.length < 2) {
+        throw new EvalError('map expects at least 2 arguments');
+    }
+    const [procedure, ...listArgs] = args;
+    const lists = listArgs.map((listArg) => listToArray(listArg, 'map'));
+    const resultLength = lists[0].length;
+    for (const list of lists) {
+        if (list.length !== resultLength) {
+            throw new EvalError('map expects lists of equal length');
+        }
+    }
+    const results = [];
+    for (let index = 0; index < resultLength; index += 1) {
+        results.push(applyProcedure(procedure, lists.map((list) => list[index]), context));
+    }
+    return buildList(results);
+}
 function applySubstring(args) {
     if (args.length !== 3) {
         throw new EvalError('substring expects exactly 3 arguments');
@@ -833,11 +1041,60 @@ function applyStringSet(args) {
     target.value = chars.join('');
     return VOID_VALUE;
 }
+function applyStringComparison(args, name, normalize, predicate) {
+    if (args.length < 2) {
+        throw new EvalError(`${name} expects at least 2 arguments`);
+    }
+    const strings = args.map((arg) => normalize(expectStringValue(arg, name).value));
+    for (let index = 0; index < strings.length - 1; index += 1) {
+        if (!predicate(strings[index], strings[index + 1])) {
+            return makeBoolean(false);
+        }
+    }
+    return makeBoolean(true);
+}
+function applyStringCase(args, name, transform) {
+    if (args.length !== 1) {
+        throw new EvalError(`${name} expects exactly 1 argument`);
+    }
+    return makeString(transform(expectStringValue(args[0], name).value));
+}
+function applyCharPredicate(args, name, predicate) {
+    if (args.length !== 1) {
+        throw new EvalError(`${name} expects exactly 1 argument`);
+    }
+    return makeBoolean(predicate(expectChar(args[0], name).value));
+}
+function applyCharCase(args, name, transform) {
+    if (args.length !== 1) {
+        throw new EvalError(`${name} expects exactly 1 argument`);
+    }
+    return makeChar(transform(expectChar(args[0], name).value));
+}
+function applyCharComparison(args, name, predicate) {
+    if (args.length < 2) {
+        throw new EvalError(`${name} expects at least 2 arguments`);
+    }
+    const codePoints = args.map((arg) => charCodePoint(expectChar(arg, name).value));
+    for (let index = 0; index < codePoints.length - 1; index += 1) {
+        if (!predicate(codePoints[index], codePoints[index + 1])) {
+            return makeBoolean(false);
+        }
+    }
+    return makeBoolean(true);
+}
 function expectNumber(value, procedure) {
     if (value.kind !== 'number') {
         throw new EvalError(`${procedure} expects numeric arguments`);
     }
     return value.value;
+}
+function expectInteger(value, procedure) {
+    const numericValue = expectNumber(value, procedure);
+    if (!Number.isInteger(numericValue)) {
+        throw new EvalError(`${procedure} expects integer arguments`);
+    }
+    return numericValue;
 }
 function expectStringValue(value, procedure) {
     if (value.kind !== 'string') {
@@ -901,6 +1158,23 @@ function applyAppend(args) {
 function listLength(value) {
     return listToArray(value, 'length').length;
 }
+function getListTail(value, index, procedure) {
+    let current = value;
+    for (let remaining = index; remaining > 0; remaining -= 1) {
+        if (current.kind === 'pair') {
+            current = current.cdr;
+            continue;
+        }
+        if (current.kind === 'nil') {
+            throw new EvalError(`${procedure} index out of range`);
+        }
+        throw new EvalError(`${procedure} expects a proper list`);
+    }
+    if (current.kind !== 'pair' && current.kind !== 'nil') {
+        throw new EvalError(`${procedure} expects a proper list`);
+    }
+    return current;
+}
 function listToArray(value, procedure) {
     const elements = [];
     let current = value;
@@ -912,6 +1186,63 @@ function listToArray(value, procedure) {
         throw new EvalError(`${procedure} expects a proper list`);
     }
     return elements;
+}
+function isProperList(value) {
+    const seen = new Set();
+    let current = value;
+    while (current.kind === 'pair') {
+        if (seen.has(current)) {
+            return false;
+        }
+        seen.add(current);
+        current = current.cdr;
+    }
+    return current.kind === 'nil';
+}
+function eqValues(left, right) {
+    if (left.kind === 'number' && right.kind === 'number') {
+        return left.value === right.value;
+    }
+    if (left.kind === 'boolean' && right.kind === 'boolean') {
+        return left.value === right.value;
+    }
+    if (left.kind === 'string' && right.kind === 'string') {
+        return left.value === right.value;
+    }
+    if (left.kind === 'char' && right.kind === 'char') {
+        return left.value === right.value;
+    }
+    if (left.kind === 'symbol' && right.kind === 'symbol') {
+        return left.name === right.name;
+    }
+    if (left.kind === 'nil' && right.kind === 'nil') {
+        return true;
+    }
+    if (left.kind === 'builtin' && right.kind === 'builtin') {
+        return left.name === right.name;
+    }
+    if (left.kind === 'void' && right.kind === 'void') {
+        return true;
+    }
+    return left === right;
+}
+function equalValues(left, right, seen = new WeakMap()) {
+    if (left.kind === 'pair' && right.kind === 'pair') {
+        let seenRights = seen.get(left);
+        if (seenRights?.has(right)) {
+            return true;
+        }
+        if (seenRights === undefined) {
+            seenRights = new WeakSet();
+            seen.set(left, seenRights);
+        }
+        seenRights.add(right);
+        return equalValues(left.car, right.car, seen) && equalValues(left.cdr, right.cdr, seen);
+    }
+    if (left.kind === 'string' && right.kind === 'string') {
+        return left.value === right.value;
+    }
+    return eqValues(left, right);
 }
 function applyTypePredicate(args, name, predicate) {
     if (args.length !== 1) {
@@ -1028,6 +1359,13 @@ function formatChar(value) {
 }
 function stringChars(value) {
     return Array.from(value);
+}
+function charCodePoint(value) {
+    const codePoint = value.codePointAt(0);
+    if (codePoint === undefined) {
+        throw new EvalError('character values must contain exactly 1 character');
+    }
+    return codePoint;
 }
 function parseNumberString(value) {
     const trimmed = value.trim();
