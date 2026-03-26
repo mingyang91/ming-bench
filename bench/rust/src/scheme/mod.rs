@@ -109,6 +109,7 @@ enum Token {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +175,27 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                     match chars[i + 1] {
                         't' => { tokens.push(SpannedToken { token: Token::Boolean(true), pos: start_pos }); i += 2; col += 2; }
                         'f' => { tokens.push(SpannedToken { token: Token::Boolean(false), pos: start_pos }); i += 2; col += 2; }
+                        '\\' => {
+                            // Character literal: #\x or #\space, #\newline, #\tab
+                            i += 2; col += 2;
+                            if i >= chars.len() {
+                                return Err(EvalError::Parse(format!("{start_pos}: incomplete character literal")));
+                            }
+                            // Collect the name
+                            let name_start = i;
+                            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != ')' && chars[i] != '(' {
+                                i += 1; col += 1;
+                            }
+                            let name: String = chars[name_start..i].iter().collect();
+                            let ch = match name.as_str() {
+                                "space" => ' ',
+                                "newline" => '\n',
+                                "tab" => '\t',
+                                s if s.len() == 1 => s.chars().next().expect("single-char string guaranteed non-empty"),
+                                _ => return Err(EvalError::Parse(format!("{start_pos}: unknown character name: {name}"))),
+                            };
+                            tokens.push(SpannedToken { token: Token::Char(ch), pos: start_pos });
+                        }
                         _ => return Err(EvalError::Parse(format!("{start_pos}: unexpected #-literal")))
                     }
                 } else {
@@ -211,6 +233,7 @@ enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -243,6 +266,7 @@ fn parse_tokens(tokens: &[SpannedToken], pos: &mut usize) -> Result<Expr, EvalEr
         Token::Integer(n) => { let n = *n; *pos += 1; Ok(Expr::new(ExprKind::Integer(n), spos)) }
         Token::Boolean(b) => { let b = *b; *pos += 1; Ok(Expr::new(ExprKind::Boolean(b), spos)) }
         Token::Str(s) => { let s = s.clone(); *pos += 1; Ok(Expr::new(ExprKind::Str(s), spos)) }
+        Token::Char(c) => { let c = *c; *pos += 1; Ok(Expr::new(ExprKind::Char(c), spos)) }
         Token::Symbol(s) if s == "'" => {
             *pos += 1;
             let inner = parse_tokens(tokens, pos)?;
@@ -295,6 +319,7 @@ fn eval_expr(expr: &Expr, env: &EnvRef, out: &RefCell<String>) -> Result<Value, 
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Symbol(name) => {
             env_get(env, name)
                 .ok_or_else(|| EvalError::UnboundVariable(format!("{p}: {name}")))
@@ -319,6 +344,7 @@ fn eval_expr(expr: &Expr, env: &EnvRef, out: &RefCell<String>) -> Result<Value, 
                     "let" => return eval_let(&items[1..], env, p, out),
                     "begin" => return eval_begin(&items[1..], env, out),
                     "cond" => return eval_cond(&items[1..], env, out),
+                    "string-set!" => return eval_string_set(&items[1..], env, p, out),
                     _ => {}
                 }
             }
@@ -533,6 +559,7 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
     }
@@ -849,7 +876,63 @@ fn apply_builtin_by_name(name: &str, args: &[Value], call_pos: Pos, out: &RefCel
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
         }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string-copy requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type(format!("{call_pos}: string-copy: expected string"))),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
+    }
+}
+
+fn env_set_existing(env: &EnvRef, name: &str, val: Value) -> bool {
+    let mut frame = env.borrow_mut();
+    if frame.bindings.contains_key(name) {
+        frame.bindings.insert(name.to_string(), val);
+        return true;
+    }
+    if let Some(parent) = &frame.parent {
+        env_set_existing(parent, name, val)
+    } else {
+        false
+    }
+}
+
+fn eval_string_set(args: &[Expr], env: &EnvRef, p: Pos, out: &RefCell<String>) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity(format!("{p}: string-set! requires 3 arguments")));
+    }
+    let var_name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type(format!("{p}: string-set!: first argument must be a variable"))),
+    };
+    let idx = eval_expr(&args[1], env, out)?;
+    let idx = match idx {
+        Value::Integer(n) => n as usize,
+        _ => return Err(EvalError::Type(format!("{p}: string-set!: expected integer index"))),
+    };
+    let ch = eval_expr(&args[2], env, out)?;
+    let ch = match ch {
+        Value::Char(c) => c,
+        _ => return Err(EvalError::Type(format!("{p}: string-set!: expected char"))),
+    };
+    let s = env_get(env, &var_name)
+        .ok_or_else(|| EvalError::UnboundVariable(format!("{p}: {var_name}")))?;
+    match s {
+        Value::Str(mut string) => {
+            if idx >= string.len() {
+                return Err(EvalError::Type(format!("{p}: string-set!: index out of range")));
+            }
+            // SAFETY: replacing ASCII-range byte with a char
+            unsafe { string.as_bytes_mut()[idx] = ch as u8; }
+            env_set_existing(env, &var_name, Value::Str(string));
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::Type(format!("{p}: string-set!: expected string"))),
     }
 }
 
@@ -875,7 +958,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
                   "string-append", "string-length", "substring",
                   "string->number", "number->string",
                   "symbol->string", "string->symbol",
-                  "string-ref", "char?"] {
+                  "string-ref", "char?", "string-copy"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     let out = RefCell::new(String::new());
@@ -901,7 +984,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
                   "string-append", "string-length", "substring",
                   "string->number", "number->string",
                   "symbol->string", "string->symbol",
-                  "string-ref", "char?"] {
+                  "string-ref", "char?", "string-copy"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     let out = RefCell::new(String::new());
