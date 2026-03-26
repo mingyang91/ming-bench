@@ -1,9 +1,32 @@
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourcePos {
+    line: usize,
+    col: usize,
+}
+
+impl SourcePos {
+    pub const fn new(line: usize, col: usize) -> Self {
+        Self { line, col }
+    }
+}
+
+impl fmt::Display for SourcePos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 /// Evaluation error type for the Scheme interpreter.
 ///
 /// Agents must add domain-specific variants here. Using `String` as the
 /// error type is not possible — the `eval_str` signature requires this type.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
+    #[error("{pos}: {source}")]
+    WithPosition { pos: SourcePos, source: Box<EvalError> },
+
     #[error("empty input")]
     EmptyInput,
 
@@ -46,4 +69,16 @@ pub enum EvalError {
 
     #[error("division by zero")]
     DivisionByZero,
+}
+
+impl EvalError {
+    pub(crate) fn with_position(self, pos: SourcePos) -> Self {
+        match self {
+            Self::WithPosition { .. } => self,
+            other => Self::WithPosition {
+                pos,
+                source: Box::new(other),
+            },
+        }
+    }
 }

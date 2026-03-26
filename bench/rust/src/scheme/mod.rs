@@ -4,10 +4,11 @@ use std::rc::Rc;
 
 pub mod error;
 
+use error::SourcePos;
 pub use error::EvalError;
 
 #[derive(Clone, Debug, PartialEq)]
-enum Token {
+enum TokenKind {
     LParen,
     RParen,
     Quote,
@@ -18,12 +19,30 @@ enum Token {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Expr {
+struct Token {
+    kind: TokenKind,
+    pos: SourcePos,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ExprKind {
     Integer(i64),
     Boolean(bool),
     String(String),
     Symbol(String),
     List(Vec<Expr>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Expr {
+    kind: ExprKind,
+    pos: SourcePos,
+}
+
+impl Expr {
+    fn new(kind: ExprKind, pos: SourcePos) -> Self {
+        Self { kind, pos }
+    }
 }
 
 type NativeFunc = fn(&[Value]) -> Result<Value, EvalError>;
@@ -166,11 +185,16 @@ impl Closure {
 struct Parser {
     tokens: Vec<Token>,
     index: usize,
+    eof_pos: SourcePos,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, index: 0 }
+    fn new(tokens: Vec<Token>, eof_pos: SourcePos) -> Self {
+        Self {
+            tokens,
+            index: 0,
+            eof_pos,
+        }
     }
 
     fn parse_program(&mut self) -> Result<Vec<Expr>, EvalError> {
@@ -186,32 +210,40 @@ impl Parser {
             .tokens
             .get(self.index)
             .cloned()
-            .ok_or(EvalError::UnexpectedEof)?;
+            .ok_or_else(|| EvalError::UnexpectedEof.with_position(self.eof_pos))?;
         self.index += 1;
 
-        match token {
-            Token::LParen => {
+        match token.kind {
+            TokenKind::LParen => {
                 let mut items = Vec::new();
                 while self.index < self.tokens.len() {
-                    if matches!(self.tokens.get(self.index), Some(Token::RParen)) {
+                    if self
+                        .tokens
+                        .get(self.index)
+                        .is_some_and(|token| matches!(token.kind, TokenKind::RParen))
+                    {
                         self.index += 1;
-                        return Ok(Expr::List(items));
+                        return Ok(Expr::new(ExprKind::List(items), token.pos));
                     }
                     items.push(self.parse_expr()?);
                 }
-                Err(EvalError::UnexpectedEof)
+                Err(EvalError::UnexpectedEof.with_position(self.eof_pos))
             }
-            Token::RParen => Err(EvalError::UnexpectedToken {
+            TokenKind::RParen => Err(EvalError::UnexpectedToken {
                 token: ")".to_string(),
-            }),
-            Token::Integer(value) => Ok(Expr::Integer(value)),
-            Token::Boolean(value) => Ok(Expr::Boolean(value)),
-            Token::String(value) => Ok(Expr::String(value)),
-            Token::Symbol(value) => Ok(Expr::Symbol(value)),
-            Token::Quote => Ok(Expr::List(vec![
-                Expr::Symbol("quote".to_string()),
-                self.parse_expr()?,
-            ])),
+            }
+            .with_position(token.pos)),
+            TokenKind::Integer(value) => Ok(Expr::new(ExprKind::Integer(value), token.pos)),
+            TokenKind::Boolean(value) => Ok(Expr::new(ExprKind::Boolean(value), token.pos)),
+            TokenKind::String(value) => Ok(Expr::new(ExprKind::String(value), token.pos)),
+            TokenKind::Symbol(value) => Ok(Expr::new(ExprKind::Symbol(value), token.pos)),
+            TokenKind::Quote => Ok(Expr::new(
+                ExprKind::List(vec![
+                    Expr::new(ExprKind::Symbol("quote".to_string()), token.pos),
+                    self.parse_expr()?,
+                ]),
+                token.pos,
+            )),
         }
     }
 }
@@ -233,8 +265,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let tokens = tokenize(input)?;
-    let mut parser = Parser::new(tokens);
+    let (tokens, eof_pos) = tokenize(input)?;
+    let mut parser = Parser::new(tokens, eof_pos);
     let exprs = parser.parse_program()?;
 
     if exprs.is_empty() {
@@ -276,12 +308,13 @@ fn default_env() -> EnvRef {
     env
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
+fn tokenize(input: &str) -> Result<(Vec<Token>, SourcePos), EvalError> {
     let bytes = input.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
 
     while index < bytes.len() {
+        let pos = pos_from_index(input, index);
         match bytes[index] {
             b' ' | b'\n' | b'\r' | b'\t' => {
                 index += 1;
@@ -292,30 +325,44 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 }
             }
             b'(' => {
-                tokens.push(Token::LParen);
+                tokens.push(Token {
+                    kind: TokenKind::LParen,
+                    pos,
+                });
                 index += 1;
             }
             b')' => {
-                tokens.push(Token::RParen);
+                tokens.push(Token {
+                    kind: TokenKind::RParen,
+                    pos,
+                });
                 index += 1;
             }
             b'\'' => {
-                tokens.push(Token::Quote);
+                tokens.push(Token {
+                    kind: TokenKind::Quote,
+                    pos,
+                });
                 index += 1;
             }
             b'"' => {
-                let (value, next_index) = parse_string(input, index + 1)?;
-                tokens.push(Token::String(value));
+                let (value, next_index) =
+                    parse_string(input, index + 1).map_err(|err| err.with_position(pos))?;
+                tokens.push(Token {
+                    kind: TokenKind::String(value),
+                    pos,
+                });
                 index = next_index;
             }
             b'#' => {
-                if let Some((token, next_index)) = parse_boolean(input, index) {
-                    tokens.push(token);
+                if let Some((kind, next_index)) = parse_boolean(input, index) {
+                    tokens.push(Token { kind, pos });
                     index = next_index;
                 } else {
                     return Err(EvalError::UnexpectedToken {
                         token: input[index..].to_string(),
-                    });
+                    }
+                    .with_position(pos));
                 }
             }
             _ => {
@@ -325,23 +372,31 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
                 }
 
                 let atom = &input[start..index];
+                let atom_pos = pos_from_index(input, start);
                 if let Ok(value) = atom.parse::<i64>() {
-                    tokens.push(Token::Integer(value));
+                    tokens.push(Token {
+                        kind: TokenKind::Integer(value),
+                        pos: atom_pos,
+                    });
                 } else if atom.chars().next().is_some_and(|ch| ch == '+' || ch == '-')
                     && atom.len() > 1
                     && atom[1..].chars().all(|ch| ch.is_ascii_digit())
                 {
                     return Err(EvalError::InvalidInteger {
                         value: atom.to_string(),
-                    });
+                    }
+                    .with_position(atom_pos));
                 } else {
-                    tokens.push(Token::Symbol(atom.to_string()));
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol(atom.to_string()),
+                        pos: atom_pos,
+                    });
                 }
             }
         }
     }
 
-    Ok(tokens)
+    Ok((tokens, pos_from_index(input, input.len())))
 }
 
 fn parse_string(input: &str, mut index: usize) -> Result<(String, usize), EvalError> {
@@ -373,15 +428,31 @@ fn parse_string(input: &str, mut index: usize) -> Result<(String, usize), EvalEr
     Err(EvalError::UnterminatedString)
 }
 
-fn parse_boolean(input: &str, index: usize) -> Option<(Token, usize)> {
+fn parse_boolean(input: &str, index: usize) -> Option<(TokenKind, usize)> {
     let remainder = &input[index..];
     if remainder.starts_with("#t") && is_delimiter(input, index + 2) {
-        Some((Token::Boolean(true), index + 2))
+        Some((TokenKind::Boolean(true), index + 2))
     } else if remainder.starts_with("#f") && is_delimiter(input, index + 2) {
-        Some((Token::Boolean(false), index + 2))
+        Some((TokenKind::Boolean(false), index + 2))
     } else {
         None
     }
+}
+
+fn pos_from_index(input: &str, index: usize) -> SourcePos {
+    let mut line = 1;
+    let mut col = 1;
+
+    for byte in input.as_bytes().iter().take(index) {
+        if *byte == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+
+    SourcePos::new(line, col)
 }
 
 fn is_delimiter(input: &str, index: usize) -> bool {
@@ -408,42 +479,43 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 }
 
 fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Integer(value) => Ok(Value::Integer(*value)),
-        Expr::Boolean(value) => Ok(Value::Boolean(*value)),
-        Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => env
-            .lookup(name)
-            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
-        Expr::List(items) => eval_list(items, env),
+    match &expr.kind {
+        ExprKind::Integer(value) => Ok(Value::Integer(*value)),
+        ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
+        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::Symbol(name) => env.lookup(name).ok_or_else(|| {
+            EvalError::UnboundVariable { name: name.clone() }.with_position(expr.pos)
+        }),
+        ExprKind::List(items) => eval_list(expr.pos, items, env),
     }
 }
 
-fn eval_list(items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_list(pos: SourcePos, items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     let (head, tail) = items
         .split_first()
         .ok_or_else(|| EvalError::NotAProcedure {
             found: "()".to_string(),
-        })?;
+        }
+        .with_position(pos))?;
 
-    if let Expr::Symbol(name) = head {
+    if let ExprKind::Symbol(name) = &head.kind {
         match name.as_str() {
-            "define" => return eval_define(tail, env),
-            "if" => return eval_if(tail, env),
-            "quote" => return eval_quote(tail),
-            "lambda" => return eval_lambda(tail, env),
-            "and" => return eval_and(tail, env),
-            "or" => return eval_or(tail, env),
-            "begin" => return eval_begin(tail, env),
-            "cond" => return eval_cond(tail, env),
-            "let" => return eval_let(tail, env),
+            "define" => return eval_define(tail, env).map_err(|err| err.with_position(head.pos)),
+            "if" => return eval_if(tail, env).map_err(|err| err.with_position(head.pos)),
+            "quote" => return eval_quote(tail).map_err(|err| err.with_position(head.pos)),
+            "lambda" => return eval_lambda(tail, env).map_err(|err| err.with_position(head.pos)),
+            "and" => return eval_and(tail, env).map_err(|err| err.with_position(head.pos)),
+            "or" => return eval_or(tail, env).map_err(|err| err.with_position(head.pos)),
+            "begin" => return eval_begin(tail, env).map_err(|err| err.with_position(head.pos)),
+            "cond" => return eval_cond(tail, env).map_err(|err| err.with_position(head.pos)),
+            "let" => return eval_let(tail, env).map_err(|err| err.with_position(head.pos)),
             _ => {}
         }
     }
 
     let procedure = eval(head, env.clone())?;
     let args = eval_args(tail, env)?;
-    apply(procedure, &args)
+    apply(procedure, &args).map_err(|err| err.with_position(head.pos))
 }
 
 fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -453,8 +525,8 @@ fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         });
     };
 
-    match target {
-        Expr::Symbol(name) => {
+    match &target.kind {
+        ExprKind::Symbol(name) => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount {
                     name: "define",
@@ -467,7 +539,7 @@ fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
             env.define(name.clone(), value);
             Ok(Value::Void)
         }
-        Expr::List(signature) => {
+        ExprKind::List(signature) => {
             let (name_expr, params_exprs) =
                 signature
                     .split_first()
@@ -475,7 +547,7 @@ fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
                         message: "define requires a binding name".to_string(),
                     })?;
 
-            let Expr::Symbol(name) = name_expr else {
+            let ExprKind::Symbol(name) = &name_expr.kind else {
                 return Err(EvalError::InvalidSyntax {
                     message: "function name must be a symbol".to_string(),
                 });
@@ -573,7 +645,7 @@ fn eval_begin(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 
 fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     for (index, clause) in args.iter().enumerate() {
-        let Expr::List(items) = clause else {
+        let ExprKind::List(items) = &clause.kind else {
             return Err(EvalError::InvalidSyntax {
                 message: "cond clauses must be lists".to_string(),
             });
@@ -585,7 +657,7 @@ fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
                 message: "cond clauses cannot be empty".to_string(),
             })?;
 
-        if matches!(test, Expr::Symbol(name) if name == "else") {
+        if matches!(&test.kind, ExprKind::Symbol(name) if name == "else") {
             if index + 1 != args.len() {
                 return Err(EvalError::InvalidSyntax {
                     message: "cond else clause must be last".to_string(),
@@ -614,9 +686,9 @@ fn eval_let(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         });
     };
 
-    match first {
-        Expr::Symbol(name) => eval_named_let(name, &args[1..], env),
-        bindings => eval_plain_let(bindings, &args[1..], env),
+    match &first.kind {
+        ExprKind::Symbol(name) => eval_named_let(name, &args[1..], env),
+        _ => eval_plain_let(first, &args[1..], env),
     }
 }
 
@@ -663,7 +735,7 @@ fn eval_named_let(name: &str, args: &[Expr], env: EnvRef) -> Result<Value, EvalE
 }
 
 fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
-    let Expr::List(bindings) = expr else {
+    let ExprKind::List(bindings) = &expr.kind else {
         return Err(EvalError::InvalidSyntax {
             message: "let bindings must be a list".to_string(),
         });
@@ -671,7 +743,7 @@ fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
 
     let mut parsed = Vec::with_capacity(bindings.len());
     for binding in bindings {
-        let Expr::List(items) = binding else {
+        let ExprKind::List(items) = &binding.kind else {
             return Err(EvalError::InvalidSyntax {
                 message: "let bindings must be pairs".to_string(),
             });
@@ -683,7 +755,7 @@ fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
             });
         }
 
-        let Expr::Symbol(name) = &items[0] else {
+        let ExprKind::Symbol(name) = &items[0].kind else {
             return Err(EvalError::InvalidSyntax {
                 message: "let binding names must be symbols".to_string(),
             });
@@ -722,8 +794,8 @@ fn apply(procedure: Value, args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
-    match expr {
-        Expr::List(items) => parse_param_slice(items),
+    match &expr.kind {
+        ExprKind::List(items) => parse_param_slice(items),
         _ => Err(EvalError::InvalidSyntax {
             message: "lambda parameters must be a list".to_string(),
         }),
@@ -733,7 +805,7 @@ fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
 fn parse_param_slice(items: &[Expr]) -> Result<Vec<String>, EvalError> {
     let mut params = Vec::with_capacity(items.len());
     for item in items {
-        let Expr::Symbol(name) = item else {
+        let ExprKind::Symbol(name) = &item.kind else {
             return Err(EvalError::InvalidSyntax {
                 message: "parameter names must be symbols".to_string(),
             });
@@ -744,12 +816,12 @@ fn parse_param_slice(items: &[Expr]) -> Result<Vec<String>, EvalError> {
 }
 
 fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Integer(value) => Ok(Value::Integer(*value)),
-        Expr::Boolean(value) => Ok(Value::Boolean(*value)),
-        Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(value) => Ok(Value::Symbol(value.clone())),
-        Expr::List(items) => {
+    match &expr.kind {
+        ExprKind::Integer(value) => Ok(Value::Integer(*value)),
+        ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
+        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::Symbol(value) => Ok(Value::Symbol(value.clone())),
+        ExprKind::List(items) => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
                 values.push(quote_expr(item)?);
