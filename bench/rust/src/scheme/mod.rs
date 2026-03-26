@@ -408,6 +408,16 @@ fn is_builtin(name: &str) -> bool {
             | "string-ref"
             | "string-copy"
             | "apply"
+            | "abs" | "modulo" | "remainder" | "quotient"
+            | "min" | "max" | "expt"
+            | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
+            | "list-ref" | "list-tail" | "list?" | "assoc"
+            | "map" | "eq?" | "equal?"
+            | "char-alphabetic?" | "char-numeric?"
+            | "char-upcase" | "char-downcase"
+            | "char=?" | "char<?"
+            | "string=?" | "string<?" | "string-ci=?"
+            | "string-upcase" | "string-downcase"
     )
 }
 
@@ -1213,7 +1223,253 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             }
             apply_value(func, &call_args, p)
         }
+        "abs" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Integer(args[0].as_integer_at(p)?.abs()))
+        }
+        "modulo" => {
+            ensure_args(op, args, 2, p)?;
+            let a = args[0].as_integer_at(p)?;
+            let b = args[1].as_integer_at(p)?;
+            if b == 0 { return Err(EvalError::DivisionByZero(format!("{}", p))); }
+            Ok(Value::Integer(((a % b) + b) % b))
+        }
+        "remainder" => {
+            ensure_args(op, args, 2, p)?;
+            let a = args[0].as_integer_at(p)?;
+            let b = args[1].as_integer_at(p)?;
+            if b == 0 { return Err(EvalError::DivisionByZero(format!("{}", p))); }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            ensure_args(op, args, 2, p)?;
+            let a = args[0].as_integer_at(p)?;
+            let b = args[1].as_integer_at(p)?;
+            if b == 0 { return Err(EvalError::DivisionByZero(format!("{}", p))); }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity(format!("min requires at least 1 argument at {}", p)));
+            }
+            let mut m = args[0].as_integer_at(p)?;
+            for a in &args[1..] { m = m.min(a.as_integer_at(p)?); }
+            Ok(Value::Integer(m))
+        }
+        "max" => {
+            if args.is_empty() {
+                return Err(EvalError::Arity(format!("max requires at least 1 argument at {}", p)));
+            }
+            let mut m = args[0].as_integer_at(p)?;
+            for a in &args[1..] { m = m.max(a.as_integer_at(p)?); }
+            Ok(Value::Integer(m))
+        }
+        "expt" => {
+            ensure_args(op, args, 2, p)?;
+            let base = args[0].as_integer_at(p)?;
+            let exp = args[1].as_integer_at(p)?;
+            Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        "zero?" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Boolean(args[0].as_integer_at(p)? == 0))
+        }
+        "positive?" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Boolean(args[0].as_integer_at(p)? > 0))
+        }
+        "negative?" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Boolean(args[0].as_integer_at(p)? < 0))
+        }
+        "odd?" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Boolean(args[0].as_integer_at(p)? % 2 != 0))
+        }
+        "even?" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Boolean(args[0].as_integer_at(p)? % 2 == 0))
+        }
+        "list-ref" => {
+            ensure_args(op, args, 2, p)?;
+            let idx = args[1].as_integer_at(p)? as usize;
+            let mut cur = &args[0];
+            for _ in 0..idx {
+                match cur {
+                    Value::Pair(_, cdr) => cur = cdr,
+                    _ => return Err(EvalError::Type(format!("list-ref: index out of range at {}", p))),
+                }
+            }
+            match cur {
+                Value::Pair(car, _) => Ok(*car.clone()),
+                _ => Err(EvalError::Type(format!("list-ref: index out of range at {}", p))),
+            }
+        }
+        "list-tail" => {
+            ensure_args(op, args, 2, p)?;
+            let idx = args[1].as_integer_at(p)? as usize;
+            let mut cur = args[0].clone();
+            for _ in 0..idx {
+                match cur {
+                    Value::Pair(_, cdr) => cur = *cdr,
+                    _ => return Err(EvalError::Type(format!("list-tail: index out of range at {}", p))),
+                }
+            }
+            Ok(cur)
+        }
+        "list?" => {
+            ensure_args(op, args, 1, p)?;
+            let mut cur = &args[0];
+            let result = loop {
+                match cur {
+                    Value::Nil => break true,
+                    Value::Pair(_, cdr) => cur = cdr,
+                    _ => break false,
+                }
+            };
+            Ok(Value::Boolean(result))
+        }
+        "assoc" => {
+            ensure_args(op, args, 2, p)?;
+            let key = &args[0];
+            let mut cur = &args[1];
+            loop {
+                match cur {
+                    Value::Nil => return Ok(Value::Boolean(false)),
+                    Value::Pair(car, cdr) => {
+                        if let Value::Pair(k, _) = car.as_ref() {
+                            if values_equal(k, key) {
+                                return Ok(*car.clone());
+                            }
+                        }
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type(format!("assoc: expected list at {}", p))),
+                }
+            }
+        }
+        "eq?" => {
+            ensure_args(op, args, 2, p)?;
+            let result = match (&args[0], &args[1]) {
+                (Value::Symbol(a), Value::Symbol(b)) => a == b,
+                (Value::Integer(a), Value::Integer(b)) => a == b,
+                (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                (Value::Char(a), Value::Char(b)) => a == b,
+                (Value::Nil, Value::Nil) => true,
+                _ => false,
+            };
+            Ok(Value::Boolean(result))
+        }
+        "equal?" => {
+            ensure_args(op, args, 2, p)?;
+            Ok(Value::Boolean(values_equal(&args[0], &args[1])))
+        }
+        "map" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity(format!("map requires at least 2 arguments at {}", p)));
+            }
+            let func = &args[0];
+            let mut current_lists: Vec<Value> = args[1..].to_vec();
+            let mut results = Vec::new();
+            loop {
+                let all_pairs = current_lists.iter().all(|l| matches!(l, Value::Pair(_, _)));
+                if !all_pairs { break; }
+                let mut call_args = Vec::new();
+                let mut next_lists = Vec::new();
+                for list in &current_lists {
+                    match list {
+                        Value::Pair(car, cdr) => {
+                            call_args.push(*car.clone());
+                            next_lists.push(*cdr.clone());
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                results.push(apply_value(func, &call_args, p)?);
+                current_lists = next_lists;
+            }
+            Ok(vec_to_list(results))
+        }
+        "char-alphabetic?" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())),
+                _ => Err(EvalError::Type(format!("char-alphabetic?: expected char at {}", p))),
+            }
+        }
+        "char-numeric?" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())),
+                _ => Err(EvalError::Type(format!("char-numeric?: expected char at {}", p))),
+            }
+        }
+        "char-upcase" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())),
+                _ => Err(EvalError::Type(format!("char-upcase: expected char at {}", p))),
+            }
+        }
+        "char-downcase" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())),
+                _ => Err(EvalError::Type(format!("char-downcase: expected char at {}", p))),
+            }
+        }
+        "char=?" => {
+            ensure_args(op, args, 2, p)?;
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(EvalError::Type(format!("char=?: expected chars at {}", p))),
+            }
+        }
+        "char<?" => {
+            ensure_args(op, args, 2, p)?;
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(EvalError::Type(format!("char<?: expected chars at {}", p))),
+            }
+        }
+        "string=?" => {
+            ensure_args(op, args, 2, p)?;
+            Ok(Value::Boolean(args[0].as_string_at(p)? == args[1].as_string_at(p)?))
+        }
+        "string<?" => {
+            ensure_args(op, args, 2, p)?;
+            Ok(Value::Boolean(args[0].as_string_at(p)? < args[1].as_string_at(p)?))
+        }
+        "string-ci=?" => {
+            ensure_args(op, args, 2, p)?;
+            Ok(Value::Boolean(
+                args[0].as_string_at(p)?.to_lowercase() == args[1].as_string_at(p)?.to_lowercase()
+            ))
+        }
+        "string-upcase" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Str(args[0].as_string_at(p)?.to_uppercase()))
+        }
+        "string-downcase" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Str(args[0].as_string_at(p)?.to_lowercase()))
+        }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", op, p))),
+    }
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::Char(a), Value::Char(b)) => a == b,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
+            values_equal(a1, b1) && values_equal(a2, b2)
+        }
+        _ => false,
     }
 }
 
