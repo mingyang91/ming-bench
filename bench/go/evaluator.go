@@ -452,9 +452,18 @@ func evalStrInternal(input string) (any, string, error) {
 	}
 
 	scope := newGlobalEnv(&output)
-	if level18UsesCPS() && programUsesDynamicControl(exprs) {
-		if err := predeclareLevel18TopLevelDefines(scope, exprs); err != nil {
+	if level24UsesMacroPreExpansion() {
+		exprs, err = preprocessLevel24Program(scope, exprs)
+		if err != nil {
 			return nil, output.String(), err
+		}
+	}
+
+	if level18UsesCPS() && programUsesDynamicControl(exprs) {
+		if !level24UsesMacroPreExpansion() {
+			if err := predeclareLevel18TopLevelDefines(scope, exprs); err != nil {
+				return nil, output.String(), err
+			}
 		}
 
 		normalizedExprs, err := normalizeLevel18TopLevelExprs(exprs)
@@ -834,6 +843,8 @@ func evalRaw(scope *env, expr any) (any, error) {
 			return node, nil
 		case callCCProc:
 			return node, nil
+		case callCCReturnProc:
+			return node, nil
 		case dynamicWindEnterProc:
 			return node, nil
 		case dynamicWindExitProc:
@@ -1039,6 +1050,8 @@ func prepareProcedureCall(proc any, args []any) (any, *tailEvalState, error) {
 		return prepareDynamicWindReenterCall(callable, args)
 	case callWithValuesProducerProc:
 		return prepareCallWithValuesProducerCall(callable, args)
+	case callCCReturnProc:
+		return prepareCallCCReturnCall(callable, args)
 	case exceptionHandlerReturnProc:
 		return prepareExceptionHandlerReturnCall(callable, args)
 	case exceptionHandlerInvokeProc:
@@ -2432,6 +2445,8 @@ func typeName(value any) string {
 		return "vector"
 	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, callWithValuesProducerProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
 		return "procedure"
+	case callCCReturnProc:
+		return "procedure"
 	case syntaxObject, syntaxPatternValue, syntaxPatternRepeatValue:
 		return "syntax"
 	case voidValue:
@@ -2447,7 +2462,7 @@ func typeName(value any) string {
 
 func isProcedureValue(value any) bool {
 	switch value.(type) {
-	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, callWithValuesProducerProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc, callCCReturnProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, callWithValuesProducerProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
 		return true
 	default:
 		return false

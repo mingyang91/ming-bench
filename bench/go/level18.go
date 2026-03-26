@@ -13,6 +13,12 @@ type continuationProc struct {
 
 type callCCProc struct{}
 
+type callCCReturnProc struct {
+	runtime    *runtimeState
+	target     any
+	voidTarget any
+}
+
 type continuationTransfer struct {
 	value any
 	next  *tailEvalState
@@ -265,10 +271,27 @@ func prepareApplyCPSCall(proc any, args []any, k any, runtime *runtimeState) (an
 			return nil, nil, &EvalError{Message: "call/cc expects exactly 1 argument"}
 		}
 
-		return prepareApplyCPSCall(args[0], []any{continuationProc{target: k, dynamic: runtime.dynamic}}, k, runtime)
+		return prepareApplyCPSCall(args[0], []any{continuationProc{target: k, dynamic: runtime.dynamic}}, callCCReturnProc{
+			runtime:    runtime,
+			target:     k,
+			voidTarget: level24CallCCVoidReturnTarget(k),
+		}, runtime)
 	default:
 		return nil, nil, &EvalError{Message: fmt.Sprintf("expected procedure, got %s", typeName(proc))}
 	}
+}
+
+func prepareCallCCReturnCall(callable callCCReturnProc, args []any) (any, *tailEvalState, error) {
+	if len(args) != 1 {
+		return nil, nil, &EvalError{Message: "call/cc return continuation expects exactly 1 argument"}
+	}
+
+	target := callable.target
+	if _, ok := args[0].(voidValue); ok && callable.voidTarget != nil {
+		target = callable.voidTarget
+	}
+
+	return prepareInvokeContinuationTarget(callable.runtime, target, args[0])
 }
 
 func builtinApplyRuntimeCPS(args []any, k any, runtime *runtimeState) (any, error) {
