@@ -6,15 +6,18 @@ import SchemeRuntime.*
 object SchemeInterpreter:
 
   def evalToString(input: String): String =
-    render(evalProgram(input))
+    val output = new StringBuilder
+    render(evalProgram(input, output))
 
   def evalToStringWithOutput(input: String): (String, String) =
-    (render(evalProgram(input)), "")
+    val output = new StringBuilder
+    val result = evalProgram(input, output)
+    (render(result), output.result())
 
-  private def evalProgram(input: String): Value =
+  private def evalProgram(input: String, output: StringBuilder): Value =
     val expressions = SchemeParser.parseProgram(input)
     if expressions.isEmpty then throw new EvalError("empty program")
-    evalSequence(expressions, baseEnv())
+    evalSequence(expressions, baseEnv(output))
 
   private def eval(expr: Expr, env: Env): Value =
     withErrorContext(expr.pos) {

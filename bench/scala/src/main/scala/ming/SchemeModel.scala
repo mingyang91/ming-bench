@@ -25,6 +25,7 @@ private[ming] object SchemeModel:
     case IntegerValue(value: BigInt)
     case BooleanValue(value: Boolean)
     case StringValue(value: String)
+    case CharValue(codePoint: Int)
     case SymbolValue(name: String)
     case NilValue
     case PairValue(car: Value, cdr: Value)
