@@ -37,6 +37,7 @@ enum Value {
     RecordConstructor { type_id: u64, n_fields: usize },
     RecordPredicate { type_id: u64 },
     RecordAccessor { type_id: u64, index: usize },
+    CaseLambda { clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>, Env)> },
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -170,7 +171,7 @@ impl Value {
                 out.push(')');
                 out
             }
-            Value::Lambda { .. } => "#<procedure>".into(),
+            Value::Lambda { .. } | Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
             Value::Void => "".into(),
             Value::Macro { .. } => "#<macro>".into(),
@@ -258,7 +259,7 @@ fn global_env() -> Env {
                    "char-upcase", "char-downcase", "char=?", "char<?",
                    "string=?", "string<?", "string-ci=?",
                    "string-upcase", "string-downcase",
-                   "equal?", "eq?"] {
+                   "equal?", "eq?", "procedure?"] {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string()));
     }
     env
@@ -511,6 +512,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                     "set!" => return eval_set(&list[1..], env, span, out),
                     "define-syntax" => return eval_define_syntax(&list[1..], env, span),
                     "define-record-type" => return eval_define_record_type(&list[1..], env, span),
+                    "case-lambda" => return eval_case_lambda(&list[1..], env, span),
                     _ => {
                         if let Some(Value::Macro { ref literals, ref rules, ref def_env }) = env_get(env, op) {
                             let expanded = expand_macro(list, &literals, &rules, &def_env, span, env)?;
@@ -639,6 +641,28 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
     };
     let body = args[1..].to_vec();
     Ok(Value::Lambda { params, rest_param, body, env: env.clone() })
+}
+
+fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    let mut clauses = Vec::new();
+    for clause in args {
+        match &clause.kind {
+            ExprKind::List(items) => {
+                if items.len() < 2 {
+                    return Err(err_at(span, "case-lambda: each clause needs params and body"));
+                }
+                let (params, rest_param) = match &items[0].kind {
+                    ExprKind::List(param_exprs) => parse_params(param_exprs, span, "case-lambda")?,
+                    ExprKind::Symbol(s) => (Vec::new(), Some(s.clone())),
+                    _ => return Err(err_at(span, "case-lambda: expected parameter list")),
+                };
+                let body = items[1..].to_vec();
+                clauses.push((params, rest_param, body, env.clone()));
+            }
+            _ => return Err(err_at(span, "case-lambda: expected clause")),
+        }
+    }
+    Ok(Value::CaseLambda { clauses })
 }
 
 fn eval_and(args: &[Expr], env: &Env, out: &Output) -> Result<Value, EvalError> {
@@ -1169,6 +1193,34 @@ fn apply_func(func: &Value, args: &[Value], span: Span, out: &Output) -> Result<
                 result = eval(expr, &local, out)?;
             }
             Ok(result)
+        }
+        Value::CaseLambda { clauses } => {
+            for (params, rest_param, body, cenv) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let local = new_env(Some(cenv.clone()));
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        env_set(&local, p.clone(), a.clone());
+                    }
+                    if let Some(ref rp) = rest_param {
+                        let mut rest = Value::Nil;
+                        for a in args[params.len()..].iter().rev() {
+                            rest = Value::Pair(Box::new(a.clone()), Box::new(rest));
+                        }
+                        env_set(&local, rp.clone(), rest);
+                    }
+                    let mut result = Value::Void;
+                    for expr in body {
+                        result = eval(expr, &local, out)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(err_at(span, format!("case-lambda: no matching clause for {} arguments", args.len())))
         }
         Value::Builtin(name) => apply_builtin(name, args, span, out),
         Value::RecordConstructor { type_id, n_fields } => {
@@ -1926,6 +1978,10 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 }
                 _ => Err(err_at(span, "string-downcase: expected string")),
             }
+        }
+        "procedure?" => {
+            if args.len() != 1 { return Err(err_at(span, "procedure? requires 1 argument")); }
+            Ok(Value::Boolean(matches!(&args[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::Builtin(_) | Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. })))
         }
         _ => Err(err_at(span, format!("unknown procedure: {}", name))),
     }
