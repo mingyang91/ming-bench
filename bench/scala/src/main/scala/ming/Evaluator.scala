@@ -6,6 +6,21 @@ import CekSteps.{bodyToCek, posOf}
 
 object Evaluator:
 
+  // ── Dynamic-wind stack ────────────────────────────────────────────────
+  private[ming] var windStack: List[WindEntry] = Nil
+
+  private[ming] def commonTail(a: List[WindEntry], b: List[WindEntry]): List[WindEntry] =
+    val aLen                = a.length
+    val bLen                = b.length
+    var aa: List[WindEntry] = a
+    var bb: List[WindEntry] = b
+    if aLen > bLen then for _ <- 0 until (aLen - bLen) do aa = aa.tail
+    else for _ <- 0 until (bLen - aLen) do bb = bb.tail
+    while !(aa eq bb) do
+      aa = aa.tail
+      bb = bb.tail
+    aa
+
   // ── Environment ──────────────────────────────────────────────────────
   private def defaultEnv(
     output: StringBuilder = new StringBuilder
@@ -62,10 +77,10 @@ object Evaluator:
         CekSteps.stepOr(args, env, k)
 
       case Expr.SList(Expr.Symbol("let", _) :: rest, p) =>
-        CekSteps.stepLet(rest, env, p, k)
+        CekLetSteps.stepLet(rest, env, p, k)
 
       case Expr.SList(Expr.Symbol("let*", _) :: rest, p) =>
-        CekSteps.stepLetStar(rest, env, p, k)
+        CekLetSteps.stepLetStar(rest, env, p, k)
 
       case Expr.SList(Expr.Symbol("begin", _) :: body, _) =>
         bodyToCek(body, env, k)
@@ -112,8 +127,17 @@ object Evaluator:
     case Value.VBuiltin("call/cc") | Value.VBuiltin("call-with-current-continuation") =>
       if args.length != 1 then throw errAt(pos, "call/cc requires 1 argument")
       val proc    = args.head
-      val contVal = Value.VContinuation(k)
+      val contVal = Value.VContinuation(k, windStack)
       cekApply(proc, List(contVal), pos, env, k)
+
+    case Value.VBuiltin("dynamic-wind") =>
+      if args.length != 3 then throw errAt(pos, "dynamic-wind requires 3 arguments")
+      val inThunk   = args(0)
+      val bodyThunk = args(1)
+      val outThunk  = args(2)
+      val entry     = new WindEntry(inThunk, outThunk)
+      val afterIn   = Kont.DynWindAfterIn(bodyThunk, entry, env, pos, k)
+      cekApply(inThunk, Nil, pos, env, afterIn)
 
     case Value.VBuiltin("apply") =>
       if args.length < 2 then throw errAt(pos, "apply requires at least 2 arguments")
@@ -151,9 +175,19 @@ object Evaluator:
           bodyToCek(body, callEnv, k)
         case None => throw errAt(pos, "wrong number of arguments")
 
-    case Value.VContinuation(savedK) =>
+    case Value.VContinuation(savedK, savedWindStack) =>
       if args.length != 1 then throw errAt(pos, "continuation requires 1 argument")
-      CekState.ApplyK(args.head, savedK)
+      val common   = commonTail(windStack, savedWindStack)
+      val toUnwind = windStack.take(windStack.length - common.length)
+      val toRewind = savedWindStack.take(savedWindStack.length - common.length).reverse
+      val ops: List[(Boolean, WindEntry)] =
+        toUnwind.map(e => (false, e)) ++ toRewind.map(e => (true, e))
+      if ops.isEmpty then CekState.ApplyK(args.head, savedK)
+      else
+        CekState.ApplyK(
+          Value.VVoid,
+          Kont.DynWindTransition(ops, args.head, savedK, env, pos)
+        )
 
     case _ => throw errAt(pos, "not a procedure")
 
@@ -175,7 +209,7 @@ object Evaluator:
     case Value.VBuiltin("call/cc") | Value.VBuiltin("call-with-current-continuation") =>
       if args.length != 1 then throw errAt(pos, "call/cc requires 1 argument")
       val proc    = args.head
-      val contVal = Value.VContinuation(Kont.Halt)
+      val contVal = Value.VContinuation(Kont.Halt, windStack)
       applyFunc(proc, List(contVal), pos, env)
     case Value.VBuiltin("apply") =>
       if args.length < 2 then throw errAt(pos, "apply requires at least 2 arguments")
@@ -203,7 +237,7 @@ object Evaluator:
           EvalTail.bindArgs(params, restParam, args, callEnv, pos)
           evalBody(body, callEnv)
         case None => throw errAt(pos, "wrong number of arguments")
-    case Value.VContinuation(savedK) =>
+    case Value.VContinuation(savedK, _) =>
       if args.length != 1 then throw errAt(pos, "continuation requires 1 argument")
       throw new ContinuationInvoke(args.head, savedK)
     case _ => throw errAt(pos, "not a procedure")
@@ -212,12 +246,14 @@ object Evaluator:
   def evalStr(input: String): String =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw EvalError("no expressions")
+    windStack = Nil
     val env = defaultEnv()
     display(runCek(bodyToCek(exprs, env, Kont.Halt)))
 
   def evalStrWithOutput(input: String): (String, String) =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw EvalError("no expressions")
+    windStack = Nil
     val output = new StringBuilder
     val env    = defaultEnv(output)
     val result = display(runCek(bodyToCek(exprs, env, Kont.Halt)))

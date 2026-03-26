@@ -2,6 +2,9 @@ package ming
 
 import SchemeTypes.{Env, Pos, Value}
 
+/** A dynamic-wind extent entry (identity-based for wind stack sharing). */
+class WindEntry(val inThunk: Value, val outThunk: Value)
+
 /** Explicit continuation frames for the CEK machine. call/cc captures these as first-class values.
   */
 enum Kont:
@@ -55,6 +58,20 @@ enum Kont:
     remainingClauses: List[Expr],
     env: Env,
     next: Kont
+  )
+
+  // dynamic-wind continuation frames
+  case DynWindAfterIn(bodyThunk: Value, entry: WindEntry, env: Env, pos: Pos, next: Kont)
+  case DynWindAfterBody(entry: WindEntry, env: Env, pos: Pos, next: Kont)
+  case DynWindAfterOut(bodyResult: Value, next: Kont)
+
+  // Wind transition: list of (isIn, entry) pairs to process before applying savedK
+  case DynWindTransition(
+    ops: List[(Boolean, WindEntry)],
+    value: Value,
+    savedK: Kont,
+    env: Env,
+    pos: Pos
   )
 
 /** Exception for continuation invocation from non-CEK code paths (builtins). */

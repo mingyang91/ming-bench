@@ -42,7 +42,7 @@ object SchemeTypes:
       typeName: String,
       fields: Map[String, Value]
     )
-    case VContinuation(k: Kont)
+    case VContinuation(k: Kont, savedWindStack: List[WindEntry])
     case VVoid
 
   type Pos = ming.Pos

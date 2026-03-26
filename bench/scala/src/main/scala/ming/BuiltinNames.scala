@@ -111,5 +111,6 @@ object BuiltinNames:
     "member",
     "assv",
     "call/cc",
-    "call-with-current-continuation"
+    "call-with-current-continuation",
+    "dynamic-wind"
   )

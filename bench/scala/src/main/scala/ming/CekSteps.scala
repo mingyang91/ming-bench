@@ -107,6 +107,45 @@ object CekSteps:
         else CekState.ApplyK(v, next)
       else stepCond(remaining, env, next)
 
+    case k: Kont.DynWindAfterIn    => stepDynWind(v, k)
+    case k: Kont.DynWindAfterBody  => stepDynWind(v, k)
+    case k: Kont.DynWindAfterOut   => stepDynWind(v, k)
+    case k: Kont.DynWindTransition => stepDynWind(v, k)
+    case k: Kont.AppHead           => stepAppKont(v, k)
+    case k: Kont.AppArg            => stepAppKont(v, k)
+
+  // ── Dynamic-wind continuation helpers ─────────────────────────────
+  private def stepDynWind(v: Value, k: Kont): CekState = k match
+    case Kont.DynWindAfterIn(bodyThunk, entry, env, pos, next) =>
+      Evaluator.windStack = entry :: Evaluator.windStack
+      val afterBody = Kont.DynWindAfterBody(entry, env, pos, next)
+      Evaluator.cekApply(bodyThunk, Nil, pos, env, afterBody)
+
+    case Kont.DynWindAfterBody(entry, env, pos, next) =>
+      Evaluator.windStack = Evaluator.windStack.tail
+      val afterOut = Kont.DynWindAfterOut(v, next)
+      Evaluator.cekApply(entry.outThunk, Nil, pos, env, afterOut)
+
+    case Kont.DynWindAfterOut(bodyResult, next) =>
+      CekState.ApplyK(bodyResult, next)
+
+    case Kont.DynWindTransition(ops, value, savedK, env, pos) =>
+      ops match
+        case Nil =>
+          CekState.ApplyK(value, savedK)
+        case (isIn, entry) :: rest =>
+          val nextK = Kont.DynWindTransition(rest, value, savedK, env, pos)
+          if isIn then
+            Evaluator.windStack = entry :: Evaluator.windStack
+            Evaluator.cekApply(entry.inThunk, Nil, pos, env, nextK)
+          else
+            Evaluator.windStack = Evaluator.windStack.tail
+            Evaluator.cekApply(entry.outThunk, Nil, pos, env, nextK)
+
+    case _ => throw EvalError("unreachable: stepDynWind")
+
+  // ── Application continuation helpers ─────────────────────────────
+  private def stepAppKont(v: Value, k: Kont): CekState = k match
     case Kont.AppHead(argExprs, env, pos, next) =>
       argExprs match
         case Nil =>
@@ -122,6 +161,8 @@ object CekSteps:
           Evaluator.cekApply(func, newDone, pos, env, next)
         case nextExpr :: rest =>
           CekState.Eval(nextExpr, env, Kont.AppArg(func, newDone, rest, env, pos, next))
+
+    case _ => throw EvalError("unreachable: stepAppKont")
 
   // ── Special form step helpers ──────────────────────────────────────
 
@@ -163,74 +204,6 @@ object CekSteps:
       case Nil          => CekState.ApplyK(Value.VBool(false), k)
       case last :: Nil  => CekState.Eval(last, env, k)
       case head :: rest => CekState.Eval(head, env, Kont.Or(rest, env, k))
-
-  private[ming] def stepLet(rest: List[Expr], env: Env, pos: Pos, k: Kont): CekState =
-    rest match
-      case Expr.Symbol(name, _) :: Expr.SList(bindings, _) :: body if body.nonEmpty =>
-        stepNamedLet(name, bindings, body, env, pos, k)
-      case Expr.SList(bindings, _) :: body if body.nonEmpty =>
-        stepSimpleLet(bindings, body, env, pos, k)
-      case _ => throw errAt(pos, "invalid let")
-
-  private def stepSimpleLet(
-    bindings: List[Expr],
-    body: List[Expr],
-    env: Env,
-    pos: Pos,
-    k: Kont
-  ): CekState =
-    val parsed = bindings.map {
-      case Expr.SList(Expr.Symbol(n, _) :: initExpr :: Nil, _) => (n, initExpr)
-      case _                                                   => throw errAt(pos, "invalid let binding")
-    }
-    val letEnv = env.child()
-    parsed match
-      case Nil =>
-        bodyToCek(body, letEnv, k)
-      case (name, initExpr) :: rest =>
-        CekState.Eval(initExpr, env, Kont.LetBind(name, rest, letEnv, env, body, k))
-
-  private def stepNamedLet(
-    name: String,
-    bindings: List[Expr],
-    body: List[Expr],
-    env: Env,
-    pos: Pos,
-    k: Kont
-  ): CekState =
-    val parsed = bindings.map {
-      case Expr.SList(Expr.Symbol(n, _) :: initExpr :: Nil, _) => (n, initExpr)
-      case _                                                   => throw errAt(pos, "invalid let binding")
-    }
-    val paramNames = parsed.map(_._1)
-    val loopEnv    = env.child()
-    val lambda     = Value.VLambda(paramNames, None, body, loopEnv)
-    loopEnv.define(name, lambda)
-    parsed match
-      case Nil =>
-        val callEnv = loopEnv.child()
-        bodyToCek(body, callEnv, k)
-      case (_, initExpr) :: rest =>
-        CekState.Eval(
-          initExpr,
-          env,
-          Kont.NamedLetArgs(paramNames, Nil, rest.map(_._2), env, loopEnv, body, k)
-        )
-
-  private[ming] def stepLetStar(rest: List[Expr], env: Env, pos: Pos, k: Kont): CekState =
-    rest match
-      case Expr.SList(bindings, _) :: body if body.nonEmpty =>
-        val parsed = bindings.map {
-          case Expr.SList(Expr.Symbol(n, _) :: initExpr :: Nil, _) => (n, initExpr)
-          case _                                                   => throw errAt(pos, "invalid let* binding")
-        }
-        val letEnv = env.child()
-        parsed match
-          case Nil =>
-            bodyToCek(body, letEnv, k)
-          case (name, initExpr) :: rest =>
-            CekState.Eval(initExpr, letEnv, Kont.LetStarBind(name, rest, letEnv, body, k))
-      case _ => throw errAt(pos, "invalid let*")
 
   private[ming] def stepSet(rest: List[Expr], env: Env, pos: Pos, k: Kont): CekState =
     rest match
