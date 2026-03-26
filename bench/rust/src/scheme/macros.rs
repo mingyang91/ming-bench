@@ -4,9 +4,9 @@ use std::rc::Rc;
 use super::error::{EvalError, SourcePos};
 use super::evaluator::{apply, quote_expr};
 use super::model::{
-    dotted_list_parts, expr_datum_eq, fresh_identifier, is_core_syntax, is_ellipsis, Env, EnvRef,
-    ExpansionState, Expr, MacroExpansion, MacroRef, MacroTransformer, PatternBindings,
-    SchemeString, SyntaxCaseClause, SyntaxRule, Value,
+    dotted_list_parts, expr_datum_eq, is_core_syntax, is_ellipsis, Env, EnvRef, ExpansionState,
+    Expr, MacroExpansion, MacroRef, MacroTransformer, PatternBindings, SchemeString,
+    SyntaxCaseClause, SyntaxRule, Value,
 };
 
 pub(super) fn parse_macro_transformer(expr: &Expr, env: &EnvRef) -> Result<MacroRef, EvalError> {
@@ -1024,7 +1024,7 @@ fn expand_template_symbol(
     }
 
     let mut captured_any = false;
-    let alias = fresh_identifier(name);
+    let alias = state.definition_env.fresh_identifier(name);
 
     if let Some(cell) = state.definition_env.lookup_cell(name) {
         state.value_aliases.push((alias.clone(), cell));
@@ -1224,7 +1224,7 @@ fn expand_binding_target(
                 return Ok(expr);
             }
 
-            let fresh = fresh_identifier(name);
+            let fresh = state.definition_env.fresh_identifier(name);
             introduced.insert(name.clone(), fresh.clone());
             Ok(Expr::Symbol(fresh, *pos))
         }

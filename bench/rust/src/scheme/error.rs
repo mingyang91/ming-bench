@@ -1,7 +1,5 @@
 use std::fmt;
 
-use super::model::{ContinuationProc, Value};
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourcePos {
     pub line: usize,
@@ -17,46 +15,6 @@ impl SourcePos {
 impl fmt::Display for SourcePos {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.line, self.column)
-    }
-}
-
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ContinuationJumpKind {
-    User,
-    Trampoline,
-}
-
-#[doc(hidden)]
-pub struct ContinuationJumpData {
-    kind: ContinuationJumpKind,
-    continuation: ContinuationProc,
-    value: Value,
-}
-
-impl ContinuationJumpData {
-    pub(super) fn new(continuation: ContinuationProc, value: Value) -> Self {
-        Self {
-            kind: ContinuationJumpKind::User,
-            continuation,
-            value,
-        }
-    }
-
-    pub(super) fn trampoline(continuation: ContinuationProc, value: Value) -> Self {
-        Self {
-            kind: ContinuationJumpKind::Trampoline,
-            continuation,
-            value,
-        }
-    }
-
-    pub(super) fn is_trampoline(&self) -> bool {
-        matches!(self.kind, ContinuationJumpKind::Trampoline)
-    }
-
-    pub(super) fn into_parts(self) -> (ContinuationProc, Value) {
-        (self.continuation, self.value)
     }
 }
 
@@ -138,14 +96,14 @@ pub enum EvalError {
     #[error("uncaught exception: {value}")]
     UncaughtException { value: String },
 
-    #[error("internal continuation jump")]
-    ContinuationJump { jump: ContinuationJumpData },
+    #[error("internal continuation jump escaped")]
+    InternalContinuationEscape,
 }
 
 impl EvalError {
     pub fn with_position(self, position: SourcePos) -> Self {
         match self {
-            Self::Positioned { .. } | Self::ContinuationJump { .. } => self,
+            Self::Positioned { .. } => self,
             error => Self::Positioned {
                 position,
                 error: Box::new(error),
@@ -272,7 +230,7 @@ impl PartialEq for EvalError {
             (Self::UncaughtException { value: left }, Self::UncaughtException { value: right }) => {
                 left == right
             }
-            (Self::ContinuationJump { .. }, Self::ContinuationJump { .. }) => false,
+            (Self::InternalContinuationEscape, Self::InternalContinuationEscape) => true,
             _ => false,
         }
     }

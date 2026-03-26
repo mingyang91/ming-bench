@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::builtins::{apply_builtin, error_exception_value};
-use super::error::{ContinuationJumpData, EvalError, SourcePos};
+use super::error::{EvalError, SourcePos};
 use super::evaluator::wrong_arg_count;
 use super::model::{
-    list_from_values, Builtin, ContinuationProc, Env, EnvRef, Expr, Procedure, Value,
+    list_from_values, Builtin, ContinuationJumpData, ContinuationProc, Env, EnvRef, Expr,
+    Procedure, RuntimeError, RuntimeResult, Value,
 };
 use super::records::apply_record_procedure;
 use super::step_limit::StepBudgetRef;
@@ -98,8 +99,8 @@ impl CpsRuntime {
 pub(super) fn bounce_continuation(
     continuation: Continuation,
     value: Value,
-) -> Result<Value, EvalError> {
-    Err(EvalError::ContinuationJump {
+) -> RuntimeResult {
+    Err(RuntimeError::ContinuationJump {
         jump: ContinuationJumpData::trampoline(continuation, value),
     })
 }
@@ -109,7 +110,7 @@ pub(super) fn bounce_eval(
     env: EnvRef,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     bounce_continuation(
         Rc::new(move |_ignored, output| {
             eval_cps(
@@ -129,7 +130,7 @@ pub(super) fn bounce_sequence(
     env: EnvRef,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     bounce_continuation(
         Rc::new(move |_ignored, output| {
             eval_sequence_cps(
@@ -175,7 +176,7 @@ fn transition_to_winders(
     value: Value,
     output: &mut String,
     k: Continuation,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let current = runtime.current_winders();
     let shared = shared_winder_prefix_len(&current, &target_winders);
     let exiting = current[shared..].iter().cloned().rev().collect::<Vec<_>>();
@@ -190,7 +191,7 @@ fn unwind_then_rewind(
     value: Value,
     output: &mut String,
     k: Continuation,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((frame, rest)) = exiting.split_first() else {
         return rewind_winders(runtime, entering, value, output, k);
     };
@@ -225,7 +226,7 @@ fn rewind_winders(
     value: Value,
     output: &mut String,
     k: Continuation,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((frame, rest)) = entering.split_first() else {
         return k(value, output);
     };
@@ -259,7 +260,7 @@ pub(super) fn apply_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     match callable {
         Value::Builtin(Builtin::Raise) => apply_raise_cps(args, output, runtime),
         Value::Builtin(Builtin::Error) => apply_error_cps(args, output, runtime),
@@ -277,7 +278,7 @@ pub(super) fn apply_cps(
                 k,
                 runtime,
             ),
-            _ => Err(wrong_arg_count("call/cc", "1", args.len())),
+            _ => Err(wrong_arg_count("call/cc", "1", args.len()).into()),
         },
         Value::Builtin(Builtin::DynamicWind) => apply_dynamic_wind_cps(args, output, k, runtime),
         Value::Builtin(Builtin::Values) => k(Value::from_values(args), output),
@@ -287,18 +288,22 @@ pub(super) fn apply_cps(
         Value::Builtin(Builtin::Apply) => apply_apply_cps(args, output, k, runtime),
         Value::Builtin(Builtin::Map) => apply_map_cps(args, output, k, runtime),
         Value::Builtin(Builtin::ForEach) => apply_for_each_cps(args, output, k, runtime),
-        Value::Builtin(builtin) => apply_builtin(builtin, &args, output, runtime.steps())
-            .and_then(|value| k(value, output)),
+        Value::Builtin(builtin) => {
+            let value = apply_builtin(builtin, &args, output, runtime.steps())?;
+            k(value, output)
+        }
         Value::Procedure(procedure) => apply_procedure_cps(&procedure, args, output, k, runtime),
-        Value::Continuation(continuation) => Err(EvalError::ContinuationJump {
+        Value::Continuation(continuation) => Err(RuntimeError::ContinuationJump {
             jump: ContinuationJumpData::new(continuation, Value::from_values(args)),
         }),
         Value::RecordProcedure(procedure) => {
-            apply_record_procedure(&procedure, &args).and_then(|value| k(value, output))
+            let value = apply_record_procedure(&procedure, &args)?;
+            k(value, output)
         }
         value => Err(EvalError::NotAProcedure {
             got: value.type_name().into(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -307,9 +312,9 @@ fn apply_call_with_values_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [producer, consumer] = args.as_slice() else {
-        return Err(wrong_arg_count("call-with-values", "2", args.len()));
+        return Err(wrong_arg_count("call-with-values", "2", args.len()).into());
     };
 
     let consumer = consumer.clone();
@@ -336,10 +341,10 @@ fn apply_raise_cps(
     args: Vec<Value>,
     output: &mut String,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     match args.as_slice() {
         [value] => raise_cps(value.clone(), output, runtime),
-        _ => Err(wrong_arg_count("raise", "1", args.len())),
+        _ => Err(wrong_arg_count("raise", "1", args.len()).into()),
     }
 }
 
@@ -347,7 +352,7 @@ fn apply_error_cps(
     args: Vec<Value>,
     output: &mut String,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     raise_cps(error_exception_value(&args), output, runtime)
 }
 
@@ -355,11 +360,12 @@ fn raise_cps(
     value: Value,
     output: &mut String,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some(frame) = runtime.pop_handler() else {
         return Err(EvalError::UncaughtException {
             value: value.render(),
-        });
+        }
+        .into());
     };
 
     let handler = frame.handler.clone();
@@ -388,9 +394,9 @@ fn apply_with_exception_handler_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [handler, thunk] = args.as_slice() else {
-        return Err(wrong_arg_count("with-exception-handler", "2", args.len()));
+        return Err(wrong_arg_count("with-exception-handler", "2", args.len()).into());
     };
 
     let frame = Rc::new(ExceptionHandlerFrame {
@@ -416,7 +422,7 @@ fn apply_with_exception_handler_cps(
 
     if matches!(
         result,
-        Err(EvalError::ContinuationJump { ref jump }) if jump.is_trampoline()
+        Err(RuntimeError::ContinuationJump { ref jump }) if jump.is_trampoline()
     ) {
         return result;
     }
@@ -434,7 +440,7 @@ fn apply_procedure_cps(
     _output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some(clause) = procedure
         .clauses
         .iter()
@@ -445,7 +451,8 @@ fn apply_procedure_cps(
             procedure.error_name(),
             &expected,
             args.len(),
-        ));
+        )
+        .into());
     };
 
     let call_env = Env::new(Some(procedure.env.clone()));
@@ -466,13 +473,13 @@ fn apply_apply_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [callable, prefix_and_list @ ..] = args.as_slice() else {
-        return Err(wrong_arg_count("apply", "at least 2", 0));
+        return Err(wrong_arg_count("apply", "at least 2", 0).into());
     };
 
     if prefix_and_list.is_empty() {
-        return Err(wrong_arg_count("apply", "at least 2", 1));
+        return Err(wrong_arg_count("apply", "at least 2", 1).into());
     }
 
     let (list_arg, prefix_args) = prefix_and_list
@@ -491,13 +498,13 @@ fn apply_map_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [callable, list_args @ ..] = args.as_slice() else {
-        return Err(wrong_arg_count("map", "at least 2", 0));
+        return Err(wrong_arg_count("map", "at least 2", 0).into());
     };
 
     if list_args.is_empty() {
-        return Err(wrong_arg_count("map", "at least 2", 1));
+        return Err(wrong_arg_count("map", "at least 2", 1).into());
     }
 
     let mut lists = Vec::with_capacity(list_args.len());
@@ -516,7 +523,7 @@ fn apply_map_loop_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let len = lists.iter().map(Vec::len).min().unwrap_or(0);
     if index >= len {
         return k(list_from_values(results), output);
@@ -557,9 +564,9 @@ fn apply_dynamic_wind_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [in_thunk, body_thunk, out_thunk] = args.as_slice() else {
-        return Err(wrong_arg_count("dynamic-wind", "3", args.len()));
+        return Err(wrong_arg_count("dynamic-wind", "3", args.len()).into());
     };
 
     let frame = Rc::new(WindFrame {
@@ -605,13 +612,13 @@ fn apply_for_each_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [callable, list_args @ ..] = args.as_slice() else {
-        return Err(wrong_arg_count("for-each", "at least 2", 0));
+        return Err(wrong_arg_count("for-each", "at least 2", 0).into());
     };
 
     if list_args.is_empty() {
-        return Err(wrong_arg_count("for-each", "at least 2", 1));
+        return Err(wrong_arg_count("for-each", "at least 2", 1).into());
     }
 
     let mut lists = Vec::with_capacity(list_args.len());
@@ -629,7 +636,7 @@ fn apply_for_each_loop_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let len = lists.iter().map(Vec::len).min().unwrap_or(0);
     if index >= len {
         return k(Value::Void, output);

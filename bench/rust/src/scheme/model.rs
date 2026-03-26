@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::error::{EvalError, SourcePos};
 use super::number::Number;
@@ -418,7 +417,73 @@ impl SchemePair {
     }
 }
 
-pub(super) type ContinuationProc = Rc<dyn Fn(Value, &mut String) -> Result<Value, EvalError>>;
+pub(super) type RuntimeResult = Result<Value, RuntimeError>;
+pub(super) type ContinuationProc = Rc<dyn Fn(Value, &mut String) -> RuntimeResult>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContinuationJumpKind {
+    User,
+    Trampoline,
+}
+
+pub(super) struct ContinuationJumpData {
+    kind: ContinuationJumpKind,
+    continuation: ContinuationProc,
+    value: Value,
+}
+
+impl ContinuationJumpData {
+    pub(super) fn new(continuation: ContinuationProc, value: Value) -> Self {
+        Self {
+            kind: ContinuationJumpKind::User,
+            continuation,
+            value,
+        }
+    }
+
+    pub(super) fn trampoline(continuation: ContinuationProc, value: Value) -> Self {
+        Self {
+            kind: ContinuationJumpKind::Trampoline,
+            continuation,
+            value,
+        }
+    }
+
+    pub(super) fn is_trampoline(&self) -> bool {
+        matches!(self.kind, ContinuationJumpKind::Trampoline)
+    }
+
+    pub(super) fn into_parts(self) -> (ContinuationProc, Value) {
+        (self.continuation, self.value)
+    }
+}
+
+pub(super) enum RuntimeError {
+    Eval(EvalError),
+    ContinuationJump { jump: ContinuationJumpData },
+}
+
+impl RuntimeError {
+    pub(super) fn with_position(self, position: SourcePos) -> Self {
+        match self {
+            Self::Eval(error) => Self::Eval(error.with_position(position)),
+            Self::ContinuationJump { .. } => self,
+        }
+    }
+
+    pub(super) fn into_eval_error(self) -> EvalError {
+        match self {
+            Self::Eval(error) => error,
+            Self::ContinuationJump { .. } => EvalError::InternalContinuationEscape,
+        }
+    }
+}
+
+impl From<EvalError> for RuntimeError {
+    fn from(error: EvalError) -> Self {
+        Self::Eval(error)
+    }
+}
 
 #[derive(Clone)]
 pub(super) enum Value {
@@ -537,24 +602,29 @@ pub(super) struct Env {
     transparent_definitions: bool,
     bindings: RefCell<HashMap<String, ValueCell>>,
     macro_bindings: RefCell<HashMap<String, MacroRef>>,
+    gensym_counter: Rc<RefCell<usize>>,
 }
 
 impl Env {
     pub(super) fn new(parent: Option<EnvRef>) -> EnvRef {
+        let gensym_counter = inherited_gensym_counter(&parent);
         Rc::new(Self {
             parent,
             transparent_definitions: false,
             bindings: RefCell::new(HashMap::new()),
             macro_bindings: RefCell::new(HashMap::new()),
+            gensym_counter,
         })
     }
 
     pub(super) fn new_transparent(parent: Option<EnvRef>) -> EnvRef {
+        let gensym_counter = inherited_gensym_counter(&parent);
         Rc::new(Self {
             parent,
             transparent_definitions: true,
             bindings: RefCell::new(HashMap::new()),
             macro_bindings: RefCell::new(HashMap::new()),
+            gensym_counter,
         })
     }
 
@@ -620,6 +690,20 @@ impl Env {
             .as_ref()
             .is_some_and(|parent| parent.set(name, value))
     }
+
+    pub(super) fn fresh_identifier(&self, base: &str) -> String {
+        let mut counter = self.gensym_counter.borrow_mut();
+        let next = *counter;
+        *counter += 1;
+        format!("__ming_macro_{base}_{next}__")
+    }
+}
+
+fn inherited_gensym_counter(parent: &Option<EnvRef>) -> Rc<RefCell<usize>> {
+    parent
+        .as_ref()
+        .map(|env| env.gensym_counter.clone())
+        .unwrap_or_else(|| Rc::new(RefCell::new(0)))
 }
 
 pub(super) struct Procedure {
@@ -857,8 +941,6 @@ impl ExpansionState {
     }
 }
 
-static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 pub(super) fn is_ellipsis(expr: &Expr) -> bool {
     matches!(expr, Expr::Symbol(name, _) if name == "...")
 }
@@ -917,14 +999,6 @@ pub(super) fn is_core_syntax(name: &str) -> bool {
             | "letrec*"
             | "case"
             | "do"
-    )
-}
-
-pub(super) fn fresh_identifier(base: &str) -> String {
-    format!(
-        "__ming_macro_{}_{}__",
-        base,
-        GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed)
     )
 }
 

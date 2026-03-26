@@ -25,7 +25,9 @@ use evaluator::{
     parse_let_bindings, parse_param_list, quote_expr, wrong_arg_count, CondClauseBody, DoLoopState,
 };
 use macros::{env_with_expansion_aliases, expand_macro_call};
-use model::{fresh_identifier, ContinuationProc, Env, EnvRef, Expr, Params, SchemeString, Value};
+use model::{
+    ContinuationProc, Env, EnvRef, Expr, Params, RuntimeError, RuntimeResult, SchemeString, Value,
+};
 use number::Number;
 use parser::Parser;
 use records::eval_define_record_type;
@@ -48,7 +50,11 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let (value, output) = eval_program(input, StepBudget::unlimited())?;
-    Ok((value.render(), output))
+    let result = match &value {
+        Value::String(_) => value.render_display(),
+        _ => value.render(),
+    };
+    Ok((result, output))
 }
 
 /// Evaluate Scheme expressions with a maximum number of eval dispatches.
@@ -81,7 +87,7 @@ fn matches_l24_coroutine_scheduler_fixture(input: &str) -> bool {
 }
 
 type Continuation = ContinuationProc;
-type ValuesContinuation = Rc<dyn Fn(Vec<Value>, &mut String) -> Result<Value, EvalError>>;
+type ValuesContinuation = Rc<dyn Fn(Vec<Value>, &mut String) -> RuntimeResult>;
 
 #[derive(Clone)]
 struct LetrecBindingsState {
@@ -138,14 +144,15 @@ fn run_cps_program(
         };
 
         match result {
-            Err(EvalError::ContinuationJump { jump }) => {
+            Err(RuntimeError::ContinuationJump { jump }) => {
                 let (continuation, value) = jump.into_parts();
                 work = CpsWork::InvokeContinuation {
                     continuation,
                     value,
                 };
             }
-            other => break other,
+            Err(RuntimeError::Eval(error)) => break Err(error),
+            Ok(value) => break Ok(value),
         }
     };
 
@@ -182,7 +189,7 @@ fn eval_sequence_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((first, rest)) = exprs.split_first() else {
         return k(Value::Void, output);
     };
@@ -218,7 +225,7 @@ fn eval_exprs_to_values_cps(
     output: &mut String,
     k: ValuesContinuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     eval_exprs_to_values_acc_cps(Vec::new(), exprs, env, output, k, runtime)
 }
 
@@ -229,7 +236,7 @@ fn eval_exprs_to_values_acc_cps(
     output: &mut String,
     k: ValuesContinuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((last, prefix)) = exprs.split_last() else {
         return k(values, output);
     };
@@ -265,7 +272,7 @@ fn eval_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let pos = expr.pos();
     runtime.step(pos)?;
 
@@ -274,11 +281,13 @@ fn eval_cps(
         Expr::Boolean(value, _) => k(Value::Boolean(value), output),
         Expr::String(value, _) => k(Value::String(SchemeString::literal(&value)), output),
         Expr::Char(value, _) => k(Value::Char(value), output),
-        Expr::Symbol(name, pos) => env
-            .lookup(&name)
-            .ok_or(EvalError::UnboundVariable { name })
-            .map_err(|error| error.with_position(pos))
-            .and_then(|value| k(value, output)),
+        Expr::Symbol(name, pos) => {
+            let value = env
+                .lookup(&name)
+                .ok_or(EvalError::UnboundVariable { name })
+                .map_err(|error| error.with_position(pos))?;
+            k(value, output)
+        }
         Expr::List(items, pos) => {
             eval_list_cps(items, env, output, k, runtime).map_err(|error| error.with_position(pos))
         }
@@ -291,38 +300,46 @@ fn eval_list_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((head, tail)) = items.split_first() else {
         return Err(EvalError::Syntax {
             message: "cannot evaluate empty list".into(),
-        });
+        }
+        .into());
     };
 
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => return eval_define_cps(tail.to_vec(), env, output, k, runtime),
             "define-syntax" => {
-                return eval_define_syntax(tail, &env).and_then(|value| k(value, output));
+                let value = eval_define_syntax(tail, &env)?;
+                return k(value, output);
             }
             "define-record-type" => {
-                return eval_define_record_type(tail, &env).and_then(|value| k(value, output));
+                let value = eval_define_record_type(tail, &env)?;
+                return k(value, output);
             }
             "set!" => return eval_set_cps(tail.to_vec(), env, output, k, runtime),
             "if" => return eval_if_cps(tail.to_vec(), env, output, k, runtime),
-            "quote" => return eval_quote(tail).and_then(|value| k(value, output)),
+            "quote" => {
+                let value = eval_quote(tail)?;
+                return k(value, output);
+            }
             "quasiquote" => return eval_quasiquote_cps(tail.to_vec(), env, output, k, runtime),
             "lambda" => {
-                return build_lambda(tail, &env, None).and_then(|value| k(value, output));
+                let value = build_lambda(tail, &env, None)?;
+                return k(value, output);
             }
             "case-lambda" => {
-                return build_case_lambda(tail, &env, None).and_then(|value| k(value, output));
+                let value = build_case_lambda(tail, &env, None)?;
+                return k(value, output);
             }
             "and" => return eval_and_cps(tail.to_vec(), env, output, k, runtime),
             "or" => return eval_or_cps(tail.to_vec(), env, output, k, runtime),
             "begin" => return eval_sequence_cps(tail.to_vec(), env, output, k, runtime),
             "cond" => return eval_cond_cps(tail.to_vec(), env, output, k, runtime),
             "guard" => {
-                let expanded = expand_guard_form(tail, head.pos())?;
+                let expanded = expand_guard_form(tail, head.pos(), &env)?;
                 return eval_cps(expanded, env, output, k, runtime);
             }
             "let" => return eval_let_cps(tail.to_vec(), env, output, k, runtime),
@@ -374,7 +391,7 @@ fn eval_list_cps(
     )
 }
 
-fn expand_guard_form(args: &[Expr], pos: SourcePos) -> Result<Expr, EvalError> {
+fn expand_guard_form(args: &[Expr], pos: SourcePos, env: &EnvRef) -> Result<Expr, EvalError> {
     let [Expr::List(spec, _), body @ ..] = args else {
         return Err(EvalError::Syntax {
             message: "guard: invalid syntax".into(),
@@ -410,7 +427,7 @@ fn expand_guard_form(args: &[Expr], pos: SourcePos) -> Result<Expr, EvalError> {
         ));
     }
 
-    let guard_return = fresh_identifier("guard_return");
+    let guard_return = env.fresh_identifier("guard_return");
     let cond_expr = Expr::List(
         std::iter::once(Expr::Symbol("cond".into(), pos))
             .chain(cond_clauses)
@@ -473,7 +490,7 @@ fn eval_define_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     match args.as_slice() {
         [Expr::Symbol(name, _), value_expr] => {
             if let Some(parts) = lambda_parts(value_expr) {
@@ -504,12 +521,14 @@ fn eval_define_cps(
             let Some((Expr::Symbol(name, _), params)) = signature.split_first() else {
                 return Err(EvalError::Syntax {
                     message: "define: expected function name".into(),
-                });
+                }
+                .into());
             };
             if body.is_empty() {
                 return Err(EvalError::Syntax {
                     message: "define: expected function body".into(),
-                });
+                }
+                .into());
             }
 
             let value = new_procedure(Some(name.clone()), parse_param_list(params)?, body, &env);
@@ -518,7 +537,8 @@ fn eval_define_cps(
         }
         _ => Err(EvalError::Syntax {
             message: "define: invalid syntax".into(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -528,7 +548,7 @@ fn eval_set_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     match args.as_slice() {
         [Expr::Symbol(name, _), value_expr] => {
             let set_env = env.clone();
@@ -544,7 +564,8 @@ fn eval_set_cps(
                     } else {
                         Err(EvalError::UnboundVariable {
                             name: set_name.clone(),
-                        })
+                        }
+                        .into())
                     }
                 }),
                 runtime,
@@ -552,8 +573,9 @@ fn eval_set_cps(
         }
         [_, _] => Err(EvalError::Syntax {
             message: "set!: expected variable name".into(),
-        }),
-        _ => Err(wrong_arg_count("set!", "2", args.len())),
+        }
+        .into()),
+        _ => Err(wrong_arg_count("set!", "2", args.len()).into()),
     }
 }
 
@@ -563,7 +585,7 @@ fn eval_if_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     match args.as_slice() {
         [condition, then_branch] => {
             let then_expr = then_branch.clone();
@@ -615,7 +637,7 @@ fn eval_if_cps(
                 runtime,
             )
         }
-        _ => Err(wrong_arg_count("if", "2 or 3", args.len())),
+        _ => Err(wrong_arg_count("if", "2 or 3", args.len()).into()),
     }
 }
 
@@ -625,7 +647,7 @@ fn eval_and_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((first, rest)) = args.split_first() else {
         return k(Value::Boolean(true), output);
     };
@@ -661,7 +683,7 @@ fn eval_or_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((first, rest)) = args.split_first() else {
         return k(Value::Boolean(false), output);
     };
@@ -699,7 +721,7 @@ fn eval_cond_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((clause, rest)) = clauses.split_first() else {
         return k(Value::Void, output);
     };
@@ -707,19 +729,22 @@ fn eval_cond_cps(
     let Expr::List(items, _) = clause else {
         return Err(EvalError::Syntax {
             message: "cond: expected clause".into(),
-        });
+        }
+        .into());
     };
     let Some((test, body)) = items.split_first() else {
         return Err(EvalError::Syntax {
             message: "cond: expected clause".into(),
-        });
+        }
+        .into());
     };
 
     if matches!(test, Expr::Symbol(name, _) if name == "else") {
         if !rest.is_empty() {
             return Err(EvalError::Syntax {
                 message: "cond: else must be last".into(),
-            });
+            }
+            .into());
         }
         return eval_sequence_cps(body.to_vec(), env, output, k, runtime);
     }
@@ -785,7 +810,7 @@ fn eval_quasiquote_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     match args.as_slice() {
         [template] => eval_cps(
             expand_quasiquote_expr(template, 1)?,
@@ -794,7 +819,7 @@ fn eval_quasiquote_cps(
             k,
             runtime,
         ),
-        _ => Err(wrong_arg_count("quasiquote", "1", args.len())),
+        _ => Err(wrong_arg_count("quasiquote", "1", args.len()).into()),
     }
 }
 
@@ -804,7 +829,7 @@ fn eval_let_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     match args.as_slice() {
         [Expr::Symbol(name, _), bindings, body @ ..] => eval_named_let_cps(
             name,
@@ -820,7 +845,8 @@ fn eval_let_cps(
         }
         _ => Err(EvalError::Syntax {
             message: "let: invalid syntax".into(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -831,11 +857,12 @@ fn eval_plain_let_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     if body.is_empty() {
         return Err(EvalError::Syntax {
             message: "let: expected body".into(),
-        });
+        }
+        .into());
     }
 
     let bindings = parse_let_bindings(&bindings_expr)?;
@@ -877,11 +904,12 @@ fn eval_named_let_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     if body.is_empty() {
         return Err(EvalError::Syntax {
             message: "let: expected body".into(),
-        });
+        }
+        .into());
     }
 
     let bindings = parse_let_bindings(&bindings_expr)?;
@@ -929,17 +957,19 @@ fn eval_let_star_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [bindings_expr, body @ ..] = args.as_slice() else {
         return Err(EvalError::Syntax {
             message: "let*: invalid syntax".into(),
-        });
+        }
+        .into());
     };
 
     if body.is_empty() {
         return Err(EvalError::Syntax {
             message: "let*: expected body".into(),
-        });
+        }
+        .into());
     }
 
     let bindings = parse_let_bindings(bindings_expr)?;
@@ -955,7 +985,7 @@ fn eval_let_star_bindings_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     if index == bindings.len() {
         return eval_sequence_cps(body, let_env, output, k, runtime);
     }
@@ -993,17 +1023,19 @@ fn eval_letrec_cps(
     k: Continuation,
     runtime: CpsRuntimeRef,
     sequential: bool,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [bindings_expr, body @ ..] = args.as_slice() else {
         return Err(EvalError::Syntax {
             message: "letrec: invalid syntax".into(),
-        });
+        }
+        .into());
     };
 
     if body.is_empty() {
         return Err(EvalError::Syntax {
             message: "letrec: expected body".into(),
-        });
+        }
+        .into());
     }
 
     let bindings = parse_let_bindings(bindings_expr)?;
@@ -1034,7 +1066,7 @@ fn eval_letrec_star_bindings_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     if index == bindings.len() {
         return eval_sequence_cps(body, letrec_env, output, k, runtime);
     }
@@ -1074,7 +1106,7 @@ fn eval_letrec_bindings_cps(
     index: usize,
     values: Vec<Value>,
     output: &mut String,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     if index == state.bindings.len() {
         for ((name, _), value) in state.bindings.iter().zip(values.into_iter()) {
             let updated = state.letrec_env.set(name, value);
@@ -1112,7 +1144,7 @@ fn eval_letrec_initializer_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     if let Some(parts) = lambda_parts(&value_expr) {
         let value = build_lambda(parts, &env, Some(name))?;
         k(value, output)
@@ -1130,11 +1162,12 @@ fn eval_case_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [key_expr, clauses @ ..] = args.as_slice() else {
         return Err(EvalError::Syntax {
             message: "case: invalid syntax".into(),
-        });
+        }
+        .into());
     };
 
     let case_clauses = clauses.to_vec();
@@ -1166,7 +1199,7 @@ fn eval_case_clauses_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let Some((clause, rest)) = clauses.split_first() else {
         return k(Value::Void, output);
     };
@@ -1174,19 +1207,22 @@ fn eval_case_clauses_cps(
     let Expr::List(items, _) = clause else {
         return Err(EvalError::Syntax {
             message: "case: expected clause".into(),
-        });
+        }
+        .into());
     };
     let Some((datum_expr, body)) = items.split_first() else {
         return Err(EvalError::Syntax {
             message: "case: expected clause".into(),
-        });
+        }
+        .into());
     };
 
     if matches!(datum_expr, Expr::Symbol(name, _) if name == "else") {
         if !rest.is_empty() {
             return Err(EvalError::Syntax {
                 message: "case: else must be last".into(),
-            });
+            }
+            .into());
         }
         return if body.is_empty() {
             k(Value::Void, output)
@@ -1198,7 +1234,8 @@ fn eval_case_clauses_cps(
     let Expr::List(datums, _) = datum_expr else {
         return Err(EvalError::Syntax {
             message: "case: expected datum list".into(),
-        });
+        }
+        .into());
     };
 
     if datums
@@ -1222,11 +1259,12 @@ fn eval_do_cps(
     output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let [bindings_expr, test_clause_expr, body @ ..] = args.as_slice() else {
         return Err(EvalError::Syntax {
             message: "do: invalid syntax".into(),
-        });
+        }
+        .into());
     };
 
     let bindings = parse_do_bindings(bindings_expr)?;
@@ -1263,7 +1301,7 @@ fn run_do_loop_cps(
     state: DoLoopState,
     output: &mut String,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     let test_expr = state.test_expr.clone();
     let test_results = state.result_exprs.clone();
     let test_body = state.body.clone();
@@ -1323,7 +1361,7 @@ fn eval_do_steps_cps(
     next_values: Vec<Value>,
     output: &mut String,
     runtime: CpsRuntimeRef,
-) -> Result<Value, EvalError> {
+) -> RuntimeResult {
     if index == state.bindings.len() {
         state.update_step_values(next_values);
         return run_do_loop_cps(state, output, runtime);

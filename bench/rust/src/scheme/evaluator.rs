@@ -5,7 +5,7 @@ use super::error::{EvalError, SourcePos};
 use super::macros::{env_with_expansion_aliases, expand_macro_call, parse_macro_transformer};
 use super::model::{
     dotted_list_parts, list_from_values, ContinuationProc, Env, EnvRef, Expr, Params, Procedure,
-    ProcedureClause, ProcedureKind, SchemePair, SchemeString, Value,
+    ProcedureClause, ProcedureKind, RuntimeError, RuntimeResult, SchemePair, SchemeString, Value,
 };
 use super::records::{apply_record_procedure, eval_define_record_type};
 use super::step_limit::{StepBudget, StepBudgetRef};
@@ -1576,6 +1576,14 @@ pub(super) fn apply(
     apply_with_steps(callable, args, output, &steps)
 }
 
+fn resolve_runtime_result(result: RuntimeResult) -> Result<Value, EvalError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(RuntimeError::Eval(error)) => Err(error),
+        Err(RuntimeError::ContinuationJump { .. }) => Err(EvalError::InternalContinuationEscape),
+    }
+}
+
 pub(super) fn apply_with_steps(
     callable: Value,
     args: &[Value],
@@ -1586,7 +1594,7 @@ pub(super) fn apply_with_steps(
         Value::Builtin(builtin) => apply_builtin(builtin, args, output, steps),
         Value::Procedure(procedure) => apply_procedure(&procedure, args, output, steps),
         Value::Continuation(continuation) => {
-            continuation(Value::from_values(args.to_vec()), output)
+            resolve_runtime_result(continuation(Value::from_values(args.to_vec()), output))
         }
         Value::RecordProcedure(procedure) => apply_record_procedure(&procedure, args),
         value => Err(EvalError::NotAProcedure {
@@ -1606,9 +1614,10 @@ fn apply_tail(
             apply_builtin(builtin, args, output, steps).map(TailAction::Return)
         }
         Value::Procedure(procedure) => prepare_tail_procedure(&procedure, args, output, steps),
-        Value::Continuation(continuation) => {
-            continuation(Value::from_values(args.to_vec()), output).map(TailAction::Return)
-        }
+        Value::Continuation(continuation) => resolve_runtime_result(
+            continuation(Value::from_values(args.to_vec()), output),
+        )
+        .map(TailAction::Return),
         Value::RecordProcedure(procedure) => {
             apply_record_procedure(&procedure, args).map(TailAction::Return)
         }
