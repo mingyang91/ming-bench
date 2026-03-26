@@ -1,14 +1,225 @@
 package ming
 
-/** Scheme interpreter entry point. Agents implement this object. */
 object Evaluator:
 
-  /** Evaluate one or more Scheme expressions and return the string representation of the last result.
-    */
-  def evalStr(input: String): String =
-    throw new EvalError("not implemented")
+  // ── AST ──────────────────────────────────────────────────────────────
+  private enum Expr:
+    case Num(value: Long)
+    case Bool(value: Boolean)
+    case Str(value: String)
+    case Symbol(name: String)
+    case SList(elems: List[Expr])
 
-  /** Evaluate Scheme expressions and return both the result string and any captured output from display/write/newline.
-    */
+  // ── Tokeniser ────────────────────────────────────────────────────────
+  private def readWord(input: String, start: Int): (String, Int) =
+    val sb = new StringBuilder
+    var i  = start
+    while i < input.length && !input(i).isWhitespace && input(i) != '(' && input(i) != ')' do
+      sb += input(i); i += 1
+    (sb.toString, i)
+
+  private def readString(input: String, start: Int): (String, Int) =
+    val sb = new StringBuilder("\"")
+    var i  = start + 1
+    while i < input.length && input(i) != '"' do
+      if input(i) == '\\' then
+        sb += input(i); i += 1
+        if i < input.length then
+          sb += input(i); i += 1
+      else
+        sb += input(i); i += 1
+    if i < input.length then
+      sb += '"'; i += 1
+    (sb.toString, i)
+
+  private def readHash(input: String, start: Int): (String, Int) =
+    if start + 1 >= input.length then ("#", start + 1)
+    else
+      val next = input(start + 1)
+      if next == 't' || next == 'f' then (input.substring(start, start + 2), start + 2)
+      else readWord(input, start)
+
+  private def skipComment(input: String, start: Int): Int =
+    var i = start
+    while i < input.length && input(i) != '\n' do i += 1
+    i
+
+  private def tokenize(input: String): List[String] =
+    val tokens = scala.collection.mutable.ListBuffer[String]()
+    var i      = 0
+    while i < input.length do
+      input(i) match
+        case c if c.isWhitespace => i += 1
+        case ';'                 => i = skipComment(input, i)
+        case '(' | ')' | '\'' =>
+          tokens += input(i).toString; i += 1
+        case '"' =>
+          val (tok, next) = readString(input, i)
+          tokens += tok; i = next
+        case '#' =>
+          val (tok, next) = readHash(input, i)
+          tokens += tok; i = next
+        case _ =>
+          val (tok, next) = readWord(input, i)
+          tokens += tok; i = next
+    tokens.toList
+
+  // ── Parser ───────────────────────────────────────────────────────────
+  private def parseAll(tokens: List[String]): List[Expr] =
+    val exprs = scala.collection.mutable.ListBuffer[Expr]()
+    var rest  = tokens
+    while rest.nonEmpty do
+      val (expr, remaining) = parseExpr(rest)
+      exprs += expr
+      rest = remaining
+    exprs.toList
+
+  private def parseExpr(tokens: List[String]): (Expr, List[String]) = tokens match
+    case Nil => throw EvalError("unexpected end of input")
+    case "(" :: rest =>
+      val (elems, remaining) = parseList(rest)
+      (Expr.SList(elems), remaining)
+    case "'" :: rest =>
+      val (expr, remaining) = parseExpr(rest)
+      (Expr.SList(List(Expr.Symbol("quote"), expr)), remaining)
+    case ")" :: _      => throw EvalError("unexpected )")
+    case token :: rest => (parseAtom(token), rest)
+
+  private def parseList(tokens: List[String]): (List[Expr], List[String]) =
+    val elems = scala.collection.mutable.ListBuffer[Expr]()
+    var rest  = tokens
+    while rest.nonEmpty && rest.head != ")" do
+      val (expr, remaining) = parseExpr(rest)
+      elems += expr
+      rest = remaining
+    if rest.isEmpty then throw EvalError("missing )")
+    (elems.toList, rest.tail) // skip ")"
+
+  private def parseAtom(token: String): Expr =
+    if token == "#t" then Expr.Bool(true)
+    else if token == "#f" then Expr.Bool(false)
+    else if token.startsWith("\"") then Expr.Str(token.substring(1, token.length - 1))
+    else
+      token.toLongOption match
+        case Some(n) => Expr.Num(n)
+        case None    => Expr.Symbol(token)
+
+  // ── Values ───────────────────────────────────────────────────────────
+  private enum Value:
+    case VNum(n: Long)
+    case VBool(b: Boolean)
+    case VStr(s: String)
+    case VBuiltin(name: String)
+    case VVoid
+
+  private def display(v: Value): String = v match
+    case Value.VNum(n)      => n.toString
+    case Value.VBool(true)  => "#t"
+    case Value.VBool(false) => "#f"
+    case Value.VStr(s)      => s"\"$s\""
+    case Value.VBuiltin(n)  => s"#<procedure $n>"
+    case Value.VVoid        => ""
+
+  // ── Environment ──────────────────────────────────────────────────────
+  private type Env = Map[String, Value]
+
+  private val defaultEnv: Env = Map(
+    "+"   -> Value.VBuiltin("+"),
+    "-"   -> Value.VBuiltin("-"),
+    "*"   -> Value.VBuiltin("*"),
+    "/"   -> Value.VBuiltin("/"),
+    "<"   -> Value.VBuiltin("<"),
+    ">"   -> Value.VBuiltin(">"),
+    "="   -> Value.VBuiltin("="),
+    "<="  -> Value.VBuiltin("<="),
+    ">="  -> Value.VBuiltin(">="),
+    "not" -> Value.VBuiltin("not")
+  )
+
+  // ── Eval ─────────────────────────────────────────────────────────────
+  private def eval(expr: Expr, env: Env): Value = expr match
+    case Expr.Num(n)  => Value.VNum(n)
+    case Expr.Bool(b) => Value.VBool(b)
+    case Expr.Str(s)  => Value.VStr(s)
+    case Expr.Symbol(name) =>
+      env.getOrElse(name, throw EvalError(s"unbound variable: $name"))
+    case Expr.SList(Nil)                        => throw EvalError("empty application")
+    case Expr.SList(Expr.Symbol("and") :: args) => evalAnd(args, env)
+    case Expr.SList(Expr.Symbol("or") :: args)  => evalOr(args, env)
+    case Expr.SList(head :: args) =>
+      val func = eval(head, env)
+      func match
+        case Value.VBuiltin(name) => applyBuiltin(name, args.map(a => eval(a, env)))
+        case _                    => throw EvalError("not a procedure")
+
+  private def evalAnd(args: List[Expr], env: Env): Value =
+    args match
+      case Nil         => Value.VBool(true)
+      case last :: Nil => eval(last, env)
+      case head :: tail =>
+        eval(head, env) match
+          case Value.VBool(false) => Value.VBool(false)
+          case _                  => evalAnd(tail, env)
+
+  private def evalOr(args: List[Expr], env: Env): Value =
+    args match
+      case Nil         => Value.VBool(false)
+      case last :: Nil => eval(last, env)
+      case head :: tail =>
+        val result = eval(head, env)
+        if isTruthy(result) then result else evalOr(tail, env)
+
+  private def isTruthy(v: Value): Boolean = v match
+    case Value.VBool(false) => false
+    case _                  => true
+
+  private def asNum(v: Value): Long = v match
+    case Value.VNum(n) => n
+    case _             => throw EvalError("expected number")
+
+  private def applyBuiltin(name: String, args: List[Value]): Value = name match
+    case "+" => Value.VNum(args.map(asNum).sum)
+    case "*" => Value.VNum(args.map(asNum).product)
+    case "-" =>
+      if args.isEmpty then throw EvalError("- requires at least 1 argument")
+      else if args.length == 1 then Value.VNum(-asNum(args.head))
+      else Value.VNum(args.map(asNum).reduceLeft(_ - _))
+    case "/" =>
+      if args.isEmpty then throw EvalError("/ requires at least 1 argument")
+      else if args.length == 1 then Value.VNum(1 / asNum(args.head))
+      else
+        val nums = args.map(asNum)
+        if nums.tail.contains(0L) then throw EvalError("division by zero")
+        Value.VNum(nums.reduceLeft(_ / _))
+    case "<" =>
+      val nums = args.map(asNum)
+      Value.VBool(nums.zip(nums.tail).forall((a, b) => a < b))
+    case ">" =>
+      val nums = args.map(asNum)
+      Value.VBool(nums.zip(nums.tail).forall((a, b) => a > b))
+    case "=" =>
+      val nums = args.map(asNum)
+      Value.VBool(nums.zip(nums.tail).forall((a, b) => a == b))
+    case "<=" =>
+      val nums = args.map(asNum)
+      Value.VBool(nums.zip(nums.tail).forall((a, b) => a <= b))
+    case ">=" =>
+      val nums = args.map(asNum)
+      Value.VBool(nums.zip(nums.tail).forall((a, b) => a >= b))
+    case "not" =>
+      if args.length != 1 then throw EvalError("not requires 1 argument")
+      Value.VBool(!isTruthy(args.head))
+    case _ => throw EvalError(s"unknown builtin: $name")
+
+  // ── Public API ───────────────────────────────────────────────────────
+  def evalStr(input: String): String =
+    val tokens = tokenize(input)
+    val exprs  = parseAll(tokens)
+    if exprs.isEmpty then throw EvalError("no expressions")
+    var result: Value = Value.VVoid
+    val env           = defaultEnv
+    for expr <- exprs do result = eval(expr, env)
+    display(result)
+
   def evalStrWithOutput(input: String): (String, String) =
-    throw new EvalError("not implemented")
+    (evalStr(input), "")
