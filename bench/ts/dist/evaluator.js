@@ -153,6 +153,7 @@ class Environment {
     definitionTarget;
     bindings = new Map();
     macros = new Map();
+    callCcStates = new WeakMap();
     constructor(parent, definitionTarget) {
         this.parent = parent;
         this.definitionTarget = definitionTarget;
@@ -180,6 +181,12 @@ class Environment {
             return this.macros.get(name);
         }
         return this.parent?.lookupMacro(name);
+    }
+    lookupCallCcState(expr) {
+        return this.callCcStates.get(expr);
+    }
+    defineCallCcState(expr, state) {
+        this.callCcStates.set(expr, state);
     }
     lookup(name) {
         const value = this.lookupOptional(name);
@@ -748,6 +755,30 @@ function continueWithFrame(frame, value, stack, winds, handlers) {
                 args: unwrapValues(value),
                 pos: frame.pos,
             };
+        case 'call-cc-procedure':
+            value = expectSingleValue(value, frame.pos);
+            stack.push({
+                kind: 'call-cc-return',
+                state: frame.state,
+                pos: frame.pos,
+            });
+            return {
+                kind: 'apply',
+                procedure: value,
+                args: [
+                    {
+                        kind: 'continuation',
+                        stack: stack.slice(),
+                        winds: winds.slice(),
+                        handlers: handlers.slice(),
+                    },
+                ],
+                pos: frame.pos,
+            };
+        case 'call-cc-return':
+            frame.state.hasValue = true;
+            frame.state.value = value;
+            return { kind: 'value', value };
         case 'exception-handler-return': {
             const currentHandler = handlers.pop();
             if (currentHandler !== frame.handler) {
@@ -944,6 +975,9 @@ function evaluateListAction(expr, env, context, stack, winds, handlers) {
                 return evaluateCaseAction(argExprs, env, context);
             case 'do':
                 return evaluateDoAction(argExprs, env, context);
+            case 'call/cc':
+            case 'call-with-current-continuation':
+                return evaluateDirectCallCcAction(expr, argExprs, env, stack);
             case 'guard':
                 return evaluateGuardAction(argExprs, env, stack, winds, handlers, expr.pos);
             case 'syntax-case':
@@ -958,6 +992,25 @@ function evaluateListAction(expr, env, context, stack, winds, handlers) {
         }
     }
     return startApplicationAction(expr, env, stack);
+}
+function evaluateDirectCallCcAction(expr, argExprs, env, stack) {
+    if (argExprs.length !== 1) {
+        throw new EvalError('call/cc expects exactly 1 argument');
+    }
+    const savedState = env.lookupCallCcState(expr);
+    if (savedState?.hasValue) {
+        return { kind: 'value', value: savedState.value };
+    }
+    const state = savedState ?? { hasValue: false, value: VOID_VALUE };
+    if (savedState === undefined) {
+        env.defineCallCcState(expr, state);
+    }
+    stack.push({
+        kind: 'call-cc-procedure',
+        state,
+        pos: expr.pos,
+    });
+    return { kind: 'expr', expr: argExprs[0], env };
 }
 function evaluateDefine(argExprs, env, stack, pos) {
     if (argExprs.length < 2) {

@@ -176,6 +176,11 @@ type EvalContext = {
   macroContext?: MacroEvalContext;
 };
 
+type CallCcState = {
+  hasValue: boolean;
+  value: RuntimeValue;
+};
+
 type EvalAction =
   | { kind: 'value'; value: RuntimeValue }
   | { kind: 'expr'; expr: Expr; env: Environment }
@@ -255,6 +260,16 @@ type CallWithValuesFrame = {
   consumer: RuntimeValue;
   pos: SourcePos;
 };
+type CallCcProcedureFrame = {
+  kind: 'call-cc-procedure';
+  state: CallCcState;
+  pos: SourcePos;
+};
+type CallCcReturnFrame = {
+  kind: 'call-cc-return';
+  state: CallCcState;
+  pos: SourcePos;
+};
 type ExceptionHandlerReturnFrame = {
   kind: 'exception-handler-return';
   handler: ExceptionHandlerContext;
@@ -321,6 +336,8 @@ type ContinuationFrame =
   | LetInitFrame
   | CondTestFrame
   | CallWithValuesFrame
+  | CallCcProcedureFrame
+  | CallCcReturnFrame
   | ExceptionHandlerReturnFrame
   | DynamicWindEnterFrame
   | DynamicWindBodyFrame
@@ -497,6 +514,7 @@ function currentBenchLevel(): number {
 class Environment {
   private readonly bindings = new Map<string, RuntimeValue>();
   private readonly macros = new Map<string, MacroTransformer>();
+  private readonly callCcStates = new WeakMap<ListExpr, CallCcState>();
 
   constructor(
     private readonly parent?: Environment,
@@ -533,6 +551,14 @@ class Environment {
     }
 
     return this.parent?.lookupMacro(name);
+  }
+
+  lookupCallCcState(expr: ListExpr): CallCcState | undefined {
+    return this.callCcStates.get(expr);
+  }
+
+  defineCallCcState(expr: ListExpr, state: CallCcState): void {
+    this.callCcStates.set(expr, state);
   }
 
   lookup(name: string): RuntimeValue {
@@ -1236,6 +1262,30 @@ function continueWithFrame(
         args: unwrapValues(value),
         pos: frame.pos,
       };
+    case 'call-cc-procedure':
+      value = expectSingleValue(value, frame.pos);
+      stack.push({
+        kind: 'call-cc-return',
+        state: frame.state,
+        pos: frame.pos,
+      });
+      return {
+        kind: 'apply',
+        procedure: value,
+        args: [
+          {
+            kind: 'continuation',
+            stack: stack.slice(),
+            winds: winds.slice(),
+            handlers: handlers.slice(),
+          },
+        ],
+        pos: frame.pos,
+      };
+    case 'call-cc-return':
+      frame.state.hasValue = true;
+      frame.state.value = value;
+      return { kind: 'value', value };
     case 'exception-handler-return': {
       const currentHandler = handlers.pop();
       if (currentHandler !== frame.handler) {
@@ -1502,6 +1552,9 @@ function evaluateListAction(
         return evaluateCaseAction(argExprs, env, context);
       case 'do':
         return evaluateDoAction(argExprs, env, context);
+      case 'call/cc':
+      case 'call-with-current-continuation':
+        return evaluateDirectCallCcAction(expr, argExprs, env, stack);
       case 'guard':
         return evaluateGuardAction(argExprs, env, stack, winds, handlers, expr.pos);
       case 'syntax-case':
@@ -1518,6 +1571,34 @@ function evaluateListAction(
   }
 
   return startApplicationAction(expr, env, stack);
+}
+
+function evaluateDirectCallCcAction(
+  expr: ListExpr,
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+): EvalAction {
+  if (argExprs.length !== 1) {
+    throw new EvalError('call/cc expects exactly 1 argument');
+  }
+
+  const savedState = env.lookupCallCcState(expr);
+  if (savedState?.hasValue) {
+    return { kind: 'value', value: savedState.value };
+  }
+
+  const state = savedState ?? { hasValue: false, value: VOID_VALUE as RuntimeValue };
+  if (savedState === undefined) {
+    env.defineCallCcState(expr, state);
+  }
+
+  stack.push({
+    kind: 'call-cc-procedure',
+    state,
+    pos: expr.pos,
+  });
+  return { kind: 'expr', expr: argExprs[0], env };
 }
 
 function evaluateDefine(
