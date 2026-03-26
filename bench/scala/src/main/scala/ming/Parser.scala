@@ -130,6 +130,15 @@ private[ming] object Parser:
   private def parseAtom(s: String, p: Pos): Expr =
     if s == "#t" then BoolLit(true, p)
     else if s == "#f" then BoolLit(false, p)
+    else if s.startsWith("#\\") then
+      val rest = s.substring(2)
+      val ch = rest match
+        case "space"            => ' '
+        case "newline"          => '\n'
+        case "tab"              => '\t'
+        case c if c.length == 1 => c.charAt(0)
+        case _                  => throw new EvalError(s"$p: unknown character literal: $s")
+      CharLit(ch, p)
     else
       s.toLongOption match
         case Some(n) => IntLit(n, p)

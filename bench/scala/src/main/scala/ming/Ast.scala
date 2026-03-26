@@ -16,6 +16,7 @@ sealed trait Expr:
 case class IntLit(value: Long, pos: Pos = Pos.zero)      extends Expr
 case class BoolLit(value: Boolean, pos: Pos = Pos.zero)  extends Expr
 case class StringLit(value: String, pos: Pos = Pos.zero) extends Expr
+case class CharLit(value: Char, pos: Pos = Pos.zero)     extends Expr
 case class Symbol(name: String, pos: Pos = Pos.zero)     extends Expr
 case class SList(elems: List[Expr], pos: Pos = Pos.zero) extends Expr
 
@@ -29,8 +30,13 @@ case class SchemeInt(value: Long) extends SchemeVal:
 case class SchemeBool(value: Boolean) extends SchemeVal:
   def display: String = if value then "#t" else "#f"
 
-case class SchemeString(value: String) extends SchemeVal:
-  def display: String = s"\"$value\""
+class SchemeString(val chars: Array[Char]) extends SchemeVal:
+  def value: String   = new String(chars)
+  def display: String = "\"" + value + "\""
+
+object SchemeString:
+  def apply(s: String): SchemeString          = new SchemeString(s.toCharArray)
+  def unapply(ss: SchemeString): Some[String] = Some(ss.value)
 
 case class SchemeBuiltin(name: String, fn: List[SchemeVal] => SchemeVal) extends SchemeVal:
   def display: String = s"#<procedure:$name>"

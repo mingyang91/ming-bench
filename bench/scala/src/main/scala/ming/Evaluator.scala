@@ -40,6 +40,7 @@ object Evaluator:
         case IntLit(v, _)    => SchemeInt(v)
         case BoolLit(v, _)   => SchemeBool(v)
         case StringLit(v, _) => SchemeString(v)
+        case CharLit(v, _)   => SchemeChar(v)
         case Symbol(name, _) => env.get(name)
         case SList(Nil, _)   => throw new EvalError("empty application")
         case SList(elems, _) => evalApplication(elems, env)
@@ -127,6 +128,7 @@ object Evaluator:
       case IntLit(v, _)    => SchemeInt(v)
       case BoolLit(v, _)   => SchemeBool(v)
       case StringLit(v, _) => SchemeString(v)
+      case CharLit(v, _)   => SchemeChar(v)
       case Symbol(name, _) => SchemeSymbol(name)
       case SList(elems, _) => SchemeList(elems.map(exprToVal))
 
