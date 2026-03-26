@@ -59,6 +59,9 @@ public class Evaluator {
         }
     }
 
+    // --- Output buffer ---
+    private StringBuilder outputBuffer = new StringBuilder();
+
     // --- Public API ---
 
     public String evalStr(String input) throws EvalError {
@@ -72,8 +75,14 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        String result = evalStr(input);
-        return new EvalResult(result, "");
+        outputBuffer = new StringBuilder();
+        List<Object> exprs = parse(input);
+        Env env = makeGlobalEnv();
+        Object result = null;
+        for (Object expr : exprs) {
+            result = eval(expr, env);
+        }
+        return new EvalResult(schemeToString(result), outputBuffer.toString());
     }
 
     private Env makeGlobalEnv() {
@@ -198,6 +207,22 @@ public class Evaluator {
         } else if (c == 'f') {
             pos++;
             return Boolean.FALSE;
+        } else if (c == '\\') {
+            pos++; // skip backslash
+            if (pos >= src.length()) throw new EvalError("unexpected end of character literal");
+            // Check for named characters
+            int start = pos;
+            while (pos < src.length() && !Character.isWhitespace(src.charAt(pos)) && src.charAt(pos) != ')' && src.charAt(pos) != '(') {
+                pos++;
+            }
+            String name = src.substring(start, pos);
+            if (name.length() == 1) return new SchemeChar(name.charAt(0));
+            return switch (name) {
+                case "space" -> new SchemeChar(' ');
+                case "newline" -> new SchemeChar('\n');
+                case "tab" -> new SchemeChar('\t');
+                default -> throw new EvalError("unknown character name: " + name);
+            };
         }
         throw new EvalError("unknown hash literal: #" + c);
     }
@@ -235,7 +260,7 @@ public class Evaluator {
     // --- Eval ---
 
     private Object eval(Object expr, Env env) throws EvalError {
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof SchemeSymbol sym) {
@@ -600,6 +625,78 @@ public class Evaluator {
             requireArgCount("pair?", args, 1);
             return args.get(0) instanceof SchemePair;
         }));
+
+        // L05: Display, Write, Newline
+        env.define("display", new BuiltinProc("display", args -> {
+            requireArgCount("display", args, 1);
+            outputBuffer.append(displayValue(args.get(0)));
+            return null; // void
+        }));
+        env.define("write", new BuiltinProc("write", args -> {
+            requireArgCount("write", args, 1);
+            outputBuffer.append(schemeToString(args.get(0)));
+            return null; // void
+        }));
+        env.define("newline", new BuiltinProc("newline", args -> {
+            requireArgCount("newline", args, 0);
+            outputBuffer.append("\n");
+            return null; // void
+        }));
+
+        // L05: String operations
+        env.define("string-append", new BuiltinProc("string-append", args -> {
+            StringBuilder sb = new StringBuilder();
+            for (Object a : args) {
+                if (!(a instanceof SchemeString s)) throw new EvalError("string-append: not a string: " + schemeToString(a));
+                sb.append(s.value);
+            }
+            return new SchemeString(sb.toString());
+        }));
+        env.define("string-length", new BuiltinProc("string-length", args -> {
+            requireArgCount("string-length", args, 1);
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-length: not a string");
+            return (long) s.value.length();
+        }));
+        env.define("substring", new BuiltinProc("substring", args -> {
+            if (args.size() < 2 || args.size() > 3) throw new EvalError("substring: expected 2 or 3 arguments");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("substring: not a string");
+            int start = (int) requireLong(args.get(1), "substring");
+            int end = args.size() == 3 ? (int) requireLong(args.get(2), "substring") : s.value.length();
+            return new SchemeString(s.value.substring(start, end));
+        }));
+        env.define("string->number", new BuiltinProc("string->number", args -> {
+            requireArgCount("string->number", args, 1);
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->number: not a string");
+            try {
+                return Long.parseLong(s.value);
+            } catch (NumberFormatException e) {
+                return Boolean.FALSE;
+            }
+        }));
+        env.define("number->string", new BuiltinProc("number->string", args -> {
+            requireArgCount("number->string", args, 1);
+            return new SchemeString(String.valueOf(requireLong(args.get(0), "number->string")));
+        }));
+        env.define("symbol->string", new BuiltinProc("symbol->string", args -> {
+            requireArgCount("symbol->string", args, 1);
+            if (!(args.get(0) instanceof SchemeSymbol s)) throw new EvalError("symbol->string: not a symbol");
+            return new SchemeString(s.name);
+        }));
+        env.define("string->symbol", new BuiltinProc("string->symbol", args -> {
+            requireArgCount("string->symbol", args, 1);
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->symbol: not a string");
+            return new SchemeSymbol(s.value, 0, 0);
+        }));
+        env.define("string-ref", new BuiltinProc("string-ref", args -> {
+            requireArgCount("string-ref", args, 2);
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-ref: not a string");
+            int idx = (int) requireLong(args.get(1), "string-ref");
+            return new SchemeChar(s.value.charAt(idx));
+        }));
+        env.define("char?", new BuiltinProc("char?", args -> {
+            requireArgCount("char?", args, 1);
+            return args.get(0) instanceof SchemeChar;
+        }));
     }
 
     private long requireLong(Object val, String op) throws EvalError {
@@ -647,9 +744,35 @@ public class Evaluator {
             sb.append(")");
             return sb.toString();
         }
+        if (val instanceof SchemeChar c) return "#\\" + c.value;
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         return val.toString();
+    }
+
+    private String displayValue(Object val) {
+        if (val == null) return "void";
+        if (val == NIL) return "()";
+        if (val instanceof SchemeString s) return s.value;
+        if (val instanceof SchemeChar c) return String.valueOf(c.value);
+        if (val instanceof SchemePair) {
+            StringBuilder sb = new StringBuilder("(");
+            Object cur = val;
+            boolean first = true;
+            while (cur instanceof SchemePair p) {
+                if (!first) sb.append(" ");
+                first = false;
+                sb.append(displayValue(p.car));
+                cur = p.cdr;
+            }
+            if (cur != NIL) {
+                sb.append(" . ");
+                sb.append(displayValue(cur));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
+        return schemeToString(val);
     }
 
     // --- Data types ---
@@ -657,4 +780,5 @@ public class Evaluator {
     record SchemeSymbol(String name, int line, int col) {}
     record SchemeString(String value) {}
     record SchemeList(List<Object> elems, int line, int col) {}
+    record SchemeChar(char value) {}
 }
