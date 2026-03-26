@@ -69,6 +69,7 @@ func (e *listExpr) exprPos() position { return e.pos }
 
 type stringValue string
 type symbolValue string
+type charValue rune
 type emptyList struct{}
 type voidValue struct{}
 
@@ -83,11 +84,11 @@ type callable interface {
 
 type builtinProcedure struct {
 	name string
-	fn   func([]any, position) (any, error)
+	fn   func(*interpreter, []any, position) (any, error)
 }
 
-func (p *builtinProcedure) Call(_ *interpreter, args []any, pos position) (any, error) {
-	return p.fn(args, pos)
+func (p *builtinProcedure) Call(i *interpreter, args []any, pos position) (any, error) {
+	return p.fn(i, args, pos)
 }
 
 type lambdaProcedure struct {
@@ -169,12 +170,17 @@ func installBuiltins(env *environment) {
 		"+", "-", "*", "/", "<", ">", "=", "<=", "not",
 		"cons", "car", "cdr", "null?", "list", "length", "append",
 		"string?", "number?", "boolean?", "pair?", "symbol?",
+		"display", "write", "newline",
+		"string-append", "string-length", "substring",
+		"string->number", "number->string",
+		"symbol->string", "string->symbol",
+		"string-ref", "char?",
 	} {
 		name := name
 		env.define(name, &builtinProcedure{
 			name: name,
-			fn: func(args []any, pos position) (any, error) {
-				return applyBuiltin(name, args, pos)
+			fn: func(i *interpreter, args []any, pos position) (any, error) {
+				return applyBuiltin(i, name, args, pos)
 			},
 		})
 	}
@@ -571,7 +577,7 @@ func applyProcedure(i *interpreter, operator any, args []any, pos position) (any
 	return procedure.Call(i, args, pos)
 }
 
-func applyBuiltin(name string, args []any, pos position) (any, error) {
+func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, error) {
 	switch name {
 	case "+":
 		total := 0
@@ -751,6 +757,139 @@ func applyBuiltin(name string, args []any, pos position) (any, error) {
 		}
 		_, ok := args[0].(symbolValue)
 		return ok, nil
+
+	case "display":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		i.output.WriteString(formatDisplayValue(args[0]))
+		return voidValue{}, nil
+
+	case "write":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		i.output.WriteString(formatValue(args[0]))
+		return voidValue{}, nil
+
+	case "newline":
+		if len(args) != 0 {
+			return nil, newEvalError(pos, "%s expects exactly 0 arguments", name)
+		}
+		i.output.WriteByte('\n')
+		return voidValue{}, nil
+
+	case "string-append":
+		var builder strings.Builder
+		for _, arg := range args {
+			text, err := expectString(arg, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			builder.WriteString(text)
+		}
+		return stringValue(builder.String()), nil
+
+	case "string-length":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return len([]rune(text)), nil
+
+	case "substring":
+		if len(args) != 3 {
+			return nil, newEvalError(pos, "%s expects exactly 3 arguments", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		start, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		end, err := expectInt(args[2], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		runes := []rune(text)
+		if start < 0 || end < 0 || start > end || end > len(runes) {
+			return nil, newEvalError(pos, "%s index out of range", name)
+		}
+		return stringValue(string(runes[start:end])), nil
+
+	case "string->number":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		value, convErr := strconv.Atoi(text)
+		if convErr != nil {
+			return false, nil
+		}
+		return value, nil
+
+	case "number->string":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return stringValue(strconv.Itoa(value)), nil
+
+	case "symbol->string":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		symbol, err := expectSymbol(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return stringValue(symbol), nil
+
+	case "string->symbol":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return symbolValue(text), nil
+
+	case "string-ref":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		index, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		runes := []rune(text)
+		if index < 0 || index >= len(runes) {
+			return nil, newEvalError(pos, "%s index out of range", name)
+		}
+		return charValue(runes[index]), nil
+
+	case "char?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(charValue)
+		return ok, nil
 	default:
 		return nil, newEvalError(pos, "unknown procedure: %s", name)
 	}
@@ -786,6 +925,22 @@ func expectInt(value any, pos position, procedure string) (int, error) {
 		return 0, newEvalError(pos, "%s expects numeric arguments", procedure)
 	}
 	return n, nil
+}
+
+func expectString(value any, pos position, procedure string) (string, error) {
+	text, ok := value.(stringValue)
+	if !ok {
+		return "", newEvalError(pos, "%s expects a string", procedure)
+	}
+	return string(text), nil
+}
+
+func expectSymbol(value any, pos position, procedure string) (string, error) {
+	symbol, ok := value.(symbolValue)
+	if !ok {
+		return "", newEvalError(pos, "%s expects a symbol", procedure)
+	}
+	return string(symbol), nil
 }
 
 func expectPair(value any, pos position, procedure string) (*pairValue, error) {
@@ -841,6 +996,8 @@ func formatValue(value any) string {
 		return strconv.Quote(string(v))
 	case symbolValue:
 		return string(v)
+	case charValue:
+		return formatCharLiteral(rune(v))
 	case emptyList:
 		return "()"
 	case *pairValue:
@@ -849,6 +1006,28 @@ func formatValue(value any) string {
 		return "#<procedure>"
 	default:
 		return fmt.Sprintf("%v", v)
+	}
+}
+
+func formatDisplayValue(value any) string {
+	switch v := value.(type) {
+	case stringValue:
+		return string(v)
+	case charValue:
+		return string(rune(v))
+	default:
+		return formatValue(value)
+	}
+}
+
+func formatCharLiteral(value rune) string {
+	switch value {
+	case ' ':
+		return "#\\space"
+	case '\n':
+		return "#\\newline"
+	default:
+		return "#\\" + string(value)
 	}
 }
 
