@@ -162,6 +162,9 @@ enum NativeProcedureKind {
     Map,
     Apply,
     ForEach,
+    Display,
+    Write,
+    Newline,
     CallCc,
     DynamicWind,
     Raise,
@@ -256,6 +259,7 @@ struct EvalState {
     next_unique: u64,
     current_handlers: ExceptionHandlers,
     latest_continuation_epoch: u64,
+    output: String,
 }
 
 enum TailAction {
@@ -361,6 +365,7 @@ impl EvalState {
             next_unique: 1,
             current_handlers: None,
             latest_continuation_epoch: 0,
+            output: String::new(),
         }
     }
 
@@ -378,6 +383,14 @@ impl EvalState {
         let epoch = self.fresh_unique_id();
         self.latest_continuation_epoch = epoch;
         epoch
+    }
+
+    fn write_output(&mut self, text: &str) {
+        self.output.push_str(text);
+    }
+
+    fn output(&self) -> String {
+        self.output.clone()
     }
 }
 
@@ -714,6 +727,18 @@ impl Reader {
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    let (result, _) = evaluate_input(input)?;
+    Ok(format_value(&result))
+}
+
+/// Evaluate Scheme expressions, returning both the result value and
+/// any output produced by `display`, `write`, or `newline`.
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let (result, output) = evaluate_input(input)?;
+    Ok((format_value(&result), output))
+}
+
+fn evaluate_input(input: &str) -> Result<(Value, String), EvalError> {
     let program = Reader::new(input).parse_program()?;
 
     if program.is_empty() {
@@ -723,14 +748,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let env = create_global_env();
     let mut state = EvalState::new();
     let result = evaluate_program(&program, &env, &mut state)?;
-
-    Ok(format_value(&result))
-}
-
-/// Evaluate Scheme expressions, returning both the result value and
-/// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    Ok((eval_str(input)?, String::new()))
+    Ok((result, state.output()))
 }
 
 fn create_global_env() -> Environment {
@@ -786,6 +804,9 @@ fn create_global_env() -> Environment {
     env.define("map", native("map", NativeProcedureKind::Map));
     env.define("apply", native("apply", NativeProcedureKind::Apply));
     env.define("for-each", native("for-each", NativeProcedureKind::ForEach));
+    env.define("display", native("display", NativeProcedureKind::Display));
+    env.define("write", native("write", NativeProcedureKind::Write));
+    env.define("newline", native("newline", NativeProcedureKind::Newline));
     env.define("call/cc", native("call/cc", NativeProcedureKind::CallCc));
     env.define(
         "call-with-current-continuation",
@@ -1540,6 +1561,10 @@ fn continue_with_native_procedure(
     current_winders: &mut Winders,
     state: &mut EvalState,
 ) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    if let Some(result) = apply_output_native_procedure(&procedure.kind, &procedure.name, &args, loc, state) {
+        return Ok((MachineControl::Value(result?), continuation));
+    }
+
     match &procedure.kind {
         NativeProcedureKind::Map => {
             if args.len() < 2 {
@@ -1677,6 +1702,9 @@ fn continue_with_native_procedure(
                 state,
             )
         }
+        NativeProcedureKind::Display
+        | NativeProcedureKind::Write
+        | NativeProcedureKind::Newline => unreachable!("handled before match"),
         NativeProcedureKind::CallCc => {
             expect_exact_args(&procedure.name, &args, loc, 1)?;
 
@@ -3626,6 +3654,10 @@ fn apply_native_procedure(
     loc: SourceLoc,
     state: &mut EvalState,
 ) -> Result<Value, EvalError> {
+    if let Some(result) = apply_output_native_procedure(&procedure.kind, &procedure.name, args, loc, state) {
+        return result;
+    }
+
     match &procedure.kind {
         NativeProcedureKind::Map => {
             if args.len() < 2 {
@@ -3729,6 +3761,9 @@ fn apply_native_procedure(
 
             Ok(Value::Void)
         }
+        NativeProcedureKind::Display
+        | NativeProcedureKind::Write
+        | NativeProcedureKind::Newline => unreachable!("handled before match"),
         NativeProcedureKind::CallCc => {
             expect_exact_args(&procedure.name, args, loc, 1)?;
 
@@ -3846,6 +3881,41 @@ fn apply_native_procedure(
             Ok(Value::Void)
         }
     }
+}
+
+fn apply_output_native_procedure(
+    kind: &NativeProcedureKind,
+    name: &str,
+    args: &[EvaluatedArg],
+    loc: SourceLoc,
+    state: &mut EvalState,
+) -> Option<Result<Value, EvalError>> {
+    match kind {
+        NativeProcedureKind::Display => {
+            Some(write_output_value(name, args, loc, state, format_display_value))
+        }
+        NativeProcedureKind::Write => Some(write_output_value(name, args, loc, state, format_value)),
+        NativeProcedureKind::Newline => {
+            Some((|| {
+                expect_exact_args(name, args, loc, 0)?;
+                state.write_output("\n");
+                Ok(Value::Void)
+            })())
+        }
+        _ => None,
+    }
+}
+
+fn write_output_value(
+    name: &str,
+    args: &[EvaluatedArg],
+    loc: SourceLoc,
+    state: &mut EvalState,
+    formatter: fn(&Value) -> String,
+) -> Result<Value, EvalError> {
+    expect_exact_args(name, args, loc, 1)?;
+    state.write_output(&formatter(&args[0].value));
+    Ok(Value::Void)
 }
 
 fn apply_tail_action(action: TailAction, state: &mut EvalState) -> Result<Value, EvalError> {
@@ -4084,6 +4154,10 @@ fn pair_id(pair: &Rc<PairValue>) -> usize {
     Rc::as_ptr(pair) as usize
 }
 
+fn vector_id(vector: &Rc<VectorValue>) -> usize {
+    Rc::as_ptr(vector) as usize
+}
+
 fn dotted_tail_index(elements: &[Expr]) -> Option<usize> {
     let mut dot_index = None;
 
@@ -4198,9 +4272,8 @@ fn match_macro_rule(
         return None;
     }
 
-    if expr_symbol_name(&pattern_items[0])? != expr_symbol_name(&invocation_items[0])? {
-        return None;
-    }
+    expr_symbol_name(&pattern_items[0])?;
+    expr_symbol_name(&invocation_items[0])?;
 
     let mut bindings = MacroBindings::default();
     if match_pattern_list(
@@ -4266,6 +4339,10 @@ fn match_pattern_once(
     literals: &HashSet<String>,
     bindings: &mut MacroBindings,
 ) -> bool {
+    if is_pattern_wildcard(pattern) {
+        return true;
+    }
+
     match &pattern.kind {
         ExprKind::Number(value) => matches!(datum.kind, ExprKind::Number(other) if other == *value),
         ExprKind::Boolean(value) => {
@@ -4295,6 +4372,10 @@ fn match_pattern_repeated(
     literals: &HashSet<String>,
     bindings: &mut MacroBindings,
 ) -> bool {
+    if is_pattern_wildcard(pattern) {
+        return true;
+    }
+
     if let ExprKind::Symbol(identifier) = &pattern.kind {
         let name = identifier.display_name();
         if !literals.contains(name) {
@@ -4310,6 +4391,10 @@ fn initialize_repeated_binding(
     literals: &HashSet<String>,
     bindings: &mut MacroBindings,
 ) -> bool {
+    if is_pattern_wildcard(pattern) {
+        return true;
+    }
+
     let ExprKind::Symbol(identifier) = &pattern.kind else {
         return true;
     };
@@ -5601,6 +5686,10 @@ fn expr_plain_symbol(expr: &Expr) -> Option<&str> {
     }
 }
 
+fn is_pattern_wildcard(expr: &Expr) -> bool {
+    matches!(expr_symbol_name(expr), Some("_"))
+}
+
 fn is_ellipsis(expr: &Expr) -> bool {
     matches!(expr_symbol_name(expr), Some("..."))
 }
@@ -5711,7 +5800,36 @@ fn procedure_display_name(procedure: &ClosureProcedure) -> &str {
     procedure.name.as_deref().unwrap_or("lambda")
 }
 
+#[derive(Clone, Copy)]
+enum FormatMode {
+    Write,
+    Display,
+}
+
 fn format_value(value: &Value) -> String {
+    format_value_with_mode(
+        value,
+        FormatMode::Write,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+    )
+}
+
+fn format_display_value(value: &Value) -> String {
+    format_value_with_mode(
+        value,
+        FormatMode::Display,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+    )
+}
+
+fn format_value_with_mode(
+    value: &Value,
+    mode: FormatMode,
+    seen_pairs: &mut HashSet<usize>,
+    seen_vectors: &mut HashSet<usize>,
+) -> String {
     match value {
         Value::Number(value) => format_number(*value),
         Value::Boolean(value) => {
@@ -5721,26 +5839,33 @@ fn format_value(value: &Value) -> String {
                 "#f".to_string()
             }
         }
-        Value::String(value) => format!("\"{}\"", escape_string(value)),
+        Value::String(value) => match mode {
+            FormatMode::Write => format!("\"{}\"", escape_string(value)),
+            FormatMode::Display => value.clone(),
+        },
         Value::Symbol(value) => value.clone(),
         Value::EmptyList => "()".to_string(),
-        Value::Pair(value) => format_pair(value),
-        Value::Vector(value) => format_vector(value),
+        Value::Pair(value) => format_pair(value, mode, seen_pairs, seen_vectors),
+        Value::Vector(value) => format_vector(value, mode, seen_pairs, seen_vectors),
         Value::Void => "#<void>".to_string(),
         Value::Procedure(_) => "#<procedure>".to_string(),
         Value::Record(_) => "#<record>".to_string(),
     }
 }
 
-fn format_pair(value: &Rc<PairValue>) -> String {
+fn format_pair(
+    value: &Rc<PairValue>,
+    mode: FormatMode,
+    seen_pairs: &mut HashSet<usize>,
+    seen_vectors: &mut HashSet<usize>,
+) -> String {
     let mut parts = Vec::new();
     let mut tail = Value::Pair(value.clone());
-    let mut seen = HashSet::new();
 
     loop {
         match tail {
             Value::Pair(pair) => {
-                if !seen.insert(pair_id(&pair)) {
+                if !seen_pairs.insert(pair_id(&pair)) {
                     if parts.is_empty() {
                         return "(...)".to_string();
                     }
@@ -5748,22 +5873,42 @@ fn format_pair(value: &Rc<PairValue>) -> String {
                     return format!("({} ...)", parts.join(" "));
                 }
 
-                parts.push(format_value(&pair_car(&pair)));
+                parts.push(format_value_with_mode(
+                    &pair_car(&pair),
+                    mode,
+                    seen_pairs,
+                    seen_vectors,
+                ));
                 tail = pair_cdr(&pair);
             }
             Value::EmptyList => return format!("({})", parts.join(" ")),
-            other => return format!("({} . {})", parts.join(" "), format_value(&other)),
+            other => {
+                return format!(
+                    "({} . {})",
+                    parts.join(" "),
+                    format_value_with_mode(&other, mode, seen_pairs, seen_vectors),
+                )
+            }
         }
     }
 }
 
-fn format_vector(value: &Rc<VectorValue>) -> String {
+fn format_vector(
+    value: &Rc<VectorValue>,
+    mode: FormatMode,
+    seen_pairs: &mut HashSet<usize>,
+    seen_vectors: &mut HashSet<usize>,
+) -> String {
+    if !seen_vectors.insert(vector_id(value)) {
+        return "#(...)".to_string();
+    }
+
     let elements = value.elements.borrow();
     format!(
         "#({})",
         elements
             .iter()
-            .map(format_value)
+            .map(|element| format_value_with_mode(element, mode, seen_pairs, seen_vectors))
             .collect::<Vec<_>>()
             .join(" ")
     )
