@@ -176,6 +176,48 @@ public class Evaluator {
         }
     }
 
+    // ---- Record types ----
+    static final class RecordType {
+        final String name;
+        final List<String> fieldNames;
+        RecordType(String name, List<String> fieldNames) {
+            this.name = name;
+            this.fieldNames = fieldNames;
+        }
+    }
+
+    static final class SchemeRecord {
+        final RecordType type;
+        final Object[] fields;
+        SchemeRecord(RecordType type, Object[] fields) {
+            this.type = type;
+            this.fields = fields;
+        }
+    }
+
+    static final class RecordConstructor {
+        final RecordType type;
+        final List<String> fieldOrder;
+        RecordConstructor(RecordType type, List<String> fieldOrder) {
+            this.type = type;
+            this.fieldOrder = fieldOrder;
+        }
+    }
+
+    static final class RecordPredicate {
+        final RecordType type;
+        RecordPredicate(RecordType type) { this.type = type; }
+    }
+
+    static final class RecordAccessor {
+        final RecordType type;
+        final int fieldIndex;
+        RecordAccessor(RecordType type, int fieldIndex) {
+            this.type = type;
+            this.fieldIndex = fieldIndex;
+        }
+    }
+
     static final class SyntaxRules {
         final List<String> literals;
         final List<Object[]> rules; // each: {pattern (List<?>), template (Object)}
@@ -531,6 +573,56 @@ public class Evaluator {
                         env.define(name, transformer);
                         return null;
                     }
+                    case "define-record-type" -> {
+                        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+                        if (list.size() < 4) throw posError("define-record-type: bad syntax");
+                        String typeName = (String) unwrap(list.get(1));
+                        List<?> ctorSpec = (List<?>) unwrap(list.get(2));
+                        String ctorName = (String) unwrap(ctorSpec.get(0));
+                        List<String> ctorFields = new ArrayList<>();
+                        for (int i = 1; i < ctorSpec.size(); i++) {
+                            ctorFields.add((String) unwrap(ctorSpec.get(i)));
+                        }
+                        String predName = (String) unwrap(list.get(3));
+
+                        // Collect field accessors
+                        List<String> allFieldNames = new ArrayList<>(ctorFields);
+                        Map<String, String> fieldAccessors = new HashMap<>();
+                        for (int i = 4; i < list.size(); i++) {
+                            List<?> fieldSpec = (List<?>) unwrap(list.get(i));
+                            String fieldName = (String) unwrap(fieldSpec.get(0));
+                            String accessorName = (String) unwrap(fieldSpec.get(1));
+                            fieldAccessors.put(fieldName, accessorName);
+                        }
+
+                        RecordType rt = new RecordType(typeName, allFieldNames);
+
+                        // Define constructor
+                        final RecordType rtFinal = rt;
+                        final List<String> ctorFieldsFinal = ctorFields;
+                        env.define(ctorName, new BuiltinProc("__record-ctor__" + typeName));
+                        // We need a lambda-based constructor approach. Let's use Lambda.
+                        List<String> params = new ArrayList<>(ctorFields);
+                        // Build constructor as a special lambda that creates records
+                        // Instead, let's define a custom callable. Use Lambda with a trick:
+                        // Actually, let's just store the record type info and handle in apply.
+
+                        // Store record type and define constructor as a lambda
+                        env.define(ctorName, new RecordConstructor(rt, ctorFields));
+
+                        // Define predicate
+                        env.define(predName, new RecordPredicate(rt));
+
+                        // Define accessors
+                        for (int i = 0; i < allFieldNames.size(); i++) {
+                            String fn = allFieldNames.get(i);
+                            String accName = fieldAccessors.get(fn);
+                            if (accName != null) {
+                                env.define(accName, new RecordAccessor(rt, i));
+                            }
+                        }
+                        return null;
+                    }
                 }
                 // Check if head is a macro
                 try {
@@ -621,6 +713,25 @@ public class Evaluator {
                 result = eval(bodyExpr, callEnv);
             }
             return result;
+        }
+        if (proc instanceof RecordConstructor rc) {
+            if (args.size() != rc.fieldOrder.size()) {
+                throw posError("wrong number of arguments to constructor: expected " + rc.fieldOrder.size() + ", got " + args.size());
+            }
+            return new SchemeRecord(rc.type, args.toArray());
+        }
+        if (proc instanceof RecordPredicate rp) {
+            if (args.size() != 1) throw posError("wrong number of arguments to predicate");
+            Object arg = args.get(0);
+            return (arg instanceof SchemeRecord sr && sr.type == rp.type);
+        }
+        if (proc instanceof RecordAccessor ra) {
+            if (args.size() != 1) throw posError("wrong number of arguments to accessor");
+            Object arg = args.get(0);
+            if (!(arg instanceof SchemeRecord sr) || sr.type != ra.type) {
+                throw posError("accessor applied to wrong type");
+            }
+            return sr.fields[ra.fieldIndex];
         }
         throw posError("not a procedure: " + schemeToString(proc));
     }
@@ -732,7 +843,8 @@ public class Evaluator {
     private static boolean isKeyword(String sym) {
         return switch (sym) {
             case "if", "define", "lambda", "quote", "set!", "begin", "cond",
-                 "let", "and", "or", "define-syntax", "syntax-rules" -> true;
+                 "let", "and", "or", "define-syntax", "syntax-rules",
+                 "define-record-type" -> true;
             default -> false;
         };
     }
