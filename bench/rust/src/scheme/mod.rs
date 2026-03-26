@@ -6,7 +6,12 @@ pub use error::EvalError;
 
 use macros::{register_macro_definition, MacroEnv, MacroExpander};
 use number::Number;
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::OnceLock};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::OnceLock,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
@@ -56,6 +61,14 @@ struct RecordType {
 struct RecordValue {
     record_type: Rc<RecordType>,
     fields: Vec<Value>,
+}
+
+type PairRef = Rc<RefCell<PairCell>>;
+
+#[derive(Debug, Clone)]
+struct PairCell {
+    car: Value,
+    cdr: Value,
 }
 
 impl SchemeString {
@@ -150,7 +163,7 @@ enum Value {
     Symbol(String),
     Char(char),
     List(Vec<Value>),
-    Pair(Box<Value>, Box<Value>),
+    Pair(PairRef),
     Vector(SchemeVector),
     Record(Rc<RecordValue>),
     Procedure(Rc<Procedure>),
@@ -336,16 +349,7 @@ impl Procedure {
                     let tail = args
                         .last()
                         .expect("apply arity checked before reading tail");
-
-                    match tail {
-                        Value::List(items) => applied_args.extend(items.iter().cloned()),
-                        other => {
-                            return Err(EvalError::ExpectedList {
-                                name: "apply",
-                                found: other.type_name(),
-                            });
-                        }
-                    }
+                    applied_args.extend(collect_list("apply", tail)?);
 
                     Ok(EvalStep::Apply(args[0].clone(), applied_args))
                 } else {
@@ -466,7 +470,7 @@ impl Value {
             Self::Symbol(_) => "symbol",
             Self::Char(_) => "character",
             Self::List(_) => "list",
-            Self::Pair(_, _) => "pair",
+            Self::Pair(_) => "pair",
             Self::Vector(_) => "vector",
             Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
@@ -476,67 +480,11 @@ impl Value {
     }
 
     fn render(&self) -> String {
-        match self {
-            Self::Number(value) => value.render(),
-            Self::Boolean(true) => "#t".into(),
-            Self::Boolean(false) => "#f".into(),
-            Self::String(value) => {
-                let escaped = value
-                    .to_plain_string()
-                    .chars()
-                    .flat_map(|ch| match ch {
-                        '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
-                        '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
-                        '\n' => ['\\', 'n'].into_iter().collect::<Vec<_>>(),
-                        '\t' => ['\\', 't'].into_iter().collect::<Vec<_>>(),
-                        other => [other].into_iter().collect::<Vec<_>>(),
-                    })
-                    .collect::<String>();
-
-                format!("\"{escaped}\"")
-            }
-            Self::Symbol(value) => value.clone(),
-            Self::Char(value) => render_char(*value),
-            Self::List(items) => {
-                let rendered = items
-                    .iter()
-                    .map(Value::render)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("({rendered})")
-            }
-            Self::Pair(car, cdr) => render_pair(car, cdr, false),
-            Self::Vector(vector) => {
-                let rendered = vector
-                    .values()
-                    .iter()
-                    .map(Value::render)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("#({rendered})")
-            }
-            Self::Record(record) => format!("#<record {}>", record.record_type.name),
-            Self::Procedure(_) => "#<procedure>".into(),
-            Self::Uninitialized => "#<uninitialized>".into(),
-            Self::Void => "#<void>".into(),
-        }
+        render_value(self, false)
     }
 
     fn display_render(&self) -> String {
-        match self {
-            Self::String(value) => value.to_plain_string(),
-            Self::Char(value) => value.to_string(),
-            Self::List(items) => {
-                let rendered = items
-                    .iter()
-                    .map(Value::display_render)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("({rendered})")
-            }
-            Self::Pair(car, cdr) => render_pair(car, cdr, true),
-            _ => self.render(),
-        }
+        render_value(self, true)
     }
 }
 
@@ -865,6 +813,7 @@ fn eval_application_step(
             "if" => return eval_if_step(tail, &env, context),
             "lambda" => return eval_lambda_step(tail, &env),
             "let" => return eval_let_step(tail, &env, context),
+            "let*" => return eval_let_star_step(tail, &env, context),
             "letrec" => return eval_letrec_step(tail, &env, context, false),
             "letrec*" => return eval_letrec_step(tail, &env, context, true),
             "or" => return eval_or_step(tail, &env, context),
@@ -1403,6 +1352,37 @@ fn eval_let_step(
     }
 }
 
+fn eval_let_star_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "let*",
+            expected: "bindings and at least one body expression",
+            got: 0,
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::InvalidForm {
+            name: "let*",
+            message: "expected at least one body expression",
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings_expr, "let*")?;
+    let let_star_env = Env::new(Some(env.clone()));
+
+    for (name, init) in bindings {
+        let value = eval_expr_in_env(&init, &let_star_env, context)?;
+        let_star_env.define(name, value);
+    }
+
+    Ok(EvalStep::Sequence(body.to_vec(), let_star_env))
+}
+
 fn eval_letrec(
     args: &[Expr],
     env: &EnvRef,
@@ -1782,7 +1762,7 @@ fn quote_expr(expr: &Expr) -> Value {
         Expr::Char(value) => Value::Char(*value),
         Expr::String(value) => Value::String(SchemeString::new_immutable(value)),
         Expr::Symbol(value) => Value::Symbol(value.clone()),
-        Expr::List(items) => Value::List(items.iter().map(quote_expr).collect()),
+        Expr::List(items) => list_from_vec(items.iter().map(quote_expr).collect()),
     }
 }
 
@@ -1806,47 +1786,143 @@ fn bind_lambda_args(params: &LambdaParams, args: Vec<Value>, env: &EnvRef) -> En
     }
 
     if let Some(rest) = &params.rest {
-        call_env.define(rest.clone(), Value::List(args.collect()));
+        call_env.define(rest.clone(), list_from_vec(args.collect()));
     }
 
     call_env
 }
 
-fn render_pair(car: &Value, cdr: &Value, display: bool) -> String {
-    let mut rendered = vec![if display {
-        car.display_render()
-    } else {
-        car.render()
-    }];
-    let mut tail = cdr;
+fn empty_list() -> Value {
+    Value::List(Vec::new())
+}
+
+fn new_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new(PairCell { car, cdr })))
+}
+
+fn list_from_vec(values: Vec<Value>) -> Value {
+    values
+        .into_iter()
+        .rev()
+        .fold(empty_list(), |cdr, car| new_pair(car, cdr))
+}
+
+fn pair_id(pair: &PairRef) -> usize {
+    Rc::as_ptr(pair) as usize
+}
+
+fn clear_active_pairs(active: &mut HashSet<usize>, inserted: &mut Vec<usize>) {
+    for id in inserted.drain(..).rev() {
+        active.remove(&id);
+    }
+}
+
+fn render_string_literal(value: &SchemeString) -> String {
+    let escaped = value
+        .to_plain_string()
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
+            '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
+            '\n' => ['\\', 'n'].into_iter().collect::<Vec<_>>(),
+            '\t' => ['\\', 't'].into_iter().collect::<Vec<_>>(),
+            other => [other].into_iter().collect::<Vec<_>>(),
+        })
+        .collect::<String>();
+
+    format!("\"{escaped}\"")
+}
+
+fn render_value(value: &Value, display: bool) -> String {
+    let mut active = HashSet::new();
+    render_value_inner(value, display, &mut active)
+}
+
+fn render_value_inner(value: &Value, display: bool, active: &mut HashSet<usize>) -> String {
+    match value {
+        Value::Number(value) => value.render(),
+        Value::Boolean(true) => "#t".into(),
+        Value::Boolean(false) => "#f".into(),
+        Value::String(value) => {
+            if display {
+                value.to_plain_string()
+            } else {
+                render_string_literal(value)
+            }
+        }
+        Value::Symbol(value) => value.clone(),
+        Value::Char(value) => {
+            if display {
+                value.to_string()
+            } else {
+                render_char(*value)
+            }
+        }
+        Value::List(items) => {
+            let rendered = items
+                .iter()
+                .map(|item| render_value_inner(item, display, active))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("({rendered})")
+        }
+        Value::Pair(pair) => render_pair(pair, display, active),
+        Value::Vector(vector) => {
+            let rendered = vector
+                .values()
+                .iter()
+                .map(|item| render_value_inner(item, display, active))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("#({rendered})")
+        }
+        Value::Record(record) => format!("#<record {}>", record.record_type.name),
+        Value::Procedure(_) => "#<procedure>".into(),
+        Value::Uninitialized => "#<uninitialized>".into(),
+        Value::Void => "#<void>".into(),
+    }
+}
+
+fn render_pair(pair: &PairRef, display: bool, active: &mut HashSet<usize>) -> String {
+    let mut rendered = Vec::new();
+    let mut inserted = Vec::new();
+    let mut current = pair.clone();
 
     loop {
-        match tail {
+        let id = pair_id(&current);
+        if !active.insert(id) {
+            let result = if rendered.is_empty() {
+                "#<circular>".into()
+            } else {
+                format!("({} . #<circular>)", rendered.join(" "))
+            };
+            clear_active_pairs(active, &mut inserted);
+            return result;
+        }
+
+        inserted.push(id);
+        let cell = current.borrow();
+        rendered.push(render_value_inner(&cell.car, display, active));
+        let next = cell.cdr.clone();
+        drop(cell);
+
+        match next {
             Value::List(items) => {
-                rendered.extend(items.iter().map(|item| {
-                    if display {
-                        item.display_render()
-                    } else {
-                        item.render()
-                    }
-                }));
-                return format!("({})", rendered.join(" "));
+                rendered.extend(
+                    items
+                        .iter()
+                        .map(|item| render_value_inner(item, display, active)),
+                );
+                let result = format!("({})", rendered.join(" "));
+                clear_active_pairs(active, &mut inserted);
+                return result;
             }
-            Value::Pair(next_car, next_cdr) => {
-                rendered.push(if display {
-                    next_car.display_render()
-                } else {
-                    next_car.render()
-                });
-                tail = next_cdr;
-            }
+            Value::Pair(next_pair) => current = next_pair,
             other => {
-                let tail_rendered = if display {
-                    other.display_render()
-                } else {
-                    other.render()
-                };
-                return format!("({} . {tail_rendered})", rendered.join(" "));
+                let tail_rendered = render_value_inner(&other, display, active);
+                let result = format!("({} . {tail_rendered})", rendered.join(" "));
+                clear_active_pairs(active, &mut inserted);
+                return result;
             }
         }
     }
@@ -1868,7 +1944,10 @@ fn root_env() -> EnvRef {
         "apply",
         "append",
         "assoc",
+        "assv",
         "boolean?",
+        "caar",
+        "cadr",
         "char?",
         "char-alphabetic?",
         "char-downcase",
@@ -1879,21 +1958,27 @@ fn root_env() -> EnvRef {
         "char=?",
         "car",
         "cdr",
+        "cdar",
+        "cddr",
         "cons",
         "display",
         "denominator",
         "eq?",
         "eqv?",
+        "error",
         "exact->inexact",
         "exact?",
         "equal?",
         "even?",
         "expt",
+        "for-each",
+        "gcd",
         "inexact->exact",
         "inexact?",
         "integer->char",
         "integer?",
         "length",
+        "lcm",
         "list",
         "list-ref",
         "list-tail",
@@ -1901,8 +1986,10 @@ fn root_env() -> EnvRef {
         "list->vector",
         "list?",
         "make-vector",
+        "make-string",
         "map",
         "max",
+        "member",
         "min",
         "modulo",
         "negative?",
@@ -1919,11 +2006,19 @@ fn root_env() -> EnvRef {
         "quotient",
         "rational?",
         "remainder",
+        "reverse",
+        "round",
+        "set-car!",
+        "set-cdr!",
+        "string",
         "string-ci=?",
         "string-downcase",
         "string->list",
         "string<?",
         "string=?",
+        "string<=?",
+        "string>=?",
+        "string>?",
         "string->number",
         "string->symbol",
         "string-append",
@@ -1936,6 +2031,7 @@ fn root_env() -> EnvRef {
         "substring",
         "symbol?",
         "symbol->string",
+        "truncate",
         "vector",
         "vector->list",
         "vector-length",
@@ -2000,34 +2096,17 @@ fn apply_builtin(
             let tail = args
                 .last()
                 .expect("apply arity checked before reading tail");
-
-            match tail {
-                Value::List(items) => applied_args.extend(items.iter().cloned()),
-                other => {
-                    return Err(EvalError::ExpectedList {
-                        name: "apply",
-                        found: other.type_name(),
-                    });
-                }
-            }
+            applied_args.extend(collect_list("apply", tail)?);
 
             apply_procedure(args[0].clone(), applied_args, context)
         }
         "append" => {
             let mut values = Vec::new();
             for arg in args {
-                match arg {
-                    Value::List(items) => values.extend(items.iter().cloned()),
-                    other => {
-                        return Err(EvalError::ExpectedList {
-                            name: "append",
-                            found: other.type_name(),
-                        });
-                    }
-                }
+                values.extend(collect_list("append", arg)?);
             }
 
-            Ok(Value::List(values))
+            Ok(list_from_vec(values))
         }
         "assoc" => {
             if args.len() != 2 {
@@ -2038,17 +2117,42 @@ fn apply_builtin(
                 });
             }
 
-            let alist = expect_list("assoc", &args[1])?;
+            let alist = collect_list("assoc", &args[1])?;
             for entry in alist {
-                let Some(key) = pair_first(entry) else {
+                let Some(key) = pair_first(&entry) else {
                     return Err(EvalError::ExpectedPair {
                         name: "assoc",
                         found: entry.type_name(),
                     });
                 };
 
-                if equal_values(&args[0], key) {
-                    return Ok(entry.clone());
+                if equal_values(&args[0], &key) {
+                    return Ok(entry);
+                }
+            }
+
+            Ok(Value::Boolean(false))
+        }
+        "assv" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "assv",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let alist = collect_list("assv", &args[1])?;
+            for entry in alist {
+                let Some(key) = pair_first(&entry) else {
+                    return Err(EvalError::ExpectedPair {
+                        name: "assv",
+                        found: entry.type_name(),
+                    });
+                };
+
+                if eq_values(&args[0], &key) {
+                    return Ok(entry);
                 }
             }
 
@@ -2149,22 +2253,26 @@ fn apply_builtin(
         }
         "char<?" => compare_characters("char<?", args, |left, right| left < right),
         "char=?" => compare_characters("char=?", args, |left, right| left == right),
+        "caar" => apply_cxr("caar", args),
+        "cadr" => apply_cxr("cadr", args),
         "car" => {
-            let value = expect_pair_value("car", args)?;
+            let value = expect_pair_arg("car", args)?;
             Ok(match value {
                 Value::List(items) => items[0].clone(),
-                Value::Pair(car, _) => (**car).clone(),
+                Value::Pair(pair) => pair.borrow().car.clone(),
                 _ => unreachable!("expect_pair_value only returns pairs"),
             })
         }
         "cdr" => {
-            let value = expect_pair_value("cdr", args)?;
+            let value = expect_pair_arg("cdr", args)?;
             Ok(match value {
-                Value::List(items) => Value::List(items[1..].to_vec()),
-                Value::Pair(_, cdr) => (**cdr).clone(),
+                Value::List(items) => list_from_vec(items[1..].to_vec()),
+                Value::Pair(pair) => pair.borrow().cdr.clone(),
                 _ => unreachable!("expect_pair_value only returns pairs"),
             })
         }
+        "cdar" => apply_cxr("cdar", args),
+        "cddr" => apply_cxr("cddr", args),
         "cons" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount {
@@ -2174,18 +2282,7 @@ fn apply_builtin(
                 });
             }
 
-            match &args[1] {
-                Value::List(rest) => {
-                    let mut values = Vec::with_capacity(rest.len() + 1);
-                    values.push(args[0].clone());
-                    values.extend(rest.iter().cloned());
-                    Ok(Value::List(values))
-                }
-                other => Ok(Value::Pair(
-                    Box::new(args[0].clone()),
-                    Box::new(other.clone()),
-                )),
-            }
+            Ok(new_pair(args[0].clone(), args[1].clone()))
         }
         "display" => {
             if args.len() != 1 {
@@ -2207,11 +2304,33 @@ fn apply_builtin(
                     .expect("exact numbers always have a denominator"),
             )))
         }
+        "error" => {
+            if args.is_empty() {
+                return Err(EvalError::WrongArgCount {
+                    name: "error",
+                    expected: "at least 1 argument",
+                    got: 0,
+                });
+            }
+
+            let mut message = args[0].display_render();
+            for arg in &args[1..] {
+                if !message.is_empty() {
+                    message.push(' ');
+                }
+                message.push_str(&arg.render());
+            }
+
+            Err(EvalError::RaisedError { message })
+        }
+        "for-each" => apply_for_each(args, context),
+        "gcd" => apply_gcd(args),
         "length" => {
-            let list = expect_list_arg("length", args)?;
+            let list = collect_list_arg("length", args)?;
             Ok(Value::Number(Number::integer(list.len() as i64)))
         }
-        "list" => Ok(Value::List(args.to_vec())),
+        "lcm" => apply_lcm(args),
+        "list" => Ok(list_from_vec(args.to_vec())),
         "list-ref" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount {
@@ -2221,7 +2340,7 @@ fn apply_builtin(
                 });
             }
 
-            let list = expect_list("list-ref", &args[0])?;
+            let list = collect_list("list-ref", &args[0])?;
             let index = expect_index("list-ref", &args[1], list.len())?;
             Ok(list[index].clone())
         }
@@ -2234,12 +2353,12 @@ fn apply_builtin(
                 });
             }
 
-            let list = expect_list("list-tail", &args[0])?;
+            let list = collect_list("list-tail", &args[0])?;
             let index = expect_index_inclusive_end("list-tail", &args[1], list.len())?;
-            Ok(Value::List(list[index..].to_vec()))
+            Ok(list_from_vec(list[index..].to_vec()))
         }
         "list->string" => {
-            let list = expect_list_arg("list->string", args)?;
+            let list = collect_list_arg("list->string", args)?;
             let chars = list
                 .iter()
                 .map(|value| expect_char("list->string", value))
@@ -2247,10 +2366,29 @@ fn apply_builtin(
             Ok(Value::String(SchemeString::from_runtime_chars(chars)))
         }
         "list->vector" => {
-            let list = expect_list_arg("list->vector", args)?;
-            Ok(Value::Vector(SchemeVector::new(list.to_vec())))
+            let list = collect_list_arg("list->vector", args)?;
+            Ok(Value::Vector(SchemeVector::new(list)))
         }
-        "list?" => predicate_builtin("list?", args, |value| matches!(value, Value::List(_))),
+        "list?" => predicate_builtin("list?", args, is_proper_list),
+        "make-string" => {
+            if !(1..=2).contains(&args.len()) {
+                return Err(EvalError::WrongArgCount {
+                    name: "make-string",
+                    expected: "1 or 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let length = expect_nonnegative_length("make-string", &args[0])?;
+            let fill = args
+                .get(1)
+                .map(|value| expect_char("make-string", value))
+                .transpose()?
+                .unwrap_or(' ');
+            Ok(Value::String(SchemeString::new_runtime(
+                std::iter::repeat_n(fill, length).collect::<String>(),
+            )))
+        }
         "make-vector" => {
             if !(1..=2).contains(&args.len()) {
                 return Err(EvalError::WrongArgCount {
@@ -2288,6 +2426,7 @@ fn apply_builtin(
 
             Ok(Value::Number(maximum))
         }
+        "member" => apply_member(args),
         "min" => {
             let numbers = extract_numbers("min", args)?;
             let Some(first) = numbers.first() else {
@@ -2374,7 +2513,7 @@ fn apply_builtin(
             Ok(Value::Boolean(number.rem_euclid(2) == 1))
         }
         "pair?" => predicate_builtin("pair?", args, |value| match value {
-            Value::Pair(_, _) => true,
+            Value::Pair(_) => true,
             Value::List(items) => !items.is_empty(),
             _ => false,
         }),
@@ -2440,6 +2579,44 @@ fn apply_builtin(
 
             Ok(Value::Number(Number::integer(left % right)))
         }
+        "reverse" => {
+            let mut list = collect_list_arg("reverse", args)?;
+            list.reverse();
+            Ok(list_from_vec(list))
+        }
+        "round" => {
+            let number = expect_number_arg("round", args)?;
+            Ok(match number {
+                Number::Exact(_) => Value::Number(Number::integer(number.to_f64().round() as i64)),
+                Number::Inexact(value) => Value::Number(Number::Inexact(value.round())),
+            })
+        }
+        "set-car!" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "set-car!",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let pair = expect_mutable_pair("set-car!", &args[0])?;
+            pair.borrow_mut().car = args[1].clone();
+            Ok(Value::Void)
+        }
+        "set-cdr!" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "set-cdr!",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let pair = expect_mutable_pair("set-cdr!", &args[0])?;
+            pair.borrow_mut().cdr = args[1].clone();
+            Ok(Value::Void)
+        }
         "string->number" => {
             let value = expect_string_arg("string->number", args)?;
             match Number::parse_literal(&value.to_plain_string()) {
@@ -2449,13 +2626,22 @@ fn apply_builtin(
         }
         "string->list" => {
             let value = expect_string_arg("string->list", args)?;
-            Ok(Value::List(
+            Ok(list_from_vec(
                 value.chars().into_iter().map(Value::Char).collect(),
             ))
         }
         "string->symbol" => {
             let value = expect_string_arg("string->symbol", args)?;
             Ok(Value::Symbol(value.to_plain_string()))
+        }
+        "string" => {
+            let chars = args
+                .iter()
+                .map(|value| expect_char("string", value))
+                .collect::<Result<Vec<_>, EvalError>>()?;
+            Ok(Value::String(SchemeString::new_runtime(
+                chars.into_iter().collect::<String>(),
+            )))
         }
         "string-append" => {
             let mut result = String::new();
@@ -2478,10 +2664,13 @@ fn apply_builtin(
             )))
         }
         "string=?" => compare_strings("string=?", args, |left, right| left == right),
+        "string<=?" => compare_strings("string<=?", args, |left, right| left <= right),
         "string-length" => {
             let value = expect_string_arg("string-length", args)?;
             Ok(Value::Number(Number::integer(value.len() as i64)))
         }
+        "string>=?" => compare_strings("string>=?", args, |left, right| left >= right),
+        "string>?" => compare_strings("string>?", args, |left, right| left > right),
         "string<?" => compare_strings("string<?", args, |left, right| left < right),
         "string-ref" => {
             if args.len() != 2 {
@@ -2548,10 +2737,19 @@ fn apply_builtin(
             let value = expect_symbol_arg("symbol->string", args)?;
             Ok(Value::String(SchemeString::new_runtime(value)))
         }
+        "truncate" => {
+            let number = expect_number_arg("truncate", args)?;
+            Ok(match number {
+                Number::Exact(_) => Value::Number(Number::integer(
+                    number.numerator().unwrap() / number.denominator().unwrap(),
+                )),
+                Number::Inexact(value) => Value::Number(Number::Inexact(value.trunc())),
+            })
+        }
         "vector" => Ok(Value::Vector(SchemeVector::new(args.to_vec()))),
         "vector->list" => {
             let vector = expect_vector_arg("vector->list", args)?;
-            Ok(Value::List(vector.values()))
+            Ok(list_from_vec(vector.values()))
         }
         "vector-length" => {
             let vector = expect_vector_arg("vector-length", args)?;
@@ -2905,17 +3103,59 @@ fn predicate_builtin(
     Ok(Value::Boolean(predicate(&args[0])))
 }
 
-fn expect_list<'a>(name: &'static str, value: &'a Value) -> Result<&'a [Value], EvalError> {
-    match value {
-        Value::List(items) => Ok(items),
-        other => Err(EvalError::ExpectedList {
-            name,
-            found: other.type_name(),
-        }),
+fn is_proper_list(value: &Value) -> bool {
+    let mut seen = HashSet::new();
+    let mut current = value.clone();
+
+    loop {
+        match current {
+            Value::List(_) => return true,
+            Value::Pair(pair) => {
+                if !seen.insert(pair_id(&pair)) {
+                    return false;
+                }
+
+                current = pair.borrow().cdr.clone();
+            }
+            _ => return false,
+        }
     }
 }
 
-fn expect_list_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a [Value], EvalError> {
+fn collect_list(name: &'static str, value: &Value) -> Result<Vec<Value>, EvalError> {
+    let mut seen = HashSet::new();
+    let mut current = value.clone();
+    let mut items = Vec::new();
+
+    loop {
+        match current {
+            Value::List(list_items) => {
+                items.extend(list_items);
+                return Ok(items);
+            }
+            Value::Pair(pair) => {
+                if !seen.insert(pair_id(&pair)) {
+                    return Err(EvalError::ExpectedList {
+                        name,
+                        found: "pair",
+                    });
+                }
+
+                let cell = pair.borrow();
+                items.push(cell.car.clone());
+                current = cell.cdr.clone();
+            }
+            other => {
+                return Err(EvalError::ExpectedList {
+                    name,
+                    found: other.type_name(),
+                })
+            }
+        }
+    }
+}
+
+fn collect_list_arg(name: &'static str, args: &[Value]) -> Result<Vec<Value>, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name,
@@ -2924,7 +3164,7 @@ fn expect_list_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a [Val
         });
     }
 
-    expect_list(name, &args[0])
+    collect_list(name, &args[0])
 }
 
 fn expect_vector(name: &'static str, value: &Value) -> Result<SchemeVector, EvalError> {
@@ -2961,7 +3201,7 @@ fn expect_nonnegative_length(name: &'static str, value: &Value) -> Result<usize,
     Ok(length as usize)
 }
 
-fn expect_pair_value<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a Value, EvalError> {
+fn expect_pair_arg(name: &'static str, args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name,
@@ -2975,7 +3215,7 @@ fn expect_pair_value<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a Va
             name,
             found: "list",
         }),
-        value @ Value::List(_) | value @ Value::Pair(_, _) => Ok(value),
+        value @ Value::List(_) | value @ Value::Pair(_) => Ok(value.clone()),
         other => Err(EvalError::ExpectedPair {
             name,
             found: other.type_name(),
@@ -2983,10 +3223,24 @@ fn expect_pair_value<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a Va
     }
 }
 
-fn pair_first(value: &Value) -> Option<&Value> {
+fn expect_mutable_pair(name: &'static str, value: &Value) -> Result<PairRef, EvalError> {
     match value {
-        Value::List(items) => items.first(),
-        Value::Pair(car, _) => Some(car),
+        Value::Pair(pair) => Ok(pair.clone()),
+        Value::List(_) => Err(EvalError::ExpectedPair {
+            name,
+            found: "list",
+        }),
+        other => Err(EvalError::ExpectedPair {
+            name,
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn pair_first(value: &Value) -> Option<Value> {
+    match value {
+        Value::List(items) => items.first().cloned(),
+        Value::Pair(pair) => Some(pair.borrow().car.clone()),
         _ => None,
     }
 }
@@ -3001,6 +3255,7 @@ fn eq_values(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(&left.inner, &right.inner),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
         (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -3008,6 +3263,15 @@ fn eq_values(left: &Value, right: &Value) -> bool {
 }
 
 fn equal_values(left: &Value, right: &Value) -> bool {
+    let mut seen_pairs = HashSet::new();
+    equal_values_inner(left, right, &mut seen_pairs)
+}
+
+fn equal_values_inner(
+    left: &Value,
+    right: &Value,
+    seen_pairs: &mut HashSet<(usize, usize)>,
+) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => left.numeric_eq(right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
@@ -3018,27 +3282,171 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::List(left), Value::List(right)) => {
             left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left_item, right_item)| equal_values(left_item, right_item))
+                && left.iter().zip(right.iter()).all(|(left_item, right_item)| {
+                    equal_values_inner(left_item, right_item, seen_pairs)
+                })
         }
-        (Value::Pair(left_car, left_cdr), Value::Pair(right_car, right_cdr)) => {
-            equal_values(left_car, right_car) && equal_values(left_cdr, right_cdr)
+        (Value::Pair(left), Value::Pair(right)) => {
+            let pair_key = (pair_id(left), pair_id(right));
+            if !seen_pairs.insert(pair_key) {
+                return true;
+            }
+
+            let left_cell = left.borrow();
+            let right_cell = right.borrow();
+            equal_values_inner(&left_cell.car, &right_cell.car, seen_pairs)
+                && equal_values_inner(&left_cell.cdr, &right_cell.cdr, seen_pairs)
         }
         (Value::Vector(left), Value::Vector(right)) => {
             let left_values = left.values();
             let right_values = right.values();
             left_values.len() == right_values.len()
-                && left_values
-                    .iter()
-                    .zip(right_values.iter())
-                    .all(|(left_item, right_item)| equal_values(left_item, right_item))
+                && left_values.iter().zip(right_values.iter()).all(|(left_item, right_item)| {
+                    equal_values_inner(left_item, right_item, seen_pairs)
+                })
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
+    }
+}
+
+fn car_from_value(name: &'static str, value: &Value) -> Result<Value, EvalError> {
+    match value {
+        Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+        Value::List(_) => Err(EvalError::ExpectedPair {
+            name,
+            found: "list",
+        }),
+        Value::Pair(pair) => Ok(pair.borrow().car.clone()),
+        other => Err(EvalError::ExpectedPair {
+            name,
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn cdr_from_value(name: &'static str, value: &Value) -> Result<Value, EvalError> {
+    match value {
+        Value::List(items) if !items.is_empty() => Ok(list_from_vec(items[1..].to_vec())),
+        Value::List(_) => Err(EvalError::ExpectedPair {
+            name,
+            found: "list",
+        }),
+        Value::Pair(pair) => Ok(pair.borrow().cdr.clone()),
+        other => Err(EvalError::ExpectedPair {
+            name,
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn apply_cxr(name: &'static str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exactly 1 argument",
+            got: args.len(),
+        });
+    }
+
+    let mut value = args[0].clone();
+    for op in name[1..name.len() - 1].chars().rev() {
+        value = match op {
+            'a' => car_from_value(name, &value)?,
+            'd' => cdr_from_value(name, &value)?,
+            _ => unreachable!("cxr builtin names only contain a and d"),
+        };
+    }
+
+    Ok(value)
+}
+
+fn gcd_i64(left: i64, right: i64) -> i64 {
+    let mut left = (left as i128).abs();
+    let mut right = (right as i128).abs();
+
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+
+    left as i64
+}
+
+fn apply_gcd(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = 0_i64;
+    for value in args {
+        result = gcd_i64(result, expect_exact_integer("gcd", value)?);
+    }
+
+    Ok(Value::Number(Number::integer(result)))
+}
+
+fn apply_lcm(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = 1_i64;
+
+    for value in args {
+        let next = expect_exact_integer("lcm", value)?;
+        if result == 0 || next == 0 {
+            result = 0;
+            continue;
+        }
+
+        let gcd = gcd_i64(result, next) as i128;
+        let lcm = ((result as i128) / gcd) * (next as i128);
+        result = i64::try_from(lcm.abs()).map_err(|_| EvalError::InvalidArgument {
+            name: "lcm",
+            message: "result overflowed i64",
+        })?;
+    }
+
+    Ok(Value::Number(Number::integer(result)))
+}
+
+fn apply_member(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "member",
+            expected: "exactly 2 arguments",
+            got: args.len(),
+        });
+    }
+
+    let mut seen = HashSet::new();
+    let mut current = args[1].clone();
+
+    loop {
+        match current {
+            Value::List(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    if equal_values(&args[0], item) {
+                        return Ok(list_from_vec(items[index..].to_vec()));
+                    }
+                }
+
+                return Ok(Value::Boolean(false));
+            }
+            Value::Pair(pair) => {
+                if !seen.insert(pair_id(&pair)) {
+                    return Ok(Value::Boolean(false));
+                }
+
+                let cell = pair.borrow();
+                if equal_values(&args[0], &cell.car) {
+                    return Ok(Value::Pair(pair.clone()));
+                }
+                current = cell.cdr.clone();
+            }
+            other => {
+                return Err(EvalError::ExpectedList {
+                    name: "member",
+                    found: other.type_name(),
+                })
+            }
+        }
     }
 }
 
@@ -3057,7 +3465,7 @@ fn apply_map(args: &[Value], context: &mut EvalContext) -> Result<Value, EvalErr
 
     let lists = args[1..]
         .iter()
-        .map(|value| expect_list("map", value))
+        .map(|value| collect_list("map", value))
         .collect::<Result<Vec<_>, EvalError>>()?;
     let length = lists.iter().map(|list| list.len()).min().unwrap_or(0);
 
@@ -3070,7 +3478,37 @@ fn apply_map(args: &[Value], context: &mut EvalContext) -> Result<Value, EvalErr
         results.push(apply_procedure(args[0].clone(), call_args, context)?);
     }
 
-    Ok(Value::List(results))
+    Ok(list_from_vec(results))
+}
+
+fn apply_for_each(args: &[Value], context: &mut EvalContext) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "for-each",
+            expected: "a procedure and at least one list",
+            got: args.len(),
+        });
+    }
+
+    if !matches!(args[0], Value::Procedure(_)) {
+        return Err(EvalError::NotAProcedure);
+    }
+
+    let lists = args[1..]
+        .iter()
+        .map(|value| collect_list("for-each", value))
+        .collect::<Result<Vec<_>, EvalError>>()?;
+    let length = lists.iter().map(|list| list.len()).min().unwrap_or(0);
+
+    for index in 0..length {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        apply_procedure(args[0].clone(), call_args, context)?;
+    }
+
+    Ok(Value::Void)
 }
 
 fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
