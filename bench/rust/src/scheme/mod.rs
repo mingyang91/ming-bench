@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 mod builtins;
+mod continuation;
 pub mod error;
 mod number;
 mod parser;
@@ -10,6 +11,7 @@ mod special_forms;
 mod syntax;
 
 use builtins::default_env;
+use continuation::{eval_program_with_continuations, program_uses_first_class_continuations};
 pub use error::EvalError;
 use error::SourcePos;
 use number::Number;
@@ -47,6 +49,7 @@ type RecordRef = Rc<RecordInstance>;
 type RecordTypeRef = Rc<RecordType>;
 type RecordProcRef = Rc<RecordProcedure>;
 type StringRef = Rc<StringCell>;
+type ContinuationRef = Rc<Continuation>;
 type VectorRef = Rc<RefCell<Vec<Value>>>;
 
 struct StringCell {
@@ -75,6 +78,19 @@ enum RecordProcedureKind {
     Constructor,
     Predicate,
     Accessor(usize),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ControlProc {
+    CallCc,
+}
+
+impl ControlProc {
+    fn name(self) -> &'static str {
+        match self {
+            Self::CallCc => "call/cc",
+        }
+    }
 }
 
 struct EvalContext {
@@ -117,12 +133,14 @@ enum Value {
     Nil,
     Pair(PairRef),
     Record(RecordRef),
+    ControlProc(ControlProc),
     NativeProc {
         name: &'static str,
         func: NativeFunc,
     },
     RecordProc(RecordProcRef),
     Closure(Rc<Closure>),
+    Continuation(ContinuationRef),
     Void,
 }
 
@@ -151,6 +169,65 @@ struct CallRequest {
 enum TailOutcome {
     Value(Value),
     Apply(CallRequest),
+}
+
+#[derive(Clone)]
+struct Continuation {
+    frames: Vec<ContinuationFrame>,
+}
+
+#[derive(Clone)]
+enum ContinuationFrame {
+    Sequence {
+        rest: Vec<Expr>,
+        env: EnvRef,
+    },
+    If {
+        consequent: Expr,
+        alternate: Option<Expr>,
+        env: EnvRef,
+    },
+    DefineValue {
+        name: String,
+        env: EnvRef,
+    },
+    SetValue {
+        name: String,
+        target_env: EnvRef,
+        pos: SourcePos,
+    },
+    ApplicationOperator {
+        args: Vec<Expr>,
+        env: EnvRef,
+        pos: SourcePos,
+    },
+    ApplicationArgument {
+        procedure: Value,
+        evaluated: Vec<Value>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+        pos: SourcePos,
+    },
+    CondTest {
+        body: Vec<Expr>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    LetBinding {
+        current_name: String,
+        evaluated: Vec<(String, Value)>,
+        pending: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    },
+    And {
+        rest: Vec<Expr>,
+        env: EnvRef,
+    },
+    Or {
+        rest: Vec<Expr>,
+        env: EnvRef,
+    },
 }
 
 struct Env {
@@ -198,9 +275,11 @@ impl Value {
             Self::Nil => "()".to_string(),
             Self::Pair(pair) => render_pair(pair.clone()),
             Self::Record(record) => format!("#<record:{}>", record.record_type.name),
+            Self::ControlProc(proc) => format!("#<procedure:{}>", proc.name()),
             Self::NativeProc { name, .. } => format!("#<procedure:{name}>"),
             Self::RecordProc(procedure) => format!("#<procedure:{}>", procedure.name),
             Self::Closure(_) => "#<procedure>".to_string(),
+            Self::Continuation(_) => "#<procedure>".to_string(),
             Self::Void => "#<void>".to_string(),
         }
     }
@@ -512,6 +591,11 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 
     let env = default_env();
     let ctx = EvalContext::new();
+    if program_uses_first_class_continuations(&exprs) {
+        let last = eval_program_with_continuations(&exprs, env, &ctx)?;
+        return Ok((last.render(), ctx.into_output()));
+    }
+
     let last = eval_sequence(&exprs, env, &ctx)?;
     Ok((last.render(), ctx.into_output()))
 }
@@ -678,6 +762,15 @@ fn apply_call(mut call: CallRequest, ctx: &EvalContext) -> Result<Value, EvalErr
         } = call;
 
         match procedure {
+            Value::ControlProc(_) | Value::Continuation(_) => {
+                return Err(attach_call_position(
+                    EvalError::InvalidSyntax {
+                        message: "continuations require the continuation-aware evaluator"
+                            .to_string(),
+                    },
+                    pos,
+                ));
+            }
             Value::NativeProc { func, .. } => {
                 return func(&args, ctx).map_err(|err| attach_call_position(err, pos));
             }

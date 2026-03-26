@@ -1,6 +1,7 @@
 use super::{
     apply_procedure, list_from_values, list_to_vec, make_mutable_string, make_pair, make_string,
-    make_vector, number::Number, Env, EnvRef, EvalContext, EvalError, NativeFunc, Value,
+    make_vector, number::Number, ControlProc, Env, EnvRef, EvalContext, EvalError, NativeFunc,
+    Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -122,6 +123,11 @@ pub(super) fn default_env() -> EnvRef {
     ] {
         env.define(name.to_string(), Value::NativeProc { name, func });
     }
+    env.define("call/cc".to_string(), Value::ControlProc(ControlProc::CallCc));
+    env.define(
+        "call-with-current-continuation".to_string(),
+        Value::ControlProc(ControlProc::CallCc),
+    );
     env
 }
 
@@ -1267,7 +1273,11 @@ fn native_procedure_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, Eva
     native_predicate("procedure?", args, ctx, |value| {
         matches!(
             value,
-            Value::NativeProc { .. } | Value::RecordProc(_) | Value::Closure(_)
+            Value::ControlProc(_)
+                | Value::NativeProc { .. }
+                | Value::RecordProc(_)
+                | Value::Closure(_)
+                | Value::Continuation(_)
         )
     })
 }
@@ -1782,11 +1792,13 @@ pub(super) fn value_eq(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::ControlProc(left), Value::ControlProc(right)) => left == right,
         (Value::NativeProc { name: left, .. }, Value::NativeProc { name: right, .. }) => {
             left == right
         }
         (Value::RecordProc(left), Value::RecordProc(right)) => Rc::ptr_eq(left, right),
         (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
     }
