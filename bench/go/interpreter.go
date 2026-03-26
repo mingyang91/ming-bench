@@ -128,6 +128,20 @@ type callable interface {
 	Call(*interpreter, []any, position) (any, error)
 }
 
+type tailCall struct {
+	procedure callable
+	args      []any
+	pos       position
+}
+
+func newTailCall(procedure callable, args []any, pos position) *tailCall {
+	return &tailCall{
+		procedure: procedure,
+		args:      append([]any(nil), args...),
+		pos:       pos,
+	}
+}
+
 type builtinProcedure struct {
 	name string
 	fn   func(*interpreter, []any, position) (any, error)
@@ -168,21 +182,28 @@ func (p *lambdaProcedure) Call(i *interpreter, args []any, pos position) (any, e
 		callEnv.define(p.restName, buildList(args[len(p.params):]))
 	}
 
-	return i.evalSequence(p.body, callEnv)
+	return i.evalSequence(p.body, callEnv, true)
 }
 
 type caseLambdaProcedure struct {
 	clauses []*lambdaProcedure
 }
 
-func (p *caseLambdaProcedure) Call(i *interpreter, args []any, pos position) (any, error) {
+func (p *caseLambdaProcedure) matchingClause(argCount int) *lambdaProcedure {
 	for _, clause := range p.clauses {
-		if clause.matchesArity(len(args)) {
-			return clause.Call(i, args, pos)
+		if clause.matchesArity(argCount) {
+			return clause
 		}
 	}
+	return nil
+}
 
-	return nil, newEvalError(pos, "wrong number of arguments: no matching case-lambda clause for %d argument(s)", len(args))
+func (p *caseLambdaProcedure) Call(i *interpreter, args []any, pos position) (any, error) {
+	clause := p.matchingClause(len(args))
+	if clause == nil {
+		return nil, newEvalError(pos, "wrong number of arguments: no matching case-lambda clause for %d argument(s)", len(args))
+	}
+	return clause.Call(i, args, pos)
 }
 
 type recordType struct {
@@ -303,9 +324,9 @@ func (e *environment) assign(name string, value any) bool {
 }
 
 type interpreter struct {
-	output strings.Builder
-	global            *environment
-	gensymCounter     int
+	output           strings.Builder
+	global           *environment
+	gensymCounter    int
 	immutableStrings bool
 }
 
@@ -351,6 +372,21 @@ func evalInput(input string) (string, string, error) {
 	return formatValue(result), intp.output.String(), nil
 }
 
+func (i *interpreter) resolveTailResult(result any) (any, error) {
+	for {
+		call, ok := result.(*tailCall)
+		if !ok {
+			return result, nil
+		}
+
+		var err error
+		result, err = call.procedure.Call(i, call.args, call.pos)
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
 func installBuiltins(env *environment) {
 	for _, name := range []string{
 		"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -390,6 +426,14 @@ func parseProgram(input string) ([]expr, error) {
 }
 
 func (i *interpreter) eval(expression expr, env *environment) (any, error) {
+	result, err := i.evalExpr(expression, env, false)
+	if err != nil {
+		return nil, err
+	}
+	return i.resolveTailResult(result)
+}
+
+func (i *interpreter) evalExpr(expression expr, env *environment, tail bool) (any, error) {
 	switch e := expression.(type) {
 	case *integerExpr:
 		return e.value, nil
@@ -413,13 +457,13 @@ func (i *interpreter) eval(expression expr, env *environment) (any, error) {
 		}
 		return value, nil
 	case *listExpr:
-		return i.evalList(e, env)
+		return i.evalList(e, env, tail)
 	default:
 		return nil, newEvalError(expression.exprPos(), "internal error: unknown expression")
 	}
 }
 
-func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
+func (i *interpreter) evalList(list *listExpr, env *environment, tail bool) (any, error) {
 	if len(list.elements) == 0 {
 		return nil, newEvalError(list.pos, "cannot evaluate empty list")
 	}
@@ -430,7 +474,7 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			return i.eval(expanded, env)
+			return i.evalExpr(expanded, env, tail)
 		}
 
 		if operator.binding == nil {
@@ -442,36 +486,36 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 				if err != nil {
 					return nil, err
 				}
-				return i.eval(expanded, env)
+				return i.evalExpr(expanded, env, tail)
 			}
 		}
 
 		if operator.binding == nil {
 			switch operator.value {
 			case "and":
-				return i.evalAnd(list.elements[1:], env)
+				return i.evalAnd(list.elements[1:], env, tail)
 			case "or":
-				return i.evalOr(list.elements[1:], env)
+				return i.evalOr(list.elements[1:], env, tail)
 			case "begin":
-				return i.evalBegin(list.elements[1:], env)
+				return i.evalBegin(list.elements[1:], env, tail)
 			case "if":
-				return i.evalIf(list.elements[1:], operator.pos, env)
+				return i.evalIf(list.elements[1:], operator.pos, env, tail)
 			case "cond":
-				return i.evalCond(list.elements[1:], operator.pos, env)
+				return i.evalCond(list.elements[1:], operator.pos, env, tail)
 			case "case":
-				return i.evalCase(list.elements[1:], operator.pos, env)
+				return i.evalCase(list.elements[1:], operator.pos, env, tail)
 			case "do":
-				return i.evalDo(list.elements[1:], operator.pos, env)
+				return i.evalDo(list.elements[1:], operator.pos, env, tail)
 			case "define":
 				return i.evalDefine(list.elements[1:], operator.pos, env)
 			case "set!":
 				return i.evalSet(list.elements[1:], operator.pos, env)
 			case "let":
-				return i.evalLet(list.elements[1:], operator.pos, env)
+				return i.evalLet(list.elements[1:], operator.pos, env, tail)
 			case "letrec":
-				return i.evalLetRec(list.elements[1:], operator.pos, env, false, "letrec")
+				return i.evalLetRec(list.elements[1:], operator.pos, env, false, "letrec", tail)
 			case "letrec*":
-				return i.evalLetRec(list.elements[1:], operator.pos, env, true, "letrec*")
+				return i.evalLetRec(list.elements[1:], operator.pos, env, true, "letrec*", tail)
 			case "quote":
 				return i.evalQuote(list.elements[1:], operator.pos)
 			case "lambda":
@@ -498,12 +542,16 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 		args = append(args, arg)
 	}
 
-	return applyProcedure(i, operatorValue, args, list.elements[0].exprPos())
+	return applyProcedure(i, operatorValue, args, list.elements[0].exprPos(), tail)
 }
 
-func (i *interpreter) evalSequence(expressions []expr, env *environment) (any, error) {
+func (i *interpreter) evalSequence(expressions []expr, env *environment, tail bool) (any, error) {
 	result := any(voidValue{})
-	for _, expression := range expressions {
+	for index, expression := range expressions {
+		if tail && index == len(expressions)-1 {
+			return i.evalExpr(expression, env, true)
+		}
+
 		var err error
 		result, err = i.eval(expression, env)
 		if err != nil {
@@ -513,13 +561,17 @@ func (i *interpreter) evalSequence(expressions []expr, env *environment) (any, e
 	return result, nil
 }
 
-func (i *interpreter) evalAnd(args []expr, env *environment) (any, error) {
+func (i *interpreter) evalAnd(args []expr, env *environment, tail bool) (any, error) {
 	if len(args) == 0 {
 		return true, nil
 	}
 
 	result := any(true)
-	for _, argExpr := range args {
+	for index, argExpr := range args {
+		if tail && index == len(args)-1 {
+			return i.evalExpr(argExpr, env, true)
+		}
+
 		value, err := i.eval(argExpr, env)
 		if err != nil {
 			return nil, err
@@ -533,8 +585,12 @@ func (i *interpreter) evalAnd(args []expr, env *environment) (any, error) {
 	return result, nil
 }
 
-func (i *interpreter) evalOr(args []expr, env *environment) (any, error) {
-	for _, argExpr := range args {
+func (i *interpreter) evalOr(args []expr, env *environment, tail bool) (any, error) {
+	for index, argExpr := range args {
+		if tail && index == len(args)-1 {
+			return i.evalExpr(argExpr, env, true)
+		}
+
 		value, err := i.eval(argExpr, env)
 		if err != nil {
 			return nil, err
@@ -547,11 +603,11 @@ func (i *interpreter) evalOr(args []expr, env *environment) (any, error) {
 	return false, nil
 }
 
-func (i *interpreter) evalBegin(args []expr, env *environment) (any, error) {
-	return i.evalSequence(args, env)
+func (i *interpreter) evalBegin(args []expr, env *environment, tail bool) (any, error) {
+	return i.evalSequence(args, env, tail)
 }
 
-func (i *interpreter) evalIf(args []expr, pos position, env *environment) (any, error) {
+func (i *interpreter) evalIf(args []expr, pos position, env *environment, tail bool) (any, error) {
 	if len(args) < 2 || len(args) > 3 {
 		return nil, newEvalError(pos, "if expects 2 or 3 arguments")
 	}
@@ -562,15 +618,21 @@ func (i *interpreter) evalIf(args []expr, pos position, env *environment) (any, 
 	}
 
 	if isTruthy(condition) {
+		if tail {
+			return i.evalExpr(args[1], env, true)
+		}
 		return i.eval(args[1], env)
 	}
 	if len(args) == 3 {
+		if tail {
+			return i.evalExpr(args[2], env, true)
+		}
 		return i.eval(args[2], env)
 	}
 	return voidValue{}, nil
 }
 
-func (i *interpreter) evalCond(args []expr, pos position, env *environment) (any, error) {
+func (i *interpreter) evalCond(args []expr, pos position, env *environment, tail bool) (any, error) {
 	for index, clauseExpr := range args {
 		clause, ok := clauseExpr.(*listExpr)
 		if !ok || len(clause.elements) == 0 {
@@ -581,7 +643,7 @@ func (i *interpreter) evalCond(args []expr, pos position, env *environment) (any
 			if index != len(args)-1 {
 				return nil, newEvalError(symbol.pos, "cond else clause must be last")
 			}
-			return i.evalSequence(clause.elements[1:], env)
+			return i.evalSequence(clause.elements[1:], env, tail)
 		}
 
 		testValue, err := i.eval(clause.elements[0], env)
@@ -592,14 +654,14 @@ func (i *interpreter) evalCond(args []expr, pos position, env *environment) (any
 			if len(clause.elements) == 1 {
 				return testValue, nil
 			}
-			return i.evalSequence(clause.elements[1:], env)
+			return i.evalSequence(clause.elements[1:], env, tail)
 		}
 	}
 
 	return voidValue{}, nil
 }
 
-func (i *interpreter) evalCase(args []expr, pos position, env *environment) (any, error) {
+func (i *interpreter) evalCase(args []expr, pos position, env *environment, tail bool) (any, error) {
 	if len(args) == 0 {
 		return nil, newEvalError(pos, "case expects a key and at least 1 clause")
 	}
@@ -623,7 +685,7 @@ func (i *interpreter) evalCase(args []expr, pos position, env *environment) (any
 			if len(clause.elements) == 1 {
 				return voidValue{}, nil
 			}
-			return i.evalSequence(clause.elements[1:], env)
+			return i.evalSequence(clause.elements[1:], env, tail)
 		}
 
 		datumList, ok := clause.elements[0].(*listExpr)
@@ -647,14 +709,14 @@ func (i *interpreter) evalCase(args []expr, pos position, env *environment) (any
 			if len(clause.elements) == 1 {
 				return voidValue{}, nil
 			}
-			return i.evalSequence(clause.elements[1:], env)
+			return i.evalSequence(clause.elements[1:], env, tail)
 		}
 	}
 
 	return voidValue{}, nil
 }
 
-func (i *interpreter) evalDo(args []expr, pos position, env *environment) (any, error) {
+func (i *interpreter) evalDo(args []expr, pos position, env *environment, tail bool) (any, error) {
 	if len(args) < 2 {
 		return nil, newEvalError(pos, "do expects bindings, a termination clause, and an optional body")
 	}
@@ -695,10 +757,10 @@ func (i *interpreter) evalDo(args []expr, pos position, env *environment) (any, 
 			if len(termination.elements) == 1 {
 				return voidValue{}, nil
 			}
-			return i.evalSequence(termination.elements[1:], loopEnv)
+			return i.evalSequence(termination.elements[1:], loopEnv, tail)
 		}
 
-		if _, err := i.evalSequence(args[2:], loopEnv); err != nil {
+		if _, err := i.evalSequence(args[2:], loopEnv, false); err != nil {
 			return nil, err
 		}
 
@@ -802,19 +864,19 @@ func (i *interpreter) evalQuote(args []expr, pos position) (any, error) {
 	return datumFromExpr(args[0])
 }
 
-func (i *interpreter) evalLet(args []expr, pos position, env *environment) (any, error) {
+func (i *interpreter) evalLet(args []expr, pos position, env *environment, tail bool) (any, error) {
 	if len(args) < 2 {
 		return nil, newEvalError(pos, "let expects bindings and a body")
 	}
 
 	if name, ok := args[0].(*symbolExpr); ok {
-		return i.evalNamedLet(name, args[1:], pos, env)
+		return i.evalNamedLet(name, args[1:], pos, env, tail)
 	}
 
-	return i.evalPlainLet(args, pos, env)
+	return i.evalPlainLet(args, pos, env, tail)
 }
 
-func (i *interpreter) evalNamedLet(name *symbolExpr, args []expr, pos position, env *environment) (any, error) {
+func (i *interpreter) evalNamedLet(name *symbolExpr, args []expr, pos position, env *environment, tail bool) (any, error) {
 	if len(args) < 2 {
 		return nil, newEvalError(pos, "named let expects bindings and a body")
 	}
@@ -843,10 +905,10 @@ func (i *interpreter) evalNamedLet(name *symbolExpr, args []expr, pos position, 
 	}
 	letEnv.define(name.value, procedure)
 
-	return procedure.Call(i, values, name.pos)
+	return applyProcedure(i, procedure, values, name.pos, tail)
 }
 
-func (i *interpreter) evalPlainLet(args []expr, _ position, env *environment) (any, error) {
+func (i *interpreter) evalPlainLet(args []expr, _ position, env *environment, tail bool) (any, error) {
 	bindings, err := parseLetBindings(args[0])
 	if err != nil {
 		return nil, err
@@ -861,10 +923,10 @@ func (i *interpreter) evalPlainLet(args []expr, _ position, env *environment) (a
 		letEnv.define(binding.name, value)
 	}
 
-	return i.evalSequence(args[1:], letEnv)
+	return i.evalSequence(args[1:], letEnv, tail)
 }
 
-func (i *interpreter) evalLetRec(args []expr, pos position, env *environment, sequential bool, formName string) (any, error) {
+func (i *interpreter) evalLetRec(args []expr, pos position, env *environment, sequential bool, formName string, tail bool) (any, error) {
 	if len(args) < 2 {
 		return nil, newEvalError(pos, "%s expects bindings and a body", formName)
 	}
@@ -904,7 +966,7 @@ func (i *interpreter) evalLetRec(args []expr, pos position, env *environment, se
 		}
 	}
 
-	return i.evalSequence(args[1:], letEnv)
+	return i.evalSequence(args[1:], letEnv, tail)
 }
 
 func (i *interpreter) evalLambda(args []expr, pos position, env *environment) (any, error) {
@@ -1212,28 +1274,83 @@ func datumList(elements []expr) (any, error) {
 	return result, nil
 }
 
-func applyProcedure(i *interpreter, operator any, args []any, pos position) (any, error) {
-	procedure, ok := operator.(callable)
-	if !ok {
+func expandApplyArgs(args []any, pos position, name string) ([]any, error) {
+	if len(args) < 2 {
+		return nil, newEvalError(pos, "%s expects at least 2 arguments", name)
+	}
+
+	listArgs, err := listElements(args[len(args)-1], pos, name)
+	if err != nil {
+		return nil, err
+	}
+
+	callArgs := make([]any, 0, len(args)-2+len(listArgs))
+	callArgs = append(callArgs, args[1:len(args)-1]...)
+	callArgs = append(callArgs, listArgs...)
+	return callArgs, nil
+}
+
+func applyProcedure(i *interpreter, operator any, args []any, pos position, tail bool) (any, error) {
+	switch procedure := operator.(type) {
+	case *lambdaProcedure:
+		if tail {
+			return newTailCall(procedure, args, pos), nil
+		}
+		result, err := procedure.Call(i, args, pos)
+		if err != nil {
+			return nil, err
+		}
+		return i.resolveTailResult(result)
+
+	case *caseLambdaProcedure:
+		clause := procedure.matchingClause(len(args))
+		if clause == nil {
+			return nil, newEvalError(pos, "wrong number of arguments: no matching case-lambda clause for %d argument(s)", len(args))
+		}
+		if tail {
+			return newTailCall(clause, args, pos), nil
+		}
+		result, err := clause.Call(i, args, pos)
+		if err != nil {
+			return nil, err
+		}
+		return i.resolveTailResult(result)
+
+	case *builtinProcedure:
+		if tail && procedure.name == "apply" {
+			callArgs, err := expandApplyArgs(args, pos, procedure.name)
+			if err != nil {
+				return nil, err
+			}
+			return applyProcedure(i, args[0], callArgs, pos, true)
+		}
+
+		result, err := procedure.Call(i, args, pos)
+		if err != nil {
+			return nil, err
+		}
+		return i.resolveTailResult(result)
+
+	case callable:
+		result, err := procedure.Call(i, args, pos)
+		if err != nil {
+			return nil, err
+		}
+		return i.resolveTailResult(result)
+
+	default:
 		return nil, newEvalError(pos, "attempt to call non-procedure")
 	}
-	return procedure.Call(i, args, pos)
 }
 
 func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, error) {
 	switch name {
 	case "apply":
-		if len(args) < 2 {
-			return nil, newEvalError(pos, "%s expects at least 2 arguments", name)
-		}
-		listArgs, err := listElements(args[len(args)-1], pos, name)
+		callArgs, err := expandApplyArgs(args, pos, name)
 		if err != nil {
 			return nil, err
 		}
-		callArgs := make([]any, 0, len(args)-2+len(listArgs))
-		callArgs = append(callArgs, args[1:len(args)-1]...)
-		callArgs = append(callArgs, listArgs...)
-		return applyProcedure(i, args[0], callArgs, pos)
+		return applyProcedure(i, args[0], callArgs, pos, false)
 
 	case "eq?":
 		if len(args) != 2 {
@@ -1660,7 +1777,7 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			for listIndex := range lists {
 				callArgs[listIndex] = lists[listIndex][index]
 			}
-			result, err := applyProcedure(i, args[0], callArgs, pos)
+			result, err := applyProcedure(i, args[0], callArgs, pos, false)
 			if err != nil {
 				return nil, err
 			}
