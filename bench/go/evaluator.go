@@ -85,11 +85,11 @@ type builtinProc struct {
 }
 
 type closure struct {
-	params     []symbolExpr
-	restParam  symbolExpr
-	hasRest    bool
-	body       []any
-	env        *env
+	params    []symbolExpr
+	restParam symbolExpr
+	hasRest   bool
+	body      []any
+	env       *env
 }
 
 func newEnv(parent *env) *env {
@@ -201,16 +201,16 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("*", builtinProc{name: "*", fn: builtinMul})
 	scope.define("/", builtinProc{name: "/", fn: builtinDiv})
 	scope.define("<", builtinProc{name: "<", fn: func(args []any) (any, error) {
-		return builtinCompare(args, func(a, b int64) bool { return a < b })
+		return builtinCompare(args, func(order int) bool { return order < 0 })
 	}})
 	scope.define(">", builtinProc{name: ">", fn: func(args []any) (any, error) {
-		return builtinCompare(args, func(a, b int64) bool { return a > b })
+		return builtinCompare(args, func(order int) bool { return order > 0 })
 	}})
 	scope.define("=", builtinProc{name: "=", fn: func(args []any) (any, error) {
-		return builtinCompare(args, func(a, b int64) bool { return a == b })
+		return builtinCompare(args, func(order int) bool { return order == 0 })
 	}})
 	scope.define("<=", builtinProc{name: "<=", fn: func(args []any) (any, error) {
-		return builtinCompare(args, func(a, b int64) bool { return a <= b })
+		return builtinCompare(args, func(order int) bool { return order <= 0 })
 	}})
 	scope.define("not", builtinProc{name: "not", fn: builtinNot})
 	scope.define("cons", builtinProc{name: "cons", fn: builtinCons})
@@ -232,10 +232,13 @@ func newGlobalEnv(output *strings.Builder) *env {
 	}})
 	scope.define("number?", builtinProc{name: "number?", fn: func(args []any) (any, error) {
 		return builtinPredicate("number?", args, func(value any) bool {
-			_, ok := value.(int64)
-			return ok
+			return isNumberValue(value)
 		})
 	}})
+	scope.define("exact?", builtinProc{name: "exact?", fn: builtinExactPredicate})
+	scope.define("inexact?", builtinProc{name: "inexact?", fn: builtinInexactPredicate})
+	scope.define("integer?", builtinProc{name: "integer?", fn: builtinIntegerPredicate})
+	scope.define("rational?", builtinProc{name: "rational?", fn: builtinRationalPredicate})
 	scope.define("boolean?", builtinProc{name: "boolean?", fn: func(args []any) (any, error) {
 		return builtinPredicate("boolean?", args, func(value any) bool {
 			_, ok := value.(bool)
@@ -273,6 +276,10 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("string-ref", builtinProc{name: "string-ref", fn: builtinStringRef})
 	scope.define("string-copy", builtinProc{name: "string-copy", fn: builtinStringCopy})
 	scope.define("string-set!", builtinProc{name: "string-set!", fn: builtinStringSet})
+	scope.define("exact->inexact", builtinProc{name: "exact->inexact", fn: builtinExactToInexact})
+	scope.define("inexact->exact", builtinProc{name: "inexact->exact", fn: builtinInexactToExact})
+	scope.define("numerator", builtinProc{name: "numerator", fn: builtinNumerator})
+	scope.define("denominator", builtinProc{name: "denominator", fn: builtinDenominator})
 	scope.define("abs", builtinProc{name: "abs", fn: builtinAbs})
 	scope.define("modulo", builtinProc{name: "modulo", fn: builtinModulo})
 	scope.define("remainder", builtinProc{name: "remainder", fn: builtinRemainder})
@@ -490,8 +497,11 @@ func (p *parser) parseAtom() (any, error) {
 		return nil, p.posAt(start).errorf("invalid character literal")
 	}
 
-	if n, err := strconv.ParseInt(token, 10, 64); err == nil {
-		return n, nil
+	if number, ok, err := parseNumberLiteral(token); ok {
+		if err != nil {
+			return nil, p.posAt(start).errorf(err.Error())
+		}
+		return number, nil
 	}
 
 	return symbolExpr{name: token, pos: p.posAt(start)}, nil
@@ -590,6 +600,10 @@ func isDelimiter(ch byte) bool {
 func eval(scope *env, expr any) (any, error) {
 	switch node := expr.(type) {
 	case int64:
+		return node, nil
+	case rationalValue:
+		return node, nil
+	case float64:
 		return node, nil
 	case bool:
 		return node, nil
@@ -1047,13 +1061,13 @@ func builtinPredicate(name string, args []any, pred func(any) bool) (any, error)
 }
 
 func builtinAdd(args []any) (any, error) {
-	var sum int64
+	sum := any(int64(0))
 	for _, arg := range args {
-		n, err := expectInt(arg)
+		next, err := addNumberValues(sum, arg)
 		if err != nil {
 			return nil, err
 		}
-		sum += n
+		sum = next
 	}
 	return sum, nil
 }
@@ -1063,34 +1077,29 @@ func builtinSub(args []any) (any, error) {
 		return nil, &EvalError{Message: "- expects at least 1 argument"}
 	}
 
-	first, err := expectInt(args[0])
-	if err != nil {
-		return nil, err
-	}
-
 	if len(args) == 1 {
-		return -first, nil
+		return negateNumber(args[0])
 	}
 
-	result := first
+	result := args[0]
 	for _, arg := range args[1:] {
-		n, err := expectInt(arg)
+		next, err := subtractNumberValues(result, arg)
 		if err != nil {
 			return nil, err
 		}
-		result -= n
+		result = next
 	}
 	return result, nil
 }
 
 func builtinMul(args []any) (any, error) {
-	result := int64(1)
+	result := any(int64(1))
 	for _, arg := range args {
-		n, err := expectInt(arg)
+		next, err := multiplyNumberValues(result, arg)
 		if err != nil {
 			return nil, err
 		}
-		result *= n
+		result = next
 	}
 	return result, nil
 }
@@ -1100,44 +1109,33 @@ func builtinDiv(args []any) (any, error) {
 		return nil, &EvalError{Message: "/ expects at least 2 arguments"}
 	}
 
-	result, err := expectInt(args[0])
-	if err != nil {
-		return nil, err
-	}
-
+	result := args[0]
 	for _, arg := range args[1:] {
-		n, err := expectInt(arg)
+		next, err := divideNumberValues(result, arg)
 		if err != nil {
 			return nil, err
 		}
-		if n == 0 {
-			return nil, &EvalError{Message: "division by zero"}
-		}
-		result /= n
+		result = next
 	}
 
 	return result, nil
 }
 
-func builtinCompare(args []any, cmp func(a, b int64) bool) (any, error) {
+func builtinCompare(args []any, cmp func(order int) bool) (any, error) {
 	if len(args) < 2 {
 		return nil, &EvalError{Message: "comparison expects at least 2 arguments"}
 	}
 
-	prev, err := expectInt(args[0])
-	if err != nil {
-		return nil, err
-	}
-
+	prev := args[0]
 	for _, arg := range args[1:] {
-		next, err := expectInt(arg)
+		order, err := compareNumberValues(prev, arg)
 		if err != nil {
 			return nil, err
 		}
-		if !cmp(prev, next) {
+		if !cmp(order) {
 			return false, nil
 		}
-		prev = next
+		prev = arg
 	}
 
 	return true, nil
@@ -1304,11 +1302,11 @@ func builtinStringToNumber(args []any) (any, error) {
 		return nil, err
 	}
 
-	n, parseErr := strconv.ParseInt(s, 10, 64)
-	if parseErr != nil {
+	number, ok, parseErr := parseNumberLiteral(s)
+	if parseErr != nil || !ok {
 		return false, nil
 	}
-	return n, nil
+	return number, nil
 }
 
 func builtinNumberToString(args []any) (any, error) {
@@ -1316,11 +1314,10 @@ func builtinNumberToString(args []any) (any, error) {
 		return nil, &EvalError{Message: "number->string expects exactly 1 argument"}
 	}
 
-	n, err := expectInt(args[0])
-	if err != nil {
-		return nil, err
+	if !isNumberValue(args[0]) {
+		return nil, &EvalError{Message: fmt.Sprintf("expected number, got %s", typeName(args[0]))}
 	}
-	return strconv.FormatInt(n, 10), nil
+	return formatNumberValue(args[0]), nil
 }
 
 func builtinSymbolToString(args []any) (any, error) {
@@ -1486,6 +1483,10 @@ func quoteDatum(expr any) any {
 	switch node := expr.(type) {
 	case int64:
 		return node
+	case rationalValue:
+		return node
+	case float64:
+		return node
 	case bool:
 		return node
 	case stringExpr:
@@ -1538,7 +1539,7 @@ func isTruthy(value any) bool {
 
 func typeName(value any) string {
 	switch value.(type) {
-	case int64:
+	case int64, rationalValue, float64:
 		return "number"
 	case bool:
 		return "boolean"
@@ -1569,8 +1570,8 @@ func formatValue(value any) string {
 	switch v := value.(type) {
 	case voidValue:
 		return ""
-	case int64:
-		return strconv.FormatInt(v, 10)
+	case int64, rationalValue, float64:
+		return formatNumberValue(v)
 	case bool:
 		if v {
 			return "#t"

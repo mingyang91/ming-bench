@@ -392,6 +392,10 @@ func isProperList(value any) bool {
 }
 
 func valuesEq(left, right any) bool {
+	if isNumberValue(left) && isNumberValue(right) {
+		return numberValuesEqual(left, right)
+	}
+
 	switch lhs := left.(type) {
 	case int64:
 		rhs, ok := right.(int64)
@@ -426,6 +430,10 @@ func valuesEq(left, right any) bool {
 }
 
 func valuesEqual(left, right any) bool {
+	if isNumberValue(left) && isNumberValue(right) {
+		return numberValuesEqual(left, right)
+	}
+
 	switch lhs := left.(type) {
 	case int64:
 		rhs, ok := right.(int64)
