@@ -14,6 +14,13 @@ final private[ming] class Environment private (
   def reserve(name: String): Unit =
     bindings.update(name, UninitializedValue)
 
+  def assign(name: String, value: Value, position: Position): Unit =
+    if bindings.contains(name) then bindings.update(name, value)
+    else
+      parent match
+        case Some(outer) => outer.assign(name, value, position)
+        case None        => SchemeFailure.raise(s"unbound symbol: $name", position)
+
   def lookup(name: String, position: Position): Value =
     bindings.get(name) match
       case Some(UninitializedValue) =>
