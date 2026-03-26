@@ -1,8 +1,13 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Scheme interpreter entry point.
@@ -11,6 +16,28 @@ import java.util.Locale;
 public class Evaluator {
     private record Binding(String name, Expr valueExpression) {
     }
+
+    private sealed interface MatchBinding permits SingleMatchBinding, RepeatedMatchBinding {
+    }
+
+    private record SingleMatchBinding(Expr value) implements MatchBinding {
+    }
+
+    private static final class RepeatedMatchBinding implements MatchBinding {
+        private final List<Expr> values = new ArrayList<>();
+
+        List<Expr> values() {
+            return values;
+        }
+    }
+
+    private record ExpansionContext(MacroDefinition macroDefinition,
+                                    Environment useEnvironment,
+                                    Map<String, MatchBinding> bindings,
+                                    Map<String, String> hygienicNames) {
+    }
+
+    private static final AtomicLong NEXT_GENSYM = new AtomicLong();
 
     private StringBuilder outputBuffer;
 
@@ -153,6 +180,16 @@ public class Evaluator {
         List<Expr> arguments = elements.subList(1, elements.size());
 
         if (operatorExpression instanceof SymbolExpr symbolExpr) {
+            if ("define-syntax".equals(symbolExpr.name())) {
+                return evalDefineSyntax(arguments, environment);
+            }
+
+            MacroDefinition macroDefinition = environment.lookupMacro(symbolExpr.name());
+            if (macroDefinition != null) {
+                Expr expanded = expandMacroCall(macroDefinition, listExpr, environment);
+                return eval(expanded, environment);
+            }
+
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, environment);
                 case "set!" -> evalSet(arguments, environment);
@@ -229,6 +266,20 @@ public class Evaluator {
         }
 
         throw new EvalError("define expected a symbol or function signature");
+    }
+
+    private Value evalDefineSyntax(List<Expr> arguments, Environment environment) throws EvalError {
+        requireExactArity("define-syntax", arguments.size(), 2);
+
+        Expr nameExpression = arguments.getFirst();
+        if (!(nameExpression instanceof SymbolExpr symbolExpr)) {
+            throw new EvalError("define-syntax expected a macro name");
+        }
+
+        environment.defineMacro(
+                symbolExpr.name(),
+                parseMacroDefinition(symbolExpr.name(), arguments.get(1), environment));
+        return VoidValue.INSTANCE;
     }
 
     private Value evalSet(List<Expr> arguments, Environment environment) throws EvalError {
@@ -422,6 +473,569 @@ public class Evaluator {
         }
 
         return new ParameterSpec(List.copyOf(parameterNames), restParameter);
+    }
+
+    private MacroDefinition parseMacroDefinition(String name,
+                                                 Expr transformer,
+                                                 Environment environment) throws EvalError {
+        if (!(transformer instanceof ListExpr transformerList)) {
+            throw new EvalError("define-syntax expected a syntax-rules transformer");
+        }
+
+        List<Expr> elements = transformerList.elements();
+        if (elements.isEmpty()) {
+            throw new EvalError("define-syntax expected a syntax-rules transformer");
+        }
+
+        Expr headExpression = elements.getFirst();
+        if (!(headExpression instanceof SymbolExpr headSymbol)
+                || !"syntax-rules".equals(headSymbol.name())) {
+            throw new EvalError("define-syntax expected syntax-rules");
+        }
+        if (elements.size() < 3) {
+            throw new EvalError("syntax-rules expected literals and at least one rule");
+        }
+
+        Expr literalsExpression = elements.get(1);
+        if (!(literalsExpression instanceof ListExpr literalList)) {
+            throw new EvalError("syntax-rules literals must be a list");
+        }
+
+        Set<String> literals = new HashSet<>();
+        for (Expr literalExpression : literalList.elements()) {
+            if (!(literalExpression instanceof SymbolExpr literalSymbol)) {
+                throw new EvalError("syntax-rules literals must be identifiers");
+            }
+            literals.add(literalSymbol.name());
+        }
+
+        List<SyntaxRule> rules = new ArrayList<>(elements.size() - 2);
+        for (int i = 2; i < elements.size(); i++) {
+            Expr ruleExpression = elements.get(i);
+            if (!(ruleExpression instanceof ListExpr ruleList)) {
+                throw new EvalError("syntax-rules clauses must be lists");
+            }
+            List<Expr> ruleElements = ruleList.elements();
+            if (ruleElements.size() != 2) {
+                throw new EvalError("syntax-rules clauses must contain a pattern and template");
+            }
+            rules.add(new SyntaxRule(ruleElements.get(0), ruleElements.get(1)));
+        }
+
+        return new MacroDefinition(name, literals, rules, environment);
+    }
+
+    private Expr expandMacroCall(MacroDefinition macroDefinition,
+                                 Expr callExpression,
+                                 Environment useEnvironment) throws EvalError {
+        for (SyntaxRule rule : macroDefinition.rules()) {
+            Map<String, MatchBinding> bindings = new HashMap<>();
+            if (matchPattern(rule.pattern(), callExpression, macroDefinition, bindings)) {
+                ExpansionContext context = new ExpansionContext(
+                        macroDefinition,
+                        useEnvironment,
+                        bindings,
+                        new HashMap<>());
+                return instantiateTemplate(rule.template(), context, Map.of(), null);
+            }
+        }
+
+        throw new EvalError("no matching syntax-rules clause for " + macroDefinition.name());
+    }
+
+    private boolean matchPattern(Expr pattern,
+                                 Expr input,
+                                 MacroDefinition macroDefinition,
+                                 Map<String, MatchBinding> bindings) throws EvalError {
+        if (pattern instanceof IntExpr expected && input instanceof IntExpr found) {
+            return expected.value() == found.value();
+        }
+        if (pattern instanceof BoolExpr expected && input instanceof BoolExpr found) {
+            return expected.value() == found.value();
+        }
+        if (pattern instanceof StringExpr expected && input instanceof StringExpr found) {
+            return expected.value().equals(found.value());
+        }
+        if (pattern instanceof CharExpr expected && input instanceof CharExpr found) {
+            return expected.value() == found.value();
+        }
+        if (pattern instanceof SymbolExpr symbolPattern) {
+            String name = symbolPattern.name();
+            if ("...".equals(name)) {
+                return false;
+            }
+            if ("_".equals(name)) {
+                return true;
+            }
+            if (macroDefinition.name().equals(name) || macroDefinition.literals().contains(name)) {
+                return input instanceof SymbolExpr found && name.equals(found.name());
+            }
+
+            MatchBinding existing = bindings.get(name);
+            if (existing instanceof SingleMatchBinding singleBinding) {
+                return exprSameStructure(singleBinding.value(), input);
+            }
+            if (existing instanceof RepeatedMatchBinding) {
+                return false;
+            }
+
+            bindings.put(name, new SingleMatchBinding(input));
+            return true;
+        }
+        if (pattern instanceof ListExpr patternList && input instanceof ListExpr inputList) {
+            return matchPatternList(
+                    patternList.elements(),
+                    inputList.elements(),
+                    macroDefinition,
+                    bindings);
+        }
+
+        return false;
+    }
+
+    private boolean matchPatternList(List<Expr> patternElements,
+                                     List<Expr> inputElements,
+                                     MacroDefinition macroDefinition,
+                                     Map<String, MatchBinding> bindings) throws EvalError {
+        if (patternElements.size() >= 2 && isEllipsis(patternElements.getLast())) {
+            List<Expr> fixedPatterns = patternElements.subList(0, patternElements.size() - 2);
+            Expr repeatedPattern = patternElements.get(patternElements.size() - 2);
+
+            if (inputElements.size() < fixedPatterns.size()) {
+                return false;
+            }
+
+            for (int i = 0; i < fixedPatterns.size(); i++) {
+                if (!matchPattern(fixedPatterns.get(i), inputElements.get(i), macroDefinition, bindings)) {
+                    return false;
+                }
+            }
+
+            initializeRepeatedBindings(repeatedPattern, macroDefinition, bindings);
+            for (int i = fixedPatterns.size(); i < inputElements.size(); i++) {
+                Map<String, MatchBinding> iterationBindings = new HashMap<>();
+                if (!matchPattern(repeatedPattern, inputElements.get(i), macroDefinition, iterationBindings)) {
+                    return false;
+                }
+                if (!mergeRepeatedBindings(bindings, iterationBindings)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (patternElements.size() != inputElements.size()) {
+            return false;
+        }
+
+        for (int i = 0; i < patternElements.size(); i++) {
+            if (!matchPattern(patternElements.get(i), inputElements.get(i), macroDefinition, bindings)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void initializeRepeatedBindings(Expr pattern,
+                                            MacroDefinition macroDefinition,
+                                            Map<String, MatchBinding> bindings) throws EvalError {
+        Set<String> variables = new HashSet<>();
+        collectPatternVariables(pattern, macroDefinition, variables);
+
+        for (String variable : variables) {
+            MatchBinding existing = bindings.get(variable);
+            if (existing instanceof SingleMatchBinding) {
+                throw new EvalError("macro variable `" + variable + "` used inconsistently");
+            }
+            bindings.putIfAbsent(variable, new RepeatedMatchBinding());
+        }
+    }
+
+    private boolean mergeRepeatedBindings(Map<String, MatchBinding> bindings,
+                                          Map<String, MatchBinding> iterationBindings) {
+        for (Map.Entry<String, MatchBinding> entry : iterationBindings.entrySet()) {
+            List<Expr> values = switch (entry.getValue()) {
+                case SingleMatchBinding singleBinding -> List.of(singleBinding.value());
+                case RepeatedMatchBinding repeatedBinding -> repeatedBinding.values();
+            };
+
+            MatchBinding existing = bindings.get(entry.getKey());
+            if (existing instanceof RepeatedMatchBinding repeatedBinding) {
+                repeatedBinding.values().addAll(values);
+                continue;
+            }
+            if (existing instanceof SingleMatchBinding) {
+                return false;
+            }
+
+            RepeatedMatchBinding repeatedBinding = new RepeatedMatchBinding();
+            repeatedBinding.values().addAll(values);
+            bindings.put(entry.getKey(), repeatedBinding);
+        }
+        return true;
+    }
+
+    private void collectPatternVariables(Expr pattern,
+                                         MacroDefinition macroDefinition,
+                                         Set<String> variables) {
+        if (pattern instanceof SymbolExpr symbolExpr) {
+            String name = symbolExpr.name();
+            if (!"...".equals(name)
+                    && !"_".equals(name)
+                    && !macroDefinition.name().equals(name)
+                    && !macroDefinition.literals().contains(name)) {
+                variables.add(name);
+            }
+            return;
+        }
+
+        if (pattern instanceof ListExpr listExpr) {
+            for (Expr element : listExpr.elements()) {
+                if (!isEllipsis(element)) {
+                    collectPatternVariables(element, macroDefinition, variables);
+                }
+            }
+        }
+    }
+
+    private Expr instantiateTemplate(Expr template,
+                                     ExpansionContext context,
+                                     Map<String, String> scope,
+                                     Integer repeatIndex) throws EvalError {
+        return switch (template) {
+            case IntExpr ignored -> template;
+            case BoolExpr ignored -> template;
+            case StringExpr ignored -> template;
+            case CharExpr ignored -> template;
+            case SymbolExpr symbolExpr -> instantiateSymbol(symbolExpr, context, scope, repeatIndex);
+            case ListExpr listExpr -> instantiateTemplateList(
+                    listExpr,
+                    listExpr.elements(),
+                    context,
+                    scope,
+                    repeatIndex);
+        };
+    }
+
+    private Expr instantiateTemplateList(Expr template,
+                                         List<Expr> elements,
+                                         ExpansionContext context,
+                                         Map<String, String> scope,
+                                         Integer repeatIndex) throws EvalError {
+        if (!elements.isEmpty() && elements.getFirst() instanceof SymbolExpr headSymbol) {
+            if ("let".equals(headSymbol.name())) {
+                return instantiateTemplateLet(template, elements, context, scope, repeatIndex);
+            }
+            if ("lambda".equals(headSymbol.name())) {
+                return instantiateTemplateLambda(template, elements, context, scope, repeatIndex);
+            }
+        }
+
+        List<Expr> expanded = new ArrayList<>(elements.size());
+        int index = 0;
+        while (index < elements.size()) {
+            if (index + 1 < elements.size() && isEllipsis(elements.get(index + 1))) {
+                int repeatCount = repetitionCount(elements.get(index), context.bindings());
+                for (int currentIndex = 0; currentIndex < repeatCount; currentIndex++) {
+                    expanded.add(instantiateTemplate(
+                            elements.get(index),
+                            context,
+                            scope,
+                            currentIndex));
+                }
+                index += 2;
+                continue;
+            }
+
+            expanded.add(instantiateTemplate(elements.get(index), context, scope, repeatIndex));
+            index++;
+        }
+
+        return new ListExpr(List.copyOf(expanded), template.line(), template.column());
+    }
+
+    private Expr instantiateTemplateLet(Expr template,
+                                        List<Expr> elements,
+                                        ExpansionContext context,
+                                        Map<String, String> scope,
+                                        Integer repeatIndex) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("macro let template expected bindings and a body");
+        }
+
+        Expr bindingsExpression = elements.get(1);
+        if (!(bindingsExpression instanceof ListExpr bindingList)) {
+            throw new EvalError("macro let template expected a binding list");
+        }
+
+        Map<String, String> localScope = new HashMap<>(scope);
+        List<Expr> expandedBindings = new ArrayList<>(bindingList.elements().size());
+        for (Expr bindingTemplate : bindingList.elements()) {
+            if (!(bindingTemplate instanceof ListExpr bindingExprList)) {
+                throw new EvalError("macro let bindings must be lists");
+            }
+
+            List<Expr> bindingElements = bindingExprList.elements();
+            if (bindingElements.size() != 2) {
+                throw new EvalError("macro let bindings must contain a name and value");
+            }
+
+            Expr bindingName = bindingElements.get(0);
+            Expr expandedName;
+            if (bindingName instanceof SymbolExpr symbolExpr
+                    && !context.bindings().containsKey(symbolExpr.name())) {
+                String renamed = freshSymbol(symbolExpr.name());
+                localScope.put(symbolExpr.name(), renamed);
+                expandedName = new SymbolExpr(renamed, bindingName.line(), bindingName.column());
+            } else {
+                expandedName = instantiateTemplate(bindingName, context, scope, repeatIndex);
+            }
+
+            Expr expandedValue = instantiateTemplate(
+                    bindingElements.get(1),
+                    context,
+                    scope,
+                    repeatIndex);
+            expandedBindings.add(new ListExpr(
+                    List.of(expandedName, expandedValue),
+                    bindingTemplate.line(),
+                    bindingTemplate.column()));
+        }
+
+        List<Expr> expanded = new ArrayList<>(elements.size());
+        expanded.add(new SymbolExpr("let", elements.getFirst().line(), elements.getFirst().column()));
+        expanded.add(new ListExpr(
+                List.copyOf(expandedBindings),
+                bindingsExpression.line(),
+                bindingsExpression.column()));
+        for (int i = 2; i < elements.size(); i++) {
+            expanded.add(instantiateTemplate(elements.get(i), context, localScope, repeatIndex));
+        }
+        return new ListExpr(List.copyOf(expanded), template.line(), template.column());
+    }
+
+    private Expr instantiateTemplateLambda(Expr template,
+                                           List<Expr> elements,
+                                           ExpansionContext context,
+                                           Map<String, String> scope,
+                                           Integer repeatIndex) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("macro lambda template expected parameters and a body");
+        }
+
+        Map<String, String> localScope = new HashMap<>(scope);
+        Expr parameterExpression = instantiateLambdaParameters(
+                elements.get(1),
+                context,
+                scope,
+                localScope,
+                repeatIndex);
+
+        List<Expr> expanded = new ArrayList<>(elements.size());
+        expanded.add(new SymbolExpr("lambda", elements.getFirst().line(), elements.getFirst().column()));
+        expanded.add(parameterExpression);
+        for (int i = 2; i < elements.size(); i++) {
+            expanded.add(instantiateTemplate(elements.get(i), context, localScope, repeatIndex));
+        }
+        return new ListExpr(List.copyOf(expanded), template.line(), template.column());
+    }
+
+    private Expr instantiateLambdaParameters(Expr parametersExpression,
+                                             ExpansionContext context,
+                                             Map<String, String> scope,
+                                             Map<String, String> localScope,
+                                             Integer repeatIndex) throws EvalError {
+        if (parametersExpression instanceof SymbolExpr symbolExpr) {
+            if (context.bindings().containsKey(symbolExpr.name())) {
+                return instantiateTemplate(parametersExpression, context, scope, repeatIndex);
+            }
+
+            String renamed = freshSymbol(symbolExpr.name());
+            localScope.put(symbolExpr.name(), renamed);
+            return new SymbolExpr(renamed, parametersExpression.line(), parametersExpression.column());
+        }
+
+        if (!(parametersExpression instanceof ListExpr parameterList)) {
+            throw new EvalError("macro lambda template expected a parameter list");
+        }
+
+        List<Expr> expandedParameters = new ArrayList<>(parameterList.elements().size());
+        for (Expr parameterExpression : parameterList.elements()) {
+            if (parameterExpression instanceof SymbolExpr parameterSymbol) {
+                if (".".equals(parameterSymbol.name())) {
+                    expandedParameters.add(parameterExpression);
+                    continue;
+                }
+                if (!context.bindings().containsKey(parameterSymbol.name())) {
+                    String renamed = freshSymbol(parameterSymbol.name());
+                    localScope.put(parameterSymbol.name(), renamed);
+                    expandedParameters.add(new SymbolExpr(
+                            renamed,
+                            parameterExpression.line(),
+                            parameterExpression.column()));
+                    continue;
+                }
+            }
+
+            expandedParameters.add(instantiateTemplate(
+                    parameterExpression,
+                    context,
+                    scope,
+                    repeatIndex));
+        }
+        return new ListExpr(
+                List.copyOf(expandedParameters),
+                parametersExpression.line(),
+                parametersExpression.column());
+    }
+
+    private Expr instantiateSymbol(SymbolExpr symbolExpr,
+                                   ExpansionContext context,
+                                   Map<String, String> scope,
+                                   Integer repeatIndex) throws EvalError {
+        String name = symbolExpr.name();
+        String scopedName = scope.get(name);
+        if (scopedName != null) {
+            return new SymbolExpr(scopedName, symbolExpr.line(), symbolExpr.column());
+        }
+
+        MatchBinding binding = context.bindings().get(name);
+        if (binding instanceof SingleMatchBinding singleBinding) {
+            return singleBinding.value();
+        }
+        if (binding instanceof RepeatedMatchBinding repeatedBinding) {
+            if (repeatIndex == null) {
+                throw new EvalError("macro variable `" + name + "` used without ellipsis");
+            }
+            if (repeatIndex < 0 || repeatIndex >= repeatedBinding.values().size()) {
+                throw new EvalError("macro variable `" + name + "` repetition index out of range");
+            }
+            return repeatedBinding.values().get(repeatIndex);
+        }
+
+        return new SymbolExpr(
+                hygienicIdentifier(name, context),
+                symbolExpr.line(),
+                symbolExpr.column());
+    }
+
+    private int repetitionCount(Expr template, Map<String, MatchBinding> bindings) throws EvalError {
+        int[] count = new int[]{-1};
+        collectRepetitionCount(template, bindings, count);
+        if (count[0] < 0) {
+            throw new EvalError("ellipsis template has no repeated pattern variables");
+        }
+        return count[0];
+    }
+
+    private void collectRepetitionCount(Expr template,
+                                        Map<String, MatchBinding> bindings,
+                                        int[] count) throws EvalError {
+        if (template instanceof SymbolExpr symbolExpr) {
+            MatchBinding binding = bindings.get(symbolExpr.name());
+            if (binding instanceof RepeatedMatchBinding repeatedBinding) {
+                int size = repeatedBinding.values().size();
+                if (count[0] >= 0 && count[0] != size) {
+                    throw new EvalError("macro template ellipsis lengths do not match");
+                }
+                count[0] = size;
+            }
+            return;
+        }
+
+        if (template instanceof ListExpr listExpr) {
+            for (Expr element : listExpr.elements()) {
+                if (!isEllipsis(element)) {
+                    collectRepetitionCount(element, bindings, count);
+                }
+            }
+        }
+    }
+
+    private String hygienicIdentifier(String name, ExpansionContext context) {
+        if (isSpecialForm(name)
+                || context.macroDefinition().name().equals(name)
+                || context.macroDefinition().definingEnvironment().lookupMacro(name) != null) {
+            return name;
+        }
+
+        String existing = context.hygienicNames().get(name);
+        if (existing != null) {
+            return existing;
+        }
+
+        String renamed = freshSymbol(name);
+        BindingCell cell = context.macroDefinition().definingEnvironment().lookupCell(name);
+        if (cell != null) {
+            context.useEnvironment().defineCell(renamed, cell);
+        }
+        context.hygienicNames().put(name, renamed);
+        return renamed;
+    }
+
+    private String freshSymbol(String base) {
+        return "__macro_" + sanitizeSymbol(base) + "_" + NEXT_GENSYM.getAndIncrement();
+    }
+
+    private String sanitizeSymbol(String name) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < name.length(); i++) {
+            char ch = name.charAt(i);
+            builder.append(Character.isLetterOrDigit(ch) ? ch : '_');
+        }
+        return builder.isEmpty() ? "id" : builder.toString();
+    }
+
+    private boolean isSpecialForm(String name) {
+        return switch (name) {
+            case "define",
+                    "define-syntax",
+                    "if",
+                    "quote",
+                    "lambda",
+                    "begin",
+                    "cond",
+                    "let",
+                    "and",
+                    "or",
+                    "set!",
+                    "syntax-rules" -> true;
+            default -> false;
+        };
+    }
+
+    private boolean isEllipsis(Expr expression) {
+        return expression instanceof SymbolExpr symbolExpr && "...".equals(symbolExpr.name());
+    }
+
+    private boolean exprSameStructure(Expr left, Expr right) {
+        if (left instanceof IntExpr leftInt && right instanceof IntExpr rightInt) {
+            return leftInt.value() == rightInt.value();
+        }
+        if (left instanceof BoolExpr leftBool && right instanceof BoolExpr rightBool) {
+            return leftBool.value() == rightBool.value();
+        }
+        if (left instanceof StringExpr leftString && right instanceof StringExpr rightString) {
+            return leftString.value().equals(rightString.value());
+        }
+        if (left instanceof CharExpr leftChar && right instanceof CharExpr rightChar) {
+            return leftChar.value() == rightChar.value();
+        }
+        if (left instanceof SymbolExpr leftSymbol && right instanceof SymbolExpr rightSymbol) {
+            return leftSymbol.name().equals(rightSymbol.name());
+        }
+        if (left instanceof ListExpr leftList && right instanceof ListExpr rightList) {
+            if (leftList.elements().size() != rightList.elements().size()) {
+                return false;
+            }
+            for (int i = 0; i < leftList.elements().size(); i++) {
+                if (!exprSameStructure(leftList.elements().get(i), rightList.elements().get(i))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
     }
 
     private Value quote(Expr expression) throws EvalError {
