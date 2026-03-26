@@ -12,6 +12,7 @@ enum Expr {
     Integer(i64, SourcePos),
     Boolean(bool, SourcePos),
     String(String, SourcePos),
+    Char(char, SourcePos),
     Symbol(String, SourcePos),
     List(Vec<Expr>, SourcePos),
 }
@@ -22,6 +23,7 @@ impl Expr {
             Self::Integer(_, pos)
             | Self::Boolean(_, pos)
             | Self::String(_, pos)
+            | Self::Char(_, pos)
             | Self::Symbol(_, pos)
             | Self::List(_, pos) => *pos,
         }
@@ -56,6 +58,8 @@ enum Builtin {
     SymbolToString,
     StringToSymbol,
     StringRef,
+    StringSet,
+    StringCopy,
     NullPred,
     NumberPred,
     StringPred,
@@ -94,6 +98,8 @@ impl Builtin {
             Builtin::SymbolToString => "symbol->string",
             Builtin::StringToSymbol => "string->symbol",
             Builtin::StringRef => "string-ref",
+            Builtin::StringSet => "string-set!",
+            Builtin::StringCopy => "string-copy",
             Builtin::NullPred => "null?",
             Builtin::NumberPred => "number?",
             Builtin::StringPred => "string?",
@@ -106,10 +112,69 @@ impl Builtin {
 }
 
 #[derive(Clone)]
+struct SchemeString {
+    chars: Rc<RefCell<Vec<char>>>,
+    mutable: bool,
+}
+
+impl SchemeString {
+    fn from_owned(value: String, mutable: bool) -> Self {
+        Self {
+            chars: Rc::new(RefCell::new(value.chars().collect())),
+            mutable,
+        }
+    }
+
+    fn literal(value: &str) -> Self {
+        Self::from_owned(value.into(), false)
+    }
+
+    fn fresh(value: String) -> Self {
+        Self::from_owned(value, true)
+    }
+
+    fn mutable_copy(&self) -> Self {
+        Self {
+            chars: Rc::new(RefCell::new(self.chars.borrow().clone())),
+            mutable: true,
+        }
+    }
+
+    fn to_plain_string(&self) -> String {
+        self.chars.borrow().iter().collect()
+    }
+
+    fn chars(&self) -> Vec<char> {
+        self.chars.borrow().clone()
+    }
+
+    fn len(&self) -> usize {
+        self.chars.borrow().len()
+    }
+
+    fn get(&self, index: usize) -> Option<char> {
+        self.chars.borrow().get(index).copied()
+    }
+
+    fn set(&self, index: usize, value: char) -> bool {
+        let mut chars = self.chars.borrow_mut();
+        let Some(slot) = chars.get_mut(index) else {
+            return false;
+        };
+        *slot = value;
+        true
+    }
+
+    fn is_mutable(&self) -> bool {
+        self.mutable
+    }
+}
+
+#[derive(Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
-    String(String),
+    String(SchemeString),
     Symbol(String),
     Char(char),
     List(Vec<Value>),
@@ -306,6 +371,16 @@ impl<'a> Parser<'a> {
         match token {
             "#t" => Ok(Expr::Boolean(true, pos)),
             "#f" => Ok(Expr::Boolean(false, pos)),
+            _ if token.starts_with("#\\") => {
+                let literal = &token[2..];
+                match parse_char_literal(literal) {
+                    Some(ch) => Ok(Expr::Char(ch, pos)),
+                    None => Err(EvalError::Syntax {
+                        message: "invalid character literal".into(),
+                    }
+                    .with_position(pos)),
+                }
+            }
             _ => match token.parse::<i64>() {
                 Ok(value) => Ok(Expr::Integer(value, pos)),
                 Err(_) => Ok(Expr::Symbol(token.into(), pos)),
@@ -350,6 +425,22 @@ impl<'a> Parser<'a> {
             self.column += 1;
         }
         Some(ch)
+    }
+}
+
+fn parse_char_literal(token: &str) -> Option<char> {
+    match token {
+        "space" => Some(' '),
+        "newline" => Some('\n'),
+        _ => {
+            let mut chars = token.chars();
+            let ch = chars.next()?;
+            if chars.next().is_none() {
+                Some(ch)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -412,6 +503,8 @@ fn initial_env() -> EnvRef {
         Builtin::SymbolToString,
         Builtin::StringToSymbol,
         Builtin::StringRef,
+        Builtin::StringSet,
+        Builtin::StringCopy,
         Builtin::NullPred,
         Builtin::NumberPred,
         Builtin::StringPred,
@@ -442,7 +535,8 @@ fn eval(expr: &Expr, env: &EnvRef, output: &mut String) -> Result<Value, EvalErr
     match expr {
         Expr::Integer(value, _) => Ok(Value::Integer(*value)),
         Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
-        Expr::String(value, _) => Ok(Value::String(value.clone())),
+        Expr::String(value, _) => Ok(Value::String(SchemeString::literal(value))),
+        Expr::Char(value, _) => Ok(Value::Char(*value)),
         Expr::Symbol(name, _) => env
             .lookup(name)
             .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() })
@@ -776,7 +870,8 @@ fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Integer(value, _) => Value::Integer(*value),
         Expr::Boolean(value, _) => Value::Boolean(*value),
-        Expr::String(value, _) => Value::String(value.clone()),
+        Expr::String(value, _) => Value::String(SchemeString::literal(value)),
+        Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
         Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),
     }
@@ -846,6 +941,8 @@ fn apply_builtin(
         Builtin::SymbolToString => builtin_symbol_to_string(args),
         Builtin::StringToSymbol => builtin_string_to_symbol(args),
         Builtin::StringRef => builtin_string_ref(args),
+        Builtin::StringSet => builtin_string_set(args),
+        Builtin::StringCopy => builtin_string_copy(args),
         Builtin::NullPred => builtin_predicate(
             "null?",
             args,
@@ -1014,16 +1111,16 @@ fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
     let mut result = String::new();
 
     for arg in args {
-        result.push_str(expect_string("string-append", arg)?);
+        result.push_str(&expect_string("string-append", arg)?.to_plain_string());
     }
 
-    Ok(Value::String(result))
+    Ok(Value::String(SchemeString::fresh(result)))
 }
 
 fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value] => Ok(Value::Integer(
-            expect_string("string-length", value)?.chars().count() as i64,
+            expect_string("string-length", value)?.len() as i64
         )),
         _ => Err(wrong_arg_count("string-length", "1", args.len())),
     }
@@ -1033,7 +1130,7 @@ fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value, start_value, end_value] => {
             let string = expect_string("substring", value)?;
-            let chars: Vec<char> = string.chars().collect();
+            let chars = string.chars();
             let len = chars.len();
             let start = expect_number("substring", start_value)?;
             let end = expect_number("substring", end_value)?;
@@ -1048,7 +1145,7 @@ fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
             }
 
             let slice: String = chars[start as usize..end as usize].iter().collect();
-            Ok(Value::String(slice))
+            Ok(Value::String(SchemeString::fresh(slice)))
         }
         _ => Err(wrong_arg_count("substring", "3", args.len())),
     }
@@ -1057,7 +1154,7 @@ fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value] => {
-            let string = expect_string("string->number", value)?;
+            let string = expect_string("string->number", value)?.to_plain_string();
             match string.parse::<i64>() {
                 Ok(number) => Ok(Value::Integer(number)),
                 Err(_) => Ok(Value::Boolean(false)),
@@ -1069,18 +1166,18 @@ fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::String(
+        [value] => Ok(Value::String(SchemeString::fresh(
             expect_number("number->string", value)?.to_string(),
-        )),
+        ))),
         _ => Err(wrong_arg_count("number->string", "1", args.len())),
     }
 }
 
 fn builtin_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::String(
+        [value] => Ok(Value::String(SchemeString::fresh(
             expect_symbol("symbol->string", value)?.to_string(),
-        )),
+        ))),
         _ => Err(wrong_arg_count("symbol->string", "1", args.len())),
     }
 }
@@ -1088,7 +1185,7 @@ fn builtin_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value] => Ok(Value::Symbol(
-            expect_string("string->symbol", value)?.to_string(),
+            expect_string("string->symbol", value)?.to_plain_string(),
         )),
         _ => Err(wrong_arg_count("string->symbol", "1", args.len())),
     }
@@ -1098,20 +1195,61 @@ fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value, index_value] => {
             let string = expect_string("string-ref", value)?;
-            let chars: Vec<char> = string.chars().collect();
             let index = expect_number("string-ref", index_value)?;
 
-            if index < 0 || index as usize >= chars.len() {
+            if index < 0 || index as usize >= string.len() {
                 return Err(EvalError::IndexOutOfBounds {
                     name: "string-ref".into(),
                     index,
-                    len: chars.len(),
+                    len: string.len(),
                 });
             }
 
-            Ok(Value::Char(chars[index as usize]))
+            Ok(Value::Char(
+                string
+                    .get(index as usize)
+                    .expect("bounds checked before string-ref access"),
+            ))
         }
         _ => Err(wrong_arg_count("string-ref", "2", args.len())),
+    }
+}
+
+fn builtin_string_set(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [string_value, index_value, char_value] => {
+            let string = expect_string("string-set!", string_value)?;
+            if !string.is_mutable() {
+                return Err(EvalError::ImmutableString {
+                    name: "string-set!".into(),
+                });
+            }
+
+            let index = expect_number("string-set!", index_value)?;
+            let len = string.len();
+            if index < 0 || index as usize >= len {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: "string-set!".into(),
+                    index,
+                    len,
+                });
+            }
+
+            let ch = expect_char("string-set!", char_value)?;
+            let updated = string.set(index as usize, ch);
+            debug_assert!(updated, "string-set! index already validated");
+            Ok(Value::Void)
+        }
+        _ => Err(wrong_arg_count("string-set!", "3", args.len())),
+    }
+}
+
+fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::String(
+            expect_string("string-copy", value)?.mutable_copy(),
+        )),
+        _ => Err(wrong_arg_count("string-copy", "1", args.len())),
     }
 }
 
@@ -1158,9 +1296,9 @@ fn expect_number(name: &str, value: &Value) -> Result<i64, EvalError> {
     }
 }
 
-fn expect_string<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError> {
+fn expect_string(name: &str, value: &Value) -> Result<SchemeString, EvalError> {
     match value {
-        Value::String(string) => Ok(string),
+        Value::String(string) => Ok(string.clone()),
         _ => Err(EvalError::TypeMismatch {
             name: name.into(),
             expected: "string".into(),
@@ -1175,6 +1313,17 @@ fn expect_symbol<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError>
         _ => Err(EvalError::TypeMismatch {
             name: name.into(),
             expected: "symbol".into(),
+            got: value.type_name().into(),
+        }),
+    }
+}
+
+fn expect_char(name: &str, value: &Value) -> Result<char, EvalError> {
+    match value {
+        Value::Char(ch) => Ok(*ch),
+        _ => Err(EvalError::TypeMismatch {
+            name: name.into(),
+            expected: "char".into(),
             got: value.type_name().into(),
         }),
     }
@@ -1217,8 +1366,8 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         Value::Boolean(true) => "#t".into(),
         Value::Boolean(false) => "#f".into(),
         Value::String(value) => match mode {
-            RenderMode::Write => format!("\"{}\"", escape_string(value)),
-            RenderMode::Display => value.clone(),
+            RenderMode::Write => format!("\"{}\"", escape_string(&value.to_plain_string())),
+            RenderMode::Display => value.to_plain_string(),
         },
         Value::Symbol(value) => value.clone(),
         Value::Char(ch) => render_char(*ch, mode),

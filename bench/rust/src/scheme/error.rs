@@ -75,6 +75,9 @@ pub enum EvalError {
         len: usize,
     },
 
+    #[error("{name}: cannot mutate immutable string")]
+    ImmutableString { name: String },
+
     #[error("application: expected procedure, got {got}")]
     NotAProcedure { got: String },
 }
