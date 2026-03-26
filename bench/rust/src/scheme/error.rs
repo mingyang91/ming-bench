@@ -86,6 +86,9 @@ pub enum EvalError {
     #[error("{name}: expected pair, found {found}")]
     ExpectedPair { name: &'static str, found: String },
 
+    #[error("{name}: expected vector, found {found}")]
+    ExpectedVector { name: &'static str, found: String },
+
     #[error("{name}: expected list, found {found}")]
     ExpectedList { name: &'static str, found: String },
 

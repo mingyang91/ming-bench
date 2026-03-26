@@ -1,6 +1,6 @@
 use super::{
-    apply_procedure, list_from_values, list_to_vec, make_pair, make_string, number::Number, Env,
-    EnvRef, EvalContext, EvalError, NativeFunc, Value,
+    apply_procedure, list_from_values, list_to_vec, make_pair, make_string, make_vector,
+    number::Number, Env, EnvRef, EvalContext, EvalError, NativeFunc, Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -41,8 +41,17 @@ pub(super) fn default_env() -> EnvRef {
         ("append", native_append as NativeFunc),
         ("assoc", native_assoc as NativeFunc),
         ("map", native_map as NativeFunc),
+        ("eqv?", native_eqv as NativeFunc),
         ("eq?", native_eq as NativeFunc),
         ("equal?", native_equal as NativeFunc),
+        ("vector", native_vector as NativeFunc),
+        ("make-vector", native_make_vector as NativeFunc),
+        ("vector-ref", native_vector_ref as NativeFunc),
+        ("vector-set!", native_vector_set as NativeFunc),
+        ("vector-length", native_vector_length as NativeFunc),
+        ("vector?", native_vector_pred as NativeFunc),
+        ("vector->list", native_vector_to_list as NativeFunc),
+        ("list->vector", native_list_to_vector as NativeFunc),
         ("display", native_display as NativeFunc),
         ("write", native_write as NativeFunc),
         ("newline", native_newline as NativeFunc),
@@ -347,6 +356,18 @@ fn native_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     Ok(Value::Boolean(value_eq(&args[0], &args[1])))
 }
 
+fn native_eqv(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "eqv?",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Boolean(value_eq(&args[0], &args[1])))
+}
+
 fn native_equal(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::WrongArgCount {
@@ -357,6 +378,126 @@ fn native_equal(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> 
     }
 
     Ok(Value::Boolean(value_equal(&args[0], &args[1])))
+}
+
+fn native_vector(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    Ok(make_vector(args.to_vec()))
+}
+
+fn native_make_vector(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(EvalError::WrongArgCount {
+            name: "make-vector",
+            expected: "1 or 2",
+            got: args.len(),
+        });
+    }
+
+    let len = args[0].as_integer("make-vector")?;
+    let Ok(len) = usize::try_from(len) else {
+        return Err(EvalError::IndexOutOfBounds {
+            name: "make-vector",
+            index: len,
+            len: 0,
+        });
+    };
+    let fill = args.get(1).cloned().unwrap_or(Value::Void);
+    Ok(make_vector(vec![fill; len]))
+}
+
+fn native_vector_ref(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-ref",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    let vector = args[0].as_vector("vector-ref")?;
+    let index = args[1].as_integer("vector-ref")?;
+    let vector = vector.borrow();
+    let len = vector.len();
+    let Some(index) = usize::try_from(index).ok().filter(|index| *index < len) else {
+        return Err(EvalError::IndexOutOfBounds {
+            name: "vector-ref",
+            index,
+            len,
+        });
+    };
+
+    Ok(vector[index].clone())
+}
+
+fn native_vector_set(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-set!",
+            expected: "exactly 3",
+            got: args.len(),
+        });
+    }
+
+    let vector = args[0].as_vector("vector-set!")?;
+    let index = args[1].as_integer("vector-set!")?;
+    let mut vector = vector.borrow_mut();
+    let len = vector.len();
+    let Some(index) = usize::try_from(index).ok().filter(|index| *index < len) else {
+        return Err(EvalError::IndexOutOfBounds {
+            name: "vector-set!",
+            index,
+            len,
+        });
+    };
+
+    vector[index] = args[2].clone();
+    Ok(Value::Void)
+}
+
+fn native_vector_length(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-length",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(exact_integer(
+        args[0].as_vector("vector-length")?.borrow().len() as i64,
+    ))
+}
+
+fn native_vector_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("vector?", args, ctx, |value| {
+        matches!(value, Value::Vector(_))
+    })
+}
+
+fn native_vector_to_list(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "vector->list",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(list_from_values(
+        args[0].as_vector("vector->list")?.borrow().clone(),
+    ))
+}
+
+fn native_list_to_vector(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "list->vector",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(make_vector(list_to_vec(&args[0], "list->vector")?))
 }
 
 fn native_display(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -626,27 +767,39 @@ fn native_number_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalEr
 }
 
 fn native_integer_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("integer?", args, ctx, |value| {
-        matches!(value, Value::Number(number) if number.is_integer())
-    })
+    native_predicate(
+        "integer?",
+        args,
+        ctx,
+        |value| matches!(value, Value::Number(number) if number.is_integer()),
+    )
 }
 
 fn native_rational_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("rational?", args, ctx, |value| {
-        matches!(value, Value::Number(number) if number.is_rational())
-    })
+    native_predicate(
+        "rational?",
+        args,
+        ctx,
+        |value| matches!(value, Value::Number(number) if number.is_rational()),
+    )
 }
 
 fn native_exact_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("exact?", args, ctx, |value| {
-        matches!(value, Value::Number(number) if number.is_exact())
-    })
+    native_predicate(
+        "exact?",
+        args,
+        ctx,
+        |value| matches!(value, Value::Number(number) if number.is_exact()),
+    )
 }
 
 fn native_inexact_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("inexact?", args, ctx, |value| {
-        matches!(value, Value::Number(number) if number.is_inexact())
-    })
+    native_predicate(
+        "inexact?",
+        args,
+        ctx,
+        |value| matches!(value, Value::Number(number) if number.is_inexact()),
+    )
 }
 
 fn native_exact_to_inexact(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -1088,7 +1241,10 @@ fn native_positive_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, Eva
     }
 
     Ok(Value::Boolean(
-        args[0].as_number("positive?")?.compare(Number::integer(0)).is_gt(),
+        args[0]
+            .as_number("positive?")?
+            .compare(Number::integer(0))
+            .is_gt(),
     ))
 }
 
@@ -1102,7 +1258,10 @@ fn native_negative_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, Eva
     }
 
     Ok(Value::Boolean(
-        args[0].as_number("negative?")?.compare(Number::integer(0)).is_lt(),
+        args[0]
+            .as_number("negative?")?
+            .compare(Number::integer(0))
+            .is_lt(),
     ))
 }
 
@@ -1217,7 +1376,7 @@ fn is_proper_list(value: &Value) -> bool {
     }
 }
 
-fn value_eq(left: &Value, right: &Value) -> bool {
+pub(super) fn value_eq(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
@@ -1225,6 +1384,7 @@ fn value_eq(left: &Value, right: &Value) -> bool {
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Nil, Value::Nil) => true,
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(left, right),
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::NativeProc { name: left, .. }, Value::NativeProc { name: right, .. }) => {
@@ -1245,6 +1405,15 @@ fn value_equal(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => *left.borrow() == *right.borrow(),
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Nil, Value::Nil) => true,
+        (Value::Vector(left), Value::Vector(right)) => {
+            let left = left.borrow();
+            let right = right.borrow();
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| value_equal(left, right))
+        }
         (Value::Pair(left), Value::Pair(right)) => {
             let (left_car, left_cdr) = {
                 let borrowed = left.borrow();

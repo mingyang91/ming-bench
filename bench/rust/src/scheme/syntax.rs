@@ -1,6 +1,6 @@
 use super::{
-    EnvRef, EvalContext, EvalError, Expr, ExprKind, SourcePos, expr_plain_symbol_name,
-    expr_symbol_name, is_ellipsis_expr,
+    expr_plain_symbol_name, expr_symbol_name, is_ellipsis_expr, EnvRef, EvalContext, EvalError,
+    Expr, ExprKind, SourcePos,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -163,13 +163,9 @@ fn match_pattern(
 
             bind_single(name, value, bindings)
         }
-        ExprKind::List(pattern_items) => match_list_pattern(
-            pattern_items,
-            value,
-            literals,
-            macro_name,
-            bindings,
-        ),
+        ExprKind::List(pattern_items) => {
+            match_list_pattern(pattern_items, value, literals, macro_name, bindings)
+        }
     }
 }
 
@@ -343,9 +339,14 @@ fn expand_template(
         ExprKind::Boolean(value) => Ok(Expr::new(ExprKind::Boolean(*value), template.pos)),
         ExprKind::Char(value) => Ok(Expr::new(ExprKind::Char(*value), template.pos)),
         ExprKind::String(value) => Ok(Expr::new(ExprKind::String(value.clone()), template.pos)),
-        ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => {
-            expand_template_symbol(name, template, bindings, definition_env, renames, repeat_index)
-        }
+        ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => expand_template_symbol(
+            name,
+            template,
+            bindings,
+            definition_env,
+            renames,
+            repeat_index,
+        ),
         ExprKind::List(items) => expand_template_list(
             template,
             items,

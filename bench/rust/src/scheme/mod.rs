@@ -8,7 +8,7 @@ mod number;
 mod parser;
 mod syntax;
 
-use builtins::default_env;
+use builtins::{default_env, value_eq};
 pub use error::EvalError;
 use error::SourcePos;
 use number::Number;
@@ -45,6 +45,7 @@ type RecordRef = Rc<RecordInstance>;
 type RecordTypeRef = Rc<RecordType>;
 type RecordProcRef = Rc<RecordProcedure>;
 type StringRef = Rc<RefCell<Vec<char>>>;
+type VectorRef = Rc<RefCell<Vec<Value>>>;
 
 struct RecordType {
     name: String,
@@ -103,6 +104,7 @@ enum Value {
     Number(Number),
     Boolean(bool),
     String(StringRef),
+    Vector(VectorRef),
     Char(char),
     Symbol(String),
     Nil,
@@ -133,6 +135,12 @@ struct ClosureClause {
     body: Vec<Expr>,
 }
 
+struct DoBinding {
+    name: String,
+    init: Expr,
+    step: Option<Expr>,
+}
+
 struct Env {
     bindings: RefCell<HashMap<String, Value>>,
     syntax_bindings: RefCell<HashMap<String, MacroRef>>,
@@ -161,6 +169,7 @@ impl Value {
                     .replace('\t', "\\t");
                 format!("\"{escaped}\"")
             }
+            Self::Vector(value) => render_vector(value),
             Self::Char(value) => render_char(*value),
             Self::Symbol(value) => value.clone(),
             Self::Nil => "()".to_string(),
@@ -197,10 +206,14 @@ impl Value {
 
     fn as_integer(&self, name: &'static str) -> Result<i64, EvalError> {
         match self {
-            Self::Number(value) => value.exact_integer().ok_or_else(|| EvalError::ExpectedInteger {
-                name,
-                found: value.render(),
-            }),
+            Self::Number(value) => {
+                value
+                    .exact_integer()
+                    .ok_or_else(|| EvalError::ExpectedInteger {
+                        name,
+                        found: value.render(),
+                    })
+            }
             other => Err(EvalError::ExpectedInteger {
                 name,
                 found: other.render(),
@@ -252,6 +265,16 @@ impl Value {
         match self {
             Self::Pair(pair) => Ok(pair.clone()),
             other => Err(EvalError::ExpectedPair {
+                name,
+                found: other.render(),
+            }),
+        }
+    }
+
+    fn as_vector(&self, name: &'static str) -> Result<VectorRef, EvalError> {
+        match self {
+            Self::Vector(vector) => Ok(vector.clone()),
+            other => Err(EvalError::ExpectedVector {
                 name,
                 found: other.render(),
             }),
@@ -418,9 +441,7 @@ impl RecordProcedure {
                 }
 
                 let record = match &args[0] {
-                    Value::Record(record)
-                        if Rc::ptr_eq(&record.record_type, &self.record_type) =>
-                    {
+                    Value::Record(record) if Rc::ptr_eq(&record.record_type, &self.record_type) => {
                         record
                     }
                     other => {
@@ -521,7 +542,8 @@ fn eval_list(
                 return eval_define(tail, env, ctx).map_err(|err| err.with_position(head.pos))
             }
             "define-record-type" => {
-                return eval_define_record_type(tail, env).map_err(|err| err.with_position(head.pos))
+                return eval_define_record_type(tail, env)
+                    .map_err(|err| err.with_position(head.pos))
             }
             "define-syntax" => {
                 return eval_define_syntax(tail, env).map_err(|err| err.with_position(head.pos))
@@ -540,6 +562,14 @@ fn eval_list(
             }
             "cond" => return eval_cond(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             "let" => return eval_let(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
+            "letrec" => {
+                return eval_letrec(tail, env, ctx).map_err(|err| err.with_position(head.pos))
+            }
+            "letrec*" => {
+                return eval_letrec_star(tail, env, ctx).map_err(|err| err.with_position(head.pos))
+            }
+            "case" => return eval_case(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
+            "do" => return eval_do(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             _ => {}
         }
     }
@@ -634,8 +664,7 @@ fn eval_define_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 fn eval_define_record_type(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     if args.len() < 3 {
         return Err(EvalError::InvalidSyntax {
-            message: "define-record-type requires a type, constructor, and predicate"
-                .to_string(),
+            message: "define-record-type requires a type, constructor, and predicate".to_string(),
         });
     }
 
@@ -729,18 +758,20 @@ fn eval_set(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, Eval
 }
 
 fn eval_if(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 3 {
+    if !(2..=3).contains(&args.len()) {
         return Err(EvalError::WrongArgCount {
             name: "if",
-            expected: "exactly 3",
+            expected: "2 or 3",
             got: args.len(),
         });
     }
 
     if eval(&args[0], env.clone(), ctx)?.is_truthy() {
         eval(&args[1], env, ctx)
+    } else if let Some(alternate) = args.get(2) {
+        eval(alternate, env, ctx)
     } else {
-        eval(&args[2], env, ctx)
+        Ok(Value::Void)
     }
 }
 
@@ -872,6 +903,57 @@ fn eval_cond(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, Eva
     Ok(Value::Void)
 }
 
+fn eval_case(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    let Some((key_expr, clauses)) = args.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "case requires a key and at least zero clauses".to_string(),
+        });
+    };
+
+    let key = eval(key_expr, env.clone(), ctx)?;
+    for (index, clause) in clauses.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case clauses must be lists".to_string(),
+            });
+        };
+
+        let Some((datums_expr, body)) = items.split_first() else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case clauses cannot be empty".to_string(),
+            });
+        };
+
+        if expr_symbol_name(datums_expr).is_some_and(|name| name == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "case else clause must be last".to_string(),
+                });
+            }
+            return eval_sequence(body, env, ctx);
+        }
+
+        let ExprKind::List(datums) = &datums_expr.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case clause datums must be a list".to_string(),
+            });
+        };
+
+        let matched = datums.iter().try_fold(false, |matched, datum| {
+            if matched {
+                Ok(true)
+            } else {
+                Ok(value_eq(&key, &quote_expr(datum)?))
+            }
+        })?;
+        if matched {
+            return eval_sequence(body, env, ctx);
+        }
+    }
+
+    Ok(Value::Void)
+}
+
 fn eval_let(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     let Some(first) = args.first() else {
         return Err(EvalError::InvalidSyntax {
@@ -938,6 +1020,108 @@ fn eval_named_let(
     apply_procedure(closure, &values, ctx)
 }
 
+fn eval_letrec(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    eval_letrec_impl(args, env, ctx, false)
+}
+
+fn eval_letrec_star(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    eval_letrec_impl(args, env, ctx, true)
+}
+
+fn eval_letrec_impl(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        let name = if sequential { "letrec*" } else { "letrec" };
+        return Err(EvalError::InvalidSyntax {
+            message: format!("{name} requires bindings and a body"),
+        });
+    }
+
+    let bindings = parse_bindings(&args[0])?;
+    let frame = Env::new(Some(env));
+    for (name, _) in &bindings {
+        frame.define(name.clone(), Value::Void);
+    }
+
+    if sequential {
+        for (name, expr) in &bindings {
+            let value = eval(expr, frame.clone(), ctx)?;
+            let _ = frame.set(name, value);
+        }
+    } else {
+        let mut values = Vec::with_capacity(bindings.len());
+        for (_, expr) in &bindings {
+            values.push(eval(expr, frame.clone(), ctx)?);
+        }
+        for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
+            let _ = frame.set(name, value);
+        }
+    }
+
+    eval_sequence(&args[1..], frame, ctx)
+}
+
+fn eval_do(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::InvalidSyntax {
+            message: "do requires bindings and a termination clause".to_string(),
+        });
+    }
+
+    let bindings = parse_do_bindings(&args[0])?;
+    let ExprKind::List(test_clause) = &args[1].kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "do termination clause must be a list".to_string(),
+        });
+    };
+    let Some((test_expr, result_exprs)) = test_clause.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "do termination clause cannot be empty".to_string(),
+        });
+    };
+
+    let mut init_values = Vec::with_capacity(bindings.len());
+    for binding in &bindings {
+        init_values.push(eval(&binding.init, env.clone(), ctx)?);
+    }
+
+    let frame = Env::new(Some(env));
+    for (binding, value) in bindings.iter().zip(init_values.into_iter()) {
+        frame.define(binding.name.clone(), value);
+    }
+
+    loop {
+        if eval(test_expr, frame.clone(), ctx)?.is_truthy() {
+            return if result_exprs.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(result_exprs, frame, ctx)
+            };
+        }
+
+        eval_sequence(&args[2..], frame.clone(), ctx)?;
+
+        let mut updates = Vec::with_capacity(bindings.len());
+        for binding in &bindings {
+            let value = if let Some(step) = &binding.step {
+                eval(step, frame.clone(), ctx)?
+            } else {
+                frame
+                    .lookup(&binding.name)
+                    .expect("do binding should remain present")
+            };
+            updates.push(value);
+        }
+
+        for (binding, value) in bindings.iter().zip(updates.into_iter()) {
+            let _ = frame.set(&binding.name, value);
+        }
+    }
+}
 
 fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
     let ExprKind::List(bindings) = &expr.kind else {
@@ -972,6 +1156,43 @@ fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
     Ok(parsed)
 }
 
+fn parse_do_bindings(expr: &Expr) -> Result<Vec<DoBinding>, EvalError> {
+    let ExprKind::List(bindings) = &expr.kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "do bindings must be a list".to_string(),
+        });
+    };
+
+    let mut parsed = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let ExprKind::List(items) = &binding.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "do bindings must be lists".to_string(),
+            });
+        };
+
+        if !(2..=3).contains(&items.len()) {
+            return Err(EvalError::InvalidSyntax {
+                message: "do bindings must contain 2 or 3 items".to_string(),
+            });
+        }
+
+        let ExprKind::Symbol(name) = &items[0].kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "do binding names must be symbols".to_string(),
+            });
+        };
+
+        parsed.push(DoBinding {
+            name: name.clone(),
+            init: items[1].clone(),
+            step: items.get(2).cloned(),
+        });
+    }
+
+    Ok(parsed)
+}
+
 fn eval_binding_values(
     bindings: &[(String, Expr)],
     env: EnvRef,
@@ -991,9 +1212,11 @@ fn parse_record_constructor_spec(expr: &Expr) -> Result<(String, usize), EvalErr
         });
     };
 
-    let (name_expr, params) = items.split_first().ok_or_else(|| EvalError::InvalidSyntax {
-        message: "record constructor specification cannot be empty".to_string(),
-    })?;
+    let (name_expr, params) = items
+        .split_first()
+        .ok_or_else(|| EvalError::InvalidSyntax {
+            message: "record constructor specification cannot be empty".to_string(),
+        })?;
     let Some(name) = expr_plain_symbol_name(name_expr) else {
         return Err(EvalError::InvalidSyntax {
             message: "record constructor name must be a symbol".to_string(),
@@ -1130,6 +1353,10 @@ fn make_pair(car: Value, cdr: Value) -> Value {
     Value::Pair(Rc::new(RefCell::new(PairCell { car, cdr })))
 }
 
+fn make_vector(values: Vec<Value>) -> Value {
+    Value::Vector(Rc::new(RefCell::new(values)))
+}
+
 fn list_from_values(values: Vec<Value>) -> Value {
     values
         .into_iter()
@@ -1183,6 +1410,16 @@ fn render_pair(pair: PairRef) -> String {
             }
         }
     }
+}
+
+fn render_vector(vector: &VectorRef) -> String {
+    let items = vector.borrow();
+    let rendered = items
+        .iter()
+        .map(Value::render)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("#({rendered})")
 }
 
 fn render_char(value: char) -> String {
