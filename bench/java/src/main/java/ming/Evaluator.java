@@ -52,7 +52,7 @@ public class Evaluator {
                 "gcd", "lcm", "truncate", "round",
                 "make-string", "string",
                 "string>?", "string<=?", "string>=?",
-                "procedure?", "values",
+                "procedure?", "values", "error",
                 "syntax->datum", "datum->syntax"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
@@ -337,136 +337,10 @@ public class Evaluator {
     String gensym(String base) { return base + "__g" + (gensymCounter++); }
 
     private final MacroExpander macroExpander = new MacroExpander(this);
-
-    // ---- Token ----
-    private static final class Token {
-        final String value;
-        final int line;
-        final int col;
-        Token(String value, int line, int col) { this.value = value; this.line = line; this.col = col; }
-    }
-
-    // ---- Tokenizer ----
-    private List<Token> tokenize(String input) {
-        List<Token> tokens = new ArrayList<>();
-        int i = 0, len = input.length(), line = 1, col = 1;
-        while (i < len) {
-            char c = input.charAt(i);
-            if (c == '\n') { i++; line++; col = 1; continue; }
-            if (Character.isWhitespace(c)) { i++; col++; continue; }
-            if (c == ';') { while (i < len && input.charAt(i) != '\n') { i++; col++; } continue; }
-            int startLine = line, startCol = col;
-            if (c == '#' && i + 1 < len && input.charAt(i + 1) == '\'') {
-                tokens.add(new Token("#'", startLine, startCol)); i += 2; col += 2; continue;
-            }
-            if (c == '#' && i + 1 < len && input.charAt(i + 1) == '(') {
-                tokens.add(new Token("#(", startLine, startCol)); i += 2; col += 2; continue;
-            }
-            if (c == '(') { tokens.add(new Token("(", startLine, startCol)); i++; col++; continue; }
-            if (c == ')') { tokens.add(new Token(")", startLine, startCol)); i++; col++; continue; }
-            if (c == '\'') { tokens.add(new Token("'", startLine, startCol)); i++; col++; continue; }
-            if (c == '"') {
-                StringBuilder sb = new StringBuilder();
-                sb.append('"'); i++; col++;
-                while (i < len && input.charAt(i) != '"') {
-                    if (input.charAt(i) == '\\') {
-                        sb.append(input.charAt(i)); i++; col++;
-                        if (i < len) { sb.append(input.charAt(i)); i++; col++; }
-                    } else {
-                        if (input.charAt(i) == '\n') { line++; col = 1; } else { col++; }
-                        sb.append(input.charAt(i)); i++;
-                    }
-                }
-                if (i < len) { sb.append('"'); i++; col++; }
-                tokens.add(new Token(sb.toString(), startLine, startCol));
-                continue;
-            }
-            StringBuilder sb = new StringBuilder();
-            while (i < len) {
-                char ch = input.charAt(i);
-                if (Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == '"' || ch == ';') break;
-                sb.append(ch); i++; col++;
-            }
-            tokens.add(new Token(sb.toString(), startLine, startCol));
-        }
-        return tokens;
-    }
-
-    // ---- Parser ----
-    private int pos;
+    private final SchemeParser parser = new SchemeParser();
 
     private List<Object> parse(String input) throws EvalError {
-        List<Token> tokens = tokenize(input);
-        pos = 0;
-        List<Object> exprs = new ArrayList<>();
-        while (pos < tokens.size()) exprs.add(parseExpr(tokens));
-        return exprs;
-    }
-
-    private Object parseExpr(List<Token> tokens) throws EvalError {
-        if (pos >= tokens.size()) throw new EvalError("unexpected end of input");
-        Token token = tokens.get(pos++);
-        if (token.value.equals("#(")) {
-            List<Object> elems = new ArrayList<>();
-            while (pos < tokens.size() && !tokens.get(pos).value.equals(")")) elems.add(parseExpr(tokens));
-            if (pos >= tokens.size()) throw new EvalError("missing closing parenthesis");
-            pos++;
-            List<Object> list = new ArrayList<>();
-            list.add("vector");
-            list.addAll(elems);
-            return new Located(list, token.line, token.col);
-        }
-        if (token.value.equals("(")) {
-            List<Object> list = new ArrayList<>();
-            while (pos < tokens.size() && !tokens.get(pos).value.equals(")")) list.add(parseExpr(tokens));
-            if (pos >= tokens.size()) throw new EvalError("missing closing parenthesis");
-            pos++;
-            return new Located(list, token.line, token.col);
-        }
-        if (token.value.equals(")")) throw new EvalError("unexpected )");
-        if (token.value.equals("'")) {
-            Object quoted = parseExpr(tokens);
-            List<Object> q = new ArrayList<>();
-            q.add("quote"); q.add(quoted);
-            return new Located(q, token.line, token.col);
-        }
-        if (token.value.equals("#'")) {
-            Object syntaxed = parseExpr(tokens);
-            List<Object> q = new ArrayList<>();
-            q.add("syntax"); q.add(syntaxed);
-            return new Located(q, token.line, token.col);
-        }
-        Object atom = parseAtom(token.value);
-        return new Located(atom, token.line, token.col);
-    }
-
-    private Object parseAtom(String token) {
-        if (token.equals("#t")) return Boolean.TRUE;
-        if (token.equals("#f")) return Boolean.FALSE;
-        if (token.startsWith("#\\")) {
-            String charName = token.substring(2);
-            if (charName.equals("space")) return new SchemeChar(' ');
-            if (charName.equals("newline")) return new SchemeChar('\n');
-            if (charName.equals("tab")) return new SchemeChar('\t');
-            if (charName.length() == 1) return new SchemeChar(charName.charAt(0));
-            throw new RuntimeException("unknown character literal: " + token);
-        }
-        if (token.startsWith("\"") && token.endsWith("\"")) {
-            String s = token.substring(1, token.length() - 1);
-            s = s.replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\").replace("\\\"", "\"");
-            return new SchemeString(s);
-        }
-        try { return Long.parseLong(token); } catch (NumberFormatException ignored) {}
-        int slashIdx = token.indexOf('/');
-        if (slashIdx > 0 && slashIdx < token.length() - 1) {
-            try {
-                long numer = Long.parseLong(token.substring(0, slashIdx));
-                long denom = Long.parseLong(token.substring(slashIdx + 1));
-                if (denom != 0) return makeRational(numer, denom);
-            } catch (NumberFormatException ignored) {}
-        }
-        try { return Double.parseDouble(token); } catch (NumberFormatException ignored) {}
-        return token;
+        return parser.parse(input);
     }
 
     private Object unwrap(Object expr) {
@@ -527,6 +401,10 @@ public class Evaluator {
                         if (list.size() != 2) throw posError("quote: expected 1 argument");
                         return new BounceApplyK(k, quoteDatum(list.get(1)));
                     }
+                    case "quasiquote": {
+                        if (list.size() != 2) throw posError("quasiquote: expected 1 argument");
+                        return expandQuasiquote(list.get(1), env, k, 0);
+                    }
                     case "if": {
                         if (list.size() < 3 || list.size() > 4) throw posError("if: expected 2 or 3 arguments");
                         Object thenE = list.get(2);
@@ -552,6 +430,14 @@ public class Evaluator {
                             if (sig.isEmpty()) throw posError("define: bad syntax");
                             String name = (String) unwrap(sig.get(0));
                             ParamSpec ps = parseParamList(sig.subList(1, sig.size()));
+                            List<Object> body = new ArrayList<>();
+                            for (int i = 2; i < list.size(); i++) body.add(list.get(i));
+                            env.define(name, new Lambda(ps.params, ps.restParam, body, env));
+                            return new BounceApplyK(k, null);
+                        }
+                        if (target instanceof Pair sig) {
+                            String name = (String) unwrap(sig.car);
+                            ParamSpec ps = parseParamList(unwrap(sig.cdr));
                             List<Object> body = new ArrayList<>();
                             for (int i = 2; i < list.size(); i++) body.add(list.get(i));
                             env.define(name, new Lambda(ps.params, ps.restParam, body, env));
@@ -1079,6 +965,16 @@ public class Evaluator {
         return new BounceStep(clause.get(0), env, testVal -> {
             if (!isFalse(testVal)) {
                 if (clause.size() == 1) return new BounceApplyK(k, testVal);
+                // Handle (cond (test => proc)) syntax
+                Object second = unwrap(clause.get(1));
+                if (second instanceof String s && s.equals("=>")) {
+                    if (clause.size() != 3) throw posError("cond =>: expected procedure after =>");
+                    return new BounceStep(clause.get(2), env, proc -> {
+                        List<Object> args = new ArrayList<>();
+                        args.add(testVal);
+                        return applyProc(proc, args, k);
+                    });
+                }
                 return evalClauseBody(clause, 1, env, k);
             }
             return evalCond(form, clauseIdx + 1, env, k);
@@ -1364,13 +1260,23 @@ public class Evaluator {
     private ParamSpec parseParamList(Object paramListRaw) {
         List<String> params = new ArrayList<>();
         String restParam = null;
-        if (paramListRaw instanceof List<?> paramList) {
+        if (paramListRaw instanceof Pair) {
+            // Dotted pair chain: (a b . rest)
+            Object curr = paramListRaw;
+            while (curr instanceof Pair pair) {
+                params.add((String) unwrap(pair.car));
+                Object next = unwrap(pair.cdr);
+                if (next instanceof Pair) {
+                    curr = next;
+                } else {
+                    // dotted tail = rest param
+                    if (next instanceof String s) restParam = s;
+                    curr = null;
+                }
+            }
+        } else if (paramListRaw instanceof List<?> paramList) {
             for (int i = 0; i < paramList.size(); i++) {
                 String p = (String) unwrap(paramList.get(i));
-                if (p.equals(".")) {
-                    if (i + 1 < paramList.size()) restParam = (String) unwrap(paramList.get(i + 1));
-                    break;
-                }
                 params.add(p);
             }
         } else if (paramListRaw instanceof String sym) {
@@ -1455,7 +1361,90 @@ public class Evaluator {
             for (int i = list.size() - 1; i >= 0; i--) result = new Pair(quoteDatum(list.get(i)), result);
             return result;
         }
+        if (datum instanceof Pair p) {
+            return new Pair(quoteDatum(p.car), quoteDatum(p.cdr));
+        }
         return datum;
+    }
+
+    // ---- Quasiquote ----
+
+    private Object expandQuasiquote(Object datum, Env env, Cont k, int depth) throws EvalError {
+        Object raw = unwrap(datum);
+        if (raw instanceof List<?> list) {
+            if (!list.isEmpty()) {
+                Object head = unwrap(list.get(0));
+                if ("unquote".equals(head) && list.size() == 2) {
+                    if (depth == 0) {
+                        return new BounceStep(list.get(1), env, k);
+                    } else {
+                        return expandQuasiquote(list.get(1), env, innerVal -> {
+                            return new BounceApplyK(k, new Pair("unquote", new Pair(innerVal, NIL)));
+                        }, depth - 1);
+                    }
+                }
+                if ("quasiquote".equals(head) && list.size() == 2) {
+                    return expandQuasiquote(list.get(1), env, innerVal -> {
+                        return new BounceApplyK(k, new Pair("quasiquote", new Pair(innerVal, NIL)));
+                    }, depth + 1);
+                }
+            }
+            // Process list elements, handling unquote-splicing
+            return qqList(list, 0, env, k, depth);
+        }
+        if (raw instanceof Pair p) {
+            // Dotted pair in quasiquote
+            Object carRaw = unwrap(p.car);
+            if ("unquote".equals(carRaw)) {
+                // (unquote expr) as a pair - shouldn't normally happen but handle it
+                Object cdrRaw = unwrap(p.cdr);
+                if (cdrRaw instanceof Pair cdrPair) {
+                    if (depth == 0) {
+                        return new BounceStep(cdrPair.car, env, k);
+                    }
+                }
+            }
+            return expandQuasiquote(p.car, env, carVal -> {
+                return expandQuasiquote(p.cdr, env, cdrVal -> {
+                    return new BounceApplyK(k, new Pair(carVal, cdrVal));
+                }, depth);
+            }, depth);
+        }
+        // Atom - just quote it
+        return new BounceApplyK(k, quoteDatum(datum));
+    }
+
+    private Object qqList(List<?> list, int idx, Env env, Cont k, int depth) throws EvalError {
+        if (idx >= list.size()) {
+            return new BounceApplyK(k, NIL);
+        }
+        Object elem = list.get(idx);
+        Object rawElem = unwrap(elem);
+        // Check for unquote-splicing
+        if (rawElem instanceof List<?> subList && subList.size() == 2) {
+            Object subHead = unwrap(subList.get(0));
+            if ("unquote-splicing".equals(subHead) && depth == 0) {
+                return new BounceStep(subList.get(1), env, splicedVal -> {
+                    return qqList(list, idx + 1, env, restVal -> {
+                        // Append splicedVal to restVal
+                        return new BounceApplyK(k, appendPairLists(splicedVal, restVal));
+                    }, depth);
+                });
+            }
+        }
+        return expandQuasiquote(elem, env, elemVal -> {
+            return qqList(list, idx + 1, env, restVal -> {
+                return new BounceApplyK(k, new Pair(elemVal, restVal));
+            }, depth);
+        }, depth);
+    }
+
+    private Object appendPairLists(Object a, Object b) {
+        if (a == NIL || a == null) return b;
+        if (a instanceof Pair p) {
+            return new Pair(p.car, appendPairLists(p.cdr, b));
+        }
+        return b; // shouldn't happen for proper lists
     }
 
     private boolean isFalse(Object val) {

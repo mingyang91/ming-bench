@@ -96,6 +96,14 @@ final class Builtins {
                 yield new Evaluator.SchemeValues(new ArrayList<>(args));
             }
 
+            case "error" -> {
+                StringBuilder msg = new StringBuilder();
+                for (int i = 0; i < args.size(); i++) {
+                    msg.append(SchemeFormatter.displayString(args.get(i)));
+                }
+                throw new EvalError(msg.toString());
+            }
+
             case "syntax->datum" -> {
                 Object stx = args.get(0);
                 if (stx instanceof Evaluator.SyntaxObject so) {
@@ -315,18 +323,21 @@ final class Builtins {
     // ---- Comparison ----
 
     private Object applyComparison(String name, List<Object> args) throws EvalError {
-        requireArgCount(args, 2, name);
-        requireNumber(args.get(0), name);
-        requireNumber(args.get(1), name);
-        double a = toDouble(args.get(0)), b = toDouble(args.get(1));
-        return switch (name) {
-            case "<" -> a < b;
-            case ">" -> a > b;
-            case "=" -> a == b;
-            case "<=" -> a <= b;
-            case ">=" -> a >= b;
-            default -> throw evaluator.posError("unknown comparison: " + name);
-        };
+        if (args.size() < 2) throw evaluator.posError(name + ": expected at least 2 arguments");
+        for (Object arg : args) requireNumber(arg, name);
+        for (int i = 0; i < args.size() - 1; i++) {
+            double a = toDouble(args.get(i)), b = toDouble(args.get(i + 1));
+            boolean ok = switch (name) {
+                case "<" -> a < b;
+                case ">" -> a > b;
+                case "=" -> a == b;
+                case "<=" -> a <= b;
+                case ">=" -> a >= b;
+                default -> throw evaluator.posError("unknown comparison: " + name);
+            };
+            if (!ok) return false;
+        }
+        return true;
     }
 
     private Object applyEq(List<Object> args) throws EvalError {

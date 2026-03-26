@@ -47,14 +47,42 @@ class MacroExpander {
         return new Evaluator.SyntaxRules(literals, rules, env);
     }
 
+    // Linearize a pattern (List or Pair chain) into elements + optional rest variable
+    private static class LinearPattern {
+        List<Object> elems = new ArrayList<>();
+        Object rest = null; // non-null if dotted (e.g., (a b . rest))
+    }
+
+    private LinearPattern linearize(Object obj) {
+        LinearPattern lp = new LinearPattern();
+        Object raw = unwrap(obj);
+        if (raw instanceof List<?> list) {
+            for (Object e : list) lp.elems.add(e);
+        } else if (raw instanceof Evaluator.Pair) {
+            Object curr = raw;
+            while (curr instanceof Evaluator.Pair pair) {
+                lp.elems.add(pair.car);
+                Object next = unwrap(pair.cdr);
+                if (next instanceof Evaluator.Pair) {
+                    curr = next;
+                } else {
+                    // dotted tail
+                    lp.rest = next;
+                    curr = null;
+                }
+            }
+        }
+        return lp;
+    }
+
     @SuppressWarnings("unchecked")
     Object expandMacro(Evaluator.SyntaxRules sr, List<?> form) throws EvalError {
         Set<String> literalSet = new HashSet<>(sr.literals);
         for (Object[] rule : sr.rules) {
-            List<?> pattern = (List<?>) unwrap(rule[0]);
+            Object patternObj = rule[0];
             Object template = rule[1];
             Set<String> ellipsisVars = new HashSet<>();
-            Map<String, Object> bindings = matchPattern(pattern, form, literalSet, ellipsisVars);
+            Map<String, Object> bindings = matchPattern(patternObj, form, literalSet, ellipsisVars);
             if (bindings != null) {
                 Set<String> patternVars = new HashSet<>(bindings.keySet());
                 Map<String, String> gensymMap = new HashMap<>();
@@ -64,10 +92,77 @@ class MacroExpander {
         throw evaluator.posError("no matching syntax-rules pattern");
     }
 
-    private Map<String, Object> matchPattern(List<?> pattern, List<?> form,
+    private Map<String, Object> matchPattern(Object patternObj, List<?> form,
                                               Set<String> literals, Set<String> ellipsisVars) {
+        LinearPattern lp = linearize(patternObj);
+        List<Object> pattern = lp.elems;
         Map<String, Object> bindings = new HashMap<>();
         int pi = 1, fi = 1;
+        int patLen = pattern.size(), formLen = form.size();
+        while (pi < patLen) {
+            Object rawPat = unwrap(pattern.get(pi));
+            boolean hasEllipsis = (pi + 1 < patLen && "...".equals(unwrap(pattern.get(pi + 1))));
+            if (hasEllipsis) {
+                if (!(rawPat instanceof String varName)) return null;
+                int remaining = 0;
+                for (int k = pi + 2; k < patLen; k++) {
+                    if (!"...".equals(unwrap(pattern.get(k)))) remaining++;
+                }
+                int endFi = formLen - remaining;
+                List<Object> matched = new ArrayList<>();
+                while (fi < endFi) { matched.add(form.get(fi)); fi++; }
+                ellipsisVars.add(varName);
+                bindings.put(varName, matched);
+                pi += 2;
+            } else if (rawPat instanceof String sym) {
+                if (literals.contains(sym)) {
+                    if (fi >= formLen) return null;
+                    if (!sym.equals(unwrap(form.get(fi)))) return null;
+                    fi++;
+                } else {
+                    if (fi >= formLen) return null;
+                    bindings.put(sym, form.get(fi));
+                    fi++;
+                }
+                pi++;
+            } else if (rawPat instanceof List<?> || rawPat instanceof Evaluator.Pair) {
+                // Sub-pattern matching (nested list/pair patterns)
+                if (fi >= formLen) return null;
+                Object formElem = form.get(fi);
+                Object formRaw = unwrap(formElem);
+                if (formRaw instanceof List<?> subForm) {
+                    Map<String, Object> subBindings = matchSubPattern(rawPat, subForm, literals, ellipsisVars);
+                    if (subBindings == null) return null;
+                    bindings.putAll(subBindings);
+                } else {
+                    return null;
+                }
+                fi++; pi++;
+            } else {
+                if (fi >= formLen) return null;
+                fi++; pi++;
+            }
+        }
+        // Handle dotted tail (rest pattern variable)
+        if (lp.rest != null) {
+            Object restRaw = unwrap(lp.rest);
+            if (restRaw instanceof String restVar) {
+                List<Object> restElems = new ArrayList<>();
+                while (fi < formLen) { restElems.add(form.get(fi)); fi++; }
+                bindings.put(restVar, new Evaluator.Located(restElems, 0, 0));
+            }
+            return bindings;
+        }
+        return (fi == formLen) ? bindings : null;
+    }
+
+    private Map<String, Object> matchSubPattern(Object patternObj, List<?> form,
+                                                  Set<String> literals, Set<String> ellipsisVars) {
+        // Reuse matchPattern but starting from index 0 instead of 1
+        LinearPattern lp = linearize(patternObj);
+        List<Object> pattern = lp.elems;
+        Map<String, Object> bindings = new HashMap<>();
+        int pi = 0, fi = 0;
         int patLen = pattern.size(), formLen = form.size();
         while (pi < patLen) {
             Object rawPat = unwrap(pattern.get(pi));
@@ -100,6 +195,15 @@ class MacroExpander {
                 fi++; pi++;
             }
         }
+        if (lp.rest != null) {
+            Object restRaw = unwrap(lp.rest);
+            if (restRaw instanceof String restVar) {
+                List<Object> restElems = new ArrayList<>();
+                while (fi < formLen) { restElems.add(form.get(fi)); fi++; }
+                bindings.put(restVar, new Evaluator.Located(restElems, 0, 0));
+            }
+            return bindings;
+        }
         return (fi == formLen) ? bindings : null;
     }
 
@@ -121,6 +225,9 @@ class MacroExpander {
         }
         if (raw instanceof Boolean || raw instanceof Long ||
             raw instanceof Evaluator.SchemeString || raw instanceof Evaluator.SchemeChar) return raw;
+        if (raw instanceof Evaluator.Pair) {
+            return expandPairTemplate(raw, bindings, patternVars, ellipsisVars, sr, gensymMap);
+        }
         if (raw instanceof List<?> tmplList) {
             // Don't expand inside quote forms
             if (!tmplList.isEmpty() && "quote".equals(unwrap(tmplList.get(0)))) {
@@ -155,6 +262,62 @@ class MacroExpander {
             return new Evaluator.Located(result, 0, 0);
         }
         return raw;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object expandPairTemplate(Object pairChain, Map<String, Object> bindings,
+                                       Set<String> patternVars, Set<String> ellipsisVars,
+                                       Evaluator.SyntaxRules sr, Map<String, String> gensymMap) throws EvalError {
+        // Linearize the Pair chain into elements + rest
+        List<Object> elems = new ArrayList<>();
+        Object rest = null;
+        Object curr = pairChain;
+        while (curr instanceof Evaluator.Pair pair) {
+            elems.add(pair.car);
+            Object next = unwrap(pair.cdr);
+            if (next instanceof Evaluator.Pair) {
+                curr = next;
+            } else {
+                rest = next;
+                curr = null;
+            }
+        }
+        // Expand each element
+        List<Object> result = new ArrayList<>();
+        for (int i = 0; i < elems.size(); i++) {
+            boolean hasEllipsis = (i + 1 < elems.size() && "...".equals(unwrap(elems.get(i + 1))));
+            if (hasEllipsis) {
+                Set<String> usedEllipsis = findEllipsisVarsInTemplate(elems.get(i), ellipsisVars);
+                if (!usedEllipsis.isEmpty()) {
+                    String anyVar = usedEllipsis.iterator().next();
+                    List<Object> varList = (List<Object>) bindings.get(anyVar);
+                    for (int j = 0; j < varList.size(); j++) {
+                        Map<String, Object> iterBindings = new HashMap<>(bindings);
+                        for (String ev : usedEllipsis) {
+                            List<Object> evList = (List<Object>) bindings.get(ev);
+                            iterBindings.put(ev, evList.get(j));
+                        }
+                        Set<String> adjustedEllipsis = new HashSet<>(ellipsisVars);
+                        adjustedEllipsis.removeAll(usedEllipsis);
+                        result.add(expandTemplate(elems.get(i), iterBindings, patternVars,
+                                                   adjustedEllipsis, sr, gensymMap));
+                    }
+                }
+                i++;
+            } else {
+                result.add(expandTemplate(elems.get(i), bindings, patternVars,
+                                           ellipsisVars, sr, gensymMap));
+            }
+        }
+        // Handle the rest/tail: expand it and splice into the result list
+        if (rest != null) {
+            Object expandedRest = expandTemplate(rest, bindings, patternVars, ellipsisVars, sr, gensymMap);
+            Object unwrappedRest = unwrap(expandedRest);
+            if (unwrappedRest instanceof List<?> restList) {
+                result.addAll(restList);
+            }
+        }
+        return new Evaluator.Located(result, 0, 0);
     }
 
     Map<String, Object> matchSyntaxCasePattern(Object patternRaw, Object datum,
@@ -240,6 +403,18 @@ class MacroExpander {
             found.add(sym);
         } else if (raw instanceof List<?> list) {
             for (Object elem : list) found.addAll(findEllipsisVarsInTemplate(elem, ellipsisVars));
+        } else if (raw instanceof Evaluator.Pair) {
+            Object curr = raw;
+            while (curr instanceof Evaluator.Pair pair) {
+                found.addAll(findEllipsisVarsInTemplate(pair.car, ellipsisVars));
+                Object next = unwrap(pair.cdr);
+                if (next instanceof Evaluator.Pair) {
+                    curr = next;
+                } else {
+                    found.addAll(findEllipsisVarsInTemplate(pair.cdr, ellipsisVars));
+                    break;
+                }
+            }
         }
         return found;
     }
