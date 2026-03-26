@@ -47,7 +47,12 @@ impl Value {
             Value::Integer(n) => n.to_string(),
             Value::Boolean(true) => "#t".into(),
             Value::Boolean(false) => "#f".into(),
-            Value::Char(c) if write_mode => format!("#\\{}", c),
+            Value::Char(c) if write_mode => match c {
+                ' ' => "#\\space".into(),
+                '\n' => "#\\newline".into(),
+                '\t' => "#\\tab".into(),
+                _ => format!("#\\{}", c),
+            },
             Value::Char(c) => c.to_string(),
             Value::Str(s) if write_mode => {
                 let chars = s.borrow();
@@ -152,7 +157,16 @@ fn global_env() -> Env {
                    "string->number", "number->string",
                    "symbol->string", "string->symbol",
                    "string-ref", "string-set!", "string-copy",
-                   "apply"] {
+                   "apply",
+                   "abs", "modulo", "remainder", "quotient",
+                   "min", "max", "expt",
+                   "zero?", "positive?", "negative?", "odd?", "even?",
+                   "list-ref", "list-tail", "list?", "assoc", "map",
+                   "char-alphabetic?", "char-numeric?",
+                   "char-upcase", "char-downcase", "char=?", "char<?",
+                   "string=?", "string<?", "string-ci=?",
+                   "string-upcase", "string-downcase",
+                   "equal?", "eq?"] {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string()));
     }
     env
@@ -679,6 +693,19 @@ fn apply_func(func: &Value, args: &[Value], span: Span, out: &Output) -> Result<
     }
 }
 
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Boolean(x), Value::Boolean(y)) => x == y,
+        (Value::Char(x), Value::Char(y)) => x == y,
+        (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => *x.borrow() == *y.borrow(),
+        (Value::Nil, Value::Nil) => true,
+        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
+        _ => false,
+    }
+}
+
 fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result<Value, EvalError> {
     match name {
         "+" => {
@@ -1019,6 +1046,266 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 }
             }
             apply_func(func, &all_args, span, out)
+        }
+        "abs" => {
+            if args.len() != 1 { return Err(err_at(span, "abs requires 1 argument")); }
+            Ok(Value::Integer(args[0].as_integer()?.abs()))
+        }
+        "modulo" => {
+            if args.len() != 2 { return Err(err_at(span, "modulo requires 2 arguments")); }
+            let a = args[0].as_integer()?;
+            let b = args[1].as_integer()?;
+            if b == 0 { return Err(err_at(span, "division by zero")); }
+            let r = a % b;
+            let result = if r != 0 && (r > 0) != (b > 0) { r + b } else { r };
+            Ok(Value::Integer(result))
+        }
+        "remainder" => {
+            if args.len() != 2 { return Err(err_at(span, "remainder requires 2 arguments")); }
+            let a = args[0].as_integer()?;
+            let b = args[1].as_integer()?;
+            if b == 0 { return Err(err_at(span, "division by zero")); }
+            Ok(Value::Integer(a % b))
+        }
+        "quotient" => {
+            if args.len() != 2 { return Err(err_at(span, "quotient requires 2 arguments")); }
+            let a = args[0].as_integer()?;
+            let b = args[1].as_integer()?;
+            if b == 0 { return Err(err_at(span, "division by zero")); }
+            Ok(Value::Integer(a / b))
+        }
+        "min" => {
+            if args.is_empty() { return Err(err_at(span, "min requires at least 1 argument")); }
+            let mut m = args[0].as_integer()?;
+            for a in &args[1..] { let v = a.as_integer()?; if v < m { m = v; } }
+            Ok(Value::Integer(m))
+        }
+        "max" => {
+            if args.is_empty() { return Err(err_at(span, "max requires at least 1 argument")); }
+            let mut m = args[0].as_integer()?;
+            for a in &args[1..] { let v = a.as_integer()?; if v > m { m = v; } }
+            Ok(Value::Integer(m))
+        }
+        "expt" => {
+            if args.len() != 2 { return Err(err_at(span, "expt requires 2 arguments")); }
+            let base = args[0].as_integer()?;
+            let exp = args[1].as_integer()?;
+            if exp < 0 { return Err(err_at(span, "expt: negative exponent")); }
+            Ok(Value::Integer(base.pow(exp as u32)))
+        }
+        "zero?" => {
+            if args.len() != 1 { return Err(err_at(span, "zero? requires 1 argument")); }
+            Ok(Value::Boolean(args[0].as_integer()? == 0))
+        }
+        "positive?" => {
+            if args.len() != 1 { return Err(err_at(span, "positive? requires 1 argument")); }
+            Ok(Value::Boolean(args[0].as_integer()? > 0))
+        }
+        "negative?" => {
+            if args.len() != 1 { return Err(err_at(span, "negative? requires 1 argument")); }
+            Ok(Value::Boolean(args[0].as_integer()? < 0))
+        }
+        "odd?" => {
+            if args.len() != 1 { return Err(err_at(span, "odd? requires 1 argument")); }
+            Ok(Value::Boolean(args[0].as_integer()? % 2 != 0))
+        }
+        "even?" => {
+            if args.len() != 1 { return Err(err_at(span, "even? requires 1 argument")); }
+            Ok(Value::Boolean(args[0].as_integer()? % 2 == 0))
+        }
+        "list-ref" => {
+            if args.len() != 2 { return Err(err_at(span, "list-ref requires 2 arguments")); }
+            let idx = args[1].as_integer()? as usize;
+            let mut cur = &args[0];
+            for _ in 0..idx {
+                match cur {
+                    Value::Pair(_, cdr) => cur = cdr,
+                    _ => return Err(err_at(span, "list-ref: index out of range")),
+                }
+            }
+            match cur {
+                Value::Pair(car, _) => Ok(*car.clone()),
+                _ => Err(err_at(span, "list-ref: index out of range")),
+            }
+        }
+        "list-tail" => {
+            if args.len() != 2 { return Err(err_at(span, "list-tail requires 2 arguments")); }
+            let idx = args[1].as_integer()? as usize;
+            let mut cur = &args[0];
+            for _ in 0..idx {
+                match cur {
+                    Value::Pair(_, cdr) => cur = cdr,
+                    _ => return Err(err_at(span, "list-tail: index out of range")),
+                }
+            }
+            Ok(cur.clone())
+        }
+        "list?" => {
+            if args.len() != 1 { return Err(err_at(span, "list? requires 1 argument")); }
+            let mut cur = &args[0];
+            let result = loop {
+                match cur {
+                    Value::Nil => break true,
+                    Value::Pair(_, cdr) => cur = cdr,
+                    _ => break false,
+                }
+            };
+            Ok(Value::Boolean(result))
+        }
+        "assoc" => {
+            if args.len() != 2 { return Err(err_at(span, "assoc requires 2 arguments")); }
+            let key = &args[0];
+            let mut cur = &args[1];
+            loop {
+                match cur {
+                    Value::Nil => return Ok(Value::Boolean(false)),
+                    Value::Pair(car, cdr) => {
+                        if let Value::Pair(k, _) = car.as_ref() {
+                            if values_equal(k, key) {
+                                return Ok(*car.clone());
+                            }
+                        }
+                        cur = cdr;
+                    }
+                    _ => return Err(err_at(span, "assoc: not a proper list")),
+                }
+            }
+        }
+        "map" => {
+            if args.len() < 2 { return Err(err_at(span, "map requires at least 2 arguments")); }
+            let func = &args[0];
+            let mut lists: Vec<&Value> = args[1..].iter().collect();
+            let mut result_elems = Vec::new();
+            loop {
+                // Check if any list is exhausted
+                let mut call_args = Vec::new();
+                let mut new_lists = Vec::new();
+                let mut done = false;
+                for lst in &lists {
+                    match lst {
+                        Value::Nil => { done = true; break; }
+                        Value::Pair(car, cdr) => {
+                            call_args.push(*car.clone());
+                            new_lists.push(cdr.as_ref());
+                        }
+                        _ => return Err(err_at(span, "map: not a proper list")),
+                    }
+                }
+                if done { break; }
+                result_elems.push(apply_func(func, &call_args, span, out)?);
+                lists = new_lists;
+            }
+            let mut result = Value::Nil;
+            for e in result_elems.into_iter().rev() {
+                result = Value::Pair(Box::new(e), Box::new(result));
+            }
+            Ok(result)
+        }
+        "equal?" => {
+            if args.len() != 2 { return Err(err_at(span, "equal? requires 2 arguments")); }
+            Ok(Value::Boolean(values_equal(&args[0], &args[1])))
+        }
+        "eq?" => {
+            if args.len() != 2 { return Err(err_at(span, "eq? requires 2 arguments")); }
+            let result = match (&args[0], &args[1]) {
+                (Value::Integer(a), Value::Integer(b)) => a == b,
+                (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                (Value::Char(a), Value::Char(b)) => a == b,
+                (Value::Symbol(a), Value::Symbol(b)) => a == b,
+                (Value::Nil, Value::Nil) => true,
+                _ => std::ptr::eq(
+                    &args[0] as *const Value,
+                    &args[1] as *const Value,
+                ),
+            };
+            Ok(Value::Boolean(result))
+        }
+        "char-alphabetic?" => {
+            if args.len() != 1 { return Err(err_at(span, "char-alphabetic? requires 1 argument")); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_alphabetic())),
+                _ => Err(err_at(span, "char-alphabetic?: expected char")),
+            }
+        }
+        "char-numeric?" => {
+            if args.len() != 1 { return Err(err_at(span, "char-numeric? requires 1 argument")); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Boolean(c.is_ascii_digit())),
+                _ => Err(err_at(span, "char-numeric?: expected char")),
+            }
+        }
+        "char-upcase" => {
+            if args.len() != 1 { return Err(err_at(span, "char-upcase requires 1 argument")); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_uppercase())),
+                _ => Err(err_at(span, "char-upcase: expected char")),
+            }
+        }
+        "char-downcase" => {
+            if args.len() != 1 { return Err(err_at(span, "char-downcase requires 1 argument")); }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Char(c.to_ascii_lowercase())),
+                _ => Err(err_at(span, "char-downcase: expected char")),
+            }
+        }
+        "char=?" => {
+            if args.len() != 2 { return Err(err_at(span, "char=? requires 2 arguments")); }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a == b)),
+                _ => Err(err_at(span, "char=?: expected chars")),
+            }
+        }
+        "char<?" => {
+            if args.len() != 2 { return Err(err_at(span, "char<? requires 2 arguments")); }
+            match (&args[0], &args[1]) {
+                (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
+                _ => Err(err_at(span, "char<?: expected chars")),
+            }
+        }
+        "string=?" => {
+            if args.len() != 2 { return Err(err_at(span, "string=? requires 2 arguments")); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(*a.borrow() == *b.borrow())),
+                _ => Err(err_at(span, "string=?: expected strings")),
+            }
+        }
+        "string<?" => {
+            if args.len() != 2 { return Err(err_at(span, "string<? requires 2 arguments")); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(*a.borrow() < *b.borrow())),
+                _ => Err(err_at(span, "string<?: expected strings")),
+            }
+        }
+        "string-ci=?" => {
+            if args.len() != 2 { return Err(err_at(span, "string-ci=? requires 2 arguments")); }
+            match (&args[0], &args[1]) {
+                (Value::Str(a), Value::Str(b)) => {
+                    let al: Vec<char> = a.borrow().iter().map(|c| c.to_ascii_lowercase()).collect();
+                    let bl: Vec<char> = b.borrow().iter().map(|c| c.to_ascii_lowercase()).collect();
+                    Ok(Value::Boolean(al == bl))
+                }
+                _ => Err(err_at(span, "string-ci=?: expected strings")),
+            }
+        }
+        "string-upcase" => {
+            if args.len() != 1 { return Err(err_at(span, "string-upcase requires 1 argument")); }
+            match &args[0] {
+                Value::Str(s) => {
+                    let upper: String = s.borrow().iter().map(|c| c.to_ascii_uppercase()).collect();
+                    Ok(make_str(&upper))
+                }
+                _ => Err(err_at(span, "string-upcase: expected string")),
+            }
+        }
+        "string-downcase" => {
+            if args.len() != 1 { return Err(err_at(span, "string-downcase requires 1 argument")); }
+            match &args[0] {
+                Value::Str(s) => {
+                    let lower: String = s.borrow().iter().map(|c| c.to_ascii_lowercase()).collect();
+                    Ok(make_str(&lower))
+                }
+                _ => Err(err_at(span, "string-downcase: expected string")),
+            }
         }
         _ => Err(err_at(span, format!("unknown procedure: {}", name))),
     }
