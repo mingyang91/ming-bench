@@ -41,6 +41,8 @@ pub enum EvalError {
     },
     #[error("type mismatch: expected {expected}, got {found}")]
     TypeMismatch { expected: String, found: String },
+    #[error("invalid argument: {message}")]
+    InvalidArgument { message: String },
     #[error("cannot mutate immutable string")]
     ImmutableString,
     #[error("division by zero")]

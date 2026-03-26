@@ -45,6 +45,7 @@ enum Value {
     Char(char),
     Symbol(String),
     List(Vec<Value>),
+    Pair(Box<Value>, Box<Value>),
     Builtin(Builtin),
     Procedure(Rc<Closure>),
     Void,
@@ -84,6 +85,7 @@ impl Value {
             Self::Char(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::List(_) => "list",
+            Self::Pair(_, _) => "pair",
             Self::Builtin(_) | Self::Procedure(_) => "procedure",
             Self::Void => "void",
         }
@@ -112,6 +114,7 @@ impl Value {
             Self::Char(value) => render_char(*value, mode),
             Self::Symbol(name) => name.clone(),
             Self::List(items) => render_list(items, mode),
+            Self::Pair(head, tail) => render_pair(head, tail, mode),
             Self::Builtin(_) | Self::Procedure(_) => "#<procedure>".into(),
             Self::Void => "#<void>".into(),
         }
@@ -171,6 +174,34 @@ fn render_list(items: &[Value], mode: RenderMode) -> String {
     rendered
 }
 
+fn render_pair(head: &Value, tail: &Value, mode: RenderMode) -> String {
+    let mut rendered = String::from("(");
+    render_pair_contents(head, tail, mode, &mut rendered);
+    rendered.push(')');
+    rendered
+}
+
+fn render_pair_contents(head: &Value, tail: &Value, mode: RenderMode, output: &mut String) {
+    output.push_str(&head.render_with(mode));
+
+    match tail {
+        Value::List(items) => {
+            for item in items {
+                output.push(' ');
+                output.push_str(&item.render_with(mode));
+            }
+        }
+        Value::Pair(next_head, next_tail) => {
+            output.push(' ');
+            render_pair_contents(next_head, next_tail, mode, output);
+        }
+        other => {
+            output.push_str(" . ");
+            output.push_str(&other.render_with(mode));
+        }
+    }
+}
+
 fn render_char(value: char, mode: RenderMode) -> String {
     match mode {
         RenderMode::Display => value.to_string(),
@@ -191,15 +222,34 @@ enum Builtin {
     LessThan,
     GreaterThan,
     Equal,
+    Eq,
+    EqualDeep,
     LessEqual,
     Not,
+    Abs,
+    Modulo,
+    Remainder,
+    Quotient,
+    Min,
+    Max,
+    Expt,
+    ZeroPred,
+    PositivePred,
+    NegativePred,
+    OddPred,
+    EvenPred,
     Cons,
     Car,
     Cdr,
     NullPred,
     List,
+    ListRef,
+    ListTail,
+    ListPred,
     Length,
     Append,
+    Assoc,
+    Map,
     StringPred,
     NumberPred,
     BooleanPred,
@@ -219,6 +269,17 @@ enum Builtin {
     StringToSymbol,
     StringRef,
     CharPred,
+    CharAlphabeticPred,
+    CharNumericPred,
+    CharUpcase,
+    CharDowncase,
+    CharEqual,
+    CharLess,
+    StringEqual,
+    StringLess,
+    StringCiEqual,
+    StringUpcase,
+    StringDowncase,
     Apply,
 }
 
@@ -232,15 +293,34 @@ impl Builtin {
             Self::LessThan => "<",
             Self::GreaterThan => ">",
             Self::Equal => "=",
+            Self::Eq => "eq?",
+            Self::EqualDeep => "equal?",
             Self::LessEqual => "<=",
             Self::Not => "not",
+            Self::Abs => "abs",
+            Self::Modulo => "modulo",
+            Self::Remainder => "remainder",
+            Self::Quotient => "quotient",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Expt => "expt",
+            Self::ZeroPred => "zero?",
+            Self::PositivePred => "positive?",
+            Self::NegativePred => "negative?",
+            Self::OddPred => "odd?",
+            Self::EvenPred => "even?",
             Self::Cons => "cons",
             Self::Car => "car",
             Self::Cdr => "cdr",
             Self::NullPred => "null?",
             Self::List => "list",
+            Self::ListRef => "list-ref",
+            Self::ListTail => "list-tail",
+            Self::ListPred => "list?",
             Self::Length => "length",
             Self::Append => "append",
+            Self::Assoc => "assoc",
+            Self::Map => "map",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
             Self::BooleanPred => "boolean?",
@@ -260,6 +340,17 @@ impl Builtin {
             Self::StringToSymbol => "string->symbol",
             Self::StringRef => "string-ref",
             Self::CharPred => "char?",
+            Self::CharAlphabeticPred => "char-alphabetic?",
+            Self::CharNumericPred => "char-numeric?",
+            Self::CharUpcase => "char-upcase",
+            Self::CharDowncase => "char-downcase",
+            Self::CharEqual => "char=?",
+            Self::CharLess => "char<?",
+            Self::StringEqual => "string=?",
+            Self::StringLess => "string<?",
+            Self::StringCiEqual => "string-ci=?",
+            Self::StringUpcase => "string-upcase",
+            Self::StringDowncase => "string-downcase",
             Self::Apply => "apply",
         }
     }
@@ -301,15 +392,34 @@ impl Env {
             ("<", Builtin::LessThan),
             (">", Builtin::GreaterThan),
             ("=", Builtin::Equal),
+            ("eq?", Builtin::Eq),
+            ("equal?", Builtin::EqualDeep),
             ("<=", Builtin::LessEqual),
             ("not", Builtin::Not),
+            ("abs", Builtin::Abs),
+            ("modulo", Builtin::Modulo),
+            ("remainder", Builtin::Remainder),
+            ("quotient", Builtin::Quotient),
+            ("min", Builtin::Min),
+            ("max", Builtin::Max),
+            ("expt", Builtin::Expt),
+            ("zero?", Builtin::ZeroPred),
+            ("positive?", Builtin::PositivePred),
+            ("negative?", Builtin::NegativePred),
+            ("odd?", Builtin::OddPred),
+            ("even?", Builtin::EvenPred),
             ("cons", Builtin::Cons),
             ("car", Builtin::Car),
             ("cdr", Builtin::Cdr),
             ("null?", Builtin::NullPred),
             ("list", Builtin::List),
+            ("list-ref", Builtin::ListRef),
+            ("list-tail", Builtin::ListTail),
+            ("list?", Builtin::ListPred),
             ("length", Builtin::Length),
             ("append", Builtin::Append),
+            ("assoc", Builtin::Assoc),
+            ("map", Builtin::Map),
             ("string?", Builtin::StringPred),
             ("number?", Builtin::NumberPred),
             ("boolean?", Builtin::BooleanPred),
@@ -329,6 +439,17 @@ impl Env {
             ("string->symbol", Builtin::StringToSymbol),
             ("string-ref", Builtin::StringRef),
             ("char?", Builtin::CharPred),
+            ("char-alphabetic?", Builtin::CharAlphabeticPred),
+            ("char-numeric?", Builtin::CharNumericPred),
+            ("char-upcase", Builtin::CharUpcase),
+            ("char-downcase", Builtin::CharDowncase),
+            ("char=?", Builtin::CharEqual),
+            ("char<?", Builtin::CharLess),
+            ("string=?", Builtin::StringEqual),
+            ("string<?", Builtin::StringLess),
+            ("string-ci=?", Builtin::StringCiEqual),
+            ("string-upcase", Builtin::StringUpcase),
+            ("string-downcase", Builtin::StringDowncase),
             ("apply", Builtin::Apply),
         ] {
             env.define(name.into(), Value::Builtin(builtin));
@@ -667,19 +788,50 @@ fn eval_builtin(
         Builtin::Equal => eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
             left == right
         }),
+        Builtin::Eq => eval_eq(arguments, env, call_pos),
+        Builtin::EqualDeep => eval_equal(arguments, env, call_pos),
         Builtin::LessEqual => {
             eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
                 left <= right
             })
         }
         Builtin::Not => eval_not(arguments, env, call_pos),
+        Builtin::Abs => eval_abs(arguments, env, call_pos),
+        Builtin::Modulo => eval_modulo(arguments, env, call_pos),
+        Builtin::Remainder => eval_remainder(arguments, env, call_pos),
+        Builtin::Quotient => eval_quotient(arguments, env, call_pos),
+        Builtin::Min => eval_min(arguments, env, call_pos),
+        Builtin::Max => eval_max(arguments, env, call_pos),
+        Builtin::Expt => eval_expt(arguments, env, call_pos),
+        Builtin::ZeroPred => eval_number_predicate(arguments, env, "zero?", call_pos, |value| {
+            value == 0
+        }),
+        Builtin::PositivePred => {
+            eval_number_predicate(arguments, env, "positive?", call_pos, |value| value > 0)
+        }
+        Builtin::NegativePred => {
+            eval_number_predicate(arguments, env, "negative?", call_pos, |value| value < 0)
+        }
+        Builtin::OddPred => eval_number_predicate(arguments, env, "odd?", call_pos, |value| {
+            value % 2 != 0
+        }),
+        Builtin::EvenPred => eval_number_predicate(arguments, env, "even?", call_pos, |value| {
+            value % 2 == 0
+        }),
         Builtin::Cons => eval_cons(arguments, env, call_pos),
         Builtin::Car => eval_car(arguments, env, call_pos),
         Builtin::Cdr => eval_cdr(arguments, env, call_pos),
         Builtin::NullPred => eval_null_pred(arguments, env, call_pos),
         Builtin::List => eval_list_builtin(arguments, env),
+        Builtin::ListRef => eval_list_ref(arguments, env, call_pos),
+        Builtin::ListTail => eval_list_tail(arguments, env, call_pos),
+        Builtin::ListPred => eval_type_predicate(arguments, env, "list?", call_pos, |value| {
+            matches!(value, Value::List(_))
+        }),
         Builtin::Length => eval_length(arguments, env, call_pos),
         Builtin::Append => eval_append(arguments, env),
+        Builtin::Assoc => eval_assoc(arguments, env, call_pos),
+        Builtin::Map => eval_map(arguments, env, call_pos),
         Builtin::StringPred => eval_type_predicate(arguments, env, "string?", call_pos, |value| {
             matches!(value, Value::String(_))
         }),
@@ -696,7 +848,7 @@ fn eval_builtin(
             env,
             "pair?",
             call_pos,
-            |value| matches!(value, Value::List(items) if !items.is_empty()),
+            is_pair,
         ),
         Builtin::SymbolPred => eval_type_predicate(arguments, env, "symbol?", call_pos, |value| {
             matches!(value, Value::Symbol(_))
@@ -717,6 +869,49 @@ fn eval_builtin(
         Builtin::CharPred => eval_type_predicate(arguments, env, "char?", call_pos, |value| {
             matches!(value, Value::Char(_))
         }),
+        Builtin::CharAlphabeticPred => {
+            eval_char_predicate(arguments, env, "char-alphabetic?", call_pos, |ch| {
+                ch.is_alphabetic()
+            })
+        }
+        Builtin::CharNumericPred => {
+            eval_char_predicate(arguments, env, "char-numeric?", call_pos, |ch| ch.is_numeric())
+        }
+        Builtin::CharUpcase => eval_char_transform(arguments, env, "char-upcase", call_pos, |ch| {
+            ch.to_uppercase().next().unwrap_or(ch)
+        }),
+        Builtin::CharDowncase => {
+            eval_char_transform(arguments, env, "char-downcase", call_pos, |ch| {
+                ch.to_lowercase().next().unwrap_or(ch)
+            })
+        }
+        Builtin::CharEqual => {
+            eval_char_compare("char=?", arguments, env, call_pos, |left, right| left == right)
+        }
+        Builtin::CharLess => {
+            eval_char_compare("char<?", arguments, env, call_pos, |left, right| left < right)
+        }
+        Builtin::StringEqual => {
+            eval_string_compare("string=?", arguments, env, call_pos, |left, right| left == right)
+        }
+        Builtin::StringLess => {
+            eval_string_compare("string<?", arguments, env, call_pos, |left, right| left < right)
+        }
+        Builtin::StringCiEqual => {
+            eval_string_compare("string-ci=?", arguments, env, call_pos, |left, right| {
+                left.to_lowercase() == right.to_lowercase()
+            })
+        }
+        Builtin::StringUpcase => {
+            eval_string_transform(arguments, env, "string-upcase", call_pos, |value| {
+                value.chars().flat_map(|ch| ch.to_uppercase()).collect()
+            })
+        }
+        Builtin::StringDowncase => {
+            eval_string_transform(arguments, env, "string-downcase", call_pos, |value| {
+                value.chars().flat_map(|ch| ch.to_lowercase()).collect()
+            })
+        }
         Builtin::Apply => eval_apply_builtin(arguments, env, call_pos),
     }
 }
@@ -1228,6 +1423,36 @@ fn eval_add(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Integer(numbers.into_iter().sum()))
 }
 
+fn eval_eq(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [left_expr, right_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "eq?".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let left = eval_expr(left_expr, env)?;
+    let right = eval_expr(right_expr, env)?;
+    Ok(Value::Boolean(value_equal(&left, &right)))
+}
+
+fn eval_equal(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [left_expr, right_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "equal?".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let left = eval_expr(left_expr, env)?;
+    let right = eval_expr(right_expr, env)?;
+    Ok(Value::Boolean(value_equal(&left, &right)))
+}
+
 fn eval_sub(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     let numbers = eval_number_args(arguments, env)?;
 
@@ -1321,6 +1546,149 @@ fn eval_not(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
     Ok(Value::Boolean(!value.is_truthy()))
 }
 
+fn eval_abs(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "abs".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let value = eval_number(expr, env)?;
+    let value = value
+        .checked_abs()
+        .ok_or_else(|| EvalError::InvalidArgument {
+            message: "abs: integer overflow".into(),
+        }
+        .with_offset(expr.pos.offset))?;
+    Ok(Value::Integer(value))
+}
+
+fn eval_modulo(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let (dividend, divisor) = eval_division_operands("modulo", arguments, env, call_pos)?;
+    let remainder = dividend
+        .checked_rem(divisor)
+        .ok_or_else(|| EvalError::InvalidArgument {
+            message: "modulo: integer overflow".into(),
+        }
+        .with_offset(call_pos.offset))?;
+    let value = if remainder != 0 && (remainder > 0) != (divisor > 0) {
+        remainder + divisor
+    } else {
+        remainder
+    };
+    Ok(Value::Integer(value))
+}
+
+fn eval_remainder(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let (dividend, divisor) = eval_division_operands("remainder", arguments, env, call_pos)?;
+    let value = dividend
+        .checked_rem(divisor)
+        .ok_or_else(|| EvalError::InvalidArgument {
+            message: "remainder: integer overflow".into(),
+        }
+        .with_offset(call_pos.offset))?;
+    Ok(Value::Integer(value))
+}
+
+fn eval_quotient(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let (dividend, divisor) = eval_division_operands("quotient", arguments, env, call_pos)?;
+    let value = dividend
+        .checked_div(divisor)
+        .ok_or_else(|| EvalError::InvalidArgument {
+            message: "quotient: integer overflow".into(),
+        }
+        .with_offset(call_pos.offset))?;
+    Ok(Value::Integer(value))
+}
+
+fn eval_min(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let numbers = eval_number_args(arguments, env)?;
+    let value = numbers.into_iter().min().ok_or_else(|| {
+        EvalError::WrongArgCount {
+            name: "min".into(),
+            expected: "at least 1".into(),
+            got: 0,
+        }
+        .with_offset(call_pos.offset)
+    })?;
+    Ok(Value::Integer(value))
+}
+
+fn eval_max(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let numbers = eval_number_args(arguments, env)?;
+    let value = numbers.into_iter().max().ok_or_else(|| {
+        EvalError::WrongArgCount {
+            name: "max".into(),
+            expected: "at least 1".into(),
+            got: 0,
+        }
+        .with_offset(call_pos.offset)
+    })?;
+    Ok(Value::Integer(value))
+}
+
+fn eval_expt(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [base_expr, exponent_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "expt".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let base = eval_number(base_expr, env)?;
+    let exponent = eval_number(exponent_expr, env)?;
+    if exponent < 0 {
+        return Err(EvalError::InvalidArgument {
+            message: "expt: exponent must be non-negative".into(),
+        }
+        .with_offset(exponent_expr.pos.offset));
+    }
+
+    let value = base
+        .checked_pow(exponent as u32)
+        .ok_or_else(|| EvalError::InvalidArgument {
+            message: "expt: integer overflow".into(),
+        }
+        .with_offset(call_pos.offset))?;
+    Ok(Value::Integer(value))
+}
+
+fn eval_number_predicate(
+    arguments: &[Expr],
+    env: &EnvRef,
+    name: &str,
+    call_pos: SourcePos,
+    predicate: impl Fn(i64) -> bool,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::Boolean(predicate(eval_number(expr, env)?)))
+}
+
 fn eval_cons(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     let [head_expr, tail_expr] = arguments else {
         return Err(EvalError::WrongArgCount {
@@ -1339,11 +1707,7 @@ fn eval_cons(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Va
             items.insert(0, head);
             Ok(Value::List(items))
         }
-        other => Err(EvalError::TypeMismatch {
-            expected: "list".into(),
-            found: other.kind().into(),
-        }
-        .with_offset(tail_expr.pos.offset)),
+        other => Ok(Value::Pair(Box::new(head), Box::new(other))),
     }
 }
 
@@ -1359,6 +1723,7 @@ fn eval_car(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
 
     match eval_expr(list_expr, env)? {
         Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+        Value::Pair(head, _) => Ok(*head),
         Value::List(_) => Err(EvalError::TypeMismatch {
             expected: "pair".into(),
             found: "list".into(),
@@ -1384,6 +1749,7 @@ fn eval_cdr(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
 
     match eval_expr(list_expr, env)? {
         Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+        Value::Pair(_, tail) => Ok(*tail),
         Value::List(_) => Err(EvalError::TypeMismatch {
             expected: "pair".into(),
             found: "list".into(),
@@ -1419,6 +1785,54 @@ fn eval_null_pred(
 
 fn eval_list_builtin(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(Value::List(eval_args(arguments, env)?))
+}
+
+fn eval_list_ref(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [list_expr, index_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "list-ref".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let items = eval_list_items(list_expr, env)?;
+    let index = eval_index(index_expr, env)?;
+    let len = items.len();
+    if index >= len {
+        return Err(EvalError::IndexOutOfBounds { index, len }.with_offset(index_expr.pos.offset));
+    }
+
+    Ok(items[index].clone())
+}
+
+fn eval_list_tail(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [list_expr, index_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "list-tail".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let items = eval_list_items(list_expr, env)?;
+    let index = eval_index(index_expr, env)?;
+    let len = items.len();
+    if index > len {
+        return Err(EvalError::IndexOutOfBounds { index, len }.with_offset(index_expr.pos.offset));
+    }
+
+    Ok(Value::List(items[index..].to_vec()))
 }
 
 fn eval_length(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
@@ -1459,6 +1873,80 @@ fn eval_append(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     }
 
     Ok(Value::List(items))
+}
+
+fn eval_assoc(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [key_expr, alist_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "assoc".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let key = eval_expr(key_expr, env)?;
+    let entries = eval_list_items(alist_expr, env)?;
+
+    for entry in entries {
+        if let Some(entry_key) = pair_head(&entry) {
+            if value_equal(&key, entry_key) {
+                return Ok(entry);
+            }
+        }
+    }
+
+    Ok(Value::Boolean(false))
+}
+
+fn eval_map(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let Some((procedure_expr, list_exprs)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "map".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    if list_exprs.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "map".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(call_pos.offset));
+    }
+
+    let procedure = eval_expr(procedure_expr, env)?;
+    let lists: Vec<Vec<Value>> = list_exprs
+        .iter()
+        .map(|expr| eval_list_items(expr, env))
+        .collect::<Result<_, _>>()?;
+
+    let len = lists.first().map(Vec::len).unwrap_or(0);
+    if lists.iter().any(|list| list.len() != len) {
+        return Err(EvalError::InvalidArgument {
+            message: "map: all lists must have the same length".into(),
+        }
+        .with_offset(call_pos.offset));
+    }
+
+    let mut results = Vec::with_capacity(len);
+    for index in 0..len {
+        let row = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        results.push(apply_value_with_values(
+            procedure.clone(),
+            row,
+            env,
+            procedure_expr.pos,
+        )?);
+    }
+
+    Ok(Value::List(results))
 }
 
 fn eval_display(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
@@ -1722,6 +2210,115 @@ fn eval_string_ref(
     Ok(Value::Char(chars[index]))
 }
 
+fn eval_char_predicate(
+    arguments: &[Expr],
+    env: &EnvRef,
+    name: &str,
+    call_pos: SourcePos,
+    predicate: impl Fn(char) -> bool,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::Boolean(predicate(eval_char(expr, env)?)))
+}
+
+fn eval_char_transform(
+    arguments: &[Expr],
+    env: &EnvRef,
+    name: &str,
+    call_pos: SourcePos,
+    transform: impl Fn(char) -> char,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::Char(transform(eval_char(expr, env)?)))
+}
+
+fn eval_char_compare(
+    name: &str,
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+    predicate: impl Fn(char, char) -> bool,
+) -> Result<Value, EvalError> {
+    let chars = arguments
+        .iter()
+        .map(|argument| eval_char(argument, env))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if chars.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "at least 2".into(),
+            got: chars.len(),
+        }
+        .with_offset(call_pos.offset));
+    }
+
+    Ok(Value::Boolean(chars.windows(2).all(|pair| predicate(pair[0], pair[1]))))
+}
+
+fn eval_string_compare(
+    name: &str,
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+    predicate: impl Fn(&str, &str) -> bool,
+) -> Result<Value, EvalError> {
+    let strings = arguments
+        .iter()
+        .map(|argument| eval_string(argument, env))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if strings.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "at least 2".into(),
+            got: strings.len(),
+        }
+        .with_offset(call_pos.offset));
+    }
+
+    Ok(Value::Boolean(
+        strings.windows(2).all(|pair| predicate(&pair[0], &pair[1])),
+    ))
+}
+
+fn eval_string_transform(
+    arguments: &[Expr],
+    env: &EnvRef,
+    name: &str,
+    call_pos: SourcePos,
+    transform: impl Fn(String) -> String,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::String(SchemeString::immutable(transform(eval_string(
+        expr, env,
+    )?))))
+}
+
 fn eval_type_predicate(
     arguments: &[Expr],
     env: &EnvRef,
@@ -1775,6 +2372,30 @@ fn eval_number_args(arguments: &[Expr], env: &EnvRef) -> Result<Vec<i64>, EvalEr
         .iter()
         .map(|argument| eval_number(argument, env))
         .collect()
+}
+
+fn eval_division_operands(
+    name: &str,
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<(i64, i64), EvalError> {
+    let [dividend_expr, divisor_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let dividend = eval_number(dividend_expr, env)?;
+    let divisor = eval_number(divisor_expr, env)?;
+    if divisor == 0 {
+        return Err(EvalError::DivisionByZero.with_offset(divisor_expr.pos.offset));
+    }
+
+    Ok((dividend, divisor))
 }
 
 fn eval_number(expr: &Expr, env: &EnvRef) -> Result<i64, EvalError> {
@@ -1838,6 +2459,53 @@ fn eval_index(expr: &Expr, env: &EnvRef) -> Result<usize, EvalError> {
         Err(EvalError::NegativeIndex { index }.with_offset(expr.pos.offset))
     } else {
         Ok(index as usize)
+    }
+}
+
+fn eval_list_items(expr: &Expr, env: &EnvRef) -> Result<Vec<Value>, EvalError> {
+    match eval_expr(expr, env)? {
+        Value::List(items) => Ok(items),
+        other => Err(EvalError::TypeMismatch {
+            expected: "list".into(),
+            found: other.kind().into(),
+        }
+        .with_offset(expr.pos.offset)),
+    }
+}
+
+fn is_pair(value: &Value) -> bool {
+    matches!(value, Value::List(items) if !items.is_empty()) || matches!(value, Value::Pair(_, _))
+}
+
+fn pair_head(value: &Value) -> Option<&Value> {
+    match value {
+        Value::List(items) if !items.is_empty() => Some(&items[0]),
+        Value::Pair(head, _) => Some(head.as_ref()),
+        _ => None,
+    }
+}
+
+fn value_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left.as_string() == right.as_string(),
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::List(left), Value::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left_item, right_item)| value_equal(left_item, right_item))
+        }
+        (Value::Pair(left_head, left_tail), Value::Pair(right_head, right_tail)) => {
+            value_equal(left_head, right_head) && value_equal(left_tail, right_tail)
+        }
+        (Value::Builtin(left), Value::Builtin(right)) => left.name() == right.name(),
+        (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        _ => false,
     }
 }
 
