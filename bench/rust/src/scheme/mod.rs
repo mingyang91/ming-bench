@@ -14,6 +14,7 @@ static NEXT_CONTINUATION_JUMP_ID: AtomicUsize = AtomicUsize::new(0);
 std::thread_local! {
     static CONTINUATION_JUMPS: RefCell<HashMap<usize, PendingContinuationJump>> =
         RefCell::new(HashMap::new());
+    static DYNAMIC_WIND_STACK: RefCell<Vec<WindFrameRef>> = RefCell::new(Vec::new());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -321,14 +322,24 @@ type ContinuationFn = dyn Fn(Value) -> Result<Value, EvalError>;
 type ContinuationRef = Rc<ContinuationFn>;
 type ValuesContinuationFn = dyn Fn(Vec<Value>) -> Result<Value, EvalError>;
 type ValuesContinuationRef = Rc<ValuesContinuationFn>;
+type WindFrameRef = Rc<DynamicWindFrame>;
+
+#[derive(Clone)]
+struct DynamicWindFrame {
+    before: Value,
+    after: Value,
+    env: EnvRef,
+    call_pos: SourcePos,
+}
 
 #[derive(Clone)]
 struct SchemeContinuation {
     inner: ContinuationRef,
+    wind_stack: Rc<[WindFrameRef]>,
 }
 
 struct PendingContinuationJump {
-    continuation: ContinuationRef,
+    continuation: SchemeContinuation,
     value: Value,
 }
 
@@ -423,7 +434,10 @@ fn render_value(value: &Value, mode: RenderMode, active_pairs: &mut HashSet<usiz
 
 impl SchemeContinuation {
     fn new(inner: ContinuationRef) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            wind_stack: rc_wind_frames(current_dynamic_wind_stack()),
+        }
     }
 
     fn invoke(&self, value: Value) -> Result<Value, EvalError> {
@@ -995,6 +1009,7 @@ enum Builtin {
     InexactToExact,
     Numerator,
     Denominator,
+    DynamicWind,
     CallCc,
     Apply,
 }
@@ -1109,6 +1124,7 @@ impl Builtin {
             Self::InexactToExact => "inexact->exact",
             Self::Numerator => "numerator",
             Self::Denominator => "denominator",
+            Self::DynamicWind => "dynamic-wind",
             Self::CallCc => "call/cc",
             Self::Apply => "apply",
         }
@@ -1257,6 +1273,7 @@ impl Env {
             ("inexact->exact", Builtin::InexactToExact),
             ("numerator", Builtin::Numerator),
             ("denominator", Builtin::Denominator),
+            ("dynamic-wind", Builtin::DynamicWind),
             ("call/cc", Builtin::CallCc),
             ("call-with-current-continuation", Builtin::CallCc),
             ("apply", Builtin::Apply),
@@ -1586,7 +1603,10 @@ fn requires_cps_evaluator(expressions: &[Expr]) -> bool {
 fn expr_mentions_continuations(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Symbol(name) => {
-            matches!(name.as_str(), "call/cc" | "call-with-current-continuation")
+            matches!(
+                name.as_str(),
+                "call/cc" | "call-with-current-continuation" | "dynamic-wind"
+            )
         }
         ExprKind::List(items) => items.iter().any(expr_mentions_continuations),
         _ => false,
@@ -1597,7 +1617,133 @@ fn identity_continuation() -> ContinuationRef {
     Rc::new(|value| Ok(value))
 }
 
-fn queue_continuation_jump(continuation: ContinuationRef, value: Value) -> EvalError {
+fn current_dynamic_wind_stack() -> Vec<WindFrameRef> {
+    DYNAMIC_WIND_STACK.with(|stack| stack.borrow().clone())
+}
+
+fn replace_dynamic_wind_stack(stack: Vec<WindFrameRef>) -> Vec<WindFrameRef> {
+    DYNAMIC_WIND_STACK.with(|current| std::mem::replace(&mut *current.borrow_mut(), stack))
+}
+
+fn push_dynamic_wind_frame(frame: WindFrameRef) {
+    DYNAMIC_WIND_STACK.with(|stack| stack.borrow_mut().push(frame));
+}
+
+fn pop_dynamic_wind_frame(frame: &WindFrameRef) {
+    DYNAMIC_WIND_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        debug_assert!(stack.last().is_some_and(|last| Rc::ptr_eq(last, frame)));
+        if stack.last().is_some_and(|last| Rc::ptr_eq(last, frame)) {
+            stack.pop();
+        }
+    });
+}
+
+fn shared_dynamic_wind_prefix_len(current: &[WindFrameRef], target: &[WindFrameRef]) -> usize {
+    let mut index = 0;
+    while index < current.len()
+        && index < target.len()
+        && Rc::ptr_eq(&current[index], &target[index])
+    {
+        index += 1;
+    }
+    index
+}
+
+fn apply_thunk_cps(
+    procedure: Value,
+    env: EnvRef,
+    call_pos: SourcePos,
+    k: ContinuationRef,
+) -> Result<Value, EvalError> {
+    apply_value_cps(procedure, Vec::new(), env, call_pos, k)
+}
+
+fn rewind_dynamic_wind_cps(
+    incoming: Vec<WindFrameRef>,
+    active_stack: Vec<WindFrameRef>,
+    continuation: SchemeContinuation,
+    value: Value,
+) -> Result<Value, EvalError> {
+    let Some((frame, rest)) = incoming.split_first() else {
+        replace_dynamic_wind_stack(active_stack);
+        return continuation.invoke(value);
+    };
+
+    let frame = frame.clone();
+    let rest = rest.to_vec();
+    let mut next_active_stack = active_stack.clone();
+    next_active_stack.push(frame.clone());
+    let next_continuation = continuation.clone();
+
+    apply_thunk_cps(
+        frame.before.clone(),
+        frame.env.clone(),
+        frame.call_pos,
+        Rc::new(move |_| {
+            replace_dynamic_wind_stack(next_active_stack.clone());
+            rewind_dynamic_wind_cps(
+                rest.clone(),
+                next_active_stack.clone(),
+                next_continuation.clone(),
+                value.clone(),
+            )
+        }),
+    )
+}
+
+fn unwind_dynamic_wind_cps(
+    outgoing: Vec<WindFrameRef>,
+    active_stack: Vec<WindFrameRef>,
+    incoming: Vec<WindFrameRef>,
+    continuation: SchemeContinuation,
+    value: Value,
+) -> Result<Value, EvalError> {
+    let Some((frame, rest)) = outgoing.split_first() else {
+        return rewind_dynamic_wind_cps(incoming, active_stack, continuation, value);
+    };
+
+    let frame = frame.clone();
+    let rest = rest.to_vec();
+    let next_incoming = incoming.clone();
+    let next_continuation = continuation.clone();
+
+    apply_thunk_cps(
+        frame.after.clone(),
+        frame.env.clone(),
+        frame.call_pos,
+        Rc::new(move |_| {
+            unwind_dynamic_wind_cps(
+                rest.clone(),
+                active_stack.clone(),
+                next_incoming.clone(),
+                next_continuation.clone(),
+                value.clone(),
+            )
+        }),
+    )
+}
+
+fn resume_continuation_jump(
+    continuation: SchemeContinuation,
+    value: Value,
+) -> Result<Value, EvalError> {
+    let current_stack = current_dynamic_wind_stack();
+    let shared_prefix =
+        shared_dynamic_wind_prefix_len(&current_stack, continuation.wind_stack.as_ref());
+    let active_stack = current_stack[..shared_prefix].to_vec();
+    let outgoing = current_stack[shared_prefix..]
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    let incoming = continuation.wind_stack[shared_prefix..].to_vec();
+
+    replace_dynamic_wind_stack(active_stack.clone());
+    unwind_dynamic_wind_cps(outgoing, active_stack, incoming, continuation, value)
+}
+
+fn queue_continuation_jump(continuation: SchemeContinuation, value: Value) -> EvalError {
     let id = NEXT_CONTINUATION_JUMP_ID.fetch_add(1, Ordering::Relaxed);
     CONTINUATION_JUMPS.with(|jumps| {
         jumps.borrow_mut().insert(
@@ -1619,6 +1765,10 @@ fn rc_exprs(expressions: Vec<Expr>) -> Rc<[Expr]> {
     Rc::from(expressions.into_boxed_slice())
 }
 
+fn rc_wind_frames(frames: Vec<WindFrameRef>) -> Rc<[WindFrameRef]> {
+    Rc::from(frames.into_boxed_slice())
+}
+
 fn rc_bindings(bindings: Vec<(String, Expr)>) -> Rc<[(String, Expr)]> {
     Rc::from(bindings.into_boxed_slice())
 }
@@ -1633,27 +1783,32 @@ fn rc_value_lists(lists: Vec<Vec<Value>>) -> Rc<[Vec<Value>]> {
 
 fn eval_program_cps(expressions: &[Expr], output: Rc<RefCell<String>>) -> Result<Value, EvalError> {
     let env = Env::new(output);
-    let mut result = eval_sequence_cps(
-        rc_exprs(expressions.to_vec()),
-        0,
-        env,
-        identity_continuation(),
-    );
+    let saved_stack = replace_dynamic_wind_stack(Vec::new());
+    let result = {
+        let mut result = eval_sequence_cps(
+            rc_exprs(expressions.to_vec()),
+            0,
+            env,
+            identity_continuation(),
+        );
 
-    loop {
-        match result {
-            Ok(value) => return Ok(value),
-            Err(EvalError::InternalContinuationJump { id }) => {
-                let PendingContinuationJump {
-                    continuation,
-                    value,
-                } = take_continuation_jump(id)
-                    .expect("continuation jump payload should be available");
-                result = continuation(value);
+        loop {
+            match result {
+                Ok(value) => break Ok(value),
+                Err(EvalError::InternalContinuationJump { id }) => {
+                    let PendingContinuationJump {
+                        continuation,
+                        value,
+                    } = take_continuation_jump(id)
+                        .expect("continuation jump payload should be available");
+                    result = resume_continuation_jump(continuation, value);
+                }
+                Err(error) => break Err(error),
             }
-            Err(error) => return Err(error),
         }
-    }
+    };
+    replace_dynamic_wind_stack(saved_stack);
+    result
 }
 
 fn eval_sequence_cps(
@@ -2748,6 +2903,9 @@ fn apply_value_cps(
     k: ContinuationRef,
 ) -> Result<Value, EvalError> {
     match value {
+        Value::Builtin(Builtin::DynamicWind) => {
+            eval_dynamic_wind_cps(argument_values, env, call_pos, k)
+        }
         Value::Builtin(Builtin::CallCc) => eval_call_cc_cps(argument_values, env, call_pos, k),
         Value::Builtin(Builtin::Apply) => eval_apply_builtin_cps(argument_values, env, call_pos, k),
         Value::Builtin(Builtin::Map) => eval_map_cps(argument_values, env, call_pos, k),
@@ -2782,16 +2940,68 @@ fn apply_value_cps(
                 }
                 .with_offset(call_pos.offset));
             };
-            Err(queue_continuation_jump(
-                continuation.inner.clone(),
-                value.clone(),
-            ))
+            Err(queue_continuation_jump(continuation, value.clone()))
         }
         other => Err(EvalError::NotAProcedure {
             found: other.kind().into(),
         }
         .with_offset(call_pos.offset)),
     }
+}
+
+fn eval_dynamic_wind_cps(
+    argument_values: Vec<Value>,
+    env: EnvRef,
+    call_pos: SourcePos,
+    k: ContinuationRef,
+) -> Result<Value, EvalError> {
+    let [before, body, after] = argument_values.as_slice() else {
+        return Err(EvalError::WrongArgCount {
+            name: "dynamic-wind".into(),
+            expected: "exactly 3".into(),
+            got: argument_values.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let frame = Rc::new(DynamicWindFrame {
+        before: before.clone(),
+        after: after.clone(),
+        env: env.clone(),
+        call_pos,
+    });
+
+    let enter_frame = frame.clone();
+    let body_procedure = body.clone();
+    let body_env = env.clone();
+    let body_k = k.clone();
+    apply_thunk_cps(
+        before.clone(),
+        env,
+        call_pos,
+        Rc::new(move |_| {
+            push_dynamic_wind_frame(enter_frame.clone());
+            let exit_frame = enter_frame.clone();
+            let complete_k = body_k.clone();
+            apply_thunk_cps(
+                body_procedure.clone(),
+                body_env.clone(),
+                call_pos,
+                Rc::new(move |body_value| {
+                    pop_dynamic_wind_frame(&exit_frame);
+                    let after_value = exit_frame.after.clone();
+                    let after_env = exit_frame.env.clone();
+                    let final_k = complete_k.clone();
+                    apply_thunk_cps(
+                        after_value,
+                        after_env,
+                        exit_frame.call_pos,
+                        Rc::new(move |_| final_k.clone()(body_value.clone())),
+                    )
+                }),
+            )
+        }),
+    )
 }
 
 fn eval_call_cc_cps(
@@ -3036,7 +3246,7 @@ fn eval_builtin_from_values(
 ) -> Result<Value, EvalError> {
     debug_assert!(!matches!(
         builtin,
-        Builtin::CallCc | Builtin::Apply | Builtin::Map | Builtin::ForEach
+        Builtin::DynamicWind | Builtin::CallCc | Builtin::Apply | Builtin::Map | Builtin::ForEach
     ));
 
     let apply_env = Env::child(env);
@@ -3374,10 +3584,7 @@ fn eval_tail_application<'a>(
                 .with_offset(call_pos.offset));
             };
 
-            Err(queue_continuation_jump(
-                continuation.inner.clone(),
-                value.clone(),
-            ))
+            Err(queue_continuation_jump(continuation, value.clone()))
         }
         other => Err(EvalError::NotAProcedure {
             found: other.kind().into(),
@@ -3704,10 +3911,7 @@ fn apply_value(
                 .with_offset(call_pos.offset));
             };
 
-            Err(queue_continuation_jump(
-                continuation.inner.clone(),
-                value.clone(),
-            ))
+            Err(queue_continuation_jump(continuation, value.clone()))
         }
         other => Err(EvalError::NotAProcedure {
             found: other.kind().into(),
@@ -4032,6 +4236,10 @@ fn eval_builtin(
         Builtin::InexactToExact => eval_inexact_to_exact(arguments, env, call_pos),
         Builtin::Numerator => eval_numerator(arguments, env, call_pos),
         Builtin::Denominator => eval_denominator(arguments, env, call_pos),
+        Builtin::DynamicWind => Err(EvalError::InvalidArgument {
+            message: "dynamic-wind requires continuation-aware evaluation".into(),
+        }
+        .with_offset(call_pos.offset)),
         Builtin::CallCc => Err(EvalError::InvalidArgument {
             message: "call/cc requires continuation-aware evaluation".into(),
         }
