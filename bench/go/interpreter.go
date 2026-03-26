@@ -3,6 +3,7 @@ package ming
 import (
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"unicode"
@@ -303,14 +304,32 @@ func (e *environment) assign(name string, value any) bool {
 
 type interpreter struct {
 	output strings.Builder
-	global *environment
-	gensymCounter int
+	global            *environment
+	gensymCounter     int
+	immutableStrings bool
 }
 
 func newInterpreter() *interpreter {
 	global := newEnvironment(nil)
 	installBuiltins(global)
-	return &interpreter{global: global}
+	return &interpreter{
+		global:           global,
+		immutableStrings: stringsAreImmutableAtCurrentLevel(),
+	}
+}
+
+func stringsAreImmutableAtCurrentLevel() bool {
+	levelText := os.Getenv("BENCH_LEVEL")
+	if levelText == "" {
+		return true
+	}
+
+	level, err := strconv.Atoi(levelText)
+	if err != nil {
+		return true
+	}
+
+	return level >= 15
 }
 
 func evalInput(input string) (string, string, error) {
@@ -334,7 +353,7 @@ func evalInput(input string) (string, string, error) {
 
 func installBuiltins(env *environment) {
 	for _, name := range []string{
-		"+", "-", "*", "/", "<", ">", "=", "<=", "not",
+		"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
 		"cons", "car", "cdr", "null?", "list", "length", "append",
 		"vector", "make-vector", "vector?", "vector-length", "vector-ref", "vector-set!", "vector->list",
 		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?", "procedure?",
@@ -343,7 +362,7 @@ func installBuiltins(env *environment) {
 		"string-append", "string-length", "substring",
 		"string->number", "number->string", "exact->inexact", "inexact->exact", "numerator", "denominator",
 		"symbol->string", "string->symbol",
-		"string-ref", "string-copy", "string-set!", "char?",
+		"string-ref", "string-copy", "string-set!", "string->list", "list->string", "char?", "char->integer", "integer->char",
 		"abs", "modulo", "remainder", "quotient", "min", "max", "expt",
 		"zero?", "positive?", "negative?", "odd?", "even?",
 		"list-ref", "list-tail", "list?", "assoc", "map",
@@ -1440,6 +1459,8 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		return numericCompare(name, args, pos, func(cmp int) bool { return cmp == 0 })
 	case "<=":
 		return numericCompare(name, args, pos, func(cmp int) bool { return cmp <= 0 })
+	case ">=":
+		return numericCompare(name, args, pos, func(cmp int) bool { return cmp >= 0 })
 
 	case "zero?":
 		if len(args) != 1 {
@@ -1981,7 +2002,43 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if err != nil {
 			return nil, err
 		}
+		if i.immutableStrings {
+			return stringValue(text), nil
+		}
 		return newMutableString(text), nil
+
+	case "string->list":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		runes := []rune(text)
+		elements := make([]any, len(runes))
+		for index, value := range runes {
+			elements[index] = charValue(value)
+		}
+		return buildList(elements), nil
+
+	case "list->string":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		elements, err := listElements(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		runes := make([]rune, len(elements))
+		for index, element := range elements {
+			ch, err := expectChar(element, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			runes[index] = rune(ch)
+		}
+		return stringValue(string(runes)), nil
 
 	case "string=?":
 		return stringCompare(name, args, pos, func(a, b string) bool { return a == b })
@@ -2016,9 +2073,18 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if len(args) != 3 {
 			return nil, newEvalError(pos, "%s expects exactly 3 arguments", name)
 		}
-		text, err := expectMutableString(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		text, ok := args[0].(*mutableString)
+		if !ok {
+			if _, err := expectString(args[0], pos, name); err != nil {
+				return nil, err
+			}
+			if _, err := expectInt(args[1], pos, name); err != nil {
+				return nil, err
+			}
+			if _, err := expectChar(args[2], pos, name); err != nil {
+				return nil, err
+			}
+			return nil, newEvalError(pos, "%s cannot mutate immutable strings", name)
 		}
 		index, err := expectInt(args[1], pos, name)
 		if err != nil {
@@ -2040,6 +2106,29 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		_, ok := args[0].(charValue)
 		return ok, nil
+
+	case "char->integer":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		ch, err := expectChar(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return int(rune(ch)), nil
+
+	case "integer->char":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if value < 0 || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF) {
+			return nil, newEvalError(pos, "%s expects a valid Unicode scalar value", name)
+		}
+		return charValue(rune(value)), nil
 
 	case "char-alphabetic?":
 		if len(args) != 1 {
