@@ -64,7 +64,8 @@ type Kont =
   | { tag: 'cwv'; consumer: SchemeVal; pos?: Pos; k: Kont }
   | { tag: 'syntax-case-eval'; literals: string[]; clauses: SchemeVal[]; env: Env; pos?: Pos; k: Kont }
   | { tag: 'syntax-pop'; k: Kont }
-  | { tag: 'with-syntax-bind'; pats: SchemeVal[]; doneVals: SchemeVal[]; todoExprs: SchemeVal[]; body: SchemeVal[]; env: Env; k: Kont };
+  | { tag: 'with-syntax-bind'; pats: SchemeVal[]; doneVals: SchemeVal[]; todoExprs: SchemeVal[]; body: SchemeVal[]; env: Env; k: Kont }
+  | { tag: 'cond-arrow'; testVal: SchemeVal; k: Kont };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}: ` : '';
@@ -272,11 +273,30 @@ function parse(tokens: Token[]): SchemeVal[] {
     }
     if (tok.text === '(') {
       const elems: SchemeVal[] = [];
+      let isDotted = false;
+      let cdrVal: SchemeVal | undefined;
       while (idx < tokens.length && tokens[idx].text !== ')') {
+        if (tokens[idx].text === '.' && elems.length > 0 && idx + 1 < tokens.length && tokens[idx + 1].text !== ')') {
+          // Dot is a dotted-pair separator (exactly one char, not "..." or ".symbol")
+          {
+            idx++; // skip the dot
+            cdrVal = parseExpr();
+            isDotted = true;
+            break;
+          }
+        }
         elems.push(parseExpr());
       }
       if (idx >= tokens.length) throw new EvalError(`${tok.pos.line}:${tok.pos.col}: missing closing paren`);
       idx++;
+      if (isDotted) {
+        // Build improper list: (a b . c) => pair(a, pair(b, c))
+        let result: SchemeVal = cdrVal!;
+        for (let i = elems.length - 1; i >= 0; i--) {
+          result = { tag: 'pair', car: elems[i], cdr: result, pos: tok.pos };
+        }
+        return result;
+      }
       return { tag: 'list', value: elems, pos: tok.pos };
     }
     if (tok.text === ')') throw new EvalError(`${tok.pos.line}:${tok.pos.col}: unexpected )`);
@@ -320,6 +340,18 @@ function parseParams(paramList: SchemeVal, pos?: Pos): { params: string[]; rest?
   if (paramList.tag === 'symbol') {
     // (lambda args body) — single rest param
     return { params: [], rest: paramList.value };
+  }
+  if (paramList.tag === 'pair') {
+    // Dotted pair from parser: (a b . rest)
+    const params: string[] = [];
+    let cur: SchemeVal = paramList;
+    while (cur.tag === 'pair') {
+      if (cur.car.tag !== 'symbol') throw new EvalError(`${posStr(pos)}parameter must be a symbol`);
+      params.push(cur.car.value);
+      cur = cur.cdr;
+    }
+    if (cur.tag !== 'symbol') throw new EvalError(`${posStr(pos)}invalid dot syntax in parameters`);
+    return { params, rest: cur.value };
   }
   if (paramList.tag !== 'list') throw new EvalError(`${posStr(pos)}parameters must be a list`);
   const items = paramList.value;
@@ -1111,6 +1143,24 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       }
       return { tag: 'boolean', value: false };
     }
+    case 'memq': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}memq: need 2 arguments`);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        if (schemeEq(args[0], cur.car)) return cur;
+        cur = cur.cdr;
+      }
+      return { tag: 'boolean', value: false };
+    }
+    case 'memv': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}memv: need 2 arguments`);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        if (schemeEq(args[0], cur.car)) return cur;
+        cur = cur.cdr;
+      }
+      return { tag: 'boolean', value: false };
+    }
     case 'reverse': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}reverse: need 1 argument`);
       const items = schemeListToArray(args[0]);
@@ -1440,6 +1490,7 @@ const BUILTIN_NAMES = new Set([
   'values', 'call-with-values',
   // L22
   'syntax->datum', 'datum->syntax',
+  'memq', 'memv',
 ]);
 
 function bindLambdaArgs(proc: { params: string[]; rest?: string; body: SchemeVal[] }, args: SchemeVal[], procEnv: Env, callPos?: Pos): Env {
@@ -1575,7 +1626,9 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
       throw new EvalError(`${posStr(pos)}case-lambda: no matching clause for ${args.length} arguments`);
     }
     if (proc.tag === 'continuation') {
-      const targetVal: SchemeVal = args.length > 0 ? args[0] : { tag: 'void' };
+      const targetVal: SchemeVal = args.length === 0 ? { tag: 'void' }
+        : args.length === 1 ? args[0]
+        : { tag: 'values', vals: args };
       const targetWinders = proc.winders;
       const targetK = proc.k;
 
@@ -1768,6 +1821,15 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
             if (clause.tag === 'list' && clause.value.length === 1) {
               k = k.k; break;
             }
+            if (clause.tag === 'list' && clause.value.length === 3 &&
+                clause.value[1].tag === 'symbol' && clause.value[1].value === '=>') {
+              // (test => proc) — evaluate proc, then apply it to test result
+              const testVal = val;
+              const condEnv = k.env;
+              k = { tag: 'cond-arrow', testVal, k: k.k };
+              expr = clause.value[2]; env = condEnv;
+              isEval = true; break;
+            }
             if (clause.tag === 'list') {
               evalBody(clause.value.slice(1), k.env, k.k);
             } else {
@@ -1787,6 +1849,12 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
           expr = nextTest; env = k.env;
           k = { tag: 'cond', cl: k.cl, ci: nextCi, env: k.env, k: k.k };
           isEval = true; break;
+        }
+
+        case 'cond-arrow': {
+          // val is the proc, k.testVal is the test result
+          doApply(val, [k.testVal], undefined, k.k);
+          break;
         }
 
         case 'do-init': {
@@ -2064,6 +2132,13 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
             const name = target.value[0].value;
             const paramList: SchemeVal = { tag: 'list', value: target.value.slice(1) };
             const { params, rest } = parseParams(paramList, expr.pos);
+            const body = elems.slice(2);
+            env.set(name, { tag: 'lambda', params, rest, body, env });
+            val = { tag: 'void' }; isEval = false; continue;
+          }
+          if (target.tag === 'pair' && target.car.tag === 'symbol') {
+            const name = target.car.value;
+            const { params, rest } = parseParams(target.cdr, expr.pos);
             const body = elems.slice(2);
             env.set(name, { tag: 'lambda', params, rest, body, env });
             val = { tag: 'void' }; isEval = false; continue;
