@@ -2,18 +2,78 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
+
+// ── Environment ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct EnvInner {
+    bindings: HashMap<String, Value>,
+    parent: Option<Env>,
+}
+
+#[derive(Debug, Clone)]
+struct Env(Rc<RefCell<EnvInner>>);
+
+impl Env {
+    fn new() -> Self {
+        Env(Rc::new(RefCell::new(EnvInner {
+            bindings: HashMap::new(),
+            parent: None,
+        })))
+    }
+
+    fn with_parent(parent: &Env) -> Self {
+        Env(Rc::new(RefCell::new(EnvInner {
+            bindings: HashMap::new(),
+            parent: Some(parent.clone()),
+        })))
+    }
+
+    fn get(&self, name: &str) -> Option<Value> {
+        let inner = self.0.borrow();
+        if let Some(v) = inner.bindings.get(name) {
+            Some(v.clone())
+        } else if let Some(ref parent) = inner.parent {
+            parent.get(name)
+        } else {
+            None
+        }
+    }
+
+    fn set(&self, name: String, val: Value) {
+        self.0.borrow_mut().bindings.insert(name, val);
+    }
+}
 
 // ── Values ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
     Str(String),
     Symbol(String),
     List(Vec<Value>),
+    Lambda(Vec<String>, Vec<Expr>, Env),
     Void,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Void, Value::Void) => true,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Value {
@@ -32,6 +92,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Lambda(..) => write!(f, "#<procedure>"),
             Value::Void => Ok(()),
         }
     }
@@ -187,12 +248,24 @@ fn parse_all(tokens: &[Token]) -> Result<Vec<Expr>, EvalError> {
 
 // ── Evaluator ───────────────────────────────────────────────────────
 
-fn eval(expr: &Expr) -> Result<Value, EvalError> {
+fn expr_to_value(expr: &Expr) -> Value {
+    match expr {
+        Expr::Integer(n) => Value::Integer(*n),
+        Expr::Boolean(b) => Value::Boolean(*b),
+        Expr::Str(s) => Value::Str(s.clone()),
+        Expr::Symbol(s) => Value::Symbol(s.clone()),
+        Expr::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
+    }
+}
+
+fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     match expr {
         Expr::Integer(n) => Ok(Value::Integer(*n)),
         Expr::Boolean(b) => Ok(Value::Boolean(*b)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Symbol(s) => Err(EvalError::UnboundVariable(s.clone())),
+        Expr::Symbol(s) => {
+            env.get(s).ok_or_else(|| EvalError::UnboundVariable(s.clone()))
+        }
         Expr::List(items) => {
             if items.is_empty() {
                 return Err(EvalError::Parse("empty application".into()));
@@ -200,23 +273,128 @@ fn eval(expr: &Expr) -> Result<Value, EvalError> {
             // Check for special forms
             if let Expr::Symbol(op) = &items[0] {
                 match op.as_str() {
-                    "+" => return eval_add(&items[1..]),
-                    "-" => return eval_sub(&items[1..]),
-                    "*" => return eval_mul(&items[1..]),
-                    "/" => return eval_div(&items[1..]),
-                    "<" => return eval_cmp(&items[1..], |a, b| a < b),
-                    ">" => return eval_cmp(&items[1..], |a, b| a > b),
-                    "=" => return eval_cmp(&items[1..], |a, b| a == b),
-                    "<=" => return eval_cmp(&items[1..], |a, b| a <= b),
-                    ">=" => return eval_cmp(&items[1..], |a, b| a >= b),
-                    "not" => return eval_not(&items[1..]),
-                    "and" => return eval_and(&items[1..]),
-                    "or" => return eval_or(&items[1..]),
+                    "define" => return eval_define(&items[1..], env),
+                    "if" => return eval_if(&items[1..], env),
+                    "quote" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity("quote requires exactly 1 argument".into()));
+                        }
+                        return Ok(expr_to_value(&items[1]));
+                    }
+                    "lambda" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity("lambda requires params and body".into()));
+                        }
+                        let params = match &items[1] {
+                            Expr::List(ps) => {
+                                let mut names = Vec::new();
+                                for p in ps {
+                                    match p {
+                                        Expr::Symbol(s) => names.push(s.clone()),
+                                        _ => return Err(EvalError::Parse("lambda param must be symbol".into())),
+                                    }
+                                }
+                                names
+                            }
+                            _ => return Err(EvalError::Parse("lambda params must be a list".into())),
+                        };
+                        let body = items[2..].to_vec();
+                        return Ok(Value::Lambda(params, body, env.clone()));
+                    }
+                    "+" => return eval_add(&items[1..], env),
+                    "-" => return eval_sub(&items[1..], env),
+                    "*" => return eval_mul(&items[1..], env),
+                    "/" => return eval_div(&items[1..], env),
+                    "<" => return eval_cmp(&items[1..], env, |a, b| a < b),
+                    ">" => return eval_cmp(&items[1..], env, |a, b| a > b),
+                    "=" => return eval_cmp(&items[1..], env, |a, b| a == b),
+                    "<=" => return eval_cmp(&items[1..], env, |a, b| a <= b),
+                    ">=" => return eval_cmp(&items[1..], env, |a, b| a >= b),
+                    "not" => return eval_not(&items[1..], env),
+                    "and" => return eval_and(&items[1..], env),
+                    "or" => return eval_or(&items[1..], env),
                     _ => {}
                 }
             }
-            Err(EvalError::Generic(format!("unknown procedure: {}", items[0].symbol_name())))
+            // Function application
+            let func = eval(&items[0], env)?;
+            let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env)).collect();
+            let args = args?;
+            apply(&func, &args)
         }
+    }
+}
+
+fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+    match func {
+        Value::Lambda(params, body, closure_env) => {
+            if args.len() != params.len() {
+                return Err(EvalError::Arity(format!(
+                    "expected {} args, got {}", params.len(), args.len()
+                )));
+            }
+            let call_env = Env::with_parent(closure_env);
+            for (p, a) in params.iter().zip(args) {
+                call_env.set(p.clone(), a.clone());
+            }
+            let mut result = Value::Void;
+            for expr in body {
+                result = eval(expr, &call_env)?;
+            }
+            Ok(result)
+        }
+        other => Err(EvalError::Type(format!("not a procedure: {}", other))),
+    }
+}
+
+fn eval_define(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity("define requires at least 2 arguments".into()));
+    }
+    match &args[0] {
+        Expr::Symbol(name) => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("define requires exactly 2 arguments".into()));
+            }
+            let val = eval(&args[1], env)?;
+            env.set(name.clone(), val);
+            Ok(Value::Void)
+        }
+        Expr::List(parts) => {
+            // (define (f x y) body...) => (define f (lambda (x y) body...))
+            if parts.is_empty() {
+                return Err(EvalError::Parse("define: empty name list".into()));
+            }
+            let name = match &parts[0] {
+                Expr::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse("define: name must be symbol".into())),
+            };
+            let params: Vec<String> = parts[1..].iter().map(|p| {
+                match p {
+                    Expr::Symbol(s) => Ok(s.clone()),
+                    _ => Err(EvalError::Parse("define: param must be symbol".into())),
+                }
+            }).collect::<Result<_, _>>()?;
+            let body = args[1..].to_vec();
+            let lambda = Value::Lambda(params, body, env.clone());
+            env.set(name, lambda);
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::Parse("define: first argument must be symbol or list".into())),
+    }
+}
+
+fn eval_if(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(EvalError::Arity("if requires 2 or 3 arguments".into()));
+    }
+    let cond = eval(&args[0], env)?;
+    if is_truthy(&cond) {
+        eval(&args[1], env)
+    } else if args.len() == 3 {
+        eval(&args[2], env)
+    } else {
+        Ok(Value::Void)
     }
 }
 
@@ -240,42 +418,42 @@ fn is_truthy(v: &Value) -> bool {
     !matches!(v, Value::Boolean(false))
 }
 
-fn eval_add(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_add(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let mut sum = 0i64;
     for a in args {
-        sum += require_int(&eval(a)?)?;
+        sum += require_int(&eval(a, env)?)?;
     }
     Ok(Value::Integer(sum))
 }
 
-fn eval_sub(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_sub(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("- requires at least 1 argument".into()));
     }
-    let first = require_int(&eval(&args[0])?)?;
+    let first = require_int(&eval(&args[0], env)?)?;
     if args.len() == 1 {
         return Ok(Value::Integer(-first));
     }
     let mut result = first;
     for a in &args[1..] {
-        result -= require_int(&eval(a)?)?;
+        result -= require_int(&eval(a, env)?)?;
     }
     Ok(Value::Integer(result))
 }
 
-fn eval_mul(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_mul(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let mut product = 1i64;
     for a in args {
-        product *= require_int(&eval(a)?)?;
+        product *= require_int(&eval(a, env)?)?;
     }
     Ok(Value::Integer(product))
 }
 
-fn eval_div(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_div(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("/ requires at least 1 argument".into()));
     }
-    let first = require_int(&eval(&args[0])?)?;
+    let first = require_int(&eval(&args[0], env)?)?;
     if args.len() == 1 {
         if first == 0 {
             return Err(EvalError::DivisionByZero);
@@ -284,7 +462,7 @@ fn eval_div(args: &[Expr]) -> Result<Value, EvalError> {
     }
     let mut result = first;
     for a in &args[1..] {
-        let d = require_int(&eval(a)?)?;
+        let d = require_int(&eval(a, env)?)?;
         if d == 0 {
             return Err(EvalError::DivisionByZero);
         }
@@ -293,13 +471,13 @@ fn eval_div(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(Value::Integer(result))
 }
 
-fn eval_cmp(args: &[Expr], cmp: fn(i64, i64) -> bool) -> Result<Value, EvalError> {
+fn eval_cmp(args: &[Expr], env: &Env, cmp: fn(i64, i64) -> bool) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("comparison requires at least 2 arguments".into()));
     }
-    let mut prev = require_int(&eval(&args[0])?)?;
+    let mut prev = require_int(&eval(&args[0], env)?)?;
     for a in &args[1..] {
-        let curr = require_int(&eval(a)?)?;
+        let curr = require_int(&eval(a, env)?)?;
         if !cmp(prev, curr) {
             return Ok(Value::Boolean(false));
         }
@@ -308,18 +486,18 @@ fn eval_cmp(args: &[Expr], cmp: fn(i64, i64) -> bool) -> Result<Value, EvalError
     Ok(Value::Boolean(true))
 }
 
-fn eval_not(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_not(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("not requires exactly 1 argument".into()));
     }
-    let v = eval(&args[0])?;
+    let v = eval(&args[0], env)?;
     Ok(Value::Boolean(!is_truthy(&v)))
 }
 
-fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for a in args {
-        result = eval(a)?;
+        result = eval(a, env)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
@@ -327,10 +505,10 @@ fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn eval_or(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(false);
     for a in args {
-        result = eval(a)?;
+        result = eval(a, env)?;
         if is_truthy(&result) {
             return Ok(result);
         }
@@ -351,9 +529,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse("no expressions".into()));
     }
+    let env = Env::new();
     let mut last = Value::Void;
     for expr in &exprs {
-        last = eval(expr)?;
+        last = eval(expr, &env)?;
     }
     Ok(last.to_string())
 }
