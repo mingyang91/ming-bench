@@ -43,7 +43,7 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     static Object eval(Object expr, Env env) throws EvalError {
-        if (expr instanceof Long || expr instanceof Boolean) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof Character) {
             return expr;
         }
         if (expr instanceof String s) {

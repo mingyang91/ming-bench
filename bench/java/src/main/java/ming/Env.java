@@ -148,7 +148,7 @@ class Env {
         }));
         env.define("string?", Builtin.named("string?", args -> {
             requireArgCount("string?", args, 1);
-            return args.get(0) instanceof String s && s.startsWith("\"");
+            return (args.get(0) instanceof String s && s.startsWith("\"")) || args.get(0) instanceof MutableString;
         }));
         env.define("pair?", Builtin.named("pair?", args -> {
             requireArgCount("pair?", args, 1);
@@ -231,6 +231,23 @@ class Env {
             requireArgCount("char?", args, 1);
             return args.get(0) instanceof Character;
         }));
+        env.define("string-copy", Builtin.named("string-copy", args -> {
+            requireArgCount("string-copy", args, 1);
+            String s = requireString("string-copy", args.get(0));
+            return new MutableString(s.toCharArray());
+        }));
+        env.define("string-set!", Builtin.named("string-set!", args -> {
+            requireArgCount("string-set!", args, 3);
+            Object target = args.get(0);
+            if (!(target instanceof MutableString ms))
+                throw new EvalError("string-set!: expected mutable string");
+            int idx = (int) requireLong("string-set!", args.get(1));
+            Object chObj = args.get(2);
+            if (!(chObj instanceof Character ch))
+                throw new EvalError("string-set!: expected character, got: " + SchemeValue.toStr(chObj));
+            ms.chars[idx] = ch;
+            return null; // void
+        }));
 
         return env;
     }
@@ -239,6 +256,9 @@ class Env {
         if (val instanceof String s && s.startsWith("\"") && s.endsWith("\"")) {
             return s.substring(1, s.length() - 1);
         }
+        if (val instanceof MutableString ms) {
+            return ms.inner();
+        }
         throw new EvalError(name + ": expected string, got: " + SchemeValue.toStr(val));
     }
 
@@ -246,6 +266,9 @@ class Env {
         if (val == null) return "";
         if (val instanceof String s && s.startsWith("\"") && s.endsWith("\"")) {
             return s.substring(1, s.length() - 1);
+        }
+        if (val instanceof MutableString ms) {
+            return ms.inner();
         }
         return SchemeValue.toStr(val);
     }

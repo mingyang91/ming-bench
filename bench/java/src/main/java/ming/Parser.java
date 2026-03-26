@@ -123,6 +123,26 @@ class Parser {
         char c = input.charAt(pos);
         if (c == 't') { advance(); return Boolean.TRUE; }
         if (c == 'f') { advance(); return Boolean.FALSE; }
+        if (c == '\\') {
+            advance(); // skip '\'
+            if (pos >= input.length()) throw new EvalError("unexpected end after #\\");
+            // Check for named characters
+            int start = pos;
+            if (Character.isLetter(input.charAt(pos))) {
+                while (pos < input.length() && Character.isLetter(input.charAt(pos))) advance();
+                String name = input.substring(start, pos);
+                if (name.length() == 1) return name.charAt(0);
+                return switch (name) {
+                    case "space" -> ' ';
+                    case "newline" -> '\n';
+                    case "tab" -> '\t';
+                    default -> throw new EvalError("unknown character name: " + name);
+                };
+            }
+            char ch = input.charAt(pos);
+            advance();
+            return ch;
+        }
         throw new EvalError("unknown # literal: #" + c);
     }
 
