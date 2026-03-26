@@ -3,6 +3,7 @@ package ming
 import scala.annotation.tailrec
 
 import SchemeModel.*
+import SchemeNumbers.*
 
 private[ming] object SchemeRuntime:
 
@@ -20,7 +21,8 @@ private[ming] object SchemeRuntime:
 
   def render(value: Value): String =
     value match
-      case Value.IntegerValue(number) => number.toString
+      case number @ (Value.IntegerValue(_) | Value.RationalValue(_, _) | Value.InexactValue(_)) =>
+        SchemeNumbers.render(number)
       case Value.BooleanValue(flag)   => if flag then "#t" else "#f"
       case Value.StringValue(text)    => s""""${escapeString(text.text)}""""
       case Value.CharValue(codePoint) => renderChar(codePoint)

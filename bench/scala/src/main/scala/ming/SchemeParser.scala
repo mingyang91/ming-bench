@@ -4,6 +4,7 @@ import java.util.Arrays
 import scala.collection.mutable.ListBuffer
 
 import SchemeModel.*
+import SchemeNumbers.*
 
 private[ming] object SchemeParser:
 
@@ -124,8 +125,7 @@ private[ming] object SchemeParser:
       while !isAtEnd && !isDelimiter(input.charAt(index)) do index += 1
 
       val token = input.substring(start, index)
-      if token.matches("-?\\d+") then Expr.IntegerLiteral(BigInt(token), pos)
-      else Expr.Symbol(token, pos)
+      parseNumberExpr(token, pos).getOrElse(Expr.Symbol(token, pos))
 
     private def skipTrivia(): Unit =
       var keepSkipping = true

@@ -2,6 +2,7 @@ package ming
 
 import SchemeBuiltinSupport.*
 import SchemeModel.*
+import SchemeNumbers.*
 
 private[ming] object SchemePredicateBuiltins:
 
@@ -14,9 +15,8 @@ private[ming] object SchemePredicateBuiltins:
       case Value.CharValue(_) => true
       case _                  => false
     },
-    "number?" -> predicateBuiltin("number?") {
-      case Value.IntegerValue(_) => true
-      case _                     => false
+    "number?" -> predicateBuiltin("number?") { case value =>
+      isNumber(value)
     },
     "boolean?" -> predicateBuiltin("boolean?") {
       case Value.BooleanValue(_) => true

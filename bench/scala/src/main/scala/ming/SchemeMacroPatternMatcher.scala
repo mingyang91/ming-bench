@@ -30,6 +30,17 @@ private[ming] object SchemeMacroPatternMatcher:
         input match
           case Expr.IntegerLiteral(other, _) if other == value => Some(bindings)
           case _                                               => None
+      case Expr.RationalLiteral(numerator, denominator, _) =>
+        input match
+          case Expr.RationalLiteral(otherNumerator, otherDenominator, _)
+              if otherNumerator == numerator && otherDenominator == denominator =>
+            Some(bindings)
+          case _ =>
+            None
+      case Expr.InexactLiteral(value, _) =>
+        input match
+          case Expr.InexactLiteral(other, _) if other == value => Some(bindings)
+          case _                                               => None
       case Expr.BooleanLiteral(value, _) =>
         input match
           case Expr.BooleanLiteral(other, _) if other == value => Some(bindings)
@@ -133,6 +144,9 @@ private[ming] object SchemeMacroPatternMatcher:
   private def exprEquals(left: Expr, right: Expr): Boolean =
     (left, right) match
       case (Expr.IntegerLiteral(a, _), Expr.IntegerLiteral(b, _)) => a == b
+      case (Expr.RationalLiteral(aNum, aDen, _), Expr.RationalLiteral(bNum, bDen, _)) =>
+        aNum == bNum && aDen == bDen
+      case (Expr.InexactLiteral(a, _), Expr.InexactLiteral(b, _)) => a == b
       case (Expr.BooleanLiteral(a, _), Expr.BooleanLiteral(b, _)) => a == b
       case (Expr.StringLiteral(a, _), Expr.StringLiteral(b, _))   => a == b
       case (Expr.CharLiteral(a, _), Expr.CharLiteral(b, _))       => a == b

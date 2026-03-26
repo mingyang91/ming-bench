@@ -4,6 +4,7 @@ import java.util.Locale
 
 import SchemeBuiltinSupport.*
 import SchemeModel.*
+import SchemeNumbers.*
 import SchemeRuntime.*
 
 private[ming] object SchemeTextBuiltins:
@@ -27,13 +28,13 @@ private[ming] object SchemeTextBuiltins:
         buildSubstring(text, args(1), args(2))
     ),
     "string->number" -> unaryStringBuiltin("string->number") { text =>
-      parseInteger(text)
+      parseNumber(text)
     },
     "number->string" -> Value.Builtin(
       "number->string",
       args =>
         requireArgCount("number->string", args, 1)
-        Value.StringValue(SchemeString.fromText(requireInteger("number->string", args.head).toString))
+        Value.StringValue(SchemeString.fromText(SchemeNumbers.render(requireNumber("number->string", args.head))))
     ),
     "symbol->string" -> Value.Builtin(
       "symbol->string",

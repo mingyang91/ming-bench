@@ -6,6 +6,8 @@ private[ming] object SchemeModel:
 
   enum Expr:
     case IntegerLiteral(value: BigInt, pos: SourcePos)
+    case RationalLiteral(numerator: BigInt, denominator: BigInt, pos: SourcePos)
+    case InexactLiteral(value: BigDecimal, pos: SourcePos)
     case BooleanLiteral(value: Boolean, pos: SourcePos)
     case StringLiteral(value: String, pos: SourcePos)
     case CharLiteral(value: Int, pos: SourcePos)
@@ -21,12 +23,14 @@ private[ming] object SchemeModel:
 
     def pos: SourcePos =
       expr match
-        case Expr.IntegerLiteral(_, pos) => pos
-        case Expr.BooleanLiteral(_, pos) => pos
-        case Expr.StringLiteral(_, pos)  => pos
-        case Expr.CharLiteral(_, pos)    => pos
-        case Expr.Symbol(_, pos)         => pos
-        case Expr.ListExpr(_, pos)       => pos
+        case Expr.IntegerLiteral(_, pos)     => pos
+        case Expr.RationalLiteral(_, _, pos) => pos
+        case Expr.InexactLiteral(_, pos)     => pos
+        case Expr.BooleanLiteral(_, pos)     => pos
+        case Expr.StringLiteral(_, pos)      => pos
+        case Expr.CharLiteral(_, pos)        => pos
+        case Expr.Symbol(_, pos)             => pos
+        case Expr.ListExpr(_, pos)           => pos
 
   final class SchemeString private (private val codePoints: Array[Int]):
 
@@ -61,6 +65,8 @@ private[ming] object SchemeModel:
 
   enum Value:
     case IntegerValue(value: BigInt)
+    case RationalValue(numerator: BigInt, denominator: BigInt)
+    case InexactValue(value: BigDecimal)
     case BooleanValue(value: Boolean)
     case StringValue(value: SchemeString)
     case CharValue(codePoint: Int)

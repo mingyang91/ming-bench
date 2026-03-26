@@ -4,6 +4,7 @@ import scala.annotation.tailrec
 
 import SchemeBuiltinSupport.*
 import SchemeModel.*
+import SchemeNumbers.*
 import SchemeRuntime.*
 
 private[ming] object SchemeNumericBuiltins:
@@ -11,50 +12,41 @@ private[ming] object SchemeNumericBuiltins:
   val bindings: List[(String, Value)] = List(
     "+" -> Value.Builtin(
       "+",
-      args => Value.IntegerValue(numericArgs("+", args).foldLeft(BigInt(0))(_ + _))
+      args => add(numericArgs("+", args))
     ),
     "-" -> Value.Builtin(
       "-",
       args =>
-        val numbers = numericArgs("-", args)
         requireMinArgCount("-", args, 1)
-        val result =
-          if numbers.length == 1 then -numbers.head
-          else numbers.tail.foldLeft(numbers.head)(_ - _)
-        Value.IntegerValue(result)
+        subtract(numericArgs("-", args))
     ),
     "*" -> Value.Builtin(
       "*",
-      args => Value.IntegerValue(numericArgs("*", args).foldLeft(BigInt(1))(_ * _))
+      args => multiply(numericArgs("*", args))
     ),
     "/" -> Value.Builtin(
       "/",
       args =>
-        val numbers = numericArgs("/", args)
         requireMinArgCount("/", args, 2)
-        val result = numbers.tail.foldLeft(numbers.head) { (left, right) =>
-          requireNonZeroDivisor("/", right)
-          left / right
-        }
-        Value.IntegerValue(result)
+        divide(numericArgs("/", args))
     ),
-    "<"  -> numericComparator("<")(_ < _),
-    ">"  -> numericComparator(">")(_ > _),
-    "="  -> numericComparator("=")(_ == _),
-    "<=" -> numericComparator("<=")(_ <= _),
+    "<"  -> numericComparator("<")(_ < 0),
+    ">"  -> numericComparator(">")(_ > 0),
+    "="  -> numericComparator("=")(_ == 0),
+    "<=" -> numericComparator("<=")(_ <= 0),
     "abs" -> Value.Builtin(
       "abs",
       args =>
         requireArgCount("abs", args, 1)
-        Value.IntegerValue(requireInteger("abs", args.head).abs)
+        SchemeNumbers.abs(requireNumber("abs", args.head))
     ),
     "modulo" -> Value.Builtin(
       "modulo",
       args =>
         requireArgCount("modulo", args, 2)
-        val dividend = requireInteger("modulo", args.head)
-        val divisor  = requireInteger("modulo", args(1))
-        requireNonZeroDivisor("modulo", divisor)
+        val dividend = requireExactInteger("modulo", args.head)
+        val divisor  = requireExactInteger("modulo", args(1))
+        if divisor == 0 then throw new EvalError("division by zero")
         val remainder = dividend % divisor
         val result =
           if remainder == 0 || remainder.signum == divisor.signum then remainder
@@ -65,61 +57,100 @@ private[ming] object SchemeNumericBuiltins:
       "remainder",
       args =>
         requireArgCount("remainder", args, 2)
-        val dividend = requireInteger("remainder", args.head)
-        val divisor  = requireInteger("remainder", args(1))
-        requireNonZeroDivisor("remainder", divisor)
+        val dividend = requireExactInteger("remainder", args.head)
+        val divisor  = requireExactInteger("remainder", args(1))
+        if divisor == 0 then throw new EvalError("division by zero")
         Value.IntegerValue(dividend % divisor)
     ),
     "quotient" -> Value.Builtin(
       "quotient",
       args =>
         requireArgCount("quotient", args, 2)
-        val dividend = requireInteger("quotient", args.head)
-        val divisor  = requireInteger("quotient", args(1))
-        requireNonZeroDivisor("quotient", divisor)
+        val dividend = requireExactInteger("quotient", args.head)
+        val divisor  = requireExactInteger("quotient", args(1))
+        if divisor == 0 then throw new EvalError("division by zero")
         Value.IntegerValue(dividend / divisor)
     ),
     "min" -> Value.Builtin(
       "min",
       args =>
         requireMinArgCount("min", args, 1)
-        Value.IntegerValue(numericArgs("min", args).min)
+        SchemeNumbers.min(numericArgs("min", args))
     ),
     "max" -> Value.Builtin(
       "max",
       args =>
         requireMinArgCount("max", args, 1)
-        Value.IntegerValue(numericArgs("max", args).max)
+        SchemeNumbers.max(numericArgs("max", args))
     ),
     "expt" -> Value.Builtin(
       "expt",
       args =>
         requireArgCount("expt", args, 2)
-        val base     = requireInteger("expt", args.head)
-        val exponent = requireInteger("expt", args(1))
+        val base     = requireNumber("expt", args.head)
+        val exponent = requireExactInteger("expt", args(1))
         if exponent.signum < 0 then throw new EvalError("expt expected a non-negative exponent")
-        Value.IntegerValue(integerPower(base, exponent))
+        integerPower(base, exponent)
     ),
-    "zero?"     -> unaryNumericPredicate("zero?")(_ == 0),
-    "positive?" -> unaryNumericPredicate("positive?")(_ > 0),
-    "negative?" -> unaryNumericPredicate("negative?")(_ < 0),
-    "odd?"      -> unaryNumericPredicate("odd?")(_ % 2 != 0),
-    "even?"     -> unaryNumericPredicate("even?")(_ % 2 == 0)
+    "zero?"     -> unaryNumericPredicate("zero?")(value => SchemeNumbers.compare(value, Value.IntegerValue(0)) == 0),
+    "positive?" -> unaryNumericPredicate("positive?")(value => SchemeNumbers.compare(value, Value.IntegerValue(0)) > 0),
+    "negative?" -> unaryNumericPredicate("negative?")(value => SchemeNumbers.compare(value, Value.IntegerValue(0)) < 0),
+    "odd?" -> Value.Builtin(
+      "odd?",
+      args =>
+        requireArgCount("odd?", args, 1)
+        Value.BooleanValue(requireInteger("odd?", args.head) % 2 != 0)
+    ),
+    "even?" -> Value.Builtin(
+      "even?",
+      args =>
+        requireArgCount("even?", args, 1)
+        Value.BooleanValue(requireInteger("even?", args.head) % 2 == 0)
+    ),
+    "exact?"    -> predicateBuiltin("exact?")(SchemeNumbers.isExact),
+    "inexact?"  -> predicateBuiltin("inexact?")(SchemeNumbers.isInexact),
+    "integer?"  -> predicateBuiltin("integer?")(SchemeNumbers.isInteger),
+    "rational?" -> predicateBuiltin("rational?")(SchemeNumbers.isRational),
+    "exact->inexact" -> Value.Builtin(
+      "exact->inexact",
+      args =>
+        requireArgCount("exact->inexact", args, 1)
+        SchemeNumbers.exactToInexact(requireNumber("exact->inexact", args.head))
+    ),
+    "inexact->exact" -> Value.Builtin(
+      "inexact->exact",
+      args =>
+        requireArgCount("inexact->exact", args, 1)
+        SchemeNumbers.inexactToExact(requireNumber("inexact->exact", args.head))
+    ),
+    "numerator" -> Value.Builtin(
+      "numerator",
+      args =>
+        requireArgCount("numerator", args, 1)
+        Value.IntegerValue(SchemeNumbers.numerator(requireNumber("numerator", args.head)))
+    ),
+    "denominator" -> Value.Builtin(
+      "denominator",
+      args =>
+        requireArgCount("denominator", args, 1)
+        Value.IntegerValue(SchemeNumbers.denominator(requireNumber("denominator", args.head)))
+    )
   )
 
-  private def unaryNumericPredicate(name: String)(predicate: BigInt => Boolean): Value =
+  private def unaryNumericPredicate(name: String)(predicate: Value => Boolean): Value =
     Value.Builtin(
       name,
       args =>
         requireArgCount(name, args, 1)
-        Value.BooleanValue(predicate(requireInteger(name, args.head)))
+        Value.BooleanValue(predicate(requireNumber(name, args.head)))
     )
 
-  private def integerPower(base: BigInt, exponent: BigInt): BigInt =
+  private def integerPower(base: Value, exponent: BigInt): Value =
     @tailrec
-    def loop(factor: BigInt, remaining: BigInt, acc: BigInt): BigInt =
+    def loop(factor: Value, remaining: BigInt, acc: Value): Value =
       if remaining == 0 then acc
-      else if (remaining % 2) == 0 then loop(factor * factor, remaining / 2, acc)
-      else loop(factor * factor, remaining / 2, acc * factor)
+      else if (remaining % 2) == 0 then loop(multiply(List(factor, factor)), remaining / 2, acc)
+      else loop(multiply(List(factor, factor)), remaining / 2, multiply(List(acc, factor)))
 
-    loop(base, exponent, BigInt(1))
+    val power = loop(base, exponent, Value.IntegerValue(1))
+    if SchemeNumbers.isInexact(base) then SchemeNumbers.exactToInexact(power) else power

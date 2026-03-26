@@ -9,12 +9,12 @@ object SchemeInterpreter:
 
   def evalToString(input: String): String =
     val output = new StringBuilder
-    render(evalProgram(input, output))
+    SchemeRuntime.render(evalProgram(input, output))
 
   def evalToStringWithOutput(input: String): (String, String) =
     val output = new StringBuilder
     val result = evalProgram(input, output)
-    (render(result), output.result())
+    (SchemeRuntime.render(result), output.result())
 
   private def evalProgram(input: String, output: StringBuilder): Value =
     val expressions = SchemeParser.parseProgram(input)
@@ -25,6 +25,9 @@ object SchemeInterpreter:
     withErrorContext(expr.pos) {
       expr match
         case Expr.IntegerLiteral(value, _) => Value.IntegerValue(value)
+        case Expr.RationalLiteral(numerator, denominator, _) =>
+          SchemeNumbers.exactRational(numerator, denominator)
+        case Expr.InexactLiteral(value, _) => Value.InexactValue(value)
         case Expr.BooleanLiteral(value, _) => Value.BooleanValue(value)
         case Expr.StringLiteral(value, _)  => Value.StringValue(SchemeString.fromText(value))
         case Expr.CharLiteral(value, _)    => Value.CharValue(value)
@@ -231,6 +234,9 @@ object SchemeInterpreter:
   private def quoteExpr(expr: Expr): Value =
     expr match
       case Expr.IntegerLiteral(value, _) => Value.IntegerValue(value)
+      case Expr.RationalLiteral(numerator, denominator, _) =>
+        SchemeNumbers.exactRational(numerator, denominator)
+      case Expr.InexactLiteral(value, _) => Value.InexactValue(value)
       case Expr.BooleanLiteral(value, _) => Value.BooleanValue(value)
       case Expr.StringLiteral(value, _)  => Value.StringValue(SchemeString.fromText(value))
       case Expr.CharLiteral(value, _)    => Value.CharValue(value)
@@ -267,7 +273,7 @@ object SchemeInterpreter:
       case Value.Builtin(_, implementation) => implementation(args)
       case closure: Value.Closure           => applyClosure(closure, args)
       case other =>
-        throw new EvalError(s"not a procedure: ${render(other)}")
+        throw new EvalError(s"not a procedure: ${SchemeRuntime.render(other)}")
 
   private def applyClosure(closure: Value.Closure, args: List[Value]): Value =
     val name = closure.name.getOrElse("lambda")
