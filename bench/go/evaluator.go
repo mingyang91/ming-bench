@@ -38,6 +38,13 @@ type listExpr struct {
 	elements []any
 }
 
+type pairValue struct {
+	car any
+	cdr any
+}
+
+type emptyListValue struct{}
+
 type voidValue struct{}
 
 type parser struct {
@@ -102,6 +109,48 @@ func newGlobalEnv() *env {
 		return builtinCompare(args, func(a, b int64) bool { return a <= b })
 	}})
 	scope.define("not", builtinProc{name: "not", fn: builtinNot})
+	scope.define("cons", builtinProc{name: "cons", fn: builtinCons})
+	scope.define("car", builtinProc{name: "car", fn: builtinCar})
+	scope.define("cdr", builtinProc{name: "cdr", fn: builtinCdr})
+	scope.define("null?", builtinProc{name: "null?", fn: func(args []any) (any, error) {
+		return builtinPredicate("null?", args, func(value any) bool {
+			_, ok := value.(emptyListValue)
+			return ok
+		})
+	}})
+	scope.define("append", builtinProc{name: "append", fn: builtinAppend})
+	scope.define("list", builtinProc{name: "list", fn: builtinList})
+	scope.define("length", builtinProc{name: "length", fn: builtinLength})
+	scope.define("string?", builtinProc{name: "string?", fn: func(args []any) (any, error) {
+		return builtinPredicate("string?", args, func(value any) bool {
+			_, ok := value.(string)
+			return ok
+		})
+	}})
+	scope.define("number?", builtinProc{name: "number?", fn: func(args []any) (any, error) {
+		return builtinPredicate("number?", args, func(value any) bool {
+			_, ok := value.(int64)
+			return ok
+		})
+	}})
+	scope.define("boolean?", builtinProc{name: "boolean?", fn: func(args []any) (any, error) {
+		return builtinPredicate("boolean?", args, func(value any) bool {
+			_, ok := value.(bool)
+			return ok
+		})
+	}})
+	scope.define("pair?", builtinProc{name: "pair?", fn: func(args []any) (any, error) {
+		return builtinPredicate("pair?", args, func(value any) bool {
+			_, ok := value.(pairValue)
+			return ok
+		})
+	}})
+	scope.define("symbol?", builtinProc{name: "symbol?", fn: func(args []any) (any, error) {
+		return builtinPredicate("symbol?", args, func(value any) bool {
+			_, ok := value.(symbolExpr)
+			return ok
+		})
+	}})
 	return scope
 }
 
@@ -154,9 +203,27 @@ func (p *parser) parseExpr() (any, error) {
 		return p.parseList()
 	case '"':
 		return p.parseString()
+	case '\'':
+		return p.parseQuoteShorthand()
 	default:
 		return p.parseAtom()
 	}
+}
+
+func (p *parser) parseQuoteShorthand() (any, error) {
+	p.pos++
+
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	return listExpr{
+		elements: []any{
+			symbolExpr{name: "quote"},
+			expr,
+		},
+	}, nil
 }
 
 func (p *parser) parseList() (any, error) {
@@ -303,6 +370,10 @@ func eval(scope *env, expr any) (any, error) {
 		return node, nil
 	case closure:
 		return node, nil
+	case pairValue:
+		return node, nil
+	case emptyListValue:
+		return node, nil
 	case voidValue:
 		return node, nil
 	default:
@@ -330,6 +401,12 @@ func evalList(scope *env, expr listExpr) (any, error) {
 			return evalAnd(scope, args)
 		case "or":
 			return evalOr(scope, args)
+		case "begin":
+			return evalBegin(scope, args)
+		case "let":
+			return evalLet(scope, args)
+		case "cond":
+			return evalCond(scope, args)
 		}
 	}
 
@@ -469,6 +546,116 @@ func evalOr(scope *env, args []any) (any, error) {
 	return result, nil
 }
 
+func evalBegin(scope *env, args []any) (any, error) {
+	return evalSequence(scope, args)
+}
+
+func evalLet(scope *env, args []any) (any, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "let expects bindings and a body"}
+	}
+
+	if name, ok := args[0].(symbolExpr); ok {
+		if len(args) < 3 {
+			return nil, &EvalError{Message: "named let expects bindings and a body"}
+		}
+
+		bindingsExpr, ok := args[1].(listExpr)
+		if !ok {
+			return nil, &EvalError{Message: "let bindings must be a list"}
+		}
+
+		params, values, err := evalBindings(scope, bindingsExpr.elements)
+		if err != nil {
+			return nil, err
+		}
+
+		letScope := newEnv(scope)
+		proc := closure{
+			params: params,
+			body:   args[2:],
+			env:    letScope,
+		}
+		letScope.define(name.name, proc)
+		return applyProcedure(proc, values)
+	}
+
+	bindingsExpr, ok := args[0].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "let bindings must be a list"}
+	}
+
+	params, values, err := evalBindings(scope, bindingsExpr.elements)
+	if err != nil {
+		return nil, err
+	}
+
+	letScope := newEnv(scope)
+	for i, param := range params {
+		letScope.define(param, values[i])
+	}
+
+	return evalSequence(letScope, args[1:])
+}
+
+func evalCond(scope *env, args []any) (any, error) {
+	for i, clauseExpr := range args {
+		clause, ok := clauseExpr.(listExpr)
+		if !ok || len(clause.elements) == 0 {
+			return nil, &EvalError{Message: "cond clauses must be non-empty lists"}
+		}
+
+		if symbol, ok := clause.elements[0].(symbolExpr); ok && symbol.name == "else" {
+			if i != len(args)-1 {
+				return nil, &EvalError{Message: "cond else clause must be last"}
+			}
+			if len(clause.elements) == 1 {
+				return voidValue{}, nil
+			}
+			return evalSequence(scope, clause.elements[1:])
+		}
+
+		testValue, err := eval(scope, clause.elements[0])
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(testValue) {
+			continue
+		}
+		if len(clause.elements) == 1 {
+			return testValue, nil
+		}
+		return evalSequence(scope, clause.elements[1:])
+	}
+
+	return voidValue{}, nil
+}
+
+func evalBindings(scope *env, bindings []any) ([]string, []any, error) {
+	names := make([]string, 0, len(bindings))
+	values := make([]any, 0, len(bindings))
+	for _, bindingExpr := range bindings {
+		binding, ok := bindingExpr.(listExpr)
+		if !ok || len(binding.elements) != 2 {
+			return nil, nil, &EvalError{Message: "let bindings must be name/value pairs"}
+		}
+
+		name, ok := binding.elements[0].(symbolExpr)
+		if !ok {
+			return nil, nil, &EvalError{Message: "let binding name must be a symbol"}
+		}
+
+		value, err := eval(scope, binding.elements[1])
+		if err != nil {
+			return nil, nil, err
+		}
+
+		names = append(names, name.name)
+		values = append(values, value)
+	}
+	return names, values, nil
+}
+
 func parseParams(params []any) ([]string, error) {
 	names := make([]string, 0, len(params))
 	for _, param := range params {
@@ -518,6 +705,13 @@ func builtinNot(args []any) (any, error) {
 		return nil, &EvalError{Message: "not expects exactly 1 argument"}
 	}
 	return !isTruthy(args[0]), nil
+}
+
+func builtinPredicate(name string, args []any, pred func(any) bool) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: fmt.Sprintf("%s expects exactly 1 argument", name)}
+	}
+	return pred(args[0]), nil
 }
 
 func builtinAdd(args []any) (any, error) {
@@ -617,6 +811,83 @@ func builtinCompare(args []any, cmp func(a, b int64) bool) (any, error) {
 	return true, nil
 }
 
+func builtinCons(args []any) (any, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "cons expects exactly 2 arguments"}
+	}
+	return pairValue{car: args[0], cdr: args[1]}, nil
+}
+
+func builtinCar(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "car expects exactly 1 argument"}
+	}
+
+	pair, ok := args[0].(pairValue)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("car expects a pair, got %s", typeName(args[0]))}
+	}
+	return pair.car, nil
+}
+
+func builtinCdr(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "cdr expects exactly 1 argument"}
+	}
+
+	pair, ok := args[0].(pairValue)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("cdr expects a pair, got %s", typeName(args[0]))}
+	}
+	return pair.cdr, nil
+}
+
+func builtinList(args []any) (any, error) {
+	return makeListValue(args), nil
+}
+
+func builtinLength(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "length expects exactly 1 argument"}
+	}
+
+	var length int64
+	current := args[0]
+	for {
+		switch value := current.(type) {
+		case emptyListValue:
+			return length, nil
+		case pairValue:
+			length++
+			current = value.cdr
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("length expects a list, got %s", typeName(args[0]))}
+		}
+	}
+}
+
+func builtinAppend(args []any) (any, error) {
+	if len(args) == 0 {
+		return emptyListValue{}, nil
+	}
+	if len(args) == 1 {
+		return args[0], nil
+	}
+
+	result := args[len(args)-1]
+	for i := len(args) - 2; i >= 0; i-- {
+		elements, err := properListElements(args[i], "append")
+		if err != nil {
+			return nil, err
+		}
+		for j := len(elements) - 1; j >= 0; j-- {
+			result = pairValue{car: elements[j], cdr: result}
+		}
+	}
+
+	return result, nil
+}
+
 func expectInt(value any) (int64, error) {
 	n, ok := value.(int64)
 	if !ok {
@@ -640,9 +911,33 @@ func quoteDatum(expr any) any {
 		for i, elem := range node.elements {
 			elements[i] = quoteDatum(elem)
 		}
-		return listExpr{elements: elements}
+		return makeListValue(elements)
 	default:
 		return expr
+	}
+}
+
+func makeListValue(elements []any) any {
+	result := any(emptyListValue{})
+	for i := len(elements) - 1; i >= 0; i-- {
+		result = pairValue{car: elements[i], cdr: result}
+	}
+	return result
+}
+
+func properListElements(value any, builtinName string) ([]any, error) {
+	var elements []any
+	current := value
+	for {
+		switch list := current.(type) {
+		case emptyListValue:
+			return elements, nil
+		case pairValue:
+			elements = append(elements, list.car)
+			current = list.cdr
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects a list, got %s", builtinName, typeName(value))}
+		}
 	}
 }
 
@@ -663,6 +958,10 @@ func typeName(value any) string {
 		return "string"
 	case symbolExpr:
 		return "symbol"
+	case pairValue:
+		return "pair"
+	case emptyListValue:
+		return "list"
 	case listExpr:
 		return "list"
 	case builtinProc, closure:
@@ -689,6 +988,10 @@ func formatValue(value any) string {
 		return strconv.Quote(v)
 	case symbolExpr:
 		return v.name
+	case emptyListValue:
+		return "()"
+	case pairValue:
+		return formatPairValue(v)
 	case listExpr:
 		if len(v.elements) == 0 {
 			return "()"
@@ -701,5 +1004,21 @@ func formatValue(value any) string {
 		return "(" + strings.Join(parts, " ") + ")"
 	default:
 		return ""
+	}
+}
+
+func formatPairValue(pair pairValue) string {
+	parts := []string{formatValue(pair.car)}
+	current := pair.cdr
+	for {
+		switch value := current.(type) {
+		case emptyListValue:
+			return "(" + strings.Join(parts, " ") + ")"
+		case pairValue:
+			parts = append(parts, formatValue(value.car))
+			current = value.cdr
+		default:
+			return "(" + strings.Join(parts, " ") + " . " + formatValue(value) + ")"
+		}
 	}
 }
