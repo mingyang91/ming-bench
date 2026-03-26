@@ -62,6 +62,38 @@ public class Evaluator {
             requireArity("not", args.size(), 1);
             return BoolValue.of(!isTruthy(args.getFirst()));
         }));
+        env.define("cons", builtin("cons", args -> {
+            requireArity("cons", args.size(), 2);
+            return new PairValue(args.get(0), args.get(1));
+        }));
+        env.define("car", builtin("car", args -> {
+            requireArity("car", args.size(), 1);
+            return expectPair(args.getFirst()).car();
+        }));
+        env.define("cdr", builtin("cdr", args -> {
+            requireArity("cdr", args.size(), 1);
+            return expectPair(args.getFirst()).cdr();
+        }));
+        env.define("null?", builtin("null?", args -> {
+            requireArity("null?", args.size(), 1);
+            return BoolValue.of(args.getFirst() instanceof EmptyListValue);
+        }));
+        env.define("list", builtin("list", this::makeList));
+        env.define("length", builtin("length", args -> {
+            requireArity("length", args.size(), 1);
+            return new IntValue(lengthOfList(args.getFirst()));
+        }));
+        env.define("append", builtin("append", this::appendLists));
+        env.define("string?", builtin("string?",
+                args -> typePredicate("string?", args, value -> value instanceof StringValue)));
+        env.define("number?", builtin("number?",
+                args -> typePredicate("number?", args, value -> value instanceof IntValue)));
+        env.define("boolean?", builtin("boolean?",
+                args -> typePredicate("boolean?", args, value -> value instanceof BoolValue)));
+        env.define("pair?", builtin("pair?",
+                args -> typePredicate("pair?", args, value -> value instanceof PairValue)));
+        env.define("symbol?", builtin("symbol?",
+                args -> typePredicate("symbol?", args, value -> value instanceof SymbolValue)));
 
         return env;
     }
@@ -95,6 +127,9 @@ public class Evaluator {
                 case "if" -> evalIf(argExprs, env);
                 case "quote" -> evalQuote(argExprs);
                 case "lambda" -> evalLambda(argExprs, env);
+                case "begin" -> evalBegin(argExprs, env);
+                case "let" -> evalLet(argExprs, env);
+                case "cond" -> evalCond(argExprs, env);
                 case "and" -> evalAnd(argExprs, env);
                 case "or" -> evalOr(argExprs, env);
                 default -> applyProcedure(eval(head, env), evalArgs(argExprs, env));
@@ -165,6 +200,102 @@ public class Evaluator {
         return new UserProcedure(null, parameterNames, body, env);
     }
 
+    private Value evalBegin(List<Expr> argExprs, Environment env) throws EvalError {
+        return evalSequence(argExprs, env);
+    }
+
+    private Value evalLet(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.isEmpty()) {
+            throw new EvalError("let requires bindings and a body");
+        }
+
+        Expr firstArg = argExprs.getFirst();
+        if (firstArg instanceof SymbolExpr nameExpr) {
+            if (argExprs.size() < 2) {
+                throw new EvalError("let requires bindings and a body");
+            }
+            if (!(argExprs.get(1) instanceof ListExpr bindingsExpr)) {
+                throw new EvalError("let bindings must be a list");
+            }
+
+            List<LetBinding> bindings = parseBindings(bindingsExpr.elements());
+            List<Expr> body = parseBody("let", argExprs.subList(2, argExprs.size()));
+            return evalNamedLet(nameExpr.name(), bindings, body, env);
+        }
+
+        if (!(firstArg instanceof ListExpr bindingsExpr)) {
+            throw new EvalError("let bindings must be a list");
+        }
+
+        List<LetBinding> bindings = parseBindings(bindingsExpr.elements());
+        List<Expr> body = parseBody("let", argExprs.subList(1, argExprs.size()));
+        return evalSimpleLet(bindings, body, env);
+    }
+
+    private Value evalSimpleLet(List<LetBinding> bindings, List<Expr> body, Environment env)
+            throws EvalError {
+        Environment letEnv = new Environment(env);
+        for (LetBinding binding : bindings) {
+            letEnv.define(binding.name(), eval(binding.valueExpr(), env));
+        }
+        return evalSequence(body, letEnv);
+    }
+
+    private Value evalNamedLet(String name, List<LetBinding> bindings, List<Expr> body,
+                               Environment env) throws EvalError {
+        List<String> parameterNames = new ArrayList<>(bindings.size());
+        List<Value> arguments = new ArrayList<>(bindings.size());
+        for (LetBinding binding : bindings) {
+            parameterNames.add(binding.name());
+            arguments.add(eval(binding.valueExpr(), env));
+        }
+
+        Environment letEnv = new Environment(env);
+        ProcedureValue procedure = new UserProcedure(name, parameterNames, body, letEnv);
+        letEnv.define(name, procedure);
+        return procedure.apply(arguments);
+    }
+
+    private Value evalCond(List<Expr> argExprs, Environment env) throws EvalError {
+        for (int index = 0; index < argExprs.size(); index++) {
+            Expr clauseExpr = argExprs.get(index);
+            if (!(clauseExpr instanceof ListExpr clauseList)) {
+                throw new EvalError("cond clause must be a list");
+            }
+
+            List<Expr> clause = clauseList.elements();
+            if (clause.isEmpty()) {
+                throw new EvalError("cond clause cannot be empty");
+            }
+
+            Expr testExpr = clause.getFirst();
+            if (testExpr instanceof SymbolExpr symbolExpr && symbolExpr.name().equals("else")) {
+                if (index != argExprs.size() - 1) {
+                    throw new EvalError("cond else clause must be last");
+                }
+                return evalClauseBody("cond", clause.subList(1, clause.size()), env, null);
+            }
+
+            Value testValue = eval(testExpr, env);
+            if (isTruthy(testValue)) {
+                return evalClauseBody("cond", clause.subList(1, clause.size()), env, testValue);
+            }
+        }
+
+        return VoidValue.INSTANCE;
+    }
+
+    private Value evalClauseBody(String formName, List<Expr> body, Environment env,
+                                 Value defaultValue) throws EvalError {
+        if (body.isEmpty()) {
+            if (defaultValue != null) {
+                return defaultValue;
+            }
+            throw new EvalError(formName + " clause requires a body");
+        }
+        return evalSequence(body, env);
+    }
+
     private List<String> parseParameterNames(List<Expr> params) throws EvalError {
         List<String> parameterNames = new ArrayList<>(params.size());
         for (Expr param : params) {
@@ -174,6 +305,26 @@ public class Evaluator {
             parameterNames.add(symbolExpr.name());
         }
         return parameterNames;
+    }
+
+    private List<LetBinding> parseBindings(List<Expr> bindingExprs) throws EvalError {
+        List<LetBinding> bindings = new ArrayList<>(bindingExprs.size());
+        for (Expr bindingExpr : bindingExprs) {
+            if (!(bindingExpr instanceof ListExpr bindingList)) {
+                throw new EvalError("let binding must be a list");
+            }
+
+            List<Expr> parts = bindingList.elements();
+            if (parts.size() != 2) {
+                throw new EvalError("let binding must contain a name and value");
+            }
+            if (!(parts.getFirst() instanceof SymbolExpr symbolExpr)) {
+                throw new EvalError("let binding name must be a symbol");
+            }
+
+            bindings.add(new LetBinding(symbolExpr.name(), parts.get(1)));
+        }
+        return bindings;
     }
 
     private List<Expr> parseBody(String formName, List<Expr> body) throws EvalError {
@@ -314,6 +465,68 @@ public class Evaluator {
         throw new EvalError("expected number");
     }
 
+    private PairValue expectPair(Value value) throws EvalError {
+        if (value instanceof PairValue pairValue) {
+            return pairValue;
+        }
+        throw new EvalError("expected pair");
+    }
+
+    private int lengthOfList(Value value) throws EvalError {
+        int length = 0;
+        Value current = value;
+        while (current instanceof PairValue pairValue) {
+            length++;
+            current = pairValue.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return length;
+        }
+        throw new EvalError("expected list");
+    }
+
+    private List<Value> listElements(Value value) throws EvalError {
+        List<Value> elements = new ArrayList<>();
+        Value current = value;
+        while (current instanceof PairValue pairValue) {
+            elements.add(pairValue.car());
+            current = pairValue.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return elements;
+        }
+        throw new EvalError("expected list");
+    }
+
+    private Value appendLists(List<Value> args) throws EvalError {
+        if (args.isEmpty()) {
+            return EmptyListValue.INSTANCE;
+        }
+
+        Value result = args.get(args.size() - 1);
+        for (int argIndex = args.size() - 2; argIndex >= 0; argIndex--) {
+            List<Value> elements = listElements(args.get(argIndex));
+            for (int elementIndex = elements.size() - 1; elementIndex >= 0; elementIndex--) {
+                result = new PairValue(elements.get(elementIndex), result);
+            }
+        }
+        return result;
+    }
+
+    private Value makeList(List<Value> args) {
+        Value result = EmptyListValue.INSTANCE;
+        for (int index = args.size() - 1; index >= 0; index--) {
+            result = new PairValue(args.get(index), result);
+        }
+        return result;
+    }
+
+    private BoolValue typePredicate(String name, List<Value> args, ValuePredicate predicate)
+            throws EvalError {
+        requireArity(name, args.size(), 1);
+        return BoolValue.of(predicate.matches(args.getFirst()));
+    }
+
     private void requireArity(String name, int actual, int expected)
             throws EvalError {
         if (actual != expected) {
@@ -354,6 +567,9 @@ public class Evaluator {
     }
 
     private record ListExpr(List<Expr> elements) implements Expr {
+    }
+
+    private record LetBinding(String name, Expr valueExpr) {
     }
 
     private interface Value {
@@ -436,6 +652,11 @@ public class Evaluator {
     @FunctionalInterface
     private interface BuiltinAction {
         Value apply(List<Value> args) throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface ValuePredicate {
+        boolean matches(Value value);
     }
 
     private final class BuiltinProcedure extends ProcedureValue {
@@ -605,10 +826,16 @@ public class Evaluator {
             char ch = input.charAt(index);
             return switch (ch) {
                 case '(' -> parseList();
+                case '\'' -> parseQuoted();
                 case '"' -> parseString();
                 case ')' -> throw new EvalError("unexpected ')'");
                 default -> parseAtom();
             };
+        }
+
+        private Expr parseQuoted() throws EvalError {
+            index++;
+            return new ListExpr(List.of(new SymbolExpr("quote"), parseExpr()));
         }
 
         private Expr parseList() throws EvalError {
@@ -667,7 +894,7 @@ public class Evaluator {
             int start = index;
             while (index < input.length()) {
                 char ch = input.charAt(index);
-                if (Character.isWhitespace(ch) || ch == '(' || ch == ')') {
+                if (Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';') {
                     break;
                 }
                 index++;
@@ -687,8 +914,20 @@ public class Evaluator {
         }
 
         private void skipWhitespace() {
-            while (index < input.length() && Character.isWhitespace(input.charAt(index))) {
-                index++;
+            while (index < input.length()) {
+                char ch = input.charAt(index);
+                if (Character.isWhitespace(ch)) {
+                    index++;
+                    continue;
+                }
+                if (ch == ';') {
+                    index++;
+                    while (index < input.length() && input.charAt(index) != '\n') {
+                        index++;
+                    }
+                    continue;
+                }
+                break;
             }
         }
     }
