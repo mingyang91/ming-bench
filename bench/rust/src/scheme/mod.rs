@@ -18,9 +18,10 @@ use continuation_runtime::{
 pub use error::EvalError;
 use error::SourcePos;
 use evaluator::{
-    apply, build_case_lambda, build_lambda, case_lambda_clauses, eval_define_syntax, eval_quote,
-    eval_sequence, lambda_parts, new_procedure, parse_do_bindings, parse_do_test_clause,
-    parse_let_bindings, parse_param_list, quote_expr, wrong_arg_count, DoLoopState,
+    apply, build_case_lambda, build_lambda, case_lambda_clauses, classify_cond_clause_body,
+    eval_define_syntax, eval_quote, eval_sequence, expand_quasiquote_expr, lambda_parts,
+    new_procedure, parse_do_bindings, parse_do_test_clause, parse_let_bindings, parse_param_list,
+    quote_expr, wrong_arg_count, CondClauseBody, DoLoopState,
 };
 use macros::{env_with_expansion_aliases, expand_macro_call};
 use model::{fresh_identifier, ContinuationProc, Env, EnvRef, Expr, Params, SchemeString, Value};
@@ -293,6 +294,7 @@ fn eval_list_cps(
             "set!" => return eval_set_cps(tail.to_vec(), env, output, k, runtime),
             "if" => return eval_if_cps(tail.to_vec(), env, output, k, runtime),
             "quote" => return eval_quote(tail).and_then(|value| k(value, output)),
+            "quasiquote" => return eval_quasiquote_cps(tail.to_vec(), env, output, k, runtime),
             "lambda" => {
                 return build_lambda(tail, &env, None).and_then(|value| k(value, output));
             }
@@ -717,16 +719,35 @@ fn eval_cond_cps(
         output,
         Rc::new(move |value, output| {
             if value.is_truthy() {
-                if clause_body.is_empty() {
-                    cond_k.clone()(value, output)
-                } else {
-                    eval_sequence_cps(
-                        clause_body.clone(),
+                match classify_cond_clause_body(&clause_body)? {
+                    CondClauseBody::ReturnTestValue => cond_k.clone()(value, output),
+                    CondClauseBody::Sequence(body) => eval_sequence_cps(
+                        body.to_vec(),
                         cond_env.clone(),
                         output,
                         cond_k.clone(),
                         cond_runtime.clone(),
-                    )
+                    ),
+                    CondClauseBody::Arrow(recipient) => {
+                        let clause_value = value.clone();
+                        let recipient_k = cond_k.clone();
+                        let apply_runtime = cond_runtime.clone();
+                        eval_cps(
+                            recipient.clone(),
+                            cond_env.clone(),
+                            output,
+                            Rc::new(move |procedure, output| {
+                                apply_cps(
+                                    procedure,
+                                    vec![clause_value.clone()],
+                                    output,
+                                    recipient_k.clone(),
+                                    apply_runtime.clone(),
+                                )
+                            }),
+                            cond_runtime.clone(),
+                        )
+                    }
                 }
             } else {
                 eval_cond_cps(
@@ -740,6 +761,19 @@ fn eval_cond_cps(
         }),
         runtime,
     )
+}
+
+fn eval_quasiquote_cps(
+    args: Vec<Expr>,
+    env: EnvRef,
+    output: &mut String,
+    k: Continuation,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
+    match args.as_slice() {
+        [template] => eval_cps(expand_quasiquote_expr(template, 1)?, env, output, k, runtime),
+        _ => Err(wrong_arg_count("quasiquote", "1", args.len())),
+    }
 }
 
 fn eval_let_cps(

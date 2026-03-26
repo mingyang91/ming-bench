@@ -94,6 +94,8 @@ pub(super) fn apply_builtin(
         Builtin::ListRef => builtin_list_ref(args),
         Builtin::ListTail => builtin_list_tail(args),
         Builtin::ListPred => builtin_predicate("list?", args, is_proper_list),
+        Builtin::Memq => builtin_memq(args),
+        Builtin::Memv => builtin_memv(args),
         Builtin::Member => builtin_member(args),
         Builtin::Vector => builtin_vector(args),
         Builtin::MakeVector => builtin_make_vector(args),
@@ -105,6 +107,7 @@ pub(super) fn apply_builtin(
         }
         Builtin::VectorToList => builtin_vector_to_list(args),
         Builtin::ListToVector => builtin_list_to_vector(args),
+        Builtin::Assq => builtin_assq(args),
         Builtin::Assoc => builtin_assoc(args),
         Builtin::Assv => builtin_assv(args),
         Builtin::Map => builtin_map(args, output),
@@ -179,6 +182,7 @@ pub(super) fn apply_builtin(
         Builtin::StringDowncase => {
             builtin_string_map("string-downcase", args, |value| value.to_ascii_lowercase())
         }
+        Builtin::Error => builtin_error(args),
         Builtin::Raise => Err(EvalError::Syntax {
             message: "raise requires continuation-aware evaluation".into(),
         }),
@@ -225,6 +229,37 @@ fn builtin_apply(args: &[Value], output: &mut String) -> Result<Value, EvalError
     applied_args.extend(prefix_args.iter().cloned());
     applied_args.extend(list_items);
     apply(callable.clone(), &applied_args, output)
+}
+
+pub(super) fn error_exception_value(args: &[Value]) -> Value {
+    Value::String(SchemeString::fresh(format_error_message(args)))
+}
+
+fn format_error_message(args: &[Value]) -> String {
+    match args {
+        [] => "error".into(),
+        [Value::Symbol(who), rest @ ..] if !rest.is_empty() => {
+            let mut rendered = format!("{who}: ");
+            for (index, arg) in rest.iter().enumerate() {
+                if index > 0 {
+                    rendered.push(' ');
+                }
+                rendered.push_str(&arg.render_display());
+            }
+            rendered
+        }
+        _ => args
+            .iter()
+            .map(Value::render_display)
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+fn builtin_error(args: &[Value]) -> Result<Value, EvalError> {
+    Err(EvalError::UncaughtException {
+        value: error_exception_value(args).render(),
+    })
 }
 
 fn builtin_add(args: &[Value]) -> Result<Value, EvalError> {
@@ -532,11 +567,21 @@ fn builtin_set_cdr(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(Value::EmptyList);
+    };
+
     let mut items = Vec::new();
-    for value in args {
+    for value in prefix {
         items.extend(collect_list("append", value)?);
     }
-    Ok(list_from_values(items))
+
+    let mut result = last.clone();
+    for item in items.into_iter().rev() {
+        result = Value::Pair(SchemePair::new(item, result));
+    }
+
+    Ok(result)
 }
 
 fn builtin_reverse(args: &[Value]) -> Result<Value, EvalError> {
@@ -705,56 +750,61 @@ fn builtin_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn builtin_assoc(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [key, list] => {
-            for entry in collect_list("assoc", list)? {
-                let entry_key = match &entry {
-                    Value::Pair(pair) => pair.car(),
-                    _ => {
-                        return Err(EvalError::TypeMismatch {
-                            name: "assoc".into(),
-                            expected: "pair".into(),
-                            got: entry.type_name().into(),
-                        });
-                    }
-                };
+    builtin_assoc_by("assoc", args, equal_values)
+}
 
-                if equal_values(key, &entry_key) {
-                    return Ok(entry);
-                }
-            }
-            Ok(Value::Boolean(false))
-        }
-        _ => Err(wrong_arg_count("assoc", "2", args.len())),
-    }
+fn builtin_assq(args: &[Value]) -> Result<Value, EvalError> {
+    builtin_assoc_by("assq", args, eq_values)
 }
 
 fn builtin_assv(args: &[Value]) -> Result<Value, EvalError> {
+    builtin_assoc_by("assv", args, eqv_values)
+}
+
+fn builtin_assoc_by<F>(name: &str, args: &[Value], matches: F) -> Result<Value, EvalError>
+where
+    F: Fn(&Value, &Value) -> bool,
+{
     match args {
         [key, list] => {
-            for entry in collect_list("assv", list)? {
+            for entry in collect_list(name, list)? {
                 let entry_key = match &entry {
                     Value::Pair(pair) => pair.car(),
                     _ => {
                         return Err(EvalError::TypeMismatch {
-                            name: "assv".into(),
+                            name: name.into(),
                             expected: "pair".into(),
                             got: entry.type_name().into(),
                         });
                     }
                 };
 
-                if eqv_values(key, &entry_key) {
+                if matches(key, &entry_key) {
                     return Ok(entry);
                 }
             }
             Ok(Value::Boolean(false))
         }
-        _ => Err(wrong_arg_count("assv", "2", args.len())),
+        _ => Err(wrong_arg_count(name, "2", args.len())),
     }
 }
 
+fn builtin_memq(args: &[Value]) -> Result<Value, EvalError> {
+    builtin_member_by("memq", args, eq_values)
+}
+
+fn builtin_memv(args: &[Value]) -> Result<Value, EvalError> {
+    builtin_member_by("memv", args, eqv_values)
+}
+
 fn builtin_member(args: &[Value]) -> Result<Value, EvalError> {
+    builtin_member_by("member", args, equal_values)
+}
+
+fn builtin_member_by<F>(name: &str, args: &[Value], matches: F) -> Result<Value, EvalError>
+where
+    F: Fn(&Value, &Value) -> bool,
+{
     match args {
         [key, list] => {
             let mut current = list.clone();
@@ -766,18 +816,18 @@ fn builtin_member(args: &[Value]) -> Result<Value, EvalError> {
                     Value::Pair(pair) => {
                         if !seen.insert(pair.id()) {
                             return Err(EvalError::CircularList {
-                                name: "member".into(),
+                                name: name.into(),
                             });
                         }
 
-                        if equal_values(key, &pair.car()) {
+                        if matches(key, &pair.car()) {
                             return Ok(Value::Pair(pair));
                         }
                         current = pair.cdr();
                     }
                     other => {
                         return Err(EvalError::TypeMismatch {
-                            name: "member".into(),
+                            name: name.into(),
                             expected: "list".into(),
                             got: other.type_name().into(),
                         });
@@ -785,7 +835,7 @@ fn builtin_member(args: &[Value]) -> Result<Value, EvalError> {
                 }
             }
         }
-        _ => Err(wrong_arg_count("member", "2", args.len())),
+        _ => Err(wrong_arg_count(name, "2", args.len())),
     }
 }
 

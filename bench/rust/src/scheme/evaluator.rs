@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
 use super::builtins::{apply_builtin, eqv_values};
-use super::error::EvalError;
+use super::error::{EvalError, SourcePos};
 use super::macros::{env_with_expansion_aliases, expand_macro_call, parse_macro_transformer};
 use super::model::{
-    list_from_values, ContinuationProc, Env, EnvRef, Expr, Params, Procedure, ProcedureClause,
-    ProcedureKind, SchemeString, Value,
+    dotted_list_parts, list_from_values, ContinuationProc, Env, EnvRef, Expr, Params, Procedure,
+    ProcedureClause, ProcedureKind, SchemePair, SchemeString, Value,
 };
 use super::records::{apply_record_procedure, eval_define_record_type};
 
@@ -26,6 +26,12 @@ pub(super) fn eval_sequence(
 enum TailAction {
     Return(Value),
     Continue { expr: Expr, env: EnvRef },
+}
+
+pub(super) enum CondClauseBody<'a> {
+    ReturnTestValue,
+    Sequence(&'a [Expr]),
+    Arrow(&'a Expr),
 }
 
 fn tail_sequence(
@@ -103,6 +109,7 @@ fn eval_tail_list(
             "set!" => return eval_set(tail, env, output).map(TailAction::Return),
             "if" => return eval_tail_if(tail, env, output),
             "quote" => return eval_quote(tail).map(TailAction::Return),
+            "quasiquote" => return eval_tail_quasiquote(tail, env),
             "lambda" => return build_lambda(tail, env, None).map(TailAction::Return),
             "case-lambda" => return build_case_lambda(tail, env, None).map(TailAction::Return),
             "and" => return eval_tail_and(tail, env, output),
@@ -160,6 +167,16 @@ fn eval_tail_if(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Tail
     }
 }
 
+fn eval_tail_quasiquote(args: &[Expr], env: &EnvRef) -> Result<TailAction, EvalError> {
+    match args {
+        [template] => Ok(TailAction::Continue {
+            expr: expand_quasiquote_expr(template, 1)?,
+            env: env.clone(),
+        }),
+        _ => Err(wrong_arg_count("quasiquote", "1", args.len())),
+    }
+}
+
 fn eval_tail_and(
     args: &[Expr],
     env: &EnvRef,
@@ -208,6 +225,20 @@ fn eval_tail_begin(
     tail_sequence(args, env, output)
 }
 
+pub(super) fn classify_cond_clause_body(body: &[Expr]) -> Result<CondClauseBody<'_>, EvalError> {
+    match body {
+        [] => Ok(CondClauseBody::ReturnTestValue),
+        [Expr::Symbol(name, _)] if name == "=>" => Err(EvalError::Syntax {
+            message: "cond: => must be followed by a recipient".into(),
+        }),
+        [Expr::Symbol(name, _), recipient] if name == "=>" => Ok(CondClauseBody::Arrow(recipient)),
+        [Expr::Symbol(name, _), ..] if name == "=>" => Err(EvalError::Syntax {
+            message: "cond: => clause must have exactly one recipient".into(),
+        }),
+        _ => Ok(CondClauseBody::Sequence(body)),
+    }
+}
+
 fn eval_tail_cond(
     clauses: &[Expr],
     env: &EnvRef,
@@ -236,10 +267,14 @@ fn eval_tail_cond(
 
         let value = eval(test, env, output)?;
         if value.is_truthy() {
-            return if body.is_empty() {
-                Ok(TailAction::Return(value))
-            } else {
-                tail_sequence(body, env, output)
+            return match classify_cond_clause_body(body)? {
+                CondClauseBody::ReturnTestValue => Ok(TailAction::Return(value)),
+                CondClauseBody::Sequence(body) => tail_sequence(body, env, output),
+                CondClauseBody::Arrow(recipient) => {
+                    let procedure = eval(recipient, env, output)?;
+                    let args = [value];
+                    apply_tail(procedure, &args, output)
+                }
             };
         }
     }
@@ -533,6 +568,7 @@ fn eval_list(items: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value,
             "set!" => return eval_set(tail, env, output),
             "if" => return eval_if(tail, env, output),
             "quote" => return eval_quote(tail),
+            "quasiquote" => return eval_quasiquote(tail, env, output),
             "lambda" => return build_lambda(tail, env, None),
             "case-lambda" => return build_case_lambda(tail, env, None),
             "and" => return eval_and(tail, env, output),
@@ -653,6 +689,16 @@ pub(super) fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     }
 }
 
+fn eval_quasiquote(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    match args {
+        [template] => {
+            let expanded = expand_quasiquote_expr(template, 1)?;
+            eval(&expanded, env, output)
+        }
+        _ => Err(wrong_arg_count("quasiquote", "1", args.len())),
+    }
+}
+
 fn eval_args(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Vec<Value>, EvalError> {
     let mut values = Vec::with_capacity(args.len());
     for expr in args {
@@ -714,10 +760,14 @@ fn eval_cond(clauses: &[Expr], env: &EnvRef, output: &mut String) -> Result<Valu
 
         let value = eval(test, env, output)?;
         if value.is_truthy() {
-            return if body.is_empty() {
-                Ok(value)
-            } else {
-                eval_sequence(body, env, output)
+            return match classify_cond_clause_body(body)? {
+                CondClauseBody::ReturnTestValue => Ok(value),
+                CondClauseBody::Sequence(body) => eval_sequence(body, env, output),
+                CondClauseBody::Arrow(recipient) => {
+                    let procedure = eval(recipient, env, output)?;
+                    let args = [value];
+                    apply(procedure, &args, output)
+                }
             };
         }
     }
@@ -1281,8 +1331,129 @@ pub(super) fn quote_expr(expr: &Expr) -> Value {
         Expr::String(value, _) => Value::String(SchemeString::literal(value)),
         Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
-        Expr::List(items, _) => list_from_values(items.iter().map(quote_expr)),
+        Expr::List(items, _) => quote_list_expr(items),
     }
+}
+
+fn quote_list_expr(items: &[Expr]) -> Value {
+    if let Some((prefix, tail)) = dotted_list_parts(items) {
+        let mut result = quote_expr(tail);
+        for item in prefix.iter().rev() {
+            result = Value::Pair(SchemePair::new(quote_expr(item), result));
+        }
+        result
+    } else {
+        list_from_values(items.iter().map(quote_expr))
+    }
+}
+
+pub(super) fn expand_quasiquote_expr(template: &Expr, depth: usize) -> Result<Expr, EvalError> {
+    match template {
+        Expr::Number(_, _)
+        | Expr::Boolean(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::Symbol(_, _) => Ok(quote_datum_expr(template)),
+        Expr::List(items, pos) => {
+            if let Some(arg) = quasiquote_form_arg(template, "unquote") {
+                if depth == 1 {
+                    return Ok(arg.clone());
+                }
+
+                return expand_nested_quasiquote_form("unquote", arg, depth - 1, *pos);
+            }
+
+            if let Some(arg) = quasiquote_form_arg(template, "unquote-splicing") {
+                if depth == 1 {
+                    return Err(EvalError::Syntax {
+                        message: "quasiquote: unquote-splicing is only valid within a list".into(),
+                    });
+                }
+
+                return expand_nested_quasiquote_form(
+                    "unquote-splicing",
+                    arg,
+                    depth - 1,
+                    *pos,
+                );
+            }
+
+            if let Some(arg) = quasiquote_form_arg(template, "quasiquote") {
+                return expand_nested_quasiquote_form("quasiquote", arg, depth + 1, *pos);
+            }
+
+            expand_quasiquote_list(items, *pos, depth)
+        }
+    }
+}
+
+fn expand_quasiquote_list(
+    items: &[Expr],
+    pos: SourcePos,
+    depth: usize,
+) -> Result<Expr, EvalError> {
+    let (prefix, tail) = if let Some((prefix, tail)) = dotted_list_parts(items) {
+        (prefix, Some(tail))
+    } else {
+        (items, None)
+    };
+
+    let mut result = match tail {
+        Some(tail) => expand_quasiquote_expr(tail, depth)?,
+        None => quote_datum_expr(&Expr::List(Vec::new(), pos)),
+    };
+
+    for item in prefix.iter().rev() {
+        if depth == 1 {
+            if let Some(arg) = quasiquote_form_arg(item, "unquote-splicing") {
+                result = build_list_expr("append", vec![arg.clone(), result], pos);
+                continue;
+            }
+        }
+
+        result = build_list_expr("cons", vec![expand_quasiquote_expr(item, depth)?, result], pos);
+    }
+
+    Ok(result)
+}
+
+fn expand_nested_quasiquote_form(
+    name: &str,
+    arg: &Expr,
+    depth: usize,
+    pos: SourcePos,
+) -> Result<Expr, EvalError> {
+    Ok(build_list_expr(
+        "list",
+        vec![
+            quote_datum_expr(&Expr::Symbol(name.into(), pos)),
+            expand_quasiquote_expr(arg, depth)?,
+        ],
+        pos,
+    ))
+}
+
+fn quasiquote_form_arg<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
+    let Expr::List(items, _) = expr else {
+        return None;
+    };
+
+    match items.as_slice() {
+        [Expr::Symbol(keyword, _), arg] if keyword == name => Some(arg),
+        _ => None,
+    }
+}
+
+fn quote_datum_expr(expr: &Expr) -> Expr {
+    let pos = expr.pos();
+    Expr::List(vec![Expr::Symbol("quote".into(), pos), expr.clone()], pos)
+}
+
+fn build_list_expr(name: &str, args: Vec<Expr>, pos: SourcePos) -> Expr {
+    let mut items = Vec::with_capacity(args.len() + 1);
+    items.push(Expr::Symbol(name.into(), pos));
+    items.extend(args);
+    Expr::List(items, pos)
 }
 
 pub(super) fn apply(

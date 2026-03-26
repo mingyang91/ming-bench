@@ -48,6 +48,11 @@ impl<'a> Parser<'a> {
             Some('#') if self.input[self.pos..].starts_with("#'") => {
                 self.parse_syntax_shorthand(pos)
             }
+            Some('`') => self.parse_keyword_shorthand(pos, 1, "quasiquote"),
+            Some(',') if self.input[self.pos..].starts_with(",@") => {
+                self.parse_keyword_shorthand(pos, 2, "unquote-splicing")
+            }
+            Some(',') => self.parse_keyword_shorthand(pos, 1, "unquote"),
             Some('\'') => self.parse_quote_shorthand(pos),
             Some('"') => self.parse_string(pos),
             Some(_) => self.parse_atom(pos),
@@ -99,6 +104,23 @@ impl<'a> Parser<'a> {
         let quoted = self.parse_expr()?;
         Ok(Expr::List(
             vec![Expr::Symbol("quote".into(), pos), quoted],
+            pos,
+        ))
+    }
+
+    fn parse_keyword_shorthand(
+        &mut self,
+        pos: SourcePos,
+        prefix_len: usize,
+        keyword: &str,
+    ) -> Result<Expr, EvalError> {
+        for _ in 0..prefix_len {
+            self.bump_char();
+        }
+
+        let expr = self.parse_expr()?;
+        Ok(Expr::List(
+            vec![Expr::Symbol(keyword.into(), pos), expr],
             pos,
         ))
     }

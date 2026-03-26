@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use super::builtins::apply_builtin;
+use super::builtins::{apply_builtin, error_exception_value};
 use super::error::{ContinuationJumpData, EvalError};
 use super::evaluator::wrong_arg_count;
 use super::model::{
@@ -249,6 +249,7 @@ pub(super) fn apply_cps(
 ) -> Result<Value, EvalError> {
     match callable {
         Value::Builtin(Builtin::Raise) => apply_raise_cps(args, output, runtime),
+        Value::Builtin(Builtin::Error) => apply_error_cps(args, output, runtime),
         Value::Builtin(Builtin::WithExceptionHandler) => {
             apply_with_exception_handler_cps(args, output, k, runtime)
         }
@@ -328,6 +329,14 @@ fn apply_raise_cps(
         [value] => raise_cps(value.clone(), output, runtime),
         _ => Err(wrong_arg_count("raise", "1", args.len())),
     }
+}
+
+fn apply_error_cps(
+    args: Vec<Value>,
+    output: &mut String,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
+    raise_cps(error_exception_value(&args), output, runtime)
 }
 
 fn raise_cps(

@@ -84,6 +84,8 @@ pub(super) enum Builtin {
     ListRef,
     ListTail,
     ListPred,
+    Memq,
+    Memv,
     Member,
     Vector,
     MakeVector,
@@ -93,6 +95,7 @@ pub(super) enum Builtin {
     VectorPred,
     VectorToList,
     ListToVector,
+    Assq,
     Assoc,
     Assv,
     Map,
@@ -135,6 +138,7 @@ pub(super) enum Builtin {
     StringCiEqual,
     StringUpcase,
     StringDowncase,
+    Error,
     Raise,
     WithExceptionHandler,
     DynamicWind,
@@ -200,6 +204,8 @@ impl Builtin {
             Builtin::ListRef => "list-ref",
             Builtin::ListTail => "list-tail",
             Builtin::ListPred => "list?",
+            Builtin::Memq => "memq",
+            Builtin::Memv => "memv",
             Builtin::Member => "member",
             Builtin::Vector => "vector",
             Builtin::MakeVector => "make-vector",
@@ -209,6 +215,7 @@ impl Builtin {
             Builtin::VectorPred => "vector?",
             Builtin::VectorToList => "vector->list",
             Builtin::ListToVector => "list->vector",
+            Builtin::Assq => "assq",
             Builtin::Assoc => "assoc",
             Builtin::Assv => "assv",
             Builtin::Map => "map",
@@ -251,6 +258,7 @@ impl Builtin {
             Builtin::StringCiEqual => "string-ci=?",
             Builtin::StringUpcase => "string-upcase",
             Builtin::StringDowncase => "string-downcase",
+            Builtin::Error => "error",
             Builtin::Raise => "raise",
             Builtin::WithExceptionHandler => "with-exception-handler",
             Builtin::DynamicWind => "dynamic-wind",
@@ -853,6 +861,25 @@ static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn is_ellipsis(expr: &Expr) -> bool {
     matches!(expr, Expr::Symbol(name, _) if name == "...")
+}
+
+pub(super) fn dotted_list_parts(items: &[Expr]) -> Option<(&[Expr], &Expr)> {
+    let [prefix @ .., Expr::Symbol(dot, _), tail] = items else {
+        return None;
+    };
+
+    if dot != "." {
+        return None;
+    }
+
+    if prefix
+        .iter()
+        .any(|expr| matches!(expr, Expr::Symbol(name, _) if name == "."))
+    {
+        return None;
+    }
+
+    Some((prefix, tail))
 }
 
 pub(super) fn expr_datum_eq(left: &Expr, right: &Expr) -> bool {

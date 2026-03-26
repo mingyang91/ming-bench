@@ -4,9 +4,9 @@ use std::rc::Rc;
 use super::error::{EvalError, SourcePos};
 use super::evaluator::{apply, quote_expr};
 use super::model::{
-    expr_datum_eq, fresh_identifier, is_core_syntax, is_ellipsis, Env, EnvRef, ExpansionState,
-    Expr, MacroExpansion, MacroRef, MacroTransformer, PatternBindings, SchemeString,
-    SyntaxCaseClause, SyntaxRule, Value,
+    dotted_list_parts, expr_datum_eq, fresh_identifier, is_core_syntax, is_ellipsis, Env,
+    EnvRef, ExpansionState, Expr, MacroExpansion, MacroRef, MacroTransformer, PatternBindings,
+    SchemeString, SyntaxCaseClause, SyntaxRule, Value,
 };
 
 pub(super) fn parse_macro_transformer(expr: &Expr, env: &EnvRef) -> Result<MacroRef, EvalError> {
@@ -604,11 +604,11 @@ fn value_to_datum_expr_with_state(
                         current = pair.cdr();
                     }
                     other => {
-                        return Err(EvalError::TypeMismatch {
-                            name: name.into(),
-                            expected: "datum".into(),
-                            got: other.type_name().into(),
-                        });
+                        items.push(Expr::Symbol(".".into(), pos));
+                        items.push(value_to_datum_expr_with_state(
+                            name, &other, pos, seen_pairs,
+                        )?);
+                        return Ok(Expr::List(items, pos));
                     }
                 }
             }
@@ -686,11 +686,83 @@ fn match_pattern(
         }
         Expr::List(pattern_items, _) => match input {
             Expr::List(input_items, _) => {
+                if let Some((prefix_patterns, tail_pattern)) = dotted_list_parts(pattern_items) {
+                    return match_dotted_list_pattern(
+                        prefix_patterns,
+                        tail_pattern,
+                        input_items,
+                        input.pos(),
+                        literals,
+                        bindings,
+                        repeated,
+                    );
+                }
                 match_list_pattern(pattern_items, input_items, literals, bindings, repeated)
             }
             _ => Ok(false),
         },
     }
+}
+
+fn match_dotted_list_pattern(
+    prefix_patterns: &[Expr],
+    tail_pattern: &Expr,
+    input_items: &[Expr],
+    input_pos: SourcePos,
+    literals: &HashSet<String>,
+    bindings: &mut PatternBindings,
+    repeated: bool,
+) -> Result<bool, EvalError> {
+    if find_ellipsis_index(prefix_patterns)?.is_some() {
+        return Err(EvalError::Syntax {
+            message: "syntax-rules: dotted patterns with ellipsis are unsupported".into(),
+        });
+    }
+
+    let input_prefix = if let Some((prefix, _)) = dotted_list_parts(input_items) {
+        prefix
+    } else {
+        input_items
+    };
+
+    if input_prefix.len() < prefix_patterns.len() {
+        return Ok(false);
+    }
+
+    for (pattern, input) in prefix_patterns.iter().zip(input_prefix.iter()) {
+        if !match_pattern(pattern, input, literals, bindings, repeated)? {
+            return Ok(false);
+        }
+    }
+
+    let Some(tail_input) = expr_list_tail(input_items, prefix_patterns.len(), input_pos) else {
+        return Ok(false);
+    };
+
+    match_pattern(tail_pattern, &tail_input, literals, bindings, repeated)
+}
+
+fn expr_list_tail(items: &[Expr], consumed: usize, pos: SourcePos) -> Option<Expr> {
+    if let Some((prefix, tail)) = dotted_list_parts(items) {
+        if consumed > prefix.len() {
+            return None;
+        }
+
+        if consumed == prefix.len() {
+            return Some(tail.clone());
+        }
+
+        let mut remaining = prefix[consumed..].to_vec();
+        remaining.push(Expr::Symbol(".".into(), pos));
+        remaining.push(tail.clone());
+        return Some(Expr::List(remaining, pos));
+    }
+
+    if consumed > items.len() {
+        return None;
+    }
+
+    Some(Expr::List(items[consumed..].to_vec(), pos))
 }
 
 fn match_list_pattern(
@@ -850,6 +922,10 @@ fn expand_template_expr(
                 }
             }
 
+            if let Some((prefix, tail)) = dotted_list_parts(items) {
+                return expand_dotted_template(prefix, tail, *pos, state, scope, repeat_index);
+            }
+
             Ok(Expr::List(
                 expand_template_items(items, state, scope, repeat_index)?,
                 *pos,
@@ -898,6 +974,30 @@ fn expand_template_items(
     }
 
     Ok(expanded)
+}
+
+fn expand_dotted_template(
+    prefix: &[Expr],
+    tail: &Expr,
+    pos: SourcePos,
+    state: &mut ExpansionState,
+    scope: &HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    let mut expanded = expand_template_items(prefix, state, scope, repeat_index)?;
+    let expanded_tail = expand_template_expr(tail, state, scope, repeat_index)?;
+
+    match expanded_tail {
+        Expr::List(mut tail_items, _) => {
+            expanded.append(&mut tail_items);
+            Ok(Expr::List(expanded, pos))
+        }
+        other => {
+            expanded.push(Expr::Symbol(".".into(), pos));
+            expanded.push(other);
+            Ok(Expr::List(expanded, pos))
+        }
+    }
 }
 
 fn expand_template_symbol(
