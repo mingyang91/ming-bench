@@ -64,6 +64,9 @@ pub enum EvalError {
     #[error("{name}: expected number, found {found}")]
     ExpectedNumber { name: &'static str, found: String },
 
+    #[error("{name}: expected integer, found {found}")]
+    ExpectedInteger { name: &'static str, found: String },
+
     #[error("{name}: expected string, found {found}")]
     ExpectedString { name: &'static str, found: String },
 

@@ -1,11 +1,11 @@
-use super::{error::SourcePos, EvalError, Expr, ExprKind};
+use super::{error::SourcePos, number::Number, EvalError, Expr, ExprKind};
 
 #[derive(Clone, Debug, PartialEq)]
 enum TokenKind {
     LParen,
     RParen,
     Quote,
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     Char(char),
     String(String),
@@ -60,7 +60,7 @@ impl Parser {
                 token: ")".to_string(),
             }
             .with_position(token.pos)),
-            TokenKind::Integer(value) => Ok(Expr::new(ExprKind::Integer(value), token.pos)),
+            TokenKind::Number(value) => Ok(Expr::new(ExprKind::Number(value), token.pos)),
             TokenKind::Boolean(value) => Ok(Expr::new(ExprKind::Boolean(value), token.pos)),
             TokenKind::Char(value) => Ok(Expr::new(ExprKind::Char(value), token.pos)),
             TokenKind::String(value) => Ok(Expr::new(ExprKind::String(value), token.pos)),
@@ -161,9 +161,9 @@ fn tokenize(input: &str) -> Result<(Vec<Token>, SourcePos), EvalError> {
 
                 let atom = &input[start..index];
                 let atom_pos = pos_from_index(input, start);
-                if let Ok(value) = atom.parse::<i64>() {
+                if let Some(value) = Number::parse_literal(atom)? {
                     tokens.push(Token {
-                        kind: TokenKind::Integer(value),
+                        kind: TokenKind::Number(value),
                         pos: atom_pos,
                     });
                 } else if atom.chars().next().is_some_and(|ch| ch == '+' || ch == '-')

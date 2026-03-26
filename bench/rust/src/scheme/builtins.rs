@@ -1,6 +1,6 @@
 use super::{
-    apply_procedure, list_from_values, list_to_vec, make_pair, make_string, Env, EnvRef,
-    EvalContext, EvalError, NativeFunc, Value,
+    apply_procedure, list_from_values, list_to_vec, make_pair, make_string, number::Number, Env,
+    EnvRef, EvalContext, EvalError, NativeFunc, Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -63,6 +63,14 @@ pub(super) fn default_env() -> EnvRef {
         ("string-set!", native_string_set as NativeFunc),
         ("string?", native_string_pred as NativeFunc),
         ("number?", native_number_pred as NativeFunc),
+        ("integer?", native_integer_pred as NativeFunc),
+        ("rational?", native_rational_pred as NativeFunc),
+        ("exact?", native_exact_pred as NativeFunc),
+        ("inexact?", native_inexact_pred as NativeFunc),
+        ("exact->inexact", native_exact_to_inexact as NativeFunc),
+        ("inexact->exact", native_inexact_to_exact as NativeFunc),
+        ("numerator", native_numerator as NativeFunc),
+        ("denominator", native_denominator as NativeFunc),
         ("boolean?", native_boolean_pred as NativeFunc),
         ("char?", native_char_pred as NativeFunc),
         (
@@ -165,7 +173,7 @@ fn native_list_ref(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErro
     }
 
     let items = list_to_vec(&args[0], "list-ref")?;
-    let index = args[1].as_number("list-ref")?;
+    let index = args[1].as_integer("list-ref")?;
     let Some(index) = usize::try_from(index)
         .ok()
         .filter(|index| *index < items.len())
@@ -189,7 +197,7 @@ fn native_list_tail(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErr
         });
     }
 
-    let index = args[1].as_number("list-tail")?;
+    let index = args[1].as_integer("list-tail")?;
     let Ok(index) = usize::try_from(index) else {
         return Err(EvalError::IndexOutOfBounds {
             name: "list-tail",
@@ -241,7 +249,7 @@ fn native_length(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError>
         });
     }
 
-    Ok(Value::Integer(list_to_vec(&args[0], "length")?.len() as i64))
+    Ok(exact_integer(list_to_vec(&args[0], "length")?.len() as i64))
 }
 
 fn native_append(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -419,7 +427,7 @@ fn native_string_length(args: &[Value], _ctx: &EvalContext) -> Result<Value, Eva
         });
     }
 
-    Ok(Value::Integer(
+    Ok(exact_integer(
         args[0].as_string("string-length")?.chars().count() as i64,
     ))
 }
@@ -476,7 +484,7 @@ fn native_string_set(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalEr
     }
 
     let string = args[0].as_string_ref("string-set!")?;
-    let index = args[1].as_number("string-set!")?;
+    let index = args[1].as_integer("string-set!")?;
     let value = args[2].as_char("string-set!")?;
     let mut string = string.borrow_mut();
     let len = string.len();
@@ -502,8 +510,8 @@ fn native_substring(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErr
     }
 
     let string = args[0].as_string("substring")?;
-    let start = args[1].as_number("substring")?;
-    let end = args[2].as_number("substring")?;
+    let start = args[1].as_integer("substring")?;
+    let end = args[2].as_integer("substring")?;
     let chars: Vec<char> = string.chars().collect();
     let len = chars.len();
     let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
@@ -538,9 +546,9 @@ fn native_string_to_number(args: &[Value], _ctx: &EvalContext) -> Result<Value, 
     }
 
     let string = args[0].as_string("string->number")?;
-    match string.parse::<i64>() {
-        Ok(value) => Ok(Value::Integer(value)),
-        Err(_) => Ok(Value::Boolean(false)),
+    match Number::parse_literal(&string)? {
+        Some(value) => Ok(Value::Number(value)),
+        None => Ok(Value::Boolean(false)),
     }
 }
 
@@ -553,9 +561,7 @@ fn native_number_to_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, 
         });
     }
 
-    Ok(make_string(
-        args[0].as_number("number->string")?.to_string(),
-    ))
+    Ok(make_string(args[0].as_number("number->string")?.render()))
 }
 
 fn native_symbol_to_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -592,7 +598,7 @@ fn native_string_ref(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalEr
     }
 
     let string = args[0].as_string("string-ref")?;
-    let index = args[1].as_number("string-ref")?;
+    let index = args[1].as_integer("string-ref")?;
     let chars: Vec<char> = string.chars().collect();
     let len = chars.len();
     let Some(index) = usize::try_from(index).ok().filter(|index| *index < len) else {
@@ -614,8 +620,86 @@ fn native_string_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalEr
 
 fn native_number_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
     native_predicate("number?", args, ctx, |value| {
-        matches!(value, Value::Integer(_))
+        matches!(value, Value::Number(_))
     })
+}
+
+fn native_integer_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("integer?", args, ctx, |value| {
+        matches!(value, Value::Number(number) if number.is_integer())
+    })
+}
+
+fn native_rational_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("rational?", args, ctx, |value| {
+        matches!(value, Value::Number(number) if number.is_rational())
+    })
+}
+
+fn native_exact_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("exact?", args, ctx, |value| {
+        matches!(value, Value::Number(number) if number.is_exact())
+    })
+}
+
+fn native_inexact_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("inexact?", args, ctx, |value| {
+        matches!(value, Value::Number(number) if number.is_inexact())
+    })
+}
+
+fn native_exact_to_inexact(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "exact->inexact",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Number(
+        args[0].as_number("exact->inexact")?.exact_to_inexact(),
+    ))
+}
+
+fn native_inexact_to_exact(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "inexact->exact",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Number(
+        args[0].as_number("inexact->exact")?.inexact_to_exact()?,
+    ))
+}
+
+fn native_numerator(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "numerator",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(exact_integer(args[0].as_number("numerator")?.numerator()?))
+}
+
+fn native_denominator(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "denominator",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(exact_integer(
+        args[0].as_number("denominator")?.denominator()?,
+    ))
 }
 
 fn native_boolean_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -742,11 +826,11 @@ where
 }
 
 fn native_add(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let mut sum = 0_i64;
+    let mut sum = Number::integer(0);
     for value in values_as_numbers("+", args)? {
-        sum += value;
+        sum = sum.add(value)?;
     }
-    Ok(Value::Integer(sum))
+    Ok(Value::Number(sum))
 }
 
 fn native_abs(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -759,8 +843,12 @@ fn native_abs(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     }
 
     let value = args[0].as_number("abs")?;
-    let value = value.checked_abs().ok_or_else(|| overflow_error("abs"))?;
-    Ok(Value::Integer(value))
+    let value = if value.compare(Number::integer(0)).is_lt() {
+        value.neg()?
+    } else {
+        value
+    };
+    Ok(Value::Number(value))
 }
 
 fn native_sub(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -772,20 +860,24 @@ fn native_sub(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     })?;
 
     let result = if rest.is_empty() {
-        -*first
+        first.neg()?
     } else {
-        rest.iter().fold(*first, |acc, value| acc - value)
+        let mut result = *first;
+        for value in rest {
+            result = result.sub(*value)?;
+        }
+        result
     };
 
-    Ok(Value::Integer(result))
+    Ok(Value::Number(result))
 }
 
 fn native_mul(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let mut product = 1_i64;
+    let mut product = Number::integer(1);
     for value in values_as_numbers("*", args)? {
-        product *= value;
+        product = product.mul(value)?;
     }
-    Ok(Value::Integer(product))
+    Ok(Value::Number(product))
 }
 
 fn native_div(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -797,20 +889,14 @@ fn native_div(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     })?;
 
     if rest.is_empty() {
-        if *first == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        return Ok(Value::Integer(1 / first));
+        return Ok(Value::Number(Number::integer(1).div(*first)?));
     }
 
     let mut result = *first;
     for value in rest {
-        if *value == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        result /= value;
+        result = result.div(*value)?;
     }
-    Ok(Value::Integer(result))
+    Ok(Value::Number(result))
 }
 
 fn native_quotient(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -822,8 +908,8 @@ fn native_quotient(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErro
         });
     }
 
-    let dividend = args[0].as_number("quotient")?;
-    let divisor = args[1].as_number("quotient")?;
+    let dividend = args[0].as_integer("quotient")?;
+    let divisor = args[1].as_integer("quotient")?;
     if divisor == 0 {
         return Err(EvalError::DivisionByZero);
     }
@@ -831,7 +917,7 @@ fn native_quotient(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErro
     let quotient = dividend
         .checked_div(divisor)
         .ok_or_else(|| overflow_error("quotient"))?;
-    Ok(Value::Integer(quotient))
+    Ok(exact_integer(quotient))
 }
 
 fn native_remainder(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -843,8 +929,8 @@ fn native_remainder(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErr
         });
     }
 
-    let dividend = args[0].as_number("remainder")?;
-    let divisor = args[1].as_number("remainder")?;
+    let dividend = args[0].as_integer("remainder")?;
+    let divisor = args[1].as_integer("remainder")?;
     if divisor == 0 {
         return Err(EvalError::DivisionByZero);
     }
@@ -852,7 +938,7 @@ fn native_remainder(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErr
     let remainder = dividend
         .checked_rem(divisor)
         .ok_or_else(|| overflow_error("remainder"))?;
-    Ok(Value::Integer(remainder))
+    Ok(exact_integer(remainder))
 }
 
 fn native_modulo(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -864,8 +950,8 @@ fn native_modulo(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError>
         });
     }
 
-    let dividend = args[0].as_number("modulo")?;
-    let divisor = args[1].as_number("modulo")?;
+    let dividend = args[0].as_integer("modulo")?;
+    let divisor = args[1].as_integer("modulo")?;
     if divisor == 0 {
         return Err(EvalError::DivisionByZero);
     }
@@ -881,31 +967,41 @@ fn native_modulo(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError>
         remainder
     };
 
-    Ok(Value::Integer(result))
+    Ok(exact_integer(result))
 }
 
 fn native_min(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let values = values_as_numbers("min", args)?;
-    let Some(value) = values.into_iter().min() else {
+    let mut values = values_as_numbers("min", args)?.into_iter();
+    let Some(mut best) = values.next() else {
         return Err(EvalError::WrongArgCount {
             name: "min",
             expected: "at least 1",
             got: 0,
         });
     };
-    Ok(Value::Integer(value))
+    for value in values {
+        if value.compare(best).is_lt() {
+            best = value;
+        }
+    }
+    Ok(Value::Number(best))
 }
 
 fn native_max(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let values = values_as_numbers("max", args)?;
-    let Some(value) = values.into_iter().max() else {
+    let mut values = values_as_numbers("max", args)?.into_iter();
+    let Some(mut best) = values.next() else {
         return Err(EvalError::WrongArgCount {
             name: "max",
             expected: "at least 1",
             got: 0,
         });
     };
-    Ok(Value::Integer(value))
+    for value in values {
+        if value.compare(best).is_gt() {
+            best = value;
+        }
+    }
+    Ok(Value::Number(best))
 }
 
 fn native_expt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -917,8 +1013,8 @@ fn native_expt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
         });
     }
 
-    let mut base = args[0].as_number("expt")?;
-    let exponent = args[1].as_number("expt")?;
+    let mut base = args[0].as_integer("expt")?;
+    let exponent = args[1].as_integer("expt")?;
     if exponent < 0 {
         return Err(EvalError::InvalidSyntax {
             message: format!("expt: expected a non-negative exponent, got {exponent}"),
@@ -941,23 +1037,23 @@ fn native_expt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
         }
     }
 
-    Ok(Value::Integer(result))
+    Ok(exact_integer(result))
 }
 
 fn native_lt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_compare(args, "<", |left, right| left < right)
+    native_compare(args, "<", |left, right| left.compare(right).is_lt())
 }
 
 fn native_gt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_compare(args, ">", |left, right| left > right)
+    native_compare(args, ">", |left, right| left.compare(right).is_gt())
 }
 
 fn native_num_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_compare(args, "=", |left, right| left == right)
+    native_compare(args, "=", |left, right| left.numeric_eq(right))
 }
 
 fn native_lte(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_compare(args, "<=", |left, right| left <= right)
+    native_compare(args, "<=", |left, right| !left.compare(right).is_gt())
 }
 
 fn native_zero_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -969,7 +1065,7 @@ fn native_zero_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErr
         });
     }
 
-    Ok(Value::Boolean(args[0].as_number("zero?")? == 0))
+    Ok(Value::Boolean(args[0].as_number("zero?")?.is_zero()))
 }
 
 fn native_positive_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -981,7 +1077,9 @@ fn native_positive_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, Eva
         });
     }
 
-    Ok(Value::Boolean(args[0].as_number("positive?")? > 0))
+    Ok(Value::Boolean(
+        args[0].as_number("positive?")?.compare(Number::integer(0)).is_gt(),
+    ))
 }
 
 fn native_negative_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -993,7 +1091,9 @@ fn native_negative_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, Eva
         });
     }
 
-    Ok(Value::Boolean(args[0].as_number("negative?")? < 0))
+    Ok(Value::Boolean(
+        args[0].as_number("negative?")?.compare(Number::integer(0)).is_lt(),
+    ))
 }
 
 fn native_odd_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -1005,7 +1105,7 @@ fn native_odd_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErro
         });
     }
 
-    Ok(Value::Boolean(args[0].as_number("odd?")? % 2 != 0))
+    Ok(Value::Boolean(args[0].as_integer("odd?")? % 2 != 0))
 }
 
 fn native_even_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -1017,12 +1117,12 @@ fn native_even_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErr
         });
     }
 
-    Ok(Value::Boolean(args[0].as_number("even?")? % 2 == 0))
+    Ok(Value::Boolean(args[0].as_integer("even?")? % 2 == 0))
 }
 
 fn native_compare<F>(args: &[Value], name: &'static str, cmp: F) -> Result<Value, EvalError>
 where
-    F: Fn(i64, i64) -> bool,
+    F: Fn(Number, Number) -> bool,
 {
     let values = values_as_numbers(name, args)?;
     if values.len() < 2 {
@@ -1109,7 +1209,7 @@ fn is_proper_list(value: &Value) -> bool {
 
 fn value_eq(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
@@ -1127,7 +1227,7 @@ fn value_eq(left: &Value, right: &Value) -> bool {
 
 fn value_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::String(left), Value::String(right)) => *left.borrow() == *right.borrow(),
@@ -1154,7 +1254,11 @@ fn overflow_error(name: &'static str) -> EvalError {
     }
 }
 
-fn values_as_numbers(name: &'static str, args: &[Value]) -> Result<Vec<i64>, EvalError> {
+fn exact_integer(value: i64) -> Value {
+    Value::Number(Number::integer(value))
+}
+
+fn values_as_numbers(name: &'static str, args: &[Value]) -> Result<Vec<Number>, EvalError> {
     let mut values = Vec::with_capacity(args.len());
     for value in args {
         values.push(value.as_number(name)?);

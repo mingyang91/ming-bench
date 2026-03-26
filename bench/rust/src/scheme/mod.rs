@@ -4,16 +4,18 @@ use std::rc::Rc;
 
 mod builtins;
 pub mod error;
+mod number;
 mod parser;
 
 use builtins::default_env;
 pub use error::EvalError;
 use error::SourcePos;
+use number::Number;
 use parser::parse_program;
 
 #[derive(Clone)]
 enum ExprKind {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     Char(char),
     String(String),
@@ -88,7 +90,7 @@ impl EvalContext {
 
 #[derive(Clone)]
 enum Value {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     String(StringRef),
     Char(char),
@@ -132,7 +134,7 @@ fn render_string(value: &StringRef) -> String {
 impl Value {
     fn render(&self) -> String {
         match self {
-            Self::Integer(value) => value.to_string(),
+            Self::Number(value) => value.render(),
             Self::Boolean(true) => "#t".to_string(),
             Self::Boolean(false) => "#f".to_string(),
             Self::String(value) => {
@@ -165,26 +167,25 @@ impl Value {
         !matches!(self, Self::Boolean(false))
     }
 
-    fn type_name(&self) -> &'static str {
+    fn as_number(&self, name: &'static str) -> Result<Number, EvalError> {
         match self {
-            Self::Integer(_) => "number",
-            Self::Boolean(_) => "boolean",
-            Self::String(_) => "string",
-            Self::Char(_) => "char",
-            Self::Symbol(_) => "symbol",
-            Self::Nil => "null",
-            Self::Pair(_) => "pair",
-            Self::NativeProc { .. } | Self::Closure(_) => "procedure",
-            Self::Void => "void",
+            Self::Number(value) => Ok(*value),
+            other => Err(EvalError::ExpectedNumber {
+                name,
+                found: other.render(),
+            }),
         }
     }
 
-    fn as_number(&self, name: &'static str) -> Result<i64, EvalError> {
+    fn as_integer(&self, name: &'static str) -> Result<i64, EvalError> {
         match self {
-            Self::Integer(value) => Ok(*value),
-            other => Err(EvalError::ExpectedNumber {
+            Self::Number(value) => value.exact_integer().ok_or_else(|| EvalError::ExpectedInteger {
                 name,
-                found: other.type_name().to_string(),
+                found: value.render(),
+            }),
+            other => Err(EvalError::ExpectedInteger {
+                name,
+                found: other.render(),
             }),
         }
     }
@@ -353,7 +354,7 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value
 
 fn eval(expr: &Expr, env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     match &expr.kind {
-        ExprKind::Integer(value) => Ok(Value::Integer(*value)),
+        ExprKind::Number(value) => Ok(Value::Number(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
         ExprKind::Char(value) => Ok(Value::Char(*value)),
         ExprKind::String(value) => Ok(make_string(value)),
@@ -795,8 +796,8 @@ fn match_pattern(
     bindings: &mut HashMap<String, MatchBinding>,
 ) -> Result<bool, EvalError> {
     match &pattern.kind {
-        ExprKind::Integer(expected) => {
-            Ok(matches!(&value.kind, ExprKind::Integer(found) if found == expected))
+        ExprKind::Number(expected) => {
+            Ok(matches!(&value.kind, ExprKind::Number(found) if found == expected))
         }
         ExprKind::Boolean(expected) => {
             Ok(matches!(&value.kind, ExprKind::Boolean(found) if found == expected))
@@ -933,7 +934,7 @@ fn bind_many(
 
 fn expr_syntax_eq(left: &Expr, right: &Expr) -> bool {
     match (&left.kind, &right.kind) {
-        (ExprKind::Integer(left), ExprKind::Integer(right)) => left == right,
+        (ExprKind::Number(left), ExprKind::Number(right)) => left == right,
         (ExprKind::Boolean(left), ExprKind::Boolean(right)) => left == right,
         (ExprKind::Char(left), ExprKind::Char(right)) => left == right,
         (ExprKind::String(left), ExprKind::String(right)) => left == right,
@@ -963,7 +964,7 @@ fn expand_template(
     repeat_index: Option<usize>,
 ) -> Result<Expr, EvalError> {
     match &template.kind {
-        ExprKind::Integer(value) => Ok(Expr::new(ExprKind::Integer(*value), template.pos)),
+        ExprKind::Number(value) => Ok(Expr::new(ExprKind::Number(*value), template.pos)),
         ExprKind::Boolean(value) => Ok(Expr::new(ExprKind::Boolean(*value), template.pos)),
         ExprKind::Char(value) => Ok(Expr::new(ExprKind::Char(*value), template.pos)),
         ExprKind::String(value) => Ok(Expr::new(ExprKind::String(value.clone()), template.pos)),
@@ -1203,7 +1204,7 @@ fn collect_template_repeat_count(
                 collect_template_repeat_count(item, bindings, count)?;
             }
         }
-        ExprKind::Integer(_) | ExprKind::Boolean(_) | ExprKind::Char(_) | ExprKind::String(_) => {}
+        ExprKind::Number(_) | ExprKind::Boolean(_) | ExprKind::Char(_) | ExprKind::String(_) => {}
     }
 
     Ok(())
@@ -1323,7 +1324,7 @@ fn parse_param_slice(items: &[Expr]) -> Result<(Vec<String>, Option<String>), Ev
 
 fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     match &expr.kind {
-        ExprKind::Integer(value) => Ok(Value::Integer(*value)),
+        ExprKind::Number(value) => Ok(Value::Number(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
         ExprKind::Char(value) => Ok(Value::Char(*value)),
         ExprKind::String(value) => Ok(make_string(value)),
