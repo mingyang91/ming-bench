@@ -8,9 +8,8 @@ private[ming] object Level1Interpreter:
     val expressions = SchemeParser.parseProgram(input)
     if expressions.isEmpty then SchemeFailure.raise("expected expression", Position(1, 1))
 
-    val result =
-      expressions.foldLeft[Value](BoolValue(false)): (_, expression) =>
-        eval(expression, builtins)
+    val env    = Environment.root(builtins)
+    val result = evalSequence(expressions, env)
 
     result.render
 
@@ -26,17 +25,21 @@ private[ming] object Level1Interpreter:
     "not" -> BuiltinValue("not", logicalNot)
   )
 
-  private def eval(expression: Expr, env: Map[String, Value]): Value =
+  private def evalSequence(expressions: List[Expr], env: Environment): Value =
+    expressions.foldLeft[Value](VoidValue): (_, expression) =>
+      eval(expression, env)
+
+  private def eval(expression: Expr, env: Environment): Value =
     expression match
       case IntExpr(value, _)    => IntValue(value)
       case BoolExpr(value, _)   => BoolValue(value)
       case StringExpr(value, _) => StringValue(value)
       case SymbolExpr(name, position) =>
-        env.getOrElse(name, SchemeFailure.raise(s"unbound symbol: $name", position))
+        env.lookup(name, position)
       case ListExpr(items, position) =>
         evalList(items, position, env)
 
-  private def evalList(items: List[Expr], position: Position, env: Map[String, Value]): Value =
+  private def evalList(items: List[Expr], position: Position, env: Environment): Value =
     items match
       case Nil =>
         SchemeFailure.raise("cannot evaluate an empty list", position)
@@ -44,13 +47,21 @@ private[ming] object Level1Interpreter:
         evalAnd(rest, env)
       case SymbolExpr("or", _) :: rest =>
         evalOr(rest, env)
+      case SymbolExpr("define", _) :: rest =>
+        evalDefine(rest, position, env)
+      case SymbolExpr("if", _) :: rest =>
+        evalIf(rest, position, env)
+      case SymbolExpr("quote", _) :: rest =>
+        evalQuote(rest, position)
+      case SymbolExpr("lambda", _) :: rest =>
+        evalLambda(rest, position, env)
       case operator :: arguments =>
         val function           = eval(operator, env)
         val evaluatedArguments = arguments.map(argument => eval(argument, env))
         apply(function, evaluatedArguments, position)
 
   @tailrec
-  private def evalAnd(expressions: List[Expr], env: Map[String, Value]): Value =
+  private def evalAnd(expressions: List[Expr], env: Environment): Value =
     expressions match
       case Nil =>
         BoolValue(true)
@@ -62,7 +73,7 @@ private[ming] object Level1Interpreter:
         else result
 
   @tailrec
-  private def evalOr(expressions: List[Expr], env: Map[String, Value]): Value =
+  private def evalOr(expressions: List[Expr], env: Environment): Value =
     expressions match
       case Nil =>
         BoolValue(false)
@@ -71,10 +82,95 @@ private[ming] object Level1Interpreter:
         if isTruthy(result) then result
         else evalOr(rest, env)
 
+  private def evalDefine(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): Value =
+    arguments match
+      case SymbolExpr(name, _) :: valueExpression :: Nil =>
+        env.reserve(name)
+        val value = eval(valueExpression, env)
+        env.define(name, value)
+        VoidValue
+      case ListExpr(SymbolExpr(name, _) :: parameters, _) :: body if body.nonEmpty =>
+        env.reserve(name)
+        val value = buildClosure(parameters, body, env, Some(name), position)
+        env.define(name, value)
+        VoidValue
+      case _ =>
+        SchemeFailure.raise(
+          "define expected (define name expr) or (define (name args) body ...)",
+          position
+        )
+
+  private def evalIf(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): Value =
+    arguments match
+      case condition :: consequent :: alternate :: Nil =>
+        if isTruthy(eval(condition, env)) then eval(consequent, env)
+        else eval(alternate, env)
+      case _ =>
+        SchemeFailure.raise("if expected 3 argument(s)", position)
+
+  private def evalQuote(arguments: List[Expr], position: Position): Value =
+    arguments match
+      case expression :: Nil =>
+        quote(expression)
+      case _ =>
+        SchemeFailure.raise("quote expected 1 argument(s)", position)
+
+  private def evalLambda(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): Value =
+    arguments match
+      case ListExpr(parameters, _) :: body if body.nonEmpty =>
+        buildClosure(parameters, body, env, None, position)
+      case _ =>
+        SchemeFailure.raise("lambda expected a parameter list and body", position)
+
+  private def buildClosure(
+    parameterExpressions: List[Expr],
+    body: List[Expr],
+    env: Environment,
+    name: Option[String],
+    position: Position
+  ): ClosureValue =
+    val parameters = parameterExpressions.map:
+      case SymbolExpr(parameterName, _) => parameterName
+      case _ =>
+        SchemeFailure.raise("lambda parameters must be symbols", position)
+
+    ClosureValue(parameters, body, env, name)
+
+  private def quote(expression: Expr): Value =
+    expression match
+      case IntExpr(value, _)    => IntValue(value)
+      case BoolExpr(value, _)   => BoolValue(value)
+      case StringExpr(value, _) => StringValue(value)
+      case SymbolExpr(name, _)  => SymbolValue(name)
+      case ListExpr(items, _) =>
+        items.foldRight[Value](EmptyListValue): (item, rest) =>
+          PairValue(quote(item), rest)
+
   private def apply(function: Value, arguments: List[Value], position: Position): Value =
     function match
       case BuiltinValue(_, implementation) =>
         implementation(arguments, position)
+      case ClosureValue(parameters, body, closureEnv, _) =>
+        if arguments.length != parameters.length then
+          SchemeFailure.raise(
+            s"procedure expected ${parameters.length} argument(s), got ${arguments.length}",
+            position
+          )
+
+        val callEnv = Environment.child(closureEnv, parameters.zip(arguments))
+        evalSequence(body, callEnv)
       case other =>
         SchemeFailure.raise(
           s"attempted to call a non-procedure value: ${other.render}",
@@ -172,7 +268,16 @@ private[ming] object Level1Interpreter:
       case IntValue(_)        => "number"
       case BoolValue(_)       => "boolean"
       case StringValue(_)     => "string"
+      case SymbolValue(_)     => "symbol"
+      case EmptyListValue     => "list"
+      case PairValue(_, _)    => "pair"
       case BuiltinValue(_, _) => "procedure"
+      case ClosureValue(_, _, _, _) =>
+        "procedure"
+      case VoidValue =>
+        "void"
+      case UninitializedValue =>
+        "uninitialized"
 
   private def unreachable(message: String): Nothing =
     throw new IllegalStateException(message)
