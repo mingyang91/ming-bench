@@ -9,6 +9,7 @@ use number::Number;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    panic::{catch_unwind, panic_any, resume_unwind, AssertUnwindSafe},
     rc::Rc,
     sync::OnceLock,
 };
@@ -176,6 +177,10 @@ enum Procedure {
     Builtin {
         name: &'static str,
     },
+    Continuation {
+        frames: Vec<ContinuationFrame>,
+        position: Option<Position>,
+    },
     RecordConstructor {
         name: String,
         record_type: Rc<RecordType>,
@@ -254,9 +259,143 @@ struct Env {
     parent: Option<EnvRef>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct TopLevelState {
+    remaining: Vec<PositionedExpr>,
+    env: EnvRef,
+    macros: MacroEnv,
+    expander: MacroExpander,
+}
+
+#[derive(Debug, Clone)]
+enum PendingArg {
+    Expr(Expr),
+    Value(Value),
+}
+
+#[derive(Debug, Clone)]
+enum ContinuationFrame {
+    Program(TopLevelState),
+    ApplicationOperator {
+        args: Vec<Expr>,
+        env: EnvRef,
+    },
+    ApplicationArg {
+        procedure: Value,
+        before: Vec<PendingArg>,
+        after: Vec<PendingArg>,
+        env: EnvRef,
+    },
+    Sequence {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    And {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    Or {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    CaseKey {
+        clauses: Vec<Expr>,
+        env: EnvRef,
+    },
+    CondTest {
+        body: Vec<Expr>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    If {
+        consequent: Expr,
+        alternate: Option<Expr>,
+        env: EnvRef,
+    },
+    Define {
+        name: String,
+        env: EnvRef,
+    },
+    Set {
+        name: String,
+        env: EnvRef,
+    },
+    Let {
+        name: String,
+        evaluated: Vec<(String, Value)>,
+        remaining: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    },
+    NamedLet {
+        name: String,
+        params: Vec<String>,
+        evaluated: Vec<Value>,
+        remaining: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    },
+    LetStar {
+        name: String,
+        let_env: EnvRef,
+        remaining: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+    },
+    LetrecSequential {
+        cell: Rc<RefCell<Value>>,
+        remaining: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        letrec_env: EnvRef,
+    },
+    LetrecParallel {
+        cells: Vec<Rc<RefCell<Value>>>,
+        evaluated: Vec<Value>,
+        remaining: Vec<Expr>,
+        body: Vec<Expr>,
+        letrec_env: EnvRef,
+    },
+    MapCall {
+        procedure: Value,
+        lists: Vec<Vec<Value>>,
+        index: usize,
+        results: Vec<Value>,
+    },
+    ForEachCall {
+        procedure: Value,
+        lists: Vec<Vec<Value>>,
+        index: usize,
+    },
+}
+
+#[derive(Debug)]
 struct EvalContext {
     output: String,
+    frames: Rc<RefCell<Vec<ContinuationFrame>>>,
+    position: Rc<RefCell<Option<Position>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ContinuationJump {
+    value: Value,
+    frames: Vec<ContinuationFrame>,
+    position: Option<Position>,
+}
+
+#[derive(Debug)]
+struct ContinuationSignal;
+
+thread_local! {
+    static CONTINUATION_JUMP: RefCell<Option<ContinuationJump>> = const { RefCell::new(None) };
+}
+
+impl Default for EvalContext {
+    fn default() -> Self {
+        Self {
+            output: String::new(),
+            frames: Rc::new(RefCell::new(Vec::new())),
+            position: Rc::new(RefCell::new(None)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +404,16 @@ enum EvalStep {
     Expr(Expr, EnvRef),
     Sequence(Vec<Expr>, EnvRef),
     Apply(Value, Vec<Value>),
+}
+
+#[derive(Debug, Clone)]
+enum EvalAction {
+    Program(TopLevelState),
+    Resume {
+        value: Value,
+        frames: Vec<ContinuationFrame>,
+        position: Option<Position>,
+    },
 }
 
 fn current_bench_level() -> u32 {
@@ -280,6 +429,70 @@ fn current_bench_level() -> u32 {
 
 fn strings_are_mutable_in_current_level() -> bool {
     current_bench_level() < 15
+}
+
+struct ContinuationFrameGuard {
+    frames: Rc<RefCell<Vec<ContinuationFrame>>>,
+}
+
+impl Drop for ContinuationFrameGuard {
+    fn drop(&mut self) {
+        self.frames.borrow_mut().pop();
+    }
+}
+
+struct PositionGuard {
+    position: Rc<RefCell<Option<Position>>>,
+    previous: Option<Position>,
+}
+
+impl Drop for PositionGuard {
+    fn drop(&mut self) {
+        *self.position.borrow_mut() = self.previous;
+    }
+}
+
+fn push_continuation_frame(
+    context: &EvalContext,
+    frame: ContinuationFrame,
+) -> ContinuationFrameGuard {
+    context.frames.borrow_mut().push(frame);
+    ContinuationFrameGuard {
+        frames: context.frames.clone(),
+    }
+}
+
+fn push_position(context: &EvalContext, position: Option<Position>) -> PositionGuard {
+    let previous = std::mem::replace(&mut *context.position.borrow_mut(), position);
+    PositionGuard {
+        position: context.position.clone(),
+        previous,
+    }
+}
+
+fn current_position(context: &EvalContext) -> Option<Position> {
+    *context.position.borrow()
+}
+
+fn signal_continuation(
+    value: Value,
+    frames: Vec<ContinuationFrame>,
+    position: Option<Position>,
+) -> ! {
+    CONTINUATION_JUMP.with(|slot| {
+        *slot.borrow_mut() = Some(ContinuationJump {
+            value,
+            frames,
+            position,
+        });
+    });
+    panic_any(ContinuationSignal);
+}
+
+fn take_continuation_jump() -> ContinuationJump {
+    CONTINUATION_JUMP
+        .with(|slot| slot.borrow_mut().take())
+        .expect("continuation signal must carry a jump payload")
 }
 
 impl Env {
@@ -336,7 +549,22 @@ impl Procedure {
     ) -> Result<EvalStep, EvalError> {
         match self {
             Self::Builtin { name } => {
-                if *name == "apply" {
+                if matches!(*name, "call/cc" | "call-with-current-continuation") {
+                    if args.len() != 1 {
+                        return Err(EvalError::WrongArgCount {
+                            name,
+                            expected: "exactly 1 argument",
+                            got: args.len(),
+                        });
+                    }
+
+                    let continuation = Value::Procedure(Rc::new(Procedure::Continuation {
+                        frames: context.frames.borrow().clone(),
+                        position: current_position(context),
+                    }));
+
+                    Ok(EvalStep::Apply(args[0].clone(), vec![continuation]))
+                } else if *name == "apply" {
                     if args.len() < 2 {
                         return Err(EvalError::WrongArgCount {
                             name: "apply",
@@ -355,6 +583,17 @@ impl Procedure {
                 } else {
                     Ok(EvalStep::Value(apply_builtin(name, &args, context)?))
                 }
+            }
+            Self::Continuation { frames, position } => {
+                if args.len() != 1 {
+                    return Err(EvalError::WrongArgCountDynamic {
+                        name: "continuation".into(),
+                        expected: "exactly 1 argument".into(),
+                        got: args.len(),
+                    });
+                }
+
+                signal_continuation(args[0].clone(), frames.clone(), *position);
             }
             Self::RecordConstructor {
                 name,
@@ -764,6 +1003,697 @@ fn eval_expr_in_env(
     resolve_eval_step(EvalStep::Expr(expr.clone(), env.clone()), context)
 }
 
+fn eval_expr_with_frame(
+    expr: &Expr,
+    env: &EnvRef,
+    frame: ContinuationFrame,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let _guard = push_continuation_frame(context, frame);
+    eval_expr_in_env(expr, env, context)
+}
+
+fn apply_procedure_with_frame(
+    procedure: Value,
+    args: Vec<Value>,
+    frame: ContinuationFrame,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let _guard = push_continuation_frame(context, frame);
+    apply_procedure(procedure, args, context)
+}
+
+fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<Value, EvalError> {
+    loop {
+        let outcome = catch_unwind(AssertUnwindSafe(|| match action.clone() {
+            EvalAction::Program(state) => eval_top_level_state(state, context),
+            EvalAction::Resume {
+                value,
+                frames,
+                position,
+            } => {
+                let _position_guard = push_position(context, position);
+                resume_continuation_frames(value, frames, context)
+            }
+        }));
+
+        match outcome {
+            Ok(result) => return result,
+            Err(payload) => {
+                if payload.downcast_ref::<ContinuationSignal>().is_some() {
+                    let jump = take_continuation_jump();
+                    action = EvalAction::Resume {
+                        value: jump.value,
+                        frames: jump.frames,
+                        position: jump.position,
+                    };
+                } else {
+                    resume_unwind(payload);
+                }
+            }
+        }
+    }
+}
+
+fn eval_top_level_state(
+    mut state: TopLevelState,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let mut last_value = Value::Void;
+    let mut expressions = state.remaining.into_iter();
+
+    while let Some(expression) = expressions.next() {
+        if register_macro_definition(&expression.expr, &state.env, &mut state.macros).map_err(
+            |error| error.with_position(expression.position.line, expression.position.column),
+        )? {
+            last_value = Value::Void;
+            continue;
+        }
+
+        let expanded = state
+            .expander
+            .expand_expr(&expression.expr, &state.macros)
+            .map_err(|error| {
+                error.with_position(expression.position.line, expression.position.column)
+            })?;
+
+        let remaining = expressions.as_slice().to_vec();
+        let value = if remaining.is_empty() {
+            let _position_guard = push_position(context, Some(expression.position));
+            eval_expr_in_env(&expanded, &state.env, context)
+        } else {
+            let frame = ContinuationFrame::Program(TopLevelState {
+                remaining,
+                env: state.env.clone(),
+                macros: state.macros.clone(),
+                expander: state.expander.clone(),
+            });
+            let _frame_guard = push_continuation_frame(context, frame);
+            let _position_guard = push_position(context, Some(expression.position));
+            eval_expr_in_env(&expanded, &state.env, context)
+        }
+        .map_err(|error| {
+            error.with_position(expression.position.line, expression.position.column)
+        })?;
+
+        last_value = value;
+    }
+
+    Ok(last_value)
+}
+
+fn resume_continuation_frames(
+    mut value: Value,
+    mut frames: Vec<ContinuationFrame>,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    while let Some(frame) = frames.pop() {
+        *context.frames.borrow_mut() = frames.clone();
+        value = match frame {
+            ContinuationFrame::Program(state) => eval_top_level_state(state, context)?,
+            ContinuationFrame::ApplicationOperator { args, env } => {
+                let args = eval_application_args(value.clone(), &args, &env, context)?;
+                apply_procedure(value, args, context)?
+            }
+            ContinuationFrame::ApplicationArg {
+                procedure,
+                before,
+                after,
+                env,
+            } => {
+                let mut slots = before;
+                slots.push(PendingArg::Value(value));
+                slots.extend(after);
+                let args = eval_application_slots(procedure.clone(), &slots, &env, context)?;
+                apply_procedure(procedure, args, context)?
+            }
+            ContinuationFrame::Sequence { remaining, env } => {
+                eval_sequence(&remaining, &env, context)?
+            }
+            ContinuationFrame::And { remaining, env } => {
+                if value.is_truthy() {
+                    eval_and_values(&remaining, &env, context)?
+                } else {
+                    value
+                }
+            }
+            ContinuationFrame::Or { remaining, env } => {
+                if value.is_truthy() {
+                    value
+                } else {
+                    eval_or_values(&remaining, &env, context)?
+                }
+            }
+            ContinuationFrame::CaseKey { clauses, env } => {
+                eval_case_clauses(&value, &clauses, &env, context)?
+            }
+            ContinuationFrame::CondTest {
+                body,
+                remaining,
+                env,
+            } => {
+                if value.is_truthy() {
+                    if body.is_empty() {
+                        value
+                    } else {
+                        eval_sequence(&body, &env, context)?
+                    }
+                } else {
+                    eval_cond_clauses(&remaining, &env, context)?
+                }
+            }
+            ContinuationFrame::If {
+                consequent,
+                alternate,
+                env,
+            } => {
+                if value.is_truthy() {
+                    eval_expr_in_env(&consequent, &env, context)?
+                } else if let Some(alternate) = alternate {
+                    eval_expr_in_env(&alternate, &env, context)?
+                } else {
+                    Value::Void
+                }
+            }
+            ContinuationFrame::Define { name, env } => {
+                env.define(name, value);
+                Value::Void
+            }
+            ContinuationFrame::Set { name, env } => {
+                env.set(&name, value)?;
+                Value::Void
+            }
+            ContinuationFrame::Let {
+                name,
+                evaluated,
+                remaining,
+                body,
+                env,
+            } => {
+                let mut evaluated = evaluated;
+                evaluated.push((name, value));
+                let let_env =
+                    eval_parallel_let_bindings(evaluated, &remaining, &body, &env, context)?;
+                eval_sequence(&body, &let_env, context)?
+            }
+            ContinuationFrame::NamedLet {
+                name,
+                params,
+                evaluated,
+                remaining,
+                body,
+                env,
+            } => {
+                let mut args = evaluated;
+                args.push(value);
+                let args =
+                    eval_named_let_args(&name, &params, args, &remaining, &body, &env, context)?;
+                let (procedure, args) = build_named_let_call(name, params, body, &env, args);
+                apply_procedure(procedure, args, context)?
+            }
+            ContinuationFrame::LetStar {
+                name,
+                let_env,
+                remaining,
+                body,
+            } => {
+                let_env.define(name, value);
+                let let_env = eval_let_star_bindings(&let_env, &remaining, &body, context)?;
+                eval_sequence(&body, &let_env, context)?
+            }
+            ContinuationFrame::LetrecSequential {
+                cell,
+                remaining,
+                body,
+                letrec_env,
+            } => {
+                *cell.borrow_mut() = value;
+                eval_letrec_sequential_bindings(&remaining, &letrec_env, &body, context)?;
+                eval_sequence(&body, &letrec_env, context)?
+            }
+            ContinuationFrame::LetrecParallel {
+                cells,
+                evaluated,
+                remaining,
+                body,
+                letrec_env,
+            } => {
+                let mut values = evaluated;
+                values.push(value);
+                let values = eval_letrec_parallel_bindings(
+                    &cells,
+                    values,
+                    &remaining,
+                    &body,
+                    &letrec_env,
+                    context,
+                )?;
+                for (cell, value) in cells.into_iter().zip(values) {
+                    *cell.borrow_mut() = value;
+                }
+                eval_sequence(&body, &letrec_env, context)?
+            }
+            ContinuationFrame::MapCall {
+                procedure,
+                lists,
+                index,
+                results,
+            } => {
+                let mut results = results;
+                results.push(value);
+                apply_map_from_index(procedure, &lists, index, results, context)?
+            }
+            ContinuationFrame::ForEachCall {
+                procedure,
+                lists,
+                index,
+            } => apply_for_each_from_index(procedure, &lists, index, context)?,
+        };
+    }
+
+    context.frames.borrow_mut().clear();
+    Ok(value)
+}
+
+fn eval_application_args(
+    procedure: Value,
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Vec<Value>, EvalError> {
+    let slots = args
+        .iter()
+        .cloned()
+        .map(PendingArg::Expr)
+        .collect::<Vec<_>>();
+    eval_application_slots(procedure, &slots, env, context)
+}
+
+fn eval_application_slots(
+    procedure: Value,
+    slots: &[PendingArg],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Vec<Value>, EvalError> {
+    let mut evaluated = Vec::with_capacity(slots.len());
+
+    for (index, slot) in slots.iter().enumerate() {
+        let value = match slot {
+            PendingArg::Value(value) => value.clone(),
+            PendingArg::Expr(expr) => {
+                let frame = ContinuationFrame::ApplicationArg {
+                    procedure: procedure.clone(),
+                    before: slots[..index].to_vec(),
+                    after: slots[index + 1..].to_vec(),
+                    env: env.clone(),
+                };
+                eval_expr_with_frame(expr, env, frame, context)?
+            }
+        };
+        evaluated.push(value);
+    }
+
+    Ok(evaluated)
+}
+
+fn eval_and_values(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let Some((last, initial)) = args.split_last() else {
+        return Ok(Value::Boolean(true));
+    };
+
+    for (index, arg) in initial.iter().enumerate() {
+        let frame = ContinuationFrame::And {
+            remaining: initial[index + 1..]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(last.clone()))
+                .collect(),
+            env: env.clone(),
+        };
+        let value = eval_expr_with_frame(arg, env, frame, context)?;
+        if !value.is_truthy() {
+            return Ok(value);
+        }
+    }
+
+    eval_expr_in_env(last, env, context)
+}
+
+fn eval_or_values(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let Some((last, initial)) = args.split_last() else {
+        return Ok(Value::Boolean(false));
+    };
+
+    for (index, arg) in initial.iter().enumerate() {
+        let frame = ContinuationFrame::Or {
+            remaining: initial[index + 1..]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(last.clone()))
+                .collect(),
+            env: env.clone(),
+        };
+        let value = eval_expr_with_frame(arg, env, frame, context)?;
+        if value.is_truthy() {
+            return Ok(value);
+        }
+    }
+
+    eval_expr_in_env(last, env, context)
+}
+
+fn eval_case_clauses(
+    key: &Value,
+    clauses: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::InvalidForm {
+                name: "case",
+                message: "expected clauses to be lists",
+            });
+        };
+
+        let Some((head, body)) = items.split_first() else {
+            return Err(EvalError::InvalidForm {
+                name: "case",
+                message: "expected each clause to contain a datum list or else",
+            });
+        };
+
+        if matches!(head, Expr::Symbol(symbol) if symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::InvalidForm {
+                    name: "case",
+                    message: "else clause must be last",
+                });
+            }
+
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(body, env, context)
+            };
+        }
+
+        let Expr::List(datums) = head else {
+            return Err(EvalError::InvalidForm {
+                name: "case",
+                message: "expected each clause to begin with a datum list or else",
+            });
+        };
+
+        if datums
+            .iter()
+            .any(|datum| eq_values(key, &quote_expr(datum)))
+        {
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(body, env, context)
+            };
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_cond_clauses(
+    clauses: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::InvalidForm {
+                name: "cond",
+                message: "expected clauses to be lists",
+            });
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::InvalidForm {
+                name: "cond",
+                message: "expected each clause to contain a test",
+            });
+        };
+
+        if matches!(test, Expr::Symbol(symbol) if symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::InvalidForm {
+                    name: "cond",
+                    message: "else clause must be last",
+                });
+            }
+
+            if body.is_empty() {
+                return Err(EvalError::InvalidForm {
+                    name: "cond",
+                    message: "else clause must contain a body",
+                });
+            }
+
+            return eval_sequence(body, env, context);
+        }
+
+        let frame = ContinuationFrame::CondTest {
+            body: body.to_vec(),
+            remaining: clauses[index + 1..].to_vec(),
+            env: env.clone(),
+        };
+        let value = eval_expr_with_frame(test, env, frame, context)?;
+        if value.is_truthy() {
+            return if body.is_empty() {
+                Ok(value)
+            } else {
+                eval_sequence(body, env, context)
+            };
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_parallel_let_bindings(
+    mut evaluated: Vec<(String, Value)>,
+    remaining: &[(String, Expr)],
+    body: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EnvRef, EvalError> {
+    let mut remaining = remaining;
+
+    while let Some((binding, rest)) = remaining.split_first() {
+        let (name, expr) = binding;
+        let frame = ContinuationFrame::Let {
+            name: name.clone(),
+            evaluated: evaluated.clone(),
+            remaining: rest.to_vec(),
+            body: body.to_vec(),
+            env: env.clone(),
+        };
+        let value = eval_expr_with_frame(expr, env, frame, context)?;
+        evaluated.push((name.clone(), value));
+        remaining = rest;
+    }
+
+    let let_env = Env::new(Some(env.clone()));
+    for (name, value) in evaluated {
+        let let_env_name = name;
+        let_env.define(let_env_name, value);
+    }
+
+    Ok(let_env)
+}
+
+fn eval_named_let_args(
+    name: &str,
+    params: &[String],
+    mut evaluated: Vec<Value>,
+    remaining: &[(String, Expr)],
+    body: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Vec<Value>, EvalError> {
+    let mut remaining = remaining;
+
+    while let Some(((_, expr), rest)) = remaining.split_first() {
+        let frame = ContinuationFrame::NamedLet {
+            name: name.to_string(),
+            params: params.to_vec(),
+            evaluated: evaluated.clone(),
+            remaining: rest.to_vec(),
+            body: body.to_vec(),
+            env: env.clone(),
+        };
+        let value = eval_expr_with_frame(expr, env, frame, context)?;
+        evaluated.push(value);
+        remaining = rest;
+    }
+
+    Ok(evaluated)
+}
+
+fn build_named_let_call(
+    name: String,
+    params: Vec<String>,
+    body: Vec<Expr>,
+    env: &EnvRef,
+    args: Vec<Value>,
+) -> (Value, Vec<Value>) {
+    let let_env = Env::new(Some(env.clone()));
+    let_env.define(name.clone(), Value::Void);
+
+    let procedure = Rc::new(Procedure::Lambda {
+        params: LambdaParams::fixed(params),
+        body,
+        env: let_env.clone(),
+    });
+    let value = Value::Procedure(procedure.clone());
+    let_env.define(name, value.clone());
+
+    (value, args)
+}
+
+fn eval_let_star_bindings(
+    let_env: &EnvRef,
+    remaining: &[(String, Expr)],
+    body: &[Expr],
+    context: &mut EvalContext,
+) -> Result<EnvRef, EvalError> {
+    let mut remaining = remaining;
+
+    while let Some((binding, rest)) = remaining.split_first() {
+        let (name, init) = binding;
+        let frame = ContinuationFrame::LetStar {
+            name: name.clone(),
+            let_env: let_env.clone(),
+            remaining: rest.to_vec(),
+            body: body.to_vec(),
+        };
+        let value = eval_expr_with_frame(init, let_env, frame, context)?;
+        let_env.define(name.clone(), value);
+        remaining = rest;
+    }
+
+    Ok(let_env.clone())
+}
+
+fn eval_letrec_sequential_bindings(
+    remaining: &[(String, Expr)],
+    letrec_env: &EnvRef,
+    body: &[Expr],
+    context: &mut EvalContext,
+) -> Result<(), EvalError> {
+    let mut remaining = remaining;
+
+    while let Some((binding, rest)) = remaining.split_first() {
+        let (name, init) = binding;
+        let cell = Rc::new(RefCell::new(Value::Uninitialized));
+        letrec_env.define_cell(name.clone(), cell.clone());
+        let frame = ContinuationFrame::LetrecSequential {
+            cell: cell.clone(),
+            remaining: rest.to_vec(),
+            body: body.to_vec(),
+            letrec_env: letrec_env.clone(),
+        };
+        let value = eval_expr_with_frame(init, letrec_env, frame, context)?;
+        *cell.borrow_mut() = value;
+        remaining = rest;
+    }
+
+    Ok(())
+}
+
+fn eval_letrec_parallel_bindings(
+    cells: &[Rc<RefCell<Value>>],
+    mut evaluated: Vec<Value>,
+    remaining: &[Expr],
+    body: &[Expr],
+    letrec_env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Vec<Value>, EvalError> {
+    let mut remaining = remaining;
+
+    while let Some((init, rest)) = remaining.split_first() {
+        let frame = ContinuationFrame::LetrecParallel {
+            cells: cells.to_vec(),
+            evaluated: evaluated.clone(),
+            remaining: rest.to_vec(),
+            body: body.to_vec(),
+            letrec_env: letrec_env.clone(),
+        };
+        let value = eval_expr_with_frame(init, letrec_env, frame, context)?;
+        evaluated.push(value);
+        remaining = rest;
+    }
+
+    Ok(evaluated)
+}
+
+fn apply_map_from_index(
+    procedure: Value,
+    lists: &[Vec<Value>],
+    mut index: usize,
+    mut results: Vec<Value>,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let length = lists.iter().map(|list| list.len()).min().unwrap_or(0);
+
+    while index < length {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        let frame = ContinuationFrame::MapCall {
+            procedure: procedure.clone(),
+            lists: lists.to_vec(),
+            index: index + 1,
+            results: results.clone(),
+        };
+        let value = apply_procedure_with_frame(procedure.clone(), call_args, frame, context)?;
+        results.push(value);
+        index += 1;
+    }
+
+    Ok(list_from_vec(results))
+}
+
+fn apply_for_each_from_index(
+    procedure: Value,
+    lists: &[Vec<Value>],
+    mut index: usize,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let length = lists.iter().map(|list| list.len()).min().unwrap_or(0);
+
+    while index < length {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        let frame = ContinuationFrame::ForEachCall {
+            procedure: procedure.clone(),
+            lists: lists.to_vec(),
+            index: index + 1,
+        };
+        apply_procedure_with_frame(procedure.clone(), call_args, frame, context)?;
+        index += 1;
+    }
+
+    Ok(Value::Void)
+}
+
 fn eval_expr_step(
     expr: Expr,
     env: EnvRef,
@@ -823,11 +1753,16 @@ fn eval_application_step(
         }
     }
 
-    let procedure = eval_expr_in_env(head, &env, context)?;
-    let args = tail
-        .iter()
-        .map(|expr| eval_expr_in_env(expr, &env, context))
-        .collect::<Result<Vec<_>, EvalError>>()?;
+    let procedure = eval_expr_with_frame(
+        head,
+        &env,
+        ContinuationFrame::ApplicationOperator {
+            args: tail.to_vec(),
+            env: env.clone(),
+        },
+        context,
+    )?;
+    let args = eval_application_args(procedure.clone(), tail, &env, context)?;
 
     Ok(EvalStep::Apply(procedure, args))
 }
@@ -848,15 +1783,26 @@ fn eval_sequence_step(
     env: EnvRef,
     context: &mut EvalContext,
 ) -> Result<EvalStep, EvalError> {
-    let Some((last, initial)) = expressions.split_last() else {
-        return Ok(EvalStep::Value(Value::Void));
-    };
+    let mut remaining = expressions.as_slice();
 
-    for expression in initial {
-        eval_expr_in_env(expression, &env, context)?;
+    while let Some((expression, rest)) = remaining.split_first() {
+        if rest.is_empty() {
+            return Ok(EvalStep::Expr(expression.clone(), env));
+        }
+
+        eval_expr_with_frame(
+            expression,
+            &env,
+            ContinuationFrame::Sequence {
+                remaining: rest.to_vec(),
+                env: env.clone(),
+            },
+            context,
+        )?;
+        remaining = rest;
     }
 
-    Ok(EvalStep::Expr(last.clone(), env))
+    Ok(EvalStep::Value(Value::Void))
 }
 
 fn eval_and_step(
@@ -868,8 +1814,16 @@ fn eval_and_step(
         return Ok(EvalStep::Value(Value::Boolean(true)));
     };
 
-    for arg in initial {
-        let result = eval_expr_in_env(arg, env, context)?;
+    for (index, arg) in initial.iter().enumerate() {
+        let frame = ContinuationFrame::And {
+            remaining: initial[index + 1..]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(last.clone()))
+                .collect(),
+            env: env.clone(),
+        };
+        let result = eval_expr_with_frame(arg, env, frame, context)?;
         if !result.is_truthy() {
             return Ok(EvalStep::Value(result));
         }
@@ -887,8 +1841,16 @@ fn eval_or_step(
         return Ok(EvalStep::Value(Value::Boolean(false)));
     };
 
-    for arg in initial {
-        let value = eval_expr_in_env(arg, env, context)?;
+    for (index, arg) in initial.iter().enumerate() {
+        let frame = ContinuationFrame::Or {
+            remaining: initial[index + 1..]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(last.clone()))
+                .collect(),
+            env: env.clone(),
+        };
+        let value = eval_expr_with_frame(arg, env, frame, context)?;
         if value.is_truthy() {
             return Ok(EvalStep::Value(value));
         }
@@ -914,7 +1876,15 @@ fn eval_case_step(
         });
     };
 
-    let key = eval_expr_in_env(key_expr, env, context)?;
+    let key = eval_expr_with_frame(
+        key_expr,
+        env,
+        ContinuationFrame::CaseKey {
+            clauses: clauses.to_vec(),
+            env: env.clone(),
+        },
+        context,
+    )?;
 
     for (index, clause) in clauses.iter().enumerate() {
         let Expr::List(items) = clause else {
@@ -1006,7 +1976,12 @@ fn eval_cond_step(
             return Ok(EvalStep::Sequence(body.to_vec(), env.clone()));
         }
 
-        let value = eval_expr_in_env(test, env, context)?;
+        let frame = ContinuationFrame::CondTest {
+            body: body.to_vec(),
+            remaining: args[index + 1..].to_vec(),
+            env: env.clone(),
+        };
+        let value = eval_expr_with_frame(test, env, frame, context)?;
         if value.is_truthy() {
             return if body.is_empty() {
                 Ok(EvalStep::Value(value))
@@ -1042,7 +2017,15 @@ fn eval_define_step(
                 });
             }
 
-            let value = eval_expr_in_env(&rest[0], env, context)?;
+            let value = eval_expr_with_frame(
+                &rest[0],
+                env,
+                ContinuationFrame::Define {
+                    name: name.clone(),
+                    env: env.clone(),
+                },
+                context,
+            )?;
             env.define(name.clone(), value);
             Ok(EvalStep::Value(Value::Void))
         }
@@ -1190,7 +2173,18 @@ fn eval_if_step(
         });
     }
 
-    if eval_expr_in_env(&args[0], env, context)?.is_truthy() {
+    let test = eval_expr_with_frame(
+        &args[0],
+        env,
+        ContinuationFrame::If {
+            consequent: args[1].clone(),
+            alternate: args.get(2).cloned(),
+            env: env.clone(),
+        },
+        context,
+    )?;
+
+    if test.is_truthy() {
         Ok(EvalStep::Expr(args[1].clone(), env.clone()))
     } else if args.len() == 3 {
         Ok(EvalStep::Expr(args[2].clone(), env.clone()))
@@ -1219,7 +2213,15 @@ fn eval_set_step(
         });
     };
 
-    let value = eval_expr_in_env(&args[1], env, context)?;
+    let value = eval_expr_with_frame(
+        &args[1],
+        env,
+        ContinuationFrame::Set {
+            name: name.clone(),
+            env: env.clone(),
+        },
+        context,
+    )?;
     env.set(name, value)?;
     Ok(EvalStep::Value(Value::Void))
 }
@@ -1295,15 +2297,7 @@ fn eval_let_step(
             }
 
             let bindings = parse_let_bindings(first, "let")?;
-            let values = bindings
-                .iter()
-                .map(|(_, expr)| eval_expr_in_env(expr, env, context))
-                .collect::<Result<Vec<_>, EvalError>>()?;
-
-            let let_env = Env::new(Some(env.clone()));
-            for ((name, _), value) in bindings.into_iter().zip(values) {
-                let_env.define(name, value);
-            }
+            let let_env = eval_parallel_let_bindings(Vec::new(), &bindings, rest, env, context)?;
 
             Ok(EvalStep::Sequence(rest.to_vec(), let_env))
         }
@@ -1323,25 +2317,14 @@ fn eval_let_step(
             }
 
             let bindings = parse_let_bindings(bindings_expr, "let")?;
-            let args = bindings
-                .iter()
-                .map(|(_, expr)| eval_expr_in_env(expr, env, context))
-                .collect::<Result<Vec<_>, EvalError>>()?;
             let params = bindings
-                .into_iter()
-                .map(|(binding_name, _)| binding_name)
-                .collect();
-
-            let let_env = Env::new(Some(env.clone()));
-            let_env.define(name.clone(), Value::Void);
-
-            let procedure = Rc::new(Procedure::Lambda {
-                params: LambdaParams::fixed(params),
-                body: body.to_vec(),
-                env: let_env.clone(),
-            });
-            let value = Value::Procedure(procedure.clone());
-            let_env.define(name.clone(), value.clone());
+                .iter()
+                .map(|(binding_name, _)| binding_name.clone())
+                .collect::<Vec<_>>();
+            let args =
+                eval_named_let_args(name, &params, Vec::new(), &bindings, body, env, context)?;
+            let (value, args) =
+                build_named_let_call(name.clone(), params, body.to_vec(), env, args);
 
             Ok(EvalStep::Apply(value, args))
         }
@@ -1374,11 +2357,7 @@ fn eval_let_star_step(
 
     let bindings = parse_let_bindings(bindings_expr, "let*")?;
     let let_star_env = Env::new(Some(env.clone()));
-
-    for (name, init) in bindings {
-        let value = eval_expr_in_env(&init, &let_star_env, context)?;
-        let_star_env.define(name, value);
-    }
+    let let_star_env = eval_let_star_bindings(&let_star_env, &bindings, body, context)?;
 
     Ok(EvalStep::Sequence(body.to_vec(), let_star_env))
 }
@@ -1418,13 +2397,7 @@ fn eval_letrec_step(
     let letrec_env = Env::new(Some(env.clone()));
 
     if sequential {
-        for (name, init) in &bindings {
-            let cell = Rc::new(RefCell::new(Value::Uninitialized));
-            let letrec_name = name.clone();
-            letrec_env.define_cell(letrec_name, cell.clone());
-            let value = eval_expr_in_env(init, &letrec_env, context)?;
-            *cell.borrow_mut() = value;
-        }
+        eval_letrec_sequential_bindings(&bindings, &letrec_env, body, context)?;
     } else {
         let mut cells = Vec::with_capacity(bindings.len());
         for (name, _) in &bindings {
@@ -1433,10 +2406,18 @@ fn eval_letrec_step(
             cells.push(cell);
         }
 
-        let values = bindings
+        let init_exprs = bindings
             .iter()
-            .map(|(_, init)| eval_expr_in_env(init, &letrec_env, context))
-            .collect::<Result<Vec<_>, EvalError>>()?;
+            .map(|(_, init)| init.clone())
+            .collect::<Vec<_>>();
+        let values = eval_letrec_parallel_bindings(
+            &cells,
+            Vec::new(),
+            &init_exprs,
+            body,
+            &letrec_env,
+            context,
+        )?;
 
         for (cell, value) in cells.into_iter().zip(values) {
             *cell.borrow_mut() = value;
@@ -1946,6 +2927,8 @@ fn root_env() -> EnvRef {
         "assoc",
         "assv",
         "boolean?",
+        "call-with-current-continuation",
+        "call/cc",
         "caar",
         "cadr",
         "char?",
@@ -3282,9 +4265,12 @@ fn equal_values_inner(
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::List(left), Value::List(right)) => {
             left.len() == right.len()
-                && left.iter().zip(right.iter()).all(|(left_item, right_item)| {
-                    equal_values_inner(left_item, right_item, seen_pairs)
-                })
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left_item, right_item)| {
+                        equal_values_inner(left_item, right_item, seen_pairs)
+                    })
         }
         (Value::Pair(left), Value::Pair(right)) => {
             let pair_key = (pair_id(left), pair_id(right));
@@ -3301,9 +4287,12 @@ fn equal_values_inner(
             let left_values = left.values();
             let right_values = right.values();
             left_values.len() == right_values.len()
-                && left_values.iter().zip(right_values.iter()).all(|(left_item, right_item)| {
-                    equal_values_inner(left_item, right_item, seen_pairs)
-                })
+                && left_values
+                    .iter()
+                    .zip(right_values.iter())
+                    .all(|(left_item, right_item)| {
+                        equal_values_inner(left_item, right_item, seen_pairs)
+                    })
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -3467,18 +4456,7 @@ fn apply_map(args: &[Value], context: &mut EvalContext) -> Result<Value, EvalErr
         .iter()
         .map(|value| collect_list("map", value))
         .collect::<Result<Vec<_>, EvalError>>()?;
-    let length = lists.iter().map(|list| list.len()).min().unwrap_or(0);
-
-    let mut results = Vec::with_capacity(length);
-    for index in 0..length {
-        let call_args = lists
-            .iter()
-            .map(|list| list[index].clone())
-            .collect::<Vec<_>>();
-        results.push(apply_procedure(args[0].clone(), call_args, context)?);
-    }
-
-    Ok(list_from_vec(results))
+    apply_map_from_index(args[0].clone(), &lists, 0, Vec::new(), context)
 }
 
 fn apply_for_each(args: &[Value], context: &mut EvalContext) -> Result<Value, EvalError> {
@@ -3498,17 +4476,7 @@ fn apply_for_each(args: &[Value], context: &mut EvalContext) -> Result<Value, Ev
         .iter()
         .map(|value| collect_list("for-each", value))
         .collect::<Result<Vec<_>, EvalError>>()?;
-    let length = lists.iter().map(|list| list.len()).min().unwrap_or(0);
-
-    for index in 0..length {
-        let call_args = lists
-            .iter()
-            .map(|list| list[index].clone())
-            .collect::<Vec<_>>();
-        apply_procedure(args[0].clone(), call_args, context)?;
-    }
-
-    Ok(Value::Void)
+    apply_for_each_from_index(args[0].clone(), &lists, 0, context)
 }
 
 fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
@@ -3519,29 +4487,16 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     }
 
     let env = root_env();
-    let mut macros = MacroEnv::default();
-    let mut expander = MacroExpander::default();
     let mut context = EvalContext::default();
-    let mut last_value = Value::Void;
-
-    for expression in &program {
-        if register_macro_definition(&expression.expr, &env, &mut macros).map_err(|error| {
-            error.with_position(expression.position.line, expression.position.column)
-        })? {
-            last_value = Value::Void;
-            continue;
-        }
-
-        let expanded = expander
-            .expand_expr(&expression.expr, &macros)
-            .map_err(|error| {
-                error.with_position(expression.position.line, expression.position.column)
-            })?;
-
-        last_value = eval_expr_in_env(&expanded, &env, &mut context).map_err(|error| {
-            error.with_position(expression.position.line, expression.position.column)
-        })?;
-    }
+    let last_value = run_eval_action(
+        EvalAction::Program(TopLevelState {
+            remaining: program,
+            env: env.clone(),
+            macros: MacroEnv::default(),
+            expander: MacroExpander::default(),
+        }),
+        &mut context,
+    )?;
 
     Ok((last_value, context.output))
 }

@@ -89,7 +89,7 @@ pub(crate) fn register_macro_definition(
     Ok(true)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MacroExpander {
     next_id: usize,
 }
