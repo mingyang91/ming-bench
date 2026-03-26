@@ -16,7 +16,7 @@ func builtinStringToList(args []expr) (expr, error) {
 	for i, r := range text.runes {
 		items[i] = charExpr(r)
 	}
-	return listExpr{items: items}, nil
+	return properListFromSlice(items), nil
 }
 
 func builtinListToString(args []expr) (expr, error) {
@@ -24,13 +24,13 @@ func builtinListToString(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "list->string expects exactly 1 argument"}
 	}
 
-	list, ok := args[0].(listExpr)
+	list, ok := listElements(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "list->string expects a list"}
 	}
 
-	runes := make([]rune, len(list.items))
-	for i, item := range list.items {
+	runes := make([]rune, len(list))
+	for i, item := range list {
 		ch, ok := item.(charExpr)
 		if !ok {
 			return nil, &EvalError{Message: "list->string expects a list of characters"}

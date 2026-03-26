@@ -123,7 +123,7 @@ func builtinVectorToList(args []expr) (expr, error) {
 	}
 
 	items := append([]expr(nil), vector.items...)
-	return listExpr{items: items}, nil
+	return properListFromSlice(items), nil
 }
 
 func builtinListToVector(args []expr) (expr, error) {
@@ -131,12 +131,12 @@ func builtinListToVector(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "list->vector expects exactly 1 argument"}
 	}
 
-	list, ok := args[0].(listExpr)
+	list, ok := listElements(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "list->vector expects a list"}
 	}
 
-	items := append([]expr(nil), list.items...)
+	items := append([]expr(nil), list...)
 	return &vectorExpr{items: items}, nil
 }
 

@@ -204,6 +204,8 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define(">=", builtinProc{name: ">=", fn: comparisonBuiltin(">=", func(a, b int) bool { return a >= b })})
 	root.define("abs", builtinProc{name: "abs", fn: builtinAbs})
 	root.define("assoc", builtinProc{name: "assoc", fn: builtinAssoc})
+	root.define("assq", builtinProc{name: "assq", fn: builtinAssq})
+	root.define("assv", builtinProc{name: "assv", fn: builtinAssv})
 	root.define("not", builtinProc{name: "not", fn: builtinNot})
 	root.define("apply", builtinProc{name: "apply", fn: builtinApply})
 	root.define("append", builtinProc{name: "append", fn: builtinAppend})
@@ -226,13 +228,17 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("eqv?", builtinProc{name: "eqv?", fn: builtinEqv})
 	root.define("equal?", builtinProc{name: "equal?", fn: builtinEqual})
 	root.define("even?", builtinProc{name: "even?", fn: builtinEven})
+	root.define("error", builtinProc{name: "error", fn: builtinError})
 	root.define("exact?", builtinProc{name: "exact?", fn: builtinExact})
 	root.define("exact->inexact", builtinProc{name: "exact->inexact", fn: builtinExactToInexact})
 	root.define("expt", builtinProc{name: "expt", fn: builtinExpt})
+	root.define("for-each", builtinProc{name: "for-each", fn: builtinForEach})
+	root.define("gcd", builtinProc{name: "gcd", fn: builtinGCD})
 	root.define("inexact?", builtinProc{name: "inexact?", fn: builtinInexact})
 	root.define("inexact->exact", builtinProc{name: "inexact->exact", fn: builtinInexactToExact})
 	root.define("integer->char", builtinProc{name: "integer->char", fn: builtinIntegerToChar})
 	root.define("integer?", builtinProc{name: "integer?", fn: builtinInteger})
+	root.define("lcm", builtinProc{name: "lcm", fn: builtinLCM})
 	root.define("length", builtinProc{name: "length", fn: builtinLength})
 	root.define("list", builtinProc{name: "list", fn: builtinList})
 	root.define("list?", builtinProc{name: "list?", fn: builtinListPred})
@@ -241,8 +247,12 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("list-tail", builtinProc{name: "list-tail", fn: builtinListTail})
 	root.define("map", builtinProc{name: "map", fn: builtinMap})
 	root.define("max", builtinProc{name: "max", fn: builtinMax})
+	root.define("make-string", builtinProc{name: "make-string", fn: builtinMakeString})
 	root.define("min", builtinProc{name: "min", fn: builtinMin})
 	root.define("modulo", builtinProc{name: "modulo", fn: builtinModulo})
+	root.define("member", builtinProc{name: "member", fn: builtinMember})
+	root.define("memq", builtinProc{name: "memq", fn: builtinMemq})
+	root.define("memv", builtinProc{name: "memv", fn: builtinMemv})
 	root.define("negative?", builtinProc{name: "negative?", fn: builtinNegative})
 	root.define("newline", builtinProc{name: "newline", fn: makeNewlineBuiltin(rt)})
 	root.define("null?", builtinProc{name: "null?", fn: builtinNull})
@@ -256,20 +266,18 @@ func newGlobalEnv(rt *runtime) *env {
 	})})
 	root.define("numerator", builtinProc{name: "numerator", fn: builtinNumerator})
 	root.define("pair?", builtinProc{name: "pair?", fn: typePredicate(func(value expr) bool {
-		list, ok := value.(listExpr)
-		if ok {
-			return len(list.items) > 0
-		}
-		_, ok = value.(*pairExpr)
-		return ok
+		return isPairValue(value)
 	})})
 	root.define("positive?", builtinProc{name: "positive?", fn: builtinPositive})
 	root.define("procedure?", builtinProc{name: "procedure?", fn: typePredicate(isProcedure)})
 	root.define("quotient", builtinProc{name: "quotient", fn: builtinQuotient})
 	root.define("rational?", builtinProc{name: "rational?", fn: builtinRational})
 	root.define("remainder", builtinProc{name: "remainder", fn: builtinRemainder})
+	root.define("reverse", builtinProc{name: "reverse", fn: builtinReverse})
+	root.define("round", builtinProc{name: "round", fn: builtinRound})
 	root.define("denominator", builtinProc{name: "denominator", fn: builtinDenominator})
 	root.define("number->string", builtinProc{name: "number->string", fn: builtinNumberToString})
+	root.define("string", builtinProc{name: "string", fn: builtinString})
 	root.define("string?", builtinProc{name: "string?", fn: typePredicate(func(value expr) bool {
 		_, ok := asString(value)
 		return ok
@@ -286,6 +294,15 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("string<?", builtinProc{name: "string<?", fn: stringComparisonBuiltin("string<?", func(a, b string) bool {
 		return compareStringLex(a, b) < 0
 	})})
+	root.define("string>?", builtinProc{name: "string>?", fn: stringComparisonBuiltin("string>?", func(a, b string) bool {
+		return compareStringLex(a, b) > 0
+	})})
+	root.define("string<=?", builtinProc{name: "string<=?", fn: stringComparisonBuiltin("string<=?", func(a, b string) bool {
+		return compareStringLex(a, b) <= 0
+	})})
+	root.define("string>=?", builtinProc{name: "string>=?", fn: stringComparisonBuiltin("string>=?", func(a, b string) bool {
+		return compareStringLex(a, b) >= 0
+	})})
 	root.define("string-length", builtinProc{name: "string-length", fn: builtinStringLength})
 	root.define("string-ref", builtinProc{name: "string-ref", fn: builtinStringRef})
 	root.define("string-set!", builtinProc{name: "string-set!", fn: builtinStringSet})
@@ -299,6 +316,9 @@ func newGlobalEnv(rt *runtime) *env {
 		return ok
 	})})
 	root.define("symbol->string", builtinProc{name: "symbol->string", fn: builtinSymbolToString})
+	root.define("set-car!", builtinProc{name: "set-car!", fn: builtinSetCar})
+	root.define("set-cdr!", builtinProc{name: "set-cdr!", fn: builtinSetCdr})
+	root.define("truncate", builtinProc{name: "truncate", fn: builtinTruncate})
 	root.define("vector", builtinProc{name: "vector", fn: builtinVector})
 	root.define("make-vector", builtinProc{name: "make-vector", fn: builtinMakeVector})
 	root.define("vector->list", builtinProc{name: "vector->list", fn: builtinVectorToList})
@@ -309,6 +329,7 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("vector?", builtinProc{name: "vector?", fn: builtinVectorPred})
 	root.define("write", builtinProc{name: "write", fn: makeWriteBuiltin(rt)})
 	root.define("zero?", builtinProc{name: "zero?", fn: builtinZero})
+	registerCxrBuiltins(root)
 
 	return root
 }
@@ -645,6 +666,9 @@ func evalListStep(environment *env, items listExpr) (evalStep, error) {
 		case "let":
 			step, err := evalLet(environment, items.items[1:])
 			return step, attachPos(err, operator.pos)
+		case "let*":
+			step, err := evalLetStar(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "letrec":
 			step, err := evalLetrec(environment, items.items[1:], false)
 			return step, attachPos(err, operator.pos)
@@ -814,7 +838,7 @@ func evalQuote(forms []expr) (expr, error) {
 	if len(forms) != 1 {
 		return nil, &EvalError{Message: "quote expects exactly 1 argument"}
 	}
-	return forms[0], nil
+	return quoteDatum(forms[0]), nil
 }
 
 func evalLet(environment *env, forms []expr) (evalStep, error) {
@@ -1080,7 +1104,7 @@ func prepareClosureCall(callable closureExpr, args []expr) (evalStep, error) {
 	}
 	if callable.variadic {
 		rest := append([]expr(nil), args[len(callable.params):]...)
-		callEnv.define(callable.restParam, listExpr{items: rest})
+		callEnv.define(callable.restParam, properListFromSlice(rest))
 	}
 	return evalSequenceTail(callEnv, callable.body)
 }
@@ -1138,14 +1162,14 @@ func applyBuiltinStep(args []expr) (evalStep, error) {
 		return evalStep{}, &EvalError{Message: "apply expects at least 2 arguments"}
 	}
 
-	tailList, ok := args[len(args)-1].(listExpr)
+	tailList, ok := listElements(args[len(args)-1])
 	if !ok {
 		return evalStep{}, &EvalError{Message: "apply expects a list as its final argument"}
 	}
 
-	callArgs := make([]expr, 0, len(args)-2+len(tailList.items))
+	callArgs := make([]expr, 0, len(args)-2+len(tailList))
 	callArgs = append(callArgs, args[1:len(args)-1]...)
-	callArgs = append(callArgs, tailList.items...)
+	callArgs = append(callArgs, tailList...)
 	return applyCallableStep(args[0], callArgs)
 }
 
@@ -1303,13 +1327,13 @@ func builtinAbs(args []expr) (expr, error) {
 func builtinAppend(args []expr) (expr, error) {
 	result := make([]expr, 0)
 	for _, arg := range args {
-		list, ok := arg.(listExpr)
+		items, ok := listElements(arg)
 		if !ok {
 			return nil, &EvalError{Message: "append expects list arguments"}
 		}
-		result = append(result, list.items...)
+		result = append(result, items...)
 	}
-	return listExpr{items: result}, nil
+	return properListFromSlice(result), nil
 }
 
 func builtinApply(args []expr) (expr, error) {
@@ -1317,14 +1341,14 @@ func builtinApply(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "apply expects at least 2 arguments"}
 	}
 
-	tailList, ok := args[len(args)-1].(listExpr)
+	tailList, ok := listElements(args[len(args)-1])
 	if !ok {
 		return nil, &EvalError{Message: "apply expects a list as its final argument"}
 	}
 
-	callArgs := make([]expr, 0, len(args)-2+len(tailList.items))
+	callArgs := make([]expr, 0, len(args)-2+len(tailList))
 	callArgs = append(callArgs, args[1:len(args)-1]...)
-	callArgs = append(callArgs, tailList.items...)
+	callArgs = append(callArgs, tailList...)
 	return applyCallable(args[0], callArgs)
 }
 
@@ -1333,15 +1357,11 @@ func builtinCar(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "car expects exactly 1 argument"}
 	}
 
-	if pair, ok := args[0].(*pairExpr); ok {
-		return pair.car, nil
-	}
-
-	list, ok := args[0].(listExpr)
-	if !ok || len(list.items) == 0 {
+	value, ok := carValue(args[0])
+	if !ok {
 		return nil, &EvalError{Message: "car expects a non-empty list"}
 	}
-	return list.items[0], nil
+	return value, nil
 }
 
 func builtinCdr(args []expr) (expr, error) {
@@ -1349,29 +1369,16 @@ func builtinCdr(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "cdr expects exactly 1 argument"}
 	}
 
-	if pair, ok := args[0].(*pairExpr); ok {
-		return pair.cdr, nil
-	}
-
-	list, ok := args[0].(listExpr)
-	if !ok || len(list.items) == 0 {
+	value, ok := cdrValue(args[0])
+	if !ok {
 		return nil, &EvalError{Message: "cdr expects a non-empty list"}
 	}
-	items := append([]expr(nil), list.items[1:]...)
-	return listExpr{items: items}, nil
+	return value, nil
 }
 
 func builtinCons(args []expr) (expr, error) {
 	if len(args) != 2 {
 		return nil, &EvalError{Message: "cons expects exactly 2 arguments"}
-	}
-
-	list, ok := args[1].(listExpr)
-	if ok {
-		result := make([]expr, 0, len(list.items)+1)
-		result = append(result, args[0])
-		result = append(result, list.items...)
-		return listExpr{items: result}, nil
 	}
 
 	return &pairExpr{car: args[0], cdr: args[1]}, nil
@@ -1382,17 +1389,17 @@ func builtinLength(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "length expects exactly 1 argument"}
 	}
 
-	list, ok := args[0].(listExpr)
+	list, ok := listElements(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "length expects a list"}
 	}
-	return intExpr(len(list.items)), nil
+	return intExpr(len(list)), nil
 }
 
 func builtinList(args []expr) (expr, error) {
 	result := make([]expr, len(args))
 	copy(result, args)
-	return listExpr{items: result}, nil
+	return properListFromSlice(result), nil
 }
 
 func builtinListPred(args []expr) (expr, error) {
@@ -1400,8 +1407,7 @@ func builtinListPred(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "list? expects exactly 1 argument"}
 	}
 
-	_, ok := args[0].(listExpr)
-	return boolExpr(ok), nil
+	return boolExpr(isProperListValue(args[0])), nil
 }
 
 func builtinListRef(args []expr) (expr, error) {
@@ -1409,7 +1415,7 @@ func builtinListRef(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "list-ref expects exactly 2 arguments"}
 	}
 
-	list, ok := args[0].(listExpr)
+	list, ok := listElements(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "list-ref expects a list as its first argument"}
 	}
@@ -1420,11 +1426,11 @@ func builtinListRef(args []expr) (expr, error) {
 	}
 
 	idx := int(index)
-	if idx < 0 || idx >= len(list.items) {
+	if idx < 0 || idx >= len(list) {
 		return nil, &EvalError{Message: "list-ref index out of range"}
 	}
 
-	return list.items[idx], nil
+	return list[idx], nil
 }
 
 func builtinListTail(args []expr) (expr, error) {
@@ -1432,7 +1438,7 @@ func builtinListTail(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "list-tail expects exactly 2 arguments"}
 	}
 
-	list, ok := args[0].(listExpr)
+	list, ok := listElements(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "list-tail expects a list as its first argument"}
 	}
@@ -1443,12 +1449,12 @@ func builtinListTail(args []expr) (expr, error) {
 	}
 
 	idx := int(index)
-	if idx < 0 || idx > len(list.items) {
+	if idx < 0 || idx > len(list) {
 		return nil, &EvalError{Message: "list-tail index out of range"}
 	}
 
-	items := append([]expr(nil), list.items[idx:]...)
-	return listExpr{items: items}, nil
+	items := append([]expr(nil), list[idx:]...)
+	return properListFromSlice(items), nil
 }
 
 func builtinMap(args []expr) (expr, error) {
@@ -1456,16 +1462,16 @@ func builtinMap(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "map expects a procedure and at least one list"}
 	}
 
-	lists := make([]listExpr, len(args)-1)
+	lists := make([][]expr, len(args)-1)
 	expectedLen := -1
 	for i, arg := range args[1:] {
-		list, ok := arg.(listExpr)
+		list, ok := listElements(arg)
 		if !ok {
 			return nil, &EvalError{Message: "map expects list arguments"}
 		}
 		if expectedLen == -1 {
-			expectedLen = len(list.items)
-		} else if len(list.items) != expectedLen {
+			expectedLen = len(list)
+		} else if len(list) != expectedLen {
 			return nil, &EvalError{Message: "map expects lists of equal length"}
 		}
 		lists[i] = list
@@ -1475,7 +1481,7 @@ func builtinMap(args []expr) (expr, error) {
 	for i := 0; i < expectedLen; i++ {
 		callArgs := make([]expr, len(lists))
 		for j, list := range lists {
-			callArgs[j] = list.items[i]
+			callArgs[j] = list[i]
 		}
 
 		value, err := applyCallable(args[0], callArgs)
@@ -1485,7 +1491,7 @@ func builtinMap(args []expr) (expr, error) {
 		result[i] = value
 	}
 
-	return listExpr{items: result}, nil
+	return properListFromSlice(result), nil
 }
 
 func builtinMax(args []expr) (expr, error) {
@@ -1553,8 +1559,7 @@ func builtinNull(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "null? expects exactly 1 argument"}
 	}
 
-	list, ok := args[0].(listExpr)
-	return boolExpr(ok && len(list.items) == 0), nil
+	return boolExpr(isEmptyList(args[0])), nil
 }
 
 func makeDisplayBuiltin(rt *runtime) builtinFunc {
@@ -1923,26 +1928,18 @@ func builtinAssoc(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "assoc expects exactly 2 arguments"}
 	}
 
-	alist, ok := args[1].(listExpr)
+	alist, ok := listElements(args[1])
 	if !ok {
 		return nil, &EvalError{Message: "assoc expects a list as its second argument"}
 	}
 
-	for _, entry := range alist.items {
-		switch pair := entry.(type) {
-		case listExpr:
-			if len(pair.items) == 0 {
-				return nil, &EvalError{Message: "assoc expects non-empty association entries"}
-			}
-			if equalExpr(args[0], pair.items[0]) {
-				return pair, nil
-			}
-		case *pairExpr:
-			if equalExpr(args[0], pair.car) {
-				return pair, nil
-			}
-		default:
+	for _, entry := range alist {
+		key, ok := carValue(entry)
+		if !ok {
 			return nil, &EvalError{Message: "assoc expects association entries to be pairs"}
+		}
+		if equalExpr(args[0], key) {
+			return entry, nil
 		}
 	}
 
@@ -2091,60 +2088,7 @@ func eqExpr(a, b expr) bool {
 }
 
 func equalExpr(a, b expr) bool {
-	if equal, ok := numericEqualExpr(a, b); ok {
-		return equal
-	}
-
-	switch left := a.(type) {
-	case intExpr:
-		right, ok := b.(intExpr)
-		return ok && left == right
-	case boolExpr:
-		right, ok := b.(boolExpr)
-		return ok && left == right
-	case charExpr:
-		right, ok := b.(charExpr)
-		return ok && left == right
-	case symbolExpr:
-		right, ok := b.(symbolExpr)
-		return ok && left.name == right.name
-	case *stringExpr:
-		right, ok := asString(b)
-		return ok && left.text() == right.text()
-	case listExpr:
-		right, ok := b.(listExpr)
-		if !ok || len(left.items) != len(right.items) {
-			return false
-		}
-		for i := range left.items {
-			if !equalExpr(left.items[i], right.items[i]) {
-				return false
-			}
-		}
-		return true
-	case *pairExpr:
-		right, ok := b.(*pairExpr)
-		return ok && equalExpr(left.car, right.car) && equalExpr(left.cdr, right.cdr)
-	case *vectorExpr:
-		right, ok := b.(*vectorExpr)
-		if !ok || len(left.items) != len(right.items) {
-			return false
-		}
-		for i := range left.items {
-			if !equalExpr(left.items[i], right.items[i]) {
-				return false
-			}
-		}
-		return true
-	case builtinProc:
-		right, ok := b.(builtinProc)
-		return ok && left.name == right.name
-	case voidExpr:
-		_, ok := b.(voidExpr)
-		return ok
-	default:
-		return false
-	}
+	return equalExprSeen(a, b, map[pairCompareKey]struct{}{}, map[vectorCompareKey]struct{}{})
 }
 
 func isTruthy(value expr) bool {
@@ -2230,19 +2174,24 @@ func displayExpr(value expr) string {
 }
 
 func renderPair(pair *pairExpr, render func(expr) string) string {
-	parts := []string{render(pair.car)}
-	tail := pair.cdr
+	parts := []string{}
+	seen := map[*pairExpr]struct{}{}
+	tail := expr(pair)
 
 	for {
 		switch v := tail.(type) {
+		case *pairExpr:
+			if _, ok := seen[v]; ok {
+				return "(" + strings.Join(parts, " ") + " . #<cycle>)"
+			}
+			seen[v] = struct{}{}
+			parts = append(parts, render(v.car))
+			tail = v.cdr
 		case listExpr:
 			for _, item := range v.items {
 				parts = append(parts, render(item))
 			}
 			return "(" + strings.Join(parts, " ") + ")"
-		case *pairExpr:
-			parts = append(parts, render(v.car))
-			tail = v.cdr
 		default:
 			return "(" + strings.Join(parts, " ") + " . " + render(tail) + ")"
 		}
