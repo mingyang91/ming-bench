@@ -16,7 +16,8 @@ type SchemeVal =
   | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }  // parse-time only
   | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; pos?: Pos }
-  | { tag: 'macro'; rules: MacroRule[]; defEnv: Env; pos?: Pos };
+  | { tag: 'macro'; rules: MacroRule[]; defEnv: Env; pos?: Pos }
+  | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal>; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (after macro name)
@@ -650,6 +651,76 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             }
             return result;
           }
+          case 'define-record-type': {
+            // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+            if (elems.length < 4) throw errAt('define-record-type: bad syntax', expr.pos);
+            const rtName = elems[1];
+            if (rtName.tag !== 'symbol') throw errAt('define-record-type: expected type name', expr.pos);
+            const ctorForm = elems[2];
+            if (ctorForm.tag !== 'list' || ctorForm.elements.length < 1)
+              throw errAt('define-record-type: bad constructor', expr.pos);
+            const ctorName = ctorForm.elements[0];
+            if (ctorName.tag !== 'symbol') throw errAt('define-record-type: expected constructor name', expr.pos);
+            const ctorFields = ctorForm.elements.slice(1).map(e => {
+              if (e.tag !== 'symbol') throw errAt('define-record-type: expected field name', expr.pos);
+              return e.value;
+            });
+            const predName = elems[3];
+            if (predName.tag !== 'symbol') throw errAt('define-record-type: expected predicate name', expr.pos);
+
+            // Parse field accessors
+            const accessors: { field: string; accessor: string }[] = [];
+            for (let i = 4; i < elems.length; i++) {
+              const fd = elems[i];
+              if (fd.tag !== 'list' || fd.elements.length < 2)
+                throw errAt('define-record-type: bad field spec', expr.pos);
+              const fname = fd.elements[0];
+              const acc = fd.elements[1];
+              if (fname.tag !== 'symbol' || acc.tag !== 'symbol')
+                throw errAt('define-record-type: expected symbols in field spec', expr.pos);
+              accessors.push({ field: fname.value, accessor: acc.value });
+            }
+
+            const typeId = Symbol(rtName.value);
+
+            // Constructor
+            const ctorFieldsCopy = [...ctorFields];
+            const ctorLambda: SchemeVal = {
+              tag: 'lambda', params: ctorFieldsCopy, body: [], env: new Env(),
+            };
+            (ctorLambda as any).nativeFn = (...args: SchemeVal[]): SchemeVal => {
+              const fields = new Map<string, SchemeVal>();
+              for (let i = 0; i < ctorFieldsCopy.length; i++) {
+                fields.set(ctorFieldsCopy[i], args[i]);
+              }
+              return { tag: 'record', typeName: rtName.value, typeId, fields };
+            };
+            env.set(ctorName.value, ctorLambda);
+
+            // Predicate
+            const predLambda: SchemeVal = {
+              tag: 'lambda', params: ['__x__'], body: [], env: new Env(),
+            };
+            (predLambda as any).nativeFn = (x: SchemeVal): SchemeVal => {
+              return x.tag === 'record' && x.typeId === typeId ? SCM_TRUE : SCM_FALSE;
+            };
+            env.set(predName.value, predLambda);
+
+            // Accessors
+            for (const { field, accessor } of accessors) {
+              const accLambda: SchemeVal = {
+                tag: 'lambda', params: ['__x__'], body: [], env: new Env(),
+              };
+              (accLambda as any).nativeFn = (x: SchemeVal): SchemeVal => {
+                if (x.tag !== 'record' || x.typeId !== typeId)
+                  throw new EvalError(`${accessor}: not a ${rtName.value}`);
+                return x.fields.get(field)!;
+              };
+              env.set(accessor, accLambda);
+            }
+
+            return SCM_FALSE;
+          }
           case 'define-syntax': {
             if (elems.length !== 3) throw errAt('define-syntax: bad syntax', expr.pos);
             const nameElem = elems[1];
@@ -710,6 +781,9 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
 }
 
 function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], pos?: Pos): SchemeVal {
+  // Native functions (record constructors, predicates, accessors)
+  const nativeFn = (proc as any).nativeFn;
+  if (nativeFn) return nativeFn(...args);
   if (proc.restParam) {
     if (args.length < proc.params.length)
       throw errAt(`expected at least ${proc.params.length} arguments, got ${args.length}`, pos);
@@ -1306,6 +1380,7 @@ function display(val: SchemeVal): string {
     case 'lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
     case 'macro': return '#<macro>';
+    case 'record': return `#<record ${val.typeName}>`;
   }
 }
 
