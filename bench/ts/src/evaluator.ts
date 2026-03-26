@@ -8,6 +8,7 @@ type SchemeVal =
   | { tag: 'number'; value: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
+  | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
   | { tag: 'nil'; pos?: Pos }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
@@ -375,7 +376,12 @@ function requireNumbers(name: string, args: SchemeVal[], pos?: Pos): number[] {
 const BUILTINS = new Set([
   '+', '-', '*', '/', '<', '>', '=', '<=', '>=',
   'cons', 'car', 'cdr', 'null?', 'list', 'length', 'append',
-  'number?', 'string?', 'boolean?', 'pair?', 'symbol?',
+  'number?', 'string?', 'boolean?', 'pair?', 'symbol?', 'char?',
+  'display', 'write', 'newline',
+  'string-append', 'string-length', 'substring',
+  'string->number', 'number->string',
+  'symbol->string', 'string->symbol',
+  'string-ref',
 ]);
 
 function isBuiltin(name: string): boolean {
@@ -484,13 +490,82 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
     case 'symbol?':
       if (args.length !== 1) throw errAt('symbol?: expected 1 argument', pos);
       return args[0].tag === 'symbol' ? SCM_TRUE : SCM_FALSE;
+    case 'char?':
+      if (args.length !== 1) throw errAt('char?: expected 1 argument', pos);
+      return args[0].tag === 'char' ? SCM_TRUE : SCM_FALSE;
+    case 'display': {
+      if (args.length !== 1) throw errAt('display: expected 1 argument', pos);
+      outputBuffer.push(displayFormat(args[0]));
+      return SCM_FALSE;
+    }
+    case 'write': {
+      if (args.length !== 1) throw errAt('write: expected 1 argument', pos);
+      outputBuffer.push(display(args[0]));
+      return SCM_FALSE;
+    }
+    case 'newline': {
+      outputBuffer.push('\n');
+      return SCM_FALSE;
+    }
+    case 'string-append': {
+      const strs = args.map(a => {
+        if (a.tag !== 'string') throw errAt('string-append: expected string', pos);
+        return a.value;
+      });
+      return { tag: 'string', value: strs.join('') };
+    }
+    case 'string-length': {
+      if (args.length !== 1 || args[0].tag !== 'string')
+        throw errAt('string-length: expected string', pos);
+      return { tag: 'number', value: args[0].value.length };
+    }
+    case 'substring': {
+      if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'number')
+        throw errAt('substring: expected string, start, end', pos);
+      return { tag: 'string', value: args[0].value.slice(args[1].value, args[2].value) };
+    }
+    case 'string->number': {
+      if (args.length !== 1 || args[0].tag !== 'string')
+        throw errAt('string->number: expected string', pos);
+      const n = Number(args[0].value);
+      if (isNaN(n)) return SCM_FALSE;
+      return { tag: 'number', value: n };
+    }
+    case 'number->string': {
+      if (args.length !== 1 || args[0].tag !== 'number')
+        throw errAt('number->string: expected number', pos);
+      return { tag: 'string', value: String(args[0].value) };
+    }
+    case 'symbol->string': {
+      if (args.length !== 1 || args[0].tag !== 'symbol')
+        throw errAt('symbol->string: expected symbol', pos);
+      return { tag: 'string', value: args[0].value };
+    }
+    case 'string->symbol': {
+      if (args.length !== 1 || args[0].tag !== 'string')
+        throw errAt('string->symbol: expected string', pos);
+      return { tag: 'symbol', value: args[0].value };
+    }
+    case 'string-ref': {
+      if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'number')
+        throw errAt('string-ref: expected string and index', pos);
+      const idx = args[1].value;
+      if (idx < 0 || idx >= args[0].value.length)
+        throw errAt('string-ref: index out of range', pos);
+      return { tag: 'char', value: args[0].value[idx] };
+    }
     default:
       throw errAt(`unbound variable: ${name}`, pos);
   }
 }
 
+// ── Output buffer ──────────────────────────────────────────────────────
+
+let outputBuffer: string[] = [];
+
 // ── Display ────────────────────────────────────────────────────────────
 
+// write format: strings quoted
 function display(val: SchemeVal): string {
   switch (val.tag) {
     case 'number': return String(val.value);
@@ -512,8 +587,29 @@ function display(val: SchemeVal): string {
       return result;
     }
     case 'list': return `(${val.elements.map(display).join(' ')})`;
+    case 'char': return `#\\${val.value === ' ' ? 'space' : val.value === '\n' ? 'newline' : val.value}`;
     case 'lambda': return '#<procedure>';
   }
+}
+
+// display format: strings unquoted
+function displayFormat(val: SchemeVal): string {
+  if (val.tag === 'string') return val.value;
+  if (val.tag === 'char') return val.value;
+  if (val.tag === 'pair') {
+    let result = '(' + displayFormat(val.car);
+    let cur: SchemeVal = val.cdr;
+    while (cur.tag === 'pair') {
+      result += ' ' + displayFormat(cur.car);
+      cur = cur.cdr;
+    }
+    if (cur.tag !== 'nil') {
+      result += ' . ' + displayFormat(cur);
+    }
+    result += ')';
+    return result;
+  }
+  return display(val);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────
@@ -535,5 +631,14 @@ export function evalStr(input: string): string {
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  throw new EvalError('not implemented');
+  const tokens = tokenize(input);
+  const exprs = parse(tokens);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  outputBuffer = [];
+  const env = makeGlobalEnv();
+  let result: SchemeVal | undefined;
+  for (const expr of exprs) {
+    result = evalExpr(expr, env);
+  }
+  return { result: display(result!), output: outputBuffer.join('') };
 }
