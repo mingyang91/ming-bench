@@ -61,6 +61,19 @@ pub enum EvalError {
     #[error("integer overflow")]
     IntegerOverflow,
 
+    #[error("expected non-negative integer, got {value}")]
+    NegativeIndex { value: i64 },
+
+    #[error("index out of bounds: index {index}, length {len}")]
+    IndexOutOfBounds { index: usize, len: usize },
+
+    #[error("invalid substring range: start {start}, end {end}, length {len}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+
     #[error("{inner} at {position}")]
     WithPosition {
         inner: Box<EvalError>,
