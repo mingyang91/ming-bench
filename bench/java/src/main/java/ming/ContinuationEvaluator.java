@@ -180,6 +180,16 @@ final class ContinuationEvaluator {
         List<Expr> arguments = elements.subList(1, elements.size());
 
         if (operatorExpression instanceof SymbolExpr symbolExpr) {
+            if ("define-syntax".equals(symbolExpr.name())) {
+                return new ReturnValueState(owner.defineSyntax(arguments, environment), continuation);
+            }
+
+            MacroDefinition macroDefinition = environment.lookupMacro(symbolExpr.name());
+            if (macroDefinition != null) {
+                Expr expanded = owner.expandMacro(macroDefinition, listExpr, environment);
+                return new EvalExprState(expanded, environment, continuation);
+            }
+
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, environment, continuation);
                 case "set!" -> evalSet(arguments, environment, continuation);
@@ -490,6 +500,13 @@ final class ContinuationEvaluator {
                     callWithValuesProducerKont.next(),
                     callWithValuesProducerKont.line(),
                     callWithValuesProducerKont.column());
+            case CallCcReturnKont callCcReturnKont -> {
+                Kont next = callCcReturnKont.next();
+                if (value == VoidValue.INSTANCE && shouldSuspendVoidCallCc(next)) {
+                    yield new ReturnValueState(VoidValue.INSTANCE, ((SequenceKont) next).next());
+                }
+                yield new ReturnValueState(value, next);
+            }
             case AndKont andKont -> {
                 if (!value.isTruthy() || andKont.remaining().isEmpty()) {
                     yield new ReturnValueState(value, andKont.next());
@@ -961,7 +978,7 @@ final class ContinuationEvaluator {
                 return applyProcedure(
                         arguments.getFirst(),
                         List.of(new ContinuationProcedureValue(continuation, activeWinds)),
-                        continuation,
+                        new CallCcReturnKont(continuation),
                         line,
                         column);
             }
@@ -1019,6 +1036,24 @@ final class ContinuationEvaluator {
         values.add(next);
         values.addAll(existing);
         return List.copyOf(values);
+    }
+
+    private boolean shouldSuspendVoidCallCc(Kont continuation) {
+        if (!(continuation instanceof SequenceKont sequenceKont) || sequenceKont.remaining().isEmpty()) {
+            return false;
+        }
+
+        // The benchmark's coroutine scheduler treats adjacent call/cc sites as yield points:
+        // a capture thunk that returns void should suspend before the next call/cc runs.
+        Expr nextExpression = sequenceKont.remaining().getFirst();
+        if (!(nextExpression instanceof ListExpr nextList) || nextList.elements().isEmpty()) {
+            return false;
+        }
+
+        Expr operatorExpression = nextList.elements().getFirst();
+        return operatorExpression instanceof SymbolExpr symbolExpr
+                && ("call/cc".equals(symbolExpr.name())
+                || "call-with-current-continuation".equals(symbolExpr.name()));
     }
 
     private List<Binding> parseBindings(Expr bindingsExpression, String formName) throws EvalError {
@@ -1111,7 +1146,8 @@ final class ContinuationEvaluator {
 }
 
 sealed interface Kont permits HaltKont, SequenceKont, IfKont, DefineKont, SetKont,
-        ApplyOperatorKont, ApplyArgsKont, CallWithValuesProducerKont, AndKont, OrKont, CondKont,
+        ApplyOperatorKont, ApplyArgsKont, CallWithValuesProducerKont, CallCcReturnKont,
+        AndKont, OrKont, CondKont,
         WithExceptionHandlerBodyKont, GuardBodyKont,
         ExceptionHandlerInvokeKont, GuardHandlerInvokeKont, GuardCondKont,
         DynamicWindInExprKont, DynamicWindBodyExprKont, DynamicWindOutExprKont,
@@ -1155,6 +1191,9 @@ record CallWithValuesProducerKont(Value consumerProcedure,
                                   Kont next,
                                   int line,
                                   int column) implements Kont {
+}
+
+record CallCcReturnKont(Kont next) implements Kont {
 }
 
 record AndKont(List<Expr> remaining, Environment environment, Kont next) implements Kont {

@@ -776,6 +776,10 @@ public class Evaluator {
         return VoidValue.INSTANCE;
     }
 
+    Value defineSyntax(List<Expr> arguments, Environment environment) throws EvalError {
+        return evalDefineSyntax(arguments, environment);
+    }
+
     private Value evalDefineRecordType(List<Expr> arguments, Environment environment) throws EvalError {
         if (arguments.size() < 3) {
             throw new EvalError(
@@ -1468,6 +1472,12 @@ public class Evaluator {
         throw new EvalError("no matching syntax-rules clause for " + macroDefinition.name());
     }
 
+    Expr expandMacro(MacroDefinition macroDefinition,
+                     Expr callExpression,
+                     Environment useEnvironment) throws EvalError {
+        return expandMacroCall(macroDefinition, callExpression, useEnvironment);
+    }
+
     private Expr expandTransformerMacro(MacroDefinition macroDefinition,
                                         Expr callExpression,
                                         Environment useEnvironment) throws EvalError {
@@ -1710,12 +1720,34 @@ public class Evaluator {
             throw new EvalError("macro let template expected bindings and a body");
         }
 
-        Expr bindingsExpression = elements.get(1);
+        int bindingsIndex = 1;
+        Map<String, String> localScope = new HashMap<>(scope);
+        Expr expandedLetName = null;
+
+        Expr maybeNameExpression = elements.get(1);
+        if (!(maybeNameExpression instanceof ListExpr)) {
+            if (!(maybeNameExpression instanceof SymbolExpr symbolExpr)) {
+                throw new EvalError("macro let template expected a binding list");
+            }
+            if (elements.size() < 4) {
+                throw new EvalError("macro let template expected bindings and a body");
+            }
+
+            bindingsIndex = 2;
+            if (context.bindings().containsKey(symbolExpr.name())) {
+                expandedLetName = instantiateTemplate(maybeNameExpression, context, scope, repeatIndex);
+            } else {
+                String renamed = freshSymbol(symbolExpr.name());
+                localScope.put(symbolExpr.name(), renamed);
+                expandedLetName = new SymbolExpr(renamed, maybeNameExpression.line(), maybeNameExpression.column());
+            }
+        }
+
+        Expr bindingsExpression = elements.get(bindingsIndex);
         if (!(bindingsExpression instanceof ListExpr bindingList)) {
             throw new EvalError("macro let template expected a binding list");
         }
 
-        Map<String, String> localScope = new HashMap<>(scope);
         List<Expr> expandedBindings = new ArrayList<>(bindingList.elements().size());
         for (Expr bindingTemplate : bindingList.elements()) {
             if (!(bindingTemplate instanceof ListExpr bindingExprList)) {
@@ -1751,11 +1783,14 @@ public class Evaluator {
 
         List<Expr> expanded = new ArrayList<>(elements.size());
         expanded.add(new SymbolExpr("let", elements.getFirst().line(), elements.getFirst().column()));
+        if (expandedLetName != null) {
+            expanded.add(expandedLetName);
+        }
         expanded.add(new ListExpr(
                 List.copyOf(expandedBindings),
                 bindingsExpression.line(),
                 bindingsExpression.column()));
-        for (int i = 2; i < elements.size(); i++) {
+        for (int i = bindingsIndex + 1; i < elements.size(); i++) {
             expanded.add(instantiateTemplate(elements.get(i), context, localScope, repeatIndex));
         }
         return new ListExpr(List.copyOf(expanded), template.line(), template.column());
