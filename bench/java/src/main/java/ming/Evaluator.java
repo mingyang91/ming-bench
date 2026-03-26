@@ -22,14 +22,69 @@ public class Evaluator {
     private final boolean immutableStringsEnabled;
     private StringBuilder outputBuffer;
 
-    private sealed interface EvalStep permits ValueStep, TailStep {
+    private sealed interface Step permits EvalExprStep, ReturnStep, ApplyStep, DoneStep {
     }
 
-    private record ValueStep(Value value) implements EvalStep {
+    private record EvalExprStep(Expr expr, Env env, Kont kont) implements Step {
     }
 
-    private record TailStep(Expr expr, Env env) implements EvalStep {
+    private record ReturnStep(Value value, Kont kont) implements Step {
     }
+
+    private record ApplyStep(Value operator, List<Value> arguments, Kont kont, int line,
+            int column) implements Step {
+    }
+
+    private record DoneStep(Value value) implements Step {
+    }
+
+    @FunctionalInterface
+    private interface ContinuationBody {
+        Step apply(Value value) throws EvalError;
+    }
+
+    private record Kont(int line, int column, ContinuationBody body) {
+        Step apply(Value value) throws EvalError {
+            try {
+                return body.apply(value);
+            } catch (EvalError error) {
+                if (line <= 0 || column <= 0) {
+                    throw error;
+                }
+                throw error.withPosition(line, column);
+            }
+        }
+    }
+
+    private static final class ContinuationJump extends RuntimeException {
+        private final Kont target;
+        private final Value value;
+
+        private ContinuationJump(Kont target, Value value) {
+            this.target = target;
+            this.value = value;
+        }
+
+        private Kont target() {
+            return target;
+        }
+
+        private Value value() {
+            return value;
+        }
+
+        @Override
+        public synchronized Throwable fillInStackTrace() {
+            return this;
+        }
+    }
+
+    @FunctionalInterface
+    private interface ValueListHandler {
+        Step apply(List<Value> values) throws EvalError;
+    }
+
+    private static final Kont DONE = new Kont(0, 0, DoneStep::new);
 
     public Evaluator() {
         this.immutableStringsEnabled = currentBenchLevel() >= STRING_IMMUTABILITY_LEVEL;
@@ -78,10 +133,7 @@ public class Evaluator {
         StringBuilder previousOutput = outputBuffer;
         outputBuffer = captureOutput ? new StringBuilder() : null;
         try {
-            Value result = VOID;
-            for (Expr expression : expressions) {
-                result = eval(expression, globalEnv);
-            }
+            Value result = run(evalSequence(expressions, globalEnv, DONE));
             String output = outputBuffer == null ? "" : outputBuffer.toString();
             return new EvalResult(ValueRenderer.render(result), output);
         } finally {
@@ -97,51 +149,68 @@ public class Evaluator {
                 this::quoteToValue);
     }
 
-    private Value eval(Expr expr, Env env) throws EvalError {
-        Expr currentExpr = expr;
-        Env currentEnv = env;
+    private Value run(Step initialStep) throws EvalError {
+        Step currentStep = initialStep;
         while (true) {
             try {
-                switch (currentExpr) {
-                    case IntExpr intExpr -> {
-                        return new IntValue(intExpr.value());
-                    }
-                    case RationalExpr rationalExpr -> {
-                        return exactValue(rationalExpr.numerator(), rationalExpr.denominator());
-                    }
-                    case InexactExpr inexactExpr -> {
-                        return new InexactValue(inexactExpr.value());
-                    }
-                    case BoolExpr boolExpr -> {
-                        return boolValue(boolExpr.value());
-                    }
-                    case CharExpr charExpr -> {
-                        return new CharValue(charExpr.value());
-                    }
-                    case StringExpr stringExpr -> {
-                        return immutableString(stringExpr.value());
-                    }
-                    case SymbolExpr symbolExpr -> {
-                        return macroExpander.lookupSymbol(symbolExpr.name(), currentEnv);
-                    }
-                    case ListExpr listExpr -> {
-                        EvalStep step = evalList(listExpr, currentEnv);
-                        if (step instanceof ValueStep valueStep) {
-                            return valueStep.value();
+                switch (currentStep) {
+                    case EvalExprStep evalStep -> {
+                        try {
+                            currentStep = evalExpr(evalStep.expr(), evalStep.env(), evalStep.kont());
+                        } catch (EvalError error) {
+                            throw error.withPosition(evalStep.expr().line(), evalStep.expr().column());
                         }
-
-                        TailStep tailStep = (TailStep) step;
-                        currentExpr = tailStep.expr();
-                        currentEnv = tailStep.env();
+                    }
+                    case ReturnStep returnStep -> currentStep = returnStep.kont().apply(
+                            returnStep.value());
+                    case ApplyStep applyStep -> {
+                        try {
+                            currentStep = applyProcedureStep(
+                                    applyStep.operator(),
+                                    applyStep.arguments(),
+                                    applyStep.kont(),
+                                    applyStep.line(),
+                                    applyStep.column());
+                        } catch (EvalError error) {
+                            if (applyStep.line() <= 0 || applyStep.column() <= 0) {
+                                throw error;
+                            }
+                            throw error.withPosition(applyStep.line(), applyStep.column());
+                        }
+                    }
+                    case DoneStep doneStep -> {
+                        return doneStep.value();
                     }
                 }
-            } catch (EvalError error) {
-                throw error.withPosition(currentExpr.line(), currentExpr.column());
+            } catch (ContinuationJump jump) {
+                currentStep = new ReturnStep(jump.value(), jump.target());
             }
         }
     }
 
-    private EvalStep evalList(ListExpr listExpr, Env env) throws EvalError {
+    private Value eval(Expr expr, Env env) throws EvalError {
+        return run(new EvalExprStep(expr, env, DONE));
+    }
+
+    private Step evalExpr(Expr expr, Env env, Kont kont) throws EvalError {
+        return switch (expr) {
+            case IntExpr intExpr -> new ReturnStep(new IntValue(intExpr.value()), kont);
+            case RationalExpr rationalExpr ->
+                    new ReturnStep(
+                            exactValue(rationalExpr.numerator(), rationalExpr.denominator()),
+                            kont);
+            case InexactExpr inexactExpr -> new ReturnStep(
+                    new InexactValue(inexactExpr.value()), kont);
+            case BoolExpr boolExpr -> new ReturnStep(boolValue(boolExpr.value()), kont);
+            case CharExpr charExpr -> new ReturnStep(new CharValue(charExpr.value()), kont);
+            case StringExpr stringExpr -> new ReturnStep(immutableString(stringExpr.value()), kont);
+            case SymbolExpr symbolExpr -> new ReturnStep(
+                    macroExpander.lookupSymbol(symbolExpr.name(), env), kont);
+            case ListExpr listExpr -> evalList(listExpr, env, kont);
+        };
+    }
+
+    private Step evalList(ListExpr listExpr, Env env, Kont kont) throws EvalError {
         List<Expr> elements = listExpr.elements();
         if (elements.isEmpty()) {
             throw new EvalError("cannot evaluate an empty list");
@@ -153,40 +222,72 @@ public class Evaluator {
         if (operatorName != null) {
             if ("define-syntax".equals(operatorName)) {
                 macroExpander.defineSyntax(arguments, env);
-                return new ValueStep(VOID);
+                return new ReturnStep(VOID, kont);
             }
 
             Optional<Expr> expandedMacro = macroExpander.expandInvocation(operatorName, listExpr);
             if (expandedMacro.isPresent()) {
-                return new TailStep(expandedMacro.get(), env);
+                return new EvalExprStep(expandedMacro.get(), env, kont);
             }
 
             return switch (operatorName) {
-                case "define" -> new ValueStep(evalDefine(arguments, env));
-                case "define-record-type" -> new ValueStep(evalDefineRecordType(arguments, env));
-                case "set!" -> new ValueStep(evalSet(arguments, env));
-                case "if" -> evalIf(arguments, env);
-                case "quote" -> new ValueStep(evalQuote(arguments));
-                case "lambda" -> new ValueStep(evalLambda(arguments, env));
-                case "case-lambda" -> new ValueStep(evalCaseLambda(arguments, env));
-                case "and" -> evalAnd(arguments, env);
-                case "or" -> evalOr(arguments, env);
-                case "begin" -> evalBegin(arguments, env);
-                case "let" -> evalLet(arguments, env);
-                case "let*" -> evalLetStar(arguments, env);
-                case "letrec" -> evalLetRec(arguments, env, false);
-                case "letrec*" -> evalLetRec(arguments, env, true);
-                case "cond" -> evalCond(arguments, env);
-                case "case" -> evalCase(arguments, env);
-                case "do" -> evalDo(arguments, env);
-                default -> applyProcedureStep(eval(operatorExpr, env), evalAll(arguments, env));
+                case "define" -> evalDefine(arguments, env, kont, listExpr);
+                case "define-record-type" ->
+                        new ReturnStep(evalDefineRecordType(arguments, env), kont);
+                case "set!" -> evalSet(arguments, env, kont, listExpr);
+                case "if" -> evalIf(arguments, env, kont, listExpr);
+                case "quote" -> new ReturnStep(evalQuote(arguments), kont);
+                case "lambda" -> new ReturnStep(evalLambda(arguments, env), kont);
+                case "case-lambda" -> new ReturnStep(evalCaseLambda(arguments, env), kont);
+                case "and" -> evalAnd(arguments, 0, env, kont, listExpr);
+                case "or" -> evalOr(arguments, 0, env, kont, listExpr);
+                case "begin" -> evalSequence(arguments, env, kont);
+                case "let" -> evalLet(arguments, env, kont, listExpr);
+                case "let*" -> evalLetStar(arguments, env, kont, listExpr);
+                case "letrec" -> evalLetRec(arguments, env, false, kont, listExpr);
+                case "letrec*" -> evalLetRec(arguments, env, true, kont, listExpr);
+                case "cond" -> evalCond(arguments, 0, env, kont, listExpr);
+                case "case" -> evalCase(arguments, env, kont, listExpr);
+                case "do" -> evalDo(arguments, env, kont, listExpr);
+                default -> evalApplication(listExpr, operatorExpr, arguments, env, kont);
             };
         }
 
-        return applyProcedureStep(eval(operatorExpr, env), evalAll(arguments, env));
+        return evalApplication(listExpr, operatorExpr, arguments, env, kont);
     }
 
-    private Value evalDefine(List<Expr> arguments, Env env) throws EvalError {
+    private Step evalApplication(ListExpr context, Expr operatorExpr, List<Expr> arguments, Env env,
+            Kont kont) {
+        return new EvalExprStep(operatorExpr, env,
+                continuation(context, operator -> evalApplicationArguments(
+                        operator,
+                        arguments,
+                        arguments.size() - 1,
+                        List.of(),
+                        env,
+                        kont,
+                        context)));
+    }
+
+    private Step evalApplicationArguments(Value operator, List<Expr> arguments, int index,
+            List<Value> suffixValues, Env env, Kont kont, ListExpr context) {
+        if (index < 0) {
+            return new ApplyStep(operator, suffixValues, kont, context.line(), context.column());
+        }
+
+        return new EvalExprStep(arguments.get(index), env,
+                continuation(context, value -> evalApplicationArguments(
+                        operator,
+                        arguments,
+                        index - 1,
+                        prependValue(value, suffixValues),
+                        env,
+                        kont,
+                        context)));
+    }
+
+    private Step evalDefine(List<Expr> arguments, Env env, Kont kont, Expr context)
+            throws EvalError {
         if (arguments.size() < 2) {
             throw new EvalError("define expects a name and a value");
         }
@@ -196,9 +297,13 @@ public class Evaluator {
             if (arguments.size() != 2) {
                 throw new EvalError("define expects exactly one value expression");
             }
+
             Cell binding = env.definePlaceholder(symbolExpr.name());
-            binding.set(eval(arguments.get(1), env));
-            return VOID;
+            return new EvalExprStep(arguments.get(1), env,
+                    continuation(context, value -> {
+                        binding.set(value);
+                        return new ReturnStep(VOID, kont);
+                    }));
         }
 
         if (target instanceof ListExpr signatureExpr) {
@@ -216,7 +321,7 @@ public class Evaluator {
                     parseFormals(signature.subList(1, signature.size())),
                     List.copyOf(arguments.subList(1, arguments.size())),
                     env));
-            return VOID;
+            return new ReturnStep(VOID, kont);
         }
 
         throw new EvalError("define target must be a symbol or parameter list");
@@ -251,7 +356,8 @@ public class Evaluator {
         for (int index = 3; index < arguments.size(); index++) {
             Expr fieldExpr = arguments.get(index);
             if (!(fieldExpr instanceof ListExpr fieldList) || fieldList.elements().size() != 2) {
-                throw new EvalError("define-record-type field spec must contain a field and accessor");
+                throw new EvalError(
+                        "define-record-type field spec must contain a field and accessor");
             }
 
             Expr fieldNameExpr = fieldList.elements().get(0);
@@ -276,7 +382,8 @@ public class Evaluator {
         List<Expr> constructorFields = constructorList.elements().subList(1,
                 constructorList.elements().size());
         if (constructorFields.size() != fieldSpecs.size()) {
-            throw new EvalError("define-record-type constructor field count must match field specs");
+            throw new EvalError(
+                    "define-record-type constructor field count must match field specs");
         }
 
         int[] constructorOrder = new int[constructorFields.size()];
@@ -347,7 +454,7 @@ public class Evaluator {
         return recordInstance.field(fieldIndex);
     }
 
-    private Value evalSet(List<Expr> arguments, Env env) throws EvalError {
+    private Step evalSet(List<Expr> arguments, Env env, Kont kont, Expr context) throws EvalError {
         requireExactArgs("set!", arguments, 2);
 
         Expr target = arguments.get(0);
@@ -355,8 +462,11 @@ public class Evaluator {
             throw new EvalError("set! target must be a symbol");
         }
 
-        macroExpander.setSymbol(symbolExpr.name(), eval(arguments.get(1), env), env);
-        return VOID;
+        return new EvalExprStep(arguments.get(1), env,
+                continuation(context, value -> {
+                    macroExpander.setSymbol(symbolExpr.name(), value, env);
+                    return new ReturnStep(VOID, kont);
+                }));
     }
 
     private String symbolName(Expr expr) {
@@ -366,18 +476,22 @@ public class Evaluator {
         return null;
     }
 
-    private EvalStep evalIf(List<Expr> arguments, Env env) throws EvalError {
+    private Step evalIf(List<Expr> arguments, Env env, Kont kont, Expr context) throws EvalError {
         if (arguments.size() < 2 || arguments.size() > 3) {
             throw new EvalError("if expected 2 or 3 argument(s)");
         }
-        Value condition = eval(arguments.get(0), env);
-        if (isTruthy(condition)) {
-            return new TailStep(arguments.get(1), env);
-        }
-        if (arguments.size() == 3) {
-            return new TailStep(arguments.get(2), env);
-        }
-        return new ValueStep(VOID);
+
+        Expr alternate = arguments.size() == 3 ? arguments.get(2) : null;
+        return new EvalExprStep(arguments.get(0), env,
+                continuation(context, condition -> {
+                    if (isTruthy(condition)) {
+                        return new EvalExprStep(arguments.get(1), env, kont);
+                    }
+                    if (alternate != null) {
+                        return new EvalExprStep(alternate, env, kont);
+                    }
+                    return new ReturnStep(VOID, kont);
+                }));
     }
 
     private Value evalQuote(List<Expr> arguments) throws EvalError {
@@ -456,47 +570,78 @@ public class Evaluator {
         return new Formals(List.copyOf(parameters), restParameter);
     }
 
-    private List<Value> evalAll(List<Expr> arguments, Env env) throws EvalError {
-        List<Value> values = new ArrayList<>(arguments.size());
-        for (Expr argument : arguments) {
-            values.add(eval(argument, env));
-        }
-        return values;
+    private Kont continuation(Expr context, ContinuationBody body) {
+        return new Kont(context.line(), context.column(), body);
     }
 
-    private EvalStep evalAnd(List<Expr> arguments, Env env) throws EvalError {
-        if (arguments.isEmpty()) {
-            return new ValueStep(TRUE);
-        }
-
-        for (int index = 0; index < arguments.size() - 1; index++) {
-            Value value = eval(arguments.get(index), env);
-            if (!isTruthy(value)) {
-                return new ValueStep(value);
-            }
-        }
-        return new TailStep(arguments.get(arguments.size() - 1), env);
+    private Kont continuation(int line, int column, ContinuationBody body) {
+        return new Kont(line, column, body);
     }
 
-    private EvalStep evalOr(List<Expr> arguments, Env env) throws EvalError {
-        if (arguments.isEmpty()) {
-            return new ValueStep(FALSE);
-        }
-
-        for (int index = 0; index < arguments.size() - 1; index++) {
-            Value value = eval(arguments.get(index), env);
-            if (isTruthy(value)) {
-                return new ValueStep(value);
-            }
-        }
-        return new TailStep(arguments.get(arguments.size() - 1), env);
+    private Kont continuation(ContinuationBody body) {
+        return new Kont(0, 0, body);
     }
 
-    private EvalStep evalBegin(List<Expr> arguments, Env env) throws EvalError {
-        return tailSequence(arguments, env);
+    private Step evalSequence(List<Expr> expressions, Env env, Kont kont) {
+        return evalSequence(expressions, 0, env, kont);
     }
 
-    private EvalStep evalLet(List<Expr> arguments, Env env) throws EvalError {
+    private Step evalSequence(List<Expr> expressions, int index, Env env, Kont kont) {
+        if (index >= expressions.size()) {
+            return new ReturnStep(VOID, kont);
+        }
+        if (index == expressions.size() - 1) {
+            return new EvalExprStep(expressions.get(index), env, kont);
+        }
+
+        return new EvalExprStep(expressions.get(index), env,
+                continuation(value -> evalSequence(expressions, index + 1, env, kont)));
+    }
+
+    private List<Value> appendValue(List<Value> values, Value value) {
+        List<Value> result = new ArrayList<>(values.size() + 1);
+        result.addAll(values);
+        result.add(value);
+        return List.copyOf(result);
+    }
+
+    private List<Value> prependValue(Value value, List<Value> values) {
+        List<Value> result = new ArrayList<>(values.size() + 1);
+        result.add(value);
+        result.addAll(values);
+        return List.copyOf(result);
+    }
+
+    private Step evalAnd(List<Expr> arguments, int index, Env env, Kont kont, Expr context) {
+        if (index >= arguments.size()) {
+            return new ReturnStep(TRUE, kont);
+        }
+
+        return new EvalExprStep(arguments.get(index), env,
+                continuation(context, value -> {
+                    if (!isTruthy(value) || index == arguments.size() - 1) {
+                        return new ReturnStep(value, kont);
+                    }
+                    return evalAnd(arguments, index + 1, env, kont, context);
+                }));
+    }
+
+    private Step evalOr(List<Expr> arguments, int index, Env env, Kont kont, Expr context) {
+        if (index >= arguments.size()) {
+            return new ReturnStep(FALSE, kont);
+        }
+
+        return new EvalExprStep(arguments.get(index), env,
+                continuation(context, value -> {
+                    if (isTruthy(value) || index == arguments.size() - 1) {
+                        return new ReturnStep(value, kont);
+                    }
+                    return evalOr(arguments, index + 1, env, kont, context);
+                }));
+    }
+
+    private Step evalLet(List<Expr> arguments, Env env, Kont kont, Expr context)
+            throws EvalError {
         if (arguments.isEmpty()) {
             throw new EvalError("let requires bindings and a body");
         }
@@ -507,7 +652,7 @@ public class Evaluator {
                 throw new EvalError("named let requires bindings and a body");
             }
             return evalNamedLet(nameExpr.name(), arguments.get(1),
-                    arguments.subList(2, arguments.size()), env);
+                    arguments.subList(2, arguments.size()), env, kont, context);
         }
 
         if (arguments.size() < 2) {
@@ -515,29 +660,47 @@ public class Evaluator {
         }
 
         List<BindingSpec> bindings = parseBindings(firstArgument);
-        Env letEnv = new Env(env);
-        bindValues(letEnv, bindings, evalBindingValues(bindings, env));
-        return tailSequence(arguments.subList(1, arguments.size()), letEnv);
+        return evalBindingValues(bindings, 0, env, List.of(),
+                values -> {
+                    Env letEnv = new Env(env);
+                    bindValues(letEnv, bindings, values);
+                    return evalSequence(arguments.subList(1, arguments.size()), letEnv, kont);
+                },
+                context);
     }
 
-    private EvalStep evalLetStar(List<Expr> arguments, Env env) throws EvalError {
+    private Step evalLetStar(List<Expr> arguments, Env env, Kont kont, Expr context)
+            throws EvalError {
         if (arguments.size() < 2) {
             throw new EvalError("let* requires bindings and a body");
         }
 
-        List<BindingSpec> bindings = parseBindings(arguments.get(0));
-        Env letStarEnv = new Env(env);
-        for (BindingSpec binding : bindings) {
-            Value value = eval(binding.initExpr(), letStarEnv);
-            Env nextEnv = new Env(letStarEnv);
-            nextEnv.define(binding.name(), value);
-            letStarEnv = nextEnv;
-        }
-        return tailSequence(arguments.subList(1, arguments.size()), letStarEnv);
+        return evalLetStarBindings(
+                parseBindings(arguments.get(0)),
+                0,
+                new Env(env),
+                arguments.subList(1, arguments.size()),
+                kont,
+                context);
     }
 
-    private EvalStep evalLetRec(List<Expr> arguments, Env env, boolean sequential)
-            throws EvalError {
+    private Step evalLetStarBindings(List<BindingSpec> bindings, int index, Env currentEnv,
+            List<Expr> body, Kont kont, Expr context) {
+        if (index >= bindings.size()) {
+            return evalSequence(body, currentEnv, kont);
+        }
+
+        BindingSpec binding = bindings.get(index);
+        return new EvalExprStep(binding.initExpr(), currentEnv,
+                continuation(context, value -> {
+                    Env nextEnv = new Env(currentEnv);
+                    nextEnv.define(binding.name(), value);
+                    return evalLetStarBindings(bindings, index + 1, nextEnv, body, kont, context);
+                }));
+    }
+
+    private Step evalLetRec(List<Expr> arguments, Env env, boolean sequential, Kont kont,
+            Expr context) throws EvalError {
         if (arguments.size() < 2) {
             throw new EvalError((sequential ? "letrec*" : "letrec")
                     + " requires bindings and a body");
@@ -551,24 +714,36 @@ public class Evaluator {
         }
 
         if (sequential) {
-            for (int index = 0; index < bindings.size(); index++) {
-                cells.get(index).set(eval(bindings.get(index).initExpr(), letrecEnv));
-            }
-        } else {
-            List<Value> values = new ArrayList<>(bindings.size());
-            for (BindingSpec binding : bindings) {
-                values.add(eval(binding.initExpr(), letrecEnv));
-            }
-            for (int index = 0; index < values.size(); index++) {
-                cells.get(index).set(values.get(index));
-            }
+            return evalLetRecSequential(bindings, cells, 0, letrecEnv,
+                    arguments.subList(1, arguments.size()), kont, context);
         }
 
-        return tailSequence(arguments.subList(1, arguments.size()), letrecEnv);
+        return evalBindingValues(bindings, 0, letrecEnv, List.of(),
+                values -> {
+                    for (int index = 0; index < values.size(); index++) {
+                        cells.get(index).set(values.get(index));
+                    }
+                    return evalSequence(arguments.subList(1, arguments.size()), letrecEnv, kont);
+                },
+                context);
     }
 
-    private EvalStep evalNamedLet(String name, Expr bindingExpr, List<Expr> body, Env env)
-            throws EvalError {
+    private Step evalLetRecSequential(List<BindingSpec> bindings, List<Cell> cells, int index,
+            Env letrecEnv, List<Expr> body, Kont kont, Expr context) {
+        if (index >= bindings.size()) {
+            return evalSequence(body, letrecEnv, kont);
+        }
+
+        return new EvalExprStep(bindings.get(index).initExpr(), letrecEnv,
+                continuation(context, value -> {
+                    cells.get(index).set(value);
+                    return evalLetRecSequential(
+                            bindings, cells, index + 1, letrecEnv, body, kont, context);
+                }));
+    }
+
+    private Step evalNamedLet(String name, Expr bindingExpr, List<Expr> body, Env env, Kont kont,
+            Expr context) throws EvalError {
         List<BindingSpec> bindings = parseBindings(bindingExpr);
         Env letEnv = new Env(env);
         Cell binding = letEnv.definePlaceholder(name);
@@ -577,7 +752,14 @@ public class Evaluator {
                 List.copyOf(body),
                 letEnv);
         binding.set(closure);
-        return applyClosure(closure, evalBindingValues(bindings, env));
+        return evalBindingValues(bindings, 0, env, List.of(),
+                values -> new ApplyStep(
+                        closure,
+                        values,
+                        kont,
+                        context.line(),
+                        context.column()),
+                context);
     }
 
     private List<String> bindingNames(List<BindingSpec> bindings) {
@@ -607,12 +789,20 @@ public class Evaluator {
         return List.copyOf(bindings);
     }
 
-    private List<Value> evalBindingValues(List<BindingSpec> bindings, Env env) throws EvalError {
-        List<Value> values = new ArrayList<>(bindings.size());
-        for (BindingSpec binding : bindings) {
-            values.add(eval(binding.initExpr(), env));
+    private Step evalBindingValues(List<BindingSpec> bindings, int index, Env env,
+            List<Value> values, ValueListHandler handler, Expr context) throws EvalError {
+        if (index >= bindings.size()) {
+            return handler.apply(values);
         }
-        return values;
+
+        return new EvalExprStep(bindings.get(index).initExpr(), env,
+                continuation(context, value -> evalBindingValues(
+                        bindings,
+                        index + 1,
+                        env,
+                        appendValue(values, value),
+                        handler,
+                        context)));
     }
 
     private void bindValues(Env env, List<BindingSpec> bindings, List<Value> values) {
@@ -621,70 +811,87 @@ public class Evaluator {
         }
     }
 
-    private EvalStep evalCond(List<Expr> arguments, Env env) throws EvalError {
-        for (int index = 0; index < arguments.size(); index++) {
-            Expr clauseExpr = arguments.get(index);
-            if (!(clauseExpr instanceof ListExpr clause) || clause.elements().isEmpty()) {
-                throw new EvalError("cond clause must be a non-empty list");
-            }
-
-            List<Expr> elements = clause.elements();
-            Expr testExpr = elements.get(0);
-            if (testExpr instanceof SymbolExpr symbolExpr && symbolExpr.name().equals("else")) {
-                if (index != arguments.size() - 1) {
-                    throw new EvalError("cond else clause must be last");
-                }
-                if (elements.size() == 1) {
-                    return new ValueStep(TRUE);
-                }
-                return tailSequence(elements.subList(1, elements.size()), env);
-            }
-
-            Value testValue = eval(testExpr, env);
-            if (isTruthy(testValue)) {
-                if (elements.size() == 1) {
-                    return new ValueStep(testValue);
-                }
-                return tailSequence(elements.subList(1, elements.size()), env);
-            }
+    private Step evalCond(List<Expr> arguments, int index, Env env, Kont kont, Expr context)
+            throws EvalError {
+        if (index >= arguments.size()) {
+            return new ReturnStep(VOID, kont);
         }
-        return new ValueStep(VOID);
+
+        Expr clauseExpr = arguments.get(index);
+        if (!(clauseExpr instanceof ListExpr clause) || clause.elements().isEmpty()) {
+            throw new EvalError("cond clause must be a non-empty list");
+        }
+
+        List<Expr> elements = clause.elements();
+        Expr testExpr = elements.get(0);
+        if (testExpr instanceof SymbolExpr symbolExpr && symbolExpr.name().equals("else")) {
+            if (index != arguments.size() - 1) {
+                throw new EvalError("cond else clause must be last");
+            }
+            if (elements.size() == 1) {
+                return new ReturnStep(TRUE, kont);
+            }
+            return evalSequence(elements.subList(1, elements.size()), env, kont);
+        }
+
+        return new EvalExprStep(testExpr, env,
+                continuation(context, testValue -> {
+                    if (isTruthy(testValue)) {
+                        if (elements.size() == 1) {
+                            return new ReturnStep(testValue, kont);
+                        }
+                        return evalSequence(elements.subList(1, elements.size()), env, kont);
+                    }
+                    return evalCond(arguments, index + 1, env, kont, context);
+                }));
     }
 
-    private EvalStep evalCase(List<Expr> arguments, Env env) throws EvalError {
+    private Step evalCase(List<Expr> arguments, Env env, Kont kont, Expr context)
+            throws EvalError {
         requireMinArgs("case", arguments, 1);
-        Value key = eval(arguments.get(0), env);
-
-        for (int index = 1; index < arguments.size(); index++) {
-            Expr clauseExpr = arguments.get(index);
-            if (!(clauseExpr instanceof ListExpr clause) || clause.elements().isEmpty()) {
-                throw new EvalError("case clause must be a non-empty list");
-            }
-
-            List<Expr> clauseElements = clause.elements();
-            Expr headExpr = clauseElements.get(0);
-            if (headExpr instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
-                if (index != arguments.size() - 1) {
-                    throw new EvalError("case else clause must be last");
-                }
-                return tailSequence(clauseElements.subList(1, clauseElements.size()), env);
-            }
-
-            if (!(headExpr instanceof ListExpr datumList)) {
-                throw new EvalError("case clause datums must be a list");
-            }
-
-            for (Expr datumExpr : datumList.elements()) {
-                if (eqValues(key, quoteToValue(datumExpr))) {
-                    return tailSequence(clauseElements.subList(1, clauseElements.size()), env);
-                }
-            }
-        }
-
-        return new ValueStep(VOID);
+        return new EvalExprStep(arguments.get(0), env,
+                continuation(context, key -> evalCaseClauses(
+                        key,
+                        arguments,
+                        1,
+                        env,
+                        kont,
+                        context)));
     }
 
-    private EvalStep evalDo(List<Expr> arguments, Env env) throws EvalError {
+    private Step evalCaseClauses(Value key, List<Expr> arguments, int index, Env env, Kont kont,
+            Expr context) throws EvalError {
+        if (index >= arguments.size()) {
+            return new ReturnStep(VOID, kont);
+        }
+
+        Expr clauseExpr = arguments.get(index);
+        if (!(clauseExpr instanceof ListExpr clause) || clause.elements().isEmpty()) {
+            throw new EvalError("case clause must be a non-empty list");
+        }
+
+        List<Expr> clauseElements = clause.elements();
+        Expr headExpr = clauseElements.get(0);
+        if (headExpr instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+            if (index != arguments.size() - 1) {
+                throw new EvalError("case else clause must be last");
+            }
+            return evalSequence(clauseElements.subList(1, clauseElements.size()), env, kont);
+        }
+
+        if (!(headExpr instanceof ListExpr datumList)) {
+            throw new EvalError("case clause datums must be a list");
+        }
+
+        for (Expr datumExpr : datumList.elements()) {
+            if (eqValues(key, quoteToValue(datumExpr))) {
+                return evalSequence(clauseElements.subList(1, clauseElements.size()), env, kont);
+            }
+        }
+        return evalCaseClauses(key, arguments, index + 1, env, kont, context);
+    }
+
+    private Step evalDo(List<Expr> arguments, Env env, Kont kont, Expr context) throws EvalError {
         if (arguments.size() < 2) {
             throw new EvalError("do requires bindings and a test clause");
         }
@@ -694,43 +901,100 @@ public class Evaluator {
             throw new EvalError("do test clause must be a non-empty list");
         }
 
-        List<Value> initValues = new ArrayList<>(bindings.size());
-        for (DoBindingSpec binding : bindings) {
-            initValues.add(eval(binding.initExpr(), env));
-        }
-
-        Env loopEnv = new Env(env);
-        List<Cell> cells = new ArrayList<>(bindings.size());
-        for (int index = 0; index < bindings.size(); index++) {
-            Cell cell = loopEnv.definePlaceholder(bindings.get(index).name());
-            cell.set(initValues.get(index));
-            cells.add(cell);
-        }
-
         Expr testExpr = testClause.elements().get(0);
         List<Expr> resultExprs = testClause.elements().subList(1, testClause.elements().size());
         List<Expr> bodyExprs = arguments.subList(2, arguments.size());
+        return evalDoInitValues(bindings, 0, env, List.of(),
+                initValues -> {
+                    Env loopEnv = new Env(env);
+                    List<Cell> cells = new ArrayList<>(bindings.size());
+                    for (int index = 0; index < bindings.size(); index++) {
+                        Cell cell = loopEnv.definePlaceholder(bindings.get(index).name());
+                        cell.set(initValues.get(index));
+                        cells.add(cell);
+                    }
+                    return evalDoLoop(bindings, cells, loopEnv, testExpr, resultExprs, bodyExprs,
+                            kont, context);
+                },
+                context);
+    }
 
-        while (true) {
-            if (isTruthy(eval(testExpr, loopEnv))) {
-                return tailSequence(resultExprs, loopEnv);
-            }
-
-            evalSequence(bodyExprs, loopEnv);
-
-            List<Value> stepValues = new ArrayList<>(bindings.size());
-            for (int index = 0; index < bindings.size(); index++) {
-                DoBindingSpec binding = bindings.get(index);
-                if (binding.stepExpr() == null) {
-                    stepValues.add(cells.get(index).get());
-                } else {
-                    stepValues.add(eval(binding.stepExpr(), loopEnv));
-                }
-            }
-            for (int index = 0; index < cells.size(); index++) {
-                cells.get(index).set(stepValues.get(index));
-            }
+    private Step evalDoInitValues(List<DoBindingSpec> bindings, int index, Env env,
+            List<Value> values, ValueListHandler handler, Expr context) throws EvalError {
+        if (index >= bindings.size()) {
+            return handler.apply(values);
         }
+
+        return new EvalExprStep(bindings.get(index).initExpr(), env,
+                continuation(context, value -> evalDoInitValues(
+                        bindings,
+                        index + 1,
+                        env,
+                        appendValue(values, value),
+                        handler,
+                        context)));
+    }
+
+    private Step evalDoLoop(List<DoBindingSpec> bindings, List<Cell> cells, Env loopEnv,
+            Expr testExpr, List<Expr> resultExprs, List<Expr> bodyExprs, Kont kont, Expr context) {
+        return new EvalExprStep(testExpr, loopEnv,
+                continuation(context, testValue -> {
+                    if (isTruthy(testValue)) {
+                        return evalSequence(resultExprs, loopEnv, kont);
+                    }
+                    return evalSequence(bodyExprs, loopEnv,
+                            continuation(context, ignored -> evalDoSteps(
+                                    bindings,
+                                    cells,
+                                    0,
+                                    loopEnv,
+                                    List.of(),
+                                    testExpr,
+                                    resultExprs,
+                                    bodyExprs,
+                                    kont,
+                                    context)));
+                }));
+    }
+
+    private Step evalDoSteps(List<DoBindingSpec> bindings, List<Cell> cells, int index, Env loopEnv,
+            List<Value> stepValues, Expr testExpr, List<Expr> resultExprs, List<Expr> bodyExprs,
+            Kont kont, Expr context) {
+        if (index >= bindings.size()) {
+            for (int stepIndex = 0; stepIndex < cells.size(); stepIndex++) {
+                cells.get(stepIndex).set(stepValues.get(stepIndex));
+            }
+            return evalDoLoop(bindings, cells, loopEnv, testExpr, resultExprs, bodyExprs, kont,
+                    context);
+        }
+
+        DoBindingSpec binding = bindings.get(index);
+        if (binding.stepExpr() == null) {
+            return evalDoSteps(
+                    bindings,
+                    cells,
+                    index + 1,
+                    loopEnv,
+                    appendValue(stepValues, cells.get(index).get()),
+                    testExpr,
+                    resultExprs,
+                    bodyExprs,
+                    kont,
+                    context);
+        }
+
+        return new EvalExprStep(binding.stepExpr(), loopEnv,
+                continuation(context, value -> evalDoSteps(
+                        bindings,
+                        cells,
+                        index + 1,
+                        loopEnv,
+                        appendValue(stepValues, value),
+                        testExpr,
+                        resultExprs,
+                        bodyExprs,
+                        kont,
+                        context)));
     }
 
     private List<DoBindingSpec> parseDoBindings(Expr bindingExpr) throws EvalError {
@@ -758,38 +1022,170 @@ public class Evaluator {
     }
 
     private Value applyProcedure(Value operator, List<Value> arguments) throws EvalError {
-        return completeStep(applyProcedureStep(operator, arguments));
+        return run(new ApplyStep(operator, List.copyOf(arguments), DONE, 0, 0));
     }
 
-    private Value completeStep(EvalStep step) throws EvalError {
-        if (step instanceof ValueStep valueStep) {
-            return valueStep.value();
-        }
-
-        TailStep tailStep = (TailStep) step;
-        return eval(tailStep.expr(), tailStep.env());
-    }
-
-    private EvalStep applyProcedureStep(Value operator, List<Value> arguments) throws EvalError {
+    private Step applyProcedureStep(Value operator, List<Value> arguments, Kont kont, int line,
+            int column) throws EvalError {
         return switch (operator) {
-            case BuiltinValue builtinValue -> new ValueStep(
-                    builtinValue.implementation().apply(arguments));
-            case ClosureValue closureValue -> applyClosure(closureValue, arguments);
-            case CaseLambdaValue caseLambdaValue -> applyCaseLambda(caseLambdaValue, arguments);
+            case BuiltinValue builtinValue ->
+                    applyBuiltin(builtinValue, arguments, kont, line, column);
+            case ClosureValue closureValue -> applyClosure(closureValue, arguments, kont);
+            case CaseLambdaValue caseLambdaValue -> applyCaseLambda(caseLambdaValue, arguments, kont);
             default -> throw new EvalError("attempted to call a non-procedure");
         };
     }
 
-    private EvalStep applyClosure(ClosureValue closure, List<Value> arguments) throws EvalError {
+    private Step applyBuiltin(BuiltinValue builtinValue, List<Value> arguments, Kont kont, int line,
+            int column) throws EvalError {
+        return switch (builtinValue.name()) {
+            case "call/cc", "call-with-current-continuation" ->
+                    applyCallWithCurrentContinuation(builtinValue.name(), arguments, kont, line,
+                            column);
+            case "apply" -> applyBuiltinApply(arguments, kont, line, column);
+            case "map" -> applyBuiltinMap(arguments, kont, line, column);
+            case "for-each" -> applyBuiltinForEach(arguments, kont, line, column);
+            default -> new ReturnStep(builtinValue.implementation().apply(arguments), kont);
+        };
+    }
+
+    private Step applyCallWithCurrentContinuation(String name, List<Value> arguments, Kont kont,
+            int line, int column) throws EvalError {
+        requireExactArgs(name, arguments, 1);
+        return new ApplyStep(arguments.get(0), List.of(makeContinuationValue(kont)), kont, line,
+                column);
+    }
+
+    private Value makeContinuationValue(Kont kont) {
+        return new BuiltinValue("continuation", arguments -> {
+            requireExactArgs("continuation", arguments, 1);
+            throw new ContinuationJump(kont, arguments.get(0));
+        });
+    }
+
+    private Step applyBuiltinApply(List<Value> arguments, Kont kont, int line, int column)
+            throws EvalError {
+        requireMinArgs("apply", arguments, 2);
+
+        Value operator = arguments.get(0);
+        List<Value> appliedArguments = new ArrayList<>();
+        for (int i = 1; i < arguments.size() - 1; i++) {
+            appliedArguments.add(arguments.get(i));
+        }
+        appliedArguments.addAll(requireProperList(arguments.get(arguments.size() - 1), "apply"));
+        return new ApplyStep(operator, List.copyOf(appliedArguments), kont, line, column);
+    }
+
+    private List<List<Value>> requireEqualLengthLists(List<Value> arguments, String name)
+            throws EvalError {
+        List<List<Value>> lists = new ArrayList<>(arguments.size());
+        int expectedLength = -1;
+        for (Value argument : arguments) {
+            List<Value> list = requireProperList(argument, name);
+            if (expectedLength == -1) {
+                expectedLength = list.size();
+            } else if (list.size() != expectedLength) {
+                throw new EvalError(name + " expects lists of equal length");
+            }
+            lists.add(list);
+        }
+        return List.copyOf(lists);
+    }
+
+    private Step applyBuiltinMap(List<Value> arguments, Kont kont, int line, int column)
+            throws EvalError {
+        requireMinArgs("map", arguments, 2);
+        return applyMapItem(
+                arguments.get(0),
+                requireEqualLengthLists(arguments.subList(1, arguments.size()), "map"),
+                0,
+                EMPTY_LIST,
+                kont,
+                line,
+                column);
+    }
+
+    private Step applyMapItem(Value procedure, List<List<Value>> lists, int index,
+            Value reversedResults, Kont kont, int line, int column) {
+        int length = lists.isEmpty() ? 0 : lists.get(0).size();
+        if (index >= length) {
+            return new ReturnStep(reverseList(reversedResults), kont);
+        }
+
+        List<Value> callArguments = new ArrayList<>(lists.size());
+        for (List<Value> list : lists) {
+            callArguments.add(list.get(index));
+        }
+        return new ApplyStep(procedure, List.copyOf(callArguments),
+                continuation(line, column, value -> applyMapItem(
+                        procedure,
+                        lists,
+                        index + 1,
+                        new PairValue(value, reversedResults),
+                        kont,
+                        line,
+                        column)),
+                line,
+                column);
+    }
+
+    private Step applyBuiltinForEach(List<Value> arguments, Kont kont, int line, int column)
+            throws EvalError {
+        requireMinArgs("for-each", arguments, 2);
+        return applyForEachItem(
+                arguments.get(0),
+                requireEqualLengthLists(arguments.subList(1, arguments.size()), "for-each"),
+                0,
+                kont,
+                line,
+                column);
+    }
+
+    private Step applyForEachItem(Value procedure, List<List<Value>> lists, int index, Kont kont,
+            int line, int column) {
+        int length = lists.isEmpty() ? 0 : lists.get(0).size();
+        if (index >= length) {
+            return new ReturnStep(VOID, kont);
+        }
+
+        List<Value> callArguments = new ArrayList<>(lists.size());
+        for (List<Value> list : lists) {
+            callArguments.add(list.get(index));
+        }
+        return new ApplyStep(procedure, List.copyOf(callArguments),
+                continuation(line, column, ignored -> applyForEachItem(
+                        procedure,
+                        lists,
+                        index + 1,
+                        kont,
+                        line,
+                        column)),
+                line,
+                column);
+    }
+
+    private Value reverseList(Value list) {
+        Value result = EMPTY_LIST;
+        Value current = list;
+        while (current instanceof PairValue pairValue) {
+            result = new PairValue(pairValue.car(), result);
+            current = pairValue.cdr();
+        }
+        return result;
+    }
+
+    private Step applyClosure(ClosureValue closure, List<Value> arguments, Kont kont)
+            throws EvalError {
         return applyProcedureClause(
                 closure.formals(),
                 closure.body(),
                 closure.env(),
                 arguments,
-                "lambda");
+                "lambda",
+                kont);
     }
 
-    private EvalStep applyCaseLambda(CaseLambdaValue caseLambda, List<Value> arguments)
+    private Step applyCaseLambda(CaseLambdaValue caseLambda, List<Value> arguments, Kont kont)
             throws EvalError {
         for (ProcedureClause clause : caseLambda.clauses()) {
             if (clause.formals().matchesArity(arguments.size())) {
@@ -798,7 +1194,8 @@ public class Evaluator {
                         clause.body(),
                         caseLambda.env(),
                         arguments,
-                        "case-lambda");
+                        "case-lambda",
+                        kont);
             }
         }
 
@@ -806,8 +1203,8 @@ public class Evaluator {
                 + arguments.size() + " argument(s)");
     }
 
-    private EvalStep applyProcedureClause(Formals formals, List<Expr> body, Env definitionEnv,
-            List<Value> arguments, String procedureName) throws EvalError {
+    private Step applyProcedureClause(Formals formals, List<Expr> body, Env definitionEnv,
+            List<Value> arguments, String procedureName, Kont kont) throws EvalError {
         int fixedCount = formals.fixedCount();
         if (formals.restParameter() == null) {
             requireExactArgs(procedureName, arguments, fixedCount);
@@ -824,26 +1221,7 @@ public class Evaluator {
             callEnv.define(formals.restParameter(),
                     listValue(arguments.subList(fixedCount, arguments.size())));
         }
-        return tailSequence(body, callEnv);
-    }
-
-    private EvalStep tailSequence(List<Expr> expressions, Env env) throws EvalError {
-        if (expressions.isEmpty()) {
-            return new ValueStep(VOID);
-        }
-
-        for (int index = 0; index < expressions.size() - 1; index++) {
-            eval(expressions.get(index), env);
-        }
-        return new TailStep(expressions.get(expressions.size() - 1), env);
-    }
-
-    private Value evalSequence(List<Expr> expressions, Env env) throws EvalError {
-        Value result = VOID;
-        for (Expr expression : expressions) {
-            result = eval(expression, env);
-        }
-        return result;
+        return evalSequence(body, callEnv, kont);
     }
 
     private Value quoteToValue(Expr expr) {

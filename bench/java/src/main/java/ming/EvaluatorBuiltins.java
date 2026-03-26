@@ -153,6 +153,13 @@ final class EvaluatorBuiltins {
         env.define("map", new BuiltinValue("map", this::map));
         env.define("for-each", new BuiltinValue("for-each", this::forEach));
         env.define("apply", new BuiltinValue("apply", this::apply));
+        env.define("call/cc", new BuiltinValue("call/cc", this::specialBuiltin));
+        env.define("call-with-current-continuation",
+                new BuiltinValue("call-with-current-continuation", this::specialBuiltin));
+    }
+
+    private Value specialBuiltin(List<Value> arguments) throws EvalError {
+        throw new EvalError("special builtin must be handled by the evaluator");
     }
 
     private void installTypePredicates(Env env) {
