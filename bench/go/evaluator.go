@@ -11,7 +11,7 @@ import (
 // EvalStr evaluates one or more Scheme expressions and returns the string
 // representation of the last result.
 func EvalStr(input string) (string, error) {
-	result, _, err := evalStrInternal(input)
+	result, _, err := evalStrInternal(input, false, 0)
 	if err != nil {
 		return "", ensureSourcePos(err)
 	}
@@ -25,7 +25,7 @@ func EvalStr(input string) (string, error) {
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	value, output, err := evalStrInternal(input)
+	value, output, err := evalStrInternal(input, false, 0)
 	if err != nil {
 		return "", output, ensureSourcePos(err)
 	}
@@ -34,6 +34,23 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 		return "", output, ensureSourcePos(err)
 	}
 	return formatValue(value), output, nil
+}
+
+// EvalStrWithLimit evaluates Scheme expressions with a fixed eval-dispatch budget.
+func EvalStrWithLimit(input string, maxSteps int) (string, error) {
+	if maxSteps < 0 {
+		return "", ensureSourcePos(&EvalError{Message: "step limit must be non-negative"})
+	}
+
+	result, _, err := evalStrInternal(input, true, maxSteps)
+	if err != nil {
+		return "", ensureSourcePos(err)
+	}
+	result, err = consumeSingleValue(result)
+	if err != nil {
+		return "", ensureSourcePos(err)
+	}
+	return formatValue(result), nil
 }
 
 type stringExpr struct {
@@ -440,7 +457,7 @@ func newGlobalEnv(output *strings.Builder) *env {
 	return scope
 }
 
-func evalStrInternal(input string) (any, string, error) {
+func evalStrInternal(input string, stepLimitEnabled bool, maxSteps int) (any, string, error) {
 	var output strings.Builder
 	p := parser{input: input}
 	exprs, err := p.parseProgram()
@@ -452,6 +469,8 @@ func evalStrInternal(input string) (any, string, error) {
 	}
 
 	scope := newGlobalEnv(&output)
+	scope.runtime.stepLimitEnabled = stepLimitEnabled
+	scope.runtime.remainingSteps = maxSteps
 	if level24UsesMacroPreExpansion() {
 		exprs, err = preprocessLevel24Program(scope, exprs)
 		if err != nil {
@@ -798,6 +817,10 @@ func eval(scope *env, expr any) (any, error) {
 
 func evalRaw(scope *env, expr any) (any, error) {
 	for {
+		if err := chargeEvalStep(scope, expr); err != nil {
+			return nil, err
+		}
+
 		switch node := expr.(type) {
 		case int64:
 			return node, nil
@@ -869,6 +892,17 @@ func evalRaw(scope *env, expr any) (any, error) {
 			return nil, &EvalError{Message: "unsupported expression"}
 		}
 	}
+}
+
+func chargeEvalStep(scope *env, expr any) error {
+	if scope == nil || scope.runtime == nil || !scope.runtime.stepLimitEnabled {
+		return nil
+	}
+	if scope.runtime.remainingSteps <= 0 {
+		return exprSourcePos(expr).errorf("step limit exceeded")
+	}
+	scope.runtime.remainingSteps--
+	return nil
 }
 
 func evalListTail(scope *env, expr listExpr) (any, *tailEvalState, error) {

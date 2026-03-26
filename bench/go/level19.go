@@ -5,6 +5,8 @@ const level19DynamicWindKey = "__level19_dynamic_wind__"
 type runtimeState struct {
 	dynamic          *dynamicWindFrame
 	exceptionHandler *exceptionHandlerFrame
+	stepLimitEnabled bool
+	remainingSteps   int
 }
 
 type dynamicWindFrame struct {
