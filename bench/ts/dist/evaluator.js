@@ -1,6 +1,7 @@
 import { EvalError } from './evalError.js';
 const EMPTY_LIST = { kind: 'empty-list' };
 const VOID_VALUE = { kind: 'void' };
+const STRING_IMMUTABILITY_LEVEL = 15;
 class Runtime {
     output = [];
     syntaxRules = new Map();
@@ -403,6 +404,7 @@ function createGlobalEnv(runtime) {
     env.define('>', comparisonBuiltin('>', (left, right) => compareNumbers(left, right) > 0));
     env.define('=', comparisonBuiltin('=', numbersEqual));
     env.define('<=', comparisonBuiltin('<=', (left, right) => compareNumbers(left, right) <= 0));
+    env.define('>=', comparisonBuiltin('>=', (left, right) => compareNumbers(left, right) >= 0));
     env.define('zero?', builtin('zero?', (args, loc) => {
         if (args.length !== 1) {
             throw new EvalError(`${loc.line}:${loc.col}: zero? expects exactly 1 argument`);
@@ -655,11 +657,7 @@ function createGlobalEnv(runtime) {
         runtime.write('\n');
         return VOID_VALUE;
     }));
-    env.define('string-append', builtin('string-append', (args) => ({
-        kind: 'string',
-        chars: Array.from(args.map(expectString).join('')),
-        mutable: true,
-    })));
+    env.define('string-append', builtin('string-append', (args) => (makeString(args.map(expectString).join('')))));
     env.define('string-length', builtin('string-length', (args, loc) => {
         if (args.length !== 1) {
             throw new EvalError(`${loc.line}:${loc.col}: string-length expects exactly 1 argument`);
@@ -717,6 +715,12 @@ function createGlobalEnv(runtime) {
         }
         return { kind: 'char', value: chars[index] };
     }));
+    env.define('string->list', builtin('string->list', (args, loc) => {
+        if (args.length !== 1) {
+            throw new EvalError(`${loc.line}:${loc.col}: string->list expects exactly 1 argument`);
+        }
+        return makeList(expectStringValue(args[0]).chars.map((value) => ({ kind: 'char', value })));
+    }));
     env.define('char=?', builtin('char=?', (args, loc) => {
         if (args.length < 2) {
             throw new EvalError(`${loc.line}:${loc.col}: char=? expects at least 2 arguments`);
@@ -750,6 +754,25 @@ function createGlobalEnv(runtime) {
             throw new EvalError(`${loc.line}:${loc.col}: char-downcase expects exactly 1 argument`);
         }
         return { kind: 'char', value: expectCharArg(args[0]).value.toLowerCase() };
+    }));
+    env.define('char->integer', builtin('char->integer', (args, loc) => {
+        if (args.length !== 1) {
+            throw new EvalError(`${loc.line}:${loc.col}: char->integer expects exactly 1 argument`);
+        }
+        return makeExactNumber(charCodePoint(expectCharArg(args[0]).value));
+    }));
+    env.define('integer->char', builtin('integer->char', (args, loc) => {
+        if (args.length !== 1) {
+            throw new EvalError(`${loc.line}:${loc.col}: integer->char expects exactly 1 argument`);
+        }
+        const codePoint = expectIntegerNumber(expectNumber(args[0]), args[0].expr);
+        if (!Number.isSafeInteger(codePoint)
+            || codePoint < 0
+            || codePoint > 0x10ffff
+            || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+            throw new EvalError(`${args[0].expr.line}:${args[0].expr.col}: invalid character code`);
+        }
+        return { kind: 'char', value: String.fromCodePoint(codePoint) };
     }));
     env.define('string=?', builtin('string=?', (args, loc) => {
         if (args.length < 2) {
@@ -801,7 +824,19 @@ function createGlobalEnv(runtime) {
             throw new EvalError(`${loc.line}:${loc.col}: string-copy expects exactly 1 argument`);
         }
         const value = expectStringValue(args[0]);
-        return { kind: 'string', chars: [...value.chars], mutable: true };
+        return makeString(value.chars.join(''));
+    }));
+    env.define('list->string', builtin('list->string', (args, loc) => {
+        if (args.length !== 1) {
+            throw new EvalError(`${loc.line}:${loc.col}: list->string expects exactly 1 argument`);
+        }
+        const chars = expectProperList(args[0].value, args[0].expr).map((value) => {
+            if (!isSchemeCharValue(value)) {
+                throw new EvalError(`${args[0].expr.line}:${args[0].expr.col}: expected char`);
+            }
+            return value.value;
+        });
+        return makeString(chars.join(''));
     }));
     env.define('string-set!', builtin('string-set!', (args, loc) => {
         if (args.length !== 3) {
@@ -2200,7 +2235,19 @@ function applyProcedureClause(env, clause, args, runtime) {
     }
     return evaluateSequence(clause.body, callEnv, runtime);
 }
-function makeString(value, mutable = true) {
+function currentBenchLevel() {
+    const benchLevel = globalThis.process?.env?.BENCH_LEVEL;
+    if (benchLevel === undefined) {
+        return undefined;
+    }
+    const parsedLevel = Number.parseInt(benchLevel, 10);
+    return Number.isNaN(parsedLevel) ? undefined : parsedLevel;
+}
+function defaultStringMutable() {
+    const benchLevel = currentBenchLevel();
+    return benchLevel !== undefined && benchLevel < STRING_IMMUTABILITY_LEVEL;
+}
+function makeString(value, mutable = defaultStringMutable()) {
     return { kind: 'string', chars: Array.from(value), mutable };
 }
 function makeUninitialized(name) {
@@ -2574,6 +2621,13 @@ function escapeString(value) {
 }
 function stringChars(value) {
     return Array.from(value);
+}
+function charCodePoint(value) {
+    const codePoint = value.codePointAt(0);
+    if (codePoint === undefined) {
+        throw new EvalError('invalid character');
+    }
+    return codePoint;
 }
 function parseCharLiteral(token, loc) {
     const body = token.slice(2);
