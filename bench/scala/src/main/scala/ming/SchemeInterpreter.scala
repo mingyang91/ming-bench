@@ -1,6 +1,7 @@
 package ming
 
 import SchemeBuiltinSupport.*
+import SchemeMacros.*
 import SchemeModel.*
 import SchemeRuntime.*
 
@@ -28,31 +29,47 @@ object SchemeInterpreter:
         case Expr.StringLiteral(value, _)  => Value.StringValue(SchemeString.fromText(value))
         case Expr.CharLiteral(value, _)    => Value.CharValue(value)
         case Expr.Symbol(name, _)          => env.lookup(name)
-        case Expr.ListExpr(Nil, _) =>
+        case list @ Expr.ListExpr(Nil, _) =>
           throw new EvalError("cannot evaluate an empty list")
-        case Expr.ListExpr(Expr.Symbol("quote", _) :: args, _) =>
-          evalQuote(args)
-        case Expr.ListExpr(Expr.Symbol("if", _) :: args, _) =>
-          evalIf(args, env)
-        case Expr.ListExpr(Expr.Symbol("define", _) :: args, _) =>
-          evalDefine(args, env)
-        case Expr.ListExpr(Expr.Symbol("lambda", _) :: args, _) =>
-          evalLambda(args, env)
-        case Expr.ListExpr(Expr.Symbol("set!", _) :: args, _) =>
-          evalSet(args, env)
-        case Expr.ListExpr(Expr.Symbol("and", _) :: rest, _) =>
-          evalAnd(rest, env)
-        case Expr.ListExpr(Expr.Symbol("or", _) :: rest, _) =>
-          evalOr(rest, env)
-        case Expr.ListExpr(Expr.Symbol("begin", _) :: rest, _) =>
-          evalBegin(rest, env)
-        case Expr.ListExpr(Expr.Symbol("cond", _) :: rest, _) =>
-          evalCond(rest, env)
-        case Expr.ListExpr(Expr.Symbol("let", _) :: rest, _) =>
-          evalLet(rest, env)
-        case Expr.ListExpr(operator :: args, _) =>
-          applyProcedure(eval(operator, env), args.map(arg => eval(arg, env)))
+        case list @ Expr.ListExpr(operator :: args, _) =>
+          operator match
+            case Expr.Symbol(name, _) =>
+              env.lookupSyntax(name) match
+                case Some(transformer) =>
+                  val expanded = transformer.expand(list, env)
+                  eval(expanded.expr, expanded.env)
+                case None =>
+                  evalList(list, operator, args, env)
+            case _ =>
+              evalList(list, operator, args, env)
     }
+
+  private def evalList(list: Expr.ListExpr, operator: Expr, args: List[Expr], env: Env): Value =
+    operator match
+      case Expr.Symbol("quote", _) =>
+        evalQuote(args)
+      case Expr.Symbol("if", _) =>
+        evalIf(args, env)
+      case Expr.Symbol("define", _) =>
+        evalDefine(args, env)
+      case Expr.Symbol("define-syntax", _) =>
+        evalDefineSyntax(args, env)
+      case Expr.Symbol("lambda", _) =>
+        evalLambda(args, env)
+      case Expr.Symbol("set!", _) =>
+        evalSet(args, env)
+      case Expr.Symbol("and", _) =>
+        evalAnd(args, env)
+      case Expr.Symbol("or", _) =>
+        evalOr(args, env)
+      case Expr.Symbol("begin", _) =>
+        evalBegin(args, env)
+      case Expr.Symbol("cond", _) =>
+        evalCond(args, env)
+      case Expr.Symbol("let", _) =>
+        evalLet(args, env)
+      case _ =>
+        applyProcedure(eval(operator, env), args.map(arg => eval(arg, env)))
 
   private def withErrorContext[T](pos: SourcePos)(thunk: => T): T =
     try thunk
@@ -84,6 +101,14 @@ object SchemeInterpreter:
         Value.VoidValue
       case _ =>
         throw new EvalError("invalid define form")
+
+  private def evalDefineSyntax(args: List[Expr], env: Env): Value =
+    args match
+      case Expr.Symbol(name, _) :: transformer :: Nil =>
+        env.defineSyntax(name, parseSyntaxRules(name, transformer, env))
+        Value.VoidValue
+      case _ =>
+        throw new EvalError("invalid define-syntax form")
 
   private def evalLambda(args: List[Expr], env: Env): Value =
     args match

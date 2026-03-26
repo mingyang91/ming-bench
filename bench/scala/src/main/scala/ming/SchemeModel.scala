@@ -12,6 +12,11 @@ private[ming] object SchemeModel:
     case Symbol(name: String, pos: SourcePos)
     case ListExpr(items: List[Expr], pos: SourcePos)
 
+  final case class ExpandedExpr(expr: Expr, env: Env)
+
+  trait SyntaxTransformer:
+    def expand(invocation: Expr, useSiteEnv: Env): ExpandedExpr
+
   extension (expr: Expr)
 
     def pos: SourcePos =
@@ -73,23 +78,36 @@ private[ming] object SchemeModel:
     )
     case VoidValue
 
+  final class BindingCell(var value: Value)
+
   final class Env(parent: Option[Env]):
-    private val bindings = mutable.LinkedHashMap.empty[String, Value]
+    private val bindings       = mutable.LinkedHashMap.empty[String, BindingCell]
+    private val syntaxBindings = mutable.LinkedHashMap.empty[String, SyntaxTransformer]
 
     def define(name: String, value: Value): Unit =
-      bindings(name) = value
+      bindings(name) = new BindingCell(value)
+
+    def defineAlias(name: String, cell: BindingCell): Unit =
+      bindings(name) = cell
+
+    def defineSyntax(name: String, transformer: SyntaxTransformer): Unit =
+      syntaxBindings(name) = transformer
+
+    def lookupSyntax(name: String): Option[SyntaxTransformer] =
+      syntaxBindings.get(name).orElse(parent.flatMap(_.lookupSyntax(name)))
+
+    def lookupValueCell(name: String): Option[BindingCell] =
+      bindings.get(name).orElse(parent.flatMap(_.lookupValueCell(name)))
+
+    def lookupLocalValueCell(name: String): Option[BindingCell] =
+      bindings.get(name)
 
     def set(name: String, value: Value): Unit =
-      if bindings.contains(name) then bindings(name) = value
-      else
-        parent match
-          case Some(outer) => outer.set(name, value)
-          case None        => throw new EvalError(s"unbound variable: $name")
+      lookupValueCell(name) match
+        case Some(cell) => cell.value = value
+        case None       => throw new EvalError(s"unbound variable: $name")
 
     def lookup(name: String): Value =
-      bindings.get(name) match
-        case Some(value) => value
-        case None =>
-          parent match
-            case Some(outer) => outer.lookup(name)
-            case None        => throw new EvalError(s"unbound variable: $name")
+      lookupValueCell(name) match
+        case Some(cell) => cell.value
+        case None       => throw new EvalError(s"unbound variable: $name")
