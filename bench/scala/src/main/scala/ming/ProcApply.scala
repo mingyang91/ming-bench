@@ -42,6 +42,12 @@ object ProcApply:
         Evaluator.handlerStack = WHHandler(args(0)) :: Evaluator.handlerStack
         applyFunction(args(1), Nil, ExHandlerPopK(k))
 
+      case SchemeCallWithValues =>
+        if args.size != 2 then throw new EvalError("call-with-values: expected 2 arguments")
+        val producer = args(0)
+        val consumer = args(1)
+        applyFunction(producer, Nil, CallWithValuesK(consumer, k))
+
       case SchemeDynamicWind =>
         if args.size != 3 then throw new EvalError("dynamic-wind: expected 3 arguments")
         val List(inThunk, bodyThunk, outThunk) = args: @unchecked

@@ -245,6 +245,7 @@ private[ming] object Builtins:
         case _: SchemeCaseLambda   => true
         case _: SchemeContinuation => true
         case SchemeCallCC          => true
+        case SchemeCallWithValues  => true
         case _                     => false
       }
     )

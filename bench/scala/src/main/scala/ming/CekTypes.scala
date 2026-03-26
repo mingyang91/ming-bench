@@ -88,7 +88,8 @@ private[ming] case class GuardTestK(
   env: Env,
   k: Kont
 ) extends Kont
-private[ming] case object RaiseReturnCheckK extends Kont
+private[ming] case object RaiseReturnCheckK                            extends Kont
+private[ming] case class CallWithValuesK(consumer: SchemeVal, k: Kont) extends Kont
 
 // ── CEK Machine State ──────────────────────────────────────────
 

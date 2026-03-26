@@ -31,6 +31,16 @@ object Evaluator:
     env.set("call-with-current-continuation", SchemeCallCC)
     env.set("dynamic-wind", SchemeDynamicWind)
     env.set("with-exception-handler", SchemeWithExceptionHandler)
+    env.set("call-with-values", SchemeCallWithValues)
+    env.set(
+      "values",
+      SchemeBuiltin(
+        "values",
+        args =>
+          if args.size == 1 then args.head
+          else SchemeValues(args)
+      )
+    )
     env.set(
       "raise",
       SchemeBuiltin(
@@ -248,9 +258,6 @@ object Evaluator:
     case DynWindAfterOutK(bodyVal, k2) =>
       SApply(bodyVal, k2)
 
-    case other => applyKontSpecial(value, other)
-
-  private def applyKontSpecial(value: SchemeVal, k: Kont): MState = k match
     case WindContK(actions, savedVal, targetK) =>
       ProcApply.processWindActions(actions, savedVal, targetK)
 
@@ -277,10 +284,14 @@ object Evaluator:
           evalBodyCEK(body, localEnv, k2)
       else ProcApply.evaluateGuardClauses(exnVal, variable, remaining, env, k2)
 
+    case CallWithValuesK(consumer, k2) =>
+      val args = value match
+        case SchemeValues(vals) => vals
+        case single             => List(single)
+      ProcApply.applyFunction(consumer, args, k2)
+
     case RaiseReturnCheckK =>
       throw new EvalError("handler returned from non-continuable exception")
-
-    case _ => throw new AssertionError(s"unexpected continuation: $k")
 
   private[ming] def evalBodyCEK(exprs: List[Expr], env: Env, k: Kont): MState =
     if exprs.isEmpty then SApply(SchemeVoid, k)
