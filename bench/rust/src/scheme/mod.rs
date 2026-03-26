@@ -115,6 +115,8 @@ enum Value {
         id: usize,
         func: ContFn,
     },
+    // Multiple return values (from `values`)
+    Values(Vec<Value>),
 }
 
 fn make_pair(car: Value, cdr: Value) -> Value {
@@ -323,6 +325,14 @@ impl fmt::Display for Value {
             }
             Value::TailCall { .. } => write!(f, "#<tailcall>"),
             Value::Continuation { .. } => write!(f, "#<continuation>"),
+            Value::Values(vals) => {
+                // Display the last value (or void for empty)
+                if let Some(v) = vals.last() {
+                    write!(f, "{}", v)
+                } else {
+                    write!(f, "")
+                }
+            }
         }
     }
 }
@@ -789,6 +799,7 @@ fn is_builtin(name: &str) -> bool {
             | "call/cc" | "call-with-current-continuation"
             | "dynamic-wind"
             | "raise" | "with-exception-handler"
+            | "values" | "call-with-values"
     )
 }
 
@@ -3388,6 +3399,25 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                 }
                 Err(e) => Err(e),
             }
+        }
+        "values" => {
+            if args.len() == 1 {
+                // Single value is transparent
+                Ok(args[0].clone())
+            } else {
+                Ok(Value::Values(args.to_vec()))
+            }
+        }
+        "call-with-values" => {
+            ensure_args("call-with-values", args, 2, p)?;
+            let producer = args[0].clone();
+            let consumer = args[1].clone();
+            let produced = force(apply_value(&producer, &[], p)?)?;
+            let call_args = match produced {
+                Value::Values(vals) => vals,
+                single => vec![single],
+            };
+            force(apply_value(&consumer, &call_args, p)?)
         }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", op, p))),
     }
