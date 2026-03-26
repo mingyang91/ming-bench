@@ -91,6 +91,9 @@ public class Evaluator {
             if ("define-syntax".equals(name)) {
                 return evalDefineSyntax(elements, environment);
             }
+            if ("define-record-type".equals(name)) {
+                return evalDefineRecordType(elements, environment);
+            }
             if ("set!".equals(name)) {
                 return evalSet(elements, environment);
             }
@@ -198,6 +201,99 @@ public class Evaluator {
         }
 
         environment.defineMacro(symbol.name(), parseSyntaxRules(symbol.name(), elements.get(2), environment));
+        return VoidValue.INSTANCE;
+    }
+
+    private SchemeValue evalDefineRecordType(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 4) {
+            throw new EvalError("define-record-type: expected type name, constructor, predicate, and fields");
+        }
+        if (!(elements.get(1) instanceof SymbolExpression typeName)) {
+            throw new EvalError("define-record-type: expected type name");
+        }
+        if (!(elements.get(2) instanceof ListExpression constructorExpression)) {
+            throw new EvalError("define-record-type: expected constructor clause");
+        }
+        if (!(elements.get(3) instanceof SymbolExpression predicateName)) {
+            throw new EvalError("define-record-type: expected predicate name");
+        }
+
+        List<String> fieldNames = new ArrayList<>(Math.max(0, elements.size() - 4));
+        List<RecordAccessorSpec> accessors = new ArrayList<>(Math.max(0, elements.size() - 4));
+        Set<String> seenFields = new HashSet<>();
+        for (int index = 4; index < elements.size(); index++) {
+            SchemeExpression fieldExpression = elements.get(index);
+            if (!(fieldExpression instanceof ListExpression fieldClause)) {
+                throw new EvalError("define-record-type: expected field clause");
+            }
+
+            List<SchemeExpression> fieldElements = fieldClause.elements();
+            if (fieldElements.size() != 2) {
+                throw new EvalError("define-record-type: expected field and accessor names");
+            }
+            if (!(fieldElements.get(0) instanceof SymbolExpression fieldName)) {
+                throw new EvalError("define-record-type: expected field name");
+            }
+            if (!(fieldElements.get(1) instanceof SymbolExpression accessorName)) {
+                throw new EvalError("define-record-type: expected accessor name");
+            }
+            if (!seenFields.add(fieldName.name())) {
+                throw new EvalError("define-record-type: duplicate field " + fieldName.name());
+            }
+
+            fieldNames.add(fieldName.name());
+            accessors.add(new RecordAccessorSpec(fieldName.name(), accessorName.name()));
+        }
+
+        RecordType recordType = new RecordType(typeName.name(), fieldNames);
+
+        List<SchemeExpression> constructorElements = constructorExpression.elements();
+        if (constructorElements.isEmpty()) {
+            throw new EvalError("define-record-type: expected constructor name");
+        }
+        if (!(constructorElements.getFirst() instanceof SymbolExpression constructorName)) {
+            throw new EvalError("define-record-type: expected constructor name");
+        }
+
+        List<Integer> constructorFieldIndexes = new ArrayList<>(Math.max(0, constructorElements.size() - 1));
+        Set<String> seenConstructorFields = new HashSet<>();
+        for (int index = 1; index < constructorElements.size(); index++) {
+            if (!(constructorElements.get(index) instanceof SymbolExpression constructorField)) {
+                throw new EvalError("define-record-type: expected constructor field name");
+            }
+            if (!seenConstructorFields.add(constructorField.name())) {
+                throw new EvalError("define-record-type: duplicate constructor field " + constructorField.name());
+            }
+            constructorFieldIndexes.add(recordType.requireFieldIndex(constructorField.name()));
+        }
+        if (constructorFieldIndexes.size() != recordType.fieldCount()) {
+            throw new EvalError("define-record-type: constructor must initialize all fields");
+        }
+
+        environment.define(
+                constructorName.name(),
+                new BuiltinProcedure(
+                        constructorName.name(),
+                        arguments -> applyRecordConstructor(recordType, constructorFieldIndexes, arguments, constructorName.name())
+                )
+        );
+        environment.define(
+                predicateName.name(),
+                new BuiltinProcedure(
+                        predicateName.name(),
+                        arguments -> applyRecordPredicate(recordType, arguments, predicateName.name())
+                )
+        );
+        for (RecordAccessorSpec accessor : accessors) {
+            int fieldIndex = recordType.requireFieldIndex(accessor.fieldName());
+            environment.define(
+                    accessor.accessorName(),
+                    new BuiltinProcedure(
+                            accessor.accessorName(),
+                            arguments -> applyRecordAccessor(recordType, fieldIndex, arguments, accessor.accessorName())
+                    )
+            );
+        }
         return VoidValue.INSTANCE;
     }
 
@@ -1035,6 +1131,49 @@ public class Evaluator {
         return SchemeValue.booleanValue(equalValues(arguments.get(0), arguments.get(1)));
     }
 
+    private static SchemeValue applyRecordConstructor(
+            RecordType recordType,
+            List<Integer> constructorFieldIndexes,
+            List<SchemeValue> arguments,
+            String constructorName
+    ) throws EvalError {
+        if (arguments.size() != constructorFieldIndexes.size()) {
+            throw new EvalError(constructorName + ": expected " + constructorFieldIndexes.size() + " arguments");
+        }
+
+        List<SchemeValue> fields = new ArrayList<>(recordType.fieldCount());
+        for (int index = 0; index < recordType.fieldCount(); index++) {
+            fields.add(VoidValue.INSTANCE);
+        }
+        for (int index = 0; index < constructorFieldIndexes.size(); index++) {
+            fields.set(constructorFieldIndexes.get(index), arguments.get(index));
+        }
+        return new RecordValue(recordType, fields);
+    }
+
+    private static SchemeValue applyRecordPredicate(
+            RecordType recordType,
+            List<SchemeValue> arguments,
+            String predicateName
+    ) throws EvalError {
+        requireArgumentCount(arguments, 1, predicateName);
+        return SchemeValue.booleanValue(arguments.getFirst() instanceof RecordValue recordValue
+                && recordValue.hasType(recordType));
+    }
+
+    private static SchemeValue applyRecordAccessor(
+            RecordType recordType,
+            int fieldIndex,
+            List<SchemeValue> arguments,
+            String accessorName
+    ) throws EvalError {
+        requireArgumentCount(arguments, 1, accessorName);
+        if (!(arguments.getFirst() instanceof RecordValue recordValue) || !recordValue.hasType(recordType)) {
+            throw new EvalError(accessorName + ": expected " + recordType.name());
+        }
+        return recordValue.field(fieldIndex);
+    }
+
     private static SchemeValue applyPredicate(
             List<SchemeValue> arguments,
             String name,
@@ -1286,6 +1425,9 @@ public class Evaluator {
     }
 
     private record ParameterSpec(List<String> fixedParameters, String restParameter) {
+    }
+
+    private record RecordAccessorSpec(String fieldName, String accessorName) {
     }
 
     @FunctionalInterface
