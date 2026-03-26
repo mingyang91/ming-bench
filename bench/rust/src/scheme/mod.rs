@@ -2,9 +2,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod builtins;
 pub mod error;
 mod parser;
 
+use builtins::apply_builtin;
 pub use error::EvalError;
 use error::SourcePos;
 use parser::Parser;
@@ -32,16 +34,30 @@ impl Expr {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Builtin {
     Add,
     Sub,
     Mul,
     Div,
+    Abs,
+    Modulo,
+    Remainder,
+    Quotient,
+    Min,
+    Max,
+    Expt,
+    ZeroPred,
+    PositivePred,
+    NegativePred,
+    OddPred,
+    EvenPred,
     Less,
     Greater,
     Equal,
     LessEqual,
+    EqPred,
+    EqualPred,
     Not,
     Display,
     Write,
@@ -52,6 +68,11 @@ enum Builtin {
     Append,
     List,
     Length,
+    ListRef,
+    ListTail,
+    ListPred,
+    Assoc,
+    Map,
     StringAppend,
     StringLength,
     Substring,
@@ -69,6 +90,17 @@ enum Builtin {
     PairPred,
     SymbolPred,
     CharPred,
+    CharAlphabeticPred,
+    CharNumericPred,
+    CharUpcase,
+    CharDowncase,
+    CharEqual,
+    CharLess,
+    StringEqual,
+    StringLess,
+    StringCiEqual,
+    StringUpcase,
+    StringDowncase,
     Apply,
 }
 
@@ -79,10 +111,24 @@ impl Builtin {
             Builtin::Sub => "-",
             Builtin::Mul => "*",
             Builtin::Div => "/",
+            Builtin::Abs => "abs",
+            Builtin::Modulo => "modulo",
+            Builtin::Remainder => "remainder",
+            Builtin::Quotient => "quotient",
+            Builtin::Min => "min",
+            Builtin::Max => "max",
+            Builtin::Expt => "expt",
+            Builtin::ZeroPred => "zero?",
+            Builtin::PositivePred => "positive?",
+            Builtin::NegativePred => "negative?",
+            Builtin::OddPred => "odd?",
+            Builtin::EvenPred => "even?",
             Builtin::Less => "<",
             Builtin::Greater => ">",
             Builtin::Equal => "=",
             Builtin::LessEqual => "<=",
+            Builtin::EqPred => "eq?",
+            Builtin::EqualPred => "equal?",
             Builtin::Not => "not",
             Builtin::Display => "display",
             Builtin::Write => "write",
@@ -93,6 +139,11 @@ impl Builtin {
             Builtin::Append => "append",
             Builtin::List => "list",
             Builtin::Length => "length",
+            Builtin::ListRef => "list-ref",
+            Builtin::ListTail => "list-tail",
+            Builtin::ListPred => "list?",
+            Builtin::Assoc => "assoc",
+            Builtin::Map => "map",
             Builtin::StringAppend => "string-append",
             Builtin::StringLength => "string-length",
             Builtin::Substring => "substring",
@@ -110,6 +161,17 @@ impl Builtin {
             Builtin::PairPred => "pair?",
             Builtin::SymbolPred => "symbol?",
             Builtin::CharPred => "char?",
+            Builtin::CharAlphabeticPred => "char-alphabetic?",
+            Builtin::CharNumericPred => "char-numeric?",
+            Builtin::CharUpcase => "char-upcase",
+            Builtin::CharDowncase => "char-downcase",
+            Builtin::CharEqual => "char=?",
+            Builtin::CharLess => "char<?",
+            Builtin::StringEqual => "string=?",
+            Builtin::StringLess => "string<?",
+            Builtin::StringCiEqual => "string-ci=?",
+            Builtin::StringUpcase => "string-upcase",
+            Builtin::StringDowncase => "string-downcase",
             Builtin::Apply => "apply",
         }
     }
@@ -182,6 +244,7 @@ enum Value {
     Symbol(String),
     Char(char),
     List(Vec<Value>),
+    Pair(Box<Value>, Box<Value>),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
     Void,
@@ -196,6 +259,7 @@ impl Value {
             Value::Symbol(_) => "symbol",
             Value::Char(_) => "char",
             Value::List(_) => "list",
+            Value::Pair(_, _) => "pair",
             Value::Builtin(_) | Value::Procedure(_) => "procedure",
             Value::Void => "void",
         }
@@ -335,10 +399,24 @@ fn initial_env() -> EnvRef {
         Builtin::Sub,
         Builtin::Mul,
         Builtin::Div,
+        Builtin::Abs,
+        Builtin::Modulo,
+        Builtin::Remainder,
+        Builtin::Quotient,
+        Builtin::Min,
+        Builtin::Max,
+        Builtin::Expt,
+        Builtin::ZeroPred,
+        Builtin::PositivePred,
+        Builtin::NegativePred,
+        Builtin::OddPred,
+        Builtin::EvenPred,
         Builtin::Less,
         Builtin::Greater,
         Builtin::Equal,
         Builtin::LessEqual,
+        Builtin::EqPred,
+        Builtin::EqualPred,
         Builtin::Not,
         Builtin::Display,
         Builtin::Write,
@@ -349,6 +427,11 @@ fn initial_env() -> EnvRef {
         Builtin::Append,
         Builtin::List,
         Builtin::Length,
+        Builtin::ListRef,
+        Builtin::ListTail,
+        Builtin::ListPred,
+        Builtin::Assoc,
+        Builtin::Map,
         Builtin::StringAppend,
         Builtin::StringLength,
         Builtin::Substring,
@@ -366,6 +449,17 @@ fn initial_env() -> EnvRef {
         Builtin::PairPred,
         Builtin::SymbolPred,
         Builtin::CharPred,
+        Builtin::CharAlphabeticPred,
+        Builtin::CharNumericPred,
+        Builtin::CharUpcase,
+        Builtin::CharDowncase,
+        Builtin::CharEqual,
+        Builtin::CharLess,
+        Builtin::StringEqual,
+        Builtin::StringLess,
+        Builtin::StringCiEqual,
+        Builtin::StringUpcase,
+        Builtin::StringDowncase,
         Builtin::Apply,
     ] {
         env.define(builtin.name().into(), Value::Builtin(builtin));
@@ -808,470 +902,6 @@ fn apply_procedure(
     eval_sequence(&procedure.body, &call_env, output)
 }
 
-fn apply_builtin(
-    builtin: Builtin,
-    args: &[Value],
-    output: &mut String,
-) -> Result<Value, EvalError> {
-    match builtin {
-        Builtin::Add => builtin_add(args),
-        Builtin::Sub => builtin_sub(args),
-        Builtin::Mul => builtin_mul(args),
-        Builtin::Div => builtin_div(args),
-        Builtin::Less => compare_numbers("<", args, |left, right| left < right),
-        Builtin::Greater => compare_numbers(">", args, |left, right| left > right),
-        Builtin::Equal => compare_numbers("=", args, |left, right| left == right),
-        Builtin::LessEqual => compare_numbers("<=", args, |left, right| left <= right),
-        Builtin::Not => builtin_not(args),
-        Builtin::Display => builtin_display(args, output),
-        Builtin::Write => builtin_write(args, output),
-        Builtin::Newline => builtin_newline(args, output),
-        Builtin::Cons => builtin_cons(args),
-        Builtin::Car => builtin_car(args),
-        Builtin::Cdr => builtin_cdr(args),
-        Builtin::Append => builtin_append(args),
-        Builtin::List => builtin_list(args),
-        Builtin::Length => builtin_length(args),
-        Builtin::StringAppend => builtin_string_append(args),
-        Builtin::StringLength => builtin_string_length(args),
-        Builtin::Substring => builtin_substring(args),
-        Builtin::StringToNumber => builtin_string_to_number(args),
-        Builtin::NumberToString => builtin_number_to_string(args),
-        Builtin::SymbolToString => builtin_symbol_to_string(args),
-        Builtin::StringToSymbol => builtin_string_to_symbol(args),
-        Builtin::StringRef => builtin_string_ref(args),
-        Builtin::StringSet => builtin_string_set(args),
-        Builtin::StringCopy => builtin_string_copy(args),
-        Builtin::NullPred => builtin_predicate(
-            "null?",
-            args,
-            |value| matches!(value, Value::List(items) if items.is_empty()),
-        ),
-        Builtin::NumberPred => {
-            builtin_predicate("number?", args, |value| matches!(value, Value::Integer(_)))
-        }
-        Builtin::StringPred => {
-            builtin_predicate("string?", args, |value| matches!(value, Value::String(_)))
-        }
-        Builtin::BooleanPred => {
-            builtin_predicate("boolean?", args, |value| matches!(value, Value::Boolean(_)))
-        }
-        Builtin::PairPred => builtin_predicate(
-            "pair?",
-            args,
-            |value| matches!(value, Value::List(items) if !items.is_empty()),
-        ),
-        Builtin::SymbolPred => {
-            builtin_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
-        }
-        Builtin::CharPred => {
-            builtin_predicate("char?", args, |value| matches!(value, Value::Char(_)))
-        }
-        Builtin::Apply => builtin_apply(args, output),
-    }
-}
-
-fn builtin_apply(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
-    let [callable, prefix_and_list @ ..] = args else {
-        return Err(wrong_arg_count("apply", "at least 2", 0));
-    };
-
-    if prefix_and_list.is_empty() {
-        return Err(wrong_arg_count("apply", "at least 2", 1));
-    }
-
-    let (list_arg, prefix_args) = prefix_and_list
-        .split_last()
-        .expect("prefix_and_list is known to be non-empty");
-    let list_items = expect_list("apply", list_arg)?;
-
-    let mut applied_args = Vec::with_capacity(prefix_args.len() + list_items.len());
-    applied_args.extend(prefix_args.iter().cloned());
-    applied_args.extend(list_items.iter().cloned());
-    apply(callable.clone(), &applied_args, output)
-}
-
-fn builtin_add(args: &[Value]) -> Result<Value, EvalError> {
-    let mut total = 0;
-    for arg in args {
-        total += expect_number("+", arg)?;
-    }
-    Ok(Value::Integer(total))
-}
-
-fn builtin_sub(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [] => Err(wrong_arg_count("-", "at least 1", 0)),
-        [arg] => Ok(Value::Integer(-expect_number("-", arg)?)),
-        [first, rest @ ..] => {
-            let mut total = expect_number("-", first)?;
-            for arg in rest {
-                total -= expect_number("-", arg)?;
-            }
-            Ok(Value::Integer(total))
-        }
-    }
-}
-
-fn builtin_mul(args: &[Value]) -> Result<Value, EvalError> {
-    let mut total = 1;
-    for arg in args {
-        total *= expect_number("*", arg)?;
-    }
-    Ok(Value::Integer(total))
-}
-
-fn builtin_div(args: &[Value]) -> Result<Value, EvalError> {
-    let [first, rest @ ..] = args else {
-        return Err(wrong_arg_count("/", "at least 2", 0));
-    };
-
-    if rest.is_empty() {
-        return Err(wrong_arg_count("/", "at least 2", 1));
-    }
-
-    let mut total = expect_number("/", first)?;
-    for arg in rest {
-        let divisor = expect_number("/", arg)?;
-        if divisor == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        total /= divisor;
-    }
-
-    Ok(Value::Integer(total))
-}
-
-fn builtin_not(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::Boolean(!value.is_truthy())),
-        _ => Err(wrong_arg_count("not", "1", args.len())),
-    }
-}
-
-fn builtin_display(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            output.push_str(&value.render_display());
-            Ok(Value::Void)
-        }
-        _ => Err(wrong_arg_count("display", "1", args.len())),
-    }
-}
-
-fn builtin_write(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            output.push_str(&value.render());
-            Ok(Value::Void)
-        }
-        _ => Err(wrong_arg_count("write", "1", args.len())),
-    }
-}
-
-fn builtin_newline(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
-    match args {
-        [] => {
-            output.push('\n');
-            Ok(Value::Void)
-        }
-        _ => Err(wrong_arg_count("newline", "0", args.len())),
-    }
-}
-
-fn builtin_cons(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [head, tail] => {
-            let mut items = Vec::new();
-            items.push(head.clone());
-            items.extend(expect_list("cons", tail)?.iter().cloned());
-            Ok(Value::List(items))
-        }
-        _ => Err(wrong_arg_count("cons", "2", args.len())),
-    }
-}
-
-fn builtin_car(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(expect_pair("car", value)?[0].clone()),
-        _ => Err(wrong_arg_count("car", "1", args.len())),
-    }
-}
-
-fn builtin_cdr(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            let items = expect_pair("cdr", value)?;
-            Ok(Value::List(items[1..].to_vec()))
-        }
-        _ => Err(wrong_arg_count("cdr", "1", args.len())),
-    }
-}
-
-fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
-    let mut items = Vec::new();
-    for value in args {
-        items.extend(expect_list("append", value)?.iter().cloned());
-    }
-    Ok(Value::List(items))
-}
-
-fn builtin_list(args: &[Value]) -> Result<Value, EvalError> {
-    Ok(Value::List(args.to_vec()))
-}
-
-fn builtin_length(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::Integer(expect_list("length", value)?.len() as i64)),
-        _ => Err(wrong_arg_count("length", "1", args.len())),
-    }
-}
-
-fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
-    let mut result = String::new();
-
-    for arg in args {
-        result.push_str(&expect_string("string-append", arg)?.to_plain_string());
-    }
-
-    Ok(Value::String(SchemeString::fresh(result)))
-}
-
-fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::Integer(
-            expect_string("string-length", value)?.len() as i64
-        )),
-        _ => Err(wrong_arg_count("string-length", "1", args.len())),
-    }
-}
-
-fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value, start_value, end_value] => {
-            let string = expect_string("substring", value)?;
-            let chars = string.chars();
-            let len = chars.len();
-            let start = expect_number("substring", start_value)?;
-            let end = expect_number("substring", end_value)?;
-
-            if start < 0 || end < 0 || start > end || end as usize > len {
-                return Err(EvalError::InvalidRange {
-                    name: "substring".into(),
-                    start,
-                    end,
-                    len,
-                });
-            }
-
-            let slice: String = chars[start as usize..end as usize].iter().collect();
-            Ok(Value::String(SchemeString::fresh(slice)))
-        }
-        _ => Err(wrong_arg_count("substring", "3", args.len())),
-    }
-}
-
-fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => {
-            let string = expect_string("string->number", value)?.to_plain_string();
-            match string.parse::<i64>() {
-                Ok(number) => Ok(Value::Integer(number)),
-                Err(_) => Ok(Value::Boolean(false)),
-            }
-        }
-        _ => Err(wrong_arg_count("string->number", "1", args.len())),
-    }
-}
-
-fn builtin_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::String(SchemeString::fresh(
-            expect_number("number->string", value)?.to_string(),
-        ))),
-        _ => Err(wrong_arg_count("number->string", "1", args.len())),
-    }
-}
-
-fn builtin_symbol_to_string(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::String(SchemeString::fresh(
-            expect_symbol("symbol->string", value)?.to_string(),
-        ))),
-        _ => Err(wrong_arg_count("symbol->string", "1", args.len())),
-    }
-}
-
-fn builtin_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::Symbol(
-            expect_string("string->symbol", value)?.to_plain_string(),
-        )),
-        _ => Err(wrong_arg_count("string->symbol", "1", args.len())),
-    }
-}
-
-fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value, index_value] => {
-            let string = expect_string("string-ref", value)?;
-            let index = expect_number("string-ref", index_value)?;
-
-            if index < 0 || index as usize >= string.len() {
-                return Err(EvalError::IndexOutOfBounds {
-                    name: "string-ref".into(),
-                    index,
-                    len: string.len(),
-                });
-            }
-
-            Ok(Value::Char(
-                string
-                    .get(index as usize)
-                    .expect("bounds checked before string-ref access"),
-            ))
-        }
-        _ => Err(wrong_arg_count("string-ref", "2", args.len())),
-    }
-}
-
-fn builtin_string_set(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [string_value, index_value, char_value] => {
-            let string = expect_string("string-set!", string_value)?;
-            if !string.is_mutable() {
-                return Err(EvalError::ImmutableString {
-                    name: "string-set!".into(),
-                });
-            }
-
-            let index = expect_number("string-set!", index_value)?;
-            let len = string.len();
-            if index < 0 || index as usize >= len {
-                return Err(EvalError::IndexOutOfBounds {
-                    name: "string-set!".into(),
-                    index,
-                    len,
-                });
-            }
-
-            let ch = expect_char("string-set!", char_value)?;
-            let updated = string.set(index as usize, ch);
-            debug_assert!(updated, "string-set! index already validated");
-            Ok(Value::Void)
-        }
-        _ => Err(wrong_arg_count("string-set!", "3", args.len())),
-    }
-}
-
-fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
-    match args {
-        [value] => Ok(Value::String(
-            expect_string("string-copy", value)?.mutable_copy(),
-        )),
-        _ => Err(wrong_arg_count("string-copy", "1", args.len())),
-    }
-}
-
-fn builtin_predicate<F>(name: &str, args: &[Value], predicate: F) -> Result<Value, EvalError>
-where
-    F: Fn(&Value) -> bool,
-{
-    match args {
-        [value] => Ok(Value::Boolean(predicate(value))),
-        _ => Err(wrong_arg_count(name, "1", args.len())),
-    }
-}
-
-fn compare_numbers<F>(name: &str, args: &[Value], predicate: F) -> Result<Value, EvalError>
-where
-    F: Fn(i64, i64) -> bool,
-{
-    if args.len() < 2 {
-        return Err(wrong_arg_count(name, "at least 2", args.len()));
-    }
-
-    let mut iter = args.iter();
-    let mut left = expect_number(name, iter.next().expect("len checked"))?;
-
-    for arg in iter {
-        let right = expect_number(name, arg)?;
-        if !predicate(left, right) {
-            return Ok(Value::Boolean(false));
-        }
-        left = right;
-    }
-
-    Ok(Value::Boolean(true))
-}
-
-fn expect_number(name: &str, value: &Value) -> Result<i64, EvalError> {
-    match value {
-        Value::Integer(number) => Ok(*number),
-        _ => Err(EvalError::TypeMismatch {
-            name: name.into(),
-            expected: "number".into(),
-            got: value.type_name().into(),
-        }),
-    }
-}
-
-fn expect_string(name: &str, value: &Value) -> Result<SchemeString, EvalError> {
-    match value {
-        Value::String(string) => Ok(string.clone()),
-        _ => Err(EvalError::TypeMismatch {
-            name: name.into(),
-            expected: "string".into(),
-            got: value.type_name().into(),
-        }),
-    }
-}
-
-fn expect_symbol<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError> {
-    match value {
-        Value::Symbol(symbol) => Ok(symbol),
-        _ => Err(EvalError::TypeMismatch {
-            name: name.into(),
-            expected: "symbol".into(),
-            got: value.type_name().into(),
-        }),
-    }
-}
-
-fn expect_char(name: &str, value: &Value) -> Result<char, EvalError> {
-    match value {
-        Value::Char(ch) => Ok(*ch),
-        _ => Err(EvalError::TypeMismatch {
-            name: name.into(),
-            expected: "char".into(),
-            got: value.type_name().into(),
-        }),
-    }
-}
-
-fn expect_list<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalError> {
-    match value {
-        Value::List(items) => Ok(items),
-        _ => Err(EvalError::TypeMismatch {
-            name: name.into(),
-            expected: "list".into(),
-            got: value.type_name().into(),
-        }),
-    }
-}
-
-fn expect_pair<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalError> {
-    let items = expect_list(name, value)?;
-    if items.is_empty() {
-        return Err(EvalError::TypeMismatch {
-            name: name.into(),
-            expected: "pair".into(),
-            got: value.type_name().into(),
-        });
-    }
-    Ok(items)
-}
-
 fn wrong_arg_count(name: &str, expected: &str, got: usize) -> EvalError {
     EvalError::WrongArgCount {
         name: name.into(),
@@ -1292,6 +922,7 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         Value::Symbol(value) => value.clone(),
         Value::Char(ch) => render_char(*ch, mode),
         Value::List(items) => render_list(items, mode),
+        Value::Pair(head, tail) => render_pair(head, tail, mode),
         Value::Builtin(_) | Value::Procedure(_) => "#<procedure>".into(),
         Value::Void => String::new(),
     }
@@ -1303,6 +934,35 @@ fn render_list(items: &[Value], mode: RenderMode) -> String {
         .map(|value| render_value(value, mode))
         .collect();
     format!("({})", parts.join(" "))
+}
+
+fn render_pair(head: &Value, tail: &Value, mode: RenderMode) -> String {
+    let mut rendered = String::new();
+    rendered.push('(');
+    rendered.push_str(&render_value(head, mode));
+    render_pair_tail(tail, mode, &mut rendered);
+    rendered.push(')');
+    rendered
+}
+
+fn render_pair_tail(tail: &Value, mode: RenderMode, rendered: &mut String) {
+    match tail {
+        Value::List(items) => {
+            for item in items {
+                rendered.push(' ');
+                rendered.push_str(&render_value(item, mode));
+            }
+        }
+        Value::Pair(head, next) => {
+            rendered.push(' ');
+            rendered.push_str(&render_value(head, mode));
+            render_pair_tail(next, mode, rendered);
+        }
+        other => {
+            rendered.push_str(" . ");
+            rendered.push_str(&render_value(other, mode));
+        }
+    }
 }
 
 fn render_char(ch: char, mode: RenderMode) -> String {
