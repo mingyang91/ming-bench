@@ -3,10 +3,9 @@ pub mod error;
 pub use error::EvalError;
 
 use std::cmp::Ordering;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 type EnvRef = Rc<Environment>;
 type MacroRef = Rc<SyntaxRulesMacro>;
@@ -131,6 +130,10 @@ enum BuiltinName {
     Denominator,
     IntegerPred,
     RationalPred,
+    StringLength,
+    Display,
+    Write,
+    Newline,
 }
 
 #[derive(Clone)]
@@ -160,13 +163,18 @@ enum RuntimeSignal {
     Escape { id: usize, value: Value },
 }
 
+enum EvalStep {
+    Value(Value),
+    TailCall { procedure: Value, args: Vec<Value> },
+}
+
 impl From<EvalError> for RuntimeSignal {
     fn from(error: EvalError) -> Self {
         Self::Error(error)
     }
 }
 
-const BUILTINS: [(&str, BuiltinName); 32] = [
+const BUILTINS: [(&str, BuiltinName); 36] = [
     ("+", BuiltinName::Add),
     ("-", BuiltinName::Sub),
     ("*", BuiltinName::Mul),
@@ -199,10 +207,17 @@ const BUILTINS: [(&str, BuiltinName); 32] = [
     ("denominator", BuiltinName::Denominator),
     ("integer?", BuiltinName::IntegerPred),
     ("rational?", BuiltinName::RationalPred),
+    ("string-length", BuiltinName::StringLength),
+    ("display", BuiltinName::Display),
+    ("write", BuiltinName::Write),
+    ("newline", BuiltinName::Newline),
 ];
 
-static MACRO_IDENTIFIER_COUNTER: AtomicUsize = AtomicUsize::new(0);
-static CONTINUATION_COUNTER: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static CAPTURED_OUTPUT: RefCell<String> = RefCell::new(String::new());
+    static MACRO_IDENTIFIER_COUNTER: Cell<usize> = Cell::new(0);
+    static CONTINUATION_COUNTER: Cell<usize> = Cell::new(0);
+}
 
 impl Rational {
     fn integer(value: i128) -> Self {
@@ -492,10 +507,12 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let (result, output) = evaluate_program(input)?;
-    Ok((format_value(&result), output))
+    Ok((format_output_result(&result), output))
 }
 
 fn evaluate_program(input: &str) -> Result<(Value, String), EvalError> {
+    reset_evaluation_state();
+
     let expressions = parse_program(input)?;
     if expressions.is_empty() {
         return Err(EvalError::msg("expected at least one expression"));
@@ -508,7 +525,7 @@ fn evaluate_program(input: &str) -> Result<(Value, String), EvalError> {
         result = evaluate_expr(expr, env.clone()).map_err(signal_to_eval_error)?;
     }
 
-    Ok((result, String::new()))
+    Ok((result, take_captured_output()))
 }
 
 fn signal_to_eval_error(signal: RuntimeSignal) -> EvalError {
@@ -529,6 +546,36 @@ fn create_global_env() -> EnvRef {
     }
 
     env
+}
+
+fn reset_evaluation_state() {
+    CAPTURED_OUTPUT.with(|output| output.borrow_mut().clear());
+    MACRO_IDENTIFIER_COUNTER.with(|counter| counter.set(0));
+    CONTINUATION_COUNTER.with(|counter| counter.set(0));
+}
+
+fn take_captured_output() -> String {
+    CAPTURED_OUTPUT.with(|output| std::mem::take(&mut *output.borrow_mut()))
+}
+
+fn append_captured_output(text: &str) {
+    CAPTURED_OUTPUT.with(|output| output.borrow_mut().push_str(text));
+}
+
+fn next_macro_identifier() -> usize {
+    MACRO_IDENTIFIER_COUNTER.with(|counter| {
+        let current = counter.get();
+        counter.set(current + 1);
+        current
+    })
+}
+
+fn next_continuation_id() -> usize {
+    CONTINUATION_COUNTER.with(|counter| {
+        let current = counter.get();
+        counter.set(current + 1);
+        current
+    })
 }
 
 fn parse_program(input: &str) -> Result<Vec<Expr>, EvalError> {
@@ -713,16 +760,50 @@ fn parse_number_literal(text: &str) -> Result<Option<Number>, EvalError> {
 }
 
 fn evaluate_expr(expr: &Expr, env: EnvRef) -> EvalResult<Value> {
+    resolve_eval_step(evaluate_expr_tail(expr, env)?)
+}
+
+fn evaluate_expr_tail(expr: &Expr, env: EnvRef) -> EvalResult<EvalStep> {
     match expr {
-        Expr::Number(value) => Ok(Value::Number(value.clone())),
-        Expr::Boolean(value) => Ok(Value::Boolean(*value)),
-        Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => env.lookup(name).map_err(RuntimeSignal::from),
-        Expr::List(elements) => evaluate_list(elements, env),
+        Expr::Number(value) => Ok(EvalStep::Value(Value::Number(value.clone()))),
+        Expr::Boolean(value) => Ok(EvalStep::Value(Value::Boolean(*value))),
+        Expr::String(value) => Ok(EvalStep::Value(Value::String(value.clone()))),
+        Expr::Symbol(name) => env
+            .lookup(name)
+            .map(EvalStep::Value)
+            .map_err(RuntimeSignal::from),
+        Expr::List(elements) => evaluate_list_tail(elements, env),
     }
 }
 
-fn evaluate_list(elements: &[Expr], env: EnvRef) -> EvalResult<Value> {
+fn resolve_eval_step(mut step: EvalStep) -> EvalResult<Value> {
+    loop {
+        match step {
+            EvalStep::Value(value) => return Ok(value),
+            EvalStep::TailCall { procedure, args } => {
+                step = start_procedure_call(procedure, args)?;
+            }
+        }
+    }
+}
+
+fn start_procedure_call(procedure: Value, args: Vec<Value>) -> EvalResult<EvalStep> {
+    match procedure {
+        Value::Builtin(name) => {
+            let value = apply_builtin(name, &args).map_err(RuntimeSignal::from)?;
+            Ok(EvalStep::Value(value))
+        }
+        Value::Closure(procedure) => apply_closure_step(procedure, args),
+        Value::CaseLambda(procedure) => apply_case_lambda_step(procedure, args),
+        Value::Continuation(continuation) => {
+            let value = apply_continuation(continuation, args)?;
+            Ok(EvalStep::Value(value))
+        }
+        _ => Err(EvalError::msg("attempted to call a non-procedure").into()),
+    }
+}
+
+fn evaluate_list_tail(elements: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
     if elements.is_empty() {
         return Err(EvalError::msg("cannot evaluate empty list").into());
     }
@@ -733,34 +814,35 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> EvalResult<Value> {
 
     if let Expr::Symbol(name) = head {
         match name.as_str() {
-            "define-syntax" => return evaluate_define_syntax(arg_exprs, env),
-            "define" => return evaluate_define(arg_exprs, env),
-            "set!" => return evaluate_set(arg_exprs, env),
+            "define-syntax" => return evaluate_define_syntax(arg_exprs, env).map(EvalStep::Value),
+            "define" => return evaluate_define(arg_exprs, env).map(EvalStep::Value),
+            "set!" => return evaluate_set(arg_exprs, env).map(EvalStep::Value),
             "if" => return evaluate_if(arg_exprs, env),
-            "quote" => return evaluate_quote(arg_exprs),
-            "lambda" => return evaluate_lambda(arg_exprs, env),
-            "case-lambda" => return evaluate_case_lambda(arg_exprs, env),
+            "quote" => return evaluate_quote(arg_exprs).map(EvalStep::Value),
+            "lambda" => return evaluate_lambda(arg_exprs, env).map(EvalStep::Value),
+            "case-lambda" => return evaluate_case_lambda(arg_exprs, env).map(EvalStep::Value),
             "and" => return evaluate_and(arg_exprs, env),
             "or" => return evaluate_or(arg_exprs, env),
             "let" => return evaluate_let(arg_exprs, env),
-            "begin" => return evaluate_begin(arg_exprs, env),
+            "begin" => return evaluate_sequence_tail(arg_exprs, env),
             "cond" => return evaluate_cond(arg_exprs, env),
+            "case" => return evaluate_case(arg_exprs, env),
             "call/cc" | "call-with-current-continuation" => {
-                return evaluate_call_cc(arg_exprs, env);
+                return evaluate_call_cc(arg_exprs, env).map(EvalStep::Value);
             }
-            "dynamic-wind" => return evaluate_dynamic_wind(arg_exprs, env),
-            "raise" => return evaluate_raise(arg_exprs, env),
+            "dynamic-wind" => return evaluate_dynamic_wind(arg_exprs, env).map(EvalStep::Value),
+            "raise" => return evaluate_raise(arg_exprs, env).map(EvalStep::Value),
             "with-exception-handler" => {
-                return evaluate_with_exception_handler(arg_exprs, env);
+                return evaluate_with_exception_handler(arg_exprs, env).map(EvalStep::Value);
             }
-            "guard" => return evaluate_guard(arg_exprs, env),
+            "guard" => return evaluate_guard(arg_exprs, env).map(EvalStep::Value),
             _ => {}
         }
 
         if let Some(macro_rules) = env.lookup_macro(name) {
             let (expanded_expr, expanded_env) =
                 expand_macro_invocation(elements, macro_rules, env).map_err(RuntimeSignal::from)?;
-            return evaluate_expr(&expanded_expr, expanded_env);
+            return evaluate_expr_tail(&expanded_expr, expanded_env);
         }
     }
 
@@ -770,7 +852,7 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> EvalResult<Value> {
         args.push(evaluate_expr(expr, env.clone())?);
     }
 
-    apply_procedure(procedure, args)
+    Ok(EvalStep::TailCall { procedure, args })
 }
 
 fn evaluate_define_syntax(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
@@ -848,16 +930,16 @@ fn evaluate_set(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     Ok(Value::Void)
 }
 
-fn evaluate_if(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+fn evaluate_if(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
     if arg_exprs.len() != 3 {
         return Err(EvalError::msg("if expects exactly 3 arguments").into());
     }
 
     let condition = evaluate_expr(&arg_exprs[0], env.clone())?;
     if is_truthy(&condition) {
-        evaluate_expr(&arg_exprs[1], env)
+        evaluate_expr_tail(&arg_exprs[1], env)
     } else {
-        evaluate_expr(&arg_exprs[2], env)
+        evaluate_expr_tail(&arg_exprs[2], env)
     }
 }
 
@@ -1881,6 +1963,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "define-syntax"
             | "set!"
             | "if"
+            | "case"
             | "quote"
             | "lambda"
             | "and"
@@ -1901,7 +1984,7 @@ fn is_special_form_name(name: &str) -> bool {
 }
 
 fn fresh_macro_identifier(name: &str) -> String {
-    let counter = MACRO_IDENTIFIER_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let counter = next_macro_identifier();
     let sanitized: String = name
         .chars()
         .map(|ch| {
@@ -1917,31 +2000,37 @@ fn fresh_macro_identifier(name: &str) -> String {
     format!("__macro_{counter}_{suffix}")
 }
 
-fn evaluate_and(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
-    let mut last_value = Value::Boolean(true);
+fn evaluate_and(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
+    let Some((last_expr, init_exprs)) = arg_exprs.split_last() else {
+        return Ok(EvalStep::Value(Value::Boolean(true)));
+    };
 
-    for expr in arg_exprs {
-        last_value = evaluate_expr(expr, env.clone())?;
-        if !is_truthy(&last_value) {
-            return Ok(last_value);
+    for expr in init_exprs {
+        let value = evaluate_expr(expr, env.clone())?;
+        if !is_truthy(&value) {
+            return Ok(EvalStep::Value(value));
         }
     }
 
-    Ok(last_value)
+    evaluate_expr_tail(last_expr, env)
 }
 
-fn evaluate_or(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
-    for expr in arg_exprs {
+fn evaluate_or(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
+    let Some((last_expr, init_exprs)) = arg_exprs.split_last() else {
+        return Ok(EvalStep::Value(Value::Boolean(false)));
+    };
+
+    for expr in init_exprs {
         let value = evaluate_expr(expr, env.clone())?;
         if is_truthy(&value) {
-            return Ok(value);
+            return Ok(EvalStep::Value(value));
         }
     }
 
-    Ok(Value::Boolean(false))
+    evaluate_expr_tail(last_expr, env)
 }
 
-fn evaluate_let(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+fn evaluate_let(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
     if arg_exprs.len() < 2 {
         return Err(EvalError::msg("let expects bindings and a body").into());
     }
@@ -1954,7 +2043,7 @@ fn evaluate_let(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     evaluate_let_body(&bindings, &arg_exprs[1..], env)
 }
 
-fn evaluate_named_let(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+fn evaluate_named_let(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
     if arg_exprs.len() < 3 {
         return Err(EvalError::msg("named let expects a name, bindings, and a body").into());
     }
@@ -1979,7 +2068,10 @@ fn evaluate_named_let(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
         args.push(evaluate_expr(&binding.value_expr, env.clone())?);
     }
 
-    apply_closure(procedure, args)
+    Ok(EvalStep::TailCall {
+        procedure: Value::Closure(procedure),
+        args,
+    })
 }
 
 fn read_let_bindings(bindings_expr: &Expr) -> Result<Vec<LetBinding>, EvalError> {
@@ -2011,7 +2103,7 @@ fn read_let_bindings(bindings_expr: &Expr) -> Result<Vec<LetBinding>, EvalError>
     Ok(bindings)
 }
 
-fn evaluate_let_body(bindings: &[LetBinding], body: &[Expr], env: EnvRef) -> EvalResult<Value> {
+fn evaluate_let_body(bindings: &[LetBinding], body: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
     if body.is_empty() {
         return Err(EvalError::msg("let expects a body").into());
     }
@@ -2026,14 +2118,10 @@ fn evaluate_let_body(bindings: &[LetBinding], body: &[Expr], env: EnvRef) -> Eva
         let_env.define(binding.name.clone(), value);
     }
 
-    evaluate_sequence(body, let_env)
+    evaluate_sequence_tail(body, let_env)
 }
 
-fn evaluate_begin(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
-    evaluate_sequence(arg_exprs, env)
-}
-
-fn evaluate_cond(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+fn evaluate_cond(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
     for (index, clause_expr) in arg_exprs.iter().enumerate() {
         let Expr::List(items) = clause_expr else {
             return Err(EvalError::msg("cond clauses must be non-empty lists").into());
@@ -2056,24 +2144,71 @@ fn evaluate_cond(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
                 return Err(EvalError::msg("else clause requires a body").into());
             }
 
-            return evaluate_sequence(body, env.clone());
+            return evaluate_sequence_tail(body, env.clone());
         }
 
         let test_value = evaluate_expr(test_expr, env.clone())?;
         if is_truthy(&test_value) {
             if body.is_empty() {
-                return Ok(test_value);
+                return Ok(EvalStep::Value(test_value));
             }
 
-            return evaluate_sequence(body, env.clone());
+            return evaluate_sequence_tail(body, env.clone());
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
+}
+
+fn evaluate_case(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
+    if arg_exprs.len() < 2 {
+        return Err(EvalError::msg("case expects a key and at least 1 clause").into());
+    }
+
+    let key = evaluate_expr(&arg_exprs[0], env.clone())?;
+
+    for (index, clause_expr) in arg_exprs[1..].iter().enumerate() {
+        let Expr::List(items) = clause_expr else {
+            return Err(EvalError::msg("case clauses must be non-empty lists").into());
+        };
+
+        if items.is_empty() {
+            return Err(EvalError::msg("case clauses must be non-empty lists").into());
+        }
+
+        let (datum_expr, body) = items
+            .split_first()
+            .ok_or_else(|| RuntimeSignal::from(EvalError::msg("case clauses must be non-empty lists")))?;
+
+        if matches!(datum_expr, Expr::Symbol(name) if name == "else") {
+            if index + 2 != arg_exprs.len() {
+                return Err(EvalError::msg("else clause must be last in case").into());
+            }
+            if body.is_empty() {
+                return Err(EvalError::msg("else clause requires a body").into());
+            }
+
+            return evaluate_sequence_tail(body, env.clone());
+        }
+
+        let Expr::List(datums) = datum_expr else {
+            return Err(EvalError::msg("case clauses must start with a datum list or else").into());
+        };
+
+        if datums.iter().any(|datum| case_datum_matches(&key, datum)) {
+            if body.is_empty() {
+                return Ok(EvalStep::Value(key));
+            }
+
+            return evaluate_sequence_tail(body, env.clone());
+        }
+    }
+
+    Ok(EvalStep::Value(Value::Void))
 }
 
 fn fresh_continuation_id() -> usize {
-    CONTINUATION_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+    next_continuation_id()
 }
 
 fn evaluate_call_cc(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
@@ -2211,13 +2346,7 @@ fn evaluate_guard_clauses(clauses: &[Expr], env: EnvRef) -> EvalResult<Option<Va
 }
 
 fn apply_procedure(procedure: Value, args: Vec<Value>) -> EvalResult<Value> {
-    match procedure {
-        Value::Builtin(name) => apply_builtin(name, &args).map_err(RuntimeSignal::from),
-        Value::Closure(procedure) => apply_closure(procedure, args),
-        Value::CaseLambda(procedure) => apply_case_lambda(procedure, args),
-        Value::Continuation(continuation) => apply_continuation(continuation, args),
-        _ => Err(EvalError::msg("attempted to call a non-procedure").into()),
-    }
+    resolve_eval_step(EvalStep::TailCall { procedure, args })
 }
 
 fn apply_continuation(continuation: Rc<Continuation>, args: Vec<Value>) -> EvalResult<Value> {
@@ -2231,7 +2360,7 @@ fn apply_continuation(continuation: Rc<Continuation>, args: Vec<Value>) -> EvalR
     })
 }
 
-fn apply_closure(procedure: Rc<Closure>, args: Vec<Value>) -> EvalResult<Value> {
+fn apply_closure_step(procedure: Rc<Closure>, args: Vec<Value>) -> EvalResult<EvalStep> {
     if procedure.rest_param.is_none() && args.len() != procedure.params.len() {
         return Err(EvalError::msg(format!(
             "expected {} arguments, got {}",
@@ -2263,17 +2392,17 @@ fn apply_closure(procedure: Rc<Closure>, args: Vec<Value>) -> EvalResult<Value> 
         call_env.define(rest_param.clone(), build_list(args.collect()));
     }
 
-    evaluate_sequence(&procedure.body, call_env)
+    evaluate_sequence_tail(&procedure.body, call_env)
 }
 
-fn apply_case_lambda(procedure: Rc<CaseLambda>, args: Vec<Value>) -> EvalResult<Value> {
+fn apply_case_lambda_step(procedure: Rc<CaseLambda>, args: Vec<Value>) -> EvalResult<EvalStep> {
     if let Some(clause) = procedure
         .clauses
         .iter()
         .find(|clause| closure_accepts_arity(clause, args.len()))
         .cloned()
     {
-        return apply_closure(clause, args);
+        return apply_closure_step(clause, args);
     }
 
     Err(EvalError::msg(format!(
@@ -2291,13 +2420,19 @@ fn closure_accepts_arity(procedure: &Closure, arg_count: usize) -> bool {
 }
 
 fn evaluate_sequence(exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
-    let mut result = Value::Void;
+    resolve_eval_step(evaluate_sequence_tail(exprs, env)?)
+}
 
-    for expr in exprs {
-        result = evaluate_expr(expr, env.clone())?;
+fn evaluate_sequence_tail(exprs: &[Expr], env: EnvRef) -> EvalResult<EvalStep> {
+    let Some((last_expr, init_exprs)) = exprs.split_last() else {
+        return Ok(EvalStep::Value(Value::Void));
+    };
+
+    for expr in init_exprs {
+        evaluate_expr(expr, env.clone())?;
     }
 
-    Ok(result)
+    evaluate_expr_tail(last_expr, env)
 }
 
 fn apply_builtin(name: BuiltinName, args: &[Value]) -> Result<Value, EvalError> {
@@ -2368,6 +2503,10 @@ fn apply_builtin(name: BuiltinName, args: &[Value]) -> Result<Value, EvalError> 
         BuiltinName::RationalPred => {
             apply_number_predicate(args, "rational?", |number| number.is_rational())
         }
+        BuiltinName::StringLength => apply_string_length(args),
+        BuiltinName::Display => apply_display(args),
+        BuiltinName::Write => apply_write(args),
+        BuiltinName::Newline => apply_newline(args),
     }
 }
 
@@ -2549,6 +2688,34 @@ fn apply_string_append(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::String(result))
 }
 
+fn apply_string_length(args: &[Value]) -> Result<Value, EvalError> {
+    expect_arg_count(args, 1, "string-length")?;
+
+    let Value::String(text) = &args[0] else {
+        return Err(EvalError::msg("string-length expects a string"));
+    };
+
+    Ok(make_exact_integer(text.chars().count() as i128))
+}
+
+fn apply_display(args: &[Value]) -> Result<Value, EvalError> {
+    expect_arg_count(args, 1, "display")?;
+    append_captured_output(&format_display_value(&args[0]));
+    Ok(Value::Void)
+}
+
+fn apply_write(args: &[Value]) -> Result<Value, EvalError> {
+    expect_arg_count(args, 1, "write")?;
+    append_captured_output(&format_value(&args[0]));
+    Ok(Value::Void)
+}
+
+fn apply_newline(args: &[Value]) -> Result<Value, EvalError> {
+    expect_arg_count(args, 0, "newline")?;
+    append_captured_output("\n");
+    Ok(Value::Void)
+}
+
 fn apply_type_predicate<F>(args: &[Value], name: &str, predicate: F) -> Result<Value, EvalError>
 where
     F: Fn(&Value) -> bool,
@@ -2698,6 +2865,27 @@ fn is_callable_value(value: &Value) -> bool {
     )
 }
 
+fn case_datum_matches(key: &Value, datum: &Expr) -> bool {
+    value_eqv(key, &quote_expr(datum))
+}
+
+fn value_eqv(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => compare_numbers(left, right) == Ordering::Equal,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Builtin(left), Value::Builtin(right)) => std::mem::discriminant(left) == std::mem::discriminant(right),
+        (Value::Continuation(left), Value::Continuation(right)) => left.id == right.id,
+        (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
+        (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
+        (Value::CaseLambda(left), Value::CaseLambda(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
 fn make_number(value: Number) -> Value {
     Value::Number(value)
 }
@@ -2738,6 +2926,20 @@ fn format_value(value: &Value) -> String {
             "#<procedure>".into()
         }
         Value::Void => String::new(),
+    }
+}
+
+fn format_output_result(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        _ => format_value(value),
+    }
+}
+
+fn format_display_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        _ => format_value(value),
     }
 }
 

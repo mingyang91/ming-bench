@@ -223,8 +223,9 @@ export function evalStrWithLimit(input, maxSteps) {
  */
 export function evalStrWithOutput(input) {
     const evaluation = evaluateProgram(input);
+    const result = expectSingleValue(evaluation.result);
     return {
-        result: formatValue(expectSingleValue(evaluation.result)),
+        result: formatOutputResult(result),
         output: evaluation.output,
     };
 }
@@ -3841,6 +3842,9 @@ function makeSyntaxObject(expr, env) {
 }
 function formatValue(value) {
     return formatValueWithMode(value, 'write');
+}
+function formatOutputResult(value) {
+    return value.kind === 'string' ? value.value : formatValue(value);
 }
 function formatDisplayValue(value) {
     return formatValueWithMode(value, 'display');

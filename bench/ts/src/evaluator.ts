@@ -635,8 +635,9 @@ export function evalStrWithLimit(input: string, maxSteps: number): string {
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const evaluation = evaluateProgram(input);
+  const result = expectSingleValue(evaluation.result);
   return {
-    result: formatValue(expectSingleValue(evaluation.result)),
+    result: formatOutputResult(result),
     output: evaluation.output,
   };
 }
@@ -5703,6 +5704,10 @@ function makeSyntaxObject(expr: Expr, env: Environment): SyntaxObjectValue {
 
 function formatValue(value: RuntimeValue): string {
   return formatValueWithMode(value, 'write');
+}
+
+function formatOutputResult(value: RuntimeValue): string {
+  return value.kind === 'string' ? value.value : formatValue(value);
 }
 
 function formatDisplayValue(value: RuntimeValue): string {
