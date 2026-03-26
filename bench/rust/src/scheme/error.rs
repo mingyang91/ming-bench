@@ -60,6 +60,9 @@ pub enum EvalError {
     #[error("division by zero")]
     DivisionByZero,
 
+    #[error("{name}: numeric overflow")]
+    NumericOverflow { name: String },
+
     #[error("{name}: index {index} out of bounds for length {len}")]
     IndexOutOfBounds {
         name: String,

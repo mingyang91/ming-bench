@@ -4,10 +4,11 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::error::{EvalError, SourcePos};
+use super::number::Number;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Expr {
-    Integer(i64, SourcePos),
+    Number(Number, SourcePos),
     Boolean(bool, SourcePos),
     String(String, SourcePos),
     Char(char, SourcePos),
@@ -18,7 +19,7 @@ pub(super) enum Expr {
 impl Expr {
     pub(super) fn pos(&self) -> SourcePos {
         match self {
-            Self::Integer(_, pos)
+            Self::Number(_, pos)
             | Self::Boolean(_, pos)
             | Self::String(_, pos)
             | Self::Char(_, pos)
@@ -46,6 +47,14 @@ pub(super) enum Builtin {
     NegativePred,
     OddPred,
     EvenPred,
+    ExactPred,
+    InexactPred,
+    IntegerPred,
+    RationalPred,
+    ExactToInexact,
+    InexactToExact,
+    Numerator,
+    Denominator,
     Less,
     Greater,
     Equal,
@@ -117,6 +126,14 @@ impl Builtin {
             Builtin::NegativePred => "negative?",
             Builtin::OddPred => "odd?",
             Builtin::EvenPred => "even?",
+            Builtin::ExactPred => "exact?",
+            Builtin::InexactPred => "inexact?",
+            Builtin::IntegerPred => "integer?",
+            Builtin::RationalPred => "rational?",
+            Builtin::ExactToInexact => "exact->inexact",
+            Builtin::InexactToExact => "inexact->exact",
+            Builtin::Numerator => "numerator",
+            Builtin::Denominator => "denominator",
             Builtin::Less => "<",
             Builtin::Greater => ">",
             Builtin::Equal => "=",
@@ -236,7 +253,7 @@ impl SchemeString {
 
 #[derive(Clone)]
 pub(super) enum Value {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     String(SchemeString),
     Symbol(String),
@@ -251,7 +268,7 @@ pub(super) enum Value {
 impl Value {
     pub(super) fn type_name(&self) -> &'static str {
         match self {
-            Value::Integer(_) => "number",
+            Value::Number(_) => "number",
             Value::Boolean(_) => "boolean",
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
@@ -506,7 +523,7 @@ pub(super) fn is_ellipsis(expr: &Expr) -> bool {
 
 pub(super) fn expr_datum_eq(left: &Expr, right: &Expr) -> bool {
     match (left, right) {
-        (Expr::Integer(a, _), Expr::Integer(b, _)) => a == b,
+        (Expr::Number(a, _), Expr::Number(b, _)) => a == b,
         (Expr::Boolean(a, _), Expr::Boolean(b, _)) => a == b,
         (Expr::String(a, _), Expr::String(b, _)) => a == b,
         (Expr::Char(a, _), Expr::Char(b, _)) => a == b,
@@ -545,7 +562,7 @@ pub(super) fn fresh_identifier(base: &str) -> String {
 
 fn render_value(value: &Value, mode: RenderMode) -> String {
     match value {
-        Value::Integer(value) => value.to_string(),
+        Value::Number(value) => value.render(),
         Value::Boolean(true) => "#t".into(),
         Value::Boolean(false) => "#f".into(),
         Value::String(value) => match mode {

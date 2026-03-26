@@ -1,4 +1,4 @@
-use super::{error::SourcePos, model::Expr, EvalError};
+use super::{error::SourcePos, model::Expr, number::Number, EvalError};
 
 pub(super) struct Parser<'a> {
     input: &'a str,
@@ -130,9 +130,9 @@ impl<'a> Parser<'a> {
                     .with_position(pos)),
                 }
             }
-            _ => match token.parse::<i64>() {
-                Ok(value) => Ok(Expr::Integer(value, pos)),
-                Err(_) => Ok(Expr::Symbol(token.into(), pos)),
+            _ => match Number::parse(token) {
+                Some(value) => Ok(Expr::Number(value, pos)),
+                None => Ok(Expr::Symbol(token.into(), pos)),
             },
         }
     }

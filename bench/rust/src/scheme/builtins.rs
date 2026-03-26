@@ -1,8 +1,10 @@
+use std::cmp::Ordering;
 use std::rc::Rc;
 
 use super::{
     apply,
     model::{Builtin, SchemeString, Value},
+    number::Number,
     wrong_arg_count, EvalError,
 };
 
@@ -20,18 +22,50 @@ pub(super) fn apply_builtin(
         Builtin::Modulo => builtin_modulo(args),
         Builtin::Remainder => builtin_remainder(args),
         Builtin::Quotient => builtin_quotient(args),
-        Builtin::Min => builtin_min_max("min", args, |left, right| left.min(right)),
-        Builtin::Max => builtin_min_max("max", args, |left, right| left.max(right)),
+        Builtin::Min => builtin_min_max("min", args, |ordering| ordering == Ordering::Less),
+        Builtin::Max => builtin_min_max("max", args, |ordering| ordering == Ordering::Greater),
         Builtin::Expt => builtin_expt(args),
-        Builtin::ZeroPred => builtin_number_predicate("zero?", args, |value| value == 0),
-        Builtin::PositivePred => builtin_number_predicate("positive?", args, |value| value > 0),
-        Builtin::NegativePred => builtin_number_predicate("negative?", args, |value| value < 0),
-        Builtin::OddPred => builtin_number_predicate("odd?", args, |value| value % 2 != 0),
-        Builtin::EvenPred => builtin_number_predicate("even?", args, |value| value % 2 == 0),
-        Builtin::Less => compare_numbers("<", args, |left, right| left < right),
-        Builtin::Greater => compare_numbers(">", args, |left, right| left > right),
-        Builtin::Equal => compare_numbers("=", args, |left, right| left == right),
-        Builtin::LessEqual => compare_numbers("<=", args, |left, right| left <= right),
+        Builtin::ZeroPred => builtin_number_predicate("zero?", args, Number::is_zero),
+        Builtin::PositivePred => builtin_number_predicate("positive?", args, |value| {
+            matches!(value.compare(Number::exact_int(0)), Some(Ordering::Greater))
+        }),
+        Builtin::NegativePred => builtin_number_predicate("negative?", args, |value| {
+            matches!(value.compare(Number::exact_int(0)), Some(Ordering::Less))
+        }),
+        Builtin::OddPred => builtin_exact_integer_predicate("odd?", args, |value| value % 2 != 0),
+        Builtin::EvenPred => {
+            builtin_exact_integer_predicate("even?", args, |value| value % 2 == 0)
+        }
+        Builtin::ExactPred => builtin_predicate(
+            "exact?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_exact()),
+        ),
+        Builtin::InexactPred => builtin_predicate(
+            "inexact?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_inexact()),
+        ),
+        Builtin::IntegerPred => builtin_predicate(
+            "integer?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_integer()),
+        ),
+        Builtin::RationalPred => builtin_predicate(
+            "rational?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_rational()),
+        ),
+        Builtin::ExactToInexact => builtin_exact_to_inexact(args),
+        Builtin::InexactToExact => builtin_inexact_to_exact(args),
+        Builtin::Numerator => builtin_numerator(args),
+        Builtin::Denominator => builtin_denominator(args),
+        Builtin::Less => compare_numbers("<", args, |ordering| ordering == Ordering::Less),
+        Builtin::Greater => compare_numbers(">", args, |ordering| ordering == Ordering::Greater),
+        Builtin::Equal => compare_numbers("=", args, |ordering| ordering == Ordering::Equal),
+        Builtin::LessEqual => compare_numbers("<=", args, |ordering| {
+            matches!(ordering, Ordering::Less | Ordering::Equal)
+        }),
         Builtin::EqPred => builtin_eq(args),
         Builtin::EqualPred => builtin_equal(args),
         Builtin::Not => builtin_not(args),
@@ -67,7 +101,7 @@ pub(super) fn apply_builtin(
             |value| matches!(value, Value::List(items) if items.is_empty()),
         ),
         Builtin::NumberPred => {
-            builtin_predicate("number?", args, |value| matches!(value, Value::Integer(_)))
+            builtin_predicate("number?", args, |value| matches!(value, Value::Number(_)))
         }
         Builtin::StringPred => {
             builtin_predicate("string?", args, |value| matches!(value, Value::String(_)))
@@ -128,16 +162,16 @@ fn builtin_apply(args: &[Value], output: &mut String) -> Result<Value, EvalError
 }
 
 fn builtin_add(args: &[Value]) -> Result<Value, EvalError> {
-    let mut total = 0;
+    let mut total = Number::exact_int(0);
     for arg in args {
-        total += expect_number("+", arg)?;
+        total = total.add(expect_number("+", arg)?, "+")?;
     }
-    Ok(Value::Integer(total))
+    Ok(Value::Number(total))
 }
 
 fn builtin_abs(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::Integer(expect_number("abs", value)?.abs())),
+        [value] => Ok(Value::Number(expect_number("abs", value)?.abs("abs")?)),
         _ => Err(wrong_arg_count("abs", "1", args.len())),
     }
 }
@@ -145,23 +179,23 @@ fn builtin_abs(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_sub(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [] => Err(wrong_arg_count("-", "at least 1", 0)),
-        [arg] => Ok(Value::Integer(-expect_number("-", arg)?)),
+        [arg] => Ok(Value::Number(expect_number("-", arg)?.negate("-")?)),
         [first, rest @ ..] => {
             let mut total = expect_number("-", first)?;
             for arg in rest {
-                total -= expect_number("-", arg)?;
+                total = total.sub(expect_number("-", arg)?, "-")?;
             }
-            Ok(Value::Integer(total))
+            Ok(Value::Number(total))
         }
     }
 }
 
 fn builtin_mul(args: &[Value]) -> Result<Value, EvalError> {
-    let mut total = 1;
+    let mut total = Number::exact_int(1);
     for arg in args {
-        total *= expect_number("*", arg)?;
+        total = total.mul(expect_number("*", arg)?, "*")?;
     }
-    Ok(Value::Integer(total))
+    Ok(Value::Number(total))
 }
 
 fn builtin_div(args: &[Value]) -> Result<Value, EvalError> {
@@ -176,20 +210,20 @@ fn builtin_div(args: &[Value]) -> Result<Value, EvalError> {
     let mut total = expect_number("/", first)?;
     for arg in rest {
         let divisor = expect_number("/", arg)?;
-        if divisor == 0 {
+        if divisor.is_zero() {
             return Err(EvalError::DivisionByZero);
         }
-        total /= divisor;
+        total = total.div(divisor, "/")?;
     }
 
-    Ok(Value::Integer(total))
+    Ok(Value::Number(total))
 }
 
 fn builtin_modulo(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [dividend, divisor] => {
-            let dividend = expect_number("modulo", dividend)?;
-            let divisor = expect_number("modulo", divisor)?;
+            let dividend = expect_exact_integer("modulo", dividend)?;
+            let divisor = expect_exact_integer("modulo", divisor)?;
             if divisor == 0 {
                 return Err(EvalError::DivisionByZero);
             }
@@ -198,7 +232,7 @@ fn builtin_modulo(args: &[Value]) -> Result<Value, EvalError> {
             if remainder != 0 && (remainder > 0) != (divisor > 0) {
                 remainder += divisor;
             }
-            Ok(Value::Integer(remainder))
+            Ok(Value::Number(Number::exact_int(remainder)))
         }
         _ => Err(wrong_arg_count("modulo", "2", args.len())),
     }
@@ -207,12 +241,12 @@ fn builtin_modulo(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_remainder(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [dividend, divisor] => {
-            let dividend = expect_number("remainder", dividend)?;
-            let divisor = expect_number("remainder", divisor)?;
+            let dividend = expect_exact_integer("remainder", dividend)?;
+            let divisor = expect_exact_integer("remainder", divisor)?;
             if divisor == 0 {
                 return Err(EvalError::DivisionByZero);
             }
-            Ok(Value::Integer(dividend % divisor))
+            Ok(Value::Number(Number::exact_int(dividend % divisor)))
         }
         _ => Err(wrong_arg_count("remainder", "2", args.len())),
     }
@@ -221,12 +255,12 @@ fn builtin_remainder(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_quotient(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [dividend, divisor] => {
-            let dividend = expect_number("quotient", dividend)?;
-            let divisor = expect_number("quotient", divisor)?;
+            let dividend = expect_exact_integer("quotient", dividend)?;
+            let divisor = expect_exact_integer("quotient", divisor)?;
             if divisor == 0 {
                 return Err(EvalError::DivisionByZero);
             }
-            Ok(Value::Integer(dividend / divisor))
+            Ok(Value::Number(Number::exact_int(dividend / divisor)))
         }
         _ => Err(wrong_arg_count("quotient", "2", args.len())),
     }
@@ -234,7 +268,7 @@ fn builtin_quotient(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_min_max<F>(name: &str, args: &[Value], choose: F) -> Result<Value, EvalError>
 where
-    F: Fn(i64, i64) -> i64,
+    F: Fn(Ordering) -> bool,
 {
     let [first, rest @ ..] = args else {
         return Err(wrong_arg_count(name, "at least 1", 0));
@@ -242,20 +276,66 @@ where
 
     let mut result = expect_number(name, first)?;
     for arg in rest {
-        result = choose(result, expect_number(name, arg)?);
+        let candidate = expect_number(name, arg)?;
+        if matches!(candidate.compare(result), Some(ordering) if choose(ordering)) {
+            result = candidate;
+        }
     }
-    Ok(Value::Integer(result))
+    Ok(Value::Number(result))
 }
 
 fn builtin_expt(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [base, exponent] => {
-            let base = expect_number("expt", base)?;
-            let exponent = expect_number("expt", exponent)?;
+            let base = expect_exact_integer("expt", base)?;
+            let exponent = expect_exact_integer("expt", exponent)?;
             let exponent = exponent.max(0) as u32;
-            Ok(Value::Integer(base.pow(exponent)))
+            let result = base
+                .checked_pow(exponent)
+                .ok_or_else(|| EvalError::NumericOverflow {
+                    name: "expt".into(),
+                })?;
+            Ok(Value::Number(Number::exact_int(result)))
         }
         _ => Err(wrong_arg_count("expt", "2", args.len())),
+    }
+}
+
+fn builtin_exact_to_inexact(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::Number(expect_number("exact->inexact", value)?.to_inexact())),
+        _ => Err(wrong_arg_count("exact->inexact", "1", args.len())),
+    }
+}
+
+fn builtin_inexact_to_exact(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::Number(
+            expect_number("inexact->exact", value)?.to_exact("inexact->exact")?,
+        )),
+        _ => Err(wrong_arg_count("inexact->exact", "1", args.len())),
+    }
+}
+
+fn builtin_numerator(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::Number(Number::exact_int(
+            expect_exact_number("numerator", value)?
+                .numerator()
+                .expect("exact numbers always have numerators"),
+        ))),
+        _ => Err(wrong_arg_count("numerator", "1", args.len())),
+    }
+}
+
+fn builtin_denominator(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::Number(Number::exact_int(
+            expect_exact_number("denominator", value)?
+                .denominator()
+                .expect("exact numbers always have denominators"),
+        ))),
+        _ => Err(wrong_arg_count("denominator", "1", args.len())),
     }
 }
 
@@ -351,7 +431,9 @@ fn builtin_list(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_length(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::Integer(expect_list("length", value)?.len() as i64)),
+        [value] => Ok(Value::Number(Number::exact_int(
+            expect_list("length", value)?.len() as i64,
+        ))),
         _ => Err(wrong_arg_count("length", "1", args.len())),
     }
 }
@@ -360,7 +442,7 @@ fn builtin_list_ref(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [list, index_value] => {
             let items = expect_list("list-ref", list)?;
-            let index = expect_number("list-ref", index_value)?;
+            let index = expect_exact_integer("list-ref", index_value)?;
             if index < 0 || index as usize >= items.len() {
                 return Err(EvalError::IndexOutOfBounds {
                     name: "list-ref".into(),
@@ -378,7 +460,7 @@ fn builtin_list_tail(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [list, index_value] => {
             let items = expect_list("list-tail", list)?;
-            let index = expect_number("list-tail", index_value)?;
+            let index = expect_exact_integer("list-tail", index_value)?;
             if index < 0 || index as usize > items.len() {
                 return Err(EvalError::IndexOutOfBounds {
                     name: "list-tail".into(),
@@ -458,9 +540,9 @@ fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_string_length(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::Integer(
-            expect_string("string-length", value)?.len() as i64
-        )),
+        [value] => Ok(Value::Number(Number::exact_int(
+            expect_string("string-length", value)?.len() as i64,
+        ))),
         _ => Err(wrong_arg_count("string-length", "1", args.len())),
     }
 }
@@ -471,8 +553,8 @@ fn builtin_substring(args: &[Value]) -> Result<Value, EvalError> {
             let string = expect_string("substring", value)?;
             let chars = string.chars();
             let len = chars.len();
-            let start = expect_number("substring", start_value)?;
-            let end = expect_number("substring", end_value)?;
+            let start = expect_exact_integer("substring", start_value)?;
+            let end = expect_exact_integer("substring", end_value)?;
 
             if start < 0 || end < 0 || start > end || end as usize > len {
                 return Err(EvalError::InvalidRange {
@@ -494,9 +576,9 @@ fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value] => {
             let string = expect_string("string->number", value)?.to_plain_string();
-            match string.parse::<i64>() {
-                Ok(number) => Ok(Value::Integer(number)),
-                Err(_) => Ok(Value::Boolean(false)),
+            match Number::parse(&string) {
+                Some(number) => Ok(Value::Number(number)),
+                None => Ok(Value::Boolean(false)),
             }
         }
         _ => Err(wrong_arg_count("string->number", "1", args.len())),
@@ -506,7 +588,7 @@ fn builtin_string_to_number(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_number_to_string(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value] => Ok(Value::String(SchemeString::fresh(
-            expect_number("number->string", value)?.to_string(),
+            expect_number("number->string", value)?.render(),
         ))),
         _ => Err(wrong_arg_count("number->string", "1", args.len())),
     }
@@ -534,7 +616,7 @@ fn builtin_string_ref(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value, index_value] => {
             let string = expect_string("string-ref", value)?;
-            let index = expect_number("string-ref", index_value)?;
+            let index = expect_exact_integer("string-ref", index_value)?;
 
             if index < 0 || index as usize >= string.len() {
                 return Err(EvalError::IndexOutOfBounds {
@@ -564,7 +646,7 @@ fn builtin_string_set(args: &[Value]) -> Result<Value, EvalError> {
                 });
             }
 
-            let index = expect_number("string-set!", index_value)?;
+            let index = expect_exact_integer("string-set!", index_value)?;
             let len = string.len();
             if index < 0 || index as usize >= len {
                 return Err(EvalError::IndexOutOfBounds {
@@ -618,10 +700,24 @@ where
 
 fn builtin_number_predicate<F>(name: &str, args: &[Value], predicate: F) -> Result<Value, EvalError>
 where
-    F: Fn(i64) -> bool,
+    F: Fn(Number) -> bool,
 {
     match args {
         [value] => Ok(Value::Boolean(predicate(expect_number(name, value)?))),
+        _ => Err(wrong_arg_count(name, "1", args.len())),
+    }
+}
+
+fn builtin_exact_integer_predicate<F>(
+    name: &str,
+    args: &[Value],
+    predicate: F,
+) -> Result<Value, EvalError>
+where
+    F: Fn(i64) -> bool,
+{
+    match args {
+        [value] => Ok(Value::Boolean(predicate(expect_exact_integer(name, value)?))),
         _ => Err(wrong_arg_count(name, "1", args.len())),
     }
 }
@@ -672,7 +768,7 @@ fn builtin_string_ci_equal(args: &[Value]) -> Result<Value, EvalError> {
 
 fn compare_numbers<F>(name: &str, args: &[Value], predicate: F) -> Result<Value, EvalError>
 where
-    F: Fn(i64, i64) -> bool,
+    F: Fn(Ordering) -> bool,
 {
     if args.len() < 2 {
         return Err(wrong_arg_count(name, "at least 2", args.len()));
@@ -683,7 +779,10 @@ where
 
     for arg in iter {
         let right = expect_number(name, arg)?;
-        if !predicate(left, right) {
+        let Some(ordering) = left.compare(right) else {
+            return Ok(Value::Boolean(false));
+        };
+        if !predicate(ordering) {
             return Ok(Value::Boolean(false));
         }
         left = right;
@@ -742,7 +841,7 @@ fn is_pair(value: &Value) -> bool {
 
 fn eq_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.compare(*right) == Some(Ordering::Equal),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::String(left), Value::String(right)) => left.shares_storage(right),
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
@@ -757,7 +856,9 @@ fn eq_values(left: &Value, right: &Value) -> bool {
 
 fn equal_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => {
+            left.compare(*right) == Some(Ordering::Equal)
+        }
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::String(left), Value::String(right)) => {
             left.to_plain_string() == right.to_plain_string()
@@ -781,12 +882,37 @@ fn equal_values(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn expect_number(name: &str, value: &Value) -> Result<i64, EvalError> {
+fn expect_number(name: &str, value: &Value) -> Result<Number, EvalError> {
     match value {
-        Value::Integer(number) => Ok(*number),
+        Value::Number(number) => Ok(*number),
         _ => Err(EvalError::TypeMismatch {
             name: name.into(),
             expected: "number".into(),
+            got: value.type_name().into(),
+        }),
+    }
+}
+
+fn expect_exact_number(name: &str, value: &Value) -> Result<Number, EvalError> {
+    let number = expect_number(name, value)?;
+    if number.is_exact() {
+        Ok(number)
+    } else {
+        Err(EvalError::TypeMismatch {
+            name: name.into(),
+            expected: "exact number".into(),
+            got: value.type_name().into(),
+        })
+    }
+}
+
+fn expect_exact_integer(name: &str, value: &Value) -> Result<i64, EvalError> {
+    let number = expect_number(name, value)?;
+    match number.exact_integer() {
+        Some(integer) => Ok(integer),
+        None => Err(EvalError::TypeMismatch {
+            name: name.into(),
+            expected: "exact integer".into(),
             got: value.type_name().into(),
         }),
     }

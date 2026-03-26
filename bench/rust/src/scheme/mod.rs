@@ -4,6 +4,7 @@ use std::rc::Rc;
 mod builtins;
 pub mod error;
 mod model;
+mod number;
 mod parser;
 
 use builtins::apply_builtin;
@@ -65,6 +66,14 @@ fn initial_env() -> EnvRef {
         Builtin::NegativePred,
         Builtin::OddPred,
         Builtin::EvenPred,
+        Builtin::ExactPred,
+        Builtin::InexactPred,
+        Builtin::IntegerPred,
+        Builtin::RationalPred,
+        Builtin::ExactToInexact,
+        Builtin::InexactToExact,
+        Builtin::Numerator,
+        Builtin::Denominator,
         Builtin::Less,
         Builtin::Greater,
         Builtin::Equal,
@@ -136,7 +145,7 @@ fn eval(expr: &Expr, env: &EnvRef, output: &mut String) -> Result<Value, EvalErr
     let pos = expr.pos();
 
     match expr {
-        Expr::Integer(value, _) => Ok(Value::Integer(*value)),
+        Expr::Number(value, _) => Ok(Value::Number(*value)),
         Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
         Expr::String(value, _) => Ok(Value::String(SchemeString::literal(value))),
         Expr::Char(value, _) => Ok(Value::Char(*value)),
@@ -582,7 +591,7 @@ fn match_pattern(
     repeated: bool,
 ) -> Result<bool, EvalError> {
     match pattern {
-        Expr::Integer(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
+        Expr::Number(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
             Ok(expr_datum_eq(pattern, input))
         }
         Expr::Symbol(name, _) => {
@@ -690,7 +699,7 @@ fn seed_repeated_bindings(
                 }
             }
         }
-        Expr::Integer(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {}
+        Expr::Number(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {}
     }
 
     Ok(())
@@ -729,7 +738,7 @@ fn expand_template_expr(
     repeat_index: Option<usize>,
 ) -> Result<Expr, EvalError> {
     match template {
-        Expr::Integer(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
+        Expr::Number(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {
             Ok(template.clone())
         }
         Expr::Symbol(name, pos) => expand_template_symbol(name, *pos, state, scope, repeat_index),
@@ -1037,7 +1046,7 @@ fn collect_repetition_lens(
                 }
             }
         }
-        Expr::Integer(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {}
+        Expr::Number(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) => {}
     }
 
     Ok(())
@@ -1140,7 +1149,7 @@ fn lambda_parts(expr: &Expr) -> Option<&[Expr]> {
 
 fn quote_expr(expr: &Expr) -> Value {
     match expr {
-        Expr::Integer(value, _) => Value::Integer(*value),
+        Expr::Number(value, _) => Value::Number(*value),
         Expr::Boolean(value, _) => Value::Boolean(*value),
         Expr::String(value, _) => Value::String(SchemeString::literal(value)),
         Expr::Char(value, _) => Value::Char(*value),
