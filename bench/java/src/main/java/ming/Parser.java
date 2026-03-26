@@ -157,7 +157,21 @@ class Parser {
         try {
             return Long.parseLong(token);
         } catch (NumberFormatException e) {
-            return token;
+            // Try rational n/d (but not symbols like "let/cc")
+            int slash = token.indexOf('/');
+            if (slash > 0 && slash < token.length() - 1) {
+                try {
+                    long num = Long.parseLong(token.substring(0, slash));
+                    long den = Long.parseLong(token.substring(slash + 1));
+                    if (den != 0) return new Rational(num, den).simplify();
+                } catch (NumberFormatException ignored) {}
+            }
+            // Try floating point
+            try {
+                return Double.parseDouble(token);
+            } catch (NumberFormatException e2) {
+                return token;
+            }
         }
     }
 }

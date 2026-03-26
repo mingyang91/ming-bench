@@ -11,6 +11,14 @@ class SchemeValue {
         if (val == null) return "void";
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
+        if (val instanceof Rational r) return r.toString();
+        if (val instanceof Double d) {
+            if (d == Math.floor(d) && !Double.isInfinite(d) && Math.abs(d) < 1e15) {
+                // Print as e.g. 5.0 not 5
+                return String.valueOf(d);
+            }
+            return String.valueOf(d);
+        }
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof String s) return s;
         if (val instanceof Pair p) {

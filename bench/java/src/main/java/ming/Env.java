@@ -40,53 +40,51 @@ class Env {
         Env env = new Env(null);
         // Arithmetic
         env.define("+", Builtin.named("+", args -> {
-            long sum = 0;
-            for (Object a : args) sum += requireLong("+", a);
+            Object sum = 0L;
+            for (Object a : args) sum = numAdd(sum, requireNumber("+", a));
             return sum;
         }));
         env.define("-", Builtin.named("-", args -> {
             if (args.isEmpty()) throw new EvalError("-: need at least 1 argument");
-            if (args.size() == 1) return -requireLong("-", args.get(0));
-            long r = requireLong("-", args.get(0));
-            for (int i = 1; i < args.size(); i++) r -= requireLong("-", args.get(i));
+            Object first = requireNumber("-", args.get(0));
+            if (args.size() == 1) return numNegate(first);
+            Object r = first;
+            for (int i = 1; i < args.size(); i++) r = numSub(r, requireNumber("-", args.get(i)));
             return r;
         }));
         env.define("*", Builtin.named("*", args -> {
-            long p = 1;
-            for (Object a : args) p *= requireLong("*", a);
+            Object p = 1L;
+            for (Object a : args) p = numMul(p, requireNumber("*", a));
             return p;
         }));
         env.define("/", Builtin.named("/", args -> {
             if (args.isEmpty()) throw new EvalError("/: need at least 1 argument");
-            long r = requireLong("/", args.get(0));
-            for (int i = 1; i < args.size(); i++) {
-                long d = requireLong("/", args.get(i));
-                if (d == 0) throw new EvalError("division by zero");
-                r /= d;
-            }
+            Object r = requireNumber("/", args.get(0));
+            if (args.size() == 1) return numDiv(1L, r);
+            for (int i = 1; i < args.size(); i++) r = numDiv(r, requireNumber("/", args.get(i)));
             return r;
         }));
 
         // Comparisons
         env.define("<", Builtin.named("<", args -> {
             requireArgCount("<", args, 2);
-            return requireLong("<", args.get(0)) < requireLong("<", args.get(1));
+            return numCompare(requireNumber("<", args.get(0)), requireNumber("<", args.get(1))) < 0;
         }));
         env.define(">", Builtin.named(">", args -> {
             requireArgCount(">", args, 2);
-            return requireLong(">", args.get(0)) > requireLong(">", args.get(1));
+            return numCompare(requireNumber(">", args.get(0)), requireNumber(">", args.get(1))) > 0;
         }));
         env.define("=", Builtin.named("=", args -> {
             requireArgCount("=", args, 2);
-            return requireLong("=", args.get(0)) == requireLong("=", args.get(1));
+            return numCompare(requireNumber("=", args.get(0)), requireNumber("=", args.get(1))) == 0;
         }));
         env.define("<=", Builtin.named("<=", args -> {
             requireArgCount("<=", args, 2);
-            return requireLong("<=", args.get(0)) <= requireLong("<=", args.get(1));
+            return numCompare(requireNumber("<=", args.get(0)), requireNumber("<=", args.get(1))) <= 0;
         }));
         env.define(">=", Builtin.named(">=", args -> {
             requireArgCount(">=", args, 2);
-            return requireLong(">=", args.get(0)) >= requireLong(">=", args.get(1));
+            return numCompare(requireNumber(">=", args.get(0)), requireNumber(">=", args.get(1))) >= 0;
         }));
         env.define("not", Builtin.named("not", args -> {
             requireArgCount("not", args, 1);
@@ -173,7 +171,7 @@ class Env {
         }));
         env.define("number?", Builtin.named("number?", args -> {
             requireArgCount("number?", args, 1);
-            return args.get(0) instanceof Long;
+            return isNumber(args.get(0));
         }));
         env.define("string?", Builtin.named("string?", args -> {
             requireArgCount("string?", args, 1);
@@ -236,8 +234,8 @@ class Env {
         }));
         env.define("number->string", Builtin.named("number->string", args -> {
             requireArgCount("number->string", args, 1);
-            long n = requireLong("number->string", args.get(0));
-            return "\"" + n + "\"";
+            Object a = args.get(0);
+            return "\"" + SchemeValue.toStr(a) + "\"";
         }));
         env.define("symbol->string", Builtin.named("symbol->string", args -> {
             requireArgCount("symbol->string", args, 1);
@@ -485,10 +483,59 @@ class Env {
             return "\"" + requireString("string-downcase", args.get(0)).toLowerCase() + "\"";
         }));
 
-        // L09 — integer? predicate
+        // L09 — integer? predicate (updated for L11: 4/2 is integer)
         env.define("integer?", Builtin.named("integer?", args -> {
             requireArgCount("integer?", args, 1);
-            return args.get(0) instanceof Long;
+            Object a = args.get(0);
+            if (a instanceof Long) return true;
+            if (a instanceof Rational r) return r.isInteger();
+            if (a instanceof Double d) return d == Math.floor(d) && !Double.isInfinite(d);
+            return false;
+        }));
+
+        // L11 — Exact/inexact predicates and conversions
+        env.define("exact?", Builtin.named("exact?", args -> {
+            requireArgCount("exact?", args, 1);
+            Object a = args.get(0);
+            return a instanceof Long || a instanceof Rational;
+        }));
+        env.define("inexact?", Builtin.named("inexact?", args -> {
+            requireArgCount("inexact?", args, 1);
+            return args.get(0) instanceof Double;
+        }));
+        env.define("rational?", Builtin.named("rational?", args -> {
+            requireArgCount("rational?", args, 1);
+            Object a = args.get(0);
+            return a instanceof Long || a instanceof Rational;
+        }));
+        env.define("exact->inexact", Builtin.named("exact->inexact", args -> {
+            requireArgCount("exact->inexact", args, 1);
+            Object a = args.get(0);
+            if (a instanceof Long l) return (double) l;
+            if (a instanceof Rational r) return r.toDouble();
+            if (a instanceof Double) return a;
+            throw new EvalError("exact->inexact: expected number");
+        }));
+        env.define("inexact->exact", Builtin.named("inexact->exact", args -> {
+            requireArgCount("inexact->exact", args, 1);
+            Object a = args.get(0);
+            if (a instanceof Double d) return Rational.fromDouble(d).simplify();
+            if (a instanceof Long || a instanceof Rational) return a;
+            throw new EvalError("inexact->exact: expected number");
+        }));
+        env.define("numerator", Builtin.named("numerator", args -> {
+            requireArgCount("numerator", args, 1);
+            Object a = args.get(0);
+            if (a instanceof Long l) return l;
+            if (a instanceof Rational r) return r.num;
+            throw new EvalError("numerator: expected rational");
+        }));
+        env.define("denominator", Builtin.named("denominator", args -> {
+            requireArgCount("denominator", args, 1);
+            Object a = args.get(0);
+            if (a instanceof Long) return 1L;
+            if (a instanceof Rational r) return r.den;
+            throw new EvalError("denominator: expected rational");
         }));
 
         return env;
@@ -520,6 +567,68 @@ class Env {
         throw new EvalError(name + ": expected number, got: " + SchemeValue.toStr(val));
     }
 
+    private static boolean isNumber(Object val) {
+        return val instanceof Long || val instanceof Double || val instanceof Rational;
+    }
+
+    private static Object requireNumber(String name, Object val) throws EvalError {
+        if (isNumber(val)) return val;
+        throw new EvalError(name + ": expected number, got: " + SchemeValue.toStr(val));
+    }
+
+    private static double toDouble(Object n) {
+        if (n instanceof Long l) return l;
+        if (n instanceof Double d) return d;
+        if (n instanceof Rational r) return r.toDouble();
+        throw new IllegalArgumentException();
+    }
+
+    private static Rational toRational(Object n) {
+        if (n instanceof Long l) return Rational.fromLong(l);
+        if (n instanceof Rational r) return r;
+        throw new IllegalArgumentException();
+    }
+
+    private static boolean isInexact(Object n) { return n instanceof Double; }
+
+    private static Object numAdd(Object a, Object b) {
+        if (isInexact(a) || isInexact(b)) return toDouble(a) + toDouble(b);
+        return toRational(a).add(toRational(b)).simplify();
+    }
+
+    private static Object numSub(Object a, Object b) {
+        if (isInexact(a) || isInexact(b)) return toDouble(a) - toDouble(b);
+        return toRational(a).sub(toRational(b)).simplify();
+    }
+
+    private static Object numMul(Object a, Object b) {
+        if (isInexact(a) || isInexact(b)) return toDouble(a) * toDouble(b);
+        return toRational(a).mul(toRational(b)).simplify();
+    }
+
+    private static Object numDiv(Object a, Object b) throws EvalError {
+        if (isInexact(a) || isInexact(b)) {
+            double d = toDouble(b);
+            if (d == 0) throw new EvalError("division by zero");
+            return toDouble(a) / d;
+        }
+        Rational rb = toRational(b);
+        if (rb.num == 0) throw new EvalError("division by zero");
+        return toRational(a).div(rb).simplify();
+    }
+
+    private static Object numNegate(Object a) {
+        if (a instanceof Long l) return -l;
+        if (a instanceof Double d) return -d;
+        if (a instanceof Rational r) return r.negate().simplify();
+        throw new IllegalArgumentException();
+    }
+
+    private static int numCompare(Object a, Object b) {
+        if (isInexact(a) || isInexact(b)) return Double.compare(toDouble(a), toDouble(b));
+        return toRational(a).compareTo(toRational(b));
+    }
+
     private static void requireArgCount(String name, List<Object> args, int n) throws EvalError {
         if (args.size() != n)
             throw new EvalError(name + ": expected " + n + " arguments, got " + args.size());
@@ -533,6 +642,7 @@ class Env {
     static boolean schemeEq(Object a, Object b) {
         if (a == b) return true;
         if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
+        if (a instanceof Rational ra && b instanceof Rational rb) return ra.equals(rb);
         if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
         if (a instanceof Character ca && b instanceof Character cb) return ca.equals(cb);
         if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
