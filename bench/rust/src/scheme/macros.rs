@@ -44,6 +44,7 @@ pub(crate) enum SyntaxExpr {
     String(String),
     Symbol(SyntaxSymbol),
     List(Vec<SyntaxExpr>),
+    Vector(Vec<SyntaxExpr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,7 +138,7 @@ impl MacroExpander {
             }
 
             match name.as_str() {
-                "quote" | "syntax" => return Ok(Expr::List(items.to_vec())),
+                "quasiquote" | "quote" | "syntax" => return Ok(Expr::List(items.to_vec())),
                 "define" => return self.expand_define(items, macros),
                 "define-syntax" => return Ok(Expr::List(items.to_vec())),
                 "lambda" => return self.expand_lambda(items, macros),
@@ -383,6 +384,36 @@ impl MacroExpander {
 
                 SyntaxExpr::List(expanded)
             }
+            Expr::Vector(items) => {
+                let mut expanded = Vec::new();
+                let mut index = 0;
+
+                while index < items.len() {
+                    if matches!(items.get(index + 1), Some(Expr::Symbol(symbol)) if symbol == "...")
+                    {
+                        let repeat_count = repetition_count(&items[index], bindings, macro_name)?;
+                        for repeated_index in 0..repeat_count {
+                            expanded.push(self.expand_template(
+                                &items[index],
+                                bindings,
+                                Some(repeated_index),
+                                macro_name,
+                            )?);
+                        }
+                        index += 2;
+                    } else {
+                        expanded.push(self.expand_template(
+                            &items[index],
+                            bindings,
+                            repetition_index,
+                            macro_name,
+                        )?);
+                        index += 1;
+                    }
+                }
+
+                SyntaxExpr::Vector(expanded)
+            }
         })
     }
 
@@ -395,6 +426,12 @@ impl MacroExpander {
     ) -> Result<SyntaxExpr, EvalError> {
         match expr {
             SyntaxExpr::List(items) => self.hygienize_list(items, macro_def, macros, scopes),
+            SyntaxExpr::Vector(items) => Ok(SyntaxExpr::Vector(
+                items
+                    .into_iter()
+                    .map(|item| self.hygienize(item, macro_def, macros, scopes))
+                    .collect::<Result<Vec<_>, EvalError>>()?,
+            )),
             SyntaxExpr::Symbol(symbol) => Ok(SyntaxExpr::Symbol(
                 self.resolve_symbol(symbol, macro_def, macros, scopes),
             )),
@@ -714,6 +751,9 @@ fn match_pattern(
             Some(bindings)
         }
         (Expr::List(patterns), Expr::List(inputs)) => match_list_pattern(patterns, inputs, context),
+        (Expr::Vector(patterns), Expr::Vector(inputs)) => {
+            match_list_pattern(patterns, inputs, context)
+        }
         _ => None,
     }
 }
@@ -833,6 +873,18 @@ fn collect_pattern_variables(
                 }
             }
         }
+        Expr::Vector(items) => {
+            if let Some((prefix, repeated)) = split_tail_ellipsis(items) {
+                for item in prefix {
+                    collect_pattern_variables(item, context, variables);
+                }
+                collect_pattern_variables(repeated, context, variables);
+            } else {
+                for item in items {
+                    collect_pattern_variables(item, context, variables);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -877,7 +929,7 @@ fn collect_repeated_bindings(
                 repeated.push(values.len());
             }
         }
-        Expr::List(items) => {
+        Expr::List(items) | Expr::Vector(items) => {
             for item in items {
                 collect_repeated_bindings(item, bindings, repeated);
             }
@@ -897,6 +949,7 @@ pub(crate) fn syntax_from_use_expr(expr: &Expr) -> SyntaxExpr {
             origin: SymbolOrigin::UseSite,
         }),
         Expr::List(items) => SyntaxExpr::List(items.iter().map(syntax_from_use_expr).collect()),
+        Expr::Vector(items) => SyntaxExpr::Vector(items.iter().map(syntax_from_use_expr).collect()),
     }
 }
 
@@ -908,6 +961,9 @@ pub(crate) fn expr_from_syntax(expr: SyntaxExpr) -> Expr {
         SyntaxExpr::String(value) => Expr::String(value),
         SyntaxExpr::Symbol(symbol) => Expr::Symbol(symbol.name),
         SyntaxExpr::List(items) => Expr::List(items.into_iter().map(expr_from_syntax).collect()),
+        SyntaxExpr::Vector(items) => {
+            Expr::Vector(items.into_iter().map(expr_from_syntax).collect())
+        }
     }
 }
 
@@ -932,6 +988,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "lambda"
             | "let"
             | "or"
+            | "quasiquote"
             | "quote"
             | "set!"
             | "syntax"

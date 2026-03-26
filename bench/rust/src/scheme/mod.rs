@@ -27,6 +27,7 @@ enum Expr {
     String(String),
     Symbol(String),
     List(Vec<Expr>),
+    Vector(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,6 +605,11 @@ enum EvalAction {
     },
 }
 
+enum QuasiquoteElement {
+    Value(Value),
+    Splice(Vec<Value>),
+}
+
 fn current_bench_level() -> u32 {
     static BENCH_LEVEL: OnceLock<u32> = OnceLock::new();
 
@@ -1178,6 +1184,8 @@ impl<'a> Parser<'a> {
         match ch {
             '(' => self.parse_list(),
             '\'' => self.parse_quote_shorthand(),
+            '`' => self.parse_quasiquote_shorthand(),
+            ',' => self.parse_unquote_shorthand(),
             '"' => self.parse_string(),
             '#' => self.parse_hash_literal(),
             ')' => Err(self.error(EvalError::UnexpectedToken { token: ")".into() })),
@@ -1196,6 +1204,24 @@ impl<'a> Parser<'a> {
         self.expect_char('\'')?;
         let quoted = self.parse_expr()?;
         Ok(Expr::List(vec![Expr::Symbol("quote".into()), quoted]))
+    }
+
+    fn parse_quasiquote_shorthand(&mut self) -> Result<Expr, EvalError> {
+        self.expect_char('`')?;
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![Expr::Symbol("quasiquote".into()), quoted]))
+    }
+
+    fn parse_unquote_shorthand(&mut self) -> Result<Expr, EvalError> {
+        self.expect_char(',')?;
+        let name = if self.peek_char() == Some('@') {
+            self.bump_char();
+            "unquote-splicing"
+        } else {
+            "unquote"
+        };
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![Expr::Symbol(name.into()), quoted]))
     }
 
     fn parse_syntax_shorthand(&mut self) -> Result<Expr, EvalError> {
@@ -1252,12 +1278,30 @@ impl<'a> Parser<'a> {
         match self.bump_char() {
             Some('t') => Ok(Expr::Boolean(true)),
             Some('f') => Ok(Expr::Boolean(false)),
+            Some('(') => self.parse_vector(),
             Some('\'') => self.parse_syntax_shorthand(),
             Some('\\') => self.parse_character_literal(),
             Some(other) => Err(self.error(EvalError::InvalidBoolean {
                 literal: format!("#{other}"),
             })),
             None => Err(self.error(EvalError::UnexpectedEof)),
+        }
+    }
+
+    fn parse_vector(&mut self) -> Result<Expr, EvalError> {
+        let mut items = Vec::new();
+
+        loop {
+            self.skip_ignored();
+
+            match self.peek_char() {
+                Some(')') => {
+                    self.bump_char();
+                    return Ok(Expr::Vector(items));
+                }
+                Some(_) => items.push(self.parse_expr()?),
+                None => return Err(self.error(EvalError::UnexpectedEof)),
+            }
         }
     }
 
@@ -1502,9 +1546,7 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
                 value,
                 handler,
                 outer_handlers,
-            } => {
-                handle_exception(value, &handler, outer_handlers, context)
-            }
+            } => handle_exception(value, &handler, outer_handlers, context),
             EvalAction::UncaughtException { value, position } => {
                 let _position_guard = push_position(context, position);
                 transition_dynamic_winds(&[], context)?;
@@ -1536,8 +1578,7 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
                 } else if payload.downcast_ref::<ExceptionSignal>().is_some() {
                     let jump = take_exception_jump();
                     if let Some(handler) = jump.handlers.last().cloned() {
-                        let outer_handlers =
-                            jump.handlers[..handler.outer_handler_depth].to_vec();
+                        let outer_handlers = jump.handlers[..handler.outer_handler_depth].to_vec();
                         action = EvalAction::HandleException {
                             value: jump.value,
                             handler,
@@ -1771,11 +1812,7 @@ fn resume_continuation_frames(
             } => {
                 let value = expect_single_value(value)?;
                 if value.is_truthy() {
-                    if body.is_empty() {
-                        value
-                    } else {
-                        eval_sequence(&body, &env, context)?
-                    }
+                    eval_cond_clause_body(value, &body, &env, context)?
                 } else {
                     eval_cond_clauses(&remaining, &env, context)?
                 }
@@ -1963,6 +2000,13 @@ fn eval_application_args(
     env: &EnvRef,
     context: &mut EvalContext,
 ) -> Result<Vec<Value>, EvalError> {
+    if !continuations_are_enabled_in_current_level() {
+        return args
+            .iter()
+            .map(|expr| eval_expr_in_env_single(expr, env, context))
+            .collect();
+    }
+
     let slots = args
         .iter()
         .cloned()
@@ -2155,15 +2199,36 @@ fn eval_cond_clauses(
         };
         let value = eval_expr_with_frame_single(test, env, frame, context)?;
         if value.is_truthy() {
-            return if body.is_empty() {
-                Ok(value)
-            } else {
-                eval_sequence(body, env, context)
-            };
+            return eval_cond_clause_body(value, body, env, context);
         }
     }
 
     Ok(Value::Void)
+}
+
+fn eval_cond_clause_body(
+    test_value: Value,
+    body: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    match body {
+        [] => Ok(test_value),
+        [Expr::Symbol(symbol), recipient] if symbol == "=>" => {
+            let recipient = eval_expr_in_env_single(recipient, env, context)?;
+            let recipient = expect_single_value(recipient)?;
+            apply_procedure(recipient, vec![test_value], context)
+        }
+        [Expr::Symbol(symbol)] if symbol == "=>" => Err(EvalError::InvalidForm {
+            name: "cond",
+            message: "=> clause must contain a recipient",
+        }),
+        [Expr::Symbol(symbol), ..] if symbol == "=>" => Err(EvalError::InvalidForm {
+            name: "cond",
+            message: "=> clause must contain exactly one recipient",
+        }),
+        _ => eval_sequence(body, env, context),
+    }
 }
 
 fn eval_parallel_let_bindings(
@@ -2401,6 +2466,9 @@ fn eval_expr_step(
             }
         }
         Expr::List(items) => eval_application_step(items, env, context),
+        Expr::Vector(items) => Ok(EvalStep::Value(Value::Vector(SchemeVector::new(
+            items.iter().map(quote_expr).collect(),
+        )))),
     }
 }
 
@@ -2431,6 +2499,7 @@ fn eval_application_step(
             "letrec" => return eval_letrec_step(tail, &env, context, false),
             "letrec*" => return eval_letrec_step(tail, &env, context, true),
             "or" => return eval_or_step(tail, &env, context),
+            "quasiquote" => return eval_quasiquote_step(tail, &env, context),
             "quote" => return eval_quote_step(tail),
             "set!" => return eval_set_step(tail, &env, context),
             "syntax" => return eval_syntax_step(tail, &env),
@@ -2438,6 +2507,15 @@ fn eval_application_step(
             "with-syntax" => return eval_with_syntax_step(tail, &env, context),
             _ => {}
         }
+    }
+
+    if !continuations_are_enabled_in_current_level() {
+        let procedure = eval_expr_in_env_single(head, &env, context)?;
+        let args = tail
+            .iter()
+            .map(|expr| eval_expr_in_env_single(expr, &env, context))
+            .collect::<Result<Vec<_>, EvalError>>()?;
+        return Ok(EvalStep::Apply(procedure, args));
     }
 
     let procedure = eval_expr_with_frame(
@@ -2471,6 +2549,18 @@ fn eval_sequence_step(
     env: EnvRef,
     context: &mut EvalContext,
 ) -> Result<EvalStep, EvalError> {
+    if !continuations_are_enabled_in_current_level() {
+        let Some((last, initial)) = expressions.split_last() else {
+            return Ok(EvalStep::Value(Value::Void));
+        };
+
+        for expression in initial {
+            expect_single_value(eval_expr_in_env(expression, &env, context)?)?;
+        }
+
+        return Ok(EvalStep::Expr(last.clone(), env));
+    }
+
     let is_direct_call_cc = |expr: &Expr| {
         matches!(
             expr,
@@ -2525,6 +2615,17 @@ fn eval_and_step(
         return Ok(EvalStep::Value(Value::Boolean(true)));
     };
 
+    if !continuations_are_enabled_in_current_level() {
+        for arg in initial {
+            let result = eval_expr_in_env_single(arg, env, context)?;
+            if !result.is_truthy() {
+                return Ok(EvalStep::Value(result));
+            }
+        }
+
+        return Ok(EvalStep::Expr(last.clone(), env.clone()));
+    }
+
     for (index, arg) in initial.iter().enumerate() {
         let frame = ContinuationFrame::And {
             remaining: initial[index + 1..]
@@ -2551,6 +2652,17 @@ fn eval_or_step(
     let Some((last, initial)) = args.split_last() else {
         return Ok(EvalStep::Value(Value::Boolean(false)));
     };
+
+    if !continuations_are_enabled_in_current_level() {
+        for arg in initial {
+            let value = eval_expr_in_env_single(arg, env, context)?;
+            if value.is_truthy() {
+                return Ok(EvalStep::Value(value));
+            }
+        }
+
+        return Ok(EvalStep::Expr(last.clone(), env.clone()));
+    }
 
     for (index, arg) in initial.iter().enumerate() {
         let frame = ContinuationFrame::Or {
@@ -2586,6 +2698,60 @@ fn eval_case_step(
             got: 0,
         });
     };
+
+    if !continuations_are_enabled_in_current_level() {
+        let key = eval_expr_in_env_single(key_expr, env, context)?;
+        for (index, clause) in clauses.iter().enumerate() {
+            let Expr::List(items) = clause else {
+                return Err(EvalError::InvalidForm {
+                    name: "case",
+                    message: "expected clauses to be lists",
+                });
+            };
+
+            let Some((head, body)) = items.split_first() else {
+                return Err(EvalError::InvalidForm {
+                    name: "case",
+                    message: "expected each clause to contain a datum list or else",
+                });
+            };
+
+            if matches!(head, Expr::Symbol(symbol) if symbol == "else") {
+                if index + 1 != clauses.len() {
+                    return Err(EvalError::InvalidForm {
+                        name: "case",
+                        message: "else clause must be last",
+                    });
+                }
+
+                return if body.is_empty() {
+                    Ok(EvalStep::Value(Value::Void))
+                } else {
+                    Ok(EvalStep::Sequence(body.to_vec(), env.clone()))
+                };
+            }
+
+            let Expr::List(datums) = head else {
+                return Err(EvalError::InvalidForm {
+                    name: "case",
+                    message: "expected each clause to begin with a datum list or else",
+                });
+            };
+
+            if datums
+                .iter()
+                .any(|datum| eq_values(&key, &quote_expr(datum)))
+            {
+                return if body.is_empty() {
+                    Ok(EvalStep::Value(Value::Void))
+                } else {
+                    Ok(EvalStep::Sequence(body.to_vec(), env.clone()))
+                };
+            }
+        }
+
+        return Ok(EvalStep::Value(Value::Void));
+    }
 
     let key = eval_expr_with_frame(
         key_expr,
@@ -2655,6 +2821,51 @@ fn eval_cond_step(
     env: &EnvRef,
     context: &mut EvalContext,
 ) -> Result<EvalStep, EvalError> {
+    if !continuations_are_enabled_in_current_level() {
+        for (index, clause) in args.iter().enumerate() {
+            let Expr::List(items) = clause else {
+                return Err(EvalError::InvalidForm {
+                    name: "cond",
+                    message: "expected clauses to be lists",
+                });
+            };
+
+            let Some((test, body)) = items.split_first() else {
+                return Err(EvalError::InvalidForm {
+                    name: "cond",
+                    message: "expected each clause to contain a test",
+                });
+            };
+
+            if matches!(test, Expr::Symbol(symbol) if symbol == "else") {
+                if index + 1 != args.len() {
+                    return Err(EvalError::InvalidForm {
+                        name: "cond",
+                        message: "else clause must be last",
+                    });
+                }
+
+                if body.is_empty() {
+                    return Err(EvalError::InvalidForm {
+                        name: "cond",
+                        message: "else clause must contain a body",
+                    });
+                }
+
+                return Ok(EvalStep::Sequence(body.to_vec(), env.clone()));
+            }
+
+            let value = eval_expr_in_env_single(test, env, context)?;
+            if value.is_truthy() {
+                return Ok(EvalStep::Value(eval_cond_clause_body(
+                    value, body, env, context,
+                )?));
+            }
+        }
+
+        return Ok(EvalStep::Value(Value::Void));
+    }
+
     for (index, clause) in args.iter().enumerate() {
         let Expr::List(items) = clause else {
             return Err(EvalError::InvalidForm {
@@ -2695,11 +2906,9 @@ fn eval_cond_step(
         };
         let value = eval_expr_with_frame_single(test, env, frame, context)?;
         if value.is_truthy() {
-            return if body.is_empty() {
-                Ok(EvalStep::Value(value))
-            } else {
-                Ok(EvalStep::Sequence(body.to_vec(), env.clone()))
-            };
+            return Ok(EvalStep::Value(eval_cond_clause_body(
+                value, body, env, context,
+            )?));
         }
     }
 
@@ -3017,6 +3226,17 @@ fn eval_if_step(
             expected: "2 or 3 arguments",
             got: args.len(),
         });
+    }
+
+    if !continuations_are_enabled_in_current_level() {
+        let test = eval_expr_in_env_single(&args[0], env, context)?;
+        return if test.is_truthy() {
+            Ok(EvalStep::Expr(args[1].clone(), env.clone()))
+        } else if args.len() == 3 {
+            Ok(EvalStep::Expr(args[2].clone(), env.clone()))
+        } else {
+            Ok(EvalStep::Value(Value::Void))
+        };
     }
 
     let test = eval_expr_with_frame(
@@ -3345,6 +3565,171 @@ fn eval_quote_step(args: &[Expr]) -> Result<EvalStep, EvalError> {
     Ok(EvalStep::Value(quote_expr(&args[0])))
 }
 
+fn eval_quasiquote_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "quasiquote",
+            expected: "exactly 1 argument",
+            got: args.len(),
+        });
+    }
+
+    Ok(EvalStep::Value(eval_quasiquote(&args[0], 1, env, context)?))
+}
+
+fn eval_quasiquote(
+    expr: &Expr,
+    depth: usize,
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    if let Some(args) = quasiquote_form_args(expr, "quasiquote") {
+        if args.len() != 1 {
+            return Err(EvalError::InvalidForm {
+                name: "quasiquote",
+                message: "quasiquote expects exactly 1 argument",
+            });
+        }
+
+        return Ok(list_from_vec(vec![
+            Value::Symbol("quasiquote".into()),
+            eval_quasiquote(&args[0], depth + 1, env, context)?,
+        ]));
+    }
+
+    if let Some(args) = quasiquote_form_args(expr, "unquote") {
+        if args.len() != 1 {
+            return Err(EvalError::InvalidForm {
+                name: "quasiquote",
+                message: "unquote expects exactly 1 argument",
+            });
+        }
+
+        return if depth == 1 {
+            eval_expr_in_env_single(&args[0], env, context).and_then(expect_single_value)
+        } else {
+            Ok(list_from_vec(vec![
+                Value::Symbol("unquote".into()),
+                eval_quasiquote(&args[0], depth - 1, env, context)?,
+            ]))
+        };
+    }
+
+    if let Some(args) = quasiquote_form_args(expr, "unquote-splicing") {
+        if args.len() != 1 {
+            return Err(EvalError::InvalidForm {
+                name: "quasiquote",
+                message: "unquote-splicing expects exactly 1 argument",
+            });
+        }
+
+        return if depth == 1 {
+            Err(EvalError::InvalidForm {
+                name: "quasiquote",
+                message: "unquote-splicing must appear within a list or vector template",
+            })
+        } else {
+            Ok(list_from_vec(vec![
+                Value::Symbol("unquote-splicing".into()),
+                eval_quasiquote(&args[0], depth - 1, env, context)?,
+            ]))
+        };
+    }
+
+    match expr {
+        Expr::List(items) => eval_quasiquote_list(items, depth, env, context),
+        Expr::Vector(items) => eval_quasiquote_vector(items, depth, env, context),
+        _ => Ok(quote_expr(expr)),
+    }
+}
+
+fn eval_quasiquote_list(
+    items: &[Expr],
+    depth: usize,
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let (prefix, tail) = split_dotted_list(items);
+    let mut values = Vec::new();
+
+    for item in prefix {
+        match eval_quasiquote_element(item, depth, env, context)? {
+            QuasiquoteElement::Value(value) => values.push(value),
+            QuasiquoteElement::Splice(spliced) => values.extend(spliced),
+        }
+    }
+
+    let tail = match tail {
+        Some(expr) => eval_quasiquote(expr, depth, env, context)?,
+        None => empty_list(),
+    };
+
+    Ok(values
+        .into_iter()
+        .rev()
+        .fold(tail, |cdr, car| new_pair(car, cdr)))
+}
+
+fn eval_quasiquote_vector(
+    items: &[Expr],
+    depth: usize,
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let mut values = Vec::new();
+
+    for item in items {
+        match eval_quasiquote_element(item, depth, env, context)? {
+            QuasiquoteElement::Value(value) => values.push(value),
+            QuasiquoteElement::Splice(spliced) => values.extend(spliced),
+        }
+    }
+
+    Ok(Value::Vector(SchemeVector::new(values)))
+}
+
+fn eval_quasiquote_element(
+    expr: &Expr,
+    depth: usize,
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<QuasiquoteElement, EvalError> {
+    if depth == 1 {
+        if let Some(args) = quasiquote_form_args(expr, "unquote-splicing") {
+            if args.len() != 1 {
+                return Err(EvalError::InvalidForm {
+                    name: "quasiquote",
+                    message: "unquote-splicing expects exactly 1 argument",
+                });
+            }
+
+            let value = eval_expr_in_env_single(&args[0], env, context)?;
+            let value = expect_single_value(value)?;
+            return Ok(QuasiquoteElement::Splice(collect_list(
+                "quasiquote",
+                &value,
+            )?));
+        }
+    }
+
+    Ok(QuasiquoteElement::Value(eval_quasiquote(
+        expr, depth, env, context,
+    )?))
+}
+
+fn quasiquote_form_args<'a>(expr: &'a Expr, name: &str) -> Option<&'a [Expr]> {
+    match expr {
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(symbol)) if symbol == name) => {
+            Some(&items[1..])
+        }
+        _ => None,
+    }
+}
+
 fn eval_syntax_step(args: &[Expr], env: &EnvRef) -> Result<EvalStep, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
@@ -3598,6 +3983,35 @@ fn build_syntax_from_template(
 
             SyntaxExpr::List(expanded)
         }
+        Expr::Vector(items) => {
+            let mut expanded = Vec::new();
+            let mut index = 0;
+
+            while index < items.len() {
+                if matches!(items.get(index + 1), Some(Expr::Symbol(symbol)) if symbol == "...") {
+                    let repeat_count = syntax_repetition_count(&items[index], env, name)?;
+                    for repeated_index in 0..repeat_count {
+                        expanded.push(build_syntax_from_template(
+                            &items[index],
+                            env,
+                            Some(repeated_index),
+                            name,
+                        )?);
+                    }
+                    index += 2;
+                } else {
+                    expanded.push(build_syntax_from_template(
+                        &items[index],
+                        env,
+                        repetition_index,
+                        name,
+                    )?);
+                    index += 1;
+                }
+            }
+
+            SyntaxExpr::Vector(expanded)
+        }
     })
 }
 
@@ -3633,7 +4047,7 @@ fn collect_repeated_syntax_bindings(template: &Expr, env: &EnvRef, repeated: &mu
                 repeated.push(values.len());
             }
         }
-        Expr::List(items) => {
+        Expr::List(items) | Expr::Vector(items) => {
             for item in items {
                 collect_repeated_syntax_bindings(item, env, repeated);
             }
@@ -3645,7 +4059,7 @@ fn collect_repeated_syntax_bindings(template: &Expr, env: &EnvRef, repeated: &mu
 fn syntax_origin(expr: &SyntaxExpr) -> SymbolOrigin {
     match expr {
         SyntaxExpr::Symbol(symbol) => symbol.origin,
-        SyntaxExpr::List(items) => {
+        SyntaxExpr::List(items) | SyntaxExpr::Vector(items) => {
             if items
                 .iter()
                 .any(|item| syntax_origin(item) == SymbolOrigin::UseSite)
@@ -3681,6 +4095,13 @@ fn datum_to_syntax(
             collect_list(name, value)?
                 .into_iter()
                 .map(|item| datum_to_syntax(&item, origin, name))
+                .collect::<Result<Vec<_>, EvalError>>()?,
+        )),
+        Value::Vector(vector) => Ok(SyntaxExpr::Vector(
+            vector
+                .values()
+                .iter()
+                .map(|item| datum_to_syntax(item, origin, name))
                 .collect::<Result<Vec<_>, EvalError>>()?,
         )),
         Value::Syntax(syntax) => Ok(syntax.as_ref().clone()),
@@ -3938,8 +4359,42 @@ fn quote_expr(expr: &Expr) -> Value {
         Expr::Char(value) => Value::Char(*value),
         Expr::String(value) => Value::String(SchemeString::new_immutable(value)),
         Expr::Symbol(value) => Value::Symbol(value.clone()),
-        Expr::List(items) => list_from_vec(items.iter().map(quote_expr).collect()),
+        Expr::List(items) => quote_list_expr(items),
+        Expr::Vector(items) => {
+            Value::Vector(SchemeVector::new(items.iter().map(quote_expr).collect()))
+        }
     }
+}
+
+fn quote_list_expr(items: &[Expr]) -> Value {
+    let (prefix, tail) = split_dotted_list(items);
+
+    if let Some(tail) = tail {
+        return prefix
+            .iter()
+            .rev()
+            .fold(quote_expr(tail), |cdr, car| new_pair(quote_expr(car), cdr));
+    }
+
+    list_from_vec(items.iter().map(quote_expr).collect())
+}
+
+fn split_dotted_list(items: &[Expr]) -> (&[Expr], Option<&Expr>) {
+    let dotted_tail = items
+        .iter()
+        .enumerate()
+        .find_map(|(index, item)| match item {
+            Expr::Symbol(symbol) if symbol == "." => Some(index),
+            _ => None,
+        });
+
+    if let Some(dot_index) = dotted_tail {
+        if dot_index > 0 && dot_index + 2 == items.len() {
+            return (&items[..dot_index], Some(&items[dot_index + 1]));
+        }
+    }
+
+    (items, None)
 }
 
 fn render_char(value: char) -> String {
@@ -4131,6 +4586,7 @@ fn root_env() -> EnvRef {
         "apply",
         "append",
         "assoc",
+        "assq",
         "assv",
         "boolean?",
         "call-with-current-continuation",
@@ -4183,6 +4639,8 @@ fn root_env() -> EnvRef {
         "map",
         "max",
         "member",
+        "memq",
+        "memv",
         "min",
         "modulo",
         "negative?",
@@ -4298,12 +4756,19 @@ fn apply_builtin(
             apply_procedure(args[0].clone(), applied_args, context)
         }
         "append" => {
+            let Some((tail, prefixes)) = args.split_last() else {
+                return Ok(empty_list());
+            };
+
             let mut values = Vec::new();
-            for arg in args {
+            for arg in prefixes {
                 values.extend(collect_list("append", arg)?);
             }
 
-            Ok(list_from_vec(values))
+            Ok(values
+                .into_iter()
+                .rev()
+                .fold(tail.clone(), |cdr, car| new_pair(car, cdr)))
         }
         "assoc" => {
             if args.len() != 2 {
@@ -4324,6 +4789,31 @@ fn apply_builtin(
                 };
 
                 if equal_values(&args[0], &key) {
+                    return Ok(entry);
+                }
+            }
+
+            Ok(Value::Boolean(false))
+        }
+        "assq" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "assq",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let alist = collect_list("assq", &args[1])?;
+            for entry in alist {
+                let Some(key) = pair_first(&entry) else {
+                    return Err(EvalError::ExpectedPair {
+                        name: "assq",
+                        found: entry.type_name(),
+                    });
+                };
+
+                if eq_values(&args[0], &key) {
                     return Ok(entry);
                 }
             }
@@ -4646,6 +5136,92 @@ fn apply_builtin(
             Ok(Value::Number(maximum))
         }
         "member" => apply_member(args),
+        "memq" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "memq",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let mut seen = HashSet::new();
+            let mut current = args[1].clone();
+
+            loop {
+                match current {
+                    Value::List(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            if eq_values(&args[0], item) {
+                                return Ok(list_from_vec(items[index..].to_vec()));
+                            }
+                        }
+
+                        return Ok(Value::Boolean(false));
+                    }
+                    Value::Pair(pair) => {
+                        if !seen.insert(pair_id(&pair)) {
+                            return Ok(Value::Boolean(false));
+                        }
+
+                        let cell = pair.borrow();
+                        if eq_values(&args[0], &cell.car) {
+                            return Ok(Value::Pair(pair.clone()));
+                        }
+                        current = cell.cdr.clone();
+                    }
+                    other => {
+                        return Err(EvalError::ExpectedList {
+                            name: "memq",
+                            found: other.type_name(),
+                        })
+                    }
+                }
+            }
+        }
+        "memv" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "memv",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let mut seen = HashSet::new();
+            let mut current = args[1].clone();
+
+            loop {
+                match current {
+                    Value::List(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            if eq_values(&args[0], item) {
+                                return Ok(list_from_vec(items[index..].to_vec()));
+                            }
+                        }
+
+                        return Ok(Value::Boolean(false));
+                    }
+                    Value::Pair(pair) => {
+                        if !seen.insert(pair_id(&pair)) {
+                            return Ok(Value::Boolean(false));
+                        }
+
+                        let cell = pair.borrow();
+                        if eq_values(&args[0], &cell.car) {
+                            return Ok(Value::Pair(pair.clone()));
+                        }
+                        current = cell.cdr.clone();
+                    }
+                    other => {
+                        return Err(EvalError::ExpectedList {
+                            name: "memv",
+                            found: other.type_name(),
+                        })
+                    }
+                }
+            }
+        }
         "min" => {
             let numbers = extract_numbers("min", args)?;
             let Some(first) = numbers.first() else {
@@ -5848,7 +6424,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 }
 
 fn is_token_delimiter(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '(' | ')' | ';' | '\'' | '"')
+    ch.is_whitespace() || matches!(ch, '(' | ')' | ';' | '\'' | '"' | '`' | ',')
 }
 
 #[cfg(test)]
