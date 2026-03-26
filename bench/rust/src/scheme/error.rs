@@ -48,6 +48,12 @@ pub enum EvalError {
         message: &'static str,
     },
 
+    #[error("macro did not match any syntax-rules clause: {name}")]
+    NoMatchingSyntaxRule { name: String },
+
+    #[error("invalid macro template for {name}: {message}")]
+    InvalidMacroTemplate { name: String, message: &'static str },
+
     #[error("{name} expected {expected}, got {got}")]
     WrongArgCount {
         name: &'static str,

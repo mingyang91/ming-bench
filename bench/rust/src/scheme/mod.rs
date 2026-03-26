@@ -1,7 +1,9 @@
 pub mod error;
+mod macros;
 
 pub use error::EvalError;
 
+use macros::{register_macro_definition, MacroEnv, MacroExpander};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,7 +131,7 @@ type EnvRef = Rc<Env>;
 
 #[derive(Debug)]
 struct Env {
-    values: RefCell<HashMap<String, Value>>,
+    values: RefCell<HashMap<String, Rc<RefCell<Value>>>>,
     parent: Option<EnvRef>,
 }
 
@@ -147,28 +149,35 @@ impl Env {
     }
 
     fn define(&self, name: impl Into<String>, value: Value) {
+        let name = name.into();
+        let mut values = self.values.borrow_mut();
+        if let Some(slot) = values.get(&name) {
+            *slot.borrow_mut() = value;
+        } else {
+            values.insert(name, Rc::new(RefCell::new(value)));
+        }
+    }
+
+    fn define_cell(&self, name: impl Into<String>, value: Rc<RefCell<Value>>) {
         self.values.borrow_mut().insert(name.into(), value);
     }
 
     fn get(&self, name: &str) -> Option<Value> {
-        self.values
-            .borrow()
-            .get(name)
-            .cloned()
-            .or_else(|| self.parent.as_ref().and_then(|parent| parent.get(name)))
+        self.lookup_cell(name).map(|value| value.borrow().clone())
+    }
+
+    fn lookup_cell(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+        self.values.borrow().get(name).cloned().or_else(|| {
+            self.parent
+                .as_ref()
+                .and_then(|parent| parent.lookup_cell(name))
+        })
     }
 
     fn set(&self, name: &str, value: Value) -> Result<(), EvalError> {
-        {
-            let mut values = self.values.borrow_mut();
-            if let Some(slot) = values.get_mut(name) {
-                *slot = value;
-                return Ok(());
-            }
-        }
-
-        if let Some(parent) = &self.parent {
-            parent.set(name, value)
+        if let Some(slot) = self.lookup_cell(name) {
+            *slot.borrow_mut() = value;
+            Ok(())
         } else {
             Err(EvalError::UnboundVariable {
                 name: name.to_string(),
@@ -200,7 +209,9 @@ impl Procedure {
                 let mut args = args.into_iter();
 
                 for param in &params.required {
-                    let value = args.next().expect("arity checked before binding lambda args");
+                    let value = args
+                        .next()
+                        .expect("arity checked before binding lambda args");
                     call_env.define(param.clone(), value);
                 }
 
@@ -1159,7 +1170,9 @@ fn apply_builtin(
             }
 
             let mut applied_args = args[1..args.len() - 1].to_vec();
-            let tail = args.last().expect("apply arity checked before reading tail");
+            let tail = args
+                .last()
+                .expect("apply arity checked before reading tail");
 
             match tail {
                 Value::List(items) => applied_args.extend(items.iter().cloned()),
@@ -1273,16 +1286,20 @@ fn apply_builtin(
             predicate_builtin("boolean?", args, |value| matches!(value, Value::Boolean(_)))
         }
         "char?" => predicate_builtin("char?", args, |value| matches!(value, Value::Char(_))),
-        "char-alphabetic?" => predicate_builtin("char-alphabetic?", args, |value| {
-            matches!(value, Value::Char(ch) if ch.is_alphabetic())
-        }),
+        "char-alphabetic?" => predicate_builtin(
+            "char-alphabetic?",
+            args,
+            |value| matches!(value, Value::Char(ch) if ch.is_alphabetic()),
+        ),
         "char-downcase" => {
             let ch = expect_char_arg("char-downcase", args)?;
             Ok(Value::Char(ch.to_ascii_lowercase()))
         }
-        "char-numeric?" => predicate_builtin("char-numeric?", args, |value| {
-            matches!(value, Value::Char(ch) if ch.is_numeric())
-        }),
+        "char-numeric?" => predicate_builtin(
+            "char-numeric?",
+            args,
+            |value| matches!(value, Value::Char(ch) if ch.is_numeric()),
+        ),
         "char-upcase" => {
             let ch = expect_char_arg("char-upcase", args)?;
             Ok(Value::Char(ch.to_ascii_uppercase()))
@@ -1450,15 +1467,11 @@ fn apply_builtin(
             let number = expect_number_arg("odd?", args)?;
             Ok(Value::Boolean(number.rem_euclid(2) == 1))
         }
-        "pair?" => predicate_builtin(
-            "pair?",
-            args,
-            |value| match value {
-                Value::Pair(_, _) => true,
-                Value::List(items) => !items.is_empty(),
-                _ => false,
-            },
-        ),
+        "pair?" => predicate_builtin("pair?", args, |value| match value {
+            Value::Pair(_, _) => true,
+            Value::List(items) => !items.is_empty(),
+            _ => false,
+        }),
         "positive?" => {
             let number = expect_number_arg("positive?", args)?;
             Ok(Value::Boolean(number > 0))
@@ -1616,12 +1629,12 @@ fn apply_builtin(
                 });
             }
 
-            base.checked_pow(exponent as u32)
-                .map(Value::Integer)
-                .ok_or(EvalError::InvalidArgument {
+            base.checked_pow(exponent as u32).map(Value::Integer).ok_or(
+                EvalError::InvalidArgument {
                     name: "expt",
                     message: "overflow",
-                })
+                },
+            )
         }
         "write" => {
             if args.len() != 1 {
@@ -1959,7 +1972,9 @@ fn equal_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Integer(left), Value::Integer(right)) => left == right,
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
-        (Value::String(left), Value::String(right)) => left.to_plain_string() == right.to_plain_string(),
+        (Value::String(left), Value::String(right)) => {
+            left.to_plain_string() == right.to_plain_string()
+        }
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::List(left), Value::List(right)) => {
@@ -2017,11 +2032,26 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     }
 
     let env = root_env();
+    let mut macros = MacroEnv::default();
+    let mut expander = MacroExpander::default();
     let mut context = EvalContext::default();
     let mut last_value = Value::Void;
 
     for expression in &program {
-        last_value = eval_expr_in_env(&expression.expr, &env, &mut context).map_err(|error| {
+        if register_macro_definition(&expression.expr, &env, &mut macros).map_err(|error| {
+            error.with_position(expression.position.line, expression.position.column)
+        })? {
+            last_value = Value::Void;
+            continue;
+        }
+
+        let expanded = expander
+            .expand_expr(&expression.expr, &macros)
+            .map_err(|error| {
+                error.with_position(expression.position.line, expression.position.column)
+            })?;
+
+        last_value = eval_expr_in_env(&expanded, &env, &mut context).map_err(|error| {
             error.with_position(expression.position.line, expression.position.column)
         })?;
     }
