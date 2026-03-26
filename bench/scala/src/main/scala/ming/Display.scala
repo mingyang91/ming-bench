@@ -30,6 +30,7 @@ object Display:
     case Value.VBuiltin(n)         => s"#<procedure $n>"
     case Value.VLambda(_, _, _, _) => "#<procedure>"
     case Value.VCaseLambda(_)      => "#<procedure>"
+    case Value.VContinuation(_)    => "#<continuation>"
     case Value.VMacro(_, _, _)     => "#<macro>"
     case Value.VVector(elems) =>
       "#(" + elems.map(e => displaySafe(e, seen)).mkString(" ") + ")"

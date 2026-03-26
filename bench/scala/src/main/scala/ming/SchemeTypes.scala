@@ -42,6 +42,7 @@ object SchemeTypes:
       typeName: String,
       fields: Map[String, Value]
     )
+    case VContinuation(k: Kont)
     case VVoid
 
   type Pos = ming.Pos

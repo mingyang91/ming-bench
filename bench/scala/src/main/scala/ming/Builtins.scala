@@ -57,7 +57,9 @@ object Builtins:
         "string-downcase" =>
       StringCharBuiltins.applyStringCompare(name, args, pos)
     case s if s.startsWith("__record-") => Records.applyRecordOp(s, args, pos)
-    case _                              => throw errAt(pos, s"unknown builtin: $name")
+    case "call/cc" | "call-with-current-continuation" =>
+      Evaluator.applyFunc(Value.VBuiltin(name), args, pos, env)
+    case _ => throw errAt(pos, s"unknown builtin: $name")
 
   private def applyListOps(
     name: String,
@@ -163,23 +165,24 @@ object Builtins:
         v match
           case _: Value.VNum | _: Value.VRational => true
           case _                                  => false
-      case ("string?", _: Value.VStr)           => true
-      case ("string?", _)                       => false
-      case ("boolean?", _: Value.VBool)         => true
-      case ("boolean?", _)                      => false
-      case ("pair?", _: Value.VPair)            => true
-      case ("pair?", Value.VList(_ :: _))       => true
-      case ("pair?", _: Value.VDottedList)      => true
-      case ("pair?", _)                         => false
-      case ("symbol?", _: Value.VSymbol)        => true
-      case ("symbol?", _)                       => false
-      case ("char?", _: Value.VChar)            => true
-      case ("char?", _)                         => false
-      case ("procedure?", _: Value.VBuiltin)    => true
-      case ("procedure?", _: Value.VLambda)     => true
-      case ("procedure?", _: Value.VCaseLambda) => true
-      case ("procedure?", _)                    => false
-      case _                                    => throw errAt(pos, s"unknown type check: $name")
+      case ("string?", _: Value.VStr)             => true
+      case ("string?", _)                         => false
+      case ("boolean?", _: Value.VBool)           => true
+      case ("boolean?", _)                        => false
+      case ("pair?", _: Value.VPair)              => true
+      case ("pair?", Value.VList(_ :: _))         => true
+      case ("pair?", _: Value.VDottedList)        => true
+      case ("pair?", _)                           => false
+      case ("symbol?", _: Value.VSymbol)          => true
+      case ("symbol?", _)                         => false
+      case ("char?", _: Value.VChar)              => true
+      case ("char?", _)                           => false
+      case ("procedure?", _: Value.VBuiltin)      => true
+      case ("procedure?", _: Value.VLambda)       => true
+      case ("procedure?", _: Value.VCaseLambda)   => true
+      case ("procedure?", _: Value.VContinuation) => true
+      case ("procedure?", _)                      => false
+      case _                                      => throw errAt(pos, s"unknown type check: $name")
     Value.VBool(result)
 
   private def applyIO(

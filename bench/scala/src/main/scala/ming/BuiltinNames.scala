@@ -109,5 +109,7 @@ object BuiltinNames:
     "string<=?",
     "string>=?",
     "member",
-    "assv"
+    "assv",
+    "call/cc",
+    "call-with-current-continuation"
   )

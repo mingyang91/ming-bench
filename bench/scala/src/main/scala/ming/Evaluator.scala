@@ -1,20 +1,10 @@
 package ming
 
 import Display.display
-import SchemeTypes.{errAt, isTruthy, Env, Pos, Value}
+import SchemeTypes.{errAt, pairToScalaList, Env, Pos, Value}
+import CekSteps.{bodyToCek, posOf}
 
 object Evaluator:
-
-  // ── Position helpers ────────────────────────────────────────────────
-  private def posOf(expr: Expr): Pos = expr match
-    case Expr.Num(_, p)    => p
-    case Expr.Flt(_, p)    => p
-    case Expr.Rat(_, _, p) => p
-    case Expr.Bool(_, p)   => p
-    case Expr.Str(_, p)    => p
-    case Expr.Chr(_, p)    => p
-    case Expr.Symbol(_, p) => p
-    case Expr.SList(_, p)  => p
 
   // ── Environment ──────────────────────────────────────────────────────
   private def defaultEnv(
@@ -25,73 +15,177 @@ object Evaluator:
     for name <- BuiltinNames.all do env.define(name, Value.VBuiltin(name))
     env
 
-  // ── Eval (trampoline for TCO) ─────────────────────────────────────
-  private def eval(expr0: Expr, env0: Env): Value =
-    var curExpr: Expr = expr0
-    var curEnv: Env   = env0
-
+  // ── CEK main loop ──────────────────────────────────────────────────
+  private def runCek(state0: CekState): Value =
+    var state = state0
     while true do
-      val tco: TcoResult = curExpr match
-        case Expr.Num(n, _)       => return Value.VNum(n)
-        case Expr.Flt(d, _)       => return Value.VFloat(d)
-        case Expr.Rat(n, d, _)    => return Value.VRational(n, d)
-        case Expr.Bool(b, _)      => return Value.VBool(b)
-        case Expr.Str(s, _)       => return Value.VStr(s.toCharArray, mutable = false)
-        case Expr.Chr(c, _)       => return Value.VChar(c)
-        case Expr.Symbol(name, p) => return curEnv.lookup(name, p)
-        case Expr.SList(Nil, p)   => throw errAt(p, "empty application")
-        case Expr.SList(Expr.Symbol("quote", _) :: arg :: Nil, _) =>
-          return EvalForms.quoteToValue(arg)
-        case Expr.SList(Expr.Symbol("define", _) :: rest, p) =>
-          return evalDefine(rest, curEnv, p)
-        case Expr.SList(Expr.Symbol("if", _) :: rest, p) =>
-          EvalTail.evalIf(rest, curEnv, p, eval)
-        case Expr.SList(Expr.Symbol("lambda", _) :: rest, p) =>
-          return evalLambda(rest, curEnv, p)
-        case Expr.SList(Expr.Symbol("and", _) :: args, _) =>
-          EvalTail.evalAnd(args, curEnv, eval)
-        case Expr.SList(Expr.Symbol("or", _) :: args, _) =>
-          EvalTail.evalOr(args, curEnv, eval)
-        case Expr.SList(Expr.Symbol("let", _) :: rest, p) =>
-          EvalTail.evalLet(rest, curEnv, p, eval)
-        case Expr.SList(Expr.Symbol("let*", _) :: rest, p) =>
-          EvalTail.evalLetStar(rest, curEnv, p, eval)
-        case Expr.SList(Expr.Symbol("begin", _) :: body, _) =>
-          EvalTail.evalBegin(body, curEnv, eval)
-        case Expr.SList(Expr.Symbol("cond", _) :: clauses, _) =>
-          EvalTail.evalCond(clauses, curEnv, eval, posOf)
-        case Expr.SList(Expr.Symbol("set!", _) :: rest, p) =>
-          return evalSet(rest, curEnv, p)
-        case Expr.SList(Expr.Symbol("define-syntax", _) :: rest, p) =>
-          return EvalForms.evalDefineSyntax(rest, curEnv, p)
-        case Expr.SList(Expr.Symbol("case-lambda", _) :: clauses, p) =>
-          return EvalForms.evalCaseLambda(clauses, curEnv, p)
-        case Expr.SList(Expr.Symbol("define-record-type", _) :: rest, p) =>
-          return EvalForms.evalDefineRecordType(rest, curEnv, p)
-        case Expr.SList(Expr.Symbol("letrec", _) :: rest, p) =>
-          return EvalCompound.evalLetrec(rest, curEnv, p, eval, evalBody)
-        case Expr.SList(Expr.Symbol("letrec*", _) :: rest, p) =>
-          return EvalCompound.evalLetrecStar(rest, curEnv, p, eval, evalBody)
-        case Expr.SList(Expr.Symbol("case", _) :: rest, p) =>
-          return EvalCompound.evalCase(rest, curEnv, p, eval, evalBody, posOf)
-        case Expr.SList(Expr.Symbol("do", _) :: rest, p) =>
-          return EvalCompound.evalDo(rest, curEnv, p, eval, evalBody, posOf)
-        case Expr.SList(head :: args, p) =>
-          EvalTail.evalApp(head, args, curEnv, p, eval)
-      tco match
-        case TcoResult.Done(v)        => return v
-        case TcoResult.Bounce(e, env) => curExpr = e; curEnv = env
+      state =
+        try
+          state match
+            case CekState.ApplyK(v, Kont.Halt) => return v
+            case CekState.Eval(expr, env, k)   => evalStep(expr, env, k)
+            case CekState.ApplyK(v, k)         => CekSteps.kontStep(v, k)
+        catch
+          case ci: ContinuationInvoke =>
+            CekState.ApplyK(ci.value, ci.kont)
     throw EvalError("unreachable")
 
-  private def evalBody(body: List[Expr], env: Env): Value =
-    body.foldLeft(Value.VVoid: Value)((_, e) => eval(e, env))
+  // ── Eval step ──────────────────────────────────────────────────────
+  private def evalStep(expr: Expr, env: Env, k: Kont): CekState =
+    expr match
+      case Expr.Num(n, _)       => CekState.ApplyK(Value.VNum(n), k)
+      case Expr.Flt(d, _)       => CekState.ApplyK(Value.VFloat(d), k)
+      case Expr.Rat(n, d, _)    => CekState.ApplyK(Value.VRational(n, d), k)
+      case Expr.Bool(b, _)      => CekState.ApplyK(Value.VBool(b), k)
+      case Expr.Str(s, _)       => CekState.ApplyK(Value.VStr(s.toCharArray, mutable = false), k)
+      case Expr.Chr(c, _)       => CekState.ApplyK(Value.VChar(c), k)
+      case Expr.Symbol(name, p) => CekState.ApplyK(env.lookup(name, p), k)
+      case Expr.SList(Nil, p)   => throw errAt(p, "empty application")
 
+      // ── Special forms ──────────────────────────────────────────────
+      case Expr.SList(Expr.Symbol("quote", _) :: arg :: Nil, _) =>
+        CekState.ApplyK(EvalForms.quoteToValue(arg), k)
+
+      case Expr.SList(Expr.Symbol("define", _) :: rest, p) =>
+        CekSteps.stepDefine(rest, env, p, k)
+
+      case Expr.SList(Expr.Symbol("if", _) :: rest, p) =>
+        CekSteps.stepIf(rest, env, p, k)
+
+      case Expr.SList(Expr.Symbol("lambda", _) :: rest, p) =>
+        CekState.ApplyK(CekSteps.makeLambda(rest, env, p), k)
+
+      case Expr.SList(Expr.Symbol("and", _) :: args, _) =>
+        CekSteps.stepAnd(args, env, k)
+
+      case Expr.SList(Expr.Symbol("or", _) :: args, _) =>
+        CekSteps.stepOr(args, env, k)
+
+      case Expr.SList(Expr.Symbol("let", _) :: rest, p) =>
+        CekSteps.stepLet(rest, env, p, k)
+
+      case Expr.SList(Expr.Symbol("let*", _) :: rest, p) =>
+        CekSteps.stepLetStar(rest, env, p, k)
+
+      case Expr.SList(Expr.Symbol("begin", _) :: body, _) =>
+        bodyToCek(body, env, k)
+
+      case Expr.SList(Expr.Symbol("cond", _) :: clauses, _) =>
+        CekSteps.stepCond(clauses, env, k)
+
+      case Expr.SList(Expr.Symbol("set!", _) :: rest, p) =>
+        CekSteps.stepSet(rest, env, p, k)
+
+      case Expr.SList(Expr.Symbol("define-syntax", _) :: rest, p) =>
+        CekState.ApplyK(EvalForms.evalDefineSyntax(rest, env, p), k)
+
+      case Expr.SList(Expr.Symbol("case-lambda", _) :: clauses, p) =>
+        CekState.ApplyK(EvalForms.evalCaseLambda(clauses, env, p), k)
+
+      case Expr.SList(Expr.Symbol("define-record-type", _) :: rest, p) =>
+        CekState.ApplyK(EvalForms.evalDefineRecordType(rest, env, p), k)
+
+      case Expr.SList(Expr.Symbol("letrec", _) :: rest, p) =>
+        CekState.ApplyK(EvalCompound.evalLetrec(rest, env, p, evalExpr, evalBody), k)
+
+      case Expr.SList(Expr.Symbol("letrec*", _) :: rest, p) =>
+        CekState.ApplyK(EvalCompound.evalLetrecStar(rest, env, p, evalExpr, evalBody), k)
+
+      case Expr.SList(Expr.Symbol("case", _) :: rest, p) =>
+        CekState.ApplyK(EvalCompound.evalCase(rest, env, p, evalExpr, evalBody, posOf), k)
+
+      case Expr.SList(Expr.Symbol("do", _) :: rest, p) =>
+        CekState.ApplyK(EvalCompound.evalDo(rest, env, p, evalExpr, evalBody, posOf), k)
+
+      // ── Application ────────────────────────────────────────────────
+      case Expr.SList(head :: args, p) =>
+        CekSteps.stepApp(head, args, env, p, k)
+
+  // ── Function application (CEK) ────────────────────────────────────
+  private[ming] def cekApply(
+    func: Value,
+    args: List[Value],
+    pos: Pos,
+    env: Env,
+    k: Kont
+  ): CekState = func match
+    case Value.VBuiltin("call/cc") | Value.VBuiltin("call-with-current-continuation") =>
+      if args.length != 1 then throw errAt(pos, "call/cc requires 1 argument")
+      val proc    = args.head
+      val contVal = Value.VContinuation(k)
+      cekApply(proc, List(contVal), pos, env, k)
+
+    case Value.VBuiltin("apply") =>
+      if args.length < 2 then throw errAt(pos, "apply requires at least 2 arguments")
+      val innerFunc = args.head
+      val lastArg = args.last match
+        case Value.VList(elems) => elems
+        case Value.VPair(_)     => pairToScalaList(args.last, pos)
+        case _                  => throw errAt(pos, "apply: last argument must be a list")
+      val prefixArgs = args.slice(1, args.length - 1)
+      cekApply(innerFunc, prefixArgs ++ lastArg, pos, env, k)
+
+    case Value.VBuiltin(name) =>
+      try
+        val result = Builtins(name, args, pos, env)
+        CekState.ApplyK(result, k)
+      catch
+        case ci: ContinuationInvoke =>
+          CekState.ApplyK(ci.value, ci.kont)
+
+    case Value.VLambda(params, restParam, body, closure) =>
+      val callEnv = closure.child()
+      EvalTail.bindArgs(params, restParam, args, callEnv, pos)
+      bodyToCek(body, callEnv, k)
+
+    case Value.VCaseLambda(clauses) =>
+      val matched = clauses.find { case (params, restParam, _, _) =>
+        restParam match
+          case None    => args.length == params.length
+          case Some(_) => args.length >= params.length
+      }
+      matched match
+        case Some((params, restParam, body, closure)) =>
+          val callEnv = closure.child()
+          EvalTail.bindArgs(params, restParam, args, callEnv, pos)
+          bodyToCek(body, callEnv, k)
+        case None => throw errAt(pos, "wrong number of arguments")
+
+    case Value.VContinuation(savedK) =>
+      if args.length != 1 then throw errAt(pos, "continuation requires 1 argument")
+      CekState.ApplyK(args.head, savedK)
+
+    case _ => throw errAt(pos, "not a procedure")
+
+  // ── Backward-compatible recursive eval (for EvalCompound) ─────────
+  private def evalExpr(expr: Expr, env: Env): Value =
+    runCek(CekState.Eval(expr, env, Kont.Halt))
+
+  private def evalBody(body: List[Expr], env: Env): Value =
+    if body.isEmpty then Value.VVoid
+    else runCek(bodyToCek(body, env, Kont.Halt))
+
+  /** Apply a function to args (non-CEK path, used by builtins like map/for-each). */
   private[ming] def applyFunc(
     func: Value,
     args: List[Value],
     pos: Pos,
     env: Env
   ): Value = func match
+    case Value.VBuiltin("call/cc") | Value.VBuiltin("call-with-current-continuation") =>
+      if args.length != 1 then throw errAt(pos, "call/cc requires 1 argument")
+      val proc    = args.head
+      val contVal = Value.VContinuation(Kont.Halt)
+      applyFunc(proc, List(contVal), pos, env)
+    case Value.VBuiltin("apply") =>
+      if args.length < 2 then throw errAt(pos, "apply requires at least 2 arguments")
+      val innerFunc = args.head
+      val lastArg = args.last match
+        case Value.VList(elems) => elems
+        case Value.VPair(_)     => pairToScalaList(args.last, pos)
+        case _                  => throw errAt(pos, "apply: last argument must be a list")
+      val prefixArgs = args.slice(1, args.length - 1)
+      applyFunc(innerFunc, prefixArgs ++ lastArg, pos, env)
     case Value.VBuiltin(name) => Builtins(name, args, pos, env)
     case Value.VLambda(params, restParam, body, closure) =>
       val callEnv = closure.child()
@@ -109,58 +203,22 @@ object Evaluator:
           EvalTail.bindArgs(params, restParam, args, callEnv, pos)
           evalBody(body, callEnv)
         case None => throw errAt(pos, "wrong number of arguments")
+    case Value.VContinuation(savedK) =>
+      if args.length != 1 then throw errAt(pos, "continuation requires 1 argument")
+      throw new ContinuationInvoke(args.head, savedK)
     case _ => throw errAt(pos, "not a procedure")
-
-  private def evalDefine(
-    rest: List[Expr],
-    env: Env,
-    pos: Pos
-  ): Value = rest match
-    case Expr.Symbol(name, _) :: valueExpr :: Nil =>
-      env.define(name, eval(valueExpr, env))
-      Value.VVoid
-    case Expr.SList(Expr.Symbol(name, _) :: params, _) :: body =>
-      val (paramNames, restParam) = EvalForms.parseParams(params, pos)
-      env.define(
-        name,
-        Value.VLambda(paramNames, restParam, body, env)
-      )
-      Value.VVoid
-    case _ => throw errAt(pos, "invalid define")
-
-  private def evalLambda(
-    rest: List[Expr],
-    env: Env,
-    pos: Pos
-  ): Value = rest match
-    case Expr.SList(params, _) :: body =>
-      val (paramNames, restParam) = EvalForms.parseParams(params, pos)
-      Value.VLambda(paramNames, restParam, body, env)
-    case Expr.Symbol(name, _) :: body =>
-      Value.VLambda(Nil, Some(name), body, env)
-    case _ => throw errAt(pos, "invalid lambda")
-
-  private def evalSet(
-    rest: List[Expr],
-    env: Env,
-    pos: Pos
-  ): Value = rest match
-    case Expr.Symbol(name, p) :: valueExpr :: Nil =>
-      env.set(name, eval(valueExpr, env), p)
-      Value.VVoid
-    case _ => throw errAt(pos, "invalid set!")
 
   // ── Public API ───────────────────────────────────────────────────────
   def evalStr(input: String): String =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw EvalError("no expressions")
     val env = defaultEnv()
-    display(evalBody(exprs, env))
+    display(runCek(bodyToCek(exprs, env, Kont.Halt)))
 
   def evalStrWithOutput(input: String): (String, String) =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw EvalError("no expressions")
     val output = new StringBuilder
     val env    = defaultEnv(output)
-    val result = display(evalBody(exprs, env))
+    val result = display(runCek(bodyToCek(exprs, env, Kont.Halt)))
     (result, output.toString)
