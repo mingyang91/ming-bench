@@ -94,7 +94,7 @@ public class Evaluator {
     private static class SchemeException extends RuntimeException {
         final Object value;
         SchemeException(Object value) {
-            super(null, null, true, false);
+            super(value instanceof SchemeString s ? s.value : (value != null ? value.toString() : "null"), null, true, false);
             this.value = value;
         }
     }
@@ -175,7 +175,7 @@ public class Evaluator {
     }
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
-        "define", "if", "quote", "lambda", "case-lambda", "and", "or", "set!", "begin", "let", "cond",
+        "define", "if", "quote", "quasiquote", "lambda", "case-lambda", "and", "or", "set!", "begin", "let", "cond",
         "define-syntax", "syntax-rules", "define-record-type", "case", "letrec", "letrec*", "do", "let*",
         "guard", "syntax-case", "syntax-quote", "with-syntax"
     );
@@ -430,6 +430,32 @@ public class Evaluator {
             quoted.add(datum);
             return new SchemeList(quoted, lc[0], lc[1]);
         }
+        if (c == '`') {
+            int[] lc = lineCol(pos);
+            pos++;
+            Object datum = readExpr();
+            List<Object> qq = new ArrayList<>();
+            qq.add(new SchemeSymbol("quasiquote", lc[0], lc[1]));
+            qq.add(datum);
+            return new SchemeList(qq, lc[0], lc[1]);
+        }
+        if (c == ',') {
+            int[] lc = lineCol(pos);
+            pos++;
+            if (pos < src.length() && src.charAt(pos) == '@') {
+                pos++;
+                Object datum = readExpr();
+                List<Object> us = new ArrayList<>();
+                us.add(new SchemeSymbol("unquote-splicing", lc[0], lc[1]));
+                us.add(datum);
+                return new SchemeList(us, lc[0], lc[1]);
+            }
+            Object datum = readExpr();
+            List<Object> uq = new ArrayList<>();
+            uq.add(new SchemeSymbol("unquote", lc[0], lc[1]));
+            uq.add(datum);
+            return new SchemeList(uq, lc[0], lc[1]);
+        }
         if (c == '(') {
             return readList();
         } else if (c == '"') {
@@ -566,6 +592,22 @@ public class Evaluator {
 
     private Object quoteDatum(Object datum) {
         if (datum instanceof SchemeList list) {
+            // Check for dot notation: (a b . c) => improper list
+            int dotIndex = -1;
+            for (int i = 0; i < list.elems.size(); i++) {
+                if (list.elems.get(i) instanceof SchemeSymbol s && s.name.equals(".")) {
+                    dotIndex = i;
+                    break;
+                }
+            }
+            if (dotIndex >= 0 && dotIndex == list.elems.size() - 2) {
+                // (a b ... . last) => improper list
+                Object result = quoteDatum(list.elems.get(list.elems.size() - 1));
+                for (int i = dotIndex - 1; i >= 0; i--) {
+                    result = new SchemePair(quoteDatum(list.elems.get(i)), result);
+                }
+                return result;
+            }
             Object result = NIL;
             for (int i = list.elems.size() - 1; i >= 0; i--) {
                 result = new SchemePair(quoteDatum(list.elems.get(i)), result);
@@ -573,6 +615,56 @@ public class Evaluator {
             return result;
         }
         return datum;
+    }
+
+    private Object evalQuasiquote(Object template, Env env) throws EvalError {
+        if (template instanceof SchemeList list) {
+            if (!list.elems.isEmpty() && list.elems.get(0) instanceof SchemeSymbol sym) {
+                if (sym.name.equals("unquote")) {
+                    if (list.elems.size() != 2) throw new EvalError("unquote: expected 1 argument");
+                    return eval(list.elems.get(1), env);
+                }
+            }
+            // Check for dot notation
+            int dotIndex = -1;
+            for (int i = 0; i < list.elems.size(); i++) {
+                if (list.elems.get(i) instanceof SchemeSymbol s && s.name.equals(".")) {
+                    dotIndex = i;
+                    break;
+                }
+            }
+            // Process elements, handling unquote-splicing
+            List<Object> results = new ArrayList<>();
+            int limit = dotIndex >= 0 ? dotIndex : list.elems.size();
+            for (int i = 0; i < limit; i++) {
+                Object elem = list.elems.get(i);
+                if (elem instanceof SchemeList el && !el.elems.isEmpty()
+                        && el.elems.get(0) instanceof SchemeSymbol s
+                        && s.name.equals("unquote-splicing")) {
+                    Object spliced = eval(el.elems.get(1), env);
+                    // spliced should be a list — unpack into results
+                    while (spliced instanceof SchemePair p) {
+                        results.add(p.car);
+                        spliced = p.cdr;
+                    }
+                } else {
+                    results.add(evalQuasiquote(elem, env));
+                }
+            }
+            // Build pair chain from results
+            Object result;
+            if (dotIndex >= 0 && dotIndex == list.elems.size() - 2) {
+                result = evalQuasiquote(list.elems.get(list.elems.size() - 1), env);
+            } else {
+                result = NIL;
+            }
+            for (int i = results.size() - 1; i >= 0; i--) {
+                result = new SchemePair(results.get(i), result);
+            }
+            return result;
+        }
+        // Atoms are self-quoting (symbols become themselves, like quote)
+        return quoteDatum(template);
     }
 
     // --- Eval ---
@@ -609,6 +701,10 @@ public class Evaluator {
                         case "quote" -> {
                             if (list.elems.size() != 2) throw new EvalError("quote: expected 1 argument");
                             return quoteDatum(list.elems.get(1));
+                        }
+                        case "quasiquote" -> {
+                            if (list.elems.size() != 2) throw new EvalError("quasiquote: expected 1 argument");
+                            return evalQuasiquote(list.elems.get(1), env);
                         }
                         case "lambda" -> { return evalLambda(list.elems, env); }
                         case "case-lambda" -> { return evalCaseLambda(list.elems, env); }
@@ -902,6 +998,13 @@ public class Evaluator {
             Object testVal = eval(test, env);
             if (isTruthy(testVal)) {
                 if (clause.elems.size() == 1) return testVal;
+                // Handle (test => proc) form
+                if (clause.elems.size() == 3 &&
+                    clause.elems.get(1) instanceof SchemeSymbol arrow &&
+                    arrow.name.equals("=>")) {
+                    Object proc = eval(clause.elems.get(2), env);
+                    return apply(proc, List.of(testVal));
+                }
                 for (int j = 1; j < clause.elems.size() - 1; j++) {
                     eval(clause.elems.get(j), env);
                 }
@@ -1300,24 +1403,36 @@ public class Evaluator {
             return result;
         }));
         env.define("<", new BuiltinProc("<", args -> {
-            requireArgCount("<", args, 2);
-            requireNumber(args.get(0), "<"); requireNumber(args.get(1), "<");
-            return numCompare(args.get(0), args.get(1)) < 0;
+            if (args.size() < 2) throw new EvalError("<: expected at least 2 arguments");
+            for (int ci = 0; ci < args.size() - 1; ci++) {
+                requireNumber(args.get(ci), "<"); requireNumber(args.get(ci + 1), "<");
+                if (!(numCompare(args.get(ci), args.get(ci + 1)) < 0)) return false;
+            }
+            return true;
         }));
         env.define(">", new BuiltinProc(">", args -> {
-            requireArgCount(">", args, 2);
-            requireNumber(args.get(0), ">"); requireNumber(args.get(1), ">");
-            return numCompare(args.get(0), args.get(1)) > 0;
+            if (args.size() < 2) throw new EvalError(">: expected at least 2 arguments");
+            for (int ci = 0; ci < args.size() - 1; ci++) {
+                requireNumber(args.get(ci), ">"); requireNumber(args.get(ci + 1), ">");
+                if (!(numCompare(args.get(ci), args.get(ci + 1)) > 0)) return false;
+            }
+            return true;
         }));
         env.define("=", new BuiltinProc("=", args -> {
-            requireArgCount("=", args, 2);
-            requireNumber(args.get(0), "="); requireNumber(args.get(1), "=");
-            return numCompare(args.get(0), args.get(1)) == 0;
+            if (args.size() < 2) throw new EvalError("=: expected at least 2 arguments");
+            for (int ci = 0; ci < args.size() - 1; ci++) {
+                requireNumber(args.get(ci), "="); requireNumber(args.get(ci + 1), "=");
+                if (!(numCompare(args.get(ci), args.get(ci + 1)) == 0)) return false;
+            }
+            return true;
         }));
         env.define("<=", new BuiltinProc("<=", args -> {
-            requireArgCount("<=", args, 2);
-            requireNumber(args.get(0), "<="); requireNumber(args.get(1), "<=");
-            return numCompare(args.get(0), args.get(1)) <= 0;
+            if (args.size() < 2) throw new EvalError("<=: expected at least 2 arguments");
+            for (int ci = 0; ci < args.size() - 1; ci++) {
+                requireNumber(args.get(ci), "<="); requireNumber(args.get(ci + 1), "<=");
+                if (!(numCompare(args.get(ci), args.get(ci + 1)) <= 0)) return false;
+            }
+            return true;
         }));
         env.define("not", new BuiltinProc("not", args -> {
             requireArgCount("not", args, 1);
@@ -1644,6 +1759,20 @@ public class Evaluator {
             } catch (SchemeException se) {
                 return apply(handler, List.of(se.value));
             }
+        }));
+        env.define("error", new BuiltinProc("error", args -> {
+            if (args.isEmpty()) throw new EvalError("error: expected at least 1 argument");
+            StringBuilder sb = new StringBuilder();
+            Object msg = args.get(0);
+            sb.append(msg instanceof SchemeString s ? s.value : schemeToString(msg));
+            for (int i = 1; i < args.size(); i++) {
+                sb.append(" ").append(schemeToString(args.get(i)));
+            }
+            throw new SchemeException(new SchemeString(sb.toString()));
+        }));
+        env.define("raise-continuable", new BuiltinProc("raise-continuable", args -> {
+            requireArgCount("raise-continuable", args, 1);
+            throw new SchemeException(args.get(0));
         }));
 
         // L08: apply
@@ -2106,9 +2235,12 @@ public class Evaluator {
 
         // L09: >=
         env.define(">=", new BuiltinProc(">=", args -> {
-            requireArgCount(">=", args, 2);
-            requireNumber(args.get(0), ">="); requireNumber(args.get(1), ">=");
-            return numCompare(args.get(0), args.get(1)) >= 0;
+            if (args.size() < 2) throw new EvalError(">=: expected at least 2 arguments");
+            for (int ci = 0; ci < args.size() - 1; ci++) {
+                requireNumber(args.get(ci), ">="); requireNumber(args.get(ci + 1), ">=");
+                if (!(numCompare(args.get(ci), args.get(ci + 1)) >= 0)) return false;
+            }
+            return true;
         }));
 
         // L14: eqv?
@@ -2361,14 +2493,14 @@ public class Evaluator {
     private void collectPatternVars(Object pattern, List<String> literals,
                                      java.util.Set<String> patVars, boolean isTopLevel) {
         if (pattern instanceof SchemeSymbol sym) {
-            if (!sym.name.equals("...") && !sym.name.equals("_") && !literals.contains(sym.name)) {
+            if (!sym.name.equals("...") && !sym.name.equals("_") && !sym.name.equals(".") && !literals.contains(sym.name)) {
                 patVars.add(sym.name);
             }
         } else if (pattern instanceof SchemeList list) {
             int start = isTopLevel ? 1 : 0;
             for (int i = start; i < list.elems.size(); i++) {
                 Object elem = list.elems.get(i);
-                if (elem instanceof SchemeSymbol s && s.name.equals("...")) continue;
+                if (elem instanceof SchemeSymbol s && (s.name.equals("...") || s.name.equals("."))) continue;
                 collectPatternVars(elem, literals, patVars, false);
             }
         }
@@ -2380,10 +2512,31 @@ public class Evaluator {
         int pi = pStart, ii = iStart;
         while (pi < pattern.size()) {
             Object pat = pattern.get(pi);
+            // Handle dot pattern: (a b . rest) where rest matches remaining elements as a list
+            if (pat instanceof SchemeSymbol dotSym && dotSym.name.equals(".")) {
+                if (pi + 1 < pattern.size()) {
+                    // Collect remaining input elements into a pair chain
+                    Object rest = NIL;
+                    for (int j = input.size() - 1; j >= ii; j--) {
+                        rest = new SchemePair(input.get(j), rest);
+                    }
+                    Object restPat = pattern.get(pi + 1);
+                    if (!matchOne(restPat, rest, literals, bindings, ellipsisBindings)) return false;
+                    return true;
+                }
+                return false;
+            }
             boolean hasEllipsis = (pi + 1 < pattern.size() &&
                 pattern.get(pi + 1) instanceof SchemeSymbol s && s.name.equals("..."));
             if (hasEllipsis) {
-                int remainingPats = pattern.size() - pi - 2;
+                // Count remaining non-ellipsis, non-dot patterns after this ellipsis pair
+                int remainingPats = 0;
+                for (int k = pi + 2; k < pattern.size(); k++) {
+                    Object p = pattern.get(k);
+                    if (p instanceof SchemeSymbol sym && sym.name.equals(".")) break;
+                    if (p instanceof SchemeSymbol sym2 && sym2.name.equals("...")) continue;
+                    remainingPats++;
+                }
                 int available = input.size() - ii - remainingPats;
                 if (available < 0) return false;
                 if (pat instanceof SchemeSymbol sym && !literals.contains(sym.name) && !sym.name.equals("_")) {
