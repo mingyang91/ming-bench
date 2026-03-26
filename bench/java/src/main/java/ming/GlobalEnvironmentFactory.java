@@ -436,6 +436,8 @@ final class GlobalEnvironmentFactory {
 
     private void installUtilityProcedures() {
         define("error", evaluator::errorBuiltin);
+        defineValue("values", new ValuesProcedure("values"));
+        defineValue("call-with-values", new CallWithValuesProcedure("call-with-values"));
         defineValue("dynamic-wind", new DynamicWindProcedure("dynamic-wind"));
         defineValue("call/cc", new CallCcProcedure("call/cc"));
         defineValue("call-with-current-continuation",

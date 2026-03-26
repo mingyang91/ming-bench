@@ -120,6 +120,50 @@ final class CallCcProcedure extends ProcedureValue {
     }
 }
 
+final class ValuesProcedure extends ProcedureValue {
+    private final String name;
+
+    ValuesProcedure(String name) {
+        this.name = name;
+    }
+
+    String name() {
+        return name;
+    }
+
+    @Override
+    Value apply(List<Value> args) throws EvalError {
+        throw new EvalError(name + " cannot be applied directly");
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:" + name + ">";
+    }
+}
+
+final class CallWithValuesProcedure extends ProcedureValue {
+    private final String name;
+
+    CallWithValuesProcedure(String name) {
+        this.name = name;
+    }
+
+    String name() {
+        return name;
+    }
+
+    @Override
+    Value apply(List<Value> args) throws EvalError {
+        throw new EvalError(name + " cannot be applied directly");
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:" + name + ">";
+    }
+}
+
 final class DynamicWindProcedure extends ProcedureValue {
     private final String name;
 

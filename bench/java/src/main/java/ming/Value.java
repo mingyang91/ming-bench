@@ -10,7 +10,7 @@ import java.util.Map;
 sealed interface Value permits IntValue, RationalValue, InexactValue,
         BoolValue, StringValue, CharValue, SymbolValue,
         PairValue, VectorValue, RecordValue, EmptyListValue, VoidValue,
-        UninitializedValue, ProcedureValue {
+        UninitializedValue, MultiValueValue, ProcedureValue {
     String render();
 }
 
@@ -277,6 +277,17 @@ enum UninitializedValue implements Value {
     @Override
     public String render() {
         return "#<uninitialized>";
+    }
+}
+
+record MultiValueValue(List<Value> values) implements Value {
+    MultiValueValue {
+        values = List.copyOf(values);
+    }
+
+    @Override
+    public String render() {
+        return "#<values>";
     }
 }
 

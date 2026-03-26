@@ -27,7 +27,7 @@ final class DynamicWindSupport {
 
     Evaluator.Bounce apply(Value inThunk, Value bodyThunk, Value outThunk,
                            Evaluator.Continuation cont) throws EvalError {
-        return invokeThunk(inThunk, ignored -> enterBody(inThunk, bodyThunk, outThunk, cont));
+        return invokeThunk(inThunk, ignoredValues -> enterBody(inThunk, bodyThunk, outThunk, cont));
     }
 
     Evaluator.Bounce transferTo(WindFrame targetWind, Evaluator.Bounce next)
@@ -39,13 +39,13 @@ final class DynamicWindSupport {
                                        Evaluator.Continuation cont) throws EvalError {
         WindFrame frame = new WindFrame(currentWind, inThunk, outThunk);
         currentWind = frame;
-        return invokeThunk(bodyThunk, bodyValue -> leaveBody(frame, bodyValue, cont));
+        return invokeThunk(bodyThunk, bodyValues -> leaveBody(frame, bodyValues, cont));
     }
 
-    private Evaluator.Bounce leaveBody(WindFrame frame, Value bodyValue,
+    private Evaluator.Bounce leaveBody(WindFrame frame, List<Value> bodyValues,
                                        Evaluator.Continuation cont) throws EvalError {
         currentWind = frame.parent();
-        return invokeThunk(frame.outThunk(), ignored -> deliver(cont, bodyValue));
+        return invokeThunk(frame.outThunk(), ignoredValues -> deliver(cont, bodyValues));
     }
 
     private Evaluator.Bounce switchWind(WindFrame targetWind, Evaluator.Bounce next)
@@ -65,7 +65,7 @@ final class DynamicWindSupport {
 
         WindFrame frame = exitFrames.get(exitIndex);
         currentWind = frame.parent();
-        return invokeThunk(frame.outThunk(), ignored ->
+        return invokeThunk(frame.outThunk(), ignoredValues ->
                 runWindExits(exitFrames, exitIndex + 1, entryFrames, entryIndex, next));
     }
 
@@ -76,7 +76,7 @@ final class DynamicWindSupport {
         }
 
         WindFrame frame = entryFrames.get(entryIndex);
-        return invokeThunk(frame.inThunk(), ignored -> {
+        return invokeThunk(frame.inThunk(), ignoredValues -> {
             currentWind = frame;
             return runWindEntries(entryFrames, entryIndex - 1, next);
         });
@@ -103,8 +103,8 @@ final class DynamicWindSupport {
         return null;
     }
 
-    private Evaluator.Bounce deliver(Evaluator.Continuation cont, Value value) {
-        return () -> cont.resume(value);
+    private Evaluator.Bounce deliver(Evaluator.Continuation cont, List<Value> values) {
+        return () -> cont.resume(values);
     }
 
     private Evaluator.Bounce invokeThunk(Value thunk, Evaluator.Continuation cont)

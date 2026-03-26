@@ -15,6 +15,11 @@ public class Evaluator {
 
     @FunctionalInterface
     interface Continuation {
+        Bounce resume(List<Value> values) throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface SingleValueContinuation {
         Bounce resume(Value value) throws EvalError;
     }
 
@@ -63,7 +68,7 @@ public class Evaluator {
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        return evalProgram(input, null).render();
+        return renderResult(evalProgram(input, null));
     }
 
     private Value evalProgram(String input, StringBuilder output) throws EvalError {
@@ -101,7 +106,7 @@ public class Evaluator {
     public EvalResult evalStrWithOutput(String input) throws EvalError {
         StringBuilder output = new StringBuilder();
         Value result = evalProgram(input, output);
-        return new EvalResult(result.render(), output.toString());
+        return new EvalResult(renderResult(result), output.toString());
     }
 
     ProcedureValue builtin(String name, BuiltinAction action) {
@@ -128,10 +133,32 @@ public class Evaluator {
         return value.render();
     }
 
+    private String renderResult(Value value) throws EvalError {
+        if (value instanceof MultiValueValue multiValue) {
+            throw new EvalError("top-level expression returned " + multiValue.values().size()
+                    + " values");
+        }
+        return value.render();
+    }
+
+    private Value packValues(List<Value> values) {
+        if (values.size() == 1) {
+            return values.getFirst();
+        }
+        return new MultiValueValue(values);
+    }
+
+    private Value requireSingleValue(List<Value> values) throws EvalError {
+        if (values.size() != 1) {
+            throw new EvalError("expected single value, got " + values.size());
+        }
+        return values.getFirst();
+    }
+
     private Value run(BounceFactory factory) throws EvalError {
         ResultBox result = new ResultBox();
-        Bounce current = factory.create(value -> {
-            result.value = value;
+        Bounce current = factory.create(values -> {
+            result.value = packValues(values);
             return null;
         });
 
@@ -142,7 +169,11 @@ public class Evaluator {
     }
 
     private Bounce deliver(Continuation cont, Value value) {
-        return () -> cont.resume(value);
+        return deliverValues(cont, List.of(value));
+    }
+
+    private Bounce deliverValues(Continuation cont, List<Value> values) {
+        return () -> cont.resume(values);
     }
 
     private Bounce deliverValues(ValueListContinuation cont, List<Value> values) {
@@ -163,8 +194,8 @@ public class Evaluator {
         };
     }
 
-    private Continuation positionedCont(SourcePos position, Continuation cont) {
-        return value -> withPosition(position, () -> cont.resume(value));
+    private Continuation positionedCont(SourcePos position, SingleValueContinuation cont) {
+        return values -> withPosition(position, () -> cont.resume(requireSingleValue(values)));
     }
 
     private ValueListContinuation positionedValues(SourcePos position, ValueListContinuation cont) {
@@ -714,9 +745,9 @@ public class Evaluator {
         currentExceptionHandler = guardHandler;
 
         try {
-            return evalSequenceBounce(argExprs.subList(1, argExprs.size()), env, value -> {
+            return evalSequenceBounce(argExprs.subList(1, argExprs.size()), env, values -> {
                 currentExceptionHandler = previousHandler;
-                return deliver(cont, value);
+                return deliverValues(cont, values);
             });
         } catch (EvalError error) {
             currentExceptionHandler = previousHandler;
@@ -820,12 +851,13 @@ public class Evaluator {
             return evalExpr(argExprs.get(index), env, cont);
         }
 
-        return evalExpr(argExprs.get(index), env, value -> {
+        Expr expr = argExprs.get(index);
+        return evalExpr(expr, env, positionedCont(expr.position(), value -> {
             if (!isTruthy(value)) {
                 return deliver(cont, value);
             }
             return evalAnd(argExprs, index + 1, env, cont);
-        });
+        }));
     }
 
     private Bounce evalOr(List<Expr> argExprs, int index, Environment env, Continuation cont)
@@ -837,12 +869,13 @@ public class Evaluator {
             return evalExpr(argExprs.get(index), env, cont);
         }
 
-        return evalExpr(argExprs.get(index), env, value -> {
+        Expr expr = argExprs.get(index);
+        return evalExpr(expr, env, positionedCont(expr.position(), value -> {
             if (isTruthy(value)) {
                 return deliver(cont, value);
             }
             return evalOr(argExprs, index + 1, env, cont);
-        });
+        }));
     }
 
     private Bounce evalApplication(SourcePos position, Expr head, List<Expr> argExprs,
@@ -882,8 +915,9 @@ public class Evaluator {
             return evalExpr(exprs.getFirst(), env, cont);
         }
 
-        return evalExpr(exprs.getFirst(), env,
-                ignored -> evalSequenceBounce(exprs.subList(1, exprs.size()), env, cont));
+        Expr expr = exprs.getFirst();
+        return evalExpr(expr, env, positionedCont(expr.position(),
+                ignored -> evalSequenceBounce(exprs.subList(1, exprs.size()), env, cont)));
     }
 
     Value applyUserProcedure(String displayName, ParameterSpec parameters,
@@ -953,10 +987,9 @@ public class Evaluator {
         }
 
         if (procedure instanceof ContinuationProcedure continuationProcedure) {
-            requireArity("continuation", argumentValues.size(), 1);
             return dynamicWindSupport.transferTo(continuationProcedure.windContext(), () -> {
                 currentExceptionHandler = continuationProcedure.exceptionHandlerContext();
-                return deliver(continuationProcedure.continuation(), argumentValues.getFirst());
+                return deliverValues(continuationProcedure.continuation(), argumentValues);
             });
         }
 
@@ -966,6 +999,18 @@ public class Evaluator {
                     List.of(new ContinuationProcedure(cont, dynamicWindSupport.currentWind(),
                             currentExceptionHandler)),
                     cont);
+        }
+
+        if (procedure instanceof ValuesProcedure) {
+            return deliverValues(cont, argumentValues);
+        }
+
+        if (procedure instanceof CallWithValuesProcedure callWithValuesProcedure) {
+            requireArity(callWithValuesProcedure.name(), argumentValues.size(), 2);
+            Value producer = argumentValues.get(0);
+            Value consumer = argumentValues.get(1);
+            return applyProcedureCps(producer, List.of(),
+                    producedValues -> applyProcedureCps(consumer, producedValues, cont));
         }
 
         if (procedure instanceof DynamicWindProcedure dynamicWindProcedure) {
@@ -993,7 +1038,11 @@ public class Evaluator {
             return applyCaseLambdaProcedureCps(caseLambdaProcedure, argumentValues, cont);
         }
 
-        return deliver(cont, procedure.apply(argumentValues));
+        Value result = procedure.apply(argumentValues);
+        if (result instanceof MultiValueValue multiValue) {
+            return deliverValues(cont, multiValue.values());
+        }
+        return deliver(cont, result);
     }
 
     private Bounce applyCaseLambdaProcedureCps(CaseLambdaProcedure procedure, List<Value> args,
@@ -1014,15 +1063,15 @@ public class Evaluator {
                 previousHandler,
                 exceptionValue -> applyProcedureCps(handlerProcedure,
                         List.of(exceptionValue),
-                        ignored -> signalException(exceptionValue)),
+                        ignoredValues -> signalException(exceptionValue)),
                 dynamicWindSupport.currentWind()
         );
         currentExceptionHandler = handlerFrame;
 
         try {
-            return applyProcedureCps(thunk, List.of(), value -> {
+            return applyProcedureCps(thunk, List.of(), values -> {
                 currentExceptionHandler = previousHandler;
-                return deliver(cont, value);
+                return deliverValues(cont, values);
             });
         } catch (EvalError error) {
             currentExceptionHandler = previousHandler;
