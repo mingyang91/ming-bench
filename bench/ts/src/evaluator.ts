@@ -974,6 +974,60 @@ function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
               )
             );
           }
+          case 'guard': {
+            // (guard (var clause ...) body ...)
+            if (elems.length < 3) throw errAt('guard: bad syntax', expr.pos);
+            const guardSpec = elems[1];
+            if (guardSpec.tag !== 'list' || guardSpec.elements.length < 2)
+              throw errAt('guard: bad syntax', expr.pos);
+            const exnVarSym = guardSpec.elements[0];
+            if (exnVarSym.tag !== 'symbol') throw errAt('guard: expected variable', expr.pos);
+            const guardClauses = guardSpec.elements.slice(1);
+            const guardBody = elems.slice(2);
+            const guardK = k;
+            const guardEnv = env;
+            const guardWindSnapshot = [...windStack];
+
+            const handlerFn: ExceptionHandler = (exnVal) => {
+              // Wind back to guard's dynamic extent, then evaluate clauses
+              return doWindSwitch(windStack, guardWindSnapshot, () => {
+                const clauseEnv = new Env(guardEnv);
+                clauseEnv.set(exnVarSym.value, exnVal);
+
+                function tryClauses(ci: number): Bounce {
+                  if (ci >= guardClauses.length) {
+                    // No clause matched — re-raise
+                    if (exceptionHandlers.length === 0)
+                      throw errAt(`unhandled exception: ${display(exnVal)}`);
+                    const nextHandler = exceptionHandlers.pop()!;
+                    return bounce(() => nextHandler(exnVal));
+                  }
+                  const clause = guardClauses[ci];
+                  if (clause.tag !== 'list' || clause.elements.length < 1)
+                    throw errAt('guard: bad clause', expr.pos);
+                  const test = clause.elements[0];
+                  if (test.tag === 'symbol' && test.value === 'else') {
+                    return evalBeginK(clause.elements.slice(1), clauseEnv, guardK);
+                  }
+                  return evalK(test, clauseEnv, (testVal) => {
+                    if (isTruthy(testVal)) {
+                      if (clause.elements.length === 1) return guardK(testVal);
+                      return evalBeginK(clause.elements.slice(1), clauseEnv, guardK);
+                    }
+                    return tryClauses(ci + 1);
+                  });
+                }
+                return tryClauses(0);
+              });
+            };
+
+            exceptionHandlers.push(handlerFn);
+            return evalBeginK(guardBody, env, (val) => {
+              const idx = exceptionHandlers.lastIndexOf(handlerFn);
+              if (idx !== -1) exceptionHandlers.splice(idx, 1);
+              return k(val);
+            });
+          }
         }
         // Check for macro
         try {
@@ -1102,6 +1156,29 @@ function applyK(proc: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce 
         }
         return mapLoop(0);
       }
+      case 'raise': {
+        if (args.length !== 1) throw errAt('raise: expected 1 argument', pos);
+        if (exceptionHandlers.length === 0)
+          throw errAt(`unhandled exception: ${display(args[0])}`, pos);
+        const handler = exceptionHandlers.pop()!;
+        return bounce(() => handler(args[0]));
+      }
+      case 'with-exception-handler': {
+        if (args.length !== 2) throw errAt('with-exception-handler: expected 2 arguments', pos);
+        const handlerProc = args[0];
+        const thunk = args[1];
+        const handlerFn: ExceptionHandler = (val) => {
+          return applyK(handlerProc, [val], (_) => {
+            throw errAt('raise: handler returned for non-continuable exception', pos);
+          }, pos);
+        };
+        exceptionHandlers.push(handlerFn);
+        return bounce(() => applyK(thunk, [], (val) => {
+          const idx = exceptionHandlers.lastIndexOf(handlerFn);
+          if (idx !== -1) exceptionHandlers.splice(idx, 1);
+          return k(val);
+        }, pos));
+      }
       case 'for-each': {
         if (args.length < 2) throw errAt('for-each: expected at least 2 arguments', pos);
         const feProc = args[0];
@@ -1226,6 +1303,7 @@ const BUILTINS = new Set([
   'gcd', 'lcm', 'truncate', 'round', 'floor', 'ceiling',
   'procedure?',
   'call/cc', 'call-with-current-continuation',
+  'raise', 'with-exception-handler',
 ]);
 
 function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
@@ -1891,6 +1969,11 @@ let outputBuffer: string[] = [];
 type WindEntry = { inThunk: SchemeVal; outThunk: SchemeVal };
 let windStack: WindEntry[] = [];
 
+// ── Exception handler stack ───────────────────────────────────────────
+
+type ExceptionHandler = (val: SchemeVal) => Bounce;
+let exceptionHandlers: ExceptionHandler[] = [];
+
 // Find common prefix length between two wind stacks
 function windCommonPrefix(from: WindEntry[], to: WindEntry[]): number {
   const len = Math.min(from.length, to.length);
@@ -2012,6 +2095,7 @@ export function evalStr(input: string): string {
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
   windStack = [];
+  exceptionHandlers = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
   return display(result);
@@ -2023,6 +2107,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   if (exprs.length === 0) throw new EvalError('no expressions');
   outputBuffer = [];
   windStack = [];
+  exceptionHandlers = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
   return { result: display(result), output: outputBuffer.join('') };
