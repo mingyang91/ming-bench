@@ -87,6 +87,15 @@ public class Evaluator {
     private int pos;
     private String src;
 
+    private int[] lineCol(int offset) {
+        int line = 1, col = 1;
+        for (int i = 0; i < offset && i < src.length(); i++) {
+            if (src.charAt(i) == '\n') { line++; col = 1; }
+            else col++;
+        }
+        return new int[]{line, col};
+    }
+
     private List<Object> parse(String input) throws EvalError {
         this.src = input;
         this.pos = 0;
@@ -117,12 +126,13 @@ public class Evaluator {
         if (pos >= src.length()) throw new EvalError("unexpected end of input");
         char c = src.charAt(pos);
         if (c == '\'') {
+            int[] lc = lineCol(pos);
             pos++;
             Object datum = readExpr();
             List<Object> quoted = new ArrayList<>();
-            quoted.add(new SchemeSymbol("quote"));
+            quoted.add(new SchemeSymbol("quote", lc[0], lc[1]));
             quoted.add(datum);
-            return new SchemeList(quoted);
+            return new SchemeList(quoted, lc[0], lc[1]);
         }
         if (c == '(') {
             return readList();
@@ -136,6 +146,7 @@ public class Evaluator {
     }
 
     private SchemeList readList() throws EvalError {
+        int[] lc = lineCol(pos);
         pos++; // skip '('
         List<Object> elems = new ArrayList<>();
         while (true) {
@@ -143,7 +154,7 @@ public class Evaluator {
             if (pos >= src.length()) throw new EvalError("unexpected end of input");
             if (src.charAt(pos) == ')') {
                 pos++;
-                return new SchemeList(elems);
+                return new SchemeList(elems, lc[0], lc[1]);
             }
             elems.add(readExpr());
         }
@@ -192,6 +203,7 @@ public class Evaluator {
     }
 
     private Object readAtom() throws EvalError {
+        int[] lc = lineCol(pos);
         int start = pos;
         while (pos < src.length()) {
             char c = src.charAt(pos);
@@ -203,7 +215,7 @@ public class Evaluator {
         try {
             return Long.parseLong(token);
         } catch (NumberFormatException e) {
-            return new SchemeSymbol(token);
+            return new SchemeSymbol(token, lc[0], lc[1]);
         }
     }
 
@@ -227,7 +239,11 @@ public class Evaluator {
             return expr;
         }
         if (expr instanceof SchemeSymbol sym) {
-            return env.lookup(sym.name);
+            try {
+                return env.lookup(sym.name);
+            } catch (EvalError e) {
+                throw addPosition(e, sym.line, sym.col);
+            }
         }
         if (expr instanceof SchemeList list) {
             if (list.elems.isEmpty()) {
@@ -235,28 +251,36 @@ public class Evaluator {
             }
             Object first = list.elems.get(0);
             if (first instanceof SchemeSymbol sym) {
-                switch (sym.name) {
-                    case "define" -> { return evalDefine(list.elems, env); }
-                    case "if" -> { return evalIf(list.elems, env); }
-                    case "quote" -> {
-                        if (list.elems.size() != 2) throw new EvalError("quote: expected 1 argument");
-                        return quoteDatum(list.elems.get(1));
+                try {
+                    switch (sym.name) {
+                        case "define" -> { return evalDefine(list.elems, env); }
+                        case "if" -> { return evalIf(list.elems, env); }
+                        case "quote" -> {
+                            if (list.elems.size() != 2) throw new EvalError("quote: expected 1 argument");
+                            return quoteDatum(list.elems.get(1));
+                        }
+                        case "lambda" -> { return evalLambda(list.elems, env); }
+                        case "and" -> { return evalAnd(list.elems, env); }
+                        case "or" -> { return evalOr(list.elems, env); }
+                        case "begin" -> { return evalBegin(list.elems, env); }
+                        case "let" -> { return evalLet(list.elems, env); }
+                        case "cond" -> { return evalCond(list.elems, env); }
                     }
-                    case "lambda" -> { return evalLambda(list.elems, env); }
-                    case "and" -> { return evalAnd(list.elems, env); }
-                    case "or" -> { return evalOr(list.elems, env); }
-                    case "begin" -> { return evalBegin(list.elems, env); }
-                    case "let" -> { return evalLet(list.elems, env); }
-                    case "cond" -> { return evalCond(list.elems, env); }
+                } catch (EvalError e) {
+                    throw addPosition(e, list.line, list.col);
                 }
             }
             // Function call
-            Object proc = eval(first, env);
-            List<Object> args = new ArrayList<>();
-            for (int i = 1; i < list.elems.size(); i++) {
-                args.add(eval(list.elems.get(i), env));
+            try {
+                Object proc = eval(first, env);
+                List<Object> args = new ArrayList<>();
+                for (int i = 1; i < list.elems.size(); i++) {
+                    args.add(eval(list.elems.get(i), env));
+                }
+                return apply(proc, args);
+            } catch (EvalError e) {
+                throw addPosition(e, list.line, list.col);
             }
-            return apply(proc, args);
         }
         throw new EvalError("cannot eval: " + expr);
     }
@@ -406,6 +430,12 @@ public class Evaluator {
             result = eval(expr, env);
         }
         return result;
+    }
+
+    private EvalError addPosition(EvalError e, int line, int col) {
+        String msg = e.getMessage();
+        if (msg != null && msg.matches(".*\\d+:\\d+.*")) return e;
+        return new EvalError(line + ":" + col + ": " + msg);
     }
 
     private boolean isTruthy(Object val) {
@@ -624,7 +654,7 @@ public class Evaluator {
 
     // --- Data types ---
 
-    record SchemeSymbol(String name) {}
+    record SchemeSymbol(String name, int line, int col) {}
     record SchemeString(String value) {}
-    record SchemeList(List<Object> elems) {}
+    record SchemeList(List<Object> elems, int line, int col) {}
 }
