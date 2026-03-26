@@ -8,7 +8,7 @@ type SchemeVal =
   | { tag: 'number'; value: number; exact?: boolean; pos?: Pos }
   | { tag: 'rational'; num: number; den: number; pos?: Pos }
   | { tag: 'boolean'; value: boolean; pos?: Pos }
-  | { tag: 'string'; value: string; pos?: Pos }
+  | { tag: 'string'; value: string; immutable?: boolean; pos?: Pos }
   | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
   | { tag: 'nil'; pos?: Pos }
@@ -282,7 +282,7 @@ function parse(tokens: Token[]): SchemeVal[] {
       throw new EvalError(`${tok.pos.line}:${tok.pos.col}: unknown character literal: ${tok.text}`);
     }
     if (tok.text.startsWith('"') && tok.text.endsWith('"')) {
-      return { tag: 'string', value: tok.text.slice(1, -1), pos: tok.pos };
+      return { tag: 'string', value: tok.text.slice(1, -1), immutable: true, pos: tok.pos };
     }
     // Rational literal: n/d (e.g. 1/3, -5/2)
     const ratMatch = /^(-?\d+)\/(\d+)$/.exec(tok.text);
@@ -1073,6 +1073,7 @@ const BUILTINS = new Set([
   'symbol->string', 'string->symbol',
   'string-ref',
   'string-copy', 'string-set!',
+  'string->list', 'list->string', 'char->integer', 'integer->char',
   'apply',
   'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
   'zero?', 'positive?', 'negative?', 'odd?', 'even?',
@@ -1284,11 +1285,44 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
     case 'string-set!': {
       if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'char')
         throw errAt('string-set!: expected string, index, char', pos);
+      if (args[0].immutable)
+        throw errAt('string-set!: strings are immutable', pos);
       const si = args[1].value;
       if (si < 0 || si >= args[0].value.length)
         throw errAt('string-set!: index out of range', pos);
       (args[0] as any).value = args[0].value.substring(0, si) + args[2].value + args[0].value.substring(si + 1);
       return SCM_FALSE;
+    }
+    case 'string->list': {
+      if (args.length < 1 || args[0].tag !== 'string')
+        throw errAt('string->list: expected string', pos);
+      const str = args[0].value;
+      let result: SchemeVal = SCM_NIL;
+      for (let i = str.length - 1; i >= 0; i--) {
+        result = { tag: 'pair', car: { tag: 'char', value: str[i] }, cdr: result };
+      }
+      return result;
+    }
+    case 'list->string': {
+      if (args.length !== 1) throw errAt('list->string: expected 1 argument', pos);
+      const chars: string[] = [];
+      let cur = args[0];
+      while (cur.tag === 'pair') {
+        if (cur.car.tag !== 'char') throw errAt('list->string: expected list of characters', pos);
+        chars.push(cur.car.value);
+        cur = cur.cdr;
+      }
+      return { tag: 'string', value: chars.join('') };
+    }
+    case 'char->integer': {
+      if (args.length !== 1 || args[0].tag !== 'char')
+        throw errAt('char->integer: expected char', pos);
+      return { tag: 'number', value: args[0].value.charCodeAt(0), exact: true };
+    }
+    case 'integer->char': {
+      if (args.length !== 1 || args[0].tag !== 'number')
+        throw errAt('integer->char: expected integer', pos);
+      return { tag: 'char', value: String.fromCharCode(args[0].value) };
     }
     case 'apply': {
       if (args.length < 2) throw errAt('apply: expected at least 2 arguments', pos);
