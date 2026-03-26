@@ -105,6 +105,10 @@ type ContinuationProcedure = {
   winds: DynamicWindContext[];
   handlers: ExceptionHandlerContext[];
 };
+type MultipleValuesValue = {
+  kind: 'multiple-values';
+  values: RuntimeValue[];
+};
 type VoidValue = { kind: 'void' };
 type GuardHandlerProcedure = {
   kind: 'guard-handler';
@@ -141,6 +145,7 @@ type RuntimeValue =
   | RecordAccessorProcedure
   | RecordMutatorProcedure
   | ContinuationProcedure
+  | MultipleValuesValue
   | GuardHandlerProcedure
   | VoidValue;
 
@@ -223,6 +228,11 @@ type CondTestFrame = {
   env: Environment;
   pos: SourcePos;
 };
+type CallWithValuesFrame = {
+  kind: 'call-with-values';
+  consumer: RuntimeValue;
+  pos: SourcePos;
+};
 type ExceptionHandlerReturnFrame = {
   kind: 'exception-handler-return';
   handler: ExceptionHandlerContext;
@@ -288,6 +298,7 @@ type ContinuationFrame =
   | OrFrame
   | LetInitFrame
   | CondTestFrame
+  | CallWithValuesFrame
   | ExceptionHandlerReturnFrame
   | DynamicWindEnterFrame
   | DynamicWindBodyFrame
@@ -413,6 +424,8 @@ const BUILTIN_NAMES = [
   'vector->list',
   'list->vector',
   'apply',
+  'values',
+  'call-with-values',
   'call/cc',
   'call-with-current-continuation',
   'dynamic-wind',
@@ -513,7 +526,7 @@ class Environment {
  * representation of the last result.
  */
 export function evalStr(input: string): string {
-  return formatValue(evaluateProgram(input).result);
+  return formatValue(expectSingleValue(evaluateProgram(input).result));
 }
 
 /**
@@ -523,7 +536,7 @@ export function evalStr(input: string): string {
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const evaluation = evaluateProgram(input);
   return {
-    result: formatValue(evaluation.result),
+    result: formatValue(expectSingleValue(evaluation.result)),
     output: evaluation.output,
   };
 }
@@ -803,6 +816,10 @@ function evaluateExpr(expr: Expr, env: Environment, context: EvalContext): Runti
   return runEvaluation({ kind: 'expr', expr, env }, context);
 }
 
+function evaluateExprSingle(expr: Expr, env: Environment, context: EvalContext): RuntimeValue {
+  return expectSingleValue(evaluateExpr(expr, env, context), expr.pos);
+}
+
 function runEvaluation(initialAction: EvalAction, context: EvalContext): RuntimeValue {
   let action = initialAction;
   const stack: ContinuationFrame[] = [];
@@ -865,6 +882,26 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
                   handlers: handlers.slice(),
                 },
               ],
+              pos: action.pos,
+            };
+            break;
+          }
+
+          if (action.procedure.kind === 'builtin' && action.procedure.name === 'call-with-values') {
+            if (action.args.length !== 2) {
+              throw new EvalError('call-with-values expects exactly 2 arguments');
+            }
+
+            const [producer, consumer] = action.args;
+            stack.push({
+              kind: 'call-with-values',
+              consumer,
+              pos: action.pos ?? DEFAULT_SOURCE_POS,
+            });
+            action = {
+              kind: 'apply',
+              procedure: producer,
+              args: [],
               pos: action.pos,
             };
             break;
@@ -1036,8 +1073,10 @@ function continueWithFrame(
 ): EvalAction {
   switch (frame.kind) {
     case 'sequence':
+      expectSingleValue(value, frame.pos);
       return startSequenceAction(frame.remainingExprs, frame.env, stack, frame.pos);
     case 'call-operator':
+      value = expectSingleValue(value, frame.pos);
       if (frame.argExprs.length === 0) {
         return {
           kind: 'apply',
@@ -1057,6 +1096,7 @@ function continueWithFrame(
       });
       return { kind: 'expr', expr: frame.argExprs[frame.argExprs.length - 1], env: frame.env };
     case 'call-argument': {
+      value = expectSingleValue(value, frame.pos);
       const args = [value, ...frame.evaluatedArgs];
       if (frame.remainingArgExprs.length === 0) {
         return {
@@ -1082,12 +1122,15 @@ function continueWithFrame(
       };
     }
     case 'define-value':
+      value = expectSingleValue(value, frame.pos);
       frame.env.define(frame.name, value);
       return { kind: 'value', value: VOID_VALUE };
     case 'set-value':
+      value = expectSingleValue(value, frame.pos);
       frame.env.assign(frame.name, value);
       return { kind: 'value', value: VOID_VALUE };
     case 'if':
+      value = expectSingleValue(value, frame.pos);
       if (isTruthy(value)) {
         return { kind: 'expr', expr: frame.consequent, env: frame.env };
       }
@@ -1098,20 +1141,24 @@ function continueWithFrame(
 
       return { kind: 'expr', expr: frame.alternate, env: frame.env };
     case 'and':
+      value = expectSingleValue(value, frame.pos);
       if (!isTruthy(value)) {
         return { kind: 'value', value };
       }
 
       return startShortCircuitAction('and', frame.remainingExprs, frame.env, stack, frame.pos);
     case 'or':
+      value = expectSingleValue(value, frame.pos);
       if (isTruthy(value)) {
         return { kind: 'value', value };
       }
 
       return startShortCircuitAction('or', frame.remainingExprs, frame.env, stack, frame.pos);
     case 'let-init':
+      value = expectSingleValue(value, frame.pos);
       return continueLetInitAction(frame, value, stack);
     case 'cond-test':
+      value = expectSingleValue(value, frame.pos);
       if (!isTruthy(value)) {
         return startCondAction(frame.remainingClauses, frame.env, stack, frame.pos);
       }
@@ -1121,6 +1168,13 @@ function continueWithFrame(
       }
 
       return startSequenceAction(frame.body, frame.env, stack, frame.pos);
+    case 'call-with-values':
+      return {
+        kind: 'apply',
+        procedure: frame.consumer,
+        args: unwrapValues(value),
+        pos: frame.pos,
+      };
     case 'exception-handler-return': {
       const currentHandler = handlers.pop();
       if (currentHandler !== frame.handler) {
@@ -1130,6 +1184,7 @@ function continueWithFrame(
       return { kind: 'value', value };
     }
     case 'dynamic-wind-enter':
+      expectSingleValue(value, frame.pos);
       winds.push(frame.wind);
       stack.push({
         kind: 'dynamic-wind-body',
@@ -1161,8 +1216,10 @@ function continueWithFrame(
       };
     }
     case 'dynamic-wind-after':
+      expectSingleValue(value, frame.pos);
       return { kind: 'value', value: frame.result };
     case 'wind-transfer-after':
+      expectSingleValue(value, frame.pos);
       return startWindTransferAction(
         frame.exiting,
         frame.entering,
@@ -1173,6 +1230,7 @@ function continueWithFrame(
         frame.pos,
       );
     case 'wind-transfer-before':
+      expectSingleValue(value, frame.pos);
       winds.push(frame.wind);
       return startWindTransferAction(
         [],
@@ -2837,7 +2895,10 @@ function evaluateLetStarAction(
   const letEnv = new Environment(env);
 
   for (let index = 0; index < bindings.names.length; index += 1) {
-    letEnv.define(bindings.names[index], evaluateExpr(bindings.initExprs[index], letEnv, context));
+    letEnv.define(
+      bindings.names[index],
+      evaluateExprSingle(bindings.initExprs[index], letEnv, context),
+    );
   }
 
   return { kind: 'sequence', exprs: body, env: letEnv };
@@ -2886,14 +2947,14 @@ function evaluateLetrecAction(
     for (let index = 0; index < bindings.names.length; index += 1) {
       const name = bindings.names[index];
       letEnv.define(name, VOID_VALUE);
-      letEnv.assign(name, evaluateExpr(bindings.initExprs[index], letEnv, context));
+      letEnv.assign(name, evaluateExprSingle(bindings.initExprs[index], letEnv, context));
     }
   } else {
     for (const name of bindings.names) {
       letEnv.define(name, VOID_VALUE);
     }
 
-    const values = bindings.initExprs.map((expr) => evaluateExpr(expr, letEnv, context));
+    const values = bindings.initExprs.map((expr) => evaluateExprSingle(expr, letEnv, context));
     for (let index = 0; index < bindings.names.length; index += 1) {
       letEnv.assign(bindings.names[index], values[index]);
     }
@@ -2959,7 +3020,7 @@ function evaluateCaseAction(argExprs: Expr[], env: Environment, context: EvalCon
     throw new EvalError('case expects at least 1 clause');
   }
 
-  const key = evaluateExpr(keyExpr, env, context);
+  const key = evaluateExprSingle(keyExpr, env, context);
 
   for (let index = 0; index < clauseExprs.length; index += 1) {
     const clauseExpr = clauseExprs[index];
@@ -3010,7 +3071,9 @@ function evaluateDoAction(argExprs: Expr[], env: Environment, context: EvalConte
   }
 
   const [testExpr, ...resultExprs] = terminationExpr.elements;
-  const initialValues = bindings.map((binding) => evaluateExpr(binding.initExpr, env, context));
+  const initialValues = bindings.map((binding) =>
+    evaluateExprSingle(binding.initExpr, env, context),
+  );
   const doEnv = new Environment(env);
 
   for (let index = 0; index < bindings.length; index += 1) {
@@ -3018,18 +3081,20 @@ function evaluateDoAction(argExprs: Expr[], env: Environment, context: EvalConte
   }
 
   while (true) {
-    if (isTruthy(evaluateExpr(testExpr, doEnv, context))) {
+    if (isTruthy(evaluateExprSingle(testExpr, doEnv, context))) {
       return resultExprs.length === 0
         ? { kind: 'value', value: VOID_VALUE }
         : { kind: 'sequence', exprs: resultExprs, env: doEnv };
     }
 
     if (body.length > 0) {
-      evaluateSequence(body, doEnv, context);
+      evaluateSequenceSingle(body, doEnv, context);
     }
 
     const nextValues = bindings.map((binding) =>
-      binding.stepExpr === undefined ? doEnv.lookup(binding.name) : evaluateExpr(binding.stepExpr, doEnv, context),
+      binding.stepExpr === undefined
+        ? doEnv.lookup(binding.name)
+        : evaluateExprSingle(binding.stepExpr, doEnv, context),
     );
 
     for (let index = 0; index < bindings.length; index += 1) {
@@ -3120,6 +3185,15 @@ function applyProcedure(
   return runEvaluation({ kind: 'apply', procedure, args, pos }, context);
 }
 
+function applyProcedureSingle(
+  procedure: RuntimeValue,
+  args: RuntimeValue[],
+  context: EvalContext,
+  pos?: SourcePos,
+): RuntimeValue {
+  return expectSingleValue(applyProcedure(procedure, args, context, pos), pos);
+}
+
 function applyProcedureAction(
   procedure: RuntimeValue,
   args: RuntimeValue[],
@@ -3189,7 +3263,7 @@ function evaluateGuardClauses(
       return evaluateSequence(body, env, context);
     }
 
-    const testValue = evaluateExpr(testExpr, env, context);
+    const testValue = evaluateExprSingle(testExpr, env, context);
     if (isTruthy(testValue)) {
       return body.length === 0 ? testValue : evaluateSequence(body, env, context);
     }
@@ -3303,13 +3377,20 @@ function evaluateSequence(exprs: Expr[], env: Environment, context: EvalContext)
   return runEvaluation({ kind: 'sequence', exprs, env }, context);
 }
 
+function evaluateSequenceSingle(exprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
+  return expectSingleValue(
+    evaluateSequence(exprs, env, context),
+    exprs[exprs.length - 1]?.pos ?? DEFAULT_SOURCE_POS,
+  );
+}
+
 function evaluateSequenceAction(exprs: Expr[], env: Environment, context: EvalContext): EvalAction {
   if (exprs.length === 0) {
     return { kind: 'value', value: VOID_VALUE };
   }
 
   for (let index = 0; index < exprs.length - 1; index += 1) {
-    evaluateExpr(exprs[index], env, context);
+    evaluateExprSingle(exprs[index], env, context);
   }
 
   return { kind: 'expr', expr: exprs[exprs.length - 1], env };
@@ -3636,6 +3717,9 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return { kind: 'vector', elements: listToArray(args[0], 'list->vector') };
     case 'apply':
       return applyApply(args, context);
+    case 'values':
+      return makeValuesResult(args);
+    case 'call-with-values':
     case 'call/cc':
     case 'call-with-current-continuation':
     case 'dynamic-wind':
@@ -4003,7 +4087,7 @@ function applyMap(args: RuntimeValue[], context: EvalContext): RuntimeValue {
 
   const results: RuntimeValue[] = [];
   for (let index = 0; index < resultLength; index += 1) {
-    results.push(applyProcedure(procedure, lists.map((list) => list[index]), context));
+    results.push(applyProcedureSingle(procedure, lists.map((list) => list[index]), context));
   }
 
   return buildList(results);
@@ -4025,7 +4109,7 @@ function applyForEach(args: RuntimeValue[], context: EvalContext): RuntimeValue 
   }
 
   for (let index = 0; index < resultLength; index += 1) {
-    applyProcedure(procedure, lists.map((list) => list[index]), context);
+    applyProcedureSingle(procedure, lists.map((list) => list[index]), context);
   }
 
   return VOID_VALUE;
@@ -4509,6 +4593,33 @@ function isTruthy(value: RuntimeValue): boolean {
   return value.kind !== 'boolean' || value.value;
 }
 
+function makeValuesResult(values: RuntimeValue[]): RuntimeValue {
+  if (values.length === 1) {
+    return values[0];
+  }
+
+  return {
+    kind: 'multiple-values',
+    values: [...values],
+  };
+}
+
+function unwrapValues(value: RuntimeValue): RuntimeValue[] {
+  return value.kind === 'multiple-values' ? [...value.values] : [value];
+}
+
+function expectSingleValue(value: RuntimeValue, pos?: SourcePos): RuntimeValue {
+  if (value.kind !== 'multiple-values') {
+    return value;
+  }
+
+  if (value.values.length === 1) {
+    return value.values[0];
+  }
+
+  throw new EvalError(`expected 1 value, got ${value.values.length}`, pos);
+}
+
 function makeNumber(value: SchemeNumber | number): NumberExpr {
   return {
     kind: 'number',
@@ -4590,6 +4701,8 @@ function formatValueWithModeInternal(
     case 'continuation':
     case 'guard-handler':
       return '#<procedure>';
+    case 'multiple-values':
+      return formatValueWithModeInternal(expectSingleValue(value), mode, seen);
     case 'void':
       return '';
   }
