@@ -4,7 +4,11 @@ mod number;
 
 pub use error::EvalError;
 
-use macros::{register_macro_definition, MacroEnv, MacroExpander};
+use macros::{
+    expr_from_syntax, match_syntax_pattern, parse_transformer, syntax_from_use_expr,
+    transformer_macro, MacroEnv, MacroExpander, PatternBinding, SymbolOrigin, SyntaxExpr,
+    SyntaxSymbol,
+};
 use number::Number;
 use std::{
     cell::RefCell,
@@ -174,6 +178,8 @@ enum Value {
     Pair(PairRef),
     Vector(SchemeVector),
     Record(Rc<RecordValue>),
+    Syntax(Rc<SyntaxExpr>),
+    SyntaxList(Vec<Rc<SyntaxExpr>>),
     Procedure(Rc<Procedure>),
     Values(Vec<Value>),
     Uninitialized,
@@ -986,6 +992,8 @@ impl Value {
             Self::Pair(_) => "pair",
             Self::Vector(_) => "vector",
             Self::Record(_) => "record",
+            Self::Syntax(_) => "syntax",
+            Self::SyntaxList(_) => "syntax-list",
             Self::Procedure(_) => "procedure",
             Self::Values(_) => "values",
             Self::Uninitialized => "uninitialized",
@@ -1085,6 +1093,11 @@ impl<'a> Parser<'a> {
         Ok(Expr::List(vec![Expr::Symbol("quote".into()), quoted]))
     }
 
+    fn parse_syntax_shorthand(&mut self) -> Result<Expr, EvalError> {
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![Expr::Symbol("syntax".into()), quoted]))
+    }
+
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
         self.expect_char('(')?;
         let mut items = Vec::new();
@@ -1134,6 +1147,7 @@ impl<'a> Parser<'a> {
         match self.bump_char() {
             Some('t') => Ok(Expr::Boolean(true)),
             Some('f') => Ok(Expr::Boolean(false)),
+            Some('\'') => self.parse_syntax_shorthand(),
             Some('\\') => self.parse_character_literal(),
             Some(other) => Err(self.error(EvalError::InvalidBoolean {
                 literal: format!("#{other}"),
@@ -1457,6 +1471,77 @@ fn handle_exception(
     resume_continuation_frames(result, frames, context)
 }
 
+fn parse_define_syntax<'a>(expr: &'a Expr) -> Result<Option<(&'a String, &'a Expr)>, EvalError> {
+    let Expr::List(items) = expr else {
+        return Ok(None);
+    };
+
+    let Some(Expr::Symbol(keyword)) = items.first() else {
+        return Ok(None);
+    };
+
+    if keyword != "define-syntax" {
+        return Ok(None);
+    }
+
+    if items.len() != 3 {
+        return Err(EvalError::InvalidForm {
+            name: "define-syntax",
+            message: "expected a name and transformer",
+        });
+    }
+
+    let Expr::Symbol(name) = &items[1] else {
+        return Err(EvalError::InvalidForm {
+            name: "define-syntax",
+            message: "expected a macro name",
+        });
+    };
+
+    Ok(Some((name, &items[2])))
+}
+
+fn register_top_level_macro_definition(
+    expr: &Expr,
+    env: &EnvRef,
+    macros: &mut MacroEnv,
+) -> Result<bool, EvalError> {
+    let Some((name, transformer_expr)) = parse_define_syntax(expr)? else {
+        return Ok(false);
+    };
+
+    let macro_def = if matches!(
+        transformer_expr,
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(symbol)) if symbol == "syntax-rules")
+    ) {
+        parse_transformer(name.clone(), transformer_expr, env.clone())?
+    } else {
+        let mut macro_context = EvalContext::default();
+        let transformer = eval_expr_in_env_single(transformer_expr, env, &mut macro_context)?;
+        if !matches!(transformer, Value::Procedure(_)) {
+            return Err(EvalError::InvalidForm {
+                name: "define-syntax",
+                message: "expected the transformer to evaluate to a procedure",
+            });
+        }
+        transformer_macro(name.clone(), transformer, env.clone())
+    };
+
+    macros.insert(name.clone(), Rc::new(macro_def));
+    Ok(true)
+}
+
+fn run_transformer_macro(invocation: &Expr, transformer: &Value) -> Result<SyntaxExpr, EvalError> {
+    let mut context = EvalContext::default();
+    let result = apply_procedure_single(
+        transformer.clone(),
+        vec![Value::Syntax(Rc::new(syntax_from_use_expr(invocation)))],
+        &mut context,
+    )?;
+    let syntax = expect_syntax("macro transformer", &result)?;
+    Ok(syntax.as_ref().clone())
+}
+
 fn eval_top_level_state(
     mut state: TopLevelState,
     context: &mut EvalContext,
@@ -1465,7 +1550,7 @@ fn eval_top_level_state(
     let mut expressions = state.remaining.into_iter();
 
     while let Some(expression) = expressions.next() {
-        if register_macro_definition(&expression.expr, &state.env, &mut state.macros).map_err(
+        if register_top_level_macro_definition(&expression.expr, &state.env, &mut state.macros).map_err(
             |error| error.with_position(expression.position.line, expression.position.column),
         )? {
             last_value = Value::Void;
@@ -2225,6 +2310,9 @@ fn eval_application_step(
             "or" => return eval_or_step(tail, &env, context),
             "quote" => return eval_quote_step(tail),
             "set!" => return eval_set_step(tail, &env, context),
+            "syntax" => return eval_syntax_step(tail, &env),
+            "syntax-case" => return eval_syntax_case_step(tail, &env, context),
+            "with-syntax" => return eval_with_syntax_step(tail, &env, context),
             _ => {}
         }
     }
@@ -3111,6 +3199,348 @@ fn eval_quote_step(args: &[Expr]) -> Result<EvalStep, EvalError> {
     Ok(EvalStep::Value(quote_expr(&args[0])))
 }
 
+fn eval_syntax_step(args: &[Expr], env: &EnvRef) -> Result<EvalStep, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "syntax",
+            expected: "exactly 1 argument",
+            got: args.len(),
+        });
+    }
+
+    Ok(EvalStep::Value(Value::Syntax(Rc::new(
+        build_syntax_from_template(&args[0], env, None, "syntax")?,
+    ))))
+}
+
+fn eval_syntax_case_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
+    if args.len() < 3 {
+        return Err(EvalError::WrongArgCount {
+            name: "syntax-case",
+            expected: "an expression, literal identifiers, and at least 1 clause",
+            got: args.len(),
+        });
+    }
+
+    let target = eval_expr_in_env_single(&args[0], env, context)?;
+    let target = expect_syntax("syntax-case", &target)?;
+    let target_expr = expr_from_syntax(target.as_ref().clone());
+    let literals = parse_syntax_literals(&args[1])?;
+
+    for clause in &args[2..] {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::InvalidForm {
+                name: "syntax-case",
+                message: "expected clauses to be lists",
+            });
+        };
+
+        if items.len() < 2 {
+            return Err(EvalError::InvalidForm {
+                name: "syntax-case",
+                message: "expected each clause to contain a pattern and body",
+            });
+        }
+
+        let Some(bindings) = match_syntax_pattern(&items[0], &target_expr, &literals) else {
+            continue;
+        };
+
+        let clause_env = Env::new(Some(env.clone()));
+        bind_syntax_pattern_bindings(&clause_env, bindings);
+
+        let body_index = if items.len() == 2 {
+            1
+        } else {
+            let fender = eval_expr_in_env_single(&items[1], &clause_env, context)?;
+            if !fender.is_truthy() {
+                continue;
+            }
+            2
+        };
+
+        if body_index >= items.len() {
+            return Err(EvalError::InvalidForm {
+                name: "syntax-case",
+                message: "expected each clause to contain a body expression",
+            });
+        }
+
+        let result = expect_single_value(eval_sequence(&items[body_index..], &clause_env, context)?)?;
+        let syntax = expect_syntax("syntax-case", &result)?;
+        return Ok(EvalStep::Value(Value::Syntax(syntax)));
+    }
+
+    Err(EvalError::NoMatchingSyntaxCase)
+}
+
+fn eval_with_syntax_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "with-syntax",
+            expected: "bindings and at least 1 body expression",
+            got: 0,
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::InvalidForm {
+            name: "with-syntax",
+            message: "expected at least one body expression",
+        });
+    }
+
+    let Expr::List(bindings) = bindings_expr else {
+        return Err(EvalError::InvalidForm {
+            name: "with-syntax",
+            message: "expected a binding list",
+        });
+    };
+
+    let evaluated_bindings = bindings
+        .iter()
+        .map(|binding| {
+            let Expr::List(items) = binding else {
+                return Err(EvalError::InvalidForm {
+                    name: "with-syntax",
+                    message: "expected each binding to be a list",
+                });
+            };
+
+            if items.len() != 2 {
+                return Err(EvalError::InvalidForm {
+                    name: "with-syntax",
+                    message: "expected each binding to contain a pattern and expression",
+                });
+            }
+
+            let produced = eval_expr_in_env_single(&items[1], env, context)?;
+            let produced = expect_syntax("with-syntax", &produced)?;
+            Ok((items[0].clone(), expr_from_syntax(produced.as_ref().clone())))
+        })
+        .collect::<Result<Vec<_>, EvalError>>()?;
+
+    let body_env = Env::new(Some(env.clone()));
+    let empty_literals = HashSet::new();
+    for (pattern, produced) in evaluated_bindings {
+        let Some(bindings) = match_syntax_pattern(&pattern, &produced, &empty_literals) else {
+            return Err(EvalError::InvalidForm {
+                name: "with-syntax",
+                message: "binding pattern did not match the produced syntax",
+            });
+        };
+        bind_syntax_pattern_bindings(&body_env, bindings);
+    }
+
+    Ok(EvalStep::Value(eval_sequence(body, &body_env, context)?))
+}
+
+fn parse_syntax_literals(expr: &Expr) -> Result<HashSet<String>, EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::InvalidForm {
+            name: "syntax-case",
+            message: "expected a literal identifier list",
+        });
+    };
+
+    items
+        .iter()
+        .map(|item| match item {
+            Expr::Symbol(symbol) => Ok(symbol.clone()),
+            _ => Err(EvalError::InvalidForm {
+                name: "syntax-case",
+                message: "expected literal identifiers to be symbols",
+            }),
+        })
+        .collect()
+}
+
+fn bind_syntax_pattern_bindings(env: &EnvRef, bindings: HashMap<String, PatternBinding>) {
+    for (name, binding) in bindings {
+        match binding {
+            PatternBinding::Single(expr) => {
+                env.define(name, Value::Syntax(Rc::new(syntax_from_use_expr(&expr))));
+            }
+            PatternBinding::Repeated(values) => {
+                env.define(
+                    name,
+                    Value::SyntaxList(
+                        values
+                            .into_iter()
+                            .map(|expr| Rc::new(syntax_from_use_expr(&expr)))
+                            .collect(),
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn build_syntax_from_template(
+    template: &Expr,
+    env: &EnvRef,
+    repetition_index: Option<usize>,
+    name: &'static str,
+) -> Result<SyntaxExpr, EvalError> {
+    Ok(match template {
+        Expr::Number(value) => SyntaxExpr::Number(value.clone()),
+        Expr::Boolean(value) => SyntaxExpr::Boolean(*value),
+        Expr::Char(value) => SyntaxExpr::Char(*value),
+        Expr::String(value) => SyntaxExpr::String(value.clone()),
+        Expr::Symbol(symbol) => match env.get(symbol) {
+            Some(Value::Syntax(syntax)) => syntax.as_ref().clone(),
+            Some(Value::SyntaxList(values)) => {
+                let Some(index) = repetition_index else {
+                    return Err(EvalError::InvalidMacroTemplate {
+                        name: name.to_string(),
+                        message: "ellipsis variables must appear under ellipsis in templates",
+                    });
+                };
+
+                let Some(value) = values.get(index) else {
+                    return Err(EvalError::InvalidMacroTemplate {
+                        name: name.to_string(),
+                        message: "ellipsis repetitions had inconsistent lengths",
+                    });
+                };
+
+                value.as_ref().clone()
+            }
+            _ => SyntaxExpr::Symbol(SyntaxSymbol {
+                name: symbol.clone(),
+                origin: SymbolOrigin::Template,
+            }),
+        },
+        Expr::List(items) => {
+            let mut expanded = Vec::new();
+            let mut index = 0;
+
+            while index < items.len() {
+                if matches!(items.get(index + 1), Some(Expr::Symbol(symbol)) if symbol == "...") {
+                    let repeat_count = syntax_repetition_count(&items[index], env, name)?;
+                    for repeated_index in 0..repeat_count {
+                        expanded.push(build_syntax_from_template(
+                            &items[index],
+                            env,
+                            Some(repeated_index),
+                            name,
+                        )?);
+                    }
+                    index += 2;
+                } else {
+                    expanded.push(build_syntax_from_template(
+                        &items[index],
+                        env,
+                        repetition_index,
+                        name,
+                    )?);
+                    index += 1;
+                }
+            }
+
+            SyntaxExpr::List(expanded)
+        }
+    })
+}
+
+fn syntax_repetition_count(
+    template: &Expr,
+    env: &EnvRef,
+    name: &'static str,
+) -> Result<usize, EvalError> {
+    let mut repeated = Vec::new();
+    collect_repeated_syntax_bindings(template, env, &mut repeated);
+
+    let Some((first, rest)) = repeated.split_first() else {
+        return Err(EvalError::InvalidMacroTemplate {
+            name: name.to_string(),
+            message: "ellipsis must repeat at least one pattern variable",
+        });
+    };
+
+    if rest.iter().any(|count| *count != *first) {
+        return Err(EvalError::InvalidMacroTemplate {
+            name: name.to_string(),
+            message: "ellipsis repetitions had inconsistent lengths",
+        });
+    }
+
+    Ok(*first)
+}
+
+fn collect_repeated_syntax_bindings(template: &Expr, env: &EnvRef, repeated: &mut Vec<usize>) {
+    match template {
+        Expr::Symbol(symbol) => {
+            if let Some(Value::SyntaxList(values)) = env.get(symbol) {
+                repeated.push(values.len());
+            }
+        }
+        Expr::List(items) => {
+            for item in items {
+                collect_repeated_syntax_bindings(item, env, repeated);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn syntax_origin(expr: &SyntaxExpr) -> SymbolOrigin {
+    match expr {
+        SyntaxExpr::Symbol(symbol) => symbol.origin,
+        SyntaxExpr::List(items) => {
+            if items
+                .iter()
+                .any(|item| syntax_origin(item) == SymbolOrigin::UseSite)
+            {
+                SymbolOrigin::UseSite
+            } else {
+                SymbolOrigin::Template
+            }
+        }
+        _ => SymbolOrigin::Template,
+    }
+}
+
+fn syntax_to_datum_value(expr: &SyntaxExpr) -> Value {
+    quote_expr(&expr_from_syntax(expr.clone()))
+}
+
+fn datum_to_syntax(
+    value: &Value,
+    origin: SymbolOrigin,
+    name: &'static str,
+) -> Result<SyntaxExpr, EvalError> {
+    match value {
+        Value::Number(number) => Ok(SyntaxExpr::Number(number.clone())),
+        Value::Boolean(boolean) => Ok(SyntaxExpr::Boolean(*boolean)),
+        Value::Char(ch) => Ok(SyntaxExpr::Char(*ch)),
+        Value::String(string) => Ok(SyntaxExpr::String(string.to_plain_string())),
+        Value::Symbol(symbol) => Ok(SyntaxExpr::Symbol(SyntaxSymbol {
+            name: symbol.clone(),
+            origin,
+        })),
+        Value::List(_) | Value::Pair(_) => Ok(SyntaxExpr::List(
+            collect_list(name, value)?
+                .into_iter()
+                .map(|item| datum_to_syntax(&item, origin, name))
+                .collect::<Result<Vec<_>, EvalError>>()?,
+        )),
+        Value::Syntax(syntax) => Ok(syntax.as_ref().clone()),
+        _ => Err(EvalError::InvalidArgument {
+            name,
+            message: "expected a datum that can be converted to syntax",
+        }),
+    }
+}
+
 fn parse_params(expr: &Expr, name: &'static str) -> Result<LambdaParams, EvalError> {
     match expr {
         Expr::List(items) => parse_param_names(items, name),
@@ -3473,6 +3903,8 @@ fn render_value_inner(value: &Value, display: bool, active: &mut HashSet<usize>)
             format!("#({rendered})")
         }
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
+        Value::Syntax(_) => "#<syntax>".into(),
+        Value::SyntaxList(_) => "#<syntax-list>".into(),
         Value::Procedure(_) => "#<procedure>".into(),
         Value::Values(values) => match values.as_slice() {
             [] => "#<values>".into(),
@@ -3572,6 +4004,7 @@ fn root_env() -> EnvRef {
         "cdar",
         "cddr",
         "cons",
+        "datum->syntax",
         "display",
         "denominator",
         "dynamic-wind",
@@ -3585,6 +4018,7 @@ fn root_env() -> EnvRef {
         "expt",
         "for-each",
         "gcd",
+        "identifier?",
         "inexact->exact",
         "inexact?",
         "integer->char",
@@ -3644,6 +4078,7 @@ fn root_env() -> EnvRef {
         "substring",
         "symbol?",
         "symbol->string",
+        "syntax->datum",
         "truncate",
         "vector",
         "vector->list",
@@ -3899,6 +4334,23 @@ fn apply_builtin(
 
             Ok(new_pair(args[0].clone(), args[1].clone()))
         }
+        "datum->syntax" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "datum->syntax",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let context_syntax = expect_syntax("datum->syntax", &args[0])?;
+            let origin = syntax_origin(context_syntax.as_ref());
+            Ok(Value::Syntax(Rc::new(datum_to_syntax(
+                &args[1],
+                origin,
+                "datum->syntax",
+            )?)))
+        }
         "display" => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount {
@@ -3940,6 +4392,9 @@ fn apply_builtin(
         }
         "for-each" => apply_for_each(args, context),
         "gcd" => apply_gcd(args),
+        "identifier?" => predicate_builtin("identifier?", args, |value| {
+            matches!(value, Value::Syntax(syntax) if matches!(syntax.as_ref(), SyntaxExpr::Symbol(_)))
+        }),
         "length" => {
             let list = collect_list_arg("length", args)?;
             Ok(Value::Number(Number::integer(list.len() as i64)))
@@ -4367,6 +4822,10 @@ fn apply_builtin(
             let value = expect_symbol_arg("symbol->string", args)?;
             Ok(Value::String(SchemeString::new_runtime(value)))
         }
+        "syntax->datum" => {
+            let syntax = expect_syntax_arg("syntax->datum", args)?;
+            Ok(syntax_to_datum_value(syntax.as_ref()))
+        }
         "truncate" => {
             let number = expect_number_arg("truncate", args)?;
             Ok(match number {
@@ -4720,6 +5179,28 @@ fn expect_symbol_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a st
     }
 }
 
+fn expect_syntax(name: &'static str, value: &Value) -> Result<Rc<SyntaxExpr>, EvalError> {
+    match value {
+        Value::Syntax(syntax) => Ok(syntax.clone()),
+        other => Err(EvalError::ExpectedSyntax {
+            name,
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn expect_syntax_arg(name: &'static str, args: &[Value]) -> Result<Rc<SyntaxExpr>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exactly 1 argument",
+            got: args.len(),
+        });
+    }
+
+    expect_syntax(name, &args[0])
+}
+
 fn expect_index(name: &'static str, value: &Value, len: usize) -> Result<usize, EvalError> {
     let index = expect_exact_integer(name, value)?;
 
@@ -4911,6 +5392,14 @@ fn eq_values(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(&left.inner, &right.inner),
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(&left.inner, &right.inner),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Syntax(left), Value::Syntax(right)) => Rc::ptr_eq(left, right),
+        (Value::SyntaxList(left), Value::SyntaxList(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left_item, right_item)| Rc::ptr_eq(left_item, right_item))
+        }
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
         (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
@@ -4969,6 +5458,14 @@ fn equal_values_inner(
                     })
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Syntax(left), Value::Syntax(right)) => left.as_ref() == right.as_ref(),
+        (Value::SyntaxList(left), Value::SyntaxList(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left_item, right_item)| left_item.as_ref() == right_item.as_ref())
+        }
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,

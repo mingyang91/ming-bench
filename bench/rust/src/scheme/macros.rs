@@ -1,4 +1,4 @@
-use super::{number::Number, EnvRef, EvalError, Expr};
+use super::{number::Number, EnvRef, EvalError, Expr, Value};
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -8,10 +8,20 @@ pub(crate) type MacroEnv = HashMap<String, Rc<MacroDef>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MacroDef {
-    name: String,
-    literals: HashSet<String>,
-    rules: Vec<MacroRule>,
-    def_env: EnvRef,
+    pub(crate) name: String,
+    pub(crate) kind: MacroDefKind,
+    pub(crate) def_env: EnvRef,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum MacroDefKind {
+    SyntaxRules {
+        literals: HashSet<String>,
+        rules: Vec<MacroRule>,
+    },
+    Transformer {
+        procedure: Value,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -21,13 +31,13 @@ struct MacroRule {
 }
 
 #[derive(Debug, Clone)]
-enum PatternBinding {
+pub(crate) enum PatternBinding {
     Single(Expr),
     Repeated(Vec<Expr>),
 }
 
-#[derive(Debug, Clone)]
-enum SyntaxExpr {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SyntaxExpr {
     Number(Number),
     Boolean(bool),
     Char(char),
@@ -36,14 +46,14 @@ enum SyntaxExpr {
     List(Vec<SyntaxExpr>),
 }
 
-#[derive(Debug, Clone)]
-struct SyntaxSymbol {
-    name: String,
-    origin: SymbolOrigin,
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SyntaxSymbol {
+    pub(crate) name: String,
+    pub(crate) origin: SymbolOrigin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SymbolOrigin {
+pub(crate) enum SymbolOrigin {
     UseSite,
     Template,
 }
@@ -89,6 +99,16 @@ pub(crate) fn register_macro_definition(
     Ok(true)
 }
 
+pub(crate) fn transformer_macro(name: String, transformer: Value, def_env: EnvRef) -> MacroDef {
+    MacroDef {
+        name,
+        kind: MacroDefKind::Transformer {
+            procedure: transformer,
+        },
+        def_env,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MacroExpander {
     next_id: usize,
@@ -117,7 +137,7 @@ impl MacroExpander {
             }
 
             match name.as_str() {
-                "quote" => return Ok(Expr::List(items.to_vec())),
+                "quote" | "syntax" => return Ok(Expr::List(items.to_vec())),
                 "define" => return self.expand_define(items, macros),
                 "define-syntax" => return Ok(Expr::List(items.to_vec())),
                 "lambda" => return self.expand_lambda(items, macros),
@@ -138,25 +158,35 @@ impl MacroExpander {
         macro_def: &MacroDef,
         macros: &MacroEnv,
     ) -> Result<Expr, EvalError> {
-        for rule in &macro_def.rules {
-            if let Some(bindings) = match_pattern(
-                &rule.pattern,
-                invocation,
-                &PatternContext {
-                    macro_name: &macro_def.name,
-                    literals: &macro_def.literals,
-                },
-            ) {
-                let template =
-                    self.expand_template(&rule.template, &bindings, None, &macro_def.name)?;
+        match &macro_def.kind {
+            MacroDefKind::SyntaxRules { literals, rules } => {
+                for rule in rules {
+                    if let Some(bindings) = match_pattern(
+                        &rule.pattern,
+                        invocation,
+                        &PatternContext {
+                            macro_name: &macro_def.name,
+                            literals,
+                        },
+                    ) {
+                        let template =
+                            self.expand_template(&rule.template, &bindings, None, &macro_def.name)?;
+                        let hygienic =
+                            self.hygienize(template, macro_def, macros, &mut Vec::new())?;
+                        return self.expand_expr(&expr_from_syntax(hygienic), macros);
+                    }
+                }
+
+                Err(EvalError::NoMatchingSyntaxRule {
+                    name: macro_def.name.clone(),
+                })
+            }
+            MacroDefKind::Transformer { procedure } => {
+                let template = super::run_transformer_macro(invocation, procedure)?;
                 let hygienic = self.hygienize(template, macro_def, macros, &mut Vec::new())?;
-                return self.expand_expr(&expr_from_syntax(hygienic), macros);
+                self.expand_expr(&expr_from_syntax(hygienic), macros)
             }
         }
-
-        Err(EvalError::NoMatchingSyntaxRule {
-            name: macro_def.name.clone(),
-        })
     }
 
     fn expand_define(&mut self, items: &[Expr], macros: &MacroEnv) -> Result<Expr, EvalError> {
@@ -583,7 +613,11 @@ impl MacroExpander {
     }
 }
 
-fn parse_transformer(name: String, expr: &Expr, def_env: EnvRef) -> Result<MacroDef, EvalError> {
+pub(crate) fn parse_transformer(
+    name: String,
+    expr: &Expr,
+    def_env: EnvRef,
+) -> Result<MacroDef, EvalError> {
     let Expr::List(items) = expr else {
         return Err(EvalError::InvalidForm {
             name: "define-syntax",
@@ -613,8 +647,7 @@ fn parse_transformer(name: String, expr: &Expr, def_env: EnvRef) -> Result<Macro
 
     Ok(MacroDef {
         name,
-        literals,
-        rules,
+        kind: MacroDefKind::SyntaxRules { literals, rules },
         def_env,
     })
 }
@@ -683,6 +716,21 @@ fn match_pattern(
         (Expr::List(patterns), Expr::List(inputs)) => match_list_pattern(patterns, inputs, context),
         _ => None,
     }
+}
+
+pub(crate) fn match_syntax_pattern(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &HashSet<String>,
+) -> Option<HashMap<String, PatternBinding>> {
+    match_pattern(
+        pattern,
+        input,
+        &PatternContext {
+            macro_name: "",
+            literals,
+        },
+    )
 }
 
 fn match_list_pattern(
@@ -838,7 +886,7 @@ fn collect_repeated_bindings(
     }
 }
 
-fn syntax_from_use_expr(expr: &Expr) -> SyntaxExpr {
+pub(crate) fn syntax_from_use_expr(expr: &Expr) -> SyntaxExpr {
     match expr {
         Expr::Number(value) => SyntaxExpr::Number(value.clone()),
         Expr::Boolean(value) => SyntaxExpr::Boolean(*value),
@@ -852,7 +900,7 @@ fn syntax_from_use_expr(expr: &Expr) -> SyntaxExpr {
     }
 }
 
-fn expr_from_syntax(expr: SyntaxExpr) -> Expr {
+pub(crate) fn expr_from_syntax(expr: SyntaxExpr) -> Expr {
     match expr {
         SyntaxExpr::Number(value) => Expr::Number(value),
         SyntaxExpr::Boolean(value) => Expr::Boolean(value),
@@ -886,6 +934,9 @@ fn is_special_form_name(name: &str) -> bool {
             | "or"
             | "quote"
             | "set!"
+            | "syntax"
+            | "syntax-case"
             | "syntax-rules"
+            | "with-syntax"
     )
 }

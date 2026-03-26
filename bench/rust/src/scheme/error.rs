@@ -54,6 +54,9 @@ pub enum EvalError {
     #[error("macro did not match any syntax-rules clause: {name}")]
     NoMatchingSyntaxRule { name: String },
 
+    #[error("syntax-case did not match any clause")]
+    NoMatchingSyntaxCase,
+
     #[error("invalid macro template for {name}: {message}")]
     InvalidMacroTemplate { name: String, message: &'static str },
 
@@ -91,6 +94,12 @@ pub enum EvalError {
 
     #[error("{name} expected a symbol, got {found}")]
     ExpectedSymbol {
+        name: &'static str,
+        found: &'static str,
+    },
+
+    #[error("{name} expected syntax, got {found}")]
+    ExpectedSyntax {
         name: &'static str,
         found: &'static str,
     },
