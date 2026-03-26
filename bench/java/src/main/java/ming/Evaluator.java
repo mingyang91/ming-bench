@@ -155,6 +155,10 @@ public class Evaluator {
                 args -> typePredicate("pair?", args, value -> value instanceof PairValue)));
         env.define("symbol?", builtin("symbol?",
                 args -> typePredicate("symbol?", args, value -> value instanceof SymbolValue)));
+        env.define("procedure?", builtin("procedure?", args -> {
+            requireArity("procedure?", args.size(), 1);
+            return BoolValue.of(args.getFirst() instanceof ProcedureValue);
+        }));
         env.define("integer?", builtin("integer?",
                 args -> typePredicate("integer?", args, NumericSupport::isInteger)));
         env.define("rational?", builtin("rational?",
@@ -350,6 +354,7 @@ public class Evaluator {
                 case "if" -> evalIf(argExprs, env);
                 case "quote" -> evalQuote(argExprs);
                 case "lambda" -> evalLambda(argExprs, env);
+                case "case-lambda" -> evalCaseLambda(argExprs, env);
                 case "begin" -> evalBegin(argExprs, env);
                 case "let" -> evalLet(argExprs, env);
                 case "cond" -> evalCond(argExprs, env);
@@ -392,7 +397,8 @@ public class Evaluator {
 
             ParameterSpec parameters = parseParameterSpec(signature.subList(1, signature.size()));
             List<Expr> body = parseBody("define", argExprs.subList(1, argExprs.size()));
-            ProcedureValue procedure = new UserProcedure(nameExpr.name(), parameters, body, env);
+            ProcedureValue procedure = new UserProcedure(this, nameExpr.name(), parameters, body,
+                    env);
             env.define(nameExpr.name(), procedure);
             return VoidValue.INSTANCE;
         }
@@ -487,7 +493,19 @@ public class Evaluator {
 
         ParameterSpec parameters = parseLambdaParameterSpec(argExprs.getFirst());
         List<Expr> body = parseBody("lambda", argExprs.subList(1, argExprs.size()));
-        return new UserProcedure(null, parameters, body, env);
+        return new UserProcedure(this, null, parameters, body, env);
+    }
+
+    private Value evalCaseLambda(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.isEmpty()) {
+            throw new EvalError("case-lambda requires at least one clause");
+        }
+
+        List<ProcedureClause> clauses = new ArrayList<>(argExprs.size());
+        for (Expr clauseExpr : argExprs) {
+            clauses.add(parseCaseLambdaClause(clauseExpr));
+        }
+        return new CaseLambdaProcedure(this, clauses, env);
     }
 
     private Value evalBegin(List<Expr> argExprs, Environment env) throws EvalError {
@@ -541,7 +559,7 @@ public class Evaluator {
         }
 
         Environment letEnv = new Environment(env);
-        ProcedureValue procedure = new UserProcedure(name,
+        ProcedureValue procedure = new UserProcedure(this, name,
                 new ParameterSpec(parameterNames, null), body, letEnv);
         letEnv.define(name, procedure);
         return procedure.apply(arguments);
@@ -598,6 +616,20 @@ public class Evaluator {
             return new ParameterSpec(List.of(), symbolExpr.name());
         }
         throw new EvalError("lambda parameters must be a list or symbol");
+    }
+
+    private ProcedureClause parseCaseLambdaClause(Expr clauseExpr) throws EvalError {
+        if (!(clauseExpr instanceof ListExpr clauseList)) {
+            throw new EvalError("case-lambda clause must be a list");
+        }
+
+        List<Expr> parts = clauseList.elements();
+        if (parts.size() < 2) {
+            throw new EvalError("case-lambda clause requires parameters and a body");
+        }
+
+        return new ProcedureClause(parseLambdaParameterSpec(parts.getFirst()),
+                parseBody("case-lambda", parts.subList(1, parts.size())));
     }
 
     private ParameterSpec parseParameterSpec(List<Expr> params) throws EvalError {
@@ -778,6 +810,49 @@ public class Evaluator {
             result = eval(expr, env);
         }
         return result;
+    }
+
+    Value applyUserProcedure(String displayName, ParameterSpec parameters,
+                             List<Expr> body, Environment closureEnv, List<Value> args)
+            throws EvalError {
+        Environment callEnv = createCallEnv(displayName, parameters, closureEnv, args);
+        return evalSequence(body, callEnv);
+    }
+
+    private Environment createCallEnv(String displayName, ParameterSpec parameters,
+                                      Environment closureEnv, List<Value> args) throws EvalError {
+        validateArity(displayName, parameters, args.size());
+
+        int requiredCount = parameters.requiredParameters().size();
+        Environment callEnv = new Environment(closureEnv);
+        for (int index = 0; index < requiredCount; index++) {
+            callEnv.define(parameters.requiredParameters().get(index), args.get(index));
+        }
+        if (parameters.restParameter() != null) {
+            callEnv.define(parameters.restParameter(), makeList(args.subList(requiredCount,
+                    args.size())));
+        }
+        return callEnv;
+    }
+
+    private void validateArity(String displayName, ParameterSpec parameters, int actual)
+            throws EvalError {
+        int requiredCount = parameters.requiredParameters().size();
+        if (parameters.restParameter() == null) {
+            requireArity(displayName, actual, requiredCount);
+            return;
+        }
+        if (actual < requiredCount) {
+            requireAtLeast(displayName, actual, requiredCount);
+        }
+    }
+
+    boolean matchesArity(ParameterSpec parameters, int actual) {
+        int requiredCount = parameters.requiredParameters().size();
+        if (parameters.restParameter() == null) {
+            return actual == requiredCount;
+        }
+        return actual >= requiredCount;
     }
 
     private String freshSyntheticName(String kind, String base) {
@@ -1403,62 +1478,4 @@ public class Evaluator {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
     }
 
-    private final class BuiltinProcedure extends ProcedureValue {
-        private final String name;
-        private final BuiltinAction action;
-
-        private BuiltinProcedure(String name, BuiltinAction action) {
-            this.name = name;
-            this.action = action;
-        }
-
-        @Override
-        Value apply(List<Value> args) throws EvalError {
-            return action.apply(args);
-        }
-
-        @Override
-        public String render() {
-            return "#<procedure:" + name + ">";
-        }
-    }
-
-    private final class UserProcedure extends ProcedureValue {
-        private final String name;
-        private final ParameterSpec parameters;
-        private final List<Expr> body;
-        private final Environment closureEnv;
-
-        private UserProcedure(String name, ParameterSpec parameters,
-                              List<Expr> body, Environment closureEnv) {
-            this.name = name;
-            this.parameters = parameters;
-            this.body = List.copyOf(body);
-            this.closureEnv = closureEnv;
-        }
-
-        @Override
-        Value apply(List<Value> args) throws EvalError {
-            int requiredCount = parameters.requiredParameters().size();
-            if (parameters.restParameter() == null) {
-                requireArity(displayName(), args.size(), requiredCount);
-            } else if (args.size() < requiredCount) {
-                requireAtLeast(displayName(), args.size(), requiredCount);
-            }
-
-            Environment callEnv = new Environment(closureEnv);
-            for (int index = 0; index < requiredCount; index++) {
-                callEnv.define(parameters.requiredParameters().get(index), args.get(index));
-            }
-            if (parameters.restParameter() != null) {
-                callEnv.define(parameters.restParameter(), makeList(args.subList(requiredCount,
-                        args.size())));
-            }
-            return evalSequence(body, callEnv);
-        }
-
-        private String displayName() {
-            return name == null ? "lambda" : name;
-        }
-    }
 }

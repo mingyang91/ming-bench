@@ -60,14 +60,35 @@ impl Interpreter {
         env.define("list", builtin_value("list", Self::builtin_list));
         env.define("length", builtin_value("length", Self::builtin_length));
         env.define("append", builtin_value("append", Self::builtin_append));
-        env.define("string?", builtin_value("string?", Self::builtin_string_predicate));
-        env.define("number?", builtin_value("number?", Self::builtin_number_predicate));
+        env.define("apply", builtin_value("apply", Self::builtin_apply));
+        env.define(
+            "equal?",
+            builtin_value("equal?", Self::builtin_equal_predicate),
+        );
+        env.define(
+            "string?",
+            builtin_value("string?", Self::builtin_string_predicate),
+        );
+        env.define(
+            "number?",
+            builtin_value("number?", Self::builtin_number_predicate),
+        );
         env.define(
             "boolean?",
             builtin_value("boolean?", Self::builtin_boolean_predicate),
         );
-        env.define("pair?", builtin_value("pair?", Self::builtin_pair_predicate));
-        env.define("symbol?", builtin_value("symbol?", Self::builtin_symbol_predicate));
+        env.define(
+            "pair?",
+            builtin_value("pair?", Self::builtin_pair_predicate),
+        );
+        env.define(
+            "symbol?",
+            builtin_value("symbol?", Self::builtin_symbol_predicate),
+        );
+        env.define(
+            "procedure?",
+            builtin_value("procedure?", Self::builtin_procedure_predicate),
+        );
         env.define("display", builtin_value("display", Self::builtin_display));
         env.define("write", builtin_value("write", Self::builtin_write));
         env.define("newline", builtin_value("newline", Self::builtin_newline));
@@ -79,7 +100,10 @@ impl Interpreter {
             "string-length",
             builtin_value("string-length", Self::builtin_string_length),
         );
-        env.define("substring", builtin_value("substring", Self::builtin_substring));
+        env.define(
+            "substring",
+            builtin_value("substring", Self::builtin_substring),
+        );
         env.define(
             "string->number",
             builtin_value("string->number", Self::builtin_string_to_number),
@@ -96,10 +120,22 @@ impl Interpreter {
             "string->symbol",
             builtin_value("string->symbol", Self::builtin_string_to_symbol),
         );
-        env.define("string-ref", builtin_value("string-ref", Self::builtin_string_ref));
-        env.define("char?", builtin_value("char?", Self::builtin_char_predicate));
-        env.define("string-copy", builtin_value("string-copy", Self::builtin_string_copy));
-        env.define("string-set!", builtin_value("string-set!", Self::builtin_string_set));
+        env.define(
+            "string-ref",
+            builtin_value("string-ref", Self::builtin_string_ref),
+        );
+        env.define(
+            "char?",
+            builtin_value("char?", Self::builtin_char_predicate),
+        );
+        env.define(
+            "string-copy",
+            builtin_value("string-copy", Self::builtin_string_copy),
+        );
+        env.define(
+            "string-set!",
+            builtin_value("string-set!", Self::builtin_string_set),
+        );
 
         env
     }
@@ -161,6 +197,7 @@ impl Interpreter {
                 "if" => self.eval_if(arg_exprs, env),
                 "quote" => self.eval_quote(arg_exprs),
                 "lambda" => self.eval_lambda(arg_exprs, env),
+                "case-lambda" => self.eval_case_lambda(arg_exprs, env),
                 "begin" => self.eval_begin(arg_exprs, env),
                 "let" => self.eval_let(arg_exprs, env),
                 "cond" => self.eval_cond(arg_exprs, env),
@@ -179,7 +216,11 @@ impl Interpreter {
         self.apply_procedure(procedure, arguments)
     }
 
-    fn eval_define(&mut self, arg_exprs: &[Expr], env: Rc<Environment>) -> Result<Value, EvalError> {
+    fn eval_define(
+        &mut self,
+        arg_exprs: &[Expr],
+        env: Rc<Environment>,
+    ) -> Result<Value, EvalError> {
         if arg_exprs.len() < 2 {
             return Err(EvalError::new("define requires a name and a value"));
         }
@@ -199,11 +240,11 @@ impl Interpreter {
                     return Err(EvalError::new("function name must be a symbol"));
                 };
 
-                let parameter_names = Self::parse_parameter_names(parameter_exprs)?;
+                let parameters = Self::parse_parameter_spec(parameter_exprs)?;
                 let body = Self::parse_body("define", &arg_exprs[1..])?;
                 let procedure = Value::Procedure(Rc::new(Procedure::User(UserProcedure {
                     name: Some(name.clone()),
-                    parameter_names,
+                    parameters,
                     body,
                     closure_env: env.clone(),
                 })));
@@ -238,26 +279,51 @@ impl Interpreter {
             return Err(EvalError::new("lambda requires parameters and a body"));
         }
 
-        let Expr::List { elements, .. } = &arg_exprs[0] else {
-            return Err(EvalError::new("lambda parameters must be a list"));
-        };
-
-        let parameter_names = Self::parse_parameter_names(elements)?;
+        let parameters = Self::parse_lambda_parameters(&arg_exprs[0])?;
         let body = Self::parse_body("lambda", &arg_exprs[1..])?;
 
         Ok(Value::Procedure(Rc::new(Procedure::User(UserProcedure {
             name: None,
-            parameter_names,
+            parameters,
             body,
             closure_env: env,
         }))))
     }
 
-    fn eval_begin(
+    fn eval_case_lambda(
         &mut self,
         arg_exprs: &[Expr],
         env: Rc<Environment>,
     ) -> Result<Value, EvalError> {
+        if arg_exprs.is_empty() {
+            return Err(EvalError::new("case-lambda requires at least one clause"));
+        }
+
+        let mut clauses = Vec::with_capacity(arg_exprs.len());
+        for clause_expr in arg_exprs {
+            let Expr::List { elements, .. } = clause_expr else {
+                return Err(EvalError::new("case-lambda clause must be a list"));
+            };
+            let Some((parameters_expr, body_exprs)) = elements.split_first() else {
+                return Err(EvalError::new(
+                    "case-lambda clause requires parameters and a body",
+                ));
+            };
+
+            let parameters = Self::parse_lambda_parameters(parameters_expr)?;
+            let body = Self::parse_body("case-lambda", body_exprs)?;
+            clauses.push(CaseLambdaClause { parameters, body });
+        }
+
+        Ok(Value::Procedure(Rc::new(Procedure::CaseLambda(
+            CaseLambdaProcedure {
+                clauses,
+                closure_env: env,
+            },
+        ))))
+    }
+
+    fn eval_begin(&mut self, arg_exprs: &[Expr], env: Rc<Environment>) -> Result<Value, EvalError> {
         self.eval_sequence(arg_exprs, env)
     }
 
@@ -321,7 +387,10 @@ impl Interpreter {
         let let_env = Environment::new(Some(env));
         let procedure = Value::Procedure(Rc::new(Procedure::User(UserProcedure {
             name: Some(name.to_owned()),
-            parameter_names,
+            parameters: ParameterSpec {
+                required_names: parameter_names,
+                rest_name: None,
+            },
             body: body.to_vec(),
             closure_env: let_env.clone(),
         })));
@@ -332,7 +401,10 @@ impl Interpreter {
 
     fn eval_cond(&mut self, arg_exprs: &[Expr], env: Rc<Environment>) -> Result<Value, EvalError> {
         for (index, clause_expr) in arg_exprs.iter().enumerate() {
-            let Expr::List { elements: clause, .. } = clause_expr else {
+            let Expr::List {
+                elements: clause, ..
+            } = clause_expr
+            else {
                 return Err(EvalError::new("cond clause must be a list"));
             };
             let Some((test_expr, body)) = clause.split_first() else {
@@ -367,22 +439,62 @@ impl Interpreter {
         if body.is_empty() {
             return match default_value {
                 Some(value) => Ok(value),
-                None => Err(EvalError::new(format!("{form_name} clause requires a body"))),
+                None => Err(EvalError::new(format!(
+                    "{form_name} clause requires a body"
+                ))),
             };
         }
 
         self.eval_sequence(body, env)
     }
 
-    fn parse_parameter_names(params: &[Expr]) -> Result<Vec<String>, EvalError> {
-        let mut parameter_names = Vec::with_capacity(params.len());
-        for param in params {
-            let Expr::Symbol { name, .. } = param else {
-                return Err(EvalError::new("parameter must be a symbol"));
-            };
-            parameter_names.push(name.clone());
+    fn parse_lambda_parameters(params_expr: &Expr) -> Result<ParameterSpec, EvalError> {
+        match params_expr {
+            Expr::List { elements, .. } => Self::parse_parameter_spec(elements),
+            Expr::Symbol { name, .. } if name != "." => Ok(ParameterSpec {
+                required_names: Vec::new(),
+                rest_name: Some(name.clone()),
+            }),
+            Expr::Symbol { .. } => Err(EvalError::new("invalid parameter list")),
+            _ => Err(EvalError::new("lambda parameters must be a list or symbol")),
         }
-        Ok(parameter_names)
+    }
+
+    fn parse_parameter_spec(params: &[Expr]) -> Result<ParameterSpec, EvalError> {
+        let mut required_names = Vec::with_capacity(params.len());
+        let mut rest_name = None;
+        let mut index = 0;
+
+        while index < params.len() {
+            match &params[index] {
+                Expr::Symbol { name, .. } if name == "." => {
+                    if rest_name.is_some() || index != params.len().saturating_sub(2) || index == 0
+                    {
+                        return Err(EvalError::new("invalid parameter list"));
+                    }
+
+                    let Expr::Symbol { name, .. } = &params[index + 1] else {
+                        return Err(EvalError::new("rest parameter must be a symbol"));
+                    };
+                    if name == "." {
+                        return Err(EvalError::new("rest parameter must be a symbol"));
+                    }
+
+                    rest_name = Some(name.clone());
+                    index += 2;
+                }
+                Expr::Symbol { name, .. } => {
+                    required_names.push(name.clone());
+                    index += 1;
+                }
+                _ => return Err(EvalError::new("parameter must be a symbol")),
+            }
+        }
+
+        Ok(ParameterSpec {
+            required_names,
+            rest_name,
+        })
     }
 
     fn parse_bindings(binding_exprs: &[Expr]) -> Result<Vec<LetBinding>, EvalError> {
@@ -416,12 +528,29 @@ impl Interpreter {
         Ok(body.to_vec())
     }
 
-    fn eval_args(&mut self, arg_exprs: &[Expr], env: Rc<Environment>) -> Result<Vec<Value>, EvalError> {
+    fn eval_args(
+        &mut self,
+        arg_exprs: &[Expr],
+        env: Rc<Environment>,
+    ) -> Result<Vec<Value>, EvalError> {
         let mut values = Vec::with_capacity(arg_exprs.len());
         for arg_expr in arg_exprs {
             values.push(self.eval(arg_expr, env.clone())?);
         }
         Ok(values)
+    }
+
+    fn bind_parameters(call_env: &Rc<Environment>, parameters: &ParameterSpec, args: &[Value]) {
+        for (parameter_name, value) in parameters.required_names.iter().zip(args.iter()) {
+            call_env.define(parameter_name.clone(), value.clone());
+        }
+
+        if let Some(rest_name) = &parameters.rest_name {
+            call_env.define(
+                rest_name.clone(),
+                Self::make_list(&args[parameters.required_names.len()..]),
+            );
+        }
     }
 
     fn eval_and(&mut self, arg_exprs: &[Expr], env: Rc<Environment>) -> Result<Value, EvalError> {
@@ -517,10 +646,7 @@ impl Interpreter {
         )?))
     }
 
-    fn builtin_greater(
-        _interpreter: &mut Interpreter,
-        args: &[Value],
-    ) -> Result<Value, EvalError> {
+    fn builtin_greater(_interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
         Ok(Value::Bool(Self::compare_increasing(
             args,
             Comparison::StrictlyGreater,
@@ -528,7 +654,10 @@ impl Interpreter {
     }
 
     fn builtin_equal(_interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
-        Ok(Value::Bool(Self::compare_increasing(args, Comparison::Equal)?))
+        Ok(Value::Bool(Self::compare_increasing(
+            args,
+            Comparison::Equal,
+        )?))
     }
 
     fn builtin_less_equal(
@@ -573,19 +702,30 @@ impl Interpreter {
         Ok(Self::make_list(args))
     }
 
-    fn builtin_length(
-        _interpreter: &mut Interpreter,
-        args: &[Value],
-    ) -> Result<Value, EvalError> {
+    fn builtin_length(_interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
         Self::require_arity("length", args.len(), 1)?;
         Ok(Value::Int(Self::length_of_list(&args[0])? as i64))
     }
 
-    fn builtin_append(
+    fn builtin_append(_interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+        Self::append_lists(args)
+    }
+
+    fn builtin_apply(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
+        Self::require_at_least("apply", args.len(), 2)?;
+
+        let mut expanded_args = Vec::new();
+        expanded_args.extend(args[1..args.len() - 1].iter().cloned());
+        expanded_args.extend(Self::list_elements(&args[args.len() - 1])?);
+        interpreter.apply_procedure(args[0].clone(), expanded_args)
+    }
+
+    fn builtin_equal_predicate(
         _interpreter: &mut Interpreter,
         args: &[Value],
     ) -> Result<Value, EvalError> {
-        Self::append_lists(args)
+        Self::require_arity("equal?", args.len(), 2)?;
+        Ok(Value::Bool(Self::equal_values(&args[0], &args[1])))
     }
 
     fn builtin_string_predicate(
@@ -623,10 +763,16 @@ impl Interpreter {
         Self::type_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
     }
 
-    fn builtin_display(
-        interpreter: &mut Interpreter,
+    fn builtin_procedure_predicate(
+        _interpreter: &mut Interpreter,
         args: &[Value],
     ) -> Result<Value, EvalError> {
+        Self::type_predicate("procedure?", args, |value| {
+            matches!(value, Value::Procedure(_))
+        })
+    }
+
+    fn builtin_display(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
         Self::require_arity("display", args.len(), 1)?;
         interpreter.append_output(&Self::render_for_display(&args[0]));
         Ok(Value::Void)
@@ -638,10 +784,7 @@ impl Interpreter {
         Ok(Value::Void)
     }
 
-    fn builtin_newline(
-        interpreter: &mut Interpreter,
-        args: &[Value],
-    ) -> Result<Value, EvalError> {
+    fn builtin_newline(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
         Self::require_arity("newline", args.len(), 0)?;
         interpreter.append_output("\n");
         Ok(Value::Void)
@@ -651,7 +794,9 @@ impl Interpreter {
         _interpreter: &mut Interpreter,
         args: &[Value],
     ) -> Result<Value, EvalError> {
-        Ok(Value::String(SchemeString::new_owned(Self::string_append(args)?)))
+        Ok(Value::String(SchemeString::new_owned(Self::string_append(
+            args,
+        )?)))
     }
 
     fn builtin_string_length(
@@ -716,7 +861,9 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, EvalError> {
         Self::require_arity("string->symbol", args.len(), 1)?;
-        Ok(Value::Symbol(Self::expect_string(&args[0])?.as_plain_string()))
+        Ok(Value::Symbol(
+            Self::expect_string(&args[0])?.as_plain_string(),
+        ))
     }
 
     fn builtin_string_ref(
@@ -831,7 +978,9 @@ impl Interpreter {
     fn expect_index(value: &Value, operation_name: &str) -> Result<usize, EvalError> {
         let index = Self::expect_int(value)?;
         if index < 0 {
-            return Err(EvalError::new(format!("{operation_name} index out of range")));
+            return Err(EvalError::new(format!(
+                "{operation_name} index out of range"
+            )));
         }
         Ok(index as usize)
     }
@@ -922,6 +1071,25 @@ impl Interpreter {
         Ok(result)
     }
 
+    fn equal_values(left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::Int(left), Value::Int(right)) => left == right,
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::String(left), Value::String(right)) => {
+                left.as_plain_string() == right.as_plain_string()
+            }
+            (Value::Char(left), Value::Char(right)) => left == right,
+            (Value::Symbol(left), Value::Symbol(right)) => left == right,
+            (Value::EmptyList, Value::EmptyList) => true,
+            (Value::Pair(left), Value::Pair(right)) => {
+                Self::equal_values(&left.car, &right.car)
+                    && Self::equal_values(&left.cdr, &right.cdr)
+            }
+            (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
     fn make_list(args: &[Value]) -> Value {
         let mut result = Value::EmptyList;
         for arg in args.iter().rev() {
@@ -968,12 +1136,30 @@ impl Interpreter {
 
 #[derive(Clone)]
 enum Expr {
-    Int { value: i64, position: SourcePos },
-    Bool { value: bool, position: SourcePos },
-    String { value: String, position: SourcePos },
-    Char { value: char, position: SourcePos },
-    Symbol { name: String, position: SourcePos },
-    List { elements: Vec<Expr>, position: SourcePos },
+    Int {
+        value: i64,
+        position: SourcePos,
+    },
+    Bool {
+        value: bool,
+        position: SourcePos,
+    },
+    String {
+        value: String,
+        position: SourcePos,
+    },
+    Char {
+        value: char,
+        position: SourcePos,
+    },
+    Symbol {
+        name: String,
+        position: SourcePos,
+    },
+    List {
+        elements: Vec<Expr>,
+        position: SourcePos,
+    },
 }
 
 impl Expr {
@@ -993,6 +1179,22 @@ impl Expr {
 struct LetBinding {
     name: String,
     value_expr: Expr,
+}
+
+#[derive(Clone)]
+struct ParameterSpec {
+    required_names: Vec<String>,
+    rest_name: Option<String>,
+}
+
+impl ParameterSpec {
+    fn matches_arity(&self, actual: usize) -> bool {
+        if self.rest_name.is_some() {
+            actual >= self.required_names.len()
+        } else {
+            actual == self.required_names.len()
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -1094,6 +1296,7 @@ type BuiltinAction = fn(&mut Interpreter, &[Value]) -> Result<Value, EvalError>;
 enum Procedure {
     Builtin(BuiltinProcedure),
     User(UserProcedure),
+    CaseLambda(CaseLambdaProcedure),
 }
 
 impl Procedure {
@@ -1101,13 +1304,14 @@ impl Procedure {
         match self {
             Procedure::Builtin(procedure) => (procedure.action)(interpreter, &args),
             Procedure::User(procedure) => procedure.apply(interpreter, args),
+            Procedure::CaseLambda(procedure) => procedure.apply(interpreter, args),
         }
     }
 
     fn render(&self) -> String {
         match self {
             Procedure::Builtin(procedure) => format!("#<procedure:{}>", procedure.name),
-            Procedure::User(_) => "#<procedure>".to_owned(),
+            Procedure::User(_) | Procedure::CaseLambda(_) => "#<procedure>".to_owned(),
         }
     }
 }
@@ -1121,25 +1325,66 @@ struct BuiltinProcedure {
 #[derive(Clone)]
 struct UserProcedure {
     name: Option<String>,
-    parameter_names: Vec<String>,
+    parameters: ParameterSpec,
     body: Vec<Expr>,
     closure_env: Rc<Environment>,
 }
 
 impl UserProcedure {
     fn apply(&self, interpreter: &mut Interpreter, args: Vec<Value>) -> Result<Value, EvalError> {
-        Interpreter::require_arity(self.display_name(), args.len(), self.parameter_names.len())?;
+        if self.parameters.rest_name.is_some() {
+            Interpreter::require_at_least(
+                self.display_name(),
+                args.len(),
+                self.parameters.required_names.len(),
+            )?;
+        } else {
+            Interpreter::require_arity(
+                self.display_name(),
+                args.len(),
+                self.parameters.required_names.len(),
+            )?;
+        }
 
         let call_env = Environment::new(Some(self.closure_env.clone()));
-        for (parameter_name, value) in self.parameter_names.iter().zip(args) {
-            call_env.define(parameter_name.clone(), value);
-        }
+        Interpreter::bind_parameters(&call_env, &self.parameters, &args);
 
         interpreter.eval_sequence(&self.body, call_env)
     }
 
     fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or("lambda")
+    }
+}
+
+#[derive(Clone)]
+struct CaseLambdaClause {
+    parameters: ParameterSpec,
+    body: Vec<Expr>,
+}
+
+#[derive(Clone)]
+struct CaseLambdaProcedure {
+    clauses: Vec<CaseLambdaClause>,
+    closure_env: Rc<Environment>,
+}
+
+impl CaseLambdaProcedure {
+    fn apply(&self, interpreter: &mut Interpreter, args: Vec<Value>) -> Result<Value, EvalError> {
+        for clause in &self.clauses {
+            if !clause.parameters.matches_arity(args.len()) {
+                continue;
+            }
+
+            let call_env = Environment::new(Some(self.closure_env.clone()));
+            Interpreter::bind_parameters(&call_env, &clause.parameters, &args);
+            return interpreter.eval_sequence(&clause.body, call_env);
+        }
+
+        Err(EvalError::new(format!(
+            "wrong number of arguments for case-lambda: got {}",
+            args.len()
+        )))
     }
 }
 
@@ -1200,7 +1445,10 @@ impl Comparison {
 }
 
 fn builtin_value(name: &'static str, action: BuiltinAction) -> Value {
-    Value::Procedure(Rc::new(Procedure::Builtin(BuiltinProcedure { name, action })))
+    Value::Procedure(Rc::new(Procedure::Builtin(BuiltinProcedure {
+        name,
+        action,
+    })))
 }
 
 fn append_list_contents(builder: &mut String, value: &Value) {
