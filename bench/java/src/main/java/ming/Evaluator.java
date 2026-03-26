@@ -1,10 +1,8 @@
 package ming;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 
 /**
  * Scheme interpreter entry point.
@@ -13,6 +11,7 @@ import java.util.Map;
 public class Evaluator {
     private final Environment globalEnv;
     private StringBuilder activeOutput;
+    private long syntheticCounter;
 
     public Evaluator() {
         globalEnv = createGlobalEnv();
@@ -329,6 +328,7 @@ public class Evaluator {
         if (head instanceof SymbolExpr symbolExpr) {
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(argExprs, env);
+                case "define-syntax" -> evalDefineSyntax(argExprs, env);
                 case "set!" -> evalSet(argExprs, env);
                 case "if" -> evalIf(argExprs, env);
                 case "quote" -> evalQuote(argExprs);
@@ -338,7 +338,13 @@ public class Evaluator {
                 case "cond" -> evalCond(argExprs, env);
                 case "and" -> evalAnd(argExprs, env);
                 case "or" -> evalOr(argExprs, env);
-                default -> applyProcedure(eval(head, env), evalArgs(argExprs, env));
+                default -> {
+                    MacroBinding macro = env.lookupSyntax(symbolExpr.name());
+                    if (macro != null) {
+                        yield eval(macro.expand(listExpr), env);
+                    }
+                    yield applyProcedure(eval(head, env), evalArgs(argExprs, env));
+                }
             };
         }
 
@@ -400,6 +406,19 @@ public class Evaluator {
     private Value evalQuote(List<Expr> argExprs) throws EvalError {
         requireArity("quote", argExprs.size(), 1);
         return quoteToValue(argExprs.getFirst());
+    }
+
+    private Value evalDefineSyntax(List<Expr> argExprs, Environment env) throws EvalError {
+        requireArity("define-syntax", argExprs.size(), 2);
+
+        if (!(argExprs.getFirst() instanceof SymbolExpr nameExpr)) {
+            throw new EvalError("define-syntax name must be a symbol");
+        }
+
+        env.defineSyntax(nameExpr.name(),
+                SyntaxRulesMacro.compile(nameExpr.name(), argExprs.get(1), env,
+                        this::freshSyntheticName));
+        return VoidValue.INSTANCE;
     }
 
     private Value evalLambda(List<Expr> argExprs, Environment env) throws EvalError {
@@ -617,6 +636,11 @@ public class Evaluator {
         return result;
     }
 
+    private String freshSyntheticName(String kind, String base) {
+        syntheticCounter++;
+        return "__ming$" + kind + "$" + syntheticCounter + "$" + base;
+    }
+
     private Value applyProcedure(Value procedureValue, List<Value> argumentValues)
             throws EvalError {
         if (!(procedureValue instanceof ProcedureValue procedure)) {
@@ -759,7 +783,7 @@ public class Evaluator {
 
     private boolean compareIncreasing(List<Value> args, Comparison comparison)
             throws EvalError {
-        requireAtLeast(comparison.symbol, args.size(), 2);
+        requireAtLeast(comparison.symbol(), args.size(), 2);
 
         int previous = expectInt(args.getFirst());
         for (int index = 1; index < args.size(); index++) {
@@ -1085,139 +1109,6 @@ public class Evaluator {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
     }
 
-    private interface Value {
-        String render();
-    }
-
-    private record IntValue(int value) implements Value {
-        @Override
-        public String render() {
-            return Integer.toString(value);
-        }
-    }
-
-    private record BoolValue(boolean value) implements Value {
-        private static final BoolValue TRUE = new BoolValue(true);
-        private static final BoolValue FALSE = new BoolValue(false);
-
-        private static BoolValue of(boolean value) {
-            return value ? TRUE : FALSE;
-        }
-
-        @Override
-        public String render() {
-            return value ? "#t" : "#f";
-        }
-    }
-
-    private static final class StringValue implements Value {
-        private final StringBuilder value;
-        private final boolean mutable;
-
-        private StringValue(String value) {
-            this(value, false);
-        }
-
-        private StringValue(String value, boolean mutable) {
-            this.value = new StringBuilder(value);
-            this.mutable = mutable;
-        }
-
-        private String value() {
-            return value.toString();
-        }
-
-        private int length() {
-            return value.length();
-        }
-
-        private char charAt(int index) {
-            return value.charAt(index);
-        }
-
-        private void setCharAt(int index, char ch) throws EvalError {
-            if (!mutable) {
-                throw new EvalError("string is immutable");
-            }
-            value.setCharAt(index, ch);
-        }
-
-        private StringValue copy(boolean mutable) {
-            return new StringValue(value(), mutable);
-        }
-
-        @Override
-        public String render() {
-            return "\"" + escapeString(value()) + "\"";
-        }
-    }
-
-    private record CharValue(char value) implements Value {
-        @Override
-        public String render() {
-            return switch (value) {
-                case ' ' -> "#\\space";
-                case '\n' -> "#\\newline";
-                default -> "#\\" + value;
-            };
-        }
-    }
-
-    private record SymbolValue(String name) implements Value {
-        @Override
-        public String render() {
-            return name;
-        }
-    }
-
-    private record PairValue(Value car, Value cdr) implements Value {
-        @Override
-        public String render() {
-            StringBuilder builder = new StringBuilder();
-            builder.append('(');
-            appendListContents(builder, this);
-            builder.append(')');
-            return builder.toString();
-        }
-    }
-
-    private enum EmptyListValue implements Value {
-        INSTANCE;
-
-        @Override
-        public String render() {
-            return "()";
-        }
-    }
-
-    private enum VoidValue implements Value {
-        INSTANCE;
-
-        @Override
-        public String render() {
-            return "#<void>";
-        }
-    }
-
-    private abstract class ProcedureValue implements Value {
-        @Override
-        public String render() {
-            return "#<procedure>";
-        }
-
-        abstract Value apply(List<Value> args) throws EvalError;
-    }
-
-    @FunctionalInterface
-    private interface BuiltinAction {
-        Value apply(List<Value> args) throws EvalError;
-    }
-
-    @FunctionalInterface
-    private interface ValuePredicate {
-        boolean matches(Value value);
-    }
-
     private final class BuiltinProcedure extends ProcedureValue {
         private final String name;
         private final BuiltinAction action;
@@ -1276,159 +1167,4 @@ public class Evaluator {
             return name == null ? "lambda" : name;
         }
     }
-
-    private static final class Environment {
-        private final Environment parent;
-        private final Map<String, Cell> bindings = new HashMap<>();
-
-        private Environment(Environment parent) {
-            this.parent = parent;
-        }
-
-        private void define(String name, Value value) {
-            bindings.put(name, new Cell(value));
-        }
-
-        private Value lookup(String name) throws EvalError {
-            return lookupCell(name).value();
-        }
-
-        private void set(String name, Value value) throws EvalError {
-            lookupCell(name).set(value);
-        }
-
-        private Cell lookupCell(String name) throws EvalError {
-            Cell binding = bindings.get(name);
-            if (binding != null) {
-                return binding;
-            }
-            if (parent != null) {
-                return parent.lookupCell(name);
-            }
-            throw new EvalError("unbound variable: " + name);
-        }
-    }
-
-    private static final class Cell {
-        private Value value;
-
-        private Cell(Value value) {
-            this.value = value;
-        }
-
-        private Value value() {
-            return value;
-        }
-
-        private void set(Value value) {
-            this.value = value;
-        }
-    }
-
-    private enum Comparison {
-        STRICTLY_LESS("<") {
-            @Override
-            boolean matches(int left, int right) {
-                return left < right;
-            }
-        },
-        STRICTLY_GREATER(">") {
-            @Override
-            boolean matches(int left, int right) {
-                return left > right;
-            }
-        },
-        EQUAL("=") {
-            @Override
-            boolean matches(int left, int right) {
-                return left == right;
-            }
-        },
-        LESS_OR_EQUAL("<=") {
-            @Override
-            boolean matches(int left, int right) {
-                return left <= right;
-            }
-        };
-
-        private final String symbol;
-
-        Comparison(String symbol) {
-            this.symbol = symbol;
-        }
-
-        abstract boolean matches(int left, int right);
-    }
-
-    private enum CharComparison {
-        EQUAL {
-            @Override
-            boolean matches(char left, char right) {
-                return left == right;
-            }
-        },
-        LESS {
-            @Override
-            boolean matches(char left, char right) {
-                return left < right;
-            }
-        };
-
-        abstract boolean matches(char left, char right);
-    }
-
-    private enum StringComparison {
-        EQUAL {
-            @Override
-            boolean matches(String left, String right) {
-                return left.equals(right);
-            }
-        },
-        LESS {
-            @Override
-            boolean matches(String left, String right) {
-                return left.compareTo(right) < 0;
-            }
-        };
-
-        abstract boolean matches(String left, String right);
-    }
-
-    private static void appendListContents(StringBuilder builder, Value value) {
-        Value current = value;
-        boolean first = true;
-
-        while (current instanceof PairValue pairValue) {
-            if (!first) {
-                builder.append(' ');
-            }
-            builder.append(pairValue.car().render());
-            current = pairValue.cdr();
-            first = false;
-        }
-
-        if (!(current instanceof EmptyListValue)) {
-            if (!first) {
-                builder.append(" . ");
-            }
-            builder.append(current.render());
-        }
-    }
-
-    private static String escapeString(String value) {
-        StringBuilder builder = new StringBuilder(value.length());
-        for (int index = 0; index < value.length(); index++) {
-            char ch = value.charAt(index);
-            switch (ch) {
-                case '\\' -> builder.append("\\\\");
-                case '"' -> builder.append("\\\"");
-                case '\n' -> builder.append("\\n");
-                case '\t' -> builder.append("\\t");
-                case '\r' -> builder.append("\\r");
-                default -> builder.append(ch);
-            }
-        }
-        return builder.toString();
-    }
-
 }
