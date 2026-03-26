@@ -99,8 +99,9 @@ type bindingCell struct {
 type env struct {
 	parent   *env
 	runtime  *runtimeState
+	syntaxDefEnv *env
 	bindings map[string]*bindingCell
-	macros   map[string]*syntaxMacro
+	macros   map[string]macroExpander
 }
 
 type builtinFunc func(args []any) (any, error)
@@ -139,6 +140,7 @@ type closure struct {
 	hasRest   bool
 	body      []any
 	env       *env
+	syntaxDefEnv *env
 }
 
 type caseClosure struct {
@@ -147,14 +149,17 @@ type caseClosure struct {
 
 func newEnv(parent *env) *env {
 	runtime := &runtimeState{}
+	var syntaxDefEnv *env
 	if parent != nil {
 		runtime = parent.runtime
+		syntaxDefEnv = parent.syntaxDefEnv
 	}
 	return &env{
-		parent:   parent,
-		runtime:  runtime,
-		bindings: map[string]*bindingCell{},
-		macros:   map[string]*syntaxMacro{},
+		parent:       parent,
+		runtime:      runtime,
+		syntaxDefEnv: syntaxDefEnv,
+		bindings:     map[string]*bindingCell{},
+		macros:       map[string]macroExpander{},
 	}
 }
 
@@ -227,19 +232,19 @@ func (e *env) setSymbol(symbol symbolExpr, value any) bool {
 	return e.setByKey(symbol.bindingKey(), value)
 }
 
-func (e *env) defineMacro(name string, macro *syntaxMacro) {
+func (e *env) defineMacro(name string, macro macroExpander) {
 	e.defineMacroKey(name, macro)
 }
 
-func (e *env) defineMacroKey(key string, macro *syntaxMacro) {
+func (e *env) defineMacroKey(key string, macro macroExpander) {
 	e.macros[key] = macro
 }
 
-func (e *env) lookupMacro(name string) (*syntaxMacro, bool) {
+func (e *env) lookupMacro(name string) (macroExpander, bool) {
 	return e.lookupMacroByKey(name)
 }
 
-func (e *env) lookupMacroByKey(key string) (*syntaxMacro, bool) {
+func (e *env) lookupMacroByKey(key string) (macroExpander, bool) {
 	for scope := e; scope != nil; scope = scope.parent {
 		if macro, ok := scope.macros[key]; ok {
 			return macro, true
@@ -248,7 +253,7 @@ func (e *env) lookupMacroByKey(key string) (*syntaxMacro, bool) {
 	return nil, false
 }
 
-func (e *env) lookupMacroSymbol(symbol symbolExpr) (*syntaxMacro, bool) {
+func (e *env) lookupMacroSymbol(symbol symbolExpr) (macroExpander, bool) {
 	return e.lookupMacroByKey(symbol.bindingKey())
 }
 
@@ -416,6 +421,9 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("call-with-values", builtinProc{name: "call-with-values", fn: builtinCallWithValues})
 	scope.define("apply", builtinProc{name: "apply", fn: builtinApply})
 	scope.define("procedure?", builtinProc{name: "procedure?", fn: builtinProcedurePredicate})
+	scope.define("syntax->datum", builtinProc{name: "syntax->datum", fn: builtinSyntaxToDatum})
+	scope.define("datum->syntax", builtinProc{name: "datum->syntax", fn: builtinDatumToSyntax})
+	scope.define("identifier?", builtinProc{name: "identifier?", fn: builtinIdentifierPredicate})
 	raiseProc := builtinProc{name: "raise", fn: builtinRaise}
 	scope.define("raise", raiseProc)
 	scope.defineKey(level20RaiseKey, raiseProc)
@@ -506,6 +514,11 @@ func (p *parser) parseExpr() (any, error) {
 		return p.parseString()
 	case '\'':
 		return p.parseQuoteShorthand()
+	case '#':
+		if p.pos+1 < len(p.input) && p.input[p.pos+1] == '\'' {
+			return p.parseSyntaxShorthand()
+		}
+		return p.parseAtom()
 	default:
 		return p.parseAtom()
 	}
@@ -524,6 +537,25 @@ func (p *parser) parseQuoteShorthand() (any, error) {
 	return listExpr{
 		elements: []any{
 			symbolExpr{name: "quote", pos: pos},
+			expr,
+		},
+		pos: pos,
+	}, nil
+}
+
+func (p *parser) parseSyntaxShorthand() (any, error) {
+	start := p.pos
+	p.pos += 2
+
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	pos := p.posAt(start)
+	return listExpr{
+		elements: []any{
+			symbolExpr{name: "syntax", pos: pos},
 			expr,
 		},
 		pos: pos,
@@ -851,6 +883,15 @@ func evalListTail(scope *env, expr listExpr) (any, *tailEvalState, error) {
 		case "define-record-type":
 			value, err := evalDefineRecordType(scope, args)
 			return value, nil, err
+		case "syntax":
+			value, err := evalSyntax(scope, args)
+			return value, nil, err
+		case "syntax-case":
+			value, err := evalSyntaxCase(scope, args)
+			return value, nil, err
+		case "with-syntax":
+			value, err := evalWithSyntax(scope, args)
+			return value, nil, err
 		case "set!":
 			value, err := evalSet(scope, args)
 			return value, nil, err
@@ -1029,6 +1070,9 @@ func prepareClosureCall(callable closure, args []any) (any, *tailEvalState, erro
 
 func bindClosureArgs(callable closure, args []any) *env {
 	callScope := newEnv(callable.env)
+	if callable.syntaxDefEnv != nil {
+		callScope.syntaxDefEnv = callable.syntaxDefEnv
+	}
 	for i, param := range callable.params {
 		callScope.defineSymbol(param, args[i])
 	}
@@ -1060,9 +1104,10 @@ func evalLetTail(scope *env, args []any) (any, *tailEvalState, error) {
 
 		letScope := newEnv(scope)
 		proc := closure{
-			params: params,
-			body:   args[2:],
-			env:    letScope,
+			params:       params,
+			body:         args[2:],
+			env:          letScope,
+			syntaxDefEnv: scope.syntaxDefEnv,
 		}
 		letScope.defineSymbol(name, proc)
 		return prepareClosureCall(proc, values)
@@ -1299,6 +1344,12 @@ func evalList(scope *env, expr listExpr) (any, error) {
 			return evalDefineSyntax(scope, args)
 		case "define-record-type":
 			return evalDefineRecordType(scope, args)
+		case "syntax":
+			return evalSyntax(scope, args)
+		case "syntax-case":
+			return evalSyntaxCase(scope, args)
+		case "with-syntax":
+			return evalWithSyntax(scope, args)
 		case "set!":
 			return evalSet(scope, args)
 		case "if":
@@ -1390,11 +1441,12 @@ func evalDefine(scope *env, args []any) (any, error) {
 		}
 
 		proc := closure{
-			params:    params,
-			restParam: restParam,
-			hasRest:   hasRest,
-			body:      args[1:],
-			env:       scope,
+			params:       params,
+			restParam:    restParam,
+			hasRest:      hasRest,
+			body:         args[1:],
+			env:          scope,
+			syntaxDefEnv: scope.syntaxDefEnv,
 		}
 		scope.defineSymbol(name, proc)
 		return voidValue{}, nil
@@ -1413,12 +1465,24 @@ func evalDefineSyntax(scope *env, args []any) (any, error) {
 		return nil, &EvalError{Message: "define-syntax requires a symbol"}
 	}
 
-	macro, err := parseSyntaxRules(name, args[1], scope)
+	if isSyntaxRulesForm(args[1]) {
+		macro, err := parseSyntaxRules(name, args[1], scope)
+		if err != nil {
+			return nil, err
+		}
+		scope.defineMacroKey(name.bindingKey(), macro)
+		return voidValue{}, nil
+	}
+
+	transformer, err := eval(scope, args[1])
 	if err != nil {
 		return nil, err
 	}
+	if !isProcedureValue(transformer) {
+		return nil, &EvalError{Message: fmt.Sprintf("define-syntax transformer must be a procedure, got %s", typeName(transformer))}
+	}
 
-	scope.defineMacroKey(name.bindingKey(), macro)
+	scope.defineMacroKey(name.bindingKey(), transformerMacro{proc: markTransformerProcedure(transformer, scope)})
 	return voidValue{}, nil
 }
 
@@ -1481,11 +1545,12 @@ func evalLambda(scope *env, args []any) (any, error) {
 	}
 
 	return closure{
-		params:    params,
-		restParam: restParam,
-		hasRest:   hasRest,
-		body:      args[1:],
-		env:       scope,
+		params:       params,
+		restParam:    restParam,
+		hasRest:      hasRest,
+		body:         args[1:],
+		env:          scope,
+		syntaxDefEnv: scope.syntaxDefEnv,
 	}, nil
 }
 
@@ -1507,11 +1572,12 @@ func evalCaseLambda(scope *env, args []any) (any, error) {
 		}
 
 		clauses = append(clauses, closure{
-			params:    params,
-			restParam: restParam,
-			hasRest:   hasRest,
-			body:      clause.elements[1:],
-			env:       scope,
+			params:       params,
+			restParam:    restParam,
+			hasRest:      hasRest,
+			body:         clause.elements[1:],
+			env:          scope,
+			syntaxDefEnv: scope.syntaxDefEnv,
 		})
 	}
 
@@ -1574,9 +1640,10 @@ func evalLet(scope *env, args []any) (any, error) {
 
 		letScope := newEnv(scope)
 		proc := closure{
-			params: params,
-			body:   args[2:],
-			env:    letScope,
+			params:       params,
+			body:         args[2:],
+			env:          letScope,
+			syntaxDefEnv: scope.syntaxDefEnv,
 		}
 		letScope.defineSymbol(name, proc)
 		return applyProcedure(proc, values)
@@ -2365,6 +2432,8 @@ func typeName(value any) string {
 		return "vector"
 	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, callWithValuesProducerProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
 		return "procedure"
+	case syntaxObject, syntaxPatternValue, syntaxPatternRepeatValue:
+		return "syntax"
 	case voidValue:
 		return "void"
 	case *recordValue:
@@ -2422,6 +2491,8 @@ func formatValueWithState(value any, state *formatState) string {
 		return fmt.Sprintf("#<record %s>", v.typ.name)
 	case multipleValues:
 		return "#<values>"
+	case syntaxObject, syntaxPatternValue, syntaxPatternRepeatValue:
+		return "#<syntax>"
 	case listExpr:
 		if len(v.elements) == 0 {
 			return "()"
