@@ -32,7 +32,8 @@ type SchemeVal =
   | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[]; pos?: Pos }
   | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos }
-  | { tag: 'continuation'; k: Cont; windStack: WindEntry[]; pos?: Pos };
+  | { tag: 'continuation'; k: Cont; windStack: WindEntry[]; pos?: Pos }
+  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (after macro name)
@@ -1179,6 +1180,19 @@ function applyK(proc: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce 
           return k(val);
         }, pos));
       }
+      case 'values': {
+        if (args.length === 1) return k(args[0]);
+        return k({ tag: 'values', vals: args });
+      }
+      case 'call-with-values': {
+        if (args.length !== 2) throw errAt('call-with-values: expected 2 arguments', pos);
+        const producer = args[0];
+        const consumer = args[1];
+        return bounce(() => applyK(producer, [], (produced) => {
+          const consumerArgs = produced.tag === 'values' ? produced.vals : [produced];
+          return bounce(() => applyK(consumer, consumerArgs, k, pos));
+        }, pos));
+      }
       case 'for-each': {
         if (args.length < 2) throw errAt('for-each: expected at least 2 arguments', pos);
         const feProc = args[0];
@@ -1304,6 +1318,7 @@ const BUILTINS = new Set([
   'procedure?',
   'call/cc', 'call-with-current-continuation',
   'raise', 'with-exception-handler',
+  'values', 'call-with-values',
 ]);
 
 function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
@@ -2053,6 +2068,7 @@ function display(val: SchemeVal): string {
     case 'macro': return '#<macro>';
     case 'vector': return `#(${val.elements.map(display).join(' ')})`;
     case 'record': return `#<record ${val.typeName}>`;
+    case 'values': return val.vals.map(display).join('\n');
   }
 }
 
