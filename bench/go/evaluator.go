@@ -19,15 +19,80 @@ func evalInput(input string, env *Env) (*Value, error) {
 		return nil, &EvalError{Message: "no expressions"}
 	}
 
+	result, err := evalSequenceWithCC(exprs, env)
+	if err != nil {
+		return nil, &EvalError{Message: err.Error()}
+	}
+	return result, nil
+}
+
+// evalSequenceWithCC evaluates a sequence of expressions, handling call/cc
+// capture requests that propagate up via panic.
+func evalSequenceWithCC(exprs []*Expr, env *Env) (result *Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cr, ok := r.(*CaptureRequest); ok {
+				result, err = processCallCC(cr)
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	return evalSequence(exprs, env)
+}
+
+// evalSequence evaluates a list of expressions, returning the last value.
+// It adds a continuation frame for the remaining expressions when a
+// CaptureRequest propagates through.
+func evalSequence(exprs []*Expr, env *Env) (*Value, error) {
 	var last *Value
-	for _, expr := range exprs {
-		v, err := Eval(expr, env)
+	for i, expr := range exprs {
+		v, err := evalWithSeqCapture(expr, env, exprs, i)
 		if err != nil {
-			return nil, &EvalError{Message: err.Error()}
+			return nil, err
 		}
 		last = v
 	}
+	if last == nil {
+		return Void, nil
+	}
 	return last, nil
+}
+
+// evalWithSeqCapture evaluates a single expression within a sequence,
+// capturing the remaining sequence as a continuation frame if needed.
+func evalWithSeqCapture(expr *Expr, env *Env, allExprs []*Expr, idx int) (result *Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cr, ok := r.(*CaptureRequest); ok {
+				remaining := allExprs[idx+1:]
+				if len(remaining) > 0 {
+					capturedRemaining := make([]*Expr, len(remaining))
+					copy(capturedRemaining, remaining)
+					capturedEnv := env
+					cr.Frames = append(cr.Frames, ContFrame{
+						Apply: func(val *Value) (*Value, error) {
+							// Evaluate the remaining expressions in the sequence
+							var last *Value = val
+							for _, e := range capturedRemaining {
+								v, err := Eval(e, capturedEnv)
+								if err != nil {
+									return nil, err
+								}
+								last = v
+							}
+							return last, nil
+						},
+					})
+				}
+				panic(cr) // Continue propagation
+			}
+			panic(r)
+		}
+	}()
+
+	return Eval(expr, env)
 }
 
 // EvalStr evaluates one or more Scheme expressions and returns the string

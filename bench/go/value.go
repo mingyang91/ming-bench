@@ -24,7 +24,8 @@ const (
 	TypeSyntax
 	TypeRecord
 	TypeVector
-	TypeTailCall // trampoline marker for TCO
+	TypeTailCall      // trampoline marker for TCO
+	TypeContinuation  // first-class continuation (call/cc)
 )
 
 // Value represents a Scheme value.
@@ -56,10 +57,36 @@ type Value struct {
 	// TailCall fields (trampoline for TCO)
 	TailExpr *Expr
 	TailEnv  *Env
+	// Continuation fields (call/cc)
+	ContFrames []ContFrame
 }
 
 var Void = &Value{Type: TypeVoid}
 var Nil = &Value{Type: TypeNil}
+
+// ContFrame represents one frame of a captured continuation.
+// Apply takes a value and produces the next value in the continuation chain.
+type ContFrame struct {
+	Apply func(val *Value) (*Value, error)
+}
+
+// ContJumpError is returned when a continuation is invoked.
+// It propagates up the call stack to be caught by the matching processCallCC.
+type ContJumpError struct {
+	ContID int
+	Frames []ContFrame
+	Value  *Value
+}
+
+func (e *ContJumpError) Error() string { return "continuation jump" }
+
+// CaptureRequest is panicked when call/cc needs to capture continuation frames.
+type CaptureRequest struct {
+	Proc   *Value
+	Env    *Env
+	Expr   *Expr
+	Frames []ContFrame
+}
 
 func IntValue(n int64) *Value    { return &Value{Type: TypeInt, IntVal: n} }
 func BoolValue(b bool) *Value    { return &Value{Type: TypeBool, BoolVal: b} }
@@ -156,6 +183,8 @@ func (v *Value) String() string {
 		return ""
 	case TypeLambda:
 		return "#<procedure>"
+	case TypeContinuation:
+		return "#<continuation>"
 	case TypeChar:
 		return fmt.Sprintf("#\\%c", rune(v.IntVal))
 	case TypeRational:

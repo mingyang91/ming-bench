@@ -119,6 +119,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 	// Special forms
 	if head.Type == ExprSymbol {
 		switch head.StrVal {
+		case "call/cc", "call-with-current-continuation":
+			return evalCallCC(expr, env)
 		case "and":
 			return evalAnd(expr, env)
 		case "or":
@@ -176,14 +178,35 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 		return nil, err
 	}
 
-	// Evaluate arguments
-	args := make([]*Value, 0, len(expr.List)-1)
-	for _, a := range expr.List[1:] {
-		v, err := Eval(a, env)
-		if err != nil {
-			return nil, err
+	// Check if operator is call/cc or call-with-current-continuation (first-class use)
+	if op.Type == TypeSymbol && (op.StrVal == "__builtin:call/cc" || op.StrVal == "__builtin:call-with-current-continuation") {
+		// (call/cc proc) where call/cc was looked up as a value
+		if len(expr.List) != 2 {
+			return nil, fmt.Errorf("%d:%d: call/cc: expected 1 argument", expr.Line, expr.Col)
 		}
-		args = append(args, v)
+		proc, err2 := Eval(expr.List[1], env)
+		if err2 != nil {
+			return nil, err2
+		}
+		panic(&CaptureRequest{Proc: proc, Env: env, Expr: expr, Frames: nil})
+	}
+
+	// Check if operator is a continuation
+	if op.Type == TypeContinuation {
+		if len(expr.List) != 2 {
+			return nil, fmt.Errorf("%d:%d: continuation: expected 1 argument", expr.Line, expr.Col)
+		}
+		argVal, err2 := Eval(expr.List[1], env)
+		if err2 != nil {
+			return nil, err2
+		}
+		return invokeContinuation(op, argVal)
+	}
+
+	// Evaluate arguments with call/cc capture support
+	args, err := evalArgsWithCapture(expr, env, op)
+	if err != nil {
+		return nil, err
 	}
 
 	// Dispatch builtins
@@ -263,22 +286,56 @@ func callLambda(op *Value, args []*Value, expr *Expr) (*Value, error) {
 		callEnv.Set(param, args[i])
 	}
 	if op.RestParam != "" {
-		// Collect remaining args into a list
 		rest := Nil
 		for i := len(args) - 1; i >= len(op.Params); i-- {
 			rest = &Value{Type: TypePair, Car: args[i], Cdr: rest}
 		}
 		callEnv.Set(op.RestParam, rest)
 	}
-	// Evaluate all but the last body expression normally
-	for _, bodyExpr := range op.Body[:len(op.Body)-1] {
-		_, err := Eval(bodyExpr, callEnv)
+	// Evaluate all but the last body expression, with call/cc frame capture
+	for i, bodyExpr := range op.Body[:len(op.Body)-1] {
+		_, err := evalBodyExprWithCapture(bodyExpr, callEnv, op.Body, i)
 		if err != nil {
 			return nil, err
 		}
 	}
 	// Return tail call for the last body expression
 	return tailCall(op.Body[len(op.Body)-1], callEnv), nil
+}
+
+// evalBodyExprWithCapture evaluates a body expression and captures remaining
+// body expressions as a continuation frame if a CaptureRequest propagates.
+func evalBodyExprWithCapture(bodyExpr *Expr, env *Env, allBody []*Expr, idx int) (result *Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cr, ok := r.(*CaptureRequest); ok {
+				remaining := allBody[idx+1:]
+				if len(remaining) > 0 {
+					capturedRemaining := make([]*Expr, len(remaining))
+					copy(capturedRemaining, remaining)
+					capturedEnv := env
+					cr.Frames = append(cr.Frames, ContFrame{
+						Apply: func(val *Value) (*Value, error) {
+							// Evaluate remaining body expressions.
+							// The last one is in tail position, so we trampoline it.
+							for _, e := range capturedRemaining[:len(capturedRemaining)-1] {
+								_, evalErr := Eval(e, capturedEnv)
+								if evalErr != nil {
+									return nil, evalErr
+								}
+							}
+							last := capturedRemaining[len(capturedRemaining)-1]
+							return Eval(last, capturedEnv)
+						},
+					})
+				}
+				panic(cr)
+			}
+			panic(r)
+		}
+	}()
+
+	return Eval(bodyExpr, env)
 }
 
 func evalAnd(expr *Expr, env *Env) (*Value, error) {
@@ -443,6 +500,9 @@ func MakeDefaultEnv() *Env {
 		"string>?":    builtinStringGtQ,
 		"string<=?":   builtinStringLeQ,
 		"string>=?":   builtinStringGeQ,
+		// L18: call/cc
+		"call/cc":                         nil,
+		"call-with-current-continuation":  nil,
 	}
 
 	for name, fn := range builtins {
@@ -713,13 +773,29 @@ func builtinNot(args []*Value, expr *Expr) (*Value, error) {
 	return BoolValue(!args[0].IsTruthy()), nil
 }
 
-func evalDefine(expr *Expr, env *Env) (*Value, error) {
+func evalDefine(expr *Expr, env *Env) (result *Value, err error) {
 	if len(expr.List) < 3 {
 		return nil, fmt.Errorf("%d:%d: define: too few arguments", expr.Line, expr.Col)
 	}
 	target := expr.List[1]
 	if target.Type == ExprSymbol {
-		// (define x val)
+		// (define x val) — with call/cc capture support
+		defer func() {
+			if r := recover(); r != nil {
+				if cr, ok := r.(*CaptureRequest); ok {
+					varName := target.StrVal
+					capturedEnv := env
+					cr.Frames = append(cr.Frames, ContFrame{
+						Apply: func(val *Value) (*Value, error) {
+							capturedEnv.Set(varName, val)
+							return Void, nil
+						},
+					})
+					panic(cr)
+				}
+				panic(r)
+			}
+		}()
 		val, err := Eval(expr.List[2], env)
 		if err != nil {
 			return nil, err
@@ -869,8 +945,8 @@ func evalLet(expr *Expr, env *Env) (*Value, error) {
 		}
 		letEnv.Set(b.List[0].StrVal, v)
 	}
-	for _, bodyExpr := range body[:len(body)-1] {
-		_, err := Eval(bodyExpr, letEnv)
+	for i, bodyExpr := range body[:len(body)-1] {
+		_, err := evalBodyExprWithCapture(bodyExpr, letEnv, body, i)
 		if err != nil {
 			return nil, err
 		}
@@ -898,8 +974,8 @@ func evalLetStar(expr *Expr, env *Env) (*Value, error) {
 		}
 		letEnv.Set(b.List[0].StrVal, v)
 	}
-	for _, bodyExpr := range body[:len(body)-1] {
-		_, err := Eval(bodyExpr, letEnv)
+	for i, bodyExpr := range body[:len(body)-1] {
+		_, err := evalBodyExprWithCapture(bodyExpr, letEnv, body, i)
 		if err != nil {
 			return nil, err
 		}
@@ -912,8 +988,8 @@ func evalBegin(expr *Expr, env *Env) (*Value, error) {
 	if len(body) == 0 {
 		return Void, nil
 	}
-	for _, e := range body[:len(body)-1] {
-		_, err := Eval(e, env)
+	for i, e := range body[:len(body)-1] {
+		_, err := evalBodyExprWithCapture(e, env, body, i)
 		if err != nil {
 			return nil, err
 		}
@@ -1292,6 +1368,19 @@ func builtinApply(args []*Value, expr *Expr, env *Env) (*Value, error) {
 	}
 
 	// Dispatch based on function type
+	if fn.Type == TypeContinuation {
+		if len(callArgs) != 1 {
+			return nil, fmt.Errorf("%d:%d: continuation: expected 1 argument", expr.Line, expr.Col)
+		}
+		return invokeContinuation(fn, callArgs[0])
+	}
+	// Handle call/cc passed as value to apply
+	if fn.Type == TypeSymbol && (fn.StrVal == "__builtin:call/cc" || fn.StrVal == "__builtin:call-with-current-continuation") {
+		if len(callArgs) != 1 {
+			return nil, fmt.Errorf("%d:%d: call/cc: expected 1 argument", expr.Line, expr.Col)
+		}
+		panic(&CaptureRequest{Proc: callArgs[0], Env: env, Expr: expr, Frames: nil})
+	}
 	if fn.Type == TypeLambda {
 		if fn.Clauses != nil {
 			return callCaseLambda(fn, callArgs, expr)
@@ -1704,7 +1793,7 @@ func builtinProcedureQ(args []*Value, expr *Expr) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: procedure?: expected 1 argument", expr.Line, expr.Col)
 	}
 	a := args[0]
-	if a.Type == TypeLambda {
+	if a.Type == TypeLambda || a.Type == TypeContinuation {
 		return BoolValue(true), nil
 	}
 	if a.Type == TypeSymbol && len(a.StrVal) > 10 && a.StrVal[:10] == "__builtin:" {
@@ -2203,7 +2292,7 @@ func builtinStringGeQ(args []*Value, expr *Expr) (*Value, error) {
 	return BoolValue(args[0].StrContent() >= args[1].StrContent()), nil
 }
 
-func evalSetBang(expr *Expr, env *Env) (*Value, error) {
+func evalSetBang(expr *Expr, env *Env) (result *Value, err error) {
 	if len(expr.List) != 3 {
 		return nil, fmt.Errorf("%d:%d: set!: expected 2 arguments", expr.Line, expr.Col)
 	}
@@ -2211,6 +2300,27 @@ func evalSetBang(expr *Expr, env *Env) (*Value, error) {
 	if target.Type != ExprSymbol {
 		return nil, fmt.Errorf("%d:%d: set!: first argument must be a symbol", target.Line, target.Col)
 	}
+
+	// Capture frame for call/cc in the RHS
+	defer func() {
+		if r := recover(); r != nil {
+			if cr, ok := r.(*CaptureRequest); ok {
+				varName := target.StrVal
+				capturedEnv := env
+				cr.Frames = append(cr.Frames, ContFrame{
+					Apply: func(val *Value) (*Value, error) {
+						if !capturedEnv.SetExisting(varName, val) {
+							return nil, fmt.Errorf("set!: unbound variable: %s", varName)
+						}
+						return Void, nil
+					},
+				})
+				panic(cr)
+			}
+			panic(r)
+		}
+	}()
+
 	val, err := Eval(expr.List[2], env)
 	if err != nil {
 		return nil, err
@@ -2717,4 +2827,298 @@ func builtinListToVector(args []*Value, expr *Expr) (*Value, error) {
 		v = v.Cdr
 	}
 	return &Value{Type: TypeVector, VecElems: elems}, nil
+}
+
+// --- call/cc (first-class continuations) ---
+
+// evalArgsWithCapture evaluates function arguments, catching CaptureRequest panics
+// to add an application frame to the continuation.
+func evalArgsWithCapture(expr *Expr, env *Env, op *Value) (args []*Value, err error) {
+	argExprs := expr.List[1:]
+	args = make([]*Value, 0, len(argExprs))
+
+	for i, a := range argExprs {
+		v, evalErr := evalArgWithCapture(a, env, expr, argExprs, i, op)
+		if evalErr != nil {
+			return nil, evalErr
+		}
+		args = append(args, v)
+	}
+	return args, nil
+}
+
+// evalArgWithCapture evaluates a single argument, capturing the application
+// context if a CaptureRequest propagates through.
+func evalArgWithCapture(argExpr *Expr, env *Env, appExpr *Expr, allArgExprs []*Expr, idx int, op *Value) (result *Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cr, ok := r.(*CaptureRequest); ok {
+				// Capture the function application context.
+				// When the continuation is invoked, re-evaluate the full application
+				// with the continuation's value substituted for this argument.
+				capturedAppExpr := appExpr
+				capturedArgExprs := make([]*Expr, len(allArgExprs))
+				copy(capturedArgExprs, allArgExprs)
+				capturedIdx := idx
+				capturedEnv := env
+
+				cr.Frames = append(cr.Frames, ContFrame{
+					Apply: func(val *Value) (*Value, error) {
+						// Bind val to a temp variable and re-evaluate via normal path
+						// so nested call/cc in other args gets proper frame capture.
+						contIDCounter++
+						tmpName := fmt.Sprintf("__cc_%d__", contIDCounter)
+						capturedEnv.Set(tmpName, val)
+						// Build synthetic expression: (op arg0 ... tmpName ... argN)
+						newList := make([]*Expr, len(capturedAppExpr.List))
+						newList[0] = capturedAppExpr.List[0]
+						for j, ae := range capturedArgExprs {
+							if j == capturedIdx {
+								newList[j+1] = &Expr{Type: ExprSymbol, StrVal: tmpName, Line: ae.Line, Col: ae.Col}
+							} else {
+								newList[j+1] = ae
+							}
+						}
+						synExpr := &Expr{Type: ExprList, List: newList, Line: capturedAppExpr.Line, Col: capturedAppExpr.Col}
+						return Eval(synExpr, capturedEnv)
+					},
+				})
+				panic(cr)
+			}
+			panic(r)
+		}
+	}()
+
+	return Eval(argExpr, env)
+}
+
+// applyOp applies an operator to arguments (used by continuation frames).
+func applyOp(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if op.Type == TypeContinuation {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("continuation: expected 1 argument")
+		}
+		return invokeContinuation(op, args[0])
+	}
+	if op.Type == TypeSymbol && len(op.StrVal) > 10 && op.StrVal[:10] == "__builtin:" {
+		name := op.StrVal[10:]
+		switch name {
+		case "display":
+			return builtinDisplay(args, expr, env)
+		case "write":
+			return builtinWrite(args, expr, env)
+		case "newline":
+			return builtinNewline(args, expr, env)
+		case "apply":
+			return builtinApply(args, expr, env)
+		case "map":
+			return builtinMap(args, expr, env)
+		case "for-each":
+			return builtinForEach(args, expr, env)
+		}
+		if fn, ok := builtinRegistry[name]; ok {
+			return fn(args, expr)
+		}
+		if strings.HasPrefix(name, "record-ctor:") {
+			return dispatchRecordCtor(name[12:], args, expr)
+		}
+		if strings.HasPrefix(name, "record-pred:") {
+			tag := name[12:]
+			if len(args) != 1 {
+				return nil, fmt.Errorf("record predicate: expected 1 argument")
+			}
+			return BoolValue(args[0].Type == TypeRecord && args[0].RecordTag == tag), nil
+		}
+		if strings.HasPrefix(name, "record-acc:") {
+			rest := name[11:]
+			sepIdx := strings.Index(rest, ":")
+			tag := rest[:sepIdx]
+			field := rest[sepIdx+1:]
+			if len(args) != 1 {
+				return nil, fmt.Errorf("record accessor: expected 1 argument")
+			}
+			if args[0].Type != TypeRecord || args[0].RecordTag != tag {
+				return nil, fmt.Errorf("record accessor: not a %s", tag)
+			}
+			v, ok := args[0].RecordFields[field]
+			if !ok {
+				return nil, fmt.Errorf("record accessor: no field %s", field)
+			}
+			return v, nil
+		}
+	}
+	if op.Type == TypeLambda {
+		if op.Clauses != nil {
+			v, err := callCaseLambda(op, args, expr)
+			if err != nil {
+				return nil, err
+			}
+			return trampolineVal(v)
+		}
+		v, err := callLambda(op, args, expr)
+		if err != nil {
+			return nil, err
+		}
+		return trampolineVal(v)
+	}
+	return nil, fmt.Errorf("not a procedure")
+}
+
+// contIDCounter generates unique IDs for continuations.
+var contIDCounter int
+
+// evalCallCC handles (call/cc proc) or (call-with-current-continuation proc).
+func evalCallCC(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) != 2 {
+		return nil, fmt.Errorf("%d:%d: call/cc: expected 1 argument", expr.Line, expr.Col)
+	}
+	proc, err := Eval(expr.List[1], env)
+	if err != nil {
+		return nil, err
+	}
+	if proc.Type != TypeLambda && proc.Type != TypeContinuation {
+		return nil, fmt.Errorf("%d:%d: call/cc: argument must be a procedure", expr.Line, expr.Col)
+	}
+	panic(&CaptureRequest{
+		Proc:   proc,
+		Env:    env,
+		Expr:   expr,
+		Frames: nil,
+	})
+}
+
+// invokeContinuation is called when a continuation value is applied.
+func invokeContinuation(cont *Value, val *Value) (*Value, error) {
+	frames := make([]ContFrame, len(cont.ContFrames))
+	copy(frames, cont.ContFrames)
+	return nil, &ContJumpError{ContID: int(cont.IntVal), Frames: frames, Value: val}
+}
+
+// applyContFrames runs a value through continuation frames.
+// Only catches ContJumpErrors for myContID (reentrant case).
+func applyContFrames(val *Value, frames []ContFrame, myContID int) (*Value, error) {
+	for {
+		result, err := runContFrames(val, frames)
+		if err != nil {
+			if jump, ok := err.(*ContJumpError); ok {
+				if jump.ContID == myContID {
+					// Reentrant: our continuation re-invoked
+					val = jump.Value
+					frames = jump.Frames
+					continue
+				}
+				// Different continuation — propagate
+				return nil, err
+			}
+			return nil, err
+		}
+		return result, nil
+	}
+}
+
+// runContFrames applies frames sequentially, catching CaptureRequests from nested call/cc.
+func runContFrames(val *Value, frames []ContFrame) (*Value, error) {
+	for i, frame := range frames {
+		var err error
+		val, err = applyOneFrame(frame, val, frames[i+1:])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return val, nil
+}
+
+// applyOneFrame applies a single frame, catching CaptureRequest panics.
+// The result of processCallCC goes back to runContFrames, which continues
+// with remaining frames. We do NOT add remaining frames to the CaptureRequest
+// to avoid double-application.
+func applyOneFrame(frame ContFrame, val *Value, remainingFrames []ContFrame) (result *Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cr, ok := r.(*CaptureRequest); ok {
+				result, err = processCallCC(cr)
+				return
+			}
+			panic(r)
+		}
+	}()
+	return frame.Apply(val)
+}
+
+// processCallCC creates a continuation from captured frames, calls proc(k),
+// and applies frames to the result.
+func processCallCC(cr *CaptureRequest) (*Value, error) {
+	contIDCounter++
+	contID := contIDCounter
+
+	k := &Value{
+		Type:       TypeContinuation,
+		IntVal:     int64(contID),
+		ContFrames: cr.Frames,
+	}
+
+	result, err := callProcTrapping(cr.Proc, k, cr.Env, cr.Expr)
+	if err != nil {
+		if jump, ok := err.(*ContJumpError); ok {
+			if jump.ContID == contID {
+				// k was invoked (escape case)
+				return applyContFrames(jump.Value, jump.Frames, contID)
+			}
+			// Different continuation — propagate
+			return nil, err
+		}
+		return nil, err
+	}
+
+	// proc returned normally — apply frames
+	return applyContFrames(result, cr.Frames, contID)
+}
+
+// callProcTrapping calls proc(k) and catches CaptureRequest panics for nested call/cc.
+// It does NOT add k.ContFrames to the CaptureRequest — the outer processCallCC
+// applies its frames to the result instead. This avoids double-application.
+func callProcTrapping(proc *Value, k *Value, env *Env, expr *Expr) (result *Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cr, ok := r.(*CaptureRequest); ok {
+				result, err = processCallCC(cr)
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	return callProcForCC(proc, k, env, expr)
+}
+
+// callProcForCC calls a procedure with a single argument (the continuation k).
+func callProcForCC(proc *Value, k *Value, env *Env, expr *Expr) (*Value, error) {
+	if proc.Type == TypeLambda {
+		args := []*Value{k}
+		if proc.Clauses != nil {
+			v, err := callCaseLambda(proc, args, expr)
+			if err != nil {
+				return nil, err
+			}
+			return trampolineVal(v)
+		}
+		v, err := callLambda(proc, args, expr)
+		if err != nil {
+			return nil, err
+		}
+		return trampolineVal(v)
+	}
+	return nil, fmt.Errorf("%d:%d: call/cc: argument must be a procedure", expr.Line, expr.Col)
+}
+
+// trampolineVal resolves tail calls to a final value.
+func trampolineVal(v *Value) (*Value, error) {
+	for v.Type == TypeTailCall {
+		var err error
+		v, err = evalInner(v.TailExpr, v.TailEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return v, nil
 }
