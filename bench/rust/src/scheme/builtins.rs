@@ -1216,9 +1216,11 @@ fn value_eq(left: &Value, right: &Value) -> bool {
         (Value::Nil, Value::Nil) => true,
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(left, right),
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::NativeProc { name: left, .. }, Value::NativeProc { name: right, .. }) => {
             left == right
         }
+        (Value::RecordProc(left), Value::RecordProc(right)) => Rc::ptr_eq(left, right),
         (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,

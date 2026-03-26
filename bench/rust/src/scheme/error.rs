@@ -61,6 +61,13 @@ pub enum EvalError {
         got: usize,
     },
 
+    #[error("{name}: wrong argument count, expected {expected}, got {got}")]
+    WrongArgCountDynamic {
+        name: String,
+        expected: String,
+        got: usize,
+    },
+
     #[error("{name}: expected number, found {found}")]
     ExpectedNumber { name: &'static str, found: String },
 
@@ -81,6 +88,13 @@ pub enum EvalError {
 
     #[error("{name}: expected list, found {found}")]
     ExpectedList { name: &'static str, found: String },
+
+    #[error("{name}: expected {expected}, found {found}")]
+    ExpectedRecordType {
+        name: String,
+        expected: String,
+        found: String,
+    },
 
     #[error("{name}: index out of bounds: {index} (length {len})")]
     IndexOutOfBounds {
