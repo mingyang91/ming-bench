@@ -18,8 +18,9 @@ type stringExpr struct {
 }
 type charExpr rune
 type symbolExpr struct {
-	name string
-	pos  sourcePos
+	name      string
+	pos       sourcePos
+	lookupEnv *env
 }
 type listExpr struct {
 	items []expr
@@ -506,7 +507,11 @@ func evalExpr(environment *env, form expr) (expr, error) {
 	case intExpr, boolExpr, charExpr, *stringExpr:
 		return v, nil
 	case symbolExpr:
-		value, ok := environment.lookup(v.name)
+		lookupEnv := environment
+		if v.lookupEnv != nil {
+			lookupEnv = v.lookupEnv
+		}
+		value, ok := lookupEnv.lookup(v.name)
 		if !ok {
 			return nil, errorAt(v.pos, fmt.Sprintf("unbound symbol: %s", v.name))
 		}
@@ -527,6 +532,9 @@ func evalList(environment *env, items listExpr) (expr, error) {
 		switch operator.name {
 		case "define":
 			value, err := evalDefine(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
+		case "define-syntax":
+			value, err := evalDefineSyntax(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
 		case "set!":
 			value, err := evalSet(environment, items.items[1:])
@@ -555,6 +563,20 @@ func evalList(environment *env, items listExpr) (expr, error) {
 		case "or":
 			value, err := evalOr(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
+		}
+
+		lookupEnv := environment
+		if operator.lookupEnv != nil {
+			lookupEnv = operator.lookupEnv
+		}
+		if macroValue, ok := lookupEnv.lookup(operator.name); ok {
+			if macro, ok := macroValue.(macroExpr); ok {
+				expanded, err := expandMacro(macro, items)
+				if err != nil {
+					return nil, attachPos(err, operator.pos)
+				}
+				return evalExpr(environment, expanded)
+			}
 		}
 	}
 
@@ -1876,6 +1898,8 @@ func renderExpr(value expr) string {
 		return "#<procedure:" + v.name + ">"
 	case closureExpr:
 		return "#<procedure>"
+	case macroExpr:
+		return "#<macro>"
 	default:
 		return ""
 	}
