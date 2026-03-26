@@ -85,6 +85,30 @@ public class Evaluator {
         return lastValue;
     }
 
+    Value evalTailSequence(List<Expr> expressions, Environment environment) throws EvalError {
+        List<Expr> currentExpressions = expressions;
+        Environment currentEnvironment = environment;
+
+        while (true) {
+            if (currentExpressions.isEmpty()) {
+                return VoidValue.INSTANCE;
+            }
+
+            for (int i = 0; i < currentExpressions.size() - 1; i++) {
+                eval(currentExpressions.get(i), currentEnvironment);
+            }
+
+            TailCall tailCall = evalTail(currentExpressions.getLast(), currentEnvironment);
+            if (tailCall instanceof TailCallValue tailCallValue) {
+                return tailCallValue.value();
+            }
+
+            TailCallSequence tailCallSequence = (TailCallSequence) tailCall;
+            currentExpressions = tailCallSequence.expressions();
+            currentEnvironment = tailCallSequence.environment();
+        }
+    }
+
     private Environment createGlobalEnvironment() {
         Environment environment = new Environment(null);
         environment.define("+", new PrimitiveProcedureValue("+", this::applyAdd));
@@ -197,6 +221,81 @@ public class Evaluator {
         }
     }
 
+    private TailCall evalTail(Expr expression, Environment environment) throws EvalError {
+        try {
+            return switch (expression) {
+                case IntExpr intExpr -> new TailCallValue(new IntValue(intExpr.value()));
+                case NumberExpr numberExpr -> new TailCallValue(Numbers.parseLiteral(numberExpr.token()));
+                case BoolExpr boolExpr -> new TailCallValue(new BoolValue(boolExpr.value()));
+                case StringExpr stringExpr -> new TailCallValue(new StringValue(stringExpr.value(), false));
+                case CharExpr charExpr -> new TailCallValue(new CharValue(charExpr.value()));
+                case SymbolExpr symbolExpr -> new TailCallValue(environment.lookup(symbolExpr.name()));
+                case ListExpr listExpr -> evalTailList(listExpr, environment);
+            };
+        } catch (EvalError error) {
+            throw error.withPosition(expression.line(), expression.column());
+        }
+    }
+
+    private TailCall evalTailList(ListExpr listExpr, Environment environment) throws EvalError {
+        List<Expr> elements = listExpr.elements();
+        if (elements.isEmpty()) {
+            throw new EvalError("cannot evaluate empty list");
+        }
+
+        Expr operatorExpression = elements.getFirst();
+        List<Expr> arguments = elements.subList(1, elements.size());
+
+        if (operatorExpression instanceof SymbolExpr symbolExpr) {
+            if ("define-syntax".equals(symbolExpr.name())) {
+                return new TailCallValue(evalDefineSyntax(arguments, environment));
+            }
+
+            MacroDefinition macroDefinition = environment.lookupMacro(symbolExpr.name());
+            if (macroDefinition != null) {
+                Expr expanded = expandMacroCall(macroDefinition, listExpr, environment);
+                return new TailCallSequence(List.of(expanded), environment);
+            }
+
+            return switch (symbolExpr.name()) {
+                case "define" -> new TailCallValue(evalDefine(arguments, environment));
+                case "define-record-type" -> new TailCallValue(evalDefineRecordType(arguments, environment));
+                case "set!" -> new TailCallValue(evalSet(arguments, environment));
+                case "if" -> evalTailIf(arguments, environment);
+                case "quote" -> new TailCallValue(evalQuote(arguments));
+                case "lambda" -> new TailCallValue(evalLambda(arguments, environment));
+                case "case-lambda" -> new TailCallValue(evalCaseLambda(arguments, environment));
+                case "begin" -> evalTailBegin(arguments, environment);
+                case "cond" -> evalTailCond(arguments, environment);
+                case "let" -> evalTailLet(arguments, environment);
+                case "letrec" -> evalTailLetRec(arguments, environment, false);
+                case "letrec*" -> evalTailLetRec(arguments, environment, true);
+                case "case" -> evalTailCase(arguments, environment);
+                case "do" -> new TailCallValue(evalDo(arguments, environment));
+                case "and" -> evalTailAnd(arguments, environment);
+                case "or" -> evalTailOr(arguments, environment);
+                default -> applyProcedureTail(operatorExpression, arguments, environment);
+            };
+        }
+
+        return applyProcedureTail(operatorExpression, arguments, environment);
+    }
+
+    private TailCall applyProcedureTail(Expr operatorExpression,
+                                        List<Expr> argumentExpressions,
+                                        Environment environment) throws EvalError {
+        Value operator = eval(operatorExpression, environment);
+        if (!(operator instanceof ProcedureValue procedure)) {
+            throw new EvalError("attempted to call non-procedure");
+        }
+
+        List<Value> arguments = new ArrayList<>(argumentExpressions.size());
+        for (Expr argumentExpression : argumentExpressions) {
+            arguments.add(eval(argumentExpression, environment));
+        }
+        return procedure.applyTail(List.copyOf(arguments), this);
+    }
+
     private Value evalList(ListExpr listExpr, Environment environment) throws EvalError {
         List<Expr> elements = listExpr.elements();
         if (elements.isEmpty()) {
@@ -254,6 +353,224 @@ public class Evaluator {
             arguments.add(eval(argumentExpression, environment));
         }
         return procedure.apply(List.copyOf(arguments), this);
+    }
+
+    private TailCall evalTailIf(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.size() < 2 || arguments.size() > 3) {
+            throw new EvalError("if expected 2 or 3 argument(s)");
+        }
+
+        Value condition = eval(arguments.get(0), environment);
+        if (condition.isTruthy()) {
+            return new TailCallSequence(List.of(arguments.get(1)), environment);
+        }
+        if (arguments.size() == 2) {
+            return new TailCallValue(VoidValue.INSTANCE);
+        }
+        return new TailCallSequence(List.of(arguments.get(2)), environment);
+    }
+
+    private TailCall evalTailBegin(List<Expr> arguments, Environment environment) {
+        if (arguments.isEmpty()) {
+            return new TailCallValue(VoidValue.INSTANCE);
+        }
+        return new TailCallSequence(arguments, environment);
+    }
+
+    private TailCall evalTailCond(List<Expr> clauses, Environment environment) throws EvalError {
+        for (int i = 0; i < clauses.size(); i++) {
+            Expr clauseExpression = clauses.get(i);
+            if (!(clauseExpression instanceof ListExpr clauseList)) {
+                throw new EvalError("cond clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.isEmpty()) {
+                throw new EvalError("cond clause cannot be empty");
+            }
+
+            Expr testExpression = clauseElements.getFirst();
+            if (testExpression instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+                if (i != clauses.size() - 1) {
+                    throw new EvalError("cond else clause must be last");
+                }
+                if (clauseElements.size() == 1) {
+                    throw new EvalError("cond else clause expected a body");
+                }
+                return new TailCallSequence(clauseElements.subList(1, clauseElements.size()), environment);
+            }
+
+            Value testValue = eval(testExpression, environment);
+            if (testValue.isTruthy()) {
+                if (clauseElements.size() == 1) {
+                    return new TailCallValue(testValue);
+                }
+                return new TailCallSequence(clauseElements.subList(1, clauseElements.size()), environment);
+            }
+        }
+
+        return new TailCallValue(VoidValue.INSTANCE);
+    }
+
+    private TailCall evalTailLet(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("let expected bindings and a body");
+        }
+
+        Expr firstArgument = arguments.getFirst();
+        if (firstArgument instanceof SymbolExpr name) {
+            return evalTailNamedLet(name.name(), arguments.subList(1, arguments.size()), environment);
+        }
+
+        List<Binding> bindings = parseBindings(firstArgument, "let");
+        List<Expr> body = arguments.subList(1, arguments.size());
+        Environment localEnvironment = new Environment(environment);
+        for (Binding binding : bindings) {
+            localEnvironment.define(binding.name(), eval(binding.valueExpression(), environment));
+        }
+        return new TailCallSequence(body, localEnvironment);
+    }
+
+    private TailCall evalTailLetRec(List<Expr> arguments,
+                                    Environment environment,
+                                    boolean sequential) throws EvalError {
+        String formName = sequential ? "letrec*" : "letrec";
+        if (arguments.size() < 2) {
+            throw new EvalError(formName + " expected bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(arguments.getFirst(), formName);
+        List<Expr> body = arguments.subList(1, arguments.size());
+        Environment localEnvironment = new Environment(environment);
+        List<BindingCell> cells = new ArrayList<>(bindings.size());
+
+        for (Binding binding : bindings) {
+            BindingCell cell = new BindingCell(UninitializedValue.INSTANCE);
+            localEnvironment.defineCell(binding.name(), cell);
+            cells.add(cell);
+        }
+
+        if (sequential) {
+            for (int i = 0; i < bindings.size(); i++) {
+                cells.get(i).set(eval(bindings.get(i).valueExpression(), localEnvironment));
+            }
+        } else {
+            List<Value> values = new ArrayList<>(bindings.size());
+            for (Binding binding : bindings) {
+                values.add(eval(binding.valueExpression(), localEnvironment));
+            }
+            for (int i = 0; i < cells.size(); i++) {
+                cells.get(i).set(values.get(i));
+            }
+        }
+
+        return new TailCallSequence(body, localEnvironment);
+    }
+
+    private TailCall evalTailCase(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw new EvalError("case expected a key and at least one clause");
+        }
+
+        Value key = eval(arguments.getFirst(), environment);
+        for (int i = 1; i < arguments.size(); i++) {
+            Expr clauseExpression = arguments.get(i);
+            if (!(clauseExpression instanceof ListExpr clauseList)) {
+                throw new EvalError("case clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.isEmpty()) {
+                throw new EvalError("case clause cannot be empty");
+            }
+
+            Expr datumsExpression = clauseElements.getFirst();
+            if (datumsExpression instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+                if (i != arguments.size() - 1) {
+                    throw new EvalError("case else clause must be last");
+                }
+                if (clauseElements.size() == 1) {
+                    throw new EvalError("case else clause expected a body");
+                }
+                return new TailCallSequence(clauseElements.subList(1, clauseElements.size()), environment);
+            }
+
+            if (!(datumsExpression instanceof ListExpr datumsList)) {
+                throw new EvalError("case clause expected a datum list");
+            }
+
+            for (Expr datum : datumsList.elements()) {
+                if (eqvValue(key, quote(datum))) {
+                    if (clauseElements.size() == 1) {
+                        return new TailCallValue(VoidValue.INSTANCE);
+                    }
+                    return new TailCallSequence(clauseElements.subList(1, clauseElements.size()), environment);
+                }
+            }
+        }
+
+        return new TailCallValue(VoidValue.INSTANCE);
+    }
+
+    private TailCall evalTailNamedLet(String name,
+                                      List<Expr> arguments,
+                                      Environment environment) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("let expected bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(arguments.getFirst(), "let");
+        List<String> parameters = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            parameters.add(binding.name());
+        }
+
+        List<Expr> body = arguments.subList(1, arguments.size());
+        Environment localEnvironment = new Environment(environment);
+        LambdaProcedureValue procedure = new LambdaProcedureValue(
+                name,
+                List.copyOf(parameters),
+                null,
+                body,
+                localEnvironment);
+        localEnvironment.define(name, procedure);
+
+        List<Value> initialValues = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            initialValues.add(eval(binding.valueExpression(), localEnvironment));
+        }
+
+        return procedure.applyTail(List.copyOf(initialValues), this);
+    }
+
+    private TailCall evalTailAnd(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.isEmpty()) {
+            return new TailCallValue(new BoolValue(true));
+        }
+
+        for (int i = 0; i < arguments.size() - 1; i++) {
+            Value value = eval(arguments.get(i), environment);
+            if (!value.isTruthy()) {
+                return new TailCallValue(value);
+            }
+        }
+
+        return new TailCallSequence(List.of(arguments.getLast()), environment);
+    }
+
+    private TailCall evalTailOr(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.isEmpty()) {
+            return new TailCallValue(new BoolValue(false));
+        }
+
+        for (int i = 0; i < arguments.size() - 1; i++) {
+            Value value = eval(arguments.get(i), environment);
+            if (value.isTruthy()) {
+                return new TailCallValue(value);
+            }
+        }
+
+        return new TailCallSequence(List.of(arguments.getLast()), environment);
     }
 
     private Value evalDefine(List<Expr> arguments, Environment environment) throws EvalError {
@@ -678,7 +995,7 @@ public class Evaluator {
                 if (testClauseElements.size() == 1) {
                     return VoidValue.INSTANCE;
                 }
-                return evalSequence(testClauseElements.subList(1, testClauseElements.size()), loopEnvironment);
+                return evalTailSequence(testClauseElements.subList(1, testClauseElements.size()), loopEnvironment);
             }
 
             if (!body.isEmpty()) {

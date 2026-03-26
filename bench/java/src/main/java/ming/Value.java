@@ -313,10 +313,23 @@ sealed interface ProcedureValue extends Value
         permits PrimitiveProcedureValue, LambdaProcedureValue, CaseLambdaProcedureValue {
     Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError;
 
+    default TailCall applyTail(List<Value> arguments, Evaluator evaluator) throws EvalError {
+        return new TailCallValue(apply(arguments, evaluator));
+    }
+
     @Override
     default String render() {
         return "#<procedure>";
     }
+}
+
+sealed interface TailCall permits TailCallValue, TailCallSequence {
+}
+
+record TailCallValue(Value value) implements TailCall {
+}
+
+record TailCallSequence(List<Expr> expressions, Environment environment) implements TailCall {
 }
 
 @FunctionalInterface
@@ -356,8 +369,7 @@ final class LambdaProcedureValue implements ProcedureValue {
         this.definingEnvironment = definingEnvironment;
     }
 
-    @Override
-    public Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError {
+    private Environment createCallEnvironment(List<Value> arguments) throws EvalError {
         if (restParameter == null && arguments.size() != parameters.size()) {
             String procedureName = name == null ? "lambda" : name;
             throw new EvalError(procedureName + " expected " + parameters.size() + " argument(s)");
@@ -377,7 +389,17 @@ final class LambdaProcedureValue implements ProcedureValue {
                     new ListValue(List.copyOf(arguments.subList(parameters.size(), arguments.size()))));
         }
 
-        return evaluator.evalSequence(body, callEnvironment);
+        return callEnvironment;
+    }
+
+    @Override
+    public Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError {
+        return evaluator.evalTailSequence(body, createCallEnvironment(arguments));
+    }
+
+    @Override
+    public TailCall applyTail(List<Value> arguments, Evaluator evaluator) throws EvalError {
+        return new TailCallSequence(body, createCallEnvironment(arguments));
     }
 
     @Override
@@ -404,8 +426,7 @@ final class CaseLambdaProcedureValue implements ProcedureValue {
         this.definingEnvironment = definingEnvironment;
     }
 
-    @Override
-    public Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError {
+    private TailCall matchClause(List<Value> arguments) throws EvalError {
         for (CaseLambdaClause clause : clauses) {
             ParameterSpec parameters = clause.parameters();
             if (!parameters.matchesArity(arguments.size())) {
@@ -423,10 +444,25 @@ final class CaseLambdaProcedureValue implements ProcedureValue {
                                 parameters.fixedParameters().size(),
                                 arguments.size()))));
             }
-            return evaluator.evalSequence(clause.body(), callEnvironment);
+            return new TailCallSequence(clause.body(), callEnvironment);
         }
 
         throw new EvalError(
                 "case-lambda expected a matching clause for " + arguments.size() + " argument(s)");
+    }
+
+    @Override
+    public Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError {
+        TailCall tailCall = matchClause(arguments);
+        if (tailCall instanceof TailCallValue tailCallValue) {
+            return tailCallValue.value();
+        }
+        TailCallSequence tailCallSequence = (TailCallSequence) tailCall;
+        return evaluator.evalTailSequence(tailCallSequence.expressions(), tailCallSequence.environment());
+    }
+
+    @Override
+    public TailCall applyTail(List<Value> arguments, Evaluator evaluator) throws EvalError {
+        return matchClause(arguments);
     }
 }
