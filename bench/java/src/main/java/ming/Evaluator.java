@@ -80,6 +80,14 @@ public class Evaluator {
         @Override public String toString() { return "#<dynamic-wind>"; }
     };
 
+    // ===== values & call-with-values support =====
+
+    static final Object CALL_WITH_VALUES = new Object() {
+        @Override public String toString() { return "#<call-with-values>"; }
+    };
+
+    record MultipleValues(List<Object> values) {}
+
     record DynamicWindEntry(Object inThunk, Object outThunk) {}
 
     static final ThreadLocal<List<DynamicWindEntry>> WIND_STACK = ThreadLocal.withInitial(ArrayList::new);
@@ -116,6 +124,7 @@ public class Evaluator {
         record LetStar(List<?> bindings, int idx, Env letEnv, List<Object> body, Kont next) implements Kont {}
         record Letrec(List<String> names, int idx, List<Object> inits, List<Object> body, Env letEnv, Kont next) implements Kont {}
         record DynWindBody(Object inThunk, Object outThunk, Kont next) implements Kont {}
+        record CallWithValues(Object consumer, Kont next) implements Kont {}
     }
 
     // ===== CEK Machine =====
@@ -156,6 +165,12 @@ public class Evaluator {
                     fn = bodyThunk; fa = List.of();
                     k = new Kont.DynWindBody(inThunk, outThunk, k);
                     continue;
+                }
+                if (fn == CALL_WITH_VALUES) {
+                    if (fa.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+                    Object producer = fa.get(0), consumer = fa.get(1);
+                    k = new Kont.CallWithValues(consumer, k);
+                    fn = producer; fa = List.of(); continue;
                 }
                 if (fn instanceof CaseLambda cl) {
                     Lambda matched = null;
@@ -543,6 +558,14 @@ public class Evaluator {
                     catch (ContinuationReturn cr) { val = cr.value; k = cr.kont; continue mainLoop; }
                     k = next;
                 }
+
+                case Kont.CallWithValues(var consumer, var next) -> {
+                    if (val instanceof MultipleValues mv) {
+                        fn = consumer; fa = mv.values; k = next;
+                    } else {
+                        fn = consumer; fa = List.of(val); k = next;
+                    }
+                }
             }
 
         }} catch (SchemeException se) {
@@ -798,6 +821,18 @@ public class Evaluator {
                 applyProc(outTh, List.of());
                 return result;
             }
+            if (func == CALL_WITH_VALUES) {
+                if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+                Object producer = args.get(0), consumer = args.get(1);
+                Object result = applyProc(producer, List.of());
+                List<Object> vals;
+                if (result instanceof MultipleValues mv) {
+                    vals = mv.values;
+                } else {
+                    vals = List.of(result);
+                }
+                return applyProc(consumer, vals);
+            }
             throw new EvalError("not a procedure: " + SchemeValue.toStr(func));
 
             } catch (EvalError e) {
@@ -917,6 +952,18 @@ public class Evaluator {
             WIND_STACK.get().remove(WIND_STACK.get().size() - 1);
             applyProc(outTh, List.of());
             return result;
+        }
+        if (func == CALL_WITH_VALUES) {
+            if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+            Object producer = args.get(0), consumer = args.get(1);
+            Object result = applyProc(producer, List.of());
+            List<Object> vals;
+            if (result instanceof MultipleValues mv) {
+                vals = mv.values;
+            } else {
+                vals = List.of(result);
+            }
+            return applyProc(consumer, vals);
         }
         if (func instanceof Builtin b) {
             return b.apply(args);
