@@ -9,6 +9,7 @@ type SchemeVal =
   | { tag: 'boolean'; value: boolean; pos?: Pos }
   | { tag: 'string'; value: string; pos?: Pos }
   | { tag: 'symbol'; value: string; pos?: Pos }
+  | { tag: 'char'; value: string; pos?: Pos }
   | { tag: 'list'; value: SchemeVal[]; pos?: Pos }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
   | { tag: 'nil'; pos?: Pos }
@@ -172,6 +173,8 @@ function toNumber(v: SchemeVal, op: string, callPos?: Pos): number {
   return v.value;
 }
 
+let _outputBuf: string[] = [];
+
 function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal {
   switch (name) {
     case '+': {
@@ -283,6 +286,74 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}not: need 1 argument`);
       return { tag: 'boolean', value: !isTruthy(args[0]) };
     }
+    case 'display': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}display: need 1 argument`);
+      _outputBuf.push(displayVal(args[0]));
+      return { tag: 'void' };
+    }
+    case 'write': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}write: need 1 argument`);
+      _outputBuf.push(writeVal(args[0]));
+      return { tag: 'void' };
+    }
+    case 'newline': {
+      if (args.length !== 0) throw new EvalError(`${posStr(callPos)}newline: need 0 arguments`);
+      _outputBuf.push('\n');
+      return { tag: 'void' };
+    }
+    case 'string-append': {
+      let result = '';
+      for (const a of args) {
+        if (a.tag !== 'string') throw new EvalError(`${posStr(callPos)}string-append: expected string`);
+        result += a.value;
+      }
+      return { tag: 'string', value: result };
+    }
+    case 'string-length': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string-length: need 1 argument`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-length: expected string`);
+      return { tag: 'number', value: args[0].value.length };
+    }
+    case 'substring': {
+      if (args.length !== 3) throw new EvalError(`${posStr(callPos)}substring: need 3 arguments`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}substring: expected string`);
+      const start = toNumber(args[1], 'substring', callPos);
+      const end = toNumber(args[2], 'substring', callPos);
+      return { tag: 'string', value: args[0].value.substring(start, end) };
+    }
+    case 'string->number': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string->number: need 1 argument`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string->number: expected string`);
+      const n = Number(args[0].value);
+      if (isNaN(n)) return { tag: 'boolean', value: false };
+      return { tag: 'number', value: n };
+    }
+    case 'number->string': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}number->string: need 1 argument`);
+      if (args[0].tag !== 'number') throw new EvalError(`${posStr(callPos)}number->string: expected number`);
+      return { tag: 'string', value: String(args[0].value) };
+    }
+    case 'symbol->string': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}symbol->string: need 1 argument`);
+      if (args[0].tag !== 'symbol') throw new EvalError(`${posStr(callPos)}symbol->string: expected symbol`);
+      return { tag: 'string', value: args[0].value };
+    }
+    case 'string->symbol': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string->symbol: need 1 argument`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string->symbol: expected string`);
+      return { tag: 'symbol', value: args[0].value };
+    }
+    case 'string-ref': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}string-ref: need 2 arguments`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-ref: expected string`);
+      const idx = toNumber(args[1], 'string-ref', callPos);
+      if (idx < 0 || idx >= args[0].value.length) throw new EvalError(`${posStr(callPos)}string-ref: index out of range`);
+      return { tag: 'char', value: args[0].value[idx] };
+    }
+    case 'char?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}char?: need 1 argument`);
+      return { tag: 'boolean', value: args[0].tag === 'char' };
+    }
     default:
       throw new EvalError(`${posStr(callPos)}unknown builtin: ${name}`);
   }
@@ -292,6 +363,11 @@ const BUILTIN_NAMES = new Set([
   '+', '-', '*', '/', '<', '>', '=', '<=', '>=',
   'cons', 'car', 'cdr', 'null?', 'pair?', 'list', 'length', 'append',
   'number?', 'boolean?', 'string?', 'symbol?', 'not',
+  'display', 'write', 'newline',
+  'string-append', 'string-length', 'substring',
+  'string->number', 'number->string',
+  'symbol->string', 'string->symbol',
+  'string-ref', 'char?',
 ]);
 
 function evaluate(expr: SchemeVal, env: Env): SchemeVal {
@@ -483,30 +559,41 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
 
 // ── Display ────────────────────────────────────────────────────────
 
-function display(val: SchemeVal): string {
+// writeVal: like Scheme's `write` — strings get quotes
+function writeVal(val: SchemeVal): string {
   switch (val.tag) {
     case 'number': return String(val.value);
     case 'boolean': return val.value ? '#t' : '#f';
     case 'string': return `"${val.value}"`;
+    case 'char': return `#\\${val.value}`;
     case 'symbol': return val.value;
     case 'void': return '';
     case 'nil': return '()';
     case 'pair': {
-      let result = '(' + display(val.car);
+      let result = '(' + writeVal(val.car);
       let cur: SchemeVal = val.cdr;
       while (cur.tag === 'pair') {
-        result += ' ' + display(cur.car);
+        result += ' ' + writeVal(cur.car);
         cur = cur.cdr;
       }
       if (cur.tag !== 'nil') {
-        result += ' . ' + display(cur);
+        result += ' . ' + writeVal(cur);
       }
       result += ')';
       return result;
     }
-    case 'list': return `(${val.value.map(display).join(' ')})`;
+    case 'list': return `(${val.value.map(writeVal).join(' ')})`;
     case 'lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
+  }
+}
+
+// displayVal: like Scheme's `display` — strings without quotes
+function displayVal(val: SchemeVal): string {
+  switch (val.tag) {
+    case 'string': return val.value;
+    case 'char': return val.value;
+    default: return writeVal(val);
   }
 }
 
@@ -517,14 +604,23 @@ export function evalStr(input: string): string {
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
   const globalEnv = new Env();
+  _outputBuf = [];
   let result: SchemeVal = { tag: 'void' };
   for (const expr of exprs) {
     result = evaluate(expr, globalEnv);
   }
-  return display(result);
+  return writeVal(result);
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  const result = evalStr(input);
-  return { result, output: '' };
+  const tokens = tokenize(input);
+  const exprs = parse(tokens);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  const globalEnv = new Env();
+  _outputBuf = [];
+  let result: SchemeVal = { tag: 'void' };
+  for (const expr of exprs) {
+    result = evaluate(expr, globalEnv);
+  }
+  return { result: writeVal(result), output: _outputBuf.join('') };
 }
