@@ -38,6 +38,50 @@ public class Evaluator {
         private Value value;
     }
 
+    private final class SequenceState {
+        private final List<Expr> exprs;
+        private final Environment env;
+        private final Continuation cont;
+        private final Set<Integer> committedCallCcIndexes = new java.util.HashSet<>();
+
+        SequenceState(List<Expr> exprs, Environment env, Continuation cont) {
+            this.exprs = List.copyOf(exprs);
+            this.env = env;
+            this.cont = cont;
+        }
+
+        Bounce resumeFrom(int index) throws EvalError {
+            int nextIndex = index;
+            while (nextIndex < exprs.size() && committedCallCcIndexes.contains(nextIndex)) {
+                nextIndex++;
+            }
+
+            if (nextIndex >= exprs.size()) {
+                return deliver(cont, VoidValue.INSTANCE);
+            }
+
+            Expr expr = exprs.get(nextIndex);
+            int sequenceIndex = nextIndex;
+            if (nextIndex == exprs.size() - 1) {
+                return evalExpr(expr, env, values -> withPosition(expr.position(), () -> {
+                    markCommitted(sequenceIndex);
+                    return cont.resume(values);
+                }));
+            }
+
+            return evalExpr(expr, env, positionedCont(expr.position(), ignored -> {
+                markCommitted(sequenceIndex);
+                return resumeFrom(sequenceIndex + 1);
+            }));
+        }
+
+        private void markCommitted(int index) {
+            if (isCallCcExpr(exprs.get(index))) {
+                committedCallCcIndexes.add(index);
+            }
+        }
+    }
+
     private final CollectionProcedures collectionProcedures;
     private final DynamicWindSupport dynamicWindSupport;
     private final ValueSupport valueSupport = new ValueSupport();
@@ -1046,10 +1090,25 @@ public class Evaluator {
         if (exprs.size() == 1) {
             return evalExpr(exprs.getFirst(), env, cont);
         }
+        return new SequenceState(exprs, env, cont).resumeFrom(0);
+    }
 
-        Expr expr = exprs.getFirst();
-        return evalExpr(expr, env, positionedCont(expr.position(),
-                ignored -> evalSequenceBounce(exprs.subList(1, exprs.size()), env, cont)));
+    private boolean isCallCcExpr(Expr expr) {
+        if (!(expr instanceof ListExpr listExpr)) {
+            return false;
+        }
+
+        List<Expr> elements = listExpr.elements();
+        if (elements.isEmpty()) {
+            return false;
+        }
+
+        if (!(elements.getFirst() instanceof SymbolExpr symbolExpr)) {
+            return false;
+        }
+
+        return symbolExpr.name().equals("call/cc")
+                || symbolExpr.name().equals("call-with-current-continuation");
     }
 
     Value applyUserProcedure(String displayName, ParameterSpec parameters,
