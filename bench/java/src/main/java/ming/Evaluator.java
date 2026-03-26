@@ -12,6 +12,7 @@ public class Evaluator {
     public String evalStr(String input) throws EvalError {
         List<Object> exprs = Parser.parse(input);
         Env env = Env.global();
+        WIND_STACK.get().clear();
         Object result = runCEK(exprs, env);
         return SchemeValue.toStr(result);
     }
@@ -21,11 +22,13 @@ public class Evaluator {
         Env env = Env.global();
         StringBuilder outputBuf = new StringBuilder();
         OUTPUT.set(outputBuf);
+        WIND_STACK.get().clear();
         try {
             Object result = runCEK(exprs, env);
             return new EvalResult(SchemeValue.toStr(result), outputBuf.toString());
         } finally {
             OUTPUT.remove();
+            WIND_STACK.get().clear();
         }
     }
 
@@ -44,7 +47,11 @@ public class Evaluator {
 
     static final class ContinuationObj {
         final Kont kont;
-        ContinuationObj(Kont kont) { this.kont = kont; }
+        final List<DynamicWindEntry> windStack;
+        ContinuationObj(Kont kont, List<DynamicWindEntry> windStack) {
+            this.kont = kont;
+            this.windStack = windStack;
+        }
     }
 
     static final class ContinuationReturn extends RuntimeException {
@@ -54,6 +61,33 @@ public class Evaluator {
             super(null, null, true, false);
             this.value = value;
             this.kont = kont;
+        }
+    }
+
+    // ===== dynamic-wind support =====
+
+    static final Object DYNAMIC_WIND = new Object() {
+        @Override public String toString() { return "#<dynamic-wind>"; }
+    };
+
+    record DynamicWindEntry(Object inThunk, Object outThunk) {}
+
+    static final ThreadLocal<List<DynamicWindEntry>> WIND_STACK = ThreadLocal.withInitial(ArrayList::new);
+
+    static void windTo(List<DynamicWindEntry> target) throws EvalError {
+        List<DynamicWindEntry> current = WIND_STACK.get();
+        int common = 0;
+        int minLen = Math.min(current.size(), target.size());
+        while (common < minLen && current.get(common) == target.get(common)) common++;
+        // Unwind: out-thunks from innermost to outermost
+        for (int i = current.size() - 1; i >= common; i--) {
+            DynamicWindEntry e = current.remove(i);
+            applyProc(e.outThunk, List.of());
+        }
+        // Rewind: in-thunks from outermost to innermost
+        for (int i = common; i < target.size(); i++) {
+            current.add(target.get(i));
+            applyProc(target.get(i).inThunk, List.of());
         }
     }
 
@@ -71,6 +105,7 @@ public class Evaluator {
         record CondTest(List<?> clause, int nextCI, List<?> form, Env env, Kont next) implements Kont {}
         record LetStar(List<?> bindings, int idx, Env letEnv, List<Object> body, Kont next) implements Kont {}
         record Letrec(List<String> names, int idx, List<Object> inits, List<Object> body, Env letEnv, Kont next) implements Kont {}
+        record DynWindBody(Object inThunk, Object outThunk, Kont next) implements Kont {}
     }
 
     // ===== CEK Machine =====
@@ -95,11 +130,22 @@ public class Evaluator {
             if (fn != null) {
                 if (fn instanceof ContinuationObj co) {
                     val = (fa == null || fa.isEmpty()) ? null : fa.get(0);
+                    windTo(co.windStack);
                     k = co.kont; fn = null; fa = null; ev = false; continue;
                 }
                 if (fn == CALLCC) {
-                    ContinuationObj co = new ContinuationObj(k);
+                    ContinuationObj co = new ContinuationObj(k, new ArrayList<>(WIND_STACK.get()));
                     fn = fa.get(0); fa = List.of(co); continue;
+                }
+                if (fn == DYNAMIC_WIND) {
+                    if (fa.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+                    Object inThunk = fa.get(0), bodyThunk = fa.get(1), outThunk = fa.get(2);
+                    try { applyProc(inThunk, List.of()); }
+                    catch (ContinuationReturn cr) { val = cr.value; k = cr.kont; fn = null; fa = null; ev = false; continue; }
+                    WIND_STACK.get().add(new DynamicWindEntry(inThunk, outThunk));
+                    fn = bodyThunk; fa = List.of();
+                    k = new Kont.DynWindBody(inThunk, outThunk, k);
+                    continue;
                 }
                 if (fn instanceof CaseLambda cl) {
                     Lambda matched = null;
@@ -474,6 +520,14 @@ public class Evaluator {
                         env = le; ev = true;
                     }
                 }
+
+                case Kont.DynWindBody(var inThunk, var outThunk, var next) -> {
+                    var ws = WIND_STACK.get();
+                    if (!ws.isEmpty()) ws.remove(ws.size() - 1);
+                    try { applyProc(outThunk, List.of()); }
+                    catch (ContinuationReturn cr) { val = cr.value; k = cr.kont; continue mainLoop; }
+                    k = next;
+                }
             }
 
         }} catch (EvalError e) {
@@ -697,7 +751,26 @@ public class Evaluator {
                 expr = lam.body.get(lam.body.size() - 1); env = localEnv; continue;
             }
             if (func instanceof ContinuationObj co) {
+                windTo(co.windStack);
                 throw new ContinuationReturn(args.isEmpty() ? null : args.get(0), co.kont);
+            }
+            if (func == DYNAMIC_WIND) {
+                if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+                Object inTh = args.get(0), bodyTh = args.get(1), outTh = args.get(2);
+                applyProc(inTh, List.of());
+                DynamicWindEntry entry = new DynamicWindEntry(inTh, outTh);
+                WIND_STACK.get().add(entry);
+                Object result;
+                try { result = applyProc(bodyTh, List.of()); }
+                catch (ContinuationReturn cr) {
+                    var ws = WIND_STACK.get();
+                    int idx2 = ws.lastIndexOf(entry);
+                    if (idx2 >= 0) { ws.remove(idx2); applyProc(outTh, List.of()); }
+                    throw cr;
+                }
+                WIND_STACK.get().remove(WIND_STACK.get().size() - 1);
+                applyProc(outTh, List.of());
+                return result;
             }
             throw new EvalError("not a procedure: " + SchemeValue.toStr(func));
 
@@ -746,7 +819,26 @@ public class Evaluator {
 
     static Object applyProc(Object func, List<Object> args) throws EvalError {
         if (func instanceof ContinuationObj co) {
+            windTo(co.windStack);
             throw new ContinuationReturn(args.isEmpty() ? null : args.get(0), co.kont);
+        }
+        if (func == DYNAMIC_WIND) {
+            if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+            Object inTh = args.get(0), bodyTh = args.get(1), outTh = args.get(2);
+            applyProc(inTh, List.of());
+            DynamicWindEntry entry = new DynamicWindEntry(inTh, outTh);
+            WIND_STACK.get().add(entry);
+            Object result;
+            try { result = applyProc(bodyTh, List.of()); }
+            catch (ContinuationReturn cr) {
+                var ws = WIND_STACK.get();
+                int idx = ws.lastIndexOf(entry);
+                if (idx >= 0) { ws.remove(idx); applyProc(outTh, List.of()); }
+                throw cr;
+            }
+            WIND_STACK.get().remove(WIND_STACK.get().size() - 1);
+            applyProc(outTh, List.of());
+            return result;
         }
         if (func instanceof Builtin b) {
             return b.apply(args);
