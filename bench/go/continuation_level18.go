@@ -4,6 +4,7 @@ import "fmt"
 
 type continuationExpr struct {
 	cont level18Cont
+	wind *dynamicWindFrame
 }
 
 type level18Cont interface{}
@@ -51,16 +52,57 @@ type level18CallArgsCont struct {
 	next     level18Cont
 }
 
+type dynamicWindFrame struct {
+	in     expr
+	out    expr
+	parent *dynamicWindFrame
+}
+
+type dynamicWindAfterInCont struct {
+	frame    *dynamicWindFrame
+	bodyProc expr
+	next     level18Cont
+}
+
+type dynamicWindAfterBodyCont struct {
+	frame *dynamicWindFrame
+	next  level18Cont
+}
+
+type dynamicWindAfterOutCont struct {
+	frame  *dynamicWindFrame
+	result expr
+	next   level18Cont
+}
+
+type dynamicWindTransitionStep struct {
+	frame    *dynamicWindFrame
+	entering bool
+}
+
+type dynamicWindTransitionCont struct {
+	steps      []dynamicWindTransitionStep
+	index      int
+	targetCont level18Cont
+	targetWind *dynamicWindFrame
+	value      expr
+}
+
 type level18Machine struct {
 	evaluating bool
 	env        *env
 	form       expr
 	value      expr
 	cont       level18Cont
+	wind       *dynamicWindFrame
 }
 
 func builtinContinuationSentinel(args []expr) (expr, error) {
 	return nil, &EvalError{Message: "call/cc requires the level 18 evaluator"}
+}
+
+func builtinDynamicWindSentinel(args []expr) (expr, error) {
+	return nil, &EvalError{Message: "dynamic-wind requires the level 19 evaluator"}
 }
 
 func evalSequenceLevel18(environment *env, forms []expr) (expr, error) {
@@ -178,6 +220,42 @@ func (m *level18Machine) run() (expr, error) {
 			if err := m.apply(cont.proc, values, cont.next); err != nil {
 				return nil, attachPos(err, cont.pos)
 			}
+		case *dynamicWindAfterInCont:
+			m.wind = cont.frame
+			if err := m.apply(cont.bodyProc, nil, &dynamicWindAfterBodyCont{
+				frame: cont.frame,
+				next:  cont.next,
+			}); err != nil {
+				return nil, err
+			}
+		case *dynamicWindAfterBodyCont:
+			if err := m.apply(cont.frame.out, nil, &dynamicWindAfterOutCont{
+				frame:  cont.frame,
+				result: m.value,
+				next:   cont.next,
+			}); err != nil {
+				return nil, err
+			}
+		case *dynamicWindAfterOutCont:
+			m.wind = cont.frame.parent
+			m.returnValue(cont.result, cont.next)
+		case *dynamicWindTransitionCont:
+			step := cont.steps[cont.index]
+			if step.entering {
+				m.wind = step.frame
+			} else {
+				m.wind = step.frame.parent
+			}
+
+			if cont.index+1 < len(cont.steps) {
+				if err := m.runWindTransition(cont.steps, cont.index+1, cont.targetCont, cont.targetWind, cont.value); err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			m.wind = cont.targetWind
+			m.returnValue(cont.value, cont.targetCont)
 		default:
 			return nil, &EvalError{Message: "unsupported continuation"}
 		}
@@ -381,6 +459,91 @@ func (m *level18Machine) stepIf(environment *env, forms []expr, pos sourcePos) e
 	return nil
 }
 
+func (m *level18Machine) applyDynamicWind(args []expr, cont level18Cont) error {
+	if len(args) != 3 {
+		return &EvalError{Message: "dynamic-wind expects exactly 3 arguments"}
+	}
+
+	frame := &dynamicWindFrame{
+		in:     args[0],
+		out:    args[2],
+		parent: m.wind,
+	}
+
+	return m.apply(args[0], nil, &dynamicWindAfterInCont{
+		frame:    frame,
+		bodyProc: args[1],
+		next:     cont,
+	})
+}
+
+func (m *level18Machine) invokeContinuation(target *continuationExpr, value expr) error {
+	steps := buildWindTransition(m.wind, target.wind)
+	if len(steps) == 0 {
+		m.wind = target.wind
+		m.returnValue(value, target.cont)
+		return nil
+	}
+
+	return m.runWindTransition(steps, 0, target.cont, target.wind, value)
+}
+
+func (m *level18Machine) runWindTransition(steps []dynamicWindTransitionStep, index int, targetCont level18Cont, targetWind *dynamicWindFrame, value expr) error {
+	step := steps[index]
+	next := &dynamicWindTransitionCont{
+		steps:      steps,
+		index:      index,
+		targetCont: targetCont,
+		targetWind: targetWind,
+		value:      value,
+	}
+
+	if step.entering {
+		return m.apply(step.frame.in, nil, next)
+	}
+	return m.apply(step.frame.out, nil, next)
+}
+
+func buildWindTransition(from *dynamicWindFrame, to *dynamicWindFrame) []dynamicWindTransitionStep {
+	fromPath := dynamicWindPath(from)
+	toPath := dynamicWindPath(to)
+
+	common := 0
+	for common < len(fromPath) && common < len(toPath) && fromPath[common] == toPath[common] {
+		common++
+	}
+
+	steps := make([]dynamicWindTransitionStep, 0, len(fromPath)-common+len(toPath)-common)
+	for i := len(fromPath) - 1; i >= common; i-- {
+		steps = append(steps, dynamicWindTransitionStep{frame: fromPath[i]})
+	}
+	for i := common; i < len(toPath); i++ {
+		steps = append(steps, dynamicWindTransitionStep{
+			frame:    toPath[i],
+			entering: true,
+		})
+	}
+
+	return steps
+}
+
+func dynamicWindPath(frame *dynamicWindFrame) []*dynamicWindFrame {
+	if frame == nil {
+		return nil
+	}
+
+	reversed := make([]*dynamicWindFrame, 0, 4)
+	for current := frame; current != nil; current = current.parent {
+		reversed = append(reversed, current)
+	}
+
+	path := make([]*dynamicWindFrame, len(reversed))
+	for i := range reversed {
+		path[len(reversed)-1-i] = reversed[i]
+	}
+	return path
+}
+
 func (m *level18Machine) apply(proc expr, args []expr, cont level18Cont) error {
 applyLoop:
 	for {
@@ -392,8 +555,10 @@ applyLoop:
 					return &EvalError{Message: fmt.Sprintf("%s expects exactly 1 argument", callable.name)}
 				}
 				proc = args[0]
-				args = []expr{&continuationExpr{cont: cont}}
+				args = []expr{&continuationExpr{cont: cont, wind: m.wind}}
 				continue
+			case "dynamic-wind":
+				return m.applyDynamicWind(args, cont)
 			case "apply":
 				if len(args) < 2 {
 					return &EvalError{Message: "apply expects at least 2 arguments"}
@@ -422,8 +587,7 @@ applyLoop:
 			if len(args) != 1 {
 				return &EvalError{Message: "continuation expects exactly 1 argument"}
 			}
-			m.returnValue(args[0], callable.cont)
-			return nil
+			return m.invokeContinuation(callable, args[0])
 		case closureExpr:
 			if !callable.variadic && len(args) != len(callable.params) {
 				return &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}

@@ -218,6 +218,9 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("cdr", builtinProc{name: "cdr", fn: builtinCdr})
 	root.define("call/cc", builtinProc{name: "call/cc", fn: builtinContinuationSentinel})
 	root.define("call-with-current-continuation", builtinProc{name: "call-with-current-continuation", fn: builtinContinuationSentinel})
+	if currentBenchLevel() >= 19 {
+		root.define("dynamic-wind", builtinProc{name: "dynamic-wind", fn: builtinDynamicWindSentinel})
+	}
 	root.define("char-alphabetic?", builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabetic})
 	root.define("char->integer", builtinProc{name: "char->integer", fn: builtinCharToInteger})
 	root.define("char-downcase", builtinProc{name: "char-downcase", fn: builtinCharDowncase})
