@@ -9,9 +9,5 @@ func EvalStr(input string) (string, error) {
 // EvalStrWithOutput evaluates Scheme expressions and returns both the result
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	result, err = EvalStr(input)
-	if err != nil {
-		return "", "", err
-	}
-	return result, "", nil
+	return evalProgramWithOutput(input)
 }

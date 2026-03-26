@@ -13,6 +13,7 @@ type expr interface{}
 type intExpr int
 type boolExpr bool
 type stringExpr string
+type charExpr rune
 type symbolExpr struct {
 	name string
 	pos  sourcePos
@@ -62,6 +63,17 @@ type parser struct {
 	pos    int
 }
 
+type runtime struct {
+	output strings.Builder
+}
+
+func (r *runtime) writeString(text string) {
+	if r == nil {
+		return
+	}
+	r.output.WriteString(text)
+}
+
 func (p sourcePos) advance(r rune) sourcePos {
 	if r == '\n' {
 		return sourcePos{Line: p.Line + 1, Col: 1}
@@ -81,30 +93,36 @@ func formPos(form expr) sourcePos {
 }
 
 func evalProgram(input string) (string, error) {
+	result, _, err := evalProgramWithOutput(input)
+	return result, err
+}
+
+func evalProgramWithOutput(input string) (string, string, error) {
 	tokens, err := tokenize(input)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	p := parser{tokens: tokens}
 	program, err := p.parseProgram()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if len(program) == 0 {
-		return "", errorAt(sourcePos{Line: 1, Col: 1}, "empty program")
+		return "", "", errorAt(sourcePos{Line: 1, Col: 1}, "empty program")
 	}
 
-	environment := newGlobalEnv()
+	rt := &runtime{}
+	environment := newGlobalEnv(rt)
 	result, err := evalSequence(environment, program)
 	if err != nil {
-		return "", err
+		return "", rt.output.String(), err
 	}
 
-	return renderExpr(result), nil
+	return renderExpr(result), rt.output.String(), nil
 }
 
-func newGlobalEnv() *env {
+func newGlobalEnv(rt *runtime) *env {
 	root := &env{bindings: map[string]expr{}}
 
 	root.define("+", builtinProc{name: "+", fn: builtinAdd})
@@ -119,9 +137,15 @@ func newGlobalEnv() *env {
 	root.define("append", builtinProc{name: "append", fn: builtinAppend})
 	root.define("car", builtinProc{name: "car", fn: builtinCar})
 	root.define("cdr", builtinProc{name: "cdr", fn: builtinCdr})
+	root.define("char?", builtinProc{name: "char?", fn: typePredicate(func(value expr) bool {
+		_, ok := value.(charExpr)
+		return ok
+	})})
 	root.define("cons", builtinProc{name: "cons", fn: builtinCons})
+	root.define("display", builtinProc{name: "display", fn: makeDisplayBuiltin(rt)})
 	root.define("length", builtinProc{name: "length", fn: builtinLength})
 	root.define("list", builtinProc{name: "list", fn: builtinList})
+	root.define("newline", builtinProc{name: "newline", fn: makeNewlineBuiltin(rt)})
 	root.define("null?", builtinProc{name: "null?", fn: builtinNull})
 	root.define("boolean?", builtinProc{name: "boolean?", fn: typePredicate(func(value expr) bool {
 		_, ok := value.(boolExpr)
@@ -135,14 +159,23 @@ func newGlobalEnv() *env {
 		list, ok := value.(listExpr)
 		return ok && len(list.items) > 0
 	})})
+	root.define("number->string", builtinProc{name: "number->string", fn: builtinNumberToString})
 	root.define("string?", builtinProc{name: "string?", fn: typePredicate(func(value expr) bool {
 		_, ok := value.(stringExpr)
 		return ok
 	})})
+	root.define("string-append", builtinProc{name: "string-append", fn: builtinStringAppend})
+	root.define("string-length", builtinProc{name: "string-length", fn: builtinStringLength})
+	root.define("string-ref", builtinProc{name: "string-ref", fn: builtinStringRef})
+	root.define("string->number", builtinProc{name: "string->number", fn: builtinStringToNumber})
+	root.define("string->symbol", builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
+	root.define("substring", builtinProc{name: "substring", fn: builtinSubstring})
 	root.define("symbol?", builtinProc{name: "symbol?", fn: typePredicate(func(value expr) bool {
 		_, ok := value.(symbolExpr)
 		return ok
 	})})
+	root.define("symbol->string", builtinProc{name: "symbol->string", fn: builtinSymbolToString})
+	root.define("write", builtinProc{name: "write", fn: makeWriteBuiltin(rt)})
 
 	return root
 }
@@ -866,6 +899,166 @@ func builtinNull(args []expr) (expr, error) {
 	return boolExpr(ok && len(list.items) == 0), nil
 }
 
+func makeDisplayBuiltin(rt *runtime) builtinFunc {
+	return func(args []expr) (expr, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "display expects exactly 1 argument"}
+		}
+		rt.writeString(displayExpr(args[0]))
+		return voidExpr{}, nil
+	}
+}
+
+func makeWriteBuiltin(rt *runtime) builtinFunc {
+	return func(args []expr) (expr, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "write expects exactly 1 argument"}
+		}
+		rt.writeString(renderExpr(args[0]))
+		return voidExpr{}, nil
+	}
+}
+
+func makeNewlineBuiltin(rt *runtime) builtinFunc {
+	return func(args []expr) (expr, error) {
+		if len(args) != 0 {
+			return nil, &EvalError{Message: "newline expects exactly 0 arguments"}
+		}
+		rt.writeString("\n")
+		return voidExpr{}, nil
+	}
+}
+
+func builtinStringAppend(args []expr) (expr, error) {
+	var b strings.Builder
+	for _, arg := range args {
+		text, ok := arg.(stringExpr)
+		if !ok {
+			return nil, &EvalError{Message: "string-append expects string arguments"}
+		}
+		b.WriteString(string(text))
+	}
+	return stringExpr(b.String()), nil
+}
+
+func builtinStringLength(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string-length expects exactly 1 argument"}
+	}
+
+	text, ok := args[0].(stringExpr)
+	if !ok {
+		return nil, &EvalError{Message: "string-length expects a string"}
+	}
+	return intExpr(len([]rune(string(text)))), nil
+}
+
+func builtinSubstring(args []expr) (expr, error) {
+	if len(args) != 3 {
+		return nil, &EvalError{Message: "substring expects exactly 3 arguments"}
+	}
+
+	text, ok := args[0].(stringExpr)
+	if !ok {
+		return nil, &EvalError{Message: "substring expects a string as its first argument"}
+	}
+
+	start, ok := args[1].(intExpr)
+	if !ok {
+		return nil, &EvalError{Message: "substring expects numeric start and end indexes"}
+	}
+	end, ok := args[2].(intExpr)
+	if !ok {
+		return nil, &EvalError{Message: "substring expects numeric start and end indexes"}
+	}
+
+	runes := []rune(string(text))
+	startIdx := int(start)
+	endIdx := int(end)
+	if startIdx < 0 || endIdx < startIdx || endIdx > len(runes) {
+		return nil, &EvalError{Message: "substring index out of range"}
+	}
+
+	return stringExpr(string(runes[startIdx:endIdx])), nil
+}
+
+func builtinStringToNumber(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string->number expects exactly 1 argument"}
+	}
+
+	text, ok := args[0].(stringExpr)
+	if !ok {
+		return nil, &EvalError{Message: "string->number expects a string"}
+	}
+
+	n, err := strconv.Atoi(string(text))
+	if err != nil {
+		return boolExpr(false), nil
+	}
+	return intExpr(n), nil
+}
+
+func builtinNumberToString(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "number->string expects exactly 1 argument"}
+	}
+
+	n, ok := args[0].(intExpr)
+	if !ok {
+		return nil, &EvalError{Message: "number->string expects a number"}
+	}
+	return stringExpr(strconv.Itoa(int(n))), nil
+}
+
+func builtinSymbolToString(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "symbol->string expects exactly 1 argument"}
+	}
+
+	symbol, ok := args[0].(symbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: "symbol->string expects a symbol"}
+	}
+	return stringExpr(symbol.name), nil
+}
+
+func builtinStringToSymbol(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string->symbol expects exactly 1 argument"}
+	}
+
+	text, ok := args[0].(stringExpr)
+	if !ok {
+		return nil, &EvalError{Message: "string->symbol expects a string"}
+	}
+	return symbolExpr{name: string(text)}, nil
+}
+
+func builtinStringRef(args []expr) (expr, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "string-ref expects exactly 2 arguments"}
+	}
+
+	text, ok := args[0].(stringExpr)
+	if !ok {
+		return nil, &EvalError{Message: "string-ref expects a string as its first argument"}
+	}
+
+	index, ok := args[1].(intExpr)
+	if !ok {
+		return nil, &EvalError{Message: "string-ref expects a numeric index"}
+	}
+
+	runes := []rune(string(text))
+	idx := int(index)
+	if idx < 0 || idx >= len(runes) {
+		return nil, &EvalError{Message: "string-ref index out of range"}
+	}
+
+	return charExpr(runes[idx]), nil
+}
+
 func comparisonBuiltin(name string, cmp func(int, int) bool) builtinFunc {
 	return func(args []expr) (expr, error) {
 		numbers, err := numericArgs(args)
@@ -922,6 +1115,8 @@ func renderExpr(value expr) string {
 		return "#f"
 	case stringExpr:
 		return strconv.Quote(string(v))
+	case charExpr:
+		return renderChar(v)
 	case symbolExpr:
 		return v.name
 	case listExpr:
@@ -938,5 +1133,33 @@ func renderExpr(value expr) string {
 		return "#<procedure>"
 	default:
 		return ""
+	}
+}
+
+func displayExpr(value expr) string {
+	switch v := value.(type) {
+	case stringExpr:
+		return string(v)
+	case charExpr:
+		return string(rune(v))
+	case listExpr:
+		parts := make([]string, 0, len(v.items))
+		for _, item := range v.items {
+			parts = append(parts, displayExpr(item))
+		}
+		return "(" + strings.Join(parts, " ") + ")"
+	default:
+		return renderExpr(value)
+	}
+}
+
+func renderChar(value charExpr) string {
+	switch rune(value) {
+	case ' ':
+		return "#\\space"
+	case '\n':
+		return "#\\newline"
+	default:
+		return "#\\" + string(rune(value))
 	}
 }
