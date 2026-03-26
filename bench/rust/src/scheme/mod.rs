@@ -16,7 +16,7 @@ enum Value {
     Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
     Boolean(bool),
     Char(char),
-    Str(Rc<RefCell<Vec<char>>>),
+    Str(Rc<RefCell<Vec<char>>>, bool), // bool = mutable
     Symbol(String),
     Pair(Rc<Value>, Rc<Value>),
     Nil,
@@ -111,7 +111,11 @@ fn any_inexact(args: &[Value]) -> bool {
 }
 
 fn make_str(s: &str) -> Value {
-    Value::Str(Rc::new(RefCell::new(s.chars().collect())))
+    Value::Str(Rc::new(RefCell::new(s.chars().collect())), false)
+}
+
+fn make_mutable_str(chars: Vec<char>) -> Value {
+    Value::Str(Rc::new(RefCell::new(chars)), true)
 }
 
 impl Value {
@@ -142,11 +146,11 @@ impl Value {
                 _ => format!("#\\{}", c),
             },
             Value::Char(c) => c.to_string(),
-            Value::Str(s) if write_mode => {
+            Value::Str(s, _) if write_mode => {
                 let chars = s.borrow();
                 format!("\"{}\"", chars.iter().collect::<String>())
             }
-            Value::Str(s) => s.borrow().iter().collect(),
+            Value::Str(s, _) => s.borrow().iter().collect(),
             Value::Symbol(s) => s.clone(),
             Value::Nil => "()".into(),
             Value::Pair(_, _) => {
@@ -256,6 +260,8 @@ fn global_env() -> Env {
                    "string->number", "number->string",
                    "symbol->string", "string->symbol",
                    "string-ref", "string-set!", "string-copy",
+                   "string->list", "list->string",
+                   "char->integer", "integer->char",
                    "apply",
                    "abs", "modulo", "remainder", "quotient",
                    "min", "max", "expt",
@@ -1516,7 +1522,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => *x.borrow() == *y.borrow(),
+        (Value::Str(x, _), Value::Str(y, _)) => *x.borrow() == *y.borrow(),
         (Value::Nil, Value::Nil) => true,
         (Value::Pair(a1, a2), Value::Pair(b1, b2)) => values_equal(a1, b1) && values_equal(a2, b2),
         (Value::Vector(a), Value::Vector(b)) => {
@@ -1744,7 +1750,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
             if args.len() != 1 {
                 return Err(err_at(span, "string? requires 1 argument"));
             }
-            Ok(Value::Boolean(matches!(args[0], Value::Str(_))))
+            Ok(Value::Boolean(matches!(args[0], Value::Str(_, _))))
         }
         "pair?" => {
             if args.len() != 1 {
@@ -1827,7 +1833,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
             let mut result = String::new();
             for a in args {
                 match a {
-                    Value::Str(s) => result.push_str(&s.borrow().iter().collect::<String>()),
+                    Value::Str(s, _) => result.push_str(&s.borrow().iter().collect::<String>()),
                     _ => return Err(err_at(span, format!("string-append: expected string, got {}", a.display()))),
                 }
             }
@@ -1838,7 +1844,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 return Err(err_at(span, "string-length requires 1 argument"));
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.borrow().len() as i64)),
+                Value::Str(s, _) => Ok(Value::Integer(s.borrow().len() as i64)),
                 _ => Err(err_at(span, "string-length: expected string")),
             }
         }
@@ -1847,7 +1853,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 return Err(err_at(span, "substring requires 3 arguments"));
             }
             let s = match &args[0] {
-                Value::Str(s) => s,
+                Value::Str(s, _) => s,
                 _ => return Err(err_at(span, "substring: expected string")),
             };
             let start = args[1].as_integer()? as usize;
@@ -1864,7 +1870,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 return Err(err_at(span, "string->number requires 1 argument"));
             }
             match &args[0] {
-                Value::Str(s) => {
+                Value::Str(s, _) => {
                     let st: String = s.borrow().iter().collect();
                     if let Ok(n) = st.parse::<i64>() {
                         Ok(Value::Integer(n))
@@ -1897,7 +1903,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 return Err(err_at(span, "string->symbol requires 1 argument"));
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.borrow().iter().collect())),
+                Value::Str(s, _) => Ok(Value::Symbol(s.borrow().iter().collect())),
                 _ => Err(err_at(span, "string->symbol: expected string")),
             }
         }
@@ -1906,7 +1912,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 return Err(err_at(span, "string-ref requires 2 arguments"));
             }
             let s = match &args[0] {
-                Value::Str(s) => s,
+                Value::Str(s, _) => s,
                 _ => return Err(err_at(span, "string-ref: expected string")),
             };
             let idx = args[1].as_integer()? as usize;
@@ -1920,29 +1926,88 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
             if args.len() != 3 {
                 return Err(err_at(span, "string-set! requires 3 arguments"));
             }
-            let s = match &args[0] {
-                Value::Str(s) => s,
-                _ => return Err(err_at(span, "string-set!: expected string")),
-            };
-            let idx = args[1].as_integer()? as usize;
-            let c = match &args[2] {
-                Value::Char(c) => *c,
-                _ => return Err(err_at(span, "string-set!: expected char")),
-            };
-            let mut chars = s.borrow_mut();
-            if idx >= chars.len() {
-                return Err(err_at(span, "string-set!: index out of range"));
+            match &args[0] {
+                Value::Str(s, true) => {
+                    let idx = args[1].as_integer()? as usize;
+                    let c = match &args[2] {
+                        Value::Char(c) => *c,
+                        _ => return Err(err_at(span, "string-set!: expected char")),
+                    };
+                    let mut chars = s.borrow_mut();
+                    if idx >= chars.len() {
+                        return Err(err_at(span, "string-set!: index out of range"));
+                    }
+                    chars[idx] = c;
+                    Ok(Value::Void)
+                }
+                Value::Str(_, false) => {
+                    Err(err_at(span, "string-set!: strings are immutable"))
+                }
+                _ => Err(err_at(span, "string-set!: expected string")),
             }
-            chars[idx] = c;
-            Ok(Value::Void)
         }
         "string-copy" => {
             if args.len() != 1 {
                 return Err(err_at(span, "string-copy requires 1 argument"));
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Str(Rc::new(RefCell::new(s.borrow().clone())))),
+                Value::Str(s, _) => Ok(make_mutable_str(s.borrow().clone())),
                 _ => Err(err_at(span, "string-copy: expected string")),
+            }
+        }
+        "string->list" => {
+            if args.len() != 1 {
+                return Err(err_at(span, "string->list requires 1 argument"));
+            }
+            match &args[0] {
+                Value::Str(s, _) => {
+                    let chars = s.borrow();
+                    let list = chars.iter().rev().fold(Value::Nil, |acc, &c| {
+                        Value::Pair(Rc::new(Value::Char(c)), Rc::new(acc))
+                    });
+                    Ok(list)
+                }
+                _ => Err(err_at(span, "string->list: expected string")),
+            }
+        }
+        "list->string" => {
+            if args.len() != 1 {
+                return Err(err_at(span, "list->string requires 1 argument"));
+            }
+            let mut chars = Vec::new();
+            let mut cur = args[0].clone();
+            loop {
+                match cur {
+                    Value::Pair(car, cdr) => {
+                        match car.as_ref() {
+                            Value::Char(c) => chars.push(*c),
+                            _ => return Err(err_at(span, "list->string: expected list of characters")),
+                        }
+                        cur = cdr.as_ref().clone();
+                    }
+                    Value::Nil => break,
+                    _ => return Err(err_at(span, "list->string: expected proper list")),
+                }
+            }
+            Ok(make_mutable_str(chars))
+        }
+        "char->integer" => {
+            if args.len() != 1 {
+                return Err(err_at(span, "char->integer requires 1 argument"));
+            }
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                _ => Err(err_at(span, "char->integer: expected char")),
+            }
+        }
+        "integer->char" => {
+            if args.len() != 1 {
+                return Err(err_at(span, "integer->char requires 1 argument"));
+            }
+            let n = args[0].as_integer()?;
+            match char::from_u32(n as u32) {
+                Some(c) => Ok(Value::Char(c)),
+                None => Err(err_at(span, "integer->char: invalid code point")),
             }
         }
         "apply" => {
@@ -2145,7 +2210,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 (Value::Nil, Value::Nil) => true,
                 (Value::Void, Value::Void) => true,
                 (Value::Pair(a1, a2), Value::Pair(b1, b2)) => Rc::ptr_eq(a1, b1) && Rc::ptr_eq(a2, b2),
-                (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b),
+                (Value::Str(a, _), Value::Str(b, _)) => Rc::ptr_eq(a, b),
                 (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
                 _ => false,
             };
@@ -2196,21 +2261,21 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
         "string=?" => {
             if args.len() != 2 { return Err(err_at(span, "string=? requires 2 arguments")); }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(*a.borrow() == *b.borrow())),
+                (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(*a.borrow() == *b.borrow())),
                 _ => Err(err_at(span, "string=?: expected strings")),
             }
         }
         "string<?" => {
             if args.len() != 2 { return Err(err_at(span, "string<? requires 2 arguments")); }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => Ok(Value::Boolean(*a.borrow() < *b.borrow())),
+                (Value::Str(a, _), Value::Str(b, _)) => Ok(Value::Boolean(*a.borrow() < *b.borrow())),
                 _ => Err(err_at(span, "string<?: expected strings")),
             }
         }
         "string-ci=?" => {
             if args.len() != 2 { return Err(err_at(span, "string-ci=? requires 2 arguments")); }
             match (&args[0], &args[1]) {
-                (Value::Str(a), Value::Str(b)) => {
+                (Value::Str(a, _), Value::Str(b, _)) => {
                     let al: Vec<char> = a.borrow().iter().map(|c| c.to_ascii_lowercase()).collect();
                     let bl: Vec<char> = b.borrow().iter().map(|c| c.to_ascii_lowercase()).collect();
                     Ok(Value::Boolean(al == bl))
@@ -2221,7 +2286,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
         "string-upcase" => {
             if args.len() != 1 { return Err(err_at(span, "string-upcase requires 1 argument")); }
             match &args[0] {
-                Value::Str(s) => {
+                Value::Str(s, _) => {
                     let upper: String = s.borrow().iter().map(|c| c.to_ascii_uppercase()).collect();
                     Ok(make_str(&upper))
                 }
@@ -2231,7 +2296,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
         "string-downcase" => {
             if args.len() != 1 { return Err(err_at(span, "string-downcase requires 1 argument")); }
             match &args[0] {
-                Value::Str(s) => {
+                Value::Str(s, _) => {
                     let lower: String = s.borrow().iter().map(|c| c.to_ascii_lowercase()).collect();
                     Ok(make_str(&lower))
                 }
