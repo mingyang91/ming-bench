@@ -167,6 +167,19 @@ public class Evaluator {
         @Override public String toString() { return "#<void>"; }
     };
 
+    // Convert a parsed Java List to a Scheme list (SchemePair chain ending in NIL)
+    private Object javaListToSchemeList(List<?> javaList) {
+        Object result = SchemeNil.INSTANCE;
+        for (int i = javaList.size() - 1; i >= 0; i--) {
+            Object elem = javaList.get(i);
+            if (elem instanceof List<?> subList) {
+                elem = javaListToSchemeList(subList);
+            }
+            result = new SchemePair(elem, result);
+        }
+        return result;
+    }
+
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Environment env) throws EvalError {
         if (expr instanceof Long || expr instanceof Boolean) {
@@ -193,7 +206,11 @@ public class Evaluator {
                 switch (name) {
                     case "quote" -> {
                         if (args.size() != 1) throw new EvalError("quote: expected 1 argument");
-                        return args.get(0);
+                        Object quoted = args.get(0);
+                        if (quoted instanceof List<?> ql) {
+                            return javaListToSchemeList(ql);
+                        }
+                        return quoted;
                     }
                     case "if" -> {
                         if (args.size() < 2 || args.size() > 3)
@@ -226,7 +243,6 @@ public class Evaluator {
                             if (args.size() == 2) {
                                 body = args.get(1);
                             } else {
-                                // implicit begin for multiple body exprs
                                 List<Object> beginList = new ArrayList<>();
                                 beginList.add(new SchemeSymbol("begin"));
                                 beginList.addAll(args.subList(1, args.size()));
@@ -262,9 +278,94 @@ public class Evaluator {
                         }
                         return result;
                     }
-                    // Builtins handled as procedures below
+                    case "let" -> {
+                        if (args.size() < 2) throw new EvalError("let: bad syntax");
+                        Object first2 = args.get(0);
+                        if (first2 instanceof SchemeSymbol loopName) {
+                            // Named let: (let name ((var init) ...) body ...)
+                            if (args.size() < 3) throw new EvalError("let: bad syntax");
+                            List<?> bindings = (List<?>) args.get(1);
+                            List<String> params = new ArrayList<>();
+                            List<Object> inits = new ArrayList<>();
+                            for (Object binding : bindings) {
+                                List<?> b = (List<?>) binding;
+                                params.add(((SchemeSymbol) b.get(0)).name());
+                                inits.add(eval(b.get(1), env));
+                            }
+                            Object body;
+                            if (args.size() == 3) {
+                                body = args.get(2);
+                            } else {
+                                List<Object> beginList = new ArrayList<>();
+                                beginList.add(new SchemeSymbol("begin"));
+                                beginList.addAll(args.subList(2, args.size()));
+                                body = beginList;
+                            }
+                            Environment letEnv = new Environment(env);
+                            SchemeLambda loopLam = new SchemeLambda(params, body, letEnv);
+                            letEnv.define(loopName.name(), loopLam);
+                            return apply(loopLam, inits);
+                        }
+                        // Regular let: (let ((var val) ...) body ...)
+                        List<?> bindings = (List<?>) first2;
+                        Environment letEnv = new Environment(env);
+                        for (Object binding : bindings) {
+                            List<?> b = (List<?>) binding;
+                            String varName = ((SchemeSymbol) b.get(0)).name();
+                            Object val = eval(b.get(1), env);
+                            letEnv.define(varName, val);
+                        }
+                        Object result = VOID;
+                        for (int i = 1; i < args.size(); i++) {
+                            result = eval(args.get(i), letEnv);
+                        }
+                        return result;
+                    }
+                    case "cond" -> {
+                        for (Object clause : args) {
+                            List<?> cl = (List<?>) clause;
+                            if (cl.isEmpty()) throw new EvalError("cond: empty clause");
+                            Object test = cl.get(0);
+                            if (test instanceof SchemeSymbol s && s.name().equals("else")) {
+                                Object result = VOID;
+                                for (int i = 1; i < cl.size(); i++) {
+                                    result = eval(cl.get(i), env);
+                                }
+                                return result;
+                            }
+                            Object testVal = eval(test, env);
+                            if (!testVal.equals(Boolean.FALSE)) {
+                                if (cl.size() == 1) return testVal;
+                                Object result = VOID;
+                                for (int i = 1; i < cl.size(); i++) {
+                                    result = eval(cl.get(i), env);
+                                }
+                                return result;
+                            }
+                        }
+                        return VOID;
+                    }
+                    // Builtins handled as special forms (unevaluated args for and/or)
+                    case "and" -> {
+                        Object result = Boolean.TRUE;
+                        for (Object arg : args) {
+                            result = eval(arg, env);
+                            if (result.equals(Boolean.FALSE)) return Boolean.FALSE;
+                        }
+                        return result;
+                    }
+                    case "or" -> {
+                        Object result = Boolean.FALSE;
+                        for (Object arg : args) {
+                            result = eval(arg, env);
+                            if (!result.equals(Boolean.FALSE)) return result;
+                        }
+                        return result;
+                    }
                     case "+", "-", "*", "/", "<", ">", "=", "<=", ">=",
-                         "not", "and", "or" -> {
+                         "not",
+                         "cons", "car", "cdr", "null?", "list", "length", "append",
+                         "number?", "string?", "boolean?", "pair?", "symbol?" -> {
                         return evalBuiltin(name, args, env);
                     }
                     default -> {
@@ -359,21 +460,100 @@ public class Evaluator {
                 Object val = eval(args.get(0), env);
                 return val.equals(Boolean.FALSE);
             }
-            case "and" -> {
-                Object result = Boolean.TRUE;
+            case "cons" -> {
+                requireArgCount(name, args, 2);
+                return new SchemePair(eval(args.get(0), env), eval(args.get(1), env));
+            }
+            case "car" -> {
+                requireArgCount(name, args, 1);
+                Object val = eval(args.get(0), env);
+                if (val instanceof SchemePair p) return p.car;
+                throw new EvalError("car: not a pair");
+            }
+            case "cdr" -> {
+                requireArgCount(name, args, 1);
+                Object val = eval(args.get(0), env);
+                if (val instanceof SchemePair p) return p.cdr;
+                throw new EvalError("cdr: not a pair");
+            }
+            case "null?" -> {
+                requireArgCount(name, args, 1);
+                Object val = eval(args.get(0), env);
+                return val instanceof SchemeNil;
+            }
+            case "list" -> {
+                Object result = SchemeNil.INSTANCE;
+                // Build list from right to left
+                List<Object> evaluated = new ArrayList<>();
                 for (Object arg : args) {
-                    result = eval(arg, env);
-                    if (result.equals(Boolean.FALSE)) return Boolean.FALSE;
+                    evaluated.add(eval(arg, env));
+                }
+                for (int i = evaluated.size() - 1; i >= 0; i--) {
+                    result = new SchemePair(evaluated.get(i), result);
                 }
                 return result;
             }
-            case "or" -> {
-                Object result = Boolean.FALSE;
+            case "length" -> {
+                requireArgCount(name, args, 1);
+                Object val = eval(args.get(0), env);
+                long len = 0;
+                while (val instanceof SchemePair p) {
+                    len++;
+                    val = p.cdr;
+                }
+                if (!(val instanceof SchemeNil)) {
+                    throw new EvalError("length: not a proper list");
+                }
+                return len;
+            }
+            case "append" -> {
+                // (append list1 list2 ...)
+                Object result = SchemeNil.INSTANCE;
+                // Evaluate all args
+                List<Object> evaluated = new ArrayList<>();
                 for (Object arg : args) {
-                    result = eval(arg, env);
-                    if (!result.equals(Boolean.FALSE)) return result;
+                    evaluated.add(eval(arg, env));
+                }
+                // Process from right to left
+                for (int i = evaluated.size() - 1; i >= 0; i--) {
+                    Object lst = evaluated.get(i);
+                    if (lst instanceof SchemeNil) continue;
+                    if (i == evaluated.size() - 1) {
+                        result = lst; // last arg can be anything
+                    } else {
+                        // Prepend elements of lst to result
+                        List<Object> elems = new ArrayList<>();
+                        Object cur = lst;
+                        while (cur instanceof SchemePair p) {
+                            elems.add(p.car);
+                            cur = p.cdr;
+                        }
+                        for (int j = elems.size() - 1; j >= 0; j--) {
+                            result = new SchemePair(elems.get(j), result);
+                        }
+                    }
                 }
                 return result;
+            }
+            case "number?" -> {
+                requireArgCount(name, args, 1);
+                return eval(args.get(0), env) instanceof Long;
+            }
+            case "string?" -> {
+                requireArgCount(name, args, 1);
+                return eval(args.get(0), env) instanceof String;
+            }
+            case "boolean?" -> {
+                requireArgCount(name, args, 1);
+                return eval(args.get(0), env) instanceof Boolean;
+            }
+            case "pair?" -> {
+                requireArgCount(name, args, 1);
+                return eval(args.get(0), env) instanceof SchemePair;
+            }
+            case "symbol?" -> {
+                requireArgCount(name, args, 1);
+                return eval(args.get(0), env) instanceof SchemeSymbol;
             }
             default -> throw new EvalError("unknown procedure: " + name);
         }
@@ -396,6 +576,23 @@ public class Evaluator {
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof String s) return s;
         if (val instanceof SchemeSymbol sym) return sym.name();
+        if (val instanceof SchemeNil) return "()";
+        if (val instanceof SchemePair p) {
+            StringBuilder sb = new StringBuilder("(");
+            sb.append(schemeToString(p.car));
+            Object rest = p.cdr;
+            while (rest instanceof SchemePair rp) {
+                sb.append(" ");
+                sb.append(schemeToString(rp.car));
+                rest = rp.cdr;
+            }
+            if (!(rest instanceof SchemeNil)) {
+                sb.append(" . ");
+                sb.append(schemeToString(rest));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
         if (val instanceof List<?> list) {
             StringBuilder sb = new StringBuilder("(");
             for (int i = 0; i < list.size(); i++) {
