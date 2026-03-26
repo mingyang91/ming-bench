@@ -265,6 +265,17 @@ class Environment {
         }
         throw new EvalError(`unbound symbol: ${name}`, pos);
     }
+    assign(name, value, pos) {
+        if (this.bindings.has(name)) {
+            this.bindings.set(name, value);
+            return;
+        }
+        if (this.parent !== undefined) {
+            this.parent.assign(name, value, pos);
+            return;
+        }
+        throw new EvalError(`unbound symbol: ${name}`, pos);
+    }
 }
 function createGlobalEnvironment(context) {
     const env = new Environment();
@@ -318,6 +329,8 @@ function evaluateList(elements, env, pos) {
                 return evaluateCond(argumentExprs, env, operatorExpr.pos);
             case 'let':
                 return evaluateLet(argumentExprs, env, operatorExpr.pos);
+            case 'set!':
+                return evaluateSet(argumentExprs, env, operatorExpr.pos);
         }
     }
     const operator = evaluate(operatorExpr, env);
@@ -385,6 +398,16 @@ function evaluateDefine(expressions, env, pos) {
         env,
     };
     env.define(name, closure);
+    return VOID;
+}
+function evaluateSet(expressions, env, pos) {
+    if (expressions.length !== 2) {
+        throw new EvalError(`set! expected 2 argument(s), got ${expressions.length}`, pos);
+    }
+    const [targetExpr, valueExpr] = expressions;
+    const name = expectSymbolExpr(targetExpr, 'set!');
+    const value = evaluate(valueExpr, env);
+    env.assign(name, value, targetExpr.pos);
     return VOID;
 }
 function evaluateQuote(expressions, pos) {

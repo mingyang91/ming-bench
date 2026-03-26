@@ -372,6 +372,20 @@ class Environment {
 
     throw new EvalError(`unbound symbol: ${name}`, pos);
   }
+
+  assign(name: string, value: SchemeValue, pos: SourcePosition): void {
+    if (this.bindings.has(name)) {
+      this.bindings.set(name, value);
+      return;
+    }
+
+    if (this.parent !== undefined) {
+      this.parent.assign(name, value, pos);
+      return;
+    }
+
+    throw new EvalError(`unbound symbol: ${name}`, pos);
+  }
 }
 
 function createGlobalEnvironment(context: EvaluationContext): Environment {
@@ -431,6 +445,8 @@ function evaluateList(elements: Expr[], env: Environment, pos: SourcePosition): 
         return evaluateCond(argumentExprs, env, operatorExpr.pos);
       case 'let':
         return evaluateLet(argumentExprs, env, operatorExpr.pos);
+      case 'set!':
+        return evaluateSet(argumentExprs, env, operatorExpr.pos);
     }
   }
 
@@ -518,6 +534,18 @@ function evaluateDefine(expressions: Expr[], env: Environment, pos: SourcePositi
   };
 
   env.define(name, closure);
+  return VOID;
+}
+
+function evaluateSet(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+  if (expressions.length !== 2) {
+    throw new EvalError(`set! expected 2 argument(s), got ${expressions.length}`, pos);
+  }
+
+  const [targetExpr, valueExpr] = expressions;
+  const name = expectSymbolExpr(targetExpr, 'set!');
+  const value = evaluate(valueExpr, env);
+  env.assign(name, value, targetExpr.pos);
   return VOID;
 }
 
