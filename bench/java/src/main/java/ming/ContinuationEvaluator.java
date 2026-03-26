@@ -484,6 +484,12 @@ final class ContinuationEvaluator {
                                 applyArgsKont.line(),
                                 applyArgsKont.column()));
             }
+            case CallWithValuesProducerKont callWithValuesProducerKont -> applyProcedure(
+                    callWithValuesProducerKont.consumerProcedure(),
+                    owner.unpackValues(value),
+                    callWithValuesProducerKont.next(),
+                    callWithValuesProducerKont.line(),
+                    callWithValuesProducerKont.column());
             case AndKont andKont -> {
                 if (!value.isTruthy() || andKont.remaining().isEmpty()) {
                     yield new ReturnValueState(value, andKont.next());
@@ -936,6 +942,20 @@ final class ContinuationEvaluator {
                                         int line,
                                         int column) throws EvalError {
         try {
+            if (operator instanceof ValuesProcedureValue) {
+                return new ReturnValueState(owner.packValues(arguments), continuation);
+            }
+
+            if (operator instanceof CallWithValuesProcedureValue) {
+                requireExactArity("call-with-values", arguments.size(), 2);
+                return applyProcedure(
+                        arguments.getFirst(),
+                        List.of(),
+                        new CallWithValuesProducerKont(arguments.get(1), continuation, line, column),
+                        line,
+                        column);
+            }
+
             if (operator instanceof CallCcProcedureValue) {
                 requireExactArity("call/cc", arguments.size(), 1);
                 return applyProcedure(
@@ -1091,7 +1111,7 @@ final class ContinuationEvaluator {
 }
 
 sealed interface Kont permits HaltKont, SequenceKont, IfKont, DefineKont, SetKont,
-        ApplyOperatorKont, ApplyArgsKont, AndKont, OrKont, CondKont,
+        ApplyOperatorKont, ApplyArgsKont, CallWithValuesProducerKont, AndKont, OrKont, CondKont,
         WithExceptionHandlerBodyKont, GuardBodyKont,
         ExceptionHandlerInvokeKont, GuardHandlerInvokeKont, GuardCondKont,
         DynamicWindInExprKont, DynamicWindBodyExprKont, DynamicWindOutExprKont,
@@ -1129,6 +1149,12 @@ record ApplyArgsKont(Value operator,
                      Kont next,
                      int line,
                      int column) implements Kont {
+}
+
+record CallWithValuesProducerKont(Value consumerProcedure,
+                                  Kont next,
+                                  int line,
+                                  int column) implements Kont {
 }
 
 record AndKont(List<Expr> remaining, Environment environment, Kont next) implements Kont {

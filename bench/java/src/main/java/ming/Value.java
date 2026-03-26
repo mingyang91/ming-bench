@@ -6,6 +6,7 @@ import java.util.List;
 
 sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue, ListValue,
         PairValue, CharValue, VectorValue, VoidValue, ProcedureValue, RecordValue, UninitializedValue,
+        ValuesBundleValue,
         CallCcProcedureValue, RaiseProcedureValue, WithExceptionHandlerProcedureValue, ContinuationProcedureValue {
     String render();
 
@@ -412,8 +413,26 @@ enum UninitializedValue implements Value {
     }
 }
 
+final class ValuesBundleValue implements Value {
+    private final List<Value> values;
+
+    ValuesBundleValue(List<Value> values) {
+        this.values = List.copyOf(values);
+    }
+
+    List<Value> values() {
+        return values;
+    }
+
+    @Override
+    public String render() {
+        return "#<values>";
+    }
+}
+
 sealed interface ProcedureValue extends Value
-        permits PrimitiveProcedureValue, LambdaProcedureValue, CaseLambdaProcedureValue {
+        permits PrimitiveProcedureValue, ValuesProcedureValue, CallWithValuesProcedureValue,
+        LambdaProcedureValue, CaseLambdaProcedureValue {
     Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError;
 
     default TailCall applyTail(List<Value> arguments, Evaluator evaluator) throws EvalError {
@@ -450,6 +469,40 @@ record PrimitiveProcedureValue(String name, PrimitiveImplementation implementati
     @Override
     public String render() {
         return "#<procedure:" + name + ">";
+    }
+}
+
+final class ValuesProcedureValue implements ProcedureValue {
+    @Override
+    public Value apply(List<Value> arguments, Evaluator evaluator) {
+        return evaluator.packValues(arguments);
+    }
+
+    @Override
+    public TailCall applyTail(List<Value> arguments, Evaluator evaluator) {
+        return new TailCallValue(evaluator.packValues(arguments));
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:values>";
+    }
+}
+
+final class CallWithValuesProcedureValue implements ProcedureValue {
+    @Override
+    public Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError {
+        return evaluator.applyCallWithValues(arguments);
+    }
+
+    @Override
+    public TailCall applyTail(List<Value> arguments, Evaluator evaluator) throws EvalError {
+        return evaluator.applyCallWithValuesTail(arguments);
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:call-with-values>";
     }
 }
 

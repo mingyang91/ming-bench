@@ -171,6 +171,8 @@ public class Evaluator {
         environment.define("boolean?", new PrimitiveProcedureValue("boolean?", this::applyBooleanPredicate));
         environment.define("symbol?", new PrimitiveProcedureValue("symbol?", this::applySymbolPredicate));
         environment.define("procedure?", new PrimitiveProcedureValue("procedure?", this::applyProcedurePredicate));
+        environment.define("values", new ValuesProcedureValue());
+        environment.define("call-with-values", new CallWithValuesProcedureValue());
         environment.define("eq?", new PrimitiveProcedureValue("eq?", this::applyEq));
         environment.define("eqv?", new PrimitiveProcedureValue("eqv?", this::applyEqv));
         environment.define("equal?", new PrimitiveProcedureValue("equal?", this::applyEqual));
@@ -358,15 +360,11 @@ public class Evaluator {
                                         List<Expr> argumentExpressions,
                                         Environment environment) throws EvalError {
         Value operator = eval(operatorExpression, environment);
-        if (!(operator instanceof ProcedureValue procedure)) {
-            throw new EvalError("attempted to call non-procedure");
-        }
-
         List<Value> arguments = new ArrayList<>(argumentExpressions.size());
         for (Expr argumentExpression : argumentExpressions) {
             arguments.add(eval(argumentExpression, environment));
         }
-        return procedure.applyTail(List.copyOf(arguments), this);
+        return applyProcedureTailValue(operator, List.copyOf(arguments));
     }
 
     private Value evalList(ListExpr listExpr, Environment environment) throws EvalError {
@@ -418,15 +416,51 @@ public class Evaluator {
                                  List<Expr> argumentExpressions,
                                  Environment environment) throws EvalError {
         Value operator = eval(operatorExpression, environment);
-        if (!(operator instanceof ProcedureValue procedure)) {
-            throw new EvalError("attempted to call non-procedure");
-        }
-
         List<Value> arguments = new ArrayList<>(argumentExpressions.size());
         for (Expr argumentExpression : argumentExpressions) {
             arguments.add(eval(argumentExpression, environment));
         }
-        return procedure.apply(List.copyOf(arguments), this);
+        return applyProcedureValue(operator, List.copyOf(arguments));
+    }
+
+    Value applyProcedureValue(Value operator, List<Value> arguments) throws EvalError {
+        if (!(operator instanceof ProcedureValue procedure)) {
+            throw new EvalError("attempted to call non-procedure");
+        }
+        return procedure.apply(arguments, this);
+    }
+
+    TailCall applyProcedureTailValue(Value operator, List<Value> arguments) throws EvalError {
+        if (!(operator instanceof ProcedureValue procedure)) {
+            throw new EvalError("attempted to call non-procedure");
+        }
+        return procedure.applyTail(arguments, this);
+    }
+
+    Value packValues(List<Value> arguments) {
+        if (arguments.size() == 1) {
+            return arguments.getFirst();
+        }
+        return new ValuesBundleValue(arguments);
+    }
+
+    List<Value> unpackValues(Value value) {
+        if (value instanceof ValuesBundleValue valuesBundleValue) {
+            return valuesBundleValue.values();
+        }
+        return List.of(value);
+    }
+
+    Value applyCallWithValues(List<Value> arguments) throws EvalError {
+        requireExactArity("call-with-values", arguments.size(), 2);
+        Value producerResult = applyProcedureValue(arguments.getFirst(), List.of());
+        return applyProcedureValue(arguments.get(1), unpackValues(producerResult));
+    }
+
+    TailCall applyCallWithValuesTail(List<Value> arguments) throws EvalError {
+        requireExactArity("call-with-values", arguments.size(), 2);
+        Value producerResult = applyProcedureValue(arguments.getFirst(), List.of());
+        return applyProcedureTailValue(arguments.get(1), unpackValues(producerResult));
     }
 
     private TailCall evalTailIf(List<Expr> arguments, Environment environment) throws EvalError {
