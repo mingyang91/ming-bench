@@ -32,12 +32,21 @@ type PairValue = {
   cdr: SchemeValue;
 };
 
+type CharValue = {
+  kind: 'char';
+  value: string;
+};
+
 type EmptyListValue = {
   kind: 'empty-list';
 };
 
 type VoidValue = {
   kind: 'void';
+};
+
+type EvaluationContext = {
+  output: string[];
 };
 
 type ProcedureValue = BuiltinValue | ClosureValue;
@@ -48,6 +57,7 @@ type SchemeValue =
   | string
   | SymbolValue
   | PairValue
+  | CharValue
   | EmptyListValue
   | VoidValue
   | ProcedureValue;
@@ -69,109 +79,221 @@ type TokenStream = {
 const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
 
-const builtins = new Map<string, BuiltinValue>([
-  ['+', builtin('+', (args, pos) => sum(args, 0, pos))],
-  ['-', builtin('-', (args, pos) => subtract(args, pos))],
-  ['*', builtin('*', (args, pos) => product(args, 1, pos))],
-  ['/', builtin('/', (args, pos) => divide(args, pos))],
-  [
-    '<',
-    builtin('<', (args, pos) => compareChain('<', args, (left, right) => left < right, pos)),
-  ],
-  [
-    '>',
-    builtin('>', (args, pos) => compareChain('>', args, (left, right) => left > right, pos)),
-  ],
-  [
-    '=',
-    builtin('=', (args, pos) => compareChain('=', args, (left, right) => left === right, pos)),
-  ],
-  [
-    '<=',
-    builtin('<=', (args, pos) => compareChain('<=', args, (left, right) => left <= right, pos)),
-  ],
-  [
-    'not',
-    builtin('not', (args, pos) => {
-      expectArity('not', args, 1, pos);
-      return isFalse(args[0]);
-    }),
-  ],
-  [
-    'cons',
-    builtin('cons', (args, pos) => {
-      expectArity('cons', args, 2, pos);
-      return { kind: 'pair', car: args[0], cdr: args[1] };
-    }),
-  ],
-  [
-    'car',
-    builtin('car', (args, pos) => {
-      expectArity('car', args, 1, pos);
-      return expectPair(args[0], 'car', pos).car;
-    }),
-  ],
-  [
-    'cdr',
-    builtin('cdr', (args, pos) => {
-      expectArity('cdr', args, 1, pos);
-      return expectPair(args[0], 'cdr', pos).cdr;
-    }),
-  ],
-  [
-    'null?',
-    builtin('null?', (args, pos) => {
-      expectArity('null?', args, 1, pos);
-      return isEmptyList(args[0]);
-    }),
-  ],
-  ['list', builtin('list', (args) => listToPairs(args))],
-  [
-    'length',
-    builtin('length', (args, pos) => {
-      expectArity('length', args, 1, pos);
-      return listToArray(args[0], 'length', pos).length;
-    }),
-  ],
-  ['append', builtin('append', (args, pos) => appendLists(args, pos))],
-  [
-    'string?',
-    builtin('string?', (args, pos) => {
-      expectArity('string?', args, 1, pos);
-      return typeof args[0] === 'string';
-    }),
-  ],
-  [
-    'number?',
-    builtin('number?', (args, pos) => {
-      expectArity('number?', args, 1, pos);
-      return typeof args[0] === 'number';
-    }),
-  ],
-  [
-    'boolean?',
-    builtin('boolean?', (args, pos) => {
-      expectArity('boolean?', args, 1, pos);
-      return typeof args[0] === 'boolean';
-    }),
-  ],
-  [
-    'pair?',
-    builtin('pair?', (args, pos) => {
-      expectArity('pair?', args, 1, pos);
-      return isPair(args[0]);
-    }),
-  ],
-  [
-    'symbol?',
-    builtin('symbol?', (args, pos) => {
-      expectArity('symbol?', args, 1, pos);
-      return isSymbolValue(args[0]);
-    }),
-  ],
-]);
+function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
+  return new Map<string, BuiltinValue>([
+    ['+', builtin('+', (args, pos) => sum(args, 0, pos))],
+    ['-', builtin('-', (args, pos) => subtract(args, pos))],
+    ['*', builtin('*', (args, pos) => product(args, 1, pos))],
+    ['/', builtin('/', (args, pos) => divide(args, pos))],
+    [
+      '<',
+      builtin('<', (args, pos) => compareChain('<', args, (left, right) => left < right, pos)),
+    ],
+    [
+      '>',
+      builtin('>', (args, pos) => compareChain('>', args, (left, right) => left > right, pos)),
+    ],
+    [
+      '=',
+      builtin('=', (args, pos) => compareChain('=', args, (left, right) => left === right, pos)),
+    ],
+    [
+      '<=',
+      builtin('<=', (args, pos) => compareChain('<=', args, (left, right) => left <= right, pos)),
+    ],
+    [
+      'not',
+      builtin('not', (args, pos) => {
+        expectArity('not', args, 1, pos);
+        return isFalse(args[0]);
+      }),
+    ],
+    [
+      'cons',
+      builtin('cons', (args, pos) => {
+        expectArity('cons', args, 2, pos);
+        return { kind: 'pair', car: args[0], cdr: args[1] };
+      }),
+    ],
+    [
+      'car',
+      builtin('car', (args, pos) => {
+        expectArity('car', args, 1, pos);
+        return expectPair(args[0], 'car', pos).car;
+      }),
+    ],
+    [
+      'cdr',
+      builtin('cdr', (args, pos) => {
+        expectArity('cdr', args, 1, pos);
+        return expectPair(args[0], 'cdr', pos).cdr;
+      }),
+    ],
+    [
+      'null?',
+      builtin('null?', (args, pos) => {
+        expectArity('null?', args, 1, pos);
+        return isEmptyList(args[0]);
+      }),
+    ],
+    ['list', builtin('list', (args) => listToPairs(args))],
+    [
+      'length',
+      builtin('length', (args, pos) => {
+        expectArity('length', args, 1, pos);
+        return listToArray(args[0], 'length', pos).length;
+      }),
+    ],
+    ['append', builtin('append', (args, pos) => appendLists(args, pos))],
+    [
+      'string?',
+      builtin('string?', (args, pos) => {
+        expectArity('string?', args, 1, pos);
+        return typeof args[0] === 'string';
+      }),
+    ],
+    [
+      'number?',
+      builtin('number?', (args, pos) => {
+        expectArity('number?', args, 1, pos);
+        return typeof args[0] === 'number';
+      }),
+    ],
+    [
+      'boolean?',
+      builtin('boolean?', (args, pos) => {
+        expectArity('boolean?', args, 1, pos);
+        return typeof args[0] === 'boolean';
+      }),
+    ],
+    [
+      'pair?',
+      builtin('pair?', (args, pos) => {
+        expectArity('pair?', args, 1, pos);
+        return isPair(args[0]);
+      }),
+    ],
+    [
+      'symbol?',
+      builtin('symbol?', (args, pos) => {
+        expectArity('symbol?', args, 1, pos);
+        return isSymbolValue(args[0]);
+      }),
+    ],
+    [
+      'display',
+      builtin('display', (args, pos) => {
+        expectArity('display', args, 1, pos);
+        context.output.push(formatDisplayValue(args[0]));
+        return VOID;
+      }),
+    ],
+    [
+      'write',
+      builtin('write', (args, pos) => {
+        expectArity('write', args, 1, pos);
+        context.output.push(formatValue(args[0]));
+        return VOID;
+      }),
+    ],
+    [
+      'newline',
+      builtin('newline', (args, pos) => {
+        expectArity('newline', args, 0, pos);
+        context.output.push('\n');
+        return VOID;
+      }),
+    ],
+    [
+      'string-append',
+      builtin('string-append', (args, pos) =>
+        args.map((arg) => expectString(arg, 'string-append', pos)).join(''),
+      ),
+    ],
+    [
+      'string-length',
+      builtin('string-length', (args, pos) => {
+        expectArity('string-length', args, 1, pos);
+        return stringToChars(expectString(args[0], 'string-length', pos)).length;
+      }),
+    ],
+    [
+      'substring',
+      builtin('substring', (args, pos) => {
+        expectArity('substring', args, 3, pos);
+        const chars = stringToChars(expectString(args[0], 'substring', pos));
+        const start = expectIndex(args[1], 'substring', pos);
+        const end = expectIndex(args[2], 'substring', pos);
+
+        if (start > end || end > chars.length) {
+          throw new EvalError('substring index out of bounds', pos);
+        }
+
+        return chars.slice(start, end).join('');
+      }),
+    ],
+    [
+      'string->number',
+      builtin('string->number', (args, pos) => {
+        expectArity('string->number', args, 1, pos);
+        const value = expectString(args[0], 'string->number', pos);
+        return /^[+-]?\d+$/.test(value) ? Number(value) : false;
+      }),
+    ],
+    [
+      'number->string',
+      builtin('number->string', (args, pos) => {
+        expectArity('number->string', args, 1, pos);
+        return String(normalizeNumber(expectNumber(args[0], 'number->string', pos)));
+      }),
+    ],
+    [
+      'symbol->string',
+      builtin('symbol->string', (args, pos) => {
+        expectArity('symbol->string', args, 1, pos);
+        return expectSymbolValue(args[0], 'symbol->string', pos).name;
+      }),
+    ],
+    [
+      'string->symbol',
+      builtin('string->symbol', (args, pos) => {
+        expectArity('string->symbol', args, 1, pos);
+        return { kind: 'symbol', name: expectString(args[0], 'string->symbol', pos) };
+      }),
+    ],
+    [
+      'string-ref',
+      builtin('string-ref', (args, pos) => {
+        expectArity('string-ref', args, 2, pos);
+        const chars = stringToChars(expectString(args[0], 'string-ref', pos));
+        const index = expectIndex(args[1], 'string-ref', pos);
+
+        if (index >= chars.length) {
+          throw new EvalError('string-ref index out of bounds', pos);
+        }
+
+        return { kind: 'char', value: chars[index] };
+      }),
+    ],
+    [
+      'char?',
+      builtin('char?', (args, pos) => {
+        expectArity('char?', args, 1, pos);
+        return isChar(args[0]);
+      }),
+    ],
+  ]);
+}
 
 export function evalStr(input: string): string {
+  return evaluateInput(input).result;
+}
+
+export function evalStrWithOutput(input: string): { result: string; output: string } {
+  return evaluateInput(input);
+}
+
+function evaluateInput(input: string): { result: string; output: string } {
   const parser = new Parser(tokenize(input));
   const expressions = parser.parseProgram();
 
@@ -179,20 +301,17 @@ export function evalStr(input: string): string {
     throw new EvalError('expected at least one expression', { line: 1, col: 1 });
   }
 
-  const env = createGlobalEnvironment();
+  const context: EvaluationContext = { output: [] };
+  const env = createGlobalEnvironment(context);
   let result: SchemeValue = VOID;
 
   for (const expression of expressions) {
     result = evaluate(expression, env);
   }
 
-  return formatValue(result);
-}
-
-export function evalStrWithOutput(input: string): { result: string; output: string } {
   return {
-    result: evalStr(input),
-    output: '',
+    result: formatValue(result),
+    output: context.output.join(''),
   };
 }
 
@@ -221,10 +340,10 @@ class Environment {
   }
 }
 
-function createGlobalEnvironment(): Environment {
+function createGlobalEnvironment(context: EvaluationContext): Environment {
   const env = new Environment();
 
-  for (const [name, value] of builtins) {
+  for (const [name, value] of createBuiltins(context)) {
     env.define(name, value);
   }
 
@@ -770,6 +889,10 @@ function isPair(value: SchemeValue): value is PairValue {
   return typeof value === 'object' && value !== null && value.kind === 'pair';
 }
 
+function isChar(value: SchemeValue): value is CharValue {
+  return typeof value === 'object' && value !== null && value.kind === 'char';
+}
+
 function isEmptyList(value: SchemeValue): value is EmptyListValue {
   return typeof value === 'object' && value !== null && value.kind === 'empty-list';
 }
@@ -804,12 +927,38 @@ function expectNumber(value: SchemeValue, name: string, pos: SourcePosition): nu
   return value;
 }
 
+function expectString(value: SchemeValue, name: string, pos: SourcePosition): string {
+  if (typeof value !== 'string') {
+    throw new EvalError(`${name} expected a string`, pos);
+  }
+
+  return value;
+}
+
 function expectPair(value: SchemeValue, name: string, pos: SourcePosition): PairValue {
   if (!isPair(value)) {
     throw new EvalError(`${name} expected a pair`, pos);
   }
 
   return value;
+}
+
+function expectSymbolValue(value: SchemeValue, name: string, pos: SourcePosition): SymbolValue {
+  if (!isSymbolValue(value)) {
+    throw new EvalError(`${name} expected a symbol`, pos);
+  }
+
+  return value;
+}
+
+function expectIndex(value: SchemeValue, name: string, pos: SourcePosition): number {
+  const numericValue = expectNumber(value, name, pos);
+
+  if (!Number.isInteger(numericValue) || numericValue < 0) {
+    throw new EvalError(`${name} expected a non-negative integer`, pos);
+  }
+
+  return numericValue;
 }
 
 function expectSymbolExpr(expression: Expr, name: string): string {
@@ -959,6 +1108,10 @@ function isWhitespace(value: string): boolean {
   return /\s/.test(value);
 }
 
+function stringToChars(value: string): string[] {
+  return Array.from(value);
+}
+
 function formatValue(value: SchemeValue): string {
   if (typeof value === 'number') {
     return String(normalizeNumber(value));
@@ -970,6 +1123,10 @@ function formatValue(value: SchemeValue): string {
 
   if (typeof value === 'string') {
     return JSON.stringify(value);
+  }
+
+  if (isChar(value)) {
+    return formatCharLiteral(value.value);
   }
 
   if (isBuiltin(value)) {
@@ -999,6 +1156,22 @@ function formatValue(value: SchemeValue): string {
   throw new EvalError('cannot format value');
 }
 
+function formatDisplayValue(value: SchemeValue): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (isChar(value)) {
+    return value.value;
+  }
+
+  if (isPair(value)) {
+    return formatDisplayPair(value);
+  }
+
+  return formatValue(value);
+}
+
 function formatPair(pair: PairValue): string {
   const parts: string[] = [];
   let current: SchemeValue = pair;
@@ -1013,4 +1186,32 @@ function formatPair(pair: PairValue): string {
   }
 
   return `(${parts.join(' ')} . ${formatValue(current)})`;
+}
+
+function formatDisplayPair(pair: PairValue): string {
+  const parts: string[] = [];
+  let current: SchemeValue = pair;
+
+  while (isPair(current)) {
+    parts.push(formatDisplayValue(current.car));
+    current = current.cdr;
+  }
+
+  if (isEmptyList(current)) {
+    return `(${parts.join(' ')})`;
+  }
+
+  return `(${parts.join(' ')} . ${formatDisplayValue(current)})`;
+}
+
+function formatCharLiteral(value: string): string {
+  if (value === ' ') {
+    return '#\\space';
+  }
+
+  if (value === '\n') {
+    return '#\\newline';
+  }
+
+  return `#\\${value}`;
 }
