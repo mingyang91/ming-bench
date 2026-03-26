@@ -38,6 +38,7 @@ enum Value {
 enum Procedure {
     Builtin(BuiltinProc),
     Lambda(Rc<LambdaProc>),
+    CaseLambda(Rc<CaseLambdaProc>),
     RecordConstructor(Rc<RecordConstructorProc>),
     RecordPredicate(Rc<RecordPredicateProc>),
     RecordAccessor(Rc<RecordAccessorProc>),
@@ -55,6 +56,11 @@ struct LambdaProc {
     rest: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct CaseLambdaProc {
+    clauses: Vec<LambdaProc>,
 }
 
 #[derive(Clone)]
@@ -126,7 +132,7 @@ impl Evaluator {
     }
 
     fn install_builtins(&mut self) {
-        let builtins: [(&str, BuiltinFn); 27] = [
+        let builtins: [(&str, BuiltinFn); 29] = [
             ("+", builtin_add),
             ("-", builtin_sub),
             ("*", builtin_mul),
@@ -143,12 +149,14 @@ impl Evaluator {
             ("list", builtin_list),
             ("length", builtin_length),
             ("append", builtin_append),
+            ("equal?", builtin_equal),
             ("number?", builtin_number_pred),
             ("boolean?", builtin_boolean_pred),
             ("string?", builtin_string_pred),
             ("pair?", builtin_pair_pred),
             ("symbol?", builtin_symbol_pred),
             ("char?", builtin_char_pred),
+            ("procedure?", builtin_procedure_pred),
             ("display", builtin_display),
             ("write", builtin_write),
             ("newline", builtin_newline),
@@ -206,6 +214,7 @@ impl Evaluator {
                 "if" => return self.eval_if(items, span, env),
                 "define" => return self.eval_define(items, span, env),
                 "lambda" => return self.eval_lambda(items, span, env),
+                "case-lambda" => return self.eval_case_lambda(items, span, env),
                 "begin" => return self.eval_sequence(&items[1..], env),
                 "let" => return self.eval_let(items, span, env),
                 "cond" => return self.eval_cond(items, span, env),
@@ -259,8 +268,14 @@ impl Evaluator {
                         span,
                     ));
                 }
-                let value = self.eval_expr(&items[2], env.clone())?;
-                Env::define(&env, name.clone(), value);
+                if is_recursive_procedure_expr(&items[2]) {
+                    Env::define(&env, name.clone(), Value::Void);
+                    let value = self.eval_expr(&items[2], env.clone())?;
+                    Env::define(&env, name.clone(), value);
+                } else {
+                    let value = self.eval_expr(&items[2], env.clone())?;
+                    Env::define(&env, name.clone(), value);
+                }
             }
             ExprKind::List(signature) => {
                 let Some(name_expr) = signature.first() else {
@@ -303,6 +318,36 @@ impl Evaluator {
             body: items[2..].to_vec(),
             env,
         }))))
+    }
+
+    fn eval_case_lambda(&mut self, items: &[Expr], span: Span, env: EnvRef) -> EvalResult<Value> {
+        if items.len() < 2 {
+            return Err(runtime_error("case-lambda expects at least one clause", span));
+        }
+
+        let mut clauses = Vec::with_capacity(items.len() - 1);
+        for clause in &items[1..] {
+            let ExprKind::List(parts) = &clause.kind else {
+                return Err(runtime_error("case-lambda clauses must be lists", clause.span));
+            };
+            if parts.len() < 2 {
+                return Err(runtime_error(
+                    "case-lambda clause expects parameters and body",
+                    clause.span,
+                ));
+            }
+            let params = parse_params(&parts[0])?;
+            clauses.push(LambdaProc {
+                params: params.params,
+                rest: params.rest,
+                body: parts[1..].to_vec(),
+                env: env.clone(),
+            });
+        }
+
+        Ok(Value::Procedure(Procedure::CaseLambda(Rc::new(
+            CaseLambdaProc { clauses },
+        ))))
     }
 
     fn eval_let(&mut self, items: &[Expr], span: Span, env: EnvRef) -> EvalResult<Value> {
@@ -488,33 +533,22 @@ impl Evaluator {
         match procedure {
             Value::Procedure(Procedure::Builtin(builtin)) => (builtin.func)(self, args, span),
             Value::Procedure(Procedure::Lambda(lambda)) => {
-                if args.len() < lambda.params.len() {
-                    let expected = match lambda.rest {
-                        Some(_) => format!("at least {}", lambda.params.len()),
-                        None => lambda.params.len().to_string(),
-                    };
-                    return Err(wrong_arg_count("lambda", &expected, args.len(), span));
+                apply_lambda(self, lambda.as_ref(), args, span, "lambda")
+            }
+            Value::Procedure(Procedure::CaseLambda(case_lambda)) => {
+                for clause in &case_lambda.clauses {
+                    if lambda_accepts_arity(clause, args.len()) {
+                        return apply_lambda(self, clause, args, span, "case-lambda");
+                    }
                 }
-                if lambda.rest.is_none() && args.len() != lambda.params.len() {
-                    return Err(wrong_arg_count(
-                        "lambda",
-                        &lambda.params.len().to_string(),
-                        args.len(),
-                        span,
-                    ));
-                }
-                let call_env = Env::new(Some(lambda.env.clone()));
-                for (name, value) in lambda.params.iter().zip(args.iter()) {
-                    Env::define(&call_env, name.clone(), value.clone());
-                }
-                if let Some(rest_name) = &lambda.rest {
-                    Env::define(
-                        &call_env,
-                        rest_name.clone(),
-                        list_from_vec(args[lambda.params.len()..].to_vec()),
-                    );
-                }
-                self.eval_sequence(&lambda.body, call_env)
+                Err(runtime_error(
+                    format!(
+                        "case-lambda expected {}, got {} args",
+                        describe_case_lambda_arities(&case_lambda.clauses),
+                        args.len()
+                    ),
+                    span,
+                ))
             }
             Value::Procedure(Procedure::RecordConstructor(constructor)) => {
                 if args.len() != constructor.record_type.field_count {
@@ -643,6 +677,7 @@ impl Procedure {
         match self {
             Self::Builtin(proc) => format!("#<procedure:{}>", proc.name),
             Self::Lambda(_) => "#<procedure>".to_string(),
+            Self::CaseLambda(_) => "#<procedure>".to_string(),
             Self::RecordConstructor(proc) => format!("#<procedure:{}>", proc.name),
             Self::RecordPredicate(proc) => format!("#<procedure:{}>", proc.name),
             Self::RecordAccessor(proc) => format!("#<procedure:{}>", proc.name),
@@ -734,6 +769,16 @@ fn expect_symbol_expr(expr: &Expr, message: &str) -> EvalResult<String> {
         return Err(runtime_error(message, expr.span));
     };
     Ok(name.to_string())
+}
+
+fn is_recursive_procedure_expr(expr: &Expr) -> bool {
+    let ExprKind::List(items) = &expr.kind else {
+        return false;
+    };
+    matches!(
+        items.first().and_then(symbol_name),
+        Some("lambda") | Some("case-lambda")
+    )
 }
 
 fn parse_record_constructor_spec(expr: &Expr) -> EvalResult<(String, usize)> {
@@ -839,6 +884,70 @@ fn parse_bindings(expr: &Expr) -> EvalResult<Vec<(String, Expr)>> {
     Ok(parsed)
 }
 
+fn lambda_accepts_arity(lambda: &LambdaProc, arg_count: usize) -> bool {
+    arg_count >= lambda.params.len() && (lambda.rest.is_some() || arg_count == lambda.params.len())
+}
+
+fn apply_lambda(
+    evaluator: &mut Evaluator,
+    lambda: &LambdaProc,
+    args: &[Value],
+    span: Span,
+    name: &str,
+) -> EvalResult<Value> {
+    if args.len() < lambda.params.len() {
+        let expected = match lambda.rest {
+            Some(_) => format!("at least {}", lambda.params.len()),
+            None => lambda.params.len().to_string(),
+        };
+        return Err(wrong_arg_count(name, &expected, args.len(), span));
+    }
+    if lambda.rest.is_none() && args.len() != lambda.params.len() {
+        return Err(wrong_arg_count(
+            name,
+            &lambda.params.len().to_string(),
+            args.len(),
+            span,
+        ));
+    }
+
+    let call_env = Env::new(Some(lambda.env.clone()));
+    for (param, value) in lambda.params.iter().zip(args.iter()) {
+        Env::define(&call_env, param.clone(), value.clone());
+    }
+    if let Some(rest_name) = &lambda.rest {
+        Env::define(
+            &call_env,
+            rest_name.clone(),
+            list_from_vec(args[lambda.params.len()..].to_vec()),
+        );
+    }
+    evaluator.eval_sequence(&lambda.body, call_env)
+}
+
+fn describe_case_lambda_arities(clauses: &[LambdaProc]) -> String {
+    let mut descriptions = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let description = match clause.rest {
+            Some(_) => format!("at least {}", clause.params.len()),
+            None => clause.params.len().to_string(),
+        };
+        if !descriptions.contains(&description) {
+            descriptions.push(description);
+        }
+    }
+
+    match descriptions.len() {
+        0 => "no matching clauses".to_string(),
+        1 => format!("{} args", descriptions[0]),
+        2 => format!("{} or {} args", descriptions[0], descriptions[1]),
+        _ => {
+            let last = descriptions.pop().unwrap_or_default();
+            format!("{}, or {} args", descriptions.join(", "), last)
+        }
+    }
+}
+
 fn datum_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Bool(value) => Value::Bool(*value),
@@ -935,6 +1044,31 @@ fn list_to_vec(value: &Value, span: Span, context: &str) -> EvalResult<Vec<Value
                 ))
             }
         }
+    }
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::Nil, Value::Nil) => true,
+        (Value::Void, Value::Void) => true,
+        (Value::String(left), Value::String(right)) => left.borrow().text == right.borrow().text,
+        (Value::Pair(left), Value::Pair(right)) => {
+            values_equal(&left.car, &right.car) && values_equal(&left.cdr, &right.cdr)
+        }
+        (Value::Record(left), Value::Record(right)) => {
+            Rc::ptr_eq(&left.record_type, &right.record_type)
+                && left.fields.len() == right.fields.len()
+                && left
+                    .fields
+                    .iter()
+                    .zip(&right.fields)
+                    .all(|(left, right)| values_equal(left, right))
+        }
+        _ => false,
     }
 }
 
@@ -1094,6 +1228,13 @@ fn builtin_append(_: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<V
     Ok(result)
 }
 
+fn builtin_equal(_: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<Value> {
+    if args.len() != 2 {
+        return Err(wrong_arg_count("equal?", "2", args.len(), span));
+    }
+    Ok(Value::Bool(values_equal(&args[0], &args[1])))
+}
+
 fn builtin_number_pred(_: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<Value> {
     if args.len() != 1 {
         return Err(wrong_arg_count("number?", "1", args.len(), span));
@@ -1134,6 +1275,13 @@ fn builtin_char_pred(_: &mut Evaluator, args: &[Value], span: Span) -> EvalResul
         return Err(wrong_arg_count("char?", "1", args.len(), span));
     }
     Ok(Value::Bool(matches!(args[0], Value::Char(_))))
+}
+
+fn builtin_procedure_pred(_: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<Value> {
+    if args.len() != 1 {
+        return Err(wrong_arg_count("procedure?", "1", args.len(), span));
+    }
+    Ok(Value::Bool(matches!(args[0], Value::Procedure(_))))
 }
 
 fn builtin_display(evaluator: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<Value> {

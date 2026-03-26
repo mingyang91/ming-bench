@@ -220,10 +220,13 @@ interface BuiltinImplementation {
     SchemeValue apply(List<SchemeValue> arguments) throws EvalError;
 }
 
+interface ProcedureValue extends SchemeValue {
+}
+
 record BuiltinProcedure(
         String name,
         BuiltinImplementation implementation
-) implements SchemeValue {
+) implements ProcedureValue {
     SchemeValue apply(List<SchemeValue> arguments) throws EvalError {
         return implementation.apply(arguments);
     }
@@ -240,11 +243,32 @@ record LambdaProcedure(
         String restParameter,
         List<SchemeExpression> body,
         Environment closureEnvironment
-) implements SchemeValue {
+) implements ProcedureValue {
     @Override
     public String render() {
         if (name == null || name.isEmpty()) {
             return "#<procedure:lambda>";
+        }
+        return "#<procedure:" + name + ">";
+    }
+}
+
+record CaseLambdaClause(
+        List<String> parameters,
+        String restParameter,
+        List<SchemeExpression> body
+) {
+}
+
+record CaseLambdaProcedure(
+        String name,
+        List<CaseLambdaClause> clauses,
+        Environment closureEnvironment
+) implements ProcedureValue {
+    @Override
+    public String render() {
+        if (name == null || name.isEmpty()) {
+            return "#<procedure:case-lambda>";
         }
         return "#<procedure:" + name + ">";
     }

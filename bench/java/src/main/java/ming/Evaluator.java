@@ -115,6 +115,9 @@ public class Evaluator {
             if ("lambda".equals(name)) {
                 return evalLambda(elements, environment);
             }
+            if ("case-lambda".equals(name)) {
+                return evalCaseLambda(elements, environment);
+            }
 
             SyntaxRulesMacro macro = environment.lookupMacro(name);
             if (macro != null) {
@@ -123,7 +126,7 @@ public class Evaluator {
         }
 
         SchemeValue callee = eval(head, environment);
-        if (!(callee instanceof BuiltinProcedure) && !(callee instanceof LambdaProcedure)) {
+        if (!(callee instanceof ProcedureValue)) {
             throw new EvalError("not a procedure");
         }
 
@@ -358,6 +361,8 @@ public class Evaluator {
                 value -> value instanceof PairValue)));
         builtins.put("symbol?", new BuiltinProcedure("symbol?", args -> applyPredicate(args, "symbol?",
                 value -> value instanceof SymbolValue)));
+        builtins.put("procedure?", new BuiltinProcedure("procedure?", args -> applyPredicate(args, "procedure?",
+                Evaluator::isProcedureValue)));
         builtins.put("char?", new BuiltinProcedure("char?", args -> applyPredicate(args, "char?",
                 value -> value instanceof CharValue)));
         builtins.put("char-alphabetic?", new BuiltinProcedure("char-alphabetic?",
@@ -561,6 +566,34 @@ public class Evaluator {
         );
     }
 
+    private SchemeValue evalCaseLambda(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 2) {
+            throw new EvalError("case-lambda: expected at least 1 clause");
+        }
+
+        List<CaseLambdaClause> clauses = new ArrayList<>(elements.size() - 1);
+        for (int index = 1; index < elements.size(); index++) {
+            SchemeExpression clauseExpression = elements.get(index);
+            if (!(clauseExpression instanceof ListExpression clauseList)) {
+                throw new EvalError("case-lambda: expected clause");
+            }
+
+            List<SchemeExpression> clauseElements = clauseList.elements();
+            if (clauseElements.size() < 2) {
+                throw new EvalError("case-lambda: expected clause parameters and body");
+            }
+
+            ParameterSpec parameters = parseParameters(clauseElements.getFirst(), "case-lambda");
+            clauses.add(new CaseLambdaClause(
+                    parameters.fixedParameters(),
+                    parameters.restParameter(),
+                    List.copyOf(clauseElements.subList(1, clauseElements.size()))
+            ));
+        }
+
+        return new CaseLambdaProcedure(null, List.copyOf(clauses), environment);
+    }
+
     private SyntaxRulesMacro parseSyntaxRules(
             String macroName,
             SchemeExpression transformerExpression,
@@ -637,31 +670,69 @@ public class Evaluator {
         if (callee instanceof LambdaProcedure lambdaProcedure) {
             return applyLambda(lambdaProcedure, arguments);
         }
+        if (callee instanceof CaseLambdaProcedure caseLambdaProcedure) {
+            return applyCaseLambda(caseLambdaProcedure, arguments);
+        }
         throw new EvalError("not a procedure");
     }
 
     private SchemeValue applyLambda(LambdaProcedure procedure, List<SchemeValue> arguments) throws EvalError {
-        int requiredCount = procedure.parameters().size();
-        if (procedure.restParameter() == null) {
+        return applyClosure(
+                procedure.parameters(),
+                procedure.restParameter(),
+                procedure.body(),
+                procedure.closureEnvironment(),
+                arguments,
+                procedure.render()
+        );
+    }
+
+    private SchemeValue applyCaseLambda(CaseLambdaProcedure procedure, List<SchemeValue> arguments) throws EvalError {
+        for (CaseLambdaClause clause : procedure.clauses()) {
+            if (matchesArity(clause.parameters().size(), clause.restParameter(), arguments.size())) {
+                return applyClosure(
+                        clause.parameters(),
+                        clause.restParameter(),
+                        clause.body(),
+                        procedure.closureEnvironment(),
+                        arguments,
+                        procedure.render()
+                );
+            }
+        }
+        throw new EvalError(procedure.render() + ": expected a matching clause for " + arguments.size()
+                + " arguments");
+    }
+
+    private SchemeValue applyClosure(
+            List<String> parameters,
+            String restParameter,
+            List<SchemeExpression> body,
+            Environment closureEnvironment,
+            List<SchemeValue> arguments,
+            String procedureName
+    ) throws EvalError {
+        int requiredCount = parameters.size();
+        if (restParameter == null) {
             if (arguments.size() != requiredCount) {
-                throw new EvalError(procedure.render() + ": expected " + requiredCount + " arguments");
+                throw new EvalError(procedureName + ": expected " + requiredCount + " arguments");
             }
         } else if (arguments.size() < requiredCount) {
-            throw new EvalError(procedure.render() + ": expected at least " + requiredCount + " arguments");
+            throw new EvalError(procedureName + ": expected at least " + requiredCount + " arguments");
         }
 
-        Environment invocationEnvironment = new Environment(procedure.closureEnvironment());
+        Environment invocationEnvironment = new Environment(closureEnvironment);
         for (int index = 0; index < requiredCount; index++) {
-            invocationEnvironment.define(procedure.parameters().get(index), arguments.get(index));
+            invocationEnvironment.define(parameters.get(index), arguments.get(index));
         }
-        if (procedure.restParameter() != null) {
+        if (restParameter != null) {
             invocationEnvironment.define(
-                    procedure.restParameter(),
+                    restParameter,
                     buildList(arguments.subList(requiredCount, arguments.size()))
             );
         }
 
-        return evalSequence(procedure.body(), invocationEnvironment);
+        return evalSequence(body, invocationEnvironment);
     }
 
     private ParameterSpec parseParameters(SchemeExpression parameterExpression, String formName)
@@ -1413,6 +1484,17 @@ public class Evaluator {
             return boolValue.value();
         }
         return true;
+    }
+
+    private static boolean isProcedureValue(SchemeValue value) {
+        return value instanceof ProcedureValue;
+    }
+
+    private static boolean matchesArity(int requiredCount, String restParameter, int actualCount) {
+        if (restParameter == null) {
+            return actualCount == requiredCount;
+        }
+        return actualCount >= requiredCount;
     }
 
     private void emit(String text) {
