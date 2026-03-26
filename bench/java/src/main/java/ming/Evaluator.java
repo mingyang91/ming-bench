@@ -31,6 +31,12 @@ public class Evaluator {
         void define(String name, Object val) {
             bindings.put(name, val);
         }
+
+        void set(String name, Object val) throws EvalError {
+            if (bindings.containsKey(name)) { bindings.put(name, val); return; }
+            if (parent != null) { parent.set(name, val); return; }
+            throw new EvalError("set!: unbound variable: " + name);
+        }
     }
 
     // --- Lambda (closure) ---
@@ -287,6 +293,13 @@ public class Evaluator {
                         case "lambda" -> { return evalLambda(list.elems, env); }
                         case "and" -> { return evalAnd(list.elems, env); }
                         case "or" -> { return evalOr(list.elems, env); }
+                        case "set!" -> {
+                            if (list.elems.size() != 3) throw new EvalError("set!: bad syntax");
+                            String varName = ((SchemeSymbol) list.elems.get(1)).name;
+                            Object val = eval(list.elems.get(2), env);
+                            env.set(varName, val);
+                            return null; // void
+                        }
                         case "begin" -> { return evalBegin(list.elems, env); }
                         case "let" -> { return evalLet(list.elems, env); }
                         case "cond" -> { return evalCond(list.elems, env); }
