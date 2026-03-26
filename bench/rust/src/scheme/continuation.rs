@@ -2,7 +2,8 @@ use std::rc::Rc;
 
 use super::{
     attach_call_position, expand_macro_call, expr_plain_symbol_name, expr_symbol_name,
-    list_from_values, lookup_symbol_value, lookup_syntax, make_string, Continuation,
+    list_from_values, lookup_symbol_value, lookup_syntax, make_string, unpack_values,
+    Continuation,
     ContinuationFrame, ControlProc, DynamicWindContext, DynamicWindRef, Env, EnvRef, EvalContext,
     EvalError, Expr, ExprKind, SourcePos, Value,
 };
@@ -569,6 +570,9 @@ fn continue_with_frame(
 
             Ok(MachineState::Return(result, next_frames))
         }
+        ContinuationFrame::CallWithValues { consumer, pos } => {
+            apply_value(consumer, unpack_values(value), pos, frames, ctx)
+        }
         ContinuationFrame::DynamicWindTransition {
             remaining,
             final_value,
@@ -700,6 +704,25 @@ fn apply_value(
     ctx: &EvalContext,
 ) -> Result<MachineState, EvalError> {
     match procedure {
+        Value::ControlProc(ControlProc::CallWithValues) => {
+            if args.len() != 2 {
+                return Err(attach_call_position(
+                    EvalError::WrongArgCount {
+                        name: "call-with-values",
+                        expected: "exactly 2",
+                        got: args.len(),
+                    },
+                    pos,
+                ));
+            }
+
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::CallWithValues {
+                consumer: args[1].clone(),
+                pos,
+            });
+            apply_value(args[0].clone(), Vec::new(), pos, next_frames, ctx)
+        }
         Value::ControlProc(ControlProc::DynamicWind) => {
             if args.len() != 3 {
                 return Err(attach_call_position(

@@ -91,6 +91,7 @@ enum RecordProcedureKind {
 enum ControlProc {
     CallCc,
     DynamicWind,
+    CallWithValues,
     Raise,
     WithExceptionHandler,
 }
@@ -100,6 +101,7 @@ impl ControlProc {
         match self {
             Self::CallCc => "call/cc",
             Self::DynamicWind => "dynamic-wind",
+            Self::CallWithValues => "call-with-values",
             Self::Raise => "raise",
             Self::WithExceptionHandler => "with-exception-handler",
         }
@@ -178,6 +180,7 @@ enum Value {
     RecordProc(RecordProcRef),
     Closure(Rc<Closure>),
     Continuation(ContinuationRef),
+    Multiple(Vec<Value>),
     Void,
 }
 
@@ -282,6 +285,10 @@ enum ContinuationFrame {
         context: DynamicWindRef,
         result: Value,
     },
+    CallWithValues {
+        consumer: Value,
+        pos: Option<SourcePos>,
+    },
     DynamicWindTransition {
         remaining: Vec<Value>,
         final_value: Value,
@@ -351,6 +358,7 @@ impl Value {
             Self::RecordProc(procedure) => format!("#<procedure:{}>", procedure.name),
             Self::Closure(_) => "#<procedure>".to_string(),
             Self::Continuation(_) => "#<procedure>".to_string(),
+            Self::Multiple(values) => format!("#<values:{}>", values.len()),
             Self::Void => "#<void>".to_string(),
         }
     }
@@ -833,6 +841,33 @@ fn apply_call(mut call: CallRequest, ctx: &EvalContext) -> Result<Value, EvalErr
         } = call;
 
         match procedure {
+            Value::ControlProc(ControlProc::CallWithValues) => {
+                if args.len() != 2 {
+                    return Err(attach_call_position(
+                        EvalError::WrongArgCount {
+                            name: "call-with-values",
+                            expected: "exactly 2",
+                            got: args.len(),
+                        },
+                        pos,
+                    ));
+                }
+
+                let produced = apply_call(
+                    CallRequest {
+                        procedure: args[0].clone(),
+                        args: Vec::new(),
+                        pos,
+                    },
+                    ctx,
+                )?;
+
+                call = CallRequest {
+                    procedure: args[1].clone(),
+                    args: unpack_values(produced),
+                    pos,
+                };
+            }
             Value::ControlProc(ControlProc::DynamicWind) => {
                 if args.len() != 3 {
                     return Err(attach_call_position(
@@ -999,6 +1034,21 @@ fn list_from_values(values: Vec<Value>) -> Value {
         .into_iter()
         .rev()
         .fold(Value::Nil, |tail, head| make_pair(head, tail))
+}
+
+fn pack_values(mut values: Vec<Value>) -> Value {
+    if values.len() == 1 {
+        values.pop().expect("checked length above")
+    } else {
+        Value::Multiple(values)
+    }
+}
+
+fn unpack_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Multiple(values) => values,
+        other => vec![other],
+    }
 }
 
 fn list_to_vec(value: &Value, name: &'static str) -> Result<Vec<Value>, EvalError> {

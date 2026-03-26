@@ -1,7 +1,7 @@
 use super::{
     apply_procedure, list_from_values, list_to_vec, make_mutable_string, make_pair, make_string,
-    make_vector, number::Number, ControlProc, Env, EnvRef, EvalContext, EvalError, NativeFunc,
-    Value,
+    make_vector, number::Number, pack_values, ControlProc, Env, EnvRef, EvalContext, EvalError,
+    NativeFunc, Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -46,6 +46,7 @@ pub(super) fn default_env() -> EnvRef {
         ("set-cdr!", native_set_cdr as NativeFunc),
         ("null?", native_null_pred as NativeFunc),
         ("list", native_list as NativeFunc),
+        ("values", native_values as NativeFunc),
         ("list?", native_list_pred as NativeFunc),
         ("list-ref", native_list_ref as NativeFunc),
         ("list-tail", native_list_tail as NativeFunc),
@@ -134,6 +135,10 @@ pub(super) fn default_env() -> EnvRef {
     env.define(
         "dynamic-wind".to_string(),
         Value::ControlProc(ControlProc::DynamicWind),
+    );
+    env.define(
+        "call-with-values".to_string(),
+        Value::ControlProc(ControlProc::CallWithValues),
     );
     env.define("raise".to_string(), Value::ControlProc(ControlProc::Raise));
     env.define(
@@ -267,6 +272,10 @@ fn native_null_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalErro
 
 fn native_list(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     Ok(list_from_values(args.to_vec()))
+}
+
+fn native_values(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    Ok(pack_values(args.to_vec()))
 }
 
 fn native_list_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -1811,6 +1820,13 @@ pub(super) fn value_eq(left: &Value, right: &Value) -> bool {
         (Value::RecordProc(left), Value::RecordProc(right)) => Rc::ptr_eq(left, right),
         (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
         (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
+        (Value::Multiple(left), Value::Multiple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| value_eq(left, right))
+        }
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -1845,6 +1861,13 @@ fn value_equal(left: &Value, right: &Value) -> bool {
                 (borrowed.car.clone(), borrowed.cdr.clone())
             };
             value_equal(&left_car, &right_car) && value_equal(&left_cdr, &right_cdr)
+        }
+        (Value::Multiple(left), Value::Multiple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| value_equal(left, right))
         }
         _ => value_eq(left, right),
     }
