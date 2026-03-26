@@ -21,85 +21,8 @@ public class Evaluator {
     private final MacroExpander macroExpander;
     private final boolean immutableStringsEnabled;
     private List<DynamicWindFrame> dynamicWindStack;
+    private List<ExceptionHandlerFrame> exceptionHandlerStack;
     private StringBuilder outputBuffer;
-
-    private sealed interface Step permits EvalExprStep, ReturnStep, ApplyStep, DoneStep {
-    }
-
-    private record EvalExprStep(Expr expr, Env env, Kont kont) implements Step {
-    }
-
-    private record ReturnStep(Value value, Kont kont) implements Step {
-    }
-
-    private record ApplyStep(Value operator, List<Value> arguments, Kont kont, int line,
-            int column) implements Step {
-    }
-
-    private record DoneStep(Value value) implements Step {
-    }
-
-    @FunctionalInterface
-    private interface ContinuationBody {
-        Step apply(Value value) throws EvalError;
-    }
-
-    private record Kont(int line, int column, ContinuationBody body) {
-        Step apply(Value value) throws EvalError {
-            try {
-                return body.apply(value);
-            } catch (EvalError error) {
-                if (line <= 0 || column <= 0) {
-                    throw error;
-                }
-                throw error.withPosition(line, column);
-            }
-        }
-    }
-
-    private static final class DynamicWindFrame {
-        private final Value inThunk;
-        private final Value outThunk;
-
-        private DynamicWindFrame(Value inThunk, Value outThunk) {
-            this.inThunk = inThunk;
-            this.outThunk = outThunk;
-        }
-
-        private Value inThunk() {
-            return inThunk;
-        }
-
-        private Value outThunk() {
-            return outThunk;
-        }
-    }
-
-    private record CapturedContinuation(Kont target, List<DynamicWindFrame> dynamicStack) {
-    }
-
-    private static final class ContinuationJump extends RuntimeException {
-        private final CapturedContinuation target;
-        private final Value value;
-
-        private ContinuationJump(CapturedContinuation target, Value value) {
-            this.target = target;
-            this.value = value;
-        }
-
-        private CapturedContinuation target() {
-            return target;
-        }
-
-        private Value value() {
-            return value;
-        }
-
-        @Override
-        public synchronized Throwable fillInStackTrace() {
-            return this;
-        }
-    }
 
     @FunctionalInterface
     private interface ValueListHandler {
@@ -112,7 +35,8 @@ public class Evaluator {
         this.immutableStringsEnabled = currentBenchLevel() >= STRING_IMMUTABILITY_LEVEL;
         this.globalEnv = createGlobalEnv();
         this.macroExpander = new MacroExpander();
-        this.dynamicWindStack = List.of();
+        this.dynamicWindStack = new ArrayList<>();
+        this.exceptionHandlerStack = new ArrayList<>();
     }
 
     /**
@@ -201,12 +125,15 @@ public class Evaluator {
                             throw error.withPosition(applyStep.line(), applyStep.column());
                         }
                     }
+                    case ThunkStep thunkStep -> currentStep = thunkStep.supplier().get();
                     case DoneStep doneStep -> {
                         return doneStep.value();
                     }
                 }
             } catch (ContinuationJump jump) {
                 currentStep = jumpToContinuation(jump.target(), jump.value());
+            } catch (RaisedException raised) {
+                currentStep = handleRaisedException(raised);
             }
         }
     }
@@ -265,6 +192,7 @@ public class Evaluator {
                 case "and" -> evalAnd(arguments, 0, env, kont, listExpr);
                 case "or" -> evalOr(arguments, 0, env, kont, listExpr);
                 case "begin" -> evalSequence(arguments, env, kont);
+                case "guard" -> evalGuard(arguments, env, kont, listExpr);
                 case "let" -> evalLet(arguments, env, kont, listExpr);
                 case "let*" -> evalLetStar(arguments, env, kont, listExpr);
                 case "letrec" -> evalLetRec(arguments, env, false, kont, listExpr);
@@ -1044,6 +972,86 @@ public class Evaluator {
         return List.copyOf(bindings);
     }
 
+    private Step evalGuard(List<Expr> arguments, Env env, Kont kont, Expr context)
+            throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("guard requires clauses and a body");
+        }
+
+        Expr guardExpr = arguments.get(0);
+        if (!(guardExpr instanceof ListExpr guardList) || guardList.elements().isEmpty()) {
+            throw new EvalError("guard expects an exception variable and clauses");
+        }
+
+        Expr variableExpr = guardList.elements().get(0);
+        if (!(variableExpr instanceof SymbolExpr variableSymbol)) {
+            throw new EvalError("guard exception variable must be a symbol");
+        }
+
+        List<Expr> clauses = List.copyOf(guardList.elements().subList(1,
+                guardList.elements().size()));
+        ExceptionHandlerFrame frame = new ExceptionHandlerFrame(
+                List.copyOf(dynamicWindStack),
+                List.copyOf(exceptionHandlerStack),
+                exception -> evalGuardClauses(
+                        clauses,
+                        0,
+                        createGuardEnv(env, variableSymbol.name(), exception.value()),
+                        exception,
+                        kont,
+                        context));
+        pushExceptionHandlerFrame(frame);
+        return evalSequence(arguments.subList(1, arguments.size()), env,
+                continuation(context, value -> exitExceptionHandler(frame, value, kont)));
+    }
+
+    private Env createGuardEnv(Env env, String variableName, Value exceptionValue) {
+        Env guardEnv = new Env(env);
+        guardEnv.define(variableName, exceptionValue);
+        return guardEnv;
+    }
+
+    private Step evalGuardClauses(List<Expr> clauses, int index, Env guardEnv,
+            RaisedException exception, Kont kont, Expr context) throws EvalError {
+        if (index >= clauses.size()) {
+            throw exception;
+        }
+
+        Expr clauseExpr = clauses.get(index);
+        if (!(clauseExpr instanceof ListExpr clause) || clause.elements().isEmpty()) {
+            throw new EvalError("guard clause must be a non-empty list");
+        }
+
+        List<Expr> elements = clause.elements();
+        Expr testExpr = elements.get(0);
+        if (testExpr instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+            if (index != clauses.size() - 1) {
+                throw new EvalError("guard else clause must be last");
+            }
+            if (elements.size() == 1) {
+                return new ReturnStep(TRUE, kont);
+            }
+            return evalSequence(elements.subList(1, elements.size()), guardEnv, kont);
+        }
+
+        return new EvalExprStep(testExpr, guardEnv,
+                continuation(context, testValue -> {
+                    if (isTruthy(testValue)) {
+                        if (elements.size() == 1) {
+                            return new ReturnStep(testValue, kont);
+                        }
+                        return evalSequence(elements.subList(1, elements.size()), guardEnv, kont);
+                    }
+                    return evalGuardClauses(
+                            clauses,
+                            index + 1,
+                            guardEnv,
+                            exception,
+                            kont,
+                            context);
+                }));
+    }
+
     private Value applyProcedure(Value operator, List<Value> arguments) throws EvalError {
         return run(new ApplyStep(operator, List.copyOf(arguments), DONE, 0, 0));
     }
@@ -1066,6 +1074,9 @@ public class Evaluator {
                     applyCallWithCurrentContinuation(builtinValue.name(), arguments, kont, line,
                             column);
             case "dynamic-wind" -> applyDynamicWind(arguments, kont, line, column);
+            case "raise" -> applyRaise(arguments, line, column);
+            case "with-exception-handler" ->
+                    applyWithExceptionHandler(arguments, kont, line, column);
             case "apply" -> applyBuiltinApply(arguments, kont, line, column);
             case "map" -> applyBuiltinMap(arguments, kont, line, column);
             case "for-each" -> applyBuiltinForEach(arguments, kont, line, column);
@@ -1081,7 +1092,9 @@ public class Evaluator {
     }
 
     private CapturedContinuation captureContinuation(Kont kont) {
-        return new CapturedContinuation(kont, List.copyOf(dynamicWindStack));
+        return new CapturedContinuation(kont,
+                List.copyOf(dynamicWindStack),
+                List.copyOf(exceptionHandlerStack));
     }
 
     private Value makeContinuationValue(CapturedContinuation continuation) {
@@ -1120,8 +1133,25 @@ public class Evaluator {
     }
 
     private Step jumpToContinuation(CapturedContinuation continuation, Value value) {
+        exceptionHandlerStack = new ArrayList<>(continuation.exceptionHandlerStack());
         return transitionDynamicWind(continuation.dynamicStack(),
                 new ReturnStep(value, continuation.target()));
+    }
+
+    private Step handleRaisedException(RaisedException exception) throws EvalError {
+        if (exceptionHandlerStack.isEmpty()) {
+            EvalError error = new EvalError(
+                    "uncaught exception: " + ValueRenderer.render(exception.value()));
+            if (exception.hasPosition()) {
+                throw error.withPosition(exception.line(), exception.column());
+            }
+            throw error;
+        }
+
+        ExceptionHandlerFrame frame = exceptionHandlerStack.get(exceptionHandlerStack.size() - 1);
+        exceptionHandlerStack = new ArrayList<>(frame.outerHandlers());
+        return transitionDynamicWind(frame.dynamicStack(),
+                new ThunkStep(() -> frame.body().apply(exception)));
     }
 
     private Step transitionDynamicWind(List<DynamicWindFrame> targetStack, Step nextStep) {
@@ -1168,10 +1198,7 @@ public class Evaluator {
     }
 
     private void pushDynamicWindFrame(DynamicWindFrame frame) {
-        List<DynamicWindFrame> nextStack = new ArrayList<>(dynamicWindStack.size() + 1);
-        nextStack.addAll(dynamicWindStack);
-        nextStack.add(frame);
-        dynamicWindStack = List.copyOf(nextStack);
+        dynamicWindStack.add(frame);
     }
 
     private void popDynamicWindFrame(DynamicWindFrame frame) {
@@ -1179,7 +1206,45 @@ public class Evaluator {
         if (lastIndex < 0 || dynamicWindStack.get(lastIndex) != frame) {
             throw new IllegalStateException("dynamic-wind stack out of sync");
         }
-        dynamicWindStack = List.copyOf(dynamicWindStack.subList(0, lastIndex));
+        dynamicWindStack.remove(lastIndex);
+    }
+
+    private void pushExceptionHandlerFrame(ExceptionHandlerFrame frame) {
+        exceptionHandlerStack.add(frame);
+    }
+
+    private void popExceptionHandlerFrame(ExceptionHandlerFrame frame) {
+        int lastIndex = exceptionHandlerStack.size() - 1;
+        if (lastIndex < 0 || exceptionHandlerStack.get(lastIndex) != frame) {
+            throw new IllegalStateException("exception handler stack out of sync");
+        }
+        exceptionHandlerStack.remove(lastIndex);
+    }
+
+    private Step exitExceptionHandler(ExceptionHandlerFrame frame, Value value, Kont kont) {
+        popExceptionHandlerFrame(frame);
+        return new ReturnStep(value, kont);
+    }
+
+    private Step applyRaise(List<Value> arguments, int line, int column) throws EvalError {
+        requireExactArgs("raise", arguments, 1);
+        throw new RaisedException(arguments.get(0), line, column);
+    }
+
+    private Step applyWithExceptionHandler(List<Value> arguments, Kont kont, int line, int column)
+            throws EvalError {
+        requireExactArgs("with-exception-handler", arguments, 2);
+
+        ExceptionHandlerFrame frame = new ExceptionHandlerFrame(
+                List.copyOf(dynamicWindStack),
+                List.copyOf(exceptionHandlerStack),
+                exception -> new ApplyStep(arguments.get(0), List.of(exception.value()), kont, line,
+                        column));
+        pushExceptionHandlerFrame(frame);
+        return new ApplyStep(arguments.get(1), List.of(),
+                continuation(line, column, value -> exitExceptionHandler(frame, value, kont)),
+                line,
+                column);
     }
 
     private Step applyBuiltinApply(List<Value> arguments, Kont kont, int line, int column)

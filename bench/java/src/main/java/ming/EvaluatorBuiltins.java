@@ -157,6 +157,9 @@ final class EvaluatorBuiltins {
         env.define("call-with-current-continuation",
                 new BuiltinValue("call-with-current-continuation", this::specialBuiltin));
         env.define("dynamic-wind", new BuiltinValue("dynamic-wind", this::specialBuiltin));
+        env.define("raise", new BuiltinValue("raise", this::specialBuiltin));
+        env.define("with-exception-handler",
+                new BuiltinValue("with-exception-handler", this::specialBuiltin));
     }
 
     private Value specialBuiltin(List<Value> arguments) throws EvalError {
