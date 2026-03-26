@@ -2,7 +2,7 @@ package ming;
 
 import java.util.List;
 
-sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue, ListValue,
+sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue, ListValue,
         PairValue, CharValue, VoidValue, ProcedureValue {
     String render();
 
@@ -11,10 +11,73 @@ sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue, Li
     }
 }
 
-record IntValue(long value) implements Value {
+sealed interface NumericValue extends Value permits IntValue, RationalValue, InexactValue {
+    boolean isExact();
+
+    double toDouble();
+}
+
+record IntValue(long value) implements NumericValue {
     @Override
     public String render() {
         return Long.toString(value);
+    }
+
+    @Override
+    public boolean isExact() {
+        return true;
+    }
+
+    @Override
+    public double toDouble() {
+        return (double) value;
+    }
+}
+
+record RationalValue(long numerator, long denominator) implements NumericValue {
+    RationalValue {
+        if (denominator == 0L) {
+            throw new IllegalArgumentException("denominator must be non-zero");
+        }
+        if (denominator < 0L) {
+            numerator = -numerator;
+            denominator = -denominator;
+        }
+    }
+
+    @Override
+    public String render() {
+        if (denominator == 1L) {
+            return Long.toString(numerator);
+        }
+        return numerator + "/" + denominator;
+    }
+
+    @Override
+    public boolean isExact() {
+        return true;
+    }
+
+    @Override
+    public double toDouble() {
+        return (double) numerator / (double) denominator;
+    }
+}
+
+record InexactValue(double value) implements NumericValue {
+    @Override
+    public String render() {
+        return Double.toString(value);
+    }
+
+    @Override
+    public boolean isExact() {
+        return false;
+    }
+
+    @Override
+    public double toDouble() {
+        return value;
     }
 }
 

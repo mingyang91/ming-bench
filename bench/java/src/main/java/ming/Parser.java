@@ -124,12 +124,15 @@ final class Parser {
     }
 
     private Expr parseNumberOrSymbol(String token, int startLine, int startColumn) throws EvalError {
-        if (isIntegerToken(token)) {
+        if (Numbers.isIntegerToken(token)) {
             try {
                 return new IntExpr(Long.parseLong(token), startLine, startColumn);
             } catch (NumberFormatException e) {
                 throw new EvalError("invalid integer literal: " + token, startLine, startColumn);
             }
+        }
+        if (Numbers.looksLikeNumberLiteral(token)) {
+            return new NumberExpr(token, startLine, startColumn);
         }
         return new SymbolExpr(token, startLine, startColumn);
     }
@@ -152,28 +155,6 @@ final class Parser {
         };
 
         return new CharExpr(ch, startLine, startColumn);
-    }
-
-    private boolean isIntegerToken(String token) {
-        if (token.isEmpty()) {
-            return false;
-        }
-
-        int start = 0;
-        char first = token.charAt(0);
-        if (first == '+' || first == '-') {
-            if (token.length() == 1) {
-                return false;
-            }
-            start = 1;
-        }
-
-        for (int i = start; i < token.length(); i++) {
-            if (!Character.isDigit(token.charAt(i))) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private String readToken() {

@@ -102,6 +102,10 @@ public class Evaluator {
         environment.define("null?", new PrimitiveProcedureValue("null?", this::applyNullPredicate));
         environment.define("pair?", new PrimitiveProcedureValue("pair?", this::applyPairPredicate));
         environment.define("number?", new PrimitiveProcedureValue("number?", this::applyNumberPredicate));
+        environment.define("integer?", new PrimitiveProcedureValue("integer?", this::applyIntegerPredicate));
+        environment.define("rational?", new PrimitiveProcedureValue("rational?", this::applyRationalPredicate));
+        environment.define("exact?", new PrimitiveProcedureValue("exact?", this::applyExactPredicate));
+        environment.define("inexact?", new PrimitiveProcedureValue("inexact?", this::applyInexactPredicate));
         environment.define("string?", new PrimitiveProcedureValue("string?", this::applyStringPredicate));
         environment.define("boolean?", new PrimitiveProcedureValue("boolean?", this::applyBooleanPredicate));
         environment.define("symbol?", new PrimitiveProcedureValue("symbol?", this::applySymbolPredicate));
@@ -115,6 +119,10 @@ public class Evaluator {
         environment.define("substring", new PrimitiveProcedureValue("substring", this::applySubstring));
         environment.define("string->number", new PrimitiveProcedureValue("string->number", this::applyStringToNumber));
         environment.define("number->string", new PrimitiveProcedureValue("number->string", this::applyNumberToString));
+        environment.define("exact->inexact", new PrimitiveProcedureValue("exact->inexact", this::applyExactToInexact));
+        environment.define("inexact->exact", new PrimitiveProcedureValue("inexact->exact", this::applyInexactToExact));
+        environment.define("numerator", new PrimitiveProcedureValue("numerator", this::applyNumerator));
+        environment.define("denominator", new PrimitiveProcedureValue("denominator", this::applyDenominator));
         environment.define("symbol->string", new PrimitiveProcedureValue("symbol->string", this::applySymbolToString));
         environment.define("string->symbol", new PrimitiveProcedureValue("string->symbol", this::applyStringToSymbol));
         environment.define("string-ref", new PrimitiveProcedureValue("string-ref", this::applyStringRef));
@@ -159,6 +167,7 @@ public class Evaluator {
         try {
             return switch (expression) {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
+                case NumberExpr numberExpr -> Numbers.parseLiteral(numberExpr.token());
                 case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
                 case StringExpr stringExpr -> new StringValue(stringExpr.value());
                 case CharExpr charExpr -> new CharValue(charExpr.value());
@@ -550,6 +559,9 @@ public class Evaluator {
         if (pattern instanceof IntExpr expected && input instanceof IntExpr found) {
             return expected.value() == found.value();
         }
+        if (pattern instanceof NumberExpr expected && input instanceof NumberExpr found) {
+            return expected.token().equals(found.token());
+        }
         if (pattern instanceof BoolExpr expected && input instanceof BoolExpr found) {
             return expected.value() == found.value();
         }
@@ -704,6 +716,7 @@ public class Evaluator {
                                      Integer repeatIndex) throws EvalError {
         return switch (template) {
             case IntExpr ignored -> template;
+            case NumberExpr ignored -> template;
             case BoolExpr ignored -> template;
             case StringExpr ignored -> template;
             case CharExpr ignored -> template;
@@ -1012,6 +1025,9 @@ public class Evaluator {
         if (left instanceof IntExpr leftInt && right instanceof IntExpr rightInt) {
             return leftInt.value() == rightInt.value();
         }
+        if (left instanceof NumberExpr leftNumber && right instanceof NumberExpr rightNumber) {
+            return leftNumber.token().equals(rightNumber.token());
+        }
         if (left instanceof BoolExpr leftBool && right instanceof BoolExpr rightBool) {
             return leftBool.value() == rightBool.value();
         }
@@ -1041,6 +1057,7 @@ public class Evaluator {
     private Value quote(Expr expression) throws EvalError {
         return switch (expression) {
             case IntExpr intExpr -> new IntValue(intExpr.value());
+            case NumberExpr numberExpr -> Numbers.parseLiteral(numberExpr.token());
             case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
             case CharExpr charExpr -> new CharValue(charExpr.value());
@@ -1135,7 +1152,27 @@ public class Evaluator {
 
     private Value applyNumberPredicate(List<Value> arguments) throws EvalError {
         requireExactArity("number?", arguments.size(), 1);
-        return new BoolValue(arguments.getFirst() instanceof IntValue);
+        return new BoolValue(Numbers.isNumber(arguments.getFirst()));
+    }
+
+    private Value applyIntegerPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("integer?", arguments.size(), 1);
+        return new BoolValue(Numbers.isInteger(arguments.getFirst()));
+    }
+
+    private Value applyRationalPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("rational?", arguments.size(), 1);
+        return new BoolValue(Numbers.isRational(arguments.getFirst()));
+    }
+
+    private Value applyExactPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("exact?", arguments.size(), 1);
+        return new BoolValue(Numbers.isExact(arguments.getFirst()));
+    }
+
+    private Value applyInexactPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("inexact?", arguments.size(), 1);
+        return new BoolValue(Numbers.isInexact(arguments.getFirst()));
     }
 
     private Value applyStringPredicate(List<Value> arguments) throws EvalError {
@@ -1245,16 +1282,33 @@ public class Evaluator {
     private Value applyStringToNumber(List<Value> arguments) throws EvalError {
         requireExactArity("string->number", arguments.size(), 1);
         String value = expectString(arguments.getFirst(), "string->number");
-        try {
-            return new IntValue(Long.parseLong(value));
-        } catch (NumberFormatException error) {
-            return new BoolValue(false);
-        }
+        Value parsed = Numbers.tryParseLiteral(value);
+        return parsed == null ? new BoolValue(false) : parsed;
     }
 
     private Value applyNumberToString(List<Value> arguments) throws EvalError {
         requireExactArity("number->string", arguments.size(), 1);
-        return new StringValue(Long.toString(expectInt(arguments.getFirst(), "number->string")));
+        return new StringValue(Numbers.expectNumber(arguments.getFirst(), "number->string").render());
+    }
+
+    private Value applyExactToInexact(List<Value> arguments) throws EvalError {
+        requireExactArity("exact->inexact", arguments.size(), 1);
+        return Numbers.exactToInexact(arguments.getFirst(), "exact->inexact");
+    }
+
+    private Value applyInexactToExact(List<Value> arguments) throws EvalError {
+        requireExactArity("inexact->exact", arguments.size(), 1);
+        return Numbers.inexactToExact(arguments.getFirst(), "inexact->exact");
+    }
+
+    private Value applyNumerator(List<Value> arguments) throws EvalError {
+        requireExactArity("numerator", arguments.size(), 1);
+        return Numbers.numerator(arguments.getFirst(), "numerator");
+    }
+
+    private Value applyDenominator(List<Value> arguments) throws EvalError {
+        requireExactArity("denominator", arguments.size(), 1);
+        return Numbers.denominator(arguments.getFirst(), "denominator");
     }
 
     private Value applySymbolToString(List<Value> arguments) throws EvalError {
@@ -1441,50 +1495,26 @@ public class Evaluator {
     }
 
     private Value applyAdd(List<Value> arguments) throws EvalError {
-        long total = 0L;
-        for (Value argument : arguments) {
-            total += expectInt(argument, "+");
-        }
-        return new IntValue(total);
+        return Numbers.add(arguments, "+");
     }
 
     private Value applySubtract(List<Value> arguments) throws EvalError {
         requireMinimumArity("-", arguments.size(), 1);
-        long result = expectInt(arguments.getFirst(), "-");
-        if (arguments.size() == 1) {
-            return new IntValue(-result);
-        }
-
-        for (int i = 1; i < arguments.size(); i++) {
-            result -= expectInt(arguments.get(i), "-");
-        }
-        return new IntValue(result);
+        return Numbers.subtract(arguments, "-");
     }
 
     private Value applyMultiply(List<Value> arguments) throws EvalError {
-        long product = 1L;
-        for (Value argument : arguments) {
-            product *= expectInt(argument, "*");
-        }
-        return new IntValue(product);
+        return Numbers.multiply(arguments, "*");
     }
 
     private Value applyDivide(List<Value> arguments) throws EvalError {
         requireMinimumArity("/", arguments.size(), 2);
-        long result = expectInt(arguments.getFirst(), "/");
-        for (int i = 1; i < arguments.size(); i++) {
-            long divisor = expectInt(arguments.get(i), "/");
-            if (divisor == 0L) {
-                throw new EvalError("division by zero");
-            }
-            result /= divisor;
-        }
-        return new IntValue(result);
+        return Numbers.divide(arguments, "/");
     }
 
     private Value applyAbs(List<Value> arguments) throws EvalError {
         requireExactArity("abs", arguments.size(), 1);
-        return new IntValue(Math.abs(expectInt(arguments.getFirst(), "abs")));
+        return Numbers.abs(arguments.getFirst(), "abs");
     }
 
     private Value applyModulo(List<Value> arguments) throws EvalError {
@@ -1513,20 +1543,12 @@ public class Evaluator {
 
     private Value applyMin(List<Value> arguments) throws EvalError {
         requireMinimumArity("min", arguments.size(), 1);
-        long result = expectInt(arguments.getFirst(), "min");
-        for (int i = 1; i < arguments.size(); i++) {
-            result = Math.min(result, expectInt(arguments.get(i), "min"));
-        }
-        return new IntValue(result);
+        return Numbers.min(arguments, "min");
     }
 
     private Value applyMax(List<Value> arguments) throws EvalError {
         requireMinimumArity("max", arguments.size(), 1);
-        long result = expectInt(arguments.getFirst(), "max");
-        for (int i = 1; i < arguments.size(); i++) {
-            result = Math.max(result, expectInt(arguments.get(i), "max"));
-        }
-        return new IntValue(result);
+        return Numbers.max(arguments, "max");
     }
 
     private Value applyExpt(List<Value> arguments) throws EvalError {
@@ -1552,17 +1574,17 @@ public class Evaluator {
 
     private Value applyZeroPredicate(List<Value> arguments) throws EvalError {
         requireExactArity("zero?", arguments.size(), 1);
-        return new BoolValue(expectInt(arguments.getFirst(), "zero?") == 0L);
+        return new BoolValue(Numbers.isZero(arguments.getFirst(), "zero?"));
     }
 
     private Value applyPositivePredicate(List<Value> arguments) throws EvalError {
         requireExactArity("positive?", arguments.size(), 1);
-        return new BoolValue(expectInt(arguments.getFirst(), "positive?") > 0L);
+        return new BoolValue(Numbers.isPositive(arguments.getFirst(), "positive?"));
     }
 
     private Value applyNegativePredicate(List<Value> arguments) throws EvalError {
         requireExactArity("negative?", arguments.size(), 1);
-        return new BoolValue(expectInt(arguments.getFirst(), "negative?") < 0L);
+        return new BoolValue(Numbers.isNegative(arguments.getFirst(), "negative?"));
     }
 
     private Value applyOddPredicate(List<Value> arguments) throws EvalError {
@@ -1577,27 +1599,7 @@ public class Evaluator {
 
     private Value applyComparison(String operator, List<Value> arguments) throws EvalError {
         requireMinimumArity(operator, arguments.size(), 2);
-
-        long previous = expectInt(arguments.getFirst(), operator);
-        for (int i = 1; i < arguments.size(); i++) {
-            long current = expectInt(arguments.get(i), operator);
-            if (!compare(operator, previous, current)) {
-                return new BoolValue(false);
-            }
-            previous = current;
-        }
-
-        return new BoolValue(true);
-    }
-
-    private boolean compare(String operator, long left, long right) {
-        return switch (operator) {
-            case "<" -> left < right;
-            case ">" -> left > right;
-            case "=" -> left == right;
-            case "<=" -> left <= right;
-            default -> false;
-        };
+        return new BoolValue(Numbers.compareChain(operator, arguments));
     }
 
     private long expectInt(Value value, String operator) throws EvalError {
@@ -1666,8 +1668,8 @@ public class Evaluator {
         if (left == right) {
             return true;
         }
-        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
-            return leftInt.value() == rightInt.value();
+        if (Numbers.equals(left, right)) {
+            return true;
         }
         if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
             return leftBool.value() == rightBool.value();
