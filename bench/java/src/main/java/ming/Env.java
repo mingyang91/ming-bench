@@ -254,7 +254,8 @@ class Env {
         env.define("procedure?", Builtin.named("procedure?", args -> {
             requireArgCount("procedure?", args, 1);
             Object a = args.get(0);
-            return a instanceof Builtin || a instanceof Lambda || a instanceof CaseLambda;
+            return a instanceof Builtin || a instanceof Lambda || a instanceof CaseLambda
+                || a == Evaluator.CALLCC || a instanceof Evaluator.ContinuationObj;
         }));
         env.define("symbol?", Builtin.named("symbol?", args -> {
             requireArgCount("symbol?", args, 1);
@@ -822,6 +823,10 @@ class Env {
             if (a instanceof Rational r) return r.den;
             throw new EvalError("denominator: expected rational");
         }));
+
+        // call/cc
+        env.define("call/cc", Evaluator.CALLCC);
+        env.define("call-with-current-continuation", Evaluator.CALLCC);
 
         return env;
     }

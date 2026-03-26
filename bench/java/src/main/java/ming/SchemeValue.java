@@ -76,6 +76,8 @@ class SchemeValue {
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof CaseLambda) return "#<procedure>";
+        if (val instanceof Evaluator.ContinuationObj) return "#<continuation>";
+        if (val == Evaluator.CALLCC) return "#<call/cc>";
         return val.toString();
     }
 
