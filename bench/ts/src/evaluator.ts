@@ -37,6 +37,10 @@ type SymbolExpr = ExprBase & { kind: 'symbol'; name: string };
 type ListExpr = ExprBase & { kind: 'list'; elements: Expr[] };
 
 type Expr = NumberExpr | BooleanExpr | StringExpr | CharExpr | SymbolExpr | ListExpr;
+type DottedExprList = {
+  prefixElements: Expr[];
+  tailExpr?: Expr;
+};
 
 type CharValue = { kind: 'char'; value: string };
 type StringValue = { kind: 'string'; value: string; mutable: boolean };
@@ -251,8 +255,14 @@ type LetInitFrame = {
 type CondTestFrame = {
   kind: 'cond-test';
   body: Expr[];
+  recipient?: Expr;
   remainingClauses: Expr[];
   env: Environment;
+  pos: SourcePos;
+};
+type CondArrowFrame = {
+  kind: 'cond-arrow';
+  testValue: RuntimeValue;
   pos: SourcePos;
 };
 type CallWithValuesFrame = {
@@ -335,6 +345,7 @@ type ContinuationFrame =
   | OrFrame
   | LetInitFrame
   | CondTestFrame
+  | CondArrowFrame
   | CallWithValuesFrame
   | CallCcProcedureFrame
   | CallCcReturnFrame
@@ -363,6 +374,9 @@ type Token =
   | { kind: 'atom'; value: string; pos: SourcePos }
   | { kind: 'string'; value: string; pos: SourcePos }
   | { kind: 'quote'; pos: SourcePos }
+  | { kind: 'quasiquote'; pos: SourcePos }
+  | { kind: 'unquote'; pos: SourcePos }
+  | { kind: 'unquote-splicing'; pos: SourcePos }
   | { kind: 'syntax-quote'; pos: SourcePos };
 
 const BUILTIN_NAMES = [
@@ -718,6 +732,27 @@ function tokenize(input: string): Token[] {
       continue;
     }
 
+    if (char === '`') {
+      tokens.push({ kind: 'quasiquote', pos: currentPos() });
+      advanceChar(char);
+      index += 1;
+      continue;
+    }
+
+    if (char === ',') {
+      const pos = currentPos();
+      advanceChar(char);
+      index += 1;
+      if (input[index] === '@') {
+        tokens.push({ kind: 'unquote-splicing', pos });
+        advanceChar('@');
+        index += 1;
+      } else {
+        tokens.push({ kind: 'unquote', pos });
+      }
+      continue;
+    }
+
     if (char === '"') {
       const pos = currentPos();
       const parsed = parseStringToken(input, index, pos);
@@ -813,6 +848,51 @@ function parseExpr(tokens: Token[], index: number): { expr: Expr; nextIndex: num
         pos: token.pos,
         elements: [
           { kind: 'symbol', name: 'quote', pos: token.pos },
+          parsed.expr,
+        ],
+      },
+      nextIndex: parsed.nextIndex,
+    };
+  }
+
+  if (token.kind === 'quasiquote') {
+    const parsed = parseExpr(tokens, index + 1);
+    return {
+      expr: {
+        kind: 'list',
+        pos: token.pos,
+        elements: [
+          { kind: 'symbol', name: 'quasiquote', pos: token.pos },
+          parsed.expr,
+        ],
+      },
+      nextIndex: parsed.nextIndex,
+    };
+  }
+
+  if (token.kind === 'unquote') {
+    const parsed = parseExpr(tokens, index + 1);
+    return {
+      expr: {
+        kind: 'list',
+        pos: token.pos,
+        elements: [
+          { kind: 'symbol', name: 'unquote', pos: token.pos },
+          parsed.expr,
+        ],
+      },
+      nextIndex: parsed.nextIndex,
+    };
+  }
+
+  if (token.kind === 'unquote-splicing') {
+    const parsed = parseExpr(tokens, index + 1);
+    return {
+      expr: {
+        kind: 'list',
+        pos: token.pos,
+        elements: [
+          { kind: 'symbol', name: 'unquote-splicing', pos: token.pos },
           parsed.expr,
         ],
       },
@@ -1259,11 +1339,27 @@ function continueWithFrame(
         return startCondAction(frame.remainingClauses, frame.env, stack, frame.pos);
       }
 
+      if (frame.recipient !== undefined) {
+        pushStackFrame(stack, {
+          kind: 'cond-arrow',
+          testValue: value,
+          pos: frame.pos,
+        });
+        return { kind: 'expr', expr: frame.recipient, env: frame.env };
+      }
+
       if (frame.body.length === 0) {
         return { kind: 'value', value };
       }
 
       return startSequenceAction(frame.body, frame.env, stack, frame.pos);
+    case 'cond-arrow':
+      return {
+        kind: 'apply',
+        procedure: expectSingleValue(value, frame.pos),
+        args: [frame.testValue],
+        pos: frame.pos,
+      };
     case 'call-with-values':
       return {
         kind: 'apply',
@@ -1591,6 +1687,12 @@ function evaluateListAction(
         return evaluateIfAction(argExprs, env, stack, expr.pos);
       case 'quote':
         return { kind: 'value', value: evaluateQuote(argExprs) };
+      case 'quasiquote':
+        return { kind: 'value', value: evaluateQuasiquote(argExprs, env, context) };
+      case 'unquote':
+        throw new EvalError('unquote may only appear within quasiquote');
+      case 'unquote-splicing':
+        throw new EvalError('unquote-splicing may only appear within quasiquote');
       case 'syntax':
         return { kind: 'value', value: evaluateSyntax(argExprs, env, context) };
       case 'lambda':
@@ -1884,6 +1986,18 @@ function evaluateQuote(argExprs: Expr[]): RuntimeValue {
   return quoteExpr(argExprs[0]);
 }
 
+function evaluateQuasiquote(
+  argExprs: Expr[],
+  env: Environment,
+  context: EvalContext,
+): RuntimeValue {
+  if (argExprs.length !== 1) {
+    throw new EvalError('quasiquote expects exactly 1 argument');
+  }
+
+  return quasiquoteExpr(argExprs[0], env, context, 1);
+}
+
 function evaluateSyntax(
   argExprs: Expr[],
   env: Environment,
@@ -2064,9 +2178,111 @@ function quoteExpr(expr: Expr): RuntimeValue {
       return makeChar(expr.value);
     case 'symbol':
       return { kind: 'symbol', name: expr.name };
-    case 'list':
-      return buildList(expr.elements.map((element) => quoteExpr(element)));
+    case 'list': {
+      const list = splitDottedListElements(expr.elements, 'quoted list');
+      return buildListWithTail(
+        list.prefixElements.map((element) => quoteExpr(element)),
+        list.tailExpr === undefined ? NIL_VALUE : quoteExpr(list.tailExpr),
+      );
+    }
   }
+}
+
+function quasiquoteExpr(
+  expr: Expr,
+  env: Environment,
+  context: EvalContext,
+  depth: number,
+): RuntimeValue {
+  const unquoteExpr = getSingleFormArgument(expr, 'unquote');
+  if (unquoteExpr !== undefined) {
+    if (depth === 1) {
+      return evaluateExprSingle(unquoteExpr, env, context);
+    }
+
+    return buildList([
+      { kind: 'symbol', name: 'unquote' },
+      quasiquoteExpr(unquoteExpr, env, context, depth - 1),
+    ]);
+  }
+
+  const unquoteSplicingExpr = getSingleFormArgument(expr, 'unquote-splicing');
+  if (unquoteSplicingExpr !== undefined) {
+    if (depth === 1) {
+      throw new EvalError('unquote-splicing may only appear within a quasiquoted list');
+    }
+
+    return buildList([
+      { kind: 'symbol', name: 'unquote-splicing' },
+      quasiquoteExpr(unquoteSplicingExpr, env, context, depth - 1),
+    ]);
+  }
+
+  const nestedQuasiquoteExpr = getSingleFormArgument(expr, 'quasiquote');
+  if (nestedQuasiquoteExpr !== undefined) {
+    return buildList([
+      { kind: 'symbol', name: 'quasiquote' },
+      quasiquoteExpr(nestedQuasiquoteExpr, env, context, depth + 1),
+    ]);
+  }
+
+  switch (expr.kind) {
+    case 'number':
+    case 'boolean':
+    case 'string':
+    case 'char':
+    case 'symbol':
+      return quoteExpr(expr);
+    case 'list':
+      return quasiquoteList(expr, env, context, depth);
+  }
+}
+
+function quasiquoteList(
+  expr: ListExpr,
+  env: Environment,
+  context: EvalContext,
+  depth: number,
+): RuntimeValue {
+  const list = splitDottedListElements(expr.elements, 'quasiquote');
+  const elements: RuntimeValue[] = [];
+
+  for (const element of list.prefixElements) {
+    const unquoteSplicingExpr = depth === 1 ? getSingleFormArgument(element, 'unquote-splicing') : undefined;
+    if (unquoteSplicingExpr !== undefined) {
+      elements.push(...listToArray(evaluateExprSingle(unquoteSplicingExpr, env, context), 'unquote-splicing'));
+      continue;
+    }
+
+    elements.push(quasiquoteExpr(element, env, context, depth));
+  }
+
+  let tail: RuntimeValue = NIL_VALUE;
+  if (list.tailExpr !== undefined) {
+    if (depth === 1 && getSingleFormArgument(list.tailExpr, 'unquote-splicing') !== undefined) {
+      throw new EvalError('unquote-splicing may only appear within a quasiquoted list');
+    }
+    tail = quasiquoteExpr(list.tailExpr, env, context, depth);
+  }
+
+  return buildListWithTail(elements, tail);
+}
+
+function getSingleFormArgument(expr: Expr, name: string): Expr | undefined {
+  if (expr.kind !== 'list') {
+    return undefined;
+  }
+
+  const head = expr.elements[0];
+  if (head?.kind !== 'symbol' || head.name !== name) {
+    return undefined;
+  }
+
+  if (expr.elements.length !== 2) {
+    throw new EvalError(`${name} expects exactly 1 argument`, expr.pos);
+  }
+
+  return expr.elements[1];
 }
 
 function datumToExpr(value: RuntimeValue, pos: SourcePos): Expr {
@@ -2108,11 +2324,7 @@ function datumToExpr(value: RuntimeValue, pos: SourcePos): Expr {
         elements: [],
       };
     case 'pair':
-      return {
-        kind: 'list',
-        pos,
-        elements: listToArray(value, 'datum->syntax').map((item) => datumToExpr(item, pos)),
-      };
+      return pairToExprList(value, pos);
     default:
       throw new EvalError('datum->syntax expects a datum that can be represented as syntax');
   }
@@ -2451,10 +2663,13 @@ function matchPatternList(
   isTopLevel: boolean,
   ignoreTopLevelKeyword: boolean,
 ): Map<string, PatternBinding> | undefined {
-  const parts = splitEllipsisParts(patternElements);
+  const patternList = splitDottedListElements(patternElements, 'syntax pattern');
+  const exprList = splitDottedListElements(exprElements, 'syntax input');
+  const parts = splitEllipsisParts(patternList.prefixElements);
   return matchPatternParts(
     parts,
-    exprElements,
+    patternList.tailExpr,
+    exprList,
     literals,
     bindings,
     isTopLevel,
@@ -2466,7 +2681,8 @@ function matchPatternList(
 
 function matchPatternParts(
   parts: Array<{ expr: Expr; repeated: boolean }>,
-  exprElements: Expr[],
+  tailPattern: Expr | undefined,
+  exprList: DottedExprList,
   literals: Set<string>,
   bindings: Map<string, PatternBinding>,
   isTopLevel: boolean,
@@ -2475,12 +2691,27 @@ function matchPatternParts(
   exprIndex: number,
 ): Map<string, PatternBinding> | undefined {
   if (partIndex === parts.length) {
-    return exprIndex === exprElements.length ? bindings : undefined;
+    if (tailPattern === undefined) {
+      return exprIndex === exprList.prefixElements.length && exprList.tailExpr === undefined
+        ? bindings
+        : undefined;
+    }
+
+    const nextBindings = clonePatternBindings(bindings);
+    return matchPatternExpr(
+      tailPattern,
+      buildListRemainderExpr(exprList, exprIndex),
+      literals,
+      nextBindings,
+      false,
+    )
+      ? nextBindings
+      : undefined;
   }
 
   const part = parts[partIndex];
   if (!part.repeated) {
-    const expr = exprElements[exprIndex];
+    const expr = exprList.prefixElements[exprIndex];
     if (expr === undefined) {
       return undefined;
     }
@@ -2500,7 +2731,8 @@ function matchPatternParts(
 
     return matchPatternParts(
       parts,
-      exprElements,
+      tailPattern,
+      exprList,
       literals,
       nextBindings,
       false,
@@ -2511,7 +2743,7 @@ function matchPatternParts(
   }
 
   const minRemaining = countRequiredPatternParts(parts, partIndex + 1);
-  const maxRepeats = exprElements.length - exprIndex - minRemaining;
+  const maxRepeats = exprList.prefixElements.length - exprIndex - minRemaining;
   if (maxRepeats < 0) {
     return undefined;
   }
@@ -2522,7 +2754,15 @@ function matchPatternParts(
 
     for (let offset = 0; offset < repeatCount; offset += 1) {
       const localBindings = new Map<string, PatternBinding>();
-      if (!matchPatternExpr(part.expr, exprElements[exprIndex + offset], literals, localBindings, false)) {
+      if (
+        !matchPatternExpr(
+          part.expr,
+          exprList.prefixElements[exprIndex + offset],
+          literals,
+          localBindings,
+          false,
+        )
+      ) {
         matched = false;
         break;
       }
@@ -2543,7 +2783,8 @@ function matchPatternParts(
 
     const result = matchPatternParts(
       parts,
-      exprElements,
+      tailPattern,
+      exprList,
       literals,
       nextBindings,
       false,
@@ -2703,10 +2944,16 @@ function collectPatternVariables(
         names.add(pattern.name);
       }
       return;
-    case 'list':
-      for (const part of splitEllipsisParts(pattern.elements)) {
+    case 'list': {
+      const list = splitDottedListElements(pattern.elements, 'syntax pattern');
+      for (const part of splitEllipsisParts(list.prefixElements)) {
         collectPatternVariables(part.expr, literals, names, false);
       }
+      if (list.tailExpr !== undefined) {
+        collectPatternVariables(list.tailExpr, literals, names, false);
+      }
+      return;
+    }
   }
 }
 
@@ -2889,9 +3136,10 @@ function instantiateGenericTemplateList(
   localScope: Map<string, string>,
   repeatIndex: number | undefined,
 ): Expr {
+  const templateList = splitDottedListElements(template.elements, 'syntax template');
   const elements: Expr[] = [];
 
-  for (const part of splitEllipsisParts(template.elements)) {
+  for (const part of splitEllipsisParts(templateList.prefixElements)) {
     if (!part.repeated) {
       elements.push(
         instantiateTemplate(
@@ -2923,11 +3171,21 @@ function instantiateGenericTemplateList(
     }
   }
 
-  return {
-    kind: 'list',
-    pos: template.pos,
+  return buildListExpr(
     elements,
-  };
+    template.pos,
+    templateList.tailExpr === undefined
+      ? undefined
+      : instantiateTemplate(
+          templateList.tailExpr,
+          bindings,
+          macroRules,
+          expansionEnv,
+          aliases,
+          localScope,
+          repeatIndex,
+        ),
+  );
 }
 
 function instantiateLambdaTemplate(
@@ -3199,8 +3457,14 @@ function collectRepeatedPatternVariables(
         return;
       }
 
-      for (const part of splitEllipsisParts(expr.elements)) {
-        collectRepeatedPatternVariables(part.expr, bindings, names);
+      {
+        const list = splitDottedListElements(expr.elements, 'syntax template');
+        for (const part of splitEllipsisParts(list.prefixElements)) {
+          collectRepeatedPatternVariables(part.expr, bindings, names);
+        }
+        if (list.tailExpr !== undefined) {
+          collectRepeatedPatternVariables(list.tailExpr, bindings, names);
+        }
       }
   }
 }
@@ -3301,6 +3565,9 @@ function isSpecialFormName(name: string): boolean {
     case 'set!':
     case 'if':
     case 'quote':
+    case 'quasiquote':
+    case 'unquote':
+    case 'unquote-splicing':
     case 'syntax':
     case 'lambda':
     case 'case-lambda':
@@ -3318,6 +3585,7 @@ function isSpecialFormName(name: string): boolean {
     case 'with-syntax':
     case 'syntax-rules':
     case 'else':
+    case '=>':
     case '.':
       return true;
     default:
@@ -3580,9 +3848,20 @@ function startCondAction(
     return startSequenceAction(body, env, stack, pos);
   }
 
+  let recipient: Expr | undefined;
+  let clauseBody = body;
+  if (body[0]?.kind === 'symbol' && body[0].name === '=>') {
+    if (body.length !== 2) {
+      throw new EvalError('cond => clause expects exactly 1 recipient expression');
+    }
+    recipient = body[1];
+    clauseBody = [];
+  }
+
   pushStackFrame(stack, {
     kind: 'cond-test',
-    body,
+    body: clauseBody,
+    recipient,
     remainingClauses: clauses.slice(1),
     env,
     pos,
@@ -4996,7 +5275,11 @@ function expectSymbolExpr(expr: Expr, context: string): string {
 }
 
 function buildList(elements: RuntimeValue[]): RuntimeValue {
-  let list: RuntimeValue = NIL_VALUE;
+  return buildListWithTail(elements, NIL_VALUE);
+}
+
+function buildListWithTail(elements: RuntimeValue[], tail: RuntimeValue): RuntimeValue {
+  let list: RuntimeValue = tail;
 
   for (let index = elements.length - 1; index >= 0; index -= 1) {
     list = {
@@ -5007,6 +5290,91 @@ function buildList(elements: RuntimeValue[]): RuntimeValue {
   }
 
   return list;
+}
+
+function pairToExprList(value: PairValue, pos: SourcePos): Expr {
+  const elements: Expr[] = [];
+  let current: RuntimeValue = value;
+
+  while (current.kind === 'pair') {
+    elements.push(datumToExpr(current.car, pos));
+    current = current.cdr;
+  }
+
+  return current.kind === 'nil'
+    ? {
+        kind: 'list',
+        pos,
+        elements,
+      }
+    : buildListExpr(elements, pos, datumToExpr(current, pos));
+}
+
+function buildListExpr(elements: Expr[], pos: SourcePos, tailExpr?: Expr): Expr {
+  if (tailExpr === undefined) {
+    return {
+      kind: 'list',
+      pos,
+      elements,
+    };
+  }
+
+  return {
+    kind: 'list',
+    pos,
+    elements: [
+      ...elements,
+      { kind: 'symbol', name: '.', pos },
+      tailExpr,
+    ],
+  };
+}
+
+function splitDottedListElements(elements: Expr[], context: string): DottedExprList {
+  let dotIndex = -1;
+
+  for (let index = 0; index < elements.length; index += 1) {
+    const expr = elements[index];
+    if (expr.kind === 'symbol' && expr.name === '.') {
+      if (dotIndex !== -1) {
+        throw new EvalError(`invalid dotted list in ${context}`);
+      }
+      dotIndex = index;
+    }
+  }
+
+  if (dotIndex === -1) {
+    return { prefixElements: elements };
+  }
+
+  if (dotIndex === 0 || dotIndex + 2 !== elements.length) {
+    throw new EvalError(`invalid dotted list in ${context}`);
+  }
+
+  return {
+    prefixElements: elements.slice(0, dotIndex),
+    tailExpr: elements[dotIndex + 1],
+  };
+}
+
+function buildListRemainderExpr(list: DottedExprList, startIndex: number): Expr {
+  if (startIndex === list.prefixElements.length) {
+    if (list.tailExpr !== undefined) {
+      return list.tailExpr;
+    }
+
+    return {
+      kind: 'list',
+      pos: DEFAULT_SOURCE_POS,
+      elements: [],
+    };
+  }
+
+  return buildListExpr(
+    list.prefixElements.slice(startIndex),
+    list.prefixElements[startIndex]?.pos ?? list.tailExpr?.pos ?? DEFAULT_SOURCE_POS,
+    list.tailExpr,
+  );
 }
 
 function applyAppend(args: RuntimeValue[]): RuntimeValue {
@@ -5365,7 +5733,15 @@ function isWhitespace(char: string): boolean {
 }
 
 function isDelimiter(char: string): boolean {
-  return isWhitespace(char) || char === '(' || char === ')' || char === "'" || char === ';';
+  return (
+    isWhitespace(char)
+    || char === '('
+    || char === ')'
+    || char === "'"
+    || char === '`'
+    || char === ','
+    || char === ';'
+  );
 }
 
 function formatPair(value: PairValue, mode: 'write' | 'display', seen: Set<object>): string {
