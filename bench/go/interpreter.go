@@ -219,6 +219,16 @@ func (e *env) define(name string, value expr) {
 	e.bindings[name] = value
 }
 
+func (e *env) assign(name string, value expr) bool {
+	for current := e; current != nil; current = current.parent {
+		if _, ok := current.bindings[name]; ok {
+			current.bindings[name] = value
+			return true
+		}
+	}
+	return false
+}
+
 func (e *env) lookup(name string) (expr, bool) {
 	for current := e; current != nil; current = current.parent {
 		if value, ok := current.bindings[name]; ok {
@@ -471,6 +481,9 @@ func evalList(environment *env, items listExpr) (expr, error) {
 		case "define":
 			value, err := evalDefine(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
+		case "set!":
+			value, err := evalSet(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "if":
 			value, err := evalIf(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
@@ -544,6 +557,28 @@ func evalDefine(environment *env, forms []expr) (expr, error) {
 	default:
 		return nil, &EvalError{Message: "define target must be a symbol or parameter list"}
 	}
+}
+
+func evalSet(environment *env, forms []expr) (expr, error) {
+	if len(forms) != 2 {
+		return nil, &EvalError{Message: "set! expects exactly 2 arguments"}
+	}
+
+	target, ok := forms[0].(symbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: "set! target must be a symbol"}
+	}
+
+	value, err := evalExpr(environment, forms[1])
+	if err != nil {
+		return nil, err
+	}
+
+	if !environment.assign(target.name, value) {
+		return nil, errorAt(target.pos, fmt.Sprintf("unbound symbol: %s", target.name))
+	}
+
+	return voidExpr{}, nil
 }
 
 func evalIf(environment *env, forms []expr) (expr, error) {
