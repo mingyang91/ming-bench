@@ -288,12 +288,17 @@ interface SequenceAction {
   cont: Continuation;
 }
 
+interface CallAction {
+  action: 'call';
+  invoke: () => MachineAction;
+}
+
 interface DoneAction {
   action: 'done';
   value: Value;
 }
 
-type MachineAction = EvalAction | SequenceAction | DoneAction;
+type MachineAction = EvalAction | SequenceAction | CallAction | DoneAction;
 
 const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
 const VOID_VALUE: VoidValue = { kind: 'void' };
@@ -329,7 +334,7 @@ class Runtime {
   }
 
   pushSyntaxFrame(frame: SyntaxFrame): void {
-    this.syntaxFrames = [...this.syntaxFrames, frame];
+    this.syntaxFrames.push(frame);
   }
 
   syntaxFrameDepth(): number {
@@ -337,7 +342,7 @@ class Runtime {
   }
 
   restoreSyntaxFrames(depth: number): void {
-    this.syntaxFrames = this.syntaxFrames.slice(0, depth);
+    this.syntaxFrames.length = depth;
   }
 
   currentSyntaxBindings(): Map<string, MacroBinding> {
@@ -378,13 +383,11 @@ class Runtime {
   }
 
   pushWindFrame(frame: WindFrame): void {
-    this.windStack = [...this.windStack, frame];
+    this.windStack.push(frame);
   }
 
   popWindFrame(): WindFrame | undefined {
-    const popped = this.windStack[this.windStack.length - 1];
-    this.windStack = this.windStack.slice(0, -1);
-    return popped;
+    return this.windStack.pop();
   }
 
   setWindStack(stack: WindFrame[]): void {
@@ -396,18 +399,16 @@ class Runtime {
   }
 
   pushExceptionHandler(frame: ExceptionHandlerFrame): void {
-    this.exceptionHandlers = [...this.exceptionHandlers, frame];
+    this.exceptionHandlers.push(frame);
   }
 
   popExceptionHandler(): ExceptionHandlerFrame | undefined {
-    const popped = this.exceptionHandlers[this.exceptionHandlers.length - 1];
-    this.exceptionHandlers = this.exceptionHandlers.slice(0, -1);
-    return popped;
+    return this.exceptionHandlers.pop();
   }
 
   popExceptionHandlerFrame(frame: ExceptionHandlerFrame): void {
     if (this.exceptionHandlers[this.exceptionHandlers.length - 1] === frame) {
-      this.exceptionHandlers = this.exceptionHandlers.slice(0, -1);
+      this.exceptionHandlers.pop();
     }
   }
 
@@ -1209,7 +1210,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
 
     const loop = (index: number, results: Value[]): MachineAction => {
       if (index >= expectedLength) {
-        return cont(makeList(results));
+        return makeCallAction(() => cont(makeList(results)));
       }
 
       const appliedArgs = listArgs.map((arg, listIndex) => ({
@@ -1243,7 +1244,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
 
     const loop = (index: number): MachineAction => {
       if (index >= expectedLength) {
-        return cont(VOID_VALUE);
+        return makeCallAction(() => cont(VOID_VALUE));
       }
 
       const appliedArgs = listArgs.map((arg, listIndex) => ({
@@ -1446,7 +1447,12 @@ function createGlobalEnv(runtime: Runtime): Environment {
       runtime.pushWindFrame(frame);
       return invokeThunk(bodyThunk, args[1].expr, runtime, (value) => {
         runtime.popWindFrame();
-        return invokeThunk(frame.outThunk, frame.outLoc, runtime, (_ignoredOut) => cont(value));
+        return invokeThunk(
+          frame.outThunk,
+          frame.outLoc,
+          runtime,
+          (_ignoredOut) => makeCallAction(() => cont(value)),
+        );
       });
     });
   }));
@@ -1476,7 +1482,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
     runtime.pushExceptionHandler(frame);
     return invokeThunk(thunk, args[1].expr, runtime, (value) => {
       runtime.popExceptionHandlerFrame(frame);
-      return cont(value);
+      return makeCallAction(() => cont(value));
     });
   }));
 
@@ -2011,13 +2017,13 @@ function evaluateExpr(
   switch (expr.type) {
     case 'number':
     case 'boolean':
-      return cont(expr.value);
+      return makeCallAction(() => cont(expr.value));
     case 'string':
-      return cont(makeString(expr.value));
+      return makeCallAction(() => cont(makeString(expr.value)));
     case 'char':
-      return cont({ kind: 'char', value: expr.value });
+      return makeCallAction(() => cont({ kind: 'char', value: expr.value }));
     case 'symbol':
-      return cont(env.lookupSymbol(expr, expr));
+      return makeCallAction(() => cont(env.lookupSymbol(expr, expr)));
     case 'list':
       return evaluateList(expr, env, runtime, cont);
   }
@@ -2118,7 +2124,7 @@ function evalDefineSyntax(
   const syntaxRules = parseSyntaxRulesTransformer(args[1], env);
   if (syntaxRules !== undefined) {
     runtime.defineSyntaxRule(nameExpr.value, syntaxRules);
-    return cont(VOID_VALUE);
+    return makeCallAction(() => cont(VOID_VALUE));
   }
 
   return makeEvalAction(args[1], env, (transformerValue) => {
@@ -2131,7 +2137,7 @@ function evalDefineSyntax(
       procedure: transformerValue,
       definitionEnv: env,
     });
-    return cont(VOID_VALUE);
+    return makeCallAction(() => cont(VOID_VALUE));
   });
 }
 
@@ -2242,7 +2248,7 @@ function evalDefineRecordType(
     }));
   }
 
-  return cont(VOID_VALUE);
+  return makeCallAction(() => cont(VOID_VALUE));
 }
 
 function evalDefine(
@@ -2265,7 +2271,7 @@ function evalDefine(
 
     return makeEvalAction(args[1], env, (value) => {
       env.define(symbolLookupName(target), value);
-      return cont(VOID_VALUE);
+      return makeCallAction(() => cont(VOID_VALUE));
     });
   }
 
@@ -2290,7 +2296,7 @@ function evalDefine(
   };
 
   env.define(symbolLookupName(nameExpr), proc);
-  return cont(VOID_VALUE);
+  return makeCallAction(() => cont(VOID_VALUE));
 }
 
 function evalSet(
@@ -2311,7 +2317,7 @@ function evalSet(
 
   return makeEvalAction(args[1], env, (value) => {
     env.assignSymbol(target, value, target);
-    return cont(VOID_VALUE);
+    return makeCallAction(() => cont(VOID_VALUE));
   });
 }
 
@@ -2331,7 +2337,9 @@ function evalIf(
       return makeEvalAction(args[1], env, cont);
     }
 
-    return args[2] === undefined ? cont(VOID_VALUE) : makeEvalAction(args[2], env, cont);
+    return args[2] === undefined
+      ? makeCallAction(() => cont(VOID_VALUE))
+      : makeEvalAction(args[2], env, cont);
   });
 }
 
@@ -2340,7 +2348,7 @@ function evalQuote(args: Expr[], head: SymbolExpr, cont: Continuation): MachineA
     throw new EvalError(`${head.line}:${head.col}: quote expects exactly 1 argument`);
   }
 
-  return cont(quoteExpr(args[0]));
+  return makeCallAction(() => cont(quoteExpr(args[0])));
 }
 
 function evalSyntax(
@@ -2356,7 +2364,7 @@ function evalSyntax(
 
   const expanded = expandTemplate(args[0], runtime.currentSyntaxBindings());
   const definitionEnv = runtime.currentSyntaxDefinitionEnv() ?? env;
-  return cont(makeSyntax(hygienizeExpr(expanded, new Map(), definitionEnv, runtime)));
+  return makeCallAction(() => cont(makeSyntax(hygienizeExpr(expanded, new Map(), definitionEnv, runtime))));
 }
 
 function evalSyntaxCase(
@@ -2407,7 +2415,7 @@ function evalSyntaxCaseClauses(
 
   const finishClause = (value: Value): MachineAction => {
     runtime.restoreSyntaxFrames(syntaxFrameDepth);
-    return cont(value);
+    return makeCallAction(() => cont(value));
   };
 
   if (body === undefined) {
@@ -2446,7 +2454,7 @@ function evalWithSyntax(
     runtime.pushSyntaxFrame({ bindings, definitionEnv });
     return makeSequenceAction(args.slice(1), 0, bodyEnv, (value) => {
       runtime.restoreSyntaxFrames(syntaxFrameDepth);
-      return cont(value);
+      return makeCallAction(() => cont(value));
     });
   });
 }
@@ -2460,7 +2468,7 @@ function evalWithSyntaxBindings(
   bindings = new Map<string, MacroBinding>(),
 ): MachineAction {
   if (index >= specs.length) {
-    return cont(bindings);
+    return makeCallAction(() => cont(bindings));
   }
 
   const spec = specs[index];
@@ -2496,13 +2504,13 @@ function evalLambda(
   }
 
   const { params, restParam } = parseProcedureParameters(paramsExpr.elements);
-  return cont({
+  return makeCallAction(() => cont({
     kind: 'procedure',
     params,
     restParam,
     body: args.slice(1),
     env,
-  });
+  }));
 }
 
 function evalCaseLambda(
@@ -2515,11 +2523,11 @@ function evalCaseLambda(
     throw new EvalError(`${head.line}:${head.col}: case-lambda expects at least 1 clause`);
   }
 
-  return cont({
+  return makeCallAction(() => cont({
     kind: 'procedure',
     clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr, head)),
     env,
-  });
+  }));
 }
 
 function evalAnd(
@@ -2530,12 +2538,12 @@ function evalAnd(
   index = 0,
 ): MachineAction {
   if (args.length === 0) {
-    return cont(true);
+    return makeCallAction(() => cont(true));
   }
 
   const arg = args[index];
   if (arg === undefined) {
-    return cont(true);
+    return makeCallAction(() => cont(true));
   }
 
   if (index === args.length - 1) {
@@ -2545,7 +2553,7 @@ function evalAnd(
   return makeEvalAction(arg, env, (result) => (
     isTruthy(result)
       ? evalAnd(args, env, runtime, cont, index + 1)
-      : cont(result)
+      : makeCallAction(() => cont(result))
   ));
 }
 
@@ -2557,12 +2565,12 @@ function evalOr(
   index = 0,
 ): MachineAction {
   if (args.length === 0) {
-    return cont(false);
+    return makeCallAction(() => cont(false));
   }
 
   const arg = args[index];
   if (arg === undefined) {
-    return cont(false);
+    return makeCallAction(() => cont(false));
   }
 
   if (index === args.length - 1) {
@@ -2571,7 +2579,7 @@ function evalOr(
 
   return makeEvalAction(arg, env, (result) => (
     isTruthy(result)
-      ? cont(result)
+      ? makeCallAction(() => cont(result))
       : evalOr(args, env, runtime, cont, index + 1)
   ));
 }
@@ -2589,7 +2597,7 @@ function evalCond(
   index = 0,
 ): MachineAction {
   if (index >= args.length) {
-    return cont(VOID_VALUE);
+    return makeCallAction(() => cont(VOID_VALUE));
   }
 
   const clause = args[index];
@@ -2614,7 +2622,7 @@ function evalCond(
     }
 
     if (body.length === 0) {
-      return cont(testValue);
+      return makeCallAction(() => cont(testValue));
     }
 
     return makeSequenceAction(body, 0, env, cont);
@@ -2780,7 +2788,7 @@ function evalCase(
   return makeEvalAction(args[0], env, (key) => {
     const checkClause = (index: number): MachineAction => {
       if (index >= args.length - 1) {
-        return cont(VOID_VALUE);
+        return makeCallAction(() => cont(VOID_VALUE));
       }
 
       const clause = args[index + 1];
@@ -2860,7 +2868,7 @@ function evalDoLoop(
   return makeEvalAction(testExpr, loopEnv, (testValue) => {
     if (isTruthy(testValue)) {
       return resultExprs.length === 0
-        ? cont(VOID_VALUE)
+        ? makeCallAction(() => cont(VOID_VALUE))
         : makeSequenceAction(resultExprs, 0, loopEnv, cont);
     }
 
@@ -2887,7 +2895,7 @@ function evalDoSteps(
   values: Array<Value | undefined> = [],
 ): MachineAction {
   if (index >= cells.length) {
-    return cont(values);
+    return makeCallAction(() => cont(values));
   }
 
   const stepExpr = cells[index].binding.stepExpr;
@@ -2929,7 +2937,7 @@ function evalGuard(
   runtime.pushExceptionHandler(frame);
   return makeSequenceAction(args.slice(1), 0, env, (value) => {
     runtime.popExceptionHandlerFrame(frame);
-    return cont(value);
+    return makeCallAction(() => cont(value));
   });
 }
 
@@ -2957,7 +2965,9 @@ function evalGuardClauses(
       throw new EvalError(`${testExpr.line}:${testExpr.col}: else must be the last guard clause`);
     }
 
-    return body.length === 0 ? cont(VOID_VALUE) : makeSequenceAction(body, 0, env, cont);
+    return body.length === 0
+      ? makeCallAction(() => cont(VOID_VALUE))
+      : makeSequenceAction(body, 0, env, cont);
   }
 
   return makeEvalAction(testExpr, env, (testValue) => {
@@ -2966,7 +2976,7 @@ function evalGuardClauses(
     }
 
     if (body.length === 0) {
-      return cont(testValue);
+      return makeCallAction(() => cont(testValue));
     }
 
     return makeSequenceAction(body, 0, env, cont);
@@ -2985,15 +2995,13 @@ function applyProcedure(
   }
 
   if (isContinuationProcedure(operator)) {
-    if (args.length !== 1) {
-      throw new EvalError(`${loc.line}:${loc.col}: continuation expects exactly 1 argument`);
-    }
+    const resumedValue = makeValues(args.map((arg) => arg.value));
 
     if (!runtime.isCurrentContinuationEpoch(operator.captureEpoch)) {
-      return cont(args[0].value);
+      return makeCallAction(() => cont(resumedValue));
     }
 
-    return resumeContinuation(operator, args[0].value, runtime);
+    return resumeContinuation(operator, resumedValue, runtime);
   }
 
   if (isControlBuiltinProcedure(operator)) {
@@ -3001,7 +3009,7 @@ function applyProcedure(
   }
 
   if (isPureBuiltinProcedure(operator)) {
-    return cont(operator.call(args, loc));
+    return makeCallAction(() => cont(operator.call(args, loc)));
   }
 
   if (isCaseLambdaProcedure(operator)) {
@@ -3212,7 +3220,7 @@ function stepSequence(
   cont: Continuation,
 ): MachineAction {
   if (index >= exprs.length) {
-    return cont(VOID_VALUE);
+    return makeCallAction(() => cont(VOID_VALUE));
   }
 
   if (index === exprs.length - 1) {
@@ -3232,7 +3240,7 @@ function evaluateArguments(
   evaluated: EvaluatedArg[] = [],
 ): MachineAction {
   if (index < 0) {
-    return cont(evaluated);
+    return makeCallAction(() => cont(evaluated));
   }
 
   const expr = exprs[index];
@@ -3255,7 +3263,7 @@ function evaluateExpressions(
   values: Value[] = [],
 ): MachineAction {
   if (index >= exprs.length) {
-    return cont(values);
+    return makeCallAction(() => cont(values));
   }
 
   const expr = exprs[index];
@@ -3280,7 +3288,7 @@ function resumeContinuation(
 ): MachineAction {
   return switchWindFrames(continuation.windStack, runtime, () => {
     runtime.setExceptionHandlers(continuation.handlerStack);
-    return continuation.resume(value);
+    return makeCallAction(() => continuation.resume(value));
   });
 }
 
@@ -3318,7 +3326,7 @@ function switchWindFrames(
   return unwindWindFrames(currentStack, sharedLength, runtime, () => (
     rewindWindFrames(targetStack, sharedLength, runtime, () => {
       runtime.setWindStack(targetStack);
-      return cont();
+      return makeCallAction(cont);
     })
   ));
 }
@@ -3342,7 +3350,7 @@ function unwindWindFrames(
 ): MachineAction {
   if (index < sharedLength) {
     runtime.setWindStack(currentStack.slice(0, sharedLength));
-    return cont();
+    return makeCallAction(cont);
   }
 
   const frame = currentStack[index];
@@ -3361,7 +3369,7 @@ function rewindWindFrames(
 ): MachineAction {
   if (index >= targetStack.length) {
     runtime.setWindStack(targetStack);
-    return cont();
+    return makeCallAction(cont);
   }
 
   const frame = targetStack[index];
@@ -3378,9 +3386,17 @@ function runMachine(initial: MachineAction, runtime: Runtime): Value {
   for (;;) {
     try {
       while (action.action !== 'done') {
-        action = action.action === 'eval'
-          ? evaluateExpr(action.expr, action.env, runtime, action.cont)
-          : stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
+        switch (action.action) {
+          case 'eval':
+            action = evaluateExpr(action.expr, action.env, runtime, action.cont);
+            break;
+          case 'sequence':
+            action = stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
+            break;
+          case 'call':
+            action = action.invoke();
+            break;
+        }
       }
 
       return action.value;
@@ -3410,6 +3426,10 @@ function makeSequenceAction(
   cont: Continuation,
 ): SequenceAction {
   return { action: 'sequence', exprs, index, env, cont };
+}
+
+function makeCallAction(invoke: () => MachineAction): CallAction {
+  return { action: 'call', invoke };
 }
 
 function makeList(elements: Value[]): Value {
@@ -3541,7 +3561,16 @@ function matchMacroRule(
     return undefined;
   }
 
-  if (exprSymbolName(patternItems[0]) !== exprSymbolName(invocationItems[0])) {
+  const patternHead = patternItems[0];
+  const invocationHead = invocationItems[0];
+  const patternHeadName = exprSymbolName(patternHead);
+  const invocationHeadName = exprSymbolName(invocationHead);
+
+  if (
+    patternHeadName === undefined
+    || invocationHeadName === undefined
+    || (patternHeadName !== '_' && patternHeadName !== invocationHeadName)
+  ) {
     return undefined;
   }
 

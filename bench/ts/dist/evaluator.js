@@ -26,13 +26,13 @@ class Runtime {
         return this.syntaxRules.has(name);
     }
     pushSyntaxFrame(frame) {
-        this.syntaxFrames = [...this.syntaxFrames, frame];
+        this.syntaxFrames.push(frame);
     }
     syntaxFrameDepth() {
         return this.syntaxFrames.length;
     }
     restoreSyntaxFrames(depth) {
-        this.syntaxFrames = this.syntaxFrames.slice(0, depth);
+        this.syntaxFrames.length = depth;
     }
     currentSyntaxBindings() {
         const bindings = new Map();
@@ -64,12 +64,10 @@ class Runtime {
         return [...this.windStack];
     }
     pushWindFrame(frame) {
-        this.windStack = [...this.windStack, frame];
+        this.windStack.push(frame);
     }
     popWindFrame() {
-        const popped = this.windStack[this.windStack.length - 1];
-        this.windStack = this.windStack.slice(0, -1);
-        return popped;
+        return this.windStack.pop();
     }
     setWindStack(stack) {
         this.windStack = [...stack];
@@ -78,16 +76,14 @@ class Runtime {
         return [...this.exceptionHandlers];
     }
     pushExceptionHandler(frame) {
-        this.exceptionHandlers = [...this.exceptionHandlers, frame];
+        this.exceptionHandlers.push(frame);
     }
     popExceptionHandler() {
-        const popped = this.exceptionHandlers[this.exceptionHandlers.length - 1];
-        this.exceptionHandlers = this.exceptionHandlers.slice(0, -1);
-        return popped;
+        return this.exceptionHandlers.pop();
     }
     popExceptionHandlerFrame(frame) {
         if (this.exceptionHandlers[this.exceptionHandlers.length - 1] === frame) {
-            this.exceptionHandlers = this.exceptionHandlers.slice(0, -1);
+            this.exceptionHandlers.pop();
         }
     }
     setExceptionHandlers(stack) {
@@ -722,7 +718,7 @@ function createGlobalEnv(runtime) {
         }
         const loop = (index, results) => {
             if (index >= expectedLength) {
-                return cont(makeList(results));
+                return makeCallAction(() => cont(makeList(results)));
             }
             const appliedArgs = listArgs.map((arg, listIndex) => ({
                 expr: arg.expr,
@@ -747,7 +743,7 @@ function createGlobalEnv(runtime) {
         }
         const loop = (index) => {
             if (index >= expectedLength) {
-                return cont(VOID_VALUE);
+                return makeCallAction(() => cont(VOID_VALUE));
             }
             const appliedArgs = listArgs.map((arg, listIndex) => ({
                 expr: arg.expr,
@@ -893,7 +889,7 @@ function createGlobalEnv(runtime) {
             runtime.pushWindFrame(frame);
             return invokeThunk(bodyThunk, args[1].expr, runtime, (value) => {
                 runtime.popWindFrame();
-                return invokeThunk(frame.outThunk, frame.outLoc, runtime, (_ignoredOut) => cont(value));
+                return invokeThunk(frame.outThunk, frame.outLoc, runtime, (_ignoredOut) => makeCallAction(() => cont(value)));
             });
         });
     }));
@@ -918,7 +914,7 @@ function createGlobalEnv(runtime) {
         runtime.pushExceptionHandler(frame);
         return invokeThunk(thunk, args[1].expr, runtime, (value) => {
             runtime.popExceptionHandlerFrame(frame);
-            return cont(value);
+            return makeCallAction(() => cont(value));
         });
     }));
     env.define('string?', predicateBuiltin('string?', isSchemeStringValue));
@@ -1309,13 +1305,13 @@ function evaluateExpr(expr, env, runtime, cont) {
     switch (expr.type) {
         case 'number':
         case 'boolean':
-            return cont(expr.value);
+            return makeCallAction(() => cont(expr.value));
         case 'string':
-            return cont(makeString(expr.value));
+            return makeCallAction(() => cont(makeString(expr.value)));
         case 'char':
-            return cont({ kind: 'char', value: expr.value });
+            return makeCallAction(() => cont({ kind: 'char', value: expr.value }));
         case 'symbol':
-            return cont(env.lookupSymbol(expr, expr));
+            return makeCallAction(() => cont(env.lookupSymbol(expr, expr)));
         case 'list':
             return evaluateList(expr, env, runtime, cont);
     }
@@ -1394,7 +1390,7 @@ function evalDefineSyntax(args, head, env, runtime, cont) {
     const syntaxRules = parseSyntaxRulesTransformer(args[1], env);
     if (syntaxRules !== undefined) {
         runtime.defineSyntaxRule(nameExpr.value, syntaxRules);
-        return cont(VOID_VALUE);
+        return makeCallAction(() => cont(VOID_VALUE));
     }
     return makeEvalAction(args[1], env, (transformerValue) => {
         if (!isProcedure(transformerValue)) {
@@ -1405,7 +1401,7 @@ function evalDefineSyntax(args, head, env, runtime, cont) {
             procedure: transformerValue,
             definitionEnv: env,
         });
-        return cont(VOID_VALUE);
+        return makeCallAction(() => cont(VOID_VALUE));
     });
 }
 function evalDefineRecordType(args, head, env, cont) {
@@ -1470,7 +1466,7 @@ function evalDefineRecordType(args, head, env, cont) {
             return expectRecordOfType(callArgs[0], recordType).fields[fieldIndex];
         }));
     }
-    return cont(VOID_VALUE);
+    return makeCallAction(() => cont(VOID_VALUE));
 }
 function evalDefine(args, head, env, runtime, cont) {
     if (args.length < 2) {
@@ -1483,7 +1479,7 @@ function evalDefine(args, head, env, runtime, cont) {
         }
         return makeEvalAction(args[1], env, (value) => {
             env.define(symbolLookupName(target), value);
-            return cont(VOID_VALUE);
+            return makeCallAction(() => cont(VOID_VALUE));
         });
     }
     if (target.type !== 'list' || target.elements.length === 0) {
@@ -1504,7 +1500,7 @@ function evalDefine(args, head, env, runtime, cont) {
         env,
     };
     env.define(symbolLookupName(nameExpr), proc);
-    return cont(VOID_VALUE);
+    return makeCallAction(() => cont(VOID_VALUE));
 }
 function evalSet(args, head, env, runtime, cont) {
     if (args.length !== 2) {
@@ -1516,7 +1512,7 @@ function evalSet(args, head, env, runtime, cont) {
     }
     return makeEvalAction(args[1], env, (value) => {
         env.assignSymbol(target, value, target);
-        return cont(VOID_VALUE);
+        return makeCallAction(() => cont(VOID_VALUE));
     });
 }
 function evalIf(args, head, env, runtime, cont) {
@@ -1527,14 +1523,16 @@ function evalIf(args, head, env, runtime, cont) {
         if (isTruthy(condition)) {
             return makeEvalAction(args[1], env, cont);
         }
-        return args[2] === undefined ? cont(VOID_VALUE) : makeEvalAction(args[2], env, cont);
+        return args[2] === undefined
+            ? makeCallAction(() => cont(VOID_VALUE))
+            : makeEvalAction(args[2], env, cont);
     });
 }
 function evalQuote(args, head, cont) {
     if (args.length !== 1) {
         throw new EvalError(`${head.line}:${head.col}: quote expects exactly 1 argument`);
     }
-    return cont(quoteExpr(args[0]));
+    return makeCallAction(() => cont(quoteExpr(args[0])));
 }
 function evalSyntax(args, head, env, runtime, cont) {
     if (args.length !== 1) {
@@ -1542,7 +1540,7 @@ function evalSyntax(args, head, env, runtime, cont) {
     }
     const expanded = expandTemplate(args[0], runtime.currentSyntaxBindings());
     const definitionEnv = runtime.currentSyntaxDefinitionEnv() ?? env;
-    return cont(makeSyntax(hygienizeExpr(expanded, new Map(), definitionEnv, runtime)));
+    return makeCallAction(() => cont(makeSyntax(hygienizeExpr(expanded, new Map(), definitionEnv, runtime))));
 }
 function evalSyntaxCase(args, head, env, runtime, cont) {
     if (args.length < 3) {
@@ -1570,7 +1568,7 @@ function evalSyntaxCaseClauses(clauses, syntax, literals, env, runtime, cont, in
     runtime.pushSyntaxFrame({ bindings, definitionEnv });
     const finishClause = (value) => {
         runtime.restoreSyntaxFrames(syntaxFrameDepth);
-        return cont(value);
+        return makeCallAction(() => cont(value));
     };
     if (body === undefined) {
         return makeEvalAction(maybeFender, bodyEnv, finishClause);
@@ -1597,13 +1595,13 @@ function evalWithSyntax(args, head, env, runtime, cont) {
         runtime.pushSyntaxFrame({ bindings, definitionEnv });
         return makeSequenceAction(args.slice(1), 0, bodyEnv, (value) => {
             runtime.restoreSyntaxFrames(syntaxFrameDepth);
-            return cont(value);
+            return makeCallAction(() => cont(value));
         });
     });
 }
 function evalWithSyntaxBindings(specs, env, runtime, cont, index = 0, bindings = new Map()) {
     if (index >= specs.length) {
-        return cont(bindings);
+        return makeCallAction(() => cont(bindings));
     }
     const spec = specs[index];
     if (spec.type !== 'list' || spec.elements.length !== 2) {
@@ -1628,52 +1626,52 @@ function evalLambda(args, head, env, cont) {
         throw new EvalError(`${paramsExpr.line}:${paramsExpr.col}: lambda parameters must be a list`);
     }
     const { params, restParam } = parseProcedureParameters(paramsExpr.elements);
-    return cont({
+    return makeCallAction(() => cont({
         kind: 'procedure',
         params,
         restParam,
         body: args.slice(1),
         env,
-    });
+    }));
 }
 function evalCaseLambda(args, head, env, cont) {
     if (args.length === 0) {
         throw new EvalError(`${head.line}:${head.col}: case-lambda expects at least 1 clause`);
     }
-    return cont({
+    return makeCallAction(() => cont({
         kind: 'procedure',
         clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr, head)),
         env,
-    });
+    }));
 }
 function evalAnd(args, env, runtime, cont, index = 0) {
     if (args.length === 0) {
-        return cont(true);
+        return makeCallAction(() => cont(true));
     }
     const arg = args[index];
     if (arg === undefined) {
-        return cont(true);
+        return makeCallAction(() => cont(true));
     }
     if (index === args.length - 1) {
         return makeEvalAction(arg, env, cont);
     }
     return makeEvalAction(arg, env, (result) => (isTruthy(result)
         ? evalAnd(args, env, runtime, cont, index + 1)
-        : cont(result)));
+        : makeCallAction(() => cont(result))));
 }
 function evalOr(args, env, runtime, cont, index = 0) {
     if (args.length === 0) {
-        return cont(false);
+        return makeCallAction(() => cont(false));
     }
     const arg = args[index];
     if (arg === undefined) {
-        return cont(false);
+        return makeCallAction(() => cont(false));
     }
     if (index === args.length - 1) {
         return makeEvalAction(arg, env, cont);
     }
     return makeEvalAction(arg, env, (result) => (isTruthy(result)
-        ? cont(result)
+        ? makeCallAction(() => cont(result))
         : evalOr(args, env, runtime, cont, index + 1)));
 }
 function evalBegin(args, env, cont) {
@@ -1681,7 +1679,7 @@ function evalBegin(args, env, cont) {
 }
 function evalCond(args, head, env, runtime, cont, index = 0) {
     if (index >= args.length) {
-        return cont(VOID_VALUE);
+        return makeCallAction(() => cont(VOID_VALUE));
     }
     const clause = args[index];
     if (clause.type !== 'list' || clause.elements.length === 0) {
@@ -1700,7 +1698,7 @@ function evalCond(args, head, env, runtime, cont, index = 0) {
             return evalCond(args, head, env, runtime, cont, index + 1);
         }
         if (body.length === 0) {
-            return cont(testValue);
+            return makeCallAction(() => cont(testValue));
         }
         return makeSequenceAction(body, 0, env, cont);
     });
@@ -1808,7 +1806,7 @@ function evalCase(args, head, env, runtime, cont) {
     return makeEvalAction(args[0], env, (key) => {
         const checkClause = (index) => {
             if (index >= args.length - 1) {
-                return cont(VOID_VALUE);
+                return makeCallAction(() => cont(VOID_VALUE));
             }
             const clause = args[index + 1];
             if (clause.type !== 'list' || clause.elements.length === 0) {
@@ -1860,7 +1858,7 @@ function evalDoLoop(testExpr, resultExprs, body, cells, loopEnv, runtime, cont) 
     return makeEvalAction(testExpr, loopEnv, (testValue) => {
         if (isTruthy(testValue)) {
             return resultExprs.length === 0
-                ? cont(VOID_VALUE)
+                ? makeCallAction(() => cont(VOID_VALUE))
                 : makeSequenceAction(resultExprs, 0, loopEnv, cont);
         }
         return makeSequenceAction(body, 0, loopEnv, (_ignored) => (evalDoSteps(cells, loopEnv, (nextValues) => {
@@ -1876,7 +1874,7 @@ function evalDoLoop(testExpr, resultExprs, body, cells, loopEnv, runtime, cont) 
 }
 function evalDoSteps(cells, loopEnv, cont, index = 0, values = []) {
     if (index >= cells.length) {
-        return cont(values);
+        return makeCallAction(() => cont(values));
     }
     const stepExpr = cells[index].binding.stepExpr;
     if (stepExpr === undefined) {
@@ -1904,7 +1902,7 @@ function evalGuard(args, head, env, runtime, cont) {
     runtime.pushExceptionHandler(frame);
     return makeSequenceAction(args.slice(1), 0, env, (value) => {
         runtime.popExceptionHandlerFrame(frame);
-        return cont(value);
+        return makeCallAction(() => cont(value));
     });
 }
 function evalGuardClauses(clauses, env, signal, cont, index = 0) {
@@ -1921,14 +1919,16 @@ function evalGuardClauses(clauses, env, signal, cont, index = 0) {
         if (index !== clauses.length - 1) {
             throw new EvalError(`${testExpr.line}:${testExpr.col}: else must be the last guard clause`);
         }
-        return body.length === 0 ? cont(VOID_VALUE) : makeSequenceAction(body, 0, env, cont);
+        return body.length === 0
+            ? makeCallAction(() => cont(VOID_VALUE))
+            : makeSequenceAction(body, 0, env, cont);
     }
     return makeEvalAction(testExpr, env, (testValue) => {
         if (!isTruthy(testValue)) {
             return evalGuardClauses(clauses, env, signal, cont, index + 1);
         }
         if (body.length === 0) {
-            return cont(testValue);
+            return makeCallAction(() => cont(testValue));
         }
         return makeSequenceAction(body, 0, env, cont);
     });
@@ -1938,19 +1938,17 @@ function applyProcedure(operator, args, loc, runtime, cont) {
         throw new EvalError(`${loc.line}:${loc.col}: not a procedure`);
     }
     if (isContinuationProcedure(operator)) {
-        if (args.length !== 1) {
-            throw new EvalError(`${loc.line}:${loc.col}: continuation expects exactly 1 argument`);
-        }
+        const resumedValue = makeValues(args.map((arg) => arg.value));
         if (!runtime.isCurrentContinuationEpoch(operator.captureEpoch)) {
-            return cont(args[0].value);
+            return makeCallAction(() => cont(resumedValue));
         }
-        return resumeContinuation(operator, args[0].value, runtime);
+        return resumeContinuation(operator, resumedValue, runtime);
     }
     if (isControlBuiltinProcedure(operator)) {
         return operator.invoke(args, loc, runtime, cont);
     }
     if (isPureBuiltinProcedure(operator)) {
-        return cont(operator.call(args, loc));
+        return makeCallAction(() => cont(operator.call(args, loc)));
     }
     if (isCaseLambdaProcedure(operator)) {
         const clause = findMatchingCaseLambdaClause(operator, args.length);
@@ -2100,7 +2098,7 @@ function evaluateSequence(exprs, env, runtime) {
 }
 function stepSequence(exprs, index, env, runtime, cont) {
     if (index >= exprs.length) {
-        return cont(VOID_VALUE);
+        return makeCallAction(() => cont(VOID_VALUE));
     }
     if (index === exprs.length - 1) {
         return makeEvalAction(exprs[index], env, cont);
@@ -2109,14 +2107,14 @@ function stepSequence(exprs, index, env, runtime, cont) {
 }
 function evaluateArguments(exprs, env, cont, index = exprs.length - 1, evaluated = []) {
     if (index < 0) {
-        return cont(evaluated);
+        return makeCallAction(() => cont(evaluated));
     }
     const expr = exprs[index];
     return makeEvalAction(expr, env, (value) => (evaluateArguments(exprs, env, cont, index - 1, [{ expr, value: expectSingleValue(value, expr) }, ...evaluated])));
 }
 function evaluateExpressions(exprs, env, cont, index = 0, values = []) {
     if (index >= exprs.length) {
-        return cont(values);
+        return makeCallAction(() => cont(values));
     }
     const expr = exprs[index];
     return makeEvalAction(expr, env, (value) => (evaluateExpressions(exprs, env, cont, index + 1, [...values, value])));
@@ -2127,7 +2125,7 @@ function invokeThunk(thunk, loc, runtime, cont) {
 function resumeContinuation(continuation, value, runtime) {
     return switchWindFrames(continuation.windStack, runtime, () => {
         runtime.setExceptionHandlers(continuation.handlerStack);
-        return continuation.resume(value);
+        return makeCallAction(() => continuation.resume(value));
     });
 }
 function dispatchRaisedSignal(signal, runtime) {
@@ -2149,7 +2147,7 @@ function switchWindFrames(targetStack, runtime, cont) {
     const sharedLength = sharedWindPrefixLength(currentStack, targetStack);
     return unwindWindFrames(currentStack, sharedLength, runtime, () => (rewindWindFrames(targetStack, sharedLength, runtime, () => {
         runtime.setWindStack(targetStack);
-        return cont();
+        return makeCallAction(cont);
     })));
 }
 function sharedWindPrefixLength(left, right) {
@@ -2162,7 +2160,7 @@ function sharedWindPrefixLength(left, right) {
 function unwindWindFrames(currentStack, sharedLength, runtime, cont, index = currentStack.length - 1) {
     if (index < sharedLength) {
         runtime.setWindStack(currentStack.slice(0, sharedLength));
-        return cont();
+        return makeCallAction(cont);
     }
     const frame = currentStack[index];
     runtime.setWindStack(currentStack.slice(0, index));
@@ -2171,7 +2169,7 @@ function unwindWindFrames(currentStack, sharedLength, runtime, cont, index = cur
 function rewindWindFrames(targetStack, sharedLength, runtime, cont, index = sharedLength) {
     if (index >= targetStack.length) {
         runtime.setWindStack(targetStack);
-        return cont();
+        return makeCallAction(cont);
     }
     const frame = targetStack[index];
     runtime.setWindStack(targetStack.slice(0, index));
@@ -2185,9 +2183,17 @@ function runMachine(initial, runtime) {
     for (;;) {
         try {
             while (action.action !== 'done') {
-                action = action.action === 'eval'
-                    ? evaluateExpr(action.expr, action.env, runtime, action.cont)
-                    : stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
+                switch (action.action) {
+                    case 'eval':
+                        action = evaluateExpr(action.expr, action.env, runtime, action.cont);
+                        break;
+                    case 'sequence':
+                        action = stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
+                        break;
+                    case 'call':
+                        action = action.invoke();
+                        break;
+                }
             }
             return action.value;
         }
@@ -2208,6 +2214,9 @@ function makeEvalAction(expr, env, cont) {
 }
 function makeSequenceAction(exprs, index, env, cont) {
     return { action: 'sequence', exprs, index, env, cont };
+}
+function makeCallAction(invoke) {
+    return { action: 'call', invoke };
 }
 function makeList(elements) {
     let result = EMPTY_LIST;
@@ -2290,7 +2299,13 @@ function matchMacroRule(rule, invocation, literals) {
     if (patternItems.length === 0 || invocationItems.length === 0) {
         return undefined;
     }
-    if (exprSymbolName(patternItems[0]) !== exprSymbolName(invocationItems[0])) {
+    const patternHead = patternItems[0];
+    const invocationHead = invocationItems[0];
+    const patternHeadName = exprSymbolName(patternHead);
+    const invocationHeadName = exprSymbolName(invocationHead);
+    if (patternHeadName === undefined
+        || invocationHeadName === undefined
+        || (patternHeadName !== '_' && patternHeadName !== invocationHeadName)) {
         return undefined;
     }
     const bindings = new Map();
