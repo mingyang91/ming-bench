@@ -52,7 +52,30 @@ record CharValue(char value) implements Value {
 record EmptyListValue() implements Value {
 }
 
-record PairValue(Value car, Value cdr) implements Value {
+final class PairValue implements Value {
+    private Value car;
+    private Value cdr;
+
+    PairValue(Value car, Value cdr) {
+        this.car = car;
+        this.cdr = cdr;
+    }
+
+    Value car() {
+        return car;
+    }
+
+    void setCar(Value value) {
+        car = value;
+    }
+
+    Value cdr() {
+        return cdr;
+    }
+
+    void setCdr(Value value) {
+        cdr = value;
+    }
 }
 
 final class VectorValue implements Value {

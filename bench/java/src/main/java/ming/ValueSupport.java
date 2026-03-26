@@ -2,6 +2,7 @@ package ming;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.util.IdentityHashMap;
 import java.util.List;
 
 final class ValueSupport {
@@ -112,6 +113,11 @@ final class ValueSupport {
     }
 
     static boolean equalValues(Value left, Value right) {
+        return equalValues(left, right, new IdentityHashMap<>());
+    }
+
+    private static boolean equalValues(Value left, Value right,
+            IdentityHashMap<Value, IdentityHashMap<Value, Boolean>> seen) {
         if (eqValues(left, right)) {
             return true;
         }
@@ -120,23 +126,40 @@ final class ValueSupport {
             case StringValue leftString -> right instanceof StringValue rightString
                     && leftString.text().equals(rightString.text());
             case PairValue leftPair -> right instanceof PairValue rightPair
-                    && equalValues(leftPair.car(), rightPair.car())
-                    && equalValues(leftPair.cdr(), rightPair.cdr());
+                    && compoundEqual(leftPair, rightPair, seen)
+                    && equalValues(leftPair.car(), rightPair.car(), seen)
+                    && equalValues(leftPair.cdr(), rightPair.cdr(), seen);
             case VectorValue leftVector -> right instanceof VectorValue rightVector
-                    && vectorsEqual(leftVector, rightVector);
+                    && compoundEqual(leftVector, rightVector, seen)
+                    && vectorsEqual(leftVector, rightVector, seen);
             default -> false;
         };
     }
 
-    private static boolean vectorsEqual(VectorValue left, VectorValue right) {
+    private static boolean vectorsEqual(VectorValue left, VectorValue right,
+            IdentityHashMap<Value, IdentityHashMap<Value, Boolean>> seen) {
         if (left.length() != right.length()) {
             return false;
         }
         for (int index = 0; index < left.length(); index++) {
-            if (!equalValues(left.ref(index), right.ref(index))) {
+            if (!equalValues(left.ref(index), right.ref(index), seen)) {
                 return false;
             }
         }
+        return true;
+    }
+
+    private static boolean compoundEqual(Value left, Value right,
+            IdentityHashMap<Value, IdentityHashMap<Value, Boolean>> seen) {
+        IdentityHashMap<Value, Boolean> rightValues = seen.get(left);
+        if (rightValues != null && rightValues.containsKey(right)) {
+            return true;
+        }
+        if (rightValues == null) {
+            rightValues = new IdentityHashMap<>();
+            seen.put(left, rightValues);
+        }
+        rightValues.put(right, Boolean.TRUE);
         return true;
     }
 

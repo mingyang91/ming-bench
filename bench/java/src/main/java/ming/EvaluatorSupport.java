@@ -4,7 +4,10 @@ import static ming.RuntimeConstants.EMPTY_LIST;
 import static ming.ValueSupport.requireInt;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 final class EvaluatorSupport {
     private EvaluatorSupport() {
@@ -92,8 +95,12 @@ final class EvaluatorSupport {
 
     static List<Value> requireProperList(Value value, String operator) throws EvalError {
         List<Value> elements = new ArrayList<>();
+        Set<PairValue> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         Value current = value;
         while (current instanceof PairValue pairValue) {
+            if (!seen.add(pairValue)) {
+                throw new EvalError(operator + " expects a proper list");
+            }
             elements.add(pairValue.car());
             current = pairValue.cdr();
         }
@@ -104,11 +111,34 @@ final class EvaluatorSupport {
     }
 
     static boolean isProperListValue(Value value) {
-        Value current = value;
-        while (current instanceof PairValue pairValue) {
-            current = pairValue.cdr();
+        Value slow = value;
+        Value fast = value;
+        while (true) {
+            if (fast instanceof EmptyListValue) {
+                return true;
+            }
+            if (!(fast instanceof PairValue fastPair2)) {
+                return false;
+            }
+            fast = fastPair2.cdr();
+
+            if (fast instanceof EmptyListValue) {
+                return true;
+            }
+            if (!(fast instanceof PairValue fastPair)) {
+                return false;
+            }
+            fast = fastPair.cdr();
+
+            if (!(slow instanceof PairValue slowPair)) {
+                return false;
+            }
+            slow = slowPair.cdr();
+
+            if (fast == slow) {
+                return false;
+            }
         }
-        return current instanceof EmptyListValue;
     }
 
     static boolean isTruthy(Value value) {

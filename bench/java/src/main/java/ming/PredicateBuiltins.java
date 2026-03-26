@@ -79,6 +79,9 @@ final class PredicateBuiltins {
             boolean matches = switch (operator) {
                 case "string=?" -> left.equals(right);
                 case "string<?" -> left.compareTo(right) < 0;
+                case "string>?" -> left.compareTo(right) > 0;
+                case "string<=?" -> left.compareTo(right) <= 0;
+                case "string>=?" -> left.compareTo(right) >= 0;
                 case "string-ci=?" -> left.equalsIgnoreCase(right);
                 default -> throw new EvalError("unknown string comparison operator: " + operator);
             };

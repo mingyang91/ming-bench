@@ -1,18 +1,21 @@
 package ming;
 
+import java.util.IdentityHashMap;
+
 final class ValueRenderer {
     private ValueRenderer() {
     }
 
     static String render(Value value) {
-        return renderValue(value, false);
+        return renderValue(value, false, new IdentityHashMap<>());
     }
 
     static String renderDisplay(Value value) {
-        return renderValue(value, true);
+        return renderValue(value, true, new IdentityHashMap<>());
     }
 
-    private static String renderValue(Value value, boolean displayMode) {
+    private static String renderValue(Value value, boolean displayMode,
+            IdentityHashMap<Value, Boolean> ancestors) {
         return switch (value) {
             case IntValue intValue -> Long.toString(intValue.value());
             case RationalValue rationalValue ->
@@ -26,8 +29,8 @@ final class ValueRenderer {
             case CharValue charValue -> displayMode
                     ? Character.toString(charValue.value())
                     : renderChar(charValue.value());
-            case PairValue pairValue -> renderPair(pairValue, displayMode);
-            case VectorValue vectorValue -> renderVector(vectorValue, displayMode);
+            case PairValue pairValue -> renderPair(pairValue, displayMode, ancestors);
+            case VectorValue vectorValue -> renderVector(vectorValue, displayMode, ancestors);
             case BuiltinValue ignored -> "#<procedure>";
             case ClosureValue ignored -> "#<procedure>";
             case CaseLambdaValue ignored -> "#<procedure>";
@@ -39,41 +42,72 @@ final class ValueRenderer {
         };
     }
 
-    private static String renderPair(PairValue pairValue, boolean displayMode) {
+    private static String renderPair(PairValue pairValue, boolean displayMode,
+            IdentityHashMap<Value, Boolean> ancestors) {
+        if (ancestors.containsKey(pairValue)) {
+            return "#<cycle>";
+        }
+
+        IdentityHashMap<PairValue, Boolean> chain = new IdentityHashMap<>();
         StringBuilder builder = new StringBuilder();
         builder.append('(');
-
         Value current = pairValue;
         boolean first = true;
-        while (current instanceof PairValue pair) {
-            if (!first) {
-                builder.append(' ');
+        try {
+            while (current instanceof PairValue pair) {
+                if (chain.put(pair, Boolean.TRUE) != null) {
+                    if (!first) {
+                        builder.append(" . ");
+                    }
+                    builder.append("#<cycle>");
+                    builder.append(')');
+                    return builder.toString();
+                }
+
+                ancestors.put(pair, Boolean.TRUE);
+                if (!first) {
+                    builder.append(' ');
+                }
+                builder.append(renderValue(pair.car(), displayMode, ancestors));
+                current = pair.cdr();
+                first = false;
             }
-            builder.append(renderValue(pair.car(), displayMode));
-            current = pair.cdr();
-            first = false;
-        }
 
-        if (!(current instanceof EmptyListValue)) {
-            builder.append(" . ");
-            builder.append(renderValue(current, displayMode));
-        }
+            if (!(current instanceof EmptyListValue)) {
+                builder.append(" . ");
+                builder.append(renderValue(current, displayMode, ancestors));
+            }
 
-        builder.append(')');
-        return builder.toString();
+            builder.append(')');
+            return builder.toString();
+        } finally {
+            for (PairValue pair : chain.keySet()) {
+                ancestors.remove(pair);
+            }
+        }
     }
 
-    private static String renderVector(VectorValue vectorValue, boolean displayMode) {
-        StringBuilder builder = new StringBuilder();
-        builder.append("#(");
-        for (int index = 0; index < vectorValue.length(); index++) {
-            if (index > 0) {
-                builder.append(' ');
-            }
-            builder.append(renderValue(vectorValue.ref(index), displayMode));
+    private static String renderVector(VectorValue vectorValue, boolean displayMode,
+            IdentityHashMap<Value, Boolean> ancestors) {
+        if (ancestors.containsKey(vectorValue)) {
+            return "#<cycle>";
         }
-        builder.append(')');
-        return builder.toString();
+
+        ancestors.put(vectorValue, Boolean.TRUE);
+        StringBuilder builder = new StringBuilder();
+        try {
+            builder.append("#(");
+            for (int index = 0; index < vectorValue.length(); index++) {
+                if (index > 0) {
+                    builder.append(' ');
+                }
+                builder.append(renderValue(vectorValue.ref(index), displayMode, ancestors));
+            }
+            builder.append(')');
+            return builder.toString();
+        } finally {
+            ancestors.remove(vectorValue);
+        }
     }
 
     private static String renderChar(char value) {
