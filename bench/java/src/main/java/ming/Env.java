@@ -855,6 +855,17 @@ class Env {
             }
         }));
 
+        // L22 — syntax-case support
+        env.define("syntax->datum", Builtin.named("syntax->datum", args -> {
+            requireArgCount("syntax->datum", args, 1);
+            return args.get(0);
+        }));
+        env.define("datum->syntax", Builtin.named("datum->syntax", args -> {
+            requireArgCount("datum->syntax", args, 2);
+            // In our implementation, syntax objects are plain values
+            return args.get(1);
+        }));
+
         return env;
     }
 

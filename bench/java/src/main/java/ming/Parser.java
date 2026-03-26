@@ -118,11 +118,20 @@ class Parser {
     }
 
     private Object readHash() throws EvalError {
+        int hLine = line, hCol = col;
         advance(); // skip '#'
         if (pos >= input.length()) throw new EvalError("unexpected end after #");
         char c = input.charAt(pos);
         if (c == 't') { advance(); return Boolean.TRUE; }
         if (c == 'f') { advance(); return Boolean.FALSE; }
+        if (c == '\'') {
+            advance(); // skip '
+            Object inner = readExpr();
+            SourceList s = new SourceList(hLine, hCol);
+            s.add("syntax");
+            s.add(inner);
+            return s;
+        }
         if (c == '\\') {
             advance(); // skip '\'
             if (pos >= input.length()) throw new EvalError("unexpected end after #\\");

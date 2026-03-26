@@ -1,8 +1,15 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Collections;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Scheme interpreter — CEK machine with first-class continuations.
@@ -91,6 +98,263 @@ public class Evaluator {
     record DynamicWindEntry(Object inThunk, Object outThunk) {}
 
     static final ThreadLocal<List<DynamicWindEntry>> WIND_STACK = ThreadLocal.withInitial(ArrayList::new);
+
+    // ===== syntax-case support =====
+
+    record SyntaxResult(Object form, Map<String, String> renames, Env defEnv) {}
+
+    static class SyntaxCaseContext {
+        final Map<String, Object> bindings;
+        final Map<String, List<Object>> ellipsisBindings;
+        final Env defEnv;
+        SyntaxCaseContext(Map<String, Object> bindings, Map<String, List<Object>> ellipsisBindings, Env defEnv) {
+            this.bindings = bindings;
+            this.ellipsisBindings = ellipsisBindings;
+            this.defEnv = defEnv;
+        }
+    }
+
+    static final ThreadLocal<Deque<SyntaxCaseContext>> SYNTAX_CASE_STACK =
+        ThreadLocal.withInitial(ArrayDeque::new);
+
+    private static final AtomicLong syntaxCounter = new AtomicLong(0);
+
+    private static final Set<String> SYNTAX_SPECIAL_FORMS = Set.of(
+        "define", "if", "quote", "lambda", "set!", "and", "or", "begin",
+        "let", "cond", "define-syntax", "syntax-rules", "let*", "letrec",
+        "letrec*", "case-lambda", "do", "case", "guard", "define-record-type",
+        "with-syntax", "syntax-case", "syntax", "quasiquote", "unquote"
+    );
+
+    /** Merge all syntax-case contexts (innermost first) into combined bindings. */
+    private static SyntaxCaseContext mergedSyntaxContext() {
+        Deque<SyntaxCaseContext> stack = SYNTAX_CASE_STACK.get();
+        Map<String, Object> merged = new HashMap<>();
+        Map<String, List<Object>> mergedEllipsis = new HashMap<>();
+        Env defEnv = null;
+        // Iterate from bottom to top so inner shadows outer
+        for (SyntaxCaseContext ctx : stack) {
+            merged.putAll(ctx.bindings);
+            mergedEllipsis.putAll(ctx.ellipsisBindings);
+            defEnv = ctx.defEnv;
+        }
+        return new SyntaxCaseContext(merged, mergedEllipsis, defEnv);
+    }
+
+    /** Expand a syntax template using the given context. */
+    private static Object expandSyntaxTemplate(Object tmpl, SyntaxCaseContext ctx,
+            Map<String, String> renames) throws EvalError {
+        if (tmpl instanceof String s) {
+            if (s.startsWith("\"")) return s;
+            if (ctx.bindings.containsKey(s)) return ctx.bindings.get(s);
+            if (ctx.ellipsisBindings.containsKey(s)) return ctx.bindings.get(s); // shouldn't be bare
+            if (!SYNTAX_SPECIAL_FORMS.contains(s) && !ctx.bindings.containsKey(s)
+                    && !ctx.ellipsisBindings.containsKey(s) && !"...".equals(s) && !"_".equals(s)) {
+                return renames.computeIfAbsent(s, k -> k + "$" + syntaxCounter.incrementAndGet());
+            }
+            return s;
+        }
+        if (tmpl instanceof List<?> list) {
+            // Don't expand inside (quote ...)
+            if (!list.isEmpty() && list.get(0) instanceof String qs && "quote".equals(qs)) {
+                return tmpl;
+            }
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < list.size(); i++) {
+                boolean hasEllipsis = i + 1 < list.size()
+                        && list.get(i + 1) instanceof String ds && "...".equals(ds);
+                if (hasEllipsis) {
+                    String eVar = findEllipsisVar(list.get(i), ctx.ellipsisBindings);
+                    if (eVar != null) {
+                        for (Object val : ctx.ellipsisBindings.get(eVar)) {
+                            Map<String, Object> lb = new HashMap<>(ctx.bindings);
+                            lb.put(eVar, val);
+                            SyntaxCaseContext localCtx = new SyntaxCaseContext(lb, ctx.ellipsisBindings, ctx.defEnv);
+                            result.add(expandSyntaxTemplate(list.get(i), localCtx, renames));
+                        }
+                    }
+                    i++; // skip ...
+                } else {
+                    result.add(expandSyntaxTemplate(list.get(i), ctx, renames));
+                }
+            }
+            return result;
+        }
+        return tmpl;
+    }
+
+    private static String findEllipsisVar(Object tmpl, Map<String, List<Object>> ellipsisBindings) {
+        if (tmpl instanceof String s && ellipsisBindings.containsKey(s)) return s;
+        if (tmpl instanceof List<?> list) {
+            for (Object e : list) {
+                String found = findEllipsisVar(e, ellipsisBindings);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    /** Match a syntax-case pattern against an input form. */
+    @SuppressWarnings("unchecked")
+    private static boolean matchSyntaxCasePattern(Object pattern, Object input,
+            List<String> literals, Map<String, Object> bindings,
+            Map<String, List<Object>> ellipsisBindings) {
+        if (pattern instanceof String s) {
+            if (s.equals("_")) return true;
+            if (s.startsWith("\"")) return s.equals(input);
+            if (literals.contains(s)) return s.equals(input);
+            bindings.put(s, input);
+            return true;
+        }
+        if (pattern instanceof List<?> patList) {
+            if (!(input instanceof List<?> form)) return false;
+            int pi = 0, fi = 0;
+            while (pi < patList.size()) {
+                boolean hasEllipsis = pi + 1 < patList.size() && "...".equals(patList.get(pi + 1));
+                if (hasEllipsis) {
+                    Object pe = patList.get(pi);
+                    if (!(pe instanceof String varName)) return false;
+                    int remaining = 0;
+                    for (int j = pi + 2; j < patList.size(); j++) {
+                        if (!"...".equals(patList.get(j))) remaining++;
+                    }
+                    int available = form.size() - fi - remaining;
+                    if (available < 0) return false;
+                    List<Object> collected = new ArrayList<>();
+                    for (int i = 0; i < available; i++) collected.add(form.get(fi + i));
+                    ellipsisBindings.put(varName, collected);
+                    fi += available;
+                    pi += 2;
+                } else {
+                    if (fi >= form.size()) return false;
+                    Object pe = patList.get(pi);
+                    if (!matchSyntaxCasePattern(pe, form.get(fi), literals, bindings, ellipsisBindings))
+                        return false;
+                    pi++;
+                    fi++;
+                }
+            }
+            return fi == form.size();
+        }
+        // literal value
+        if (pattern instanceof Long || pattern instanceof Boolean) return pattern.equals(input);
+        return false;
+    }
+
+    /** Evaluate syntax-case form. */
+    @SuppressWarnings("unchecked")
+    private static Object evalSyntaxCase(List<?> list, Env env) throws EvalError {
+        // (syntax-case expr (literals) clause ...)
+        if (list.size() < 4) throw new EvalError("syntax-case: bad syntax");
+        Object input = eval(list.get(1), env);
+        if (!(list.get(2) instanceof List<?> litList))
+            throw new EvalError("syntax-case: literals must be a list");
+        List<String> literals = new ArrayList<>();
+        for (Object l : litList) {
+            if (l instanceof String s) literals.add(s);
+        }
+        for (int i = 3; i < list.size(); i++) {
+            if (!(list.get(i) instanceof List<?> clause) || clause.size() < 2 || clause.size() > 3)
+                throw new EvalError("syntax-case: bad clause");
+            Object pattern = clause.get(0);
+            boolean hasFender = clause.size() == 3;
+            Object fender = hasFender ? clause.get(1) : null;
+            Object body = clause.get(hasFender ? 2 : 1);
+
+            Map<String, Object> bindings = new HashMap<>();
+            Map<String, List<Object>> ellipsisBindings = new HashMap<>();
+            if (matchSyntaxCasePattern(pattern, input, literals, bindings, ellipsisBindings)) {
+                // Create env with pattern variable bindings
+                Env matchEnv = new Env(env);
+                for (var entry : bindings.entrySet()) matchEnv.define(entry.getKey(), entry.getValue());
+
+                if (hasFender) {
+                    Object fenderResult = eval(fender, matchEnv);
+                    if (isFalse(fenderResult)) continue;
+                }
+
+                // Push syntax-case context
+                Deque<SyntaxCaseContext> stack = SYNTAX_CASE_STACK.get();
+                stack.push(new SyntaxCaseContext(bindings, ellipsisBindings, env));
+                try {
+                    return eval(body, matchEnv);
+                } finally {
+                    stack.pop();
+                }
+            }
+        }
+        throw new EvalError("syntax-case: no matching pattern");
+    }
+
+    /** Evaluate syntax (aka #') form. */
+    private static Object evalSyntax(List<?> list, Env env) throws EvalError {
+        if (list.size() != 2) throw new EvalError("syntax: bad syntax");
+        Object template = list.get(1);
+        SyntaxCaseContext ctx = mergedSyntaxContext();
+        if (ctx.defEnv == null) throw new EvalError("syntax: not in a syntax-case context");
+
+        // Single pattern variable reference
+        if (template instanceof String s && !s.startsWith("\"")) {
+            if (ctx.bindings.containsKey(s)) return ctx.bindings.get(s);
+        }
+
+        // Full template expansion
+        Map<String, String> renames = new HashMap<>();
+        Object expanded = expandSyntaxTemplate(template, ctx, renames);
+        return new SyntaxResult(expanded, renames, ctx.defEnv);
+    }
+
+    /** Evaluate with-syntax form. */
+    @SuppressWarnings("unchecked")
+    private static Object evalWithSyntax(List<?> list, Env env) throws EvalError {
+        // (with-syntax ((pattern expr) ...) body ...)
+        if (list.size() < 3) throw new EvalError("with-syntax: bad syntax");
+        if (!(list.get(1) instanceof List<?> bindingsList))
+            throw new EvalError("with-syntax: bindings must be a list");
+
+        Map<String, Object> bindings = new HashMap<>();
+        Map<String, List<Object>> ellipsisBindings = new HashMap<>();
+        for (Object b : bindingsList) {
+            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                throw new EvalError("with-syntax: bad binding");
+            Object pattern = binding.get(0);
+            Object val = eval(binding.get(1), env);
+            if (pattern instanceof String s && !s.startsWith("\"")) {
+                bindings.put(s, val);
+            } else {
+                matchSyntaxCasePattern(pattern, val, List.of(), bindings, ellipsisBindings);
+            }
+        }
+
+        Env wsEnv = new Env(env);
+        for (var entry : bindings.entrySet()) wsEnv.define(entry.getKey(), entry.getValue());
+
+        Deque<SyntaxCaseContext> stack = SYNTAX_CASE_STACK.get();
+        stack.push(new SyntaxCaseContext(bindings, ellipsisBindings, env));
+        try {
+            Object result = null;
+            for (int i = 2; i < list.size(); i++) result = eval(list.get(i), wsEnv);
+            return result;
+        } finally {
+            stack.pop();
+        }
+    }
+
+    /** Handle macro expansion result (SyntaxResult or raw form). */
+    private static Object[] handleMacroResult(Object result, Env callEnv) throws EvalError {
+        if (result instanceof SyntaxResult sr) {
+            // Add renames directly to call env (unique names won't conflict)
+            for (var entry : sr.renames.entrySet()) {
+                try {
+                    Object val = sr.defEnv.lookup(entry.getKey());
+                    callEnv.define(entry.getValue(), val);
+                } catch (EvalError e) { /* not bound at def site, skip */ }
+            }
+            return new Object[] { sr.form, callEnv };
+        }
+        // Raw form (no hygiene renames needed)
+        return new Object[] { result, callEnv };
+    }
 
     static void windTo(List<DynamicWindEntry> target) throws EvalError {
         List<DynamicWindEntry> current = WIND_STACK.get();
@@ -384,9 +648,12 @@ public class Evaluator {
                         if (!(list.get(1) instanceof String name) || name.startsWith("\""))
                             throw new EvalError("define-syntax: expected name");
                         Object tr = list.get(2);
-                        if (!(tr instanceof List<?> tl) || tl.isEmpty() || !"syntax-rules".equals(tl.get(0)))
-                            throw new EvalError("define-syntax: expected syntax-rules");
-                        env.define(name, SyntaxRules.parse(tl, env));
+                        if (tr instanceof List<?> tl && !tl.isEmpty() && "syntax-rules".equals(tl.get(0))) {
+                            env.define(name, SyntaxRules.parse(tl, env));
+                        } else {
+                            Object transformer = eval(tr, env);
+                            env.define(name, new MacroTransformer(transformer));
+                        }
                         val = null; ev = false; continue mainLoop;
                     }
                     case "define-record-type" -> {
@@ -453,6 +720,13 @@ public class Evaluator {
                     // macro expansion: operator is SyntaxRules
                     if (evald.isEmpty() && val instanceof SyntaxRules sr && form != null) {
                         Object[] expanded = sr.expandToForm(form, e);
+                        ctrl = expanded[0]; env = (Env) expanded[1]; k = next; ev = true;
+                        continue mainLoop;
+                    }
+                    // macro expansion: operator is MacroTransformer (syntax-case lambda)
+                    if (evald.isEmpty() && val instanceof MacroTransformer mt && form != null) {
+                        Object result = applyProc(mt.procedure, List.of(form));
+                        Object[] expanded = handleMacroResult(result, e);
                         ctrl = expanded[0]; env = (Env) expanded[1]; k = next; ev = true;
                         continue mainLoop;
                     }
@@ -624,13 +898,18 @@ public class Evaluator {
                         if (!(list.get(1) instanceof String name) || name.startsWith("\""))
                             throw new EvalError("define-syntax: expected name");
                         Object transformer = list.get(2);
-                        if (!(transformer instanceof List<?> trList) || trList.isEmpty()
-                                || !"syntax-rules".equals(trList.get(0)))
-                            throw new EvalError("define-syntax: expected syntax-rules");
-                        SyntaxRules sr = SyntaxRules.parse(trList, env);
-                        env.define(name, sr);
+                        if (transformer instanceof List<?> trList && !trList.isEmpty()
+                                && "syntax-rules".equals(trList.get(0))) {
+                            env.define(name, SyntaxRules.parse(trList, env));
+                        } else {
+                            Object tr = eval(transformer, env);
+                            env.define(name, new MacroTransformer(tr));
+                        }
                         return null;
                     }
+                    case "syntax-case" -> { return evalSyntaxCase(list, env); }
+                    case "syntax" -> { return evalSyntax(list, env); }
+                    case "with-syntax" -> { return evalWithSyntax(list, env); }
                     case "do" -> { return evalDo(list, env); }
 
                     case "if" -> {
@@ -763,6 +1042,11 @@ public class Evaluator {
             Object func = eval(first, env);
             if (func instanceof SyntaxRules sr) {
                 Object[] expanded = sr.expandToForm(list, env);
+                expr = expanded[0]; env = (Env) expanded[1]; continue;
+            }
+            if (func instanceof MacroTransformer mt) {
+                Object result = applyProc(mt.procedure, List.of(list));
+                Object[] expanded = handleMacroResult(result, env);
                 expr = expanded[0]; env = (Env) expanded[1]; continue;
             }
             List<Object> args = new ArrayList<>();
