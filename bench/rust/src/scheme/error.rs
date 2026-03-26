@@ -7,6 +7,8 @@ pub enum EvalError {
     Runtime(String),
     #[error("continuation return")]
     ContinuationReturn(u64),
+    #[error("scheme exception raised")]
+    SchemeRaise,
 }
 
 impl Eq for EvalError {}
@@ -17,6 +19,7 @@ impl PartialEq for EvalError {
             (EvalError::Parse(a), EvalError::Parse(b)) => a == b,
             (EvalError::Runtime(a), EvalError::Runtime(b)) => a == b,
             (EvalError::ContinuationReturn(a), EvalError::ContinuationReturn(b)) => a == b,
+            (EvalError::SchemeRaise, EvalError::SchemeRaise) => true,
             _ => false,
         }
     }
