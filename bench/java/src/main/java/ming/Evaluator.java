@@ -95,6 +95,7 @@ public class Evaluator {
         environment.define(">", new PrimitiveProcedureValue(">", arguments -> applyComparison(">", arguments)));
         environment.define("=", new PrimitiveProcedureValue("=", arguments -> applyComparison("=", arguments)));
         environment.define("<=", new PrimitiveProcedureValue("<=", arguments -> applyComparison("<=", arguments)));
+        environment.define(">=", new PrimitiveProcedureValue(">=", arguments -> applyComparison(">=", arguments)));
         environment.define("not", new PrimitiveProcedureValue("not", this::applyNot));
         environment.define("cons", new PrimitiveProcedureValue("cons", this::applyCons));
         environment.define("car", new PrimitiveProcedureValue("car", this::applyCar));
@@ -131,6 +132,8 @@ public class Evaluator {
         environment.define("symbol->string", new PrimitiveProcedureValue("symbol->string", this::applySymbolToString));
         environment.define("string->symbol", new PrimitiveProcedureValue("string->symbol", this::applyStringToSymbol));
         environment.define("string-ref", new PrimitiveProcedureValue("string-ref", this::applyStringRef));
+        environment.define("string->list", new PrimitiveProcedureValue("string->list", this::applyStringToList));
+        environment.define("list->string", new PrimitiveProcedureValue("list->string", this::applyListToString));
         environment.define("string-copy", new PrimitiveProcedureValue("string-copy", this::applyStringCopy));
         environment.define("string-set!", new PrimitiveProcedureValue("string-set!", this::applyStringSet));
         environment.define("string=?", new PrimitiveProcedureValue("string=?", this::applyStringEquality));
@@ -147,6 +150,8 @@ public class Evaluator {
         environment.define("char-downcase", new PrimitiveProcedureValue("char-downcase", this::applyCharDowncase));
         environment.define("char=?", new PrimitiveProcedureValue("char=?", this::applyCharEquality));
         environment.define("char<?", new PrimitiveProcedureValue("char<?", this::applyCharLessThan));
+        environment.define("char->integer", new PrimitiveProcedureValue("char->integer", this::applyCharToInteger));
+        environment.define("integer->char", new PrimitiveProcedureValue("integer->char", this::applyIntegerToChar));
         environment.define("abs", new PrimitiveProcedureValue("abs", this::applyAbs));
         environment.define("modulo", new PrimitiveProcedureValue("modulo", this::applyModulo));
         environment.define("remainder", new PrimitiveProcedureValue("remainder", this::applyRemainder));
@@ -182,7 +187,7 @@ public class Evaluator {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
                 case NumberExpr numberExpr -> Numbers.parseLiteral(numberExpr.token());
                 case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
-                case StringExpr stringExpr -> new StringValue(stringExpr.value());
+                case StringExpr stringExpr -> new StringValue(stringExpr.value(), false);
                 case CharExpr charExpr -> new CharValue(charExpr.value());
                 case SymbolExpr symbolExpr -> environment.lookup(symbolExpr.name());
                 case ListExpr listExpr -> evalList(listExpr, environment);
@@ -1449,7 +1454,7 @@ public class Evaluator {
             case IntExpr intExpr -> new IntValue(intExpr.value());
             case NumberExpr numberExpr -> Numbers.parseLiteral(numberExpr.token());
             case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
-            case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case StringExpr stringExpr -> new StringValue(stringExpr.value(), false);
             case CharExpr charExpr -> new CharValue(charExpr.value());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
             case ListExpr listExpr -> {
@@ -1714,7 +1719,7 @@ public class Evaluator {
     private Value applySymbolToString(List<Value> arguments) throws EvalError {
         requireExactArity("symbol->string", arguments.size(), 1);
         if (arguments.getFirst() instanceof SymbolValue symbolValue) {
-            return new StringValue(symbolValue.name());
+            return new StringValue(symbolValue.name(), false);
         }
         throw new EvalError("symbol->string expects symbol arguments");
     }
@@ -1734,6 +1739,26 @@ public class Evaluator {
         return new CharValue(value.charAt(index));
     }
 
+    private Value applyStringToList(List<Value> arguments) throws EvalError {
+        requireExactArity("string->list", arguments.size(), 1);
+        String value = expectString(arguments.getFirst(), "string->list");
+        List<Value> characters = new ArrayList<>(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            characters.add(new CharValue(value.charAt(i)));
+        }
+        return new ListValue(List.copyOf(characters));
+    }
+
+    private Value applyListToString(List<Value> arguments) throws EvalError {
+        requireExactArity("list->string", arguments.size(), 1);
+        List<Value> characters = expectList(arguments.getFirst(), "list->string");
+        StringBuilder builder = new StringBuilder(characters.size());
+        for (Value value : characters) {
+            builder.append(expectChar(value, "list->string"));
+        }
+        return new StringValue(builder.toString());
+    }
+
     private Value applyStringCopy(List<Value> arguments) throws EvalError {
         requireExactArity("string-copy", arguments.size(), 1);
         return new StringValue(expectString(arguments.getFirst(), "string-copy"));
@@ -1742,6 +1767,9 @@ public class Evaluator {
     private Value applyStringSet(List<Value> arguments) throws EvalError {
         requireExactArity("string-set!", arguments.size(), 3);
         StringValue value = expectStringValue(arguments.getFirst(), "string-set!");
+        if (!value.isMutable()) {
+            throw new EvalError("string-set! cannot mutate immutable strings");
+        }
         int index = expectIndex(arguments.get(1), "string-set!");
         char ch = expectChar(arguments.get(2), "string-set!");
         if (index >= value.length()) {
@@ -1849,6 +1877,20 @@ public class Evaluator {
             previous = current;
         }
         return new BoolValue(true);
+    }
+
+    private Value applyCharToInteger(List<Value> arguments) throws EvalError {
+        requireExactArity("char->integer", arguments.size(), 1);
+        return new IntValue(expectChar(arguments.getFirst(), "char->integer"));
+    }
+
+    private Value applyIntegerToChar(List<Value> arguments) throws EvalError {
+        requireExactArity("integer->char", arguments.size(), 1);
+        long codePoint = expectInt(arguments.getFirst(), "integer->char");
+        if (codePoint < Character.MIN_VALUE || codePoint > Character.MAX_VALUE) {
+            throw new EvalError("integer->char expects a valid character code");
+        }
+        return new CharValue((char) codePoint);
     }
 
     private Value applyApply(List<Value> arguments) throws EvalError {

@@ -134,6 +134,7 @@ final class Numbers {
                 case ">" -> comparison > 0;
                 case "=" -> comparison == 0;
                 case "<=" -> comparison <= 0;
+                case ">=" -> comparison >= 0;
                 default -> false;
             };
             if (!matches) {

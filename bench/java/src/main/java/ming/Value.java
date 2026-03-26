@@ -96,9 +96,15 @@ record BoolValue(boolean value) implements Value {
 
 final class StringValue implements Value {
     private final StringBuilder value;
+    private final boolean mutable;
 
     StringValue(String value) {
+        this(value, true);
+    }
+
+    StringValue(String value, boolean mutable) {
         this.value = new StringBuilder(value);
+        this.mutable = mutable;
     }
 
     String value() {
@@ -111,6 +117,10 @@ final class StringValue implements Value {
 
     char charAt(int index) {
         return value.charAt(index);
+    }
+
+    boolean isMutable() {
+        return mutable;
     }
 
     void setCharAt(int index, char ch) {
