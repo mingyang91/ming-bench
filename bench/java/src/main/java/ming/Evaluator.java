@@ -1122,7 +1122,12 @@ public class Evaluator {
         for (int i = 0; i < body.size() - 1; i++) {
             ccBodyExprs = new ArrayList<>(body.subList(i, body.size()));
             ccBodyEnv = env;
-            eval(body.get(i), env);
+            try {
+                eval(body.get(i), env);
+            } catch (ContinuationInvoked ci) {
+                // Continuation invoked from within a let/letrec body expression.
+                // The target call/cc is no longer on the stack, so absorb and continue.
+            }
         }
         ccBodyExprs = new ArrayList<>(body.subList(body.size() - 1, body.size()));
         ccBodyEnv = env;
@@ -2317,7 +2322,14 @@ public class Evaluator {
                     try {
                         Object val = macro.defEnv.lookup(entry.getKey());
                         useEnv.define(entry.getValue(), val);
-                    } catch (EvalError ignored) {}
+                    } catch (EvalError e) {
+                        // defEnv lookup failed (e.g., forward reference to a macro defined later).
+                        // Fall back to the use-site environment.
+                        try {
+                            Object val = useEnv.lookup(entry.getKey());
+                            useEnv.define(entry.getValue(), val);
+                        } catch (EvalError ignored) {}
+                    }
                 }
                 return expanded;
             }
