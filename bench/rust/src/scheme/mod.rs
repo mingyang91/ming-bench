@@ -3,7 +3,8 @@ pub mod error;
 pub use error::EvalError;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
 
 type Output = Rc<RefCell<String>>;
@@ -25,6 +26,11 @@ enum Value {
     },
     Builtin(String),
     Void,
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Expr, Expr)>,
+        def_env: Env,
+    },
 }
 
 fn make_str(s: &str) -> Value {
@@ -87,6 +93,7 @@ impl Value {
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::Builtin(name) => format!("#<procedure:{}>", name),
             Value::Void => "".into(),
+            Value::Macro { .. } => "#<macro>".into(),
         }
     }
 
@@ -401,7 +408,13 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                     "begin" => return eval_begin(&list[1..], env, out),
                     "cond" => return eval_cond(&list[1..], env, span, out),
                     "set!" => return eval_set(&list[1..], env, span, out),
-                    _ => {}
+                    "define-syntax" => return eval_define_syntax(&list[1..], env, span),
+                    _ => {
+                        if let Some(Value::Macro { ref literals, ref rules, ref def_env }) = env_get(env, op) {
+                            let expanded = expand_macro(list, &literals, &rules, &def_env, span, env)?;
+                            return eval(&expanded, env, out);
+                        }
+                    }
                 }
             }
             let func = eval(&list[0], env, out)?;
@@ -655,6 +668,297 @@ fn eval_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value,
         return Err(err_at(span, format!("set!: unbound variable: {}", name)));
     }
     Ok(Value::Void)
+}
+
+// ---------- Macros (syntax-rules) ----------
+
+static GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn gensym(base: &str) -> String {
+    let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("#{}#{}", base, n)
+}
+
+const SPECIAL_FORMS: &[&str] = &[
+    "define", "if", "quote", "lambda", "and", "or", "let", "begin",
+    "cond", "set!", "define-syntax", "syntax-rules",
+];
+
+fn eval_define_syntax(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(err_at(span, "define-syntax: bad syntax"));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(err_at(span, "define-syntax: expected symbol")),
+    };
+    let sr = match &args[1].kind {
+        ExprKind::List(parts) => parts,
+        _ => return Err(err_at(span, "define-syntax: expected syntax-rules")),
+    };
+    if sr.len() < 2 {
+        return Err(err_at(span, "syntax-rules: expected literals list"));
+    }
+    match &sr[0].kind {
+        ExprKind::Symbol(s) if s == "syntax-rules" => {}
+        _ => return Err(err_at(span, "define-syntax: expected syntax-rules")),
+    }
+    let literals = match &sr[1].kind {
+        ExprKind::List(lits) => {
+            let mut ls = Vec::new();
+            for l in lits {
+                match &l.kind {
+                    ExprKind::Symbol(s) => ls.push(s.clone()),
+                    _ => return Err(err_at(span, "syntax-rules: literals must be identifiers")),
+                }
+            }
+            ls
+        }
+        _ => return Err(err_at(span, "syntax-rules: expected literals list")),
+    };
+    let mut rules = Vec::new();
+    for rule_expr in &sr[2..] {
+        match &rule_expr.kind {
+            ExprKind::List(parts) if parts.len() == 2 => {
+                rules.push((parts[0].clone(), parts[1].clone()));
+            }
+            _ => return Err(err_at(span, "syntax-rules: bad rule")),
+        }
+    }
+    env_set(env, name, Value::Macro { literals, rules, def_env: env.clone() });
+    Ok(Value::Void)
+}
+
+#[derive(Debug, Clone)]
+enum MatchBinding {
+    Single(Expr),
+    Many(Vec<Expr>),
+}
+
+fn match_list_pattern(
+    pat_elems: &[Expr],
+    inp_elems: &[Expr],
+    bindings: &mut HashMap<String, MatchBinding>,
+    literals: &[String],
+) -> bool {
+    // Find ellipsis position
+    let ellipsis_pos = pat_elems.iter().position(|e| matches!(&e.kind, ExprKind::Symbol(s) if s == "..."));
+
+    if let Some(epos) = ellipsis_pos {
+        if epos == 0 { return false; }
+        let before = &pat_elems[..epos - 1];
+        let ellipsis_pat = &pat_elems[epos - 1];
+        let after = &pat_elems[epos + 1..];
+
+        if inp_elems.len() < before.len() + after.len() {
+            return false;
+        }
+
+        for (p, i) in before.iter().zip(inp_elems.iter()) {
+            if !match_pattern(p, i, bindings, literals) {
+                return false;
+            }
+        }
+
+        let after_start = inp_elems.len() - after.len();
+        for (p, i) in after.iter().zip(inp_elems[after_start..].iter()) {
+            if !match_pattern(p, i, bindings, literals) {
+                return false;
+            }
+        }
+
+        let ellipsis_inputs = &inp_elems[before.len()..after_start];
+        match &ellipsis_pat.kind {
+            ExprKind::Symbol(name) if !literals.contains(name) && name != "_" => {
+                bindings.insert(name.clone(), MatchBinding::Many(ellipsis_inputs.to_vec()));
+                true
+            }
+            _ => false,
+        }
+    } else {
+        if pat_elems.len() != inp_elems.len() {
+            return false;
+        }
+        for (p, i) in pat_elems.iter().zip(inp_elems.iter()) {
+            if !match_pattern(p, i, bindings, literals) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn match_pattern(
+    pattern: &Expr,
+    input: &Expr,
+    bindings: &mut HashMap<String, MatchBinding>,
+    literals: &[String],
+) -> bool {
+    match &pattern.kind {
+        ExprKind::Symbol(name) => {
+            if name == "_" {
+                true
+            } else if literals.contains(name) {
+                matches!(&input.kind, ExprKind::Symbol(s) if s == name)
+            } else {
+                bindings.insert(name.clone(), MatchBinding::Single(input.clone()));
+                true
+            }
+        }
+        ExprKind::Integer(n) => matches!(&input.kind, ExprKind::Integer(m) if m == n),
+        ExprKind::Boolean(b) => matches!(&input.kind, ExprKind::Boolean(b2) if b2 == b),
+        ExprKind::List(pat_elems) => {
+            match &input.kind {
+                ExprKind::List(inp_elems) => match_list_pattern(pat_elems, inp_elems, bindings, literals),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn collect_pattern_vars(pattern: &Expr, literals: &[String], vars: &mut HashSet<String>) {
+    match &pattern.kind {
+        ExprKind::Symbol(name) if name != "..." && name != "_" && !literals.contains(name) => {
+            vars.insert(name.clone());
+        }
+        ExprKind::List(elems) => {
+            for e in elems {
+                collect_pattern_vars(e, literals, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_template_symbols(template: &Expr, pattern_vars: &HashSet<String>, result: &mut HashSet<String>) {
+    match &template.kind {
+        ExprKind::Symbol(name) if name != "..." && !pattern_vars.contains(name) => {
+            result.insert(name.clone());
+        }
+        ExprKind::List(elems) => {
+            for e in elems {
+                collect_template_symbols(e, pattern_vars, result);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn find_ellipsis_var(template: &Expr, bindings: &HashMap<String, MatchBinding>) -> Option<String> {
+    match &template.kind {
+        ExprKind::Symbol(name) => {
+            if matches!(bindings.get(name), Some(MatchBinding::Many(_))) {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }
+        ExprKind::List(elems) => {
+            for e in elems {
+                if let Some(v) = find_ellipsis_var(e, bindings) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn expand_template(
+    template: &Expr,
+    bindings: &HashMap<String, MatchBinding>,
+    gensym_map: &HashMap<String, String>,
+) -> Expr {
+    match &template.kind {
+        ExprKind::Symbol(name) => {
+            if let Some(binding) = bindings.get(name) {
+                match binding {
+                    MatchBinding::Single(e) => e.clone(),
+                    MatchBinding::Many(_) => template.clone(),
+                }
+            } else if let Some(gname) = gensym_map.get(name) {
+                Expr::new(ExprKind::Symbol(gname.clone()), template.span)
+            } else {
+                template.clone()
+            }
+        }
+        ExprKind::List(elems) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len() {
+                    if let ExprKind::Symbol(ref s) = elems[i + 1].kind {
+                        if s == "..." {
+                            if let Some(var_name) = find_ellipsis_var(&elems[i], bindings) {
+                                if let Some(MatchBinding::Many(items)) = bindings.get(&var_name) {
+                                    for item in items {
+                                        let mut local_bindings = bindings.clone();
+                                        local_bindings.insert(var_name.clone(), MatchBinding::Single(item.clone()));
+                                        result.push(expand_template(&elems[i], &local_bindings, gensym_map));
+                                    }
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                result.push(expand_template(&elems[i], bindings, gensym_map));
+                i += 1;
+            }
+            Expr::new(ExprKind::List(result), template.span)
+        }
+        _ => template.clone(),
+    }
+}
+
+fn expand_macro(
+    input_elems: &[Expr],
+    literals: &[String],
+    rules: &[(Expr, Expr)],
+    def_env: &Env,
+    span: Span,
+    env: &Env,
+) -> Result<Expr, EvalError> {
+    for (pattern, template) in rules {
+        let pat_elems = match &pattern.kind {
+            ExprKind::List(e) => &e[..],
+            _ => continue,
+        };
+        if pat_elems.is_empty() { continue; }
+
+        let mut bindings = HashMap::new();
+        if match_list_pattern(&pat_elems[1..], &input_elems[1..], &mut bindings, literals) {
+            let mut pattern_vars = HashSet::new();
+            collect_pattern_vars(pattern, literals, &mut pattern_vars);
+            // Remove the keyword position symbol from pattern vars
+            if let ExprKind::Symbol(ref kw) = pat_elems[0].kind {
+                pattern_vars.remove(kw);
+            }
+
+            let mut template_syms = HashSet::new();
+            collect_template_symbols(template, &pattern_vars, &mut template_syms);
+
+            let mut gensym_map = HashMap::new();
+            for sym in &template_syms {
+                if !SPECIAL_FORMS.contains(&sym.as_str()) {
+                    gensym_map.insert(sym.clone(), gensym(sym));
+                }
+            }
+
+            // Inject definition-site bindings for gensym'd names
+            for (orig, gsym) in &gensym_map {
+                if let Some(val) = env_get(def_env, orig) {
+                    env_set(env, gsym.clone(), val);
+                }
+            }
+
+            return Ok(expand_template(template, &bindings, &gensym_map));
+        }
+    }
+    Err(err_at(span, "no matching syntax-rules pattern"))
 }
 
 fn apply_func(func: &Value, args: &[Value], span: Span, out: &Output) -> Result<Value, EvalError> {
