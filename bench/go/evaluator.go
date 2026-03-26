@@ -247,6 +247,7 @@ func (e *env) lookupMacroSymbol(symbol symbolExpr) (*syntaxMacro, bool) {
 func newGlobalEnv(output *strings.Builder) *env {
 	scope := newEnv(nil)
 	immutableStrings := stringsAreImmutable()
+	runtime := scope.runtime
 	scope.define("+", builtinProc{name: "+", fn: builtinAdd})
 	scope.define("-", builtinProc{name: "-", fn: builtinSub})
 	scope.define("*", builtinProc{name: "*", fn: builtinMul})
@@ -405,10 +406,15 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("string-downcase", builtinProc{name: "string-downcase", fn: builtinStringDowncase})
 	scope.define("apply", builtinProc{name: "apply", fn: builtinApply})
 	scope.define("procedure?", builtinProc{name: "procedure?", fn: builtinProcedurePredicate})
+	raiseProc := builtinProc{name: "raise", fn: builtinRaise}
+	scope.define("raise", raiseProc)
+	scope.defineKey(level20RaiseKey, raiseProc)
+	withExceptionHandlerProc := builtinProc{name: "with-exception-handler", fn: builtinWithExceptionHandler}
+	scope.define("with-exception-handler", withExceptionHandlerProc)
+	scope.defineKey(level20WithExceptionHandlerKey, withExceptionHandlerProc)
 	if level18UsesCPS() {
 		scope.define("call/cc", callCCProc{})
 		scope.define("call-with-current-continuation", callCCProc{})
-		runtime := scope.runtime
 		scope.defineKey(level18ApplyCPSKey, builtinProc{name: "__apply_cps", fn: func(args []any) (any, error) {
 			return builtinApplyCPS(runtime, args)
 		}})
@@ -684,12 +690,23 @@ func (pos sourcePos) errorf(format string, args ...any) *EvalError {
 }
 
 func ensureSourcePos(err error) error {
-	return attachSourcePos(err, sourcePos{line: 1, col: 1})
+	return normalizeRaisedError(attachSourcePos(err, sourcePos{line: 1, col: 1}))
 }
 
 func attachSourcePos(err error, pos sourcePos) error {
 	if err == nil {
 		return nil
+	}
+
+	if raisedErr, ok := err.(*raisedError); ok {
+		if raisedErr.Line > 0 && raisedErr.Col > 0 {
+			return err
+		}
+		return &raisedError{
+			Value: raisedErr.Value,
+			Line:  pos.line,
+			Col:   pos.col,
+		}
 	}
 
 	evalErr, ok := err.(*EvalError)
@@ -796,6 +813,12 @@ func evalListTail(scope *env, expr listExpr) (any, *tailEvalState, error) {
 	if head, ok := expr.elements[0].(symbolExpr); ok {
 		args := expr.elements[1:]
 		switch head.name {
+		case "guard":
+			desugared, err := desugarGuard(args, expr.pos)
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, &tailEvalState{scope: scope, expr: desugared}, nil
 		case "define":
 			value, err := evalDefine(scope, args)
 			return value, nil, err
@@ -950,6 +973,12 @@ func prepareProcedureCall(proc any, args []any) (any, *tailEvalState, error) {
 		return prepareDynamicWindPopCall(callable, args)
 	case dynamicWindReenterProc:
 		return prepareDynamicWindReenterCall(callable, args)
+	case exceptionHandlerReturnProc:
+		return prepareExceptionHandlerReturnCall(callable, args)
+	case exceptionHandlerInvokeProc:
+		return prepareExceptionHandlerInvokeCall(callable, args)
+	case uncaughtExceptionProc:
+		return prepareUncaughtExceptionCall(callable, args)
 	case closure:
 		return prepareClosureCall(callable, args)
 	case caseClosure:
@@ -2309,7 +2338,7 @@ func typeName(value any) string {
 		return "list"
 	case *vectorValue:
 		return "vector"
-	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
 		return "procedure"
 	case voidValue:
 		return "void"
@@ -2322,7 +2351,7 @@ func typeName(value any) string {
 
 func isProcedureValue(value any) bool {
 	switch value.(type) {
-	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
 		return true
 	default:
 		return false

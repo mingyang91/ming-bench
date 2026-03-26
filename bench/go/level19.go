@@ -3,7 +3,8 @@ package ming
 const level19DynamicWindKey = "__level19_dynamic_wind__"
 
 type runtimeState struct {
-	dynamic *dynamicWindFrame
+	dynamic          *dynamicWindFrame
+	exceptionHandler *exceptionHandlerFrame
 }
 
 type dynamicWindFrame struct {

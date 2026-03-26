@@ -222,12 +222,20 @@ func evalCPSProgram(scope *env, expr any) (result any, err error) {
 func prepareApplyCPSCall(proc any, args []any, k any, runtime *runtimeState) (any, *tailEvalState, error) {
 	switch callable := proc.(type) {
 	case builtinProc:
-		if callable.name == "apply" {
+		switch callable.name {
+		case "apply":
 			return prepareBuiltinApplyRuntimeCPS(args, k, runtime)
+		case "raise":
+			return prepareRaiseCallCPS(args, runtime)
+		case "with-exception-handler":
+			return prepareWithExceptionHandlerCallCPS(args, k, runtime)
 		}
 
 		value, err := callable.fn(args)
 		if err != nil {
+			if raisedErr, ok := err.(*raisedError); ok {
+				return prepareRaisedValue(runtime, raisedErr)
+			}
 			return nil, nil, err
 		}
 		return prepareProcedureCall(k, []any{value})
@@ -377,6 +385,12 @@ func (t *level18CPSTransformer) cpsExpr(expr any, k any) (any, error) {
 				return t.cpsSequence(args, k)
 			case "dynamic-wind":
 				return t.cpsDynamicWind(args, k, node.pos)
+			case "guard":
+				desugared, err := desugarGuard(args, node.pos)
+				if err != nil {
+					return nil, err
+				}
+				return t.cpsExpr(desugared, k)
 			case "define":
 				return t.cpsDefine(args, k, node.pos)
 			case "set!":
