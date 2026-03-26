@@ -6,7 +6,7 @@ import java.util.List;
 
 sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue, ListValue,
         PairValue, CharValue, VectorValue, VoidValue, ProcedureValue, RecordValue, UninitializedValue,
-        CallCcProcedureValue, ContinuationProcedureValue {
+        CallCcProcedureValue, RaiseProcedureValue, WithExceptionHandlerProcedureValue, ContinuationProcedureValue {
     String render();
 
     default boolean isTruthy() {

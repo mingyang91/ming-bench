@@ -31,6 +31,35 @@ final class ContinuationEvaluator {
         }
     }
 
+    sealed interface ExceptionHandlerFrame permits ProcedureExceptionHandlerFrame, GuardExceptionHandlerFrame {
+        ExceptionHandlerFrame parent();
+
+        Kont continuation();
+
+        WindFrame windFrame();
+    }
+
+    record ProcedureExceptionHandlerFrame(ExceptionHandlerFrame parent,
+                                          Value handlerProcedure,
+                                          Kont continuation,
+                                          WindFrame windFrame,
+                                          int line,
+                                          int column) implements ExceptionHandlerFrame {
+    }
+
+    record GuardExceptionHandlerFrame(ExceptionHandlerFrame parent,
+                                      String variableName,
+                                      List<Expr> clauses,
+                                      Environment environment,
+                                      Kont continuation,
+                                      WindFrame windFrame,
+                                      int line,
+                                      int column) implements ExceptionHandlerFrame {
+        GuardExceptionHandlerFrame {
+            clauses = List.copyOf(clauses);
+        }
+    }
+
     private sealed interface MachineState permits EvalExprState, ReturnValueState, DoneState {
     }
 
@@ -48,13 +77,19 @@ final class ContinuationEvaluator {
     private final Evaluator owner;
     private final Environment globalEnvironment;
     private final CallCcProcedureValue callCcProcedure = new CallCcProcedureValue();
+    private final RaiseProcedureValue raiseProcedure = new RaiseProcedureValue();
+    private final WithExceptionHandlerProcedureValue withExceptionHandlerProcedure =
+            new WithExceptionHandlerProcedureValue();
     private WindFrame activeWinds;
+    private ExceptionHandlerFrame activeHandlers;
 
     ContinuationEvaluator(Evaluator owner) {
         this.owner = owner;
         this.globalEnvironment = owner.createGlobalEnvironment();
         globalEnvironment.define("call/cc", callCcProcedure);
         globalEnvironment.define("call-with-current-continuation", callCcProcedure);
+        globalEnvironment.define("raise", raiseProcedure);
+        globalEnvironment.define("with-exception-handler", withExceptionHandlerProcedure);
     }
 
     static boolean referencesContinuations(List<Expr> expressions) {
@@ -70,7 +105,10 @@ final class ContinuationEvaluator {
         if (expression instanceof SymbolExpr symbolExpr) {
             return "call/cc".equals(symbolExpr.name())
                     || "call-with-current-continuation".equals(symbolExpr.name())
-                    || "dynamic-wind".equals(symbolExpr.name());
+                    || "dynamic-wind".equals(symbolExpr.name())
+                    || "guard".equals(symbolExpr.name())
+                    || "raise".equals(symbolExpr.name())
+                    || "with-exception-handler".equals(symbolExpr.name());
         }
         if (expression instanceof ListExpr listExpr) {
             for (Expr element : listExpr.elements()) {
@@ -87,6 +125,7 @@ final class ContinuationEvaluator {
             throw new EvalError("expected at least one expression");
         }
         activeWinds = null;
+        activeHandlers = null;
         return run(evaluateSequence(expressions, globalEnvironment, HaltKont.INSTANCE));
     }
 
@@ -152,6 +191,7 @@ final class ContinuationEvaluator {
                 case "let" -> evalLet(arguments, environment, continuation, listExpr.line(), listExpr.column());
                 case "and" -> evalAnd(arguments, environment, continuation);
                 case "or" -> evalOr(arguments, environment, continuation);
+                case "guard" -> evalGuard(arguments, environment, continuation, listExpr.line(), listExpr.column());
                 case "dynamic-wind" ->
                         evalDynamicWind(arguments, environment, continuation, listExpr.line(), listExpr.column());
                 default -> evalApplication(
@@ -197,11 +237,81 @@ final class ContinuationEvaluator {
                 new DynamicWindInExprKont(arguments.get(1), arguments.get(2), environment, continuation, line, column));
     }
 
+    private MachineState evalGuard(List<Expr> arguments,
+                                   Environment environment,
+                                   Kont continuation,
+                                   int line,
+                                   int column) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("guard expected a binding and a body");
+        }
+
+        Expr bindingExpression = arguments.getFirst();
+        if (!(bindingExpression instanceof ListExpr bindingList)) {
+            throw new EvalError("guard expected a binding list");
+        }
+
+        List<Expr> bindingElements = bindingList.elements();
+        if (bindingElements.isEmpty()) {
+            throw new EvalError("guard expected an exception variable");
+        }
+
+        Expr variableExpression = bindingElements.getFirst();
+        if (!(variableExpression instanceof SymbolExpr symbolExpr)) {
+            throw new EvalError("guard expected an exception variable");
+        }
+
+        GuardExceptionHandlerFrame handlerFrame = new GuardExceptionHandlerFrame(
+                activeHandlers,
+                symbolExpr.name(),
+                bindingElements.subList(1, bindingElements.size()),
+                environment,
+                continuation,
+                activeWinds,
+                line,
+                column);
+        activeHandlers = handlerFrame;
+        return evaluateSequence(
+                arguments.subList(1, arguments.size()),
+                environment,
+                new GuardBodyKont(handlerFrame, continuation));
+    }
+
     private MachineState applyThunk(Value thunk,
                                     Kont continuation,
                                     int line,
                                     int column) throws EvalError {
         return applyProcedure(thunk, List.of(), continuation, line, column);
+    }
+
+    private MachineState raiseValue(Value value,
+                                    int line,
+                                    int column) throws EvalError {
+        if (activeHandlers == null) {
+            throw new EvalError("uncaught exception: " + value.render(), line, column);
+        }
+
+        ExceptionHandlerFrame handlerFrame = activeHandlers;
+        activeHandlers = handlerFrame.parent();
+
+        return switch (handlerFrame) {
+            case ProcedureExceptionHandlerFrame procedureHandlerFrame -> transferAcrossWinds(
+                    value,
+                    procedureHandlerFrame.windFrame(),
+                    new ExceptionHandlerInvokeKont(
+                            procedureHandlerFrame.handlerProcedure(),
+                            procedureHandlerFrame.continuation(),
+                            procedureHandlerFrame.line(),
+                            procedureHandlerFrame.column()),
+                    line,
+                    column);
+            case GuardExceptionHandlerFrame guardHandlerFrame -> transferAcrossWinds(
+                    value,
+                    guardHandlerFrame.windFrame(),
+                    new GuardHandlerInvokeKont(guardHandlerFrame, line, column),
+                    line,
+                    column);
+        };
     }
 
     private MachineState continueWindTransition(Value value,
@@ -248,12 +358,13 @@ final class ContinuationEvaluator {
         return new ReturnValueState(value, targetContinuation);
     }
 
-    private MachineState transferToContinuation(Value value,
-                                                ContinuationProcedureValue continuationProcedureValue,
-                                                int line,
-                                                int column) throws EvalError {
+    private MachineState transferAcrossWinds(Value value,
+                                             WindFrame targetWinds,
+                                             Kont targetContinuation,
+                                             int line,
+                                             int column) throws EvalError {
         List<WindFrame> currentFrames = windFramesOuterToInner(activeWinds);
-        List<WindFrame> targetFrames = windFramesOuterToInner(continuationProcedureValue.windFrame());
+        List<WindFrame> targetFrames = windFramesOuterToInner(targetWinds);
         int commonPrefixLength = commonPrefixLength(currentFrames, targetFrames);
 
         List<WindFrame> exitFrames = new ArrayList<>(currentFrames.size() - commonPrefixLength);
@@ -270,8 +381,20 @@ final class ContinuationEvaluator {
                 value,
                 List.copyOf(exitFrames),
                 List.copyOf(enterFrames),
-                continuationProcedureValue.continuation(),
+                targetContinuation,
+                targetWinds,
+                line,
+                column);
+    }
+
+    private MachineState transferToContinuation(Value value,
+                                                ContinuationProcedureValue continuationProcedureValue,
+                                                int line,
+                                                int column) throws EvalError {
+        return transferAcrossWinds(
+                value,
                 continuationProcedureValue.windFrame(),
+                continuationProcedureValue.continuation(),
                 line,
                 column);
     }
@@ -392,6 +515,53 @@ final class ContinuationEvaluator {
                             condKont.next());
                 }
                 yield evalCond(condKont.remainingClauses(), condKont.environment(), condKont.next());
+            }
+            case WithExceptionHandlerBodyKont withExceptionHandlerBodyKont -> {
+                if (activeHandlers == withExceptionHandlerBodyKont.handlerFrame()) {
+                    activeHandlers = withExceptionHandlerBodyKont.handlerFrame().parent();
+                }
+                yield new ReturnValueState(value, withExceptionHandlerBodyKont.next());
+            }
+            case GuardBodyKont guardBodyKont -> {
+                if (activeHandlers == guardBodyKont.handlerFrame()) {
+                    activeHandlers = guardBodyKont.handlerFrame().parent();
+                }
+                yield new ReturnValueState(value, guardBodyKont.next());
+            }
+            case ExceptionHandlerInvokeKont exceptionHandlerInvokeKont -> applyProcedure(
+                    exceptionHandlerInvokeKont.handlerProcedure(),
+                    List.of(value),
+                    exceptionHandlerInvokeKont.next(),
+                    exceptionHandlerInvokeKont.line(),
+                    exceptionHandlerInvokeKont.column());
+            case GuardHandlerInvokeKont guardHandlerInvokeKont -> {
+                Environment guardEnvironment = new Environment(guardHandlerInvokeKont.handlerFrame().environment());
+                guardEnvironment.define(guardHandlerInvokeKont.handlerFrame().variableName(), value);
+                yield evalGuardClauses(
+                        guardHandlerInvokeKont.handlerFrame().clauses(),
+                        guardEnvironment,
+                        value,
+                        guardHandlerInvokeKont.handlerFrame().continuation(),
+                        guardHandlerInvokeKont.line(),
+                        guardHandlerInvokeKont.column());
+            }
+            case GuardCondKont guardCondKont -> {
+                if (value.isTruthy()) {
+                    if (guardCondKont.clauseElements().size() == 1) {
+                        yield new ReturnValueState(value, guardCondKont.next());
+                    }
+                    yield evaluateSequence(
+                            guardCondKont.clauseElements().subList(1, guardCondKont.clauseElements().size()),
+                            guardCondKont.environment(),
+                            guardCondKont.next());
+                }
+                yield evalGuardClauses(
+                        guardCondKont.remainingClauses(),
+                        guardCondKont.environment(),
+                        guardCondKont.exceptionValue(),
+                        guardCondKont.next(),
+                        guardCondKont.line(),
+                        guardCondKont.column());
             }
             case DynamicWindInExprKont dynamicWindInExprKont -> new EvalExprState(
                     dynamicWindInExprKont.bodyThunkExpression(),
@@ -604,6 +774,50 @@ final class ContinuationEvaluator {
                 new CondKont(clauseElements, clauses.subList(1, clauses.size()), environment, continuation));
     }
 
+    private MachineState evalGuardClauses(List<Expr> clauses,
+                                          Environment environment,
+                                          Value exceptionValue,
+                                          Kont continuation,
+                                          int line,
+                                          int column) throws EvalError {
+        if (clauses.isEmpty()) {
+            return raiseValue(exceptionValue, line, column);
+        }
+
+        Expr clauseExpression = clauses.getFirst();
+        if (!(clauseExpression instanceof ListExpr clauseList)) {
+            throw new EvalError("guard clauses must be lists");
+        }
+
+        List<Expr> clauseElements = clauseList.elements();
+        if (clauseElements.isEmpty()) {
+            throw new EvalError("guard clause cannot be empty");
+        }
+
+        Expr testExpression = clauseElements.getFirst();
+        if (testExpression instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+            if (clauses.size() != 1) {
+                throw new EvalError("guard else clause must be last");
+            }
+            if (clauseElements.size() == 1) {
+                throw new EvalError("guard else clause expected a body");
+            }
+            return evaluateSequence(clauseElements.subList(1, clauseElements.size()), environment, continuation);
+        }
+
+        return new EvalExprState(
+                testExpression,
+                environment,
+                new GuardCondKont(
+                        clauseElements,
+                        clauses.subList(1, clauses.size()),
+                        environment,
+                        exceptionValue,
+                        continuation,
+                        line,
+                        column));
+    }
+
     private MachineState evalLet(List<Expr> arguments,
                                  Environment environment,
                                  Kont continuation,
@@ -732,6 +946,28 @@ final class ContinuationEvaluator {
                         column);
             }
 
+            if (operator instanceof RaiseProcedureValue) {
+                requireExactArity("raise", arguments.size(), 1);
+                return raiseValue(arguments.getFirst(), line, column);
+            }
+
+            if (operator instanceof WithExceptionHandlerProcedureValue) {
+                requireExactArity("with-exception-handler", arguments.size(), 2);
+                ProcedureExceptionHandlerFrame handlerFrame = new ProcedureExceptionHandlerFrame(
+                        activeHandlers,
+                        arguments.getFirst(),
+                        continuation,
+                        activeWinds,
+                        line,
+                        column);
+                activeHandlers = handlerFrame;
+                return applyThunk(
+                        arguments.get(1),
+                        new WithExceptionHandlerBodyKont(handlerFrame, continuation),
+                        line,
+                        column);
+            }
+
             if (operator instanceof ContinuationProcedureValue continuationProcedureValue) {
                 requireExactArity("continuation", arguments.size(), 1);
                 return transferToContinuation(arguments.getFirst(), continuationProcedureValue, line, column);
@@ -856,6 +1092,8 @@ final class ContinuationEvaluator {
 
 sealed interface Kont permits HaltKont, SequenceKont, IfKont, DefineKont, SetKont,
         ApplyOperatorKont, ApplyArgsKont, AndKont, OrKont, CondKont,
+        WithExceptionHandlerBodyKont, GuardBodyKont,
+        ExceptionHandlerInvokeKont, GuardHandlerInvokeKont, GuardCondKont,
         DynamicWindInExprKont, DynamicWindBodyExprKont, DynamicWindOutExprKont,
         DynamicWindRunBodyKont, DynamicWindBodyKont, DynamicWindAfterKont,
         WindExitKont, WindEnterKont {
@@ -903,6 +1141,34 @@ record CondKont(List<Expr> clauseElements,
                 List<Expr> remainingClauses,
                 Environment environment,
                 Kont next) implements Kont {
+}
+
+record WithExceptionHandlerBodyKont(ContinuationEvaluator.ProcedureExceptionHandlerFrame handlerFrame,
+                                    Kont next) implements Kont {
+}
+
+record GuardBodyKont(ContinuationEvaluator.GuardExceptionHandlerFrame handlerFrame,
+                     Kont next) implements Kont {
+}
+
+record ExceptionHandlerInvokeKont(Value handlerProcedure,
+                                  Kont next,
+                                  int line,
+                                  int column) implements Kont {
+}
+
+record GuardHandlerInvokeKont(ContinuationEvaluator.GuardExceptionHandlerFrame handlerFrame,
+                              int line,
+                              int column) implements Kont {
+}
+
+record GuardCondKont(List<Expr> clauseElements,
+                     List<Expr> remainingClauses,
+                     Environment environment,
+                     Value exceptionValue,
+                     Kont next,
+                     int line,
+                     int column) implements Kont {
 }
 
 record DynamicWindInExprKont(Expr bodyThunkExpression,
@@ -967,6 +1233,20 @@ final class CallCcProcedureValue implements Value {
     @Override
     public String render() {
         return "#<procedure:call/cc>";
+    }
+}
+
+final class RaiseProcedureValue implements Value {
+    @Override
+    public String render() {
+        return "#<procedure:raise>";
+    }
+}
+
+final class WithExceptionHandlerProcedureValue implements Value {
+    @Override
+    public String render() {
+        return "#<procedure:with-exception-handler>";
     }
 }
 
