@@ -152,6 +152,23 @@ public class Evaluator {
         }
     }
 
+    // --- Syntax-case transformer (lambda-based macro) ---
+    private static class SyntaxCaseTransformer {
+        final Lambda transformer;
+        final Env defEnv;
+        SyntaxCaseTransformer(Lambda transformer, Env defEnv) {
+            this.transformer = transformer;
+            this.defEnv = defEnv;
+        }
+    }
+
+    // Thread pattern bindings for syntax-quote expansion
+    private Map<String, Object> syntaxCaseBindings = null;
+    private Map<String, List<Object>> syntaxCaseEllipsisBindings = null;
+    private Env syntaxCaseDefEnv = null;
+    private Env syntaxCaseUseEnv = null;
+    private java.util.Set<String> syntaxCasePatVars = null;
+
     private int gensymCounter = 0;
     private String gensym(String base) {
         return base + "_$" + (gensymCounter++);
@@ -160,7 +177,7 @@ public class Evaluator {
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "define", "if", "quote", "lambda", "case-lambda", "and", "or", "set!", "begin", "let", "cond",
         "define-syntax", "syntax-rules", "define-record-type", "case", "letrec", "letrec*", "do", "let*",
-        "guard"
+        "guard", "syntax-case", "syntax-quote", "with-syntax"
     );
 
     // --- Vector ---
@@ -467,9 +484,18 @@ public class Evaluator {
     }
 
     private Object readHash() throws EvalError {
+        int[] lc = lineCol(pos);
         pos++; // skip '#'
         if (pos >= src.length()) throw new EvalError("unexpected end of input after #");
         char c = src.charAt(pos);
+        if (c == '\'') {
+            pos++; // skip quote
+            Object datum = readExpr();
+            List<Object> quoted = new ArrayList<>();
+            quoted.add(new SchemeSymbol("syntax-quote", lc[0], lc[1]));
+            quoted.add(datum);
+            return new SchemeList(quoted, lc[0], lc[1]);
+        }
         if (c == 't') {
             pos++;
             return Boolean.TRUE;
@@ -605,6 +631,9 @@ public class Evaluator {
                         case "let*" -> { return evalLetStar(list.elems, env); }
                         case "do" -> { return evalDo(list.elems, env); }
                         case "guard" -> { return evalGuard(list.elems, env); }
+                        case "syntax-case" -> { return evalSyntaxCase(list.elems, env); }
+                        case "syntax-quote" -> { return evalSyntaxQuote(list.elems, env); }
+                        case "with-syntax" -> { return evalWithSyntax(list.elems, env); }
                     }
                 } catch (EvalError e) {
                     throw addPosition(e, list.line, list.col);
@@ -614,6 +643,9 @@ public class Evaluator {
                     Object headVal = env.lookup(sym.name);
                     if (headVal instanceof SyntaxRulesMacro macro) {
                         return new TailCall(expandMacro(macro, list, env), env);
+                    }
+                    if (headVal instanceof SyntaxCaseTransformer scm) {
+                        return new TailCall(expandSyntaxCaseMacro(scm, list, env), env);
                     }
                 } catch (EvalError ignored) {}
             }
@@ -2118,6 +2150,46 @@ public class Evaluator {
             java.util.Arrays.fill(v.elems, args.get(1));
             return null;
         }));
+
+        // L22: syntax->datum and datum->syntax
+        env.define("syntax->datum", new BuiltinProc("syntax->datum", args -> {
+            requireArgCount("syntax->datum", args, 1);
+            return syntaxToDatum(args.get(0));
+        }));
+        env.define("datum->syntax", new BuiltinProc("datum->syntax", args -> {
+            requireArgCount("datum->syntax", args, 2);
+            // datum->syntax takes a template-id and a datum, returns the datum as-is
+            // (in our representation, syntax objects are just regular values)
+            return datumToSyntax(args.get(1));
+        }));
+    }
+
+    private Object syntaxToDatum(Object stx) {
+        if (stx instanceof SchemeSymbol sym) return sym;
+        if (stx instanceof SchemeList list) {
+            // Convert to proper list (pairs)
+            Object result = NIL;
+            for (int i = list.elems.size() - 1; i >= 0; i--) {
+                result = new SchemePair(syntaxToDatum(list.elems.get(i)), result);
+            }
+            return result;
+        }
+        return stx;
+    }
+
+    private Object datumToSyntax(Object datum) {
+        if (datum instanceof SchemeSymbol) return datum;
+        if (datum instanceof SchemePair) {
+            // Convert pair list to SchemeList for use as syntax
+            List<Object> elems = new ArrayList<>();
+            Object cur = datum;
+            while (cur instanceof SchemePair p) {
+                elems.add(datumToSyntax(p.car));
+                cur = p.cdr;
+            }
+            return new SchemeList(elems, 0, 0);
+        }
+        return datum;
     }
 
     // --- Macro support ---
@@ -2126,22 +2198,40 @@ public class Evaluator {
         if (elems.size() != 3) throw new EvalError("define-syntax: bad syntax");
         String macroName = ((SchemeSymbol) elems.get(1)).name;
         Object transformer = elems.get(2);
-        if (!(transformer instanceof SchemeList srList)) throw new EvalError("define-syntax: expected syntax-rules");
-        if (srList.elems.isEmpty() || !(srList.elems.get(0) instanceof SchemeSymbol srSym)
-                || !srSym.name.equals("syntax-rules"))
-            throw new EvalError("define-syntax: expected syntax-rules");
-        List<String> literals = new ArrayList<>();
-        SchemeList litList = (SchemeList) srList.elems.get(1);
-        for (Object lit : litList.elems) {
-            literals.add(((SchemeSymbol) lit).name);
+        if (transformer instanceof SchemeList srList && !srList.elems.isEmpty()
+                && srList.elems.get(0) instanceof SchemeSymbol srSym) {
+            if (srSym.name.equals("syntax-rules")) {
+                List<String> literals = new ArrayList<>();
+                SchemeList litList = (SchemeList) srList.elems.get(1);
+                for (Object lit : litList.elems) {
+                    literals.add(((SchemeSymbol) lit).name);
+                }
+                List<Object[]> clauses = new ArrayList<>();
+                for (int i = 2; i < srList.elems.size(); i++) {
+                    SchemeList clause = (SchemeList) srList.elems.get(i);
+                    clauses.add(new Object[]{clause.elems.get(0), clause.elems.get(1)});
+                }
+                env.define(macroName, new SyntaxRulesMacro(literals, clauses, env));
+                return null;
+            }
+            if (srSym.name.equals("lambda")) {
+                // syntax-case transformer: (define-syntax name (lambda (stx) body))
+                Object lambdaVal = eval(transformer, env);
+                if (lambdaVal instanceof Lambda lam) {
+                    env.define(macroName, new SyntaxCaseTransformer(lam, env));
+                } else {
+                    throw new EvalError("define-syntax: transformer must be a procedure");
+                }
+                return null;
+            }
         }
-        List<Object[]> clauses = new ArrayList<>();
-        for (int i = 2; i < srList.elems.size(); i++) {
-            SchemeList clause = (SchemeList) srList.elems.get(i);
-            clauses.add(new Object[]{clause.elems.get(0), clause.elems.get(1)});
+        // Try evaluating it as an expression that returns a procedure
+        Object val = eval(transformer, env);
+        if (val instanceof Lambda lam) {
+            env.define(macroName, new SyntaxCaseTransformer(lam, env));
+            return null;
         }
-        env.define(macroName, new SyntaxRulesMacro(literals, clauses, env));
-        return null;
+        throw new EvalError("define-syntax: expected syntax-rules or lambda");
     }
 
     // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
@@ -2310,6 +2400,11 @@ public class Evaluator {
             return new SchemeSymbol(renamed, sym.line, sym.col);
         }
         if (template instanceof SchemeList list) {
+            // Don't rename inside (quote ...) forms
+            if (!list.elems.isEmpty() && list.elems.get(0) instanceof SchemeSymbol qs
+                    && qs.name.equals("quote")) {
+                return template;
+            }
             List<Object> newElems = new ArrayList<>();
             for (Object elem : list.elems) {
                 newElems.add(renameTemplate(elem, patVars, literals, renames));
@@ -2365,6 +2460,207 @@ public class Evaluator {
             if (ellipsisBindings.containsKey(sym.name)) found.add(sym.name);
         } else if (template instanceof SchemeList list) {
             for (Object elem : list.elems) findEllipsisVars(elem, ellipsisBindings, found);
+        }
+    }
+
+    // --- syntax-case support ---
+
+    private Object expandSyntaxCaseMacro(SyntaxCaseTransformer scm, SchemeList form, Env useEnv) throws EvalError {
+        // Call the transformer lambda with the syntax form as argument
+        // Save/restore use env for hygiene
+        Env savedUseEnv = syntaxCaseUseEnv;
+        Env savedDefEnv = syntaxCaseDefEnv;
+        syntaxCaseUseEnv = useEnv;
+        syntaxCaseDefEnv = scm.defEnv;
+        try {
+            Env callEnv = new Env(scm.transformer.closureEnv);
+            if (scm.transformer.params.size() == 1) {
+                callEnv.define(scm.transformer.params.get(0), form);
+            }
+            Object result = null;
+            for (Object bodyExpr : scm.transformer.body) {
+                result = eval(bodyExpr, callEnv);
+            }
+            return result;
+        } finally {
+            syntaxCaseUseEnv = savedUseEnv;
+            syntaxCaseDefEnv = savedDefEnv;
+        }
+    }
+
+    // (syntax-case stx (literals) clause ...)
+    // clause = (pattern output-expr) or (pattern fender output-expr)
+    private Object evalSyntaxCase(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() < 4) throw new EvalError("syntax-case: bad syntax");
+        Object stx = eval(elems.get(1), env);
+        SchemeList litList = (SchemeList) elems.get(2);
+        List<String> literals = new ArrayList<>();
+        for (Object lit : litList.elems) {
+            if (lit instanceof SchemeSymbol sym) literals.add(sym.name);
+        }
+
+        // Convert stx to a SchemeList for pattern matching if needed
+        SchemeList stxList;
+        if (stx instanceof SchemeList sl) {
+            stxList = sl;
+        } else {
+            // wrap in single-element list for matching
+            List<Object> wrap = new ArrayList<>();
+            wrap.add(stx);
+            stxList = new SchemeList(wrap, 0, 0);
+        }
+
+        for (int i = 3; i < elems.size(); i++) {
+            SchemeList clause = (SchemeList) elems.get(i);
+            if (clause.elems.size() < 2) throw new EvalError("syntax-case: bad clause");
+            Object pattern = clause.elems.get(0);
+            Object fender = null;
+            Object outputExpr;
+            if (clause.elems.size() == 3) {
+                fender = clause.elems.get(1);
+                outputExpr = clause.elems.get(2);
+            } else {
+                outputExpr = clause.elems.get(1);
+            }
+
+            java.util.Set<String> patVars = new java.util.HashSet<>();
+            Map<String, Object> bindings = new HashMap<>();
+            Map<String, List<Object>> ellipsisBindings = new HashMap<>();
+
+            boolean matched = false;
+            if (pattern instanceof SchemeList patList) {
+                collectPatternVars(patList, literals, patVars, true);
+                matched = matchElems(patList.elems, 1, stxList.elems, 1, literals, bindings, ellipsisBindings);
+            } else if (pattern instanceof SchemeSymbol sym) {
+                if (!literals.contains(sym.name) && !sym.name.equals("_")) {
+                    patVars.add(sym.name);
+                    bindings.put(sym.name, stx);
+                    matched = true;
+                } else if (sym.name.equals("_")) {
+                    matched = true;
+                }
+            }
+
+            if (matched) {
+                // Check fender if present
+                if (fender != null) {
+                    // Bind pattern vars in env for fender evaluation
+                    Env fenderEnv = new Env(env);
+                    for (Map.Entry<String, Object> e : bindings.entrySet()) {
+                        fenderEnv.define(e.getKey(), e.getValue());
+                    }
+                    Object fenderResult = eval(fender, fenderEnv);
+                    if (fenderResult instanceof Boolean b && !b) continue;
+                }
+
+                // Save bindings for syntax-quote expansion
+                Map<String, Object> savedBindings = syntaxCaseBindings;
+                Map<String, List<Object>> savedEllipsis = syntaxCaseEllipsisBindings;
+                java.util.Set<String> savedPatVars = syntaxCasePatVars;
+                syntaxCaseBindings = bindings;
+                syntaxCaseEllipsisBindings = ellipsisBindings;
+                syntaxCasePatVars = patVars;
+                try {
+                    // Also bind pattern vars in the evaluation env for use in with-syntax etc.
+                    Env clauseEnv = new Env(env);
+                    for (Map.Entry<String, Object> e : bindings.entrySet()) {
+                        clauseEnv.define(e.getKey(), e.getValue());
+                    }
+                    for (Map.Entry<String, List<Object>> e : ellipsisBindings.entrySet()) {
+                        // Make ellipsis bindings available too
+                        clauseEnv.define(e.getKey(), listToSchemeList(e.getValue()));
+                    }
+                    return eval(outputExpr, clauseEnv);
+                } finally {
+                    syntaxCaseBindings = savedBindings;
+                    syntaxCaseEllipsisBindings = savedEllipsis;
+                    syntaxCasePatVars = savedPatVars;
+                }
+            }
+        }
+        throw new EvalError("syntax-case: no matching pattern");
+    }
+
+    private SchemeList listToSchemeList(List<Object> elems) {
+        return new SchemeList(new ArrayList<>(elems), 0, 0);
+    }
+
+    // (syntax-quote template) — the #'(...) form
+    private Object evalSyntaxQuote(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() != 2) throw new EvalError("syntax-quote: bad syntax");
+        Object template = elems.get(1);
+        if (syntaxCaseBindings == null) {
+            // No active syntax-case context — return template as-is
+            return template;
+        }
+
+        Map<String, Object> bindings = syntaxCaseBindings;
+        Map<String, List<Object>> ellipsisBindings = syntaxCaseEllipsisBindings;
+        java.util.Set<String> patVars = syntaxCasePatVars;
+
+        // Apply hygiene: rename non-pattern, non-special symbols
+        Map<String, String> renames = new HashMap<>();
+        Object hygienic = renameTemplate(template, patVars, List.of(), renames);
+        Object expanded = expandTemplate(hygienic, bindings,
+            ellipsisBindings != null ? ellipsisBindings : new HashMap<>(), 0, 0);
+
+        // Propagate hygiene renames from the definition environment
+        if (syntaxCaseDefEnv != null && syntaxCaseUseEnv != null) {
+            for (Map.Entry<String, String> entry : renames.entrySet()) {
+                try {
+                    Object val = syntaxCaseDefEnv.lookup(entry.getKey());
+                    syntaxCaseUseEnv.define(entry.getValue(), val);
+                } catch (EvalError ignored) {}
+            }
+        }
+
+        return expanded;
+    }
+
+    // (with-syntax ((pattern expr) ...) body ...)
+    private Object evalWithSyntax(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() < 3) throw new EvalError("with-syntax: bad syntax");
+        SchemeList bindingsList = (SchemeList) elems.get(1);
+
+        // Save current syntax-case bindings
+        Map<String, Object> savedBindings = syntaxCaseBindings;
+        Map<String, List<Object>> savedEllipsis = syntaxCaseEllipsisBindings;
+        java.util.Set<String> savedPatVars = syntaxCasePatVars;
+
+        Map<String, Object> newBindings = syntaxCaseBindings != null ? new HashMap<>(syntaxCaseBindings) : new HashMap<>();
+        Map<String, List<Object>> newEllipsis = syntaxCaseEllipsisBindings != null ? new HashMap<>(syntaxCaseEllipsisBindings) : new HashMap<>();
+        java.util.Set<String> newPatVars = syntaxCasePatVars != null ? new java.util.HashSet<>(syntaxCasePatVars) : new java.util.HashSet<>();
+
+        Env wsEnv = new Env(env);
+
+        for (Object binding : bindingsList.elems) {
+            SchemeList b = (SchemeList) binding;
+            if (b.elems.size() != 2) throw new EvalError("with-syntax: bad binding");
+            Object pattern = b.elems.get(0);
+            Object val = eval(b.elems.get(1), wsEnv);
+
+            if (pattern instanceof SchemeSymbol sym) {
+                newBindings.put(sym.name, val);
+                newPatVars.add(sym.name);
+                wsEnv.define(sym.name, val);
+            } else {
+                throw new EvalError("with-syntax: pattern must be an identifier");
+            }
+        }
+
+        syntaxCaseBindings = newBindings;
+        syntaxCaseEllipsisBindings = newEllipsis;
+        syntaxCasePatVars = newPatVars;
+        try {
+            Object result = null;
+            for (int i = 2; i < elems.size(); i++) {
+                result = eval(elems.get(i), wsEnv);
+            }
+            return result;
+        } finally {
+            syntaxCaseBindings = savedBindings;
+            syntaxCaseEllipsisBindings = savedEllipsis;
+            syntaxCasePatVars = savedPatVars;
         }
     }
 
