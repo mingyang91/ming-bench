@@ -88,6 +88,10 @@ type RecordMutatorProcedure = {
   recordType: RecordTypeDescriptor;
   fieldIndex: number;
 };
+type ContinuationProcedure = {
+  kind: 'continuation';
+  stack: ContinuationFrame[];
+};
 type VoidValue = { kind: 'void' };
 type SyntaxRule = { pattern: Expr; template: Expr };
 type SyntaxRulesMacro = {
@@ -117,6 +121,7 @@ type RuntimeValue =
   | RecordPredicateProcedure
   | RecordAccessorProcedure
   | RecordMutatorProcedure
+  | ContinuationProcedure
   | VoidValue;
 
 type EvalContext = {
@@ -127,8 +132,89 @@ type EvalContext = {
 type EvalAction =
   | { kind: 'value'; value: RuntimeValue }
   | { kind: 'expr'; expr: Expr; env: Environment }
-  | { kind: 'sequence'; exprs: Expr[]; env: Environment }
+  | { kind: 'sequence'; exprs: Expr[]; env: Environment; pos?: SourcePos }
   | { kind: 'apply'; procedure: RuntimeValue; args: RuntimeValue[]; pos?: SourcePos };
+
+type SequenceFrame = {
+  kind: 'sequence';
+  remainingExprs: Expr[];
+  env: Environment;
+  pos: SourcePos;
+};
+type CallOperatorFrame = {
+  kind: 'call-operator';
+  argExprs: Expr[];
+  env: Environment;
+  pos: SourcePos;
+};
+type CallArgumentFrame = {
+  kind: 'call-argument';
+  procedure: RuntimeValue;
+  evaluatedArgs: RuntimeValue[];
+  remainingArgExprs: Expr[];
+  env: Environment;
+  pos: SourcePos;
+};
+type DefineValueFrame = {
+  kind: 'define-value';
+  name: string;
+  env: Environment;
+  pos: SourcePos;
+};
+type SetValueFrame = {
+  kind: 'set-value';
+  name: string;
+  env: Environment;
+  pos: SourcePos;
+};
+type IfFrame = {
+  kind: 'if';
+  consequent: Expr;
+  alternate?: Expr;
+  env: Environment;
+  pos: SourcePos;
+};
+type AndFrame = {
+  kind: 'and';
+  remainingExprs: Expr[];
+  env: Environment;
+  pos: SourcePos;
+};
+type OrFrame = {
+  kind: 'or';
+  remainingExprs: Expr[];
+  env: Environment;
+  pos: SourcePos;
+};
+type LetInitFrame = {
+  kind: 'let-init';
+  name?: string;
+  bindingNames: string[];
+  remainingInitExprs: Expr[];
+  collectedValues: RuntimeValue[];
+  body: Expr[];
+  env: Environment;
+  pos: SourcePos;
+};
+type CondTestFrame = {
+  kind: 'cond-test';
+  body: Expr[];
+  remainingClauses: Expr[];
+  env: Environment;
+  pos: SourcePos;
+};
+
+type ContinuationFrame =
+  | SequenceFrame
+  | CallOperatorFrame
+  | CallArgumentFrame
+  | DefineValueFrame
+  | SetValueFrame
+  | IfFrame
+  | AndFrame
+  | OrFrame
+  | LetInitFrame
+  | CondTestFrame;
 
 type Token =
   | { kind: 'paren'; value: '(' | ')'; pos: SourcePos }
@@ -248,6 +334,8 @@ const BUILTIN_NAMES = [
   'vector->list',
   'list->vector',
   'apply',
+  'call/cc',
+  'call-with-current-continuation',
   'error',
 ] as const;
 type BuiltinName = (typeof BUILTIN_NAMES)[number];
@@ -363,11 +451,7 @@ function evaluateProgram(input: string): { result: RuntimeValue; output: string 
     output: [],
     immutableStrings: currentBenchLevel() >= 15,
   };
-  let result: RuntimeValue = VOID_VALUE;
-
-  for (const expr of expressions) {
-    result = evaluateExpr(expr, env, context);
-  }
+  const result = evaluateSequence(expressions, env, context);
 
   return {
     result,
@@ -632,29 +716,78 @@ function evaluateExpr(expr: Expr, env: Environment, context: EvalContext): Runti
 
 function runEvaluation(initialAction: EvalAction, context: EvalContext): RuntimeValue {
   let action = initialAction;
+  let stack: ContinuationFrame[] = [];
 
   while (true) {
+    let errorPos: SourcePos | undefined;
+
     try {
       switch (action.kind) {
         case 'value':
-          return action.value;
+          if (stack.length === 0) {
+            return action.value;
+          }
+
+          {
+            const frame = stack.pop();
+            if (frame === undefined) {
+              return action.value;
+            }
+
+            errorPos = frame.pos;
+            action = continueWithFrame(frame, action.value, stack);
+          }
+          break;
         case 'expr':
-          action = evaluateExprAction(action.expr, action.env, context);
+          errorPos = action.expr.pos;
+          action = evaluateExprAction(action.expr, action.env, context, stack);
           break;
         case 'sequence':
-          action = evaluateSequenceAction(action.exprs, action.env, context);
+          errorPos = action.pos ?? action.exprs[0]?.pos;
+          action = startSequenceAction(
+            action.exprs,
+            action.env,
+            stack,
+            action.pos ?? action.exprs[0]?.pos ?? DEFAULT_SOURCE_POS,
+          );
           break;
         case 'apply':
+          errorPos = action.pos;
+
+          if (
+            action.procedure.kind === 'builtin' &&
+            (action.procedure.name === 'call/cc' ||
+              action.procedure.name === 'call-with-current-continuation')
+          ) {
+            if (action.args.length !== 1) {
+              throw new EvalError(`${action.procedure.name} expects exactly 1 argument`);
+            }
+
+            action = {
+              kind: 'apply',
+              procedure: action.args[0],
+              args: [{ kind: 'continuation', stack: stack.slice() }],
+              pos: action.pos,
+            };
+            break;
+          }
+
+          if (action.procedure.kind === 'continuation') {
+            if (action.args.length !== 1) {
+              throw new EvalError('continuation expects exactly 1 argument');
+            }
+
+            stack = action.procedure.stack.slice();
+            action = { kind: 'value', value: action.args[0] };
+            break;
+          }
+
           action = applyProcedureAction(action.procedure, action.args, context);
           break;
       }
     } catch (error) {
-      if (action.kind === 'expr') {
-        throw attachPosition(error, action.expr.pos);
-      }
-
-      if (action.kind === 'apply' && action.pos !== undefined) {
-        throw attachPosition(error, action.pos);
+      if (errorPos !== undefined) {
+        throw attachPosition(error, errorPos);
       }
 
       throw error;
@@ -662,7 +795,168 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
   }
 }
 
-function evaluateExprAction(expr: Expr, env: Environment, context: EvalContext): EvalAction {
+function startSequenceAction(
+  exprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
+  if (exprs.length === 0) {
+    return { kind: 'value', value: VOID_VALUE };
+  }
+
+  if (exprs.length > 1) {
+    stack.push({
+      kind: 'sequence',
+      remainingExprs: exprs.slice(1),
+      env,
+      pos,
+    });
+  }
+
+  return { kind: 'expr', expr: exprs[0], env };
+}
+
+function continueWithFrame(
+  frame: ContinuationFrame,
+  value: RuntimeValue,
+  stack: ContinuationFrame[],
+): EvalAction {
+  switch (frame.kind) {
+    case 'sequence':
+      return startSequenceAction(frame.remainingExprs, frame.env, stack, frame.pos);
+    case 'call-operator':
+      if (frame.argExprs.length === 0) {
+        return {
+          kind: 'apply',
+          procedure: value,
+          args: [],
+          pos: frame.pos,
+        };
+      }
+
+      stack.push({
+        kind: 'call-argument',
+        procedure: value,
+        evaluatedArgs: [],
+        remainingArgExprs: frame.argExprs.slice(0, -1),
+        env: frame.env,
+        pos: frame.pos,
+      });
+      return { kind: 'expr', expr: frame.argExprs[frame.argExprs.length - 1], env: frame.env };
+    case 'call-argument': {
+      const args = [value, ...frame.evaluatedArgs];
+      if (frame.remainingArgExprs.length === 0) {
+        return {
+          kind: 'apply',
+          procedure: frame.procedure,
+          args,
+          pos: frame.pos,
+        };
+      }
+
+      stack.push({
+        kind: 'call-argument',
+        procedure: frame.procedure,
+        evaluatedArgs: args,
+        remainingArgExprs: frame.remainingArgExprs.slice(0, -1),
+        env: frame.env,
+        pos: frame.pos,
+      });
+      return {
+        kind: 'expr',
+        expr: frame.remainingArgExprs[frame.remainingArgExprs.length - 1],
+        env: frame.env,
+      };
+    }
+    case 'define-value':
+      frame.env.define(frame.name, value);
+      return { kind: 'value', value: VOID_VALUE };
+    case 'set-value':
+      frame.env.assign(frame.name, value);
+      return { kind: 'value', value: VOID_VALUE };
+    case 'if':
+      if (isTruthy(value)) {
+        return { kind: 'expr', expr: frame.consequent, env: frame.env };
+      }
+
+      if (frame.alternate === undefined) {
+        return { kind: 'value', value: VOID_VALUE };
+      }
+
+      return { kind: 'expr', expr: frame.alternate, env: frame.env };
+    case 'and':
+      if (!isTruthy(value)) {
+        return { kind: 'value', value };
+      }
+
+      return startShortCircuitAction('and', frame.remainingExprs, frame.env, stack, frame.pos);
+    case 'or':
+      if (isTruthy(value)) {
+        return { kind: 'value', value };
+      }
+
+      return startShortCircuitAction('or', frame.remainingExprs, frame.env, stack, frame.pos);
+    case 'let-init':
+      return continueLetInitAction(frame, value, stack);
+    case 'cond-test':
+      if (!isTruthy(value)) {
+        return startCondAction(frame.remainingClauses, frame.env, stack, frame.pos);
+      }
+
+      if (frame.body.length === 0) {
+        return { kind: 'value', value };
+      }
+
+      return startSequenceAction(frame.body, frame.env, stack, frame.pos);
+  }
+}
+
+function startShortCircuitAction(
+  kind: 'and' | 'or',
+  exprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
+  if (exprs.length === 0) {
+    return { kind: 'value', value: makeBoolean(kind === 'and') };
+  }
+
+  if (exprs.length === 1) {
+    return { kind: 'expr', expr: exprs[0], env };
+  }
+
+  stack.push({
+    kind,
+    remainingExprs: exprs.slice(1),
+    env,
+    pos,
+  });
+  return { kind: 'expr', expr: exprs[0], env };
+}
+
+function startApplicationAction(
+  expr: ListExpr,
+  env: Environment,
+  stack: ContinuationFrame[],
+): EvalAction {
+  const [head, ...argExprs] = expr.elements;
+  stack.push({
+    kind: 'call-operator',
+    argExprs,
+    env,
+    pos: expr.pos,
+  });
+  return { kind: 'expr', expr: head, env };
+}
+
+function evaluateExprAction(
+  expr: Expr,
+  env: Environment,
+  context: EvalContext,
+  stack: ContinuationFrame[],
+): EvalAction {
   switch (expr.kind) {
     case 'number':
     case 'boolean':
@@ -674,11 +968,16 @@ function evaluateExprAction(expr: Expr, env: Environment, context: EvalContext):
     case 'symbol':
       return { kind: 'value', value: env.lookup(expr.name) };
     case 'list':
-      return evaluateListAction(expr, env, context);
+      return evaluateListAction(expr, env, context, stack);
   }
 }
 
-function evaluateListAction(expr: ListExpr, env: Environment, context: EvalContext): EvalAction {
+function evaluateListAction(
+  expr: ListExpr,
+  env: Environment,
+  context: EvalContext,
+  stack: ContinuationFrame[],
+): EvalAction {
   if (expr.elements.length === 0) {
     throw new EvalError('cannot evaluate empty list');
   }
@@ -690,13 +989,13 @@ function evaluateListAction(expr: ListExpr, env: Environment, context: EvalConte
       case 'define-syntax':
         return { kind: 'value', value: evaluateDefineSyntax(argExprs, env) };
       case 'define':
-        return { kind: 'value', value: evaluateDefine(argExprs, env, context) };
+        return evaluateDefine(argExprs, env, stack, expr.pos);
       case 'define-record-type':
         return { kind: 'value', value: evaluateDefineRecordType(argExprs, env) };
       case 'set!':
-        return { kind: 'value', value: evaluateSet(argExprs, env, context) };
+        return evaluateSet(argExprs, env, stack, expr.pos);
       case 'if':
-        return evaluateIfAction(argExprs, env, context);
+        return evaluateIfAction(argExprs, env, stack, expr.pos);
       case 'quote':
         return { kind: 'value', value: evaluateQuote(argExprs) };
       case 'lambda':
@@ -704,13 +1003,13 @@ function evaluateListAction(expr: ListExpr, env: Environment, context: EvalConte
       case 'case-lambda':
         return { kind: 'value', value: evaluateCaseLambda(argExprs, env) };
       case 'and':
-        return evaluateAndAction(argExprs, env, context);
+        return evaluateAndAction(argExprs, env, stack, expr.pos);
       case 'or':
-        return evaluateOrAction(argExprs, env, context);
+        return evaluateOrAction(argExprs, env, stack, expr.pos);
       case 'begin':
-        return evaluateBeginAction(argExprs, env);
+        return evaluateBeginAction(argExprs, env, stack, expr.pos);
       case 'let':
-        return evaluateLetAction(argExprs, env, context);
+        return evaluateLetAction(argExprs, env, stack, expr.pos);
       case 'let*':
         return evaluateLetStarAction(argExprs, env, context);
       case 'letrec':
@@ -718,7 +1017,7 @@ function evaluateListAction(expr: ListExpr, env: Environment, context: EvalConte
       case 'letrec*':
         return evaluateLetrecAction(argExprs, env, context, true);
       case 'cond':
-        return evaluateCondAction(argExprs, env, context);
+        return evaluateCondAction(argExprs, env, stack, expr.pos);
       case 'case':
         return evaluateCaseAction(argExprs, env, context);
       case 'do':
@@ -732,12 +1031,15 @@ function evaluateListAction(expr: ListExpr, env: Environment, context: EvalConte
     }
   }
 
-  const procedure = evaluateExpr(head, env, context);
-  const args = argExprs.map((argExpr) => evaluateExpr(argExpr, env, context));
-  return { kind: 'apply', procedure, args, pos: expr.pos };
+  return startApplicationAction(expr, env, stack);
 }
 
-function evaluateDefine(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
+function evaluateDefine(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
   if (argExprs.length < 2) {
     throw new EvalError('define expects a target and a value');
   }
@@ -749,9 +1051,13 @@ function evaluateDefine(argExprs: Expr[], env: Environment, context: EvalContext
       throw new EvalError('define variable form expects exactly 1 value expression');
     }
 
-    const value = evaluateExpr(body[0], env, context);
-    env.define(target.name, value);
-    return VOID_VALUE;
+    stack.push({
+      kind: 'define-value',
+      name: target.name,
+      env,
+      pos,
+    });
+    return { kind: 'expr', expr: body[0], env };
   }
 
   if (target.kind === 'list' && target.elements.length > 0) {
@@ -770,7 +1076,7 @@ function evaluateDefine(argExprs: Expr[], env: Environment, context: EvalContext
     };
 
     env.define(nameExpr.name, procedure);
-    return VOID_VALUE;
+    return { kind: 'value', value: VOID_VALUE };
   }
 
   throw new EvalError('invalid define form');
@@ -894,7 +1200,12 @@ function evaluateDefineRecordType(argExprs: Expr[], env: Environment): RuntimeVa
   return VOID_VALUE;
 }
 
-function evaluateSet(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
+function evaluateSet(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
   if (argExprs.length !== 2) {
     throw new EvalError('set! expects exactly 2 arguments');
   }
@@ -904,26 +1215,33 @@ function evaluateSet(argExprs: Expr[], env: Environment, context: EvalContext): 
     throw new EvalError('set! expects a symbol target');
   }
 
-  const value = evaluateExpr(valueExpr, env, context);
-  env.assign(target.name, value);
-  return VOID_VALUE;
+  stack.push({
+    kind: 'set-value',
+    name: target.name,
+    env,
+    pos,
+  });
+  return { kind: 'expr', expr: valueExpr, env };
 }
 
-function evaluateIfAction(argExprs: Expr[], env: Environment, context: EvalContext): EvalAction {
+function evaluateIfAction(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
   if (argExprs.length !== 2 && argExprs.length !== 3) {
     throw new EvalError('if expects exactly 2 or 3 arguments');
   }
 
-  const condition = evaluateExpr(argExprs[0], env, context);
-  if (isTruthy(condition)) {
-    return { kind: 'expr', expr: argExprs[1], env };
-  }
-
-  if (argExprs[2] === undefined) {
-    return { kind: 'value', value: VOID_VALUE };
-  }
-
-  return { kind: 'expr', expr: argExprs[2], env };
+  stack.push({
+    kind: 'if',
+    consequent: argExprs[1],
+    alternate: argExprs[2],
+    env,
+    pos,
+  });
+  return { kind: 'expr', expr: argExprs[0], env };
 }
 
 function evaluateQuote(argExprs: Expr[]): RuntimeValue {
@@ -2018,41 +2336,39 @@ function freshMacroIdentifier(name: string): string {
   return `__macro_${counter}_${sanitized || 'id'}`;
 }
 
-function evaluateAndAction(argExprs: Expr[], env: Environment, context: EvalContext): EvalAction {
-  if (argExprs.length === 0) {
-    return { kind: 'value', value: makeBoolean(true) };
-  }
-
-  for (let index = 0; index < argExprs.length - 1; index += 1) {
-    const value = evaluateExpr(argExprs[index], env, context);
-    if (!isTruthy(value)) {
-      return { kind: 'value', value };
-    }
-  }
-
-  return { kind: 'expr', expr: argExprs[argExprs.length - 1], env };
+function evaluateAndAction(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
+  return startShortCircuitAction('and', argExprs, env, stack, pos);
 }
 
-function evaluateOrAction(argExprs: Expr[], env: Environment, context: EvalContext): EvalAction {
-  if (argExprs.length === 0) {
-    return { kind: 'value', value: makeBoolean(false) };
-  }
-
-  for (let index = 0; index < argExprs.length - 1; index += 1) {
-    const value = evaluateExpr(argExprs[index], env, context);
-    if (isTruthy(value)) {
-      return { kind: 'value', value };
-    }
-  }
-
-  return { kind: 'expr', expr: argExprs[argExprs.length - 1], env };
+function evaluateOrAction(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
+  return startShortCircuitAction('or', argExprs, env, stack, pos);
 }
 
-function evaluateBeginAction(argExprs: Expr[], env: Environment): EvalAction {
-  return { kind: 'sequence', exprs: argExprs, env };
+function evaluateBeginAction(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
+  return startSequenceAction(argExprs, env, stack, pos);
 }
 
-function evaluateLetAction(argExprs: Expr[], env: Environment, context: EvalContext): EvalAction {
+function evaluateLetAction(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
   if (argExprs.length < 2) {
     throw new EvalError('let expects bindings and a body');
   }
@@ -2075,21 +2391,69 @@ function evaluateLetAction(argExprs: Expr[], env: Environment, context: EvalCont
   }
 
   const bindings = readLetBindings(bindingsExpr);
-  const values = bindings.initExprs.map((expr) => evaluateExpr(expr, env, context));
+  if (bindings.initExprs.length === 0) {
+    return finishLetAction(name, bindings.names, [], body, env, stack, pos);
+  }
 
+  stack.push({
+    kind: 'let-init',
+    name,
+    bindingNames: bindings.names,
+    remainingInitExprs: bindings.initExprs.slice(1),
+    collectedValues: [],
+    body,
+    env,
+    pos,
+  });
+  return { kind: 'expr', expr: bindings.initExprs[0], env };
+}
+
+function continueLetInitAction(
+  frame: LetInitFrame,
+  value: RuntimeValue,
+  stack: ContinuationFrame[],
+): EvalAction {
+  const values = [...frame.collectedValues, value];
+
+  if (frame.remainingInitExprs.length > 0) {
+    stack.push({
+      kind: 'let-init',
+      name: frame.name,
+      bindingNames: frame.bindingNames,
+      remainingInitExprs: frame.remainingInitExprs.slice(1),
+      collectedValues: values,
+      body: frame.body,
+      env: frame.env,
+      pos: frame.pos,
+    });
+    return { kind: 'expr', expr: frame.remainingInitExprs[0], env: frame.env };
+  }
+
+  return finishLetAction(frame.name, frame.bindingNames, values, frame.body, frame.env, stack, frame.pos);
+}
+
+function finishLetAction(
+  name: string | undefined,
+  bindingNames: string[],
+  values: RuntimeValue[],
+  body: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
   if (name === undefined) {
     const letEnv = new Environment(env);
-    for (let index = 0; index < bindings.names.length; index += 1) {
-      letEnv.define(bindings.names[index], values[index]);
+    for (let index = 0; index < bindingNames.length; index += 1) {
+      letEnv.define(bindingNames[index], values[index]);
     }
 
-    return { kind: 'sequence', exprs: body, env: letEnv };
+    return startSequenceAction(body, letEnv, stack, pos);
   }
 
   const letEnv = new Environment(env);
   const procedure: ClosureProcedure = {
     kind: 'closure',
-    params: bindings.names,
+    params: bindingNames,
     body,
     env: letEnv,
   };
@@ -2176,39 +2540,51 @@ function evaluateLetrecAction(
   return { kind: 'sequence', exprs: body, env: letEnv };
 }
 
-function evaluateCondAction(argExprs: Expr[], env: Environment, context: EvalContext): EvalAction {
-  for (let index = 0; index < argExprs.length; index += 1) {
-    const clauseExpr = argExprs[index];
-    if (clauseExpr.kind !== 'list' || clauseExpr.elements.length === 0) {
-      throw new EvalError('cond clauses must be non-empty lists');
-    }
+function evaluateCondAction(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
+  return startCondAction(argExprs, env, stack, pos);
+}
 
-    const [testExpr, ...body] = clauseExpr.elements;
-    const isElseClause = testExpr.kind === 'symbol' && testExpr.name === 'else';
-
-    if (isElseClause) {
-      if (index !== argExprs.length - 1) {
-        throw new EvalError('cond else clause must be last');
-      }
-      if (body.length === 0) {
-        throw new EvalError('cond else clause expects at least 1 expression');
-      }
-      return { kind: 'sequence', exprs: body, env };
-    }
-
-    const testValue = evaluateExpr(testExpr, env, context);
-    if (!isTruthy(testValue)) {
-      continue;
-    }
-
-    if (body.length === 0) {
-      return { kind: 'value', value: testValue };
-    }
-
-    return { kind: 'sequence', exprs: body, env };
+function startCondAction(
+  clauses: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  pos: SourcePos,
+): EvalAction {
+  if (clauses.length === 0) {
+    return { kind: 'value', value: VOID_VALUE };
   }
 
-  return { kind: 'value', value: VOID_VALUE };
+  const clauseExpr = clauses[0];
+  if (clauseExpr.kind !== 'list' || clauseExpr.elements.length === 0) {
+    throw new EvalError('cond clauses must be non-empty lists');
+  }
+
+  const [testExpr, ...body] = clauseExpr.elements;
+  const isElseClause = testExpr.kind === 'symbol' && testExpr.name === 'else';
+
+  if (isElseClause) {
+    if (clauses.length !== 1) {
+      throw new EvalError('cond else clause must be last');
+    }
+    if (body.length === 0) {
+      throw new EvalError('cond else clause expects at least 1 expression');
+    }
+    return startSequenceAction(body, env, stack, pos);
+  }
+
+  stack.push({
+    kind: 'cond-test',
+    body,
+    remainingClauses: clauses.slice(1),
+    env,
+    pos,
+  });
+  return { kind: 'expr', expr: testExpr, env };
 }
 
 function evaluateCaseAction(argExprs: Expr[], env: Environment, context: EvalContext): EvalAction {
@@ -2801,6 +3177,9 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return { kind: 'vector', elements: listToArray(args[0], 'list->vector') };
     case 'apply':
       return applyApply(args, context);
+    case 'call/cc':
+    case 'call-with-current-continuation':
+      throw new EvalError('internal error: continuation application must be handled by the evaluator');
     case 'error':
       return applyError(args);
   }
@@ -3655,6 +4034,7 @@ function isCallableValue(value: RuntimeValue): boolean {
     case 'record-predicate':
     case 'record-accessor':
     case 'record-mutator':
+    case 'continuation':
       return true;
     default:
       return false;
@@ -3743,6 +4123,7 @@ function formatValueWithModeInternal(
     case 'record-predicate':
     case 'record-accessor':
     case 'record-mutator':
+    case 'continuation':
       return '#<procedure>';
     case 'void':
       return '';
