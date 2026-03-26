@@ -42,6 +42,18 @@ public class Evaluator {
         return o instanceof Located loc ? loc.expr() : o;
     }
 
+    // Deep-unwrap: remove all Located wrappers recursively
+    @SuppressWarnings("unchecked")
+    static Object deepUnwrap(Object o) {
+        o = unwrap(o);
+        if (o instanceof List<?> list) {
+            List<Object> result = new ArrayList<>(list.size());
+            for (Object elem : list) result.add(deepUnwrap(elem));
+            return result;
+        }
+        return o;
+    }
+
     public String evalStr(String input) throws EvalError {
         List<Token> tokens = tokenize(input);
         int[] pos = {0};
@@ -535,7 +547,36 @@ public class Evaluator {
                          "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase" -> {
                         return evalBuiltin(name, args, env);
                     }
+                    case "define-syntax" -> {
+                        if (args.size() != 2) throw new EvalError("define-syntax: bad syntax");
+                        String macroName = ((SchemeSymbol) unwrap(args.get(0))).name();
+                        List<?> srForm = (List<?>) unwrap(args.get(1));
+                        Object srHead = unwrap(srForm.get(0));
+                        if (!(srHead instanceof SchemeSymbol ss) || !ss.name().equals("syntax-rules"))
+                            throw new EvalError("define-syntax: expected syntax-rules");
+                        List<?> litList = (List<?>) unwrap(srForm.get(1));
+                        List<String> literals = new ArrayList<>();
+                        for (Object lit : litList)
+                            literals.add(((SchemeSymbol) unwrap(lit)).name());
+                        List<Object[]> rules = new ArrayList<>();
+                        for (int i = 2; i < srForm.size(); i++) {
+                            List<?> rule = (List<?>) unwrap(srForm.get(i));
+                            rules.add(new Object[]{deepUnwrap(rule.get(0)), deepUnwrap(rule.get(1))});
+                        }
+                        env.define(macroName, new SyntaxRules(literals, rules, env));
+                        return VOID;
+                    }
                     default -> {
+                        // Check if this is a macro call
+                        try {
+                            Object val = env.lookup(name);
+                            if (val instanceof SyntaxRules sr) {
+                                @SuppressWarnings("unchecked")
+                                List<Object> deepForm = (List<Object>) deepUnwrap(list);
+                                Object expanded = sr.expand(deepForm, env);
+                                return eval(expanded, env);
+                            }
+                        } catch (EvalError ignored) {}
                         // Fall through to procedure call
                     }
                 }
