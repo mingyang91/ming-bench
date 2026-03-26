@@ -70,6 +70,12 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalQuote(expr)
 		case "lambda":
 			return evalLambda(expr, env)
+		case "let":
+			return evalLet(expr, env)
+		case "begin":
+			return evalBegin(expr, env)
+		case "cond":
+			return evalCond(expr, env)
 		}
 	}
 
@@ -166,7 +172,19 @@ func MakeDefaultEnv() *Env {
 		">":  builtinGt,
 		"=":  builtinEq,
 		"<=": builtinLe,
-		"not": builtinNot,
+		"not":      builtinNot,
+		"cons":     builtinCons,
+		"car":      builtinCar,
+		"cdr":      builtinCdr,
+		"null?":    builtinNullQ,
+		"list":     builtinList,
+		"length":   builtinLength,
+		"append":   builtinAppend,
+		"number?":  builtinNumberQ,
+		"string?":  builtinStringQ,
+		"boolean?": builtinBooleanQ,
+		"pair?":    builtinPairQ,
+		"symbol?":  builtinSymbolQ,
 	}
 
 	for name, fn := range builtins {
@@ -383,6 +401,243 @@ func exprToValue(expr *Expr) *Value {
 	default:
 		return Void
 	}
+}
+
+func evalLet(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, fmt.Errorf("%d:%d: let: too few arguments", expr.Line, expr.Col)
+	}
+	bindingExpr := expr.List[1]
+	body := expr.List[2:]
+
+	// Named let: (let name ((var init) ...) body...)
+	if bindingExpr.Type == ExprSymbol {
+		if len(expr.List) < 4 {
+			return nil, fmt.Errorf("%d:%d: let: too few arguments", expr.Line, expr.Col)
+		}
+		loopName := bindingExpr.StrVal
+		bindingExpr = expr.List[2]
+		body = expr.List[3:]
+
+		params := make([]string, 0, len(bindingExpr.List))
+		initVals := make([]*Value, 0, len(bindingExpr.List))
+		for _, b := range bindingExpr.List {
+			if b.Type != ExprList || len(b.List) != 2 || b.List[0].Type != ExprSymbol {
+				return nil, fmt.Errorf("%d:%d: let: bad binding", b.Line, b.Col)
+			}
+			params = append(params, b.List[0].StrVal)
+			v, err := Eval(b.List[1], env)
+			if err != nil {
+				return nil, err
+			}
+			initVals = append(initVals, v)
+		}
+		// Create lambda for the loop
+		letEnv := NewEnv(env)
+		lambda := &Value{
+			Type:       TypeLambda,
+			Params:     params,
+			Body:       body,
+			ClosureEnv: letEnv,
+		}
+		letEnv.Set(loopName, lambda)
+		// Call with initial values
+		callEnv := NewEnv(letEnv)
+		for i, p := range params {
+			callEnv.Set(p, initVals[i])
+		}
+		var result *Value
+		for _, bodyExpr := range body {
+			var err error
+			result, err = Eval(bodyExpr, callEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+
+	if bindingExpr.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: let: bindings must be a list", bindingExpr.Line, bindingExpr.Col)
+	}
+	letEnv := NewEnv(env)
+	for _, b := range bindingExpr.List {
+		if b.Type != ExprList || len(b.List) != 2 || b.List[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: let: bad binding", b.Line, b.Col)
+		}
+		v, err := Eval(b.List[1], env)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.Set(b.List[0].StrVal, v)
+	}
+	var result *Value
+	for _, bodyExpr := range body {
+		var err error
+		result, err = Eval(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalBegin(expr *Expr, env *Env) (*Value, error) {
+	var result *Value = Void
+	for _, e := range expr.List[1:] {
+		var err error
+		result, err = Eval(e, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCond(expr *Expr, env *Env) (*Value, error) {
+	for _, clause := range expr.List[1:] {
+		if clause.Type != ExprList || len(clause.List) < 2 {
+			return nil, fmt.Errorf("%d:%d: cond: bad clause", clause.Line, clause.Col)
+		}
+		test := clause.List[0]
+		if test.Type == ExprSymbol && test.StrVal == "else" {
+			var result *Value
+			for _, bodyExpr := range clause.List[1:] {
+				var err error
+				result, err = Eval(bodyExpr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		cond, err := Eval(test, env)
+		if err != nil {
+			return nil, err
+		}
+		if cond.IsTruthy() {
+			var result *Value
+			for _, bodyExpr := range clause.List[1:] {
+				result, err = Eval(bodyExpr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	return Void, nil
+}
+
+func builtinCons(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: cons: expected 2 arguments", expr.Line, expr.Col)
+	}
+	return &Value{Type: TypePair, Car: args[0], Cdr: args[1]}, nil
+}
+
+func builtinCar(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: car: expected a pair", expr.Line, expr.Col)
+	}
+	return args[0].Car, nil
+}
+
+func builtinCdr(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: cdr: expected a pair", expr.Line, expr.Col)
+	}
+	return args[0].Cdr, nil
+}
+
+func builtinNullQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: null?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeNil), nil
+}
+
+func builtinList(args []*Value, expr *Expr) (*Value, error) {
+	result := Nil
+	for i := len(args) - 1; i >= 0; i-- {
+		result = &Value{Type: TypePair, Car: args[i], Cdr: result}
+	}
+	return result, nil
+}
+
+func builtinLength(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: length: expected 1 argument", expr.Line, expr.Col)
+	}
+	var count int64
+	v := args[0]
+	for v.Type == TypePair {
+		count++
+		v = v.Cdr
+	}
+	return IntValue(count), nil
+}
+
+func builtinAppend(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) == 0 {
+		return Nil, nil
+	}
+	if len(args) == 1 {
+		return args[0], nil
+	}
+	// Append all lists together
+	result := args[len(args)-1]
+	for i := len(args) - 2; i >= 0; i-- {
+		lst := args[i]
+		if lst.Type == TypeNil {
+			continue
+		}
+		// Collect elements of lst
+		var elems []*Value
+		for lst.Type == TypePair {
+			elems = append(elems, lst.Car)
+			lst = lst.Cdr
+		}
+		for j := len(elems) - 1; j >= 0; j-- {
+			result = &Value{Type: TypePair, Car: elems[j], Cdr: result}
+		}
+	}
+	return result, nil
+}
+
+func builtinNumberQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: number?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeInt), nil
+}
+
+func builtinStringQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: string?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeString), nil
+}
+
+func builtinBooleanQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: boolean?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeBool), nil
+}
+
+func builtinPairQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: pair?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypePair), nil
+}
+
+func builtinSymbolQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: symbol?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeSymbol), nil
 }
 
 func evalLambda(expr *Expr, env *Env) (*Value, error) {

@@ -15,6 +15,7 @@ const (
 	TokenString
 	TokenBool
 	TokenSymbol
+	TokenQuote
 	TokenEOF
 )
 
@@ -100,6 +101,9 @@ func (t *Tokenizer) Tokenize() ([]Token, error) {
 		case ch == ')':
 			t.advance()
 			tokens = append(tokens, Token{Type: TokenRParen, Val: ")", Line: line, Col: col})
+		case ch == '\'':
+			t.advance()
+			tokens = append(tokens, Token{Type: TokenQuote, Val: "'", Line: line, Col: col})
 		case ch == '"':
 			s, err := t.readString()
 			if err != nil {
