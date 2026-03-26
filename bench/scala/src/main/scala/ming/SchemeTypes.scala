@@ -28,6 +28,10 @@ object SchemeTypes:
       defEnv: Env
     )
 
+    case VCaseLambda(
+      clauses: List[(List[String], Option[String], List[Expr], Env)]
+    )
+
     case VRecord(
       typeName: String,
       fields: Map[String, Value]
@@ -51,6 +55,7 @@ object SchemeTypes:
     case Value.VSymbol(n)           => n
     case Value.VBuiltin(n)          => s"#<procedure $n>"
     case Value.VLambda(_, _, _, _)  => "#<procedure>"
+    case Value.VCaseLambda(_)       => "#<procedure>"
     case Value.VMacro(_, _, _)      => "#<macro>"
     case Value.VRecord(typeName, _) => s"#<record:$typeName>"
     case Value.VVoid                => ""
@@ -247,5 +252,6 @@ object SchemeTypes:
     "numerator",
     "denominator",
     "rational?",
-    "integer?"
+    "integer?",
+    "procedure?"
   )

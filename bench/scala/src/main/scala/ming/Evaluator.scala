@@ -36,7 +36,7 @@ object Evaluator:
     case Expr.SList(Nil, p) =>
       throw errAt(p, "empty application")
     case Expr.SList(Expr.Symbol("quote", _) :: arg :: Nil, _) =>
-      quoteToValue(arg)
+      EvalForms.quoteToValue(arg)
     case Expr.SList(Expr.Symbol("define", _) :: rest, p) =>
       evalDefine(rest, env, p)
     case Expr.SList(Expr.Symbol("if", _) :: rest, p) =>
@@ -56,9 +56,11 @@ object Evaluator:
     case Expr.SList(Expr.Symbol("set!", _) :: rest, p) =>
       evalSet(rest, env, p)
     case Expr.SList(Expr.Symbol("define-syntax", _) :: rest, p) =>
-      evalDefineSyntax(rest, env, p)
+      EvalForms.evalDefineSyntax(rest, env, p)
+    case Expr.SList(Expr.Symbol("case-lambda", _) :: clauses, p) =>
+      EvalForms.evalCaseLambda(clauses, env, p)
     case Expr.SList(Expr.Symbol("define-record-type", _) :: rest, p) =>
-      evalDefineRecordType(rest, env, p)
+      EvalForms.evalDefineRecordType(rest, env, p)
     case Expr.SList(head :: args, p) =>
       val macroOpt = head match
         case Expr.Symbol(name, _) => env.lookupOpt(name).collect { case m: Value.VMacro => m }
@@ -97,18 +99,20 @@ object Evaluator:
           params.zip(args).foreach((p, a) => callEnv.define(p, a))
           callEnv.define(rest, Value.VList(args.drop(params.length)))
           evalBody(body, callEnv)
+    case Value.VCaseLambda(clauses) =>
+      val matched = clauses.find { case (params, restParam, _, _) =>
+        restParam match
+          case None    => args.length == params.length
+          case Some(_) => args.length >= params.length
+      }
+      matched match
+        case Some((params, restParam, body, closure)) =>
+          val callEnv = closure.child()
+          params.zip(args).foreach((p, a) => callEnv.define(p, a))
+          restParam.foreach(rest => callEnv.define(rest, Value.VList(args.drop(params.length))))
+          evalBody(body, callEnv)
+        case None => throw errAt(pos, "wrong number of arguments")
     case _ => throw errAt(pos, "not a procedure")
-
-  private def quoteToValue(expr: Expr): Value = expr match
-    case Expr.Num(n, _)       => Value.VNum(n)
-    case Expr.Flt(d, _)       => Value.VFloat(d)
-    case Expr.Rat(n, d, _)    => Value.VRational(n, d)
-    case Expr.Bool(b, _)      => Value.VBool(b)
-    case Expr.Str(s, _)       => Value.VStr(s.toCharArray)
-    case Expr.Chr(c, _)       => Value.VChar(c)
-    case Expr.Symbol(name, _) => Value.VSymbol(name)
-    case Expr.SList(elems, _) =>
-      Value.VList(elems.map(quoteToValue))
 
   private def evalDefine(
     rest: List[Expr],
@@ -119,7 +123,7 @@ object Evaluator:
       env.define(name, eval(valueExpr, env))
       Value.VVoid
     case Expr.SList(Expr.Symbol(name, _) :: params, _) :: body =>
-      val (paramNames, restParam) = parseParams(params, pos)
+      val (paramNames, restParam) = EvalForms.parseParams(params, pos)
       env.define(
         name,
         Value.VLambda(paramNames, restParam, body, env)
@@ -140,35 +144,13 @@ object Evaluator:
       else Value.VVoid
     case _ => throw errAt(pos, "invalid if")
 
-  private def parseParams(
-    params: List[Expr],
-    pos: Pos
-  ): (List[String], Option[String]) =
-    val dotIdx = params.indexWhere {
-      case Expr.Symbol(".", _) => true; case _ => false
-    }
-    if dotIdx < 0 then
-      val names = params.map {
-        case Expr.Symbol(n, _) => n
-        case _                 => throw errAt(pos, "invalid parameter")
-      }
-      (names, None)
-    else
-      val fixed = params.take(dotIdx).map {
-        case Expr.Symbol(n, _) => n
-        case _                 => throw errAt(pos, "invalid parameter")
-      }
-      params.drop(dotIdx + 1) match
-        case Expr.Symbol(rest, _) :: Nil => (fixed, Some(rest))
-        case _                           => throw errAt(pos, "invalid rest parameter")
-
   private def evalLambda(
     rest: List[Expr],
     env: Env,
     pos: Pos
   ): Value = rest match
     case Expr.SList(params, _) :: body =>
-      val (paramNames, restParam) = parseParams(params, pos)
+      val (paramNames, restParam) = EvalForms.parseParams(params, pos)
       Value.VLambda(paramNames, restParam, body, env)
     case Expr.Symbol(name, _) :: body =>
       Value.VLambda(Nil, Some(name), body, env)
@@ -249,38 +231,6 @@ object Evaluator:
       if isTruthy(eval(test, env)) then evalBody(body, env)
       else evalCond(rest, env)
     case e :: _ => throw errAt(posOf(e), "invalid cond")
-
-  // ── Macros ──────────────────────────────────────────────────────────
-
-  private def evalDefineSyntax(
-    rest: List[Expr],
-    env: Env,
-    pos: Pos
-  ): Value =
-    rest match
-      case Expr.Symbol(name, _) :: Expr.SList(
-            Expr.Symbol("syntax-rules", _) :: Expr.SList(lits, _) :: rules,
-            _
-          ) :: Nil =>
-        val literals = lits.map {
-          case Expr.Symbol(s, _) => s
-          case _                 => throw errAt(pos, "invalid syntax-rules")
-        }
-        val parsedRules = rules.map {
-          case Expr.SList(pat :: tmpl :: Nil, _) => (pat, tmpl)
-          case _                                 => throw errAt(pos, "invalid syntax-rules")
-        }
-        env.define(name, Value.VMacro(literals, parsedRules, env))
-        Value.VVoid
-      case _ => throw errAt(pos, "invalid define-syntax")
-
-  // ── Records ────────────────────────────────────────────────────────
-  private def evalDefineRecordType(
-    rest: List[Expr],
-    env: Env,
-    pos: Pos
-  ): Value =
-    Records.evalDefineRecordType(rest, env, pos)
 
   // ── Public API ───────────────────────────────────────────────────────
   def evalStr(input: String): String =
