@@ -32,6 +32,7 @@ final class Builtins {
             case "not" -> { requireArgCount(args, 1, "not"); yield isFalse(args.get(0)); }
             case "equal?" -> { requireArgCount(args, 2, "equal?"); yield evaluator.schemeEqual(args.get(0), args.get(1)); }
             case "eq?" -> applyEq(args);
+            case "eqv?" -> { requireArgCount(args, 2, "eqv?"); yield evaluator.schemeEqv(args.get(0), args.get(1)); }
 
             // Pair / List
             case "cons", "car", "cdr", "null?", "list", "length", "append",
@@ -73,6 +74,11 @@ final class Builtins {
                     || val instanceof Evaluator.RecordPredicate
                     || val instanceof Evaluator.RecordAccessor;
             }
+
+            // Vectors
+            case "vector", "make-vector", "vector-ref", "vector-set!",
+                 "vector-length", "vector?", "vector->list", "list->vector" ->
+                applyVector(name, args);
 
             // Higher-order
             case "apply" -> applyApply(args);
@@ -507,6 +513,69 @@ final class Builtins {
                 yield a.value < b.value;
             }
             default -> throw evaluator.posError("unknown char op: " + name);
+        };
+    }
+
+    // ---- Vector operations ----
+
+    private Object applyVector(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "vector" -> new Evaluator.SchemeVector(args.toArray());
+            case "make-vector" -> {
+                if (args.size() < 1 || args.size() > 2)
+                    throw evaluator.posError("make-vector: expected 1 or 2 arguments");
+                int len = (int) requireLong(args.get(0), "make-vector");
+                Object fill = args.size() == 2 ? args.get(1) : 0L;
+                Object[] data = new Object[len];
+                for (int i = 0; i < len; i++) data[i] = fill;
+                yield new Evaluator.SchemeVector(data);
+            }
+            case "vector-ref" -> {
+                requireArgCount(args, 2, "vector-ref");
+                if (!(args.get(0) instanceof Evaluator.SchemeVector v))
+                    throw evaluator.posError("vector-ref: expected vector");
+                int idx = (int) requireLong(args.get(1), "vector-ref");
+                yield v.data[idx];
+            }
+            case "vector-set!" -> {
+                requireArgCount(args, 3, "vector-set!");
+                if (!(args.get(0) instanceof Evaluator.SchemeVector v))
+                    throw evaluator.posError("vector-set!: expected vector");
+                int idx = (int) requireLong(args.get(1), "vector-set!");
+                v.data[idx] = args.get(2);
+                yield (Object) null;
+            }
+            case "vector-length" -> {
+                requireArgCount(args, 1, "vector-length");
+                if (!(args.get(0) instanceof Evaluator.SchemeVector v))
+                    throw evaluator.posError("vector-length: expected vector");
+                yield (long) v.data.length;
+            }
+            case "vector?" -> {
+                requireArgCount(args, 1, "vector?");
+                yield args.get(0) instanceof Evaluator.SchemeVector;
+            }
+            case "vector->list" -> {
+                requireArgCount(args, 1, "vector->list");
+                if (!(args.get(0) instanceof Evaluator.SchemeVector v))
+                    throw evaluator.posError("vector->list: expected vector");
+                Object result = NIL;
+                for (int i = v.data.length - 1; i >= 0; i--) {
+                    result = new Evaluator.Pair(v.data[i], result);
+                }
+                yield result;
+            }
+            case "list->vector" -> {
+                requireArgCount(args, 1, "list->vector");
+                List<Object> elems = new ArrayList<>();
+                Object cur = args.get(0);
+                while (cur instanceof Evaluator.Pair p) {
+                    elems.add(p.car);
+                    cur = p.cdr;
+                }
+                yield new Evaluator.SchemeVector(elems.toArray());
+            }
+            default -> throw evaluator.posError("unknown vector op: " + name);
         };
     }
 
