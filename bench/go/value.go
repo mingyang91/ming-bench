@@ -42,6 +42,8 @@ type Value struct {
 	RestParam string // variadic rest parameter (dot notation)
 	Body      []*Expr
 	ClosureEnv *Env
+	// Case-lambda clauses
+	Clauses []*Value // each is a TypeLambda
 	// Macro fields
 	Syntax *SyntaxRules
 	// Record fields

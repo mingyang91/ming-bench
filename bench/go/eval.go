@@ -123,6 +123,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalDefineSyntax(expr, env)
 		case "define-record-type":
 			return evalDefineRecordType(expr, env)
+		case "case-lambda":
+			return evalCaseLambda(expr, env)
 		}
 
 		// Check if head is a macro
@@ -205,6 +207,9 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 
 	// Dispatch lambda calls
 	if op.Type == TypeLambda {
+		if op.Clauses != nil {
+			return callCaseLambda(op, args, expr)
+		}
 		return callLambda(op, args, expr)
 	}
 
@@ -360,6 +365,7 @@ func MakeDefaultEnv() *Env {
 		"denominator":      builtinDenominator,
 		"integer?":         builtinIntegerQ,
 		"rational?":        builtinRationalQ,
+		"procedure?":       builtinProcedureQ,
 	}
 
 	for name, fn := range builtins {
@@ -1000,6 +1006,9 @@ func builtinApply(args []*Value, expr *Expr, env *Env) (*Value, error) {
 
 	// Dispatch based on function type
 	if fn.Type == TypeLambda {
+		if fn.Clauses != nil {
+			return callCaseLambda(fn, callArgs, expr)
+		}
 		return callLambda(fn, callArgs, expr)
 	}
 	if fn.Type == TypeSymbol && len(fn.StrVal) > 10 && fn.StrVal[:10] == "__builtin:" {
@@ -1354,6 +1363,20 @@ func builtinRationalQ(args []*Value, expr *Expr) (*Value, error) {
 	return BoolValue(args[0].Type == TypeInt || args[0].Type == TypeRational), nil
 }
 
+func builtinProcedureQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: procedure?: expected 1 argument", expr.Line, expr.Col)
+	}
+	a := args[0]
+	if a.Type == TypeLambda {
+		return BoolValue(true), nil
+	}
+	if a.Type == TypeSymbol && len(a.StrVal) > 10 && a.StrVal[:10] == "__builtin:" {
+		return BoolValue(true), nil
+	}
+	return BoolValue(false), nil
+}
+
 func builtinListRef(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 2 || args[1].Type != TypeInt {
 		return nil, fmt.Errorf("%d:%d: list-ref: expected list and int", expr.Line, expr.Col)
@@ -1466,7 +1489,11 @@ func builtinMap(args []*Value, expr *Expr, env *Env) (*Value, error) {
 		var val *Value
 		var err error
 		if fn.Type == TypeLambda {
-			val, err = callLambda(fn, callArgs, expr)
+			if fn.Clauses != nil {
+				val, err = callCaseLambda(fn, callArgs, expr)
+			} else {
+				val, err = callLambda(fn, callArgs, expr)
+			}
 		} else if fn.Type == TypeSymbol && len(fn.StrVal) > 10 && fn.StrVal[:10] == "__builtin:" {
 			name := fn.StrVal[10:]
 			if bfn, ok := builtinRegistry[name]; ok && bfn != nil {
@@ -1677,6 +1704,64 @@ func evalLambda(expr *Expr, env *Env) (*Value, error) {
 		Body:       expr.List[2:],
 		ClosureEnv: env,
 	}, nil
+}
+
+func evalCaseLambda(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 2 {
+		return nil, fmt.Errorf("%d:%d: case-lambda: no clauses", expr.Line, expr.Col)
+	}
+	var clauses []*Value
+	for _, clauseExpr := range expr.List[1:] {
+		if clauseExpr.Type != ExprList || len(clauseExpr.List) < 2 {
+			return nil, fmt.Errorf("%d:%d: case-lambda: bad clause", clauseExpr.Line, clauseExpr.Col)
+		}
+		paramList := clauseExpr.List[0]
+		body := clauseExpr.List[1:]
+		if paramList.Type == ExprSymbol {
+			// (args body...) — rest-only
+			clauses = append(clauses, &Value{
+				Type:       TypeLambda,
+				RestParam:  paramList.StrVal,
+				Body:       body,
+				ClosureEnv: env,
+			})
+			continue
+		}
+		if paramList.Type != ExprList {
+			return nil, fmt.Errorf("%d:%d: case-lambda: bad parameter list", paramList.Line, paramList.Col)
+		}
+		params, restParam, err := parseParams(paramList)
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, &Value{
+			Type:       TypeLambda,
+			Params:     params,
+			RestParam:  restParam,
+			Body:       body,
+			ClosureEnv: env,
+		})
+	}
+	return &Value{Type: TypeLambda, Clauses: clauses, ClosureEnv: env}, nil
+}
+
+func callCaseLambda(op *Value, args []*Value, expr *Expr) (*Value, error) {
+	for _, clause := range op.Clauses {
+		if clause.RestParam != "" && len(clause.Params) == 0 {
+			// rest-only: matches any arity
+			return callLambda(clause, args, expr)
+		}
+		if clause.RestParam != "" {
+			if len(args) >= len(clause.Params) {
+				return callLambda(clause, args, expr)
+			}
+		} else {
+			if len(args) == len(clause.Params) {
+				return callLambda(clause, args, expr)
+			}
+		}
+	}
+	return nil, fmt.Errorf("%d:%d: case-lambda: no matching clause for %d arguments", expr.Line, expr.Col, len(args))
 }
 
 // evalDefineRecordType handles (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
