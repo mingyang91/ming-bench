@@ -221,6 +221,10 @@ func newGlobalEnv(rt *runtime) *env {
 	if currentBenchLevel() >= 19 {
 		root.define("dynamic-wind", builtinProc{name: "dynamic-wind", fn: builtinDynamicWindSentinel})
 	}
+	if currentBenchLevel() >= 20 {
+		root.define("raise", builtinProc{name: "raise", fn: builtinRaiseSentinel})
+		root.define("with-exception-handler", builtinProc{name: "with-exception-handler", fn: builtinWithExceptionHandlerSentinel})
+	}
 	root.define("char-alphabetic?", builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabetic})
 	root.define("char->integer", builtinProc{name: "char->integer", fn: builtinCharToInteger})
 	root.define("char-downcase", builtinProc{name: "char-downcase", fn: builtinCharDowncase})
@@ -1188,6 +1192,10 @@ func applyBuiltinStep(args []expr) (evalStep, error) {
 }
 
 func builtinAdd(args []expr) (expr, error) {
+	if total, ok := tryIntSum(args); ok {
+		return intExpr(total), nil
+	}
+
 	numbers, err := numericArgs(args)
 	if err != nil {
 		return nil, err
@@ -1209,12 +1217,16 @@ func builtinAdd(args []expr) (expr, error) {
 }
 
 func builtinSub(args []expr) (expr, error) {
+	if len(args) == 0 {
+		return nil, &EvalError{Message: "- expects at least 1 argument"}
+	}
+	if total, ok := tryIntDifference(args); ok {
+		return intExpr(total), nil
+	}
+
 	numbers, err := numericArgs(args)
 	if err != nil {
 		return nil, err
-	}
-	if len(numbers) == 0 {
-		return nil, &EvalError{Message: "- expects at least 1 argument"}
 	}
 
 	if numbersContainInexact(numbers) {
@@ -1243,6 +1255,10 @@ func builtinSub(args []expr) (expr, error) {
 }
 
 func builtinMul(args []expr) (expr, error) {
+	if total, ok := tryIntProduct(args); ok {
+		return intExpr(total), nil
+	}
+
 	numbers, err := numericArgs(args)
 	if err != nil {
 		return nil, err
@@ -1962,12 +1978,30 @@ func builtinAssoc(args []expr) (expr, error) {
 
 func comparisonBuiltin(name string, cmp func(int, int) bool) builtinFunc {
 	return func(args []expr) (expr, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects at least 2 arguments", name)}
+		}
+		if previous, ok := plainIntExpr(args[0]); ok {
+			intsOnly := true
+			for i := 1; i < len(args); i++ {
+				current, ok := plainIntExpr(args[i])
+				if !ok {
+					intsOnly = false
+					break
+				}
+				if !cmp(compareInts(previous, current), 0) {
+					return boolExpr(false), nil
+				}
+				previous = current
+			}
+			if intsOnly {
+				return boolExpr(true), nil
+			}
+		}
+
 		numbers, err := numericArgs(args)
 		if err != nil {
 			return nil, err
-		}
-		if len(numbers) < 2 {
-			return nil, &EvalError{Message: fmt.Sprintf("%s expects at least 2 arguments", name)}
 		}
 
 		for i := 0; i < len(numbers)-1; i++ {

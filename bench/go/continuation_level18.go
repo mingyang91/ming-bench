@@ -3,8 +3,9 @@ package ming
 import "fmt"
 
 type continuationExpr struct {
-	cont level18Cont
-	wind *dynamicWindFrame
+	cont     level18Cont
+	wind     *dynamicWindFrame
+	handlers *exceptionHandlerFrame
 }
 
 type level18Cont interface{}
@@ -81,11 +82,12 @@ type dynamicWindTransitionStep struct {
 }
 
 type dynamicWindTransitionCont struct {
-	steps      []dynamicWindTransitionStep
-	index      int
-	targetCont level18Cont
-	targetWind *dynamicWindFrame
-	value      expr
+	steps          []dynamicWindTransitionStep
+	index          int
+	targetCont     level18Cont
+	targetWind     *dynamicWindFrame
+	targetHandlers *exceptionHandlerFrame
+	value          expr
 }
 
 type level18Machine struct {
@@ -95,6 +97,7 @@ type level18Machine struct {
 	value      expr
 	cont       level18Cont
 	wind       *dynamicWindFrame
+	handlers   *exceptionHandlerFrame
 }
 
 func builtinContinuationSentinel(args []expr) (expr, error) {
@@ -248,14 +251,26 @@ func (m *level18Machine) run() (expr, error) {
 			}
 
 			if cont.index+1 < len(cont.steps) {
-				if err := m.runWindTransition(cont.steps, cont.index+1, cont.targetCont, cont.targetWind, cont.value); err != nil {
+				if err := m.runWindTransition(cont.steps, cont.index+1, cont.targetCont, cont.targetWind, cont.targetHandlers, cont.value); err != nil {
 					return nil, err
 				}
 				continue
 			}
 
 			m.wind = cont.targetWind
+			m.handlers = cont.targetHandlers
 			m.returnValue(cont.value, cont.targetCont)
+		case *exceptionPopCont:
+			if m.handlers == cont.frame {
+				m.handlers = cont.frame.parent
+			}
+			m.returnValue(m.value, cont.next)
+		case *exceptionDispatchCont:
+			if err := m.dispatchException(cont.frame, cont.value); err != nil {
+				return nil, err
+			}
+		case *exceptionHandlerReturnedCont:
+			return nil, &EvalError{Message: "exception handler returned"}
 		default:
 			return nil, &EvalError{Message: "unsupported continuation"}
 		}
@@ -311,6 +326,10 @@ func (m *level18Machine) stepList(items listExpr) error {
 			}
 			m.eval(environment, expanded, m.cont)
 			return nil
+		case "guard":
+			if currentBenchLevel() >= 20 {
+				return m.stepGuard(environment, items.items[1:], operator.pos)
+			}
 		case "quote":
 			if len(items.items) != 2 {
 				return attachPos(&EvalError{Message: "quote expects exactly 1 argument"}, operator.pos)
@@ -481,21 +500,23 @@ func (m *level18Machine) invokeContinuation(target *continuationExpr, value expr
 	steps := buildWindTransition(m.wind, target.wind)
 	if len(steps) == 0 {
 		m.wind = target.wind
+		m.handlers = target.handlers
 		m.returnValue(value, target.cont)
 		return nil
 	}
 
-	return m.runWindTransition(steps, 0, target.cont, target.wind, value)
+	return m.runWindTransition(steps, 0, target.cont, target.wind, target.handlers, value)
 }
 
-func (m *level18Machine) runWindTransition(steps []dynamicWindTransitionStep, index int, targetCont level18Cont, targetWind *dynamicWindFrame, value expr) error {
+func (m *level18Machine) runWindTransition(steps []dynamicWindTransitionStep, index int, targetCont level18Cont, targetWind *dynamicWindFrame, targetHandlers *exceptionHandlerFrame, value expr) error {
 	step := steps[index]
 	next := &dynamicWindTransitionCont{
-		steps:      steps,
-		index:      index,
-		targetCont: targetCont,
-		targetWind: targetWind,
-		value:      value,
+		steps:          steps,
+		index:          index,
+		targetCont:     targetCont,
+		targetWind:     targetWind,
+		targetHandlers: targetHandlers,
+		value:          value,
 	}
 
 	if step.entering {
@@ -555,10 +576,17 @@ applyLoop:
 					return &EvalError{Message: fmt.Sprintf("%s expects exactly 1 argument", callable.name)}
 				}
 				proc = args[0]
-				args = []expr{&continuationExpr{cont: cont, wind: m.wind}}
+				args = []expr{&continuationExpr{cont: cont, wind: m.wind, handlers: m.handlers}}
 				continue
 			case "dynamic-wind":
 				return m.applyDynamicWind(args, cont)
+			case "raise":
+				if len(args) != 1 {
+					return &EvalError{Message: "raise expects exactly 1 argument"}
+				}
+				return m.raise(args[0])
+			case "with-exception-handler":
+				return m.applyWithExceptionHandler(args, cont)
 			case "apply":
 				if len(args) < 2 {
 					return &EvalError{Message: "apply expects at least 2 arguments"}

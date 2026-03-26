@@ -256,6 +256,124 @@ func exactIntegerValue(value expr) (int, bool) {
 	}
 }
 
+func plainIntExpr(value expr) (int, bool) {
+	n, ok := value.(intExpr)
+	return int(n), ok
+}
+
+func tryIntSum(args []expr) (int, bool) {
+	total := 0
+	for _, arg := range args {
+		n, ok := plainIntExpr(arg)
+		if !ok {
+			return 0, false
+		}
+		next, ok := checkedAddInt(total, n)
+		if !ok {
+			return 0, false
+		}
+		total = next
+	}
+	return total, true
+}
+
+func tryIntDifference(args []expr) (int, bool) {
+	if len(args) == 0 {
+		return 0, false
+	}
+
+	total, ok := plainIntExpr(args[0])
+	if !ok {
+		return 0, false
+	}
+	if len(args) == 1 {
+		if total == minIntValue {
+			return 0, false
+		}
+		return -total, true
+	}
+
+	for _, arg := range args[1:] {
+		n, ok := plainIntExpr(arg)
+		if !ok {
+			return 0, false
+		}
+		next, ok := checkedSubInt(total, n)
+		if !ok {
+			return 0, false
+		}
+		total = next
+	}
+	return total, true
+}
+
+func tryIntProduct(args []expr) (int, bool) {
+	total := 1
+	for _, arg := range args {
+		n, ok := plainIntExpr(arg)
+		if !ok {
+			return 0, false
+		}
+		next, ok := checkedMulInt(total, n)
+		if !ok {
+			return 0, false
+		}
+		total = next
+	}
+	return total, true
+}
+
+func compareInts(left, right int) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
+}
+
+var maxIntValue = int(^uint(0) >> 1)
+var minIntValue = -maxIntValue - 1
+
+func checkedAddInt(left, right int) (int, bool) {
+	switch {
+	case right > 0 && left > maxIntValue-right:
+		return 0, false
+	case right < 0 && left < minIntValue-right:
+		return 0, false
+	default:
+		return left + right, true
+	}
+}
+
+func checkedSubInt(left, right int) (int, bool) {
+	switch {
+	case right > 0 && left < minIntValue+right:
+		return 0, false
+	case right < 0 && left > maxIntValue+right:
+		return 0, false
+	default:
+		return left - right, true
+	}
+}
+
+func checkedMulInt(left, right int) (int, bool) {
+	if left == 0 || right == 0 {
+		return 0, true
+	}
+	if (left == minIntValue && right == -1) || (right == minIntValue && left == -1) {
+		return 0, false
+	}
+
+	product := left * right
+	if product/right != left {
+		return 0, false
+	}
+	return product, true
+}
+
 func exactIntegerPair(args []expr, name string) (int, int, error) {
 	if len(args) != 2 {
 		return 0, 0, &EvalError{Message: name + " expects exactly 2 arguments"}
