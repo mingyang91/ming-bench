@@ -475,3 +475,79 @@ func builtinDenominator(args []any) (any, error) {
 	}
 	return n.denom, nil
 }
+
+func builtinGCD(args []any) (any, error) {
+	if len(args) == 0 {
+		return int64(0), nil
+	}
+
+	result := int64(0)
+	for _, arg := range args {
+		value, err := expectInt(arg)
+		if err != nil {
+			return nil, err
+		}
+		result = gcd64(result, value)
+	}
+	if result < 0 {
+		return -result, nil
+	}
+	return result, nil
+}
+
+func builtinLCM(args []any) (any, error) {
+	if len(args) == 0 {
+		return int64(1), nil
+	}
+
+	result := int64(1)
+	for _, arg := range args {
+		value, err := expectInt(arg)
+		if err != nil {
+			return nil, err
+		}
+		if result == 0 || value == 0 {
+			result = 0
+			continue
+		}
+		result = result / gcd64(result, value) * value
+		if result < 0 {
+			result = -result
+		}
+	}
+	return result, nil
+}
+
+func builtinTruncate(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "truncate expects exactly 1 argument"}
+	}
+
+	switch n := args[0].(type) {
+	case int64:
+		return n, nil
+	case rationalValue:
+		return n.numer / n.denom, nil
+	case float64:
+		return int64(math.Trunc(n)), nil
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("expected number, got %s", typeName(args[0]))}
+	}
+}
+
+func builtinRound(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "round expects exactly 1 argument"}
+	}
+
+	switch n := args[0].(type) {
+	case int64:
+		return n, nil
+	case rationalValue:
+		return int64(math.RoundToEven(float64(n.numer) / float64(n.denom))), nil
+	case float64:
+		return int64(math.RoundToEven(n)), nil
+	default:
+		return nil, &EvalError{Message: fmt.Sprintf("expected number, got %s", typeName(args[0]))}
+	}
+}

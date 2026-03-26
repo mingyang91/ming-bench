@@ -379,11 +379,16 @@ func listTailValue(value any, index int64, name string) (any, error) {
 
 func isProperList(value any) bool {
 	current := value
+	seen := map[*pairCell]struct{}{}
 	for {
 		switch list := current.(type) {
 		case emptyListValue:
 			return true
 		case pairValue:
+			if _, ok := seen[list.pairCell]; ok {
+				return false
+			}
+			seen[list.pairCell] = struct{}{}
 			current = list.cdr
 		default:
 			return false
@@ -418,6 +423,9 @@ func valuesEq(left, right any) bool {
 	case emptyListValue:
 		_, ok := right.(emptyListValue)
 		return ok
+	case pairValue:
+		rhs, ok := right.(pairValue)
+		return ok && lhs == rhs
 	case *vectorValue:
 		rhs, ok := right.(*vectorValue)
 		return ok && lhs == rhs
@@ -436,6 +444,28 @@ func valuesEq(left, right any) bool {
 }
 
 func valuesEqual(left, right any) bool {
+	return valuesEqualWithState(left, right, equalityState{
+		pairs:   map[pairVisit]bool{},
+		vectors: map[vectorVisit]bool{},
+	})
+}
+
+type pairVisit struct {
+	left  *pairCell
+	right *pairCell
+}
+
+type vectorVisit struct {
+	left  *vectorValue
+	right *vectorValue
+}
+
+type equalityState struct {
+	pairs   map[pairVisit]bool
+	vectors map[vectorVisit]bool
+}
+
+func valuesEqualWithState(left, right any, state equalityState) bool {
 	if isNumberValue(left) && isNumberValue(right) {
 		return numberValuesEqual(left, right)
 	}
@@ -476,14 +506,28 @@ func valuesEqual(left, right any) bool {
 		return ok
 	case pairValue:
 		rhs, ok := right.(pairValue)
-		return ok && valuesEqual(lhs.car, rhs.car) && valuesEqual(lhs.cdr, rhs.cdr)
+		if !ok {
+			return false
+		}
+		key := pairVisit{left: lhs.pairCell, right: rhs.pairCell}
+		if state.pairs[key] {
+			return true
+		}
+		state.pairs[key] = true
+		return valuesEqualWithState(lhs.car, rhs.car, state) &&
+			valuesEqualWithState(lhs.cdr, rhs.cdr, state)
 	case *vectorValue:
 		rhs, ok := right.(*vectorValue)
 		if !ok || len(lhs.elements) != len(rhs.elements) {
 			return false
 		}
+		key := vectorVisit{left: lhs, right: rhs}
+		if state.vectors[key] {
+			return true
+		}
+		state.vectors[key] = true
 		for i := range lhs.elements {
-			if !valuesEqual(lhs.elements[i], rhs.elements[i]) {
+			if !valuesEqualWithState(lhs.elements[i], rhs.elements[i], state) {
 				return false
 			}
 		}

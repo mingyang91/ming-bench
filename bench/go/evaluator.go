@@ -49,9 +49,13 @@ type sourcePos struct {
 	col  int
 }
 
-type pairValue struct {
+type pairCell struct {
 	car any
 	cdr any
+}
+
+type pairValue struct {
+	*pairCell
 }
 
 type mutableString struct {
@@ -260,6 +264,9 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("cons", builtinProc{name: "cons", fn: builtinCons})
 	scope.define("car", builtinProc{name: "car", fn: builtinCar})
 	scope.define("cdr", builtinProc{name: "cdr", fn: builtinCdr})
+	registerCxrBuiltins(scope)
+	scope.define("set-car!", builtinProc{name: "set-car!", fn: builtinSetCar})
+	scope.define("set-cdr!", builtinProc{name: "set-cdr!", fn: builtinSetCdr})
 	scope.define("null?", builtinProc{name: "null?", fn: func(args []any) (any, error) {
 		return builtinPredicate("null?", args, func(value any) bool {
 			_, ok := value.(emptyListValue)
@@ -269,6 +276,7 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("append", builtinProc{name: "append", fn: builtinAppend})
 	scope.define("list", builtinProc{name: "list", fn: builtinList})
 	scope.define("length", builtinProc{name: "length", fn: builtinLength})
+	scope.define("reverse", builtinProc{name: "reverse", fn: builtinReverse})
 	scope.define("string?", builtinProc{name: "string?", fn: func(args []any) (any, error) {
 		return builtinPredicate("string?", args, func(value any) bool {
 			return isStringValue(value)
@@ -311,6 +319,8 @@ func newGlobalEnv(output *strings.Builder) *env {
 		return builtinNewline(args, output)
 	}})
 	scope.define("string-append", builtinProc{name: "string-append", fn: builtinStringAppend})
+	scope.define("string", builtinProc{name: "string", fn: builtinString})
+	scope.define("make-string", builtinProc{name: "make-string", fn: builtinMakeString})
 	scope.define("string-length", builtinProc{name: "string-length", fn: builtinStringLength})
 	scope.define("substring", builtinProc{name: "substring", fn: builtinSubstring})
 	scope.define("string->number", builtinProc{name: "string->number", fn: builtinStringToNumber})
@@ -331,6 +341,10 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("numerator", builtinProc{name: "numerator", fn: builtinNumerator})
 	scope.define("denominator", builtinProc{name: "denominator", fn: builtinDenominator})
 	scope.define("abs", builtinProc{name: "abs", fn: builtinAbs})
+	scope.define("gcd", builtinProc{name: "gcd", fn: builtinGCD})
+	scope.define("lcm", builtinProc{name: "lcm", fn: builtinLCM})
+	scope.define("truncate", builtinProc{name: "truncate", fn: builtinTruncate})
+	scope.define("round", builtinProc{name: "round", fn: builtinRound})
 	scope.define("modulo", builtinProc{name: "modulo", fn: builtinModulo})
 	scope.define("remainder", builtinProc{name: "remainder", fn: builtinRemainder})
 	scope.define("quotient", builtinProc{name: "quotient", fn: builtinQuotient})
@@ -349,7 +363,10 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("eqv?", builtinProc{name: "eqv?", fn: builtinEqv})
 	scope.define("equal?", builtinProc{name: "equal?", fn: builtinEqual})
 	scope.define("assoc", builtinProc{name: "assoc", fn: builtinAssoc})
+	scope.define("assv", builtinProc{name: "assv", fn: builtinAssv})
+	scope.define("member", builtinProc{name: "member", fn: builtinMember})
 	scope.define("map", builtinProc{name: "map", fn: builtinMap})
+	scope.define("for-each", builtinProc{name: "for-each", fn: builtinForEach})
 	scope.define("vector", builtinProc{name: "vector", fn: builtinVector})
 	scope.define("make-vector", builtinProc{name: "make-vector", fn: builtinMakeVector})
 	scope.define("vector-ref", builtinProc{name: "vector-ref", fn: builtinVectorRef})
@@ -374,6 +391,9 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("integer->char", builtinProc{name: "integer->char", fn: builtinIntegerToChar})
 	scope.define("string=?", builtinProc{name: "string=?", fn: builtinStringEqual})
 	scope.define("string<?", builtinProc{name: "string<?", fn: builtinStringLess})
+	scope.define("string>?", builtinProc{name: "string>?", fn: builtinStringGreater})
+	scope.define("string<=?", builtinProc{name: "string<=?", fn: builtinStringLessEqual})
+	scope.define("string>=?", builtinProc{name: "string>=?", fn: builtinStringGreaterEqual})
 	scope.define("string-ci=?", builtinProc{name: "string-ci=?", fn: builtinStringCIEqual})
 	scope.define("string-upcase", builtinProc{name: "string-upcase", fn: builtinStringUpcase})
 	scope.define("string-downcase", builtinProc{name: "string-downcase", fn: builtinStringDowncase})
@@ -804,6 +824,8 @@ func evalListTail(scope *env, expr listExpr) (any, *tailEvalState, error) {
 			return prepareTailSequence(scope, args)
 		case "let":
 			return evalLetTail(scope, args)
+		case "let*":
+			return evalLetStarTail(scope, args)
 		case "letrec":
 			return evalLetrecTail(scope, args, false)
 		case "letrec*":
@@ -1177,6 +1199,8 @@ func evalList(scope *env, expr listExpr) (any, error) {
 			return evalBegin(scope, args)
 		case "let":
 			return evalLet(scope, args)
+		case "let*":
+			return evalLetStar(scope, args)
 		case "letrec":
 			return evalLetrec(scope, args, false)
 		case "letrec*":
@@ -1701,7 +1725,7 @@ func builtinCons(args []any) (any, error) {
 	if len(args) != 2 {
 		return nil, &EvalError{Message: "cons expects exactly 2 arguments"}
 	}
-	return pairValue{car: args[0], cdr: args[1]}, nil
+	return newPair(args[0], args[1]), nil
 }
 
 func builtinCar(args []any) (any, error) {
@@ -1709,9 +1733,9 @@ func builtinCar(args []any) (any, error) {
 		return nil, &EvalError{Message: "car expects exactly 1 argument"}
 	}
 
-	pair, ok := args[0].(pairValue)
-	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("car expects a pair, got %s", typeName(args[0]))}
+	pair, err := expectPair(args[0], "car")
+	if err != nil {
+		return nil, err
 	}
 	return pair.car, nil
 }
@@ -1721,9 +1745,9 @@ func builtinCdr(args []any) (any, error) {
 		return nil, &EvalError{Message: "cdr expects exactly 1 argument"}
 	}
 
-	pair, ok := args[0].(pairValue)
-	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("cdr expects a pair, got %s", typeName(args[0]))}
+	pair, err := expectPair(args[0], "cdr")
+	if err != nil {
+		return nil, err
 	}
 	return pair.cdr, nil
 }
@@ -1739,11 +1763,16 @@ func builtinLength(args []any) (any, error) {
 
 	var length int64
 	current := args[0]
+	seen := map[*pairCell]struct{}{}
 	for {
 		switch value := current.(type) {
 		case emptyListValue:
 			return length, nil
 		case pairValue:
+			if _, ok := seen[value.pairCell]; ok {
+				return nil, &EvalError{Message: "length expects a proper list"}
+			}
+			seen[value.pairCell] = struct{}{}
 			length++
 			current = value.cdr
 		default:
@@ -1767,7 +1796,7 @@ func builtinAppend(args []any) (any, error) {
 			return nil, err
 		}
 		for j := len(elements) - 1; j >= 0; j-- {
-			result = pairValue{car: elements[j], cdr: result}
+			result = newPair(elements[j], result)
 		}
 	}
 
@@ -2161,7 +2190,7 @@ func quoteDatum(expr any) any {
 func makeListValue(elements []any) any {
 	result := any(emptyListValue{})
 	for i := len(elements) - 1; i >= 0; i-- {
-		result = pairValue{car: elements[i], cdr: result}
+		result = newPair(elements[i], result)
 	}
 	return result
 }
@@ -2169,11 +2198,16 @@ func makeListValue(elements []any) any {
 func properListElements(value any, builtinName string) ([]any, error) {
 	var elements []any
 	current := value
+	seen := map[*pairCell]struct{}{}
 	for {
 		switch list := current.(type) {
 		case emptyListValue:
 			return elements, nil
 		case pairValue:
+			if _, ok := seen[list.pairCell]; ok {
+				return nil, &EvalError{Message: fmt.Sprintf("%s expects a proper list", builtinName)}
+			}
+			seen[list.pairCell] = struct{}{}
 			elements = append(elements, list.car)
 			current = list.cdr
 		default:
@@ -2232,6 +2266,14 @@ func isProcedureValue(value any) bool {
 }
 
 func formatValue(value any) string {
+	state := &formatState{
+		pairs:   map[*pairCell]bool{},
+		vectors: map[*vectorValue]bool{},
+	}
+	return formatValueWithState(value, state)
+}
+
+func formatValueWithState(value any, state *formatState) string {
 	switch v := value.(type) {
 	case voidValue:
 		return ""
@@ -2253,9 +2295,9 @@ func formatValue(value any) string {
 	case emptyListValue:
 		return "()"
 	case pairValue:
-		return formatPairValue(v)
+		return formatPairValueWithState(v, state)
 	case *vectorValue:
-		return formatVectorValue(v)
+		return formatVectorValueWithState(v, state)
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", v.typ.name)
 	case listExpr:
@@ -2265,7 +2307,7 @@ func formatValue(value any) string {
 
 		parts := make([]string, len(v.elements))
 		for i, elem := range v.elements {
-			parts[i] = formatValue(elem)
+			parts[i] = formatValueWithState(elem, state)
 		}
 		return "(" + strings.Join(parts, " ") + ")"
 	default:
@@ -2305,25 +2347,74 @@ func writeOutput(output *strings.Builder, text string) {
 }
 
 func formatPairValue(pair pairValue) string {
-	parts := []string{formatValue(pair.car)}
-	current := pair.cdr
+	state := &formatState{
+		pairs:   map[*pairCell]bool{},
+		vectors: map[*vectorValue]bool{},
+	}
+	return formatPairValueWithState(pair, state)
+}
+
+func formatVectorValue(vector *vectorValue) string {
+	state := &formatState{
+		pairs:   map[*pairCell]bool{},
+		vectors: map[*vectorValue]bool{},
+	}
+	return formatVectorValueWithState(vector, state)
+}
+
+type formatState struct {
+	pairs   map[*pairCell]bool
+	vectors map[*vectorValue]bool
+}
+
+func formatPairValueWithState(pair pairValue, state *formatState) string {
+	parts := []string{}
+	marked := []*pairCell{}
+	unmark := func() {
+		for i := len(marked) - 1; i >= 0; i-- {
+			delete(state.pairs, marked[i])
+		}
+	}
+
+	current := pair
 	for {
-		switch value := current.(type) {
+		if state.pairs[current.pairCell] {
+			unmark()
+			if len(parts) == 0 {
+				return "#<cycle>"
+			}
+			return "(" + strings.Join(parts, " ") + " . #<cycle>)"
+		}
+
+		state.pairs[current.pairCell] = true
+		marked = append(marked, current.pairCell)
+		parts = append(parts, formatValueWithState(current.car, state))
+
+		switch next := current.cdr.(type) {
 		case emptyListValue:
+			unmark()
 			return "(" + strings.Join(parts, " ") + ")"
 		case pairValue:
-			parts = append(parts, formatValue(value.car))
-			current = value.cdr
+			current = next
 		default:
-			return "(" + strings.Join(parts, " ") + " . " + formatValue(value) + ")"
+			tail := formatValueWithState(next, state)
+			unmark()
+			return "(" + strings.Join(parts, " ") + " . " + tail + ")"
 		}
 	}
 }
 
-func formatVectorValue(vector *vectorValue) string {
+func formatVectorValueWithState(vector *vectorValue, state *formatState) string {
+	if state.vectors[vector] {
+		return "#<cycle>"
+	}
+
+	state.vectors[vector] = true
+	defer delete(state.vectors, vector)
+
 	parts := make([]string, len(vector.elements))
 	for i, elem := range vector.elements {
-		parts[i] = formatValue(elem)
+		parts[i] = formatValueWithState(elem, state)
 	}
 	return "#(" + strings.Join(parts, " ") + ")"
 }
