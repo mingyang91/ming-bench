@@ -8,13 +8,14 @@ import java.util.Map;
 public class Evaluator {
 
     private final Env globalEnv = new Env(null);
+    private final Builtins builtins = new Builtins(this);
 
     // Current source position for error reporting
     private int currentLine = 1;
     private int currentCol = 1;
 
     // Output buffer for display/write/newline
-    private StringBuilder outputBuffer = new StringBuilder();
+    StringBuilder outputBuffer = new StringBuilder();
 
     public Evaluator() {
         // Register builtins as procedures in the global environment
@@ -27,7 +28,15 @@ public class Evaluator {
                 "symbol->string", "string->symbol",
                 "string-ref", "char?",
                 "string-copy", "string-set!",
-                "apply"}) {
+                "apply", "map", "for-each",
+                "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+                "zero?", "positive?", "negative?", "odd?", "even?",
+                "list-ref", "list-tail", "list?", "assoc",
+                "equal?", "eq?",
+                "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+                "char=?", "char<?",
+                "string=?", "string<?", "string-ci=?",
+                "string-upcase", "string-downcase"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
     }
@@ -51,7 +60,7 @@ public class Evaluator {
         return new EvalResult(schemeToString(result), outputBuffer.toString());
     }
 
-    private EvalError posError(String msg) {
+    EvalError posError(String msg) {
         return new EvalError(currentLine + ":" + currentCol + ": " + msg);
     }
 
@@ -471,9 +480,9 @@ public class Evaluator {
         return datum;
     }
 
-    private Object apply(Object proc, List<Object> args) throws EvalError {
+    Object apply(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof BuiltinProc bp) {
-            return applyBuiltin(bp.name, args);
+            return builtins.apply(bp.name, args);
         }
         if (proc instanceof Lambda lam) {
             if (lam.restParam != null) {
@@ -527,262 +536,44 @@ public class Evaluator {
         return val instanceof Boolean b && !b;
     }
 
-    private Object applyBuiltin(String name, List<Object> args) throws EvalError {
-        return switch (name) {
-            case "+" -> {
-                long sum = 0;
-                for (Object a : args) sum += requireLong(a, "+");
-                yield sum;
-            }
-            case "-" -> {
-                if (args.isEmpty()) throw posError("-: need at least 1 argument");
-                if (args.size() == 1) yield -requireLong(args.get(0), "-");
-                long result = requireLong(args.get(0), "-");
-                for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i), "-");
-                yield result;
-            }
-            case "*" -> {
-                long product = 1;
-                for (Object a : args) product *= requireLong(a, "*");
-                yield product;
-            }
-            case "/" -> {
-                if (args.isEmpty()) throw posError("/: need at least 1 argument");
-                long result = requireLong(args.get(0), "/");
-                for (int i = 1; i < args.size(); i++) {
-                    long divisor = requireLong(args.get(i), "/");
-                    if (divisor == 0) throw posError("division by zero");
-                    result /= divisor;
-                }
-                yield result;
-            }
-            case "<" -> {
-                requireArgCount(args, 2, "<");
-                yield requireLong(args.get(0), "<") < requireLong(args.get(1), "<");
-            }
-            case ">" -> {
-                requireArgCount(args, 2, ">");
-                yield requireLong(args.get(0), ">") > requireLong(args.get(1), ">");
-            }
-            case "=" -> {
-                requireArgCount(args, 2, "=");
-                yield requireLong(args.get(0), "=") == requireLong(args.get(1), "=");
-            }
-            case "<=" -> {
-                requireArgCount(args, 2, "<=");
-                yield requireLong(args.get(0), "<=") <= requireLong(args.get(1), "<=");
-            }
-            case ">=" -> {
-                requireArgCount(args, 2, ">=");
-                yield requireLong(args.get(0), ">=") >= requireLong(args.get(1), ">=");
-            }
-            case "not" -> {
-                requireArgCount(args, 1, "not");
-                yield isFalse(args.get(0));
-            }
-            case "cons" -> {
-                requireArgCount(args, 2, "cons");
-                yield new Pair(args.get(0), args.get(1));
-            }
-            case "car" -> {
-                requireArgCount(args, 1, "car");
-                if (!(args.get(0) instanceof Pair p)) throw posError("car: expected pair");
-                yield p.car;
-            }
-            case "cdr" -> {
-                requireArgCount(args, 1, "cdr");
-                if (!(args.get(0) instanceof Pair p)) throw posError("cdr: expected pair");
-                yield p.cdr;
-            }
-            case "null?" -> {
-                requireArgCount(args, 1, "null?");
-                yield args.get(0) == NIL;
-            }
-            case "list" -> {
-                Object result = NIL;
-                for (int i = args.size() - 1; i >= 0; i--) {
-                    result = new Pair(args.get(i), result);
-                }
-                yield result;
-            }
-            case "length" -> {
-                requireArgCount(args, 1, "length");
-                long count = 0;
-                Object cur = args.get(0);
-                while (cur instanceof Pair p) {
-                    count++;
-                    cur = p.cdr;
-                }
-                if (cur != NIL) throw posError("length: not a proper list");
-                yield count;
-            }
-            case "string?" -> {
-                requireArgCount(args, 1, "string?");
-                yield args.get(0) instanceof SchemeString;
-            }
-            case "number?" -> {
-                requireArgCount(args, 1, "number?");
-                yield args.get(0) instanceof Long;
-            }
-            case "boolean?" -> {
-                requireArgCount(args, 1, "boolean?");
-                yield args.get(0) instanceof Boolean;
-            }
-            case "pair?" -> {
-                requireArgCount(args, 1, "pair?");
-                yield args.get(0) instanceof Pair;
-            }
-            case "symbol?" -> {
-                requireArgCount(args, 1, "symbol?");
-                yield args.get(0) instanceof String;
-            }
-            case "append" -> {
-                if (args.isEmpty()) yield NIL;
-                Object result = args.get(args.size() - 1);
-                for (int i = args.size() - 2; i >= 0; i--) {
-                    Object lst = args.get(i);
-                    List<Object> elems = new ArrayList<>();
-                    Object cur = lst;
-                    while (cur instanceof Pair p) {
-                        elems.add(p.car);
-                        cur = p.cdr;
-                    }
-                    for (int j = elems.size() - 1; j >= 0; j--) {
-                        result = new Pair(elems.get(j), result);
-                    }
-                }
-                yield result;
-            }
-            case "display" -> {
-                requireArgCount(args, 1, "display");
-                outputBuffer.append(displayString(args.get(0)));
-                yield null; // void
-            }
-            case "write" -> {
-                requireArgCount(args, 1, "write");
-                outputBuffer.append(schemeToString(args.get(0)));
-                yield null;
-            }
-            case "newline" -> {
-                outputBuffer.append("\n");
-                yield null;
-            }
-            case "string-append" -> {
-                StringBuilder sb = new StringBuilder();
-                for (Object a : args) {
-                    if (!(a instanceof SchemeString s)) throw posError("string-append: expected string");
-                    sb.append(s.value);
-                }
-                yield new SchemeString(sb.toString());
-            }
-            case "string-length" -> {
-                requireArgCount(args, 1, "string-length");
-                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-length: expected string");
-                yield (long) s.value.length();
-            }
-            case "substring" -> {
-                if (args.size() < 2 || args.size() > 3) throw posError("substring: expected 2 or 3 arguments");
-                if (!(args.get(0) instanceof SchemeString s)) throw posError("substring: expected string");
-                int start = (int) requireLong(args.get(1), "substring");
-                int end = args.size() == 3 ? (int) requireLong(args.get(2), "substring") : s.value.length();
-                yield new SchemeString(s.value.substring(start, end));
-            }
-            case "string->number" -> {
-                requireArgCount(args, 1, "string->number");
-                if (!(args.get(0) instanceof SchemeString s)) throw posError("string->number: expected string");
-                try {
-                    yield Long.parseLong(s.value);
-                } catch (NumberFormatException e) {
-                    yield Boolean.FALSE;
-                }
-            }
-            case "number->string" -> {
-                requireArgCount(args, 1, "number->string");
-                yield new SchemeString(String.valueOf(requireLong(args.get(0), "number->string")));
-            }
-            case "symbol->string" -> {
-                requireArgCount(args, 1, "symbol->string");
-                if (!(args.get(0) instanceof String s)) throw posError("symbol->string: expected symbol");
-                yield new SchemeString(s);
-            }
-            case "string->symbol" -> {
-                requireArgCount(args, 1, "string->symbol");
-                if (!(args.get(0) instanceof SchemeString s)) throw posError("string->symbol: expected string");
-                yield s.value; // symbols are plain strings
-            }
-            case "string-ref" -> {
-                requireArgCount(args, 2, "string-ref");
-                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-ref: expected string");
-                int idx = (int) requireLong(args.get(1), "string-ref");
-                yield new SchemeChar(s.value.charAt(idx));
-            }
-            case "char?" -> {
-                requireArgCount(args, 1, "char?");
-                yield args.get(0) instanceof SchemeChar;
-            }
-            case "string-copy" -> {
-                requireArgCount(args, 1, "string-copy");
-                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-copy: expected string");
-                yield new SchemeString(s.value);
-            }
-            case "string-set!" -> {
-                requireArgCount(args, 3, "string-set!");
-                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-set!: expected string");
-                int idx = (int) requireLong(args.get(1), "string-set!");
-                if (!(args.get(2) instanceof SchemeChar c)) throw posError("string-set!: expected char");
-                char[] chars = s.value.toCharArray();
-                chars[idx] = c.value;
-                s.value = new String(chars);
-                yield null; // void
-            }
-            case "apply" -> {
-                if (args.size() < 2) throw posError("apply: need at least 2 arguments");
-                Object proc = args.get(0);
-                // Collect prefix args, then flatten the last arg (a list)
-                List<Object> callArgs = new ArrayList<>();
-                for (int i = 1; i < args.size() - 1; i++) {
-                    callArgs.add(args.get(i));
-                }
-                Object lastArg = args.get(args.size() - 1);
-                Object cur = lastArg;
-                while (cur instanceof Pair p) {
-                    callArgs.add(p.car);
-                    cur = p.cdr;
-                }
-                yield apply(proc, callArgs);
-            }
-            default -> throw posError("unbound variable: " + name);
-        };
-    }
-
-    private long requireLong(Object val, String context) throws EvalError {
-        if (val instanceof Long l) return l;
-        throw posError(context + ": expected number, got " + schemeToString(val));
-    }
-
-    private void requireArgCount(List<Object> args, int expected, String name) throws EvalError {
-        if (args.size() != expected) {
-            throw posError(name + ": expected " + expected + " arguments, got " + args.size());
+    boolean schemeEqual(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof String && b instanceof String) return a.equals(b);
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value.equals(sb.value);
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value == cb.value;
+        if (a == NIL && b == NIL) return true;
+        if (a instanceof Pair pa && b instanceof Pair pb) {
+            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
         }
+        return false;
     }
 
     // ---- Output formatting ----
 
     // display format: strings without quotes
-    private String displayString(Object val) {
+    String displayString(Object val) {
         if (val instanceof SchemeString s) return s.value;
         if (val instanceof SchemeChar c) return String.valueOf(c.value);
         return schemeToString(val);
     }
 
     @SuppressWarnings("unchecked")
-    private String schemeToString(Object val) {
+    String schemeToString(Object val) {
         if (val == null) return ""; // void
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value + "\"";
-        if (val instanceof SchemeChar c) return "#\\" + c.value;
+        if (val instanceof SchemeChar c) {
+            return switch (c.value) {
+                case ' ' -> "#\\space";
+                case '\n' -> "#\\newline";
+                case '\t' -> "#\\tab";
+                default -> "#\\" + c.value;
+            };
+        }
         if (val instanceof String s) return s;
         if (val instanceof Pair) {
             StringBuilder sb = new StringBuilder("(");

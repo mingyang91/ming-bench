@@ -1,0 +1,506 @@
+package ming;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import static ming.Evaluator.NIL;
+
+/**
+ * Dispatches and implements all built-in Scheme procedures.
+ * Split from Evaluator to keep method sizes within quality-gate limits.
+ */
+final class Builtins {
+
+    private final Evaluator evaluator;
+
+    Builtins(Evaluator evaluator) {
+        this.evaluator = evaluator;
+    }
+
+    Object apply(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            // Arithmetic
+            case "+", "-", "*", "/", "abs", "modulo", "remainder", "quotient",
+                 "min", "max", "expt" -> applyArithmetic(name, args);
+
+            // Numeric predicates
+            case "zero?", "positive?", "negative?", "odd?", "even?" ->
+                applyNumericPredicate(name, args);
+
+            // Comparison
+            case "<", ">", "=", "<=", ">=" -> applyComparison(name, args);
+            case "not" -> { requireArgCount(args, 1, "not"); yield isFalse(args.get(0)); }
+            case "equal?" -> { requireArgCount(args, 2, "equal?"); yield evaluator.schemeEqual(args.get(0), args.get(1)); }
+            case "eq?" -> applyEq(args);
+
+            // Pair / List
+            case "cons", "car", "cdr", "null?", "list", "length", "append",
+                 "list-ref", "list-tail", "list?", "assoc", "pair?" ->
+                applyList(name, args);
+
+            // Type predicates
+            case "string?", "number?", "boolean?", "symbol?", "char?" ->
+                applyTypePredicate(name, args);
+
+            // I/O
+            case "display", "write", "newline" -> applyIO(name, args);
+
+            // String operations
+            case "string-append", "string-length", "substring",
+                 "string->number", "number->string", "symbol->string", "string->symbol",
+                 "string-ref", "string-copy", "string-set!",
+                 "string=?", "string<?", "string-ci=?",
+                 "string-upcase", "string-downcase" ->
+                applyString(name, args);
+
+            // Char operations
+            case "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+                 "char=?", "char<?" ->
+                applyChar(name, args);
+
+            // Higher-order
+            case "apply" -> applyApply(args);
+            case "map" -> applyMap(args);
+            case "for-each" -> applyForEach(args);
+
+            default -> throw evaluator.posError("unbound variable: " + name);
+        };
+    }
+
+    // ---- Arithmetic ----
+
+    private Object applyArithmetic(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "+" -> {
+                long sum = 0;
+                for (Object a : args) sum += requireLong(a, "+");
+                yield sum;
+            }
+            case "-" -> {
+                if (args.isEmpty()) throw evaluator.posError("-: need at least 1 argument");
+                if (args.size() == 1) yield -requireLong(args.get(0), "-");
+                long result = requireLong(args.get(0), "-");
+                for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i), "-");
+                yield result;
+            }
+            case "*" -> {
+                long product = 1;
+                for (Object a : args) product *= requireLong(a, "*");
+                yield product;
+            }
+            case "/" -> {
+                if (args.isEmpty()) throw evaluator.posError("/: need at least 1 argument");
+                long result = requireLong(args.get(0), "/");
+                for (int i = 1; i < args.size(); i++) {
+                    long divisor = requireLong(args.get(i), "/");
+                    if (divisor == 0) throw evaluator.posError("division by zero");
+                    result /= divisor;
+                }
+                yield result;
+            }
+            case "abs" -> { requireArgCount(args, 1, "abs"); yield Math.abs(requireLong(args.get(0), "abs")); }
+            case "modulo" -> {
+                requireArgCount(args, 2, "modulo");
+                long a = requireLong(args.get(0), "modulo"), b = requireLong(args.get(1), "modulo");
+                if (b == 0) throw evaluator.posError("modulo: division by zero");
+                yield Math.floorMod(a, b);
+            }
+            case "remainder" -> {
+                requireArgCount(args, 2, "remainder");
+                long a = requireLong(args.get(0), "remainder"), b = requireLong(args.get(1), "remainder");
+                if (b == 0) throw evaluator.posError("remainder: division by zero");
+                yield a % b;
+            }
+            case "quotient" -> {
+                requireArgCount(args, 2, "quotient");
+                long a = requireLong(args.get(0), "quotient"), b = requireLong(args.get(1), "quotient");
+                if (b == 0) throw evaluator.posError("quotient: division by zero");
+                yield a / b;
+            }
+            case "min" -> {
+                if (args.isEmpty()) throw evaluator.posError("min: need at least 1 argument");
+                long result = requireLong(args.get(0), "min");
+                for (int i = 1; i < args.size(); i++) { long v = requireLong(args.get(i), "min"); if (v < result) result = v; }
+                yield result;
+            }
+            case "max" -> {
+                if (args.isEmpty()) throw evaluator.posError("max: need at least 1 argument");
+                long result = requireLong(args.get(0), "max");
+                for (int i = 1; i < args.size(); i++) { long v = requireLong(args.get(i), "max"); if (v > result) result = v; }
+                yield result;
+            }
+            case "expt" -> {
+                requireArgCount(args, 2, "expt");
+                long base = requireLong(args.get(0), "expt"), exp = requireLong(args.get(1), "expt");
+                long result = 1;
+                for (long i = 0; i < exp; i++) result *= base;
+                yield result;
+            }
+            default -> throw evaluator.posError("unknown arithmetic op: " + name);
+        };
+    }
+
+    // ---- Numeric predicates ----
+
+    private Object applyNumericPredicate(String name, List<Object> args) throws EvalError {
+        requireArgCount(args, 1, name);
+        long val = requireLong(args.get(0), name);
+        return switch (name) {
+            case "zero?" -> val == 0;
+            case "positive?" -> val > 0;
+            case "negative?" -> val < 0;
+            case "odd?" -> val % 2 != 0;
+            case "even?" -> val % 2 == 0;
+            default -> throw evaluator.posError("unknown predicate: " + name);
+        };
+    }
+
+    // ---- Comparison ----
+
+    private Object applyComparison(String name, List<Object> args) throws EvalError {
+        requireArgCount(args, 2, name);
+        long a = requireLong(args.get(0), name), b = requireLong(args.get(1), name);
+        return switch (name) {
+            case "<" -> a < b;
+            case ">" -> a > b;
+            case "=" -> a == b;
+            case "<=" -> a <= b;
+            case ">=" -> a >= b;
+            default -> throw evaluator.posError("unknown comparison: " + name);
+        };
+    }
+
+    private Object applyEq(List<Object> args) throws EvalError {
+        requireArgCount(args, 2, "eq?");
+        Object a = args.get(0), b = args.get(1);
+        if (a == b) return true;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof String && b instanceof String) return a.equals(b);
+        if (a instanceof Evaluator.SchemeChar ca && b instanceof Evaluator.SchemeChar cb) return ca.value == cb.value;
+        return false;
+    }
+
+    // ---- Type predicates ----
+
+    private Object applyTypePredicate(String name, List<Object> args) throws EvalError {
+        requireArgCount(args, 1, name);
+        Object val = args.get(0);
+        return switch (name) {
+            case "string?" -> val instanceof Evaluator.SchemeString;
+            case "number?" -> val instanceof Long;
+            case "boolean?" -> val instanceof Boolean;
+            case "pair?" -> val instanceof Evaluator.Pair;
+            case "symbol?" -> val instanceof String;
+            case "char?" -> val instanceof Evaluator.SchemeChar;
+            default -> throw evaluator.posError("unknown type predicate: " + name);
+        };
+    }
+
+    // ---- Pair / List operations ----
+
+    private Object applyList(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "cons" -> { requireArgCount(args, 2, "cons"); yield new Evaluator.Pair(args.get(0), args.get(1)); }
+            case "car" -> {
+                requireArgCount(args, 1, "car");
+                if (!(args.get(0) instanceof Evaluator.Pair p)) throw evaluator.posError("car: expected pair");
+                yield p.car;
+            }
+            case "cdr" -> {
+                requireArgCount(args, 1, "cdr");
+                if (!(args.get(0) instanceof Evaluator.Pair p)) throw evaluator.posError("cdr: expected pair");
+                yield p.cdr;
+            }
+            case "null?" -> { requireArgCount(args, 1, "null?"); yield args.get(0) == NIL; }
+            case "pair?" -> { requireArgCount(args, 1, "pair?"); yield args.get(0) instanceof Evaluator.Pair; }
+            case "list" -> {
+                Object result = NIL;
+                for (int i = args.size() - 1; i >= 0; i--) result = new Evaluator.Pair(args.get(i), result);
+                yield result;
+            }
+            case "length" -> {
+                requireArgCount(args, 1, "length");
+                long count = 0;
+                Object cur = args.get(0);
+                while (cur instanceof Evaluator.Pair p) { count++; cur = p.cdr; }
+                if (cur != NIL) throw evaluator.posError("length: not a proper list");
+                yield count;
+            }
+            case "append" -> applyAppend(args);
+            case "list-ref" -> {
+                requireArgCount(args, 2, "list-ref");
+                Object cur = args.get(0);
+                int idx = (int) requireLong(args.get(1), "list-ref");
+                for (int i = 0; i < idx; i++) {
+                    if (!(cur instanceof Evaluator.Pair p)) throw evaluator.posError("list-ref: index out of range");
+                    cur = p.cdr;
+                }
+                if (!(cur instanceof Evaluator.Pair p)) throw evaluator.posError("list-ref: index out of range");
+                yield p.car;
+            }
+            case "list-tail" -> {
+                requireArgCount(args, 2, "list-tail");
+                Object cur = args.get(0);
+                int idx = (int) requireLong(args.get(1), "list-tail");
+                for (int i = 0; i < idx; i++) {
+                    if (!(cur instanceof Evaluator.Pair p)) throw evaluator.posError("list-tail: index out of range");
+                    cur = p.cdr;
+                }
+                yield cur;
+            }
+            case "list?" -> {
+                requireArgCount(args, 1, "list?");
+                Object cur = args.get(0);
+                while (cur instanceof Evaluator.Pair p) cur = p.cdr;
+                yield cur == NIL;
+            }
+            case "assoc" -> {
+                requireArgCount(args, 2, "assoc");
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Evaluator.Pair p) {
+                    if (p.car instanceof Evaluator.Pair entry && evaluator.schemeEqual(key, entry.car)) yield entry;
+                    alist = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            default -> throw evaluator.posError("unknown list op: " + name);
+        };
+    }
+
+    private Object applyAppend(List<Object> args) {
+        if (args.isEmpty()) return NIL;
+        Object result = args.get(args.size() - 1);
+        for (int i = args.size() - 2; i >= 0; i--) {
+            List<Object> elems = new ArrayList<>();
+            Object cur = args.get(i);
+            while (cur instanceof Evaluator.Pair p) { elems.add(p.car); cur = p.cdr; }
+            for (int j = elems.size() - 1; j >= 0; j--) result = new Evaluator.Pair(elems.get(j), result);
+        }
+        return result;
+    }
+
+    // ---- I/O ----
+
+    private Object applyIO(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "display" -> { requireArgCount(args, 1, "display"); evaluator.outputBuffer.append(evaluator.displayString(args.get(0))); yield null; }
+            case "write" -> { requireArgCount(args, 1, "write"); evaluator.outputBuffer.append(evaluator.schemeToString(args.get(0))); yield null; }
+            case "newline" -> { evaluator.outputBuffer.append("\n"); yield null; }
+            default -> throw evaluator.posError("unknown io op: " + name);
+        };
+    }
+
+    // ---- String operations ----
+
+    private Object applyString(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "string-append" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object a : args) {
+                    if (!(a instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-append: expected string");
+                    sb.append(s.value);
+                }
+                yield new Evaluator.SchemeString(sb.toString());
+            }
+            case "string-length" -> {
+                requireArgCount(args, 1, "string-length");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-length: expected string");
+                yield (long) s.value.length();
+            }
+            case "substring" -> {
+                if (args.size() < 2 || args.size() > 3) throw evaluator.posError("substring: expected 2 or 3 arguments");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("substring: expected string");
+                int start = (int) requireLong(args.get(1), "substring");
+                int end = args.size() == 3 ? (int) requireLong(args.get(2), "substring") : s.value.length();
+                yield new Evaluator.SchemeString(s.value.substring(start, end));
+            }
+            case "string->number" -> {
+                requireArgCount(args, 1, "string->number");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string->number: expected string");
+                try { yield Long.parseLong(s.value); } catch (NumberFormatException e) { yield Boolean.FALSE; }
+            }
+            case "number->string" -> {
+                requireArgCount(args, 1, "number->string");
+                yield new Evaluator.SchemeString(String.valueOf(requireLong(args.get(0), "number->string")));
+            }
+            case "symbol->string" -> {
+                requireArgCount(args, 1, "symbol->string");
+                if (!(args.get(0) instanceof String s)) throw evaluator.posError("symbol->string: expected symbol");
+                yield new Evaluator.SchemeString(s);
+            }
+            case "string->symbol" -> {
+                requireArgCount(args, 1, "string->symbol");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string->symbol: expected string");
+                yield s.value;
+            }
+            case "string-ref" -> {
+                requireArgCount(args, 2, "string-ref");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-ref: expected string");
+                int idx = (int) requireLong(args.get(1), "string-ref");
+                yield new Evaluator.SchemeChar(s.value.charAt(idx));
+            }
+            case "string-copy" -> {
+                requireArgCount(args, 1, "string-copy");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-copy: expected string");
+                yield new Evaluator.SchemeString(s.value);
+            }
+            case "string-set!" -> {
+                requireArgCount(args, 3, "string-set!");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-set!: expected string");
+                int idx = (int) requireLong(args.get(1), "string-set!");
+                if (!(args.get(2) instanceof Evaluator.SchemeChar c)) throw evaluator.posError("string-set!: expected char");
+                char[] chars = s.value.toCharArray();
+                chars[idx] = c.value;
+                s.value = new String(chars);
+                yield null;
+            }
+            case "string=?" -> {
+                requireArgCount(args, 2, "string=?");
+                if (!(args.get(0) instanceof Evaluator.SchemeString a)) throw evaluator.posError("string=?: expected string");
+                if (!(args.get(1) instanceof Evaluator.SchemeString b)) throw evaluator.posError("string=?: expected string");
+                yield a.value.equals(b.value);
+            }
+            case "string<?" -> {
+                requireArgCount(args, 2, "string<?");
+                if (!(args.get(0) instanceof Evaluator.SchemeString a)) throw evaluator.posError("string<?: expected string");
+                if (!(args.get(1) instanceof Evaluator.SchemeString b)) throw evaluator.posError("string<?: expected string");
+                yield a.value.compareTo(b.value) < 0;
+            }
+            case "string-ci=?" -> {
+                requireArgCount(args, 2, "string-ci=?");
+                if (!(args.get(0) instanceof Evaluator.SchemeString a)) throw evaluator.posError("string-ci=?: expected string");
+                if (!(args.get(1) instanceof Evaluator.SchemeString b)) throw evaluator.posError("string-ci=?: expected string");
+                yield a.value.equalsIgnoreCase(b.value);
+            }
+            case "string-upcase" -> {
+                requireArgCount(args, 1, "string-upcase");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-upcase: expected string");
+                yield new Evaluator.SchemeString(s.value.toUpperCase());
+            }
+            case "string-downcase" -> {
+                requireArgCount(args, 1, "string-downcase");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-downcase: expected string");
+                yield new Evaluator.SchemeString(s.value.toLowerCase());
+            }
+            default -> throw evaluator.posError("unknown string op: " + name);
+        };
+    }
+
+    // ---- Char operations ----
+
+    private Object applyChar(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "char-alphabetic?" -> {
+                requireArgCount(args, 1, "char-alphabetic?");
+                if (!(args.get(0) instanceof Evaluator.SchemeChar c)) throw evaluator.posError("char-alphabetic?: expected char");
+                yield Character.isLetter(c.value);
+            }
+            case "char-numeric?" -> {
+                requireArgCount(args, 1, "char-numeric?");
+                if (!(args.get(0) instanceof Evaluator.SchemeChar c)) throw evaluator.posError("char-numeric?: expected char");
+                yield Character.isDigit(c.value);
+            }
+            case "char-upcase" -> {
+                requireArgCount(args, 1, "char-upcase");
+                if (!(args.get(0) instanceof Evaluator.SchemeChar c)) throw evaluator.posError("char-upcase: expected char");
+                yield new Evaluator.SchemeChar(Character.toUpperCase(c.value));
+            }
+            case "char-downcase" -> {
+                requireArgCount(args, 1, "char-downcase");
+                if (!(args.get(0) instanceof Evaluator.SchemeChar c)) throw evaluator.posError("char-downcase: expected char");
+                yield new Evaluator.SchemeChar(Character.toLowerCase(c.value));
+            }
+            case "char=?" -> {
+                requireArgCount(args, 2, "char=?");
+                if (!(args.get(0) instanceof Evaluator.SchemeChar a)) throw evaluator.posError("char=?: expected char");
+                if (!(args.get(1) instanceof Evaluator.SchemeChar b)) throw evaluator.posError("char=?: expected char");
+                yield a.value == b.value;
+            }
+            case "char<?" -> {
+                requireArgCount(args, 2, "char<?");
+                if (!(args.get(0) instanceof Evaluator.SchemeChar a)) throw evaluator.posError("char<?: expected char");
+                if (!(args.get(1) instanceof Evaluator.SchemeChar b)) throw evaluator.posError("char<?: expected char");
+                yield a.value < b.value;
+            }
+            default -> throw evaluator.posError("unknown char op: " + name);
+        };
+    }
+
+    // ---- Higher-order: apply, map, for-each ----
+
+    private Object applyApply(List<Object> args) throws EvalError {
+        if (args.size() < 2) throw evaluator.posError("apply: need at least 2 arguments");
+        Object proc = args.get(0);
+        List<Object> callArgs = new ArrayList<>();
+        for (int i = 1; i < args.size() - 1; i++) callArgs.add(args.get(i));
+        Object cur = args.get(args.size() - 1);
+        while (cur instanceof Evaluator.Pair p) { callArgs.add(p.car); cur = p.cdr; }
+        return evaluator.apply(proc, callArgs);
+    }
+
+    private Object applyMap(List<Object> args) throws EvalError {
+        if (args.size() < 2) throw evaluator.posError("map: need at least 2 arguments");
+        Object proc = args.get(0);
+        List<Object> lists = new ArrayList<>();
+        for (int i = 1; i < args.size(); i++) lists.add(args.get(i));
+        List<Object> results = new ArrayList<>();
+        while (true) {
+            boolean done = false;
+            for (Object l : lists) { if (!(l instanceof Evaluator.Pair)) { done = true; break; } }
+            if (done) break;
+            List<Object> callArgs = new ArrayList<>();
+            List<Object> newLists = new ArrayList<>();
+            for (int i = 0; i < lists.size(); i++) {
+                Evaluator.Pair p = (Evaluator.Pair) lists.get(i);
+                callArgs.add(p.car);
+                newLists.add(p.cdr);
+            }
+            results.add(evaluator.apply(proc, callArgs));
+            lists = newLists;
+        }
+        Object result = NIL;
+        for (int i = results.size() - 1; i >= 0; i--) result = new Evaluator.Pair(results.get(i), result);
+        return result;
+    }
+
+    private Object applyForEach(List<Object> args) throws EvalError {
+        if (args.size() < 2) throw evaluator.posError("for-each: need at least 2 arguments");
+        Object proc = args.get(0);
+        List<Object> lists = new ArrayList<>();
+        for (int i = 1; i < args.size(); i++) lists.add(args.get(i));
+        while (true) {
+            boolean done = false;
+            for (Object l : lists) { if (!(l instanceof Evaluator.Pair)) { done = true; break; } }
+            if (done) break;
+            List<Object> callArgs = new ArrayList<>();
+            List<Object> newLists = new ArrayList<>();
+            for (int i = 0; i < lists.size(); i++) {
+                Evaluator.Pair p = (Evaluator.Pair) lists.get(i);
+                callArgs.add(p.car);
+                newLists.add(p.cdr);
+            }
+            evaluator.apply(proc, callArgs);
+            lists = newLists;
+        }
+        return null;
+    }
+
+    // ---- Helpers ----
+
+    private long requireLong(Object val, String context) throws EvalError {
+        if (val instanceof Long l) return l;
+        throw evaluator.posError(context + ": expected number, got " + evaluator.schemeToString(val));
+    }
+
+    private void requireArgCount(List<Object> args, int expected, String name) throws EvalError {
+        if (args.size() != expected) {
+            throw evaluator.posError(name + ": expected " + expected + " arguments, got " + args.size());
+        }
+    }
+
+    private boolean isFalse(Object val) {
+        return val instanceof Boolean b && !b;
+    }
+}
