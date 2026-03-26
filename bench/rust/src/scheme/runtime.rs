@@ -19,7 +19,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let mut interpreter = Interpreter::new(true);
     let result = interpreter.eval_program(input)?;
-    Ok((interpreter.render_top_level(result)?, interpreter.take_output()))
+    Ok((
+        interpreter.render_top_level(result)?,
+        interpreter.take_output(),
+    ))
 }
 
 struct Interpreter {
@@ -181,7 +184,11 @@ impl Interpreter {
         }
     }
 
-    fn eval_top_level_expr(&mut self, expr: Expr, env: Rc<Environment>) -> Result<Value, EvalError> {
+    fn eval_top_level_expr(
+        &mut self,
+        expr: Expr,
+        env: Rc<Environment>,
+    ) -> Result<Value, EvalError> {
         match catch_signal(|| self.eval_expr(expr, env)) {
             Ok(result) => result,
             Err(ControlSignal::Raised(exception)) => Err(EvalError::new(format!(
@@ -411,13 +418,11 @@ impl Interpreter {
             if let Some(mutator_name) = &field.mutator_name {
                 env.define_value(
                     mutator_name.clone(),
-                    Value::Procedure(Rc::new(Procedure::RecordMutator(
-                        RecordMutatorProcedure {
-                            name: mutator_name.clone(),
-                            record_type: record_type.clone(),
-                            field_index: index,
-                        },
-                    ))),
+                    Value::Procedure(Rc::new(Procedure::RecordMutator(RecordMutatorProcedure {
+                        name: mutator_name.clone(),
+                        record_type: record_type.clone(),
+                        field_index: index,
+                    }))),
                 );
             }
         }
@@ -432,7 +437,9 @@ impl Interpreter {
         env: Rc<Environment>,
     ) -> Result<Step, EvalError> {
         if args.len() < 2 {
-            return Err(EvalError::new("do requires bindings and a termination clause"));
+            return Err(EvalError::new(
+                "do requires bindings and a termination clause",
+            ));
         }
 
         let bindings = Self::parse_do_bindings(&args[0])?;
@@ -446,7 +453,10 @@ impl Interpreter {
         for binding in &bindings {
             let_bindings.push(Self::list_expr(
                 position,
-                vec![Self::symbol_expr(position, &binding.name), binding.init_expr.clone()],
+                vec![
+                    Self::symbol_expr(position, &binding.name),
+                    binding.init_expr.clone(),
+                ],
             ));
         }
 
@@ -558,11 +568,7 @@ impl Interpreter {
         Ok(Step::Value(Self::quote_to_value(&args[0])?))
     }
 
-    fn eval_quasiquote(
-        &mut self,
-        args: &[Expr],
-        env: Rc<Environment>,
-    ) -> Result<Step, EvalError> {
+    fn eval_quasiquote(&mut self, args: &[Expr], env: Rc<Environment>) -> Result<Step, EvalError> {
         Self::require_arity("quasiquote", args.len(), 1)?;
         Ok(Step::Value(self.eval_quasiquote_expr(&args[0], env, 1)?))
     }
@@ -878,9 +884,9 @@ impl Interpreter {
                     Value::Symbol("unquote".to_owned()),
                     self.eval_quasiquote_expr(inner, env, depth - 1)?,
                 ])),
-                QuasiquoteSpecial::UnquoteSplicing if depth == 1 => Err(EvalError::new(
-                    "unquote-splicing outside list or vector",
-                )),
+                QuasiquoteSpecial::UnquoteSplicing if depth == 1 => {
+                    Err(EvalError::new("unquote-splicing outside list or vector"))
+                }
                 QuasiquoteSpecial::UnquoteSplicing => Ok(Self::make_list(&[
                     Value::Symbol("unquote-splicing".to_owned()),
                     self.eval_quasiquote_expr(inner, env, depth - 1)?,
@@ -1030,22 +1036,16 @@ impl Interpreter {
                 if index != guard.clauses.len() - 1 {
                     return Err(EvalError::new("guard else clause must be last"));
                 }
-                return Ok(Some(Self::guard_resolution_from_step(self.tail_from_clause_body(
-                    "guard",
-                    body,
-                    guard_env.clone(),
-                    None,
-                )?)));
+                return Ok(Some(Self::guard_resolution_from_step(
+                    self.tail_from_clause_body("guard", body, guard_env.clone(), None)?,
+                )));
             }
 
             let test_value = self.eval_expr(test_expr.clone(), guard_env.clone())?;
             if Self::is_truthy(&test_value) {
-                return Ok(Some(Self::guard_resolution_from_step(self.tail_from_clause_body(
-                    "guard",
-                    body,
-                    guard_env.clone(),
-                    Some(test_value),
-                )?)));
+                return Ok(Some(Self::guard_resolution_from_step(
+                    self.tail_from_clause_body("guard", body, guard_env.clone(), Some(test_value))?,
+                )));
             }
         }
 
@@ -1085,9 +1085,7 @@ impl Interpreter {
             Procedure::Continuation(continuation) => {
                 signal_continuation_jump(continuation.id, args);
             }
-            Procedure::RecordConstructor(constructor) => {
-                Ok(Step::Value(constructor.apply(&args)?))
-            }
+            Procedure::RecordConstructor(constructor) => Ok(Step::Value(constructor.apply(&args)?)),
             Procedure::RecordPredicate(predicate) => Ok(Step::Value(predicate.apply(&args)?)),
             Procedure::RecordAccessor(accessor) => Ok(Step::Value(accessor.apply(&args)?)),
             Procedure::RecordMutator(mutator) => Ok(Step::Value(mutator.apply(&args)?)),
@@ -1335,10 +1333,14 @@ impl Interpreter {
 
         for field_name in constructor_fields {
             let Some(index) = record_type.field_indexes.get(field_name).copied() else {
-                return Err(EvalError::new(format!("unknown record field: {field_name}")));
+                return Err(EvalError::new(format!(
+                    "unknown record field: {field_name}"
+                )));
             };
             if used[index] {
-                return Err(EvalError::new(format!("duplicate record field: {field_name}")));
+                return Err(EvalError::new(format!(
+                    "duplicate record field: {field_name}"
+                )));
             }
             used[index] = true;
             indexes.push(index);
@@ -1367,21 +1369,22 @@ impl Interpreter {
             ExprKind::Char(value) => Ok(Value::Char(*value)),
             ExprKind::Symbol(name) => Ok(Value::Symbol(name.clone())),
             ExprKind::List(items) => Ok(Self::make_improper_list(
-                items.iter()
+                items
+                    .iter()
                     .map(Self::quote_to_value)
                     .collect::<Result<Vec<_>, _>>()?,
                 Value::EmptyList,
             )),
-            ExprKind::DottedList(items, tail) => {
-                Ok(Self::make_improper_list(
-                    items.iter()
-                        .map(Self::quote_to_value)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    Self::quote_to_value(tail)?,
-                ))
-            }
+            ExprKind::DottedList(items, tail) => Ok(Self::make_improper_list(
+                items
+                    .iter()
+                    .map(Self::quote_to_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+                Self::quote_to_value(tail)?,
+            )),
             ExprKind::Vector(items) => Ok(Value::Vector(Rc::new(RefCell::new(
-                items.iter()
+                items
+                    .iter()
                     .map(Self::quote_to_value)
                     .collect::<Result<Vec<_>, _>>()?,
             )))),
@@ -2273,18 +2276,14 @@ impl Interpreter {
         }
     }
 
-    fn builtin_call_cc(
-        interpreter: &mut Interpreter,
-        args: &[Value],
-    ) -> Result<Value, EvalError> {
+    fn builtin_call_cc(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, EvalError> {
         Self::require_arity("call/cc", args.len(), 1)?;
 
         let continuation_id = next_signal_id();
-        let continuation = Value::Procedure(Rc::new(Procedure::Continuation(
-            ContinuationProcedure {
+        let continuation =
+            Value::Procedure(Rc::new(Procedure::Continuation(ContinuationProcedure {
                 id: continuation_id,
-            },
-        )));
+            })));
 
         match catch_signal(|| interpreter.call_value(args[0].clone(), vec![continuation])) {
             Ok(result) => result,
@@ -2610,9 +2609,7 @@ impl Interpreter {
             (Value::Int(left), Value::Int(right)) => left == right,
             (Value::Rational(left), Value::Rational(right)) => left == right,
             (Value::Int(left), Value::Rational(right))
-            | (Value::Rational(right), Value::Int(left)) => {
-                ExactNumber::from_int(*left) == *right
-            }
+            | (Value::Rational(right), Value::Int(left)) => ExactNumber::from_int(*left) == *right,
             (Value::Bool(left), Value::Bool(right)) => left == right,
             (Value::Char(left), Value::Char(right)) => left == right,
             (Value::Symbol(left), Value::Symbol(right)) => left == right,
@@ -2640,9 +2637,7 @@ impl Interpreter {
             (Value::Int(left), Value::Int(right)) => left == right,
             (Value::Rational(left), Value::Rational(right)) => left == right,
             (Value::Int(left), Value::Rational(right))
-            | (Value::Rational(right), Value::Int(left)) => {
-                ExactNumber::from_int(*left) == *right
-            }
+            | (Value::Rational(right), Value::Int(left)) => ExactNumber::from_int(*left) == *right,
             (Value::Bool(left), Value::Bool(right)) => left == right,
             (Value::String(left), Value::String(right)) => {
                 left.as_plain_string() == right.as_plain_string()
@@ -3186,10 +3181,9 @@ impl Environment {
     }
 
     fn define_syntax(&self, name: String, macro_binding: SyntaxRulesMacro) {
-        self.syntax_bindings.borrow_mut().insert(
-            name,
-            Rc::new(MacroBinding::SyntaxRules(macro_binding)),
-        );
+        self.syntax_bindings
+            .borrow_mut()
+            .insert(name, Rc::new(MacroBinding::SyntaxRules(macro_binding)));
     }
 
     fn lookup_syntax(&self, name: &str) -> Option<Rc<MacroBinding>> {
@@ -3387,6 +3381,49 @@ struct MacroRule {
     template: Expr,
 }
 
+#[derive(Clone, Default)]
+struct PatternBindings {
+    single: HashMap<String, Expr>,
+    repeated: HashMap<String, Vec<Expr>>,
+}
+
+impl PatternBindings {
+    fn bind_single(&mut self, name: &str, expr: &Expr) -> bool {
+        match self.single.get(name) {
+            Some(existing) => expr_equal(existing, expr),
+            None => {
+                self.single.insert(name.to_owned(), expr.clone());
+                true
+            }
+        }
+    }
+
+    fn add_repetition(&mut self, repetition: PatternBindings) -> Result<(), EvalError> {
+        if !repetition.repeated.is_empty() {
+            return Err(EvalError::new("nested ellipsis patterns are not supported"));
+        }
+
+        for (name, expr) in repetition.single {
+            self.repeated.entry(name).or_default().push(expr);
+        }
+        Ok(())
+    }
+
+    fn ensure_repeated_bindings(&mut self, names: &HashSet<String>) {
+        for name in names {
+            self.repeated.entry(name.clone()).or_default();
+        }
+    }
+
+    fn single(&self, name: &str) -> Option<&Expr> {
+        self.single.get(name)
+    }
+
+    fn repeated(&self, name: &str) -> Option<&[Expr]> {
+        self.repeated.get(name).map(Vec::as_slice)
+    }
+}
+
 impl SyntaxRulesMacro {
     fn compile(name: &str, transformer_expr: &Expr) -> Result<Self, EvalError> {
         let parts = match transformer_expr.kind() {
@@ -3404,10 +3441,7 @@ impl SyntaxRulesMacro {
             ));
         }
 
-        let literal_exprs = Self::expect_list(
-            &parts[1],
-            "syntax-rules literals must be a list",
-        )?;
+        let literal_exprs = Self::expect_list(&parts[1], "syntax-rules literals must be a list")?;
         let mut literals = HashSet::with_capacity(literal_exprs.len());
         for literal_expr in literal_exprs {
             let Some(literal) = literal_expr.symbol_name() else {
@@ -3418,8 +3452,7 @@ impl SyntaxRulesMacro {
 
         let mut rules = Vec::with_capacity(parts.len() - 2);
         for rule_expr in &parts[2..] {
-            let rule_parts =
-                Self::expect_list(rule_expr, "syntax-rules rule must be a list")?;
+            let rule_parts = Self::expect_list(rule_expr, "syntax-rules rule must be a list")?;
             if rule_parts.len() != 2 {
                 return Err(EvalError::new(
                     "syntax-rules rule must contain a pattern and template",
@@ -3442,9 +3475,9 @@ impl SyntaxRulesMacro {
         let invocation = Expr::new(ExprKind::List(elements.to_vec()), position);
 
         for rule in &self.rules {
-            let mut bindings = HashMap::new();
-            if self.match_pattern(&rule.pattern, &invocation, &mut bindings)? {
-                return Ok(self.expand_template(&rule.template, &bindings));
+            let mut bindings = PatternBindings::default();
+            if self.match_macro_rule(rule, &invocation, &mut bindings)? {
+                return self.expand_template(&rule.template, &bindings, None);
             }
         }
 
@@ -3461,11 +3494,50 @@ impl SyntaxRulesMacro {
         }
     }
 
+    fn match_macro_rule(
+        &self,
+        rule: &MacroRule,
+        invocation: &Expr,
+        bindings: &mut PatternBindings,
+    ) -> Result<bool, EvalError> {
+        let input_items = match invocation.kind() {
+            ExprKind::List(items) => items,
+            _ => return Ok(false),
+        };
+        if input_items.is_empty() {
+            return Ok(false);
+        }
+
+        match rule.pattern.kind() {
+            ExprKind::List(pattern_items) => {
+                if pattern_items.is_empty() {
+                    return Ok(false);
+                }
+                self.match_pattern_elements(&pattern_items[1..], 0, &input_items[1..], 0, bindings)
+            }
+            ExprKind::DottedList(pattern_items, pattern_tail) => {
+                if pattern_items.is_empty() {
+                    return Ok(false);
+                }
+                self.match_dotted_pattern_elements(
+                    &pattern_items[1..],
+                    0,
+                    pattern_tail,
+                    &input_items[1..],
+                    0,
+                    None,
+                    bindings,
+                )
+            }
+            _ => Err(EvalError::new("syntax-rules pattern must be a list")),
+        }
+    }
+
     fn match_pattern(
         &self,
         pattern: &Expr,
         input: &Expr,
-        bindings: &mut HashMap<String, Expr>,
+        bindings: &mut PatternBindings,
     ) -> Result<bool, EvalError> {
         match (pattern.kind(), input.kind()) {
             (ExprKind::Int(left), ExprKind::Int(right)) => Ok(left == right),
@@ -3475,40 +3547,34 @@ impl SyntaxRulesMacro {
             (ExprKind::Char(left), ExprKind::Char(right)) => Ok(left == right),
             (ExprKind::Symbol(symbol), _) => self.match_pattern_symbol(symbol, input, bindings),
             (ExprKind::Vector(pattern_items), ExprKind::Vector(input_items)) => {
-                if pattern_items.len() != input_items.len() {
-                    return Ok(false);
-                }
-
-                for (pattern_item, input_item) in pattern_items.iter().zip(input_items) {
-                    if !self.match_pattern(pattern_item, input_item, bindings)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                self.match_pattern_elements(pattern_items, 0, input_items, 0, bindings)
             }
             (ExprKind::List(pattern_items), ExprKind::List(input_items)) => {
-                if pattern_items.len() != input_items.len() {
-                    return Ok(false);
-                }
-
-                for (pattern_item, input_item) in pattern_items.iter().zip(input_items) {
-                    if !self.match_pattern(pattern_item, input_item, bindings)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                self.match_pattern_elements(pattern_items, 0, input_items, 0, bindings)
             }
-            (ExprKind::DottedList(pattern_items, pattern_tail), ExprKind::DottedList(input_items, input_tail)) => {
-                if pattern_items.len() != input_items.len() {
-                    return Ok(false);
-                }
-                for (pattern_item, input_item) in pattern_items.iter().zip(input_items) {
-                    if !self.match_pattern(pattern_item, input_item, bindings)? {
-                        return Ok(false);
-                    }
-                }
-                self.match_pattern(pattern_tail, input_tail, bindings)
+            (ExprKind::DottedList(pattern_items, pattern_tail), ExprKind::List(input_items)) => {
+                self.match_dotted_pattern_elements(
+                    pattern_items,
+                    0,
+                    pattern_tail,
+                    input_items,
+                    0,
+                    None,
+                    bindings,
+                )
             }
+            (
+                ExprKind::DottedList(pattern_items, pattern_tail),
+                ExprKind::DottedList(input_items, input_tail),
+            ) => self.match_dotted_pattern_elements(
+                pattern_items,
+                0,
+                pattern_tail,
+                input_items,
+                0,
+                Some(input_tail),
+                bindings,
+            ),
             _ => Ok(false),
         }
     }
@@ -3517,7 +3583,7 @@ impl SyntaxRulesMacro {
         &self,
         symbol: &str,
         input: &Expr,
-        bindings: &mut HashMap<String, Expr>,
+        bindings: &mut PatternBindings,
     ) -> Result<bool, EvalError> {
         if symbol == "_" {
             return Ok(true);
@@ -3525,47 +3591,361 @@ impl SyntaxRulesMacro {
         if self.literals.contains(symbol) {
             return Ok(input.symbol_name() == Some(symbol));
         }
-        if let Some(existing) = bindings.get(symbol) {
-            return Ok(expr_equal(existing, input));
-        }
-
-        bindings.insert(symbol.to_owned(), input.clone());
-        Ok(true)
+        Ok(bindings.bind_single(symbol, input))
     }
 
-    fn expand_template(&self, template: &Expr, bindings: &HashMap<String, Expr>) -> Expr {
-        match template.kind() {
-            ExprKind::Symbol(symbol) => bindings
-                .get(symbol)
-                .cloned()
-                .unwrap_or_else(|| template.clone()),
-            ExprKind::List(items) => Expr::new(
-                ExprKind::List(
-                    items.iter()
-                        .map(|item| self.expand_template(item, bindings))
-                        .collect(),
-                ),
-                template.position(),
-            ),
-            ExprKind::DottedList(items, tail) => Expr::new(
-                ExprKind::DottedList(
-                    items.iter()
-                        .map(|item| self.expand_template(item, bindings))
-                        .collect(),
-                    self.expand_template(tail, bindings),
-                ),
-                template.position(),
-            ),
-            ExprKind::Vector(items) => Expr::new(
-                ExprKind::Vector(
-                    items.iter()
-                        .map(|item| self.expand_template(item, bindings))
-                        .collect(),
-                ),
-                template.position(),
-            ),
-            _ => template.clone(),
+    fn match_pattern_elements(
+        &self,
+        pattern_items: &[Expr],
+        pattern_index: usize,
+        input_items: &[Expr],
+        input_index: usize,
+        bindings: &mut PatternBindings,
+    ) -> Result<bool, EvalError> {
+        if pattern_index >= pattern_items.len() {
+            return Ok(input_index == input_items.len());
         }
+
+        let pattern = &pattern_items[pattern_index];
+        if pattern_index + 1 < pattern_items.len()
+            && Self::is_ellipsis(&pattern_items[pattern_index + 1])
+        {
+            let mut repeated_names = HashSet::new();
+            self.collect_pattern_variables(pattern, &mut repeated_names);
+
+            let min_remaining = self.minimum_pattern_arity(pattern_items, pattern_index + 2);
+            if input_items.len() < input_index + min_remaining {
+                return Ok(false);
+            }
+
+            let max_repeat = input_items.len() - input_index - min_remaining;
+            for repeat_count in 0..=max_repeat {
+                let mut candidate = bindings.clone();
+                candidate.ensure_repeated_bindings(&repeated_names);
+                let mut matched = true;
+
+                for offset in 0..repeat_count {
+                    let mut repetition = PatternBindings::default();
+                    if !self.match_pattern(
+                        pattern,
+                        &input_items[input_index + offset],
+                        &mut repetition,
+                    )? {
+                        matched = false;
+                        break;
+                    }
+                    candidate.add_repetition(repetition)?;
+                }
+
+                if matched
+                    && self.match_pattern_elements(
+                        pattern_items,
+                        pattern_index + 2,
+                        input_items,
+                        input_index + repeat_count,
+                        &mut candidate,
+                    )?
+                {
+                    *bindings = candidate;
+                    return Ok(true);
+                }
+            }
+
+            return Ok(false);
+        }
+
+        if input_index >= input_items.len() {
+            return Ok(false);
+        }
+        if !self.match_pattern(pattern, &input_items[input_index], bindings)? {
+            return Ok(false);
+        }
+
+        self.match_pattern_elements(
+            pattern_items,
+            pattern_index + 1,
+            input_items,
+            input_index + 1,
+            bindings,
+        )
+    }
+
+    fn match_dotted_pattern_elements(
+        &self,
+        pattern_items: &[Expr],
+        pattern_index: usize,
+        pattern_tail: &Expr,
+        input_items: &[Expr],
+        input_index: usize,
+        input_tail: Option<&Expr>,
+        bindings: &mut PatternBindings,
+    ) -> Result<bool, EvalError> {
+        if pattern_index >= pattern_items.len() {
+            let remainder = Self::rest_expr(
+                input_items,
+                input_index,
+                input_tail,
+                pattern_tail.position(),
+            );
+            return self.match_pattern(pattern_tail, &remainder, bindings);
+        }
+
+        let pattern = &pattern_items[pattern_index];
+        if pattern_index + 1 < pattern_items.len()
+            && Self::is_ellipsis(&pattern_items[pattern_index + 1])
+        {
+            let mut repeated_names = HashSet::new();
+            self.collect_pattern_variables(pattern, &mut repeated_names);
+
+            let min_remaining = self.minimum_pattern_arity(pattern_items, pattern_index + 2);
+            if input_items.len() < input_index + min_remaining {
+                return Ok(false);
+            }
+
+            let max_repeat = input_items.len() - input_index - min_remaining;
+            for repeat_count in 0..=max_repeat {
+                let mut candidate = bindings.clone();
+                candidate.ensure_repeated_bindings(&repeated_names);
+                let mut matched = true;
+
+                for offset in 0..repeat_count {
+                    let mut repetition = PatternBindings::default();
+                    if !self.match_pattern(
+                        pattern,
+                        &input_items[input_index + offset],
+                        &mut repetition,
+                    )? {
+                        matched = false;
+                        break;
+                    }
+                    candidate.add_repetition(repetition)?;
+                }
+
+                if matched
+                    && self.match_dotted_pattern_elements(
+                        pattern_items,
+                        pattern_index + 2,
+                        pattern_tail,
+                        input_items,
+                        input_index + repeat_count,
+                        input_tail,
+                        &mut candidate,
+                    )?
+                {
+                    *bindings = candidate;
+                    return Ok(true);
+                }
+            }
+
+            return Ok(false);
+        }
+
+        if input_index >= input_items.len() {
+            return Ok(false);
+        }
+        if !self.match_pattern(pattern, &input_items[input_index], bindings)? {
+            return Ok(false);
+        }
+
+        self.match_dotted_pattern_elements(
+            pattern_items,
+            pattern_index + 1,
+            pattern_tail,
+            input_items,
+            input_index + 1,
+            input_tail,
+            bindings,
+        )
+    }
+
+    fn minimum_pattern_arity(&self, pattern_items: &[Expr], start: usize) -> usize {
+        let mut required = 0;
+        let mut index = start;
+        while index < pattern_items.len() {
+            if index + 1 < pattern_items.len() && Self::is_ellipsis(&pattern_items[index + 1]) {
+                index += 2;
+                continue;
+            }
+            required += 1;
+            index += 1;
+        }
+        required
+    }
+
+    fn collect_pattern_variables(&self, pattern: &Expr, variables: &mut HashSet<String>) {
+        match pattern.kind() {
+            ExprKind::Symbol(symbol) => {
+                if symbol != "_" && symbol != "..." && !self.literals.contains(symbol) {
+                    variables.insert(symbol.clone());
+                }
+            }
+            ExprKind::List(items) | ExprKind::Vector(items) => {
+                for item in items {
+                    self.collect_pattern_variables(item, variables);
+                }
+            }
+            ExprKind::DottedList(items, tail) => {
+                for item in items {
+                    self.collect_pattern_variables(item, variables);
+                }
+                self.collect_pattern_variables(tail, variables);
+            }
+            ExprKind::Int(_)
+            | ExprKind::Rational(_)
+            | ExprKind::Bool(_)
+            | ExprKind::String(_)
+            | ExprKind::Char(_) => {}
+        }
+    }
+
+    fn expand_template(
+        &self,
+        template: &Expr,
+        bindings: &PatternBindings,
+        repeat_index: Option<usize>,
+    ) -> Result<Expr, EvalError> {
+        match template.kind() {
+            ExprKind::Symbol(symbol) => {
+                if let Some(bound) = bindings.single(symbol) {
+                    return Ok(bound.clone());
+                }
+                if let Some(values) = bindings.repeated(symbol) {
+                    let Some(index) = repeat_index else {
+                        return Err(EvalError::new(format!(
+                            "template uses repeated pattern variable without ellipsis: {symbol}"
+                        )));
+                    };
+                    return Ok(values[index].clone());
+                }
+                Ok(template.clone())
+            }
+            ExprKind::List(items) => {
+                if items.len() == 2 && items[0].symbol_name() == Some("quote") {
+                    return Ok(template.clone());
+                }
+                Ok(Expr::new(
+                    ExprKind::List(self.expand_template_sequence(items, bindings, repeat_index)?),
+                    template.position(),
+                ))
+            }
+            ExprKind::DottedList(items, tail) => Ok(Expr::new(
+                ExprKind::DottedList(
+                    self.expand_template_sequence(items, bindings, repeat_index)?,
+                    self.expand_template(tail, bindings, repeat_index)?,
+                ),
+                template.position(),
+            )),
+            ExprKind::Vector(items) => Ok(Expr::new(
+                ExprKind::Vector(self.expand_template_sequence(items, bindings, repeat_index)?),
+                template.position(),
+            )),
+            _ => Ok(template.clone()),
+        }
+    }
+
+    fn expand_template_sequence(
+        &self,
+        items: &[Expr],
+        bindings: &PatternBindings,
+        repeat_index: Option<usize>,
+    ) -> Result<Vec<Expr>, EvalError> {
+        let mut expanded = Vec::new();
+        let mut index = 0;
+
+        while index < items.len() {
+            let item = &items[index];
+            if index + 1 < items.len() && Self::is_ellipsis(&items[index + 1]) {
+                let count = self.repetition_count(item, bindings)?;
+                for repetition in 0..count {
+                    expanded.push(self.expand_template(item, bindings, Some(repetition))?);
+                }
+                index += 2;
+                continue;
+            }
+
+            expanded.push(self.expand_template(item, bindings, repeat_index)?);
+            index += 1;
+        }
+
+        Ok(expanded)
+    }
+
+    fn repetition_count(
+        &self,
+        template: &Expr,
+        bindings: &PatternBindings,
+    ) -> Result<usize, EvalError> {
+        let mut repeated_names = HashSet::new();
+        Self::collect_repeated_template_variables(template, bindings, &mut repeated_names);
+        if repeated_names.is_empty() {
+            return Err(EvalError::new(
+                "ellipsis template has no repeated pattern variables",
+            ));
+        }
+
+        let mut count = None;
+        for name in repeated_names {
+            let current = bindings.repeated(&name).map_or(0, <[Expr]>::len);
+            match count {
+                Some(existing) if existing != current => {
+                    return Err(EvalError::new(
+                        "mismatched ellipsis lengths in macro template",
+                    ))
+                }
+                Some(_) => {}
+                None => count = Some(current),
+            }
+        }
+
+        Ok(count.unwrap_or(0))
+    }
+
+    fn collect_repeated_template_variables(
+        template: &Expr,
+        bindings: &PatternBindings,
+        repeated_names: &mut HashSet<String>,
+    ) {
+        match template.kind() {
+            ExprKind::Symbol(symbol) => {
+                if bindings.repeated(symbol).is_some() {
+                    repeated_names.insert(symbol.clone());
+                }
+            }
+            ExprKind::List(items) | ExprKind::Vector(items) => {
+                for item in items {
+                    Self::collect_repeated_template_variables(item, bindings, repeated_names);
+                }
+            }
+            ExprKind::DottedList(items, tail) => {
+                for item in items {
+                    Self::collect_repeated_template_variables(item, bindings, repeated_names);
+                }
+                Self::collect_repeated_template_variables(tail, bindings, repeated_names);
+            }
+            ExprKind::Int(_)
+            | ExprKind::Rational(_)
+            | ExprKind::Bool(_)
+            | ExprKind::String(_)
+            | ExprKind::Char(_) => {}
+        }
+    }
+
+    fn rest_expr(
+        input_items: &[Expr],
+        input_index: usize,
+        input_tail: Option<&Expr>,
+        position: SourcePos,
+    ) -> Expr {
+        let remaining = input_items[input_index..].to_vec();
+        match input_tail {
+            Some(tail) if remaining.is_empty() => tail.clone(),
+            Some(tail) => Expr::new(ExprKind::DottedList(remaining, tail.clone()), position),
+            None => Expr::new(ExprKind::List(remaining), position),
+        }
+    }
+
+    fn is_ellipsis(expr: &Expr) -> bool {
+        expr.symbol_name() == Some("...")
     }
 }
 
@@ -3591,7 +3971,10 @@ fn expr_equal(left: &Expr, right: &Expr) -> bool {
                     .zip(right.iter())
                     .all(|(left, right)| expr_equal(left, right))
         }
-        (ExprKind::DottedList(left_items, left_tail), ExprKind::DottedList(right_items, right_tail)) => {
+        (
+            ExprKind::DottedList(left_items, left_tail),
+            ExprKind::DottedList(right_items, right_tail),
+        ) => {
             left_items.len() == right_items.len()
                 && left_items
                     .iter()
