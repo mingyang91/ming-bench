@@ -25,13 +25,15 @@ public class Evaluator {
         "symbol->string", "string->symbol",
         "string-copy", "string-set!",
         "apply",
-        "eq?", "equal?",
+        "eq?", "eqv?", "equal?",
         "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
         "zero?", "positive?", "negative?", "odd?", "even?",
         "list-ref", "list-tail", "list?", "assoc", "map",
         "char-alphabetic?", "char-numeric?", "char=?", "char<?",
         "char-upcase", "char-downcase",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+        "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
+        "vector?", "vector->list", "list->vector",
         "procedure?"
     };
 
@@ -196,6 +198,10 @@ public class Evaluator {
                             i += 2;
                             col += 2;
                         }
+                    } else if (next == '(') {
+                        tokens.add(new Token("#(", line, startCol));
+                        i += 2;
+                        col += 2;
                     } else {
                         String sym = readSymbol(input, i);
                         tokens.add(new Token(sym, line, startCol));
@@ -246,6 +252,20 @@ public class Evaluator {
             quoteExpr.add(new SchemeSymbol("quote"));
             quoteExpr.add(quoted);
             return new Located(quoteExpr, token.line(), token.col());
+        }
+
+        if (token.value().equals("#(")) {
+            List<Object> elems = new ArrayList<>();
+            while (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
+                elems.add(parse(tokens, pos));
+            }
+            if (pos[0] >= tokens.size()) throw new EvalError("missing closing parenthesis");
+            pos[0]++;
+            // Build (vector e1 e2 ...) form
+            List<Object> vecForm = new ArrayList<>();
+            vecForm.add(new SchemeSymbol("vector"));
+            vecForm.addAll(elems);
+            return new Located(vecForm, token.line(), token.col());
         }
 
         if (token.value().equals("(")) {
@@ -416,65 +436,22 @@ public class Evaluator {
                         return result;
                     }
                     case "let" -> {
-                        if (args.size() < 2) throw new EvalError("let: bad syntax");
-                        Object first2 = unwrap(args.get(0));
-                        if (first2 instanceof SchemeSymbol loopName) {
-                            // Named let: (let name ((var init) ...) body ...)
-                            if (args.size() < 3) throw new EvalError("let: bad syntax");
-                            Object bindingsObj = unwrap(args.get(1));
-                            List<?> bindings = (List<?>) bindingsObj;
-                            List<String> params = new ArrayList<>();
-                            List<Object> inits = new ArrayList<>();
-                            for (Object binding : bindings) {
-                                List<?> b = (List<?>) unwrap(binding);
-                                params.add(((SchemeSymbol) unwrap(b.get(0))).name());
-                                inits.add(eval(b.get(1), env));
-                            }
-                            Object body = wrapBodyInBegin(args, 2);
-                            Environment letEnv = new Environment(env);
-                            SchemeLambda loopLam = new SchemeLambda(params, body, letEnv);
-                            letEnv.define(loopName.name(), loopLam);
-                            return apply(loopLam, inits);
-                        }
-                        // Regular let: (let ((var val) ...) body ...)
-                        List<?> bindings = (List<?>) first2;
-                        Environment letEnv = new Environment(env);
-                        for (Object binding : bindings) {
-                            List<?> b = (List<?>) unwrap(binding);
-                            String varName = ((SchemeSymbol) unwrap(b.get(0))).name();
-                            Object val = eval(b.get(1), env);
-                            letEnv.define(varName, val);
-                        }
-                        Object result = VOID;
-                        for (int i = 1; i < args.size(); i++) {
-                            result = eval(args.get(i), letEnv);
-                        }
-                        return result;
+                        return evalLet(args, env);
+                    }
+                    case "letrec" -> {
+                        return evalLetrec(args, env);
+                    }
+                    case "letrec*" -> {
+                        return evalLetrecStar(args, env);
+                    }
+                    case "case" -> {
+                        return evalCase(args, env);
+                    }
+                    case "do" -> {
+                        return evalDo(args, env);
                     }
                     case "cond" -> {
-                        for (Object clause : args) {
-                            List<?> cl = (List<?>) unwrap(clause);
-                            if (cl.isEmpty()) throw new EvalError("cond: empty clause");
-                            Object test = cl.get(0);
-                            Object rawTest = unwrap(test);
-                            if (rawTest instanceof SchemeSymbol s && s.name().equals("else")) {
-                                Object result = VOID;
-                                for (int i = 1; i < cl.size(); i++) {
-                                    result = eval(cl.get(i), env);
-                                }
-                                return result;
-                            }
-                            Object testVal = eval(test, env);
-                            if (!testVal.equals(Boolean.FALSE)) {
-                                if (cl.size() == 1) return testVal;
-                                Object result = VOID;
-                                for (int i = 1; i < cl.size(); i++) {
-                                    result = eval(cl.get(i), env);
-                                }
-                                return result;
-                            }
-                        }
-                        return VOID;
+                        return evalCond(args, env);
                     }
                     // Builtins handled as special forms (unevaluated args for and/or)
                     case "and" -> {
@@ -506,14 +483,16 @@ public class Evaluator {
                          "symbol->string", "string->symbol",
                          "string-copy", "string-set!",
                          "apply",
-                         "eq?", "equal?",
+                         "eq?", "eqv?", "equal?",
                          "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
                          "zero?", "positive?", "negative?", "odd?", "even?",
                          "list-ref", "list-tail", "list?", "assoc", "map",
                          "char-alphabetic?", "char-numeric?", "char=?", "char<?",
                          "char-upcase", "char-downcase",
                          "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
-                         "procedure?" -> {
+                         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
+        "vector?", "vector->list", "list->vector",
+        "procedure?" -> {
                         return evalBuiltin(name, args, env);
                     }
                     case "define-record-type" -> {
@@ -563,6 +542,193 @@ public class Evaluator {
             return apply(proc, evaledArgs);
         }
         throw new EvalError("cannot evaluate: " + expr);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalLet(List<Object> args, Environment env) throws EvalError {
+        if (args.size() < 2) throw new EvalError("let: bad syntax");
+        Object first2 = unwrap(args.get(0));
+        if (first2 instanceof SchemeSymbol loopName) {
+            if (args.size() < 3) throw new EvalError("let: bad syntax");
+            Object bindingsObj = unwrap(args.get(1));
+            List<?> bindings = (List<?>) bindingsObj;
+            List<String> params = new ArrayList<>();
+            List<Object> inits = new ArrayList<>();
+            for (Object binding : bindings) {
+                List<?> b = (List<?>) unwrap(binding);
+                params.add(((SchemeSymbol) unwrap(b.get(0))).name());
+                inits.add(eval(b.get(1), env));
+            }
+            Object body = wrapBodyInBegin(args, 2);
+            Environment letEnv = new Environment(env);
+            SchemeLambda loopLam = new SchemeLambda(params, body, letEnv);
+            letEnv.define(loopName.name(), loopLam);
+            return apply(loopLam, inits);
+        }
+        List<?> bindings = (List<?>) first2;
+        Environment letEnv = new Environment(env);
+        for (Object binding : bindings) {
+            List<?> b = (List<?>) unwrap(binding);
+            String varName = ((SchemeSymbol) unwrap(b.get(0))).name();
+            Object val = eval(b.get(1), env);
+            letEnv.define(varName, val);
+        }
+        Object result = VOID;
+        for (int i = 1; i < args.size(); i++) {
+            result = eval(args.get(i), letEnv);
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalLetrec(List<Object> args, Environment env) throws EvalError {
+        if (args.size() < 2) throw new EvalError("letrec: bad syntax");
+        List<?> bindings = (List<?>) unwrap(args.get(0));
+        Environment letEnv = new Environment(env);
+        List<String> varNames = new ArrayList<>();
+        List<Object> initExprs = new ArrayList<>();
+        for (Object binding : bindings) {
+            List<?> b = (List<?>) unwrap(binding);
+            String varName = ((SchemeSymbol) unwrap(b.get(0))).name();
+            varNames.add(varName);
+            initExprs.add(b.get(1));
+            letEnv.define(varName, VOID);
+        }
+        List<Object> vals = new ArrayList<>();
+        for (Object initExpr : initExprs) {
+            vals.add(eval(initExpr, letEnv));
+        }
+        for (int i = 0; i < varNames.size(); i++) {
+            letEnv.set(varNames.get(i), vals.get(i));
+        }
+        Object result = VOID;
+        for (int i = 1; i < args.size(); i++) {
+            result = eval(args.get(i), letEnv);
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalLetrecStar(List<Object> args, Environment env) throws EvalError {
+        if (args.size() < 2) throw new EvalError("letrec*: bad syntax");
+        List<?> bindings = (List<?>) unwrap(args.get(0));
+        Environment letEnv = new Environment(env);
+        for (Object binding : bindings) {
+            List<?> b = (List<?>) unwrap(binding);
+            String varName = ((SchemeSymbol) unwrap(b.get(0))).name();
+            letEnv.define(varName, VOID);
+        }
+        for (Object binding : bindings) {
+            List<?> b = (List<?>) unwrap(binding);
+            String varName = ((SchemeSymbol) unwrap(b.get(0))).name();
+            Object val = eval(b.get(1), letEnv);
+            letEnv.set(varName, val);
+        }
+        Object result = VOID;
+        for (int i = 1; i < args.size(); i++) {
+            result = eval(args.get(i), letEnv);
+        }
+        return result;
+    }
+
+    private Object evalCase(List<Object> args, Environment env) throws EvalError {
+        if (args.isEmpty()) throw new EvalError("case: bad syntax");
+        Object key = eval(args.get(0), env);
+        for (int i = 1; i < args.size(); i++) {
+            List<?> clause = (List<?>) unwrap(args.get(i));
+            if (clause.isEmpty()) throw new EvalError("case: empty clause");
+            Object datums = unwrap(clause.get(0));
+            if (datums instanceof SchemeSymbol s && s.name().equals("else")) {
+                Object result = VOID;
+                for (int j = 1; j < clause.size(); j++) {
+                    result = eval(clause.get(j), env);
+                }
+                return result;
+            }
+            List<?> datumList = (List<?>) datums;
+            for (Object datum : datumList) {
+                Object d = unwrap(datum);
+                if (schemeEqv(key, d)) {
+                    Object result = VOID;
+                    for (int j = 1; j < clause.size(); j++) {
+                        result = eval(clause.get(j), env);
+                    }
+                    return result;
+                }
+            }
+        }
+        return VOID;
+    }
+
+    private Object evalDo(List<Object> args, Environment env) throws EvalError {
+        if (args.size() < 2) throw new EvalError("do: bad syntax");
+        List<?> varSpecs = (List<?>) unwrap(args.get(0));
+        List<?> testClause = (List<?>) unwrap(args.get(1));
+        List<String> varNames = new ArrayList<>();
+        List<Object> initExprs = new ArrayList<>();
+        List<Object> stepExprs = new ArrayList<>();
+        for (Object spec : varSpecs) {
+            List<?> s = (List<?>) unwrap(spec);
+            varNames.add(((SchemeSymbol) unwrap(s.get(0))).name());
+            initExprs.add(s.get(1));
+            stepExprs.add(s.size() > 2 ? s.get(2) : null);
+        }
+        Environment doEnv = new Environment(env);
+        for (int i = 0; i < varNames.size(); i++) {
+            doEnv.define(varNames.get(i), eval(initExprs.get(i), env));
+        }
+        while (true) {
+            Object testVal = eval(testClause.get(0), doEnv);
+            if (!testVal.equals(Boolean.FALSE)) {
+                if (testClause.size() == 1) return VOID;
+                Object result = VOID;
+                for (int j = 1; j < testClause.size(); j++) {
+                    result = eval(testClause.get(j), doEnv);
+                }
+                return result;
+            }
+            for (int j = 2; j < args.size(); j++) {
+                eval(args.get(j), doEnv);
+            }
+            List<Object> newVals = new ArrayList<>();
+            for (int i = 0; i < varNames.size(); i++) {
+                Object step = stepExprs.get(i);
+                if (step != null) {
+                    newVals.add(eval(step, doEnv));
+                } else {
+                    newVals.add(doEnv.lookup(varNames.get(i)));
+                }
+            }
+            for (int i = 0; i < varNames.size(); i++) {
+                doEnv.set(varNames.get(i), newVals.get(i));
+            }
+        }
+    }
+
+    private Object evalCond(List<Object> args, Environment env) throws EvalError {
+        for (Object clause : args) {
+            List<?> cl = (List<?>) unwrap(clause);
+            if (cl.isEmpty()) throw new EvalError("cond: empty clause");
+            Object test = cl.get(0);
+            Object rawTest = unwrap(test);
+            if (rawTest instanceof SchemeSymbol s && s.name().equals("else")) {
+                Object result = VOID;
+                for (int i = 1; i < cl.size(); i++) {
+                    result = eval(cl.get(i), env);
+                }
+                return result;
+            }
+            Object testVal = eval(test, env);
+            if (!testVal.equals(Boolean.FALSE)) {
+                if (cl.size() == 1) return testVal;
+                Object result = VOID;
+                for (int i = 1; i < cl.size(); i++) {
+                    result = eval(cl.get(i), env);
+                }
+                return result;
+            }
+        }
+        return VOID;
     }
 
     @SuppressWarnings("unchecked")
@@ -789,7 +955,40 @@ public class Evaluator {
                 if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) yield ca.value() == cb.value();
                 yield a == b || a.equals(b);
             }
+            case "eqv?" -> schemeEqv(args.get(0), args.get(1));
             case "equal?" -> schemeEqual(args.get(0), args.get(1));
+            case "vector" -> new SchemeVector(args.toArray());
+            case "make-vector" -> {
+                int size = (int) requireLong(args.get(0));
+                Object fill = args.size() > 1 ? args.get(1) : 0L;
+                yield new SchemeVector(size, fill);
+            }
+            case "vector-ref" -> {
+                if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-ref: not a vector");
+                yield v.ref((int) requireLong(args.get(1)));
+            }
+            case "vector-set!" -> {
+                if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-set!: not a vector");
+                v.set((int) requireLong(args.get(1)), args.get(2));
+                yield VOID;
+            }
+            case "vector-length" -> {
+                if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-length: not a vector");
+                yield (long) v.length();
+            }
+            case "vector?" -> args.get(0) instanceof SchemeVector;
+            case "vector->list" -> {
+                if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector->list: not a vector");
+                Object result = SchemeNil.INSTANCE;
+                for (int i = v.length() - 1; i >= 0; i--) result = new SchemePair(v.elements[i], result);
+                yield result;
+            }
+            case "list->vector" -> {
+                List<Object> elems = new ArrayList<>();
+                Object cur = args.get(0);
+                while (cur instanceof SchemePair p) { elems.add(p.car); cur = p.cdr; }
+                yield new SchemeVector(elems.toArray());
+            }
             default -> {
                 if (name.startsWith("record-ctor:")) {
                     String recType = name.substring("record-ctor:".length());
@@ -1170,7 +1369,7 @@ public class Evaluator {
         throw new EvalError("expected string, got: " + schemeToString(val));
     }
 
-    /** display format: strings without quotes, everything else like schemeToString */
+    /** display format: strings without quotes, vectors/lists display their elements */
     private String displayString(Object val) {
         if (val instanceof String s) {
             if (s.startsWith("\"") && s.endsWith("\"")) {
@@ -1184,9 +1383,26 @@ public class Evaluator {
         return schemeToString(val);
     }
 
+    private boolean schemeEqv(Object a, Object b) {
+        if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
+        if (isNumber(a) && isNumber(b)) {
+            try { return toDouble(a) == toDouble(b); } catch (EvalError e) { return false; }
+        }
+        return a == b;
+    }
+
     private boolean schemeEqual(Object a, Object b) {
         if (a instanceof SchemePair pa && b instanceof SchemePair pb) {
             return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        }
+        if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
+            if (va.length() != vb.length()) return false;
+            for (int i = 0; i < va.length(); i++) {
+                if (!schemeEqual(va.elements[i], vb.elements[i])) return false;
+            }
+            return true;
         }
         if (a instanceof SchemeNil && b instanceof SchemeNil) return true;
         if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
@@ -1223,6 +1439,15 @@ public class Evaluator {
         if (val instanceof SchemeString ss) return ss.toString();
         if (val instanceof SchemeSymbol sym) return sym.name();
         if (val instanceof SchemeChar ch) return "#\\" + ch.value();
+        if (val instanceof SchemeVector v) {
+            StringBuilder sb = new StringBuilder("#(");
+            for (int i = 0; i < v.length(); i++) {
+                if (i > 0) sb.append(" ");
+                sb.append(schemeToString(v.elements[i]));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
         if (val instanceof SchemeNil) return "()";
         if (val instanceof SchemePair p) {
             StringBuilder sb = new StringBuilder("(");
