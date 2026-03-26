@@ -31,7 +31,8 @@ public class Evaluator {
         "list-ref", "list-tail", "list?", "assoc", "map",
         "char-alphabetic?", "char-numeric?", "char=?", "char<?",
         "char-upcase", "char-downcase",
-        "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase"
+        "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+        "procedure?"
     };
 
     {
@@ -394,21 +395,18 @@ public class Evaluator {
                     }
                     case "lambda" -> {
                         if (args.size() < 2) throw new EvalError("lambda: bad syntax");
-                        Object paramObj = unwrap(args.get(0));
-                        List<?> paramList = (List<?>) paramObj;
-                        List<String> params = new ArrayList<>();
-                        String restParam = null;
-                        for (int i = 0; i < paramList.size(); i++) {
-                            String pname = ((SchemeSymbol) unwrap(paramList.get(i))).name();
-                            if (pname.equals(".")) {
-                                if (i + 1 < paramList.size()) {
-                                    restParam = ((SchemeSymbol) unwrap(paramList.get(i + 1))).name();
-                                }
-                                break;
-                            }
-                            params.add(pname);
+                        return parseLambda(args, env);
+                    }
+                    case "case-lambda" -> {
+                        if (args.isEmpty()) throw new EvalError("case-lambda: bad syntax");
+                        List<SchemeLambda> clauses = new ArrayList<>();
+                        for (Object clause : args) {
+                            List<?> clauseList = (List<?>) unwrap(clause);
+                            if (clauseList.size() < 2) throw new EvalError("case-lambda: bad clause");
+                            List<Object> clauseArgs = new ArrayList<>(clauseList);
+                            clauses.add(parseLambda(clauseArgs, env));
                         }
-                        return new SchemeLambda(params, restParam, wrapBodyInBegin(args, 1), env);
+                        return new SchemeCaseLambda(clauses);
                     }
                     case "begin" -> {
                         Object result = VOID;
@@ -514,7 +512,8 @@ public class Evaluator {
                          "list-ref", "list-tail", "list?", "assoc", "map",
                          "char-alphabetic?", "char-numeric?", "char=?", "char<?",
                          "char-upcase", "char-downcase",
-                         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase" -> {
+                         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+                         "procedure?" -> {
                         return evalBuiltin(name, args, env);
                     }
                     case "define-record-type" -> {
@@ -632,7 +631,41 @@ public class Evaluator {
         return beginList;
     }
 
+    private SchemeLambda parseLambda(List<?> args, Environment env) throws EvalError {
+        Object paramObj = unwrap(args.get(0));
+        List<?> paramList = (List<?>) paramObj;
+        List<String> params = new ArrayList<>();
+        String restParam = null;
+        for (int i = 0; i < paramList.size(); i++) {
+            String pname = ((SchemeSymbol) unwrap(paramList.get(i))).name();
+            if (pname.equals(".")) {
+                if (i + 1 < paramList.size()) {
+                    restParam = ((SchemeSymbol) unwrap(paramList.get(i + 1))).name();
+                }
+                break;
+            }
+            params.add(pname);
+        }
+        List<Object> bodyArgs = new ArrayList<>();
+        for (int i = 1; i < args.size(); i++) bodyArgs.add(args.get(i));
+        return new SchemeLambda(params, restParam, wrapBodyInBegin(bodyArgs, 0), env);
+    }
+
     private Object apply(Object proc, List<Object> args) throws EvalError {
+        if (proc instanceof SchemeCaseLambda cl) {
+            for (SchemeLambda clause : cl.clauses) {
+                if (clause.restParam != null) {
+                    if (args.size() >= clause.params.size()) {
+                        return apply(clause, args);
+                    }
+                } else {
+                    if (args.size() == clause.params.size()) {
+                        return apply(clause, args);
+                    }
+                }
+            }
+            throw new EvalError("no matching clause for " + args.size() + " arguments");
+        }
         if (proc instanceof SchemeLambda lam) {
             if (lam.restParam != null) {
                 if (args.size() < lam.params.size()) {
@@ -728,7 +761,7 @@ public class Evaluator {
             case "number?", "integer?", "rational?", "exact?", "inexact?",
                  "exact->inexact", "inexact->exact", "numerator", "denominator" ->
                 applyNumericTypeBuiltin(name, args);
-            case "string?", "boolean?", "pair?", "symbol?", "char?" ->
+            case "string?", "boolean?", "pair?", "symbol?", "char?", "procedure?" ->
                 applyTypePredicateBuiltin(name, args);
             case "display", "write", "newline" ->
                 applyIoBuiltin(name, args);
@@ -1019,6 +1052,7 @@ public class Evaluator {
             case "pair?" -> args.get(0) instanceof SchemePair;
             case "symbol?" -> args.get(0) instanceof SchemeSymbol;
             case "char?" -> args.get(0) instanceof SchemeChar;
+            case "procedure?" -> args.get(0) instanceof SchemeLambda || args.get(0) instanceof SchemeCaseLambda || args.get(0) instanceof BuiltinProcedure;
             default -> false;
         };
     }
