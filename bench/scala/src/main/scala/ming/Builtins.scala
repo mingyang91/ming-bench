@@ -2,7 +2,7 @@ package ming
 
 private[ming] object Builtins:
 
-  private def asLong(v: SchemeVal, op: String): Long = v match
+  private[ming] def asLong(v: SchemeVal, op: String): Long = v match
     case SchemeInt(n) => n
     case _            => throw new EvalError(s"$op: expected number, got ${v.display}")
 
@@ -15,7 +15,7 @@ private[ming] object Builtins:
         SchemeBool(nums.sliding(2).forall(w => op(w(0), w(1))))
     )
 
-  private def typeCheck(name: String)(pred: SchemeVal => Boolean): SchemeBuiltin =
+  private[ming] def typeCheck(name: String)(pred: SchemeVal => Boolean): SchemeBuiltin =
     SchemeBuiltin(
       name,
       args =>
@@ -67,11 +67,13 @@ private[ming] object Builtins:
       )
     )
 
-    installList(env)
     installPredicates(env)
     installIO(env, output)
-    StringBuiltins.install(env)
     installApply(env)
+    ListBuiltins.install(env)
+    StringBuiltins.install(env)
+    NumericBuiltins.install(env)
+    CharStringBuiltins.install(env)
 
   private def installApply(env: Env): Unit =
     env.set(
@@ -91,81 +93,6 @@ private[ming] object Builtins:
       )
     )
 
-  private def installList(env: Env): Unit =
-    env.set(
-      "cons",
-      SchemeBuiltin(
-        "cons",
-        args =>
-          if args.size != 2 then throw new EvalError("cons: expected 2 arguments")
-          args(1) match
-            case SchemeList(elems) => SchemeList(args(0) :: elems)
-            case _                 => throw new EvalError("cons: second argument must be a list")
-      )
-    )
-
-    env.set(
-      "car",
-      SchemeBuiltin(
-        "car",
-        args =>
-          if args.size != 1 then throw new EvalError("car: expected 1 argument")
-          args.head match
-            case SchemeList(h :: _) => h
-            case SchemeList(Nil)    => throw new EvalError("car: empty list")
-            case _                  => throw new EvalError("car: expected pair")
-      )
-    )
-
-    env.set(
-      "cdr",
-      SchemeBuiltin(
-        "cdr",
-        args =>
-          if args.size != 1 then throw new EvalError("cdr: expected 1 argument")
-          args.head match
-            case SchemeList(_ :: t) => SchemeList(t)
-            case SchemeList(Nil)    => throw new EvalError("cdr: empty list")
-            case _                  => throw new EvalError("cdr: expected pair")
-      )
-    )
-
-    env.set(
-      "null?",
-      typeCheck("null?") {
-        case SchemeList(Nil) => true
-        case _               => false
-      }
-    )
-
-    env.set("list", SchemeBuiltin("list", args => SchemeList(args)))
-
-    env.set(
-      "length",
-      SchemeBuiltin(
-        "length",
-        args =>
-          if args.size != 1 then throw new EvalError("length: expected 1 argument")
-          args.head match
-            case SchemeList(elems) => SchemeInt(elems.size.toLong)
-            case _                 => throw new EvalError("length: expected list")
-      )
-    )
-
-    env.set(
-      "append",
-      SchemeBuiltin(
-        "append",
-        args =>
-          val result = args.foldLeft(List.empty[SchemeVal]) { (acc, v) =>
-            v match
-              case SchemeList(elems) => acc ++ elems
-              case _                 => throw new EvalError("append: expected list")
-          }
-          SchemeList(result)
-      )
-    )
-
   private def installPredicates(env: Env): Unit =
     env.set("number?", typeCheck("number?") { case _: SchemeInt => true; case _ => false })
     env.set("string?", typeCheck("string?") { case _: SchemeString => true; case _ => false })
@@ -174,6 +101,7 @@ private[ming] object Builtins:
       "pair?",
       typeCheck("pair?") {
         case SchemeList(_ :: _) => true
+        case _: SchemePair      => true
         case _                  => false
       }
     )

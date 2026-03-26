@@ -53,8 +53,35 @@ case class SchemeList(elems: List[SchemeVal]) extends SchemeVal:
   def display: String =
     "(" + elems.map(_.display).mkString(" ") + ")"
 
+case class SchemePair(car: SchemeVal, cdr: SchemeVal) extends SchemeVal:
+
+  def display: String =
+    val sb = new StringBuilder("(")
+    sb.append(car.display)
+    var curr: SchemeVal = cdr
+    var done            = false
+    while !done do
+      curr match
+        case SchemeList(Nil) => done = true
+        case SchemeList(elems) =>
+          for e <- elems do sb.append(" ").append(e.display)
+          done = true
+        case SchemePair(a, d) =>
+          sb.append(" ").append(a.display)
+          curr = d
+        case other =>
+          sb.append(" . ").append(other.display)
+          done = true
+    sb.append(")")
+    sb.toString
+
 case class SchemeChar(value: Char) extends SchemeVal:
-  def display: String = s"#\\$value"
+
+  def display: String = value match
+    case ' '  => "#\\space"
+    case '\n' => "#\\newline"
+    case '\t' => "#\\tab"
+    case c    => s"#\\$c"
 
 case object SchemeVoid extends SchemeVal:
   def display: String = "#<void>"
