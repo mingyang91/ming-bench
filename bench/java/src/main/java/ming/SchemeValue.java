@@ -67,6 +67,67 @@ record StringValue(String value) implements SchemeValue {
     }
 }
 
+record SymbolValue(String name) implements SchemeValue {
+    @Override
+    public String render() {
+        return name;
+    }
+}
+
+final class EmptyListValue implements SchemeValue {
+    static final EmptyListValue INSTANCE = new EmptyListValue();
+
+    private EmptyListValue() {
+    }
+
+    @Override
+    public String render() {
+        return "()";
+    }
+}
+
+record PairValue(SchemeValue car, SchemeValue cdr) implements SchemeValue {
+    @Override
+    public String render() {
+        StringBuilder builder = new StringBuilder();
+        builder.append('(');
+        appendContents(builder, this);
+        builder.append(')');
+        return builder.toString();
+    }
+
+    private static void appendContents(StringBuilder builder, SchemeValue value) {
+        SchemeValue current = value;
+        boolean first = true;
+
+        while (current instanceof PairValue pair) {
+            if (!first) {
+                builder.append(' ');
+            }
+            builder.append(pair.car().render());
+            current = pair.cdr();
+            first = false;
+        }
+
+        if (!(current instanceof EmptyListValue)) {
+            builder.append(" . ");
+            builder.append(current.render());
+        }
+    }
+}
+
+final class VoidValue implements SchemeValue {
+    static final VoidValue INSTANCE = new VoidValue();
+
+    private VoidValue() {
+    }
+
+    @Override
+    public String render() {
+        return "#<void>";
+    }
+}
+
 @FunctionalInterface
 interface BuiltinImplementation {
     SchemeValue apply(List<SchemeValue> arguments) throws EvalError;
@@ -82,6 +143,21 @@ record BuiltinProcedure(
 
     @Override
     public String render() {
+        return "#<procedure:" + name + ">";
+    }
+}
+
+record LambdaProcedure(
+        String name,
+        List<String> parameters,
+        List<SchemeExpression> body,
+        Environment closureEnvironment
+) implements SchemeValue {
+    @Override
+    public String render() {
+        if (name == null || name.isEmpty()) {
+            return "#<procedure:lambda>";
+        }
         return "#<procedure:" + name + ">";
     }
 }
