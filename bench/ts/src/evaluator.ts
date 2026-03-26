@@ -42,6 +42,11 @@ interface SchemeSymbol {
   value: string;
 }
 
+interface SchemeChar {
+  kind: 'char';
+  value: string;
+}
+
 interface EmptyListValue {
   kind: 'empty-list';
 }
@@ -87,6 +92,7 @@ type Value =
   | boolean
   | SchemeString
   | SchemeSymbol
+  | SchemeChar
   | EmptyListValue
   | PairValue
   | VoidValue
@@ -94,6 +100,18 @@ type Value =
 
 const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
 const VOID_VALUE: VoidValue = { kind: 'void' };
+
+class Runtime {
+  private readonly output: string[] = [];
+
+  write(value: string): void {
+    this.output.push(value);
+  }
+
+  readOutput(): string {
+    return this.output.join('');
+  }
+}
 
 class Environment {
   private readonly bindings = new Map<string, Value>();
@@ -334,20 +352,7 @@ class Reader {
  * representation of the last result.
  */
 export function evalStr(input: string): string {
-  const program = new Reader(input).parseProgram();
-
-  if (program.length === 0) {
-    throw new EvalError('1:1: expected expression');
-  }
-
-  const env = createGlobalEnv();
-  let result: Value = VOID_VALUE;
-
-  for (const expr of program) {
-    result = evaluate(expr, env);
-  }
-
-  return formatValue(result);
+  return formatValue(evaluateProgram(input).result);
 }
 
 /**
@@ -355,10 +360,29 @@ export function evalStr(input: string): string {
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  return { result: evalStr(input), output: '' };
+  const { result, output } = evaluateProgram(input);
+  return { result: formatValue(result), output };
 }
 
-function createGlobalEnv(): Environment {
+function evaluateProgram(input: string): { result: Value; output: string } {
+  const program = new Reader(input).parseProgram();
+
+  if (program.length === 0) {
+    throw new EvalError('1:1: expected expression');
+  }
+
+  const runtime = new Runtime();
+  const env = createGlobalEnv(runtime);
+  let result: Value = VOID_VALUE;
+
+  for (const expr of program) {
+    result = evaluate(expr, env);
+  }
+
+  return { result, output: runtime.readOutput() };
+}
+
+function createGlobalEnv(runtime: Runtime): Environment {
   const env = new Environment();
 
   env.define('+', builtin('+', (args) => {
@@ -487,6 +511,123 @@ function createGlobalEnv(): Environment {
   env.define('boolean?', predicateBuiltin('boolean?', (value) => typeof value === 'boolean'));
   env.define('pair?', predicateBuiltin('pair?', isPair));
   env.define('symbol?', predicateBuiltin('symbol?', isSchemeSymbolValue));
+  env.define('char?', predicateBuiltin('char?', isSchemeCharValue));
+
+  env.define('display', builtin('display', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: display expects exactly 1 argument`);
+    }
+
+    runtime.write(formatDisplayValue(args[0].value));
+    return VOID_VALUE;
+  }));
+
+  env.define('write', builtin('write', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: write expects exactly 1 argument`);
+    }
+
+    runtime.write(formatValue(args[0].value));
+    return VOID_VALUE;
+  }));
+
+  env.define('newline', builtin('newline', (args, loc) => {
+    if (args.length !== 0) {
+      throw new EvalError(`${loc.line}:${loc.col}: newline expects exactly 0 arguments`);
+    }
+
+    runtime.write('\n');
+    return VOID_VALUE;
+  }));
+
+  env.define('string-append', builtin('string-append', (args) => ({
+    kind: 'string',
+    value: args.map(expectString).join(''),
+  })));
+
+  env.define('string-length', builtin('string-length', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: string-length expects exactly 1 argument`);
+    }
+
+    return stringChars(expectStringArg(args[0])).length;
+  }));
+
+  env.define('substring', builtin('substring', (args, loc) => {
+    if (args.length !== 3) {
+      throw new EvalError(`${loc.line}:${loc.col}: substring expects exactly 3 arguments`);
+    }
+
+    const value = expectStringArg(args[0]);
+    const chars = stringChars(value);
+    const start = expectIndexArg(args[1]);
+    const end = expectIndexArg(args[2]);
+
+    if (start < 0 || end < start || end > chars.length) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: substring indices out of bounds`);
+    }
+
+    return {
+      kind: 'string',
+      value: chars.slice(start, end).join(''),
+    };
+  }));
+
+  env.define('string->number', builtin('string->number', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: string->number expects exactly 1 argument`);
+    }
+
+    return parseStringNumber(expectStringArg(args[0]));
+  }));
+
+  env.define('number->string', builtin('number->string', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: number->string expects exactly 1 argument`);
+    }
+
+    return {
+      kind: 'string',
+      value: formatNumber(expectNumber(args[0])),
+    };
+  }));
+
+  env.define('symbol->string', builtin('symbol->string', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: symbol->string expects exactly 1 argument`);
+    }
+
+    return {
+      kind: 'string',
+      value: expectSymbolArg(args[0]).value,
+    };
+  }));
+
+  env.define('string->symbol', builtin('string->symbol', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: string->symbol expects exactly 1 argument`);
+    }
+
+    return {
+      kind: 'symbol',
+      value: expectStringArg(args[0]),
+    };
+  }));
+
+  env.define('string-ref', builtin('string-ref', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: string-ref expects exactly 2 arguments`);
+    }
+
+    const chars = stringChars(expectStringArg(args[0]));
+    const index = expectIndexArg(args[1]);
+
+    if (index < 0 || index >= chars.length) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: string-ref index out of bounds`);
+    }
+
+    return { kind: 'char', value: chars[index] };
+  }));
 
   return env;
 }
@@ -873,6 +1014,35 @@ function expectPairArg(arg: EvaluatedArg): PairValue {
   return arg.value;
 }
 
+function expectString(arg: EvaluatedArg): string {
+  if (!isSchemeStringValue(arg.value)) {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected string`);
+  }
+
+  return arg.value.value;
+}
+
+function expectStringArg(arg: EvaluatedArg): string {
+  return expectString(arg);
+}
+
+function expectSymbolArg(arg: EvaluatedArg): SchemeSymbol {
+  if (!isSchemeSymbolValue(arg.value)) {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected symbol`);
+  }
+
+  return arg.value;
+}
+
+function expectIndexArg(arg: EvaluatedArg): number {
+  const value = expectNumber(arg);
+  if (!Number.isInteger(value)) {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected integer`);
+  }
+
+  return value;
+}
+
 function expectProperList(value: Value, loc: SourceLoc): Value[] {
   const elements: Value[] = [];
   let current = value;
@@ -917,13 +1087,17 @@ function isSchemeSymbolValue(value: Value): value is SchemeSymbol {
   return typeof value === 'object' && value !== null && value.kind === 'symbol';
 }
 
+function isSchemeCharValue(value: Value): value is SchemeChar {
+  return typeof value === 'object' && value !== null && value.kind === 'char';
+}
+
 function procedureDisplayName(proc: ClosureProcedure): string {
   return proc.name ?? 'lambda';
 }
 
 function formatValue(value: Value): string {
   if (typeof value === 'number') {
-    return Object.is(value, -0) ? '0' : String(value);
+    return formatNumber(value);
   }
 
   if (typeof value === 'boolean') {
@@ -935,10 +1109,35 @@ function formatValue(value: Value): string {
       return `"${escapeString(value.value)}"`;
     case 'symbol':
       return value.value;
+    case 'char':
+      return formatChar(value.value);
     case 'empty-list':
       return '()';
     case 'pair':
       return formatPair(value);
+    case 'void':
+      return '#<void>';
+    case 'procedure':
+      return '#<procedure>';
+  }
+}
+
+function formatDisplayValue(value: Value): string {
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return formatValue(value);
+  }
+
+  switch (value.kind) {
+    case 'string':
+      return value.value;
+    case 'symbol':
+      return value.value;
+    case 'char':
+      return value.value;
+    case 'empty-list':
+      return '()';
+    case 'pair':
+      return formatDisplayPair(value);
     case 'void':
       return '#<void>';
     case 'procedure':
@@ -962,12 +1161,56 @@ function formatPair(value: PairValue): string {
   return `(${parts.join(' ')} . ${formatValue(tail)})`;
 }
 
+function formatDisplayPair(value: PairValue): string {
+  const parts: string[] = [];
+  let tail: Value = value;
+
+  while (isPair(tail)) {
+    parts.push(formatDisplayValue(tail.car));
+    tail = tail.cdr;
+  }
+
+  if (isEmptyList(tail)) {
+    return `(${parts.join(' ')})`;
+  }
+
+  return `(${parts.join(' ')} . ${formatDisplayValue(tail)})`;
+}
+
+function formatNumber(value: number): string {
+  return Object.is(value, -0) ? '0' : String(value);
+}
+
+function formatChar(value: string): string {
+  if (value === ' ') {
+    return '#\\space';
+  }
+
+  if (value === '\n') {
+    return '#\\newline';
+  }
+
+  return `#\\${value}`;
+}
+
 function escapeString(value: string): string {
   return value
     .replaceAll('\\', '\\\\')
     .replaceAll('"', '\\"')
     .replaceAll('\n', '\\n')
     .replaceAll('\t', '\\t');
+}
+
+function stringChars(value: string): string[] {
+  return Array.from(value);
+}
+
+function parseStringNumber(value: string): number | false {
+  if (!/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(value)) {
+    return false;
+  }
+
+  return Number(value);
 }
 
 function isWhitespace(ch: string): boolean {
