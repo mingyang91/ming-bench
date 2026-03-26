@@ -29,8 +29,8 @@ object Builtins:
     case "caddr" =>
       if args.length != 1 then throw errAt(pos, "caddr requires 1 argument")
       applyCar(applyCdr(applyCdr(args.head, pos), pos), pos)
-    case "list-ref" | "list-tail" | "list?" | "assoc" | "assv" | "member" | "map" | "for-each" | "equal?" | "eq?" |
-        "eqv?" =>
+    case "list-ref" | "list-tail" | "list?" | "assoc" | "assv" | "assq" | "member" | "memq" | "memv" | "map" |
+        "for-each" | "equal?" | "eq?" | "eqv?" =>
       ListUtilBuiltins.applyListUtils(name, args, pos, env)
     case "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" | "vector?" | "vector->list" |
         "list->vector" =>

@@ -60,6 +60,13 @@ enum Kont:
     next: Kont
   )
 
+  case CondArrow(
+    testValue: Value,
+    env: Env,
+    pos: Pos,
+    next: Kont
+  )
+
   // dynamic-wind continuation frames
   case DynWindAfterIn(bodyThunk: Value, entry: WindEntry, env: Env, pos: Pos, next: Kont)
   case DynWindAfterBody(entry: WindEntry, env: Env, pos: Pos, next: Kont)

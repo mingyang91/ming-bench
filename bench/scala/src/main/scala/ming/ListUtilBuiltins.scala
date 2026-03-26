@@ -10,41 +10,8 @@ private[ming] object ListUtilBuiltins:
     pos: Pos,
     env: Env
   ): Value = name match
-    case "list-ref" =>
-      if args.length != 2 then throw errAt(pos, "list-ref requires 2 arguments")
-      val idx = args(1) match
-        case Value.VNum(i) => i.toInt
-        case _             => throw errAt(pos, "list-ref: index must be a number")
-      args(0) match
-        case Value.VList(elems) => elems(idx)
-        case Value.VPair(_) =>
-          var cur = args(0)
-          var i   = 0
-          while i < idx do
-            cur = cur match
-              case Value.VPair(c)      => c.cdr
-              case Value.VList(_ :: t) => Value.VList(t)
-              case _                   => throw errAt(pos, "list-ref: index out of range")
-            i += 1
-          cur match
-            case Value.VPair(c)      => c.car
-            case Value.VList(h :: _) => h
-            case _                   => throw errAt(pos, "list-ref: index out of range")
-        case _ => throw errAt(pos, "list-ref: invalid arguments")
-    case "list-tail" =>
-      if args.length != 2 then throw errAt(pos, "list-tail requires 2 arguments")
-      val idx = args(1) match
-        case Value.VNum(i) => i.toInt
-        case _             => throw errAt(pos, "list-tail: index must be a number")
-      var cur = args(0)
-      var i   = 0
-      while i < idx do
-        cur = cur match
-          case Value.VPair(c)      => c.cdr
-          case Value.VList(_ :: t) => Value.VList(t)
-          case _                   => throw errAt(pos, "list-tail: index out of range")
-        i += 1
-      cur
+    case "list-ref"  => applyListRef(args, pos)
+    case "list-tail" => applyListTail(args, pos)
     case "list?" =>
       if args.length != 1 then throw errAt(pos, "list? requires 1 argument")
       Value.VBool(isProperList(args.head))
@@ -69,6 +36,21 @@ private[ming] object ListUtilBuiltins:
     case "member" =>
       if args.length != 2 then throw errAt(pos, "member requires 2 arguments")
       findInList(args(1), v => valuesEqual(v, args(0)), pos)
+    case "memq" =>
+      if args.length != 2 then throw errAt(pos, "memq requires 2 arguments")
+      findInList(args(1), v => eqCheck(v, args(0)), pos)
+    case "memv" =>
+      if args.length != 2 then throw errAt(pos, "memv requires 2 arguments")
+      findInList(args(1), v => eqvCheck(v, args(0)), pos)
+    case "assq" =>
+      if args.length != 2 then throw errAt(pos, "assq requires 2 arguments")
+      val alist = pairToScalaList(args(1), pos)
+      alist
+        .collectFirst {
+          case v @ Value.VPair(cell) if eqCheck(cell.car, args(0)) => v
+          case v @ Value.VList(key :: _) if eqCheck(key, args(0))  => v
+        }
+        .getOrElse(Value.VBool(false))
     case "map" =>
       if args.length < 2 then throw errAt(pos, "map requires at least 2 arguments")
       val func  = args.head
@@ -107,6 +89,52 @@ private[ming] object ListUtilBuiltins:
       if args.length != 2 then throw errAt(pos, "eqv? requires 2 arguments")
       Value.VBool(eqvCheck(args(0), args(1)))
     case _ => throw errAt(pos, s"unknown list util: $name")
+
+  private def applyListRef(args: List[Value], pos: Pos): Value =
+    if args.length != 2 then throw errAt(pos, "list-ref requires 2 arguments")
+    val idx = args(1) match
+      case Value.VNum(i) => i.toInt
+      case _             => throw errAt(pos, "list-ref: index must be a number")
+    args(0) match
+      case Value.VList(elems) => elems(idx)
+      case Value.VPair(_) =>
+        var cur = args(0)
+        var i   = 0
+        while i < idx do
+          cur = cur match
+            case Value.VPair(c)      => c.cdr
+            case Value.VList(_ :: t) => Value.VList(t)
+            case _                   => throw errAt(pos, "list-ref: index out of range")
+          i += 1
+        cur match
+          case Value.VPair(c)      => c.car
+          case Value.VList(h :: _) => h
+          case _                   => throw errAt(pos, "list-ref: index out of range")
+      case _ => throw errAt(pos, "list-ref: invalid arguments")
+
+  private def applyListTail(args: List[Value], pos: Pos): Value =
+    if args.length != 2 then throw errAt(pos, "list-tail requires 2 arguments")
+    val idx = args(1) match
+      case Value.VNum(i) => i.toInt
+      case _             => throw errAt(pos, "list-tail: index must be a number")
+    var cur = args(0)
+    var i   = 0
+    while i < idx do
+      cur = cur match
+        case Value.VPair(c)      => c.cdr
+        case Value.VList(_ :: t) => Value.VList(t)
+        case _                   => throw errAt(pos, "list-tail: index out of range")
+      i += 1
+    cur
+
+  private def eqCheck(a: Value, b: Value): Boolean = (a, b) match
+    case (Value.VPair(x), Value.VPair(y))     => x eq y
+    case (Value.VSymbol(x), Value.VSymbol(y)) => x == y
+    case (Value.VNum(x), Value.VNum(y))       => x == y
+    case (Value.VBool(x), Value.VBool(y))     => x == y
+    case (Value.VChar(x), Value.VChar(y))     => x == y
+    case (Value.VList(Nil), Value.VList(Nil)) => true
+    case (x, y)                               => x eq y
 
   private[ming] def eqvCheck(a: Value, b: Value): Boolean = (a, b) match
     case (Value.VPair(x), Value.VPair(y))                   => x eq y

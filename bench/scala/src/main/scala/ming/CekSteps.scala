@@ -71,29 +71,22 @@ object CekSteps:
           case last :: Nil  => CekState.Eval(last, env, next)
           case head :: rest => CekState.Eval(head, env, Kont.Or(rest, env, next))
 
-    case Kont.LetBind(name, remaining, letEnv, initEnv, body, next) =>
-      letEnv.define(name, v)
-      remaining match
-        case Nil =>
-          bodyToCek(body, letEnv, next)
-        case (nextName, nextExpr) :: rest =>
-          CekState.Eval(nextExpr, initEnv, Kont.LetBind(nextName, rest, letEnv, initEnv, body, next))
-
-    case Kont.LetStarBind(name, remaining, letEnv, body, next) =>
-      letEnv.define(name, v)
-      remaining match
-        case Nil =>
-          bodyToCek(body, letEnv, next)
-        case (nextName, nextExpr) :: rest =>
-          CekState.Eval(nextExpr, letEnv, Kont.LetStarBind(nextName, rest, letEnv, body, next))
+    case k: Kont.LetBind     => stepLetBind(v, k)
+    case k: Kont.LetStarBind => stepLetBind(v, k)
 
     case k: Kont.NamedLetArgs => stepNamedLetArgs(v, k)
 
     case Kont.CondTest(body, remaining, env, next) =>
       if isTruthy(v) then
-        if body.nonEmpty then bodyToCek(body, env, next)
-        else CekState.ApplyK(v, next)
+        body match
+          case Expr.Symbol("=>", _) :: proc :: Nil =>
+            CekState.Eval(proc, env, Kont.CondArrow(v, env, posOf(proc), next))
+          case _ if body.nonEmpty => bodyToCek(body, env, next)
+          case _                  => CekState.ApplyK(v, next)
       else stepCond(remaining, env, next)
+
+    case Kont.CondArrow(testValue, env, pos, next) =>
+      Evaluator.cekApply(v, List(testValue), pos, env, next)
 
     case k: Kont.DynWindAfterIn    => stepDynWind(v, k)
     case k: Kont.DynWindAfterBody  => stepDynWind(v, k)
@@ -191,6 +184,26 @@ object CekSteps:
           k.initEnv,
           Kont.NamedLetArgs(k.params, newDone, rest, k.initEnv, k.loopEnv, k.body, k.next)
         )
+
+  // ── Let-binding continuation helpers ─────────────────────────────
+  private def stepLetBind(v: Value, k: Kont): CekState = k match
+    case Kont.LetBind(name, remaining, letEnv, initEnv, body, next) =>
+      letEnv.define(name, v)
+      remaining match
+        case Nil =>
+          bodyToCek(body, letEnv, next)
+        case (nextName, nextExpr) :: rest =>
+          CekState.Eval(nextExpr, initEnv, Kont.LetBind(nextName, rest, letEnv, initEnv, body, next))
+
+    case Kont.LetStarBind(name, remaining, letEnv, body, next) =>
+      letEnv.define(name, v)
+      remaining match
+        case Nil =>
+          bodyToCek(body, letEnv, next)
+        case (nextName, nextExpr) :: rest =>
+          CekState.Eval(nextExpr, letEnv, Kont.LetStarBind(nextName, rest, letEnv, body, next))
+
+    case _ => throw EvalError("unreachable: stepLetBind")
 
   // ── Special form step helpers ──────────────────────────────────────
 

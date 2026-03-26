@@ -14,7 +14,47 @@ private[ming] object EvalForms:
     case Expr.Chr(c, _)       => Value.VChar(c)
     case Expr.Symbol(name, _) => Value.VSymbol(name)
     case Expr.SList(elems, _) =>
-      Value.VList(elems.map(quoteToValue))
+      val dotIdx = elems.indexWhere { case Expr.Symbol(".", _) => true; case _ => false }
+      if dotIdx >= 1 && dotIdx == elems.length - 2 then
+        val head = elems.take(dotIdx).map(quoteToValue)
+        val tail = quoteToValue(elems(dotIdx + 1))
+        head.foldRight(tail) { (car, cdr) =>
+          Value.VPair(new SchemeTypes.PairCell(car, cdr))
+        }
+      else Value.VList(elems.map(quoteToValue))
+
+  /** Expand quasiquote into an expression using cons/list/append/quote. */
+  def expandQuasiquote(expr: Expr, p: Pos): Expr = expr match
+    case Expr.SList(Expr.Symbol("unquote", _) :: inner :: Nil, _) =>
+      inner
+    case Expr.SList(elems, lp) =>
+      // Check for dotted pair: (a b . c) where dot is second-to-last
+      val dotIdx = elems.indexWhere { case Expr.Symbol(".", _) => true; case _ => false }
+      if dotIdx >= 1 && dotIdx == elems.length - 2 then
+        // Dotted quasiquote: `(a b . c)
+        val headElems = elems.take(dotIdx)
+        val tailExpr  = expandQuasiquote(elems(dotIdx + 1), p)
+        headElems.foldRight(tailExpr) { (elem, acc) =>
+          elem match
+            case Expr.SList(Expr.Symbol("unquote-splicing", _) :: inner :: Nil, _) =>
+              Expr.SList(List(Expr.Symbol("append", p), inner, acc), p)
+            case _ =>
+              Expr.SList(List(Expr.Symbol("cons", p), expandQuasiquote(elem, p), acc), p)
+        }
+      else
+        // Build list element by element
+        val expanded = elems.foldRight(Expr.SList(List(Expr.Symbol("quote", p), Expr.SList(Nil, p)), p): Expr) {
+          (elem, acc) =>
+            elem match
+              case Expr.SList(Expr.Symbol("unquote-splicing", _) :: inner :: Nil, _) =>
+                Expr.SList(List(Expr.Symbol("append", p), inner, acc), p)
+              case _ =>
+                Expr.SList(List(Expr.Symbol("cons", p), expandQuasiquote(elem, p), acc), p)
+        }
+        expanded
+    case _ =>
+      // Atom: quote it
+      Expr.SList(List(Expr.Symbol("quote", p), expr), p)
 
   def parseParams(
     params: List[Expr],

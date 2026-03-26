@@ -35,6 +35,17 @@ private[ming] object Parser:
         case '(' | ')' | '\'' =>
           tokens += Token(input(i).toString, Pos(line, col))
           i += 1; col += 1
+        case '`' =>
+          tokens += Token("`", Pos(line, col))
+          i += 1; col += 1
+        case ',' =>
+          val p = Pos(line, col)
+          if i + 1 < input.length && input(i + 1) == '@' then
+            tokens += Token(",@", p)
+            i += 2; col += 2
+          else
+            tokens += Token(",", p)
+            i += 1; col += 1
         case '"' =>
           val p           = Pos(line, col)
           val (tok, next) = readString(input, i)
@@ -76,6 +87,15 @@ private[ming] object Parser:
     case Token("#'", p) :: rest =>
       val (expr, remaining) = parseExpr(rest)
       (Expr.SList(List(Expr.Symbol("syntax", p), expr), p), remaining)
+    case Token("`", p) :: rest =>
+      val (expr, remaining) = parseExpr(rest)
+      (Expr.SList(List(Expr.Symbol("quasiquote", p), expr), p), remaining)
+    case Token(",", p) :: rest =>
+      val (expr, remaining) = parseExpr(rest)
+      (Expr.SList(List(Expr.Symbol("unquote", p), expr), p), remaining)
+    case Token(",@", p) :: rest =>
+      val (expr, remaining) = parseExpr(rest)
+      (Expr.SList(List(Expr.Symbol("unquote-splicing", p), expr), p), remaining)
     case Token(")", _) :: _     => throw EvalError("unexpected )")
     case Token(text, p) :: rest => (parseAtom(text, p), rest)
 

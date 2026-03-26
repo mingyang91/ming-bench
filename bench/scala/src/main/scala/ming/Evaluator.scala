@@ -89,6 +89,9 @@ object Evaluator:
       case Expr.SList(Expr.Symbol("quote", _) :: arg :: Nil, _) =>
         CekState.ApplyK(EvalForms.quoteToValue(arg), k)
 
+      case Expr.SList(Expr.Symbol("quasiquote", _) :: arg :: Nil, p) =>
+        CekState.Eval(EvalForms.expandQuasiquote(arg, p), env, k)
+
       case Expr.SList(Expr.Symbol("define", _) :: rest, p) =>
         CekSteps.stepDefine(rest, env, p, k)
 
