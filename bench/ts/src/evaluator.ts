@@ -165,7 +165,20 @@ function arrayToList(arr: SchemeVal[]): SchemeVal {
 // Convert a parse-time list to a runtime pair chain
 function listToPairs(val: SchemeVal): SchemeVal {
   if (val.tag === 'list') {
-    return arrayToList(val.elements.map(listToPairs));
+    const elems = val.elements;
+    // Handle dotted pair notation: (a b . c)
+    for (let i = 0; i < elems.length; i++) {
+      if (elems[i].tag === 'symbol' && (elems[i] as any).value === '.') {
+        if (i === 0 || i !== elems.length - 2)
+          throw new EvalError('bad dot syntax');
+        let result = listToPairs(elems[elems.length - 1]);
+        for (let j = i - 1; j >= 0; j--) {
+          result = makePair(listToPairs(elems[j]), result);
+        }
+        return result;
+      }
+    }
+    return arrayToList(elems.map(listToPairs));
   }
   return val;
 }
@@ -243,6 +256,13 @@ function tokenize(input: string): Token[] {
     const startPos: Pos = { line, col };
     if (ch === '(' || ch === ')') { advance(); tokens.push({ text: ch, pos: startPos }); continue; }
     if (ch === '\'') { advance(); tokens.push({ text: "'", pos: startPos }); continue; }
+    if (ch === '`') { advance(); tokens.push({ text: "`", pos: startPos }); continue; }
+    if (ch === ',') {
+      advance();
+      if (i < input.length && input[i] === '@') { advance(); tokens.push({ text: ",@", pos: startPos }); }
+      else { tokens.push({ text: ",", pos: startPos }); }
+      continue;
+    }
     if (ch === '#' && i + 1 < input.length && input[i + 1] === '\'') { advance(); advance(); tokens.push({ text: "#'", pos: startPos }); continue; }
     if (ch === '"') {
       let s = '"';
@@ -279,6 +299,18 @@ function parse(tokens: Token[]): SchemeVal[] {
     if (tok.text === "#'") {
       const inner = parseExpr();
       return { tag: 'list', elements: [{ tag: 'symbol', value: 'syntax', pos: tok.pos }, inner], pos: tok.pos };
+    }
+    if (tok.text === '`') {
+      const inner = parseExpr();
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'quasiquote', pos: tok.pos }, inner], pos: tok.pos };
+    }
+    if (tok.text === ',') {
+      const inner = parseExpr();
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'unquote', pos: tok.pos }, inner], pos: tok.pos };
+    }
+    if (tok.text === ',@') {
+      const inner = parseExpr();
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'unquote-splicing', pos: tok.pos }, inner], pos: tok.pos };
     }
     if (tok.text === '(') {
       const elements: SchemeVal[] = [];
@@ -613,6 +645,67 @@ function evalListK(exprs: SchemeVal[], env: Env, k: (vals: SchemeVal[]) => Bounc
   return loop(exprs.length - 1, []);
 }
 
+// ── Quasiquote expansion ──────────────────────────────────────────────
+
+function qqExpandK(tmpl: SchemeVal, env: Env, k: Cont): Bounce {
+  if (tmpl.tag === 'list') {
+    const elems = tmpl.elements;
+    if (elems.length === 2 && elems[0].tag === 'symbol' && elems[0].value === 'unquote') {
+      return evalK(elems[1], env, k);
+    }
+    // Check for dot notation: (a b . c)
+    let dotIdx = -1;
+    for (let i = 0; i < elems.length; i++) {
+      if (elems[i].tag === 'symbol' && (elems[i] as any).value === '.') {
+        dotIdx = i;
+        break;
+      }
+    }
+    if (dotIdx >= 0) {
+      // Dotted list: expand each element before dot, then the tail
+      const beforeDot = elems.slice(0, dotIdx);
+      const afterDot = elems[dotIdx + 1]; // single element after dot
+      return qqExpandListK(beforeDot, env, (expandedBefore) => {
+        return qqExpandK(afterDot, env, (expandedTail) => {
+          // Build improper list
+          let result = expandedTail;
+          for (let i = expandedBefore.length - 1; i >= 0; i--) {
+            result = makePair(expandedBefore[i], result);
+          }
+          return k(result);
+        });
+      });
+    }
+    // Regular list: expand each element, handling unquote-splicing
+    return qqExpandListK(elems, env, (expanded) => {
+      return k(arrayToList(expanded));
+    });
+  }
+  // Atom: return as-is (like quote)
+  return k(tmpl);
+}
+
+function qqExpandListK(elems: SchemeVal[], env: Env, k: (vals: SchemeVal[]) => Bounce): Bounce {
+  function loop(i: number, acc: SchemeVal[]): Bounce {
+    if (i >= elems.length) return k(acc);
+    const el = elems[i];
+    // Check for unquote-splicing
+    if (el.tag === 'list' && el.elements.length === 2 &&
+        el.elements[0].tag === 'symbol' && el.elements[0].value === 'unquote-splicing') {
+      return evalK(el.elements[1], env, (splicedVal) => {
+        // Convert pair list to array and splice
+        const arr = pairToArray(splicedVal);
+        if (arr === null) throw new EvalError('unquote-splicing: expected proper list');
+        return loop(i + 1, [...acc, ...arr]);
+      });
+    }
+    return qqExpandK(el, env, (expanded) => {
+      return loop(i + 1, [...acc, expanded]);
+    });
+  }
+  return loop(0, []);
+}
+
 function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
   switch (expr.tag) {
     case 'number':
@@ -638,6 +731,10 @@ function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
           case 'quote': {
             if (elems.length !== 2) throw errAt('quote: expected 1 argument', expr.pos);
             return k(listToPairs(elems[1]));
+          }
+          case 'quasiquote': {
+            if (elems.length !== 2) throw errAt('quasiquote: expected 1 argument', expr.pos);
+            return qqExpandK(elems[1], env, k);
           }
           case 'if': {
             if (elems.length < 3 || elems.length > 4)
@@ -753,6 +850,14 @@ function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
               return evalK(test, env, (testVal) => {
                 if (isTruthy(testVal)) {
                   if (clause.elements.length === 1) return k(testVal);
+                  // Handle (cond (test => proc)) syntax
+                  if (clause.elements.length === 3 &&
+                      clause.elements[1].tag === 'symbol' &&
+                      clause.elements[1].value === '=>') {
+                    return evalK(clause.elements[2], env, (proc) =>
+                      bounce(() => applyK(proc, [testVal], k, expr.pos))
+                    );
+                  }
                   return evalBeginK(clause.elements.slice(1), env, k);
                 }
                 return tryCond(ci + 1);
@@ -1496,7 +1601,8 @@ const BUILTINS = new Set([
   'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
   'zero?', 'positive?', 'negative?', 'odd?', 'even?',
   'list-ref', 'list-tail', 'list?', 'assoc', 'map', 'for-each',
-  'reverse', 'member', 'assv',
+  'reverse', 'member', 'memq', 'memv', 'assv', 'assq',
+  'error',
   'set-car!', 'set-cdr!',
   'caar', 'cadr', 'cdar', 'cddr', 'caddr',
   'eq?', 'eqv?', 'equal?',
@@ -2117,6 +2223,49 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
         cur = cur.cdr;
       }
       return SCM_FALSE;
+    }
+    case 'assq': {
+      if (args.length !== 2) throw errAt('assq: expected 2 arguments', pos);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        const entry = cur.car;
+        if (entry.tag === 'pair' && schemeEq(args[0], entry.car)) return entry;
+        cur = cur.cdr;
+      }
+      return SCM_FALSE;
+    }
+    case 'memq': {
+      if (args.length !== 2) throw errAt('memq: expected 2 arguments', pos);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        if (schemeEq(args[0], cur.car)) return cur;
+        cur = cur.cdr;
+      }
+      return SCM_FALSE;
+    }
+    case 'memv': {
+      if (args.length !== 2) throw errAt('memv: expected 2 arguments', pos);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        if (schemeEqv(args[0], cur.car)) return cur;
+        cur = cur.cdr;
+      }
+      return SCM_FALSE;
+    }
+    case 'error': {
+      if (args.length === 0) throw errAt('error: expected at least 1 argument', pos);
+      let msg = '';
+      const first = args[0];
+      let startIdx = 0;
+      if (first.tag === 'symbol') {
+        msg = first.value + ': ';
+        startIdx = 1;
+      }
+      for (let i = startIdx; i < args.length; i++) {
+        if (i > startIdx) msg += ' ';
+        msg += args[i].tag === 'string' ? (args[i] as any).value : display(args[i]);
+      }
+      throw new EvalError(msg);
     }
     case 'make-string': {
       if (args.length < 1 || args.length > 2) throw errAt('make-string: expected 1-2 arguments', pos);
