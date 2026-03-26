@@ -98,16 +98,16 @@ object Evaluator:
 
   private def dispatchForm(elems: List[Expr], env: Env, k: Kont): MState =
     elems.head match
-      case Symbol("if", _)      => SpecialForms.evalIfForm(elems.tail, env, k)
-      case Symbol("define", _)  => SpecialForms.evalDefineForm(elems.tail, env, k)
-      case Symbol("set!", _)    => SpecialForms.evalSetForm(elems.tail, env, k)
-      case Symbol("begin", _)   => SpecialForms.evalBeginForm(elems.tail, env, k)
-      case Symbol("quote", _)       => SApply(SpecialForms.evalQuote(elems.tail), k)
-      case Symbol("quasiquote", _)  => SpecialForms.evalQuasiquote(elems.tail, env, k)
-      case Symbol("lambda", _)  => SApply(SpecialForms.makeLambda(elems.tail, env), k)
-      case Symbol("and", _)     => SpecialForms.evalAndForm(elems.tail, env, k)
-      case Symbol("or", _)      => SpecialForms.evalOrForm(elems.tail, env, k)
-      case Symbol("call/cc", _) => SpecialForms.evalCallCCForm(elems.tail, env, k)
+      case Symbol("if", _)         => SpecialForms.evalIfForm(elems.tail, env, k)
+      case Symbol("define", _)     => SpecialForms.evalDefineForm(elems.tail, env, k)
+      case Symbol("set!", _)       => SpecialForms.evalSetForm(elems.tail, env, k)
+      case Symbol("begin", _)      => SpecialForms.evalBeginForm(elems.tail, env, k)
+      case Symbol("quote", _)      => SApply(SpecialForms.evalQuote(elems.tail), k)
+      case Symbol("quasiquote", _) => SpecialForms.evalQuasiquote(elems.tail, env, k)
+      case Symbol("lambda", _)     => SApply(SpecialForms.makeLambda(elems.tail, env), k)
+      case Symbol("and", _)        => SpecialForms.evalAndForm(elems.tail, env, k)
+      case Symbol("or", _)         => SpecialForms.evalOrForm(elems.tail, env, k)
+      case Symbol("call/cc", _)    => SpecialForms.evalCallCCForm(elems.tail, env, k)
       case Symbol("call-with-current-continuation", _) =>
         SpecialForms.evalCallCCForm(elems.tail, env, k)
       case Symbol("cond", _)        => SpecialForms.evalCondForm(elems.tail, env, k)

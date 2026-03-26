@@ -13,7 +13,7 @@ private[ming] object EvalHelpers:
       case StringLit(v, _)      => SchemeString(v)
       case CharLit(v, _)        => SchemeChar(v)
       case Symbol(name, _)      => SchemeSymbol(name)
-      case SList(elems, _) =>
+      case SList(elems, _)      =>
         // Handle dotted pair notation: (a b . c) is [a, b, ., c]
         val dotIdx = elems.lastIndexWhere { case Symbol(".", _) => true; case _ => false }
         if dotIdx > 0 && dotIdx == elems.size - 2 then
