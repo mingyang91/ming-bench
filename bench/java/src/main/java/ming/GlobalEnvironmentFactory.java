@@ -436,6 +436,15 @@ final class GlobalEnvironmentFactory {
 
     private void installUtilityProcedures() {
         define("error", evaluator::errorBuiltin);
+        define("syntax->datum", args -> {
+            evaluator.requireArity("syntax->datum", args.size(), 1);
+            return evaluator.syntaxToDatum(args.getFirst());
+        });
+        define("datum->syntax", args -> {
+            evaluator.requireArity("datum->syntax", args.size(), 2);
+            SyntaxValue context = evaluator.expectSyntaxValue(args.getFirst());
+            return new SyntaxValue(evaluator.datumToExpr(args.get(1), context.expr().position()));
+        });
         defineValue("values", new ValuesProcedure("values"));
         defineValue("call-with-values", new CallWithValuesProcedure("call-with-values"));
         defineValue("dynamic-wind", new DynamicWindProcedure("dynamic-wind"));

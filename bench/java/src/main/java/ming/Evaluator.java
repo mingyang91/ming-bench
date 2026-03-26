@@ -2,6 +2,7 @@ package ming;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Scheme interpreter entry point.
@@ -44,6 +45,7 @@ public class Evaluator {
     private final Environment globalEnv;
     private ExceptionHandlerFrame currentExceptionHandler;
     private StringBuilder activeOutput;
+    private Environment activeTransformerDefinitionEnv;
     private long syntheticCounter;
     private final RecordProcedureSupport recordProcedureSupport = new RecordProcedureSupport() {
         @Override
@@ -253,6 +255,9 @@ public class Evaluator {
                 case "set!" -> evalSet(position, argExprs, env, cont);
                 case "if" -> evalIf(position, argExprs, env, cont);
                 case "quote" -> evalQuote(argExprs, cont);
+                case "syntax" -> evalSyntax(argExprs, env, cont);
+                case "syntax-case" -> evalSyntaxCase(position, argExprs, env, cont);
+                case "with-syntax" -> evalWithSyntax(position, argExprs, env, cont);
                 case "lambda" -> evalLambda(argExprs, env, cont);
                 case "case-lambda" -> evalCaseLambda(argExprs, env, cont);
                 case "begin" -> evalSequenceBounce(argExprs, env, cont);
@@ -351,6 +356,117 @@ public class Evaluator {
         return deliver(cont, quoteToValue(argExprs.getFirst()));
     }
 
+    private Bounce evalSyntax(List<Expr> argExprs, Environment env, Continuation cont)
+            throws EvalError {
+        requireArity("syntax", argExprs.size(), 1);
+
+        Environment definitionEnv = activeTransformerDefinitionEnv == null
+                ? env
+                : activeTransformerDefinitionEnv;
+        Expr expanded = SyntaxCaseSupport.expandTemplate(argExprs.getFirst(), env, definitionEnv,
+                this::freshSyntheticName);
+        return deliver(cont, new SyntaxValue(expanded));
+    }
+
+    private Bounce evalSyntaxCase(SourcePos position, List<Expr> argExprs, Environment env,
+                                  Continuation cont) throws EvalError {
+        if (argExprs.size() < 3) {
+            throw new EvalError(
+                    "syntax-case requires an input, literals, and at least one clause");
+        }
+
+        Set<String> literals = SyntaxCaseSupport.parseLiteralIdentifiers(argExprs.get(1));
+        return evalExpr(argExprs.getFirst(), env, positionedCont(position, inputValue ->
+                evalSyntaxCaseClauses(position, expectSyntaxValue(inputValue).expr(), literals,
+                        argExprs.subList(2, argExprs.size()), 0, env, cont)));
+    }
+
+    private Bounce evalSyntaxCaseClauses(SourcePos position, Expr inputExpr, Set<String> literals,
+                                         List<Expr> clauseExprs, int index, Environment env,
+                                         Continuation cont) throws EvalError {
+        if (index >= clauseExprs.size()) {
+            throw new EvalError("syntax-case: no matching clause");
+        }
+
+        Expr clauseExpr = clauseExprs.get(index);
+        if (!(clauseExpr instanceof ListExpr clauseList)) {
+            throw new EvalError("syntax-case clause must be a list");
+        }
+
+        List<Expr> clauseParts = clauseList.elements();
+        if (clauseParts.size() < 2 || clauseParts.size() > 3) {
+            throw new EvalError(
+                    "syntax-case clause must contain a pattern, optional fender, and expression");
+        }
+
+        SyntaxCaseSupport.SyntaxMatch match = SyntaxCaseSupport.match(clauseParts.getFirst(),
+                inputExpr, literals);
+        if (match == null) {
+            return evalSyntaxCaseClauses(position, inputExpr, literals, clauseExprs, index + 1,
+                    env, cont);
+        }
+
+        Environment clauseEnv = new Environment(env);
+        SyntaxCaseSupport.bindPatternVariables(clauseEnv, match);
+
+        if (clauseParts.size() == 2) {
+            return evalExpr(clauseParts.get(1), clauseEnv, cont);
+        }
+
+        return evalExpr(clauseParts.get(1), clauseEnv, positionedCont(position, testValue -> {
+            if (isTruthy(testValue)) {
+                return evalExpr(clauseParts.get(2), clauseEnv, cont);
+            }
+            return evalSyntaxCaseClauses(position, inputExpr, literals, clauseExprs, index + 1,
+                    env, cont);
+        }));
+    }
+
+    private Bounce evalWithSyntax(SourcePos position, List<Expr> argExprs, Environment env,
+                                  Continuation cont) throws EvalError {
+        if (argExprs.isEmpty()) {
+            throw new EvalError("with-syntax requires bindings and a body");
+        }
+        if (!(argExprs.getFirst() instanceof ListExpr bindingList)) {
+            throw new EvalError("with-syntax bindings must be a list");
+        }
+
+        List<Expr> body = FormParser.parseBody("with-syntax", argExprs.subList(1, argExprs.size()));
+        return evalWithSyntaxBindings(position, bindingList.elements(), 0, env, body, cont);
+    }
+
+    private Bounce evalWithSyntaxBindings(SourcePos position, List<Expr> bindingExprs, int index,
+                                          Environment env, List<Expr> body, Continuation cont)
+            throws EvalError {
+        if (index >= bindingExprs.size()) {
+            return evalSequenceBounce(body, env, cont);
+        }
+
+        Expr bindingExpr = bindingExprs.get(index);
+        if (!(bindingExpr instanceof ListExpr bindingList)) {
+            throw new EvalError("with-syntax binding must be a list");
+        }
+
+        List<Expr> bindingParts = bindingList.elements();
+        if (bindingParts.size() != 2) {
+            throw new EvalError("with-syntax binding must contain a pattern and value");
+        }
+
+        Expr pattern = bindingParts.getFirst();
+        Expr valueExpr = bindingParts.get(1);
+        return evalExpr(valueExpr, env, positionedCont(position, value -> {
+            SyntaxCaseSupport.SyntaxMatch match = SyntaxCaseSupport.match(pattern,
+                    expectSyntaxValue(value).expr(), Set.of());
+            if (match == null) {
+                throw new EvalError("with-syntax pattern did not match");
+            }
+
+            Environment nextEnv = new Environment(env);
+            SyntaxCaseSupport.bindPatternVariables(nextEnv, match);
+            return evalWithSyntaxBindings(position, bindingExprs, index + 1, nextEnv, body, cont);
+        }));
+    }
+
     private Bounce evalDefineSyntax(List<Expr> argExprs, Environment env, Continuation cont)
             throws EvalError {
         requireArity("define-syntax", argExprs.size(), 2);
@@ -359,10 +475,26 @@ public class Evaluator {
             throw new EvalError("define-syntax name must be a symbol");
         }
 
-        env.defineSyntax(nameExpr.name(),
-                SyntaxRulesMacro.compile(nameExpr.name(), argExprs.get(1), env,
-                        this::freshSyntheticName));
-        return deliver(cont, VoidValue.INSTANCE);
+        Expr transformerExpr = argExprs.get(1);
+        if (transformerExpr instanceof ListExpr syntaxRulesExpr
+                && !syntaxRulesExpr.elements().isEmpty()
+                && syntaxRulesExpr.elements().getFirst() instanceof SymbolExpr head
+                && head.name().equals("syntax-rules")) {
+            env.defineSyntax(nameExpr.name(),
+                    SyntaxRulesMacro.compile(nameExpr.name(), transformerExpr, env,
+                            this::freshSyntheticName));
+            return deliver(cont, VoidValue.INSTANCE);
+        }
+
+        return evalExpr(transformerExpr, env, positionedCont(transformerExpr.position(), value -> {
+            if (!(value instanceof ProcedureValue procedureValue)) {
+                throw new EvalError(
+                        "define-syntax transformer must be a syntax-rules form or procedure");
+            }
+            env.defineSyntax(nameExpr.name(),
+                    new TransformerProcedureMacro(this, procedureValue, env));
+            return deliver(cont, VoidValue.INSTANCE);
+        }));
     }
 
     private Bounce evalDefineRecordType(List<Expr> argExprs, Environment env, Continuation cont)
@@ -980,6 +1112,17 @@ public class Evaluator {
         return run(halt -> applyProcedureCps(procedureValue, argumentValues, halt));
     }
 
+    Value applyTransformerProcedure(ProcedureValue transformer, SyntaxValue input,
+                                    Environment definitionEnv) throws EvalError {
+        Environment previousDefinitionEnv = activeTransformerDefinitionEnv;
+        activeTransformerDefinitionEnv = definitionEnv;
+        try {
+            return applyProcedure(transformer, List.of(input));
+        } finally {
+            activeTransformerDefinitionEnv = previousDefinitionEnv;
+        }
+    }
+
     private Bounce applyProcedureCps(Value procedureValue, List<Value> argumentValues,
                                      Continuation cont) throws EvalError {
         if (!(procedureValue instanceof ProcedureValue procedure)) {
@@ -1170,6 +1313,10 @@ public class Evaluator {
         return valueSupport.expectSymbol(value);
     }
 
+    SyntaxValue expectSyntaxValue(Value value) throws EvalError {
+        return valueSupport.expectSyntax(value);
+    }
+
     PairValue expectPair(Value value) throws EvalError {
         return valueSupport.expectPair(value);
     }
@@ -1200,6 +1347,14 @@ public class Evaluator {
 
     String stringAppend(List<Value> args) throws EvalError {
         return valueSupport.stringAppend(args);
+    }
+
+    Value syntaxToDatum(Value value) throws EvalError {
+        return valueSupport.syntaxToDatum(value);
+    }
+
+    Expr datumToExpr(Value value, SourcePos position) throws EvalError {
+        return valueSupport.datumToExpr(value, position);
     }
 
     Value stringToNumber(String token) {

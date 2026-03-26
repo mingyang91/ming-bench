@@ -10,7 +10,8 @@ import java.util.Map;
 sealed interface Value permits IntValue, RationalValue, InexactValue,
         BoolValue, StringValue, CharValue, SymbolValue,
         PairValue, VectorValue, RecordValue, EmptyListValue, VoidValue,
-        UninitializedValue, MultiValueValue, ProcedureValue {
+        UninitializedValue, MultiValueValue, ProcedureValue,
+        SyntaxValue, SyntaxSequenceValue {
     String render();
 }
 
@@ -129,6 +130,24 @@ record SymbolValue(String name) implements Value {
     @Override
     public String render() {
         return name;
+    }
+}
+
+record SyntaxValue(Expr expr) implements Value {
+    @Override
+    public String render() {
+        return "#<syntax>";
+    }
+}
+
+record SyntaxSequenceValue(List<Expr> expressions) implements Value {
+    SyntaxSequenceValue {
+        expressions = List.copyOf(expressions);
+    }
+
+    @Override
+    public String render() {
+        return "#<syntax-sequence>";
     }
 }
 

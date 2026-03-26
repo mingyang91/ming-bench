@@ -72,20 +72,32 @@ final class Parser {
         return switch (ch) {
             case '(' -> parseList(position);
             case '\'' -> parseQuoted(position);
+            case '#' -> parseHashPrefixed(position);
             case '"' -> parseString(position);
             case ')' -> throw errorAt(position, "unexpected ')'");
-            default -> {
-                if (ch == '#' && index + 1 < input.length() && input.charAt(index + 1) == '\\') {
-                    yield parseCharLiteral(position);
-                }
-                yield parseAtom(position);
-            }
+            default -> parseAtom(position);
         };
     }
 
     private Expr parseQuoted(SourcePos position) throws EvalError {
         advance();
         return new ListExpr(List.of(new SymbolExpr("quote", position), parseExpr()), position);
+    }
+
+    private Expr parseHashPrefixed(SourcePos position) throws EvalError {
+        if (index + 1 < input.length()) {
+            char next = input.charAt(index + 1);
+            if (next == '\'') {
+                advance();
+                advance();
+                return new ListExpr(List.of(new SymbolExpr("syntax", position), parseExpr()),
+                        position);
+            }
+            if (next == '\\') {
+                return parseCharLiteral(position);
+            }
+        }
+        return parseAtom(position);
     }
 
     private Expr parseList(SourcePos position) throws EvalError {

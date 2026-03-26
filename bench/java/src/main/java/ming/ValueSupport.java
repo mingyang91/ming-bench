@@ -1,6 +1,7 @@
 package ming;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 
@@ -76,6 +77,13 @@ final class ValueSupport {
         throw new EvalError("expected symbol");
     }
 
+    SyntaxValue expectSyntax(Value value) throws EvalError {
+        if (value instanceof SyntaxValue syntaxValue) {
+            return syntaxValue;
+        }
+        throw new EvalError("expected syntax object");
+    }
+
     PairValue expectPair(Value value) throws EvalError {
         if (value instanceof PairValue pairValue) {
             return pairValue;
@@ -103,6 +111,51 @@ final class ValueSupport {
             builder.append(expectString(arg));
         }
         return builder.toString();
+    }
+
+    Value syntaxToDatum(Value value) throws EvalError {
+        return quoteToValue(expectSyntax(value).expr());
+    }
+
+    Expr datumToExpr(Value value, SourcePos position) throws EvalError {
+        return switch (value) {
+            case IntValue intValue -> new IntExpr(intValue.value(), position);
+            case RationalValue rationalValue ->
+                    new RationalExpr(rationalValue.numerator(), rationalValue.denominator(),
+                            position);
+            case InexactValue inexactValue -> new InexactExpr(inexactValue.value(), position);
+            case BoolValue boolValue -> new BoolExpr(boolValue.value(), position);
+            case StringValue stringValue -> new StringExpr(stringValue.value(), position);
+            case CharValue charValue -> new CharExpr(charValue.value(), position);
+            case SymbolValue symbolValue -> new SymbolExpr(symbolValue.name(), position);
+            case EmptyListValue ignored -> new ListExpr(List.of(), position);
+            case PairValue pairValue -> pairToExpr(pairValue, position);
+            case SyntaxValue syntaxValue -> syntaxValue.expr();
+            case SyntaxSequenceValue sequenceValue ->
+                    throw new EvalError("expected a datum, got syntax sequence");
+            case VectorValue vectorValue -> throw new EvalError("cannot convert vector to syntax");
+            case RecordValue recordValue -> throw new EvalError("cannot convert record to syntax");
+            case VoidValue ignored -> throw new EvalError("cannot convert void to syntax");
+            case UninitializedValue ignored ->
+                    throw new EvalError("cannot convert uninitialized value to syntax");
+            case MultiValueValue multiValue ->
+                    throw new EvalError("cannot convert multiple values to syntax");
+            case ProcedureValue procedureValue ->
+                    throw new EvalError("cannot convert procedure to syntax");
+        };
+    }
+
+    private Expr pairToExpr(PairValue pairValue, SourcePos position) throws EvalError {
+        List<Expr> elements = new ArrayList<>();
+        Value current = pairValue;
+        while (current instanceof PairValue pair) {
+            elements.add(datumToExpr(pair.car(), position));
+            current = pair.cdr();
+        }
+        if (!(current instanceof EmptyListValue)) {
+            throw new EvalError("cannot convert dotted pair to syntax");
+        }
+        return new ListExpr(elements, position);
     }
 
     boolean compareChars(List<Value> args, String name, CharComparison comparison)
