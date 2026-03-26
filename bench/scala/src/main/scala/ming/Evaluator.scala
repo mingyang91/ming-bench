@@ -2,108 +2,6 @@ package ming
 
 object Evaluator:
 
-  // ── AST ──────────────────────────────────────────────────────────────
-  private enum Expr:
-    case Num(value: Long)
-    case Bool(value: Boolean)
-    case Str(value: String)
-    case Symbol(name: String)
-    case SList(elems: List[Expr])
-
-  // ── Tokeniser ────────────────────────────────────────────────────────
-  private def readWord(input: String, start: Int): (String, Int) =
-    val sb = new StringBuilder
-    var i  = start
-    while i < input.length && !input(i).isWhitespace && input(i) != '(' && input(i) != ')' do
-      sb += input(i); i += 1
-    (sb.toString, i)
-
-  private def readString(input: String, start: Int): (String, Int) =
-    val sb = new StringBuilder("\"")
-    var i  = start + 1
-    while i < input.length && input(i) != '"' do
-      if input(i) == '\\' then
-        sb += input(i); i += 1
-        if i < input.length then
-          sb += input(i); i += 1
-      else
-        sb += input(i); i += 1
-    if i < input.length then
-      sb += '"'; i += 1
-    (sb.toString, i)
-
-  private def readHash(input: String, start: Int): (String, Int) =
-    if start + 1 >= input.length then ("#", start + 1)
-    else
-      val next = input(start + 1)
-      if next == 't' || next == 'f' then (input.substring(start, start + 2), start + 2)
-      else readWord(input, start)
-
-  private def skipComment(input: String, start: Int): Int =
-    var i = start
-    while i < input.length && input(i) != '\n' do i += 1
-    i
-
-  private def tokenize(input: String): List[String] =
-    val tokens = scala.collection.mutable.ListBuffer[String]()
-    var i      = 0
-    while i < input.length do
-      input(i) match
-        case c if c.isWhitespace => i += 1
-        case ';'                 => i = skipComment(input, i)
-        case '(' | ')' | '\'' =>
-          tokens += input(i).toString; i += 1
-        case '"' =>
-          val (tok, next) = readString(input, i)
-          tokens += tok; i = next
-        case '#' =>
-          val (tok, next) = readHash(input, i)
-          tokens += tok; i = next
-        case _ =>
-          val (tok, next) = readWord(input, i)
-          tokens += tok; i = next
-    tokens.toList
-
-  // ── Parser ───────────────────────────────────────────────────────────
-  private def parseAll(tokens: List[String]): List[Expr] =
-    val exprs = scala.collection.mutable.ListBuffer[Expr]()
-    var rest  = tokens
-    while rest.nonEmpty do
-      val (expr, remaining) = parseExpr(rest)
-      exprs += expr
-      rest = remaining
-    exprs.toList
-
-  private def parseExpr(tokens: List[String]): (Expr, List[String]) = tokens match
-    case Nil => throw EvalError("unexpected end of input")
-    case "(" :: rest =>
-      val (elems, remaining) = parseList(rest)
-      (Expr.SList(elems), remaining)
-    case "'" :: rest =>
-      val (expr, remaining) = parseExpr(rest)
-      (Expr.SList(List(Expr.Symbol("quote"), expr)), remaining)
-    case ")" :: _      => throw EvalError("unexpected )")
-    case token :: rest => (parseAtom(token), rest)
-
-  private def parseList(tokens: List[String]): (List[Expr], List[String]) =
-    val elems = scala.collection.mutable.ListBuffer[Expr]()
-    var rest  = tokens
-    while rest.nonEmpty && rest.head != ")" do
-      val (expr, remaining) = parseExpr(rest)
-      elems += expr
-      rest = remaining
-    if rest.isEmpty then throw EvalError("missing )")
-    (elems.toList, rest.tail) // skip ")"
-
-  private def parseAtom(token: String): Expr =
-    if token == "#t" then Expr.Bool(true)
-    else if token == "#f" then Expr.Bool(false)
-    else if token.startsWith("\"") then Expr.Str(token.substring(1, token.length - 1))
-    else
-      token.toLongOption match
-        case Some(n) => Expr.Num(n)
-        case None    => Expr.Symbol(token)
-
   // ── Values ───────────────────────────────────────────────────────────
   private enum Value:
     case VNum(n: Long)
@@ -139,7 +37,31 @@ object Evaluator:
 
   private def defaultEnv: Env =
     val env = Env(scala.collection.mutable.Map.empty, None)
-    for name <- List("+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not") do env.define(name, Value.VBuiltin(name))
+    for name <- List(
+        "+",
+        "-",
+        "*",
+        "/",
+        "<",
+        ">",
+        "=",
+        "<=",
+        ">=",
+        "not",
+        "cons",
+        "car",
+        "cdr",
+        "null?",
+        "list",
+        "length",
+        "append",
+        "number?",
+        "string?",
+        "boolean?",
+        "pair?",
+        "symbol?"
+      )
+    do env.define(name, Value.VBuiltin(name))
     env
 
   // ── Eval ─────────────────────────────────────────────────────────────
@@ -155,9 +77,15 @@ object Evaluator:
     case Expr.SList(Expr.Symbol("lambda") :: rest)      => evalLambda(rest, env)
     case Expr.SList(Expr.Symbol("and") :: args)         => evalAnd(args, env)
     case Expr.SList(Expr.Symbol("or") :: args)          => evalOr(args, env)
+    case Expr.SList(Expr.Symbol("let") :: rest)         => evalLet(rest, env)
+    case Expr.SList(Expr.Symbol("begin") :: body)       => evalBegin(body, env)
+    case Expr.SList(Expr.Symbol("cond") :: clauses)     => evalCond(clauses, env)
     case Expr.SList(head :: args) =>
       val func = eval(head, env)
       applyFunc(func, args.map(a => eval(a, env)))
+
+  private def evalBody(body: List[Expr], env: Env): Value =
+    body.foldLeft(Value.VVoid: Value)((_, e) => eval(e, env))
 
   private def applyFunc(func: Value, args: List[Value]): Value = func match
     case Value.VBuiltin(name) => applyBuiltin(name, args)
@@ -165,9 +93,7 @@ object Evaluator:
       if args.length != params.length then throw EvalError("wrong number of arguments")
       val callEnv = closure.child()
       params.zip(args).foreach((p, a) => callEnv.define(p, a))
-      var result: Value = Value.VVoid
-      for e <- body do result = eval(e, callEnv)
-      result
+      evalBody(body, callEnv)
     case _ => throw EvalError("not a procedure")
 
   private def quoteToValue(expr: Expr): Value = expr match
@@ -217,6 +143,42 @@ object Evaluator:
         val result = eval(head, env)
         if isTruthy(result) then result else evalOr(tail, env)
 
+  private def evalLet(rest: List[Expr], env: Env): Value = rest match
+    case Expr.Symbol(name) :: Expr.SList(bindings) :: body if body.nonEmpty =>
+      val paramNames = bindings.map {
+        case Expr.SList(Expr.Symbol(n) :: _ :: Nil) => n
+        case _                                      => throw EvalError("invalid let binding")
+      }
+      val initVals = bindings.map {
+        case Expr.SList(_ :: initExpr :: Nil) => eval(initExpr, env)
+        case _                                => throw EvalError("invalid let binding")
+      }
+      val loopEnv = env.child()
+      val lambda  = Value.VLambda(paramNames, body, loopEnv)
+      loopEnv.define(name, lambda)
+      applyFunc(lambda, initVals)
+    case Expr.SList(bindings) :: body if body.nonEmpty =>
+      val letEnv = env.child()
+      for b <- bindings do
+        b match
+          case Expr.SList(Expr.Symbol(name) :: initExpr :: Nil) =>
+            letEnv.define(name, eval(initExpr, env))
+          case _ => throw EvalError("invalid let binding")
+      evalBody(body, letEnv)
+    case _ => throw EvalError("invalid let")
+
+  private def evalBegin(body: List[Expr], env: Env): Value =
+    if body.isEmpty then Value.VVoid
+    else evalBody(body, env)
+
+  private def evalCond(clauses: List[Expr], env: Env): Value = clauses match
+    case Nil                                          => Value.VVoid
+    case Expr.SList(Expr.Symbol("else") :: body) :: _ => evalBody(body, env)
+    case Expr.SList(test :: body) :: rest =>
+      if isTruthy(eval(test, env)) then evalBody(body, env)
+      else evalCond(rest, env)
+    case _ => throw EvalError("invalid cond")
+
   private def isTruthy(v: Value): Boolean = v match
     case Value.VBool(false) => false
     case _                  => true
@@ -257,17 +219,57 @@ object Evaluator:
     case "not" =>
       if args.length != 1 then throw EvalError("not requires 1 argument")
       Value.VBool(!isTruthy(args.head))
+    case "cons" =>
+      if args.length != 2 then throw EvalError("cons requires 2 arguments")
+      args(1) match
+        case Value.VList(elems) => Value.VList(args(0) :: elems)
+        case _                  => Value.VList(List(args(0), args(1)))
+    case "car" =>
+      if args.length != 1 then throw EvalError("car requires 1 argument")
+      args.head match
+        case Value.VList(h :: _) => h
+        case _                   => throw EvalError("car: not a pair")
+    case "cdr" =>
+      if args.length != 1 then throw EvalError("cdr requires 1 argument")
+      args.head match
+        case Value.VList(_ :: t) => Value.VList(t)
+        case _                   => throw EvalError("cdr: not a pair")
+    case "null?" =>
+      if args.length != 1 then throw EvalError("null? requires 1 argument")
+      Value.VBool(args.head == Value.VList(Nil))
+    case "list" => Value.VList(args)
+    case "length" =>
+      if args.length != 1 then throw EvalError("length requires 1 argument")
+      args.head match
+        case Value.VList(elems) => Value.VNum(elems.length.toLong)
+        case _                  => throw EvalError("length: not a list")
+    case "append" =>
+      args.foldRight(Value.VList(Nil): Value) { (arg, acc) =>
+        (arg, acc) match
+          case (Value.VList(elems), Value.VList(accElems)) => Value.VList(elems ++ accElems)
+          case _                                           => throw EvalError("append: not a list")
+      }
+    case "number?" =>
+      Value.VBool(args.length == 1 && args.head.isInstanceOf[Value.VNum])
+    case "string?" =>
+      Value.VBool(args.length == 1 && args.head.isInstanceOf[Value.VStr])
+    case "boolean?" =>
+      Value.VBool(args.length == 1 && args.head.isInstanceOf[Value.VBool])
+    case "pair?" =>
+      Value.VBool(args.length == 1 && (args.head match
+        case Value.VList(_ :: _) => true
+        case _                   => false))
+    case "symbol?" =>
+      Value.VBool(args.length == 1 && args.head.isInstanceOf[Value.VSymbol])
     case _ => throw EvalError(s"unknown builtin: $name")
 
   // ── Public API ───────────────────────────────────────────────────────
   def evalStr(input: String): String =
-    val tokens = tokenize(input)
-    val exprs  = parseAll(tokens)
+    val tokens = Parser.tokenize(input)
+    val exprs  = Parser.parseAll(tokens)
     if exprs.isEmpty then throw EvalError("no expressions")
-    var result: Value = Value.VVoid
-    val env           = defaultEnv
-    for expr <- exprs do result = eval(expr, env)
-    display(result)
+    val env = defaultEnv
+    display(evalBody(exprs, env))
 
   def evalStrWithOutput(input: String): (String, String) =
     (evalStr(input), "")
