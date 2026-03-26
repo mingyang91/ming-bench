@@ -10,7 +10,12 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### eval_list (src/scheme/mod.rs:153) — Dispatch a parsed list form to special-form evaluation or procedure application
+### eval_define (src/scheme/mod.rs:182) — Handle both variable definitions and function-definition shorthand with shared closure environments
+### parse_bindings (src/scheme/mod.rs:388) — Validate and normalize `let` bindings into reusable name/value pairs
+### append_lists (src/scheme/mod.rs:898) — Implement Scheme `append` by copying all but the last argument list onto the final tail value
+### append_list_contents (src/scheme/mod.rs:1206) — Render proper and dotted pair/list values into Scheme list syntax
+### parse_expr (src/scheme/mod.rs:1276) — Parse a single Scheme expression with source-position tracking for syntax errors
 
 ## Python Helpers (scripts/)
 

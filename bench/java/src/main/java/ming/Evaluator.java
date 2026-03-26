@@ -162,12 +162,26 @@ public class Evaluator {
         }));
         env.define("string-ref", builtin("string-ref", args -> {
             requireArity("string-ref", args.size(), 2);
-            String value = expectString(args.get(0));
+            StringValue value = expectStringValue(args.get(0));
             int index = expectIndex(args.get(1), "string-ref");
             if (index >= value.length()) {
                 throw new EvalError("string-ref index out of range");
             }
             return new CharValue(value.charAt(index));
+        }));
+        env.define("string-copy", builtin("string-copy", args -> {
+            requireArity("string-copy", args.size(), 1);
+            return expectStringValue(args.getFirst()).copy(true);
+        }));
+        env.define("string-set!", builtin("string-set!", args -> {
+            requireArity("string-set!", args.size(), 3);
+            StringValue value = expectStringValue(args.get(0));
+            int index = expectIndex(args.get(1), "string-set!");
+            if (index >= value.length()) {
+                throw new EvalError("string-set! index out of range");
+            }
+            value.setCharAt(index, expectChar(args.get(2)));
+            return VoidValue.INSTANCE;
         }));
         env.define("char?", builtin("char?",
                 args -> typePredicate("char?", args, value -> value instanceof CharValue)));
@@ -201,6 +215,7 @@ public class Evaluator {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
                 case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
                 case StringExpr stringExpr -> new StringValue(stringExpr.value());
+                case CharExpr charExpr -> new CharValue(charExpr.value());
                 case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
                 case ListExpr listExpr -> evalList(listExpr, env);
             };
@@ -483,6 +498,7 @@ public class Evaluator {
             case IntExpr intExpr -> new IntValue(intExpr.value());
             case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case CharExpr charExpr -> new CharValue(charExpr.value());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
             case ListExpr listExpr -> quoteListToValue(listExpr.elements());
         };
@@ -571,10 +587,21 @@ public class Evaluator {
     }
 
     private String expectString(Value value) throws EvalError {
+        return expectStringValue(value).value();
+    }
+
+    private StringValue expectStringValue(Value value) throws EvalError {
         if (value instanceof StringValue stringValue) {
-            return stringValue.value();
+            return stringValue;
         }
         throw new EvalError("expected string");
+    }
+
+    private char expectChar(Value value) throws EvalError {
+        if (value instanceof CharValue charValue) {
+            return charValue.value();
+        }
+        throw new EvalError("expected character");
     }
 
     private String expectSymbol(Value value) throws EvalError {
@@ -678,7 +705,8 @@ public class Evaluator {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
     }
 
-    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, SymbolExpr, ListExpr {
+    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr,
+            SymbolExpr, ListExpr {
         SourcePos position();
     }
 
@@ -689,6 +717,9 @@ public class Evaluator {
     }
 
     private record StringExpr(String value, SourcePos position) implements Expr {
+    }
+
+    private record CharExpr(char value, SourcePos position) implements Expr {
     }
 
     private record SymbolExpr(String name, SourcePos position) implements Expr {
@@ -728,10 +759,45 @@ public class Evaluator {
         }
     }
 
-    private record StringValue(String value) implements Value {
+    private static final class StringValue implements Value {
+        private final StringBuilder value;
+        private final boolean mutable;
+
+        private StringValue(String value) {
+            this(value, false);
+        }
+
+        private StringValue(String value, boolean mutable) {
+            this.value = new StringBuilder(value);
+            this.mutable = mutable;
+        }
+
+        private String value() {
+            return value.toString();
+        }
+
+        private int length() {
+            return value.length();
+        }
+
+        private char charAt(int index) {
+            return value.charAt(index);
+        }
+
+        private void setCharAt(int index, char ch) throws EvalError {
+            if (!mutable) {
+                throw new EvalError("string is immutable");
+            }
+            value.setCharAt(index, ch);
+        }
+
+        private StringValue copy(boolean mutable) {
+            return new StringValue(value(), mutable);
+        }
+
         @Override
         public String render() {
-            return "\"" + escapeString(value) + "\"";
+            return "\"" + escapeString(value()) + "\"";
         }
     }
 
@@ -974,7 +1040,12 @@ public class Evaluator {
                 case '\'' -> parseQuoted(position);
                 case '"' -> parseString(position);
                 case ')' -> throw errorAt(position, "unexpected ')'");
-                default -> parseAtom(position);
+                default -> {
+                    if (ch == '#' && index + 1 < input.length() && input.charAt(index + 1) == '\\') {
+                        yield parseCharLiteral(position);
+                    }
+                    yield parseAtom(position);
+                }
             };
         }
 
@@ -1019,6 +1090,38 @@ public class Evaluator {
             throw errorAt(position, "unterminated string");
         }
 
+        private Expr parseCharLiteral(SourcePos position) throws EvalError {
+            advance();
+            advance();
+
+            if (index >= input.length()) {
+                throw errorAt(position, "invalid character literal");
+            }
+
+            char next = input.charAt(index);
+            if (isTokenDelimiter(next)) {
+                advance();
+                return new CharExpr(next, position);
+            }
+
+            int start = index;
+            while (index < input.length() && !isTokenDelimiter(input.charAt(index))) {
+                advance();
+            }
+
+            String literal = input.substring(start, index);
+            return switch (literal) {
+                case "space" -> new CharExpr(' ', position);
+                case "newline" -> new CharExpr('\n', position);
+                default -> {
+                    if (literal.length() == 1) {
+                        yield new CharExpr(literal.charAt(0), position);
+                    }
+                    throw errorAt(position, "invalid character literal");
+                }
+            };
+        }
+
         private char parseEscape(SourcePos position) throws EvalError {
             if (index >= input.length()) {
                 throw errorAt(position, "unterminated string escape");
@@ -1039,7 +1142,7 @@ public class Evaluator {
             int start = index;
             while (index < input.length()) {
                 char ch = input.charAt(index);
-                if (Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';') {
+                if (isTokenDelimiter(ch)) {
                     break;
                 }
                 advance();
@@ -1056,6 +1159,10 @@ public class Evaluator {
                 return new IntExpr(Integer.parseInt(token), position);
             }
             return new SymbolExpr(token, position);
+        }
+
+        private boolean isTokenDelimiter(char ch) {
+            return Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';';
         }
 
         private void skipWhitespace() {
