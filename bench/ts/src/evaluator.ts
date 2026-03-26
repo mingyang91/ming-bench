@@ -213,6 +213,32 @@ function toNumber(v: SchemeVal, op: string, callPos?: Pos): number {
   return v.value;
 }
 
+function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag !== b.tag) return false;
+  switch (a.tag) {
+    case 'number': return a.value === (b as typeof a).value;
+    case 'boolean': return a.value === (b as typeof a).value;
+    case 'string': return a.value === (b as typeof a).value;
+    case 'symbol': return a.value === (b as typeof a).value;
+    case 'char': return a.value === (b as typeof a).value;
+    case 'nil': return true;
+    case 'pair': return b.tag === 'pair' && schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    default: return a === b;
+  }
+}
+
+function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag !== b.tag) return false;
+  switch (a.tag) {
+    case 'number': return a.value === (b as typeof a).value;
+    case 'boolean': return a.value === (b as typeof a).value;
+    case 'symbol': return a.value === (b as typeof a).value;
+    case 'char': return a.value === (b as typeof a).value;
+    case 'nil': return true;
+    default: return a === b;
+  }
+}
+
 let _outputBuf: string[] = [];
 
 function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal {
@@ -408,6 +434,188 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       (args[0] as any).value = args[0].value.substring(0, idx) + args[2].value + args[0].value.substring(idx + 1);
       return { tag: 'void' };
     }
+    // ── L09: Numeric utilities ──
+    case 'abs': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}abs: need 1 argument`);
+      return { tag: 'number', value: Math.abs(toNumber(args[0], 'abs', callPos)) };
+    }
+    case 'modulo': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}modulo: need 2 arguments`);
+      const a = toNumber(args[0], 'modulo', callPos);
+      const b = toNumber(args[1], 'modulo', callPos);
+      if (b === 0) throw new EvalError(`${posStr(callPos)}modulo: division by zero`);
+      return { tag: 'number', value: a - b * Math.floor(a / b) };
+    }
+    case 'remainder': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}remainder: need 2 arguments`);
+      const a = toNumber(args[0], 'remainder', callPos);
+      const b = toNumber(args[1], 'remainder', callPos);
+      if (b === 0) throw new EvalError(`${posStr(callPos)}remainder: division by zero`);
+      return { tag: 'number', value: a - b * Math.trunc(a / b) };
+    }
+    case 'quotient': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}quotient: need 2 arguments`);
+      const a = toNumber(args[0], 'quotient', callPos);
+      const b = toNumber(args[1], 'quotient', callPos);
+      if (b === 0) throw new EvalError(`${posStr(callPos)}quotient: division by zero`);
+      return { tag: 'number', value: Math.trunc(a / b) };
+    }
+    case 'min': {
+      if (args.length === 0) throw new EvalError(`${posStr(callPos)}min: need at least 1 argument`);
+      let result = toNumber(args[0], 'min', callPos);
+      for (let i = 1; i < args.length; i++) {
+        const v = toNumber(args[i], 'min', callPos);
+        if (v < result) result = v;
+      }
+      return { tag: 'number', value: result };
+    }
+    case 'max': {
+      if (args.length === 0) throw new EvalError(`${posStr(callPos)}max: need at least 1 argument`);
+      let result = toNumber(args[0], 'max', callPos);
+      for (let i = 1; i < args.length; i++) {
+        const v = toNumber(args[i], 'max', callPos);
+        if (v > result) result = v;
+      }
+      return { tag: 'number', value: result };
+    }
+    case 'expt': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}expt: need 2 arguments`);
+      return { tag: 'number', value: Math.pow(toNumber(args[0], 'expt', callPos), toNumber(args[1], 'expt', callPos)) };
+    }
+    case 'zero?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}zero?: need 1 argument`);
+      return { tag: 'boolean', value: toNumber(args[0], 'zero?', callPos) === 0 };
+    }
+    case 'positive?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}positive?: need 1 argument`);
+      return { tag: 'boolean', value: toNumber(args[0], 'positive?', callPos) > 0 };
+    }
+    case 'negative?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}negative?: need 1 argument`);
+      return { tag: 'boolean', value: toNumber(args[0], 'negative?', callPos) < 0 };
+    }
+    case 'odd?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}odd?: need 1 argument`);
+      return { tag: 'boolean', value: Math.abs(toNumber(args[0], 'odd?', callPos)) % 2 === 1 };
+    }
+    case 'even?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}even?: need 1 argument`);
+      return { tag: 'boolean', value: toNumber(args[0], 'even?', callPos) % 2 === 0 };
+    }
+    // ── L09: List utilities ──
+    case 'list-ref': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}list-ref: need 2 arguments`);
+      const idx = toNumber(args[1], 'list-ref', callPos);
+      const items = schemeListToArray(args[0]);
+      if (idx < 0 || idx >= items.length) throw new EvalError(`${posStr(callPos)}list-ref: index out of range`);
+      return items[idx];
+    }
+    case 'list-tail': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}list-tail: need 2 arguments`);
+      let k = toNumber(args[1], 'list-tail', callPos);
+      let cur = args[0];
+      while (k > 0) {
+        if (cur.tag !== 'pair') throw new EvalError(`${posStr(callPos)}list-tail: index out of range`);
+        cur = cur.cdr;
+        k--;
+      }
+      return cur;
+    }
+    case 'list?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}list?: need 1 argument`);
+      let cur = args[0];
+      while (cur.tag === 'pair') cur = cur.cdr;
+      return { tag: 'boolean', value: cur.tag === 'nil' };
+    }
+    case 'assoc': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}assoc: need 2 arguments`);
+      const key = args[0];
+      const items = schemeListToArray(args[1]);
+      for (const item of items) {
+        if (item.tag !== 'pair') throw new EvalError(`${posStr(callPos)}assoc: not an alist`);
+        if (schemeEqual(key, item.car)) return item;
+      }
+      return { tag: 'boolean', value: false };
+    }
+    case 'map': {
+      if (args.length < 2) throw new EvalError(`${posStr(callPos)}map: need at least 2 arguments`);
+      const fn = args[0];
+      const lists = args.slice(1).map(a => schemeListToArray(a));
+      const len = lists[0].length;
+      const result: SchemeVal[] = [];
+      for (let i = 0; i < len; i++) {
+        const fnArgs = lists.map(l => l[i]);
+        if (fn.tag === 'builtin') result.push(evalBuiltin(fn.name, fnArgs, callPos));
+        else if (fn.tag === 'lambda') result.push(applyLambda(fn, fnArgs, callPos));
+        else throw new EvalError(`${posStr(callPos)}map: not a procedure`);
+      }
+      return arrayToSchemeList(result);
+    }
+    case 'equal?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}equal?: need 2 arguments`);
+      return { tag: 'boolean', value: schemeEqual(args[0], args[1]) };
+    }
+    case 'eq?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}eq?: need 2 arguments`);
+      return { tag: 'boolean', value: schemeEq(args[0], args[1]) };
+    }
+    // ── L09: Character utilities ──
+    case 'char-alphabetic?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}char-alphabetic?: need 1 argument`);
+      if (args[0].tag !== 'char') throw new EvalError(`${posStr(callPos)}char-alphabetic?: expected char`);
+      return { tag: 'boolean', value: /[a-zA-Z]/.test(args[0].value) };
+    }
+    case 'char-numeric?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}char-numeric?: need 1 argument`);
+      if (args[0].tag !== 'char') throw new EvalError(`${posStr(callPos)}char-numeric?: expected char`);
+      return { tag: 'boolean', value: /[0-9]/.test(args[0].value) };
+    }
+    case 'char-upcase': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}char-upcase: need 1 argument`);
+      if (args[0].tag !== 'char') throw new EvalError(`${posStr(callPos)}char-upcase: expected char`);
+      return { tag: 'char', value: args[0].value.toUpperCase() };
+    }
+    case 'char-downcase': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}char-downcase: need 1 argument`);
+      if (args[0].tag !== 'char') throw new EvalError(`${posStr(callPos)}char-downcase: expected char`);
+      return { tag: 'char', value: args[0].value.toLowerCase() };
+    }
+    case 'char=?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}char=?: need 2 arguments`);
+      if (args[0].tag !== 'char' || args[1].tag !== 'char') throw new EvalError(`${posStr(callPos)}char=?: expected chars`);
+      return { tag: 'boolean', value: args[0].value === args[1].value };
+    }
+    case 'char<?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}char<?: need 2 arguments`);
+      if (args[0].tag !== 'char' || args[1].tag !== 'char') throw new EvalError(`${posStr(callPos)}char<?: expected chars`);
+      return { tag: 'boolean', value: args[0].value < args[1].value };
+    }
+    // ── L09: String utilities ──
+    case 'string=?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}string=?: need 2 arguments`);
+      if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError(`${posStr(callPos)}string=?: expected strings`);
+      return { tag: 'boolean', value: args[0].value === args[1].value };
+    }
+    case 'string<?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}string<?: need 2 arguments`);
+      if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError(`${posStr(callPos)}string<?: expected strings`);
+      return { tag: 'boolean', value: args[0].value < args[1].value };
+    }
+    case 'string-ci=?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}string-ci=?: need 2 arguments`);
+      if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-ci=?: expected strings`);
+      return { tag: 'boolean', value: args[0].value.toLowerCase() === args[1].value.toLowerCase() };
+    }
+    case 'string-upcase': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string-upcase: need 1 argument`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-upcase: expected string`);
+      return { tag: 'string', value: args[0].value.toUpperCase() };
+    }
+    case 'string-downcase': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string-downcase: need 1 argument`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-downcase: expected string`);
+      return { tag: 'string', value: args[0].value.toLowerCase() };
+    }
     case 'apply': {
       if (args.length < 2) throw new EvalError(`${posStr(callPos)}apply: need at least 2 arguments`);
       const fn = args[0];
@@ -439,6 +647,12 @@ const BUILTIN_NAMES = new Set([
   'string-ref', 'char?',
   'string-copy', 'string-set!',
   'apply',
+  // L09
+  'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
+  'zero?', 'positive?', 'negative?', 'odd?', 'even?',
+  'list-ref', 'list-tail', 'list?', 'assoc', 'map', 'equal?', 'eq?',
+  'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase', 'char=?', 'char<?',
+  'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase',
 ]);
 
 function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], callPos?: Pos): SchemeVal {
