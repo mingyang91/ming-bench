@@ -14,6 +14,8 @@ public class Evaluator {
     };
     record Lambda(List<String> params, List<Object> body, Env closure) {}
     record Builtin(String name) {}
+    record Token(Object value, int line, int col) {}
+    record Located(Object expr, int line, int col) {}
 
     static class Env {
         final Map<String, Object> bindings = new HashMap<>();
@@ -44,7 +46,7 @@ public class Evaluator {
     }
 
     public String evalStr(String input) throws EvalError {
-        List<Object> tokens = tokenize(input);
+        List<Token> tokens = tokenize(input);
         int[] pos = {0};
         Object result = null;
         while (pos[0] < tokens.size()) {
@@ -61,38 +63,43 @@ public class Evaluator {
         throw new EvalError("not implemented");
     }
 
-    private List<Object> tokenize(String input) throws EvalError {
-        List<Object> tokens = new ArrayList<>();
+    private List<Token> tokenize(String input) throws EvalError {
+        List<Token> tokens = new ArrayList<>();
         int i = 0;
         int len = input.length();
+        int line = 1, col = 1;
         while (i < len) {
             char c = input.charAt(i);
-            if (Character.isWhitespace(c)) {
-                i++;
+            if (c == '\n') {
+                i++; line++; col = 1;
+            } else if (Character.isWhitespace(c)) {
+                i++; col++;
             } else if (c == ';') {
-                while (i < len && input.charAt(i) != '\n') i++;
+                while (i < len && input.charAt(i) != '\n') { i++; col++; }
             } else if (c == '(') {
-                tokens.add("(");
-                i++;
+                tokens.add(new Token("(", line, col));
+                i++; col++;
             } else if (c == ')') {
-                tokens.add(")");
-                i++;
+                tokens.add(new Token(")", line, col));
+                i++; col++;
             } else if (c == '\'') {
-                tokens.add("'");
-                i++;
+                tokens.add(new Token("'", line, col));
+                i++; col++;
             } else if (c == '#') {
+                int startCol = col;
                 if (i + 1 < len && (input.charAt(i + 1) == 't' || input.charAt(i + 1) == 'f')) {
-                    tokens.add(input.charAt(i + 1) == 't' ? Boolean.TRUE : Boolean.FALSE);
-                    i += 2;
+                    tokens.add(new Token(input.charAt(i + 1) == 't' ? Boolean.TRUE : Boolean.FALSE, line, startCol));
+                    i += 2; col += 2;
                 } else {
-                    throw new EvalError("unexpected character after #");
+                    throw new EvalError(line + ":" + startCol + ": unexpected character after #");
                 }
             } else if (c == '"') {
+                int startCol = col;
                 StringBuilder sb = new StringBuilder();
-                i++;
+                i++; col++;
                 while (i < len && input.charAt(i) != '"') {
                     if (input.charAt(i) == '\\' && i + 1 < len) {
-                        i++;
+                        i++; col++;
                         char esc = input.charAt(i);
                         switch (esc) {
                             case 'n' -> sb.append('\n');
@@ -104,73 +111,99 @@ public class Evaluator {
                     } else {
                         sb.append(input.charAt(i));
                     }
+                    if (input.charAt(i) == '\n') { line++; col = 1; } else { col++; }
                     i++;
                 }
-                if (i >= len) throw new EvalError("unterminated string");
-                i++;
-                tokens.add(new SchemeString(sb.toString()));
+                if (i >= len) throw new EvalError(line + ":" + startCol + ": unterminated string");
+                i++; col++;
+                tokens.add(new Token(new SchemeString(sb.toString()), line, startCol));
             } else if (c == '-' && i + 1 < len && Character.isDigit(input.charAt(i + 1))
-                    && (tokens.isEmpty() || tokens.getLast().equals("("))) {
+                    && (tokens.isEmpty() || tokens.getLast().value().equals("("))) {
+                int startCol = col;
                 StringBuilder sb = new StringBuilder();
                 sb.append('-');
-                i++;
+                i++; col++;
                 while (i < len && Character.isDigit(input.charAt(i))) {
                     sb.append(input.charAt(i));
-                    i++;
+                    i++; col++;
                 }
-                tokens.add(Long.parseLong(sb.toString()));
+                tokens.add(new Token(Long.parseLong(sb.toString()), line, startCol));
             } else {
+                int startCol = col;
                 StringBuilder sb = new StringBuilder();
                 while (i < len && !Character.isWhitespace(input.charAt(i))
                         && input.charAt(i) != '(' && input.charAt(i) != ')'
                         && input.charAt(i) != '"' && input.charAt(i) != ';') {
                     sb.append(input.charAt(i));
-                    i++;
+                    i++; col++;
                 }
                 String tok = sb.toString();
                 try {
-                    tokens.add(Long.parseLong(tok));
+                    tokens.add(new Token(Long.parseLong(tok), line, startCol));
                 } catch (NumberFormatException e) {
-                    tokens.add(tok);
+                    tokens.add(new Token(tok, line, startCol));
                 }
             }
         }
         return tokens;
     }
 
-    private Object parse(List<Object> tokens, int[] pos) throws EvalError {
+    private Object parse(List<Token> tokens, int[] pos) throws EvalError {
         if (pos[0] >= tokens.size()) {
             throw new EvalError("unexpected end of input");
         }
-        Object token = tokens.get(pos[0]);
-        if (token.equals("'")) {
+        Token token = tokens.get(pos[0]);
+        int tLine = token.line(), tCol = token.col();
+        if (token.value().equals("'")) {
             pos[0]++;
             Object datum = parse(tokens, pos);
             List<Object> quoted = new ArrayList<>();
             quoted.add("quote");
             quoted.add(datum);
-            return quoted;
+            return new Located(quoted, tLine, tCol);
         }
-        if (token.equals("(")) {
+        if (token.value().equals("(")) {
             pos[0]++;
             List<Object> list = new ArrayList<>();
-            while (pos[0] < tokens.size() && !tokens.get(pos[0]).equals(")")) {
+            while (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
                 list.add(parse(tokens, pos));
             }
             if (pos[0] >= tokens.size()) {
-                throw new EvalError("missing closing parenthesis");
+                throw new EvalError(tLine + ":" + tCol + ": missing closing parenthesis");
             }
             pos[0]++;
-            return list;
-        } else if (token.equals(")")) {
-            throw new EvalError("unexpected )");
+            return new Located(list, tLine, tCol);
+        } else if (token.value().equals(")")) {
+            throw new EvalError(tLine + ":" + tCol + ": unexpected )");
         } else {
             pos[0]++;
-            return token;
+            return new Located(token.value(), tLine, tCol);
         }
     }
 
     private Object eval(Object expr, Env env) throws EvalError {
+        // Unwrap Located to get position info
+        int eLine = 0, eCol = 0;
+        if (expr instanceof Located loc) {
+            eLine = loc.line();
+            eCol = loc.col();
+            expr = loc.expr();
+        }
+        final int posLine = eLine, posCol = eCol;
+
+        try {
+            return evalInner(expr, env, posLine, posCol);
+        } catch (EvalError e) {
+            // If the error doesn't already have position info, add it
+            String msg = e.getMessage();
+            if (posLine > 0 && !msg.matches(".*\\d+:\\d+.*")) {
+                throw new EvalError(posLine + ":" + posCol + ": " + msg);
+            }
+            throw e;
+        }
+    }
+
+    private Object evalInner(Object expr, Env env, int posLine, int posCol) throws EvalError {
         if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
             return expr;
         }
@@ -182,21 +215,29 @@ public class Evaluator {
                 throw new EvalError("empty application");
             }
             Object head = list.getFirst();
-            if (head instanceof String s) {
+            // Unwrap Located head to get the raw value for switch matching
+            Object rawHead = head;
+            if (rawHead instanceof Located lh) rawHead = lh.expr();
+            if (rawHead instanceof String s) {
                 switch (s) {
                     case "define" -> {
                         if (list.size() < 3) throw new EvalError("define: bad syntax");
                         Object target = list.get(1);
+                        if (target instanceof Located lt) target = lt.expr();
                         if (target instanceof String name) {
                             Object val = eval(list.get(2), env);
                             env.define(name, val);
                             return val;
                         } else if (target instanceof List<?> sig) {
                             // (define (f params...) body...)
-                            String name = (String) sig.getFirst();
+                            Object rawFirst = sig.getFirst();
+                            if (rawFirst instanceof Located lf) rawFirst = lf.expr();
+                            String name = (String) rawFirst;
                             List<String> params = new ArrayList<>();
                             for (int i = 1; i < sig.size(); i++) {
-                                params.add((String) sig.get(i));
+                                Object p = sig.get(i);
+                                if (p instanceof Located lp) p = lp.expr();
+                                params.add((String) p);
                             }
                             List<Object> body = new ArrayList<>();
                             for (int i = 2; i < list.size(); i++) {
@@ -225,9 +266,13 @@ public class Evaluator {
                     case "lambda" -> {
                         if (list.size() < 3) throw new EvalError("lambda: bad syntax");
                         Object paramSpec = list.get(1);
+                        if (paramSpec instanceof Located lp) paramSpec = lp.expr();
                         List<String> params = new ArrayList<>();
                         if (paramSpec instanceof List<?> plist) {
-                            for (Object p : plist) params.add((String) p);
+                            for (Object p : plist) {
+                                if (p instanceof Located lpp) p = lpp.expr();
+                                params.add((String) p);
+                            }
                         } else {
                             throw new EvalError("lambda: bad parameter list");
                         }
@@ -262,15 +307,22 @@ public class Evaluator {
                     }
                     case "let" -> {
                         if (list.size() < 3) throw new EvalError("let: bad syntax");
+                        Object item1 = list.get(1);
+                        if (item1 instanceof Located li) item1 = li.expr();
                         // Named let: (let name ((var init) ...) body ...)
-                        if (list.get(1) instanceof String loopName) {
+                        if (item1 instanceof String loopName) {
                             if (list.size() < 4) throw new EvalError("let: bad syntax");
-                            List<?> bindingsList = (List<?>) list.get(2);
+                            Object bindingsRaw = list.get(2);
+                            if (bindingsRaw instanceof Located lb) bindingsRaw = lb.expr();
+                            List<?> bindingsList = (List<?>) bindingsRaw;
                             List<String> params = new ArrayList<>();
                             List<Object> inits = new ArrayList<>();
                             for (Object b : bindingsList) {
+                                if (b instanceof Located lbb) b = lbb.expr();
                                 List<?> binding = (List<?>) b;
-                                params.add((String) binding.get(0));
+                                Object bname = binding.get(0);
+                                if (bname instanceof Located lbn) bname = lbn.expr();
+                                params.add((String) bname);
                                 inits.add(eval(binding.get(1), env));
                             }
                             List<Object> body = new ArrayList<>();
@@ -278,15 +330,17 @@ public class Evaluator {
                             Env letEnv = new Env(env);
                             Lambda loopLambda = new Lambda(params, body, letEnv);
                             letEnv.define(loopName, loopLambda);
-                            // Call with initial values
                             return apply(loopLambda, inits);
                         }
                         // Regular let
-                        List<?> bindingsList2 = (List<?>) list.get(1);
+                        List<?> bindingsList2 = (List<?>) item1;
                         Env letEnv = new Env(env);
                         for (Object b : bindingsList2) {
+                            if (b instanceof Located lbb) b = lbb.expr();
                             List<?> binding = (List<?>) b;
-                            String name = (String) binding.get(0);
+                            Object bname = binding.get(0);
+                            if (bname instanceof Located lbn) bname = lbn.expr();
+                            String name = (String) bname;
                             Object val = eval(binding.get(1), env);
                             letEnv.define(name, val);
                         }
@@ -298,9 +352,13 @@ public class Evaluator {
                     }
                     case "cond" -> {
                         for (int i = 1; i < list.size(); i++) {
-                            List<?> clause = (List<?>) list.get(i);
+                            Object clauseRaw = list.get(i);
+                            if (clauseRaw instanceof Located lc) clauseRaw = lc.expr();
+                            List<?> clause = (List<?>) clauseRaw;
                             Object test = clause.getFirst();
-                            if (test instanceof String st && st.equals("else")) {
+                            Object rawTest = test;
+                            if (rawTest instanceof Located lt) rawTest = lt.expr();
+                            if (rawTest instanceof String st && st.equals("else")) {
                                 Object r = null;
                                 for (int j = 1; j < clause.size(); j++) r = eval(clause.get(j), env);
                                 return r;
@@ -350,6 +408,7 @@ public class Evaluator {
     }
 
     private Object quote(Object datum) {
+        if (datum instanceof Located loc) datum = loc.expr();
         if (datum instanceof List<?> list) {
             Object result = NIL;
             for (int i = list.size() - 1; i >= 0; i--) {
