@@ -155,6 +155,58 @@ func (p *lambdaProcedure) Call(i *interpreter, args []any, pos position) (any, e
 	return i.evalSequence(p.body, callEnv)
 }
 
+type recordType struct {
+	name       string
+	fieldNames []string
+}
+
+type recordValue struct {
+	recordType *recordType
+	fields     []any
+}
+
+type recordConstructor struct {
+	name       string
+	recordType *recordType
+}
+
+func (p *recordConstructor) Call(_ *interpreter, args []any, pos position) (any, error) {
+	if len(args) != len(p.recordType.fieldNames) {
+		return nil, newEvalError(pos, "%s expects exactly %d arguments", p.name, len(p.recordType.fieldNames))
+	}
+	fields := append([]any(nil), args...)
+	return &recordValue{recordType: p.recordType, fields: fields}, nil
+}
+
+type recordPredicate struct {
+	recordType *recordType
+}
+
+func (p *recordPredicate) Call(_ *interpreter, args []any, pos position) (any, error) {
+	if len(args) != 1 {
+		return nil, newEvalError(pos, "record predicate expects exactly 1 argument")
+	}
+	record, ok := args[0].(*recordValue)
+	return ok && record.recordType == p.recordType, nil
+}
+
+type recordAccessor struct {
+	name       string
+	recordType *recordType
+	index      int
+}
+
+func (p *recordAccessor) Call(_ *interpreter, args []any, pos position) (any, error) {
+	if len(args) != 1 {
+		return nil, newEvalError(pos, "%s expects exactly 1 argument", p.name)
+	}
+	record, ok := args[0].(*recordValue)
+	if !ok || record.recordType != p.recordType {
+		return nil, newEvalError(pos, "%s expects a %s record", p.name, p.recordType.name)
+	}
+	return record.fields[p.index], nil
+}
+
 type binding struct {
 	value any
 }
@@ -363,6 +415,8 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 				return i.evalQuote(list.elements[1:], operator.pos)
 			case "lambda":
 				return i.evalLambda(list.elements[1:], operator.pos, env)
+			case "define-record-type":
+				return i.evalDefineRecordType(list.elements[1:], operator.pos, env)
 			}
 		}
 	}
@@ -659,6 +713,80 @@ func (i *interpreter) evalDefineSyntax(args []expr, pos position, env *environme
 		return nil, err
 	}
 	env.defineMacro(name.value, macro)
+	return voidValue{}, nil
+}
+
+func (i *interpreter) evalDefineRecordType(args []expr, pos position, env *environment) (any, error) {
+	if len(args) < 3 {
+		return nil, newEvalError(pos, "define-record-type expects a name, constructor, predicate, and field clauses")
+	}
+
+	typeName, ok := args[0].(*symbolExpr)
+	if !ok {
+		return nil, newEvalError(args[0].exprPos(), "define-record-type requires a type name")
+	}
+
+	constructorSpec, ok := args[1].(*listExpr)
+	if !ok || len(constructorSpec.elements) == 0 {
+		return nil, newEvalError(args[1].exprPos(), "define-record-type requires a constructor clause")
+	}
+
+	constructorName, ok := constructorSpec.elements[0].(*symbolExpr)
+	if !ok {
+		return nil, newEvalError(constructorSpec.elements[0].exprPos(), "record constructor name must be a symbol")
+	}
+
+	fieldIndexes := make(map[string]int, len(constructorSpec.elements)-1)
+	fieldNames := make([]string, 0, len(constructorSpec.elements)-1)
+	for index, fieldExpr := range constructorSpec.elements[1:] {
+		fieldName, ok := fieldExpr.(*symbolExpr)
+		if !ok {
+			return nil, newEvalError(fieldExpr.exprPos(), "record field name must be a symbol")
+		}
+		if _, exists := fieldIndexes[fieldName.value]; exists {
+			return nil, newEvalError(fieldName.pos, "duplicate record field: %s", fieldName.value)
+		}
+		fieldIndexes[fieldName.value] = index
+		fieldNames = append(fieldNames, fieldName.value)
+	}
+
+	predicateName, ok := args[2].(*symbolExpr)
+	if !ok {
+		return nil, newEvalError(args[2].exprPos(), "record predicate name must be a symbol")
+	}
+
+	recordType := &recordType{name: typeName.value, fieldNames: fieldNames}
+	env.define(constructorName.value, &recordConstructor{name: constructorName.value, recordType: recordType})
+	env.define(predicateName.value, &recordPredicate{recordType: recordType})
+
+	for _, fieldClauseExpr := range args[3:] {
+		fieldClause, ok := fieldClauseExpr.(*listExpr)
+		if !ok || len(fieldClause.elements) != 2 {
+			return nil, newEvalError(fieldClauseExpr.exprPos(), "record field clauses must contain a field and accessor")
+		}
+
+		fieldName, ok := fieldClause.elements[0].(*symbolExpr)
+		if !ok {
+			return nil, newEvalError(fieldClause.elements[0].exprPos(), "record field name must be a symbol")
+		}
+
+		accessorName, ok := fieldClause.elements[1].(*symbolExpr)
+		if !ok {
+			return nil, newEvalError(fieldClause.elements[1].exprPos(), "record accessor name must be a symbol")
+		}
+
+		index, ok := fieldIndexes[fieldName.value]
+		if !ok {
+			return nil, newEvalError(fieldName.pos, "unknown record field: %s", fieldName.value)
+		}
+
+		env.define(accessorName.value, &recordAccessor{
+			name:       accessorName.value,
+			recordType: recordType,
+			index:      index,
+		})
+	}
+
 	return voidValue{}, nil
 }
 
@@ -1769,6 +1897,9 @@ func eqValues(left, right any) bool {
 	case *pairValue:
 		r, ok := right.(*pairValue)
 		return ok && l == r
+	case *recordValue:
+		r, ok := right.(*recordValue)
+		return ok && l == r
 	case *builtinProcedure:
 		r, ok := right.(*builtinProcedure)
 		return ok && l == r
@@ -1823,6 +1954,9 @@ func equalValues(left, right any) bool {
 	case *pairValue:
 		r, ok := right.(*pairValue)
 		return ok && equalValues(l.car, r.car) && equalValues(l.cdr, r.cdr)
+	case *recordValue:
+		r, ok := right.(*recordValue)
+		return ok && l == r
 	case *builtinProcedure:
 		r, ok := right.(*builtinProcedure)
 		return ok && l == r
@@ -1940,6 +2074,8 @@ func formatValue(value any) string {
 		return "()"
 	case *pairValue:
 		return formatPair(v)
+	case *recordValue:
+		return fmt.Sprintf("#<record %s>", v.recordType.name)
 	case callable:
 		return "#<procedure>"
 	default:
