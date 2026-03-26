@@ -133,6 +133,7 @@ public class Evaluator {
         if (operatorExpr instanceof SymbolExpr symbolExpr) {
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, env);
+                case "set!" -> evalSet(arguments, env);
                 case "if" -> evalIf(arguments, env);
                 case "quote" -> evalQuote(arguments);
                 case "lambda" -> evalLambda(arguments, env);
@@ -182,6 +183,18 @@ public class Evaluator {
         }
 
         throw new EvalError("define target must be a symbol or parameter list");
+    }
+
+    private Value evalSet(List<Expr> arguments, Env env) throws EvalError {
+        requireExactArgs("set!", arguments, 2);
+
+        Expr target = arguments.get(0);
+        if (!(target instanceof SymbolExpr symbolExpr)) {
+            throw new EvalError("set! target must be a symbol");
+        }
+
+        env.set(symbolExpr.name(), eval(arguments.get(1), env));
+        return VOID;
     }
 
     private Value evalIf(List<Expr> arguments, Env env) throws EvalError {
@@ -926,6 +939,14 @@ public class Evaluator {
                 throw new EvalError("unbound variable: " + name);
             }
             return cell.value;
+        }
+
+        private void set(String name, Value value) throws EvalError {
+            Cell cell = lookupCell(name);
+            if (cell == null || cell.value == UNINITIALIZED) {
+                throw new EvalError("unbound variable: " + name);
+            }
+            cell.value = value;
         }
 
         private Cell lookupCell(String name) {
