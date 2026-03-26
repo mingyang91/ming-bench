@@ -129,6 +129,9 @@ case object SchemeCallCC extends SchemeVal:
 case object SchemeDynamicWind extends SchemeVal:
   def display: String = "#<procedure:dynamic-wind>"
 
+case object SchemeWithExceptionHandler extends SchemeVal:
+  def display: String = "#<procedure:with-exception-handler>"
+
 // ── Environment ──────────────────────────────────────────────────────
 private[ming] class Env(val bindings: mutable.Map[String, SchemeVal], val parent: Option[Env]):
 

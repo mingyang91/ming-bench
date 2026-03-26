@@ -82,7 +82,7 @@ private[ming] object SpecialForms:
         val lambda   = SchemeLambda(parsed.map(_._1), None, body, localEnv)
         localEnv.set(name, lambda)
         val inits = parsed.map(_._2)
-        if inits.isEmpty then Evaluator.applyFunction(lambda, Nil, k)
+        if inits.isEmpty then ProcApply.applyFunction(lambda, Nil, k)
         else
           val rev = inits.reverse
           SEval(rev.head, env, EvArgsK(lambda, Nil, rev.tail, env, k))
@@ -91,7 +91,7 @@ private[ming] object SpecialForms:
         val paramNames = parsed.map(_._1)
         val inits      = parsed.map(_._2)
         val lambda     = SchemeLambda(paramNames, None, body, env)
-        if inits.isEmpty then Evaluator.applyFunction(lambda, Nil, k)
+        if inits.isEmpty then ProcApply.applyFunction(lambda, Nil, k)
         else
           val rev = inits.reverse
           SEval(rev.head, env, EvArgsK(lambda, Nil, rev.tail, env, k))
@@ -170,7 +170,7 @@ private[ming] object SpecialForms:
         val lambda   = SchemeLambda(paramNames, None, List(ifExpr), localEnv)
         localEnv.set(loopName, lambda)
 
-        if inits.isEmpty then Evaluator.applyFunction(lambda, Nil, k)
+        if inits.isEmpty then ProcApply.applyFunction(lambda, Nil, k)
         else
           val rev = inits.reverse
           SEval(rev.head, env, EvArgsK(lambda, Nil, rev.tail, env, k))

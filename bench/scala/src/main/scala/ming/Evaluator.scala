@@ -9,6 +9,7 @@ object Evaluator:
     val exprs  = Parser.parseAll(tokens)
     if exprs.isEmpty then throw new EvalError("empty input")
     windStack = Nil
+    handlerStack = Nil
     val env = makeGlobalEnv()
     evalSequence(exprs, env).display
 
@@ -17,6 +18,7 @@ object Evaluator:
     val exprs  = Parser.parseAll(tokens)
     if exprs.isEmpty then throw new EvalError("empty input")
     windStack = Nil
+    handlerStack = Nil
     val output = new StringBuilder
     val env    = makeGlobalEnv(output)
     val result = evalSequence(exprs, env)
@@ -28,6 +30,16 @@ object Evaluator:
     env.set("call/cc", SchemeCallCC)
     env.set("call-with-current-continuation", SchemeCallCC)
     env.set("dynamic-wind", SchemeDynamicWind)
+    env.set("with-exception-handler", SchemeWithExceptionHandler)
+    env.set(
+      "raise",
+      SchemeBuiltin(
+        "raise",
+        args =>
+          if args.size != 1 then throw new EvalError("raise: expected 1 argument")
+          throw new SchemeRaisedException(args.head)
+      )
+    )
     env
 
   private[ming] def isFalsy(v: SchemeVal): Boolean = v match
@@ -38,7 +50,7 @@ object Evaluator:
     run(SEval(expr, env, HaltK))
 
   private[ming] def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
-    run(applyFunction(op, args, HaltK))
+    run(ProcApply.applyFunction(op, args, HaltK))
 
   private[ming] def applyProcSafe(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
     applyProc(op, args)
@@ -52,8 +64,9 @@ object Evaluator:
     else if exprs.size == 1 then run(SEval(exprs.head, env, HaltK))
     else run(SEval(exprs.head, env, SeqK(exprs.tail, env, HaltK)))
 
-  private var lastPos: Pos                            = Pos.zero
-  private var windStack: List[(SchemeVal, SchemeVal)] = Nil
+  private var lastPos: Pos                                  = Pos.zero
+  private[ming] var windStack: List[(SchemeVal, SchemeVal)] = Nil
+  private[ming] var handlerStack: List[ExceptionHandler]    = Nil
 
   private def run(initial: MState): SchemeVal =
     var state = initial
@@ -63,6 +76,22 @@ object Evaluator:
         case _ =>
           try state = step(state)
           catch
+            case raised: SchemeRaisedException =>
+              if handlerStack.nonEmpty then
+                val handler = handlerStack.head
+                handlerStack = handlerStack.tail
+                state = handler match
+                  case WHHandler(proc) =>
+                    ProcApply.applyFunction(proc, List(raised.value), RaiseReturnCheckK)
+                  case GuardExHandler(variable, clauses, genv, guardK, savedWind) =>
+                    val common   = EvalHelpers.commonWindTail(windStack, savedWind)
+                    val toUnwind = windStack.take(windStack.length - common.length)
+                    val toRewind = savedWind.take(savedWind.length - common.length).reverse
+                    val actions: List[WindAction] =
+                      toUnwind.map(e => DoUnwind(e._2)) ++ toRewind.map(e => DoRewind(e._1, e))
+                    val clauseK = GuardClauseK(variable, raised.value, clauses, genv, guardK)
+                    ProcApply.processWindActions(actions, raised.value, clauseK)
+              else throw new EvalError(s"unhandled exception: ${raised.value.display}")
             case e: EvalError =>
               val msg = e.getMessage
               if msg.matches(".*\\d+:\\d+.*") then throw e
@@ -115,7 +144,8 @@ object Evaluator:
         SApply(SchemeVoid, k)
       case Symbol("define-record-type", _) =>
         SApply(Records.evalDefineRecordType(elems.tail, env), k)
-      case _ => dispatchMacroOrApply(elems, env, k)
+      case Symbol("guard", _) => ProcApply.evalGuardForm(elems.tail, env, k)
+      case _                  => dispatchMacroOrApply(elems, env, k)
 
   private def dispatchMacroOrApply(elems: List[Expr], env: Env, k: Kont): MState =
     val macroVal = elems.head match
@@ -156,14 +186,14 @@ object Evaluator:
       SApply(SchemeVoid, k2)
 
     case EvFunK(argExprs, env, k2) =>
-      if argExprs.isEmpty then applyFunction(value, Nil, k2)
+      if argExprs.isEmpty then ProcApply.applyFunction(value, Nil, k2)
       else
         val rev = argExprs.reverse
         SEval(rev.head, env, EvArgsK(value, Nil, rev.tail, env, k2))
 
     case EvArgsK(op, done, remaining, env, k2) =>
       val newDone = value :: done
-      if remaining.isEmpty then applyFunction(op, newDone, k2)
+      if remaining.isEmpty then ProcApply.applyFunction(op, newDone, k2)
       else SEval(remaining.head, env, EvArgsK(op, newDone, remaining.tail, env, k2))
 
     case AndK(remaining, env, k2) =>
@@ -180,7 +210,7 @@ object Evaluator:
 
     case CallCCK(k2) =>
       val cont = new SchemeContinuation(k2, windStack)
-      applyFunction(value, List(cont), k2)
+      ProcApply.applyFunction(value, List(cont), k2)
 
     case CondTestK(body, remaining, env, k2) =>
       if !isFalsy(value) then
@@ -209,90 +239,50 @@ object Evaluator:
     case DynWindAfterInK(inThunk, bodyThunk, outThunk, k2) =>
       val entry = (inThunk, outThunk)
       windStack = entry :: windStack
-      applyFunction(bodyThunk, Nil, DynWindAfterBodyK(outThunk, k2))
+      ProcApply.applyFunction(bodyThunk, Nil, DynWindAfterBodyK(outThunk, k2))
 
     case DynWindAfterBodyK(outThunk, k2) =>
       windStack = windStack.tail
-      applyFunction(outThunk, Nil, DynWindAfterOutK(value, k2))
+      ProcApply.applyFunction(outThunk, Nil, DynWindAfterOutK(value, k2))
 
     case DynWindAfterOutK(bodyVal, k2) =>
       SApply(bodyVal, k2)
 
+    case other => applyKontSpecial(value, other)
+
+  private def applyKontSpecial(value: SchemeVal, k: Kont): MState = k match
     case WindContK(actions, savedVal, targetK) =>
-      processWindActions(actions, savedVal, targetK)
+      ProcApply.processWindActions(actions, savedVal, targetK)
 
     case WindPushK(entry, actions, savedVal, targetK) =>
       windStack = entry :: windStack
-      processWindActions(actions, savedVal, targetK)
+      ProcApply.processWindActions(actions, savedVal, targetK)
 
-  private[ming] def applyFunction(op: SchemeVal, args: List[SchemeVal], k: Kont): MState =
-    op match
-      case SchemeBuiltin("apply", _) =>
-        if args.size < 2 then throw new EvalError("apply: expected at least 2 arguments")
-        val proc = args.head
-        val lastList = SchemeListOps
-          .toScalaList(args.last)
-          .getOrElse(throw new EvalError("apply: last argument must be a list"))
-        val allArgs = args.slice(1, args.size - 1) ++ lastList
-        applyFunction(proc, allArgs, k)
+    case ExHandlerPopK(k2) =>
+      handlerStack = handlerStack.tail
+      SApply(value, k2)
 
-      case SchemeBuiltin(_, fn) =>
-        SApply(fn(args), k)
+    case GuardBodyPopK(k2) =>
+      handlerStack = handlerStack.tail
+      SApply(value, k2)
 
-      case SchemeLambda(params, restParam, body, closureEnv) =>
-        val localEnv = EvalHelpers.bindArgs(params, restParam, args, closureEnv)
-        evalBodyCEK(body, localEnv, k)
+    case GuardClauseK(variable, exnVal, clauses, env, k2) =>
+      ProcApply.evaluateGuardClauses(exnVal, variable, clauses, env, k2)
 
-      case SchemeCaseLambda(clauses) =>
-        val matching = clauses.find { lam =>
-          lam.restParam match
-            case None    => args.size == lam.params.size
-            case Some(_) => args.size >= lam.params.size
-        }
-        matching match
-          case Some(lam) => applyFunction(lam, args, k)
-          case None      => throw new EvalError(s"no matching clause for ${args.size} arguments")
+    case GuardTestK(variable, exnVal, body, remaining, env, k2) =>
+      if !isFalsy(value) then
+        if body.isEmpty then SApply(value, k2)
+        else
+          val localEnv = new Env(mutable.Map(variable -> exnVal), Some(env))
+          evalBodyCEK(body, localEnv, k2)
+      else ProcApply.evaluateGuardClauses(exnVal, variable, remaining, env, k2)
 
-      case SchemeCallCC =>
-        if args.size != 1 then throw new EvalError("call/cc: expected 1 argument")
-        val cont = new SchemeContinuation(k, windStack)
-        applyFunction(args.head, List(cont), k)
+    case RaiseReturnCheckK =>
+      throw new EvalError("handler returned from non-continuable exception")
 
-      case SchemeDynamicWind =>
-        if args.size != 3 then throw new EvalError("dynamic-wind: expected 3 arguments")
-        val List(inThunk, bodyThunk, outThunk) = args
-        applyFunction(inThunk, Nil, DynWindAfterInK(inThunk, bodyThunk, outThunk, k))
-
-      case cont: SchemeContinuation =>
-        if args.size != 1 then throw new EvalError("continuation: expected 1 argument")
-        cont.savedK match
-          case targetK: Kont =>
-            val targetWind = cont.savedWind
-            val v          = args.head
-            val common     = EvalHelpers.commonWindTail(windStack, targetWind)
-            val toUnwind   = windStack.take(windStack.length - common.length)
-            val toRewind   = targetWind.take(targetWind.length - common.length).reverse
-            val actions: List[WindAction] =
-              toUnwind.map(e => DoUnwind(e._2)) ++ toRewind.map(e => DoRewind(e._1, e))
-            processWindActions(actions, v, targetK)
-          case _ => throw new EvalError("invalid continuation")
-
-      case _ => throw new EvalError(s"not a procedure: ${op.display}")
+    case _ => throw new AssertionError(s"unexpected continuation: $k")
 
   private[ming] def evalBodyCEK(exprs: List[Expr], env: Env, k: Kont): MState =
     if exprs.isEmpty then SApply(SchemeVoid, k)
     else if exprs.size == 1 then SEval(exprs.head, env, k)
     else SEval(exprs.head, env, SeqK(exprs.tail, env, k))
-
-  private def processWindActions(
-    actions: List[WindAction],
-    savedVal: SchemeVal,
-    targetK: Kont
-  ): MState =
-    actions match
-      case Nil => SApply(savedVal, targetK)
-      case DoUnwind(outThunk) :: rest =>
-        windStack = windStack.tail
-        applyFunction(outThunk, Nil, WindContK(rest, savedVal, targetK))
-      case DoRewind(inThunk, entry) :: rest =>
-        applyFunction(inThunk, Nil, WindPushK(entry, rest, savedVal, targetK))

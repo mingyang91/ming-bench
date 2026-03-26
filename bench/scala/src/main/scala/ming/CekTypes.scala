@@ -56,6 +56,40 @@ private[ming] case class WindPushK(
   targetK: Kont
 ) extends Kont
 
+// Exception handler types
+sealed private[ming] trait ExceptionHandler
+private[ming] case class WHHandler(proc: SchemeVal) extends ExceptionHandler
+
+private[ming] case class GuardExHandler(
+  variable: String,
+  clauses: List[Expr],
+  env: Env,
+  guardK: Kont,
+  savedWind: List[(SchemeVal, SchemeVal)]
+) extends ExceptionHandler
+
+// Exception-handling continuation frames
+private[ming] case class ExHandlerPopK(k: Kont) extends Kont
+private[ming] case class GuardBodyPopK(k: Kont) extends Kont
+
+private[ming] case class GuardClauseK(
+  variable: String,
+  exnVal: SchemeVal,
+  clauses: List[Expr],
+  env: Env,
+  k: Kont
+) extends Kont
+
+private[ming] case class GuardTestK(
+  variable: String,
+  exnVal: SchemeVal,
+  body: List[Expr],
+  remaining: List[Expr],
+  env: Env,
+  k: Kont
+) extends Kont
+private[ming] case object RaiseReturnCheckK extends Kont
+
 // ── CEK Machine State ──────────────────────────────────────────
 
 sealed private[ming] trait MState
