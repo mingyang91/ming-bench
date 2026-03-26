@@ -103,10 +103,25 @@ enum Procedure {
         name: &'static str,
     },
     Lambda {
-        params: Vec<String>,
+        params: LambdaParams,
         body: Vec<Expr>,
         env: EnvRef,
     },
+}
+
+#[derive(Debug, Clone)]
+struct LambdaParams {
+    required: Vec<String>,
+    rest: Option<String>,
+}
+
+impl LambdaParams {
+    fn fixed(required: Vec<String>) -> Self {
+        Self {
+            required,
+            rest: None,
+        }
+    }
 }
 
 type EnvRef = Rc<Env>;
@@ -166,17 +181,30 @@ impl Procedure {
         match self {
             Self::Builtin { name } => apply_builtin(name, &args, context),
             Self::Lambda { params, body, env } => {
-                if args.len() != params.len() {
+                if args.len() < params.required.len()
+                    || (params.rest.is_none() && args.len() != params.required.len())
+                {
                     return Err(EvalError::WrongArgCount {
                         name: "lambda",
-                        expected: "exactly the declared number of arguments",
+                        expected: if params.rest.is_some() {
+                            "at least the declared number of required arguments"
+                        } else {
+                            "exactly the declared number of arguments"
+                        },
                         got: args.len(),
                     });
                 }
 
                 let call_env = Env::new(Some(env.clone()));
-                for (param, value) in params.iter().cloned().zip(args) {
-                    call_env.define(param, value);
+                let mut args = args.into_iter();
+
+                for param in &params.required {
+                    let value = args.next().expect("arity checked before binding lambda args");
+                    call_env.define(param.clone(), value);
+                }
+
+                if let Some(rest) = &params.rest {
+                    call_env.define(rest.clone(), Value::List(args.collect()));
                 }
 
                 eval_sequence(body, &call_env, context)
@@ -843,7 +871,7 @@ fn eval_let(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Va
             let_env.define(name.clone(), Value::Void);
 
             let procedure = Rc::new(Procedure::Lambda {
-                params,
+                params: LambdaParams::fixed(params),
                 body: body.to_vec(),
                 env: let_env.clone(),
             });
@@ -871,15 +899,18 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(quote_expr(&args[0]))
 }
 
-fn parse_params(expr: &Expr, name: &'static str) -> Result<Vec<String>, EvalError> {
-    let Expr::List(items) = expr else {
-        return Err(EvalError::InvalidForm {
+fn parse_params(expr: &Expr, name: &'static str) -> Result<LambdaParams, EvalError> {
+    match expr {
+        Expr::List(items) => parse_param_names(items, name),
+        Expr::Symbol(symbol) => Ok(LambdaParams {
+            required: Vec::new(),
+            rest: Some(symbol.clone()),
+        }),
+        _ => Err(EvalError::InvalidForm {
             name,
             message: "expected a parameter list",
-        });
-    };
-
-    parse_param_names(items, name)
+        }),
+    }
 }
 
 fn parse_let_bindings(expr: &Expr, name: &'static str) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -908,17 +939,43 @@ fn parse_let_bindings(expr: &Expr, name: &'static str) -> Result<Vec<(String, Ex
         .collect()
 }
 
-fn parse_param_names(items: &[Expr], name: &'static str) -> Result<Vec<String>, EvalError> {
-    items
-        .iter()
-        .map(|item| match item {
-            Expr::Symbol(symbol) => Ok(symbol.clone()),
-            _ => Err(EvalError::InvalidForm {
-                name,
-                message: "expected parameter names to be symbols",
-            }),
-        })
-        .collect()
+fn parse_param_names(items: &[Expr], name: &'static str) -> Result<LambdaParams, EvalError> {
+    let mut required = Vec::new();
+    let mut iter = items.iter();
+
+    while let Some(item) = iter.next() {
+        match item {
+            Expr::Symbol(symbol) if symbol == "." => {
+                let Some(Expr::Symbol(rest)) = iter.next() else {
+                    return Err(EvalError::InvalidForm {
+                        name,
+                        message: "expected a rest parameter name after .",
+                    });
+                };
+
+                if iter.next().is_some() {
+                    return Err(EvalError::InvalidForm {
+                        name,
+                        message: "expected . to appear before the final parameter name only",
+                    });
+                }
+
+                return Ok(LambdaParams {
+                    required,
+                    rest: Some(rest.clone()),
+                });
+            }
+            Expr::Symbol(symbol) => required.push(symbol.clone()),
+            _ => {
+                return Err(EvalError::InvalidForm {
+                    name,
+                    message: "expected parameter names to be symbols",
+                });
+            }
+        }
+    }
+
+    Ok(LambdaParams::fixed(required))
 }
 
 fn quote_expr(expr: &Expr) -> Value {
@@ -952,6 +1009,7 @@ fn root_env() -> EnvRef {
         "=",
         ">",
         ">=",
+        "apply",
         "append",
         "boolean?",
         "char?",
@@ -1006,6 +1064,30 @@ fn apply_builtin(
         "+" => {
             let numbers = extract_numbers("+", args)?;
             Ok(Value::Integer(numbers.iter().sum()))
+        }
+        "apply" => {
+            if args.len() < 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "apply",
+                    expected: "at least 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let mut applied_args = args[1..args.len() - 1].to_vec();
+            let tail = args.last().expect("apply arity checked before reading tail");
+
+            match tail {
+                Value::List(items) => applied_args.extend(items.iter().cloned()),
+                other => {
+                    return Err(EvalError::ExpectedList {
+                        name: "apply",
+                        found: other.type_name(),
+                    });
+                }
+            }
+
+            apply_procedure(args[0].clone(), applied_args, context)
         }
         "append" => {
             let mut values = Vec::new();
