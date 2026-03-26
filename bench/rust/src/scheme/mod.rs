@@ -348,6 +348,19 @@ impl Env {
         self.parent.as_ref().and_then(|parent| parent.lookup(name))
     }
 
+    fn set(&self, name: &str, value: Value) -> bool {
+        let mut bindings = self.bindings.borrow_mut();
+        if let Some(binding) = bindings.get_mut(name) {
+            *binding = value;
+            return true;
+        }
+        drop(bindings);
+
+        self.parent
+            .as_ref()
+            .is_some_and(|parent| parent.set(name, value))
+    }
+
     fn write_output(&self, text: &str) {
         self.output.borrow_mut().push_str(text);
     }
@@ -588,6 +601,7 @@ fn eval_application(list_pos: SourcePos, items: &[Expr], env: &EnvRef) -> Result
     if let ExprKind::Symbol(name) = &operator.kind {
         match name.as_str() {
             "define" => return eval_define(operator.pos, arguments, env),
+            "set!" => return eval_set(operator.pos, arguments, env),
             "if" => return eval_if(operator.pos, arguments, env),
             "quote" => return eval_quote(operator.pos, arguments),
             "lambda" => return eval_lambda(operator.pos, arguments, env),
@@ -790,6 +804,31 @@ fn eval_define(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value
             message: "define: expected symbol or function signature".into(),
         }
         .with_offset(arguments[0].pos.offset)),
+    }
+}
+
+fn eval_set(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let [name_expr, value_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "set!".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(pos.offset));
+    };
+
+    let ExprKind::Symbol(name) = &name_expr.kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "set!: expected symbol".into(),
+        }
+        .with_offset(name_expr.pos.offset));
+    };
+
+    let value = eval_expr(value_expr, env)?;
+    if env.set(name, value) {
+        Ok(Value::Void)
+    } else {
+        Err(EvalError::UnboundVariable { name: name.clone() }.with_offset(name_expr.pos.offset))
     }
 }
 
