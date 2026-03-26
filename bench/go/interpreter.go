@@ -225,6 +225,10 @@ func newGlobalEnv(rt *runtime) *env {
 		root.define("raise", builtinProc{name: "raise", fn: builtinRaiseSentinel})
 		root.define("with-exception-handler", builtinProc{name: "with-exception-handler", fn: builtinWithExceptionHandlerSentinel})
 	}
+	if currentBenchLevel() >= 21 {
+		root.define("call-with-values", builtinProc{name: "call-with-values", fn: builtinCallWithValues})
+		root.define("values", builtinProc{name: "values", fn: builtinValues})
+	}
 	root.define("char-alphabetic?", builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabetic})
 	root.define("char->integer", builtinProc{name: "char->integer", fn: builtinCharToInteger})
 	root.define("char-downcase", builtinProc{name: "char-downcase", fn: builtinCharDowncase})
@@ -721,9 +725,9 @@ func evalListStep(environment *env, items listExpr) (evalStep, error) {
 		}
 	}
 
-	operatorValue, err := evalExpr(environment, items.items[0])
+	operatorValue, err := evalSingleExpr(environment, items.items[0], "procedure application")
 	if err != nil {
-		return evalStep{}, err
+		return evalStep{}, attachPos(err, formPos(items.items[0]))
 	}
 
 	return applyProcedureStep(environment, operatorValue, items.items[1:], items.pos)
@@ -739,7 +743,7 @@ func evalDefine(environment *env, forms []expr) (expr, error) {
 		if len(forms) != 2 {
 			return nil, &EvalError{Message: "define expects exactly 2 arguments"}
 		}
-		value, err := evalExpr(environment, forms[1])
+		value, err := evalSingleExpr(environment, forms[1], "define")
 		if err != nil {
 			return nil, err
 		}
@@ -781,7 +785,7 @@ func evalSet(environment *env, forms []expr) (expr, error) {
 		return nil, &EvalError{Message: "set! target must be a symbol"}
 	}
 
-	value, err := evalExpr(environment, forms[1])
+	value, err := evalSingleExpr(environment, forms[1], "set!")
 	if err != nil {
 		return nil, err
 	}
@@ -798,7 +802,7 @@ func evalIf(environment *env, forms []expr) (evalStep, error) {
 		return evalStep{}, &EvalError{Message: "if expects 2 or 3 arguments"}
 	}
 
-	condition, err := evalExpr(environment, forms[0])
+	condition, err := evalSingleExpr(environment, forms[0], "if")
 	if err != nil {
 		return evalStep{}, err
 	}
@@ -832,7 +836,7 @@ func evalCond(environment *env, forms []expr) (evalStep, error) {
 			return evalSequenceTail(environment, clause.items[1:])
 		}
 
-		testValue, err := evalExpr(environment, clause.items[0])
+		testValue, err := evalSingleExpr(environment, clause.items[0], "cond")
 		if err != nil {
 			return evalStep{}, err
 		}
@@ -1011,7 +1015,7 @@ func evalBindings(environment *env, bindings listExpr) ([]string, []expr, error)
 			return nil, nil, &EvalError{Message: "let binding name must be a symbol"}
 		}
 
-		value, err := evalExpr(environment, pair.items[1])
+		value, err := evalSingleExpr(environment, pair.items[1], "let")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1130,7 +1134,7 @@ func prepareClosureCall(callable closureExpr, args []expr) (evalStep, error) {
 func evalArgs(environment *env, forms []expr) ([]expr, error) {
 	args := make([]expr, 0, len(forms))
 	for _, form := range forms {
-		value, err := evalExpr(environment, form)
+		value, err := evalSingleExpr(environment, form, "procedure application")
 		if err != nil {
 			return nil, err
 		}
@@ -1145,7 +1149,7 @@ func evalAnd(environment *env, forms []expr) (evalStep, error) {
 	}
 
 	for _, form := range forms[:len(forms)-1] {
-		value, err := evalExpr(environment, form)
+		value, err := evalSingleExpr(environment, form, "and")
 		if err != nil {
 			return evalStep{}, err
 		}
@@ -1163,7 +1167,7 @@ func evalOr(environment *env, forms []expr) (evalStep, error) {
 	}
 
 	for _, form := range forms[:len(forms)-1] {
-		value, err := evalExpr(environment, form)
+		value, err := evalSingleExpr(environment, form, "or")
 		if err != nil {
 			return evalStep{}, err
 		}
@@ -1515,6 +1519,10 @@ func builtinMap(args []expr) (expr, error) {
 		}
 
 		value, err := applyCallable(args[0], callArgs)
+		if err != nil {
+			return nil, err
+		}
+		value, err = expectSingleValue(value, "map")
 		if err != nil {
 			return nil, err
 		}

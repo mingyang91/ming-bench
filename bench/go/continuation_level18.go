@@ -19,17 +19,20 @@ type level18SeqCont struct {
 type level18DefineCont struct {
 	env  *env
 	name string
+	pos  sourcePos
 	next level18Cont
 }
 
 type level18SetCont struct {
 	env    *env
 	target symbolExpr
+	pos    sourcePos
 	next   level18Cont
 }
 
 type level18IfCont struct {
 	env          *env
+	condPos      sourcePos
 	thenForm     expr
 	elseForm     expr
 	hasAlternate bool
@@ -40,6 +43,7 @@ type level18CallOpCont struct {
 	env      *env
 	argForms []expr
 	pos      sourcePos
+	opPos    sourcePos
 	next     level18Cont
 }
 
@@ -50,6 +54,11 @@ type level18CallArgsCont struct {
 	index    int
 	values   []expr
 	pos      sourcePos
+	next     level18Cont
+}
+
+type level18CallWithValuesCont struct {
+	consumer expr
 	next     level18Cont
 }
 
@@ -166,15 +175,27 @@ func (m *level18Machine) run() (expr, error) {
 		case *level18SeqCont:
 			m.evalSequence(cont.env, cont.rest, cont.next)
 		case *level18DefineCont:
-			cont.env.define(cont.name, m.value)
+			value, err := expectSingleValue(m.value, "define")
+			if err != nil {
+				return nil, attachPos(err, cont.pos)
+			}
+			cont.env.define(cont.name, value)
 			m.returnValue(voidExpr{}, cont.next)
 		case *level18SetCont:
-			if !cont.env.assign(cont.target.name, m.value) {
+			value, err := expectSingleValue(m.value, "set!")
+			if err != nil {
+				return nil, attachPos(err, cont.pos)
+			}
+			if !cont.env.assign(cont.target.name, value) {
 				return nil, errorAt(cont.target.pos, fmt.Sprintf("unbound symbol: %s", cont.target.name))
 			}
 			m.returnValue(voidExpr{}, cont.next)
 		case *level18IfCont:
-			if isTruthy(m.value) {
+			condition, err := expectSingleValue(m.value, "if")
+			if err != nil {
+				return nil, attachPos(err, cont.condPos)
+			}
+			if isTruthy(condition) {
 				m.eval(cont.env, cont.thenForm, cont.next)
 				continue
 			}
@@ -184,8 +205,12 @@ func (m *level18Machine) run() (expr, error) {
 			}
 			m.returnValue(voidExpr{}, cont.next)
 		case *level18CallOpCont:
+			proc, err := expectSingleValue(m.value, "procedure application")
+			if err != nil {
+				return nil, attachPos(err, cont.opPos)
+			}
 			if len(cont.argForms) == 0 {
-				if err := m.apply(m.value, nil, cont.next); err != nil {
+				if err := m.apply(proc, nil, cont.next); err != nil {
 					return nil, attachPos(err, cont.pos)
 				}
 				continue
@@ -194,7 +219,7 @@ func (m *level18Machine) run() (expr, error) {
 			values := make([]expr, len(cont.argForms))
 			index := len(cont.argForms) - 1
 			m.eval(cont.env, cont.argForms[index], &level18CallArgsCont{
-				proc:     m.value,
+				proc:     proc,
 				env:      cont.env,
 				argForms: cont.argForms,
 				index:    index,
@@ -203,8 +228,12 @@ func (m *level18Machine) run() (expr, error) {
 				next:     cont.next,
 			})
 		case *level18CallArgsCont:
+			value, err := expectSingleValue(m.value, "procedure application")
+			if err != nil {
+				return nil, attachPos(err, formPos(cont.argForms[cont.index]))
+			}
 			values := append([]expr(nil), cont.values...)
-			values[cont.index] = m.value
+			values[cont.index] = value
 
 			if cont.index > 0 {
 				index := cont.index - 1
@@ -222,6 +251,10 @@ func (m *level18Machine) run() (expr, error) {
 
 			if err := m.apply(cont.proc, values, cont.next); err != nil {
 				return nil, attachPos(err, cont.pos)
+			}
+		case *level18CallWithValuesCont:
+			if err := m.apply(cont.consumer, valuesSlice(m.value), cont.next); err != nil {
+				return nil, err
 			}
 		case *dynamicWindAfterInCont:
 			m.wind = cont.frame
@@ -391,6 +424,7 @@ func (m *level18Machine) stepList(items listExpr) error {
 		env:      environment,
 		argForms: argForms,
 		pos:      items.pos,
+		opPos:    formPos(items.items[0]),
 		next:     m.cont,
 	})
 	return nil
@@ -409,6 +443,7 @@ func (m *level18Machine) stepDefine(environment *env, forms []expr, pos sourcePo
 		m.eval(environment, forms[1], &level18DefineCont{
 			env:  environment,
 			name: target.name,
+			pos:  formPos(forms[1]),
 			next: m.cont,
 		})
 		return nil
@@ -454,6 +489,7 @@ func (m *level18Machine) stepSet(environment *env, forms []expr, pos sourcePos) 
 	m.eval(environment, forms[1], &level18SetCont{
 		env:    environment,
 		target: target,
+		pos:    formPos(forms[1]),
 		next:   m.cont,
 	})
 	return nil
@@ -466,6 +502,7 @@ func (m *level18Machine) stepIf(environment *env, forms []expr, pos sourcePos) e
 
 	cont := &level18IfCont{
 		env:      environment,
+		condPos:  formPos(forms[0]),
 		thenForm: forms[1],
 		next:     m.cont,
 	}
@@ -580,6 +617,14 @@ applyLoop:
 				continue
 			case "dynamic-wind":
 				return m.applyDynamicWind(args, cont)
+			case "call-with-values":
+				if len(args) != 2 {
+					return &EvalError{Message: "call-with-values expects exactly 2 arguments"}
+				}
+				return m.apply(args[0], nil, &level18CallWithValuesCont{
+					consumer: args[1],
+					next:     cont,
+				})
 			case "raise":
 				if len(args) != 1 {
 					return &EvalError{Message: "raise expects exactly 1 argument"}

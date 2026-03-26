@@ -223,7 +223,7 @@ func evalLetStar(environment *env, forms []expr) (evalStep, error) {
 			return evalStep{}, &EvalError{Message: "let* binding name must be a symbol"}
 		}
 
-		value, err := evalExpr(letEnv, pair.items[1])
+		value, err := evalSingleExpr(letEnv, pair.items[1], "let*")
 		if err != nil {
 			return evalStep{}, err
 		}

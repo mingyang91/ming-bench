@@ -164,7 +164,7 @@ func evalCase(environment *env, forms []expr) (evalStep, error) {
 		return evalStep{}, &EvalError{Message: "case expects a key and at least one clause"}
 	}
 
-	key, err := evalExpr(environment, forms[0])
+	key, err := evalSingleExpr(environment, forms[0], "case")
 	if err != nil {
 		return evalStep{}, err
 	}
@@ -240,7 +240,7 @@ func evalLetrec(environment *env, forms []expr, sequential bool) (evalStep, erro
 		for i, name := range names {
 			letEnv.define(name, uninitializedExpr{name: name})
 
-			value, err := evalExpr(letEnv, initForms[i])
+			value, err := evalSingleExpr(letEnv, initForms[i], formName)
 			if err != nil {
 				return evalStep{}, err
 			}
@@ -251,7 +251,7 @@ func evalLetrec(environment *env, forms []expr, sequential bool) (evalStep, erro
 			letEnv.define(name, uninitializedExpr{name: name})
 		}
 		for i, name := range names {
-			value, err := evalExpr(letEnv, initForms[i])
+			value, err := evalSingleExpr(letEnv, initForms[i], formName)
 			if err != nil {
 				return evalStep{}, err
 			}
@@ -326,7 +326,7 @@ func evalDo(environment *env, forms []expr) (evalStep, error) {
 		}
 		seen[name.name] = struct{}{}
 
-		initValue, err := evalExpr(environment, binding.items[1])
+		initValue, err := evalSingleExpr(environment, binding.items[1], "do")
 		if err != nil {
 			return evalStep{}, err
 		}
@@ -345,7 +345,7 @@ func evalDo(environment *env, forms []expr) (evalStep, error) {
 
 	body := forms[2:]
 	for {
-		testValue, err := evalExpr(loopEnv, testClause.items[0])
+		testValue, err := evalSingleExpr(loopEnv, testClause.items[0], "do")
 		if err != nil {
 			return evalStep{}, err
 		}
@@ -369,7 +369,7 @@ func evalDo(environment *env, forms []expr) (evalStep, error) {
 				continue
 			}
 
-			value, err := evalExpr(loopEnv, binding.step)
+			value, err := evalSingleExpr(loopEnv, binding.step, "do")
 			if err != nil {
 				return evalStep{}, err
 			}
