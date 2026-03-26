@@ -121,6 +121,7 @@ public class Evaluator {
         if (operatorExpression instanceof SymbolExpr symbolExpr) {
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, environment);
+                case "set!" -> evalSet(arguments, environment);
                 case "if" -> evalIf(arguments, environment);
                 case "quote" -> evalQuote(arguments);
                 case "lambda" -> evalLambda(arguments, environment);
@@ -193,6 +194,19 @@ public class Evaluator {
         }
 
         throw new EvalError("define expected a symbol or function signature");
+    }
+
+    private Value evalSet(List<Expr> arguments, Environment environment) throws EvalError {
+        requireExactArity("set!", arguments.size(), 2);
+
+        Expr target = arguments.getFirst();
+        if (!(target instanceof SymbolExpr symbolExpr)) {
+            throw new EvalError("set! expected a symbol");
+        }
+
+        Value value = eval(arguments.get(1), environment);
+        environment.set(symbolExpr.name(), value);
+        return VoidValue.INSTANCE;
     }
 
     private Value evalIf(List<Expr> arguments, Environment environment) throws EvalError {

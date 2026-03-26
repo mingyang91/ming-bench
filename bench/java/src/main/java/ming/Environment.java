@@ -15,6 +15,18 @@ final class Environment {
         bindings.put(name, value);
     }
 
+    void set(String name, Value value) throws EvalError {
+        if (bindings.containsKey(name)) {
+            bindings.put(name, value);
+            return;
+        }
+        if (parent != null) {
+            parent.set(name, value);
+            return;
+        }
+        throw new EvalError("unbound symbol: " + name);
+    }
+
     Value lookup(String name) throws EvalError {
         if (bindings.containsKey(name)) {
             return bindings.get(name);
