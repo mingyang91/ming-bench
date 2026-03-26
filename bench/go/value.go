@@ -27,8 +27,9 @@ type Value struct {
 	Car     *Value
 	Cdr     *Value
 	// Lambda fields
-	Params []string
-	Body   []*Expr
+	Params    []string
+	RestParam string // variadic rest parameter (dot notation)
+	Body      []*Expr
 	ClosureEnv *Env
 }
 
