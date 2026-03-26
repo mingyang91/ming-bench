@@ -82,6 +82,16 @@ public class Evaluator {
     }
     record Builtin(String name) {}
     record SyntaxRules(List<String> literals, List<Object> patterns, List<Object> templates, Env defEnv) {}
+    // Trampoline sentinel for tail call optimization
+    record TailCall(Object expr, Env env) {}
+
+    // Resolve a TailCall chain to a final value
+    private Object resolve(Object result) throws EvalError {
+        while (result instanceof TailCall tc) {
+            result = eval(tc.expr(), tc.env());
+        }
+        return result;
+    }
     record Token(Object value, int line, int col) {}
     record Located(Object expr, int line, int col) {}
 
@@ -345,24 +355,30 @@ public class Evaluator {
     }
 
     private Object eval(Object expr, Env env) throws EvalError {
-        // Unwrap Located to get position info
-        int eLine = 0, eCol = 0;
-        if (expr instanceof Located loc) {
-            eLine = loc.line();
-            eCol = loc.col();
-            expr = loc.expr();
-        }
-        final int posLine = eLine, posCol = eCol;
-
-        try {
-            return evalInner(expr, env, posLine, posCol);
-        } catch (EvalError e) {
-            // If the error doesn't already have position info, add it
-            String msg = e.getMessage();
-            if (posLine > 0 && !msg.matches(".*\\d+:\\d+.*")) {
-                throw new EvalError(posLine + ":" + posCol + ": " + msg);
+        while (true) {
+            // Unwrap Located to get position info
+            int eLine = 0, eCol = 0;
+            if (expr instanceof Located loc) {
+                eLine = loc.line();
+                eCol = loc.col();
+                expr = loc.expr();
             }
-            throw e;
+
+            try {
+                Object result = evalInner(expr, env, eLine, eCol);
+                if (result instanceof TailCall tc) {
+                    expr = tc.expr();
+                    env = tc.env();
+                    continue;
+                }
+                return result;
+            } catch (EvalError e) {
+                String msg = e.getMessage();
+                if (eLine > 0 && !msg.matches(".*\\d+:\\d+.*")) {
+                    throw new EvalError(eLine + ":" + eCol + ": " + msg);
+                }
+                throw e;
+            }
         }
     }
 
@@ -432,9 +448,9 @@ public class Evaluator {
                         if (list.size() < 3) throw new EvalError("if: bad syntax");
                         Object cond = eval(list.get(1), env);
                         if (!isFalse(cond)) {
-                            return eval(list.get(2), env);
+                            return new TailCall(list.get(2), env);
                         } else if (list.size() > 3) {
-                            return eval(list.get(3), env);
+                            return new TailCall(list.get(3), env);
                         }
                         return null; // unspecified
                     }
@@ -507,27 +523,27 @@ public class Evaluator {
                         return new CaseLambda(clauses);
                     }
                     case "and" -> {
-                        Object result = Boolean.TRUE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        if (list.size() == 1) return Boolean.TRUE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object result = eval(list.get(i), env);
                             if (isFalse(result)) return result;
                         }
-                        return result;
+                        return new TailCall(list.getLast(), env);
                     }
                     case "or" -> {
-                        Object result = Boolean.FALSE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
+                        if (list.size() == 1) return Boolean.FALSE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object result = eval(list.get(i), env);
                             if (!isFalse(result)) return result;
                         }
-                        return result;
+                        return new TailCall(list.getLast(), env);
                     }
                     case "begin" -> {
-                        Object result2 = null;
-                        for (int i = 1; i < list.size(); i++) {
-                            result2 = eval(list.get(i), env);
+                        if (list.size() == 1) return null;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            eval(list.get(i), env);
                         }
-                        return result2;
+                        return new TailCall(list.getLast(), env);
                     }
                     case "let" -> {
                         if (list.size() < 3) throw new EvalError("let: bad syntax");
@@ -554,7 +570,7 @@ public class Evaluator {
                             Env letEnv = new Env(env);
                             Lambda loopLambda = new Lambda(params, null, body, letEnv);
                             letEnv.define(loopName, loopLambda);
-                            return apply(loopLambda, inits);
+                            return apply(loopLambda, inits); // TailCall from apply is handled by eval trampoline
                         }
                         // Regular let
                         List<?> bindingsList2 = (List<?>) item1;
@@ -568,11 +584,10 @@ public class Evaluator {
                             Object val = eval(binding.get(1), env);
                             letEnv.define(name, val);
                         }
-                        Object result3 = null;
-                        for (int i = 2; i < list.size(); i++) {
-                            result3 = eval(list.get(i), letEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letEnv);
                         }
-                        return result3;
+                        return new TailCall(list.getLast(), letEnv);
                     }
                     case "cond" -> {
                         for (int i = 1; i < list.size(); i++) {
@@ -583,16 +598,14 @@ public class Evaluator {
                             Object rawTest = test;
                             if (rawTest instanceof Located lt) rawTest = lt.expr();
                             if (rawTest instanceof String st && st.equals("else")) {
-                                Object r = null;
-                                for (int j = 1; j < clause.size(); j++) r = eval(clause.get(j), env);
-                                return r;
+                                for (int j = 1; j < clause.size() - 1; j++) eval(clause.get(j), env);
+                                return new TailCall(clause.getLast(), env);
                             }
                             Object testVal = eval(test, env);
                             if (!isFalse(testVal)) {
                                 if (clause.size() == 1) return testVal;
-                                Object r = null;
-                                for (int j = 1; j < clause.size(); j++) r = eval(clause.get(j), env);
-                                return r;
+                                for (int j = 1; j < clause.size() - 1; j++) eval(clause.get(j), env);
+                                return new TailCall(clause.getLast(), env);
                             }
                         }
                         return null;
@@ -646,9 +659,8 @@ public class Evaluator {
                         for (int i = 0; i < names.size(); i++) {
                             letrecEnv.define(names.get(i), eval(initExprs.get(i), letrecEnv));
                         }
-                        Object result = null;
-                        for (int i = 2; i < list.size(); i++) result = eval(list.get(i), letrecEnv);
-                        return result;
+                        for (int i = 2; i < list.size() - 1; i++) eval(list.get(i), letrecEnv);
+                        return new TailCall(list.getLast(), letrecEnv);
                     }
                     case "letrec*" -> {
                         if (list.size() < 3) throw new EvalError("letrec*: bad syntax");
@@ -663,9 +675,8 @@ public class Evaluator {
                             if (bname instanceof Located lbn) bname = lbn.expr();
                             letrecEnv.define((String) bname, eval(binding.get(1), letrecEnv));
                         }
-                        Object result = null;
-                        for (int i = 2; i < list.size(); i++) result = eval(list.get(i), letrecEnv);
-                        return result;
+                        for (int i = 2; i < list.size() - 1; i++) eval(list.get(i), letrecEnv);
+                        return new TailCall(list.getLast(), letrecEnv);
                     }
                     case "case" -> {
                         Object key = eval(list.get(1), env);
@@ -841,11 +852,10 @@ public class Evaluator {
                 }
                 callEnv.define(lambda.restParam(), rest);
             }
-            Object result = null;
-            for (Object bodyExpr : lambda.body()) {
-                result = eval(bodyExpr, callEnv);
+            for (int i = 0; i < lambda.body().size() - 1; i++) {
+                eval(lambda.body().get(i), callEnv);
             }
-            return result;
+            return new TailCall(lambda.body().getLast(), callEnv);
         }
         if (proc instanceof CaseLambda cl) {
             for (Lambda clause : cl.clauses()) {
@@ -1256,7 +1266,7 @@ public class Evaluator {
                         callArgs.add(p.car());
                         lists.set(i, p.cdr());
                     }
-                    apply(proc, callArgs);
+                    resolve(apply(proc, callArgs));
                 }
                 yield null;
             }
@@ -1278,7 +1288,7 @@ public class Evaluator {
                         callArgs.add(p.car());
                         lists.set(i, p.cdr());
                     }
-                    resultElems.add(apply(proc, callArgs));
+                    resultElems.add(resolve(apply(proc, callArgs)));
                 }
                 Object result = NIL;
                 for (int i = resultElems.size() - 1; i >= 0; i--) {
