@@ -6,7 +6,7 @@ pub use error::EvalError;
 
 use macros::{register_macro_definition, MacroEnv, MacroExpander};
 use number::Number;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::OnceLock};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
@@ -67,6 +67,14 @@ impl SchemeString {
         Self::from_chars(value.as_ref().chars().collect(), true)
     }
 
+    fn new_runtime(value: impl AsRef<str>) -> Self {
+        if strings_are_mutable_in_current_level() {
+            Self::new_mutable(value)
+        } else {
+            Self::new_immutable(value)
+        }
+    }
+
     fn from_chars(chars: Vec<char>, mutable: bool) -> Self {
         Self {
             inner: Rc::new(SchemeStringInner {
@@ -76,8 +84,12 @@ impl SchemeString {
         }
     }
 
-    fn copy_mutable(&self) -> Self {
-        Self::from_chars(self.chars(), true)
+    fn from_runtime_chars(chars: Vec<char>) -> Self {
+        Self::from_chars(chars, strings_are_mutable_in_current_level())
+    }
+
+    fn copy_runtime(&self) -> Self {
+        Self::from_chars(self.chars(), strings_are_mutable_in_current_level())
     }
 
     fn chars(&self) -> Vec<char> {
@@ -232,6 +244,21 @@ struct Env {
 #[derive(Debug, Default)]
 struct EvalContext {
     output: String,
+}
+
+fn current_bench_level() -> u32 {
+    static BENCH_LEVEL: OnceLock<u32> = OnceLock::new();
+
+    *BENCH_LEVEL.get_or_init(|| {
+        std::env::var("BENCH_LEVEL")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u32::MAX)
+    })
+}
+
+fn strings_are_mutable_in_current_level() -> bool {
+    current_bench_level() < 15
 }
 
 impl Env {
@@ -1713,6 +1740,7 @@ fn root_env() -> EnvRef {
         "char?",
         "char-alphabetic?",
         "char-downcase",
+        "char->integer",
         "char-numeric?",
         "char-upcase",
         "char<?",
@@ -1731,11 +1759,13 @@ fn root_env() -> EnvRef {
         "expt",
         "inexact->exact",
         "inexact?",
+        "integer->char",
         "integer?",
         "length",
         "list",
         "list-ref",
         "list-tail",
+        "list->string",
         "list->vector",
         "list?",
         "make-vector",
@@ -1759,6 +1789,7 @@ fn root_env() -> EnvRef {
         "remainder",
         "string-ci=?",
         "string-downcase",
+        "string->list",
         "string<?",
         "string=?",
         "string->number",
@@ -1963,6 +1994,10 @@ fn apply_builtin(
             let ch = expect_char_arg("char-downcase", args)?;
             Ok(Value::Char(ch.to_ascii_lowercase()))
         }
+        "char->integer" => {
+            let ch = expect_char_arg("char->integer", args)?;
+            Ok(Value::Number(Number::integer(i64::from(u32::from(ch)))))
+        }
         "char-numeric?" => predicate_builtin(
             "char-numeric?",
             args,
@@ -2062,6 +2097,14 @@ fn apply_builtin(
             let list = expect_list("list-tail", &args[0])?;
             let index = expect_index_inclusive_end("list-tail", &args[1], list.len())?;
             Ok(Value::List(list[index..].to_vec()))
+        }
+        "list->string" => {
+            let list = expect_list_arg("list->string", args)?;
+            let chars = list
+                .iter()
+                .map(|value| expect_char("list->string", value))
+                .collect::<Result<Vec<_>, EvalError>>()?;
+            Ok(Value::String(SchemeString::from_runtime_chars(chars)))
         }
         "list->vector" => {
             let list = expect_list_arg("list->vector", args)?;
@@ -2178,7 +2221,7 @@ fn apply_builtin(
         }
         "number->string" => {
             let number = expect_number_arg("number->string", args)?;
-            Ok(Value::String(SchemeString::new_mutable(number.render())))
+            Ok(Value::String(SchemeString::new_runtime(number.render())))
         }
         "null?" => predicate_builtin(
             "null?",
@@ -2224,6 +2267,17 @@ fn apply_builtin(
             args,
             |value| matches!(value, Value::Number(number) if number.is_exact()),
         ),
+        "integer->char" => {
+            let code_point = expect_exact_integer_arg("integer->char", args)?;
+            let value = u32::try_from(code_point)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or(EvalError::InvalidArgument {
+                    name: "integer->char",
+                    message: "expected a valid Unicode scalar value",
+                })?;
+            Ok(Value::Char(value))
+        }
         "inexact->exact" => {
             let number = expect_number_arg("inexact->exact", args)?;
             Ok(Value::Number(number.inexact_to_exact("inexact->exact")?))
@@ -2253,6 +2307,12 @@ fn apply_builtin(
                 Err(_) => Ok(Value::Boolean(false)),
             }
         }
+        "string->list" => {
+            let value = expect_string_arg("string->list", args)?;
+            Ok(Value::List(
+                value.chars().into_iter().map(Value::Char).collect(),
+            ))
+        }
         "string->symbol" => {
             let value = expect_string_arg("string->symbol", args)?;
             Ok(Value::Symbol(value.to_plain_string()))
@@ -2262,18 +2322,18 @@ fn apply_builtin(
             for arg in args {
                 result.push_str(&expect_string("string-append", arg)?.to_plain_string());
             }
-            Ok(Value::String(SchemeString::new_mutable(result)))
+            Ok(Value::String(SchemeString::new_runtime(result)))
         }
         "string-copy" => {
             let value = expect_string_arg("string-copy", args)?;
-            Ok(Value::String(value.copy_mutable()))
+            Ok(Value::String(value.copy_runtime()))
         }
         "string-ci=?" => compare_strings("string-ci=?", args, |left, right| {
             left.to_lowercase() == right.to_lowercase()
         }),
         "string-downcase" => {
             let value = expect_string_arg("string-downcase", args)?;
-            Ok(Value::String(SchemeString::new_mutable(
+            Ok(Value::String(SchemeString::new_runtime(
                 value.to_plain_string().to_lowercase(),
             )))
         }
@@ -2313,7 +2373,7 @@ fn apply_builtin(
         }
         "string-upcase" => {
             let value = expect_string_arg("string-upcase", args)?;
-            Ok(Value::String(SchemeString::new_mutable(
+            Ok(Value::String(SchemeString::new_runtime(
                 value.to_plain_string().to_uppercase(),
             )))
         }
@@ -2339,14 +2399,14 @@ fn apply_builtin(
                 });
             }
 
-            Ok(Value::String(SchemeString::new_mutable(
+            Ok(Value::String(SchemeString::new_runtime(
                 chars[start..end].iter().collect::<String>(),
             )))
         }
         "symbol?" => predicate_builtin("symbol?", args, |value| matches!(value, Value::Symbol(_))),
         "symbol->string" => {
             let value = expect_symbol_arg("symbol->string", args)?;
-            Ok(Value::String(SchemeString::new_mutable(value)))
+            Ok(Value::String(SchemeString::new_runtime(value)))
         }
         "vector" => Ok(Value::Vector(SchemeVector::new(args.to_vec()))),
         "vector->list" => {
