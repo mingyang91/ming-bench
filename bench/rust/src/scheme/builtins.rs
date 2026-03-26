@@ -107,6 +107,12 @@ pub(super) fn apply_builtin(
         Builtin::BooleanPred => {
             builtin_predicate("boolean?", args, |value| matches!(value, Value::Boolean(_)))
         }
+        Builtin::ProcedurePred => builtin_predicate("procedure?", args, |value| {
+            matches!(
+                value,
+                Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_)
+            )
+        }),
         Builtin::PairPred => builtin_predicate("pair?", args, is_pair),
         Builtin::SymbolPred => {
             builtin_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))

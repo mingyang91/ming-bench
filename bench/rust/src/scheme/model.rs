@@ -90,6 +90,7 @@ pub(super) enum Builtin {
     NumberPred,
     StringPred,
     BooleanPred,
+    ProcedurePred,
     PairPred,
     SymbolPred,
     CharPred,
@@ -169,6 +170,7 @@ impl Builtin {
             Builtin::NumberPred => "number?",
             Builtin::StringPred => "string?",
             Builtin::BooleanPred => "boolean?",
+            Builtin::ProcedurePred => "procedure?",
             Builtin::PairPred => "pair?",
             Builtin::SymbolPred => "symbol?",
             Builtin::CharPred => "char?",
@@ -372,10 +374,47 @@ impl Env {
 }
 
 pub(super) struct Procedure {
+    pub(super) kind: ProcedureKind,
     pub(super) name: Option<String>,
+    pub(super) clauses: Vec<ProcedureClause>,
+    pub(super) env: EnvRef,
+}
+
+impl Procedure {
+    pub(super) fn expected_args(&self) -> String {
+        if self.clauses.len() == 1 {
+            return self.clauses[0].params.expected_args();
+        }
+
+        let mut expected = Vec::with_capacity(self.clauses.len());
+        for clause in &self.clauses {
+            let arity = clause.params.expected_args();
+            if !expected.contains(&arity) {
+                expected.push(arity);
+            }
+        }
+
+        format!("one of {}", expected.join(", "))
+    }
+
+    pub(super) fn error_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(match self.kind {
+            ProcedureKind::Lambda => "lambda",
+            ProcedureKind::CaseLambda => "case-lambda",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProcedureKind {
+    Lambda,
+    CaseLambda,
+}
+
+#[derive(Clone)]
+pub(super) struct ProcedureClause {
     pub(super) params: Params,
     pub(super) body: Vec<Expr>,
-    pub(super) env: EnvRef,
 }
 
 #[derive(Clone)]
@@ -580,6 +619,7 @@ pub(super) fn is_core_syntax(name: &str) -> bool {
             | "if"
             | "quote"
             | "lambda"
+            | "case-lambda"
             | "and"
             | "or"
             | "begin"

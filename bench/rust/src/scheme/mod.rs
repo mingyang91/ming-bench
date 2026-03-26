@@ -13,8 +13,8 @@ use error::SourcePos;
 use model::{
     expr_datum_eq, fresh_identifier, is_core_syntax, is_ellipsis, Builtin, Env, EnvRef,
     ExpansionState, Expr, MacroExpansion, MacroRef, MacroTransformer, Params, PatternBindings,
-    Procedure, RecordInstance, RecordProcedure, RecordProcedureKind, RecordType, SchemeString,
-    SyntaxRule, Value,
+    Procedure, ProcedureClause, ProcedureKind, RecordInstance, RecordProcedure,
+    RecordProcedureKind, RecordType, SchemeString, SyntaxRule, Value,
 };
 use parser::Parser;
 
@@ -110,6 +110,7 @@ fn initial_env() -> EnvRef {
         Builtin::NumberPred,
         Builtin::StringPred,
         Builtin::BooleanPred,
+        Builtin::ProcedurePred,
         Builtin::PairPred,
         Builtin::SymbolPred,
         Builtin::CharPred,
@@ -176,6 +177,7 @@ fn eval_list(items: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value,
             "if" => return eval_if(tail, env, output),
             "quote" => return eval_quote(tail),
             "lambda" => return build_lambda(tail, env, None),
+            "case-lambda" => return build_case_lambda(tail, env, None),
             "and" => return eval_and(tail, env, output),
             "or" => return eval_or(tail, env, output),
             "begin" => return eval_begin(tail, env, output),
@@ -201,6 +203,8 @@ fn eval_define(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value
         [Expr::Symbol(name, _), value_expr] => {
             let value = if let Some(parts) = lambda_parts(value_expr) {
                 build_lambda(parts, env, Some(name.clone()))?
+            } else if let Some(clauses) = case_lambda_clauses(value_expr) {
+                build_case_lambda(clauses, env, Some(name.clone()))?
             } else {
                 eval(value_expr, env, output)?
             };
@@ -878,6 +882,13 @@ fn expand_template_expr(
                             return Ok(expanded);
                         }
                     }
+                    "case-lambda" => {
+                        if let Some(expanded) =
+                            expand_case_lambda_template(items, *pos, state, scope, repeat_index)?
+                        {
+                            return Ok(expanded);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1061,6 +1072,49 @@ fn expand_lambda_template(
     Ok(Some(Expr::List(expanded_items, pos)))
 }
 
+fn expand_case_lambda_template(
+    items: &[Expr],
+    pos: SourcePos,
+    state: &mut ExpansionState,
+    scope: &HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Option<Expr>, EvalError> {
+    let [head, clauses @ ..] = items else {
+        return Ok(None);
+    };
+
+    let mut expanded_items = Vec::with_capacity(items.len());
+    expanded_items.push(head.clone());
+
+    for clause in clauses {
+        let Expr::List(parts, clause_pos) = clause else {
+            return Ok(None);
+        };
+        let [params_expr, body @ ..] = parts.as_slice() else {
+            return Ok(None);
+        };
+
+        let (expanded_params, introduced) =
+            expand_parameter_list(params_expr, state, scope, repeat_index)?;
+        let mut body_scope = scope.clone();
+        body_scope.extend(introduced);
+
+        let mut expanded_clause = Vec::with_capacity(parts.len());
+        expanded_clause.push(expanded_params);
+        for expr in body {
+            expanded_clause.push(expand_template_expr(
+                expr,
+                state,
+                &body_scope,
+                repeat_index,
+            )?);
+        }
+        expanded_items.push(Expr::List(expanded_clause, *clause_pos));
+    }
+
+    Ok(Some(Expr::List(expanded_items, pos)))
+}
+
 fn expand_parameter_list(
     params_expr: &Expr,
     state: &mut ExpansionState,
@@ -1192,11 +1246,63 @@ fn build_lambda(parts: &[Expr], env: &EnvRef, name: Option<String>) -> Result<Va
     ))
 }
 
+fn build_case_lambda(
+    clauses: &[Expr],
+    env: &EnvRef,
+    name: Option<String>,
+) -> Result<Value, EvalError> {
+    if clauses.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "case-lambda: expected at least one clause".into(),
+        });
+    }
+
+    let mut parsed_clauses = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let Expr::List(items, _) = clause else {
+            return Err(EvalError::Syntax {
+                message: "case-lambda: expected clause".into(),
+            });
+        };
+
+        let [params_expr, body @ ..] = items.as_slice() else {
+            return Err(EvalError::Syntax {
+                message: "case-lambda: expected parameters and body".into(),
+            });
+        };
+
+        if body.is_empty() {
+            return Err(EvalError::Syntax {
+                message: "case-lambda: expected body".into(),
+            });
+        }
+
+        parsed_clauses.push(ProcedureClause {
+            params: parse_params_expr(params_expr)?,
+            body: body.to_vec(),
+        });
+    }
+
+    Ok(new_case_procedure(name, parsed_clauses, env))
+}
+
 fn new_procedure(name: Option<String>, params: Params, body: &[Expr], env: &EnvRef) -> Value {
     Value::Procedure(Rc::new(Procedure {
+        kind: ProcedureKind::Lambda,
         name,
-        params,
-        body: body.to_vec(),
+        clauses: vec![ProcedureClause {
+            params,
+            body: body.to_vec(),
+        }],
+        env: env.clone(),
+    }))
+}
+
+fn new_case_procedure(name: Option<String>, clauses: Vec<ProcedureClause>, env: &EnvRef) -> Value {
+    Value::Procedure(Rc::new(Procedure {
+        kind: ProcedureKind::CaseLambda,
+        name,
+        clauses,
         env: env.clone(),
     }))
 }
@@ -1266,6 +1372,21 @@ fn lambda_parts(expr: &Expr) -> Option<&[Expr]> {
     }
 }
 
+fn case_lambda_clauses(expr: &Expr) -> Option<&[Expr]> {
+    let Expr::List(items, _) = expr else {
+        return None;
+    };
+    let (Expr::Symbol(name, _), tail) = items.split_first()? else {
+        return None;
+    };
+
+    if name == "case-lambda" {
+        Some(tail)
+    } else {
+        None
+    }
+}
+
 fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Number(value, _) => Value::Number(*value),
@@ -1293,24 +1414,31 @@ fn apply_procedure(
     args: &[Value],
     output: &mut String,
 ) -> Result<Value, EvalError> {
-    if !procedure.params.matches_arity(args.len()) {
-        let name = procedure.name.as_deref().unwrap_or("lambda");
-        let expected = procedure.params.expected_args();
-        return Err(wrong_arg_count(name, &expected, args.len()));
-    }
+    let Some(clause) = procedure
+        .clauses
+        .iter()
+        .find(|clause| clause.params.matches_arity(args.len()))
+    else {
+        let expected = procedure.expected_args();
+        return Err(wrong_arg_count(
+            procedure.error_name(),
+            &expected,
+            args.len(),
+        ));
+    };
 
     let call_env = Env::new(Some(procedure.env.clone()));
-    for (param, arg) in procedure.params.required.iter().zip(args.iter()) {
+    for (param, arg) in clause.params.required.iter().zip(args.iter()) {
         call_env.define(param.clone(), arg.clone());
     }
-    if let Some(rest) = &procedure.params.rest {
+    if let Some(rest) = &clause.params.rest {
         call_env.define(
             rest.clone(),
-            Value::List(args[procedure.params.required.len()..].to_vec()),
+            Value::List(args[clause.params.required.len()..].to_vec()),
         );
     }
 
-    eval_sequence(&procedure.body, &call_env, output)
+    eval_sequence(&clause.body, &call_env, output)
 }
 
 fn apply_record_procedure(procedure: &RecordProcedure, args: &[Value]) -> Result<Value, EvalError> {
