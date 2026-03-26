@@ -30,7 +30,29 @@ record BoolValue(boolean value) implements Value {
     }
 }
 
-record StringValue(String value) implements Value {
+final class StringValue implements Value {
+    private final StringBuilder value;
+
+    StringValue(String value) {
+        this.value = new StringBuilder(value);
+    }
+
+    String value() {
+        return value.toString();
+    }
+
+    int length() {
+        return value.length();
+    }
+
+    char charAt(int index) {
+        return value.charAt(index);
+    }
+
+    void setCharAt(int index, char ch) {
+        value.setCharAt(index, ch);
+    }
+
     @Override
     public String render() {
         StringBuilder builder = new StringBuilder();

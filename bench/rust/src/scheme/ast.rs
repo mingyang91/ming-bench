@@ -25,6 +25,7 @@ pub enum ExprKind {
     Int(i64),
     Bool(bool),
     String(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }

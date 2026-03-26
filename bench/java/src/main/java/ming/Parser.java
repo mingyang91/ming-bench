@@ -117,7 +117,9 @@ final class Parser {
         return switch (token) {
             case "#t" -> new BoolExpr(true, startLine, startColumn);
             case "#f" -> new BoolExpr(false, startLine, startColumn);
-            default -> parseNumberOrSymbol(token, startLine, startColumn);
+            default -> token.startsWith("#\\")
+                    ? parseCharLiteral(token, startLine, startColumn)
+                    : parseNumberOrSymbol(token, startLine, startColumn);
         };
     }
 
@@ -130,6 +132,26 @@ final class Parser {
             }
         }
         return new SymbolExpr(token, startLine, startColumn);
+    }
+
+    private Expr parseCharLiteral(String token, int startLine, int startColumn) throws EvalError {
+        String value = token.substring(2);
+        if (value.isEmpty()) {
+            throw new EvalError("invalid character literal", startLine, startColumn);
+        }
+
+        char ch = switch (value) {
+            case "space" -> ' ';
+            case "newline" -> '\n';
+            default -> {
+                if (value.length() != 1) {
+                    throw new EvalError("invalid character literal", startLine, startColumn);
+                }
+                yield value.charAt(0);
+            }
+        };
+
+        return new CharExpr(ch, startLine, startColumn);
     }
 
     private boolean isIntegerToken(String token) {

@@ -88,6 +88,8 @@ public class Evaluator {
         environment.define("symbol->string", new PrimitiveProcedureValue("symbol->string", this::applySymbolToString));
         environment.define("string->symbol", new PrimitiveProcedureValue("string->symbol", this::applyStringToSymbol));
         environment.define("string-ref", new PrimitiveProcedureValue("string-ref", this::applyStringRef));
+        environment.define("string-copy", new PrimitiveProcedureValue("string-copy", this::applyStringCopy));
+        environment.define("string-set!", new PrimitiveProcedureValue("string-set!", this::applyStringSet));
         environment.define("char?", new PrimitiveProcedureValue("char?", this::applyCharPredicate));
         return environment;
     }
@@ -98,6 +100,7 @@ public class Evaluator {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
                 case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
                 case StringExpr stringExpr -> new StringValue(stringExpr.value());
+                case CharExpr charExpr -> new CharValue(charExpr.value());
                 case SymbolExpr symbolExpr -> environment.lookup(symbolExpr.name());
                 case ListExpr listExpr -> evalList(listExpr, environment);
             };
@@ -351,6 +354,7 @@ public class Evaluator {
             case IntExpr intExpr -> new IntValue(intExpr.value());
             case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case CharExpr charExpr -> new CharValue(charExpr.value());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
             case ListExpr listExpr -> {
                 List<Value> elements = new ArrayList<>(listExpr.elements().size());
@@ -487,7 +491,7 @@ public class Evaluator {
 
     private Value applyStringLength(List<Value> arguments) throws EvalError {
         requireExactArity("string-length", arguments.size(), 1);
-        return new IntValue(expectString(arguments.getFirst(), "string-length").length());
+        return new IntValue(expectStringValue(arguments.getFirst(), "string-length").length());
     }
 
     private Value applySubstring(List<Value> arguments) throws EvalError {
@@ -531,12 +535,29 @@ public class Evaluator {
 
     private Value applyStringRef(List<Value> arguments) throws EvalError {
         requireExactArity("string-ref", arguments.size(), 2);
-        String value = expectString(arguments.getFirst(), "string-ref");
+        StringValue value = expectStringValue(arguments.getFirst(), "string-ref");
         int index = expectIndex(arguments.get(1), "string-ref");
         if (index >= value.length()) {
             throw new EvalError("string-ref index out of range");
         }
         return new CharValue(value.charAt(index));
+    }
+
+    private Value applyStringCopy(List<Value> arguments) throws EvalError {
+        requireExactArity("string-copy", arguments.size(), 1);
+        return new StringValue(expectString(arguments.getFirst(), "string-copy"));
+    }
+
+    private Value applyStringSet(List<Value> arguments) throws EvalError {
+        requireExactArity("string-set!", arguments.size(), 3);
+        StringValue value = expectStringValue(arguments.getFirst(), "string-set!");
+        int index = expectIndex(arguments.get(1), "string-set!");
+        char ch = expectChar(arguments.get(2), "string-set!");
+        if (index >= value.length()) {
+            throw new EvalError("string-set! index out of range");
+        }
+        value.setCharAt(index, ch);
+        return VoidValue.INSTANCE;
     }
 
     private Value applyCharPredicate(List<Value> arguments) throws EvalError {
@@ -627,10 +648,21 @@ public class Evaluator {
     }
 
     private String expectString(Value value, String operator) throws EvalError {
+        return expectStringValue(value, operator).value();
+    }
+
+    private StringValue expectStringValue(Value value, String operator) throws EvalError {
         if (value instanceof StringValue stringValue) {
-            return stringValue.value();
+            return stringValue;
         }
         throw new EvalError(operator + " expects string arguments");
+    }
+
+    private char expectChar(Value value, String operator) throws EvalError {
+        if (value instanceof CharValue charValue) {
+            return charValue.value();
+        }
+        throw new EvalError(operator + " expects character arguments");
     }
 
     private List<Value> expectList(Value value, String operator) throws EvalError {

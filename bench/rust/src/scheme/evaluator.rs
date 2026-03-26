@@ -7,6 +7,7 @@ use super::error::{EvalError, Position};
 use super::parser::parse_program;
 
 type EnvRef = Rc<Environment>;
+type StringRef = Rc<RefCell<Vec<char>>>;
 
 pub(crate) fn eval_program(input: &str) -> Result<Value, EvalError> {
     let expressions = parse_program(input)?;
@@ -25,7 +26,8 @@ pub(crate) fn eval_program(input: &str) -> Result<Value, EvalError> {
 pub(crate) enum Value {
     Int(i64),
     Bool(bool),
-    String(String),
+    String(StringRef),
+    Char(char),
     Symbol(String),
     List(Vec<Value>),
     Procedure(Rc<Procedure>),
@@ -43,7 +45,8 @@ impl Value {
                     "#f".to_string()
                 }
             }
-            Self::String(value) => render_string(value),
+            Self::String(value) => render_string(value.borrow().as_slice()),
+            Self::Char(value) => render_char(*value),
             Self::Symbol(name) => name.clone(),
             Self::List(elements) => render_list(elements),
             Self::Procedure(_) => "#<procedure>".to_string(),
@@ -93,6 +96,8 @@ enum Primitive {
     StringPredicate,
     BooleanPredicate,
     SymbolPredicate,
+    StringCopy,
+    StringSet,
 }
 
 impl Primitive {
@@ -119,6 +124,8 @@ impl Primitive {
             Self::StringPredicate => "string?",
             Self::BooleanPredicate => "boolean?",
             Self::SymbolPredicate => "symbol?",
+            Self::StringCopy => "string-copy",
+            Self::StringSet => "string-set!",
         }
     }
 }
@@ -180,6 +187,8 @@ fn global_environment() -> EnvRef {
     define_primitive(&environment, "string?", Primitive::StringPredicate);
     define_primitive(&environment, "boolean?", Primitive::BooleanPredicate);
     define_primitive(&environment, "symbol?", Primitive::SymbolPredicate);
+    define_primitive(&environment, "string-copy", Primitive::StringCopy);
+    define_primitive(&environment, "string-set!", Primitive::StringSet);
     environment
 }
 
@@ -202,7 +211,8 @@ fn eval(expression: &Expr, environment: &EnvRef) -> Result<Value, EvalError> {
     match &expression.kind {
         ExprKind::Int(value) => Ok(Value::Int(*value)),
         ExprKind::Bool(value) => Ok(Value::Bool(*value)),
-        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::String(value) => Ok(Value::String(new_string_ref(value.chars().collect()))),
+        ExprKind::Char(value) => Ok(Value::Char(*value)),
         ExprKind::Symbol(name) => environment.lookup(name, expression.pos),
         ExprKind::List(elements) => eval_list(expression.pos, elements, environment),
     }
@@ -389,6 +399,27 @@ fn apply_primitive(
         Primitive::SymbolPredicate => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
             Ok(Value::Bool(matches!(&arguments[0], Value::Symbol(_))))
+        }
+        Primitive::StringCopy => {
+            require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
+            let string = expect_string(&arguments[0], primitive.name(), call_pos)?;
+            let copied = string.borrow().clone();
+            Ok(Value::String(new_string_ref(copied)))
+        }
+        Primitive::StringSet => {
+            require_exact_arity(primitive.name(), arguments.len(), 3, call_pos)?;
+            let string = expect_string(&arguments[0], primitive.name(), call_pos)?;
+            let index = expect_index(&arguments[1], primitive.name(), call_pos)?;
+            let value = expect_char(&arguments[2], primitive.name(), call_pos)?;
+            let mut string = string.borrow_mut();
+            if index >= string.len() {
+                return Err(EvalError::type_mismatch(
+                    format!("{} index out of range", primitive.name()),
+                    call_pos,
+                ));
+            }
+            string[index] = value;
+            Ok(Value::Void)
         }
     }
 }
@@ -671,7 +702,8 @@ fn quote(expression: &Expr) -> Result<Value, EvalError> {
     match &expression.kind {
         ExprKind::Int(value) => Ok(Value::Int(*value)),
         ExprKind::Bool(value) => Ok(Value::Bool(*value)),
-        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::String(value) => Ok(Value::String(new_string_ref(value.chars().collect()))),
+        ExprKind::Char(value) => Ok(Value::Char(*value)),
         ExprKind::Symbol(name) => Ok(Value::Symbol(name.clone())),
         ExprKind::List(elements) => {
             let mut quoted = Vec::with_capacity(elements.len());
@@ -713,6 +745,37 @@ fn expect_int(value: &Value, operator: &str, pos: Position) -> Result<i64, EvalE
         ));
     };
     Ok(*number)
+}
+
+fn expect_index(value: &Value, operator: &str, pos: Position) -> Result<usize, EvalError> {
+    let index = expect_int(value, operator, pos)?;
+    if index < 0 {
+        return Err(EvalError::type_mismatch(
+            format!("{operator} index out of range"),
+            pos,
+        ));
+    }
+    Ok(index as usize)
+}
+
+fn expect_char(value: &Value, operator: &str, pos: Position) -> Result<char, EvalError> {
+    let Value::Char(ch) = value else {
+        return Err(EvalError::type_mismatch(
+            format!("{operator} expects character arguments"),
+            pos,
+        ));
+    };
+    Ok(*ch)
+}
+
+fn expect_string(value: &Value, operator: &str, pos: Position) -> Result<StringRef, EvalError> {
+    let Value::String(string) = value else {
+        return Err(EvalError::type_mismatch(
+            format!("{operator} expects string arguments"),
+            pos,
+        ));
+    };
+    Ok(string.clone())
 }
 
 fn expect_list<'a>(
@@ -778,10 +841,10 @@ fn require_min_arity(
     Ok(())
 }
 
-fn render_string(value: &str) -> String {
+fn render_string(value: &[char]) -> String {
     let mut rendered = String::with_capacity(value.len() + 2);
     rendered.push('"');
-    for ch in value.chars() {
+    for &ch in value {
         match ch {
             '\\' => rendered.push_str("\\\\"),
             '"' => rendered.push_str("\\\""),
@@ -793,6 +856,18 @@ fn render_string(value: &str) -> String {
     }
     rendered.push('"');
     rendered
+}
+
+fn render_char(value: char) -> String {
+    match value {
+        ' ' => "#\\space".to_string(),
+        '\n' => "#\\newline".to_string(),
+        other => format!("#\\{other}"),
+    }
+}
+
+fn new_string_ref(value: Vec<char>) -> StringRef {
+    Rc::new(RefCell::new(value))
 }
 
 fn render_list(elements: &[Value]) -> String {

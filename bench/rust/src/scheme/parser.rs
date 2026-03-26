@@ -107,6 +107,7 @@ impl Parser {
         match token.as_str() {
             "#t" => Ok(Expr::new(ExprKind::Bool(true), pos)),
             "#f" => Ok(Expr::new(ExprKind::Bool(false), pos)),
+            _ if token.starts_with("#\\") => Self::parse_char_literal(&token, pos),
             _ => self.parse_number_or_symbol(token, pos),
         }
     }
@@ -119,6 +120,29 @@ impl Parser {
                 .map_err(|_| EvalError::syntax(format!("invalid integer literal: {token}"), pos));
         }
         Ok(Expr::new(ExprKind::Symbol(token), pos))
+    }
+
+    fn parse_char_literal(token: &str, pos: Position) -> Result<Expr, EvalError> {
+        let Some(value) = token.strip_prefix("#\\") else {
+            return Err(EvalError::syntax("invalid character literal", pos));
+        };
+
+        let ch = match value {
+            "space" => ' ',
+            "newline" => '\n',
+            _ => {
+                let mut chars = value.chars();
+                let Some(ch) = chars.next() else {
+                    return Err(EvalError::syntax("invalid character literal", pos));
+                };
+                if chars.next().is_some() {
+                    return Err(EvalError::syntax("invalid character literal", pos));
+                }
+                ch
+            }
+        };
+
+        Ok(Expr::new(ExprKind::Char(ch), pos))
     }
 
     fn is_integer_token(token: &str) -> bool {
