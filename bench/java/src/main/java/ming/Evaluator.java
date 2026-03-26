@@ -353,6 +353,15 @@ public class Evaluator {
                         }
                         throw new EvalError("define: bad syntax");
                     }
+                    case "set!" -> {
+                        if (args.size() != 2) throw new EvalError("set!: bad syntax");
+                        Object target = unwrap(args.get(0));
+                        if (!(target instanceof SchemeSymbol s))
+                            throw new EvalError("set!: not a variable");
+                        Object val = eval(args.get(1), env);
+                        env.set(s.name(), val);
+                        return VOID;
+                    }
                     case "lambda" -> {
                         if (args.size() < 2) throw new EvalError("lambda: bad syntax");
                         Object paramObj = unwrap(args.get(0));
