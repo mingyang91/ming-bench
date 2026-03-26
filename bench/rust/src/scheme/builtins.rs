@@ -3,6 +3,63 @@ use std::cell::RefCell;
 use super::{ApplyFn, Pos, Value};
 use crate::scheme::EvalError;
 
+// --- Numeric helpers ---
+
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = b;
+        b = a % t;
+        a = t;
+    }
+    if a == 0 { 1 } else { a }
+}
+
+pub(super) fn make_rational(n: i64, d: i64) -> Value {
+    let sign = if d < 0 { -1 } else { 1 };
+    let n = n * sign;
+    let d = d.abs();
+    let g = gcd(n.abs(), d);
+    let (n, d) = (n / g, d / g);
+    if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
+}
+
+#[derive(Clone, Copy)]
+enum NumVal {
+    Int(i64),
+    Rat(i64, i64),
+    Flt(f64),
+}
+
+impl NumVal {
+    fn to_f64(self) -> f64 {
+        match self {
+            NumVal::Int(i) => i as f64,
+            NumVal::Rat(n, d) => n as f64 / d as f64,
+            NumVal::Flt(f) => f,
+        }
+    }
+    fn to_exact(self) -> (i64, i64) {
+        match self {
+            NumVal::Int(i) => (i, 1),
+            NumVal::Rat(n, d) => (n, d),
+            NumVal::Flt(_) => unreachable!(),
+        }
+    }
+}
+
+fn expect_num(val: &Value, call_pos: Pos) -> Result<NumVal, EvalError> {
+    match val {
+        Value::Integer(n) => Ok(NumVal::Int(*n)),
+        Value::Rational(n, d) => Ok(NumVal::Rat(*n, *d)),
+        Value::Float(f) => Ok(NumVal::Flt(*f)),
+        _ => Err(EvalError::Type(format!(
+            "{call_pos}: expected number, got {}",
+            val.display_scheme()
+        ))),
+    }
+}
+
 pub(super) fn expect_int(val: &Value, call_pos: Pos) -> Result<i64, EvalError> {
     match val {
         Value::Integer(n) => Ok(*n),
@@ -12,6 +69,56 @@ pub(super) fn expect_int(val: &Value, call_pos: Pos) -> Result<i64, EvalError> {
         ))),
     }
 }
+
+fn has_float(nums: &[NumVal]) -> bool {
+    nums.iter().any(|n| matches!(n, NumVal::Flt(_)))
+}
+
+fn collect_nums(args: &[Value], call_pos: Pos) -> Result<Vec<NumVal>, EvalError> {
+    args.iter().map(|a| expect_num(a, call_pos)).collect()
+}
+
+fn exact_add(rn: i64, rd: i64, an: i64, ad: i64) -> (i64, i64) {
+    let n = rn * ad + an * rd;
+    let d = rd * ad;
+    let g = gcd(n.abs(), d.abs());
+    (n / g, d / g)
+}
+
+fn exact_sub(rn: i64, rd: i64, an: i64, ad: i64) -> (i64, i64) {
+    let n = rn * ad - an * rd;
+    let d = rd * ad;
+    let g = gcd(n.abs(), d.abs());
+    (n / g, d / g)
+}
+
+fn exact_mul(rn: i64, rd: i64, an: i64, ad: i64) -> (i64, i64) {
+    let n = rn * an;
+    let d = rd * ad;
+    let g = gcd(n.abs(), d.abs());
+    (n / g, d / g)
+}
+
+fn float_to_rational(f: f64) -> (i64, i64) {
+    if f.fract() == 0.0 {
+        return (f as i64, 1);
+    }
+    let sign = if f < 0.0 { -1i64 } else { 1 };
+    let f = f.abs();
+    let mut n = f;
+    let mut d = 1i64;
+    for _ in 0..53 {
+        if (n - n.round()).abs() < 1e-10 {
+            return (sign * n.round() as i64, d);
+        }
+        n *= 2.0;
+        d *= 2;
+    }
+    let scale = 1_000_000_000i64;
+    (sign * (f * scale as f64).round() as i64, scale)
+}
+
+// --- String builtins ---
 
 pub(super) fn apply_string_builtin(
     name: &str,
@@ -75,10 +182,27 @@ pub(super) fn apply_string_builtin(
                 )));
             }
             match &args[0] {
-                Value::Str(s) => match s.parse::<i64>() {
-                    Ok(n) => Ok(Value::Integer(n)),
-                    Err(_) => Ok(Value::Boolean(false)),
-                },
+                Value::Str(s) => {
+                    if let Ok(n) = s.parse::<i64>() {
+                        Ok(Value::Integer(n))
+                    } else if let Some(slash) = s.find('/') {
+                        if let (Ok(n), Ok(d)) =
+                            (s[..slash].parse::<i64>(), s[slash + 1..].parse::<i64>())
+                        {
+                            if d != 0 {
+                                Ok(make_rational(n, d))
+                            } else {
+                                Ok(Value::Boolean(false))
+                            }
+                        } else {
+                            Ok(Value::Boolean(false))
+                        }
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        Ok(Value::Float(f))
+                    } else {
+                        Ok(Value::Boolean(false))
+                    }
+                }
                 _ => Err(EvalError::Type(format!(
                     "{call_pos}: string->number: expected string"
                 ))),
@@ -90,7 +214,21 @@ pub(super) fn apply_string_builtin(
                     "{call_pos}: number->string requires 1 argument"
                 )));
             }
-            Ok(Value::Str(expect_int(&args[0], call_pos)?.to_string()))
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Str(n.to_string())),
+                Value::Float(f) => {
+                    let s = format!("{f}");
+                    if f.is_finite() && !s.contains('.') {
+                        Ok(Value::Str(format!("{f}.0")))
+                    } else {
+                        Ok(Value::Str(s))
+                    }
+                }
+                Value::Rational(n, d) => Ok(Value::Str(format!("{n}/{d}"))),
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: number->string: expected number"
+                ))),
+            }
         }
         "symbol->string" => {
             if args.len() != 1 {
@@ -227,6 +365,16 @@ pub(super) fn apply_string_builtin(
                 ))),
             }
         }
+        _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
+    }
+}
+
+pub(super) fn apply_char_builtin(
+    name: &str,
+    args: &[Value],
+    call_pos: Pos,
+) -> Result<Value, EvalError> {
+    match name {
         "char-alphabetic?" => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!(
@@ -309,6 +457,8 @@ pub(super) fn apply_string_builtin(
     }
 }
 
+// --- Numeric builtins ---
+
 pub(super) fn apply_numeric_builtin(
     name: &str,
     args: &[Value],
@@ -316,11 +466,19 @@ pub(super) fn apply_numeric_builtin(
 ) -> Result<Value, EvalError> {
     match name {
         "+" => {
-            let mut sum: i64 = 0;
-            for a in args {
-                sum += expect_int(a, call_pos)?;
+            let nums = collect_nums(args, call_pos)?;
+            if has_float(&nums) {
+                Ok(Value::Float(nums.iter().map(|n| n.to_f64()).sum()))
+            } else {
+                let (mut rn, mut rd) = (0i64, 1i64);
+                for n in &nums {
+                    let (an, ad) = n.to_exact();
+                    let r = exact_add(rn, rd, an, ad);
+                    rn = r.0;
+                    rd = r.1;
+                }
+                Ok(make_rational(rn, rd))
             }
-            Ok(Value::Integer(sum))
         }
         "-" => {
             if args.is_empty() {
@@ -328,21 +486,49 @@ pub(super) fn apply_numeric_builtin(
                     "{call_pos}: - requires at least 1 argument"
                 )));
             }
-            if args.len() == 1 {
-                return Ok(Value::Integer(-expect_int(&args[0], call_pos)?));
+            let nums = collect_nums(args, call_pos)?;
+            if nums.len() == 1 {
+                return match nums[0] {
+                    NumVal::Int(i) => Ok(Value::Integer(-i)),
+                    NumVal::Rat(n, d) => Ok(make_rational(-n, d)),
+                    NumVal::Flt(f) => Ok(Value::Float(-f)),
+                };
             }
-            let mut result = expect_int(&args[0], call_pos)?;
-            for a in &args[1..] {
-                result -= expect_int(a, call_pos)?;
+            if has_float(&nums) {
+                let mut result = nums[0].to_f64();
+                for n in &nums[1..] {
+                    result -= n.to_f64();
+                }
+                Ok(Value::Float(result))
+            } else {
+                let (mut rn, mut rd) = nums[0].to_exact();
+                for n in &nums[1..] {
+                    let (an, ad) = n.to_exact();
+                    let r = exact_sub(rn, rd, an, ad);
+                    rn = r.0;
+                    rd = r.1;
+                }
+                Ok(make_rational(rn, rd))
             }
-            Ok(Value::Integer(result))
         }
         "*" => {
-            let mut product: i64 = 1;
-            for a in args {
-                product *= expect_int(a, call_pos)?;
+            let nums = collect_nums(args, call_pos)?;
+            if has_float(&nums) {
+                let mut result = 1.0f64;
+                for n in &nums {
+                    result *= n.to_f64();
+                }
+                Ok(Value::Float(result))
+            } else {
+                let (mut rn, mut rd) = (1i64, 1i64);
+                for n in &nums {
+                    let (an, ad) = n.to_exact();
+                    let r = exact_mul(rn, rd, an, ad);
+                    rn = r.0;
+                    rd = r.1;
+                }
+                Ok(make_rational(rn, rd))
             }
-            Ok(Value::Integer(product))
         }
         "/" => {
             if args.len() < 2 {
@@ -350,67 +536,70 @@ pub(super) fn apply_numeric_builtin(
                     "{call_pos}: / requires at least 2 arguments"
                 )));
             }
-            let mut result = expect_int(&args[0], call_pos)?;
-            for a in &args[1..] {
-                let d = expect_int(a, call_pos)?;
-                if d == 0 {
-                    return Err(EvalError::DivisionByZero(format!(
-                        "{call_pos}: division by zero"
-                    )));
+            let nums = collect_nums(args, call_pos)?;
+            if has_float(&nums) {
+                let mut result = nums[0].to_f64();
+                for n in &nums[1..] {
+                    let d = n.to_f64();
+                    if d == 0.0 {
+                        return Err(EvalError::DivisionByZero(format!(
+                            "{call_pos}: division by zero"
+                        )));
+                    }
+                    result /= d;
                 }
-                result /= d;
+                Ok(Value::Float(result))
+            } else {
+                let (mut rn, mut rd) = nums[0].to_exact();
+                for n in &nums[1..] {
+                    let (an, ad) = n.to_exact();
+                    if an == 0 {
+                        return Err(EvalError::DivisionByZero(format!(
+                            "{call_pos}: division by zero"
+                        )));
+                    }
+                    let r = exact_mul(rn, rd, ad, an); // divide = multiply by reciprocal
+                    rn = r.0;
+                    rd = r.1;
+                }
+                Ok(make_rational(rn, rd))
             }
-            Ok(Value::Integer(result))
         }
-        "<" => {
+        "<" | ">" | "=" | "<=" | ">=" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity(format!(
-                    "{call_pos}: < requires 2 arguments"
+                    "{call_pos}: {name} requires 2 arguments"
                 )));
             }
-            Ok(Value::Boolean(
-                expect_int(&args[0], call_pos)? < expect_int(&args[1], call_pos)?,
-            ))
-        }
-        ">" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!(
-                    "{call_pos}: > requires 2 arguments"
-                )));
-            }
-            Ok(Value::Boolean(
-                expect_int(&args[0], call_pos)? > expect_int(&args[1], call_pos)?,
-            ))
-        }
-        "=" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!(
-                    "{call_pos}: = requires 2 arguments"
-                )));
-            }
-            Ok(Value::Boolean(
-                expect_int(&args[0], call_pos)? == expect_int(&args[1], call_pos)?,
-            ))
-        }
-        "<=" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!(
-                    "{call_pos}: <= requires 2 arguments"
-                )));
-            }
-            Ok(Value::Boolean(
-                expect_int(&args[0], call_pos)? <= expect_int(&args[1], call_pos)?,
-            ))
-        }
-        ">=" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!(
-                    "{call_pos}: >= requires 2 arguments"
-                )));
-            }
-            Ok(Value::Boolean(
-                expect_int(&args[0], call_pos)? >= expect_int(&args[1], call_pos)?,
-            ))
+            let a = expect_num(&args[0], call_pos)?;
+            let b = expect_num(&args[1], call_pos)?;
+            let is_float = matches!(a, NumVal::Flt(_)) || matches!(b, NumVal::Flt(_));
+            let result = if is_float {
+                let fa = a.to_f64();
+                let fb = b.to_f64();
+                match name {
+                    "<" => fa < fb,
+                    ">" => fa > fb,
+                    "=" => fa == fb,
+                    "<=" => fa <= fb,
+                    ">=" => fa >= fb,
+                    _ => unreachable!(),
+                }
+            } else {
+                let (an, ad) = a.to_exact();
+                let (bn, bd) = b.to_exact();
+                let lhs = an * bd;
+                let rhs = bn * ad;
+                match name {
+                    "<" => lhs < rhs,
+                    ">" => lhs > rhs,
+                    "=" => lhs == rhs,
+                    "<=" => lhs <= rhs,
+                    ">=" => lhs >= rhs,
+                    _ => unreachable!(),
+                }
+            };
+            Ok(Value::Boolean(result))
         }
         "abs" => {
             if args.len() != 1 {
@@ -418,7 +607,11 @@ pub(super) fn apply_numeric_builtin(
                     "{call_pos}: abs requires 1 argument"
                 )));
             }
-            Ok(Value::Integer(expect_int(&args[0], call_pos)?.abs()))
+            match expect_num(&args[0], call_pos)? {
+                NumVal::Int(i) => Ok(Value::Integer(i.abs())),
+                NumVal::Rat(n, d) => Ok(make_rational(n.abs(), d)),
+                NumVal::Flt(f) => Ok(Value::Float(f.abs())),
+            }
         }
         "modulo" => {
             if args.len() != 2 {
@@ -510,7 +703,12 @@ pub(super) fn apply_numeric_builtin(
                     "{call_pos}: zero? requires 1 argument"
                 )));
             }
-            Ok(Value::Boolean(expect_int(&args[0], call_pos)? == 0))
+            let n = expect_num(&args[0], call_pos)?;
+            Ok(Value::Boolean(match n {
+                NumVal::Int(i) => i == 0,
+                NumVal::Rat(n, _) => n == 0,
+                NumVal::Flt(f) => f == 0.0,
+            }))
         }
         "positive?" => {
             if args.len() != 1 {
@@ -518,7 +716,7 @@ pub(super) fn apply_numeric_builtin(
                     "{call_pos}: positive? requires 1 argument"
                 )));
             }
-            Ok(Value::Boolean(expect_int(&args[0], call_pos)? > 0))
+            Ok(Value::Boolean(expect_num(&args[0], call_pos)?.to_f64() > 0.0))
         }
         "negative?" => {
             if args.len() != 1 {
@@ -526,7 +724,7 @@ pub(super) fn apply_numeric_builtin(
                     "{call_pos}: negative? requires 1 argument"
                 )));
             }
-            Ok(Value::Boolean(expect_int(&args[0], call_pos)? < 0))
+            Ok(Value::Boolean(expect_num(&args[0], call_pos)?.to_f64() < 0.0))
         }
         "odd?" => {
             if args.len() != 1 {
@@ -547,6 +745,8 @@ pub(super) fn apply_numeric_builtin(
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
     }
 }
+
+// --- List builtins ---
 
 pub(super) fn apply_list_builtin(
     name: &str,
@@ -806,6 +1006,8 @@ pub(super) fn apply_list_builtin(
     }
 }
 
+// --- Main dispatch ---
+
 pub(super) fn apply_builtin_by_name(
     name: &str,
     args: &[Value],
@@ -835,7 +1037,103 @@ pub(super) fn apply_builtin_by_name(
                     "{call_pos}: number? requires 1 argument"
                 )));
             }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::Integer(_) | Value::Float(_) | Value::Rational(_, _)
+            )))
+        }
+        "integer?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: integer? requires 1 argument"
+                )));
+            }
             Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+        }
+        "rational?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: rational? requires 1 argument"
+                )));
+            }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::Integer(_) | Value::Rational(_, _)
+            )))
+        }
+        "exact?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: exact? requires 1 argument"
+                )));
+            }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::Integer(_) | Value::Rational(_, _)
+            )))
+        }
+        "inexact?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: inexact? requires 1 argument"
+                )));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Float(_))))
+        }
+        "exact->inexact" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: exact->inexact requires 1 argument"
+                )));
+            }
+            let n = expect_num(&args[0], call_pos)?;
+            Ok(Value::Float(n.to_f64()))
+        }
+        "inexact->exact" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: inexact->exact requires 1 argument"
+                )));
+            }
+            match &args[0] {
+                Value::Float(f) => {
+                    let (n, d) = float_to_rational(*f);
+                    Ok(make_rational(n, d))
+                }
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, d) => Ok(make_rational(*n, *d)),
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: inexact->exact: expected number"
+                ))),
+            }
+        }
+        "numerator" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: numerator requires 1 argument"
+                )));
+            }
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, _) => Ok(Value::Integer(*n)),
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: numerator: expected rational"
+                ))),
+            }
+        }
+        "denominator" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: denominator requires 1 argument"
+                )));
+            }
+            match &args[0] {
+                Value::Integer(_) => Ok(Value::Integer(1)),
+                Value::Rational(_, d) => Ok(Value::Integer(*d)),
+                _ => Err(EvalError::Type(format!(
+                    "{call_pos}: denominator: expected rational"
+                ))),
+            }
         }
         "boolean?" => {
             if args.len() != 1 {
@@ -893,8 +1191,9 @@ pub(super) fn apply_builtin_by_name(
         "string-append" | "string-length" | "substring" | "string->number"
         | "number->string" | "symbol->string" | "string->symbol" | "string-ref" | "char?"
         | "string-copy" | "string=?" | "string<?" | "string-ci=?" | "string-upcase"
-        | "string-downcase" | "char-alphabetic?" | "char-numeric?" | "char-upcase"
-        | "char-downcase" | "char=?" | "char<?" => apply_string_builtin(name, args, call_pos),
+        | "string-downcase" => apply_string_builtin(name, args, call_pos),
+        "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?"
+        | "char<?" => apply_char_builtin(name, args, call_pos),
         "equal?" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity(format!(
@@ -911,6 +1210,8 @@ pub(super) fn apply_builtin_by_name(
             }
             let result = match (&args[0], &args[1]) {
                 (Value::Integer(a), Value::Integer(b)) => a == b,
+                (Value::Float(a), Value::Float(b)) => a == b,
+                (Value::Rational(a1, a2), Value::Rational(b1, b2)) => a1 == b1 && a2 == b2,
                 (Value::Boolean(a), Value::Boolean(b)) => a == b,
                 (Value::Char(a), Value::Char(b)) => a == b,
                 (Value::Symbol(a), Value::Symbol(b)) => a == b,

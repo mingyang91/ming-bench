@@ -30,6 +30,8 @@ type ApplyFn = fn(&Value, &[Value], Pos, &RefCell<String>) -> Result<Value, Eval
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Char(char),
     Str(String),
@@ -54,6 +56,8 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Rational(a1, a2), Value::Rational(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
@@ -73,6 +77,11 @@ impl Value {
     fn display_scheme(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
+            Value::Float(f) => {
+                let s = format!("{f}");
+                if f.is_finite() && !s.contains('.') { format!("{f}.0") } else { s }
+            }
+            Value::Rational(n, d) => format!("{n}/{d}"),
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
             Value::Char(c) => match c {
@@ -181,6 +190,8 @@ enum Token {
     LParen,
     RParen,
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Symbol(String),
@@ -286,6 +297,18 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                 let word: String = chars[start..i].iter().collect();
                 if let Ok(n) = word.parse::<i64>() {
                     tokens.push(SpannedToken { token: Token::Integer(n), pos: start_pos });
+                } else if let Some(slash) = word.find('/') {
+                    if let (Ok(n), Ok(d)) = (word[..slash].parse::<i64>(), word[slash+1..].parse::<i64>()) {
+                        if d != 0 {
+                            tokens.push(SpannedToken { token: Token::Rational(n, d), pos: start_pos });
+                        } else {
+                            tokens.push(SpannedToken { token: Token::Symbol(word), pos: start_pos });
+                        }
+                    } else {
+                        tokens.push(SpannedToken { token: Token::Symbol(word), pos: start_pos });
+                    }
+                } else if let Ok(f) = word.parse::<f64>() {
+                    tokens.push(SpannedToken { token: Token::Float(f), pos: start_pos });
                 } else {
                     tokens.push(SpannedToken { token: Token::Symbol(word), pos: start_pos });
                 }
@@ -306,6 +329,8 @@ struct Expr {
 #[derive(Debug, Clone)]
 enum ExprKind {
     Integer(i64),
+    Float(f64),
+    Rational(i64, i64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -339,6 +364,8 @@ fn parse_tokens(tokens: &[SpannedToken], pos: &mut usize) -> Result<Expr, EvalEr
         }
         Token::RParen => Err(EvalError::Parse(format!("{spos}: unexpected )"))),
         Token::Integer(n) => { let n = *n; *pos += 1; Ok(Expr::new(ExprKind::Integer(n), spos)) }
+        Token::Float(f) => { let f = *f; *pos += 1; Ok(Expr::new(ExprKind::Float(f), spos)) }
+        Token::Rational(n, d) => { let (n, d) = (*n, *d); *pos += 1; Ok(Expr::new(ExprKind::Rational(n, d), spos)) }
         Token::Boolean(b) => { let b = *b; *pos += 1; Ok(Expr::new(ExprKind::Boolean(b), spos)) }
         Token::Str(s) => { let s = s.clone(); *pos += 1; Ok(Expr::new(ExprKind::Str(s), spos)) }
         Token::Char(c) => { let c = *c; *pos += 1; Ok(Expr::new(ExprKind::Char(c), spos)) }
@@ -392,6 +419,8 @@ fn eval_expr(expr: &Expr, env: &EnvRef, out: &RefCell<String>) -> Result<Value, 
     let p = expr.pos;
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Float(f) => Ok(Value::Float(*f)),
+        ExprKind::Rational(n, d) => Ok(builtins::make_rational(*n, *d)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
         ExprKind::Char(c) => Ok(Value::Char(*c)),
@@ -676,6 +705,8 @@ fn eval_cond(clauses: &[Expr], env: &EnvRef, out: &RefCell<String>) -> Result<Va
 fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Float(f) => Value::Float(*f),
+        ExprKind::Rational(n, d) => builtins::make_rational(*n, *d),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Str(s) => Value::Str(s.clone()),
         ExprKind::Char(c) => Value::Char(*c),
@@ -1030,7 +1061,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
                   "list-ref", "list-tail", "list?", "assoc", "map", "for-each",
                   "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
                   "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
-                  "char=?", "char<?"] {
+                  "char=?", "char<?",
+                  "exact?", "inexact?", "rational?", "integer?",
+                  "exact->inexact", "inexact->exact",
+                  "numerator", "denominator"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     let out = RefCell::new(String::new());
@@ -1063,7 +1097,10 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
                   "list-ref", "list-tail", "list?", "assoc", "map", "for-each",
                   "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
                   "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
-                  "char=?", "char<?"] {
+                  "char=?", "char<?",
+                  "exact?", "inexact?", "rational?", "integer?",
+                  "exact->inexact", "inexact->exact",
+                  "numerator", "denominator"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     let out = RefCell::new(String::new());
