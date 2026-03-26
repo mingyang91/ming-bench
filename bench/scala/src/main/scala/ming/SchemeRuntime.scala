@@ -29,7 +29,9 @@ private[ming] object SchemeRuntime:
       case Value.SymbolValue(name)    => name
       case Value.NilValue             => "()"
       case pair: Value.PairValue      => renderPair(pair, render)
-      case Value.Builtin(name, _)     => s"#<procedure:$name>"
+      case Value.RecordValue(recordType, _) =>
+        s"#<record ${recordType.name}>"
+      case Value.Builtin(name, _) => s"#<procedure:$name>"
       case Value.Closure(Some(name), _, _, _, _) =>
         s"#<procedure:$name>"
       case Value.Closure(None, _, _, _, _) =>

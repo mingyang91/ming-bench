@@ -63,6 +63,11 @@ private[ming] object SchemeModel:
     def fromCodePoints(codePoints: Array[Int]): SchemeString =
       new SchemeString(codePoints.clone())
 
+  final class RecordType(val name: String, val fieldNames: Vector[String]):
+
+    def fieldCount: Int =
+      fieldNames.length
+
   enum Value:
     case IntegerValue(value: BigInt)
     case RationalValue(numerator: BigInt, denominator: BigInt)
@@ -73,6 +78,7 @@ private[ming] object SchemeModel:
     case SymbolValue(name: String)
     case NilValue
     case PairValue(car: Value, cdr: Value)
+    case RecordValue(recordType: RecordType, fields: Vector[Value])
     case Builtin(name: String, implementation: List[Value] => Value)
 
     case Closure(
