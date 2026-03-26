@@ -367,3 +367,12 @@ record CaseLambdaProcedure(
         return "#<procedure:" + name + ">";
     }
 }
+
+record ContinuationProcedure(
+        Object continuation
+) implements ProcedureValue {
+    @Override
+    public String render() {
+        return "#<procedure:continuation>";
+    }
+}

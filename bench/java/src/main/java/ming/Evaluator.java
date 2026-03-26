@@ -16,6 +16,7 @@ import java.util.function.Predicate;
 public class Evaluator {
     private final Map<String, BuiltinProcedure> builtins = createBuiltins();
     private StringBuilder outputBuffer;
+    private ContinuationContext currentContinuation;
 
     /**
      * Evaluate one or more Scheme expressions and return the string
@@ -43,10 +44,9 @@ public class Evaluator {
         outputBuffer = captureOutput ? new StringBuilder() : null;
         try {
             Environment environment = createTopLevelEnvironment();
-            SchemeValue result = VoidValue.INSTANCE;
-            for (SchemeExpression expression : expressions) {
-                result = eval(expression, environment);
-            }
+            SchemeValue result = runWithContinuations(
+                    () -> evalSequenceToValue(expressions, 0, environment, VoidValue.INSTANCE)
+            );
             String output = outputBuffer == null ? "" : outputBuffer.toString();
             return new EvalResult(result.render(), output);
         } finally {
@@ -93,6 +93,63 @@ public class Evaluator {
             return evalListNonTail((ListExpression) expression, environment);
         } catch (EvalError error) {
             throw error.withPosition(expression.position());
+        }
+    }
+
+    private SchemeValue runWithContinuations(RootComputation computation) throws EvalError {
+        RootComputation currentComputation = computation;
+        ContinuationContext previousContinuation = currentContinuation;
+        currentContinuation = null;
+        try {
+            while (true) {
+                try {
+                    return currentComputation.run();
+                } catch (ContinuationJump jump) {
+                    currentComputation = () -> resumeContinuation(jump.continuation(), jump.value());
+                }
+            }
+        } finally {
+            currentContinuation = previousContinuation;
+        }
+    }
+
+    private SchemeValue resumeContinuation(ContinuationContext continuation, SchemeValue value) throws EvalError {
+        SchemeValue resumedValue = value;
+        ContinuationContext context = continuation;
+        while (context != null) {
+            ContinuationContext activeContext = context;
+            SchemeValue inputValue = resumedValue;
+            resumedValue = withActiveContinuation(
+                    activeContext.parent(),
+                    () -> activeContext.frame().resume(inputValue)
+            );
+            context = activeContext.parent();
+        }
+        return resumedValue;
+    }
+
+    private SchemeValue evalNonTailWithContinuation(
+            SchemeExpression expression,
+            Environment environment,
+            ContinuationFrame frame
+    ) throws EvalError {
+        ContinuationContext savedContinuation = currentContinuation;
+        currentContinuation = new ContinuationContext(frame, savedContinuation);
+        try {
+            return evalNonTail(expression, environment);
+        } finally {
+            currentContinuation = savedContinuation;
+        }
+    }
+
+    private SchemeValue withActiveContinuation(ContinuationContext continuation, RootComputation computation)
+            throws EvalError {
+        ContinuationContext previousContinuation = currentContinuation;
+        currentContinuation = continuation;
+        try {
+            return computation.run();
+        } finally {
+            currentContinuation = previousContinuation;
         }
     }
 
@@ -166,25 +223,7 @@ public class Evaluator {
             }
         }
 
-        SchemeValue callee = evalNonTail(head, environment);
-        if (!(callee instanceof ProcedureValue)) {
-            throw new EvalError("not a procedure");
-        }
-
-        List<SchemeValue> arguments = new ArrayList<>(elements.size() - 1);
-        for (int index = 1; index < elements.size(); index++) {
-            arguments.add(evalNonTail(elements.get(index), environment));
-        }
-        if (callee instanceof BuiltinProcedure builtinProcedure) {
-            return TailStep.done(builtinProcedure.apply(arguments));
-        }
-        if (callee instanceof LambdaProcedure lambdaProcedure) {
-            return applyLambdaTail(lambdaProcedure, arguments);
-        }
-        if (callee instanceof CaseLambdaProcedure caseLambdaProcedure) {
-            return applyCaseLambdaTail(caseLambdaProcedure, arguments);
-        }
-        throw new EvalError("not a procedure");
+        return evalTailApplication(elements, environment);
     }
 
     private SchemeValue evalListNonTail(ListExpression expression, Environment environment) throws EvalError {
@@ -257,16 +296,7 @@ public class Evaluator {
             }
         }
 
-        SchemeValue callee = evalNonTail(head, environment);
-        if (!(callee instanceof ProcedureValue)) {
-            throw new EvalError("not a procedure");
-        }
-
-        List<SchemeValue> arguments = new ArrayList<>(elements.size() - 1);
-        for (int index = 1; index < elements.size(); index++) {
-            arguments.add(evalNonTail(elements.get(index), environment));
-        }
-        return applyProcedure(callee, arguments);
+        return evalApplication(elements, environment);
     }
 
     private SchemeValue evalAnd(List<SchemeExpression> expressions, Environment environment) throws EvalError {
@@ -291,6 +321,118 @@ public class Evaluator {
         return result;
     }
 
+    private SchemeValue evalApplication(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        SchemeValue callee = evalNonTailWithContinuation(
+                elements.getFirst(),
+                environment,
+                value -> continueApplication(elements, environment, value, elements.size() - 1, List.of())
+        );
+        return continueApplication(elements, environment, callee, elements.size() - 1, List.of());
+    }
+
+    private SchemeValue continueApplication(
+            List<SchemeExpression> elements,
+            Environment environment,
+            SchemeValue callee,
+            int argumentIndex,
+            List<SchemeValue> evaluatedSuffix
+    ) throws EvalError {
+        if (!(callee instanceof ProcedureValue)) {
+            throw new EvalError("not a procedure");
+        }
+
+        List<SchemeValue> arguments = new ArrayList<>(evaluatedSuffix);
+        for (int index = argumentIndex; index >= 1; index--) {
+            int nextIndex = index - 1;
+            List<SchemeValue> suffix = List.copyOf(arguments);
+            SchemeValue argument = evalNonTailWithContinuation(
+                    elements.get(index),
+                    environment,
+                    value -> continueApplication(elements, environment, callee, nextIndex, prependArgument(value, suffix))
+            );
+            arguments.add(0, argument);
+        }
+        return applyProcedure(callee, arguments);
+    }
+
+    private TailStep evalTailApplication(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        SchemeValue callee = evalNonTailWithContinuation(
+                elements.getFirst(),
+                environment,
+                value -> continueTailApplicationToValue(elements, environment, value, elements.size() - 1, List.of())
+        );
+        return continueTailApplication(elements, environment, callee, elements.size() - 1, List.of());
+    }
+
+    private TailStep continueTailApplication(
+            List<SchemeExpression> elements,
+            Environment environment,
+            SchemeValue callee,
+            int argumentIndex,
+            List<SchemeValue> evaluatedSuffix
+    ) throws EvalError {
+        if (!(callee instanceof ProcedureValue)) {
+            throw new EvalError("not a procedure");
+        }
+
+        List<SchemeValue> arguments = new ArrayList<>(evaluatedSuffix);
+        for (int index = argumentIndex; index >= 1; index--) {
+            int nextIndex = index - 1;
+            List<SchemeValue> suffix = List.copyOf(arguments);
+            SchemeValue argument = evalNonTailWithContinuation(
+                    elements.get(index),
+                    environment,
+                    value -> continueTailApplicationToValue(
+                            elements,
+                            environment,
+                            callee,
+                            nextIndex,
+                            prependArgument(value, suffix)
+                    )
+            );
+            arguments.add(0, argument);
+        }
+        return applyProcedureTail(callee, arguments);
+    }
+
+    private SchemeValue continueTailApplicationToValue(
+            List<SchemeExpression> elements,
+            Environment environment,
+            SchemeValue callee,
+            int argumentIndex,
+            List<SchemeValue> evaluatedSuffix
+    ) throws EvalError {
+        if (!(callee instanceof ProcedureValue)) {
+            throw new EvalError("not a procedure");
+        }
+
+        List<SchemeValue> arguments = new ArrayList<>(evaluatedSuffix);
+        for (int index = argumentIndex; index >= 1; index--) {
+            int nextIndex = index - 1;
+            List<SchemeValue> suffix = List.copyOf(arguments);
+            SchemeValue argument = evalNonTailWithContinuation(
+                    elements.get(index),
+                    environment,
+                    value -> continueTailApplicationToValue(
+                            elements,
+                            environment,
+                            callee,
+                            nextIndex,
+                            prependArgument(value, suffix)
+                    )
+            );
+            arguments.add(0, argument);
+        }
+        return applyProcedureTailToValue(callee, arguments);
+    }
+
+    private static List<SchemeValue> prependArgument(SchemeValue value, List<SchemeValue> arguments) {
+        List<SchemeValue> values = new ArrayList<>(arguments.size() + 1);
+        values.add(value);
+        values.addAll(arguments);
+        return values;
+    }
+
     private SchemeValue evalDefine(List<SchemeExpression> elements, Environment environment) throws EvalError {
         if (elements.size() < 3) {
             throw new EvalError("define: expected a name and value");
@@ -302,9 +444,12 @@ public class Evaluator {
                 throw new EvalError("define: expected exactly 2 arguments for variable definition");
             }
 
-            SchemeValue value = evalNonTail(elements.get(2), environment);
-            environment.define(symbol.name(), value);
-            return VoidValue.INSTANCE;
+            SchemeValue value = evalNonTailWithContinuation(
+                    elements.get(2),
+                    environment,
+                    result -> defineVariable(environment, symbol.name(), result)
+            );
+            return defineVariable(environment, symbol.name(), value);
         }
 
         if (target instanceof ListExpression signature) {
@@ -322,8 +467,21 @@ public class Evaluator {
             throw new EvalError("set!: expected variable name");
         }
 
-        SchemeValue value = evalNonTail(elements.get(2), environment);
-        environment.set(symbol.name(), value);
+        SchemeValue value = evalNonTailWithContinuation(
+                elements.get(2),
+                environment,
+                result -> setVariable(environment, symbol.name(), result)
+        );
+        return setVariable(environment, symbol.name(), value);
+    }
+
+    private SchemeValue defineVariable(Environment environment, String name, SchemeValue value) {
+        environment.define(name, value);
+        return VoidValue.INSTANCE;
+    }
+
+    private SchemeValue setVariable(Environment environment, String name, SchemeValue value) throws EvalError {
+        environment.set(name, value);
         return VoidValue.INSTANCE;
     }
 
@@ -462,6 +620,12 @@ public class Evaluator {
         builtins.put("apply", new BuiltinProcedure("apply", this::applyApply));
         builtins.put("map", new BuiltinProcedure("map", this::applyMap));
         builtins.put("for-each", new BuiltinProcedure("for-each", this::applyForEach));
+        BuiltinProcedure callWithCurrentContinuation = new BuiltinProcedure(
+                "call/cc",
+                this::applyCallWithCurrentContinuation
+        );
+        builtins.put("call/cc", callWithCurrentContinuation);
+        builtins.put("call-with-current-continuation", callWithCurrentContinuation);
         builtins.put("string-append", new BuiltinProcedure("string-append", Evaluator::applyStringAppend));
         builtins.put("make-string", new BuiltinProcedure("make-string", Evaluator::applyMakeString));
         builtins.put("string", new BuiltinProcedure("string", Evaluator::applyString));
@@ -957,12 +1121,29 @@ public class Evaluator {
         );
     }
 
-    private SchemeValue evalSequence(List<SchemeExpression> expressions, Environment environment) throws EvalError {
-        SchemeValue result = VoidValue.INSTANCE;
-        for (SchemeExpression expression : expressions) {
-            result = evalNonTail(expression, environment);
+    private SchemeValue evalSequenceToValue(
+            List<SchemeExpression> expressions,
+            int startIndex,
+            Environment environment,
+            SchemeValue defaultValue
+    ) throws EvalError {
+        if (startIndex >= expressions.size()) {
+            return defaultValue;
         }
-        return result;
+
+        for (int index = startIndex; index < expressions.size() - 1; index++) {
+            int nextIndex = index + 1;
+            evalNonTailWithContinuation(
+                    expressions.get(index),
+                    environment,
+                    value -> evalSequenceToValue(expressions, nextIndex, environment, defaultValue)
+            );
+        }
+        return eval(expressions.getLast(), environment);
+    }
+
+    private SchemeValue evalSequence(List<SchemeExpression> expressions, Environment environment) throws EvalError {
+        return evalSequenceToValue(expressions, 0, environment, VoidValue.INSTANCE);
     }
 
     private SchemeValue evalClauseBody(
@@ -1211,7 +1392,12 @@ public class Evaluator {
         }
 
         for (int index = 0; index < expressions.size() - 1; index++) {
-            evalNonTail(expressions.get(index), environment);
+            int nextIndex = index + 1;
+            evalNonTailWithContinuation(
+                    expressions.get(index),
+                    environment,
+                    value -> evalSequenceToValue(expressions, nextIndex, environment, defaultValue)
+            );
         }
         return TailStep.next(expressions.getLast(), environment);
     }
@@ -1225,14 +1411,7 @@ public class Evaluator {
     }
 
     private SchemeValue evalProcedureBody(List<SchemeExpression> body, Environment environment) throws EvalError {
-        if (body.isEmpty()) {
-            return VoidValue.INSTANCE;
-        }
-
-        for (int index = 0; index < body.size() - 1; index++) {
-            evalNonTail(body.get(index), environment);
-        }
-        return eval(body.getLast(), environment);
+        return evalSequenceToValue(body, 0, environment, VoidValue.INSTANCE);
     }
 
     private SchemeValue applyProcedure(SchemeValue callee, List<SchemeValue> arguments) throws EvalError {
@@ -1245,7 +1424,34 @@ public class Evaluator {
         if (callee instanceof CaseLambdaProcedure caseLambdaProcedure) {
             return applyCaseLambda(caseLambdaProcedure, arguments);
         }
+        if (callee instanceof ContinuationProcedure continuationProcedure) {
+            return applyContinuation(continuationProcedure, arguments);
+        }
         throw new EvalError("not a procedure");
+    }
+
+    private TailStep applyProcedureTail(SchemeValue callee, List<SchemeValue> arguments) throws EvalError {
+        if (callee instanceof BuiltinProcedure builtinProcedure) {
+            return TailStep.done(builtinProcedure.apply(arguments));
+        }
+        if (callee instanceof LambdaProcedure lambdaProcedure) {
+            return applyLambdaTail(lambdaProcedure, arguments);
+        }
+        if (callee instanceof CaseLambdaProcedure caseLambdaProcedure) {
+            return applyCaseLambdaTail(caseLambdaProcedure, arguments);
+        }
+        if (callee instanceof ContinuationProcedure continuationProcedure) {
+            return TailStep.done(applyContinuation(continuationProcedure, arguments));
+        }
+        throw new EvalError("not a procedure");
+    }
+
+    private SchemeValue applyProcedureTailToValue(SchemeValue callee, List<SchemeValue> arguments) throws EvalError {
+        TailStep step = applyProcedureTail(callee, arguments);
+        if (step.isDone()) {
+            return step.value();
+        }
+        return eval(step.nextExpression(), step.nextEnvironment());
     }
 
     private SchemeValue applyLambda(LambdaProcedure procedure, List<SchemeValue> arguments) throws EvalError {
@@ -1646,6 +1852,20 @@ public class Evaluator {
             applyProcedure(procedure, callArguments);
         }
         return VoidValue.INSTANCE;
+    }
+
+    private SchemeValue applyCallWithCurrentContinuation(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "call/cc");
+        return applyProcedure(
+                arguments.getFirst(),
+                List.of(new ContinuationProcedure(currentContinuation))
+        );
+    }
+
+    private SchemeValue applyContinuation(ContinuationProcedure continuationProcedure, List<SchemeValue> arguments)
+            throws EvalError {
+        requireArgumentCount(arguments, 1, "continuation");
+        throw new ContinuationJump((ContinuationContext) continuationProcedure.continuation(), arguments.getFirst());
     }
 
     private static SchemeValue applyStringAppend(List<SchemeValue> arguments) throws EvalError {
@@ -2529,6 +2749,38 @@ public class Evaluator {
     }
 
     private record VectorComparison(VectorValue left, VectorValue right) {
+    }
+
+    @FunctionalInterface
+    private interface RootComputation {
+        SchemeValue run() throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface ContinuationFrame {
+        SchemeValue resume(SchemeValue value) throws EvalError;
+    }
+
+    private record ContinuationContext(ContinuationFrame frame, ContinuationContext parent) {
+    }
+
+    private static final class ContinuationJump extends RuntimeException {
+        private final ContinuationContext continuation;
+        private final SchemeValue value;
+
+        private ContinuationJump(ContinuationContext continuation, SchemeValue value) {
+            super(null, null, false, false);
+            this.continuation = continuation;
+            this.value = value;
+        }
+
+        private ContinuationContext continuation() {
+            return continuation;
+        }
+
+        private SchemeValue value() {
+            return value;
+        }
     }
 
     @FunctionalInterface
