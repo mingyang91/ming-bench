@@ -153,6 +153,8 @@ final class EvaluatorBuiltins {
         env.define("map", new BuiltinValue("map", this::map));
         env.define("for-each", new BuiltinValue("for-each", this::forEach));
         env.define("apply", new BuiltinValue("apply", this::apply));
+        env.define("values", new BuiltinValue("values", this::specialBuiltin));
+        env.define("call-with-values", new BuiltinValue("call-with-values", this::specialBuiltin));
         env.define("call/cc", new BuiltinValue("call/cc", this::specialBuiltin));
         env.define("call-with-current-continuation",
                 new BuiltinValue("call-with-current-continuation", this::specialBuiltin));

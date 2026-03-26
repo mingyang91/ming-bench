@@ -108,6 +108,7 @@ final class ValueSupport {
             case SymbolValue leftSymbol -> right instanceof SymbolValue rightSymbol
                     && leftSymbol.name().equals(rightSymbol.name());
             case EmptyListValue ignored -> right instanceof EmptyListValue;
+            case MultiValue ignored -> false;
             default -> false;
         };
     }
@@ -132,6 +133,7 @@ final class ValueSupport {
             case VectorValue leftVector -> right instanceof VectorValue rightVector
                     && compoundEqual(leftVector, rightVector, seen)
                     && vectorsEqual(leftVector, rightVector, seen);
+            case MultiValue ignored -> false;
             default -> false;
         };
     }

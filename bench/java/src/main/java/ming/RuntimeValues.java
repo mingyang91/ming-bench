@@ -6,7 +6,7 @@ import java.util.List;
 sealed interface Value permits IntValue, RationalValue, InexactValue, BoolValue,
         StringValue, SymbolValue, CharValue, EmptyListValue, PairValue, VectorValue,
         BuiltinValue, ClosureValue, CaseLambdaValue, RecordTypeValue, RecordInstanceValue,
-        VoidValue, UninitializedValue {
+        MultiValue, VoidValue, UninitializedValue {
 }
 
 record IntValue(long value) implements Value {
@@ -117,6 +117,12 @@ record RecordTypeValue(String name) implements Value {
 record RecordInstanceValue(RecordTypeValue type, List<Value> fields) implements Value {
     Value field(int index) {
         return fields.get(index);
+    }
+}
+
+record MultiValue(List<Value> values) implements Value {
+    MultiValue {
+        values = List.copyOf(values);
     }
 }
 

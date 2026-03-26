@@ -37,6 +37,7 @@ final class ValueRenderer {
             case RecordTypeValue recordTypeValue -> "#<record-type " + recordTypeValue.name() + ">";
             case RecordInstanceValue recordInstanceValue ->
                     "#<record " + recordInstanceValue.type().name() + ">";
+            case MultiValue ignored -> "#<values>";
             case VoidValue ignored -> "#<void>";
             case UninitializedValue ignored -> "#<uninitialized>";
         };

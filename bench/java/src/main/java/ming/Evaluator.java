@@ -563,6 +563,20 @@ public class Evaluator {
         return List.copyOf(result);
     }
 
+    private Value packValues(List<Value> values) {
+        if (values.size() == 1) {
+            return values.get(0);
+        }
+        return new MultiValue(values);
+    }
+
+    private List<Value> unpackValues(Value value) {
+        if (value instanceof MultiValue multiValue) {
+            return multiValue.values();
+        }
+        return List.of(value);
+    }
+
     private Step evalAnd(List<Expr> arguments, int index, Env env, Kont kont, Expr context) {
         if (index >= arguments.size()) {
             return new ReturnStep(TRUE, kont);
@@ -1070,6 +1084,8 @@ public class Evaluator {
     private Step applyBuiltin(BuiltinValue builtinValue, List<Value> arguments, Kont kont, int line,
             int column) throws EvalError {
         return switch (builtinValue.name()) {
+            case "values" -> new ReturnStep(packValues(arguments), kont);
+            case "call-with-values" -> applyCallWithValues(arguments, kont, line, column);
             case "call/cc", "call-with-current-continuation" ->
                     applyCallWithCurrentContinuation(builtinValue.name(), arguments, kont, line,
                             column);
@@ -1082,6 +1098,16 @@ public class Evaluator {
             case "for-each" -> applyBuiltinForEach(arguments, kont, line, column);
             default -> new ReturnStep(builtinValue.implementation().apply(arguments), kont);
         };
+    }
+
+    private Step applyCallWithValues(List<Value> arguments, Kont kont, int line, int column)
+            throws EvalError {
+        requireExactArgs("call-with-values", arguments, 2);
+        return new ApplyStep(arguments.get(0), List.of(),
+                continuation(line, column, produced -> new ApplyStep(arguments.get(1),
+                        unpackValues(produced), kont, line, column)),
+                line,
+                column);
     }
 
     private Step applyCallWithCurrentContinuation(String name, List<Value> arguments, Kont kont,
