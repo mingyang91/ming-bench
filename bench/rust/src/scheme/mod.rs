@@ -13,7 +13,7 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     Char(char),
-    Str(String),
+    Str(Rc<RefCell<Vec<char>>>),
     Symbol(String),
     Pair(Box<Value>, Box<Value>),
     Nil,
@@ -24,6 +24,10 @@ enum Value {
     },
     Builtin(String),
     Void,
+}
+
+fn make_str(s: &str) -> Value {
+    Value::Str(Rc::new(RefCell::new(s.chars().collect())))
 }
 
 impl Value {
@@ -44,8 +48,11 @@ impl Value {
             Value::Boolean(false) => "#f".into(),
             Value::Char(c) if write_mode => format!("#\\{}", c),
             Value::Char(c) => c.to_string(),
-            Value::Str(s) if write_mode => format!("\"{}\"", s),
-            Value::Str(s) => s.clone(),
+            Value::Str(s) if write_mode => {
+                let chars = s.borrow();
+                format!("\"{}\"", chars.iter().collect::<String>())
+            }
+            Value::Str(s) => s.borrow().iter().collect(),
             Value::Symbol(s) => s.clone(),
             Value::Nil => "()".into(),
             Value::Pair(_, _) => {
@@ -131,7 +138,7 @@ fn global_env() -> Env {
                    "string-append", "string-length", "substring",
                    "string->number", "number->string",
                    "symbol->string", "string->symbol",
-                   "string-ref"] {
+                   "string-ref", "string-set!", "string-copy"] {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string()));
     }
     env
@@ -161,6 +168,7 @@ impl std::fmt::Display for Span {
 enum ExprKind {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     Str(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -310,6 +318,16 @@ fn parse_atom(token: &str, span: Span) -> Expr {
         let inner = &token[1..token.len() - 1];
         let s = inner.replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\");
         Expr::new(ExprKind::Str(s), span)
+    } else if token.starts_with("#\\") {
+        let rest = &token[2..];
+        let c = match rest {
+            "space" => ' ',
+            "newline" => '\n',
+            "tab" => '\t',
+            s if s.len() == 1 => s.chars().next().unwrap(),
+            _ => return Expr::new(ExprKind::Symbol(token.to_string()), span),
+        };
+        Expr::new(ExprKind::Char(c), span)
     } else if let Ok(n) = token.parse::<i64>() {
         Expr::new(ExprKind::Integer(n), span)
     } else {
@@ -334,7 +352,8 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
-        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Char(c) => Ok(Value::Char(*c)),
+        ExprKind::Str(s) => Ok(make_str(s)),
         ExprKind::Symbol(name) => {
             env_get(env, name).ok_or_else(|| err_at(span, format!("unbound variable: {}", name)))
         }
@@ -426,7 +445,8 @@ fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Boolean(b) => Value::Boolean(*b),
-        ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Char(c) => Value::Char(*c),
+        ExprKind::Str(s) => make_str(s),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
         ExprKind::List(items) => {
             let mut result = Value::Nil;
@@ -799,18 +819,18 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
             let mut result = String::new();
             for a in args {
                 match a {
-                    Value::Str(s) => result.push_str(s),
+                    Value::Str(s) => result.push_str(&s.borrow().iter().collect::<String>()),
                     _ => return Err(err_at(span, format!("string-append: expected string, got {}", a.display()))),
                 }
             }
-            Ok(Value::Str(result))
+            Ok(make_str(&result))
         }
         "string-length" => {
             if args.len() != 1 {
                 return Err(err_at(span, "string-length requires 1 argument"));
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.chars().count() as i64)),
+                Value::Str(s) => Ok(Value::Integer(s.borrow().len() as i64)),
                 _ => Err(err_at(span, "string-length: expected string")),
             }
         }
@@ -824,21 +844,25 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
             };
             let start = args[1].as_integer()? as usize;
             let end = args[2].as_integer()? as usize;
-            let chars: Vec<char> = s.chars().collect();
+            let chars = s.borrow();
             if end > chars.len() || start > end {
                 return Err(err_at(span, "substring: index out of range"));
             }
-            Ok(Value::Str(chars[start..end].iter().collect()))
+            let sub: String = chars[start..end].iter().collect();
+            Ok(make_str(&sub))
         }
         "string->number" => {
             if args.len() != 1 {
                 return Err(err_at(span, "string->number requires 1 argument"));
             }
             match &args[0] {
-                Value::Str(s) => match s.parse::<i64>() {
-                    Ok(n) => Ok(Value::Integer(n)),
-                    Err(_) => Ok(Value::Boolean(false)),
-                },
+                Value::Str(s) => {
+                    let st: String = s.borrow().iter().collect();
+                    match st.parse::<i64>() {
+                        Ok(n) => Ok(Value::Integer(n)),
+                        Err(_) => Ok(Value::Boolean(false)),
+                    }
+                }
                 _ => Err(err_at(span, "string->number: expected string")),
             }
         }
@@ -847,14 +871,14 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 return Err(err_at(span, "number->string requires 1 argument"));
             }
             let n = args[0].as_integer()?;
-            Ok(Value::Str(n.to_string()))
+            Ok(make_str(&n.to_string()))
         }
         "symbol->string" => {
             if args.len() != 1 {
                 return Err(err_at(span, "symbol->string requires 1 argument"));
             }
             match &args[0] {
-                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                Value::Symbol(s) => Ok(make_str(s)),
                 _ => Err(err_at(span, "symbol->string: expected symbol")),
             }
         }
@@ -863,7 +887,7 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 return Err(err_at(span, "string->symbol requires 1 argument"));
             }
             match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                Value::Str(s) => Ok(Value::Symbol(s.borrow().iter().collect())),
                 _ => Err(err_at(span, "string->symbol: expected string")),
             }
         }
@@ -876,11 +900,40 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 _ => return Err(err_at(span, "string-ref: expected string")),
             };
             let idx = args[1].as_integer()? as usize;
-            let chars: Vec<char> = s.chars().collect();
+            let chars = s.borrow();
             if idx >= chars.len() {
                 return Err(err_at(span, "string-ref: index out of range"));
             }
             Ok(Value::Char(chars[idx]))
+        }
+        "string-set!" => {
+            if args.len() != 3 {
+                return Err(err_at(span, "string-set! requires 3 arguments"));
+            }
+            let s = match &args[0] {
+                Value::Str(s) => s,
+                _ => return Err(err_at(span, "string-set!: expected string")),
+            };
+            let idx = args[1].as_integer()? as usize;
+            let c = match &args[2] {
+                Value::Char(c) => *c,
+                _ => return Err(err_at(span, "string-set!: expected char")),
+            };
+            let mut chars = s.borrow_mut();
+            if idx >= chars.len() {
+                return Err(err_at(span, "string-set!: index out of range"));
+            }
+            chars[idx] = c;
+            Ok(Value::Void)
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(err_at(span, "string-copy requires 1 argument"));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(Rc::new(RefCell::new(s.borrow().clone())))),
+                _ => Err(err_at(span, "string-copy: expected string")),
+            }
         }
         _ => Err(err_at(span, format!("unknown procedure: {}", name))),
     }
