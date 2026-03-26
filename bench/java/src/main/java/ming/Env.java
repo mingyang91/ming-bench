@@ -159,7 +159,95 @@ class Env {
             return args.get(0) instanceof String s && !s.startsWith("\"");
         }));
 
+        // I/O
+        env.define("display", Builtin.named("display", args -> {
+            requireArgCount("display", args, 1);
+            Evaluator.emitOutput(displayStr(args.get(0)));
+            return null; // void
+        }));
+        env.define("write", Builtin.named("write", args -> {
+            requireArgCount("write", args, 1);
+            Evaluator.emitOutput(SchemeValue.toStr(args.get(0)));
+            return null; // void
+        }));
+        env.define("newline", Builtin.named("newline", args -> {
+            requireArgCount("newline", args, 0);
+            Evaluator.emitOutput("\n");
+            return null; // void
+        }));
+
+        // String operations
+        env.define("string-append", Builtin.named("string-append", args -> {
+            StringBuilder sb = new StringBuilder("\"");
+            for (Object a : args) {
+                sb.append(requireString("string-append", a));
+            }
+            sb.append("\"");
+            return sb.toString();
+        }));
+        env.define("string-length", Builtin.named("string-length", args -> {
+            requireArgCount("string-length", args, 1);
+            return (long) requireString("string-length", args.get(0)).length();
+        }));
+        env.define("substring", Builtin.named("substring", args -> {
+            requireArgCount("substring", args, 3);
+            String s = requireString("substring", args.get(0));
+            int start = (int) requireLong("substring", args.get(1));
+            int end = (int) requireLong("substring", args.get(2));
+            return "\"" + s.substring(start, end) + "\"";
+        }));
+        env.define("string->number", Builtin.named("string->number", args -> {
+            requireArgCount("string->number", args, 1);
+            String s = requireString("string->number", args.get(0));
+            try {
+                return Long.parseLong(s);
+            } catch (NumberFormatException e) {
+                return Boolean.FALSE;
+            }
+        }));
+        env.define("number->string", Builtin.named("number->string", args -> {
+            requireArgCount("number->string", args, 1);
+            long n = requireLong("number->string", args.get(0));
+            return "\"" + n + "\"";
+        }));
+        env.define("symbol->string", Builtin.named("symbol->string", args -> {
+            requireArgCount("symbol->string", args, 1);
+            Object a = args.get(0);
+            if (!(a instanceof String s) || s.startsWith("\""))
+                throw new EvalError("symbol->string: expected symbol");
+            return "\"" + s + "\"";
+        }));
+        env.define("string->symbol", Builtin.named("string->symbol", args -> {
+            requireArgCount("string->symbol", args, 1);
+            return requireString("string->symbol", args.get(0));
+        }));
+        env.define("string-ref", Builtin.named("string-ref", args -> {
+            requireArgCount("string-ref", args, 2);
+            String s = requireString("string-ref", args.get(0));
+            int idx = (int) requireLong("string-ref", args.get(1));
+            return s.charAt(idx);
+        }));
+        env.define("char?", Builtin.named("char?", args -> {
+            requireArgCount("char?", args, 1);
+            return args.get(0) instanceof Character;
+        }));
+
         return env;
+    }
+
+    private static String requireString(String name, Object val) throws EvalError {
+        if (val instanceof String s && s.startsWith("\"") && s.endsWith("\"")) {
+            return s.substring(1, s.length() - 1);
+        }
+        throw new EvalError(name + ": expected string, got: " + SchemeValue.toStr(val));
+    }
+
+    private static String displayStr(Object val) {
+        if (val == null) return "";
+        if (val instanceof String s && s.startsWith("\"") && s.endsWith("\"")) {
+            return s.substring(1, s.length() - 1);
+        }
+        return SchemeValue.toStr(val);
     }
 
     private static long requireLong(String name, Object val) throws EvalError {

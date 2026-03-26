@@ -19,7 +19,26 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        List<Object> exprs = Parser.parse(input);
+        Object result = null;
+        Env env = Env.global();
+        StringBuilder outputBuf = new StringBuilder();
+        OUTPUT.set(outputBuf);
+        try {
+            for (Object expr : exprs) {
+                result = eval(expr, env);
+            }
+        } finally {
+            OUTPUT.remove();
+        }
+        return new EvalResult(SchemeValue.toStr(result), outputBuf.toString());
+    }
+
+    static final ThreadLocal<StringBuilder> OUTPUT = new ThreadLocal<>();
+
+    static void emitOutput(String s) {
+        StringBuilder buf = OUTPUT.get();
+        if (buf != null) buf.append(s);
     }
 
     @SuppressWarnings("unchecked")

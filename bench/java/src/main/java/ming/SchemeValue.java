@@ -38,6 +38,7 @@ class SchemeValue {
             sb.append(")");
             return sb.toString();
         }
+        if (val instanceof Character c) return "#\\" + c;
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
         if (val instanceof Lambda) return "#<procedure>";
         return val.toString();
