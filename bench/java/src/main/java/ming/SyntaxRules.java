@@ -9,8 +9,11 @@ public class SyntaxRules {
     private static int gensymCounter = 0;
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "quote", "if", "define", "set!", "lambda", "begin", "let", "let*", "letrec",
-        "cond", "and", "or", "define-syntax", "syntax-rules"
+        "quote", "if", "define", "set!", "lambda", "case-lambda", "begin",
+        "let", "let*", "letrec", "letrec*", "case", "do",
+        "cond", "and", "or", "define-syntax", "syntax-rules",
+        "define-record-type", "call/cc", "call-with-current-continuation",
+        "dynamic-wind", "guard", "syntax-case", "syntax", "with-syntax"
     );
 
     public SyntaxRules(List<String> literals, List<Object[]> rules, Environment defEnv) {
@@ -38,13 +41,16 @@ public class SyntaxRules {
                 Map<String, String> renames = new HashMap<>();
                 collectNonPatternSymbols(template, patVars, renames);
 
-                // Inject definition-site bindings for renamed symbols
+                // Inject definition-site bindings for renamed symbols into defEnv
+                // (not useEnv) so they persist across cached macro expansions
                 for (Map.Entry<String, String> entry : renames.entrySet()) {
                     try {
                         Object val = defEnv.lookup(entry.getKey());
-                        useEnv.define(entry.getValue(), val);
+                        defEnv.define(entry.getValue(), val);
                     } catch (EvalError ignored) {
-                        // Introduced variable with no definition-site binding — fine
+                        // Introduced variable with no definition-site binding —
+                        // define in useEnv so it resolves at use site
+                        useEnv.define(entry.getValue(), entry.getValue());
                     }
                 }
 
@@ -119,13 +125,23 @@ public class SyntaxRules {
             String name = sym.name();
             if (!patVars.contains(name) && !SPECIAL_FORMS.contains(name)
                     && !name.equals("...") && !literals.contains(name)
-                    && !renames.containsKey(name)) {
+                    && !renames.containsKey(name)
+                    && hasDefEnvBinding(name)) {
                 renames.put(name, gensym(name));
             }
         } else if (template instanceof List<?> list) {
             for (Object elem : list) {
                 collectNonPatternSymbols(elem, patVars, renames);
             }
+        }
+    }
+
+    private boolean hasDefEnvBinding(String name) {
+        try {
+            defEnv.lookup(name);
+            return true;
+        } catch (EvalError e) {
+            return false;
         }
     }
 

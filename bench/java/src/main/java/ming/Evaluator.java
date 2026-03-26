@@ -942,6 +942,11 @@ public class Evaluator {
             windStack.remove(windStack.size() - 1);
             applyResolved(outThunk, List.of());
             throw re;
+        } catch (EvalError ee) {
+            // EvalError during body: still need to run out-thunk for cleanup
+            windStack.remove(windStack.size() - 1);
+            applyResolved(outThunk, List.of());
+            throw ee;
         }
         // Normal exit: pop and run out-thunk
         windStack.remove(windStack.size() - 1);
@@ -965,8 +970,12 @@ public class Evaluator {
         Object body = wrapBodyInBegin(bodyExprs, 0);
 
         // Evaluate body, catching SchemeRaiseException
+        // Use evalStep (not eval) so tail calls in the guard body are resolved by
+        // the outer trampoline, enabling TCO across guard boundaries.
         try {
-            return eval(body, env);
+            Object result = evalStep(body, env);
+            if (result instanceof TailCall) return result;
+            return result;
         } catch (SchemeRaiseException re) {
             // Test clauses against the raised value
             Environment guardEnv = new Environment(env);
@@ -1042,14 +1051,20 @@ public class Evaluator {
     // apply returns TailCall for lambda bodies (for TCO)
     private Object apply(Object proc, List<Object> args) throws EvalError, ContinuationException, SchemeRaiseException {
         if (proc instanceof SchemeContinuation cont) {
-            if (args.size() != 1) throw new EvalError("continuation: expected 1 argument");
+            // Continuations accept multiple values: wrap as SchemeValues if > 1 arg
+            Object value;
+            if (args.size() == 1) {
+                value = args.get(0);
+            } else {
+                value = new SchemeValues(new ArrayList<>(args));
+            }
             // Within dynamic extent: escape (caught by doCallCC's try/catch)
             if (activeContinuationSites.contains(cont.id)) {
-                throw new ContinuationException(cont.id, args.get(0));
+                throw new ContinuationException(cont.id, value);
             }
             // Different top-level expression: throw for top-level replay
             if (topLevelIndex != cont.captureTopLevelIndex) {
-                throw new ContinuationException(cont.id, args.get(0));
+                throw new ContinuationException(cont.id, value);
             }
             // Same top-level: check if we're in the same body context as the call/cc
             if (cont.frameStack != null && !cont.frameStack.isEmpty()) {
@@ -1057,18 +1072,18 @@ public class Evaluator {
                 if (innermost.exprs != null) {
                     // Check current body context
                     if (innermost.exprs == currentBodyExprs) {
-                        throw new ContinuationException(cont.id, args.get(0));
+                        throw new ContinuationException(cont.id, value);
                     }
                     // Check outer frames on the stack
                     for (BodyFrame frame : bodyFrameStack) {
                         if (frame.exprs != null && frame.exprs == innermost.exprs) {
-                            throw new ContinuationException(cont.id, args.get(0));
+                            throw new ContinuationException(cont.id, value);
                         }
                     }
                 }
             }
             // Same top-level, different body context: return value directly (no replay)
-            return args.get(0);
+            return value;
         }
         if (proc instanceof SchemeCaseLambda cl) {
             for (SchemeLambda clause : cl.clauses) {
