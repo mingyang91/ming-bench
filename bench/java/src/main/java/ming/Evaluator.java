@@ -1,15 +1,26 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class Evaluator {
+
+    private final Env globalEnv = new Env(null);
+
+    public Evaluator() {
+        // Register builtins as procedures in the global environment
+        for (String name : new String[]{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"}) {
+            globalEnv.define(name, new BuiltinProc(name));
+        }
+    }
 
     public String evalStr(String input) throws EvalError {
         List<Object> exprs = parse(input);
         Object result = null;
         for (Object expr : exprs) {
-            result = eval(expr);
+            result = eval(expr, globalEnv);
         }
         return schemeToString(result);
     }
@@ -20,15 +31,42 @@ public class Evaluator {
     }
 
     // ---- Representation ----
-    // Integer  -> Long
-    // Boolean  -> Boolean
-    // String   -> SchemeString (wrapper to distinguish from symbols)
-    // Symbol   -> String
-    // List     -> List<Object>  (empty list = empty ArrayList)
-
     static final class SchemeString {
         final String value;
         SchemeString(String value) { this.value = value; }
+    }
+
+    // ---- Environment ----
+    static class Env {
+        private final Map<String, Object> bindings = new HashMap<>();
+        private final Env parent;
+
+        Env(Env parent) { this.parent = parent; }
+
+        void define(String name, Object value) { bindings.put(name, value); }
+
+        Object lookup(String name) throws EvalError {
+            if (bindings.containsKey(name)) return bindings.get(name);
+            if (parent != null) return parent.lookup(name);
+            throw new EvalError("unbound variable: " + name);
+        }
+    }
+
+    // ---- Procedure types ----
+    static final class BuiltinProc {
+        final String name;
+        BuiltinProc(String name) { this.name = name; }
+    }
+
+    static final class Lambda {
+        final List<String> params;
+        final List<Object> body;
+        final Env closureEnv;
+        Lambda(List<String> params, List<Object> body, Env closureEnv) {
+            this.params = params;
+            this.body = body;
+            this.closureEnv = closureEnv;
+        }
     }
 
     // ---- Tokenizer ----
@@ -40,7 +78,7 @@ public class Evaluator {
         while (i < len) {
             char c = input.charAt(i);
             if (Character.isWhitespace(c)) { i++; continue; }
-            if (c == ';') { // line comment
+            if (c == ';') {
                 while (i < len && input.charAt(i) != '\n') i++;
                 continue;
             }
@@ -53,19 +91,16 @@ public class Evaluator {
                 i++;
                 while (i < len && input.charAt(i) != '"') {
                     if (input.charAt(i) == '\\') {
-                        sb.append(input.charAt(i));
-                        i++;
+                        sb.append(input.charAt(i)); i++;
                         if (i < len) { sb.append(input.charAt(i)); i++; }
                     } else {
-                        sb.append(input.charAt(i));
-                        i++;
+                        sb.append(input.charAt(i)); i++;
                     }
                 }
                 if (i < len) { sb.append('"'); i++; }
                 tokens.add(sb.toString());
                 continue;
             }
-            // atom
             StringBuilder sb = new StringBuilder();
             while (i < len) {
                 char ch = input.charAt(i);
@@ -102,7 +137,7 @@ public class Evaluator {
                 list.add(parseExpr(tokens));
             }
             if (pos >= tokens.size()) throw new EvalError("missing closing parenthesis");
-            pos++; // skip )
+            pos++;
             return list;
         }
         if (token.equals(")")) throw new EvalError("unexpected )");
@@ -130,65 +165,119 @@ public class Evaluator {
 
     // ---- Evaluator ----
 
-    private static final java.util.Set<String> BUILTINS = java.util.Set.of(
-        "+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"
-    );
-
     @SuppressWarnings("unchecked")
-    private Object eval(Object expr) throws EvalError {
+    private Object eval(Object expr, Env env) throws EvalError {
         if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
             return expr;
         }
         if (expr instanceof String sym) {
-            throw new EvalError("unbound variable: " + sym);
+            return env.lookup(sym);
         }
         if (expr instanceof List<?> list) {
             if (list.isEmpty()) throw new EvalError("empty application");
             Object head = list.get(0);
 
-            // Special forms
             if (head instanceof String op) {
                 switch (op) {
-                    case "and" -> { return evalAnd((List<Object>) expr); }
-                    case "or" -> { return evalOr((List<Object>) expr); }
-                }
-                // Builtin function call
-                if (BUILTINS.contains(op)) {
-                    List<Object> args = new ArrayList<>();
-                    for (int i = 1; i < list.size(); i++) {
-                        args.add(eval(list.get(i)));
+                    case "quote" -> {
+                        if (list.size() != 2) throw new EvalError("quote: expected 1 argument");
+                        return list.get(1);
                     }
-                    return applyBuiltin(op, args);
+                    case "if" -> {
+                        if (list.size() < 3 || list.size() > 4)
+                            throw new EvalError("if: expected 2 or 3 arguments");
+                        Object cond = eval(list.get(1), env);
+                        if (!isFalse(cond)) {
+                            return eval(list.get(2), env);
+                        } else if (list.size() == 4) {
+                            return eval(list.get(3), env);
+                        }
+                        return null; // void
+                    }
+                    case "define" -> {
+                        if (list.size() < 3) throw new EvalError("define: bad syntax");
+                        Object target = list.get(1);
+                        if (target instanceof String name) {
+                            Object val = eval(list.get(2), env);
+                            env.define(name, val);
+                            return null;
+                        }
+                        if (target instanceof List<?> sig) {
+                            // (define (f params...) body...)
+                            if (sig.isEmpty()) throw new EvalError("define: bad syntax");
+                            String name = (String) sig.get(0);
+                            List<String> params = new ArrayList<>();
+                            for (int i = 1; i < sig.size(); i++) {
+                                params.add((String) sig.get(i));
+                            }
+                            List<Object> body = new ArrayList<>();
+                            for (int i = 2; i < list.size(); i++) {
+                                body.add(list.get(i));
+                            }
+                            env.define(name, new Lambda(params, body, env));
+                            return null;
+                        }
+                        throw new EvalError("define: bad syntax");
+                    }
+                    case "lambda" -> {
+                        if (list.size() < 3) throw new EvalError("lambda: bad syntax");
+                        List<?> paramList = (List<?>) list.get(1);
+                        List<String> params = new ArrayList<>();
+                        for (Object p : paramList) params.add((String) p);
+                        List<Object> body = new ArrayList<>();
+                        for (int i = 2; i < list.size(); i++) body.add(list.get(i));
+                        return new Lambda(params, body, env);
+                    }
+                    case "and" -> { return evalAnd((List<Object>) expr, env); }
+                    case "or" -> { return evalOr((List<Object>) expr, env); }
                 }
             }
 
-            // General function application
-            Object proc = eval(head);
-            if (proc instanceof String name) {
-                List<Object> args = new ArrayList<>();
-                for (int i = 1; i < list.size(); i++) {
-                    args.add(eval(list.get(i)));
-                }
-                return applyBuiltin(name, args);
+            // General application
+            Object proc = eval(head, env);
+            List<Object> args = new ArrayList<>();
+            for (int i = 1; i < list.size(); i++) {
+                args.add(eval(list.get(i), env));
             }
-            throw new EvalError("not a procedure: " + schemeToString(proc));
+            return apply(proc, args);
         }
         throw new EvalError("unknown expression type");
     }
 
-    private Object evalAnd(List<Object> expr) throws EvalError {
+    private Object apply(Object proc, List<Object> args) throws EvalError {
+        if (proc instanceof BuiltinProc bp) {
+            return applyBuiltin(bp.name, args);
+        }
+        if (proc instanceof Lambda lam) {
+            if (args.size() != lam.params.size()) {
+                throw new EvalError("wrong number of arguments: expected " + lam.params.size() + ", got " + args.size());
+            }
+            Env callEnv = new Env(lam.closureEnv);
+            for (int i = 0; i < lam.params.size(); i++) {
+                callEnv.define(lam.params.get(i), args.get(i));
+            }
+            Object result = null;
+            for (Object bodyExpr : lam.body) {
+                result = eval(bodyExpr, callEnv);
+            }
+            return result;
+        }
+        throw new EvalError("not a procedure: " + schemeToString(proc));
+    }
+
+    private Object evalAnd(List<Object> expr, Env env) throws EvalError {
         Object result = Boolean.TRUE;
         for (int i = 1; i < expr.size(); i++) {
-            result = eval(expr.get(i));
+            result = eval(expr.get(i), env);
             if (isFalse(result)) return result;
         }
         return result;
     }
 
-    private Object evalOr(List<Object> expr) throws EvalError {
+    private Object evalOr(List<Object> expr, Env env) throws EvalError {
         Object result = Boolean.FALSE;
         for (int i = 1; i < expr.size(); i++) {
-            result = eval(expr.get(i));
+            result = eval(expr.get(i), env);
             if (!isFalse(result)) return result;
         }
         return result;
