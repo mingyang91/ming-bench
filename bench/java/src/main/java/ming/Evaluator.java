@@ -73,13 +73,17 @@ public class Evaluator {
     }
 
     private Value eval(Expr expression, Environment environment) throws EvalError {
-        return switch (expression) {
-            case IntExpr intExpr -> new IntValue(intExpr.value());
-            case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
-            case StringExpr stringExpr -> new StringValue(stringExpr.value());
-            case SymbolExpr symbolExpr -> environment.lookup(symbolExpr.name());
-            case ListExpr listExpr -> evalList(listExpr, environment);
-        };
+        try {
+            return switch (expression) {
+                case IntExpr intExpr -> new IntValue(intExpr.value());
+                case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
+                case StringExpr stringExpr -> new StringValue(stringExpr.value());
+                case SymbolExpr symbolExpr -> environment.lookup(symbolExpr.name());
+                case ListExpr listExpr -> evalList(listExpr, environment);
+            };
+        } catch (EvalError error) {
+            throw error.withPosition(expression.line(), expression.column());
+        }
     }
 
     private Value evalList(ListExpr listExpr, Environment environment) throws EvalError {

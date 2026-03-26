@@ -43,11 +43,18 @@ final class Parser {
     }
 
     private Expr parseQuote() throws EvalError {
+        int startLine = line;
+        int startColumn = column;
         advance();
-        return new ListExpr(List.of(new SymbolExpr("quote"), parseExpr()));
+        return new ListExpr(
+                List.of(new SymbolExpr("quote", startLine, startColumn), parseExpr()),
+                startLine,
+                startColumn);
     }
 
     private Expr parseList() throws EvalError {
+        int startLine = line;
+        int startColumn = column;
         advance();
         List<Expr> elements = new ArrayList<>();
         skipIgnored();
@@ -62,17 +69,19 @@ final class Parser {
         }
 
         advance();
-        return new ListExpr(List.copyOf(elements));
+        return new ListExpr(List.copyOf(elements), startLine, startColumn);
     }
 
     private Expr parseString() throws EvalError {
+        int startLine = line;
+        int startColumn = column;
         advance();
         StringBuilder builder = new StringBuilder();
 
         while (!isAtEnd()) {
             char ch = advance();
             if (ch == '"') {
-                return new StringExpr(builder.toString());
+                return new StringExpr(builder.toString(), startLine, startColumn);
             }
 
             if (ch == '\\') {
@@ -98,27 +107,29 @@ final class Parser {
     }
 
     private Expr parseAtom() throws EvalError {
+        int startLine = line;
+        int startColumn = column;
         String token = readToken();
         if (token.isEmpty()) {
             throw error("expected expression");
         }
 
         return switch (token) {
-            case "#t" -> new BoolExpr(true);
-            case "#f" -> new BoolExpr(false);
-            default -> parseNumberOrSymbol(token);
+            case "#t" -> new BoolExpr(true, startLine, startColumn);
+            case "#f" -> new BoolExpr(false, startLine, startColumn);
+            default -> parseNumberOrSymbol(token, startLine, startColumn);
         };
     }
 
-    private Expr parseNumberOrSymbol(String token) throws EvalError {
+    private Expr parseNumberOrSymbol(String token, int startLine, int startColumn) throws EvalError {
         if (isIntegerToken(token)) {
             try {
-                return new IntExpr(Long.parseLong(token));
+                return new IntExpr(Long.parseLong(token), startLine, startColumn);
             } catch (NumberFormatException e) {
-                throw error("invalid integer literal: " + token);
+                throw new EvalError("invalid integer literal: " + token, startLine, startColumn);
             }
         }
-        return new SymbolExpr(token);
+        return new SymbolExpr(token, startLine, startColumn);
     }
 
     private boolean isIntegerToken(String token) {
