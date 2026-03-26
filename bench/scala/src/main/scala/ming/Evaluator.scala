@@ -24,14 +24,25 @@ object Evaluator:
     case Value.VLambda(_, _, _) => "#<procedure>"
     case Value.VVoid            => ""
 
+  // ── Position helpers ────────────────────────────────────────────────
+  private def posOf(expr: Expr): Pos = expr match
+    case Expr.Num(_, p)    => p
+    case Expr.Bool(_, p)   => p
+    case Expr.Str(_, p)    => p
+    case Expr.Symbol(_, p) => p
+    case Expr.SList(_, p)  => p
+
+  private def errAt(pos: Pos, msg: String): EvalError =
+    EvalError(s"$pos: $msg")
+
   // ── Environment ──────────────────────────────────────────────────────
   private class Env(val bindings: scala.collection.mutable.Map[String, Value], val parent: Option[Env]):
 
-    def lookup(name: String): Value =
+    def lookup(name: String, pos: Pos): Value =
       bindings
         .get(name)
-        .orElse(parent.flatMap(p => scala.util.Try(p.lookup(name)).toOption))
-        .getOrElse(throw EvalError(s"unbound variable: $name"))
+        .orElse(parent.flatMap(p => scala.util.Try(p.lookup(name, pos)).toOption))
+        .getOrElse(throw errAt(pos, s"unbound variable: $name"))
     def define(name: String, value: Value): Unit = bindings(name) = value
     def child(): Env                             = Env(scala.collection.mutable.Map.empty, Some(this))
 
@@ -66,65 +77,65 @@ object Evaluator:
 
   // ── Eval ─────────────────────────────────────────────────────────────
   private def eval(expr: Expr, env: Env): Value = expr match
-    case Expr.Num(n)                                    => Value.VNum(n)
-    case Expr.Bool(b)                                   => Value.VBool(b)
-    case Expr.Str(s)                                    => Value.VStr(s)
-    case Expr.Symbol(name)                              => env.lookup(name)
-    case Expr.SList(Nil)                                => throw EvalError("empty application")
-    case Expr.SList(Expr.Symbol("quote") :: arg :: Nil) => quoteToValue(arg)
-    case Expr.SList(Expr.Symbol("define") :: rest)      => evalDefine(rest, env)
-    case Expr.SList(Expr.Symbol("if") :: rest)          => evalIf(rest, env)
-    case Expr.SList(Expr.Symbol("lambda") :: rest)      => evalLambda(rest, env)
-    case Expr.SList(Expr.Symbol("and") :: args)         => evalAnd(args, env)
-    case Expr.SList(Expr.Symbol("or") :: args)          => evalOr(args, env)
-    case Expr.SList(Expr.Symbol("let") :: rest)         => evalLet(rest, env)
-    case Expr.SList(Expr.Symbol("begin") :: body)       => evalBegin(body, env)
-    case Expr.SList(Expr.Symbol("cond") :: clauses)     => evalCond(clauses, env)
-    case Expr.SList(head :: args) =>
+    case Expr.Num(n, _)                                       => Value.VNum(n)
+    case Expr.Bool(b, _)                                      => Value.VBool(b)
+    case Expr.Str(s, _)                                       => Value.VStr(s)
+    case Expr.Symbol(name, p)                                 => env.lookup(name, p)
+    case Expr.SList(Nil, p)                                   => throw errAt(p, "empty application")
+    case Expr.SList(Expr.Symbol("quote", _) :: arg :: Nil, _) => quoteToValue(arg)
+    case Expr.SList(Expr.Symbol("define", _) :: rest, p)      => evalDefine(rest, env, p)
+    case Expr.SList(Expr.Symbol("if", _) :: rest, p)          => evalIf(rest, env, p)
+    case Expr.SList(Expr.Symbol("lambda", _) :: rest, p)      => evalLambda(rest, env, p)
+    case Expr.SList(Expr.Symbol("and", _) :: args, _)         => evalAnd(args, env)
+    case Expr.SList(Expr.Symbol("or", _) :: args, _)          => evalOr(args, env)
+    case Expr.SList(Expr.Symbol("let", _) :: rest, p)         => evalLet(rest, env, p)
+    case Expr.SList(Expr.Symbol("begin", _) :: body, _)       => evalBegin(body, env)
+    case Expr.SList(Expr.Symbol("cond", _) :: clauses, _)     => evalCond(clauses, env)
+    case e @ Expr.SList(head :: args, p) =>
       val func = eval(head, env)
-      applyFunc(func, args.map(a => eval(a, env)))
+      applyFunc(func, args.map(a => eval(a, env)), p)
 
   private def evalBody(body: List[Expr], env: Env): Value =
     body.foldLeft(Value.VVoid: Value)((_, e) => eval(e, env))
 
-  private def applyFunc(func: Value, args: List[Value]): Value = func match
-    case Value.VBuiltin(name) => applyBuiltin(name, args)
+  private def applyFunc(func: Value, args: List[Value], pos: Pos): Value = func match
+    case Value.VBuiltin(name) => applyBuiltin(name, args, pos)
     case Value.VLambda(params, body, closure) =>
-      if args.length != params.length then throw EvalError("wrong number of arguments")
+      if args.length != params.length then throw errAt(pos, "wrong number of arguments")
       val callEnv = closure.child()
       params.zip(args).foreach((p, a) => callEnv.define(p, a))
       evalBody(body, callEnv)
-    case _ => throw EvalError("not a procedure")
+    case _ => throw errAt(pos, "not a procedure")
 
   private def quoteToValue(expr: Expr): Value = expr match
-    case Expr.Num(n)       => Value.VNum(n)
-    case Expr.Bool(b)      => Value.VBool(b)
-    case Expr.Str(s)       => Value.VStr(s)
-    case Expr.Symbol(name) => Value.VSymbol(name)
-    case Expr.SList(elems) => Value.VList(elems.map(quoteToValue))
+    case Expr.Num(n, _)       => Value.VNum(n)
+    case Expr.Bool(b, _)      => Value.VBool(b)
+    case Expr.Str(s, _)       => Value.VStr(s)
+    case Expr.Symbol(name, _) => Value.VSymbol(name)
+    case Expr.SList(elems, _) => Value.VList(elems.map(quoteToValue))
 
-  private def evalDefine(rest: List[Expr], env: Env): Value = rest match
-    case Expr.Symbol(name) :: valueExpr :: Nil =>
+  private def evalDefine(rest: List[Expr], env: Env, pos: Pos): Value = rest match
+    case Expr.Symbol(name, _) :: valueExpr :: Nil =>
       env.define(name, eval(valueExpr, env))
       Value.VVoid
-    case Expr.SList(Expr.Symbol(name) :: params) :: body =>
-      val paramNames = params.map { case Expr.Symbol(n) => n; case _ => throw EvalError("invalid parameter") }
+    case Expr.SList(Expr.Symbol(name, _) :: params, _) :: body =>
+      val paramNames = params.map { case Expr.Symbol(n, _) => n; case _ => throw errAt(pos, "invalid parameter") }
       env.define(name, Value.VLambda(paramNames, body, env))
       Value.VVoid
-    case _ => throw EvalError("invalid define")
+    case _ => throw errAt(pos, "invalid define")
 
-  private def evalIf(rest: List[Expr], env: Env): Value = rest match
+  private def evalIf(rest: List[Expr], env: Env, pos: Pos): Value = rest match
     case cond :: thenExpr :: elseExpr :: Nil =>
       if isTruthy(eval(cond, env)) then eval(thenExpr, env) else eval(elseExpr, env)
     case cond :: thenExpr :: Nil =>
       if isTruthy(eval(cond, env)) then eval(thenExpr, env) else Value.VVoid
-    case _ => throw EvalError("invalid if")
+    case _ => throw errAt(pos, "invalid if")
 
-  private def evalLambda(rest: List[Expr], env: Env): Value = rest match
-    case Expr.SList(params) :: body =>
-      val paramNames = params.map { case Expr.Symbol(n) => n; case _ => throw EvalError("invalid parameter") }
+  private def evalLambda(rest: List[Expr], env: Env, pos: Pos): Value = rest match
+    case Expr.SList(params, _) :: body =>
+      val paramNames = params.map { case Expr.Symbol(n, _) => n; case _ => throw errAt(pos, "invalid parameter") }
       Value.VLambda(paramNames, body, env)
-    case _ => throw EvalError("invalid lambda")
+    case _ => throw errAt(pos, "invalid lambda")
 
   private def evalAnd(args: List[Expr], env: Env): Value =
     args match
@@ -143,111 +154,111 @@ object Evaluator:
         val result = eval(head, env)
         if isTruthy(result) then result else evalOr(tail, env)
 
-  private def evalLet(rest: List[Expr], env: Env): Value = rest match
-    case Expr.Symbol(name) :: Expr.SList(bindings) :: body if body.nonEmpty =>
+  private def evalLet(rest: List[Expr], env: Env, pos: Pos): Value = rest match
+    case Expr.Symbol(name, _) :: Expr.SList(bindings, _) :: body if body.nonEmpty =>
       val paramNames = bindings.map {
-        case Expr.SList(Expr.Symbol(n) :: _ :: Nil) => n
-        case _                                      => throw EvalError("invalid let binding")
+        case Expr.SList(Expr.Symbol(n, _) :: _ :: Nil, _) => n
+        case _                                            => throw errAt(pos, "invalid let binding")
       }
       val initVals = bindings.map {
-        case Expr.SList(_ :: initExpr :: Nil) => eval(initExpr, env)
-        case _                                => throw EvalError("invalid let binding")
+        case Expr.SList(_ :: initExpr :: Nil, _) => eval(initExpr, env)
+        case _                                   => throw errAt(pos, "invalid let binding")
       }
       val loopEnv = env.child()
       val lambda  = Value.VLambda(paramNames, body, loopEnv)
       loopEnv.define(name, lambda)
-      applyFunc(lambda, initVals)
-    case Expr.SList(bindings) :: body if body.nonEmpty =>
+      applyFunc(lambda, initVals, pos)
+    case Expr.SList(bindings, _) :: body if body.nonEmpty =>
       val letEnv = env.child()
       for b <- bindings do
         b match
-          case Expr.SList(Expr.Symbol(name) :: initExpr :: Nil) =>
+          case Expr.SList(Expr.Symbol(name, _) :: initExpr :: Nil, _) =>
             letEnv.define(name, eval(initExpr, env))
-          case _ => throw EvalError("invalid let binding")
+          case _ => throw errAt(pos, "invalid let binding")
       evalBody(body, letEnv)
-    case _ => throw EvalError("invalid let")
+    case _ => throw errAt(pos, "invalid let")
 
   private def evalBegin(body: List[Expr], env: Env): Value =
     if body.isEmpty then Value.VVoid
     else evalBody(body, env)
 
   private def evalCond(clauses: List[Expr], env: Env): Value = clauses match
-    case Nil                                          => Value.VVoid
-    case Expr.SList(Expr.Symbol("else") :: body) :: _ => evalBody(body, env)
-    case Expr.SList(test :: body) :: rest =>
+    case Nil                                                => Value.VVoid
+    case Expr.SList(Expr.Symbol("else", _) :: body, _) :: _ => evalBody(body, env)
+    case Expr.SList(test :: body, _) :: rest =>
       if isTruthy(eval(test, env)) then evalBody(body, env)
       else evalCond(rest, env)
-    case _ => throw EvalError("invalid cond")
+    case e :: _ => throw errAt(posOf(e), "invalid cond")
 
   private def isTruthy(v: Value): Boolean = v match
     case Value.VBool(false) => false
     case _                  => true
 
-  private def asNum(v: Value): Long = v match
+  private def asNum(v: Value, pos: Pos): Long = v match
     case Value.VNum(n) => n
-    case _             => throw EvalError("expected number")
+    case _             => throw errAt(pos, "expected number")
 
-  private def applyBuiltin(name: String, args: List[Value]): Value = name match
-    case "+" => Value.VNum(args.map(asNum).sum)
-    case "*" => Value.VNum(args.map(asNum).product)
+  private def applyBuiltin(name: String, args: List[Value], pos: Pos): Value = name match
+    case "+" => Value.VNum(args.map(v => asNum(v, pos)).sum)
+    case "*" => Value.VNum(args.map(v => asNum(v, pos)).product)
     case "-" =>
-      if args.isEmpty then throw EvalError("- requires at least 1 argument")
-      else if args.length == 1 then Value.VNum(-asNum(args.head))
-      else Value.VNum(args.map(asNum).reduceLeft(_ - _))
+      if args.isEmpty then throw errAt(pos, "- requires at least 1 argument")
+      else if args.length == 1 then Value.VNum(-asNum(args.head, pos))
+      else Value.VNum(args.map(v => asNum(v, pos)).reduceLeft(_ - _))
     case "/" =>
-      if args.isEmpty then throw EvalError("/ requires at least 1 argument")
-      else if args.length == 1 then Value.VNum(1 / asNum(args.head))
+      if args.isEmpty then throw errAt(pos, "/ requires at least 1 argument")
+      else if args.length == 1 then Value.VNum(1 / asNum(args.head, pos))
       else
-        val nums = args.map(asNum)
-        if nums.tail.contains(0L) then throw EvalError("division by zero")
+        val nums = args.map(v => asNum(v, pos))
+        if nums.tail.contains(0L) then throw errAt(pos, "division by zero")
         Value.VNum(nums.reduceLeft(_ / _))
     case "<" =>
-      val nums = args.map(asNum)
+      val nums = args.map(v => asNum(v, pos))
       Value.VBool(nums.zip(nums.tail).forall((a, b) => a < b))
     case ">" =>
-      val nums = args.map(asNum)
+      val nums = args.map(v => asNum(v, pos))
       Value.VBool(nums.zip(nums.tail).forall((a, b) => a > b))
     case "=" =>
-      val nums = args.map(asNum)
+      val nums = args.map(v => asNum(v, pos))
       Value.VBool(nums.zip(nums.tail).forall((a, b) => a == b))
     case "<=" =>
-      val nums = args.map(asNum)
+      val nums = args.map(v => asNum(v, pos))
       Value.VBool(nums.zip(nums.tail).forall((a, b) => a <= b))
     case ">=" =>
-      val nums = args.map(asNum)
+      val nums = args.map(v => asNum(v, pos))
       Value.VBool(nums.zip(nums.tail).forall((a, b) => a >= b))
     case "not" =>
-      if args.length != 1 then throw EvalError("not requires 1 argument")
+      if args.length != 1 then throw errAt(pos, "not requires 1 argument")
       Value.VBool(!isTruthy(args.head))
     case "cons" =>
-      if args.length != 2 then throw EvalError("cons requires 2 arguments")
+      if args.length != 2 then throw errAt(pos, "cons requires 2 arguments")
       args(1) match
         case Value.VList(elems) => Value.VList(args(0) :: elems)
         case _                  => Value.VList(List(args(0), args(1)))
     case "car" =>
-      if args.length != 1 then throw EvalError("car requires 1 argument")
+      if args.length != 1 then throw errAt(pos, "car requires 1 argument")
       args.head match
         case Value.VList(h :: _) => h
-        case _                   => throw EvalError("car: not a pair")
+        case _                   => throw errAt(pos, "car: not a pair")
     case "cdr" =>
-      if args.length != 1 then throw EvalError("cdr requires 1 argument")
+      if args.length != 1 then throw errAt(pos, "cdr requires 1 argument")
       args.head match
         case Value.VList(_ :: t) => Value.VList(t)
-        case _                   => throw EvalError("cdr: not a pair")
+        case _                   => throw errAt(pos, "cdr: not a pair")
     case "null?" =>
-      if args.length != 1 then throw EvalError("null? requires 1 argument")
+      if args.length != 1 then throw errAt(pos, "null? requires 1 argument")
       Value.VBool(args.head == Value.VList(Nil))
     case "list" => Value.VList(args)
     case "length" =>
-      if args.length != 1 then throw EvalError("length requires 1 argument")
+      if args.length != 1 then throw errAt(pos, "length requires 1 argument")
       args.head match
         case Value.VList(elems) => Value.VNum(elems.length.toLong)
-        case _                  => throw EvalError("length: not a list")
+        case _                  => throw errAt(pos, "length: not a list")
     case "append" =>
       args.foldRight(Value.VList(Nil): Value) { (arg, acc) =>
         (arg, acc) match
           case (Value.VList(elems), Value.VList(accElems)) => Value.VList(elems ++ accElems)
-          case _                                           => throw EvalError("append: not a list")
+          case _                                           => throw errAt(pos, "append: not a list")
       }
     case "number?" =>
       Value.VBool(args.length == 1 && args.head.isInstanceOf[Value.VNum])
@@ -261,12 +272,11 @@ object Evaluator:
         case _                   => false))
     case "symbol?" =>
       Value.VBool(args.length == 1 && args.head.isInstanceOf[Value.VSymbol])
-    case _ => throw EvalError(s"unknown builtin: $name")
+    case _ => throw errAt(pos, s"unknown builtin: $name")
 
   // ── Public API ───────────────────────────────────────────────────────
   def evalStr(input: String): String =
-    val tokens = Parser.tokenize(input)
-    val exprs  = Parser.parseAll(tokens)
+    val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw EvalError("no expressions")
     val env = defaultEnv
     display(evalBody(exprs, env))

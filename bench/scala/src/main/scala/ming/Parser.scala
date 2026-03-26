@@ -1,72 +1,96 @@
 package ming
 
+private[ming] case class Pos(line: Int, col: Int):
+  override def toString: String = s"$line:$col"
+
 private[ming] enum Expr:
-  case Num(value: Long)
-  case Bool(value: Boolean)
-  case Str(value: String)
-  case Symbol(name: String)
-  case SList(elems: List[Expr])
+  case Num(value: Long, pos: Pos = Pos(0, 0))
+  case Bool(value: Boolean, pos: Pos = Pos(0, 0))
+  case Str(value: String, pos: Pos = Pos(0, 0))
+  case Symbol(name: String, pos: Pos = Pos(0, 0))
+  case SList(elems: List[Expr], pos: Pos = Pos(0, 0))
 
 private[ming] object Parser:
 
-  def tokenize(input: String): List[String] =
-    val tokens = scala.collection.mutable.ListBuffer[String]()
+  private case class Token(text: String, pos: Pos)
+
+  private def tokenize(input: String): List[Token] =
+    val tokens = scala.collection.mutable.ListBuffer[Token]()
     var i      = 0
+    var line   = 1
+    var col    = 1
     while i < input.length do
       input(i) match
-        case c if c.isWhitespace => i += 1
-        case ';'                 => i = skipComment(input, i)
+        case '\n' =>
+          i += 1; line += 1; col = 1
+        case c if c.isWhitespace =>
+          i += 1; col += 1
+        case ';' =>
+          val next = skipComment(input, i)
+          col += (next - i)
+          i = next
         case '(' | ')' | '\'' =>
-          tokens += input(i).toString; i += 1
+          tokens += Token(input(i).toString, Pos(line, col))
+          i += 1; col += 1
         case '"' =>
+          val p           = Pos(line, col)
           val (tok, next) = readString(input, i)
-          tokens += tok; i = next
+          tokens += Token(tok, p)
+          col += (next - i)
+          i = next
         case '#' =>
+          val p           = Pos(line, col)
           val (tok, next) = readHash(input, i)
-          tokens += tok; i = next
+          tokens += Token(tok, p)
+          col += (next - i)
+          i = next
         case _ =>
+          val p           = Pos(line, col)
           val (tok, next) = readWord(input, i)
-          tokens += tok; i = next
+          tokens += Token(tok, p)
+          col += (next - i)
+          i = next
     tokens.toList
 
-  def parseAll(tokens: List[String]): List[Expr] =
-    val exprs = scala.collection.mutable.ListBuffer[Expr]()
-    var rest  = tokens
+  def parseAll(input: String): List[Expr] =
+    val tokens = tokenize(input)
+    val exprs  = scala.collection.mutable.ListBuffer[Expr]()
+    var rest   = tokens
     while rest.nonEmpty do
       val (expr, remaining) = parseExpr(rest)
       exprs += expr
       rest = remaining
     exprs.toList
 
-  private def parseExpr(tokens: List[String]): (Expr, List[String]) = tokens match
+  private def parseExpr(tokens: List[Token]): (Expr, List[Token]) = tokens match
     case Nil => throw EvalError("unexpected end of input")
-    case "(" :: rest =>
+    case Token("(", p) :: rest =>
       val (elems, remaining) = parseList(rest)
-      (Expr.SList(elems), remaining)
-    case "'" :: rest =>
+      (Expr.SList(elems, p), remaining)
+    case Token("'", p) :: rest =>
       val (expr, remaining) = parseExpr(rest)
-      (Expr.SList(List(Expr.Symbol("quote"), expr)), remaining)
-    case ")" :: _      => throw EvalError("unexpected )")
-    case token :: rest => (parseAtom(token), rest)
+      (Expr.SList(List(Expr.Symbol("quote", p), expr), p), remaining)
+    case Token(")", _) :: _     => throw EvalError("unexpected )")
+    case Token(text, p) :: rest => (parseAtom(text, p), rest)
 
-  private def parseList(tokens: List[String]): (List[Expr], List[String]) =
+  private def parseList(tokens: List[Token]): (List[Expr], List[Token]) =
     val elems = scala.collection.mutable.ListBuffer[Expr]()
     var rest  = tokens
-    while rest.nonEmpty && rest.head != ")" do
+    while rest.nonEmpty && rest.head.text != ")" do
       val (expr, remaining) = parseExpr(rest)
       elems += expr
       rest = remaining
     if rest.isEmpty then throw EvalError("missing )")
     (elems.toList, rest.tail)
 
-  private def parseAtom(token: String): Expr =
-    if token == "#t" then Expr.Bool(true)
-    else if token == "#f" then Expr.Bool(false)
-    else if token.startsWith("\"") then Expr.Str(token.substring(1, token.length - 1))
+  private def parseAtom(token: String, pos: Pos): Expr =
+    if token == "#t" then Expr.Bool(true, pos)
+    else if token == "#f" then Expr.Bool(false, pos)
+    else if token.startsWith("\"") then Expr.Str(token.substring(1, token.length - 1), pos)
     else
       token.toLongOption match
-        case Some(n) => Expr.Num(n)
-        case None    => Expr.Symbol(token)
+        case Some(n) => Expr.Num(n, pos)
+        case None    => Expr.Symbol(token, pos)
 
   private def readWord(input: String, start: Int): (String, Int) =
     val sb = new StringBuilder
