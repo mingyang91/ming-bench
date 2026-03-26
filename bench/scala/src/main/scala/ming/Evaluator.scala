@@ -30,11 +30,11 @@ object Evaluator:
     Builtins.install(env, output)
     env
 
-  private def isFalsy(v: SchemeVal): Boolean = v match
+  private[ming] def isFalsy(v: SchemeVal): Boolean = v match
     case SchemeBool(false) => true
     case _                 => false
 
-  private def eval(expr: Expr, env: Env): SchemeVal =
+  private[ming] def eval(expr: Expr, env: Env): SchemeVal =
     try
       expr match
         case IntLit(v, _)         => SchemeInt(v)
@@ -61,14 +61,20 @@ object Evaluator:
       case Symbol("quote", _)              => evalQuote(elems.tail)
       case Symbol("lambda", _)             => evalLambda(elems.tail, env)
       case Symbol("begin", _)              => evalBegin(elems.tail, env)
-      case Symbol("let", _)                => evalLet(elems.tail, env)
-      case Symbol("cond", _)               => evalCond(elems.tail, env)
+      case Symbol("let", _)                => BindingForms.evalLet(elems.tail, env)
+      case Symbol("cond", _)               => BindingForms.evalCond(elems.tail, env)
       case Symbol("set!", _)               => evalSet(elems.tail, env)
       case Symbol("define-syntax", _)      => evalDefineSyntax(elems.tail, env)
       case Symbol("define-record-type", _) => Records.evalDefineRecordType(elems.tail, env)
       case Symbol("case-lambda", _)        => evalCaseLambda(elems.tail, env)
-      case _                               =>
-        // Check for macro call
+      case Symbol("letrec", _)             => BindingForms.evalLetrec(elems.tail, env)
+      case Symbol("letrec*", _)            => BindingForms.evalLetrecStar(elems.tail, env)
+      case Symbol("case", _)               => BindingForms.evalCase(elems.tail, env)
+      case Symbol("do", _)                 => BindingForms.evalDo(elems.tail, env)
+      case Symbol("let*", _)               => BindingForms.evalLetStar(elems.tail, env)
+      case Symbol("when", _)               => BindingForms.evalWhen(elems.tail, env)
+      case Symbol("unless", _)             => BindingForms.evalUnless(elems.tail, env)
+      case _ =>
         val macroVal = elems.head match
           case Symbol(name, _) =>
             try
@@ -161,7 +167,7 @@ object Evaluator:
     if args.size != 1 then throw new EvalError("quote: expected 1 argument")
     exprToVal(args.head)
 
-  private def exprToVal(expr: Expr): SchemeVal =
+  private[ming] def exprToVal(expr: Expr): SchemeVal =
     expr match
       case IntLit(v, _)         => SchemeInt(v)
       case FloatLit(v, _)       => SchemeFloat(v)
@@ -207,47 +213,6 @@ object Evaluator:
       for expr <- exprs do result = eval(expr, env)
       result
 
-  private def evalLet(args: List[Expr], env: Env): SchemeVal =
-    args match
-      case Symbol(name, _) :: SList(bindings, _) :: body if body.nonEmpty =>
-        val parsed   = parseBindings(bindings, env)
-        val localEnv = new Env(mutable.Map.empty, Some(env))
-        val lambda   = SchemeLambda(parsed.map(_._1), None, body, localEnv)
-        localEnv.set(name, lambda)
-        applyProc(lambda, parsed.map(_._2))
-      case SList(bindings, _) :: body if body.nonEmpty =>
-        val localEnv = new Env(mutable.Map.empty, Some(env))
-        for b <- bindings do
-          b match
-            case SList(Symbol(n, _) :: initExpr :: Nil, _) =>
-              localEnv.set(n, eval(initExpr, env))
-            case _ => throw new EvalError("let: bad binding")
-        var result: SchemeVal = SchemeVoid
-        for expr <- body do result = eval(expr, localEnv)
-        result
-      case _ => throw new EvalError("let: bad syntax")
-
-  private def parseBindings(
-    bindings: List[Expr],
-    env: Env
-  ): List[(String, SchemeVal)] =
-    bindings.map {
-      case SList(Symbol(n, _) :: initExpr :: Nil, _) => (n, eval(initExpr, env))
-      case _                                         => throw new EvalError("let: bad binding")
-    }
-
-  private def evalCond(clauses: List[Expr], env: Env): SchemeVal =
-    boundary:
-      for clause <- clauses do
-        clause match
-          case SList(Symbol("else", _) :: body, _) =>
-            break(evalBody(body, env))
-          case SList(test :: body, _) =>
-            val testVal = eval(test, env)
-            if !isFalsy(testVal) then break(if body.isEmpty then testVal else evalBody(body, env))
-          case _ => throw new EvalError("cond: bad clause")
-      SchemeVoid
-
   private def evalSet(args: List[Expr], env: Env): SchemeVal =
     args match
       case Symbol(name, _) :: valueExpr :: Nil =>
@@ -257,7 +222,10 @@ object Evaluator:
 
   private def evalDefineSyntax(args: List[Expr], env: Env): SchemeVal =
     args match
-      case Symbol(name, _) :: SList(Symbol("syntax-rules", _) :: SList(literals, _) :: rules, _) :: Nil =>
+      case Symbol(name, _) :: SList(
+            Symbol("syntax-rules", _) :: SList(literals, _) :: rules,
+            _
+          ) :: Nil =>
         val litNames = literals.map {
           case Symbol(n, _) => n
           case _            => throw new EvalError("syntax-rules: expected literal name")
@@ -279,7 +247,7 @@ object Evaluator:
     }
     SchemeCaseLambda(lambdas)
 
-  private def evalBody(exprs: List[Expr], env: Env): SchemeVal =
+  private[ming] def evalBody(exprs: List[Expr], env: Env): SchemeVal =
     var result: SchemeVal = SchemeVoid
     for expr <- exprs do result = eval(expr, env)
     result

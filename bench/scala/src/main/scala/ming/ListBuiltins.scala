@@ -4,21 +4,31 @@ private[ming] object ListBuiltins:
 
   import Builtins.typeCheck
 
-  private def schemeEqual(a: SchemeVal, b: SchemeVal): Boolean = (a, b) match
-    case (SchemeInt(x), SchemeInt(y))       => x == y
-    case (SchemeBool(x), SchemeBool(y))     => x == y
-    case (SchemeString(x), SchemeString(y)) => x == y
-    case (SchemeChar(x), SchemeChar(y))     => x == y
-    case (SchemeSymbol(x), SchemeSymbol(y)) => x == y
-    case (SchemeList(xs), SchemeList(ys)) =>
-      xs.length == ys.length && xs.zip(ys).forall((a, b) => schemeEqual(a, b))
-    case (SchemeVoid, SchemeVoid) => true
-    case _                        => a eq b
+  private[ming] def schemeEqual(a: SchemeVal, b: SchemeVal): Boolean =
+    (a, b) match
+      case (SchemeInt(x), SchemeInt(y))       => x == y
+      case (SchemeBool(x), SchemeBool(y))     => x == y
+      case (SchemeString(x), SchemeString(y)) => x == y
+      case (SchemeChar(x), SchemeChar(y))     => x == y
+      case (SchemeSymbol(x), SchemeSymbol(y)) => x == y
+      case (SchemeList(xs), SchemeList(ys)) =>
+        xs.length == ys.length && xs
+          .zip(ys)
+          .forall((a, b) => schemeEqual(a, b))
+      case (va: SchemeVector, vb: SchemeVector) =>
+        va.elems.length == vb.elems.length && va.elems
+          .zip(vb.elems)
+          .forall((a, b) => schemeEqual(a, b))
+      case (SchemePair(a1, d1), SchemePair(a2, d2)) =>
+        schemeEqual(a1, a2) && schemeEqual(d1, d2)
+      case (SchemeVoid, SchemeVoid) => true
+      case _                        => a eq b
 
   def install(env: Env): Unit =
     installCore(env)
     installUtils(env)
     installEquality(env)
+    VectorBuiltins.install(env)
     installMap(env)
 
   private def installCore(env: Env): Unit =
@@ -116,7 +126,8 @@ private[ming] object ListBuiltins:
             case (SchemeList(elems), SchemeInt(i)) =>
               if i < 0 || i >= elems.size then throw new EvalError("list-ref: index out of bounds")
               elems(i.toInt)
-            case _ => throw new EvalError("list-ref: expected list and integer")
+            case _ =>
+              throw new EvalError("list-ref: expected list and integer")
       )
     )
     env.set(
@@ -129,7 +140,8 @@ private[ming] object ListBuiltins:
             case (SchemeList(elems), SchemeInt(i)) =>
               if i < 0 || i > elems.size then throw new EvalError("list-tail: index out of bounds")
               SchemeList(elems.drop(i.toInt))
-            case _ => throw new EvalError("list-tail: expected list and integer")
+            case _ =>
+              throw new EvalError("list-tail: expected list and integer")
       )
     )
     env.set(
@@ -143,12 +155,26 @@ private[ming] object ListBuiltins:
             case SchemeList(elems) =>
               elems
                 .collectFirst {
-                  case entry @ SchemeList(k :: _) if schemeEqual(k, key) => entry
+                  case entry @ SchemeList(k :: _) if schemeEqual(k, key) =>
+                    entry
                 }
                 .getOrElse(SchemeBool(false))
             case _ => throw new EvalError("assoc: expected list")
       )
     )
+
+  private[ming] def schemeEqv(a: SchemeVal, b: SchemeVal): Boolean =
+    (a, b) match
+      case (SchemeInt(x), SchemeInt(y))     => x == y
+      case (SchemeFloat(x), SchemeFloat(y)) => x == y
+      case (SchemeRational(n1, d1), SchemeRational(n2, d2)) =>
+        n1 == n2 && d1 == d2
+      case (SchemeBool(x), SchemeBool(y))     => x == y
+      case (SchemeChar(x), SchemeChar(y))     => x == y
+      case (SchemeSymbol(x), SchemeSymbol(y)) => x == y
+      case (SchemeList(Nil), SchemeList(Nil)) => true
+      case (SchemeVoid, SchemeVoid)           => true
+      case (a, b)                             => a eq b
 
   private def installEquality(env: Env): Unit =
     env.set(
@@ -173,6 +199,15 @@ private[ming] object ListBuiltins:
             case (SchemeList(Nil), SchemeList(Nil)) => true
             case (a, b)                             => a eq b
           SchemeBool(result)
+      )
+    )
+    env.set(
+      "eqv?",
+      SchemeBuiltin(
+        "eqv?",
+        args =>
+          if args.size != 2 then throw new EvalError("eqv?: expected 2 arguments")
+          SchemeBool(schemeEqv(args(0), args(1)))
       )
     )
 

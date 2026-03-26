@@ -106,6 +106,9 @@ case class SchemeCaseLambda(clauses: List[SchemeLambda]) extends SchemeVal:
 case class SchemeRecord(typeName: String, fields: mutable.Map[String, SchemeVal]) extends SchemeVal:
   def display: String = s"#<$typeName>"
 
+class SchemeVector(val elems: Array[SchemeVal]) extends SchemeVal:
+  def display: String = "#(" + elems.map(_.display).mkString(" ") + ")"
+
 // ── Environment ──────────────────────────────────────────────────────
 private[ming] class Env(val bindings: mutable.Map[String, SchemeVal], val parent: Option[Env]):
 
