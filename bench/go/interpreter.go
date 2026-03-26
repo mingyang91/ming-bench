@@ -136,11 +136,18 @@ type lambdaProcedure struct {
 	env      *environment
 }
 
+func (p *lambdaProcedure) matchesArity(argCount int) bool {
+	if p.hasRest {
+		return argCount >= len(p.params)
+	}
+	return argCount == len(p.params)
+}
+
 func (p *lambdaProcedure) Call(i *interpreter, args []any, pos position) (any, error) {
-	if !p.hasRest && len(args) != len(p.params) {
+	if !p.matchesArity(len(args)) && !p.hasRest {
 		return nil, newEvalError(pos, "wrong number of arguments: expected %d, got %d", len(p.params), len(args))
 	}
-	if p.hasRest && len(args) < len(p.params) {
+	if !p.matchesArity(len(args)) && p.hasRest {
 		return nil, newEvalError(pos, "wrong number of arguments: expected at least %d, got %d", len(p.params), len(args))
 	}
 
@@ -153,6 +160,20 @@ func (p *lambdaProcedure) Call(i *interpreter, args []any, pos position) (any, e
 	}
 
 	return i.evalSequence(p.body, callEnv)
+}
+
+type caseLambdaProcedure struct {
+	clauses []*lambdaProcedure
+}
+
+func (p *caseLambdaProcedure) Call(i *interpreter, args []any, pos position) (any, error) {
+	for _, clause := range p.clauses {
+		if clause.matchesArity(len(args)) {
+			return clause.Call(i, args, pos)
+		}
+	}
+
+	return nil, newEvalError(pos, "wrong number of arguments: no matching case-lambda clause for %d argument(s)", len(args))
 }
 
 type recordType struct {
@@ -303,7 +324,7 @@ func installBuiltins(env *environment) {
 	for _, name := range []string{
 		"+", "-", "*", "/", "<", ">", "=", "<=", "not",
 		"cons", "car", "cdr", "null?", "list", "length", "append",
-		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?",
+		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?", "procedure?",
 		"apply", "eq?", "equal?",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",
@@ -415,6 +436,8 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 				return i.evalQuote(list.elements[1:], operator.pos)
 			case "lambda":
 				return i.evalLambda(list.elements[1:], operator.pos, env)
+			case "case-lambda":
+				return i.evalCaseLambda(list.elements[1:], operator.pos, env)
 			case "define-record-type":
 				return i.evalDefineRecordType(list.elements[1:], operator.pos, env)
 			}
@@ -696,6 +719,35 @@ func (i *interpreter) evalLambda(args []expr, pos position, env *environment) (a
 		body:     args[1:],
 		env:      env,
 	}, nil
+}
+
+func (i *interpreter) evalCaseLambda(args []expr, pos position, env *environment) (any, error) {
+	if len(args) == 0 {
+		return nil, newEvalError(pos, "case-lambda expects at least 1 clause")
+	}
+
+	clauses := make([]*lambdaProcedure, 0, len(args))
+	for _, clauseExpr := range args {
+		clause, ok := clauseExpr.(*listExpr)
+		if !ok || len(clause.elements) < 2 {
+			return nil, newEvalError(clauseExpr.exprPos(), "case-lambda clauses must contain parameters and a body")
+		}
+
+		params, err := parseLambdaParameters(clause.elements[0])
+		if err != nil {
+			return nil, err
+		}
+
+		clauses = append(clauses, &lambdaProcedure{
+			params:   params.required,
+			restName: params.restName,
+			hasRest:  params.hasRest,
+			body:     clause.elements[1:],
+			env:      env,
+		})
+	}
+
+	return &caseLambdaProcedure{clauses: clauses}, nil
 }
 
 func (i *interpreter) evalDefineSyntax(args []expr, pos position, env *environment) (any, error) {
@@ -1477,6 +1529,13 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		_, ok := args[0].(symbolValue)
 		return ok, nil
 
+	case "procedure?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(callable)
+		return ok, nil
+
 	case "display":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
@@ -1906,6 +1965,9 @@ func eqValues(left, right any) bool {
 	case *lambdaProcedure:
 		r, ok := right.(*lambdaProcedure)
 		return ok && l == r
+	case *caseLambdaProcedure:
+		r, ok := right.(*caseLambdaProcedure)
+		return ok && l == r
 	default:
 		return false
 	}
@@ -1962,6 +2024,9 @@ func equalValues(left, right any) bool {
 		return ok && l == r
 	case *lambdaProcedure:
 		r, ok := right.(*lambdaProcedure)
+		return ok && l == r
+	case *caseLambdaProcedure:
+		r, ok := right.(*caseLambdaProcedure)
 		return ok && l == r
 	default:
 		return false
