@@ -204,6 +204,7 @@ public class Evaluator {
         builtins.put("display", new BuiltinProcedure("display", this::applyDisplay));
         builtins.put("write", new BuiltinProcedure("write", this::applyWrite));
         builtins.put("newline", new BuiltinProcedure("newline", this::applyNewline));
+        builtins.put("apply", new BuiltinProcedure("apply", this::applyApply));
         builtins.put("string-append", new BuiltinProcedure("string-append", Evaluator::applyStringAppend));
         builtins.put("string-length", new BuiltinProcedure("string-length", Evaluator::applyStringLength));
         builtins.put("substring", new BuiltinProcedure("substring", Evaluator::applySubstring));
@@ -255,13 +256,11 @@ public class Evaluator {
             throw new EvalError("define: expected function name");
         }
 
-        List<String> parameters = parseParameters(
-                signatureElements.subList(1, signatureElements.size()),
-                "define"
-        );
+        ParameterSpec parameters = parseParameters(signatureElements.subList(1, signatureElements.size()), "define");
         LambdaProcedure procedure = new LambdaProcedure(
                 nameSymbol.name(),
-                List.copyOf(parameters),
+                parameters.fixedParameters(),
+                parameters.restParameter(),
                 List.copyOf(body),
                 environment
         );
@@ -364,6 +363,7 @@ public class Evaluator {
         LambdaProcedure procedure = new LambdaProcedure(
                 name,
                 List.copyOf(parameters),
+                null,
                 List.copyOf(elements.subList(3, elements.size())),
                 letEnvironment
         );
@@ -382,13 +382,15 @@ public class Evaluator {
         if (elements.size() < 3) {
             throw new EvalError("lambda: expected parameters and body");
         }
-        if (!(elements.get(1) instanceof ListExpression parametersExpression)) {
-            throw new EvalError("lambda: expected parameter list");
-        }
-
-        List<String> parameters = parseParameters(parametersExpression.elements(), "lambda");
+        ParameterSpec parameters = parseParameters(elements.get(1), "lambda");
         List<SchemeExpression> body = List.copyOf(elements.subList(2, elements.size()));
-        return new LambdaProcedure(null, parameters, body, environment);
+        return new LambdaProcedure(
+                null,
+                parameters.fixedParameters(),
+                parameters.restParameter(),
+                body,
+                environment
+        );
     }
 
     private SchemeValue evalSequence(List<SchemeExpression> expressions, Environment environment) throws EvalError {
@@ -421,29 +423,65 @@ public class Evaluator {
     }
 
     private SchemeValue applyLambda(LambdaProcedure procedure, List<SchemeValue> arguments) throws EvalError {
-        if (arguments.size() != procedure.parameters().size()) {
-            throw new EvalError(procedure.render() + ": expected " + procedure.parameters().size()
-                    + " arguments");
+        int requiredCount = procedure.parameters().size();
+        if (procedure.restParameter() == null) {
+            if (arguments.size() != requiredCount) {
+                throw new EvalError(procedure.render() + ": expected " + requiredCount + " arguments");
+            }
+        } else if (arguments.size() < requiredCount) {
+            throw new EvalError(procedure.render() + ": expected at least " + requiredCount + " arguments");
         }
 
         Environment invocationEnvironment = new Environment(procedure.closureEnvironment());
-        for (int index = 0; index < procedure.parameters().size(); index++) {
+        for (int index = 0; index < requiredCount; index++) {
             invocationEnvironment.define(procedure.parameters().get(index), arguments.get(index));
+        }
+        if (procedure.restParameter() != null) {
+            invocationEnvironment.define(
+                    procedure.restParameter(),
+                    buildList(arguments.subList(requiredCount, arguments.size()))
+            );
         }
 
         return evalSequence(procedure.body(), invocationEnvironment);
     }
 
-    private List<String> parseParameters(List<SchemeExpression> parameterExpressions, String formName)
+    private ParameterSpec parseParameters(SchemeExpression parameterExpression, String formName)
+            throws EvalError {
+        if (parameterExpression instanceof SymbolExpression symbol) {
+            return new ParameterSpec(List.of(), symbol.name());
+        }
+        if (parameterExpression instanceof ListExpression listExpression) {
+            return parseParameters(listExpression.elements(), formName);
+        }
+        throw new EvalError(formName + ": expected parameter list");
+    }
+
+    private ParameterSpec parseParameters(List<SchemeExpression> parameterExpressions, String formName)
             throws EvalError {
         List<String> parameters = new ArrayList<>(parameterExpressions.size());
-        for (SchemeExpression parameterExpression : parameterExpressions) {
+        String restParameter = null;
+        for (int index = 0; index < parameterExpressions.size(); index++) {
+            SchemeExpression parameterExpression = parameterExpressions.get(index);
             if (!(parameterExpression instanceof SymbolExpression symbol)) {
                 throw new EvalError(formName + ": expected symbol parameter");
             }
-            parameters.add(symbol.name());
+            String name = symbol.name();
+            if (".".equals(name)) {
+                if (index != parameterExpressions.size() - 2 || restParameter != null) {
+                    throw new EvalError(formName + ": invalid dotted parameter list");
+                }
+
+                SchemeExpression restExpression = parameterExpressions.get(index + 1);
+                if (!(restExpression instanceof SymbolExpression restSymbol)) {
+                    throw new EvalError(formName + ": expected symbol parameter");
+                }
+                restParameter = restSymbol.name();
+                break;
+            }
+            parameters.add(name);
         }
-        return parameters;
+        return new ParameterSpec(List.copyOf(parameters), restParameter);
     }
 
     private List<Binding> parseBindings(List<SchemeExpression> bindingExpressions, String formName)
@@ -596,6 +634,19 @@ public class Evaluator {
         requireArgumentCount(arguments, 0, "newline");
         emit("\n");
         return VoidValue.INSTANCE;
+    }
+
+    private SchemeValue applyApply(List<SchemeValue> arguments) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("apply: expected at least 2 arguments");
+        }
+
+        List<SchemeValue> expandedArguments = new ArrayList<>(arguments.size());
+        for (int index = 1; index < arguments.size() - 1; index++) {
+            expandedArguments.add(arguments.get(index));
+        }
+        expandedArguments.addAll(requireProperList(arguments.getLast(), "apply"));
+        return applyProcedure(arguments.getFirst(), expandedArguments);
     }
 
     private static SchemeValue applyStringAppend(List<SchemeValue> arguments) throws EvalError {
@@ -789,6 +840,9 @@ public class Evaluator {
     }
 
     private record Binding(String name, SchemeExpression valueExpression) {
+    }
+
+    private record ParameterSpec(List<String> fixedParameters, String restParameter) {
     }
 
     @FunctionalInterface

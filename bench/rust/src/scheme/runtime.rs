@@ -48,6 +48,7 @@ struct BuiltinProc {
 #[derive(Clone)]
 struct LambdaProc {
     params: Vec<String>,
+    rest: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
 }
@@ -62,6 +63,11 @@ struct Pair {
 struct SchemeString {
     text: String,
     mutable: bool,
+}
+
+struct ParamSpec {
+    params: Vec<String>,
+    rest: Option<String>,
 }
 
 impl Evaluator {
@@ -128,6 +134,7 @@ impl Evaluator {
             ("string-ref", builtin_string_ref),
             ("string-copy", builtin_string_copy),
             ("string-set!", builtin_string_set),
+            ("apply", builtin_apply),
         ] {
             self.define_builtin(name, func);
         }
@@ -230,7 +237,8 @@ impl Evaluator {
                 })?;
                 let params = parse_param_list(&signature[1..])?;
                 let lambda = Value::Procedure(Procedure::Lambda(Rc::new(LambdaProc {
-                    params,
+                    params: params.params,
+                    rest: params.rest,
                     body: items[2..].to_vec(),
                     env: env.clone(),
                 })));
@@ -253,7 +261,8 @@ impl Evaluator {
         }
         let params = parse_params(&items[1])?;
         Ok(Value::Procedure(Procedure::Lambda(Rc::new(LambdaProc {
-            params,
+            params: params.params,
+            rest: params.rest,
             body: items[2..].to_vec(),
             env,
         }))))
@@ -279,6 +288,7 @@ impl Evaluator {
             let recursion_env = Env::new(Some(env));
             let lambda = Value::Procedure(Procedure::Lambda(Rc::new(LambdaProc {
                 params,
+                rest: None,
                 body: items[3..].to_vec(),
                 env: recursion_env.clone(),
             })));
@@ -372,7 +382,14 @@ impl Evaluator {
         match procedure {
             Value::Procedure(Procedure::Builtin(builtin)) => (builtin.func)(self, args, span),
             Value::Procedure(Procedure::Lambda(lambda)) => {
-                if args.len() != lambda.params.len() {
+                if args.len() < lambda.params.len() {
+                    let expected = match lambda.rest {
+                        Some(_) => format!("at least {}", lambda.params.len()),
+                        None => lambda.params.len().to_string(),
+                    };
+                    return Err(wrong_arg_count("lambda", &expected, args.len(), span));
+                }
+                if lambda.rest.is_none() && args.len() != lambda.params.len() {
                     return Err(wrong_arg_count(
                         "lambda",
                         &lambda.params.len().to_string(),
@@ -383,6 +400,13 @@ impl Evaluator {
                 let call_env = Env::new(Some(lambda.env.clone()));
                 for (name, value) in lambda.params.iter().zip(args.iter()) {
                     Env::define(&call_env, name.clone(), value.clone());
+                }
+                if let Some(rest_name) = &lambda.rest {
+                    Env::define(
+                        &call_env,
+                        rest_name.clone(),
+                        list_from_vec(args[lambda.params.len()..].to_vec()),
+                    );
                 }
                 self.eval_sequence(&lambda.body, call_env)
             }
@@ -556,22 +580,50 @@ fn symbol_name(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn parse_params(expr: &Expr) -> EvalResult<Vec<String>> {
-    let ExprKind::List(items) = &expr.kind else {
-        return Err(runtime_error("lambda parameters must be a list", expr.span));
-    };
-    parse_param_list(items)
+fn parse_params(expr: &Expr) -> EvalResult<ParamSpec> {
+    match &expr.kind {
+        ExprKind::List(items) => parse_param_list(items),
+        ExprKind::Symbol(name) => Ok(ParamSpec {
+            params: Vec::new(),
+            rest: Some(name.clone()),
+        }),
+        _ => Err(runtime_error(
+            "lambda parameters must be a list or symbol",
+            expr.span,
+        )),
+    }
 }
 
-fn parse_param_list(items: &[Expr]) -> EvalResult<Vec<String>> {
+fn parse_param_list(items: &[Expr]) -> EvalResult<ParamSpec> {
     let mut params = Vec::with_capacity(items.len());
-    for item in items {
+    let mut index = 0;
+    while index < items.len() {
+        let item = &items[index];
+        if symbol_name(item) == Some(".") {
+            if index + 2 != items.len() {
+                return Err(runtime_error(
+                    "invalid dotted parameter list",
+                    item.span,
+                ));
+            }
+            let Some(rest) = symbol_name(&items[index + 1]) else {
+                return Err(runtime_error(
+                    "parameter names must be symbols",
+                    items[index + 1].span,
+                ));
+            };
+            return Ok(ParamSpec {
+                params,
+                rest: Some(rest.to_string()),
+            });
+        }
         let Some(name) = symbol_name(item) else {
             return Err(runtime_error("parameter names must be symbols", item.span));
         };
         params.push(name.to_string());
+        index += 1;
     }
-    Ok(params)
+    Ok(ParamSpec { params, rest: None })
 }
 
 fn parse_bindings(expr: &Expr) -> EvalResult<Vec<(String, Expr)>> {
@@ -1007,4 +1059,17 @@ fn builtin_string_set(_: &mut Evaluator, args: &[Value], span: Span) -> EvalResu
     *slot = ch;
     string.text = chars.into_iter().collect();
     Ok(Value::Void)
+}
+
+fn builtin_apply(evaluator: &mut Evaluator, args: &[Value], span: Span) -> EvalResult<Value> {
+    let Some((procedure, rest)) = args.split_first() else {
+        return Err(wrong_arg_count("apply", "at least 2", 0, span));
+    };
+    let Some((final_list, prefix_args)) = rest.split_last() else {
+        return Err(wrong_arg_count("apply", "at least 2", 1, span));
+    };
+
+    let mut applied_args = prefix_args.to_vec();
+    applied_args.extend(list_to_vec(final_list, span, "apply")?);
+    evaluator.apply(procedure.clone(), &applied_args, span)
 }

@@ -227,6 +227,7 @@ record BuiltinProcedure(
 record LambdaProcedure(
         String name,
         List<String> parameters,
+        String restParameter,
         List<SchemeExpression> body,
         Environment closureEnvironment
 ) implements SchemeValue {
