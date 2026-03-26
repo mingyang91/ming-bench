@@ -66,6 +66,10 @@ enum Value {
         type_id: usize,
         field_name: String,
     },
+    CaseLambda {
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>)>,
+        env: Env,
+    },
 }
 
 static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -191,6 +195,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Record { type_name, .. } => write!(f, "#<record:{}>", type_name),
             Value::RecordConstructor { type_name, .. } => write!(f, "#<procedure>"),
@@ -649,6 +654,7 @@ fn is_builtin(name: &str) -> bool {
             | "exact?" | "inexact?" | "rational?" | "integer?"
             | "exact->inexact" | "inexact->exact"
             | "numerator" | "denominator"
+            | "procedure?"
     )
 }
 
@@ -688,6 +694,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         return Ok(expr_to_value(&elems[1]));
                     }
                     "lambda" => return eval_lambda(&elems[1..], env, p),
+                    "case-lambda" => return eval_case_lambda(&elems[1..], env, p),
                     "and" => return eval_and(&elems[1..], env),
                     "or" => return eval_or(&elems[1..], env),
                     "let" => return eval_let(&elems[1..], env, p),
@@ -807,6 +814,34 @@ fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                     "record accessor: wrong type at {}", call_pos
                 ))),
             }
+        }
+        Value::CaseLambda { clauses, env } => {
+            for (params, rest_param, body) in clauses {
+                let matches = if let Some(_) = rest_param {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let local_env = new_env(Some(env.clone()));
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        env_set(&local_env, p.clone(), a.clone());
+                    }
+                    if let Some(ref rest) = rest_param {
+                        let rest_list = vec_to_list(args[params.len()..].to_vec());
+                        env_set(&local_env, rest.clone(), rest_list);
+                    }
+                    let mut result = Value::Boolean(false);
+                    for expr in body {
+                        result = eval(expr, &local_env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "case-lambda: no matching clause for {} arguments at {}",
+                args.len(), call_pos
+            )))
         }
         _ => Err(EvalError::Type(format!(
             "not a procedure: {} at {}",
@@ -939,6 +974,42 @@ fn eval_lambda(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
         params,
         rest_param,
         body,
+        env: env.clone(),
+    })
+}
+
+fn eval_case_lambda(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Arity(format!(
+            "case-lambda requires at least one clause at {}", p
+        )));
+    }
+    let mut clauses = Vec::new();
+    for clause in args {
+        match clause {
+            Expr::List(elems, cp) => {
+                if elems.len() < 2 {
+                    return Err(EvalError::Type(format!(
+                        "case-lambda clause needs params and body at {}", cp
+                    )));
+                }
+                let (params, rest_param) = match &elems[0] {
+                    Expr::List(param_exprs, _) => parse_params(param_exprs, *cp)?,
+                    Expr::Symbol(s, _) => (vec![], Some(s.clone())),
+                    _ => return Err(EvalError::Type(format!(
+                        "case-lambda: expected parameter list at {}", cp
+                    ))),
+                };
+                let body = elems[1..].to_vec();
+                clauses.push((params, rest_param, body));
+            }
+            _ => return Err(EvalError::Type(format!(
+                "case-lambda: expected clause at {}", p
+            ))),
+        }
+    }
+    Ok(Value::CaseLambda {
+        clauses,
         env: env.clone(),
     })
 }
@@ -1300,7 +1371,7 @@ fn eval_define_record_type(args: &[Expr], env: &Env, p: Pos) -> Result<Value, Ev
 fn is_special_form(name: &str) -> bool {
     matches!(
         name,
-        "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "begin"
+        "define" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "begin"
             | "cond" | "string-set!" | "set!" | "define-syntax" | "define-record-type"
     )
 }
@@ -2250,6 +2321,19 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                 Value::Rational(_, d) => Ok(Value::Integer(*d)),
                 _ => Err(EvalError::Type(format!("denominator: expected rational at {}", p))),
             }
+        }
+        "procedure?" => {
+            ensure_args(op, args, 1, p)?;
+            let result = match &args[0] {
+                Value::Lambda { .. }
+                | Value::CaseLambda { .. }
+                | Value::RecordConstructor { .. }
+                | Value::RecordPredicate { .. }
+                | Value::RecordAccessor { .. } => true,
+                Value::Symbol(s) => is_builtin(s),
+                _ => false,
+            };
+            Ok(Value::Boolean(result))
         }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", op, p))),
     }
