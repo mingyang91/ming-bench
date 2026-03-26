@@ -155,6 +155,16 @@ func (e *environment) lookup(name string) (any, bool) {
 	return nil, false
 }
 
+func (e *environment) assign(name string, value any) bool {
+	for current := e; current != nil; current = current.parent {
+		if _, ok := current.values[name]; ok {
+			current.values[name] = value
+			return true
+		}
+	}
+	return false
+}
+
 type interpreter struct {
 	output strings.Builder
 	global *environment
@@ -258,6 +268,8 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 			return i.evalCond(list.elements[1:], operator.pos, env)
 		case "define":
 			return i.evalDefine(list.elements[1:], operator.pos, env)
+		case "set!":
+			return i.evalSet(list.elements[1:], operator.pos, env)
 		case "let":
 			return i.evalLet(list.elements[1:], operator.pos, env)
 		case "quote":
@@ -425,6 +437,28 @@ func (i *interpreter) evalDefine(args []expr, pos position, env *environment) (a
 	default:
 		return nil, newEvalError(args[0].exprPos(), "define requires a symbol or parameter list")
 	}
+}
+
+func (i *interpreter) evalSet(args []expr, pos position, env *environment) (any, error) {
+	if len(args) != 2 {
+		return nil, newEvalError(pos, "set! expects exactly 2 arguments")
+	}
+
+	name, ok := args[0].(*symbolExpr)
+	if !ok {
+		return nil, newEvalError(args[0].exprPos(), "set! requires a symbol name")
+	}
+
+	value, err := i.eval(args[1], env)
+	if err != nil {
+		return nil, err
+	}
+
+	if !env.assign(name.value, value) {
+		return nil, newEvalError(name.pos, "unbound variable: %s", name.value)
+	}
+
+	return voidValue{}, nil
 }
 
 func (i *interpreter) evalQuote(args []expr, pos position) (any, error) {
