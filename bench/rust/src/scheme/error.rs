@@ -61,6 +61,8 @@ pub enum EvalError {
     },
     #[error("circular list")]
     CyclicList,
+    #[error("internal continuation jump")]
+    InternalContinuationJump { id: usize },
 }
 
 impl EvalError {
