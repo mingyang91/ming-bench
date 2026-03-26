@@ -32,7 +32,7 @@ type SchemeVal =
   | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[]; pos?: Pos }
   | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos }
-  | { tag: 'continuation'; k: Cont; pos?: Pos };
+  | { tag: 'continuation'; k: Cont; windStack: WindEntry[]; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (after macro name)
@@ -957,6 +957,23 @@ function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
             env.set(nameElem.value, macro);
             return k(SCM_FALSE);
           }
+          case 'dynamic-wind': {
+            if (elems.length !== 4) throw errAt('dynamic-wind: expected 3 arguments', expr.pos);
+            return evalK(elems[1], env, (inThunk) =>
+              evalK(elems[2], env, (bodyThunk) =>
+                evalK(elems[3], env, (outThunk) =>
+                  bounce(() => applyK(inThunk, [], (ignored) => {
+                    const entry: WindEntry = { inThunk, outThunk };
+                    windStack.push(entry);
+                    return bounce(() => applyK(bodyThunk, [], (bodyVal) => {
+                      windStack.pop();
+                      return bounce(() => applyK(outThunk, [], (ignored2) => k(bodyVal)));
+                    }));
+                  }))
+                )
+              )
+            );
+          }
         }
         // Check for macro
         try {
@@ -994,7 +1011,9 @@ function evalListLeftK(exprs: SchemeVal[], env: Env, k: (vals: SchemeVal[]) => B
 function applyK(proc: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce {
   if (proc.tag === 'continuation') {
     if (args.length !== 1) throw errAt('continuation: expected 1 argument', pos);
-    return bounce(() => proc.k(args[0]));
+    const targetStack = proc.windStack;
+    const val = args[0];
+    return bounce(() => doWindSwitch(windStack, targetStack, () => proc.k(val)));
   }
 
   if (proc.tag === 'lambda') {
@@ -1046,7 +1065,7 @@ function applyK(proc: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce 
       case 'call/cc':
       case 'call-with-current-continuation': {
         if (args.length !== 1) throw errAt('call/cc: expected 1 argument', pos);
-        const contVal: SchemeVal = { tag: 'continuation', k };
+        const contVal: SchemeVal = { tag: 'continuation', k, windStack: [...windStack] };
         return bounce(() => applyK(args[0], [contVal], k, pos));
       }
       case 'apply': {
@@ -1867,6 +1886,49 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
 
 let outputBuffer: string[] = [];
 
+// ── Dynamic-wind stack ────────────────────────────────────────────────
+
+type WindEntry = { inThunk: SchemeVal; outThunk: SchemeVal };
+let windStack: WindEntry[] = [];
+
+// Find common prefix length between two wind stacks
+function windCommonPrefix(from: WindEntry[], to: WindEntry[]): number {
+  const len = Math.min(from.length, to.length);
+  for (let i = 0; i < len; i++) {
+    if (from[i] !== to[i]) return i;
+  }
+  return len;
+}
+
+// Switch from current wind stack to target, calling out/in thunks as needed
+function doWindSwitch(from: WindEntry[], to: WindEntry[], then: () => Bounce): Bounce {
+  const common = windCommonPrefix(from, to);
+
+  // Unwind: call out-thunks from innermost to common prefix
+  function unwind(i: number): Bounce {
+    if (i <= common) return rewind(common);
+    const entry = from[i - 1];
+    windStack = from.slice(0, i - 1);
+    return bounce(() => applyK(entry.outThunk, [], (ignored) => bounce(() => unwind(i - 1))));
+  }
+
+  // Rewind: call in-thunks from common prefix to target
+  function rewind(i: number): Bounce {
+    if (i >= to.length) {
+      windStack = [...to];
+      return bounce(then);
+    }
+    const entry = to[i];
+    windStack = to.slice(0, i);
+    return bounce(() => applyK(entry.inThunk, [], (ignored) => {
+      windStack = to.slice(0, i + 1);
+      return bounce(() => rewind(i + 1));
+    }));
+  }
+
+  return unwind(from.length);
+}
+
 // ── Display ────────────────────────────────────────────────────────────
 
 // write format: strings quoted
@@ -1949,6 +2011,7 @@ export function evalStr(input: string): string {
   const tokens = tokenize(input);
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  windStack = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
   return display(result);
@@ -1959,6 +2022,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
   outputBuffer = [];
+  windStack = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
   return { result: display(result), output: outputBuffer.join('') };
