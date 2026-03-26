@@ -55,6 +55,7 @@ type caseClosureExpr struct {
 type env struct {
 	parent   *env
 	bindings map[string]expr
+	budget   *stepBudget
 }
 
 type tokenKind int
@@ -85,6 +86,7 @@ type parser struct {
 
 type runtime struct {
 	output strings.Builder
+	budget *stepBudget
 }
 
 type evalStep struct {
@@ -166,11 +168,20 @@ func formPos(form expr) sourcePos {
 }
 
 func evalProgram(input string) (string, error) {
-	result, _, err := evalProgramWithOutput(input)
+	result, _, err := evalProgramInternal(input, nil)
 	return result, err
 }
 
 func evalProgramWithOutput(input string) (string, string, error) {
+	return evalProgramInternal(input, nil)
+}
+
+func evalProgramWithLimit(input string, maxSteps int) (string, error) {
+	result, _, err := evalProgramInternal(input, newStepBudget(maxSteps))
+	return result, err
+}
+
+func evalProgramInternal(input string, budget *stepBudget) (string, string, error) {
 	tokens, err := tokenize(input)
 	if err != nil {
 		return "", "", err
@@ -185,7 +196,7 @@ func evalProgramWithOutput(input string) (string, string, error) {
 		return "", "", errorAt(sourcePos{Line: 1, Col: 1}, "empty program")
 	}
 
-	rt := &runtime{}
+	rt := &runtime{budget: budget}
 	environment := newGlobalEnv(rt)
 	var result expr
 	if currentBenchLevel() >= 18 {
@@ -201,7 +212,12 @@ func evalProgramWithOutput(input string) (string, string, error) {
 }
 
 func newGlobalEnv(rt *runtime) *env {
-	root := &env{bindings: map[string]expr{}}
+	root := &env{
+		bindings: map[string]expr{},
+	}
+	if rt != nil {
+		root.budget = rt.budget
+	}
 
 	root.define("+", builtinProc{name: "+", fn: builtinAdd})
 	root.define("-", builtinProc{name: "-", fn: builtinSub})
@@ -713,6 +729,10 @@ func evalExpr(environment *env, form expr) (expr, error) {
 	currentForm := form
 
 	for {
+		if err := consumeStepBudget(currentEnv); err != nil {
+			return nil, err
+		}
+
 		step, err := evalExprStep(currentEnv, currentForm)
 		if err != nil {
 			return nil, err

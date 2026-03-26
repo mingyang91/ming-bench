@@ -185,6 +185,9 @@ func (m *level18Machine) returnValue(value expr, cont level18Cont) {
 func (m *level18Machine) run() (expr, error) {
 	for {
 		if m.evaluating {
+			if err := consumeStepBudget(m.env); err != nil {
+				return nil, err
+			}
 			if err := m.stepEval(); err != nil {
 				return nil, err
 			}
