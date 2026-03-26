@@ -117,6 +117,13 @@ object CekSteps:
         case _                 => List(v)
       Evaluator.cekApply(consumer, vals, pos, env, next)
 
+    case Kont.MacroTransformerResult(callEnv, defEnv, pos, next) =>
+      v match
+        case Value.VSyntax(expr, injections) =>
+          injections.foreach((key, v) => callEnv.define(key, v))
+          CekState.Eval(expr, callEnv, next)
+        case _ => throw errAt(pos, "macro transformer must return a syntax object")
+
     case k: Kont.AppHead => stepAppKont(v, k)
     case k: Kont.AppArg  => stepAppKont(v, k)
 
@@ -257,6 +264,10 @@ object CekSteps:
             val macroEnv = env.child()
             injections.foreach((key, v) => macroEnv.define(key, v))
             CekState.Eval(expanded, macroEnv, k)
+          case Some(Value.VMacroTransformer(proc, defEnv)) =>
+            val inputSyntax = Value.VSyntax(Expr.SList(head :: args, pos))
+            val afterK      = Kont.MacroTransformerResult(env, defEnv, pos, k)
+            Evaluator.cekApply(proc, List(inputSyntax), pos, defEnv, afterK)
           case _ =>
             CekState.Eval(head, env, Kont.AppHead(args, env, pos, k))
       case _ =>

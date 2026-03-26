@@ -25,13 +25,16 @@ object Display:
         last,
         seen
       ) + ")"
-    case Value.VPair(cell)         => displayPairChain(cell, seen)
-    case Value.VSymbol(n)          => n
-    case Value.VBuiltin(n)         => s"#<procedure $n>"
-    case Value.VLambda(_, _, _, _) => "#<procedure>"
-    case Value.VCaseLambda(_)      => "#<procedure>"
-    case Value.VContinuation(_, _) => "#<continuation>"
-    case Value.VMacro(_, _, _)     => "#<macro>"
+    case Value.VPair(cell)             => displayPairChain(cell, seen)
+    case Value.VSymbol(n)              => n
+    case Value.VBuiltin(n)             => s"#<procedure $n>"
+    case Value.VLambda(_, _, _, _)     => "#<procedure>"
+    case Value.VCaseLambda(_)          => "#<procedure>"
+    case Value.VContinuation(_, _)     => "#<continuation>"
+    case Value.VMacro(_, _, _)         => "#<macro>"
+    case Value.VMacroTransformer(_, _) => "#<macro>"
+    case Value.VSyntax(_, _)           => "#<syntax>"
+    case Value.VSyntaxList(_)          => "#<syntax-list>"
     case Value.VVector(elems) =>
       "#(" + elems.map(e => displaySafe(e, seen)).mkString(" ") + ")"
     case Value.VRecord(typeName, _) => s"#<record:$typeName>"

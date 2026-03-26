@@ -116,5 +116,7 @@ object BuiltinNames:
     "raise",
     "with-exception-handler",
     "values",
-    "call-with-values"
+    "call-with-values",
+    "syntax->datum",
+    "datum->syntax"
   )

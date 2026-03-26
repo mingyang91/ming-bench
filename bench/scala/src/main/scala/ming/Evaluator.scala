@@ -1,7 +1,7 @@
 package ming
 
 import Display.display
-import SchemeTypes.{errAt, pairToScalaList, Env, Pos, Value}
+import SchemeTypes.{errAt, Env, Pos, Value}
 import CekSteps.{bodyToCek, posOf}
 
 object Evaluator:
@@ -144,6 +144,19 @@ object Evaluator:
         exceptionHandlers = ExceptionHandler.Guard(variable, clauses, env, k, windStack) :: exceptionHandlers
         bodyToCek(body, env, Kont.PopHandler(k))
 
+      // ── syntax-case ──────────────────────────────────────────────
+      case Expr.SList(Expr.Symbol("syntax-case", _) :: stxExpr :: Expr.SList(lits, _) :: clauses, p) =>
+        CekState.ApplyK(SyntaxCaseSupport.evalSyntaxCase(stxExpr, lits, clauses, env, p, evalExpr), k)
+
+      // ── syntax (template) ────────────────────────────────────────
+      case Expr.SList(Expr.Symbol("syntax", _) :: tmpl :: Nil, p) =>
+        val (expanded, injections) = SyntaxCaseSupport.expandSyntaxTemplate(tmpl, env, p)
+        CekState.ApplyK(Value.VSyntax(expanded, injections), k)
+
+      // ── with-syntax ──────────────────────────────────────────────
+      case Expr.SList(Expr.Symbol("with-syntax", _) :: Expr.SList(bindings, _) :: body, p) =>
+        CekState.ApplyK(SyntaxCaseSupport.evalWithSyntax(bindings, body, env, evalExpr, evalBody), k)
+
       // ── Application ────────────────────────────────────────────────
       case Expr.SList(head :: args, p) =>
         CekSteps.stepApp(head, args, env, p, k)
@@ -155,95 +168,7 @@ object Evaluator:
     pos: Pos,
     env: Env,
     k: Kont
-  ): CekState = func match
-    case Value.VBuiltin("call/cc") | Value.VBuiltin("call-with-current-continuation") =>
-      if args.length != 1 then throw errAt(pos, "call/cc requires 1 argument")
-      val proc    = args.head
-      val contVal = Value.VContinuation(k, windStack)
-      cekApply(proc, List(contVal), pos, env, k)
-
-    case Value.VBuiltin("raise") =>
-      if args.length != 1 then throw errAt(pos, "raise requires 1 argument")
-      throw new SchemeRaise(args.head)
-
-    case Value.VBuiltin("with-exception-handler") =>
-      if args.length != 2 then throw errAt(pos, "with-exception-handler requires 2 arguments")
-      val handler = args(0)
-      val thunk   = args(1)
-      exceptionHandlers = ExceptionHandler.Proc(handler, env, windStack) :: exceptionHandlers
-      cekApply(thunk, Nil, pos, env, Kont.PopHandler(k))
-
-    case Value.VBuiltin("dynamic-wind") =>
-      if args.length != 3 then throw errAt(pos, "dynamic-wind requires 3 arguments")
-      val inThunk   = args(0)
-      val bodyThunk = args(1)
-      val outThunk  = args(2)
-      val entry     = new WindEntry(inThunk, outThunk)
-      val afterIn   = Kont.DynWindAfterIn(bodyThunk, entry, env, pos, k)
-      cekApply(inThunk, Nil, pos, env, afterIn)
-
-    case Value.VBuiltin("values") =>
-      args match
-        case single :: Nil => CekState.ApplyK(single, k)
-        case _             => CekState.ApplyK(Value.VValues(args), k)
-
-    case Value.VBuiltin("call-with-values") =>
-      if args.length != 2 then throw errAt(pos, "call-with-values requires 2 arguments")
-      val producer = args(0)
-      val consumer = args(1)
-      cekApply(producer, Nil, pos, env, Kont.CallWithValues(consumer, env, pos, k))
-
-    case Value.VBuiltin("apply") =>
-      if args.length < 2 then throw errAt(pos, "apply requires at least 2 arguments")
-      val innerFunc = args.head
-      val lastArg = args.last match
-        case Value.VList(elems) => elems
-        case Value.VPair(_)     => pairToScalaList(args.last, pos)
-        case _                  => throw errAt(pos, "apply: last argument must be a list")
-      val prefixArgs = args.slice(1, args.length - 1)
-      cekApply(innerFunc, prefixArgs ++ lastArg, pos, env, k)
-
-    case Value.VBuiltin(name) =>
-      try
-        val result = Builtins(name, args, pos, env)
-        CekState.ApplyK(result, k)
-      catch
-        case ci: ContinuationInvoke =>
-          CekState.ApplyK(ci.value, ci.kont)
-
-    case Value.VLambda(params, restParam, body, closure) =>
-      val callEnv = closure.child()
-      EvalTail.bindArgs(params, restParam, args, callEnv, pos)
-      bodyToCek(body, callEnv, k)
-
-    case Value.VCaseLambda(clauses) =>
-      val matched = clauses.find { case (params, restParam, _, _) =>
-        restParam match
-          case None    => args.length == params.length
-          case Some(_) => args.length >= params.length
-      }
-      matched match
-        case Some((params, restParam, body, closure)) =>
-          val callEnv = closure.child()
-          EvalTail.bindArgs(params, restParam, args, callEnv, pos)
-          bodyToCek(body, callEnv, k)
-        case None => throw errAt(pos, "wrong number of arguments")
-
-    case Value.VContinuation(savedK, savedWindStack) =>
-      if args.length != 1 then throw errAt(pos, "continuation requires 1 argument")
-      val common   = commonTail(windStack, savedWindStack)
-      val toUnwind = windStack.take(windStack.length - common.length)
-      val toRewind = savedWindStack.take(savedWindStack.length - common.length).reverse
-      val ops: List[(Boolean, WindEntry)] =
-        toUnwind.map(e => (false, e)) ++ toRewind.map(e => (true, e))
-      if ops.isEmpty then CekState.ApplyK(args.head, savedK)
-      else
-        CekState.ApplyK(
-          Value.VVoid,
-          Kont.DynWindTransition(ops, args.head, savedK, env, pos)
-        )
-
-    case _ => throw errAt(pos, "not a procedure")
+  ): CekState = CekApply(func, args, pos, env, k)
 
   // ── Backward-compatible recursive eval (for EvalCompound) ─────────
   private def evalExpr(expr: Expr, env: Env): Value =

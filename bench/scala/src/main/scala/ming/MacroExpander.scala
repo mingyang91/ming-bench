@@ -26,7 +26,8 @@ object MacroExpander:
     val id = gensymCounter.incrementAndGet()
     s"$base##$id"
 
-  private type Bindings = Map[String, Either[Expr, List[Expr]]]
+  type PublicBindings   = Map[String, Either[Expr, List[Expr]]]
+  private type Bindings = PublicBindings
 
   def expand(
     mac: Value.VMacro,
@@ -167,3 +168,11 @@ object MacroExpander:
         bindings,
         gsMap
       )
+
+  /** Match a syntax-case pattern against input elements. Public for SyntaxCaseSupport. */
+  def matchSyntaxCase(
+    patElems: List[Expr],
+    inputElems: List[Expr],
+    literals: List[String]
+  ): Option[PublicBindings] =
+    matchPatternList(patElems, inputElems, literals)

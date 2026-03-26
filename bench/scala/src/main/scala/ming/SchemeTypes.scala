@@ -44,6 +44,9 @@ object SchemeTypes:
     )
     case VContinuation(k: Kont, savedWindStack: List[WindEntry])
     case VValues(vals: List[Value])
+    case VSyntax(expr: Expr, injections: Map[String, Value] = Map.empty)
+    case VSyntaxList(exprs: List[Expr])
+    case VMacroTransformer(proc: Value, defEnv: Env)
     case VVoid
 
   type Pos = ming.Pos

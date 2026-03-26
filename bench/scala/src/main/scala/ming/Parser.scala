@@ -73,6 +73,9 @@ private[ming] object Parser:
     case Token("'", p) :: rest =>
       val (expr, remaining) = parseExpr(rest)
       (Expr.SList(List(Expr.Symbol("quote", p), expr), p), remaining)
+    case Token("#'", p) :: rest =>
+      val (expr, remaining) = parseExpr(rest)
+      (Expr.SList(List(Expr.Symbol("syntax", p), expr), p), remaining)
     case Token(")", _) :: _     => throw EvalError("unexpected )")
     case Token(text, p) :: rest => (parseAtom(text, p), rest)
 
@@ -156,6 +159,9 @@ private[ming] object Parser:
     else
       val next = input(start + 1)
       if next == 't' || next == 'f' then (input.substring(start, start + 2), start + 2)
+      else if next == '\'' then
+        // #'expr → (syntax expr)
+        (s"#'", start + 2)
       else if next == '\\' then
         // Character literal: #\<char> or #\space, #\newline, etc.
         if start + 2 >= input.length then (input.substring(start), input.length)

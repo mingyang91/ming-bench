@@ -56,10 +56,32 @@ object Builtins:
     case "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" | "string-ci=?" | "string-upcase" |
         "string-downcase" =>
       StringCharBuiltins.applyStringCompare(name, args, pos)
+    case "syntax->datum" =>
+      if args.length != 1 then throw errAt(pos, "syntax->datum requires 1 argument")
+      args.head match
+        case Value.VSyntax(expr, _) => EvalForms.quoteToValue(expr)
+        case _                      => throw errAt(pos, "syntax->datum: expected syntax object")
+    case "datum->syntax" =>
+      if args.length != 2 then throw errAt(pos, "datum->syntax requires 2 arguments")
+      val datum = args(1)
+      val expr  = valueToExpr(datum)
+      Value.VSyntax(expr)
     case s if s.startsWith("__record-") => Records.applyRecordOp(s, args, pos)
     case "call/cc" | "call-with-current-continuation" =>
       ApplyFunc(Value.VBuiltin(name), args, pos, env)
     case _ => throw errAt(pos, s"unknown builtin: $name")
+
+  private def valueToExpr(v: Value): Expr = v match
+    case Value.VNum(n)          => Expr.Num(n)
+    case Value.VFloat(d)        => Expr.Flt(d)
+    case Value.VRational(n, d)  => Expr.Rat(n, d)
+    case Value.VBool(b)         => Expr.Bool(b)
+    case Value.VStr(chars, _)   => Expr.Str(new String(chars))
+    case Value.VChar(c)         => Expr.Chr(c)
+    case Value.VSymbol(name)    => Expr.Symbol(name)
+    case Value.VList(elems)     => Expr.SList(elems.map(valueToExpr))
+    case Value.VSyntax(expr, _) => expr
+    case _                      => throw EvalError(s"datum->syntax: cannot convert value to syntax")
 
   private def applyListOps(
     name: String,

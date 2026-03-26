@@ -58,6 +58,13 @@ private[ming] object EvalForms:
         }
         env.define(name, Value.VMacro(literals, parsedRules, env))
         Value.VVoid
+      case Expr.Symbol(name, _) :: Expr.SList(
+            Expr.Symbol("lambda", _) :: lambdaRest,
+            lp
+          ) :: Nil =>
+        val proc = CekSteps.makeLambda(lambdaRest, env, lp)
+        env.define(name, Value.VMacroTransformer(proc, env))
+        Value.VVoid
       case _ => throw errAt(pos, "invalid define-syntax")
 
   def evalCaseLambda(
