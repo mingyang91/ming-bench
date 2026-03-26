@@ -44,7 +44,8 @@ case class SchemeBuiltin(name: String, fn: List[SchemeVal] => SchemeVal) extends
 case class SchemeSymbol(name: String) extends SchemeVal:
   def display: String = name
 
-case class SchemeLambda(params: List[String], body: List[Expr], closureEnv: Env) extends SchemeVal:
+case class SchemeLambda(params: List[String], restParam: Option[String], body: List[Expr], closureEnv: Env)
+    extends SchemeVal:
   def display: String = "#<procedure>"
 
 case class SchemeList(elems: List[SchemeVal]) extends SchemeVal:

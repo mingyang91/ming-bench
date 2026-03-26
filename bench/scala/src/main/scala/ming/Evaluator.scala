@@ -87,25 +87,34 @@ object Evaluator:
       if !isFalsy(result) then done = true
     result
 
-  private def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
+  private[ming] def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
     op match
       case SchemeBuiltin(_, fn) => fn(args)
-      case SchemeLambda(params, body, closureEnv) =>
-        if params.size != args.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
-        val localEnv          = new Env(mutable.Map.from(params.zip(args)), Some(closureEnv))
-        var result: SchemeVal = SchemeVoid
-        for expr <- body do result = eval(expr, localEnv)
-        result
+      case SchemeLambda(params, restParam, body, closureEnv) =>
+        restParam match
+          case None =>
+            if params.size != args.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
+            val localEnv          = new Env(mutable.Map.from(params.zip(args)), Some(closureEnv))
+            var result: SchemeVal = SchemeVoid
+            for expr <- body do result = eval(expr, localEnv)
+            result
+          case Some(rest) =>
+            if args.size < params.size then
+              throw new EvalError(s"expected at least ${params.size} arguments, got ${args.size}")
+            val (required, extra) = args.splitAt(params.size)
+            val bindings          = mutable.Map.from(params.zip(required))
+            bindings(rest) = SchemeList(extra)
+            val localEnv          = new Env(bindings, Some(closureEnv))
+            var result: SchemeVal = SchemeVoid
+            for expr <- body do result = eval(expr, localEnv)
+            result
       case _ => throw new EvalError(s"not a procedure: ${op.display}")
 
   private def evalDefine(args: List[Expr], env: Env): SchemeVal =
     args match
       case SList(Symbol(name, _) :: params, _) :: body =>
-        val paramNames = params.map {
-          case Symbol(n, _) => n
-          case other        => throw new EvalError("define: expected parameter name")
-        }
-        env.set(name, SchemeLambda(paramNames, body, env))
+        val (paramNames, rest) = parseParams(params)
+        env.set(name, SchemeLambda(paramNames, rest, body, env))
         SchemeVoid
       case Symbol(name, _) :: expr :: Nil =>
         env.set(name, eval(expr, env))
@@ -133,14 +142,32 @@ object Evaluator:
       case Symbol(name, _) => SchemeSymbol(name)
       case SList(elems, _) => SchemeList(elems.map(exprToVal))
 
+  private def parseParams(paramExprs: List[Expr]): (List[String], Option[String]) =
+    val dotIdx = paramExprs.indexWhere { case Symbol(".", _) => true; case _ => false }
+    if dotIdx < 0 then
+      val params = paramExprs.map {
+        case Symbol(n, _) => n
+        case _            => throw new EvalError("expected parameter name")
+      }
+      (params, None)
+    else
+      if dotIdx + 1 >= paramExprs.size then throw new EvalError("bad dot syntax")
+      val before = paramExprs.take(dotIdx).map {
+        case Symbol(n, _) => n
+        case _            => throw new EvalError("expected parameter name")
+      }
+      val rest = paramExprs(dotIdx + 1) match
+        case Symbol(n, _) => n
+        case _            => throw new EvalError("expected parameter name after dot")
+      (before, Some(rest))
+
   private def evalLambda(args: List[Expr], env: Env): SchemeVal =
     args match
+      case Symbol(name, _) :: body if body.nonEmpty =>
+        SchemeLambda(Nil, Some(name), body, env)
       case SList(paramExprs, _) :: body if body.nonEmpty =>
-        val params = paramExprs.map {
-          case Symbol(n, _) => n
-          case _            => throw new EvalError("lambda: expected parameter name")
-        }
-        SchemeLambda(params, body, env)
+        val (params, rest) = parseParams(paramExprs)
+        SchemeLambda(params, rest, body, env)
       case _ => throw new EvalError("lambda: bad syntax")
 
   private def evalBegin(exprs: List[Expr], env: Env): SchemeVal =
@@ -155,7 +182,7 @@ object Evaluator:
       case Symbol(name, _) :: SList(bindings, _) :: body if body.nonEmpty =>
         val parsed   = parseBindings(bindings, env)
         val localEnv = new Env(mutable.Map.empty, Some(env))
-        val lambda   = SchemeLambda(parsed.map(_._1), body, localEnv)
+        val lambda   = SchemeLambda(parsed.map(_._1), None, body, localEnv)
         localEnv.set(name, lambda)
         applyProc(lambda, parsed.map(_._2))
       case SList(bindings, _) :: body if body.nonEmpty =>

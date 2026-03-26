@@ -71,6 +71,25 @@ private[ming] object Builtins:
     installPredicates(env)
     installIO(env, output)
     StringBuiltins.install(env)
+    installApply(env)
+
+  private def installApply(env: Env): Unit =
+    env.set(
+      "apply",
+      SchemeBuiltin(
+        "apply",
+        args =>
+          if args.size < 2 then throw new EvalError("apply: expected at least 2 arguments")
+          val proc    = args.head
+          val lastArg = args.last
+          val lastList = lastArg match
+            case SchemeList(elems) => elems
+            case _                 => throw new EvalError("apply: last argument must be a list")
+          val prefixArgs = args.slice(1, args.size - 1)
+          val allArgs    = prefixArgs ++ lastList
+          Evaluator.applyProc(proc, allArgs)
+      )
+    )
 
   private def installList(env: Env): Unit =
     env.set(
