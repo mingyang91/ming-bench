@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use super::builtins::{apply_builtin, eqv_values};
 use super::error::EvalError;
-use super::macros::{env_with_expansion_aliases, expand_macro_call, parse_syntax_rules};
+use super::macros::{env_with_expansion_aliases, expand_macro_call, parse_macro_transformer};
 use super::model::{
     list_from_values, ContinuationProc, Env, EnvRef, Expr, Params, Procedure, ProcedureClause,
     ProcedureKind, SchemeString, Value,
@@ -598,7 +598,7 @@ fn eval_define(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value
 pub(super) fn eval_define_syntax(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol(name, _), transformer_expr] => {
-            let transformer = parse_syntax_rules(transformer_expr, env)?;
+            let transformer = parse_macro_transformer(transformer_expr, env)?;
             env.define_macro(name.clone(), transformer);
             Ok(Value::Void)
         }

@@ -45,6 +45,9 @@ impl<'a> Parser<'a> {
                 message: "unexpected ')'".into(),
             }
             .with_position(pos)),
+            Some('#') if self.input[self.pos..].starts_with("#'") => {
+                self.parse_syntax_shorthand(pos)
+            }
             Some('\'') => self.parse_quote_shorthand(pos),
             Some('"') => self.parse_string(pos),
             Some(_) => self.parse_atom(pos),
@@ -96,6 +99,16 @@ impl<'a> Parser<'a> {
         let quoted = self.parse_expr()?;
         Ok(Expr::List(
             vec![Expr::Symbol("quote".into(), pos), quoted],
+            pos,
+        ))
+    }
+
+    fn parse_syntax_shorthand(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
+        self.bump_char();
+        self.bump_char();
+        let template = self.parse_expr()?;
+        Ok(Expr::List(
+            vec![Expr::Symbol("syntax".into(), pos), template],
             pos,
         ))
     }

@@ -526,6 +526,7 @@ pub(super) type MacroRef = Rc<MacroTransformer>;
 
 pub(super) struct Env {
     parent: Option<EnvRef>,
+    transparent_definitions: bool,
     bindings: RefCell<HashMap<String, ValueCell>>,
     macro_bindings: RefCell<HashMap<String, MacroRef>>,
 }
@@ -534,12 +535,29 @@ impl Env {
     pub(super) fn new(parent: Option<EnvRef>) -> EnvRef {
         Rc::new(Self {
             parent,
+            transparent_definitions: false,
+            bindings: RefCell::new(HashMap::new()),
+            macro_bindings: RefCell::new(HashMap::new()),
+        })
+    }
+
+    pub(super) fn new_transparent(parent: Option<EnvRef>) -> EnvRef {
+        Rc::new(Self {
+            parent,
+            transparent_definitions: true,
             bindings: RefCell::new(HashMap::new()),
             macro_bindings: RefCell::new(HashMap::new()),
         })
     }
 
     pub(super) fn define(&self, name: String, value: Value) {
+        if self.transparent_definitions {
+            if let Some(parent) = &self.parent {
+                parent.define(name, value);
+                return;
+            }
+        }
+
         self.bindings
             .borrow_mut()
             .insert(name, Rc::new(RefCell::new(value)));
@@ -550,6 +568,13 @@ impl Env {
     }
 
     pub(super) fn define_macro(&self, name: String, transformer: MacroRef) {
+        if self.transparent_definitions {
+            if let Some(parent) = &self.parent {
+                parent.define_macro(name, transformer);
+                return;
+            }
+        }
+
         self.macro_bindings.borrow_mut().insert(name, transformer);
     }
 
@@ -695,10 +720,17 @@ impl Params {
 }
 
 #[derive(Clone)]
-pub(super) struct MacroTransformer {
-    pub(super) literals: HashSet<String>,
-    pub(super) rules: Vec<SyntaxRule>,
-    pub(super) env: EnvRef,
+pub(super) enum MacroTransformer {
+    SyntaxRules {
+        literals: HashSet<String>,
+        rules: Vec<SyntaxRule>,
+        env: EnvRef,
+    },
+    SyntaxCase {
+        literals: HashSet<String>,
+        clauses: Vec<SyntaxCaseClause>,
+        env: EnvRef,
+    },
 }
 
 #[derive(Clone)]
@@ -707,7 +739,14 @@ pub(super) struct SyntaxRule {
     pub(super) template: Expr,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+pub(super) struct SyntaxCaseClause {
+    pub(super) pattern: Expr,
+    pub(super) fender: Option<Expr>,
+    pub(super) result: Expr,
+}
+
+#[derive(Clone, Default)]
 pub(super) struct PatternBindings {
     single: HashMap<String, Expr>,
     repeated: HashMap<String, Vec<Expr>>,
@@ -742,6 +781,11 @@ impl PatternBindings {
 
     pub(super) fn seed_repeated(&mut self, name: &str) {
         self.repeated.entry(name.into()).or_default();
+    }
+
+    pub(super) fn insert_single(&mut self, name: String, expr: Expr) {
+        self.repeated.remove(&name);
+        self.single.insert(name, expr);
     }
 
     pub(super) fn substitute(

@@ -2,12 +2,36 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::error::{EvalError, SourcePos};
+use super::evaluator::{apply, quote_expr};
 use super::model::{
     expr_datum_eq, fresh_identifier, is_core_syntax, is_ellipsis, Env, EnvRef, ExpansionState,
-    Expr, MacroExpansion, MacroRef, MacroTransformer, PatternBindings, SyntaxRule,
+    Expr, MacroExpansion, MacroRef, MacroTransformer, PatternBindings, SchemeString,
+    SyntaxCaseClause, SyntaxRule, Value,
 };
 
-pub(super) fn parse_syntax_rules(expr: &Expr, env: &EnvRef) -> Result<MacroRef, EvalError> {
+pub(super) fn parse_macro_transformer(expr: &Expr, env: &EnvRef) -> Result<MacroRef, EvalError> {
+    let Expr::List(items, _) = expr else {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected syntax-rules or transformer lambda".into(),
+        });
+    };
+
+    let Some(Expr::Symbol(keyword, _)) = items.first() else {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected syntax-rules or transformer lambda".into(),
+        });
+    };
+
+    match keyword.as_str() {
+        "syntax-rules" => parse_syntax_rules(expr, env),
+        "lambda" => parse_syntax_case_transformer(expr, env),
+        _ => Err(EvalError::Syntax {
+            message: "define-syntax: expected syntax-rules or transformer lambda".into(),
+        }),
+    }
+}
+
+fn parse_syntax_rules(expr: &Expr, env: &EnvRef) -> Result<MacroRef, EvalError> {
     let Expr::List(items, _) = expr else {
         return Err(EvalError::Syntax {
             message: "define-syntax: expected syntax-rules form".into(),
@@ -33,19 +57,7 @@ pub(super) fn parse_syntax_rules(expr: &Expr, env: &EnvRef) -> Result<MacroRef, 
         });
     }
 
-    let mut literals = HashSet::new();
-    for literal in literal_exprs {
-        match literal {
-            Expr::Symbol(name, _) if name != "..." => {
-                literals.insert(name.clone());
-            }
-            _ => {
-                return Err(EvalError::Syntax {
-                    message: "syntax-rules: expected literal identifier".into(),
-                });
-            }
-        }
-    }
+    let literals = parse_literal_identifiers(literal_exprs, "syntax-rules")?;
 
     let mut parsed_rules = Vec::with_capacity(rules.len());
     for rule in rules {
@@ -68,11 +80,130 @@ pub(super) fn parse_syntax_rules(expr: &Expr, env: &EnvRef) -> Result<MacroRef, 
         }
     }
 
-    Ok(Rc::new(MacroTransformer {
+    Ok(Rc::new(MacroTransformer::SyntaxRules {
         literals,
         rules: parsed_rules,
         env: env.clone(),
     }))
+}
+
+fn parse_syntax_case_transformer(expr: &Expr, env: &EnvRef) -> Result<MacroRef, EvalError> {
+    let Expr::List(items, _) = expr else {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected transformer lambda".into(),
+        });
+    };
+
+    let [Expr::Symbol(keyword, _), params_expr, body_expr] = items.as_slice() else {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected transformer lambda".into(),
+        });
+    };
+
+    if keyword != "lambda" {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected transformer lambda".into(),
+        });
+    }
+
+    let Expr::List(params, _) = params_expr else {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected transformer parameter list".into(),
+        });
+    };
+
+    let [Expr::Symbol(input_name, _)] = params.as_slice() else {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected exactly one transformer parameter".into(),
+        });
+    };
+
+    let Expr::List(body_items, _) = body_expr else {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected syntax-case body".into(),
+        });
+    };
+
+    let [Expr::Symbol(body_keyword, _), Expr::Symbol(target_name, _), Expr::List(literal_exprs, _), clauses @ ..] =
+        body_items.as_slice()
+    else {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected syntax-case body".into(),
+        });
+    };
+
+    if body_keyword != "syntax-case" {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: expected syntax-case body".into(),
+        });
+    }
+
+    if target_name != input_name {
+        return Err(EvalError::Syntax {
+            message: "define-syntax: syntax-case must match the transformer parameter".into(),
+        });
+    }
+
+    if clauses.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "syntax-case: expected at least one clause".into(),
+        });
+    }
+
+    let literals = parse_literal_identifiers(literal_exprs, "syntax-case")?;
+    let mut parsed_clauses = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let Expr::List(parts, _) = clause else {
+            return Err(EvalError::Syntax {
+                message: "syntax-case: expected clause".into(),
+            });
+        };
+
+        match parts.as_slice() {
+            [pattern, result] => parsed_clauses.push(SyntaxCaseClause {
+                pattern: pattern.clone(),
+                fender: None,
+                result: result.clone(),
+            }),
+            [pattern, fender, result] => parsed_clauses.push(SyntaxCaseClause {
+                pattern: pattern.clone(),
+                fender: Some(fender.clone()),
+                result: result.clone(),
+            }),
+            _ => {
+                return Err(EvalError::Syntax {
+                    message: "syntax-case: expected (pattern result) or (pattern fender result)"
+                        .into(),
+                });
+            }
+        }
+    }
+
+    Ok(Rc::new(MacroTransformer::SyntaxCase {
+        literals,
+        clauses: parsed_clauses,
+        env: env.clone(),
+    }))
+}
+
+fn parse_literal_identifiers(
+    literal_exprs: &[Expr],
+    form_name: &str,
+) -> Result<HashSet<String>, EvalError> {
+    let mut literals = HashSet::new();
+    for literal in literal_exprs {
+        match literal {
+            Expr::Symbol(name, _) if name != "..." => {
+                literals.insert(name.clone());
+            }
+            _ => {
+                return Err(EvalError::Syntax {
+                    message: format!("{form_name}: expected literal identifier"),
+                });
+            }
+        }
+    }
+    Ok(literals)
 }
 
 pub(super) fn env_with_expansion_aliases(env: &EnvRef, expansion: &MacroExpansion) -> EnvRef {
@@ -80,7 +211,7 @@ pub(super) fn env_with_expansion_aliases(env: &EnvRef, expansion: &MacroExpansio
         return env.clone();
     }
 
-    let expanded_env = Env::new(Some(env.clone()));
+    let expanded_env = Env::new_transparent(Some(env.clone()));
     for (name, cell) in &expansion.value_aliases {
         expanded_env.define_alias(name.clone(), cell.clone());
     }
@@ -96,16 +227,36 @@ pub(super) fn expand_macro_call(
 ) -> Result<MacroExpansion, EvalError> {
     let call_expr = Expr::List(items.to_vec(), items[0].pos());
 
-    for rule in &transformer.rules {
+    match transformer.as_ref() {
+        MacroTransformer::SyntaxRules {
+            literals,
+            rules,
+            env,
+        } => expand_syntax_rules_call(&call_expr, literals, rules, env),
+        MacroTransformer::SyntaxCase {
+            literals,
+            clauses,
+            env,
+        } => expand_syntax_case_call(&call_expr, literals, clauses, env),
+    }
+}
+
+fn expand_syntax_rules_call(
+    call_expr: &Expr,
+    literals: &HashSet<String>,
+    rules: &[SyntaxRule],
+    env: &EnvRef,
+) -> Result<MacroExpansion, EvalError> {
+    for rule in rules {
         let mut bindings = PatternBindings::default();
-        if match_macro_rule(rule, &call_expr, &transformer.literals, &mut bindings)? {
-            let mut state = ExpansionState::new(bindings, &transformer.env);
-            let expr = expand_template_expr(&rule.template, &mut state, &HashMap::new(), None)?;
-            return Ok(MacroExpansion {
-                expr,
-                value_aliases: state.value_aliases,
-                macro_aliases: state.macro_aliases,
-            });
+        if match_call_pattern(
+            &rule.pattern,
+            call_expr,
+            literals,
+            &mut bindings,
+            "syntax-rules",
+        )? {
+            return expand_syntax_template(&rule.template, bindings, env);
         }
     }
 
@@ -114,15 +265,372 @@ pub(super) fn expand_macro_call(
     })
 }
 
-fn match_macro_rule(
-    rule: &SyntaxRule,
+fn expand_syntax_case_call(
+    call_expr: &Expr,
+    literals: &HashSet<String>,
+    clauses: &[SyntaxCaseClause],
+    env: &EnvRef,
+) -> Result<MacroExpansion, EvalError> {
+    for clause in clauses {
+        let mut bindings = PatternBindings::default();
+        if !match_call_pattern(
+            &clause.pattern,
+            call_expr,
+            literals,
+            &mut bindings,
+            "syntax-case",
+        )? {
+            continue;
+        }
+
+        if let Some(fender) = &clause.fender {
+            let fender_value = expect_transformer_datum(
+                "syntax-case fender",
+                eval_transformer_expr(fender, &bindings, env)?,
+            )?;
+            if !fender_value.is_truthy() {
+                continue;
+            }
+        }
+
+        return expect_transformer_syntax(
+            "syntax-case",
+            eval_transformer_expr(&clause.result, &bindings, env)?,
+        );
+    }
+
+    Err(EvalError::Syntax {
+        message: "syntax-case: no matching clause".into(),
+    })
+}
+
+enum TransformerValue {
+    Datum(Value),
+    Syntax(MacroExpansion),
+}
+
+fn eval_transformer_expr(
+    expr: &Expr,
+    bindings: &PatternBindings,
+    env: &EnvRef,
+) -> Result<TransformerValue, EvalError> {
+    match expr {
+        Expr::Number(value, _) => Ok(TransformerValue::Datum(Value::Number(*value))),
+        Expr::Boolean(value, _) => Ok(TransformerValue::Datum(Value::Boolean(*value))),
+        Expr::String(value, _) => Ok(TransformerValue::Datum(Value::String(
+            SchemeString::literal(value),
+        ))),
+        Expr::Char(value, _) => Ok(TransformerValue::Datum(Value::Char(*value))),
+        Expr::Symbol(name, pos) => {
+            if let Some(bound) = bindings.substitute(name, None)? {
+                return Ok(TransformerValue::Syntax(simple_macro_expansion(bound)));
+            }
+
+            env.lookup(name)
+                .map(TransformerValue::Datum)
+                .ok_or_else(|| {
+                    EvalError::UnboundVariable { name: name.clone() }.with_position(*pos)
+                })
+        }
+        Expr::List(items, pos) => {
+            let Some((head, tail)) = items.split_first() else {
+                return Err(EvalError::Syntax {
+                    message: "cannot evaluate empty list".into(),
+                }
+                .with_position(*pos));
+            };
+
+            if let Expr::Symbol(name, _) = head {
+                match name.as_str() {
+                    "quote" => {
+                        let [datum] = tail else {
+                            return Err(EvalError::Syntax {
+                                message: "quote: expected 1 datum".into(),
+                            }
+                            .with_position(*pos));
+                        };
+                        return Ok(TransformerValue::Datum(quote_expr(datum)));
+                    }
+                    "syntax" => {
+                        let [template] = tail else {
+                            return Err(EvalError::Syntax {
+                                message: "syntax: expected 1 template".into(),
+                            }
+                            .with_position(*pos));
+                        };
+                        return expand_syntax_template(template, bindings.clone(), env)
+                            .map(TransformerValue::Syntax);
+                    }
+                    "with-syntax" => {
+                        return eval_transformer_with_syntax(tail, bindings, env)
+                            .map_err(|error| error.with_position(*pos));
+                    }
+                    "syntax->datum" => {
+                        return eval_transformer_syntax_to_datum(tail, bindings, env)
+                            .map_err(|error| error.with_position(*pos));
+                    }
+                    "datum->syntax" => {
+                        return eval_transformer_datum_to_syntax(tail, bindings, env)
+                            .map_err(|error| error.with_position(*pos));
+                    }
+                    _ => {}
+                }
+            }
+
+            eval_transformer_application(items, bindings, env)
+                .map_err(|error| error.with_position(*pos))
+        }
+    }
+}
+
+fn eval_transformer_sequence(
+    exprs: &[Expr],
+    bindings: &PatternBindings,
+    env: &EnvRef,
+) -> Result<TransformerValue, EvalError> {
+    let mut result = TransformerValue::Datum(Value::Void);
+    for expr in exprs {
+        result = eval_transformer_expr(expr, bindings, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_transformer_with_syntax(
+    args: &[Expr],
+    bindings: &PatternBindings,
+    env: &EnvRef,
+) -> Result<TransformerValue, EvalError> {
+    let [Expr::List(binding_specs, _), body @ ..] = args else {
+        return Err(EvalError::Syntax {
+            message: "with-syntax: invalid syntax".into(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "with-syntax: expected body".into(),
+        });
+    }
+
+    let mut local_bindings = bindings.clone();
+    let mut value_aliases = Vec::new();
+    let mut macro_aliases = Vec::new();
+
+    for binding in binding_specs {
+        let Expr::List(parts, _) = binding else {
+            return Err(EvalError::Syntax {
+                message: "with-syntax: expected binding".into(),
+            });
+        };
+
+        let [Expr::Symbol(name, _), value_expr] = parts.as_slice() else {
+            return Err(EvalError::Syntax {
+                message: "with-syntax: expected (identifier expr) binding".into(),
+            });
+        };
+
+        let expansion = expect_transformer_syntax(
+            "with-syntax",
+            eval_transformer_expr(value_expr, &local_bindings, env)?,
+        )?;
+        local_bindings.insert_single(name.clone(), expansion.expr);
+        value_aliases.extend(expansion.value_aliases);
+        macro_aliases.extend(expansion.macro_aliases);
+    }
+
+    match eval_transformer_sequence(body, &local_bindings, env)? {
+        TransformerValue::Datum(value) => Ok(TransformerValue::Datum(value)),
+        TransformerValue::Syntax(mut expansion) => {
+            expansion.value_aliases.extend(value_aliases);
+            expansion.macro_aliases.extend(macro_aliases);
+            Ok(TransformerValue::Syntax(expansion))
+        }
+    }
+}
+
+fn eval_transformer_syntax_to_datum(
+    args: &[Expr],
+    bindings: &PatternBindings,
+    env: &EnvRef,
+) -> Result<TransformerValue, EvalError> {
+    let [value_expr] = args else {
+        return Err(EvalError::Syntax {
+            message: "syntax->datum: expected 1 argument".into(),
+        });
+    };
+
+    let expansion = expect_transformer_syntax(
+        "syntax->datum",
+        eval_transformer_expr(value_expr, bindings, env)?,
+    )?;
+    Ok(TransformerValue::Datum(quote_expr(&expansion.expr)))
+}
+
+fn eval_transformer_datum_to_syntax(
+    args: &[Expr],
+    bindings: &PatternBindings,
+    env: &EnvRef,
+) -> Result<TransformerValue, EvalError> {
+    let [context_expr, datum_expr] = args else {
+        return Err(EvalError::Syntax {
+            message: "datum->syntax: expected 2 arguments".into(),
+        });
+    };
+
+    let context = expect_transformer_syntax(
+        "datum->syntax",
+        eval_transformer_expr(context_expr, bindings, env)?,
+    )?;
+    let datum = expect_transformer_datum(
+        "datum->syntax",
+        eval_transformer_expr(datum_expr, bindings, env)?,
+    )?;
+
+    Ok(TransformerValue::Syntax(simple_macro_expansion(
+        value_to_datum_expr("datum->syntax", &datum, context.expr.pos())?,
+    )))
+}
+
+fn eval_transformer_application(
+    items: &[Expr],
+    bindings: &PatternBindings,
+    env: &EnvRef,
+) -> Result<TransformerValue, EvalError> {
+    let Some((head, tail)) = items.split_first() else {
+        return Err(EvalError::Syntax {
+            message: "cannot evaluate empty list".into(),
+        });
+    };
+
+    let callable = expect_transformer_datum(
+        "transformer application",
+        eval_transformer_expr(head, bindings, env)?,
+    )?;
+    let mut args = Vec::with_capacity(tail.len());
+    for expr in tail {
+        args.push(expect_transformer_datum(
+            "transformer application",
+            eval_transformer_expr(expr, bindings, env)?,
+        )?);
+    }
+
+    let mut output = String::new();
+    apply(callable, &args, &mut output).map(TransformerValue::Datum)
+}
+
+fn expect_transformer_datum(name: &str, value: TransformerValue) -> Result<Value, EvalError> {
+    match value {
+        TransformerValue::Datum(value) => Ok(value),
+        TransformerValue::Syntax(_) => Err(EvalError::TypeMismatch {
+            name: name.into(),
+            expected: "datum".into(),
+            got: "syntax object".into(),
+        }),
+    }
+}
+
+fn expect_transformer_syntax(
+    name: &str,
+    value: TransformerValue,
+) -> Result<MacroExpansion, EvalError> {
+    match value {
+        TransformerValue::Syntax(expansion) => Ok(expansion),
+        TransformerValue::Datum(value) => Err(EvalError::TypeMismatch {
+            name: name.into(),
+            expected: "syntax object".into(),
+            got: value.type_name().into(),
+        }),
+    }
+}
+
+fn expand_syntax_template(
+    template: &Expr,
+    bindings: PatternBindings,
+    definition_env: &EnvRef,
+) -> Result<MacroExpansion, EvalError> {
+    let mut state = ExpansionState::new(bindings, definition_env);
+    let expr = expand_template_expr(template, &mut state, &HashMap::new(), None)?;
+    Ok(MacroExpansion {
+        expr,
+        value_aliases: state.value_aliases,
+        macro_aliases: state.macro_aliases,
+    })
+}
+
+fn simple_macro_expansion(expr: Expr) -> MacroExpansion {
+    MacroExpansion {
+        expr,
+        value_aliases: Vec::new(),
+        macro_aliases: Vec::new(),
+    }
+}
+
+fn value_to_datum_expr(name: &str, value: &Value, pos: SourcePos) -> Result<Expr, EvalError> {
+    let mut seen_pairs = HashSet::new();
+    value_to_datum_expr_with_state(name, value, pos, &mut seen_pairs)
+}
+
+fn value_to_datum_expr_with_state(
+    name: &str,
+    value: &Value,
+    pos: SourcePos,
+    seen_pairs: &mut HashSet<usize>,
+) -> Result<Expr, EvalError> {
+    match value {
+        Value::Number(number) => Ok(Expr::Number(*number, pos)),
+        Value::Boolean(boolean) => Ok(Expr::Boolean(*boolean, pos)),
+        Value::String(string) => Ok(Expr::String(string.to_plain_string(), pos)),
+        Value::Symbol(symbol) => Ok(Expr::Symbol(symbol.clone(), pos)),
+        Value::Char(ch) => Ok(Expr::Char(*ch, pos)),
+        Value::EmptyList => Ok(Expr::List(Vec::new(), pos)),
+        Value::Pair(pair) => {
+            let mut items = Vec::new();
+            let mut current = Value::Pair(pair.clone());
+
+            loop {
+                match current {
+                    Value::EmptyList => return Ok(Expr::List(items, pos)),
+                    Value::Pair(pair) => {
+                        if !seen_pairs.insert(pair.id()) {
+                            return Err(EvalError::CircularList { name: name.into() });
+                        }
+
+                        items.push(value_to_datum_expr_with_state(
+                            name,
+                            &pair.car(),
+                            pos,
+                            seen_pairs,
+                        )?);
+                        current = pair.cdr();
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            name: name.into(),
+                            expected: "datum".into(),
+                            got: other.type_name().into(),
+                        });
+                    }
+                }
+            }
+        }
+        other => Err(EvalError::TypeMismatch {
+            name: name.into(),
+            expected: "datum".into(),
+            got: other.type_name().into(),
+        }),
+    }
+}
+
+fn match_call_pattern(
+    pattern: &Expr,
     call_expr: &Expr,
     literals: &HashSet<String>,
     bindings: &mut PatternBindings,
+    form_name: &str,
 ) -> Result<bool, EvalError> {
-    let Expr::List(pattern_items, _) = &rule.pattern else {
+    let Expr::List(pattern_items, _) = pattern else {
         return Err(EvalError::Syntax {
-            message: "syntax-rules: expected list pattern".into(),
+            message: format!("{form_name}: expected list pattern"),
         });
     };
     let Expr::List(call_items, _) = call_expr else {
@@ -131,7 +639,7 @@ fn match_macro_rule(
 
     if pattern_items.is_empty() {
         return Err(EvalError::Syntax {
-            message: "syntax-rules: expected macro name in pattern".into(),
+            message: format!("{form_name}: expected macro name in pattern"),
         });
     }
 
