@@ -14,6 +14,8 @@ public class Evaluator {
     private int currentCol = 1;
     StringBuilder outputBuffer = new StringBuilder();
     private int trampolineDepth = 0;
+    private int stepLimit = -1;
+    private int stepCount = 0;
 
     public Evaluator() {
         for (String name : new String[]{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -75,6 +77,20 @@ public class Evaluator {
         Cont haltK = val -> new BounceVal(val);
         Object result = trampoline(evalBody(exprs, globalEnv, haltK));
         return new EvalResult(schemeToString(result), outputBuffer.toString());
+    }
+
+    public String evalStrWithLimit(String input, int maxSteps) throws EvalError {
+        stepLimit = maxSteps;
+        stepCount = 0;
+        try {
+            List<Object> exprs = parse(input);
+            if (exprs.isEmpty()) return "";
+            Cont haltK = val -> new BounceVal(val);
+            Object result = trampoline(evalBody(exprs, globalEnv, haltK));
+            return schemeToString(result);
+        } finally {
+            stepLimit = -1;
+        }
     }
 
     EvalError posError(String msg) {
@@ -355,6 +371,9 @@ public class Evaluator {
             while (true) {
                 try {
                     if (bounce instanceof BounceStep s) {
+                        if (stepLimit >= 0 && ++stepCount > stepLimit) {
+                            throw new EvalError("step limit exceeded");
+                        }
                         bounce = evalStep(s.expr, s.env, s.k);
                     } else if (bounce instanceof BounceApplyK ak) {
                         bounce = ak.k.apply(ak.value);
