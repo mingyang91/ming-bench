@@ -108,7 +108,10 @@ fn env_set(env: &Env, name: String, val: Value) {
 fn global_env() -> Env {
     let env = new_env(None);
     // Register builtins
-    for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not", "and", "or"] {
+    for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+                   "cons", "car", "cdr", "list", "length",
+                   "null?", "boolean?", "number?", "string?", "pair?", "symbol?",
+                   "append"] {
         env_set(&env, name.to_string(), Value::Builtin(name.to_string()));
     }
     env
@@ -250,6 +253,9 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "lambda" => return eval_lambda(&list[1..], env),
                     "and" => return eval_and(&list[1..], env),
                     "or" => return eval_or(&list[1..], env),
+                    "let" => return eval_let(&list[1..], env),
+                    "begin" => return eval_begin(&list[1..], env),
+                    "cond" => return eval_cond(&list[1..], env),
                     _ => {}
                 }
             }
@@ -380,6 +386,104 @@ fn eval_or(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     Ok(result)
 }
 
+fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Runtime("let: expected bindings and body".into()));
+    }
+    // Named let: (let name ((var init) ...) body ...)
+    let (name, bindings_expr, body) = match &args[0] {
+        Expr::Symbol(name) => {
+            if args.len() < 3 {
+                return Err(EvalError::Runtime("let: expected bindings and body".into()));
+            }
+            let b = match &args[1] {
+                Expr::List(b) => b,
+                _ => return Err(EvalError::Runtime("let: expected bindings list".into())),
+            };
+            (Some(name.clone()), b.as_slice(), &args[2..])
+        }
+        Expr::List(b) => (None, b.as_slice(), &args[1..]),
+        _ => return Err(EvalError::Runtime("let: expected bindings list".into())),
+    };
+
+    let mut param_names = Vec::new();
+    let mut init_vals = Vec::new();
+    for binding in bindings_expr {
+        match binding {
+            Expr::List(pair) if pair.len() == 2 => {
+                let pname = match &pair[0] {
+                    Expr::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Runtime("let: expected symbol in binding".into())),
+                };
+                let val = eval(&pair[1], env)?;
+                param_names.push(pname);
+                init_vals.push(val);
+            }
+            _ => return Err(EvalError::Runtime("let: bad binding".into())),
+        }
+    }
+
+    let local = new_env(Some(env.clone()));
+
+    if let Some(loop_name) = name {
+        // Named let: bind a recursive procedure
+        let body_vec = body.to_vec();
+        let lambda = Value::Lambda {
+            params: param_names.clone(),
+            body: body_vec,
+            env: local.clone(),
+        };
+        env_set(&local, loop_name, lambda);
+    }
+
+    for (p, v) in param_names.iter().zip(init_vals.iter()) {
+        env_set(&local, p.clone(), v.clone());
+    }
+
+    let mut result = Value::Void;
+    for expr in body {
+        result = eval(expr, &local)?;
+    }
+    Ok(result)
+}
+
+fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut result = Value::Void;
+    for expr in args {
+        result = eval(expr, env)?;
+    }
+    Ok(result)
+}
+
+fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    for clause in clauses {
+        match clause {
+            Expr::List(parts) if !parts.is_empty() => {
+                // Check for else clause
+                if let Expr::Symbol(ref s) = parts[0] {
+                    if s == "else" {
+                        let mut result = Value::Void;
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                let test = eval(&parts[0], env)?;
+                if test.is_truthy() {
+                    let mut result = test;
+                    for expr in &parts[1..] {
+                        result = eval(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            _ => return Err(EvalError::Runtime("cond: bad clause".into())),
+        }
+    }
+    Ok(Value::Void)
+}
+
 fn apply_func(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     match func {
         Value::Lambda { params, body, env } => {
@@ -451,6 +555,129 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Runtime("not requires 1 argument".into()));
             }
             Ok(Value::Boolean(!args[0].is_truthy()))
+        }
+        "cons" => {
+            if args.len() != 2 {
+                return Err(EvalError::Runtime("cons requires 2 arguments".into()));
+            }
+            Ok(Value::Pair(Box::new(args[0].clone()), Box::new(args[1].clone())))
+        }
+        "car" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("car requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Pair(car, _) => Ok(*car.clone()),
+                _ => Err(EvalError::Runtime("car: not a pair".into())),
+            }
+        }
+        "cdr" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("cdr requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Pair(_, cdr) => Ok(*cdr.clone()),
+                _ => Err(EvalError::Runtime("cdr: not a pair".into())),
+            }
+        }
+        "list" => {
+            let mut result = Value::Nil;
+            for a in args.iter().rev() {
+                result = Value::Pair(Box::new(a.clone()), Box::new(result));
+            }
+            Ok(result)
+        }
+        "length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("length requires 1 argument".into()));
+            }
+            let mut count = 0i64;
+            let mut cur = &args[0];
+            loop {
+                match cur {
+                    Value::Nil => break,
+                    Value::Pair(_, cdr) => { count += 1; cur = cdr; }
+                    _ => return Err(EvalError::Runtime("length: not a proper list".into())),
+                }
+            }
+            Ok(Value::Integer(count))
+        }
+        "null?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("null? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(args[0], Value::Nil)))
+        }
+        "boolean?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("boolean? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(args[0], Value::Boolean(_))))
+        }
+        "number?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("number? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(args[0], Value::Integer(_))))
+        }
+        "string?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("string? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(args[0], Value::Str(_))))
+        }
+        "pair?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("pair? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(args[0], Value::Pair(_, _))))
+        }
+        "symbol?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Runtime("symbol? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(args[0], Value::Symbol(_))))
+        }
+        "append" => {
+            let mut result = Value::Nil;
+            // Process lists right to left
+            for a in args.iter().rev() {
+                match a {
+                    Value::Nil => {}
+                    Value::Pair(_, _) => {
+                        // Collect elements of this list
+                        let mut elems = Vec::new();
+                        let mut cur = a;
+                        loop {
+                            match cur {
+                                Value::Pair(car, cdr) => {
+                                    elems.push(car.as_ref().clone());
+                                    cur = cdr;
+                                }
+                                Value::Nil => break,
+                                _ => {
+                                    // improper list tail
+                                    if matches!(result, Value::Nil) {
+                                        result = cur.clone();
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        for e in elems.into_iter().rev() {
+                            result = Value::Pair(Box::new(e), Box::new(result));
+                        }
+                    }
+                    _ => {
+                        if matches!(result, Value::Nil) {
+                            result = a.clone();
+                        } else {
+                            return Err(EvalError::Runtime("append: not a list".into()));
+                        }
+                    }
+                }
+            }
+            Ok(result)
         }
         _ => Err(EvalError::Runtime(format!("unknown procedure: {}", name))),
     }
