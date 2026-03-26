@@ -23,6 +23,7 @@ public class Evaluator {
         @Override public String toString() { return "()"; }
     };
     record Lambda(List<String> params, String restParam, List<Object> body, Env closure) {}
+    record CaseLambda(List<Lambda> clauses) {}
     record SchemeChar(char value) {}
 
     // Exact rational number: always in reduced form, denominator > 0
@@ -110,11 +111,12 @@ public class Evaluator {
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
         "exact?", "inexact?", "exact->inexact", "inexact->exact",
-        "numerator", "denominator", "integer?", "rational?"
+        "numerator", "denominator", "integer?", "rational?",
+        "procedure?"
     };
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "define", "set!", "if", "quote", "lambda", "and", "or", "begin", "let", "cond", "define-syntax", "define-record-type"
+        "define", "set!", "if", "quote", "lambda", "case-lambda", "and", "or", "begin", "let", "cond", "define-syntax", "define-record-type"
     );
 
     record RecordType(String typeName, List<String> fields) {}
@@ -454,6 +456,40 @@ public class Evaluator {
                         }
                         return new Lambda(params, restParam, body, env);
                     }
+                    case "case-lambda" -> {
+                        List<Lambda> clauses = new ArrayList<>();
+                        for (int ci = 1; ci < list.size(); ci++) {
+                            Object clauseObj = list.get(ci);
+                            if (clauseObj instanceof Located lc) clauseObj = lc.expr();
+                            @SuppressWarnings("unchecked")
+                            List<Object> clause = (List<Object>) clauseObj;
+                            Object cParamSpec = clause.get(0);
+                            if (cParamSpec instanceof Located lp) cParamSpec = lp.expr();
+                            List<String> cParams = new ArrayList<>();
+                            String cRestParam = null;
+                            if (cParamSpec instanceof List<?> plist) {
+                                for (int pi = 0; pi < plist.size(); pi++) {
+                                    Object p = plist.get(pi);
+                                    if (p instanceof Located lpp) p = lpp.expr();
+                                    if (".".equals(p)) {
+                                        Object rp = plist.get(pi + 1);
+                                        if (rp instanceof Located lrp) rp = lrp.expr();
+                                        cRestParam = (String) rp;
+                                        break;
+                                    }
+                                    cParams.add((String) p);
+                                }
+                            } else if (cParamSpec instanceof String singleRest) {
+                                cRestParam = singleRest;
+                            }
+                            List<Object> cBody = new ArrayList<>();
+                            for (int i = 1; i < clause.size(); i++) {
+                                cBody.add(clause.get(i));
+                            }
+                            clauses.add(new Lambda(cParams, cRestParam, cBody, env));
+                        }
+                        return new CaseLambda(clauses);
+                    }
                     case "and" -> {
                         Object result = Boolean.TRUE;
                         for (int i = 1; i < list.size(); i++) {
@@ -675,6 +711,17 @@ public class Evaluator {
                 result = eval(bodyExpr, callEnv);
             }
             return result;
+        }
+        if (proc instanceof CaseLambda cl) {
+            for (Lambda clause : cl.clauses()) {
+                int nParams = clause.params().size();
+                if (clause.restParam() != null) {
+                    if (args.size() >= nParams) return apply(clause, args);
+                } else {
+                    if (args.size() == nParams) return apply(clause, args);
+                }
+            }
+            throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
         }
         if (proc instanceof Builtin b) {
             return applyBuiltin(b.name(), args);
@@ -1225,6 +1272,11 @@ public class Evaluator {
                 Object a = args.get(0);
                 yield (a instanceof Long || a instanceof Rational) ? Boolean.TRUE : Boolean.FALSE;
             }
+            case "procedure?" -> {
+                requireArgs(op, args, 1);
+                Object a = args.get(0);
+                yield (a instanceof Lambda || a instanceof CaseLambda || a instanceof Builtin) ? Boolean.TRUE : Boolean.FALSE;
+            }
             default -> {
                 // Check for record type operations
                 if (recordTypes.containsKey(op)) {
@@ -1542,6 +1594,7 @@ public class Evaluator {
         }
         if (val instanceof SchemeRecord sr) return "#<record:" + sr.typeName + ">";
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof SyntaxRules) return "#<macro>";
         return val.toString();
     }
