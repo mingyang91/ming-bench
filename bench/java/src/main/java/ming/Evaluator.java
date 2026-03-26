@@ -21,6 +21,7 @@ public class Evaluator {
     private List<DynamicWindFrame> dynamicWindStack;
     private ExceptionHandlerFrame exceptionHandlerStack;
     private StringBuilder outputBuffer;
+    private StepBudget stepBudget;
 
     @FunctionalInterface
     private interface ValueListHandler {
@@ -43,6 +44,13 @@ public class Evaluator {
      */
     public String evalStr(String input) throws EvalError {
         return evalProgram(input, false).result();
+    }
+
+    /**
+     * Evaluate Scheme expressions using a bounded number of eval dispatches.
+     */
+    public String evalStrWithLimit(String input, int maxSteps) throws EvalError {
+        return evalProgram(input, false, new StepBudget(maxSteps)).result();
     }
 
     /**
@@ -70,12 +78,19 @@ public class Evaluator {
     }
 
     private EvalResult evalProgram(String input, boolean captureOutput) throws EvalError {
+        return evalProgram(input, captureOutput, null);
+    }
+
+    private EvalResult evalProgram(String input, boolean captureOutput, StepBudget budget)
+            throws EvalError {
         List<Expr> expressions = new Parser(input).parseProgram();
         if (expressions.isEmpty()) {
             throw new EvalError("input did not contain any expressions");
         }
 
         StringBuilder previousOutput = outputBuffer;
+        StepBudget previousBudget = stepBudget;
+        stepBudget = budget;
         outputBuffer = captureOutput ? new StringBuilder() : null;
         try {
             Value result = run(evalSequence(expressions, globalEnv, DONE));
@@ -83,6 +98,7 @@ public class Evaluator {
             return new EvalResult(ValueRenderer.render(result), output);
         } finally {
             outputBuffer = previousOutput;
+            stepBudget = previousBudget;
         }
     }
 
@@ -101,9 +117,15 @@ public class Evaluator {
                 switch (currentStep) {
                     case EvalExprStep evalStep -> {
                         try {
-                            currentStep = evalExpr(evalStep.expr(), evalStep.env(), evalStep.kont());
+                            consumeEvalStep();
+                            currentStep = evalExpr(
+                                    evalStep.expr(),
+                                    evalStep.env(),
+                                    evalStep.kont());
                         } catch (EvalError error) {
-                            throw error.withPosition(evalStep.expr().line(), evalStep.expr().column());
+                            throw error.withPosition(
+                                    evalStep.expr().line(),
+                                    evalStep.expr().column());
                         }
                     }
                     case ReturnStep returnStep -> currentStep = returnStep.kont().apply(
@@ -133,6 +155,12 @@ public class Evaluator {
             } catch (RaisedException raised) {
                 currentStep = handleRaisedException(raised);
             }
+        }
+    }
+
+    private void consumeEvalStep() throws EvalError {
+        if (stepBudget != null) {
+            stepBudget.consumeEvalStep();
         }
     }
 
