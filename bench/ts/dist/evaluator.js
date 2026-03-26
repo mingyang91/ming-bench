@@ -392,6 +392,8 @@ function evaluateList(elements, env, context) {
                 return evaluateDefineSyntax(argExprs, env);
             case 'define':
                 return evaluateDefine(argExprs, env, context);
+            case 'define-record-type':
+                return evaluateDefineRecordType(argExprs, env);
             case 'set!':
                 return evaluateSet(argExprs, env, context);
             case 'if':
@@ -451,6 +453,96 @@ function evaluateDefine(argExprs, env, context) {
         return VOID_VALUE;
     }
     throw new EvalError('invalid define form');
+}
+function evaluateDefineRecordType(argExprs, env) {
+    if (argExprs.length < 3) {
+        throw new EvalError('define-record-type expects a type name, constructor, predicate, and field specs');
+    }
+    const [typeNameExpr, constructorExpr, predicateExpr, ...fieldExprs] = argExprs;
+    const typeName = expectSymbolExpr(typeNameExpr, 'define-record-type type name');
+    const predicateName = expectSymbolExpr(predicateExpr, 'define-record-type predicate name');
+    if (constructorExpr.kind !== 'list' || constructorExpr.elements.length === 0) {
+        throw new EvalError('define-record-type constructor spec must be a non-empty list');
+    }
+    const [constructorNameExpr, ...constructorFieldExprs] = constructorExpr.elements;
+    const constructorName = expectSymbolExpr(constructorNameExpr, 'define-record-type constructor name');
+    const fieldNames = [];
+    const fieldIndexes = new Map();
+    const accessors = [];
+    const mutators = [];
+    for (const fieldExpr of fieldExprs) {
+        if (fieldExpr.kind !== 'list' ||
+            fieldExpr.elements.length < 2 ||
+            fieldExpr.elements.length > 3) {
+            throw new EvalError('define-record-type field specs must be (field accessor) or (field accessor mutator)');
+        }
+        const fieldName = expectSymbolExpr(fieldExpr.elements[0], 'define-record-type field name');
+        if (fieldIndexes.has(fieldName)) {
+            throw new EvalError('define-record-type field names must be unique');
+        }
+        const fieldIndex = fieldNames.length;
+        fieldNames.push(fieldName);
+        fieldIndexes.set(fieldName, fieldIndex);
+        accessors.push({
+            name: expectSymbolExpr(fieldExpr.elements[1], 'define-record-type accessor name'),
+            fieldIndex,
+        });
+        if (fieldExpr.elements[2] !== undefined) {
+            mutators.push({
+                name: expectSymbolExpr(fieldExpr.elements[2], 'define-record-type mutator name'),
+                fieldIndex,
+            });
+        }
+    }
+    const constructorFieldIndexes = [];
+    const constructorFields = new Set();
+    for (const fieldExpr of constructorFieldExprs) {
+        const fieldName = expectSymbolExpr(fieldExpr, 'define-record-type constructor field');
+        const fieldIndex = fieldIndexes.get(fieldName);
+        if (fieldIndex === undefined) {
+            throw new EvalError(`define-record-type constructor field is not defined: ${fieldName}`);
+        }
+        if (constructorFields.has(fieldName)) {
+            throw new EvalError('define-record-type constructor fields must be unique');
+        }
+        constructorFields.add(fieldName);
+        constructorFieldIndexes.push(fieldIndex);
+    }
+    if (constructorFieldIndexes.length !== fieldNames.length) {
+        throw new EvalError('define-record-type constructor must initialize every field');
+    }
+    const recordType = {
+        name: typeName,
+        fieldNames,
+    };
+    env.define(constructorName, {
+        kind: 'record-constructor',
+        name: constructorName,
+        recordType,
+        fieldIndexes: constructorFieldIndexes,
+    });
+    env.define(predicateName, {
+        kind: 'record-predicate',
+        name: predicateName,
+        recordType,
+    });
+    for (const accessor of accessors) {
+        env.define(accessor.name, {
+            kind: 'record-accessor',
+            name: accessor.name,
+            recordType,
+            fieldIndex: accessor.fieldIndex,
+        });
+    }
+    for (const mutator of mutators) {
+        env.define(mutator.name, {
+            kind: 'record-mutator',
+            name: mutator.name,
+            recordType,
+            fieldIndex: mutator.fieldIndex,
+        });
+    }
+    return VOID_VALUE;
 }
 function evaluateSet(argExprs, env, context) {
     if (argExprs.length !== 2) {
@@ -1063,6 +1155,7 @@ function isQuoteForm(elements) {
 function isSpecialFormName(name) {
     switch (name) {
         case 'define':
+        case 'define-record-type':
         case 'define-syntax':
         case 'set!':
         case 'if':
@@ -1202,9 +1295,50 @@ function applyProcedure(procedure, args, context) {
             return applyBuiltin(procedure.name, args, context);
         case 'closure':
             return applyClosure(procedure, args, context);
+        case 'record-constructor':
+            return applyRecordConstructor(procedure, args);
+        case 'record-predicate':
+            return applyRecordPredicate(procedure, args);
+        case 'record-accessor':
+            return applyRecordAccessor(procedure, args);
+        case 'record-mutator':
+            return applyRecordMutator(procedure, args);
         default:
             throw new EvalError('attempted to call a non-procedure');
     }
+}
+function applyRecordConstructor(procedure, args) {
+    if (args.length !== procedure.fieldIndexes.length) {
+        throw new EvalError(`expected ${procedure.fieldIndexes.length} arguments, got ${args.length}`);
+    }
+    const fields = procedure.recordType.fieldNames.map(() => VOID_VALUE);
+    for (let index = 0; index < args.length; index += 1) {
+        fields[procedure.fieldIndexes[index]] = args[index];
+    }
+    return {
+        kind: 'record',
+        recordType: procedure.recordType,
+        fields,
+    };
+}
+function applyRecordPredicate(procedure, args) {
+    if (args.length !== 1) {
+        throw new EvalError(`${procedure.name} expects exactly 1 argument`);
+    }
+    return makeBoolean(args[0].kind === 'record' && args[0].recordType === procedure.recordType);
+}
+function applyRecordAccessor(procedure, args) {
+    if (args.length !== 1) {
+        throw new EvalError(`${procedure.name} expects exactly 1 argument`);
+    }
+    return expectRecord(args[0], procedure.name, procedure.recordType).fields[procedure.fieldIndex];
+}
+function applyRecordMutator(procedure, args) {
+    if (args.length !== 2) {
+        throw new EvalError(`${procedure.name} expects exactly 2 arguments`);
+    }
+    expectRecord(args[0], procedure.name, procedure.recordType).fields[procedure.fieldIndex] = args[1];
+    return VOID_VALUE;
 }
 function applyClosure(procedure, args, context) {
     if (procedure.restParam === undefined && args.length !== procedure.params.length) {
@@ -1710,6 +1844,18 @@ function expectPair(value, procedure) {
     }
     return value;
 }
+function expectRecord(value, procedure, recordType) {
+    if (value.kind !== 'record' || value.recordType !== recordType) {
+        throw new EvalError(`${procedure} expects a ${recordType.name} record`);
+    }
+    return value;
+}
+function expectSymbolExpr(expr, context) {
+    if (expr.kind !== 'symbol') {
+        throw new EvalError(`${context} must be a symbol`);
+    }
+    return expr.name;
+}
 function buildList(elements) {
     let list = NIL_VALUE;
     for (let index = elements.length - 1; index >= 0; index -= 1) {
@@ -1888,8 +2034,14 @@ function formatValueWithMode(value, mode) {
             return '()';
         case 'pair':
             return formatPair(value, mode);
+        case 'record':
+            return `#<record ${value.recordType.name}>`;
         case 'builtin':
         case 'closure':
+        case 'record-constructor':
+        case 'record-predicate':
+        case 'record-accessor':
+        case 'record-mutator':
             return '#<procedure>';
         case 'void':
             return '';
