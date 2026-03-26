@@ -65,6 +65,8 @@ pub enum EvalError {
     UncaughtException { value: String },
     #[error("internal continuation jump")]
     InternalContinuationJump { id: usize },
+    #[error("internal raised exception")]
+    InternalRaised { id: usize },
 }
 
 impl EvalError {

@@ -10,9 +10,12 @@ pub use error::EvalError;
 static NEXT_HYGIENE_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_RECORD_TYPE_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_CONTINUATION_JUMP_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_RAISED_EXCEPTION_ID: AtomicUsize = AtomicUsize::new(0);
 
 std::thread_local! {
     static CONTINUATION_JUMPS: RefCell<HashMap<usize, PendingContinuationJump>> =
+        RefCell::new(HashMap::new());
+    static RAISED_EXCEPTIONS: RefCell<HashMap<usize, PendingRaisedException>> =
         RefCell::new(HashMap::new());
     static DYNAMIC_WIND_STACK: RefCell<Vec<WindFrameRef>> = RefCell::new(Vec::new());
     static EXCEPTION_HANDLER_STACK: RefCell<Vec<SchemeExceptionHandler>> =
@@ -380,6 +383,11 @@ struct SchemeExceptionHandler {
 struct PendingContinuationJump {
     continuation: SchemeContinuation,
     value: Value,
+}
+
+struct PendingRaisedException {
+    value: Value,
+    pos: SourcePos,
 }
 
 struct StringCell {
@@ -1242,6 +1250,13 @@ struct CaseClosure {
     clauses: Vec<Rc<Closure>>,
 }
 
+struct DirectGuardFrame {
+    exception_var: String,
+    clauses: Rc<[Expr]>,
+    env: EnvRef,
+    pos: SourcePos,
+}
+
 #[derive(Clone)]
 struct ProcedureMacro {
     name: String,
@@ -1725,7 +1740,17 @@ fn eval_program(expressions: &[Expr], output: Rc<RefCell<String>>) -> Result<Val
     }
 
     let env = Env::new(output);
-    eval_sequence(expressions, &env)
+    match eval_sequence(expressions, &env) {
+        Err(EvalError::InternalRaised { id }) => {
+            let PendingRaisedException { value, pos } =
+                take_raised_exception(id).expect("raised exception payload should be available");
+            Err(EvalError::UncaughtException {
+                value: value.render(),
+            }
+            .with_offset(pos.offset))
+        }
+        other => other,
+    }
 }
 
 fn requires_cps_evaluator(expressions: &[Expr]) -> bool {
@@ -1740,8 +1765,6 @@ fn expr_mentions_continuations(expr: &Expr) -> bool {
                 "call/cc"
                     | "call-with-current-continuation"
                     | "dynamic-wind"
-                    | "guard"
-                    | "raise"
                     | "with-exception-handler"
             )
         }
@@ -2015,6 +2038,20 @@ fn queue_continuation_jump(continuation: SchemeContinuation, value: Value) -> Ev
 
 fn take_continuation_jump(id: usize) -> Option<PendingContinuationJump> {
     CONTINUATION_JUMPS.with(|jumps| jumps.borrow_mut().remove(&id))
+}
+
+fn queue_raised_exception(value: Value, pos: SourcePos) -> EvalError {
+    let id = NEXT_RAISED_EXCEPTION_ID.fetch_add(1, Ordering::Relaxed);
+    RAISED_EXCEPTIONS.with(|exceptions| {
+        exceptions
+            .borrow_mut()
+            .insert(id, PendingRaisedException { value, pos });
+    });
+    EvalError::InternalRaised { id }
+}
+
+fn take_raised_exception(id: usize) -> Option<PendingRaisedException> {
+    RAISED_EXCEPTIONS.with(|exceptions| exceptions.borrow_mut().remove(&id))
 }
 
 fn rc_exprs(expressions: Vec<Expr>) -> Rc<[Expr]> {
@@ -3352,15 +3389,7 @@ fn apply_value_cps(
             eval_sequence_cps(clause.body.clone(), 0, call_env, k)
         }
         Value::Continuation(continuation) => {
-            let [value] = argument_values.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    name: "procedure".into(),
-                    expected: "exactly 1".into(),
-                    got: argument_values.len(),
-                }
-                .with_offset(call_pos.offset));
-            };
-            Err(queue_continuation_jump(continuation, value.clone()))
+            Err(queue_continuation_jump(continuation, pack_values(argument_values)))
         }
         other => Err(EvalError::NotAProcedure {
             found: other.kind().into(),
@@ -3791,6 +3820,11 @@ enum TailTarget<'a> {
 enum TailControl<'a> {
     Return(Value),
     Continue { target: TailTarget<'a>, env: EnvRef },
+    PushGuard {
+        frame: DirectGuardFrame,
+        target: TailTarget<'static>,
+        env: EnvRef,
+    },
 }
 
 fn borrowed_expr_target<'a>(expr: &'a Expr) -> TailTarget<'a> {
@@ -3827,6 +3861,11 @@ fn into_owned_control(control: TailControl<'_>) -> TailControl<'static> {
             target: into_owned_target(target),
             env,
         },
+        TailControl::PushGuard { frame, target, env } => TailControl::PushGuard {
+            frame,
+            target,
+            env,
+        },
     }
 }
 
@@ -3838,34 +3877,63 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     eval_tail_target(TailTarget::Expr(expr), env)
 }
 
-fn eval_tail_target<'a>(mut target: TailTarget<'a>, env: &EnvRef) -> Result<Value, EvalError> {
+fn handle_direct_raise(
+    guard_frames: &mut Vec<DirectGuardFrame>,
+    id: usize,
+) -> Result<TailControl<'static>, EvalError> {
+    let Some(frame) = guard_frames.pop() else {
+        return Err(EvalError::InternalRaised { id });
+    };
+    let PendingRaisedException { value, .. } =
+        take_raised_exception(id).expect("raised exception payload should be available");
+
+    eval_guard_handler_control(frame, value)
+}
+
+fn eval_tail_target<'a>(target: TailTarget<'a>, env: &EnvRef) -> Result<Value, EvalError> {
+    let mut target = into_owned_target(target);
     let mut env = env.clone();
+    let mut guard_frames = Vec::new();
 
     loop {
         let control = match target {
-            TailTarget::Expr(expr) => {
-                eval_expr_control(expr, &env, borrowed_expr_target, borrowed_sequence_target)?
-            }
-            TailTarget::Sequence(expressions) => {
-                eval_sequence_control(expressions, &env, borrowed_expr_target)?
-            }
-            TailTarget::OwnedExpr(expr) => into_owned_control(eval_expr_control(
+            TailTarget::OwnedExpr(expr) => match eval_expr_control(
                 &expr,
                 &env,
                 owned_expr_target,
                 owned_sequence_target,
-            )?),
-            TailTarget::OwnedSequence(expressions) => {
-                eval_owned_sequence_control(expressions, &env)?
-            }
+            ) {
+                Ok(control) => into_owned_control(control),
+                Err(EvalError::InternalRaised { id }) => handle_direct_raise(&mut guard_frames, id)?,
+                Err(error) => return Err(error),
+            },
+            TailTarget::OwnedSequence(expressions) => match eval_owned_sequence_control(expressions, &env)
+            {
+                Ok(control) => control,
+                Err(EvalError::InternalRaised { id }) => handle_direct_raise(&mut guard_frames, id)?,
+                Err(error) => return Err(error),
+            },
+            TailTarget::Expr(_) | TailTarget::Sequence(_) => unreachable!(),
         };
 
         match control {
-            TailControl::Return(value) => return Ok(value),
+            TailControl::Return(value) => {
+                guard_frames.clear();
+                return Ok(value);
+            }
             TailControl::Continue {
                 target: next_target,
                 env: next_env,
             } => {
+                target = next_target;
+                env = next_env;
+            }
+            TailControl::PushGuard {
+                frame,
+                target: next_target,
+                env: next_env,
+            } => {
+                guard_frames.push(frame);
                 target = next_target;
                 env = next_env;
             }
@@ -4013,6 +4081,7 @@ where
                     env,
                 )?))
             }
+            "guard" => return eval_guard_control(operator.pos, arguments, env),
             "set!" => return Ok(TailControl::Return(eval_set(operator.pos, arguments, env)?)),
             "if" => return eval_if_control(operator.pos, arguments, env, make_expr_target),
             "quote" => return Ok(TailControl::Return(eval_quote(operator.pos, arguments)?)),
@@ -4113,19 +4182,10 @@ fn eval_tail_application<'a>(
                 env: call_env,
             })
         }
-        Value::Continuation(continuation) => {
-            let argument_values = eval_args(arguments, env)?;
-            let [value] = argument_values.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    name: "procedure".into(),
-                    expected: "exactly 1".into(),
-                    got: argument_values.len(),
-                }
-                .with_offset(call_pos.offset));
-            };
-
-            Err(queue_continuation_jump(continuation, value.clone()))
-        }
+        Value::Continuation(continuation) => Err(queue_continuation_jump(
+            continuation,
+            pack_values(eval_args(arguments, env)?),
+        )),
         other => Err(EvalError::NotAProcedure {
             found: other.kind().into(),
         }
@@ -4427,6 +4487,115 @@ where
     Ok(TailControl::Return(Value::Void))
 }
 
+fn eval_guard_control<'a>(
+    pos: SourcePos,
+    arguments: &[Expr],
+    env: &EnvRef,
+) -> Result<TailControl<'a>, EvalError> {
+    let Some((spec, body)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "guard".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(pos.offset));
+    };
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "guard".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(pos.offset));
+    }
+
+    let ExprKind::List(spec_items) = &spec.kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard: first argument must be (var clause ...)".into(),
+        }
+        .with_offset(spec.pos.offset));
+    };
+    let Some((var_expr, clauses)) = spec_items.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard: first argument must be (var clause ...)".into(),
+        }
+        .with_offset(spec.pos.offset));
+    };
+    let ExprKind::Symbol(var_name) = &var_expr.kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard: exception variable must be a symbol".into(),
+        }
+        .with_offset(var_expr.pos.offset));
+    };
+
+    Ok(TailControl::PushGuard {
+        frame: DirectGuardFrame {
+            exception_var: var_name.clone(),
+            clauses: rc_exprs(clauses.to_vec()),
+            env: env.clone(),
+            pos,
+        },
+        target: TailTarget::OwnedSequence(rc_exprs(body.to_vec())),
+        env: env.clone(),
+    })
+}
+
+fn eval_guard_handler_control<'a>(
+    frame: DirectGuardFrame,
+    exception: Value,
+) -> Result<TailControl<'a>, EvalError> {
+    let clause_env = Env::child(&frame.env);
+    clause_env.define(frame.exception_var, exception.clone());
+
+    for (index, clause) in frame.clauses.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "guard: clauses must be lists".into(),
+            }
+            .with_offset(clause.pos.offset));
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::InvalidSyntax {
+                message: "guard: clauses cannot be empty".into(),
+            }
+            .with_offset(clause.pos.offset));
+        };
+
+        if matches!(&test.kind, ExprKind::Symbol(name) if name == "else") {
+            if index + 1 != frame.clauses.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "guard: else clause must be last".into(),
+                }
+                .with_offset(test.pos.offset));
+            }
+
+            return if body.is_empty() {
+                Ok(TailControl::Return(Value::Void))
+            } else {
+                Ok(TailControl::Continue {
+                    target: TailTarget::OwnedSequence(rc_exprs(body.to_vec())),
+                    env: clause_env,
+                })
+            };
+        }
+
+        let value = eval_expr(test, &clause_env)?;
+        if value.is_truthy() {
+            return if body.is_empty() {
+                Ok(TailControl::Return(value))
+            } else {
+                Ok(TailControl::Continue {
+                    target: TailTarget::OwnedSequence(rc_exprs(body.to_vec())),
+                    env: clause_env,
+                })
+            };
+        }
+    }
+
+    Err(queue_raised_exception(exception, frame.pos))
+}
+
 fn apply_value(
     value: Value,
     arguments: &[Expr],
@@ -4440,19 +4609,10 @@ fn apply_value(
         }
         Value::Procedure(closure) => apply_closure(closure, arguments, env, call_pos),
         Value::CaseProcedure(closure) => apply_case_closure(closure, arguments, env, call_pos),
-        Value::Continuation(continuation) => {
-            let argument_values = eval_args(arguments, env)?;
-            let [value] = argument_values.as_slice() else {
-                return Err(EvalError::WrongArgCount {
-                    name: "procedure".into(),
-                    expected: "exactly 1".into(),
-                    got: argument_values.len(),
-                }
-                .with_offset(call_pos.offset));
-            };
-
-            Err(queue_continuation_jump(continuation, value.clone()))
-        }
+        Value::Continuation(continuation) => Err(queue_continuation_jump(
+            continuation,
+            pack_values(eval_args(arguments, env)?),
+        )),
         other => Err(EvalError::NotAProcedure {
             found: other.kind().into(),
         }
@@ -4786,10 +4946,7 @@ fn eval_builtin(
             message: "call/cc requires continuation-aware evaluation".into(),
         }
         .with_offset(call_pos.offset)),
-        Builtin::Raise => Err(EvalError::InvalidArgument {
-            message: "raise requires continuation-aware evaluation".into(),
-        }
-        .with_offset(call_pos.offset)),
+        Builtin::Raise => eval_raise(arguments, env, call_pos),
         Builtin::WithExceptionHandler => Err(EvalError::InvalidArgument {
             message: "with-exception-handler requires continuation-aware evaluation".into(),
         }
@@ -8177,6 +8334,20 @@ fn eval_newline(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result
 
     env.write_output("\n");
     Ok(Value::Void)
+}
+
+fn eval_raise(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [value_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "raise".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let value = eval_expr(value_expr, env)?;
+    Err(queue_raised_exception(value, call_pos))
 }
 
 fn eval_make_string(
