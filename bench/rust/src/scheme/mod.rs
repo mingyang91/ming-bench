@@ -24,6 +24,7 @@ enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
         env: EnvRef,
     },
@@ -417,13 +418,9 @@ fn eval_define(args: &[Expr], env: &EnvRef, p: Pos, out: &RefCell<String>) -> Re
                 ExprKind::Symbol(s) => s.clone(),
                 _ => return Err(EvalError::Type(format!("{p}: define: expected symbol as function name"))),
             };
-            let params: Result<Vec<String>, _> = sig[1..].iter().map(|e| match &e.kind {
-                ExprKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type(format!("{}: define: expected symbol as parameter", e.pos))),
-            }).collect();
-            let params = params?;
+            let (params, rest_param) = parse_params(&sig[1..], p)?;
             let body = args[1..].to_vec();
-            let lambda = Value::Lambda { params, body, env: env.clone() };
+            let lambda = Value::Lambda { params, rest_param, body, env: env.clone() };
             env_set(env, name, lambda);
             Ok(Value::Void)
         }
@@ -445,25 +442,44 @@ fn eval_if(args: &[Expr], env: &EnvRef, p: Pos, out: &RefCell<String>) -> Result
     }
 }
 
+fn parse_params(sig: &[Expr], p: Pos) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut rest_param = None;
+    let mut i = 0;
+    while i < sig.len() {
+        match &sig[i].kind {
+            ExprKind::Symbol(s) if s == "." => {
+                if i + 1 != sig.len() - 1 {
+                    return Err(EvalError::Parse(format!("{p}: malformed dot in parameter list")));
+                }
+                match &sig[i + 1].kind {
+                    ExprKind::Symbol(r) => rest_param = Some(r.clone()),
+                    _ => return Err(EvalError::Type(format!("{p}: expected symbol after dot"))),
+                }
+                break;
+            }
+            ExprKind::Symbol(s) => params.push(s.clone()),
+            _ => return Err(EvalError::Type(format!("{}: expected symbol in params", sig[i].pos))),
+        }
+        i += 1;
+    }
+    Ok((params, rest_param))
+}
+
 fn eval_lambda(args: &[Expr], env: &EnvRef, p: Pos) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("{p}: lambda requires params and body")));
     }
-    let params = match &args[0].kind {
-        ExprKind::List(items) => {
-            let mut params = Vec::new();
-            for item in items {
-                match &item.kind {
-                    ExprKind::Symbol(s) => params.push(s.clone()),
-                    _ => return Err(EvalError::Type(format!("{}: lambda: expected symbol in params", item.pos))),
-                }
-            }
-            params
+    let (params, rest_param) = match &args[0].kind {
+        ExprKind::List(items) => parse_params(items, p)?,
+        ExprKind::Symbol(s) => {
+            // (lambda rest body) — single rest param captures all args
+            (vec![], Some(s.clone()))
         }
         _ => return Err(EvalError::Type(format!("{}: lambda: expected parameter list", args[0].pos))),
     };
     let body = args[1..].to_vec();
-    Ok(Value::Lambda { params, body, env: env.clone() })
+    Ok(Value::Lambda { params, rest_param, body, env: env.clone() })
 }
 
 fn eval_let(args: &[Expr], env: &EnvRef, p: Pos, out: &RefCell<String>) -> Result<Value, EvalError> {
@@ -496,7 +512,7 @@ fn eval_let(args: &[Expr], env: &EnvRef, p: Pos, out: &RefCell<String>) -> Resul
         }
         let body = args[2..].to_vec();
         let local_env = new_env(Some(env.clone()));
-        let lambda = Value::Lambda { params: params.clone(), body, env: local_env.clone() };
+        let lambda = Value::Lambda { params: params.clone(), rest_param: None, body, env: local_env.clone() };
         env_set(&local_env, name.clone(), lambda);
         for (param, init) in params.iter().zip(inits.iter()) {
             env_set(&local_env, param.clone(), init.clone());
@@ -581,8 +597,14 @@ fn expr_to_value(expr: &Expr) -> Value {
 
 fn apply_func(func: &Value, args: &[Value], call_pos: Pos, out: &RefCell<String>) -> Result<Value, EvalError> {
     match func {
-        Value::Lambda { params, body, env } => {
-            if args.len() != params.len() {
+        Value::Lambda { params, rest_param, body, env } => {
+            if rest_param.is_some() {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "{call_pos}: expected at least {} args, got {}", params.len(), args.len()
+                    )));
+                }
+            } else if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
                     "{call_pos}: expected {} args, got {}", params.len(), args.len()
                 )));
@@ -590,6 +612,14 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos, out: &RefCell<String>
             let local_env = new_env(Some(env.clone()));
             for (param, arg) in params.iter().zip(args.iter()) {
                 env_set(&local_env, param.clone(), arg.clone());
+            }
+            if let Some(rest) = rest_param {
+                let rest_args = if args.len() > params.len() {
+                    args[params.len()..].to_vec()
+                } else {
+                    vec![]
+                };
+                env_set(&local_env, rest.clone(), Value::List(rest_args));
             }
             let mut result = Value::Void;
             for expr in body {
@@ -599,6 +629,113 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos, out: &RefCell<String>
         }
         Value::Symbol(s) => apply_builtin_by_name(s, args, call_pos, out),
         _ => Err(EvalError::Type(format!("{call_pos}: not a procedure: {}", func.display_scheme()))),
+    }
+}
+
+fn apply_string_builtin(name: &str, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
+    match name {
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                match a {
+                    Value::Str(s) => result.push_str(s),
+                    _ => return Err(EvalError::Type(format!("{call_pos}: string-append: expected string"))),
+                }
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string-length requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+                _ => Err(EvalError::Type(format!("{call_pos}: string-length: expected string"))),
+            }
+        }
+        "substring" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity(format!("{call_pos}: substring requires 3 arguments")));
+            }
+            match &args[0] {
+                Value::Str(s) => {
+                    let start = expect_int(&args[1], call_pos)? as usize;
+                    let end = expect_int(&args[2], call_pos)? as usize;
+                    if end > s.len() || start > end {
+                        return Err(EvalError::Type(format!("{call_pos}: substring: index out of range")));
+                    }
+                    Ok(Value::Str(s[start..end].to_string()))
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: substring: expected string"))),
+            }
+        }
+        "string->number" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string->number requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => match s.parse::<i64>() {
+                    Ok(n) => Ok(Value::Integer(n)),
+                    Err(_) => Ok(Value::Boolean(false)),
+                },
+                _ => Err(EvalError::Type(format!("{call_pos}: string->number: expected string"))),
+            }
+        }
+        "number->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: number->string requires 1 argument")));
+            }
+            Ok(Value::Str(expect_int(&args[0], call_pos)?.to_string()))
+        }
+        "symbol->string" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: symbol->string requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type(format!("{call_pos}: symbol->string: expected symbol"))),
+            }
+        }
+        "string->symbol" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string->symbol requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Symbol(s.clone())),
+                _ => Err(EvalError::Type(format!("{call_pos}: string->symbol: expected string"))),
+            }
+        }
+        "string-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: string-ref requires 2 arguments")));
+            }
+            match &args[0] {
+                Value::Str(s) => {
+                    let idx = expect_int(&args[1], call_pos)? as usize;
+                    if idx >= s.len() {
+                        return Err(EvalError::Type(format!("{call_pos}: string-ref: index out of range")));
+                    }
+                    Ok(Value::Char(s.as_bytes()[idx] as char))
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: string-ref: expected string"))),
+            }
+        }
+        "char?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: char? requires 1 argument")));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "string-copy" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: string-copy requires 1 argument")));
+            }
+            match &args[0] {
+                Value::Str(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type(format!("{call_pos}: string-copy: expected string"))),
+            }
+        }
+        _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
     }
 }
 
@@ -798,106 +935,23 @@ fn apply_builtin_by_name(name: &str, args: &[Value], call_pos: Pos, out: &RefCel
             out.borrow_mut().push('\n');
             Ok(Value::Void)
         }
-        "string-append" => {
-            let mut result = String::new();
-            for a in args {
-                match a {
-                    Value::Str(s) => result.push_str(s),
-                    _ => return Err(EvalError::Type(format!("{call_pos}: string-append: expected string"))),
-                }
+        "string-append" | "string-length" | "substring" | "string->number"
+        | "number->string" | "symbol->string" | "string->symbol" | "string-ref"
+        | "char?" | "string-copy" => apply_string_builtin(name, args, call_pos),
+        "apply" => {
+            // (apply proc arg1 ... args-list)
+            if args.len() < 2 {
+                return Err(EvalError::Arity(format!("{call_pos}: apply requires at least 2 arguments")));
             }
-            Ok(Value::Str(result))
-        }
-        "string-length" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string-length requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
-                _ => Err(EvalError::Type(format!("{call_pos}: string-length: expected string"))),
-            }
-        }
-        "substring" => {
-            if args.len() != 3 {
-                return Err(EvalError::Arity(format!("{call_pos}: substring requires 3 arguments")));
-            }
-            match &args[0] {
-                Value::Str(s) => {
-                    let start = expect_int(&args[1], call_pos)? as usize;
-                    let end = expect_int(&args[2], call_pos)? as usize;
-                    if end > s.len() || start > end {
-                        return Err(EvalError::Type(format!("{call_pos}: substring: index out of range")));
-                    }
-                    Ok(Value::Str(s[start..end].to_string()))
-                }
-                _ => Err(EvalError::Type(format!("{call_pos}: substring: expected string"))),
-            }
-        }
-        "string->number" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string->number requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Str(s) => match s.parse::<i64>() {
-                    Ok(n) => Ok(Value::Integer(n)),
-                    Err(_) => Ok(Value::Boolean(false)),
-                },
-                _ => Err(EvalError::Type(format!("{call_pos}: string->number: expected string"))),
-            }
-        }
-        "number->string" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: number->string requires 1 argument")));
-            }
-            Ok(Value::Str(expect_int(&args[0], call_pos)?.to_string()))
-        }
-        "symbol->string" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: symbol->string requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Symbol(s) => Ok(Value::Str(s.clone())),
-                _ => Err(EvalError::Type(format!("{call_pos}: symbol->string: expected symbol"))),
-            }
-        }
-        "string->symbol" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string->symbol requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Str(s) => Ok(Value::Symbol(s.clone())),
-                _ => Err(EvalError::Type(format!("{call_pos}: string->symbol: expected string"))),
-            }
-        }
-        "string-ref" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{call_pos}: string-ref requires 2 arguments")));
-            }
-            match &args[0] {
-                Value::Str(s) => {
-                    let idx = expect_int(&args[1], call_pos)? as usize;
-                    if idx >= s.len() {
-                        return Err(EvalError::Type(format!("{call_pos}: string-ref: index out of range")));
-                    }
-                    Ok(Value::Char(s.as_bytes()[idx] as char))
-                }
-                _ => Err(EvalError::Type(format!("{call_pos}: string-ref: expected string"))),
-            }
-        }
-        "char?" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: char? requires 1 argument")));
-            }
-            Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
-        }
-        "string-copy" => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!("{call_pos}: string-copy requires 1 argument")));
-            }
-            match &args[0] {
-                Value::Str(s) => Ok(Value::Str(s.clone())),
-                _ => Err(EvalError::Type(format!("{call_pos}: string-copy: expected string"))),
-            }
+            let func = &args[0];
+            let last = &args[args.len() - 1];
+            let tail = match last {
+                Value::List(items) => items.clone(),
+                _ => return Err(EvalError::Type(format!("{call_pos}: apply: last argument must be a list"))),
+            };
+            let mut final_args: Vec<Value> = args[1..args.len()-1].to_vec();
+            final_args.extend(tail);
+            apply_func(func, &final_args, call_pos, out)
         }
         _ => Err(EvalError::UnboundVariable(format!("{call_pos}: {name}"))),
     }
@@ -972,7 +1026,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
                   "string-append", "string-length", "substring",
                   "string->number", "number->string",
                   "symbol->string", "string->symbol",
-                  "string-ref", "char?", "string-copy"] {
+                  "string-ref", "char?", "string-copy", "apply"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     let out = RefCell::new(String::new());
@@ -998,7 +1052,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
                   "string-append", "string-length", "substring",
                   "string->number", "number->string",
                   "symbol->string", "string->symbol",
-                  "string-ref", "char?", "string-copy"] {
+                  "string-ref", "char?", "string-copy", "apply"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     let out = RefCell::new(String::new());
