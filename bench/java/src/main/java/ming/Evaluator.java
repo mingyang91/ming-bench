@@ -2197,7 +2197,15 @@ public class Evaluator {
 
     private Value applyProcedurePredicate(List<Value> arguments) throws EvalError {
         requireExactArity("procedure?", arguments.size(), 1);
-        return new BoolValue(arguments.getFirst() instanceof ProcedureValue);
+        return new BoolValue(isCallable(arguments.getFirst()));
+    }
+
+    private boolean isCallable(Value value) {
+        return value instanceof ProcedureValue
+                || value instanceof CallCcProcedureValue
+                || value instanceof RaiseProcedureValue
+                || value instanceof WithExceptionHandlerProcedureValue
+                || value instanceof ContinuationProcedureValue;
     }
 
     private Value applyEq(List<Value> arguments) throws EvalError {
