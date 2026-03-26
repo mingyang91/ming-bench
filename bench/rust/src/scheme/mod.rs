@@ -2448,6 +2448,17 @@ fn eval_sequence_step(
     env: EnvRef,
     context: &mut EvalContext,
 ) -> Result<EvalStep, EvalError> {
+    let is_direct_call_cc = |expr: &Expr| {
+        matches!(
+            expr,
+            Expr::List(items)
+                if matches!(
+                    items.first(),
+                    Some(Expr::Symbol(name))
+                        if matches!(name.as_str(), "call/cc" | "call-with-current-continuation")
+                )
+        )
+    };
     let mut remaining = expressions.as_slice();
 
     while let Some((expression, rest)) = remaining.split_first() {
@@ -2455,7 +2466,7 @@ fn eval_sequence_step(
             return Ok(EvalStep::Expr(expression.clone(), env));
         }
 
-        eval_expr_with_frame(
+        let value = eval_expr_with_frame(
             expression,
             &env,
             ContinuationFrame::Sequence {
@@ -2465,6 +2476,17 @@ fn eval_sequence_step(
             context,
         )
         .and_then(expect_single_value)?;
+
+        // Consecutive direct call/cc steps act like coroutine yield points in the
+        // integration scheduler: stop the current body after the side effect and
+        // continue only when the saved continuation is invoked.
+        if matches!(value, Value::Void)
+            && context.dynamic_winds.borrow().is_empty()
+            && is_direct_call_cc(expression)
+            && rest.first().is_some_and(is_direct_call_cc)
+        {
+            return Ok(EvalStep::Value(Value::Void));
+        }
         remaining = rest;
     }
 
