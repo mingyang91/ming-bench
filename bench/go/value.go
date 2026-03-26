@@ -23,6 +23,7 @@ type Value struct {
 	IntVal  int64
 	BoolVal bool
 	StrVal  string
+	Runes   []rune // mutable string storage (used by string-copy/string-set!)
 	Car     *Value
 	Cdr     *Value
 	// Lambda fields
@@ -37,6 +38,15 @@ var Nil = &Value{Type: TypeNil}
 func IntValue(n int64) *Value    { return &Value{Type: TypeInt, IntVal: n} }
 func BoolValue(b bool) *Value    { return &Value{Type: TypeBool, BoolVal: b} }
 func StringValue(s string) *Value { return &Value{Type: TypeString, StrVal: s} }
+func MutableStringValue(s string) *Value { return &Value{Type: TypeString, Runes: []rune(s)} }
+
+// StrContent returns the effective string content, preferring Runes if set.
+func (v *Value) StrContent() string {
+	if v.Runes != nil {
+		return string(v.Runes)
+	}
+	return v.StrVal
+}
 func SymbolValue(s string) *Value { return &Value{Type: TypeSymbol, StrVal: s} }
 func CharValue(r rune) *Value    { return &Value{Type: TypeChar, IntVal: int64(r)} }
 
@@ -50,7 +60,7 @@ func (v *Value) String() string {
 		}
 		return "#f"
 	case TypeString:
-		return fmt.Sprintf("%q", v.StrVal)
+		return fmt.Sprintf("%q", v.StrContent())
 	case TypeSymbol:
 		return v.StrVal
 	case TypeNil:
@@ -84,7 +94,7 @@ func pairInner(v *Value) string {
 func (v *Value) DisplayString() string {
 	switch v.Type {
 	case TypeString:
-		return v.StrVal
+		return v.StrContent()
 	case TypeChar:
 		return string(rune(v.IntVal))
 	case TypePair:

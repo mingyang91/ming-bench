@@ -16,6 +16,7 @@ const (
 	TokenBool
 	TokenSymbol
 	TokenQuote
+	TokenChar
 	TokenEOF
 )
 
@@ -121,6 +122,35 @@ func (t *Tokenizer) Tokenize() ([]Token, error) {
 				tokens = append(tokens, Token{Type: TokenBool, Val: "#t", Line: line, Col: col})
 			case 'f':
 				tokens = append(tokens, Token{Type: TokenBool, Val: "#f", Line: line, Col: col})
+			case '\\':
+				// Character literal #\x or #\space, #\newline, #\tab
+				if t.pos >= len(t.input) {
+					return nil, fmt.Errorf("%d:%d: unexpected end after #\\", line, col)
+				}
+				// Read the character name
+				var charName strings.Builder
+				charName.WriteRune(t.advance())
+				// If it starts with a letter, read the rest of the name
+				for t.pos < len(t.input) && isSymbolChar(t.peek()) {
+					charName.WriteRune(t.advance())
+				}
+				name := charName.String()
+				var charVal string
+				switch name {
+				case "space":
+					charVal = " "
+				case "newline":
+					charVal = "\n"
+				case "tab":
+					charVal = "\t"
+				default:
+					if len([]rune(name)) == 1 {
+						charVal = name
+					} else {
+						return nil, fmt.Errorf("%d:%d: unknown character name: %s", line, col, name)
+					}
+				}
+				tokens = append(tokens, Token{Type: TokenChar, Val: charVal, Line: line, Col: col})
 			default:
 				return nil, fmt.Errorf("%d:%d: unexpected character after #: %c", line, col, next)
 			}

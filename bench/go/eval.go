@@ -55,6 +55,8 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 		return BoolValue(expr.BoolVal), nil
 	case ExprString:
 		return StringValue(expr.StrVal), nil
+	case ExprChar:
+		return CharValue(rune(expr.IntVal)), nil
 	case ExprSymbol:
 		v, ok := env.Get(expr.StrVal)
 		if !ok {
@@ -224,6 +226,8 @@ func MakeDefaultEnv() *Env {
 		"string->symbol":  builtinStringToSymbol,
 		"string-ref":      builtinStringRef,
 		"char?":           builtinCharQ,
+		"string-copy":     builtinStringCopy,
+		"string-set!":     builtinStringSet,
 		// I/O builtins (dispatch is special-cased in evalList, but need env registration)
 		"display": nil,
 		"write":   nil,
@@ -721,7 +725,7 @@ func builtinStringAppend(args []*Value, expr *Expr) (*Value, error) {
 		if a.Type != TypeString {
 			return nil, fmt.Errorf("%d:%d: string-append: expected string", expr.Line, expr.Col)
 		}
-		sb.WriteString(a.StrVal)
+		sb.WriteString(a.StrContent())
 	}
 	return StringValue(sb.String()), nil
 }
@@ -730,14 +734,14 @@ func builtinStringLength(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 1 || args[0].Type != TypeString {
 		return nil, fmt.Errorf("%d:%d: string-length: expected 1 string argument", expr.Line, expr.Col)
 	}
-	return IntValue(int64(len([]rune(args[0].StrVal)))), nil
+	return IntValue(int64(len([]rune(args[0].StrContent())))), nil
 }
 
 func builtinSubstring(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInt || args[2].Type != TypeInt {
 		return nil, fmt.Errorf("%d:%d: substring: expected string, int, int", expr.Line, expr.Col)
 	}
-	runes := []rune(args[0].StrVal)
+	runes := []rune(args[0].StrContent())
 	start := int(args[1].IntVal)
 	end := int(args[2].IntVal)
 	if start < 0 || end < start || end > len(runes) {
@@ -750,7 +754,7 @@ func builtinStringToNumber(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 1 || args[0].Type != TypeString {
 		return nil, fmt.Errorf("%d:%d: string->number: expected 1 string argument", expr.Line, expr.Col)
 	}
-	n, err := strconv.ParseInt(args[0].StrVal, 10, 64)
+	n, err := strconv.ParseInt(args[0].StrContent(), 10, 64)
 	if err != nil {
 		return BoolValue(false), nil
 	}
@@ -768,21 +772,21 @@ func builtinSymbolToString(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 1 || args[0].Type != TypeSymbol {
 		return nil, fmt.Errorf("%d:%d: symbol->string: expected 1 symbol argument", expr.Line, expr.Col)
 	}
-	return StringValue(args[0].StrVal), nil
+	return StringValue(args[0].StrContent()), nil
 }
 
 func builtinStringToSymbol(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 1 || args[0].Type != TypeString {
 		return nil, fmt.Errorf("%d:%d: string->symbol: expected 1 string argument", expr.Line, expr.Col)
 	}
-	return SymbolValue(args[0].StrVal), nil
+	return SymbolValue(args[0].StrContent()), nil
 }
 
 func builtinStringRef(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeInt {
 		return nil, fmt.Errorf("%d:%d: string-ref: expected string and int", expr.Line, expr.Col)
 	}
-	runes := []rune(args[0].StrVal)
+	runes := []rune(args[0].StrContent())
 	idx := int(args[1].IntVal)
 	if idx < 0 || idx >= len(runes) {
 		return nil, fmt.Errorf("%d:%d: string-ref: index out of range", expr.Line, expr.Col)
@@ -795,6 +799,31 @@ func builtinCharQ(args []*Value, expr *Expr) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: char?: expected 1 argument", expr.Line, expr.Col)
 	}
 	return BoolValue(args[0].Type == TypeChar), nil
+}
+
+// L06 builtins
+
+func builtinStringCopy(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string-copy: expected 1 string argument", expr.Line, expr.Col)
+	}
+	return MutableStringValue(args[0].StrContent()), nil
+}
+
+func builtinStringSet(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInt || args[2].Type != TypeChar {
+		return nil, fmt.Errorf("%d:%d: string-set!: expected string, int, char", expr.Line, expr.Col)
+	}
+	s := args[0]
+	if s.Runes == nil {
+		return nil, fmt.Errorf("%d:%d: string-set!: string is immutable", expr.Line, expr.Col)
+	}
+	idx := int(args[1].IntVal)
+	if idx < 0 || idx >= len(s.Runes) {
+		return nil, fmt.Errorf("%d:%d: string-set!: index out of range", expr.Line, expr.Col)
+	}
+	s.Runes[idx] = rune(args[2].IntVal)
+	return Void, nil
 }
 
 func evalLambda(expr *Expr, env *Env) (*Value, error) {
