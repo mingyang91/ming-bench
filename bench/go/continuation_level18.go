@@ -39,6 +39,20 @@ type level18IfCont struct {
 	next         level18Cont
 }
 
+type level18AndCont struct {
+	env        *env
+	currentPos sourcePos
+	remaining  []expr
+	next       level18Cont
+}
+
+type level18OrCont struct {
+	env        *env
+	currentPos sourcePos
+	remaining  []expr
+	next       level18Cont
+}
+
 type level18CallOpCont struct {
 	env      *env
 	argForms []expr
@@ -204,6 +218,48 @@ func (m *level18Machine) run() (expr, error) {
 				continue
 			}
 			m.returnValue(voidExpr{}, cont.next)
+		case *level18AndCont:
+			value, err := expectSingleValue(m.value, "and")
+			if err != nil {
+				return nil, attachPos(err, cont.currentPos)
+			}
+			if !isTruthy(value) {
+				m.returnValue(value, cont.next)
+				continue
+			}
+			if len(cont.remaining) == 1 {
+				m.eval(cont.env, cont.remaining[0], cont.next)
+				continue
+			}
+
+			nextForm := cont.remaining[0]
+			m.eval(cont.env, nextForm, &level18AndCont{
+				env:        cont.env,
+				currentPos: formPos(nextForm),
+				remaining:  append([]expr(nil), cont.remaining[1:]...),
+				next:       cont.next,
+			})
+		case *level18OrCont:
+			value, err := expectSingleValue(m.value, "or")
+			if err != nil {
+				return nil, attachPos(err, cont.currentPos)
+			}
+			if isTruthy(value) {
+				m.returnValue(value, cont.next)
+				continue
+			}
+			if len(cont.remaining) == 1 {
+				m.eval(cont.env, cont.remaining[0], cont.next)
+				continue
+			}
+
+			nextForm := cont.remaining[0]
+			m.eval(cont.env, nextForm, &level18OrCont{
+				env:        cont.env,
+				currentPos: formPos(nextForm),
+				remaining:  append([]expr(nil), cont.remaining[1:]...),
+				next:       cont.next,
+			})
 		case *level18CallOpCont:
 			proc, err := expectSingleValue(m.value, "procedure application")
 			if err != nil {
@@ -359,6 +415,10 @@ func (m *level18Machine) stepList(items listExpr) error {
 		case "begin":
 			m.evalSequence(environment, items.items[1:], m.cont)
 			return nil
+		case "and":
+			return m.stepAnd(environment, items.items[1:])
+		case "or":
+			return m.stepOr(environment, items.items[1:])
 		case "cond":
 			expanded, err := level18ExpandCond(items.pos, items.items[1:])
 			if err != nil {
@@ -545,6 +605,44 @@ func (m *level18Machine) stepIf(environment *env, forms []expr, pos sourcePos) e
 
 	m.eval(environment, forms[0], cont)
 	return nil
+}
+
+func (m *level18Machine) stepAnd(environment *env, forms []expr) error {
+	switch len(forms) {
+	case 0:
+		m.returnValue(boolExpr(true), m.cont)
+		return nil
+	case 1:
+		m.eval(environment, forms[0], m.cont)
+		return nil
+	default:
+		m.eval(environment, forms[0], &level18AndCont{
+			env:        environment,
+			currentPos: formPos(forms[0]),
+			remaining:  append([]expr(nil), forms[1:]...),
+			next:       m.cont,
+		})
+		return nil
+	}
+}
+
+func (m *level18Machine) stepOr(environment *env, forms []expr) error {
+	switch len(forms) {
+	case 0:
+		m.returnValue(boolExpr(false), m.cont)
+		return nil
+	case 1:
+		m.eval(environment, forms[0], m.cont)
+		return nil
+	default:
+		m.eval(environment, forms[0], &level18OrCont{
+			env:        environment,
+			currentPos: formPos(forms[0]),
+			remaining:  append([]expr(nil), forms[1:]...),
+			next:       m.cont,
+		})
+		return nil
+	}
 }
 
 func (m *level18Machine) applyDynamicWind(args []expr, cont level18Cont) error {
