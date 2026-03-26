@@ -17,6 +17,78 @@ const builtins = new Map([
             return isFalse(args[0]);
         }),
     ],
+    [
+        'cons',
+        builtin('cons', (args) => {
+            expectArity('cons', args, 2);
+            return { kind: 'pair', car: args[0], cdr: args[1] };
+        }),
+    ],
+    [
+        'car',
+        builtin('car', (args) => {
+            expectArity('car', args, 1);
+            return expectPair(args[0], 'car').car;
+        }),
+    ],
+    [
+        'cdr',
+        builtin('cdr', (args) => {
+            expectArity('cdr', args, 1);
+            return expectPair(args[0], 'cdr').cdr;
+        }),
+    ],
+    [
+        'null?',
+        builtin('null?', (args) => {
+            expectArity('null?', args, 1);
+            return isEmptyList(args[0]);
+        }),
+    ],
+    ['list', builtin('list', (args) => listToPairs(args))],
+    [
+        'length',
+        builtin('length', (args) => {
+            expectArity('length', args, 1);
+            return listToArray(args[0], 'length').length;
+        }),
+    ],
+    ['append', builtin('append', (args) => appendLists(args))],
+    [
+        'string?',
+        builtin('string?', (args) => {
+            expectArity('string?', args, 1);
+            return typeof args[0] === 'string';
+        }),
+    ],
+    [
+        'number?',
+        builtin('number?', (args) => {
+            expectArity('number?', args, 1);
+            return typeof args[0] === 'number';
+        }),
+    ],
+    [
+        'boolean?',
+        builtin('boolean?', (args) => {
+            expectArity('boolean?', args, 1);
+            return typeof args[0] === 'boolean';
+        }),
+    ],
+    [
+        'pair?',
+        builtin('pair?', (args) => {
+            expectArity('pair?', args, 1);
+            return isPair(args[0]);
+        }),
+    ],
+    [
+        'symbol?',
+        builtin('symbol?', (args) => {
+            expectArity('symbol?', args, 1);
+            return isSymbolValue(args[0]);
+        }),
+    ],
 ]);
 export function evalStr(input) {
     const parser = new Parser(tokenize(input));
@@ -94,6 +166,12 @@ function evaluateList(elements, env) {
                 return evaluateQuote(argumentExprs);
             case 'lambda':
                 return evaluateLambda(argumentExprs, env);
+            case 'begin':
+                return evaluateBegin(argumentExprs, env);
+            case 'cond':
+                return evaluateCond(argumentExprs, env);
+            case 'let':
+                return evaluateLet(argumentExprs, env);
         }
     }
     const operator = evaluate(operatorExpr, env);
@@ -185,6 +263,64 @@ function evaluateLambda(expressions, env) {
         env,
     };
 }
+function evaluateBegin(expressions, env) {
+    return evaluateSequence(expressions, env);
+}
+function evaluateCond(clauses, env) {
+    for (let index = 0; index < clauses.length; index += 1) {
+        const clause = clauses[index];
+        if (clause.kind !== 'list' || clause.elements.length === 0) {
+            throw new EvalError('cond expected a non-empty clause');
+        }
+        const [testExpr, ...bodyExprs] = clause.elements;
+        const isElseClause = testExpr.kind === 'symbol' && testExpr.name === 'else';
+        if (isElseClause) {
+            if (index !== clauses.length - 1) {
+                throw new EvalError('cond else clause must be last');
+            }
+            return evaluateSequence(bodyExprs, env);
+        }
+        const testValue = evaluate(testExpr, env);
+        if (!isFalse(testValue)) {
+            if (bodyExprs.length === 0) {
+                return testValue;
+            }
+            return evaluateSequence(bodyExprs, env);
+        }
+    }
+    return VOID;
+}
+function evaluateLet(expressions, env) {
+    if (expressions.length < 2) {
+        throw new EvalError(`let expected at least 2 argument(s), got ${expressions.length}`);
+    }
+    if (expressions[0].kind === 'symbol') {
+        const [nameExpr, bindingsExpr, ...bodyExprs] = expressions;
+        if (bindingsExpr === undefined || bodyExprs.length === 0) {
+            throw new EvalError('let expected bindings and a body');
+        }
+        const bindings = parseBindings(bindingsExpr, 'let');
+        const values = bindings.map((binding) => evaluate(binding.valueExpr, env));
+        const letEnv = new Environment(env);
+        const closure = {
+            kind: 'closure',
+            name: nameExpr.name,
+            params: bindings.map((binding) => binding.name),
+            body: bodyExprs,
+            env: letEnv,
+        };
+        letEnv.define(nameExpr.name, closure);
+        return applyProcedure(closure, values);
+    }
+    const [bindingsExpr, ...bodyExprs] = expressions;
+    const bindings = parseBindings(bindingsExpr, 'let');
+    const values = bindings.map((binding) => evaluate(binding.valueExpr, env));
+    const letEnv = new Environment(env);
+    for (let index = 0; index < bindings.length; index += 1) {
+        letEnv.define(bindings[index].name, values[index]);
+    }
+    return evaluateSequence(bodyExprs, letEnv);
+}
 function applyProcedure(value, args) {
     if (isBuiltin(value)) {
         return value.apply(args);
@@ -199,11 +335,7 @@ function applyProcedure(value, args) {
     for (let index = 0; index < value.params.length; index += 1) {
         callEnv.define(value.params[index], args[index]);
     }
-    let result = VOID;
-    for (const expression of value.body) {
-        result = evaluate(expression, callEnv);
-    }
-    return result;
+    return evaluateSequence(value.body, callEnv);
 }
 function quoteExpr(expression) {
     switch (expression.kind) {
@@ -250,6 +382,11 @@ function tokenize(input) {
         }
         if (char === ')') {
             tokens.push({ kind: 'rparen' });
+            index += 1;
+            continue;
+        }
+        if (char === '\'') {
+            tokens.push({ kind: 'quote' });
             index += 1;
             continue;
         }
@@ -348,6 +485,14 @@ class Parser {
                 return { kind: 'string', value: token.value };
             case 'symbol':
                 return { kind: 'symbol', name: token.value };
+            case 'quote':
+                return {
+                    kind: 'list',
+                    elements: [
+                        { kind: 'symbol', name: 'quote' },
+                        this.parseExpr(),
+                    ],
+                };
             case 'lparen': {
                 const elements = [];
                 while (true) {
@@ -387,6 +532,9 @@ function isBuiltin(value) {
 function isClosure(value) {
     return typeof value === 'object' && value !== null && value.kind === 'closure';
 }
+function isSymbolValue(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'symbol';
+}
 function isPair(value) {
     return typeof value === 'object' && value !== null && value.kind === 'pair';
 }
@@ -409,11 +557,58 @@ function expectNumber(value, name) {
     }
     return value;
 }
+function expectPair(value, name) {
+    if (!isPair(value)) {
+        throw new EvalError(`${name} expected a pair`);
+    }
+    return value;
+}
 function expectSymbolExpr(expression, name) {
     if (expression.kind !== 'symbol') {
         throw new EvalError(`${name} expected a symbol`);
     }
     return expression.name;
+}
+function parseBindings(bindingsExpr, name) {
+    if (bindingsExpr.kind !== 'list') {
+        throw new EvalError(`${name} expected a bindings list`);
+    }
+    return bindingsExpr.elements.map((bindingExpr) => {
+        if (bindingExpr.kind !== 'list' || bindingExpr.elements.length !== 2) {
+            throw new EvalError(`${name} expected bindings of the form (name value)`);
+        }
+        const [nameExpr, valueExpr] = bindingExpr.elements;
+        return {
+            name: expectSymbolExpr(nameExpr, name),
+            valueExpr,
+        };
+    });
+}
+function evaluateSequence(expressions, env) {
+    let result = VOID;
+    for (const expression of expressions) {
+        result = evaluate(expression, env);
+    }
+    return result;
+}
+function listToArray(value, name) {
+    const elements = [];
+    let current = value;
+    while (isPair(current)) {
+        elements.push(current.car);
+        current = current.cdr;
+    }
+    if (!isEmptyList(current)) {
+        throw new EvalError(`${name} expected a list`);
+    }
+    return elements;
+}
+function appendLists(args) {
+    const elements = [];
+    for (const arg of args) {
+        elements.push(...listToArray(arg, 'append'));
+    }
+    return listToPairs(elements);
 }
 function sum(args, identity) {
     let total = identity;
@@ -493,7 +688,7 @@ function formatValue(value) {
     if (isEmptyList(value)) {
         return '()';
     }
-    if (typeof value === 'object' && value !== null && value.kind === 'symbol') {
+    if (isSymbolValue(value)) {
         return value.name;
     }
     if (typeof value === 'object' && value !== null && value.kind === 'void') {
