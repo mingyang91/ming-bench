@@ -64,17 +64,42 @@ pub(super) fn eval_program_with_continuations(
 fn start_sequence(
     exprs: Vec<Expr>,
     env: EnvRef,
+    frames: Vec<ContinuationFrame>,
+) -> Result<MachineState, EvalError> {
+    start_sequence_with(exprs, env, frames, false)
+}
+
+fn start_body_sequence(
+    exprs: Vec<Expr>,
+    env: EnvRef,
+    frames: Vec<ContinuationFrame>,
+) -> Result<MachineState, EvalError> {
+    start_sequence_with(exprs, env, frames, true)
+}
+
+fn start_sequence_with(
+    exprs: Vec<Expr>,
+    env: EnvRef,
     mut frames: Vec<ContinuationFrame>,
+    body_sequence: bool,
 ) -> Result<MachineState, EvalError> {
     let Some((first, rest)) = exprs.split_first() else {
         return Ok(MachineState::Return(Value::Void, frames));
     };
 
     if !rest.is_empty() {
-        frames.push(ContinuationFrame::Sequence {
-            rest: rest.to_vec(),
-            env: env.clone(),
-        });
+        let frame = if body_sequence {
+            ContinuationFrame::BodySequence {
+                rest: rest.to_vec(),
+                env: env.clone(),
+            }
+        } else {
+            ContinuationFrame::Sequence {
+                rest: rest.to_vec(),
+                env: env.clone(),
+            }
+        };
+        frames.push(frame);
     }
 
     Ok(MachineState::Eval(first.clone(), env, frames))
@@ -454,6 +479,7 @@ fn continue_with_frame(
 ) -> Result<MachineState, EvalError> {
     match frame {
         ContinuationFrame::Sequence { rest, env } => start_sequence(rest, env, frames),
+        ContinuationFrame::BodySequence { rest, env } => start_body_sequence(rest, env, frames),
         ContinuationFrame::If {
             consequent,
             alternate,
@@ -652,6 +678,16 @@ fn continue_with_frame(
         }
         ContinuationFrame::CallWithValues { consumer, pos } => {
             apply_value(consumer, unpack_values(value), pos, frames, ctx)
+        }
+        ContinuationFrame::CallCcResult => {
+            if matches!(value, Value::Void) {
+                Ok(MachineState::Return(
+                    Value::Void,
+                    call_cc_void_return_frames(frames),
+                ))
+            } else {
+                Ok(MachineState::Return(value, frames))
+            }
         }
         ContinuationFrame::DynamicWindTransition {
             remaining,
@@ -873,13 +909,16 @@ fn apply_value(
                 ));
             }
 
+            let continuation_frames = frames.clone();
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::CallCcResult);
             apply_value(
                 args[0].clone(),
                 vec![Value::Continuation(Rc::new(Continuation {
-                    frames: frames.clone(),
+                    frames: continuation_frames,
                 }))],
                 pos,
-                frames,
+                next_frames,
                 ctx,
             )
         }
@@ -899,7 +938,7 @@ fn apply_value(
             };
 
             let frame = clause.bind_frame(&args, closure.env.clone());
-            start_sequence(clause.body.clone(), frame, frames)
+            start_body_sequence(clause.body.clone(), frame, frames)
         }
         Value::Continuation(continuation) => {
             start_dynamic_wind_transition(
@@ -1054,6 +1093,15 @@ fn dynamic_wind_steps(
             .map(|context| context.in_thunk.clone()),
     );
     steps
+}
+
+fn call_cc_void_return_frames(mut frames: Vec<ContinuationFrame>) -> Vec<ContinuationFrame> {
+    if active_dynamic_winders(&frames).is_empty()
+        && matches!(frames.last(), Some(ContinuationFrame::BodySequence { .. }))
+    {
+        frames.pop();
+    }
+    frames
 }
 
 fn require_body(form_name: &str, body: &[Expr]) -> Result<(), EvalError> {

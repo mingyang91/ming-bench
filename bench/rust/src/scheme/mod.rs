@@ -225,6 +225,10 @@ enum ContinuationFrame {
         rest: Vec<Expr>,
         env: EnvRef,
     },
+    BodySequence {
+        rest: Vec<Expr>,
+        env: EnvRef,
+    },
     If {
         consequent: Expr,
         alternate: Option<Expr>,
@@ -296,6 +300,7 @@ enum ContinuationFrame {
         consumer: Value,
         pos: Option<SourcePos>,
     },
+    CallCcResult,
     DynamicWindTransition {
         remaining: Vec<Value>,
         final_value: Value,
