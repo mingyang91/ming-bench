@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 	"unicode"
@@ -71,6 +72,10 @@ func Eval(expr *Expr, env *Env) (*Value, error) {
 		return StringValue(expr.StrVal), nil
 	case ExprChar:
 		return CharValue(rune(expr.IntVal)), nil
+	case ExprRational:
+		return RationalValue(expr.Num, expr.Denom), nil
+	case ExprFloat:
+		return FloatValue(expr.FloatVal), nil
 	case ExprSymbol:
 		v, ok := env.Get(expr.StrVal)
 		if !ok {
@@ -316,6 +321,15 @@ func MakeDefaultEnv() *Env {
 		"write":   nil,
 		"newline": nil,
 		"apply":   nil,
+		// L11 builtins
+		"exact?":           builtinExactQ,
+		"inexact?":         builtinInexactQ,
+		"exact->inexact":   builtinExactToInexact,
+		"inexact->exact":   builtinInexactToExact,
+		"numerator":        builtinNumerator,
+		"denominator":      builtinDenominator,
+		"integer?":         builtinIntegerQ,
+		"rational?":        builtinRationalQ,
 	}
 
 	for name, fn := range builtins {
@@ -374,100 +388,199 @@ func requireInts(args []*Value, expr *Expr, name string) error {
 	return nil
 }
 
+func requireNums(args []*Value, expr *Expr, name string) error {
+	for _, a := range args {
+		if !a.IsNumeric() {
+			return fmt.Errorf("%d:%d: %s: expected number, got %s", expr.Line, expr.Col, name, a.String())
+		}
+	}
+	return nil
+}
+
+func anyInexact(args []*Value) bool {
+	for _, a := range args {
+		if a.Type == TypeFloat {
+			return true
+		}
+	}
+	return false
+}
+
+func addRat(an, ad, bn, bd int64) *Value {
+	num := an*bd + bn*ad
+	denom := ad * bd
+	return RationalValue(num, denom)
+}
+
+func subRat(an, ad, bn, bd int64) *Value {
+	num := an*bd - bn*ad
+	denom := ad * bd
+	return RationalValue(num, denom)
+}
+
+func mulRat(an, ad, bn, bd int64) *Value {
+	return RationalValue(an*bn, ad*bd)
+}
+
+func divRat(an, ad, bn, bd int64) *Value {
+	return RationalValue(an*bd, ad*bn)
+}
+
 func builtinAdd(args []*Value, expr *Expr) (*Value, error) {
-	if err := requireInts(args, expr, "+"); err != nil {
+	if err := requireNums(args, expr, "+"); err != nil {
 		return nil, err
 	}
-	var sum int64
-	for _, a := range args {
-		sum += a.IntVal
+	if anyInexact(args) {
+		var sum float64
+		for _, a := range args {
+			sum += a.ToFloat64()
+		}
+		return FloatValue(sum), nil
 	}
-	return IntValue(sum), nil
+	result := IntValue(0)
+	for _, a := range args {
+		rn, rd := result.ToRat()
+		an, ad := a.ToRat()
+		result = addRat(rn, rd, an, ad)
+	}
+	return result, nil
 }
 
 func builtinSub(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("%d:%d: -: need at least 1 argument", expr.Line, expr.Col)
 	}
-	if err := requireInts(args, expr, "-"); err != nil {
+	if err := requireNums(args, expr, "-"); err != nil {
 		return nil, err
 	}
+	if anyInexact(args) {
+		if len(args) == 1 {
+			return FloatValue(-args[0].ToFloat64()), nil
+		}
+		result := args[0].ToFloat64()
+		for _, a := range args[1:] {
+			result -= a.ToFloat64()
+		}
+		return FloatValue(result), nil
+	}
 	if len(args) == 1 {
-		return IntValue(-args[0].IntVal), nil
+		n, d := args[0].ToRat()
+		return RationalValue(-n, d), nil
 	}
-	result := args[0].IntVal
+	result := args[0]
 	for _, a := range args[1:] {
-		result -= a.IntVal
+		rn, rd := result.ToRat()
+		an, ad := a.ToRat()
+		result = subRat(rn, rd, an, ad)
 	}
-	return IntValue(result), nil
+	return result, nil
 }
 
 func builtinMul(args []*Value, expr *Expr) (*Value, error) {
-	if err := requireInts(args, expr, "*"); err != nil {
+	if err := requireNums(args, expr, "*"); err != nil {
 		return nil, err
 	}
-	result := int64(1)
-	for _, a := range args {
-		result *= a.IntVal
+	if anyInexact(args) {
+		result := 1.0
+		for _, a := range args {
+			result *= a.ToFloat64()
+		}
+		return FloatValue(result), nil
 	}
-	return IntValue(result), nil
+	result := IntValue(1)
+	for _, a := range args {
+		rn, rd := result.ToRat()
+		an, ad := a.ToRat()
+		result = mulRat(rn, rd, an, ad)
+	}
+	return result, nil
 }
 
 func builtinDiv(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("%d:%d: /: need at least 2 arguments", expr.Line, expr.Col)
 	}
-	if err := requireInts(args, expr, "/"); err != nil {
+	if err := requireNums(args, expr, "/"); err != nil {
 		return nil, err
 	}
-	result := args[0].IntVal
+	if anyInexact(args) {
+		result := args[0].ToFloat64()
+		for _, a := range args[1:] {
+			d := a.ToFloat64()
+			if d == 0 {
+				return nil, fmt.Errorf("%d:%d: /: division by zero", expr.Line, expr.Col)
+			}
+			result /= d
+		}
+		return FloatValue(result), nil
+	}
+	result := args[0]
 	for _, a := range args[1:] {
-		if a.IntVal == 0 {
+		an, ad := a.ToRat()
+		if an == 0 {
 			return nil, fmt.Errorf("%d:%d: /: division by zero", expr.Line, expr.Col)
 		}
-		result /= a.IntVal
+		rn, rd := result.ToRat()
+		result = divRat(rn, rd, an, ad)
 	}
-	return IntValue(result), nil
+	return result, nil
+}
+
+func numCmp(a, b *Value) float64 {
+	// If both exact, compare via cross-multiplication to avoid float imprecision
+	if a.IsExact() && b.IsExact() {
+		an, ad := a.ToRat()
+		bn, bd := b.ToRat()
+		// an/ad vs bn/bd => an*bd vs bn*ad
+		lhs := an * bd
+		rhs := bn * ad
+		return float64(lhs - rhs)
+	}
+	return a.ToFloat64() - b.ToFloat64()
 }
 
 func builtinLt(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 2 {
 		return nil, fmt.Errorf("%d:%d: <: expected 2 arguments", expr.Line, expr.Col)
 	}
-	if err := requireInts(args, expr, "<"); err != nil {
+	if err := requireNums(args, expr, "<"); err != nil {
 		return nil, err
 	}
-	return BoolValue(args[0].IntVal < args[1].IntVal), nil
+	return BoolValue(numCmp(args[0], args[1]) < 0), nil
 }
 
 func builtinGt(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 2 {
 		return nil, fmt.Errorf("%d:%d: >: expected 2 arguments", expr.Line, expr.Col)
 	}
-	if err := requireInts(args, expr, ">"); err != nil {
+	if err := requireNums(args, expr, ">"); err != nil {
 		return nil, err
 	}
-	return BoolValue(args[0].IntVal > args[1].IntVal), nil
+	return BoolValue(numCmp(args[0], args[1]) > 0), nil
 }
 
 func builtinEq(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 2 {
 		return nil, fmt.Errorf("%d:%d: =: expected 2 arguments", expr.Line, expr.Col)
 	}
-	if err := requireInts(args, expr, "="); err != nil {
+	if err := requireNums(args, expr, "="); err != nil {
 		return nil, err
 	}
-	return BoolValue(args[0].IntVal == args[1].IntVal), nil
+	// Cross-tower: convert both to float for comparison if either is inexact
+	if anyInexact(args) {
+		return BoolValue(args[0].ToFloat64() == args[1].ToFloat64()), nil
+	}
+	return BoolValue(numCmp(args[0], args[1]) == 0), nil
 }
 
 func builtinLe(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 2 {
 		return nil, fmt.Errorf("%d:%d: <=: expected 2 arguments", expr.Line, expr.Col)
 	}
-	if err := requireInts(args, expr, "<="); err != nil {
+	if err := requireNums(args, expr, "<="); err != nil {
 		return nil, err
 	}
-	return BoolValue(args[0].IntVal <= args[1].IntVal), nil
+	return BoolValue(numCmp(args[0], args[1]) <= 0), nil
 }
 
 func builtinNot(args []*Value, expr *Expr) (*Value, error) {
@@ -546,6 +659,12 @@ func exprToValue(expr *Expr) *Value {
 		return StringValue(expr.StrVal)
 	case ExprSymbol:
 		return SymbolValue(expr.StrVal)
+	case ExprChar:
+		return CharValue(rune(expr.IntVal))
+	case ExprRational:
+		return RationalValue(expr.Num, expr.Denom)
+	case ExprFloat:
+		return FloatValue(expr.FloatVal)
 	case ExprList:
 		if len(expr.List) == 0 {
 			return Nil
@@ -767,7 +886,7 @@ func builtinNumberQ(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("%d:%d: number?: expected 1 argument", expr.Line, expr.Col)
 	}
-	return BoolValue(args[0].Type == TypeInt), nil
+	return BoolValue(args[0].IsNumeric()), nil
 }
 
 func builtinStringQ(args []*Value, expr *Expr) (*Value, error) {
@@ -917,10 +1036,10 @@ func builtinStringToNumber(args []*Value, expr *Expr) (*Value, error) {
 }
 
 func builtinNumberToString(args []*Value, expr *Expr) (*Value, error) {
-	if len(args) != 1 || args[0].Type != TypeInt {
+	if len(args) != 1 || !args[0].IsNumeric() {
 		return nil, fmt.Errorf("%d:%d: number->string: expected 1 number argument", expr.Line, expr.Col)
 	}
-	return StringValue(strconv.FormatInt(args[0].IntVal, 10)), nil
+	return StringValue(args[0].String()), nil
 }
 
 func builtinSymbolToString(args []*Value, expr *Expr) (*Value, error) {
@@ -1121,6 +1240,88 @@ func builtinEvenQ(args []*Value, expr *Expr) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: even?: expected 1 number argument", expr.Line, expr.Col)
 	}
 	return BoolValue(args[0].IntVal%2 == 0), nil
+}
+
+func builtinExactQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: exact?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].IsExact()), nil
+}
+
+func builtinInexactQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: inexact?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeFloat), nil
+}
+
+func builtinExactToInexact(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || !args[0].IsNumeric() {
+		return nil, fmt.Errorf("%d:%d: exact->inexact: expected 1 number argument", expr.Line, expr.Col)
+	}
+	return FloatValue(args[0].ToFloat64()), nil
+}
+
+func builtinInexactToExact(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || !args[0].IsNumeric() {
+		return nil, fmt.Errorf("%d:%d: inexact->exact: expected 1 number argument", expr.Line, expr.Col)
+	}
+	if args[0].IsExact() {
+		return args[0], nil
+	}
+	f := args[0].FloatVal
+	// Check if it's an integer
+	if f == float64(int64(f)) {
+		return IntValue(int64(f)), nil
+	}
+	// Convert float to rational using math/big
+	r := new(big.Rat).SetFloat64(f)
+	num := r.Num().Int64()
+	denom := r.Denom().Int64()
+	return RationalValue(num, denom), nil
+}
+
+func builtinNumerator(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || !args[0].IsNumeric() {
+		return nil, fmt.Errorf("%d:%d: numerator: expected 1 number argument", expr.Line, expr.Col)
+	}
+	switch args[0].Type {
+	case TypeInt:
+		return IntValue(args[0].IntVal), nil
+	case TypeRational:
+		return IntValue(args[0].Num), nil
+	default:
+		return nil, fmt.Errorf("%d:%d: numerator: expected exact number", expr.Line, expr.Col)
+	}
+}
+
+func builtinDenominator(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || !args[0].IsNumeric() {
+		return nil, fmt.Errorf("%d:%d: denominator: expected 1 number argument", expr.Line, expr.Col)
+	}
+	switch args[0].Type {
+	case TypeInt:
+		return IntValue(1), nil
+	case TypeRational:
+		return IntValue(args[0].Denom), nil
+	default:
+		return nil, fmt.Errorf("%d:%d: denominator: expected exact number", expr.Line, expr.Col)
+	}
+}
+
+func builtinIntegerQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: integer?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeInt), nil
+}
+
+func builtinRationalQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: rational?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeInt || args[0].Type == TypeRational), nil
 }
 
 func builtinListRef(args []*Value, expr *Expr) (*Value, error) {

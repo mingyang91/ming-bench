@@ -1,14 +1,21 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // Expr represents a parsed Scheme expression.
 type Expr struct {
 	// Atom types
-	Type    ExprType
-	IntVal  int64
-	BoolVal bool
-	StrVal  string
+	Type     ExprType
+	IntVal   int64
+	BoolVal  bool
+	StrVal   string
+	Num      int64   // rational numerator
+	Denom    int64   // rational denominator
+	FloatVal float64 // float value
 	// List (for compound expressions)
 	List []*Expr
 	// Source position
@@ -25,6 +32,8 @@ const (
 	ExprSymbol
 	ExprList
 	ExprChar
+	ExprRational
+	ExprFloat
 )
 
 type Parser struct {
@@ -63,6 +72,15 @@ func (p *Parser) parseExpr() (*Expr, error) {
 	switch tok.Type {
 	case TokenNumber:
 		p.advance()
+		if strings.Contains(tok.Val, "/") {
+			parts := strings.SplitN(tok.Val, "/", 2)
+			num := parseInt(parts[0])
+			denom := parseInt(parts[1])
+			return &Expr{Type: ExprRational, Num: num, Denom: denom, Line: tok.Line, Col: tok.Col}, nil
+		} else if strings.Contains(tok.Val, ".") {
+			f, _ := strconv.ParseFloat(tok.Val, 64)
+			return &Expr{Type: ExprFloat, FloatVal: f, Line: tok.Line, Col: tok.Col}, nil
+		}
 		n := parseInt(tok.Val)
 		return &Expr{Type: ExprInt, IntVal: n, Line: tok.Line, Col: tok.Col}, nil
 	case TokenBool:

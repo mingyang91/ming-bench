@@ -203,6 +203,15 @@ func (t *Tokenizer) readString() (string, error) {
 	return "", fmt.Errorf("%d:%d: unterminated string", t.line, t.col)
 }
 
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
 func isNumber(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -214,10 +223,24 @@ func isNumber(s string) bool {
 		}
 		start = 1
 	}
-	for i := start; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
+	rest := s[start:]
+	// Rational: digits/digits
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '/' {
+			return i > 0 && allDigits(rest[:i]) && allDigits(rest[i+1:])
 		}
 	}
-	return true
+	// Float: digits.digits
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '.' {
+			before := rest[:i]
+			after := rest[i+1:]
+			if len(before) == 0 && len(after) == 0 {
+				return false
+			}
+			return (len(before) == 0 || allDigits(before)) && (len(after) == 0 || allDigits(after))
+		}
+	}
+	// Integer
+	return allDigits(rest)
 }
