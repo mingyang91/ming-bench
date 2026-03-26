@@ -1,11 +1,14 @@
 package ming;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 sealed interface Value permits IntValue, RationalValue, InexactValue,
         BoolValue, StringValue, CharValue, SymbolValue,
-        PairValue, EmptyListValue, VoidValue, ProcedureValue {
+        PairValue, RecordValue, EmptyListValue, VoidValue, ProcedureValue {
     String render();
 }
 
@@ -135,6 +138,67 @@ record PairValue(Value car, Value cdr) implements Value {
         ValueFormatting.appendListContents(builder, this);
         builder.append(')');
         return builder.toString();
+    }
+}
+
+final class RecordType {
+    private final String name;
+    private final List<String> fieldNames;
+    private final Map<String, Integer> fieldIndexes = new HashMap<>();
+
+    RecordType(String name, List<String> fieldNames) {
+        this.name = name;
+        this.fieldNames = List.copyOf(fieldNames);
+
+        for (int index = 0; index < fieldNames.size(); index++) {
+            String fieldName = fieldNames.get(index);
+            if (fieldIndexes.put(fieldName, index) != null) {
+                throw new IllegalArgumentException("duplicate record field: " + fieldName);
+            }
+        }
+    }
+
+    String name() {
+        return name;
+    }
+
+    int fieldCount() {
+        return fieldNames.size();
+    }
+
+    int fieldIndex(String fieldName) {
+        Integer index = fieldIndexes.get(fieldName);
+        return index == null ? -1 : index;
+    }
+}
+
+final class RecordValue implements Value {
+    private final RecordType type;
+    private final List<Value> fields;
+
+    RecordValue(RecordType type, List<Value> fields) {
+        if (fields.size() != type.fieldCount()) {
+            throw new IllegalArgumentException("record field count mismatch");
+        }
+        this.type = type;
+        this.fields = new ArrayList<>(fields);
+    }
+
+    RecordType type() {
+        return type;
+    }
+
+    Value field(int index) {
+        return fields.get(index);
+    }
+
+    void setField(int index, Value value) {
+        fields.set(index, value);
+    }
+
+    @Override
+    public String render() {
+        return "#<record:" + type.name() + ">";
     }
 }
 
