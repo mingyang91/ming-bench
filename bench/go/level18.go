@@ -7,14 +7,20 @@ import (
 const level18ApplyCPSKey = "__level18_apply_cps__"
 
 type continuationProc struct {
-	target any
+	target  any
+	dynamic *dynamicWindFrame
 }
 
 type callCCProc struct{}
 
+type continuationTransfer struct {
+	value any
+	next  *tailEvalState
+}
+
 func level18UsesCPS() bool {
 	level, ok := activeBenchLevel()
-	return ok && level == 18
+	return ok && level >= 18
 }
 
 func predeclareLevel18TopLevelDefines(scope *env, exprs []any) error {
@@ -121,19 +127,19 @@ func normalizeLevel18TopLevelExpr(expr any) (any, error) {
 	}
 }
 
-func programUsesCallCC(exprs []any) bool {
+func programUsesDynamicControl(exprs []any) bool {
 	for _, expr := range exprs {
-		if exprUsesCallCC(expr) {
+		if exprUsesDynamicControl(expr) {
 			return true
 		}
 	}
 	return false
 }
 
-func exprUsesCallCC(expr any) bool {
+func exprUsesDynamicControl(expr any) bool {
 	switch node := expr.(type) {
 	case symbolExpr:
-		return node.name == "call/cc" || node.name == "call-with-current-continuation"
+		return node.name == "call/cc" || node.name == "call-with-current-continuation" || node.name == "dynamic-wind"
 	case listExpr:
 		if len(node.elements) == 0 {
 			return false
@@ -144,7 +150,7 @@ func exprUsesCallCC(expr any) bool {
 		}
 
 		for _, elem := range node.elements {
-			if exprUsesCallCC(elem) {
+			if exprUsesDynamicControl(elem) {
 				return true
 			}
 		}
@@ -153,7 +159,7 @@ func exprUsesCallCC(expr any) bool {
 	return false
 }
 
-func builtinApplyCPS(args []any) (any, error) {
+func builtinApplyCPS(runtime *runtimeState, args []any) (any, error) {
 	if len(args) < 2 {
 		return nil, &EvalError{Message: "__apply_cps expects a procedure and a continuation"}
 	}
@@ -161,11 +167,11 @@ func builtinApplyCPS(args []any) (any, error) {
 	proc := args[0]
 	k := args[len(args)-1]
 	callArgs := append([]any(nil), args[1:len(args)-1]...)
-	return applyCPS(proc, callArgs, k)
+	return applyCPS(proc, callArgs, k, runtime)
 }
 
-func applyCPS(proc any, args []any, k any) (any, error) {
-	value, next, err := prepareApplyCPSCall(proc, args, k)
+func applyCPS(proc any, args []any, k any, runtime *runtimeState) (any, error) {
+	value, next, err := prepareApplyCPSCall(proc, args, k, runtime)
 	if err != nil {
 		return nil, err
 	}
@@ -175,11 +181,49 @@ func applyCPS(proc any, args []any, k any) (any, error) {
 	return value, nil
 }
 
-func prepareApplyCPSCall(proc any, args []any, k any) (any, *tailEvalState, error) {
+func evalCPSProgram(scope *env, expr any) (result any, err error) {
+	currentScope := scope
+	currentExpr := expr
+
+	for {
+		transferred := false
+		var transfer continuationTransfer
+
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					signal, ok := recovered.(continuationTransfer)
+					if !ok {
+						panic(recovered)
+					}
+					transfer = signal
+					transferred = true
+				}
+			}()
+
+			result, err = eval(currentScope, currentExpr)
+		}()
+
+		if err != nil {
+			return nil, err
+		}
+		if !transferred {
+			return result, nil
+		}
+		if transfer.next == nil {
+			return transfer.value, nil
+		}
+
+		currentScope = transfer.next.scope
+		currentExpr = transfer.next.expr
+	}
+}
+
+func prepareApplyCPSCall(proc any, args []any, k any, runtime *runtimeState) (any, *tailEvalState, error) {
 	switch callable := proc.(type) {
 	case builtinProc:
 		if callable.name == "apply" {
-			return prepareBuiltinApplyRuntimeCPS(args, k)
+			return prepareBuiltinApplyRuntimeCPS(args, k, runtime)
 		}
 
 		value, err := callable.fn(args)
@@ -201,20 +245,24 @@ func prepareApplyCPSCall(proc any, args []any, k any) (any, *tailEvalState, erro
 		if len(args) != 1 {
 			return nil, nil, &EvalError{Message: "continuation expects exactly 1 argument"}
 		}
-		return prepareProcedureCall(callable.target, []any{args[0]})
+		value, next, err := prepareContinuationJump(runtime, callable, args[0])
+		if err != nil {
+			return nil, nil, err
+		}
+		panic(continuationTransfer{value: value, next: next})
 	case callCCProc:
 		if len(args) != 1 {
 			return nil, nil, &EvalError{Message: "call/cc expects exactly 1 argument"}
 		}
 
-		return prepareApplyCPSCall(args[0], []any{continuationProc{target: k}}, k)
+		return prepareApplyCPSCall(args[0], []any{continuationProc{target: k, dynamic: runtime.dynamic}}, k, runtime)
 	default:
 		return nil, nil, &EvalError{Message: fmt.Sprintf("expected procedure, got %s", typeName(proc))}
 	}
 }
 
-func builtinApplyRuntimeCPS(args []any, k any) (any, error) {
-	value, next, err := prepareBuiltinApplyRuntimeCPS(args, k)
+func builtinApplyRuntimeCPS(args []any, k any, runtime *runtimeState) (any, error) {
+	value, next, err := prepareBuiltinApplyRuntimeCPS(args, k, runtime)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +272,7 @@ func builtinApplyRuntimeCPS(args []any, k any) (any, error) {
 	return value, nil
 }
 
-func prepareBuiltinApplyRuntimeCPS(args []any, k any) (any, *tailEvalState, error) {
+func prepareBuiltinApplyRuntimeCPS(args []any, k any, runtime *runtimeState) (any, *tailEvalState, error) {
 	if len(args) < 2 {
 		return nil, nil, &EvalError{Message: "apply expects at least 2 arguments"}
 	}
@@ -238,7 +286,7 @@ func prepareBuiltinApplyRuntimeCPS(args []any, k any) (any, *tailEvalState, erro
 	callArgs = append(callArgs, args[1:len(args)-1]...)
 	callArgs = append(callArgs, restArgs...)
 
-	return prepareApplyCPSCall(args[0], callArgs, k)
+	return prepareApplyCPSCall(args[0], callArgs, k, runtime)
 }
 
 func evalLevel18ApplyCPSTail(scope *env, args []any) (any, *tailEvalState, error) {
@@ -265,7 +313,7 @@ func evalLevel18ApplyCPSTail(scope *env, args []any) (any, *tailEvalState, error
 		return nil, nil, err
 	}
 
-	return prepareApplyCPSCall(proc, callArgs, k)
+	return prepareApplyCPSCall(proc, callArgs, k, scope.runtime)
 }
 
 type level18CPSTransformer struct {
@@ -327,6 +375,8 @@ func (t *level18CPSTransformer) cpsExpr(expr any, k any) (any, error) {
 				return t.cpsIf(args, k, node.pos)
 			case "begin":
 				return t.cpsSequence(args, k)
+			case "dynamic-wind":
+				return t.cpsDynamicWind(args, k, node.pos)
 			case "define":
 				return t.cpsDefine(args, k, node.pos)
 			case "set!":
@@ -489,6 +539,36 @@ func (t *level18CPSTransformer) cpsApplication(expr listExpr, k any) (any, error
 		return nil, err
 	}
 	return t.cpsExpr(expr.elements[0], t.directLambda([]symbolExpr{procValue}, values))
+}
+
+func (t *level18CPSTransformer) cpsDynamicWind(args []any, k any, pos sourcePos) (any, error) {
+	if len(args) != 3 {
+		return nil, pos.errorf("dynamic-wind expects exactly 3 arguments")
+	}
+
+	beforeProc := t.freshSymbol("before")
+	bodyProc := t.freshSymbol("body")
+	afterProc := t.freshSymbol("after")
+
+	bodyExpr := t.list(
+		t.internalSymbol(level19DynamicWindKey),
+		beforeProc,
+		bodyProc,
+		afterProc,
+		k,
+	)
+
+	beforeExpr, err := t.cpsExpr(args[0], t.directLambda([]symbolExpr{beforeProc}, bodyExpr))
+	if err != nil {
+		return nil, err
+	}
+
+	bodyValueExpr, err := t.cpsExpr(args[1], t.directLambda([]symbolExpr{bodyProc}, beforeExpr))
+	if err != nil {
+		return nil, err
+	}
+
+	return t.cpsExpr(args[2], t.directLambda([]symbolExpr{afterProc}, bodyValueExpr))
 }
 
 func (t *level18CPSTransformer) cpsCollectOperandsReverse(exprs []any, build func([]any) (any, error)) (any, error) {
@@ -943,7 +1023,7 @@ func (t *level18CPSTransformer) begin(exprs ...any) any {
 }
 
 func (t *level18CPSTransformer) voidExpr() any {
-	return t.list(symbolExpr{name: "if"}, false, false)
+	return voidValue{}
 }
 
 func (t *level18CPSTransformer) list(elements ...any) listExpr {

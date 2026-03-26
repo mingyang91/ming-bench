@@ -90,6 +90,7 @@ type bindingCell struct {
 
 type env struct {
 	parent   *env
+	runtime  *runtimeState
 	bindings map[string]*bindingCell
 	macros   map[string]*syntaxMacro
 }
@@ -137,8 +138,13 @@ type caseClosure struct {
 }
 
 func newEnv(parent *env) *env {
+	runtime := &runtimeState{}
+	if parent != nil {
+		runtime = parent.runtime
+	}
 	return &env{
 		parent:   parent,
+		runtime:  runtime,
 		bindings: map[string]*bindingCell{},
 		macros:   map[string]*syntaxMacro{},
 	}
@@ -402,7 +408,10 @@ func newGlobalEnv(output *strings.Builder) *env {
 	if level18UsesCPS() {
 		scope.define("call/cc", callCCProc{})
 		scope.define("call-with-current-continuation", callCCProc{})
-		scope.defineKey(level18ApplyCPSKey, builtinProc{name: "__apply_cps", fn: builtinApplyCPS})
+		runtime := scope.runtime
+		scope.defineKey(level18ApplyCPSKey, builtinProc{name: "__apply_cps", fn: func(args []any) (any, error) {
+			return builtinApplyCPS(runtime, args)
+		}})
 	}
 	return scope
 }
@@ -419,7 +428,7 @@ func evalStrInternal(input string) (any, string, error) {
 	}
 
 	scope := newGlobalEnv(&output)
-	if level18UsesCPS() && programUsesCallCC(exprs) {
+	if level18UsesCPS() && programUsesDynamicControl(exprs) {
 		if err := predeclareLevel18TopLevelDefines(scope, exprs); err != nil {
 			return nil, output.String(), err
 		}
@@ -434,7 +443,7 @@ func evalStrInternal(input string) (any, string, error) {
 			return nil, output.String(), err
 		}
 
-		result, err := eval(scope, cpsExpr)
+		result, err := evalCPSProgram(scope, cpsExpr)
 		if err != nil {
 			return nil, output.String(), err
 		}
@@ -749,6 +758,20 @@ func eval(scope *env, expr any) (any, error) {
 			return node, nil
 		case builtinProc:
 			return node, nil
+		case continuationProc:
+			return node, nil
+		case callCCProc:
+			return node, nil
+		case dynamicWindEnterProc:
+			return node, nil
+		case dynamicWindExitProc:
+			return node, nil
+		case dynamicWindCompleteProc:
+			return node, nil
+		case dynamicWindPopProc:
+			return node, nil
+		case dynamicWindReenterProc:
+			return node, nil
 		case closure:
 			return node, nil
 		case caseClosure:
@@ -865,6 +888,8 @@ func evalListTail(scope *env, expr listExpr) (any, *tailEvalState, error) {
 			return evalDoTail(scope, args)
 		case level18ApplyCPSKey:
 			return evalLevel18ApplyCPSTail(scope, args)
+		case level19DynamicWindKey:
+			return evalLevel19DynamicWindTail(scope, args)
 		}
 
 		if macro, ok := scope.lookupMacroSymbol(head); ok {
@@ -915,6 +940,16 @@ func prepareProcedureCall(proc any, args []any) (any, *tailEvalState, error) {
 	case builtinProc:
 		value, err := callable.fn(args)
 		return value, nil, err
+	case dynamicWindEnterProc:
+		return prepareDynamicWindEnterCall(callable, args)
+	case dynamicWindExitProc:
+		return prepareDynamicWindExitCall(callable, args)
+	case dynamicWindCompleteProc:
+		return prepareDynamicWindCompleteCall(callable, args)
+	case dynamicWindPopProc:
+		return prepareDynamicWindPopCall(callable, args)
+	case dynamicWindReenterProc:
+		return prepareDynamicWindReenterCall(callable, args)
 	case closure:
 		return prepareClosureCall(callable, args)
 	case caseClosure:
@@ -2274,7 +2309,7 @@ func typeName(value any) string {
 		return "list"
 	case *vectorValue:
 		return "vector"
-	case builtinProc, closure, caseClosure, continuationProc, callCCProc:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc:
 		return "procedure"
 	case voidValue:
 		return "void"
@@ -2287,7 +2322,7 @@ func typeName(value any) string {
 
 func isProcedureValue(value any) bool {
 	switch value.(type) {
-	case builtinProc, closure, caseClosure, continuationProc, callCCProc:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc:
 		return true
 	default:
 		return false
