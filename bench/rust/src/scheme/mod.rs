@@ -2240,18 +2240,17 @@ fn eval_cond_clauses(
     Ok(Value::Void)
 }
 
-fn eval_cond_clause_body(
+fn eval_cond_clause_step(
     test_value: Value,
     body: &[Expr],
     env: &EnvRef,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+) -> Result<EvalStep, EvalError> {
     match body {
-        [] => Ok(test_value),
+        [] => Ok(EvalStep::Value(test_value)),
         [Expr::Symbol(symbol), recipient] if symbol == "=>" => {
             let recipient = eval_expr_in_env_single(recipient, env, context)?;
-            let recipient = expect_single_value(recipient)?;
-            apply_procedure(recipient, vec![test_value], context)
+            Ok(EvalStep::Apply(recipient, vec![test_value]))
         }
         [Expr::Symbol(symbol)] if symbol == "=>" => Err(EvalError::InvalidForm {
             name: "cond",
@@ -2261,8 +2260,17 @@ fn eval_cond_clause_body(
             name: "cond",
             message: "=> clause must contain exactly one recipient",
         }),
-        _ => eval_sequence(body, env, context),
+        _ => Ok(EvalStep::Sequence(body.to_vec(), env.clone())),
     }
+}
+
+fn eval_cond_clause_body(
+    test_value: Value,
+    body: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_cond_clause_step(test_value, body, env, context)?, context)
 }
 
 fn eval_parallel_let_bindings(
@@ -2893,9 +2901,7 @@ fn eval_cond_step(
 
             let value = eval_expr_in_env_single(test, env, context)?;
             if value.is_truthy() {
-                return Ok(EvalStep::Value(eval_cond_clause_body(
-                    value, body, env, context,
-                )?));
+                return eval_cond_clause_step(value, body, env, context);
             }
         }
 
@@ -2942,9 +2948,7 @@ fn eval_cond_step(
         };
         let value = eval_expr_with_frame_single(test, env, frame, context)?;
         if value.is_truthy() {
-            return Ok(EvalStep::Value(eval_cond_clause_body(
-                value, body, env, context,
-            )?));
+            return eval_cond_clause_step(value, body, env, context);
         }
     }
 
@@ -6417,9 +6421,38 @@ fn apply_for_each(args: &[Value], context: &mut EvalContext) -> Result<Value, Ev
     apply_for_each_from_index(args[0].clone(), &lists, 0, context)
 }
 
+fn flatten_top_level_begin(program: Vec<PositionedExpr>) -> Vec<PositionedExpr> {
+    let mut flattened = Vec::with_capacity(program.len());
+    for expr in program {
+        flatten_top_level_expr(expr, &mut flattened);
+    }
+    flattened
+}
+
+fn flatten_top_level_expr(expr: PositionedExpr, flattened: &mut Vec<PositionedExpr>) {
+    let position = expr.position;
+    match expr.expr {
+        Expr::List(items)
+            if items.len() > 1
+                && matches!(items.first(), Some(Expr::Symbol(name)) if name == "begin") =>
+        {
+            for item in items.into_iter().skip(1) {
+                flatten_top_level_expr(
+                    PositionedExpr {
+                        expr: item,
+                        position,
+                    },
+                    flattened,
+                );
+            }
+        }
+        expr => flattened.push(PositionedExpr { expr, position }),
+    }
+}
+
 fn eval_program_in_context(input: &str, context: &mut EvalContext) -> Result<Value, EvalError> {
     let mut parser = Parser::new(input);
-    let program = parser.parse_program()?;
+    let program = flatten_top_level_begin(parser.parse_program()?);
     if program.is_empty() {
         return Err(EvalError::EmptyInput.with_position(1, 1));
     }
@@ -6448,6 +6481,13 @@ fn eval_program_with_limit(input: &str, max_steps: usize) -> Result<(Value, Stri
     Ok((value, context.output))
 }
 
+fn render_value_with_output(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.to_plain_string(),
+        _ => value.render(),
+    }
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 ///
@@ -6471,7 +6511,7 @@ pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, Eval
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let (value, output) = eval_program(input)?;
-    Ok((value.render(), output))
+    Ok((render_value_with_output(&value), output))
 }
 
 fn is_token_delimiter(ch: char) -> bool {
