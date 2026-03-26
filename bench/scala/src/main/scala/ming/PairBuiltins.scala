@@ -15,6 +15,7 @@ private[ming] object PairBuiltins:
     installMutation(env)
     installAssoc(env)
     installSearch(env)
+    installMemq(env)
 
   private def installCxr(env: Env): Unit =
     def car(v: SchemeVal): SchemeVal = v match
@@ -69,6 +70,11 @@ private[ming] object PairBuiltins:
       )
     )
 
+  private[ming] def pairCar(v: SchemeVal): Option[SchemeVal] = v match
+    case SchemePair(h, _)   => Some(h)
+    case SchemeList(h :: _) => Some(h)
+    case _                  => None
+
   private def installAssoc(env: Env): Unit =
     env.set(
       "assv",
@@ -80,9 +86,7 @@ private[ming] object PairBuiltins:
           val elems = requireList(args(1), "assv")
           elems
             .collectFirst {
-              case entry
-                  if SchemeListOps.toScalaList(entry).exists(l => l.nonEmpty && ListBuiltins.schemeEqv(l.head, key)) =>
-                entry
+              case entry if pairCar(entry).exists(h => ListBuiltins.schemeEqv(h, key)) => entry
             }
             .getOrElse(SchemeBool(false))
       )
@@ -148,5 +152,59 @@ private[ming] object PairBuiltins:
           args(0) match
             case p: SchemePair => p.cdr = args(1); SchemeVoid
             case _             => throw new EvalError("set-cdr!: expected mutable pair")
+      )
+    )
+
+  private def schemeEq(a: SchemeVal, b: SchemeVal): Boolean =
+    (a, b) match
+      case (SchemeSymbol(x), SchemeSymbol(y)) => x == y
+      case (SchemeBool(x), SchemeBool(y))     => x == y
+      case (SchemeInt(x), SchemeInt(y))       => x == y
+      case (SchemeList(Nil), SchemeList(Nil)) => true
+      case (a, b)                             => a eq b
+
+  private def searchList(args: List[SchemeVal], name: String, cmp: (SchemeVal, SchemeVal) => Boolean): SchemeVal =
+    if args.size != 2 then throw new EvalError(s"$name: expected 2 arguments")
+    val key              = args(0)
+    var curr             = args(1)
+    var found: SchemeVal = SchemeBool(false)
+    var going            = true
+    while going do
+      curr match
+        case SchemeList(Nil) => going = false
+        case p: SchemePair =>
+          if cmp(p.car, key) then
+            found = p
+            going = false
+          else curr = p.cdr
+        case SchemeList(elems) =>
+          elems.indexWhere(e => cmp(e, key)) match
+            case -1 => going = false
+            case i  => found = SchemeListOps.makeList(elems.drop(i)); going = false
+        case _ => throw new EvalError(s"$name: expected list")
+    found
+
+  private def installMemq(env: Env): Unit =
+    env.set(
+      "memq",
+      SchemeBuiltin("memq", args => searchList(args, "memq", schemeEq))
+    )
+    env.set(
+      "memv",
+      SchemeBuiltin("memv", args => searchList(args, "memv", ListBuiltins.schemeEqv))
+    )
+    env.set(
+      "assq",
+      SchemeBuiltin(
+        "assq",
+        args =>
+          if args.size != 2 then throw new EvalError("assq: expected 2 arguments")
+          val key   = args(0)
+          val elems = requireList(args(1), "assq")
+          elems
+            .collectFirst {
+              case entry if pairCar(entry).exists(h => schemeEq(h, key)) => entry
+            }
+            .getOrElse(SchemeBool(false))
       )
     )

@@ -13,6 +13,9 @@ private[ming] object Tokenizer:
   case class TStr(value: String, pos: Pos)  extends Token
   case class TAtom(value: String, pos: Pos) extends Token
   case class TQuote(pos: Pos)               extends Token
+  case class TQuasiquote(pos: Pos)          extends Token
+  case class TUnquote(pos: Pos)             extends Token
+  case class TUnquoteSplicing(pos: Pos)     extends Token
   case class TSyntaxQuote(pos: Pos)         extends Token
 
   private def readString(input: String, start: Int): (String, Int) =
@@ -72,6 +75,14 @@ private[ming] object Tokenizer:
           tokens += TClose(posAt(input, i)); i += 1
         case '\'' =>
           tokens += TQuote(posAt(input, i)); i += 1
+        case '`' =>
+          tokens += TQuasiquote(posAt(input, i)); i += 1
+        case ',' =>
+          val p = posAt(input, i)
+          if i + 1 < input.length && input(i + 1) == '@' then
+            tokens += TUnquoteSplicing(p); i += 2
+          else
+            tokens += TUnquote(p); i += 1
         case '"' =>
           val p          = posAt(input, i)
           val (str, end) = readString(input, i + 1)
@@ -108,6 +119,15 @@ private[ming] object Parser:
       case TQuote(p) :: rest =>
         val (expr, remaining) = parseExpr(rest)
         (SList(List(Symbol("quote", p), expr), p), remaining)
+      case TQuasiquote(p) :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (SList(List(Symbol("quasiquote", p), expr), p), remaining)
+      case TUnquote(p) :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (SList(List(Symbol("unquote", p), expr), p), remaining)
+      case TUnquoteSplicing(p) :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (SList(List(Symbol("unquote-splicing", p), expr), p), remaining)
       case TSyntaxQuote(p) :: rest =>
         val (expr, remaining) = parseExpr(rest)
         (SList(List(Symbol("syntax-quote", p), expr), p), remaining)

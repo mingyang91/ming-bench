@@ -186,7 +186,7 @@ private[ming] object ListBuiltins:
           val elems = requireList(args(1), "assoc")
           elems
             .collectFirst {
-              case entry if SchemeListOps.toScalaList(entry).exists(l => l.nonEmpty && schemeEqual(l.head, key)) =>
+              case entry if PairBuiltins.pairCar(entry).exists(h => schemeEqual(h, key)) =>
                 entry
             }
             .getOrElse(SchemeBool(false))

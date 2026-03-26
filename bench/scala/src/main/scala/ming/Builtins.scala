@@ -202,7 +202,8 @@ private[ming] object Builtins:
             case SchemeString(s) => s
             case other           => other.display
           val irritants = args.tail.map(_.display).mkString(" ")
-          throw new EvalError(if irritants.isEmpty then msg else s"$msg $irritants")
+          val fullMsg = if irritants.isEmpty then msg else s"$msg $irritants"
+          throw new EvalError(fullMsg)
       )
     )
 

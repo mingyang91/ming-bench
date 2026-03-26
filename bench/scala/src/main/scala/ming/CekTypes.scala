@@ -21,6 +21,7 @@ private[ming] case class AndK(remaining: List[Expr], env: Env, k: Kont)         
 private[ming] case class OrK(remaining: List[Expr], env: Env, k: Kont)                         extends Kont
 private[ming] case class CallCCK(k: Kont)                                                      extends Kont
 private[ming] case class CondTestK(body: List[Expr], remaining: List[Expr], env: Env, k: Kont) extends Kont
+private[ming] case class CondArrowK(testVal: SchemeVal, k: Kont)                               extends Kont
 private[ming] case class CaseK(clauses: List[Expr], env: Env, k: Kont)                         extends Kont
 
 private[ming] case class LetrecBindK(

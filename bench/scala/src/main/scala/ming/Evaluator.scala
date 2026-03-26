@@ -102,7 +102,8 @@ object Evaluator:
       case Symbol("define", _)  => SpecialForms.evalDefineForm(elems.tail, env, k)
       case Symbol("set!", _)    => SpecialForms.evalSetForm(elems.tail, env, k)
       case Symbol("begin", _)   => SpecialForms.evalBeginForm(elems.tail, env, k)
-      case Symbol("quote", _)   => SApply(SpecialForms.evalQuote(elems.tail), k)
+      case Symbol("quote", _)       => SApply(SpecialForms.evalQuote(elems.tail), k)
+      case Symbol("quasiquote", _)  => SpecialForms.evalQuasiquote(elems.tail, env, k)
       case Symbol("lambda", _)  => SApply(SpecialForms.makeLambda(elems.tail, env), k)
       case Symbol("and", _)     => SpecialForms.evalAndForm(elems.tail, env, k)
       case Symbol("or", _)      => SpecialForms.evalOrForm(elems.tail, env, k)
@@ -209,9 +210,15 @@ object Evaluator:
 
     case CondTestK(body, remaining, env, k2) =>
       if !isFalsy(value) then
-        if body.isEmpty then SApply(value, k2)
-        else evalBodyCEK(body, env, k2)
+        body match
+          case Symbol("=>", _) :: proc :: Nil =>
+            SEval(proc, env, CondArrowK(value, k2))
+          case Nil => SApply(value, k2)
+          case _   => evalBodyCEK(body, env, k2)
       else SpecialForms.evalCondForm(remaining, env, k2)
+
+    case CondArrowK(testVal, k2) =>
+      ProcApply.applyFunction(value, List(testVal), k2)
 
     case CaseK(clauses, env, k2) =>
       SpecialForms.matchCaseClauses(value, clauses, env, k2)

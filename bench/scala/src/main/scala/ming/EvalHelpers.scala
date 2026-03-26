@@ -13,7 +13,14 @@ private[ming] object EvalHelpers:
       case StringLit(v, _)      => SchemeString(v)
       case CharLit(v, _)        => SchemeChar(v)
       case Symbol(name, _)      => SchemeSymbol(name)
-      case SList(elems, _)      => SchemeListOps.makeList(elems.map(exprToVal))
+      case SList(elems, _) =>
+        // Handle dotted pair notation: (a b . c) is [a, b, ., c]
+        val dotIdx = elems.lastIndexWhere { case Symbol(".", _) => true; case _ => false }
+        if dotIdx > 0 && dotIdx == elems.size - 2 then
+          val before = elems.take(dotIdx).map(exprToVal)
+          val after  = exprToVal(elems.last)
+          before.foldRight(after)((e, acc) => new SchemePair(e, acc))
+        else SchemeListOps.makeList(elems.map(exprToVal))
 
   def bindArgs(
     params: List[String],
