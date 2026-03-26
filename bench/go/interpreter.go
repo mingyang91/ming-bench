@@ -61,8 +61,10 @@ type charExpr struct {
 func (e *charExpr) exprPos() position { return e.pos }
 
 type symbolExpr struct {
-	value string
-	pos   position
+	value   string
+	pos     position
+	binding *binding
+	macro   *syntaxRuleMacro
 }
 
 func (e *symbolExpr) exprPos() position { return e.pos }
@@ -138,44 +140,71 @@ func (p *lambdaProcedure) Call(i *interpreter, args []any, pos position) (any, e
 	return i.evalSequence(p.body, callEnv)
 }
 
+type binding struct {
+	value any
+}
+
 type environment struct {
 	parent *environment
-	values map[string]any
+	values map[string]*binding
+	macros map[string]*syntaxRuleMacro
 }
 
 func newEnvironment(parent *environment) *environment {
 	return &environment{
 		parent: parent,
-		values: map[string]any{},
+		values: map[string]*binding{},
+		macros: map[string]*syntaxRuleMacro{},
 	}
 }
 
 func (e *environment) define(name string, value any) {
-	e.values[name] = value
+	e.values[name] = &binding{value: value}
+}
+
+func (e *environment) lookupBinding(name string) (*binding, bool) {
+	for current := e; current != nil; current = current.parent {
+		if binding, ok := current.values[name]; ok {
+			return binding, true
+		}
+	}
+	return nil, false
 }
 
 func (e *environment) lookup(name string) (any, bool) {
+	binding, ok := e.lookupBinding(name)
+	if !ok {
+		return nil, false
+	}
+	return binding.value, true
+}
+
+func (e *environment) defineMacro(name string, macro *syntaxRuleMacro) {
+	e.macros[name] = macro
+}
+
+func (e *environment) lookupMacro(name string) (*syntaxRuleMacro, bool) {
 	for current := e; current != nil; current = current.parent {
-		if value, ok := current.values[name]; ok {
-			return value, true
+		if macro, ok := current.macros[name]; ok {
+			return macro, true
 		}
 	}
 	return nil, false
 }
 
 func (e *environment) assign(name string, value any) bool {
-	for current := e; current != nil; current = current.parent {
-		if _, ok := current.values[name]; ok {
-			current.values[name] = value
-			return true
-		}
+	binding, ok := e.lookupBinding(name)
+	if !ok {
+		return false
 	}
-	return false
+	binding.value = value
+	return true
 }
 
 type interpreter struct {
 	output strings.Builder
 	global *environment
+	gensymCounter int
 }
 
 func newInterpreter() *interpreter {
@@ -251,6 +280,9 @@ func (i *interpreter) eval(expression expr, env *environment) (any, error) {
 	case *charExpr:
 		return charValue(e.value), nil
 	case *symbolExpr:
+		if e.binding != nil {
+			return e.binding.value, nil
+		}
 		value, ok := env.lookup(e.value)
 		if !ok {
 			return nil, newEvalError(e.pos, "unbound variable: %s", e.value)
@@ -269,27 +301,50 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 	}
 
 	if operator, ok := list.elements[0].(*symbolExpr); ok {
-		switch operator.value {
-		case "and":
-			return i.evalAnd(list.elements[1:], env)
-		case "or":
-			return i.evalOr(list.elements[1:], env)
-		case "begin":
-			return i.evalBegin(list.elements[1:], env)
-		case "if":
-			return i.evalIf(list.elements[1:], operator.pos, env)
-		case "cond":
-			return i.evalCond(list.elements[1:], operator.pos, env)
-		case "define":
-			return i.evalDefine(list.elements[1:], operator.pos, env)
-		case "set!":
-			return i.evalSet(list.elements[1:], operator.pos, env)
-		case "let":
-			return i.evalLet(list.elements[1:], operator.pos, env)
-		case "quote":
-			return i.evalQuote(list.elements[1:], operator.pos)
-		case "lambda":
-			return i.evalLambda(list.elements[1:], operator.pos, env)
+		if operator.macro != nil {
+			expanded, err := operator.macro.expand(i, list)
+			if err != nil {
+				return nil, err
+			}
+			return i.eval(expanded, env)
+		}
+
+		if operator.binding == nil {
+			if operator.value == "define-syntax" {
+				return i.evalDefineSyntax(list.elements[1:], operator.pos, env)
+			}
+			if macro, ok := env.lookupMacro(operator.value); ok {
+				expanded, err := macro.expand(i, list)
+				if err != nil {
+					return nil, err
+				}
+				return i.eval(expanded, env)
+			}
+		}
+
+		if operator.binding == nil {
+			switch operator.value {
+			case "and":
+				return i.evalAnd(list.elements[1:], env)
+			case "or":
+				return i.evalOr(list.elements[1:], env)
+			case "begin":
+				return i.evalBegin(list.elements[1:], env)
+			case "if":
+				return i.evalIf(list.elements[1:], operator.pos, env)
+			case "cond":
+				return i.evalCond(list.elements[1:], operator.pos, env)
+			case "define":
+				return i.evalDefine(list.elements[1:], operator.pos, env)
+			case "set!":
+				return i.evalSet(list.elements[1:], operator.pos, env)
+			case "let":
+				return i.evalLet(list.elements[1:], operator.pos, env)
+			case "quote":
+				return i.evalQuote(list.elements[1:], operator.pos)
+			case "lambda":
+				return i.evalLambda(list.elements[1:], operator.pos, env)
+			}
 		}
 	}
 
@@ -470,6 +525,11 @@ func (i *interpreter) evalSet(args []expr, pos position, env *environment) (any,
 		return nil, err
 	}
 
+	if name.binding != nil {
+		name.binding.value = value
+		return voidValue{}, nil
+	}
+
 	if !env.assign(name.value, value) {
 		return nil, newEvalError(name.pos, "unbound variable: %s", name.value)
 	}
@@ -563,6 +623,24 @@ func (i *interpreter) evalLambda(args []expr, pos position, env *environment) (a
 		body:     args[1:],
 		env:      env,
 	}, nil
+}
+
+func (i *interpreter) evalDefineSyntax(args []expr, pos position, env *environment) (any, error) {
+	if len(args) != 2 {
+		return nil, newEvalError(pos, "define-syntax expects exactly 2 arguments")
+	}
+
+	name, ok := args[0].(*symbolExpr)
+	if !ok {
+		return nil, newEvalError(args[0].exprPos(), "define-syntax requires a symbol name")
+	}
+
+	macro, err := parseSyntaxRuleMacro(name.value, args[1], env)
+	if err != nil {
+		return nil, err
+	}
+	env.defineMacro(name.value, macro)
+	return voidValue{}, nil
 }
 
 type letBinding struct {
