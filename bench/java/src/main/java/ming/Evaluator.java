@@ -1,8 +1,6 @@
 package ming;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
-import java.util.IdentityHashMap;
 import java.util.List;
 
 /**
@@ -36,7 +34,10 @@ public class Evaluator {
 
     private final CollectionProcedures collectionProcedures;
     private final DynamicWindSupport dynamicWindSupport;
+    private final ValueSupport valueSupport = new ValueSupport();
+    private final NumericProcedures numericProcedures = new NumericProcedures(valueSupport);
     private final Environment globalEnv;
+    private ExceptionHandlerFrame currentExceptionHandler;
     private StringBuilder activeOutput;
     private long syntheticCounter;
     private final RecordProcedureSupport recordProcedureSupport = new RecordProcedureSupport() {
@@ -68,8 +69,10 @@ public class Evaluator {
     private Value evalProgram(String input, StringBuilder output) throws EvalError {
         StringBuilder previousOutput = activeOutput;
         WindFrame previousWind = dynamicWindSupport.currentWind();
+        ExceptionHandlerFrame previousExceptionHandler = currentExceptionHandler;
         activeOutput = output;
         dynamicWindSupport.restore(null);
+        currentExceptionHandler = null;
 
         Parser parser = new Parser(input);
         List<Expr> exprs = new ArrayList<>();
@@ -87,6 +90,7 @@ public class Evaluator {
         } finally {
             activeOutput = previousOutput;
             dynamicWindSupport.restore(previousWind);
+            currentExceptionHandler = previousExceptionHandler;
         }
     }
 
@@ -230,6 +234,7 @@ public class Evaluator {
                 case "and" -> evalAnd(argExprs, 0, env, cont);
                 case "or" -> evalOr(argExprs, 0, env, cont);
                 case "do" -> evalDo(position, argExprs, env, cont);
+                case "guard" -> evalGuard(position, argExprs, env, cont);
                 default -> {
                     MacroBinding macro = env.lookupSyntax(symbolExpr.name());
                     if (macro != null) {
@@ -678,6 +683,90 @@ public class Evaluator {
                         terminationParts, body, cont)));
     }
 
+    private Bounce evalGuard(SourcePos position, List<Expr> argExprs, Environment env,
+                             Continuation cont) throws EvalError {
+        if (argExprs.size() < 2) {
+            throw new EvalError("guard requires a clause list and a body");
+        }
+        if (!(argExprs.getFirst() instanceof ListExpr guardSpec)) {
+            throw new EvalError("guard requires a clause list");
+        }
+
+        List<Expr> guardParts = guardSpec.elements();
+        if (guardParts.isEmpty()) {
+            throw new EvalError("guard clause list cannot be empty");
+        }
+        if (!(guardParts.getFirst() instanceof SymbolExpr variableExpr)) {
+            throw new EvalError("guard variable must be a symbol");
+        }
+
+        ExceptionHandlerFrame previousHandler = currentExceptionHandler;
+        ExceptionHandlerFrame guardHandler = new ExceptionHandlerFrame(
+                previousHandler,
+                exceptionValue -> evalGuardClauses(position,
+                        variableExpr.name(),
+                        guardParts.subList(1, guardParts.size()),
+                        exceptionValue,
+                        env,
+                        cont),
+                dynamicWindSupport.currentWind()
+        );
+        currentExceptionHandler = guardHandler;
+
+        try {
+            return evalSequenceBounce(argExprs.subList(1, argExprs.size()), env, value -> {
+                currentExceptionHandler = previousHandler;
+                return deliver(cont, value);
+            });
+        } catch (EvalError error) {
+            currentExceptionHandler = previousHandler;
+            throw error;
+        }
+    }
+
+    private Bounce evalGuardClauses(SourcePos position, String variableName, List<Expr> clauses,
+                                    Value exceptionValue, Environment env, Continuation cont)
+            throws EvalError {
+        Environment guardEnv = new Environment(env);
+        guardEnv.define(variableName, exceptionValue);
+        return evalGuardClause(position, clauses, 0, exceptionValue, guardEnv, cont);
+    }
+
+    private Bounce evalGuardClause(SourcePos position, List<Expr> clauses, int index,
+                                   Value exceptionValue, Environment guardEnv,
+                                   Continuation cont) throws EvalError {
+        if (index >= clauses.size()) {
+            return signalException(exceptionValue);
+        }
+
+        Expr clauseExpr = clauses.get(index);
+        if (!(clauseExpr instanceof ListExpr clauseList)) {
+            throw new EvalError("guard clause must be a list");
+        }
+
+        List<Expr> clause = clauseList.elements();
+        if (clause.isEmpty()) {
+            throw new EvalError("guard clause cannot be empty");
+        }
+
+        Expr testExpr = clause.getFirst();
+        if (testExpr instanceof SymbolExpr symbolExpr && symbolExpr.name().equals("else")) {
+            if (index != clauses.size() - 1) {
+                throw new EvalError("guard else clause must be last");
+            }
+            return evalClauseBody("guard", clause.subList(1, clause.size()), guardEnv, null,
+                    cont);
+        }
+
+        return evalExpr(testExpr, guardEnv, positionedCont(position, testValue -> {
+            if (isTruthy(testValue)) {
+                return evalClauseBody("guard", clause.subList(1, clause.size()), guardEnv,
+                        testValue, cont);
+            }
+            return evalGuardClause(position, clauses, index + 1, exceptionValue, guardEnv, cont);
+        }));
+    }
+
     private Bounce evalCond(SourcePos position, List<Expr> clauses, int index, Environment env,
                             Continuation cont) throws EvalError {
         if (index >= clauses.size()) {
@@ -865,13 +954,17 @@ public class Evaluator {
 
         if (procedure instanceof ContinuationProcedure continuationProcedure) {
             requireArity("continuation", argumentValues.size(), 1);
-            return dynamicWindSupport.transfer(continuationProcedure, argumentValues.getFirst());
+            return dynamicWindSupport.transferTo(continuationProcedure.windContext(), () -> {
+                currentExceptionHandler = continuationProcedure.exceptionHandlerContext();
+                return deliver(continuationProcedure.continuation(), argumentValues.getFirst());
+            });
         }
 
         if (procedure instanceof CallCcProcedure callCcProcedure) {
             requireArity(callCcProcedure.name(), argumentValues.size(), 1);
             return applyProcedureCps(argumentValues.getFirst(),
-                    List.of(new ContinuationProcedure(cont, dynamicWindSupport.currentWind())),
+                    List.of(new ContinuationProcedure(cont, dynamicWindSupport.currentWind(),
+                            currentExceptionHandler)),
                     cont);
         }
 
@@ -879,6 +972,16 @@ public class Evaluator {
             requireArity(dynamicWindProcedure.name(), argumentValues.size(), 3);
             return dynamicWindSupport.apply(argumentValues.get(0), argumentValues.get(1),
                     argumentValues.get(2), cont);
+        }
+
+        if (procedure instanceof RaiseProcedure raiseProcedure) {
+            requireArity(raiseProcedure.name(), argumentValues.size(), 1);
+            return signalException(argumentValues.getFirst());
+        }
+
+        if (procedure instanceof WithExceptionHandlerProcedure withExceptionHandlerProcedure) {
+            requireArity(withExceptionHandlerProcedure.name(), argumentValues.size(), 2);
+            return applyWithExceptionHandler(argumentValues.get(0), argumentValues.get(1), cont);
         }
 
         if (procedure instanceof UserProcedure userProcedure) {
@@ -904,595 +1007,213 @@ public class Evaluator {
         throw new EvalError("wrong number of arguments for case-lambda: got " + args.size());
     }
 
-    private Value quoteToValue(Expr expr) throws EvalError {
-        return switch (expr) {
-            case IntExpr intExpr -> new IntValue(intExpr.value());
-            case RationalExpr rationalExpr -> NumericSupport.exactToValue(
-                    new ExactFraction(rationalExpr.numerator(), rationalExpr.denominator()));
-            case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
-            case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
-            case StringExpr stringExpr -> new StringValue(stringExpr.value());
-            case CharExpr charExpr -> new CharValue(charExpr.value());
-            case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
-            case ListExpr listExpr -> quoteListToValue(listExpr.elements());
-        };
+    private Bounce applyWithExceptionHandler(Value handlerProcedure, Value thunk,
+                                             Continuation cont) throws EvalError {
+        ExceptionHandlerFrame previousHandler = currentExceptionHandler;
+        ExceptionHandlerFrame handlerFrame = new ExceptionHandlerFrame(
+                previousHandler,
+                exceptionValue -> applyProcedureCps(handlerProcedure,
+                        List.of(exceptionValue),
+                        ignored -> signalException(exceptionValue)),
+                dynamicWindSupport.currentWind()
+        );
+        currentExceptionHandler = handlerFrame;
+
+        try {
+            return applyProcedureCps(thunk, List.of(), value -> {
+                currentExceptionHandler = previousHandler;
+                return deliver(cont, value);
+            });
+        } catch (EvalError error) {
+            currentExceptionHandler = previousHandler;
+            throw error;
+        }
     }
 
-    private Value quoteListToValue(List<Expr> elements) throws EvalError {
-        Value result = EmptyListValue.INSTANCE;
-        for (int index = elements.size() - 1; index >= 0; index--) {
-            result = new PairValue(quoteToValue(elements.get(index)), result);
+    private Bounce signalException(Value exceptionValue) throws EvalError {
+        ExceptionHandlerFrame handlerFrame = currentExceptionHandler;
+        if (handlerFrame == null) {
+            throw new EvalError("uncaught exception: " + exceptionValue.render());
         }
-        return result;
+
+        currentExceptionHandler = handlerFrame.parent();
+        return dynamicWindSupport.transferTo(handlerFrame.windContext(),
+                () -> handlerFrame.action().handle(exceptionValue));
+    }
+
+    private Value quoteToValue(Expr expr) throws EvalError {
+        return valueSupport.quoteToValue(expr);
     }
 
     Value addNumbers(List<Value> args) throws EvalError {
-        if (containsInexact(args)) {
-            double total = 0.0;
-            for (Value arg : args) {
-                total += NumericSupport.toDouble(arg);
-            }
-            return new InexactValue(total);
-        }
-
-        ExactFraction total = ExactFraction.of(0);
-        for (Value arg : args) {
-            total = total.add(NumericSupport.toExactFraction(arg));
-        }
-        return NumericSupport.exactToValue(total);
+        return numericProcedures.addNumbers(args);
     }
 
     Value subtractNumbers(List<Value> args) throws EvalError {
-        requireAtLeast("-", args.size(), 1);
-
-        if (containsInexact(args)) {
-            double result = NumericSupport.toDouble(args.getFirst());
-            if (args.size() == 1) {
-                return new InexactValue(-result);
-            }
-
-            for (int index = 1; index < args.size(); index++) {
-                result -= NumericSupport.toDouble(args.get(index));
-            }
-            return new InexactValue(result);
-        }
-
-        ExactFraction result = NumericSupport.toExactFraction(args.getFirst());
-        if (args.size() == 1) {
-            return NumericSupport.exactToValue(result.negate());
-        }
-
-        for (int index = 1; index < args.size(); index++) {
-            result = result.subtract(NumericSupport.toExactFraction(args.get(index)));
-        }
-        return NumericSupport.exactToValue(result);
+        return numericProcedures.subtractNumbers(args);
     }
 
     Value multiplyNumbers(List<Value> args) throws EvalError {
-        if (containsInexact(args)) {
-            double total = 1.0;
-            for (Value arg : args) {
-                total *= NumericSupport.toDouble(arg);
-            }
-            return new InexactValue(total);
-        }
-
-        ExactFraction total = ExactFraction.of(1);
-        for (Value arg : args) {
-            total = total.multiply(NumericSupport.toExactFraction(arg));
-        }
-        return NumericSupport.exactToValue(total);
+        return numericProcedures.multiplyNumbers(args);
     }
 
     Value divideNumbers(List<Value> args) throws EvalError {
-        requireAtLeast("/", args.size(), 2);
-
-        if (containsInexact(args)) {
-            double result = NumericSupport.toDouble(args.getFirst());
-            for (int index = 1; index < args.size(); index++) {
-                double divisor = NumericSupport.toDouble(args.get(index));
-                if (divisor == 0.0) {
-                    throw new EvalError("division by zero");
-                }
-                result /= divisor;
-            }
-            return new InexactValue(result);
-        }
-
-        ExactFraction result = NumericSupport.toExactFraction(args.getFirst());
-        for (int index = 1; index < args.size(); index++) {
-            result = result.divide(NumericSupport.toExactFraction(args.get(index)));
-        }
-        return NumericSupport.exactToValue(result);
+        return numericProcedures.divideNumbers(args);
     }
 
     Value absBuiltin(List<Value> args) throws EvalError {
-        requireArity("abs", args.size(), 1);
-
-        Value value = expectNumber(args.getFirst());
-        if (value instanceof InexactValue inexactValue) {
-            return new InexactValue(Math.abs(inexactValue.value()));
-        }
-
-        ExactFraction fraction = NumericSupport.toExactFraction(value);
-        if (fraction.signum() < 0) {
-            fraction = fraction.negate();
-        }
-        return NumericSupport.exactToValue(fraction);
+        return numericProcedures.absBuiltin(args);
     }
 
     int quotient(List<Value> args) throws EvalError {
-        requireArity("quotient", args.size(), 2);
-
-        int dividend = expectInt(args.get(0));
-        int divisor = expectInt(args.get(1));
-        if (divisor == 0) {
-            throw new EvalError("division by zero");
-        }
-        return dividend / divisor;
+        return numericProcedures.quotient(args);
     }
 
     int remainder(List<Value> args) throws EvalError {
-        requireArity("remainder", args.size(), 2);
-
-        int dividend = expectInt(args.get(0));
-        int divisor = expectInt(args.get(1));
-        if (divisor == 0) {
-            throw new EvalError("division by zero");
-        }
-        return dividend % divisor;
+        return numericProcedures.remainder(args);
     }
 
     int modulo(List<Value> args) throws EvalError {
-        requireArity("modulo", args.size(), 2);
-
-        int dividend = expectInt(args.get(0));
-        int divisor = expectInt(args.get(1));
-        if (divisor == 0) {
-            throw new EvalError("division by zero");
-        }
-        return Math.floorMod(dividend, divisor);
+        return numericProcedures.modulo(args);
     }
 
     Value minBuiltin(List<Value> args) throws EvalError {
-        requireAtLeast("min", args.size(), 1);
-
-        Value result = expectNumber(args.getFirst());
-        boolean sawInexact = NumericSupport.isInexact(result);
-        for (int index = 1; index < args.size(); index++) {
-            Value current = expectNumber(args.get(index));
-            if (NumericSupport.compare(current, result) < 0) {
-                result = current;
-            }
-            sawInexact |= NumericSupport.isInexact(current);
-        }
-        if (sawInexact && NumericSupport.isExact(result)) {
-            return exactToInexact(result);
-        }
-        return result;
+        return numericProcedures.minBuiltin(args);
     }
 
     Value maxBuiltin(List<Value> args) throws EvalError {
-        requireAtLeast("max", args.size(), 1);
-
-        Value result = expectNumber(args.getFirst());
-        boolean sawInexact = NumericSupport.isInexact(result);
-        for (int index = 1; index < args.size(); index++) {
-            Value current = expectNumber(args.get(index));
-            if (NumericSupport.compare(current, result) > 0) {
-                result = current;
-            }
-            sawInexact |= NumericSupport.isInexact(current);
-        }
-        if (sawInexact && NumericSupport.isExact(result)) {
-            return exactToInexact(result);
-        }
-        return result;
+        return numericProcedures.maxBuiltin(args);
     }
 
     int expt(List<Value> args) throws EvalError {
-        requireArity("expt", args.size(), 2);
-
-        int base = expectInt(args.get(0));
-        int exponent = expectInt(args.get(1));
-        if (exponent < 0) {
-            throw new EvalError("expt exponent must be non-negative");
-        }
-
-        int result = 1;
-        for (int index = 0; index < exponent; index++) {
-            result *= base;
-        }
-        return result;
+        return numericProcedures.expt(args);
     }
 
-    boolean compareIncreasing(List<Value> args, Comparison comparison)
-            throws EvalError {
-        requireAtLeast(comparison.symbol(), args.size(), 2);
-
-        Value previous = expectNumber(args.getFirst());
-        for (int index = 1; index < args.size(); index++) {
-            Value current = expectNumber(args.get(index));
-            if (!comparison.matches(NumericSupport.compare(previous, current))) {
-                return false;
-            }
-            previous = current;
-        }
-        return true;
-    }
-
-    private boolean containsInexact(List<Value> args) throws EvalError {
-        for (Value arg : args) {
-            expectNumber(arg);
-            if (NumericSupport.isInexact(arg)) {
-                return true;
-            }
-        }
-        return false;
+    boolean compareIncreasing(List<Value> args, Comparison comparison) throws EvalError {
+        return numericProcedures.compareIncreasing(args, comparison);
     }
 
     Value expectNumber(Value value) throws EvalError {
-        if (NumericSupport.isNumber(value)) {
-            return value;
-        }
-        throw new EvalError("expected number");
+        return valueSupport.expectNumber(value);
     }
 
     int expectInt(Value value) throws EvalError {
-        BigInteger integer = NumericSupport.expectExactInteger(value);
-        try {
-            return integer.intValueExact();
-        } catch (ArithmeticException error) {
-            throw new EvalError("integer out of range");
-        }
+        return valueSupport.expectInt(value);
     }
 
     int expectIndex(Value value, String operationName) throws EvalError {
-        int index = expectInt(value);
-        if (index < 0) {
-            throw new EvalError(operationName + " index out of range");
-        }
-        return index;
+        return valueSupport.expectIndex(value, operationName);
     }
 
     String expectString(Value value) throws EvalError {
-        return expectStringValue(value).value();
+        return valueSupport.expectString(value);
     }
 
     StringValue expectStringValue(Value value) throws EvalError {
-        if (value instanceof StringValue stringValue) {
-            return stringValue;
-        }
-        throw new EvalError("expected string");
+        return valueSupport.expectStringValue(value);
     }
 
     char expectChar(Value value) throws EvalError {
-        if (value instanceof CharValue charValue) {
-            return charValue.value();
-        }
-        throw new EvalError("expected character");
+        return valueSupport.expectChar(value);
     }
 
     String expectSymbol(Value value) throws EvalError {
-        if (value instanceof SymbolValue symbolValue) {
-            return symbolValue.name();
-        }
-        throw new EvalError("expected symbol");
+        return valueSupport.expectSymbol(value);
     }
 
     PairValue expectPair(Value value) throws EvalError {
-        if (value instanceof PairValue pairValue) {
-            return pairValue;
-        }
-        throw new EvalError("expected pair");
+        return valueSupport.expectPair(value);
     }
 
     VectorValue expectVectorValue(Value value) throws EvalError {
-        if (value instanceof VectorValue vectorValue) {
-            return vectorValue;
-        }
-        throw new EvalError("expected vector");
+        return valueSupport.expectVectorValue(value);
     }
 
     private RecordValue expectRecord(Value value, RecordType recordType) throws EvalError {
-        if (value instanceof RecordValue recordValue && recordValue.type() == recordType) {
-            return recordValue;
-        }
-        throw new EvalError("expected record of type " + recordType.name());
+        return valueSupport.expectRecord(value, recordType);
     }
 
     Value gcdBuiltin(List<Value> args) throws EvalError {
-        BigInteger result = BigInteger.ZERO;
-        for (Value arg : args) {
-            result = result.gcd(NumericSupport.expectExactInteger(arg).abs());
-        }
-        return NumericSupport.integerToValue(result);
+        return numericProcedures.gcdBuiltin(args);
     }
 
     Value lcmBuiltin(List<Value> args) throws EvalError {
-        BigInteger result = BigInteger.ONE;
-        boolean sawArgument = false;
-
-        for (Value arg : args) {
-            BigInteger value = NumericSupport.expectExactInteger(arg).abs();
-            sawArgument = true;
-            if (value.signum() == 0) {
-                result = BigInteger.ZERO;
-                break;
-            }
-            result = result.divide(result.gcd(value)).multiply(value);
-        }
-
-        if (!sawArgument) {
-            return new IntValue(1);
-        }
-        return NumericSupport.integerToValue(result);
+        return numericProcedures.lcmBuiltin(args);
     }
 
     Value truncateBuiltin(List<Value> args) throws EvalError {
-        requireArity("truncate", args.size(), 1);
-
-        Value value = expectNumber(args.getFirst());
-        if (value instanceof InexactValue inexactValue) {
-            double raw = inexactValue.value();
-            return new InexactValue(raw < 0.0 ? Math.ceil(raw) : Math.floor(raw));
-        }
-
-        ExactFraction fraction = NumericSupport.toExactFraction(value);
-        return NumericSupport.integerToValue(
-                fraction.numerator().divide(fraction.denominator()));
+        return numericProcedures.truncateBuiltin(args);
     }
 
     Value roundBuiltin(List<Value> args) throws EvalError {
-        requireArity("round", args.size(), 1);
-
-        Value value = expectNumber(args.getFirst());
-        if (value instanceof InexactValue inexactValue) {
-            return new InexactValue(Math.rint(inexactValue.value()));
-        }
-
-        ExactFraction fraction = NumericSupport.toExactFraction(value);
-        BigInteger[] quotientAndRemainder = fraction.numerator().divideAndRemainder(
-                fraction.denominator());
-        BigInteger quotient = quotientAndRemainder[0];
-        BigInteger doubledRemainder = quotientAndRemainder[1].abs().multiply(BigInteger.TWO);
-        int relation = doubledRemainder.compareTo(fraction.denominator());
-
-        if (relation > 0 || (relation == 0 && quotient.testBit(0))) {
-            quotient = quotient.add(BigInteger.valueOf(fraction.signum()));
-        }
-        return NumericSupport.integerToValue(quotient);
+        return numericProcedures.roundBuiltin(args);
     }
 
     String stringAppend(List<Value> args) throws EvalError {
-        StringBuilder builder = new StringBuilder();
-        for (Value arg : args) {
-            builder.append(expectString(arg));
-        }
-        return builder.toString();
+        return valueSupport.stringAppend(args);
     }
 
     Value stringToNumber(String token) {
-        ParsedNumber parsedNumber;
-        try {
-            parsedNumber = NumericSupport.parseLiteral(token);
-        } catch (IllegalArgumentException error) {
-            return BoolValue.FALSE;
-        }
-
-        if (parsedNumber == null) {
-            return BoolValue.FALSE;
-        }
-        return parsedNumberToValue(parsedNumber);
-    }
-
-    private Value parsedNumberToValue(ParsedNumber parsedNumber) {
-        return switch (parsedNumber) {
-            case ParsedInteger parsedInteger -> new IntValue(parsedInteger.value());
-            case ParsedRational parsedRational -> NumericSupport.exactToValue(
-                    new ExactFraction(parsedRational.numerator(), parsedRational.denominator()));
-            case ParsedInexact parsedInexact -> new InexactValue(parsedInexact.value());
-        };
+        return numericProcedures.stringToNumber(token);
     }
 
     Value exactToInexact(Value value) throws EvalError {
-        return new InexactValue(NumericSupport.toDouble(value));
+        return numericProcedures.exactToInexact(value);
     }
 
     Value numeratorBuiltin(List<Value> args) throws EvalError {
-        requireArity("numerator", args.size(), 1);
-        ExactFraction fraction = NumericSupport.toExactFraction(args.getFirst());
-        return NumericSupport.integerToValue(fraction.numerator());
+        return numericProcedures.numeratorBuiltin(args);
     }
 
     Value denominatorBuiltin(List<Value> args) throws EvalError {
-        requireArity("denominator", args.size(), 1);
-        ExactFraction fraction = NumericSupport.toExactFraction(args.getFirst());
-        return NumericSupport.integerToValue(fraction.denominator());
+        return numericProcedures.denominatorBuiltin(args);
     }
 
-    BoolValue signPredicate(String name, List<Value> args, int expectedSign)
-            throws EvalError {
-        requireArity(name, args.size(), 1);
-
-        Value value = expectNumber(args.getFirst());
-        int sign;
-        if (NumericSupport.isExact(value)) {
-            sign = NumericSupport.toExactFraction(value).signum();
-        } else {
-            sign = Double.compare(((InexactValue) value).value(), 0.0);
-        }
-        return BoolValue.of(sign == expectedSign || (expectedSign == 1 && sign > 0)
-                || (expectedSign == -1 && sign < 0));
+    BoolValue signPredicate(String name, List<Value> args, int expectedSign) throws EvalError {
+        return numericProcedures.signPredicate(name, args, expectedSign);
     }
 
     boolean compareChars(List<Value> args, String name, CharComparison comparison)
             throws EvalError {
-        requireAtLeast(name, args.size(), 2);
-
-        char previous = expectChar(args.getFirst());
-        for (int index = 1; index < args.size(); index++) {
-            char current = expectChar(args.get(index));
-            if (!comparison.matches(previous, current)) {
-                return false;
-            }
-            previous = current;
-        }
-        return true;
+        return valueSupport.compareChars(args, name, comparison);
     }
 
     boolean compareStrings(List<Value> args, String name, StringComparison comparison)
             throws EvalError {
-        requireAtLeast(name, args.size(), 2);
-
-        String previous = expectString(args.getFirst());
-        for (int index = 1; index < args.size(); index++) {
-            String current = expectString(args.get(index));
-            if (!comparison.matches(previous, current)) {
-                return false;
-            }
-            previous = current;
-        }
-        return true;
+        return valueSupport.compareStrings(args, name, comparison);
     }
 
     boolean isEq(Value left, Value right) throws EvalError {
-        if (left == right) {
-            return true;
-        }
-        if (NumericSupport.isNumber(left) && NumericSupport.isNumber(right)) {
-            return NumericSupport.compare(left, right) == 0;
-        }
-        if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
-            return leftBool.value() == rightBool.value();
-        }
-        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
-            return leftChar.value() == rightChar.value();
-        }
-        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
-            return leftSymbol.name().equals(rightSymbol.name());
-        }
-        return false;
+        return valueSupport.isEq(left, right);
     }
 
     boolean isEqv(Value left, Value right) throws EvalError {
-        return isEq(left, right);
+        return valueSupport.isEqv(left, right);
     }
 
     boolean isEqual(Value left, Value right) throws EvalError {
-        return isEqual(left, right, new IdentityHashMap<>());
-    }
-
-    private boolean isEqual(Value left, Value right,
-                            IdentityHashMap<Value, IdentityHashMap<Value, Boolean>> seenPairs)
-            throws EvalError {
-        if (left == right) {
-            return true;
-        }
-        if (NumericSupport.isNumber(left) && NumericSupport.isNumber(right)) {
-            return NumericSupport.compare(left, right) == 0;
-        }
-        if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
-            return leftBool.value() == rightBool.value();
-        }
-        if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
-            return leftString.value().equals(rightString.value());
-        }
-        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
-            return leftChar.value() == rightChar.value();
-        }
-        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
-            return leftSymbol.name().equals(rightSymbol.name());
-        }
-        if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
-            if (alreadyCompared(leftPair, rightPair, seenPairs)) {
-                return true;
-            }
-            return isEqual(leftPair.car(), rightPair.car(), seenPairs)
-                    && isEqual(leftPair.cdr(), rightPair.cdr(), seenPairs);
-        }
-        if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
-            if (leftVector.length() != rightVector.length()) {
-                return false;
-            }
-            if (alreadyCompared(leftVector, rightVector, seenPairs)) {
-                return true;
-            }
-            for (int index = 0; index < leftVector.length(); index++) {
-                if (!isEqual(leftVector.element(index), rightVector.element(index), seenPairs)) {
-                    return false;
-                }
-            }
-            return true;
-        }
-        return false;
+        return valueSupport.isEqual(left, right);
     }
 
     Value errorBuiltin(List<Value> args) throws EvalError {
-        requireAtLeast("error", args.size(), 1);
-
-        Value messageValue = args.getFirst();
-        StringBuilder builder = new StringBuilder();
-        if (messageValue instanceof StringValue stringValue) {
-            builder.append(stringValue.value());
-        } else {
-            builder.append(messageValue.render());
-        }
-
-        for (int index = 1; index < args.size(); index++) {
-            if (index == 1) {
-                builder.append(':');
-            }
-            builder.append(' ');
-            builder.append(args.get(index).render());
-        }
-
-        throw new EvalError(builder.toString());
+        return valueSupport.errorBuiltin(args);
     }
 
     BoolValue typePredicate(String name, List<Value> args, ValuePredicate predicate)
             throws EvalError {
-        requireArity(name, args.size(), 1);
-        return BoolValue.of(predicate.matches(args.getFirst()));
+        return valueSupport.typePredicate(name, args, predicate);
     }
 
-    private boolean alreadyCompared(Value left, Value right,
-                                    IdentityHashMap<Value,
-                                            IdentityHashMap<Value, Boolean>> seenPairs) {
-        IdentityHashMap<Value, Boolean> rightValues = seenPairs.get(left);
-        if (rightValues == null) {
-            rightValues = new IdentityHashMap<>();
-            seenPairs.put(left, rightValues);
-        } else if (rightValues.containsKey(right)) {
-            return true;
-        }
-
-        rightValues.put(right, Boolean.TRUE);
-        return false;
+    void requireArity(String name, int actual, int expected) throws EvalError {
+        valueSupport.requireArity(name, actual, expected);
     }
 
-    void requireArity(String name, int actual, int expected)
-            throws EvalError {
-        if (actual != expected) {
-            throw new EvalError(
-                    "wrong number of arguments for " + name + ": expected " + expected
-                            + ", got " + actual
-            );
-        }
-    }
-
-    void requireAtLeast(String name, int actual, int minimum)
-            throws EvalError {
-        if (actual < minimum) {
-            throw new EvalError(
-                    "wrong number of arguments for " + name + ": expected at least "
-                            + minimum + ", got " + actual
-            );
-        }
+    void requireAtLeast(String name, int actual, int minimum) throws EvalError {
+        valueSupport.requireAtLeast(name, actual, minimum);
     }
 
     boolean isTruthy(Value value) {
-        return !(value instanceof BoolValue boolValue) || boolValue.value();
+        return valueSupport.isTruthy(value);
     }
 
 }

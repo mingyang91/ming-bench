@@ -440,5 +440,8 @@ final class GlobalEnvironmentFactory {
         defineValue("call/cc", new CallCcProcedure("call/cc"));
         defineValue("call-with-current-continuation",
                 new CallCcProcedure("call-with-current-continuation"));
+        defineValue("raise", new RaiseProcedure("raise"));
+        defineValue("with-exception-handler",
+                new WithExceptionHandlerProcedure("with-exception-handler"));
     }
 }

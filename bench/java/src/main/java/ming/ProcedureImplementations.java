@@ -142,13 +142,60 @@ final class DynamicWindProcedure extends ProcedureValue {
     }
 }
 
+final class RaiseProcedure extends ProcedureValue {
+    private final String name;
+
+    RaiseProcedure(String name) {
+        this.name = name;
+    }
+
+    String name() {
+        return name;
+    }
+
+    @Override
+    Value apply(List<Value> args) throws EvalError {
+        throw new EvalError(name + " cannot be applied directly");
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:" + name + ">";
+    }
+}
+
+final class WithExceptionHandlerProcedure extends ProcedureValue {
+    private final String name;
+
+    WithExceptionHandlerProcedure(String name) {
+        this.name = name;
+    }
+
+    String name() {
+        return name;
+    }
+
+    @Override
+    Value apply(List<Value> args) throws EvalError {
+        throw new EvalError(name + " cannot be applied directly");
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:" + name + ">";
+    }
+}
+
 final class ContinuationProcedure extends ProcedureValue {
     private final Evaluator.Continuation continuation;
     private final WindFrame windContext;
+    private final ExceptionHandlerFrame exceptionHandlerContext;
 
-    ContinuationProcedure(Evaluator.Continuation continuation, WindFrame windContext) {
+    ContinuationProcedure(Evaluator.Continuation continuation, WindFrame windContext,
+                          ExceptionHandlerFrame exceptionHandlerContext) {
         this.continuation = continuation;
         this.windContext = windContext;
+        this.exceptionHandlerContext = exceptionHandlerContext;
     }
 
     Evaluator.Continuation continuation() {
@@ -157,6 +204,10 @@ final class ContinuationProcedure extends ProcedureValue {
 
     WindFrame windContext() {
         return windContext;
+    }
+
+    ExceptionHandlerFrame exceptionHandlerContext() {
+        return exceptionHandlerContext;
     }
 
     @Override

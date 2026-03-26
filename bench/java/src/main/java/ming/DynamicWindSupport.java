@@ -30,10 +30,9 @@ final class DynamicWindSupport {
         return invokeThunk(inThunk, ignored -> enterBody(inThunk, bodyThunk, outThunk, cont));
     }
 
-    Evaluator.Bounce transfer(ContinuationProcedure continuationProcedure, Value value)
+    Evaluator.Bounce transferTo(WindFrame targetWind, Evaluator.Bounce next)
             throws EvalError {
-        return switchWind(continuationProcedure.windContext(),
-                deliver(continuationProcedure.continuation(), value));
+        return switchWind(targetWind, next);
     }
 
     private Evaluator.Bounce enterBody(Value inThunk, Value bodyThunk, Value outThunk,
