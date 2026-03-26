@@ -150,6 +150,16 @@ function parse(tokens: Token[]): SchemeVal[] {
     if (tok.text === '#t') return { tag: 'boolean', value: true, pos: tok.pos };
     if (tok.text === '#f') return { tag: 'boolean', value: false, pos: tok.pos };
     if (tok.text.startsWith('"')) return { tag: 'string', value: tok.text.slice(1, -1), pos: tok.pos };
+    if (tok.text.startsWith('#\\')) {
+      const charName = tok.text.substring(2);
+      let ch: string;
+      if (charName === 'space') ch = ' ';
+      else if (charName === 'newline') ch = '\n';
+      else if (charName === 'tab') ch = '\t';
+      else if (charName.length === 1) ch = charName;
+      else throw new EvalError(`${tok.pos.line}:${tok.pos.col}: unknown character name: ${charName}`);
+      return { tag: 'char', value: ch, pos: tok.pos };
+    }
     const num = Number(tok.text);
     if (!isNaN(num) && tok.text !== '') return { tag: 'number', value: num, pos: tok.pos };
     return { tag: 'symbol', value: tok.text, pos: tok.pos };
@@ -354,6 +364,20 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}char?: need 1 argument`);
       return { tag: 'boolean', value: args[0].tag === 'char' };
     }
+    case 'string-copy': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}string-copy: need 1 argument`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-copy: expected string`);
+      return { tag: 'string', value: args[0].value };
+    }
+    case 'string-set!': {
+      if (args.length !== 3) throw new EvalError(`${posStr(callPos)}string-set!: need 3 arguments`);
+      if (args[0].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-set!: expected string`);
+      const idx = toNumber(args[1], 'string-set!', callPos);
+      if (args[2].tag !== 'char') throw new EvalError(`${posStr(callPos)}string-set!: expected char`);
+      if (idx < 0 || idx >= args[0].value.length) throw new EvalError(`${posStr(callPos)}string-set!: index out of range`);
+      (args[0] as any).value = args[0].value.substring(0, idx) + args[2].value + args[0].value.substring(idx + 1);
+      return { tag: 'void' };
+    }
     default:
       throw new EvalError(`${posStr(callPos)}unknown builtin: ${name}`);
   }
@@ -368,10 +392,11 @@ const BUILTIN_NAMES = new Set([
   'string->number', 'number->string',
   'symbol->string', 'string->symbol',
   'string-ref', 'char?',
+  'string-copy', 'string-set!',
 ]);
 
 function evaluate(expr: SchemeVal, env: Env): SchemeVal {
-  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') return expr;
+  if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') return expr;
   if (expr.tag === 'nil' || expr.tag === 'pair') return expr;
 
   if (expr.tag === 'symbol') {
