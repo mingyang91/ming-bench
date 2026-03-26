@@ -10,6 +10,7 @@ import SchemeRuntime.*
 
 private[ming] object SchemeEvaluator
     extends SchemeEvaluatorSpecialForms
+    with SchemeEvaluatorGuardForms
     with SchemeEvaluatorBindingForms
     with SchemeEvaluatorProcedureSupport:
 
@@ -164,6 +165,10 @@ private[ming] object SchemeEvaluator
         applyCallWithCurrentContinuation(name, args, continuation, pos)
       case "dynamic-wind" =>
         applyDynamicWind(args, continuation, pos)
+      case "with-exception-handler" =>
+        applyWithExceptionHandlerBuiltin(args, continuation, pos)
+      case "raise" =>
+        applyRaise(args, pos)
       case "apply" =>
         applyBuiltinApply(args, continuation, pos)
       case "map" =>
@@ -225,6 +230,8 @@ private[ming] object SchemeEvaluator
         evalSequence(args, env, continuation)
       case Expr.Symbol("cond", _) =>
         evalCond(args, env, continuation, callPos)
+      case Expr.Symbol("guard", _) =>
+        evalGuard(args, env, continuation, callPos)
       case Expr.Symbol("let", _) =>
         evalLet(args, env, continuation, callPos)
       case Expr.Symbol("let*", _) =>

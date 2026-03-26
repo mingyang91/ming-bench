@@ -9,24 +9,47 @@ private[ming] object SchemeDynamicContext:
 
   final case class WindFrame(id: Long, inThunk: Value, outThunk: Value)
 
+  final case class ExceptionHandlerFrame(
+    handler: Value,
+    windContext: Vector[WindFrame],
+    previous: Option[ExceptionHandlerFrame]
+  )
+
+  final case class DynamicState(
+    windContext: Vector[WindFrame],
+    exceptionHandler: Option[ExceptionHandlerFrame]
+  )
+
   final case class CapturedContinuation(
     continuation: Continuation,
-    dynamicContext: Vector[WindFrame]
+    dynamicState: DynamicState
   )
 
   private val nextWindId = new AtomicLong()
 
-  private val currentContext =
-    ThreadLocal.withInitial[Vector[WindFrame]](() => Vector.empty[WindFrame])
+  private val currentState =
+    ThreadLocal.withInitial[DynamicState](() => DynamicState(Vector.empty, None))
+
+  def snapshot: DynamicState =
+    currentState.get()
 
   def current: Vector[WindFrame] =
-    currentContext.get()
+    snapshot.windContext
 
   def replace(dynamicContext: Vector[WindFrame]): Unit =
-    currentContext.set(dynamicContext)
+    replaceState(snapshot.copy(windContext = dynamicContext))
+
+  def replaceState(state: DynamicState): Unit =
+    currentState.set(state)
+
+  def currentExceptionHandler: Option[ExceptionHandlerFrame] =
+    snapshot.exceptionHandler
+
+  def replaceExceptionHandler(handler: Option[ExceptionHandlerFrame]): Unit =
+    replaceState(snapshot.copy(exceptionHandler = handler))
 
   def reset(): Unit =
-    replace(Vector.empty)
+    replaceState(DynamicState(Vector.empty, None))
 
   def newFrame(inThunk: Value, outThunk: Value): WindFrame =
     WindFrame(nextWindId.incrementAndGet(), inThunk, outThunk)

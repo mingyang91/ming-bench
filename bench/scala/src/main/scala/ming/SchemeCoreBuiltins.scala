@@ -88,6 +88,8 @@ private[ming] object SchemeCoreBuiltins:
         val listArgs   = properListElements("apply", args.last)
         SchemeInterpreter.applyProcedure(procedure, prefixArgs ++ listArgs)
     ),
+    "with-exception-handler"         -> controlPlaceholder("with-exception-handler"),
+    "raise"                          -> controlPlaceholder("raise"),
     "dynamic-wind"                   -> controlPlaceholder("dynamic-wind"),
     "call/cc"                        -> controlPlaceholder("call/cc"),
     "call-with-current-continuation" -> controlPlaceholder("call-with-current-continuation"),
