@@ -48,6 +48,10 @@ type closureExpr struct {
 	env       *env
 }
 
+type caseClosureExpr struct {
+	clauses []closureExpr
+}
+
 type env struct {
 	parent   *env
 	bindings map[string]expr
@@ -232,6 +236,7 @@ func newGlobalEnv(rt *runtime) *env {
 		return ok
 	})})
 	root.define("positive?", builtinProc{name: "positive?", fn: builtinPositive})
+	root.define("procedure?", builtinProc{name: "procedure?", fn: typePredicate(isProcedure)})
 	root.define("quotient", builtinProc{name: "quotient", fn: builtinQuotient})
 	root.define("rational?", builtinProc{name: "rational?", fn: builtinRational})
 	root.define("remainder", builtinProc{name: "remainder", fn: builtinRemainder})
@@ -568,6 +573,9 @@ func evalList(environment *env, items listExpr) (expr, error) {
 		case "lambda":
 			value, err := evalLambda(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
+		case "case-lambda":
+			value, err := evalCaseLambda(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "and":
 			value, err := evalAnd(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
@@ -803,6 +811,35 @@ func evalLambda(environment *env, forms []expr) (expr, error) {
 	}, nil
 }
 
+func evalCaseLambda(environment *env, forms []expr) (expr, error) {
+	if len(forms) == 0 {
+		return nil, &EvalError{Message: "case-lambda expects at least 1 clause"}
+	}
+
+	clauses := make([]closureExpr, 0, len(forms))
+	for _, form := range forms {
+		clause, ok := form.(listExpr)
+		if !ok || len(clause.items) < 2 {
+			return nil, &EvalError{Message: "case-lambda clauses must include parameters and a body"}
+		}
+
+		params, restParam, variadic, err := parseLambdaParams(clause.items[0])
+		if err != nil {
+			return nil, attachPos(err, clause.pos)
+		}
+
+		clauses = append(clauses, closureExpr{
+			params:    params,
+			restParam: restParam,
+			variadic:  variadic,
+			body:      append([]expr(nil), clause.items[1:]...),
+			env:       environment,
+		})
+	}
+
+	return caseClosureExpr{clauses: clauses}, nil
+}
+
 func parseLambdaParams(form expr) ([]string, string, bool, error) {
 	switch params := form.(type) {
 	case symbolExpr:
@@ -879,25 +916,14 @@ func applyCallable(proc expr, args []expr) (expr, error) {
 	case builtinProc:
 		return callable.fn(args)
 	case closureExpr:
-		if !callable.variadic && len(args) != len(callable.params) {
-			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
+		return applyClosure(callable, args)
+	case caseClosureExpr:
+		for _, clause := range callable.clauses {
+			if closureMatchesArity(clause, len(args)) {
+				return applyClosure(clause, args)
+			}
 		}
-		if callable.variadic && len(args) < len(callable.params) {
-			return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(callable.params), len(args))}
-		}
-
-		callEnv := &env{
-			parent:   callable.env,
-			bindings: map[string]expr{},
-		}
-		for i, name := range callable.params {
-			callEnv.define(name, args[i])
-		}
-		if callable.variadic {
-			rest := append([]expr(nil), args[len(callable.params):]...)
-			callEnv.define(callable.restParam, listExpr{items: rest})
-		}
-		return evalSequence(callEnv, callable.body)
+		return nil, &EvalError{Message: fmt.Sprintf("no matching case-lambda clause for %d arguments", len(args))}
 	case recordConstructorProc:
 		return applyRecordConstructor(callable, args)
 	case recordPredicateProc:
@@ -909,6 +935,35 @@ func applyCallable(proc expr, args []expr) (expr, error) {
 	default:
 		return nil, &EvalError{Message: "first list element is not a procedure"}
 	}
+}
+
+func closureMatchesArity(callable closureExpr, argc int) bool {
+	if callable.variadic {
+		return argc >= len(callable.params)
+	}
+	return argc == len(callable.params)
+}
+
+func applyClosure(callable closureExpr, args []expr) (expr, error) {
+	if !callable.variadic && len(args) != len(callable.params) {
+		return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
+	}
+	if callable.variadic && len(args) < len(callable.params) {
+		return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(callable.params), len(args))}
+	}
+
+	callEnv := &env{
+		parent:   callable.env,
+		bindings: map[string]expr{},
+	}
+	for i, name := range callable.params {
+		callEnv.define(name, args[i])
+	}
+	if callable.variadic {
+		rest := append([]expr(nil), args[len(callable.params):]...)
+		callEnv.define(callable.restParam, listExpr{items: rest})
+	}
+	return evalSequence(callEnv, callable.body)
 }
 
 func evalArgs(environment *env, forms []expr) ([]expr, error) {
@@ -1825,6 +1880,15 @@ func typePredicate(test func(expr) bool) builtinFunc {
 	}
 }
 
+func isProcedure(value expr) bool {
+	switch value.(type) {
+	case builtinProc, closureExpr, caseClosureExpr, recordConstructorProc, recordPredicateProc, recordAccessorProc, recordMutatorProc:
+		return true
+	default:
+		return false
+	}
+}
+
 func unaryCharArg(args []expr, name string) (rune, error) {
 	if len(args) != 1 {
 		return 0, &EvalError{Message: fmt.Sprintf("%s expects exactly 1 argument", name)}
@@ -1958,6 +2022,8 @@ func renderExpr(value expr) string {
 	case builtinProc:
 		return "#<procedure:" + v.name + ">"
 	case closureExpr:
+		return "#<procedure>"
+	case caseClosureExpr:
 		return "#<procedure>"
 	case recordConstructorProc:
 		return "#<procedure:" + v.recordType.constructorName + ">"
