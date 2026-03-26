@@ -1,5 +1,7 @@
 package ming;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 final class GlobalEnvironmentFactory {
@@ -48,6 +50,8 @@ final class GlobalEnvironmentFactory {
         define("=", args -> BoolValue.of(evaluator.compareIncreasing(args, Comparison.EQUAL)));
         define("<=", args -> BoolValue.of(
                 evaluator.compareIncreasing(args, Comparison.LESS_OR_EQUAL)));
+        define(">=", args -> BoolValue.of(
+                evaluator.compareIncreasing(args, Comparison.GREATER_OR_EQUAL)));
         define("zero?", args -> evaluator.signPredicate("zero?", args, 0));
         define("positive?", args -> evaluator.signPredicate("positive?", args, 1));
         define("negative?", args -> evaluator.signPredicate("negative?", args, -1));
@@ -222,6 +226,26 @@ final class GlobalEnvironmentFactory {
             }
             return new CharValue(value.charAt(index));
         });
+        define("string->list", args -> {
+            evaluator.requireArity("string->list", args.size(), 1);
+
+            String value = evaluator.expectString(args.getFirst());
+            List<Value> characters = new ArrayList<>(value.length());
+            for (int index = 0; index < value.length(); index++) {
+                characters.add(new CharValue(value.charAt(index)));
+            }
+            return evaluator.makeList(characters);
+        });
+        define("list->string", args -> {
+            evaluator.requireArity("list->string", args.size(), 1);
+
+            List<Value> elements = evaluator.listElements(args.getFirst());
+            StringBuilder builder = new StringBuilder(elements.size());
+            for (Value element : elements) {
+                builder.append(evaluator.expectChar(element));
+            }
+            return new StringValue(builder.toString());
+        });
         define("string-copy", args -> {
             evaluator.requireArity("string-copy", args.size(), 1);
             return evaluator.expectStringValue(args.getFirst()).copy(true);
@@ -268,6 +292,21 @@ final class GlobalEnvironmentFactory {
     private void installCharacterProcedures() {
         define("char?", args -> evaluator.typePredicate(
                 "char?", args, value -> value instanceof CharValue));
+        define("char->integer", args -> {
+            evaluator.requireArity("char->integer", args.size(), 1);
+            return new IntValue(evaluator.expectChar(args.getFirst()));
+        });
+        define("integer->char", args -> {
+            evaluator.requireArity("integer->char", args.size(), 1);
+
+            int codePoint = evaluator.expectInt(args.getFirst());
+            if (!Character.isValidCodePoint(codePoint)
+                    || !Character.isBmpCodePoint(codePoint)
+                    || Character.isSurrogate((char) codePoint)) {
+                throw new EvalError("integer->char code point out of range");
+            }
+            return new CharValue((char) codePoint);
+        });
         define("char-alphabetic?", args -> {
             evaluator.requireArity("char-alphabetic?", args.size(), 1);
             return BoolValue.of(Character.isLetter(evaluator.expectChar(args.getFirst())));

@@ -306,6 +306,12 @@ enum Comparison {
         boolean matches(int relation) {
             return relation <= 0;
         }
+    },
+    GREATER_OR_EQUAL(">=") {
+        @Override
+        boolean matches(int relation) {
+            return relation >= 0;
+        }
     };
 
     private final String symbol;
