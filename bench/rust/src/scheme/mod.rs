@@ -139,12 +139,22 @@ enum Procedure {
         body: Vec<Expr>,
         env: EnvRef,
     },
+    CaseLambda {
+        clauses: Vec<LambdaClause>,
+        env: EnvRef,
+    },
 }
 
 #[derive(Debug, Clone)]
 struct LambdaParams {
     required: Vec<String>,
     rest: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LambdaClause {
+    params: LambdaParams,
+    body: Vec<Expr>,
 }
 
 #[derive(Debug)]
@@ -165,6 +175,11 @@ impl LambdaParams {
             required,
             rest: None,
         }
+    }
+
+    fn matches_arity(&self, arg_count: usize) -> bool {
+        arg_count >= self.required.len()
+            && (self.rest.is_some() || arg_count == self.required.len())
     }
 }
 
@@ -298,9 +313,7 @@ impl Procedure {
                 }
             }
             Self::Lambda { params, body, env } => {
-                if args.len() < params.required.len()
-                    || (params.rest.is_none() && args.len() != params.required.len())
-                {
+                if !params.matches_arity(args.len()) {
                     return Err(EvalError::WrongArgCount {
                         name: "lambda",
                         expected: if params.rest.is_some() {
@@ -312,21 +325,23 @@ impl Procedure {
                     });
                 }
 
-                let call_env = Env::new(Some(env.clone()));
-                let mut args = args.into_iter();
-
-                for param in &params.required {
-                    let value = args
-                        .next()
-                        .expect("arity checked before binding lambda args");
-                    call_env.define(param.clone(), value);
-                }
-
-                if let Some(rest) = &params.rest {
-                    call_env.define(rest.clone(), Value::List(args.collect()));
-                }
-
+                let call_env = bind_lambda_args(params, args, env);
                 eval_sequence(body, &call_env, context)
+            }
+            Self::CaseLambda { clauses, env } => {
+                let Some(clause) = clauses
+                    .iter()
+                    .find(|clause| clause.params.matches_arity(args.len()))
+                else {
+                    return Err(EvalError::WrongArgCountDynamic {
+                        name: "case-lambda".into(),
+                        expected: "a matching clause".into(),
+                        got: args.len(),
+                    });
+                };
+
+                let call_env = bind_lambda_args(&clause.params, args, env);
+                eval_sequence(&clause.body, &call_env, context)
             }
         }
     }
@@ -694,6 +709,7 @@ fn eval_application(
         match name.as_str() {
             "and" => return eval_and(tail, env, context),
             "begin" => return eval_begin(tail, env, context),
+            "case-lambda" => return eval_case_lambda(tail, env),
             "cond" => return eval_cond(tail, env, context),
             "define" => return eval_define(tail, env, context),
             "define-record-type" => return eval_define_record_type(tail, env),
@@ -1018,6 +1034,26 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     })))
 }
 
+fn eval_case_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "case-lambda",
+            expected: "at least 1 clause",
+            got: 0,
+        });
+    }
+
+    let clauses = args
+        .iter()
+        .map(parse_case_lambda_clause)
+        .collect::<Result<Vec<_>, EvalError>>()?;
+
+    Ok(Value::Procedure(Rc::new(Procedure::CaseLambda {
+        clauses,
+        env: env.clone(),
+    })))
+}
+
 fn eval_let(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
     let Some((first, rest)) = args.split_first() else {
         return Err(EvalError::WrongArgCount {
@@ -1118,6 +1154,34 @@ fn parse_params(expr: &Expr, name: &'static str) -> Result<LambdaParams, EvalErr
             message: "expected a parameter list",
         }),
     }
+}
+
+fn parse_case_lambda_clause(expr: &Expr) -> Result<LambdaClause, EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::InvalidForm {
+            name: "case-lambda",
+            message: "expected each clause to be a list",
+        });
+    };
+
+    let Some((params_expr, body)) = items.split_first() else {
+        return Err(EvalError::InvalidForm {
+            name: "case-lambda",
+            message: "expected each clause to contain parameters and a body",
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::InvalidForm {
+            name: "case-lambda",
+            message: "expected each clause to contain at least one body expression",
+        });
+    }
+
+    Ok(LambdaClause {
+        params: parse_params(params_expr, "case-lambda")?,
+        body: body.to_vec(),
+    })
 }
 
 fn parse_record_constructor(expr: &Expr) -> Result<RecordConstructorSpec, EvalError> {
@@ -1278,6 +1342,24 @@ fn render_char(value: char) -> String {
     }
 }
 
+fn bind_lambda_args(params: &LambdaParams, args: Vec<Value>, env: &EnvRef) -> EnvRef {
+    let call_env = Env::new(Some(env.clone()));
+    let mut args = args.into_iter();
+
+    for param in &params.required {
+        let value = args
+            .next()
+            .expect("arity checked before binding lambda args");
+        call_env.define(param.clone(), value);
+    }
+
+    if let Some(rest) = &params.rest {
+        call_env.define(rest.clone(), Value::List(args.collect()));
+    }
+
+    call_env
+}
+
 fn render_pair(car: &Value, cdr: &Value, display: bool) -> String {
     let mut rendered = vec![if display {
         car.display_render()
@@ -1375,6 +1457,7 @@ fn root_env() -> EnvRef {
         "odd?",
         "pair?",
         "positive?",
+        "procedure?",
         "quotient",
         "rational?",
         "remainder",
@@ -1797,6 +1880,9 @@ fn apply_builtin(
             let number = expect_number_arg("positive?", args)?;
             Ok(Value::Boolean(number.is_positive()))
         }
+        "procedure?" => predicate_builtin("procedure?", args, |value| {
+            matches!(value, Value::Procedure(_))
+        }),
         "quotient" => {
             let (left, right) = expect_two_exact_integers("quotient", args)?;
             if right == 0 {
