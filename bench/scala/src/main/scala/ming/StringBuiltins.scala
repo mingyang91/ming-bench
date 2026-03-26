@@ -50,30 +50,6 @@ private[ming] object StringBuiltins:
       )
     )
     env.set(
-      "string->number",
-      SchemeBuiltin(
-        "string->number",
-        args =>
-          if args.size != 1 then throw new EvalError("string->number: expected 1 argument")
-          args.head match
-            case SchemeString(s) =>
-              try SchemeInt(s.toLong)
-              catch case _: NumberFormatException => SchemeBool(false)
-            case _ => throw new EvalError("string->number: expected string")
-      )
-    )
-    env.set(
-      "number->string",
-      SchemeBuiltin(
-        "number->string",
-        args =>
-          if args.size != 1 then throw new EvalError("number->string: expected 1 argument")
-          args.head match
-            case SchemeInt(n) => SchemeString(n.toString)
-            case _            => throw new EvalError("number->string: expected number")
-      )
-    )
-    env.set(
       "string-copy",
       SchemeBuiltin(
         "string-copy",
@@ -98,6 +74,32 @@ private[ming] object StringBuiltins:
             case _ => throw new EvalError("string-set!: expected string, int, char")
       )
     )
+
+  private def installStringConversions(env: Env): Unit =
+    env.set(
+      "string->number",
+      SchemeBuiltin(
+        "string->number",
+        args =>
+          if args.size != 1 then throw new EvalError("string->number: expected 1 argument")
+          args.head match
+            case SchemeString(s) =>
+              try SchemeInt(s.toLong)
+              catch case _: NumberFormatException => SchemeBool(false)
+            case _ => throw new EvalError("string->number: expected string")
+      )
+    )
+    env.set(
+      "number->string",
+      SchemeBuiltin(
+        "number->string",
+        args =>
+          if args.size != 1 then throw new EvalError("number->string: expected 1 argument")
+          args.head match
+            case SchemeInt(n) => SchemeString(n.toString)
+            case _            => throw new EvalError("number->string: expected number")
+      )
+    )
     env.set(
       "string->list",
       SchemeBuiltin(
@@ -116,18 +118,19 @@ private[ming] object StringBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("list->string: expected 1 argument")
           def extractChars(v: SchemeVal): List[Char] = v match
-            case SchemeList(elems) => elems.map {
-              case SchemeChar(c) => c
-              case _ => throw new EvalError("list->string: expected list of chars")
-            }
+            case SchemeList(elems) =>
+              elems.map {
+                case SchemeChar(c) => c
+                case _             => throw new EvalError("list->string: expected list of chars")
+              }
             case SchemePair(_, _) =>
               var chars = List.newBuilder[Char]
-              var curr = v
+              var curr  = v
               while curr match
-                case SchemePair(SchemeChar(c), rest) =>
-                  chars += c; curr = rest; true
-                case SchemeList(Nil) => false
-                case _ => throw new EvalError("list->string: expected list of chars")
+                  case SchemePair(SchemeChar(c), rest) =>
+                    chars += c; curr = rest; true
+                  case SchemeList(Nil) => false
+                  case _               => throw new EvalError("list->string: expected list of chars")
               do ()
               chars.result()
             case _ => throw new EvalError("list->string: expected list")
@@ -183,4 +186,5 @@ private[ming] object StringBuiltins:
 
   def install(env: Env): Unit =
     installStringOps(env)
+    installStringConversions(env)
     installSymbolOps(env)
