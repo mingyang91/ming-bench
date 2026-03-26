@@ -43,6 +43,7 @@ const BUILTIN_NAMES = [
     'boolean?',
     'pair?',
     'symbol?',
+    'procedure?',
     'eq?',
     'equal?',
     'display',
@@ -402,6 +403,8 @@ function evaluateList(elements, env, context) {
                 return evaluateQuote(argExprs);
             case 'lambda':
                 return evaluateLambda(argExprs, env);
+            case 'case-lambda':
+                return evaluateCaseLambda(argExprs, env);
             case 'and':
                 return evaluateAnd(argExprs, env, context);
             case 'or':
@@ -591,14 +594,7 @@ function evaluateLambda(argExprs, env) {
         throw new EvalError('lambda expects parameters and a body');
     }
     const [paramsExpr, ...body] = argExprs;
-    const params = paramsExpr.kind === 'symbol'
-        ? { fixedParams: [], restParam: paramsExpr.name }
-        : paramsExpr.kind === 'list'
-            ? readParameterList(paramsExpr.elements)
-            : undefined;
-    if (params === undefined) {
-        throw new EvalError('lambda parameters must be a list or symbol');
-    }
+    const params = readFormals(paramsExpr, 'lambda parameters must be a list or symbol');
     return {
         kind: 'closure',
         params: params.fixedParams,
@@ -606,6 +602,37 @@ function evaluateLambda(argExprs, env) {
         body,
         env,
     };
+}
+function evaluateCaseLambda(argExprs, env) {
+    if (argExprs.length === 0) {
+        throw new EvalError('case-lambda expects at least 1 clause');
+    }
+    return {
+        kind: 'case-lambda',
+        clauses: argExprs.map((clauseExpr) => {
+            if (clauseExpr.kind !== 'list' || clauseExpr.elements.length < 2) {
+                throw new EvalError('case-lambda clauses must be (formals body ...) lists');
+            }
+            const [paramsExpr, ...body] = clauseExpr.elements;
+            const params = readFormals(paramsExpr, 'case-lambda clause parameters must be a list or symbol');
+            return {
+                kind: 'closure',
+                params: params.fixedParams,
+                restParam: params.restParam,
+                body,
+                env,
+            };
+        }),
+    };
+}
+function readFormals(paramsExpr, errorMessage) {
+    if (paramsExpr.kind === 'symbol') {
+        return { fixedParams: [], restParam: paramsExpr.name };
+    }
+    if (paramsExpr.kind === 'list') {
+        return readParameterList(paramsExpr.elements);
+    }
+    throw new EvalError(errorMessage);
 }
 function readParameterList(exprs) {
     const fixedParams = [];
@@ -1161,6 +1188,7 @@ function isSpecialFormName(name) {
         case 'if':
         case 'quote':
         case 'lambda':
+        case 'case-lambda':
         case 'and':
         case 'or':
         case 'let':
@@ -1295,6 +1323,8 @@ function applyProcedure(procedure, args, context) {
             return applyBuiltin(procedure.name, args, context);
         case 'closure':
             return applyClosure(procedure, args, context);
+        case 'case-lambda':
+            return applyCaseLambda(procedure, args, context);
         case 'record-constructor':
             return applyRecordConstructor(procedure, args);
         case 'record-predicate':
@@ -1355,6 +1385,19 @@ function applyClosure(procedure, args, context) {
         callEnv.define(procedure.restParam, buildList(args.slice(procedure.params.length)));
     }
     return evaluateSequence(procedure.body, callEnv, context);
+}
+function applyCaseLambda(procedure, args, context) {
+    for (const clause of procedure.clauses) {
+        if (matchesArity(clause, args.length)) {
+            return applyClosure(clause, args, context);
+        }
+    }
+    throw new EvalError(`case-lambda: no matching clause for ${args.length} arguments`);
+}
+function matchesArity(procedure, argCount) {
+    return procedure.restParam === undefined
+        ? argCount === procedure.params.length
+        : argCount >= procedure.params.length;
 }
 function evaluateSequence(exprs, env, context) {
     let result = VOID_VALUE;
@@ -1469,6 +1512,8 @@ function applyBuiltin(name, args, context) {
             return applyTypePredicate(args, 'pair?', (value) => value.kind === 'pair');
         case 'symbol?':
             return applyTypePredicate(args, 'symbol?', (value) => value.kind === 'symbol');
+        case 'procedure?':
+            return applyTypePredicate(args, 'procedure?', (value) => isCallableValue(value));
         case 'eq?':
             if (args.length !== 2) {
                 throw new EvalError('eq? expects exactly 2 arguments');
@@ -1979,6 +2024,20 @@ function applyTypePredicate(args, name, predicate) {
     }
     return makeBoolean(predicate(args[0]));
 }
+function isCallableValue(value) {
+    switch (value.kind) {
+        case 'builtin':
+        case 'closure':
+        case 'case-lambda':
+        case 'record-constructor':
+        case 'record-predicate':
+        case 'record-accessor':
+        case 'record-mutator':
+            return true;
+        default:
+            return false;
+    }
+}
 function isTruthy(value) {
     return value.kind !== 'boolean' || value.value;
 }
@@ -2038,6 +2097,7 @@ function formatValueWithMode(value, mode) {
             return `#<record ${value.recordType.name}>`;
         case 'builtin':
         case 'closure':
+        case 'case-lambda':
         case 'record-constructor':
         case 'record-predicate':
         case 'record-accessor':

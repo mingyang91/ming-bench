@@ -59,6 +59,10 @@ type ClosureProcedure = {
   body: Expr[];
   env: Environment;
 };
+type CaseLambdaProcedure = {
+  kind: 'case-lambda';
+  clauses: ClosureProcedure[];
+};
 type RecordConstructorProcedure = {
   kind: 'record-constructor';
   name: string;
@@ -105,6 +109,7 @@ type RuntimeValue =
   | RecordValue
   | BuiltinProcedure
   | ClosureProcedure
+  | CaseLambdaProcedure
   | RecordConstructorProcedure
   | RecordPredicateProcedure
   | RecordAccessorProcedure
@@ -164,6 +169,7 @@ const BUILTIN_NAMES = [
   'boolean?',
   'pair?',
   'symbol?',
+  'procedure?',
   'eq?',
   'equal?',
   'display',
@@ -595,6 +601,8 @@ function evaluateList(elements: Expr[], env: Environment, context: EvalContext):
         return evaluateQuote(argExprs);
       case 'lambda':
         return evaluateLambda(argExprs, env);
+      case 'case-lambda':
+        return evaluateCaseLambda(argExprs, env);
       case 'and':
         return evaluateAnd(argExprs, env, context);
       case 'or':
@@ -832,16 +840,7 @@ function evaluateLambda(argExprs: Expr[], env: Environment): RuntimeValue {
   }
 
   const [paramsExpr, ...body] = argExprs;
-  const params =
-    paramsExpr.kind === 'symbol'
-      ? { fixedParams: [], restParam: paramsExpr.name }
-      : paramsExpr.kind === 'list'
-        ? readParameterList(paramsExpr.elements)
-        : undefined;
-
-  if (params === undefined) {
-    throw new EvalError('lambda parameters must be a list or symbol');
-  }
+  const params = readFormals(paramsExpr, 'lambda parameters must be a list or symbol');
 
   return {
     kind: 'closure',
@@ -850,6 +849,50 @@ function evaluateLambda(argExprs: Expr[], env: Environment): RuntimeValue {
     body,
     env,
   };
+}
+
+function evaluateCaseLambda(argExprs: Expr[], env: Environment): RuntimeValue {
+  if (argExprs.length === 0) {
+    throw new EvalError('case-lambda expects at least 1 clause');
+  }
+
+  return {
+    kind: 'case-lambda',
+    clauses: argExprs.map((clauseExpr) => {
+      if (clauseExpr.kind !== 'list' || clauseExpr.elements.length < 2) {
+        throw new EvalError('case-lambda clauses must be (formals body ...) lists');
+      }
+
+      const [paramsExpr, ...body] = clauseExpr.elements;
+      const params = readFormals(
+        paramsExpr,
+        'case-lambda clause parameters must be a list or symbol',
+      );
+
+      return {
+        kind: 'closure',
+        params: params.fixedParams,
+        restParam: params.restParam,
+        body,
+        env,
+      };
+    }),
+  };
+}
+
+function readFormals(
+  paramsExpr: Expr,
+  errorMessage: string,
+): { fixedParams: string[]; restParam?: string } {
+  if (paramsExpr.kind === 'symbol') {
+    return { fixedParams: [], restParam: paramsExpr.name };
+  }
+
+  if (paramsExpr.kind === 'list') {
+    return readParameterList(paramsExpr.elements);
+  }
+
+  throw new EvalError(errorMessage);
 }
 
 function readParameterList(exprs: Expr[]): { fixedParams: string[]; restParam?: string } {
@@ -1829,6 +1872,7 @@ function isSpecialFormName(name: string): boolean {
     case 'if':
     case 'quote':
     case 'lambda':
+    case 'case-lambda':
     case 'and':
     case 'or':
     case 'let':
@@ -1997,6 +2041,8 @@ function applyProcedure(
       return applyBuiltin(procedure.name, args, context);
     case 'closure':
       return applyClosure(procedure, args, context);
+    case 'case-lambda':
+      return applyCaseLambda(procedure, args, context);
     case 'record-constructor':
       return applyRecordConstructor(procedure, args);
     case 'record-predicate':
@@ -2088,6 +2134,29 @@ function applyClosure(
   }
 
   return evaluateSequence(procedure.body, callEnv, context);
+}
+
+function applyCaseLambda(
+  procedure: CaseLambdaProcedure,
+  args: RuntimeValue[],
+  context: EvalContext,
+): RuntimeValue {
+  for (const clause of procedure.clauses) {
+    if (matchesArity(clause, args.length)) {
+      return applyClosure(clause, args, context);
+    }
+  }
+
+  throw new EvalError(`case-lambda: no matching clause for ${args.length} arguments`);
+}
+
+function matchesArity(
+  procedure: Pick<ClosureProcedure, 'params' | 'restParam'>,
+  argCount: number,
+): boolean {
+  return procedure.restParam === undefined
+    ? argCount === procedure.params.length
+    : argCount >= procedure.params.length;
 }
 
 function evaluateSequence(exprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
@@ -2215,6 +2284,8 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return applyTypePredicate(args, 'pair?', (value) => value.kind === 'pair');
     case 'symbol?':
       return applyTypePredicate(args, 'symbol?', (value) => value.kind === 'symbol');
+    case 'procedure?':
+      return applyTypePredicate(args, 'procedure?', (value) => isCallableValue(value));
     case 'eq?':
       if (args.length !== 2) {
         throw new EvalError('eq? expects exactly 2 arguments');
@@ -2896,6 +2967,21 @@ function applyTypePredicate(
   return makeBoolean(predicate(args[0]));
 }
 
+function isCallableValue(value: RuntimeValue): boolean {
+  switch (value.kind) {
+    case 'builtin':
+    case 'closure':
+    case 'case-lambda':
+    case 'record-constructor':
+    case 'record-predicate':
+    case 'record-accessor':
+    case 'record-mutator':
+      return true;
+    default:
+      return false;
+  }
+}
+
 function isTruthy(value: RuntimeValue): boolean {
   return value.kind !== 'boolean' || value.value;
 }
@@ -2963,6 +3049,7 @@ function formatValueWithMode(value: RuntimeValue, mode: 'write' | 'display'): st
       return `#<record ${value.recordType.name}>`;
     case 'builtin':
     case 'closure':
+    case 'case-lambda':
     case 'record-constructor':
     case 'record-predicate':
     case 'record-accessor':
