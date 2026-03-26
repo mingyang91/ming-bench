@@ -16,6 +16,7 @@ private[ming] object Level1Builtins:
     "cons"           -> BuiltinValue("cons", cons),
     "car"            -> BuiltinValue("car", car),
     "cdr"            -> BuiltinValue("cdr", cdr),
+    "apply"          -> BuiltinValue("apply", applyProcedure),
     "null?"          -> BuiltinValue("null?", unaryPredicate("null?")(_ == EmptyListValue)),
     "list"           -> BuiltinValue("list", list),
     "length"         -> BuiltinValue("length", length),
@@ -100,6 +101,15 @@ private[ming] object Level1Builtins:
 
   private def cdr(arguments: List[Value], position: Position): Value =
     expectPair(expectSingleArgument(arguments, "cdr", position), "cdr", position).cdr
+
+  private def applyProcedure(arguments: List[Value], position: Position): Value =
+    expectAtLeast(arguments, 2, "apply", position) match
+      case function :: rest =>
+        val prefixArguments = rest.dropRight(1)
+        val listArguments   = expectProperList(rest.last, "apply", position)
+        InterpreterEvaluator.applyFunction(function, prefixArguments ++ listArguments, position)
+      case _ =>
+        throw new IllegalStateException("validated apply argument list")
 
   private def list(arguments: List[Value], position: Position): Value =
     buildList(arguments)

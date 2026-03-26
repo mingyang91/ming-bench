@@ -71,6 +71,7 @@ final private[ming] case class BuiltinValue(
 
 final private[ming] case class ClosureValue(
   parameters: List[String],
+  restParameter: Option[String],
   body: List[Expr],
   env: Environment,
   name: Option[String] = None

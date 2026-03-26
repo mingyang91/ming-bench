@@ -21,8 +21,8 @@ private[ming] object InterpreterEvaluator:
     function match
       case BuiltinValue(_, implementation) =>
         implementation(arguments, position)
-      case ClosureValue(parameters, body, closureEnv, _) =>
-        applyClosure(parameters, body, closureEnv, arguments, position)
+      case ClosureValue(parameters, restParameter, body, closureEnv, _) =>
+        applyClosure(parameters, restParameter, body, closureEnv, arguments, position)
       case other =>
         SchemeFailure.raise(
           s"attempted to call a non-procedure value: ${other.render}",
@@ -68,16 +68,33 @@ private[ming] object InterpreterEvaluator:
 
   private def applyClosure(
     parameters: List[String],
+    restParameter: Option[String],
     body: List[Expr],
     closureEnv: Environment,
     arguments: List[Value],
     position: Position
   ): Value =
-    if arguments.length != parameters.length then
-      SchemeFailure.raise(
-        s"procedure expected ${parameters.length} argument(s), got ${arguments.length}",
-        position
-      )
+    restParameter match
+      case None =>
+        if arguments.length != parameters.length then
+          SchemeFailure.raise(
+            s"procedure expected ${parameters.length} argument(s), got ${arguments.length}",
+            position
+          )
 
-    val callEnv = Environment.child(closureEnv, parameters.zip(arguments))
+      case Some(_) =>
+        if arguments.length < parameters.length then
+          SchemeFailure.raise(
+            s"procedure expected at least ${parameters.length} argument(s), got ${arguments.length}",
+            position
+          )
+
+    val fixedBindings = parameters.zip(arguments.take(parameters.length))
+    val bindings =
+      restParameter match
+        case Some(restName) =>
+          fixedBindings ++ List(restName -> RuntimeSupport.buildList(arguments.drop(parameters.length)))
+        case None =>
+          fixedBindings
+    val callEnv = Environment.child(closureEnv, bindings)
     evalSequence(body, callEnv)

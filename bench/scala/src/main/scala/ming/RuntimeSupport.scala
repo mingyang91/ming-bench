@@ -123,7 +123,7 @@ private[ming] object RuntimeSupport:
       case EmptyListValue     => "list"
       case PairValue(_, _)    => "pair"
       case BuiltinValue(_, _) => "procedure"
-      case ClosureValue(_, _, _, _) =>
+      case ClosureValue(_, _, _, _, _) =>
         "procedure"
       case VoidValue =>
         "void"

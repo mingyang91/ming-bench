@@ -95,8 +95,8 @@ private[ming] object SpecialFormEvaluator:
     env: Environment
   ): Value =
     arguments match
-      case ListExpr(parameters, _) :: body if body.nonEmpty =>
-        buildClosure(parameters, body, env, None, position)
+      case parametersExpression :: body if body.nonEmpty =>
+        buildClosure(parametersExpression, body, env, None, position)
       case _ =>
         SchemeFailure.raise("lambda expected a parameter list and body", position)
 
@@ -169,9 +169,19 @@ private[ming] object SpecialFormEvaluator:
     val bindings   = parseBindings(bindingsExpression, position, "let")
     val arguments  = bindings.map { case (_, expression) => InterpreterEvaluator.eval(expression, env) }
     val closureEnv = Environment.child(env)
-    val closure    = ClosureValue(bindings.map(_._1), body, closureEnv, Some(name))
+    val closure    = ClosureValue(bindings.map(_._1), None, body, closureEnv, Some(name))
     closureEnv.define(name, closure)
     InterpreterEvaluator.applyFunction(closure, arguments, position)
+
+  private def buildClosure(
+    parametersExpression: Expr,
+    body: List[Expr],
+    env: Environment,
+    name: Option[String],
+    position: Position
+  ): ClosureValue =
+    val (parameters, restParameter) = parameterSpec(parametersExpression, position)
+    ClosureValue(parameters, restParameter, body, env, name)
 
   private def buildClosure(
     parameterExpressions: List[Expr],
@@ -180,14 +190,45 @@ private[ming] object SpecialFormEvaluator:
     name: Option[String],
     position: Position
   ): ClosureValue =
-    val parameters = parameterExpressions.map(parameterName(_, position))
-    ClosureValue(parameters, body, env, name)
+    val (parameters, restParameter) = parameterSpec(parameterExpressions, position)
+    ClosureValue(parameters, restParameter, body, env, name)
+
+  private def parameterSpec(
+    parametersExpression: Expr,
+    position: Position
+  ): (List[String], Option[String]) =
+    parametersExpression match
+      case SymbolExpr(name, _) =>
+        (Nil, Some(name))
+      case ListExpr(parameterExpressions, _) =>
+        parameterSpec(parameterExpressions, position)
+      case _ =>
+        SchemeFailure.raise("lambda expected a parameter list or symbol", position)
+
+  private def parameterSpec(
+    parameterExpressions: List[Expr],
+    position: Position
+  ): (List[String], Option[String]) =
+    val dotIndex = parameterExpressions.indexWhere:
+      case SymbolExpr(".", _) => true
+      case _                  => false
+
+    if dotIndex < 0 then (parameterExpressions.map(parameterName(_, position)), None)
+    else
+      parameterExpressions.drop(dotIndex) match
+        case List(SymbolExpr(".", _), SymbolExpr(restName, _)) =>
+          (
+            parameterExpressions.take(dotIndex).map(parameterName(_, position)),
+            Some(restName)
+          )
+        case _ =>
+          SchemeFailure.raise("parameter list is malformed", position)
 
   private def parameterName(expression: Expr, position: Position): String =
     expression match
       case SymbolExpr(name, _) => name
       case _ =>
-        SchemeFailure.raise("lambda parameters must be symbols", position)
+        SchemeFailure.raise("parameters must be symbols", position)
 
   private def parseBindings(
     bindingsExpression: Expr,
