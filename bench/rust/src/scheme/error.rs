@@ -60,6 +60,21 @@ pub enum EvalError {
     #[error("division by zero")]
     DivisionByZero,
 
+    #[error("{name}: index {index} out of bounds for length {len}")]
+    IndexOutOfBounds {
+        name: String,
+        index: i64,
+        len: usize,
+    },
+
+    #[error("{name}: invalid range {start}..{end} for length {len}")]
+    InvalidRange {
+        name: String,
+        start: i64,
+        end: i64,
+        len: usize,
+    },
+
     #[error("application: expected procedure, got {got}")]
     NotAProcedure { got: String },
 }
