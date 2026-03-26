@@ -91,6 +91,11 @@ interface VoidValue {
   kind: 'void';
 }
 
+interface MultipleValuesValue {
+  kind: 'multiple-values';
+  values: Value[];
+}
+
 interface UninitializedValue {
   kind: 'uninitialized';
   name: string;
@@ -243,6 +248,7 @@ type Value =
   | VectorValue
   | RecordValue
   | VoidValue
+  | MultipleValuesValue
   | UninitializedValue
   | ProcedureValue;
 
@@ -1283,6 +1289,32 @@ function createGlobalEnv(runtime: Runtime): Environment {
     ];
 
     return applyProcedure(procedureArg.value, appliedArgs, procedureArg.expr, runtime, cont);
+  }));
+
+  env.define('values', builtin('values', (args) => (
+    makeValues(args.map((arg) => arg.value))
+  )));
+
+  env.define('call-with-values', controlBuiltin('call-with-values', (args, loc, runtime, cont) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: call-with-values expects exactly 2 arguments`);
+    }
+
+    const producer = expectProcedureArg(args[0]);
+    const consumer = expectProcedureArg(args[1]);
+
+    return invokeThunk(producer, args[0].expr, runtime, (produced) => (
+      applyProcedure(
+        consumer,
+        valuesFromResult(produced).map((value) => ({
+          expr: args[0].expr,
+          value,
+        })),
+        args[1].expr,
+        runtime,
+        cont,
+      )
+    ));
   }));
 
   const defineCallCcBuiltin = (name: string): void => {
@@ -3039,6 +3071,14 @@ function makeList(elements: Value[]): Value {
   return result;
 }
 
+function makeValues(values: Value[]): Value {
+  return values.length === 1 ? values[0] : { kind: 'multiple-values', values };
+}
+
+function valuesFromResult(value: Value): Value[] {
+  return isMultipleValuesValue(value) ? value.values : [value];
+}
+
 function parseMacroTransformer(expr: Expr, definitionEnv: Environment): MacroTransformer {
   if (expr.type !== 'list' || expr.elements.length < 2 || exprSymbolName(expr.elements[0]) !== 'syntax-rules') {
     throw new EvalError(`${expr.line}:${expr.col}: define-syntax expects a syntax-rules form`);
@@ -4084,6 +4124,10 @@ function isVoidValue(value: Value): value is VoidValue {
   return typeof value === 'object' && value !== null && value.kind === 'void';
 }
 
+function isMultipleValuesValue(value: Value): value is MultipleValuesValue {
+  return typeof value === 'object' && value !== null && value.kind === 'multiple-values';
+}
+
 function isUninitializedValue(value: Value): value is UninitializedValue {
   return typeof value === 'object' && value !== null && value.kind === 'uninitialized';
 }
@@ -4201,6 +4245,8 @@ function formatValue(value: Value): string {
       return `#<record ${value.recordType.name}>`;
     case 'void':
       return '#<void>';
+    case 'multiple-values':
+      return value.values.map(formatValue).join('\n');
     case 'uninitialized':
       return `#<uninitialized ${value.name}>`;
     case 'procedure':
@@ -4230,6 +4276,8 @@ function formatDisplayValue(value: Value): string {
       return `#<record ${value.recordType.name}>`;
     case 'void':
       return '#<void>';
+    case 'multiple-values':
+      return value.values.map(formatDisplayValue).join('\n');
     case 'uninitialized':
       return `#<uninitialized ${value.name}>`;
     case 'procedure':

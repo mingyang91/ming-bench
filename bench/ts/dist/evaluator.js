@@ -798,6 +798,18 @@ function createGlobalEnv(runtime) {
         ];
         return applyProcedure(procedureArg.value, appliedArgs, procedureArg.expr, runtime, cont);
     }));
+    env.define('values', builtin('values', (args) => (makeValues(args.map((arg) => arg.value)))));
+    env.define('call-with-values', controlBuiltin('call-with-values', (args, loc, runtime, cont) => {
+        if (args.length !== 2) {
+            throw new EvalError(`${loc.line}:${loc.col}: call-with-values expects exactly 2 arguments`);
+        }
+        const producer = expectProcedureArg(args[0]);
+        const consumer = expectProcedureArg(args[1]);
+        return invokeThunk(producer, args[0].expr, runtime, (produced) => (applyProcedure(consumer, valuesFromResult(produced).map((value) => ({
+            expr: args[0].expr,
+            value,
+        })), args[1].expr, runtime, cont)));
+    }));
     const defineCallCcBuiltin = (name) => {
         env.define(name, controlBuiltin(name, (args, loc, runtime, cont) => {
             if (args.length !== 1) {
@@ -1974,6 +1986,12 @@ function makeList(elements) {
     }
     return result;
 }
+function makeValues(values) {
+    return values.length === 1 ? values[0] : { kind: 'multiple-values', values };
+}
+function valuesFromResult(value) {
+    return isMultipleValuesValue(value) ? value.values : [value];
+}
 function parseMacroTransformer(expr, definitionEnv) {
     if (expr.type !== 'list' || expr.elements.length < 2 || exprSymbolName(expr.elements[0]) !== 'syntax-rules') {
         throw new EvalError(`${expr.line}:${expr.col}: define-syntax expects a syntax-rules form`);
@@ -2760,6 +2778,9 @@ function isEmptyList(value) {
 function isVoidValue(value) {
     return typeof value === 'object' && value !== null && value.kind === 'void';
 }
+function isMultipleValuesValue(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'multiple-values';
+}
 function isUninitializedValue(value) {
     return typeof value === 'object' && value !== null && value.kind === 'uninitialized';
 }
@@ -2841,6 +2862,8 @@ function formatValue(value) {
             return `#<record ${value.recordType.name}>`;
         case 'void':
             return '#<void>';
+        case 'multiple-values':
+            return value.values.map(formatValue).join('\n');
         case 'uninitialized':
             return `#<uninitialized ${value.name}>`;
         case 'procedure':
@@ -2868,6 +2891,8 @@ function formatDisplayValue(value) {
             return `#<record ${value.recordType.name}>`;
         case 'void':
             return '#<void>';
+        case 'multiple-values':
+            return value.values.map(formatDisplayValue).join('\n');
         case 'uninitialized':
             return `#<uninitialized ${value.name}>`;
         case 'procedure':
