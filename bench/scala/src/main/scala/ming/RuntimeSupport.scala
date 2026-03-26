@@ -52,9 +52,27 @@ private[ming] object RuntimeSupport:
 
   def expectString(value: Value, name: String, position: Position): String =
     value match
-      case StringValue(text) => text
+      case stringValue: StringLikeValue => stringValue.text
       case other =>
         SchemeFailure.raise(s"$name expected a string, got ${typeName(other)}", position)
+
+  def expectMutableString(
+    value: Value,
+    name: String,
+    position: Position
+  ): MutableStringValue =
+    value match
+      case stringValue: MutableStringValue => stringValue
+      case _: StringLikeValue =>
+        SchemeFailure.raise(s"$name expected a mutable string", position)
+      case other =>
+        SchemeFailure.raise(s"$name expected a string, got ${typeName(other)}", position)
+
+  def expectChar(value: Value, name: String, position: Position): Char =
+    value match
+      case CharValue(ch) => ch
+      case other =>
+        SchemeFailure.raise(s"$name expected a char, got ${typeName(other)}", position)
 
   def expectSymbol(value: Value, name: String, position: Position): String =
     value match
@@ -99,7 +117,7 @@ private[ming] object RuntimeSupport:
     value match
       case IntValue(_)        => "number"
       case BoolValue(_)       => "boolean"
-      case StringValue(_)     => "string"
+      case _: StringLikeValue => "string"
       case SymbolValue(_)     => "symbol"
       case CharValue(_)       => "char"
       case EmptyListValue     => "list"

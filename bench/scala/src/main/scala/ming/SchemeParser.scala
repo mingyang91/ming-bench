@@ -92,12 +92,23 @@ private[ming] object SchemeParser:
       token match
         case "#t" => BoolExpr(true, start)
         case "#f" => BoolExpr(false, start)
+        case _ if token.startsWith("#\\") =>
+          CharExpr(parseCharacterLiteral(token, start), start)
         case _ if token.matches("[+-]?\\d+") =>
           IntExpr(BigInt(token), start)
         case _ =>
           SymbolExpr(token, start)
 
     (nextState, expression)
+
+  private def parseCharacterLiteral(token: String, position: Position): Char =
+    token.stripPrefix("#\\") match
+      case "space"   => ' '
+      case "newline" => '\n'
+      case value if value.length == 1 =>
+        value.charAt(0)
+      case _ =>
+        SchemeFailure.raise("invalid character literal", position)
 
   @tailrec
   private def skipIgnorable(state0: State): State =

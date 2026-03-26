@@ -11,6 +11,8 @@ final private[ming] case class BoolExpr(value: Boolean, position: Position) exte
 
 final private[ming] case class StringExpr(value: String, position: Position) extends Expr
 
+final private[ming] case class CharExpr(value: Char, position: Position) extends Expr
+
 final private[ming] case class SymbolExpr(name: String, position: Position) extends Expr
 
 final private[ming] case class ListExpr(items: List[Expr], position: Position) extends Expr

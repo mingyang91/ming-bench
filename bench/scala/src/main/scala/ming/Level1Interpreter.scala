@@ -28,6 +28,7 @@ private[ming] object Level1Interpreter:
       case IntExpr(value, _)    => IntValue(value)
       case BoolExpr(value, _)   => BoolValue(value)
       case StringExpr(value, _) => StringValue(value)
+      case CharExpr(value, _)   => CharValue(value)
       case SymbolExpr(name, position) =>
         env.lookup(name, position)
       case ListExpr(items, position) =>
@@ -264,6 +265,7 @@ private[ming] object Level1Interpreter:
       case IntExpr(value, _)    => IntValue(value)
       case BoolExpr(value, _)   => BoolValue(value)
       case StringExpr(value, _) => StringValue(value)
+      case CharExpr(value, _)   => CharValue(value)
       case SymbolExpr(name, _)  => SymbolValue(name)
       case ListExpr(items, _)   => buildList(items.map(quote))
 

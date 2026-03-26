@@ -23,6 +23,8 @@ private[ming] object Level1Builtins:
     "display"        -> BuiltinValue("display", display),
     "write"          -> BuiltinValue("write", write),
     "newline"        -> BuiltinValue("newline", newline),
+    "string-copy"    -> BuiltinValue("string-copy", stringCopy),
+    "string-set!"    -> BuiltinValue("string-set!", stringSet),
     "string-append"  -> BuiltinValue("string-append", stringAppend),
     "string-length"  -> BuiltinValue("string-length", stringLength),
     "substring"      -> BuiltinValue("substring", substring),
@@ -125,6 +127,23 @@ private[ming] object Level1Builtins:
     OutputCapture.append("\n")
     VoidValue
 
+  private def stringCopy(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "string-copy", position)
+    MutableStringValue(expectString(value, "string-copy", position))
+
+  private def stringSet(arguments: List[Value], position: Position): Value =
+    expectExact(arguments, 3, "string-set!", position) match
+      case stringValue :: indexValue :: charValue :: Nil =>
+        val mutableString = expectMutableString(stringValue, "string-set!", position)
+        val index         = expectIndex(indexValue, "string-set!", position)
+        val char          = expectChar(charValue, "string-set!", position)
+        if index >= mutableString.text.length then SchemeFailure.raise("string-set! index out of bounds", position)
+
+        mutableString.update(index, char)
+        VoidValue
+      case _ =>
+        throw new IllegalStateException("validated three-argument list")
+
   private def stringAppend(arguments: List[Value], position: Position): Value =
     StringValue(arguments.map(expectString(_, "string-append", position)).mkString)
 
@@ -195,8 +214,8 @@ private[ming] object Level1Builtins:
 
   private def isString(value: Value): Boolean =
     value match
-      case StringValue(_) => true
-      case _              => false
+      case _: StringLikeValue => true
+      case _                  => false
 
   private def isNumber(value: Value): Boolean =
     value match

@@ -10,10 +10,11 @@ final private[ming] case class IntValue(value: BigInt) extends Value:
 final private[ming] case class BoolValue(value: Boolean) extends Value:
   override def render: String = if value then "#t" else "#f"
 
-final private[ming] case class StringValue(value: String) extends Value:
+sealed private[ming] trait StringLikeValue extends Value:
+  def text: String
 
   override def render: String =
-    val escaped = value.flatMap:
+    val escaped = text.flatMap:
       case '\\' => "\\\\"
       case '"'  => "\\\""
       case '\n' => "\\n"
@@ -22,7 +23,15 @@ final private[ming] case class StringValue(value: String) extends Value:
       case ch   => ch.toString
     s"\"$escaped\""
 
-  override def renderDisplay: String = value
+  override def renderDisplay: String = text
+
+final private[ming] case class StringValue(text: String) extends StringLikeValue
+
+final private[ming] case class MutableStringValue(private var current: String) extends StringLikeValue:
+  override def text: String = current
+
+  def update(index: Int, value: Char): Unit =
+    current = current.updated(index, value)
 
 final private[ming] case class CharValue(value: Char) extends Value:
 
