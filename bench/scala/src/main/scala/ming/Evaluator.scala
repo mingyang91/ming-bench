@@ -57,9 +57,17 @@ object Evaluator:
     else if exprs.size == 1 then run(SEval(exprs.head, env, HaltK))
     else run(SEval(exprs.head, env, SeqK(exprs.tail, env, HaltK)))
 
-  private var lastPos: Pos                                  = Pos.zero
-  private[ming] var windStack: List[(SchemeVal, SchemeVal)] = Nil
-  private[ming] var handlerStack: List[ExceptionHandler]    = Nil
+  private val _lastPos: ThreadLocal[Pos] = ThreadLocal.withInitial(() => Pos.zero)
+  private def lastPos: Pos = _lastPos.get()
+  private def lastPos_=(p: Pos): Unit = _lastPos.set(p)
+
+  private val _windStack: ThreadLocal[List[(SchemeVal, SchemeVal)]] = ThreadLocal.withInitial(() => Nil)
+  private[ming] def windStack: List[(SchemeVal, SchemeVal)] = _windStack.get()
+  private[ming] def windStack_=(v: List[(SchemeVal, SchemeVal)]): Unit = _windStack.set(v)
+
+  private val _handlerStack: ThreadLocal[List[ExceptionHandler]] = ThreadLocal.withInitial(() => Nil)
+  private[ming] def handlerStack: List[ExceptionHandler] = _handlerStack.get()
+  private[ming] def handlerStack_=(v: List[ExceptionHandler]): Unit = _handlerStack.set(v)
 
   private def run(initial: MState): SchemeVal =
     var state = initial
