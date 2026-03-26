@@ -152,6 +152,13 @@ object Evaluator:
       case Symbol("define-syntax", _) =>
         SpecialForms.evalDefineSyntax(elems.tail, env)
         SApply(SchemeVoid, k)
+      case Symbol("syntax-case", _) =>
+        evalSyntaxCaseForm(elems.tail, env, k)
+      case Symbol("syntax-quote", _) =>
+        if elems.tail.size != 1 then throw new EvalError("syntax-quote: expected 1 argument")
+        SApply(Macros.expandSyntaxQuote(elems.tail.head, env), k)
+      case Symbol("with-syntax", _) =>
+        evalWithSyntaxForm(elems.tail, env, k)
       case Symbol("define-record-type", _) =>
         SApply(Records.evalDefineRecordType(elems.tail, env), k)
       case Symbol("guard", _) => ProcApply.evalGuardForm(elems.tail, env, k)
@@ -162,15 +169,23 @@ object Evaluator:
       case Symbol(name, _) =>
         try
           env.get(name) match
-            case m: SchemeMacro => Some(m)
-            case _              => None
+            case m: SchemeMacro            => Some(m)
+            case m: SchemeTransformerMacro => Some(m)
+            case _                         => None
         catch case _: EvalError => None
       case _ => None
     macroVal match
-      case Some(m) =>
+      case Some(m: SchemeMacro) =>
         val expanded = Macros.expand(m, SList(elems, elems.head.pos), env)
         SEval(expanded, env, k)
-      case None =>
+      case Some(tm: SchemeTransformerMacro) =>
+        val inputSyntax = SchemeSyntax(SList(elems, elems.head.pos))
+        val result      = applyProc(tm.proc, List(inputSyntax))
+        result match
+          case SchemeSyntax(outExpr) => SEval(outExpr, env, k)
+          case other =>
+            throw new EvalError(s"syntax-case: transformer must return syntax, got ${other.display}")
+      case _ =>
         SEval(elems.head, env, EvFunK(elems.tail, env, k))
 
   private def applyKont(value: SchemeVal, k: Kont): MState = k match
@@ -292,6 +307,69 @@ object Evaluator:
 
     case RaiseReturnCheckK =>
       throw new EvalError("handler returned from non-continuable exception")
+
+    case SyntaxCaseK(literals, clauses, env, k2) =>
+      applySyntaxCase(value, literals, clauses, env, k2)
+
+  private def evalSyntaxCaseForm(args: List[Expr], env: Env, k: Kont): MState =
+    if args.size < 2 then throw new EvalError("syntax-case: bad syntax")
+    val stxExpr            = args.head
+    val SList(litExprs, _) = args(1): @unchecked
+    val literals = litExprs.map {
+      case Symbol(n, _) => n; case _ => throw new EvalError("syntax-case: bad literal")
+    }.toSet
+    val clauses = args.drop(2)
+    SEval(stxExpr, env, SyntaxCaseK(literals, clauses, env, k))
+
+  private def applySyntaxCase(
+    stxVal: SchemeVal,
+    literals: Set[String],
+    clauses: List[Expr],
+    env: Env,
+    k: Kont
+  ): MState =
+    val inputExpr = stxVal match
+      case SchemeSyntax(e) => e
+      case _               => throw new EvalError("syntax-case: expected syntax object")
+
+    val macroName = inputExpr match
+      case SList(Symbol(n, _) :: _, _) => n
+      case _                           => ""
+
+    for clause <- clauses do
+      val clauseElems = clause match
+        case SList(elems, _) if elems.size >= 2 => elems
+        case _                                  => throw new EvalError("syntax-case: bad clause")
+
+      val pattern = clauseElems.head
+      val body    = clauseElems.last // body is last element (skip optional fender)
+
+      Macros.matchPattern(inputExpr, pattern, literals, macroName) match
+        case Some(bindings) =>
+          // Create new env with pattern vars as SchemeSyntax values
+          val clauseEnv = new Env(mutable.Map.empty, Some(env))
+          for (name, binding) <- bindings do
+            binding match
+              case Macros.SingleBinding(expr) => clauseEnv.set(name, SchemeSyntax(expr))
+              case Macros.ListBinding(exprs)  => clauseEnv.set(name, SchemeSyntaxList(exprs))
+          return SEval(body, clauseEnv, k)
+        case None => ()
+
+    throw new EvalError(s"syntax-case: no matching pattern")
+
+  private def evalWithSyntaxForm(args: List[Expr], env: Env, k: Kont): MState =
+    args match
+      case SList(bindings, _) :: body if body.nonEmpty =>
+        val localEnv = new Env(mutable.Map.empty, Some(env))
+        // Evaluate each binding: ((name expr) ...)
+        for b <- bindings do
+          b match
+            case SList(Symbol(name, _) :: initExpr :: Nil, _) =>
+              val value = eval(initExpr, env)
+              localEnv.set(name, value)
+            case _ => throw new EvalError("with-syntax: bad binding")
+        evalBodyCEK(body, localEnv, k)
+      case _ => throw new EvalError("with-syntax: bad syntax")
 
   private[ming] def evalBodyCEK(exprs: List[Expr], env: Env, k: Kont): MState =
     if exprs.isEmpty then SApply(SchemeVoid, k)

@@ -111,6 +111,15 @@ case object SchemeVoid extends SchemeVal:
 case class SchemeMacro(literals: List[String], rules: List[(Expr, Expr)], defEnv: Env) extends SchemeVal:
   def display: String = "#<macro>"
 
+case class SchemeTransformerMacro(proc: SchemeLambda, defEnv: Env) extends SchemeVal:
+  def display: String = "#<macro>"
+
+case class SchemeSyntax(expr: Expr) extends SchemeVal:
+  def display: String = "#<syntax>"
+
+case class SchemeSyntaxList(exprs: List[Expr]) extends SchemeVal:
+  def display: String = "#<syntax-list>"
+
 case class SchemeCaseLambda(clauses: List[SchemeLambda]) extends SchemeVal:
   def display: String = "#<procedure>"
 

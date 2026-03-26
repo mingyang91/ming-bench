@@ -13,6 +13,7 @@ private[ming] object Tokenizer:
   case class TStr(value: String, pos: Pos)  extends Token
   case class TAtom(value: String, pos: Pos) extends Token
   case class TQuote(pos: Pos)               extends Token
+  case class TSyntaxQuote(pos: Pos)         extends Token
 
   private def readString(input: String, start: Int): (String, Int) =
     var i  = start
@@ -76,6 +77,9 @@ private[ming] object Tokenizer:
           val (str, end) = readString(input, i + 1)
           tokens += TStr(str, p)
           i = end
+        case '#' if i + 1 < input.length && input(i + 1) == '\'' =>
+          tokens += TSyntaxQuote(posAt(input, i))
+          i += 2
         case _ =>
           val p           = posAt(input, i)
           val (atom, end) = readAtom(input, i)
@@ -104,6 +108,9 @@ private[ming] object Parser:
       case TQuote(p) :: rest =>
         val (expr, remaining) = parseExpr(rest)
         (SList(List(Symbol("quote", p), expr), p), remaining)
+      case TSyntaxQuote(p) :: rest =>
+        val (expr, remaining) = parseExpr(rest)
+        (SList(List(Symbol("syntax-quote", p), expr), p), remaining)
       case TStr(v, p) :: rest =>
         (StringLit(v, p), rest)
       case TAtom(v, p) :: rest =>

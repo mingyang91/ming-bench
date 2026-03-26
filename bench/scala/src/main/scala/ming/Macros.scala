@@ -3,9 +3,9 @@ package ming
 import scala.collection.mutable
 
 object Macros:
-  private var gensymCounter = 0L
+  private[ming] var gensymCounter = 0L
 
-  private def gensym(base: String): String =
+  private[ming] def gensym(base: String): String =
     gensymCounter += 1
     s"${base}__m${gensymCounter}"
 
@@ -168,7 +168,7 @@ object Macros:
       case _               => Set.empty
 
   // Find identifiers introduced by let/lambda bindings in the template
-  private def findIntroducedBindings(template: Expr, patVars: Set[String]): Set[String] =
+  private[ming] def findIntroducedBindings(template: Expr, patVars: Set[String]): Set[String] =
     template match
       case SList(Symbol("let", _) :: SList(bindings, _) :: body, _) =>
         val letVars = bindings.flatMap {
@@ -202,7 +202,7 @@ object Macros:
     "syntax-rules"
   )
 
-  private def findFreeRefs(
+  private[ming] def findFreeRefs(
     template: Expr,
     patVars: Set[String],
     literals: Set[String],
@@ -263,3 +263,34 @@ object Macros:
         case None => ()
 
     throw new EvalError(s"no matching pattern for macro $macroName")
+
+  /** Expand a syntax-quote template using syntax bindings from the environment. */
+  def expandSyntaxQuote(template: Expr, env: Env): SchemeSyntax =
+    val templateSyms = collectAllSymbols(template)
+    val patVarNames  = mutable.Set[String]()
+    val bindings     = mutable.Map[String, Binding]()
+
+    for name <- templateSyms do
+      try
+        env.get(name) match
+          case SchemeSyntax(expr) =>
+            patVarNames += name
+            bindings(name) = SingleBinding(expr)
+          case SchemeSyntaxList(exprs) =>
+            patVarNames += name
+            bindings(name) = ListBinding(exprs)
+          case _ => ()
+      catch case _: EvalError => ()
+
+    // Hygiene: rename identifiers introduced by binding forms in the template
+    val introduced = findIntroducedBindings(template, patVarNames.toSet)
+    val renaming   = introduced.map(name => name -> gensym(name)).toMap
+
+    val expanded = substitute(template, bindings.toMap, renaming)
+    SchemeSyntax(expanded)
+
+  private def collectAllSymbols(expr: Expr): Set[String] =
+    expr match
+      case Symbol(name, _) => Set(name)
+      case SList(elems, _) => elems.flatMap(collectAllSymbols).toSet
+      case _               => Set.empty

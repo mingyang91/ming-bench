@@ -221,6 +221,12 @@ private[ming] object SpecialForms:
           case _                                    => throw new EvalError("syntax-rules: bad rule")
         }
         env.set(name, SchemeMacro(litNames, parsedRules, env))
+      case Symbol(name, _) :: transformerExpr :: Nil =>
+        // Evaluate the transformer expression (e.g., a lambda)
+        val transformer = Evaluator.eval(transformerExpr, env)
+        transformer match
+          case lam: SchemeLambda => env.set(name, SchemeTransformerMacro(lam, env))
+          case _                 => throw new EvalError("define-syntax: transformer must be a procedure")
       case _ => throw new EvalError("define-syntax: bad syntax")
 
   // ── Parsing Helpers ──────────────────────────────────────────────
