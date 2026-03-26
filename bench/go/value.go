@@ -22,6 +22,7 @@ const (
 	TypeRational
 	TypeFloat
 	TypeSyntax
+	TypeRecord
 )
 
 // Value represents a Scheme value.
@@ -43,6 +44,9 @@ type Value struct {
 	ClosureEnv *Env
 	// Macro fields
 	Syntax *SyntaxRules
+	// Record fields
+	RecordTag    string
+	RecordFields map[string]*Value
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -155,6 +159,8 @@ func (v *Value) String() string {
 		return s
 	case TypePair:
 		return "(" + pairInner(v) + ")"
+	case TypeRecord:
+		return fmt.Sprintf("#<%s>", v.RecordTag)
 	default:
 		return "<unknown>"
 	}

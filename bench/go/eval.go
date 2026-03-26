@@ -121,6 +121,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalSetBang(expr, env)
 		case "define-syntax":
 			return evalDefineSyntax(expr, env)
+		case "define-record-type":
+			return evalDefineRecordType(expr, env)
 		}
 
 		// Check if head is a macro
@@ -170,6 +172,34 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 		}
 		if fn, ok := builtinRegistry[name]; ok {
 			return fn(args, expr)
+		}
+		// Record type builtins
+		if strings.HasPrefix(name, "record-ctor:") {
+			return dispatchRecordCtor(name[12:], args, expr)
+		}
+		if strings.HasPrefix(name, "record-pred:") {
+			tag := name[12:]
+			if len(args) != 1 {
+				return nil, fmt.Errorf("%d:%d: record predicate: expected 1 argument", expr.Line, expr.Col)
+			}
+			return BoolValue(args[0].Type == TypeRecord && args[0].RecordTag == tag), nil
+		}
+		if strings.HasPrefix(name, "record-acc:") {
+			rest := name[11:]
+			sepIdx := strings.Index(rest, ":")
+			tag := rest[:sepIdx]
+			field := rest[sepIdx+1:]
+			if len(args) != 1 {
+				return nil, fmt.Errorf("%d:%d: record accessor: expected 1 argument", expr.Line, expr.Col)
+			}
+			if args[0].Type != TypeRecord || args[0].RecordTag != tag {
+				return nil, fmt.Errorf("%d:%d: record accessor: not a %s", expr.Line, expr.Col, tag)
+			}
+			v, ok := args[0].RecordFields[field]
+			if !ok {
+				return nil, fmt.Errorf("%d:%d: record accessor: no field %s", expr.Line, expr.Col, field)
+			}
+			return v, nil
 		}
 	}
 
@@ -1647,4 +1677,79 @@ func evalLambda(expr *Expr, env *Env) (*Value, error) {
 		Body:       expr.List[2:],
 		ClosureEnv: env,
 	}, nil
+}
+
+// evalDefineRecordType handles (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+func evalDefineRecordType(expr *Expr, env *Env) (*Value, error) {
+	// (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+	if len(expr.List) < 4 {
+		return nil, fmt.Errorf("%d:%d: define-record-type: bad syntax", expr.Line, expr.Col)
+	}
+
+	// 1. Type name
+	typeName := expr.List[1].StrVal
+
+	// 2. Constructor: (make-xxx field1 field2 ...)
+	ctorExpr := expr.List[2]
+	if ctorExpr.Type != ExprList || len(ctorExpr.List) < 1 {
+		return nil, fmt.Errorf("%d:%d: define-record-type: bad constructor", expr.Line, expr.Col)
+	}
+	ctorName := ctorExpr.List[0].StrVal
+	ctorFields := make([]string, len(ctorExpr.List)-1)
+	for i, f := range ctorExpr.List[1:] {
+		ctorFields[i] = f.StrVal
+	}
+
+	// 3. Predicate name
+	predName := expr.List[3].StrVal
+
+	// 4. Field accessors: (field-name accessor-name) ...
+	type fieldSpec struct {
+		fieldName    string
+		accessorName string
+	}
+	var fields []fieldSpec
+	for _, fExpr := range expr.List[4:] {
+		if fExpr.Type != ExprList || len(fExpr.List) < 2 {
+			return nil, fmt.Errorf("%d:%d: define-record-type: bad field spec", expr.Line, expr.Col)
+		}
+		fields = append(fields, fieldSpec{
+			fieldName:    fExpr.List[0].StrVal,
+			accessorName: fExpr.List[1].StrVal,
+		})
+	}
+
+	// Define constructor
+	tag := typeName
+	ctorFieldsCopy := make([]string, len(ctorFields))
+	copy(ctorFieldsCopy, ctorFields)
+	env.Set(ctorName, SymbolValue("__builtin:record-ctor:"+tag+":"+strings.Join(ctorFieldsCopy, ",")))
+
+	// Predicate
+	env.Set(predName, SymbolValue("__builtin:record-pred:"+tag))
+
+	// Accessors
+	for _, f := range fields {
+		env.Set(f.accessorName, SymbolValue("__builtin:record-acc:"+tag+":"+f.fieldName))
+	}
+
+	return Void, nil
+}
+
+func dispatchRecordCtor(info string, args []*Value, expr *Expr) (*Value, error) {
+	sepIdx := strings.Index(info, ":")
+	tag := info[:sepIdx]
+	fieldStr := info[sepIdx+1:]
+	var fieldNames []string
+	if fieldStr != "" {
+		fieldNames = strings.Split(fieldStr, ",")
+	}
+	if len(args) != len(fieldNames) {
+		return nil, fmt.Errorf("%d:%d: record constructor: expected %d arguments, got %d", expr.Line, expr.Col, len(fieldNames), len(args))
+	}
+	fields := make(map[string]*Value, len(fieldNames))
+	for i, name := range fieldNames {
+		fields[name] = args[i]
+	}
+	return &Value{Type: TypeRecord, RecordTag: tag, RecordFields: fields}, nil
 }
