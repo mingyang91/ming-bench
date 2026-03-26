@@ -50,6 +50,7 @@ enum Value {
 
 struct Procedure {
     params: Vec<String>,
+    rest_param: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
 }
@@ -78,6 +79,7 @@ enum BuiltinKind {
     List,
     Length,
     Append,
+    Apply,
     StringPred,
     NumberPred,
     BooleanPred,
@@ -218,6 +220,7 @@ impl BuiltinKind {
             Self::List => "list",
             Self::Length => "length",
             Self::Append => "append",
+            Self::Apply => "apply",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
             Self::BooleanPred => "boolean?",
@@ -687,9 +690,10 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             });
         }
 
-        let params = parse_param_names(params)?;
+        let (params, rest_param) = parse_param_list_items(params)?;
         let procedure = Value::Procedure(Rc::new(Procedure {
             params,
+            rest_param,
             body: body.to_vec(),
             env: Rc::clone(env),
         }));
@@ -768,9 +772,10 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         });
     }
 
-    let params = parse_param_list(params_expr)?;
+    let (params, rest_param) = parse_param_list(params_expr)?;
     Ok(Value::Procedure(Rc::new(Procedure {
         params,
+        rest_param,
         body: body.to_vec(),
         env: Rc::clone(env),
     })))
@@ -797,28 +802,54 @@ fn eval_set(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     }
 }
 
-fn parse_param_list(params_expr: &Expr) -> Result<Vec<String>, EvalError> {
+fn parse_param_list(params_expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
     match params_expr {
-        Expr::List(items, _) => parse_param_names(items),
+        Expr::List(items, _) => parse_param_list_items(items),
         _ => Err(EvalError::SyntaxError {
             message: "parameter list must be a list of symbols".into(),
         }),
     }
 }
 
-fn parse_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> {
-    let mut params = Vec::with_capacity(items.len());
+fn parse_param_list_items(items: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let dot_index = items
+        .iter()
+        .position(|item| matches!(item, Expr::Symbol(name, _) if name == "."));
 
-    for item in items {
-        let Expr::Symbol(name, _) = item else {
-            return Err(EvalError::SyntaxError {
-                message: "parameter names must be symbols".into(),
-            });
-        };
-        params.push(name.clone());
+    let Some(dot_index) = dot_index else {
+        return Ok((parse_required_param_names(items)?, None));
+    };
+
+    if items[dot_index + 1..]
+        .iter()
+        .any(|item| matches!(item, Expr::Symbol(name, _) if name == "."))
+        || dot_index + 2 != items.len()
+    {
+        return Err(EvalError::SyntaxError {
+            message: "invalid dotted parameter list".into(),
+        });
     }
 
+    let params = parse_required_param_names(&items[..dot_index])?;
+    let rest_param = parse_param_name(&items[dot_index + 1])?;
+    Ok((params, Some(rest_param)))
+}
+
+fn parse_required_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> {
+    let mut params = Vec::with_capacity(items.len());
+    for item in items {
+        params.push(parse_param_name(item)?);
+    }
     Ok(params)
+}
+
+fn parse_param_name(item: &Expr) -> Result<String, EvalError> {
+    match item {
+        Expr::Symbol(name, _) if name != "." => Ok(name.clone()),
+        _ => Err(EvalError::SyntaxError {
+            message: "parameter names must be symbols".into(),
+        }),
+    }
 }
 
 fn apply_callable(callable: Value, args: &[Value]) -> Result<Value, EvalError> {
@@ -832,17 +863,25 @@ fn apply_callable(callable: Value, args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn apply_procedure(procedure: &Procedure, args: &[Value]) -> Result<Value, EvalError> {
-    if args.len() != procedure.params.len() {
+    let required = procedure.params.len();
+    if args.len() < required || (procedure.rest_param.is_none() && args.len() != required) {
         return Err(EvalError::WrongArgCount {
             name: "lambda".into(),
-            expected: format!("exactly {} argument(s)", procedure.params.len()),
+            expected: if procedure.rest_param.is_some() {
+                format!("at least {required} argument(s)")
+            } else {
+                format!("exactly {required} argument(s)")
+            },
             got: args.len(),
         });
     }
 
     let call_env = Environment::new(Some(Rc::clone(&procedure.env)));
-    for (param, arg) in procedure.params.iter().zip(args) {
+    for (param, arg) in procedure.params.iter().zip(args.iter().take(required)) {
         env_define(&call_env, param.clone(), arg.clone());
+    }
+    if let Some(rest_param) = &procedure.rest_param {
+        env_define(&call_env, rest_param.clone(), Value::List(args[required..].to_vec()));
     }
 
     eval_sequence(&procedure.body, &call_env)
@@ -971,6 +1010,7 @@ fn eval_named_let(
     let let_env = Environment::new(Some(Rc::clone(env)));
     let procedure = Value::Procedure(Rc::new(Procedure {
         params,
+        rest_param: None,
         body: body.to_vec(),
         env: Rc::clone(&let_env),
     }));

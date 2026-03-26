@@ -23,6 +23,7 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::List,
         BuiltinKind::Length,
         BuiltinKind::Append,
+        BuiltinKind::Apply,
         BuiltinKind::StringPred,
         BuiltinKind::NumberPred,
         BuiltinKind::BooleanPred,
@@ -75,6 +76,7 @@ pub(super) fn apply_builtin(
         BuiltinKind::List => Ok(Value::List(args.to_vec())),
         BuiltinKind::Length => eval_length(args),
         BuiltinKind::Append => eval_append(args),
+        BuiltinKind::Apply => eval_apply(args),
         BuiltinKind::StringPred => eval_predicate("string?", args, |value| {
             matches!(value, Value::String(_) | Value::MutableString(_))
         }),
@@ -337,6 +339,31 @@ fn eval_append(args: &[Value]) -> Result<Value, EvalError> {
     }
 
     Ok(Value::List(result))
+}
+
+fn eval_apply(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "apply".into(),
+            expected: "at least 2 arguments".into(),
+            got: args.len(),
+        });
+    }
+
+    let callable = args[0].clone();
+    let last = &args[args.len() - 1];
+    let Value::List(tail_args) = last else {
+        return Err(EvalError::TypeMismatch {
+            expected: "list",
+            found: last.type_name().into(),
+        });
+    };
+
+    let mut applied_args = Vec::with_capacity(args.len() - 2 + tail_args.len());
+    applied_args.extend(args[1..args.len() - 1].iter().cloned());
+    applied_args.extend(tail_args.iter().cloned());
+
+    super::apply_callable(callable, &applied_args)
 }
 
 fn eval_display(args: &[Value], output: &OutputRef) -> Result<Value, EvalError> {
