@@ -17,6 +17,13 @@ pub enum EvalError {
         got: usize,
     },
 
+    #[error("{context} expected {expected}, got {got}")]
+    WrongValueCount {
+        context: String,
+        expected: String,
+        got: usize,
+    },
+
     #[error("{0}")]
     TypeMismatch(String),
 

@@ -36,6 +36,22 @@ private[ming] object SchemeRuntime:
       case Value.CaseClosure(_) => true
       case _                    => false
 
+  def requireSingleValue(value: Value): Value =
+    value match
+      case Value.MultiValues(Nil) =>
+        throw new EvalError("expected 1 value, got 0")
+      case Value.MultiValues(single :: Nil) =>
+        single
+      case Value.MultiValues(values) =>
+        throw new EvalError(s"expected 1 value, got ${values.length}")
+      case other =>
+        other
+
+  def toValueList(value: Value): List[Value] =
+    value match
+      case Value.MultiValues(values) => values
+      case other                     => List(other)
+
   def render(value: Value): String =
     renderValue(value, RenderMode.Write, new IdentityHashMap[AnyRef, java.lang.Boolean]())
 
@@ -89,6 +105,8 @@ private[ming] object SchemeRuntime:
         "#<procedure>"
       case Value.CaseClosure(_) =>
         "#<procedure>"
+      case Value.MultiValues(_) =>
+        "#<values>"
       case Value.UninitializedValue(name) =>
         s"#<uninitialized:$name>"
       case Value.VoidValue =>

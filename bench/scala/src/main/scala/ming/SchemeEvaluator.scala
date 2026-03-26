@@ -12,9 +12,10 @@ private[ming] object SchemeEvaluator
     extends SchemeEvaluatorSpecialForms
     with SchemeEvaluatorGuardForms
     with SchemeEvaluatorBindingForms
-    with SchemeEvaluatorProcedureSupport:
+    with SchemeEvaluatorProcedureSupport
+    with SchemeEvaluatorApplicationSupport:
 
-  private val finalContinuation: Continuation = value => done(value)
+  private val finalContinuation: Continuation = value => done(requireSingleValue(value))
 
   def evalSequence(expressions: List[Expr], env: Env): Value =
     withFreshDynamicContext(run(evalSequence(expressions, env, finalContinuation)))
@@ -98,7 +99,13 @@ private[ming] object SchemeEvaluator
       case last :: Nil =>
         eval(last, env, continuation)
       case head :: tail =>
-        eval(head, env, _ => suspend(evalSequenceCps(tail, env, continuation)))
+        eval(
+          head,
+          env,
+          contextualCont(head.pos) { _ =>
+            suspend(evalSequenceCps(tail, env, continuation))
+          }
+        )
 
   private def applyProcedureCps(
     procedure: Value,
@@ -169,6 +176,10 @@ private[ming] object SchemeEvaluator
         applyWithExceptionHandlerBuiltin(args, continuation, pos)
       case "raise" =>
         applyRaise(args, pos)
+      case "values" =>
+        applyValues(args, continuation)
+      case "call-with-values" =>
+        applyCallWithValues(args, continuation, pos)
       case "apply" =>
         applyBuiltinApply(args, continuation, pos)
       case "map" =>
@@ -177,80 +188,6 @@ private[ming] object SchemeEvaluator
         applyBuiltinForEach(args, continuation, pos)
       case _ =>
         resume(continuation, implementation(args))
-
-  private def evalCompoundExpression(
-    list: Expr.ListExpr,
-    operator: Expr,
-    args: List[Expr],
-    env: Env,
-    continuation: Continuation
-  ): Computation =
-    operator match
-      case Expr.Symbol(name, _) =>
-        env.lookupSyntax(name) match
-          case Some(transformer) =>
-            val expanded = transformer.expand(list, env)
-            eval(expanded.expr, expanded.env, continuation)
-          case None =>
-            evalApplication(list.pos, operator, args, env, continuation)
-      case _ =>
-        evalApplication(list.pos, operator, args, env, continuation)
-
-  private def evalApplication(
-    callPos: SourcePos,
-    operator: Expr,
-    args: List[Expr],
-    env: Env,
-    continuation: Continuation
-  ): Computation =
-    operator match
-      case Expr.Symbol("quote", _) =>
-        evalQuote(args, continuation, callPos)
-      case Expr.Symbol("if", _) =>
-        evalIf(args, env, continuation, callPos)
-      case Expr.Symbol("case", _) =>
-        evalCase(args, env, continuation, callPos)
-      case Expr.Symbol("define", _) =>
-        evalDefine(args, env, continuation, callPos)
-      case Expr.Symbol("define-syntax", _) =>
-        evalDefineSyntax(args, env, continuation, callPos)
-      case Expr.Symbol("define-record-type", _) =>
-        resume(continuation, defineRecordType(args, env))
-      case Expr.Symbol("lambda", _) =>
-        evalLambda(args, env, continuation, callPos)
-      case Expr.Symbol("case-lambda", _) =>
-        evalCaseLambda(args, env, continuation, callPos)
-      case Expr.Symbol("set!", _) =>
-        evalSet(args, env, continuation, callPos)
-      case Expr.Symbol("and", _) =>
-        evalAnd(args, env, continuation, callPos)
-      case Expr.Symbol("or", _) =>
-        evalOr(args, env, continuation, callPos)
-      case Expr.Symbol("begin", _) =>
-        evalSequence(args, env, continuation)
-      case Expr.Symbol("cond", _) =>
-        evalCond(args, env, continuation, callPos)
-      case Expr.Symbol("guard", _) =>
-        evalGuard(args, env, continuation, callPos)
-      case Expr.Symbol("let", _) =>
-        evalLet(args, env, continuation, callPos)
-      case Expr.Symbol("let*", _) =>
-        evalLetStar(args, env, continuation, callPos)
-      case Expr.Symbol("letrec", _) =>
-        evalLetRec(args, env, continuation, sequential = false, callPos)
-      case Expr.Symbol("letrec*", _) =>
-        evalLetRec(args, env, continuation, sequential = true, callPos)
-      case Expr.Symbol("do", _) =>
-        evalDo(args, env, continuation, callPos)
-      case _ =>
-        eval(
-          operator,
-          env,
-          procedure =>
-            evalExprList(args.reverse, env) { reversedArgs =>
-              applyProcedure(procedure, reversedArgs.reverse, continuation, Some(callPos))
-            }
-        )
 
   private def clauseMatchesArgCount(clause: CaseLambdaClause, argCount: Int): Boolean =
     clause.restParam match

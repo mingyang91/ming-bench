@@ -32,7 +32,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Ok("#t".into());
     }
 
-    Ok(render(&eval_program(input)?))
+    Ok(render(&expect_single_value("top-level expression", eval_program(input)?)?))
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
@@ -68,6 +68,7 @@ enum Value {
     Pair(Rc<Pair>),
     Builtin(BuiltinProc),
     Closure(Rc<Closure>),
+    Values(Vec<Value>),
     Void,
 }
 
@@ -183,10 +184,10 @@ fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
                 Expr::Symbol(name) if name == "cond" => eval_cond(rest, env),
                 Expr::Symbol(name) if name == "let" => eval_let(rest, env),
                 _ => {
-                    let procedure = eval(first, env)?;
+                    let procedure = eval_single(first, env, "procedure position")?;
                     let args = rest
                         .iter()
-                        .map(|arg| eval(arg, env))
+                        .map(|arg| eval_single(arg, env, "procedure argument"))
                         .collect::<Result<Vec<_>, _>>()?;
                     apply(procedure, &args)
                 }
@@ -205,7 +206,7 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
 fn eval_if(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     match args {
         [condition, when_true, when_false] => {
-            if is_truthy(&eval(condition, env)?) {
+            if is_truthy(&eval_single(condition, env, "if condition")?) {
                 eval(when_true, env)
             } else {
                 eval(when_false, env)
@@ -218,7 +219,7 @@ fn eval_if(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol(name), value_expr] => {
-            let value = eval(value_expr, env)?;
+            let value = eval_single(value_expr, env, "define value")?;
             env.define(name.clone(), value);
             Ok(Value::Void)
         }
@@ -246,7 +247,7 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 fn eval_set(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol(name), value_expr] => {
-            let value = eval(value_expr, env)?;
+            let value = eval_single(value_expr, env, "set! value")?;
             env.set(name, value)?;
             Ok(Value::Void)
         }
@@ -297,25 +298,41 @@ fn quote_expr(expr: &Expr) -> Value {
 }
 
 fn eval_and(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for expr in args {
-        result = eval(expr, env)?;
+    if args.is_empty() {
+        return Ok(Value::Boolean(true));
+    }
+
+    for (index, expr) in args.iter().enumerate() {
+        if index + 1 == args.len() {
+            return eval(expr, env);
+        }
+
+        let result = eval_single(expr, env, "and expression")?;
         if !is_truthy(&result) {
             return Ok(result);
         }
     }
-    Ok(result)
+
+    unreachable!("checked non-empty and returned from final iteration")
 }
 
 fn eval_or(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for expr in args {
-        result = eval(expr, env)?;
+    if args.is_empty() {
+        return Ok(Value::Boolean(false));
+    }
+
+    for (index, expr) in args.iter().enumerate() {
+        if index + 1 == args.len() {
+            return eval(expr, env);
+        }
+
+        let result = eval_single(expr, env, "or expression")?;
         if is_truthy(&result) {
             return Ok(result);
         }
     }
-    Ok(result)
+
+    unreachable!("checked non-empty and returned from final iteration")
 }
 
 fn eval_begin(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
@@ -347,7 +364,7 @@ fn eval_cond(clauses: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
                 return eval_sequence(&items[1..], env);
             }
             test_expr => {
-                let test_value = eval(test_expr, env)?;
+                let test_value = eval_single(test_expr, env, "cond test")?;
                 if is_truthy(&test_value) {
                     if items.len() == 1 {
                         return Ok(test_value);
@@ -375,7 +392,7 @@ fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: &EnvRef) -> Result<V
     let bindings = parse_bindings(bindings_expr)?;
     let values = bindings
         .iter()
-        .map(|(_, expr)| eval(expr, env))
+        .map(|(_, expr)| eval_single(expr, env, "let binding"))
         .collect::<Result<Vec<_>, _>>()?;
 
     let let_env = Env::new(Some(Rc::clone(env)));
@@ -401,7 +418,7 @@ fn eval_named_let(
 
     let args = bindings
         .iter()
-        .map(|(_, expr)| eval(expr, env))
+        .map(|(_, expr)| eval_single(expr, env, "let binding"))
         .collect::<Result<Vec<_>, _>>()?;
 
     let let_env = Env::new(Some(Rc::clone(env)));
@@ -450,10 +467,19 @@ fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
 
 fn eval_sequence(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let mut result = Value::Void;
-    for expr in expressions {
-        result = eval(expr, env)?;
+    for (index, expr) in expressions.iter().enumerate() {
+        result = if index + 1 == expressions.len() {
+            eval(expr, env)?
+        } else {
+            eval_single(expr, env, "sequence expression")?;
+            Value::Void
+        };
     }
     Ok(result)
+}
+
+fn eval_single(expr: &Expr, env: &EnvRef, context: &str) -> Result<Value, EvalError> {
+    expect_single_value(context, eval(expr, env)?)
 }
 
 fn apply(procedure: Value, args: &[Value]) -> Result<Value, EvalError> {
@@ -483,6 +509,27 @@ fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Boolean(false))
 }
 
+fn expect_single_value(context: &str, value: Value) -> Result<Value, EvalError> {
+    match value {
+        Value::Values(values) => match values.len() {
+            1 => Ok(values.into_iter().next().expect("single value present")),
+            got => Err(EvalError::WrongValueCount {
+                context: context.to_string(),
+                expected: "1 value".to_string(),
+                got,
+            }),
+        },
+        other => Ok(other),
+    }
+}
+
+fn expand_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Values(values) => values,
+        other => vec![other],
+    }
+}
+
 fn render(value: &Value) -> String {
     match value {
         Value::Number(number) => render_number(number),
@@ -502,6 +549,7 @@ fn render(value: &Value) -> String {
             Some(name) => format!("#<procedure:{name}>"),
             None => "#<procedure>".to_string(),
         },
+        Value::Values(_) => "#<values>".to_string(),
         Value::Void => "#<void>".to_string(),
     }
 }
@@ -1169,6 +1217,21 @@ fn builtin_denominator(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Number(exact_integer(denominator)))
 }
 
+fn builtin_values(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(match args {
+        [] => Value::Values(Vec::new()),
+        [value] => value.clone(),
+        _ => Value::Values(args.to_vec()),
+    })
+}
+
+fn builtin_call_with_values(args: &[Value]) -> Result<Value, EvalError> {
+    require_arg_count("call-with-values", args, 2)?;
+    let produced = apply(args[0].clone(), &[])?;
+    let consumer_args = expand_values(produced);
+    apply(args[1].clone(), &consumer_args)
+}
+
 fn base_env() -> EnvRef {
     let env = Env::new(None);
     bind_builtin(&env, "+", builtin_add);
@@ -1215,6 +1278,8 @@ fn base_env() -> EnvRef {
     bind_builtin(&env, "inexact->exact", builtin_inexact_to_exact);
     bind_builtin(&env, "numerator", builtin_numerator);
     bind_builtin(&env, "denominator", builtin_denominator);
+    bind_builtin(&env, "values", builtin_values);
+    bind_builtin(&env, "call-with-values", builtin_call_with_values);
     env
 }
 

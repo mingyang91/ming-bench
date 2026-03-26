@@ -30,7 +30,7 @@ abstract private[ming] class SchemeEvaluatorSpecialForms:
     suspend(withErrorContext(pos)(thunk))
 
   final protected def contextualCont(pos: SourcePos)(next: Value => Computation): Continuation =
-    value => contextual(pos)(next(value))
+    value => contextual(pos)(next(requireSingleValue(value)))
 
   final protected def evalExprList(
     expressions: List[Expr],
@@ -41,7 +41,13 @@ abstract private[ming] class SchemeEvaluatorSpecialForms:
         case Nil =>
           suspend(continuation(reversedValues.reverse))
         case expr :: tail =>
-          eval(expr, env, value => suspend(loop(tail, value :: reversedValues)))
+          eval(
+            expr,
+            env,
+            contextualCont(expr.pos) { value =>
+              suspend(loop(tail, value :: reversedValues))
+            }
+          )
 
     loop(expressions, Nil)
 

@@ -107,6 +107,7 @@ private[ming] object SchemeModel:
       env: Env
     )
     case CaseClosure(clauses: List[CaseLambdaClause])
+    case MultiValues(values: List[Value])
     case UninitializedValue(name: String)
     case VoidValue
 

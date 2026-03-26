@@ -218,7 +218,13 @@ private[ming] trait SchemeEvaluatorBindingForms extends SchemeEvaluatorSpecialFo
         case binding :: tail =>
           binding.stepExpr match
             case Some(stepExpr) =>
-              eval(stepExpr, doEnv, value => suspend(loop(tail, value :: reversedValues)))
+              eval(
+                stepExpr,
+                doEnv,
+                contextualCont(stepExpr.pos) { value =>
+                  suspend(loop(tail, value :: reversedValues))
+                }
+              )
             case None =>
               contextual(pos) {
                 loop(tail, doEnv.lookup(binding.name) :: reversedValues)
