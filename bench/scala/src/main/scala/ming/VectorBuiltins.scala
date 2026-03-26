@@ -72,7 +72,7 @@ private[ming] object VectorBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("vector->list: expected 1 argument")
           args.head match
-            case v: SchemeVector => SchemeList(v.elems.toList)
+            case v: SchemeVector => SchemeListOps.makeList(v.elems.toList)
             case _               => throw new EvalError("vector->list: expected vector")
       )
     )
@@ -83,7 +83,9 @@ private[ming] object VectorBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("list->vector: expected 1 argument")
           args.head match
-            case SchemeList(elems) => new SchemeVector(elems.toArray)
-            case _                 => throw new EvalError("list->vector: expected list")
+            case v =>
+              SchemeListOps.toScalaList(v) match
+                case Some(elems) => new SchemeVector(elems.toArray)
+                case None        => throw new EvalError("list->vector: expected list")
       )
     )

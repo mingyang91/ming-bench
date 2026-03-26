@@ -141,7 +141,7 @@ object Evaluator:
               throw new EvalError(s"expected at least ${params.size} arguments, got ${args.size}")
             val (required, extra) = args.splitAt(params.size)
             val bindings          = mutable.Map.from(params.zip(required))
-            bindings(rest) = SchemeList(extra)
+            bindings(rest) = SchemeListOps.makeList(extra)
             new Env(bindings, Some(closureEnv))
         for expr <- body.init do eval(expr, localEnv)
         throwTailCall(body.last, localEnv)
@@ -197,7 +197,7 @@ object Evaluator:
       case StringLit(v, _)      => SchemeString(v)
       case CharLit(v, _)        => SchemeChar(v)
       case Symbol(name, _)      => SchemeSymbol(name)
-      case SList(elems, _)      => SchemeList(elems.map(exprToVal))
+      case SList(elems, _)      => SchemeListOps.makeList(elems.map(exprToVal))
 
   private def parseParams(paramExprs: List[Expr]): (List[String], Option[String]) =
     val dotIdx = paramExprs.indexWhere { case Symbol(".", _) => true; case _ => false }

@@ -107,7 +107,7 @@ private[ming] object StringBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("string->list: expected 1 argument")
           args.head match
-            case SchemeString(s) => SchemeList(s.toList.map(SchemeChar(_)))
+            case SchemeString(s) => SchemeListOps.makeList(s.toList.map(SchemeChar(_)))
             case _               => throw new EvalError("string->list: expected string")
       )
     )
@@ -117,23 +117,14 @@ private[ming] object StringBuiltins:
         "list->string",
         args =>
           if args.size != 1 then throw new EvalError("list->string: expected 1 argument")
-          def extractChars(v: SchemeVal): List[Char] = v match
-            case SchemeList(elems) =>
-              elems.map {
-                case SchemeChar(c) => c
-                case _             => throw new EvalError("list->string: expected list of chars")
-              }
-            case SchemePair(_, _) =>
-              var chars = List.newBuilder[Char]
-              var curr  = v
-              while curr match
-                  case SchemePair(SchemeChar(c), rest) =>
-                    chars += c; curr = rest; true
-                  case SchemeList(Nil) => false
-                  case _               => throw new EvalError("list->string: expected list of chars")
-              do ()
-              chars.result()
-            case _ => throw new EvalError("list->string: expected list")
+          def extractChars(v: SchemeVal): List[Char] =
+            SchemeListOps.toScalaList(v) match
+              case Some(elems) =>
+                elems.map {
+                  case SchemeChar(c) => c
+                  case _             => throw new EvalError("list->string: expected list of chars")
+                }
+              case None => throw new EvalError("list->string: expected list")
           SchemeString(extractChars(args.head).mkString)
       )
     )
@@ -188,3 +179,29 @@ private[ming] object StringBuiltins:
     installStringOps(env)
     installStringConversions(env)
     installSymbolOps(env)
+    installStringConstructors(env)
+
+  private def installStringConstructors(env: Env): Unit =
+    env.set(
+      "make-string",
+      SchemeBuiltin(
+        "make-string",
+        args =>
+          if args.size < 1 || args.size > 2 then throw new EvalError("make-string: expected 1-2 arguments")
+          val len = Builtins.asLong(args(0), "make-string").toInt
+          val ch  = if args.size == 2 then args(1).asInstanceOf[SchemeChar].value else '\u0000'
+          SchemeString(String.valueOf(Array.fill(len)(ch)))
+      )
+    )
+    env.set(
+      "string",
+      SchemeBuiltin(
+        "string",
+        args =>
+          val chars = args.map {
+            case SchemeChar(c) => c
+            case _             => throw new EvalError("string: expected char arguments")
+          }
+          SchemeString(chars.mkString)
+      )
+    )

@@ -86,6 +86,39 @@ private[ming] object CharStringBuiltins:
       )
     )
     env.set(
+      "string>?",
+      SchemeBuiltin(
+        "string>?",
+        args =>
+          if args.size != 2 then throw new EvalError("string>?: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeString(a), SchemeString(b)) => SchemeBool(a > b)
+            case _                                  => throw new EvalError("string>?: expected strings")
+      )
+    )
+    env.set(
+      "string<=?",
+      SchemeBuiltin(
+        "string<=?",
+        args =>
+          if args.size != 2 then throw new EvalError("string<=?: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeString(a), SchemeString(b)) => SchemeBool(a <= b)
+            case _                                  => throw new EvalError("string<=?: expected strings")
+      )
+    )
+    env.set(
+      "string>=?",
+      SchemeBuiltin(
+        "string>=?",
+        args =>
+          if args.size != 2 then throw new EvalError("string>=?: expected 2 arguments")
+          (args(0), args(1)) match
+            case (SchemeString(a), SchemeString(b)) => SchemeBool(a >= b)
+            case _                                  => throw new EvalError("string>=?: expected strings")
+      )
+    )
+    env.set(
       "string-ci=?",
       SchemeBuiltin(
         "string-ci=?",

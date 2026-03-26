@@ -6,6 +6,7 @@ private[ming] object NumericBuiltins:
 
   def install(env: Env): Unit =
     installArithmetic(env)
+    installMathOps(env)
     installPredicates(env)
     installConversions(env)
     installRationalAccessors(env)
@@ -84,6 +85,57 @@ private[ming] object NumericBuiltins:
           val base = asLong(args(0), "expt")
           val exp  = asLong(args(1), "expt")
           SchemeInt(math.pow(base.toDouble, exp.toDouble).toLong)
+      )
+    )
+
+  private def installMathOps(env: Env): Unit =
+    env.set(
+      "gcd",
+      SchemeBuiltin(
+        "gcd",
+        args =>
+          if args.isEmpty then SchemeInt(0)
+          else
+            def g(a: Long, b: Long): Long = if b == 0 then a else g(b, a % b)
+            SchemeInt(args.map(a => math.abs(asLong(a, "gcd"))).reduce((a, b) => g(a, b)))
+      )
+    )
+    env.set(
+      "lcm",
+      SchemeBuiltin(
+        "lcm",
+        args =>
+          if args.isEmpty then SchemeInt(1)
+          else
+            def g(a: Long, b: Long): Long = if b == 0 then a else g(b, a % b)
+            def l(a: Long, b: Long): Long = if a == 0 && b == 0 then 0 else math.abs(a / g(a, b) * b)
+            SchemeInt(args.map(a => math.abs(asLong(a, "lcm"))).reduce((a, b) => l(a, b)))
+      )
+    )
+    env.set(
+      "truncate",
+      SchemeBuiltin(
+        "truncate",
+        args =>
+          if args.size != 1 then throw new EvalError("truncate: expected 1 argument")
+          args.head match
+            case i: SchemeInt         => i
+            case SchemeFloat(f)       => SchemeInt(f.toLong)
+            case SchemeRational(n, d) => SchemeInt(n / d)
+            case v                    => throw new EvalError(s"truncate: expected number, got ${v.display}")
+      )
+    )
+    env.set(
+      "round",
+      SchemeBuiltin(
+        "round",
+        args =>
+          if args.size != 1 then throw new EvalError("round: expected 1 argument")
+          args.head match
+            case i: SchemeInt         => i
+            case SchemeFloat(f)       => SchemeInt(math.round(f))
+            case SchemeRational(n, d) => SchemeInt(math.round(n.toDouble / d.toDouble))
+            case v                    => throw new EvalError(s"round: expected number, got ${v.display}")
       )
     )
 

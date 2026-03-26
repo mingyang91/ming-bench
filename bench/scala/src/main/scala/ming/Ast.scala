@@ -64,27 +64,38 @@ case class SchemeList(elems: List[SchemeVal]) extends SchemeVal:
   def display: String =
     "(" + elems.map(_.display).mkString(" ") + ")"
 
-case class SchemePair(car: SchemeVal, cdr: SchemeVal) extends SchemeVal:
+class SchemePair(var car: SchemeVal, var cdr: SchemeVal) extends SchemeVal:
 
   def display: String =
-    val sb = new StringBuilder("(")
+    val sb   = new StringBuilder("(")
+    val seen = new java.util.IdentityHashMap[SchemePair, java.lang.Boolean]()
+    seen.put(this, java.lang.Boolean.TRUE)
     sb.append(car.display)
     var curr: SchemeVal = cdr
     var done            = false
     while !done do
       curr match
         case SchemeList(Nil) => done = true
+        case p: SchemePair =>
+          if seen.containsKey(p) then
+            sb.append(" ...")
+            done = true
+          else
+            seen.put(p, java.lang.Boolean.TRUE)
+            sb.append(" ").append(p.car.display)
+            curr = p.cdr
         case SchemeList(elems) =>
           for e <- elems do sb.append(" ").append(e.display)
           done = true
-        case SchemePair(a, d) =>
-          sb.append(" ").append(a.display)
-          curr = d
         case other =>
           sb.append(" . ").append(other.display)
           done = true
     sb.append(")")
     sb.toString
+
+object SchemePair:
+  def apply(car: SchemeVal, cdr: SchemeVal): SchemePair    = new SchemePair(car, cdr)
+  def unapply(p: SchemePair): Some[(SchemeVal, SchemeVal)] = Some((p.car, p.cdr))
 
 case class SchemeChar(value: Char) extends SchemeVal:
 
@@ -129,3 +140,56 @@ private[ming] class Env(val bindings: mutable.Map[String, SchemeVal], val parent
       parent match
         case Some(p) => p.update(name, value)
         case None    => throw new EvalError(s"unbound variable: $name")
+
+// ── List helpers ────────────────────────────────────────────────────
+object SchemeListOps:
+
+  /** Extract Scala list from a SchemeVal proper list (pair chain or SchemeList). Returns None for improper or circular
+    * lists.
+    */
+  def toScalaList(v: SchemeVal): Option[List[SchemeVal]] =
+    v match
+      case SchemeList(Nil)   => Some(Nil)
+      case SchemeList(elems) => Some(elems)
+      case _ =>
+        val buf   = List.newBuilder[SchemeVal]
+        val seen  = new java.util.IdentityHashMap[SchemePair, java.lang.Boolean]()
+        var curr  = v
+        var going = true
+        while going do
+          curr match
+            case SchemeList(Nil)   => going = false
+            case SchemeList(elems) => buf ++= elems; going = false
+            case p: SchemePair =>
+              if seen.containsKey(p) then return None
+              seen.put(p, java.lang.Boolean.TRUE)
+              buf += p.car
+              curr = p.cdr
+            case _ => return None
+        Some(buf.result())
+
+  /** Build a proper list (pair chain ending in SchemeList(Nil)). */
+  def makeList(elems: List[SchemeVal]): SchemeVal =
+    if elems.isEmpty then SchemeList(Nil)
+    else elems.foldRight[SchemeVal](SchemeList(Nil))((e, acc) => new SchemePair(e, acc))
+
+  /** Check whether a value is a proper list (with cycle detection). */
+  def isList(v: SchemeVal): Boolean =
+    v match
+      case SchemeList(_) => true
+      case _ =>
+        var slow = v
+        var fast = v
+        while true do
+          fast match
+            case SchemeList(_) => return true
+            case fp: SchemePair =>
+              fp.cdr match
+                case SchemeList(_) => return true
+                case fp2: SchemePair =>
+                  slow = slow.asInstanceOf[SchemePair].cdr
+                  fast = fp2.cdr
+                  if slow eq fast then return false
+                case _ => return false
+            case _ => return false
+        false

@@ -166,6 +166,7 @@ private[ming] object Builtins:
     installPredicates(env)
     installIO(env, output)
     installApply(env)
+    installError(env)
     ListBuiltins.install(env)
     StringBuiltins.install(env)
     NumericBuiltins.install(env)
@@ -180,12 +181,27 @@ private[ming] object Builtins:
           if args.size < 2 then throw new EvalError("apply: expected at least 2 arguments")
           val proc    = args.head
           val lastArg = args.last
-          val lastList = lastArg match
-            case SchemeList(elems) => elems
-            case _                 => throw new EvalError("apply: last argument must be a list")
+          val lastList = SchemeListOps.toScalaList(lastArg) match
+            case Some(elems) => elems
+            case None        => throw new EvalError("apply: last argument must be a list")
           val prefixArgs = args.slice(1, args.size - 1)
           val allArgs    = prefixArgs ++ lastList
           Evaluator.applyProc(proc, allArgs)
+      )
+    )
+
+  private def installError(env: Env): Unit =
+    env.set(
+      "error",
+      SchemeBuiltin(
+        "error",
+        args =>
+          if args.isEmpty then throw new EvalError("error")
+          val msg = args.head match
+            case SchemeString(s) => s
+            case other           => other.display
+          val irritants = args.tail.map(_.display).mkString(" ")
+          throw new EvalError(if irritants.isEmpty then msg else s"$msg $irritants")
       )
     )
 
@@ -231,10 +247,20 @@ private[ming] object Builtins:
       }
     )
 
-  private def displayVal(v: SchemeVal): String = v match
-    case SchemeString(s)   => s
-    case SchemeList(elems) => "(" + elems.map(displayVal).mkString(" ") + ")"
-    case other             => other.display
+  private[ming] def displayVal(v: SchemeVal): String = v match
+    case SchemeString(s) => s
+    case _ =>
+      SchemeListOps.toScalaList(v) match
+        case Some(elems) =>
+          "(" + elems.map(displayVal).mkString(" ") + ")"
+        case None =>
+          v match
+            case p: SchemePair =>
+              val sb = new StringBuilder("(")
+              sb.append(displayVal(p.car))
+              sb.append(" . ").append(displayVal(p.cdr))
+              sb.append(")").toString
+            case other => other.display
 
   private def installIO(env: Env, output: StringBuilder): Unit =
     env.set(
