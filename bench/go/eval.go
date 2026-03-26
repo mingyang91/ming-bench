@@ -157,6 +157,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalCase(expr, env)
 		case "do":
 			return evalDo(expr, env)
+		case "dynamic-wind":
+			return evalDynamicWind(expr, env)
 		}
 
 		// Check if head is a macro
@@ -2964,6 +2966,9 @@ func applyOp(op *Value, args []*Value, expr *Expr, env *Env) (*Value, error) {
 	return nil, fmt.Errorf("not a procedure")
 }
 
+// windStack tracks active dynamic-wind frames for the current execution.
+var windStack []*WindFrame
+
 // contIDCounter generates unique IDs for continuations.
 var contIDCounter int
 
@@ -2989,6 +2994,8 @@ func evalCallCC(expr *Expr, env *Env) (*Value, error) {
 
 // invokeContinuation is called when a continuation value is applied.
 func invokeContinuation(cont *Value, val *Value) (*Value, error) {
+	// Perform wind transition from current wind stack to continuation's saved stack
+	doWindTransition(cont.ContWind)
 	frames := make([]ContFrame, len(cont.ContFrames))
 	copy(frames, cont.ContFrames)
 	return nil, &ContJumpError{ContID: int(cont.IntVal), Frames: frames, Value: val}
@@ -3051,10 +3058,15 @@ func processCallCC(cr *CaptureRequest) (*Value, error) {
 	contIDCounter++
 	contID := contIDCounter
 
+	// Snapshot current wind stack for continuation re-entry
+	savedWind := make([]*WindFrame, len(windStack))
+	copy(savedWind, windStack)
+
 	k := &Value{
 		Type:       TypeContinuation,
 		IntVal:     int64(contID),
 		ContFrames: cr.Frames,
+		ContWind:   savedWind,
 	}
 
 	result, err := callProcTrapping(cr.Proc, k, cr.Env, cr.Expr)
@@ -3121,4 +3133,132 @@ func trampolineVal(v *Value) (*Value, error) {
 		}
 	}
 	return v, nil
+}
+
+// --- dynamic-wind ---
+
+// doWindTransition transitions from the current wind stack to the target stack.
+// It unwinds (calling out-thunks) from current back to common prefix,
+// then rewinds (calling in-thunks) from common prefix to target.
+func doWindTransition(target []*WindFrame) {
+	// Find common prefix length (by pointer identity)
+	common := 0
+	for common < len(windStack) && common < len(target) && windStack[common] == target[common] {
+		common++
+	}
+	// Unwind from current to common (reverse order)
+	for i := len(windStack) - 1; i >= common; i-- {
+		wf := windStack[i]
+		windStack = windStack[:i]
+		callThunk0(wf.Out, wf.Expr, wf.Env)
+	}
+	// Rewind from common to target (forward order)
+	for i := common; i < len(target); i++ {
+		wf := target[i]
+		callThunk0(wf.In, wf.Expr, wf.Env)
+		windStack = append(windStack, wf)
+	}
+}
+
+// callThunk0 calls a zero-argument lambda (thunk).
+func callThunk0(thunk *Value, expr *Expr, env *Env) (*Value, error) {
+	if thunk.Type == TypeLambda {
+		return callLambdaAndTrampoline(thunk, nil, expr)
+	}
+	return nil, fmt.Errorf("%d:%d: dynamic-wind: argument is not a procedure", expr.Line, expr.Col)
+}
+
+// callLambdaAndTrampoline calls a lambda with args and resolves tail calls.
+func callLambdaAndTrampoline(fn *Value, args []*Value, expr *Expr) (*Value, error) {
+	v, err := callLambda(fn, args, expr)
+	if err != nil {
+		return nil, err
+	}
+	return trampolineVal(v)
+}
+
+// evalDynamicWind implements (dynamic-wind in-thunk body-thunk out-thunk).
+func evalDynamicWind(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) != 4 {
+		return nil, fmt.Errorf("%d:%d: dynamic-wind: expected 3 arguments", expr.Line, expr.Col)
+	}
+	inThunk, err := Eval(expr.List[1], env)
+	if err != nil {
+		return nil, err
+	}
+	bodyThunk, err := Eval(expr.List[2], env)
+	if err != nil {
+		return nil, err
+	}
+	outThunk, err := Eval(expr.List[3], env)
+	if err != nil {
+		return nil, err
+	}
+
+	// Call in-thunk
+	_, err = callThunk0(inThunk, expr, env)
+	if err != nil {
+		return nil, err
+	}
+
+	// Push wind frame
+	wf := &WindFrame{In: inThunk, Out: outThunk, Env: env, Expr: expr}
+	windStack = append(windStack, wf)
+
+	// Call body-thunk, handling CaptureRequest panics
+	result, bodyErr := evalDynamicWindBody(bodyThunk, outThunk, wf, expr, env)
+
+	if bodyErr != nil {
+		if _, ok := bodyErr.(*ContJumpError); ok {
+			// Wind transition in invokeContinuation already handled unwinding
+			return nil, bodyErr
+		}
+		// Other error: clean up
+		if len(windStack) > 0 && windStack[len(windStack)-1] == wf {
+			windStack = windStack[:len(windStack)-1]
+			callThunk0(outThunk, expr, env)
+		}
+		return nil, bodyErr
+	}
+
+	// Normal exit: pop wind frame, call out-thunk
+	windStack = windStack[:len(windStack)-1]
+	_, err = callThunk0(outThunk, expr, env)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// evalDynamicWindBody calls body-thunk, catching CaptureRequest to add
+// a cleanup continuation frame for the dynamic-wind out-thunk.
+func evalDynamicWindBody(bodyThunk, outThunk *Value, wf *WindFrame, expr *Expr, env *Env) (result *Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if cr, ok := r.(*CaptureRequest); ok {
+				// Add continuation frame for dynamic-wind cleanup (pop + out-thunk)
+				capturedOutThunk := outThunk
+				capturedWf := wf
+				capturedExpr := expr
+				capturedEnv := env
+				cr.Frames = append(cr.Frames, ContFrame{
+					Apply: func(val *Value) (*Value, error) {
+						// On re-entry, wind transition pushed our frame;
+						// pop it and call out-thunk
+						if len(windStack) > 0 && windStack[len(windStack)-1] == capturedWf {
+							windStack = windStack[:len(windStack)-1]
+						}
+						_, outErr := callThunk0(capturedOutThunk, capturedExpr, capturedEnv)
+						if outErr != nil {
+							return nil, outErr
+						}
+						return val, nil
+					},
+				})
+				panic(cr)
+			}
+			panic(r)
+		}
+	}()
+	return callThunk0(bodyThunk, expr, env)
 }

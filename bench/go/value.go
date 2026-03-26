@@ -59,6 +59,15 @@ type Value struct {
 	TailEnv  *Env
 	// Continuation fields (call/cc)
 	ContFrames []ContFrame
+	ContWind   []*WindFrame // wind stack snapshot at capture time
+}
+
+// WindFrame represents an active dynamic-wind frame.
+type WindFrame struct {
+	In   *Value // in-thunk
+	Out  *Value // out-thunk
+	Env  *Env
+	Expr *Expr
 }
 
 var Void = &Value{Type: TypeVoid}

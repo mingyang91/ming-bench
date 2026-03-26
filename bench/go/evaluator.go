@@ -3,6 +3,7 @@ package ming
 import "strings"
 
 func evalInput(input string, env *Env) (*Value, error) {
+	windStack = nil // reset dynamic-wind state
 	tokenizer := NewTokenizer(input)
 	tokens, err := tokenizer.Tokenize()
 	if err != nil {
