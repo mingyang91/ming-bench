@@ -13,6 +13,9 @@ public class Evaluator {
         "not",
         "cons", "car", "cdr", "null?", "list", "length", "append",
         "number?", "string?", "boolean?", "pair?", "symbol?", "char?",
+        "integer?", "rational?", "exact?", "inexact?",
+        "exact->inexact", "inexact->exact",
+        "numerator", "denominator",
         "display", "write", "newline",
         "string-append", "string-length", "substring", "string-ref",
         "string->number", "number->string",
@@ -276,11 +279,24 @@ public class Evaluator {
         if (token.startsWith("\"") && token.endsWith("\"")) {
             return token; // keep as quoted string
         }
+        // Try integer
         try {
             return Long.parseLong(token);
-        } catch (NumberFormatException e) {
-            return new SchemeSymbol(token);
+        } catch (NumberFormatException e) {}
+        // Try rational literal: num/den
+        int slash = token.indexOf('/');
+        if (slash > 0 && slash < token.length() - 1) {
+            try {
+                long num = Long.parseLong(token.substring(0, slash));
+                long den = Long.parseLong(token.substring(slash + 1));
+                return SchemeRational.make(num, den);
+            } catch (NumberFormatException e) {}
         }
+        // Try floating point (inexact)
+        try {
+            return Double.parseDouble(token);
+        } catch (NumberFormatException e) {}
+        return new SchemeSymbol(token);
     }
 
     // --- Evaluator ---
@@ -316,7 +332,7 @@ public class Evaluator {
             }
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeChar) {
+        if (expr instanceof Long || expr instanceof Double || expr instanceof SchemeRational || expr instanceof Boolean || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String s) {
@@ -532,6 +548,9 @@ public class Evaluator {
                          "not",
                          "cons", "car", "cdr", "null?", "list", "length", "append",
                          "number?", "string?", "boolean?", "pair?", "symbol?", "char?",
+                         "integer?", "rational?", "exact?", "inexact?",
+                         "exact->inexact", "inexact->exact",
+                         "numerator", "denominator",
                          "display", "write", "newline",
                          "string-append", "string-length", "substring", "string-ref",
                          "string->number", "number->string",
@@ -623,62 +642,211 @@ public class Evaluator {
         throw new EvalError("not a procedure");
     }
 
+    private static boolean isNumber(Object o) {
+        return o instanceof Long || o instanceof Double || o instanceof SchemeRational;
+    }
+
+    private static double toDouble(Object o) throws EvalError {
+        if (o instanceof Long l) return l.doubleValue();
+        if (o instanceof Double d) return d;
+        if (o instanceof SchemeRational r) return r.toDouble();
+        throw new EvalError("expected number, got: " + schemeToString(o));
+    }
+
+    private static boolean hasInexact(List<Object> args) {
+        for (Object a : args) if (a instanceof Double) return true;
+        return false;
+    }
+
+    private static long[] toRational(Object a) throws EvalError {
+        if (a instanceof Long l) return new long[]{l, 1};
+        if (a instanceof SchemeRational r) return new long[]{r.numerator, r.denominator};
+        throw new EvalError("expected number, got: " + schemeToString(a));
+    }
+
+    private static Object exactAdd(Object a, Object b) throws EvalError {
+        long[] ra = toRational(a), rb = toRational(b);
+        return SchemeRational.make(ra[0] * rb[1] + rb[0] * ra[1], ra[1] * rb[1]);
+    }
+
+    private static Object exactSub(Object a, Object b) throws EvalError {
+        long[] ra = toRational(a), rb = toRational(b);
+        return SchemeRational.make(ra[0] * rb[1] - rb[0] * ra[1], ra[1] * rb[1]);
+    }
+
+    private static Object exactMul(Object a, Object b) throws EvalError {
+        long[] ra = toRational(a), rb = toRational(b);
+        return SchemeRational.make(ra[0] * rb[0], ra[1] * rb[1]);
+    }
+
+    private static Object exactDiv(Object a, Object b) throws EvalError {
+        long[] ra = toRational(a), rb = toRational(b);
+        if (rb[0] == 0) throw new EvalError("division by zero");
+        return SchemeRational.make(ra[0] * rb[1], ra[1] * rb[0]);
+    }
+
+    private static Object exactNeg(Object a) throws EvalError {
+        if (a instanceof Long l) return -l;
+        if (a instanceof SchemeRational r) return SchemeRational.make(-r.numerator, r.denominator);
+        throw new EvalError("expected number, got: " + schemeToString(a));
+    }
+
     private Object applyBuiltin(String name, List<Object> args) throws EvalError {
-        switch (name) {
+        return switch (name) {
+            case "+", "-", "*", "/", "abs", "modulo", "remainder", "quotient",
+                 "min", "max", "expt", "zero?", "positive?", "negative?", "odd?", "even?" ->
+                applyArithmeticBuiltin(name, args);
+            case "<" -> toDouble(args.get(0)) < toDouble(args.get(1));
+            case ">" -> toDouble(args.get(0)) > toDouble(args.get(1));
+            case "=" -> toDouble(args.get(0)) == toDouble(args.get(1));
+            case "<=" -> toDouble(args.get(0)) <= toDouble(args.get(1));
+            case ">=" -> toDouble(args.get(0)) >= toDouble(args.get(1));
+            case "not" -> args.get(0).equals(Boolean.FALSE);
+            case "cons", "car", "cdr", "null?", "list", "length", "append",
+                 "list-ref", "list-tail", "list?", "assoc", "map" ->
+                applyListBuiltin(name, args);
+            case "number?", "integer?", "rational?", "exact?", "inexact?",
+                 "exact->inexact", "inexact->exact", "numerator", "denominator" ->
+                applyNumericTypeBuiltin(name, args);
+            case "string?", "boolean?", "pair?", "symbol?", "char?" ->
+                applyTypePredicateBuiltin(name, args);
+            case "display", "write", "newline" ->
+                applyIoBuiltin(name, args);
+            case "string-append", "string-length", "substring", "string-ref",
+                 "string->number", "number->string", "symbol->string", "string->symbol",
+                 "string-copy", "string-set!", "string=?", "string<?", "string-ci=?",
+                 "string-upcase", "string-downcase" ->
+                applyStringBuiltin(name, args);
+            case "char-alphabetic?", "char-numeric?", "char=?", "char<?",
+                 "char-upcase", "char-downcase" ->
+                applyCharBuiltin(name, args);
+            case "apply" -> {
+                if (args.size() < 2) throw new EvalError("apply: expected at least 2 arguments");
+                Object applyProc = args.get(0);
+                Object lastArg = args.get(args.size() - 1);
+                List<Object> allArgs = new ArrayList<>();
+                for (int i = 1; i < args.size() - 1; i++) allArgs.add(args.get(i));
+                Object cur = lastArg;
+                while (cur instanceof SchemePair p) { allArgs.add(p.car); cur = p.cdr; }
+                yield apply(applyProc, allArgs);
+            }
+            case "eq?" -> {
+                Object a = args.get(0), b = args.get(1);
+                if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) yield sa.name().equals(sb.name());
+                if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) yield ca.value() == cb.value();
+                yield a == b || a.equals(b);
+            }
+            case "equal?" -> schemeEqual(args.get(0), args.get(1));
+            default -> throw new EvalError("unknown procedure: " + name);
+        };
+    }
+
+    private Object applyArithmeticBuiltin(String name, List<Object> args) throws EvalError {
+        return switch (name) {
             case "+" -> {
-                long result = 0;
-                for (Object arg : args) result += requireLong(arg);
-                return result;
+                if (hasInexact(args)) {
+                    double result = 0;
+                    for (Object arg : args) result += toDouble(arg);
+                    yield result;
+                }
+                Object result = 0L;
+                for (Object arg : args) result = exactAdd(result, arg);
+                yield result;
             }
             case "-" -> {
                 if (args.isEmpty()) throw new EvalError("- requires at least one argument");
-                if (args.size() == 1) return -requireLong(args.get(0));
-                long result = requireLong(args.get(0));
-                for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i));
-                return result;
+                if (hasInexact(args)) {
+                    if (args.size() == 1) yield -toDouble(args.get(0));
+                    double result = toDouble(args.get(0));
+                    for (int i = 1; i < args.size(); i++) result -= toDouble(args.get(i));
+                    yield result;
+                }
+                if (args.size() == 1) yield exactNeg(args.get(0));
+                Object result = args.get(0);
+                for (int i = 1; i < args.size(); i++) result = exactSub(result, args.get(i));
+                yield result;
             }
             case "*" -> {
-                long result = 1;
-                for (Object arg : args) result *= requireLong(arg);
-                return result;
+                if (hasInexact(args)) {
+                    double result = 1;
+                    for (Object arg : args) result *= toDouble(arg);
+                    yield result;
+                }
+                Object result = 1L;
+                for (Object arg : args) result = exactMul(result, arg);
+                yield result;
             }
             case "/" -> {
                 if (args.isEmpty()) throw new EvalError("/ requires at least one argument");
-                long result = requireLong(args.get(0));
-                for (int i = 1; i < args.size(); i++) {
-                    long divisor = requireLong(args.get(i));
-                    if (divisor == 0) throw new EvalError("division by zero");
-                    result /= divisor;
+                if (hasInexact(args)) {
+                    double result = toDouble(args.get(0));
+                    if (args.size() == 1) yield 1.0 / result;
+                    for (int i = 1; i < args.size(); i++) {
+                        double d = toDouble(args.get(i));
+                        if (d == 0) throw new EvalError("division by zero");
+                        result /= d;
+                    }
+                    yield result;
                 }
-                return result;
+                Object result = args.get(0);
+                if (args.size() == 1) yield exactDiv(1L, result);
+                for (int i = 1; i < args.size(); i++) result = exactDiv(result, args.get(i));
+                yield result;
             }
-            case "<" -> { return requireLong(args.get(0)) < requireLong(args.get(1)); }
-            case ">" -> { return requireLong(args.get(0)) > requireLong(args.get(1)); }
-            case "=" -> { return requireLong(args.get(0)) == requireLong(args.get(1)); }
-            case "<=" -> { return requireLong(args.get(0)) <= requireLong(args.get(1)); }
-            case ">=" -> { return requireLong(args.get(0)) >= requireLong(args.get(1)); }
-            case "not" -> { return args.get(0).equals(Boolean.FALSE); }
-            case "cons" -> { return new SchemePair(args.get(0), args.get(1)); }
+            case "abs" -> Math.abs(requireLong(args.get(0)));
+            case "modulo" -> Math.floorMod(requireLong(args.get(0)), requireLong(args.get(1)));
+            case "remainder" -> requireLong(args.get(0)) % requireLong(args.get(1));
+            case "quotient" -> requireLong(args.get(0)) / requireLong(args.get(1));
+            case "min" -> {
+                if (args.isEmpty()) throw new EvalError("min: expected at least 1 argument");
+                long result = requireLong(args.get(0));
+                for (int i = 1; i < args.size(); i++) result = Math.min(result, requireLong(args.get(i)));
+                yield result;
+            }
+            case "max" -> {
+                if (args.isEmpty()) throw new EvalError("max: expected at least 1 argument");
+                long result = requireLong(args.get(0));
+                for (int i = 1; i < args.size(); i++) result = Math.max(result, requireLong(args.get(i)));
+                yield result;
+            }
+            case "expt" -> {
+                long base = requireLong(args.get(0)), exp = requireLong(args.get(1));
+                long result = 1;
+                for (long i = 0; i < exp; i++) result *= base;
+                yield result;
+            }
+            case "zero?" -> requireLong(args.get(0)) == 0;
+            case "positive?" -> requireLong(args.get(0)) > 0;
+            case "negative?" -> requireLong(args.get(0)) < 0;
+            case "odd?" -> Math.abs(requireLong(args.get(0))) % 2 == 1;
+            case "even?" -> requireLong(args.get(0)) % 2 == 0;
+            default -> throw new EvalError("unknown arithmetic procedure: " + name);
+        };
+    }
+
+    private Object applyListBuiltin(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "cons" -> new SchemePair(args.get(0), args.get(1));
             case "car" -> {
-                if (args.get(0) instanceof SchemePair p) return p.car;
+                if (args.get(0) instanceof SchemePair p) yield p.car;
                 throw new EvalError("car: not a pair");
             }
             case "cdr" -> {
-                if (args.get(0) instanceof SchemePair p) return p.cdr;
+                if (args.get(0) instanceof SchemePair p) yield p.cdr;
                 throw new EvalError("cdr: not a pair");
             }
-            case "null?" -> { return args.get(0) instanceof SchemeNil; }
+            case "null?" -> args.get(0) instanceof SchemeNil;
             case "list" -> {
                 Object result = SchemeNil.INSTANCE;
                 for (int i = args.size() - 1; i >= 0; i--) result = new SchemePair(args.get(i), result);
-                return result;
+                yield result;
             }
             case "length" -> {
                 Object val = args.get(0);
                 long len = 0;
                 while (val instanceof SchemePair p) { len++; val = p.cdr; }
                 if (!(val instanceof SchemeNil)) throw new EvalError("length: not a proper list");
-                return len;
+                yield len;
             }
             case "append" -> {
                 Object result = SchemeNil.INSTANCE;
@@ -694,116 +862,8 @@ public class Evaluator {
                         for (int j = elems.size() - 1; j >= 0; j--) result = new SchemePair(elems.get(j), result);
                     }
                 }
-                return result;
+                yield result;
             }
-            case "number?" -> { return args.get(0) instanceof Long; }
-            case "string?" -> { Object sv = args.get(0); return sv instanceof String || sv instanceof SchemeString; }
-            case "boolean?" -> { return args.get(0) instanceof Boolean; }
-            case "pair?" -> { return args.get(0) instanceof SchemePair; }
-            case "symbol?" -> { return args.get(0) instanceof SchemeSymbol; }
-            case "char?" -> { return args.get(0) instanceof SchemeChar; }
-            case "display" -> {
-                if (outputBuffer != null) outputBuffer.append(displayString(args.get(0)));
-                return VOID;
-            }
-            case "write" -> {
-                if (outputBuffer != null) outputBuffer.append(schemeToString(args.get(0)));
-                return VOID;
-            }
-            case "newline" -> {
-                if (outputBuffer != null) outputBuffer.append("\n");
-                return VOID;
-            }
-            case "string-append" -> {
-                StringBuilder sb = new StringBuilder();
-                for (Object arg : args) sb.append(requireString(arg));
-                return "\"" + sb + "\"";
-            }
-            case "string-length" -> { return (long) requireString(args.get(0)).length(); }
-            case "substring" -> {
-                String s = requireString(args.get(0));
-                int start = (int) requireLong(args.get(1));
-                int end = args.size() == 3 ? (int) requireLong(args.get(2)) : s.length();
-                return "\"" + s.substring(start, end) + "\"";
-            }
-            case "string-ref" -> {
-                return new SchemeChar(requireString(args.get(0)).charAt((int) requireLong(args.get(1))));
-            }
-            case "string->number" -> {
-                try { return Long.parseLong(requireString(args.get(0))); }
-                catch (NumberFormatException e) { return Boolean.FALSE; }
-            }
-            case "number->string" -> { return "\"" + requireLong(args.get(0)) + "\""; }
-            case "symbol->string" -> {
-                if (!(args.get(0) instanceof SchemeSymbol sym)) throw new EvalError("symbol->string: not a symbol");
-                return "\"" + sym.name() + "\"";
-            }
-            case "string->symbol" -> { return new SchemeSymbol(requireString(args.get(0))); }
-            case "string-copy" -> { return new SchemeString(requireString(args.get(0))); }
-            case "string-set!" -> {
-                Object target = args.get(0);
-                int idx = (int) requireLong(args.get(1));
-                Object charVal = args.get(2);
-                if (!(charVal instanceof SchemeChar ch)) throw new EvalError("string-set!: expected char");
-                if (!(target instanceof SchemeString ss)) throw new EvalError("string-set!: string is immutable");
-                ss.setCharAt(idx, ch.value());
-                return VOID;
-            }
-            case "apply" -> {
-                if (args.size() < 2) throw new EvalError("apply: expected at least 2 arguments");
-                Object applyProc = args.get(0);
-                Object lastArg = args.get(args.size() - 1);
-                List<Object> allArgs = new ArrayList<>();
-                for (int i = 1; i < args.size() - 1; i++) allArgs.add(args.get(i));
-                Object cur = lastArg;
-                while (cur instanceof SchemePair p) { allArgs.add(p.car); cur = p.cdr; }
-                return apply(applyProc, allArgs);
-            }
-            case "eq?" -> {
-                Object a = args.get(0), b = args.get(1);
-                if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
-                if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
-                return a == b || a.equals(b);
-            }
-            case "equal?" -> { return schemeEqual(args.get(0), args.get(1)); }
-            case "abs" -> { return Math.abs(requireLong(args.get(0))); }
-            case "modulo" -> {
-                long a = requireLong(args.get(0)), b = requireLong(args.get(1));
-                return Math.floorMod(a, b);
-            }
-            case "remainder" -> {
-                long a = requireLong(args.get(0)), b = requireLong(args.get(1));
-                return a % b;
-            }
-            case "quotient" -> {
-                long a = requireLong(args.get(0)), b = requireLong(args.get(1));
-                long q = a / b;
-                // truncate toward zero (Java default for long division)
-                return q;
-            }
-            case "min" -> {
-                if (args.isEmpty()) throw new EvalError("min: expected at least 1 argument");
-                long result = requireLong(args.get(0));
-                for (int i = 1; i < args.size(); i++) result = Math.min(result, requireLong(args.get(i)));
-                return result;
-            }
-            case "max" -> {
-                if (args.isEmpty()) throw new EvalError("max: expected at least 1 argument");
-                long result = requireLong(args.get(0));
-                for (int i = 1; i < args.size(); i++) result = Math.max(result, requireLong(args.get(i)));
-                return result;
-            }
-            case "expt" -> {
-                long base = requireLong(args.get(0)), exp = requireLong(args.get(1));
-                long result = 1;
-                for (long i = 0; i < exp; i++) result *= base;
-                return result;
-            }
-            case "zero?" -> { return requireLong(args.get(0)) == 0; }
-            case "positive?" -> { return requireLong(args.get(0)) > 0; }
-            case "negative?" -> { return requireLong(args.get(0)) < 0; }
-            case "odd?" -> { return Math.abs(requireLong(args.get(0))) % 2 == 1; }
-            case "even?" -> { return requireLong(args.get(0)) % 2 == 0; }
             case "list-ref" -> {
                 Object lst = args.get(0);
                 int idx = (int) requireLong(args.get(1));
@@ -812,7 +872,7 @@ public class Evaluator {
                     lst = p.cdr;
                 }
                 if (!(lst instanceof SchemePair p)) throw new EvalError("list-ref: index out of range");
-                return p.car;
+                yield p.car;
             }
             case "list-tail" -> {
                 Object lst = args.get(0);
@@ -821,79 +881,188 @@ public class Evaluator {
                     if (!(lst instanceof SchemePair p)) throw new EvalError("list-tail: index out of range");
                     lst = p.cdr;
                 }
-                return lst;
+                yield lst;
             }
             case "list?" -> {
                 Object val = args.get(0);
                 while (val instanceof SchemePair p) val = p.cdr;
-                return val instanceof SchemeNil;
+                yield val instanceof SchemeNil;
             }
             case "assoc" -> {
                 Object key = args.get(0);
                 Object lst = args.get(1);
                 while (lst instanceof SchemePair p) {
                     if (p.car instanceof SchemePair entry) {
-                        if (schemeEqual(key, entry.car)) return entry;
+                        if (schemeEqual(key, entry.car)) yield entry;
                     }
                     lst = p.cdr;
                 }
-                return Boolean.FALSE;
+                yield Boolean.FALSE;
             }
             case "map" -> {
                 if (args.size() < 2) throw new EvalError("map: expected at least 2 arguments");
                 Object proc = args.get(0);
-                // Collect all input lists into arrays
                 List<List<Object>> lists = new ArrayList<>();
                 for (int i = 1; i < args.size(); i++) {
                     List<Object> elems = new ArrayList<>();
-                    Object cur2 = args.get(i);
-                    while (cur2 instanceof SchemePair p) { elems.add(p.car); cur2 = p.cdr; }
+                    Object cur = args.get(i);
+                    while (cur instanceof SchemePair p) { elems.add(p.car); cur = p.cdr; }
                     lists.add(elems);
                 }
                 int len = lists.get(0).size();
-                Object result = SchemeNil.INSTANCE;
                 List<Object> results = new ArrayList<>();
                 for (int i = 0; i < len; i++) {
                     List<Object> callArgs = new ArrayList<>();
                     for (List<Object> l : lists) callArgs.add(l.get(i));
                     results.add(apply(proc, callArgs));
                 }
+                Object result = SchemeNil.INSTANCE;
                 for (int i = results.size() - 1; i >= 0; i--) result = new SchemePair(results.get(i), result);
-                return result;
+                yield result;
             }
+            default -> throw new EvalError("unknown list procedure: " + name);
+        };
+    }
+
+    private Object applyNumericTypeBuiltin(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "number?" -> isNumber(args.get(0));
+            case "integer?" -> {
+                Object v = args.get(0);
+                if (v instanceof Long) yield true;
+                if (v instanceof Double d) yield d == Math.floor(d) && !Double.isInfinite(d);
+                yield false;
+            }
+            case "rational?" -> args.get(0) instanceof Long || args.get(0) instanceof SchemeRational;
+            case "exact?" -> args.get(0) instanceof Long || args.get(0) instanceof SchemeRational;
+            case "inexact?" -> args.get(0) instanceof Double;
+            case "exact->inexact" -> toDouble(args.get(0));
+            case "inexact->exact" -> {
+                Object v = args.get(0);
+                if (v instanceof Long || v instanceof SchemeRational) yield v;
+                if (v instanceof Double d) {
+                    if (d == Math.floor(d) && !Double.isInfinite(d)) yield d.longValue();
+                    long bits = Double.doubleToLongBits(d);
+                    long mantissa = bits & 0x000fffffffffffffL;
+                    int exponent = (int) ((bits >> 52) & 0x7ffL) - 1023 - 52;
+                    mantissa |= 0x0010000000000000L;
+                    if ((bits & 0x8000000000000000L) != 0) mantissa = -mantissa;
+                    if (exponent >= 0) yield mantissa * (1L << exponent);
+                    else yield SchemeRational.make(mantissa, 1L << (-exponent));
+                }
+                throw new EvalError("inexact->exact: expected number");
+            }
+            case "numerator" -> {
+                Object v = args.get(0);
+                if (v instanceof Long l) yield l;
+                if (v instanceof SchemeRational r) yield r.numerator;
+                throw new EvalError("numerator: expected rational");
+            }
+            case "denominator" -> {
+                Object v = args.get(0);
+                if (v instanceof Long) yield 1L;
+                if (v instanceof SchemeRational r) yield r.denominator;
+                throw new EvalError("denominator: expected rational");
+            }
+            default -> throw new EvalError("unknown numeric type procedure: " + name);
+        };
+    }
+
+    private Object applyTypePredicateBuiltin(String name, List<Object> args) {
+        return switch (name) {
+            case "string?" -> { Object sv = args.get(0); yield sv instanceof String || sv instanceof SchemeString; }
+            case "boolean?" -> args.get(0) instanceof Boolean;
+            case "pair?" -> args.get(0) instanceof SchemePair;
+            case "symbol?" -> args.get(0) instanceof SchemeSymbol;
+            case "char?" -> args.get(0) instanceof SchemeChar;
+            default -> false;
+        };
+    }
+
+    private Object applyIoBuiltin(String name, List<Object> args) {
+        switch (name) {
+            case "display" -> { if (outputBuffer != null) outputBuffer.append(displayString(args.get(0))); }
+            case "write" -> { if (outputBuffer != null) outputBuffer.append(schemeToString(args.get(0))); }
+            case "newline" -> { if (outputBuffer != null) outputBuffer.append("\n"); }
+            default -> { }
+        }
+        return VOID;
+    }
+
+    private Object applyStringBuiltin(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "string-append" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object arg : args) sb.append(requireString(arg));
+                yield "\"" + sb + "\"";
+            }
+            case "string-length" -> (long) requireString(args.get(0)).length();
+            case "substring" -> {
+                String s = requireString(args.get(0));
+                int start = (int) requireLong(args.get(1));
+                int end = args.size() == 3 ? (int) requireLong(args.get(2)) : s.length();
+                yield "\"" + s.substring(start, end) + "\"";
+            }
+            case "string-ref" -> new SchemeChar(requireString(args.get(0)).charAt((int) requireLong(args.get(1))));
+            case "string->number" -> {
+                try { yield Long.parseLong(requireString(args.get(0))); }
+                catch (NumberFormatException e) { yield Boolean.FALSE; }
+            }
+            case "number->string" -> "\"" + schemeToString(args.get(0)) + "\"";
+            case "symbol->string" -> {
+                if (!(args.get(0) instanceof SchemeSymbol sym)) throw new EvalError("symbol->string: not a symbol");
+                yield "\"" + sym.name() + "\"";
+            }
+            case "string->symbol" -> new SchemeSymbol(requireString(args.get(0)));
+            case "string-copy" -> new SchemeString(requireString(args.get(0)));
+            case "string-set!" -> {
+                Object target = args.get(0);
+                int idx = (int) requireLong(args.get(1));
+                Object charVal = args.get(2);
+                if (!(charVal instanceof SchemeChar ch)) throw new EvalError("string-set!: expected char");
+                if (!(target instanceof SchemeString ss)) throw new EvalError("string-set!: string is immutable");
+                ss.setCharAt(idx, ch.value());
+                yield VOID;
+            }
+            case "string=?" -> requireString(args.get(0)).equals(requireString(args.get(1)));
+            case "string<?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) < 0;
+            case "string-ci=?" -> requireString(args.get(0)).equalsIgnoreCase(requireString(args.get(1)));
+            case "string-upcase" -> "\"" + requireString(args.get(0)).toUpperCase() + "\"";
+            case "string-downcase" -> "\"" + requireString(args.get(0)).toLowerCase() + "\"";
+            default -> throw new EvalError("unknown string procedure: " + name);
+        };
+    }
+
+    private Object applyCharBuiltin(String name, List<Object> args) throws EvalError {
+        return switch (name) {
             case "char-alphabetic?" -> {
                 if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-alphabetic?: expected char");
-                return Character.isLetter(ch.value());
+                yield Character.isLetter(ch.value());
             }
             case "char-numeric?" -> {
                 if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-numeric?: expected char");
-                return Character.isDigit(ch.value());
+                yield Character.isDigit(ch.value());
             }
             case "char=?" -> {
                 if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b))
                     throw new EvalError("char=?: expected chars");
-                return a.value() == b.value();
+                yield a.value() == b.value();
             }
             case "char<?" -> {
                 if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b))
                     throw new EvalError("char<?: expected chars");
-                return a.value() < b.value();
+                yield a.value() < b.value();
             }
             case "char-upcase" -> {
                 if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-upcase: expected char");
-                return new SchemeChar(Character.toUpperCase(ch.value()));
+                yield new SchemeChar(Character.toUpperCase(ch.value()));
             }
             case "char-downcase" -> {
                 if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-downcase: expected char");
-                return new SchemeChar(Character.toLowerCase(ch.value()));
+                yield new SchemeChar(Character.toLowerCase(ch.value()));
             }
-            case "string=?" -> { return requireString(args.get(0)).equals(requireString(args.get(1))); }
-            case "string<?" -> { return requireString(args.get(0)).compareTo(requireString(args.get(1))) < 0; }
-            case "string-ci=?" -> { return requireString(args.get(0)).equalsIgnoreCase(requireString(args.get(1))); }
-            case "string-upcase" -> { return "\"" + requireString(args.get(0)).toUpperCase() + "\""; }
-            case "string-downcase" -> { return "\"" + requireString(args.get(0)).toLowerCase() + "\""; }
-            default -> throw new EvalError("unknown procedure: " + name);
-        }
+            default -> throw new EvalError("unknown char procedure: " + name);
+        };
     }
 
     private Object evalBuiltin(String name, List<Object> args, Environment env) throws EvalError {
@@ -906,7 +1075,8 @@ public class Evaluator {
 
     private long requireLong(Object val) throws EvalError {
         if (val instanceof Long l) return l;
-        throw new EvalError("expected number, got: " + schemeToString(val));
+        if (val instanceof Double d) return d.longValue();
+        throw new EvalError("expected integer, got: " + schemeToString(val));
     }
 
     private String requireString(Object val) throws EvalError {
@@ -943,6 +1113,9 @@ public class Evaluator {
         if (a instanceof SchemeNil && b instanceof SchemeNil) return true;
         if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        if (isNumber(a) && isNumber(b)) {
+            try { return toDouble(a) == toDouble(b); } catch (EvalError e) { return false; }
+        }
         if ((a instanceof String || a instanceof SchemeString) && (b instanceof String || b instanceof SchemeString)) {
             try { return requireString(a).equals(requireString(b)); } catch (EvalError e) { return false; }
         }
@@ -959,6 +1132,14 @@ public class Evaluator {
     @SuppressWarnings("unchecked")
     static String schemeToString(Object val) {
         if (val instanceof Long l) return l.toString();
+        if (val instanceof Double d) {
+            if (d == Math.floor(d) && !Double.isInfinite(d) && Math.abs(d) < 1e15) {
+                // Format as e.g. "5.0" not "5"
+                return String.valueOf(d);
+            }
+            return String.valueOf(d);
+        }
+        if (val instanceof SchemeRational r) return r.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof String s) return s;
         if (val instanceof SchemeString ss) return ss.toString();
