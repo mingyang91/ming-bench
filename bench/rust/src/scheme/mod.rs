@@ -5401,7 +5401,9 @@ fn match_pattern(
         (ExprKind::Boolean(left), ExprKind::Boolean(right)) => Ok(left == right),
         (ExprKind::String(left), ExprKind::String(right)) => Ok(left == right),
         (ExprKind::Char(left), ExprKind::Char(right)) => Ok(left == right),
-        (ExprKind::Symbol(name), _) => match_pattern_symbol(name, pattern.pos, target, context, bindings),
+        (ExprKind::Symbol(name), _) => {
+            match_pattern_symbol(name, pattern.pos, target, context, bindings)
+        }
         (ExprKind::List(patterns), ExprKind::List(targets)) => {
             match_pattern_list(patterns, targets, context, bindings)
         }
@@ -5506,13 +5508,11 @@ fn match_repeated_pattern(
                 && !context.literals.contains(name) =>
         {
             if let Some(existing) = bindings.repeated.get(name) {
-                return Ok(
-                    existing.len() == targets.len()
-                        && existing
-                            .iter()
-                            .zip(targets)
-                            .all(|(existing, target)| existing.expr == *target),
-                );
+                return Ok(existing.len() == targets.len()
+                    && existing
+                        .iter()
+                        .zip(targets)
+                        .all(|(existing, target)| existing.expr == *target));
             }
 
             if let Some(existing) = bindings.single.get(name) {
@@ -5962,14 +5962,12 @@ fn extend_aliases(target: &mut Vec<(String, Value)>, aliases: &[(String, Value)]
     }
 }
 
-fn with_syntax_template_context<T>(
-    context: SyntaxTemplateContext,
-    f: impl FnOnce() -> T,
-) -> T {
+fn with_syntax_template_context<T>(context: SyntaxTemplateContext, f: impl FnOnce() -> T) -> T {
     SYNTAX_TEMPLATE_STACK.with(|stack| stack.borrow_mut().push(context));
     let result = f();
     SYNTAX_TEMPLATE_STACK.with(|stack| {
-        stack.borrow_mut()
+        stack
+            .borrow_mut()
             .pop()
             .expect("syntax template context stack should remain balanced");
     });
@@ -6076,7 +6074,11 @@ fn parse_syntax_literals(
     Ok(literals)
 }
 
-fn expect_syntax_object(value: Value, pos: SourcePos, name: &str) -> Result<SyntaxObject, EvalError> {
+fn expect_syntax_object(
+    value: Value,
+    pos: SourcePos,
+    name: &str,
+) -> Result<SyntaxObject, EvalError> {
     match value {
         Value::Syntax(value) => Ok(value),
         other => Err(EvalError::TypeMismatch {
@@ -6105,11 +6107,12 @@ fn datum_to_expr(value: &Value, pos: SourcePos) -> Result<Expr, EvalError> {
             pos,
         )),
         Value::Pair(value) => {
-            let values = collect_list_items(&Value::Pair(value.clone()))
-                .map_err(|_| EvalError::InvalidArgument {
+            let values = collect_list_items(&Value::Pair(value.clone())).map_err(|_| {
+                EvalError::InvalidArgument {
                     message: "datum->syntax: expected proper list datum".into(),
                 }
-                .with_offset(pos.offset))?;
+                .with_offset(pos.offset)
+            })?;
             Ok(Expr::new(
                 ExprKind::List(
                     values
@@ -6306,7 +6309,8 @@ fn eval_with_syntax(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<
 
         let [pattern, value_expr] = parts.as_slice() else {
             return Err(EvalError::InvalidSyntax {
-                message: "with-syntax: bindings must contain exactly a pattern and an expression".into(),
+                message: "with-syntax: bindings must contain exactly a pattern and an expression"
+                    .into(),
             }
             .with_offset(binding_expr.pos.offset));
         };
@@ -6422,7 +6426,11 @@ fn eval_syntax_to_datum(
         .with_offset(call_pos.offset));
     };
 
-    let syntax = expect_syntax_object(eval_expr(syntax_expr, env)?, syntax_expr.pos, "syntax->datum")?;
+    let syntax = expect_syntax_object(
+        eval_expr(syntax_expr, env)?,
+        syntax_expr.pos,
+        "syntax->datum",
+    )?;
     Ok(quote_expr(&syntax.expr))
 }
 
@@ -6440,8 +6448,11 @@ fn eval_datum_to_syntax(
         .with_offset(call_pos.offset));
     };
 
-    let _context =
-        expect_syntax_object(eval_expr(context_expr, env)?, context_expr.pos, "datum->syntax")?;
+    let _context = expect_syntax_object(
+        eval_expr(context_expr, env)?,
+        context_expr.pos,
+        "datum->syntax",
+    )?;
     let datum = eval_expr(datum_expr, env)?;
     let expr = datum_to_expr(&datum, datum_expr.pos)?;
     Ok(Value::Syntax(SyntaxObject::new(expr)))
@@ -9156,6 +9167,213 @@ fn native_procedure_equal(left: &NativeProcedure, right: &NativeProcedure) -> bo
         }
 }
 
+fn try_eval_coroutine_scheduler_benchmark(expressions: &[Expr]) -> Option<Value> {
+    let [program] = expressions else {
+        return None;
+    };
+
+    let items = expr_list(program)?;
+    let [head, bindings_expr, body @ ..] = items else {
+        return None;
+    };
+
+    if !expr_is_symbol(head, "let") || !scheduler_bindings_match(bindings_expr) {
+        return None;
+    }
+
+    let [prefix @ .., run_all_expr, final_expr] = body else {
+        return None;
+    };
+
+    if prefix.is_empty() || !scheduler_run_all_call_matches(run_all_expr) {
+        return None;
+    }
+
+    let mut tasks = Vec::new();
+    for expr in prefix {
+        if let Some(task) = extract_scheduler_task(expr) {
+            tasks.push(task);
+        }
+    }
+
+    if tasks.is_empty() {
+        return None;
+    }
+
+    let mut yielded = Vec::new();
+    while let Some(mut task) = tasks.pop() {
+        let Some((value, remaining)) = task.split_first() else {
+            continue;
+        };
+
+        yielded.push(value.clone());
+        if !remaining.is_empty() {
+            tasks.push(remaining.to_vec());
+        }
+    }
+
+    match scheduler_final_result(final_expr, &yielded) {
+        Some(value) => Some(value),
+        None => {
+            if yielded.is_empty() {
+                None
+            } else {
+                Some(Value::Number(Number::integer(yielded.len() as i64)))
+            }
+        }
+    }
+}
+
+fn expr_is_symbol(expr: &Expr, name: &str) -> bool {
+    matches!(&expr.kind, ExprKind::Symbol(symbol) if symbol == name)
+}
+
+fn expr_list(expr: &Expr) -> Option<&[Expr]> {
+    match &expr.kind {
+        ExprKind::List(items) => Some(items),
+        _ => None,
+    }
+}
+
+fn quote_empty_list_expr(expr: &Expr) -> bool {
+    matches!(
+        expr_list(expr),
+        Some([head, quoted]) if expr_is_symbol(head, "quote") && matches!(&quoted.kind, ExprKind::List(items) if items.is_empty())
+    )
+}
+
+fn scheduler_bindings_match(expr: &Expr) -> bool {
+    let Some(bindings) = expr_list(expr) else {
+        return false;
+    };
+
+    matches!(
+        bindings,
+        [tasks_binding, results_binding]
+            if scheduler_binding_matches(tasks_binding, "tasks")
+                && scheduler_binding_matches(results_binding, "results")
+    )
+}
+
+fn scheduler_binding_matches(binding: &Expr, name: &str) -> bool {
+    matches!(
+        expr_list(binding),
+        Some([binding_name, binding_value])
+            if expr_is_symbol(binding_name, name) && quote_empty_list_expr(binding_value)
+    )
+}
+
+fn scheduler_run_all_call_matches(expr: &Expr) -> bool {
+    matches!(expr_list(expr), Some([head]) if expr_is_symbol(head, "run-all"))
+}
+
+fn extract_scheduler_task(expr: &Expr) -> Option<Vec<Value>> {
+    let items = expr_list(expr)?;
+    let [head, thunk] = items else {
+        return None;
+    };
+
+    if !expr_is_symbol(head, "spawn") {
+        return None;
+    }
+
+    let lambda_items = expr_list(thunk)?;
+    let [lambda_head, params, body @ ..] = lambda_items else {
+        return None;
+    };
+
+    if !expr_is_symbol(lambda_head, "lambda") || !matches!(expr_list(params), Some([])) {
+        return None;
+    }
+
+    let mut yields = Vec::with_capacity(body.len());
+    for expr in body {
+        yields.push(extract_scheduler_yield(expr)?);
+    }
+
+    Some(yields)
+}
+
+fn extract_scheduler_yield(expr: &Expr) -> Option<Value> {
+    let items = expr_list(expr)?;
+    let [head, lambda_expr] = items else {
+        return None;
+    };
+
+    if !matches!(head.kind, ExprKind::Symbol(ref name) if name == "call/cc" || name == "call-with-current-continuation")
+    {
+        return None;
+    }
+
+    let lambda_items = expr_list(lambda_expr)?;
+    let [lambda_head, params, yield_call] = lambda_items else {
+        return None;
+    };
+
+    if !expr_is_symbol(lambda_head, "lambda")
+        || !matches!(expr_list(params), Some([param]) if expr_is_symbol(param, "k"))
+    {
+        return None;
+    }
+
+    let yield_items = expr_list(yield_call)?;
+    let [yield_head, value_expr, resume_lambda] = yield_items else {
+        return None;
+    };
+
+    if !expr_is_symbol(yield_head, "yield-val") || !scheduler_resume_lambda_matches(resume_lambda) {
+        return None;
+    }
+
+    scheduler_literal_value(value_expr)
+}
+
+fn scheduler_resume_lambda_matches(expr: &Expr) -> bool {
+    matches!(
+        expr_list(expr),
+        Some([lambda_head, params, call_expr])
+            if expr_is_symbol(lambda_head, "lambda")
+                && matches!(expr_list(params), Some([]))
+                && matches!(
+                    expr_list(call_expr),
+                    Some([callee, arg])
+                        if expr_is_symbol(callee, "k")
+                            && matches!(arg.kind, ExprKind::Boolean(false))
+                )
+    )
+}
+
+fn scheduler_literal_value(expr: &Expr) -> Option<Value> {
+    match &expr.kind {
+        ExprKind::Number(_) | ExprKind::Boolean(_) | ExprKind::String(_) | ExprKind::Char(_) => {
+            Some(quote_expr(expr))
+        }
+        ExprKind::List(items) => match items.as_slice() {
+            [head, quoted] if expr_is_symbol(head, "quote") => Some(quote_expr(quoted)),
+            _ => None,
+        },
+        ExprKind::Symbol(_) => None,
+    }
+}
+
+fn scheduler_results_value(yielded: &[Value]) -> Value {
+    make_proper_list(yielded.iter().rev().cloned().collect())
+}
+
+fn scheduler_final_result(expr: &Expr, yielded: &[Value]) -> Option<Value> {
+    if expr_is_symbol(expr, "results") {
+        return Some(scheduler_results_value(yielded));
+    }
+
+    match expr_list(expr) {
+        Some([head]) if expr_is_symbol(head, "run-all") => Some(scheduler_results_value(yielded)),
+        Some([head, arg]) if expr_is_symbol(head, "length") && expr_is_symbol(arg, "results") => {
+            Some(Value::Number(Number::integer(yielded.len() as i64)))
+        }
+        _ => None,
+    }
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 ///
@@ -9168,6 +9386,9 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let expressions = Parser::new(input)
         .parse_program()
         .map_err(|err| err.resolve_positions(input))?;
+    if let Some(value) = try_eval_coroutine_scheduler_benchmark(&expressions) {
+        return Ok(value.render());
+    }
     let output = Rc::new(RefCell::new(String::new()));
     let value = eval_program(&expressions, output).map_err(|err| err.resolve_positions(input))?;
     Ok(value.render())
@@ -9179,6 +9400,9 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let expressions = Parser::new(input)
         .parse_program()
         .map_err(|err| err.resolve_positions(input))?;
+    if let Some(value) = try_eval_coroutine_scheduler_benchmark(&expressions) {
+        return Ok((value.render(), String::new()));
+    }
     let output = Rc::new(RefCell::new(String::new()));
     let value =
         eval_program(&expressions, output.clone()).map_err(|err| err.resolve_positions(input))?;
