@@ -123,10 +123,14 @@ struct PairCell {
 }
 
 struct Closure {
+    clauses: Vec<ClosureClause>,
+    env: EnvRef,
+}
+
+struct ClosureClause {
     params: Vec<String>,
     rest_param: Option<String>,
     body: Vec<Expr>,
-    env: EnvRef,
 }
 
 struct Env {
@@ -303,18 +307,64 @@ impl Env {
 }
 
 impl Closure {
+    fn new_single(
+        params: Vec<String>,
+        rest_param: Option<String>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    ) -> Self {
+        Self {
+            clauses: vec![ClosureClause {
+                params,
+                rest_param,
+                body,
+            }],
+            env,
+        }
+    }
+
     fn call(&self, args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-        if args.len() < self.params.len()
-            || (self.rest_param.is_none() && args.len() != self.params.len())
-        {
-            return Err(EvalError::WrongArgCount {
+        let Some(clause) = self
+            .clauses
+            .iter()
+            .find(|clause| clause.matches_arity(args.len()))
+        else {
+            return Err(self.wrong_arg_count(args.len()));
+        };
+
+        clause.call(args, self.env.clone(), ctx)
+    }
+
+    fn wrong_arg_count(&self, got: usize) -> EvalError {
+        if self.clauses.len() == 1 {
+            EvalError::WrongArgCount {
                 name: "lambda",
                 expected: "the declared arity",
-                got: args.len(),
-            });
+                got,
+            }
+        } else {
+            let expected = self
+                .clauses
+                .iter()
+                .map(ClosureClause::arity_description)
+                .collect::<Vec<_>>()
+                .join(" or ");
+            EvalError::WrongArgCountDynamic {
+                name: "case-lambda".to_string(),
+                expected,
+                got,
+            }
         }
+    }
+}
 
-        let frame = Env::new(Some(self.env.clone()));
+impl ClosureClause {
+    fn matches_arity(&self, len: usize) -> bool {
+        len >= self.params.len() && (self.rest_param.is_some() || len == self.params.len())
+    }
+
+    fn call(&self, args: &[Value], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+        let frame = Env::new(Some(env));
         for (name, value) in self.params.iter().zip(args.iter()) {
             frame.define(name.clone(), value.clone());
         }
@@ -327,6 +377,14 @@ impl Closure {
         }
 
         eval_sequence(&self.body, frame, ctx)
+    }
+
+    fn arity_description(&self) -> String {
+        if self.rest_param.is_some() {
+            format!("at least {}", self.params.len())
+        } else {
+            format!("exactly {}", self.params.len())
+        }
     }
 }
 
@@ -472,6 +530,9 @@ fn eval_list(
             "if" => return eval_if(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             "quote" => return eval_quote(tail).map_err(|err| err.with_position(head.pos)),
             "lambda" => return eval_lambda(tail, env).map_err(|err| err.with_position(head.pos)),
+            "case-lambda" => {
+                return eval_case_lambda(tail, env).map_err(|err| err.with_position(head.pos))
+            }
             "and" => return eval_and(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             "or" => return eval_or(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             "begin" => {
@@ -535,12 +596,12 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, E
             }
 
             let (params, rest_param) = parse_param_slice(params_exprs)?;
-            let closure = Value::Closure(Rc::new(Closure {
+            let closure = Value::Closure(Rc::new(Closure::new_single(
                 params,
                 rest_param,
-                body: args[1..].to_vec(),
-                env: env.clone(),
-            }));
+                args[1..].to_vec(),
+                env.clone(),
+            )));
             env.define(name.clone(), closure);
             Ok(Value::Void)
         }
@@ -703,12 +764,50 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     }
 
     let (params, rest_param) = parse_param_list(&args[0])?;
-    Ok(Value::Closure(Rc::new(Closure {
+    Ok(Value::Closure(Rc::new(Closure::new_single(
         params,
         rest_param,
-        body: args[1..].to_vec(),
+        args[1..].to_vec(),
         env,
-    })))
+    ))))
+}
+
+fn eval_case_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::InvalidSyntax {
+            message: "case-lambda requires at least one clause".to_string(),
+        });
+    }
+
+    let mut clauses = Vec::with_capacity(args.len());
+    for clause in args {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case-lambda clauses must be lists".to_string(),
+            });
+        };
+
+        let Some((params_expr, body)) = items.split_first() else {
+            return Err(EvalError::InvalidSyntax {
+                message: "case-lambda clauses cannot be empty".to_string(),
+            });
+        };
+
+        if body.is_empty() {
+            return Err(EvalError::InvalidSyntax {
+                message: "case-lambda clauses require a body".to_string(),
+            });
+        }
+
+        let (params, rest_param) = parse_param_list(params_expr)?;
+        clauses.push(ClosureClause {
+            params,
+            rest_param,
+            body: body.to_vec(),
+        });
+    }
+
+    Ok(Value::Closure(Rc::new(Closure { clauses, env })))
 }
 
 fn eval_and(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -828,12 +927,12 @@ fn eval_named_let(
         .map(|(binding, _)| binding.clone())
         .collect();
     let frame = Env::new(Some(env));
-    let closure = Value::Closure(Rc::new(Closure {
+    let closure = Value::Closure(Rc::new(Closure::new_single(
         params,
-        rest_param: None,
-        body: args[1..].to_vec(),
-        env: frame.clone(),
-    }));
+        None,
+        args[1..].to_vec(),
+        frame.clone(),
+    )));
 
     frame.define(name.to_string(), closure.clone());
     apply_procedure(closure, &values, ctx)

@@ -83,6 +83,7 @@ pub(super) fn default_env() -> EnvRef {
         ("char=?", native_char_eq as NativeFunc),
         ("char<?", native_char_lt as NativeFunc),
         ("pair?", native_pair_pred as NativeFunc),
+        ("procedure?", native_procedure_pred as NativeFunc),
         ("symbol?", native_symbol_pred as NativeFunc),
         ("apply", native_apply as NativeFunc),
     ] {
@@ -778,6 +779,15 @@ fn native_char_lt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError
 
 fn native_pair_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
     native_predicate("pair?", args, ctx, |value| matches!(value, Value::Pair(_)))
+}
+
+fn native_procedure_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("procedure?", args, ctx, |value| {
+        matches!(
+            value,
+            Value::NativeProc { .. } | Value::RecordProc(_) | Value::Closure(_)
+        )
+    })
 }
 
 fn native_symbol_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
