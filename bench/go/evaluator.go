@@ -92,6 +92,10 @@ type closure struct {
 	env       *env
 }
 
+type caseClosure struct {
+	clauses []closure
+}
+
 func newEnv(parent *env) *env {
 	return &env{
 		parent:   parent,
@@ -317,6 +321,7 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("string-upcase", builtinProc{name: "string-upcase", fn: builtinStringUpcase})
 	scope.define("string-downcase", builtinProc{name: "string-downcase", fn: builtinStringDowncase})
 	scope.define("apply", builtinProc{name: "apply", fn: builtinApply})
+	scope.define("procedure?", builtinProc{name: "procedure?", fn: builtinProcedurePredicate})
 	return scope
 }
 
@@ -631,6 +636,8 @@ func eval(scope *env, expr any) (any, error) {
 		return node, nil
 	case closure:
 		return node, nil
+	case caseClosure:
+		return node, nil
 	case pairValue:
 		return node, nil
 	case emptyListValue:
@@ -664,6 +671,8 @@ func evalList(scope *env, expr listExpr) (any, error) {
 			return evalQuote(args)
 		case "lambda":
 			return evalLambda(scope, args)
+		case "case-lambda":
+			return evalCaseLambda(scope, args)
 		case "and":
 			return evalAnd(scope, args)
 		case "or":
@@ -829,6 +838,35 @@ func evalLambda(scope *env, args []any) (any, error) {
 		body:      args[1:],
 		env:       scope,
 	}, nil
+}
+
+func evalCaseLambda(scope *env, args []any) (any, error) {
+	if len(args) == 0 {
+		return nil, &EvalError{Message: "case-lambda expects at least 1 clause"}
+	}
+
+	clauses := make([]closure, 0, len(args))
+	for _, clauseExpr := range args {
+		clause, ok := clauseExpr.(listExpr)
+		if !ok || len(clause.elements) < 2 {
+			return nil, exprSourcePos(clauseExpr).errorf("case-lambda clauses must include parameters and a body")
+		}
+
+		params, restParam, hasRest, err := parseFormals(clause.elements[0])
+		if err != nil {
+			return nil, err
+		}
+
+		clauses = append(clauses, closure{
+			params:    params,
+			restParam: restParam,
+			hasRest:   hasRest,
+			body:      clause.elements[1:],
+			env:       scope,
+		})
+	}
+
+	return caseClosure{clauses: clauses}, nil
 }
 
 func evalAnd(scope *env, args []any) (any, error) {
@@ -1015,25 +1053,46 @@ func applyProcedure(proc any, args []any) (any, error) {
 	case builtinProc:
 		return callable.fn(args)
 	case closure:
-		if !callable.hasRest && len(args) != len(callable.params) {
-			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
+		if !closureMatchesArity(callable, len(args)) {
+			return nil, closureArgCountError(callable, len(args))
 		}
-		if callable.hasRest && len(args) < len(callable.params) {
-			return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(callable.params), len(args))}
+		return applyClosure(callable, args)
+	case caseClosure:
+		for _, clause := range callable.clauses {
+			if closureMatchesArity(clause, len(args)) {
+				return applyClosure(clause, args)
+			}
 		}
-
-		callScope := newEnv(callable.env)
-		for i, param := range callable.params {
-			callScope.defineSymbol(param, args[i])
-		}
-		if callable.hasRest {
-			callScope.defineSymbol(callable.restParam, makeListValue(args[len(callable.params):]))
-		}
-
-		return evalSequence(callScope, callable.body)
+		return nil, &EvalError{Message: fmt.Sprintf("no matching case-lambda clause for %d arguments", len(args))}
 	default:
 		return nil, &EvalError{Message: fmt.Sprintf("expected procedure, got %s", typeName(proc))}
 	}
+}
+
+func applyClosure(callable closure, args []any) (any, error) {
+	callScope := newEnv(callable.env)
+	for i, param := range callable.params {
+		callScope.defineSymbol(param, args[i])
+	}
+	if callable.hasRest {
+		callScope.defineSymbol(callable.restParam, makeListValue(args[len(callable.params):]))
+	}
+
+	return evalSequence(callScope, callable.body)
+}
+
+func closureMatchesArity(callable closure, argCount int) bool {
+	if callable.hasRest {
+		return argCount >= len(callable.params)
+	}
+	return argCount == len(callable.params)
+}
+
+func closureArgCountError(callable closure, argCount int) error {
+	if callable.hasRest {
+		return &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(callable.params), argCount)}
+	}
+	return &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), argCount)}
 }
 
 func evalSequence(scope *env, exprs []any) (any, error) {
@@ -1426,6 +1485,13 @@ func builtinApply(args []any) (any, error) {
 	return applyProcedure(args[0], callArgs)
 }
 
+func builtinProcedurePredicate(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "procedure? expects exactly 1 argument"}
+	}
+	return isProcedureValue(args[0]), nil
+}
+
 func expectInt(value any) (int64, error) {
 	n, ok := value.(int64)
 	if !ok {
@@ -1559,7 +1625,7 @@ func typeName(value any) string {
 		return "list"
 	case listExpr:
 		return "list"
-	case builtinProc, closure:
+	case builtinProc, closure, caseClosure:
 		return "procedure"
 	case voidValue:
 		return "void"
@@ -1567,6 +1633,15 @@ func typeName(value any) string {
 		return "record"
 	default:
 		return "value"
+	}
+}
+
+func isProcedureValue(value any) bool {
+	switch value.(type) {
+	case builtinProc, closure, caseClosure:
+		return true
+	default:
+		return false
 	}
 }
 
