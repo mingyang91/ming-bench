@@ -77,6 +77,11 @@ interface LetBinding {
   valueExpr: Expr;
 }
 
+interface ParsedParameters {
+  params: string[];
+  restParam?: string;
+}
+
 interface BuiltinProcedure {
   kind: 'procedure';
   name: string;
@@ -87,6 +92,7 @@ interface ClosureProcedure {
   kind: 'procedure';
   name?: string;
   params: string[];
+  restParam?: string;
   body: Expr[];
   env: Environment;
 }
@@ -530,6 +536,27 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return result;
   }));
 
+  env.define('apply', builtin('apply', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: apply expects at least 2 arguments`);
+    }
+
+    const [procedureArg, ...restArgs] = args;
+    const listArg = restArgs[restArgs.length - 1];
+    const prefixArgs = restArgs.slice(0, -1);
+    const listElements = expectProperList(listArg.value, listArg.expr);
+
+    const appliedArgs = [
+      ...prefixArgs,
+      ...listElements.map((value) => ({
+        expr: listArg.expr,
+        value,
+      })),
+    ];
+
+    return applyProcedure(procedureArg.value, appliedArgs, procedureArg.expr);
+  }));
+
   env.define('string?', predicateBuiltin('string?', isSchemeStringValue));
   env.define('number?', predicateBuiltin('number?', (value) => typeof value === 'number'));
   env.define('boolean?', predicateBuiltin('boolean?', (value) => typeof value === 'boolean'));
@@ -796,12 +823,13 @@ function evalDefine(args: Expr[], head: SymbolExpr, env: Environment): Value {
     throw new EvalError(`${nameExpr.line}:${nameExpr.col}: function name must be a symbol`);
   }
 
-  const params = paramExprs.map(expectParameterSymbol);
+  const { params, restParam } = parseProcedureParameters(paramExprs);
   const body = args.slice(1);
   const proc: ClosureProcedure = {
     kind: 'procedure',
     name: nameExpr.value,
     params,
+    restParam,
     body,
     env,
   };
@@ -855,9 +883,11 @@ function evalLambda(args: Expr[], head: SymbolExpr, env: Environment): Value {
     throw new EvalError(`${paramsExpr.line}:${paramsExpr.col}: lambda parameters must be a list`);
   }
 
+  const { params, restParam } = parseProcedureParameters(paramsExpr.elements);
   return {
     kind: 'procedure',
-    params: paramsExpr.elements.map(expectParameterSymbol),
+    params,
+    restParam,
     body: args.slice(1),
     env,
   };
@@ -982,15 +1012,28 @@ function applyProcedure(operator: Value, args: EvaluatedArg[], loc: SourceLoc): 
     return operator.call(args, loc);
   }
 
-  if (args.length !== operator.params.length) {
+  if (operator.restParam === undefined && args.length !== operator.params.length) {
     throw new EvalError(
       `${loc.line}:${loc.col}: ${procedureDisplayName(operator)} expects exactly ${operator.params.length} arguments`,
+    );
+  }
+
+  if (operator.restParam !== undefined && args.length < operator.params.length) {
+    throw new EvalError(
+      `${loc.line}:${loc.col}: ${procedureDisplayName(operator)} expects at least ${operator.params.length} arguments`,
     );
   }
 
   const callEnv = new Environment(operator.env);
   for (let index = 0; index < operator.params.length; index += 1) {
     callEnv.define(operator.params[index], args[index].value);
+  }
+
+  if (operator.restParam !== undefined) {
+    callEnv.define(
+      operator.restParam,
+      makeList(args.slice(operator.params.length).map((arg) => arg.value)),
+    );
   }
 
   return evaluateSequence(operator.body, callEnv);
@@ -1053,6 +1096,33 @@ function makeList(elements: Value[]): Value {
   }
 
   return result;
+}
+
+function parseProcedureParameters(exprs: Expr[]): ParsedParameters {
+  const params: string[] = [];
+
+  for (let index = 0; index < exprs.length; index += 1) {
+    const expr = exprs[index];
+
+    if (expr.type === 'symbol' && expr.value === '.') {
+      const restExpr = exprs[index + 1];
+
+      if (
+        restExpr === undefined ||
+        index + 2 !== exprs.length ||
+        restExpr.type !== 'symbol' ||
+        restExpr.value === '.'
+      ) {
+        throw new EvalError(`${expr.line}:${expr.col}: invalid parameter list`);
+      }
+
+      return { params, restParam: restExpr.value };
+    }
+
+    params.push(expectParameterSymbol(expr));
+  }
+
+  return { params };
 }
 
 function expectParameterSymbol(expr: Expr): string {
