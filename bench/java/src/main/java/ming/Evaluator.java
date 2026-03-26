@@ -83,6 +83,16 @@ public class Evaluator {
         }
     }
 
+    // --- Exception handling (raise/guard/with-exception-handler) ---
+
+    private static class SchemeException extends RuntimeException {
+        final Object value;
+        SchemeException(Object value) {
+            super(null, null, true, false);
+            this.value = value;
+        }
+    }
+
     private static class SchemeContinuation {
         final List<Object> bodyExprs;
         final Env bodyEnv;
@@ -143,7 +153,8 @@ public class Evaluator {
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
         "define", "if", "quote", "lambda", "case-lambda", "and", "or", "set!", "begin", "let", "cond",
-        "define-syntax", "syntax-rules", "define-record-type", "case", "letrec", "letrec*", "do", "let*"
+        "define-syntax", "syntax-rules", "define-record-type", "case", "letrec", "letrec*", "do", "let*",
+        "guard"
     );
 
     // --- Vector ---
@@ -315,6 +326,10 @@ public class Evaluator {
             // Non-local exit: call out-thunk before propagating
             apply(outThunk, List.of());
             throw ci;
+        } catch (SchemeException se) {
+            // Exception: call out-thunk before propagating
+            apply(outThunk, List.of());
+            throw se;
         }
 
         // Normal exit: call out-thunk
@@ -572,6 +587,7 @@ public class Evaluator {
                         case "letrec*" -> { return evalLetrecStar(list.elems, env); }
                         case "let*" -> { return evalLetStar(list.elems, env); }
                         case "do" -> { return evalDo(list.elems, env); }
+                        case "guard" -> { return evalGuard(list.elems, env); }
                     }
                 } catch (EvalError e) {
                     throw addPosition(e, list.line, list.col);
@@ -988,6 +1004,56 @@ public class Evaluator {
             for (int i = 0; i < varNames.size(); i++) {
                 doEnv.define(varNames.get(i), newVals[i]);
             }
+        }
+    }
+
+    // L20: guard
+    // (guard (var clause ...) body ...)
+    private Object evalGuard(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() < 3) throw new EvalError("guard: bad syntax");
+        SchemeList clauseList = (SchemeList) elems.get(1);
+        if (clauseList.elems.isEmpty()) throw new EvalError("guard: bad syntax");
+        String var = ((SchemeSymbol) clauseList.elems.get(0)).name;
+        List<Object> clauses = clauseList.elems.subList(1, clauseList.elems.size());
+        List<Object> body = elems.subList(2, elems.size());
+
+        try {
+            // Evaluate body
+            Object result = null;
+            for (Object expr : body) {
+                result = eval(expr, env);
+            }
+            return result;
+        } catch (SchemeException se) {
+            // Bind exception value to var
+            Env guardEnv = new Env(env);
+            guardEnv.define(var, se.value);
+
+            // Test cond-like clauses
+            for (Object clause : clauses) {
+                SchemeList cl = (SchemeList) clause;
+                if (cl.elems.isEmpty()) continue;
+                Object test = cl.elems.get(0);
+                if (test instanceof SchemeSymbol s && s.name.equals("else")) {
+                    // else clause
+                    Object result = null;
+                    for (int i = 1; i < cl.elems.size(); i++) {
+                        result = eval(cl.elems.get(i), guardEnv);
+                    }
+                    return result;
+                }
+                Object testVal = eval(test, guardEnv);
+                if (isTruthy(testVal)) {
+                    if (cl.elems.size() == 1) return testVal;
+                    Object result = null;
+                    for (int i = 1; i < cl.elems.size(); i++) {
+                        result = eval(cl.elems.get(i), guardEnv);
+                    }
+                    return result;
+                }
+            }
+            // No clause matched — re-raise
+            throw se;
         }
     }
 
@@ -1473,6 +1539,22 @@ public class Evaluator {
 
         // L19: dynamic-wind
         env.define("dynamic-wind", DYNAMIC_WIND_SENTINEL);
+
+        // L20: raise, with-exception-handler
+        env.define("raise", new BuiltinProc("raise", args -> {
+            requireArgCount("raise", args, 1);
+            throw new SchemeException(args.get(0));
+        }));
+        env.define("with-exception-handler", new BuiltinProc("with-exception-handler", args -> {
+            requireArgCount("with-exception-handler", args, 2);
+            Object handler = args.get(0);
+            Object thunk = args.get(1);
+            try {
+                return apply(thunk, List.of());
+            } catch (SchemeException se) {
+                return apply(handler, List.of(se.value));
+            }
+        }));
 
         // L08: apply
         env.define("apply", new BuiltinProc("apply", args -> {
