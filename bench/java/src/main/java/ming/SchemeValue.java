@@ -39,7 +39,12 @@ class SchemeValue {
             return sb.toString();
         }
         if (val instanceof MutableString ms) return ms.toSchemeStr();
-        if (val instanceof Character c) return "#\\" + c;
+        if (val instanceof Character c) {
+            if (c == ' ') return "#\\space";
+            if (c == '\n') return "#\\newline";
+            if (c == '\t') return "#\\tab";
+            return "#\\" + c;
+        }
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
         if (val instanceof Lambda) return "#<procedure>";
         return val.toString();

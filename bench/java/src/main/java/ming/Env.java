@@ -278,6 +278,219 @@ class Env {
             return null; // void
         }));
 
+        // L09 — Numeric utilities
+        env.define("abs", Builtin.named("abs", args -> {
+            requireArgCount("abs", args, 1);
+            return Math.abs(requireLong("abs", args.get(0)));
+        }));
+        env.define("modulo", Builtin.named("modulo", args -> {
+            requireArgCount("modulo", args, 2);
+            long a = requireLong("modulo", args.get(0));
+            long b = requireLong("modulo", args.get(1));
+            if (b == 0) throw new EvalError("modulo: division by zero");
+            return Math.floorMod(a, b);
+        }));
+        env.define("remainder", Builtin.named("remainder", args -> {
+            requireArgCount("remainder", args, 2);
+            long a = requireLong("remainder", args.get(0));
+            long b = requireLong("remainder", args.get(1));
+            if (b == 0) throw new EvalError("remainder: division by zero");
+            return a % b;
+        }));
+        env.define("quotient", Builtin.named("quotient", args -> {
+            requireArgCount("quotient", args, 2);
+            long a = requireLong("quotient", args.get(0));
+            long b = requireLong("quotient", args.get(1));
+            if (b == 0) throw new EvalError("quotient: division by zero");
+            long q = a / b;
+            // Truncate toward zero (Java default for integer division)
+            return q;
+        }));
+        env.define("min", Builtin.named("min", args -> {
+            if (args.isEmpty()) throw new EvalError("min: need at least 1 argument");
+            long result = requireLong("min", args.get(0));
+            for (int i = 1; i < args.size(); i++) {
+                long v = requireLong("min", args.get(i));
+                if (v < result) result = v;
+            }
+            return result;
+        }));
+        env.define("max", Builtin.named("max", args -> {
+            if (args.isEmpty()) throw new EvalError("max: need at least 1 argument");
+            long result = requireLong("max", args.get(0));
+            for (int i = 1; i < args.size(); i++) {
+                long v = requireLong("max", args.get(i));
+                if (v > result) result = v;
+            }
+            return result;
+        }));
+        env.define("expt", Builtin.named("expt", args -> {
+            requireArgCount("expt", args, 2);
+            long base = requireLong("expt", args.get(0));
+            long exp = requireLong("expt", args.get(1));
+            long result = 1;
+            for (long i = 0; i < exp; i++) result *= base;
+            return result;
+        }));
+        env.define("zero?", Builtin.named("zero?", args -> {
+            requireArgCount("zero?", args, 1);
+            return requireLong("zero?", args.get(0)) == 0;
+        }));
+        env.define("positive?", Builtin.named("positive?", args -> {
+            requireArgCount("positive?", args, 1);
+            return requireLong("positive?", args.get(0)) > 0;
+        }));
+        env.define("negative?", Builtin.named("negative?", args -> {
+            requireArgCount("negative?", args, 1);
+            return requireLong("negative?", args.get(0)) < 0;
+        }));
+        env.define("odd?", Builtin.named("odd?", args -> {
+            requireArgCount("odd?", args, 1);
+            return requireLong("odd?", args.get(0)) % 2 != 0;
+        }));
+        env.define("even?", Builtin.named("even?", args -> {
+            requireArgCount("even?", args, 1);
+            return requireLong("even?", args.get(0)) % 2 == 0;
+        }));
+
+        // L09 — List utilities
+        env.define("list-ref", Builtin.named("list-ref", args -> {
+            requireArgCount("list-ref", args, 2);
+            int idx = (int) requireLong("list-ref", args.get(1));
+            Object cur = args.get(0);
+            for (int i = 0; i < idx; i++) {
+                if (!(cur instanceof Pair p)) throw new EvalError("list-ref: index out of range");
+                cur = p.cdr;
+            }
+            if (!(cur instanceof Pair p)) throw new EvalError("list-ref: index out of range");
+            return p.car;
+        }));
+        env.define("list-tail", Builtin.named("list-tail", args -> {
+            requireArgCount("list-tail", args, 2);
+            int idx = (int) requireLong("list-tail", args.get(1));
+            Object cur = args.get(0);
+            for (int i = 0; i < idx; i++) {
+                if (!(cur instanceof Pair p)) throw new EvalError("list-tail: index out of range");
+                cur = p.cdr;
+            }
+            return cur;
+        }));
+        env.define("list?", Builtin.named("list?", args -> {
+            requireArgCount("list?", args, 1);
+            Object cur = args.get(0);
+            while (cur instanceof Pair p) {
+                cur = p.cdr;
+            }
+            return cur == SchemeValue.NIL;
+        }));
+
+        // L09 — eq? and equal?
+        env.define("eq?", Builtin.named("eq?", args -> {
+            requireArgCount("eq?", args, 2);
+            return schemeEq(args.get(0), args.get(1));
+        }));
+        env.define("equal?", Builtin.named("equal?", args -> {
+            requireArgCount("equal?", args, 2);
+            return schemeEqual(args.get(0), args.get(1));
+        }));
+
+        // L09 — assoc
+        env.define("assoc", Builtin.named("assoc", args -> {
+            requireArgCount("assoc", args, 2);
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Pair p) {
+                if (p.car instanceof Pair entry) {
+                    if (schemeEqual(key, entry.car)) return entry;
+                }
+                alist = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+
+        // L09 — Built-in map (multi-list)
+        env.define("map", Builtin.named("map", args -> {
+            if (args.size() < 2) throw new EvalError("map: need at least 2 arguments");
+            Object func = args.get(0);
+            int numLists = args.size() - 1;
+            Object[] cursors = new Object[numLists];
+            for (int i = 0; i < numLists; i++) cursors[i] = args.get(i + 1);
+            List<Object> results = new ArrayList<>();
+            while (true) {
+                boolean allPairs = true;
+                for (int i = 0; i < numLists; i++) {
+                    if (!(cursors[i] instanceof Pair)) { allPairs = false; break; }
+                }
+                if (!allPairs) break;
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 0; i < numLists; i++) {
+                    Pair p = (Pair) cursors[i];
+                    callArgs.add(p.car);
+                    cursors[i] = p.cdr;
+                }
+                results.add(Evaluator.applyProc(func, callArgs));
+            }
+            Object result = SchemeValue.NIL;
+            for (int i = results.size() - 1; i >= 0; i--) {
+                result = new Pair(results.get(i), result);
+            }
+            return result;
+        }));
+
+        // L09 — Character operations
+        env.define("char-alphabetic?", Builtin.named("char-alphabetic?", args -> {
+            requireArgCount("char-alphabetic?", args, 1);
+            return Character.isLetter(requireChar("char-alphabetic?", args.get(0)));
+        }));
+        env.define("char-numeric?", Builtin.named("char-numeric?", args -> {
+            requireArgCount("char-numeric?", args, 1);
+            return Character.isDigit(requireChar("char-numeric?", args.get(0)));
+        }));
+        env.define("char-upcase", Builtin.named("char-upcase", args -> {
+            requireArgCount("char-upcase", args, 1);
+            return Character.toUpperCase(requireChar("char-upcase", args.get(0)));
+        }));
+        env.define("char-downcase", Builtin.named("char-downcase", args -> {
+            requireArgCount("char-downcase", args, 1);
+            return Character.toLowerCase(requireChar("char-downcase", args.get(0)));
+        }));
+        env.define("char=?", Builtin.named("char=?", args -> {
+            requireArgCount("char=?", args, 2);
+            return requireChar("char=?", args.get(0)) == requireChar("char=?", args.get(1));
+        }));
+        env.define("char<?", Builtin.named("char<?", args -> {
+            requireArgCount("char<?", args, 2);
+            return requireChar("char<?", args.get(0)) < requireChar("char<?", args.get(1));
+        }));
+
+        // L09 — String comparison/case operations
+        env.define("string=?", Builtin.named("string=?", args -> {
+            requireArgCount("string=?", args, 2);
+            return requireString("string=?", args.get(0)).equals(requireString("string=?", args.get(1)));
+        }));
+        env.define("string<?", Builtin.named("string<?", args -> {
+            requireArgCount("string<?", args, 2);
+            return requireString("string<?", args.get(0)).compareTo(requireString("string<?", args.get(1))) < 0;
+        }));
+        env.define("string-ci=?", Builtin.named("string-ci=?", args -> {
+            requireArgCount("string-ci=?", args, 2);
+            return requireString("string-ci=?", args.get(0)).equalsIgnoreCase(requireString("string-ci=?", args.get(1)));
+        }));
+        env.define("string-upcase", Builtin.named("string-upcase", args -> {
+            requireArgCount("string-upcase", args, 1);
+            return "\"" + requireString("string-upcase", args.get(0)).toUpperCase() + "\"";
+        }));
+        env.define("string-downcase", Builtin.named("string-downcase", args -> {
+            requireArgCount("string-downcase", args, 1);
+            return "\"" + requireString("string-downcase", args.get(0)).toLowerCase() + "\"";
+        }));
+
+        // L09 — integer? predicate
+        env.define("integer?", Builtin.named("integer?", args -> {
+            requireArgCount("integer?", args, 1);
+            return args.get(0) instanceof Long;
+        }));
+
         return env;
     }
 
@@ -310,5 +523,37 @@ class Env {
     private static void requireArgCount(String name, List<Object> args, int n) throws EvalError {
         if (args.size() != n)
             throw new EvalError(name + ": expected " + n + " arguments, got " + args.size());
+    }
+
+    private static char requireChar(String name, Object val) throws EvalError {
+        if (val instanceof Character c) return c;
+        throw new EvalError(name + ": expected character, got: " + SchemeValue.toStr(val));
+    }
+
+    static boolean schemeEq(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
+        if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
+        if (a instanceof Character ca && b instanceof Character cb) return ca.equals(cb);
+        if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
+        return false;
+    }
+
+    static boolean schemeEqual(Object a, Object b) {
+        if (schemeEq(a, b)) return true;
+        if (a instanceof Pair pa && b instanceof Pair pb) {
+            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        }
+        // Compare strings (quoted strings and MutableStrings)
+        String sa = toRawString(a), sb = toRawString(b);
+        if (sa != null && sb != null) return sa.equals(sb);
+        return false;
+    }
+
+    private static String toRawString(Object val) {
+        if (val instanceof String s && s.startsWith("\"") && s.endsWith("\""))
+            return s.substring(1, s.length() - 1);
+        if (val instanceof MutableString ms) return ms.inner();
+        return null;
     }
 }
