@@ -25,6 +25,7 @@ enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     Nil,
     Pair(Box<Value>, Box<Value>),
     Lambda {
@@ -32,6 +33,22 @@ enum Value {
         body: Vec<Expr>,
         env: Env,
     },
+}
+
+thread_local! {
+    static OUTPUT: RefCell<String> = RefCell::new(String::new());
+}
+
+fn write_output(s: &str) {
+    OUTPUT.with(|out| out.borrow_mut().push_str(s));
+}
+
+fn display_value(val: &Value) -> String {
+    match val {
+        Value::Str(s) => s.clone(),
+        Value::Char(c) => c.to_string(),
+        other => other.to_string(),
+    }
 }
 
 type Env = Rc<RefCell<EnvInner>>;
@@ -76,6 +93,12 @@ impl fmt::Display for Value {
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Str(s) => write!(f, "\"{}\"", s),
+            Value::Char(c) => match c {
+                ' ' => write!(f, "#\\space"),
+                '\n' => write!(f, "#\\newline"),
+                '\t' => write!(f, "#\\tab"),
+                c => write!(f, "#\\{}", c),
+            },
             Value::Symbol(s) => write!(f, "{}", s),
             Value::Nil => write!(f, "()"),
             Value::Pair(_, _) => {
@@ -109,6 +132,16 @@ impl fmt::Display for Value {
 impl Value {
     fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
+    }
+
+    fn as_string_at(&self, pos: Pos) -> Result<&str, EvalError> {
+        match self {
+            Value::Str(s) => Ok(s.as_str()),
+            _ => Err(EvalError::Type(format!(
+                "expected string, got {} at {}",
+                self, pos
+            ))),
+        }
     }
 
     fn as_integer_at(&self, pos: Pos) -> Result<i64, EvalError> {
@@ -339,7 +372,12 @@ fn is_builtin(name: &str) -> bool {
         name,
         "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
             | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
-            | "number?" | "string?" | "boolean?" | "pair?" | "symbol?"
+            | "number?" | "string?" | "boolean?" | "pair?" | "symbol?" | "char?"
+            | "display" | "write" | "newline"
+            | "string-append" | "string-length" | "substring"
+            | "string->number" | "number->string"
+            | "symbol->string" | "string->symbol"
+            | "string-ref"
     )
 }
 
@@ -917,6 +955,92 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             ensure_args(op, args, 1, p)?;
             Ok(Value::Boolean(matches!(args[0], Value::Symbol(_))))
         }
+        "char?" => {
+            ensure_args(op, args, 1, p)?;
+            Ok(Value::Boolean(matches!(args[0], Value::Char(_))))
+        }
+        "display" => {
+            ensure_args(op, args, 1, p)?;
+            write_output(&display_value(&args[0]));
+            Ok(Value::Nil)
+        }
+        "write" => {
+            ensure_args(op, args, 1, p)?;
+            write_output(&args[0].to_string());
+            Ok(Value::Nil)
+        }
+        "newline" => {
+            if !args.is_empty() {
+                return Err(EvalError::Arity(format!(
+                    "newline expects 0 arguments, got {} at {}",
+                    args.len(), p
+                )));
+            }
+            write_output("\n");
+            Ok(Value::Nil)
+        }
+        "string-append" => {
+            let mut result = String::new();
+            for a in args {
+                result.push_str(a.as_string_at(p)?);
+            }
+            Ok(Value::Str(result))
+        }
+        "string-length" => {
+            ensure_args(op, args, 1, p)?;
+            let s = args[0].as_string_at(p)?;
+            Ok(Value::Integer(s.len() as i64))
+        }
+        "substring" => {
+            ensure_args(op, args, 3, p)?;
+            let s = args[0].as_string_at(p)?;
+            let start = args[1].as_integer_at(p)? as usize;
+            let end = args[2].as_integer_at(p)? as usize;
+            if start > end || end > s.len() {
+                return Err(EvalError::Type(format!(
+                    "substring: index out of range at {}", p
+                )));
+            }
+            Ok(Value::Str(s[start..end].to_string()))
+        }
+        "string->number" => {
+            ensure_args(op, args, 1, p)?;
+            let s = args[0].as_string_at(p)?;
+            match s.parse::<i64>() {
+                Ok(n) => Ok(Value::Integer(n)),
+                Err(_) => Ok(Value::Boolean(false)),
+            }
+        }
+        "number->string" => {
+            ensure_args(op, args, 1, p)?;
+            let n = args[0].as_integer_at(p)?;
+            Ok(Value::Str(n.to_string()))
+        }
+        "symbol->string" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Symbol(s) => Ok(Value::Str(s.clone())),
+                _ => Err(EvalError::Type(format!(
+                    "symbol->string: expected symbol, got {} at {}", args[0], p
+                ))),
+            }
+        }
+        "string->symbol" => {
+            ensure_args(op, args, 1, p)?;
+            let s = args[0].as_string_at(p)?;
+            Ok(Value::Symbol(s.to_string()))
+        }
+        "string-ref" => {
+            ensure_args(op, args, 2, p)?;
+            let s = args[0].as_string_at(p)?;
+            let idx = args[1].as_integer_at(p)? as usize;
+            if idx >= s.len() {
+                return Err(EvalError::Type(format!(
+                    "string-ref: index out of range at {}", p
+                )));
+            }
+            Ok(Value::Char(s.chars().nth(idx).unwrap()))
+        }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", op, p))),
     }
 }
@@ -951,8 +1075,20 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
-pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError> {
-    todo!()
+pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    OUTPUT.with(|out| out.borrow_mut().clear());
+    let mut parser = Parser::new(input);
+    let exprs = parser.parse_all()?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("empty input".into()));
+    }
+    let env = default_env();
+    let mut result = Value::Boolean(false);
+    for expr in &exprs {
+        result = eval(expr, &env)?;
+    }
+    let output = OUTPUT.with(|out| out.borrow().clone());
+    Ok((result.to_string(), output))
 }
 
 #[cfg(test)]
