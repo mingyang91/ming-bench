@@ -156,6 +156,7 @@ final class EvaluatorBuiltins {
         env.define("call/cc", new BuiltinValue("call/cc", this::specialBuiltin));
         env.define("call-with-current-continuation",
                 new BuiltinValue("call-with-current-continuation", this::specialBuiltin));
+        env.define("dynamic-wind", new BuiltinValue("dynamic-wind", this::specialBuiltin));
     }
 
     private Value specialBuiltin(List<Value> arguments) throws EvalError {

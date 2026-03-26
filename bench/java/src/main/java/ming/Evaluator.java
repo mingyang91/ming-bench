@@ -20,6 +20,7 @@ public class Evaluator {
     private final Env globalEnv;
     private final MacroExpander macroExpander;
     private final boolean immutableStringsEnabled;
+    private List<DynamicWindFrame> dynamicWindStack;
     private StringBuilder outputBuffer;
 
     private sealed interface Step permits EvalExprStep, ReturnStep, ApplyStep, DoneStep {
@@ -56,16 +57,37 @@ public class Evaluator {
         }
     }
 
+    private static final class DynamicWindFrame {
+        private final Value inThunk;
+        private final Value outThunk;
+
+        private DynamicWindFrame(Value inThunk, Value outThunk) {
+            this.inThunk = inThunk;
+            this.outThunk = outThunk;
+        }
+
+        private Value inThunk() {
+            return inThunk;
+        }
+
+        private Value outThunk() {
+            return outThunk;
+        }
+    }
+
+    private record CapturedContinuation(Kont target, List<DynamicWindFrame> dynamicStack) {
+    }
+
     private static final class ContinuationJump extends RuntimeException {
-        private final Kont target;
+        private final CapturedContinuation target;
         private final Value value;
 
-        private ContinuationJump(Kont target, Value value) {
+        private ContinuationJump(CapturedContinuation target, Value value) {
             this.target = target;
             this.value = value;
         }
 
-        private Kont target() {
+        private CapturedContinuation target() {
             return target;
         }
 
@@ -90,6 +112,7 @@ public class Evaluator {
         this.immutableStringsEnabled = currentBenchLevel() >= STRING_IMMUTABILITY_LEVEL;
         this.globalEnv = createGlobalEnv();
         this.macroExpander = new MacroExpander();
+        this.dynamicWindStack = List.of();
     }
 
     /**
@@ -183,7 +206,7 @@ public class Evaluator {
                     }
                 }
             } catch (ContinuationJump jump) {
-                currentStep = new ReturnStep(jump.value(), jump.target());
+                currentStep = jumpToContinuation(jump.target(), jump.value());
             }
         }
     }
@@ -1042,6 +1065,7 @@ public class Evaluator {
             case "call/cc", "call-with-current-continuation" ->
                     applyCallWithCurrentContinuation(builtinValue.name(), arguments, kont, line,
                             column);
+            case "dynamic-wind" -> applyDynamicWind(arguments, kont, line, column);
             case "apply" -> applyBuiltinApply(arguments, kont, line, column);
             case "map" -> applyBuiltinMap(arguments, kont, line, column);
             case "for-each" -> applyBuiltinForEach(arguments, kont, line, column);
@@ -1052,15 +1076,110 @@ public class Evaluator {
     private Step applyCallWithCurrentContinuation(String name, List<Value> arguments, Kont kont,
             int line, int column) throws EvalError {
         requireExactArgs(name, arguments, 1);
-        return new ApplyStep(arguments.get(0), List.of(makeContinuationValue(kont)), kont, line,
+        return new ApplyStep(arguments.get(0), List.of(makeContinuationValue(captureContinuation(kont))), kont, line,
                 column);
     }
 
-    private Value makeContinuationValue(Kont kont) {
+    private CapturedContinuation captureContinuation(Kont kont) {
+        return new CapturedContinuation(kont, List.copyOf(dynamicWindStack));
+    }
+
+    private Value makeContinuationValue(CapturedContinuation continuation) {
         return new BuiltinValue("continuation", arguments -> {
             requireExactArgs("continuation", arguments, 1);
-            throw new ContinuationJump(kont, arguments.get(0));
+            throw new ContinuationJump(continuation, arguments.get(0));
         });
+    }
+
+    private Step applyDynamicWind(List<Value> arguments, Kont kont, int line, int column)
+            throws EvalError {
+        requireExactArgs("dynamic-wind", arguments, 3);
+
+        DynamicWindFrame frame = new DynamicWindFrame(arguments.get(0), arguments.get(2));
+        Value bodyThunk = arguments.get(1);
+        return new ApplyStep(frame.inThunk(), List.of(),
+                continuation(line, column, ignored -> {
+                    pushDynamicWindFrame(frame);
+                    return new ApplyStep(bodyThunk, List.of(),
+                            continuation(line, column, bodyValue -> exitDynamicWind(
+                                    frame, bodyValue, kont, line, column)),
+                            line,
+                            column);
+                }),
+                line,
+                column);
+    }
+
+    private Step exitDynamicWind(DynamicWindFrame frame, Value bodyValue, Kont kont, int line,
+            int column) {
+        popDynamicWindFrame(frame);
+        return new ApplyStep(frame.outThunk(), List.of(),
+                continuation(line, column, ignored -> new ReturnStep(bodyValue, kont)),
+                line,
+                column);
+    }
+
+    private Step jumpToContinuation(CapturedContinuation continuation, Value value) {
+        return transitionDynamicWind(continuation.dynamicStack(),
+                new ReturnStep(value, continuation.target()));
+    }
+
+    private Step transitionDynamicWind(List<DynamicWindFrame> targetStack, Step nextStep) {
+        int sharedDepth = commonDynamicWindDepth(dynamicWindStack, targetStack);
+        return unwindDynamicWind(targetStack, sharedDepth, nextStep);
+    }
+
+    private Step unwindDynamicWind(List<DynamicWindFrame> targetStack, int sharedDepth,
+            Step nextStep) {
+        if (dynamicWindStack.size() <= sharedDepth) {
+            return rewindDynamicWind(targetStack, sharedDepth, nextStep);
+        }
+
+        DynamicWindFrame frame = dynamicWindStack.get(dynamicWindStack.size() - 1);
+        popDynamicWindFrame(frame);
+        return new ApplyStep(frame.outThunk(), List.of(),
+                continuation(ignored -> unwindDynamicWind(targetStack, sharedDepth, nextStep)),
+                0,
+                0);
+    }
+
+    private Step rewindDynamicWind(List<DynamicWindFrame> targetStack, int index, Step nextStep) {
+        if (index >= targetStack.size()) {
+            return nextStep;
+        }
+
+        DynamicWindFrame frame = targetStack.get(index);
+        return new ApplyStep(frame.inThunk(), List.of(),
+                continuation(ignored -> {
+                    pushDynamicWindFrame(frame);
+                    return rewindDynamicWind(targetStack, index + 1, nextStep);
+                }),
+                0,
+                0);
+    }
+
+    private int commonDynamicWindDepth(List<DynamicWindFrame> left, List<DynamicWindFrame> right) {
+        int maxShared = Math.min(left.size(), right.size());
+        int index = 0;
+        while (index < maxShared && left.get(index) == right.get(index)) {
+            index++;
+        }
+        return index;
+    }
+
+    private void pushDynamicWindFrame(DynamicWindFrame frame) {
+        List<DynamicWindFrame> nextStack = new ArrayList<>(dynamicWindStack.size() + 1);
+        nextStack.addAll(dynamicWindStack);
+        nextStack.add(frame);
+        dynamicWindStack = List.copyOf(nextStack);
+    }
+
+    private void popDynamicWindFrame(DynamicWindFrame frame) {
+        int lastIndex = dynamicWindStack.size() - 1;
+        if (lastIndex < 0 || dynamicWindStack.get(lastIndex) != frame) {
+            throw new IllegalStateException("dynamic-wind stack out of sync");
+        }
+        dynamicWindStack = List.copyOf(dynamicWindStack.subList(0, lastIndex));
     }
 
     private Step applyBuiltinApply(List<Value> arguments, Kont kont, int line, int column)
