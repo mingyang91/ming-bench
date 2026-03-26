@@ -33,7 +33,8 @@ type SchemeVal =
   | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[]; pos?: Pos }
   | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos }
   | { tag: 'continuation'; k: Cont; windStack: WindEntry[]; pos?: Pos }
-  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos };
+  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos }
+  | { tag: 'syntax-transformer'; proc: SchemeVal; defEnv: Env; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (after macro name)
@@ -188,6 +189,9 @@ function gensym(prefix: string): string {
   return `##${prefix}~${++gensymCounter}`;
 }
 
+// Stack of pattern variable bindings from enclosing syntax-case forms
+let syntaxBindingsStack: Map<string, SchemeVal | SchemeVal[]>[] = [];
+
 class Env {
   private bindings: Map<string, SchemeVal> = new Map();
   constructor(private parent?: Env) {}
@@ -239,6 +243,7 @@ function tokenize(input: string): Token[] {
     const startPos: Pos = { line, col };
     if (ch === '(' || ch === ')') { advance(); tokens.push({ text: ch, pos: startPos }); continue; }
     if (ch === '\'') { advance(); tokens.push({ text: "'", pos: startPos }); continue; }
+    if (ch === '#' && i + 1 < input.length && input[i + 1] === '\'') { advance(); advance(); tokens.push({ text: "#'", pos: startPos }); continue; }
     if (ch === '"') {
       let s = '"';
       advance();
@@ -270,6 +275,10 @@ function parse(tokens: Token[]): SchemeVal[] {
     if (tok.text === "'") {
       const inner = parseExpr();
       return { tag: 'list', elements: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, inner], pos: tok.pos };
+    }
+    if (tok.text === "#'") {
+      const inner = parseExpr();
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'syntax', pos: tok.pos }, inner], pos: tok.pos };
     }
     if (tok.text === '(') {
       const elements: SchemeVal[] = [];
@@ -351,7 +360,7 @@ function isTruthy(val: SchemeVal): boolean {
 const SPECIAL_FORMS_SET = new Set([
   'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
   'set!', 'cond', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
-  'define-syntax', 'syntax-rules',
+  'define-syntax', 'syntax-rules', 'syntax-case', 'syntax', 'with-syntax',
 ]);
 
 function isEllipsis(val: SchemeVal): boolean {
@@ -422,6 +431,9 @@ function collectFreeVars(template: SchemeVal, patVars: Set<string>, result: Set<
     return;
   }
   if (template.tag === 'list') {
+    // Skip (quote ...) forms — quoted symbols should not be treated as free variables
+    if (template.elements.length === 2 &&
+        template.elements[0].tag === 'symbol' && template.elements[0].value === 'quote') return;
     for (const e of template.elements) collectFreeVars(e, patVars, result);
   }
 }
@@ -494,6 +506,87 @@ function expandMacro(
   }
   throw errAt('no matching pattern in syntax-rules', pos);
 }
+
+// ── syntax-case helpers ─────────────────────────────────────────────
+
+function schemeValToList(val: SchemeVal): SchemeVal[] {
+  if (val.tag === 'list') return val.elements;
+  if (val.tag === 'nil') return [];
+  if (val.tag === 'pair') {
+    const result: SchemeVal[] = [val.car];
+    let cur: SchemeVal = val.cdr;
+    while (cur.tag === 'pair') { result.push(cur.car); cur = cur.cdr; }
+    if (cur.tag === 'nil') return result;
+    // improper list — just return what we have
+    return result;
+  }
+  return [val];
+}
+
+function matchSyntaxCasePattern(
+  pattern: SchemeVal, form: SchemeVal, literals: string[],
+): Map<string, SchemeVal | SchemeVal[]> | null {
+  const bindings = new Map<string, SchemeVal | SchemeVal[]>();
+  if (matchSyntaxCaseSingle(pattern, form, literals, bindings)) return bindings;
+  return null;
+}
+
+function matchSyntaxCaseSingle(
+  pattern: SchemeVal, form: SchemeVal, literals: string[],
+  bindings: Map<string, SchemeVal | SchemeVal[]>,
+): boolean {
+  if (pattern.tag === 'symbol') {
+    if (pattern.value === '_') return true;
+    if (literals.includes(pattern.value))
+      return form.tag === 'symbol' && form.value === pattern.value;
+    bindings.set(pattern.value, form);
+    return true;
+  }
+  if (pattern.tag === 'list') {
+    const formElems = schemeValToList(form);
+    if (form.tag !== 'list' && form.tag !== 'pair' && form.tag !== 'nil') return false;
+    return matchSyntaxCaseListPattern(pattern.elements, formElems, literals, bindings);
+  }
+  // Literal match (numbers, booleans, strings)
+  if (pattern.tag === 'number' && form.tag === 'number') return pattern.value === form.value;
+  if (pattern.tag === 'boolean' && form.tag === 'boolean') return pattern.value === form.value;
+  if (pattern.tag === 'string' && form.tag === 'string') return pattern.value === form.value;
+  return false;
+}
+
+function matchSyntaxCaseListPattern(
+  patterns: SchemeVal[], forms: SchemeVal[], literals: string[],
+  bindings: Map<string, SchemeVal | SchemeVal[]>,
+): boolean {
+  let pi = 0, fi = 0;
+  while (pi < patterns.length) {
+    if (pi + 1 < patterns.length && isEllipsis(patterns[pi + 1])) {
+      const subPat = patterns[pi];
+      pi += 2;
+      const remainingPatterns = patterns.length - pi;
+      const availableForEllipsis = forms.length - fi - remainingPatterns;
+      if (availableForEllipsis < 0) return false;
+      if (subPat.tag === 'symbol' && !literals.includes(subPat.value) && subPat.value !== '_') {
+        const matches: SchemeVal[] = [];
+        for (let k = 0; k < availableForEllipsis; k++) matches.push(forms[fi + k]);
+        bindings.set(subPat.value, matches);
+      } else {
+        // complex sub-pattern with ellipsis — match each element
+        for (let k = 0; k < availableForEllipsis; k++) {
+          if (!matchSyntaxCaseSingle(subPat, forms[fi + k], literals, bindings)) return false;
+        }
+      }
+      fi += availableForEllipsis;
+      continue;
+    }
+    if (fi >= forms.length) return false;
+    if (!matchSyntaxCaseSingle(patterns[pi], forms[fi], literals, bindings)) return false;
+    pi++;
+    fi++;
+  }
+  return fi === forms.length;
+}
+
 
 // ── CPS Evaluator ──────────────────────────────────────────────────────
 
@@ -934,29 +1027,119 @@ function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
             const nameElem = elems[1];
             if (nameElem.tag !== 'symbol') throw errAt('define-syntax: expected symbol', expr.pos);
             const transformer = elems[2];
-            if (transformer.tag !== 'list' || transformer.elements.length < 2 ||
-                transformer.elements[0].tag !== 'symbol' || transformer.elements[0].value !== 'syntax-rules')
-              throw errAt('define-syntax: expected syntax-rules', expr.pos);
-            const srElems = transformer.elements;
-            const litList = srElems[1];
-            if (litList.tag !== 'list') throw errAt('syntax-rules: expected literal list', expr.pos);
-            const literals = litList.elements.map(e => {
-              if (e.tag !== 'symbol') throw errAt('syntax-rules: literals must be symbols', expr.pos);
-              return e.value;
-            });
-            const rules: MacroRule[] = [];
-            for (let i = 2; i < srElems.length; i++) {
-              const clause = srElems[i];
-              if (clause.tag !== 'list' || clause.elements.length !== 2)
-                throw errAt('syntax-rules: bad clause', expr.pos);
-              const pattern = clause.elements[0];
-              if (pattern.tag !== 'list' || pattern.elements.length === 0)
-                throw errAt('syntax-rules: bad pattern', expr.pos);
-              rules.push({ pattern: pattern.elements.slice(1), template: clause.elements[1], literals });
+            // Check if it's syntax-rules (existing) or a lambda transformer (syntax-case style)
+            if (transformer.tag === 'list' && transformer.elements.length >= 2 &&
+                transformer.elements[0].tag === 'symbol' && transformer.elements[0].value === 'syntax-rules') {
+              const srElems = transformer.elements;
+              const litList = srElems[1];
+              if (litList.tag !== 'list') throw errAt('syntax-rules: expected literal list', expr.pos);
+              const literals = litList.elements.map(e => {
+                if (e.tag !== 'symbol') throw errAt('syntax-rules: literals must be symbols', expr.pos);
+                return e.value;
+              });
+              const rules: MacroRule[] = [];
+              for (let i = 2; i < srElems.length; i++) {
+                const clause = srElems[i];
+                if (clause.tag !== 'list' || clause.elements.length !== 2)
+                  throw errAt('syntax-rules: bad clause', expr.pos);
+                const pattern = clause.elements[0];
+                if (pattern.tag !== 'list' || pattern.elements.length === 0)
+                  throw errAt('syntax-rules: bad pattern', expr.pos);
+                rules.push({ pattern: pattern.elements.slice(1), template: clause.elements[1], literals });
+              }
+              const macro: SchemeVal = { tag: 'macro', rules, defEnv: env };
+              env.set(nameElem.value, macro);
+              return k(SCM_FALSE);
+            } else {
+              // Lambda transformer (syntax-case style)
+              return evalK(transformer, env, (proc) => {
+                const st: SchemeVal = { tag: 'syntax-transformer', proc, defEnv: env };
+                env.set(nameElem.value, st);
+                return k(SCM_FALSE);
+              });
             }
-            const macro: SchemeVal = { tag: 'macro', rules, defEnv: env };
-            env.set(nameElem.value, macro);
-            return k(SCM_FALSE);
+          }
+          case 'syntax-case': {
+            // (syntax-case expr (literals) clause ...)
+            // clause = (pattern expr) or (pattern fender expr)
+            if (elems.length < 4) throw errAt('syntax-case: bad syntax', expr.pos);
+            return evalK(elems[1], env, (stxVal) => {
+              const litList = elems[2];
+              if (litList.tag !== 'list') throw errAt('syntax-case: expected literal list', expr.pos);
+              const literals = litList.elements.map(e => {
+                if (e.tag !== 'symbol') throw errAt('syntax-case: literals must be symbols', expr.pos);
+                return e.value;
+              });
+              // Convert stx value to list form for pattern matching
+              const stxForm = schemeValToList(stxVal);
+              for (let ci = 3; ci < elems.length; ci++) {
+                const clause = elems[ci];
+                if (clause.tag !== 'list' || clause.elements.length < 2)
+                  throw errAt('syntax-case: bad clause', expr.pos);
+                const pattern = clause.elements[0];
+                const bindings = matchSyntaxCasePattern(pattern, stxVal, literals);
+                if (bindings !== null) {
+                  // Check fender if present (3 elements = pattern fender expr)
+                  const bodyExpr = clause.elements.length === 3 ? clause.elements[2] : clause.elements[1];
+                  const hasFender = clause.elements.length === 3;
+                  if (hasFender) {
+                    // Push bindings, evaluate fender
+                    syntaxBindingsStack.push(bindings);
+                    const fenderResult = trampoline(evalK(clause.elements[1], env, (v) => done(v)));
+                    syntaxBindingsStack.pop();
+                    if (fenderResult.tag === 'boolean' && !fenderResult.value) continue;
+                  }
+                  syntaxBindingsStack.push(bindings);
+                  return evalK(bodyExpr, env, (result) => {
+                    syntaxBindingsStack.pop();
+                    return k(result);
+                  });
+                }
+              }
+              throw errAt('syntax-case: no matching pattern', expr.pos);
+            });
+          }
+          case 'syntax': {
+            // (syntax template) aka #'template — expand with current syntax bindings
+            if (elems.length !== 2) throw errAt('syntax: bad syntax', expr.pos);
+            const template = elems[1];
+            // Merge all syntax bindings from the stack
+            const allBindings = new Map<string, SchemeVal | SchemeVal[]>();
+            for (const frame of syntaxBindingsStack) {
+              for (const [k2, v] of frame) allBindings.set(k2, v);
+            }
+            const renames = new Map<string, string>();
+            const expanded = expandTemplate(template, allBindings, renames);
+            return k(expanded);
+          }
+          case 'with-syntax': {
+            // (with-syntax ((pattern expr) ...) body ...)
+            if (elems.length < 3) throw errAt('with-syntax: bad syntax', expr.pos);
+            const wsBindingsList = elems[1];
+            if (wsBindingsList.tag !== 'list') throw errAt('with-syntax: expected bindings list', expr.pos);
+            const wsBindingsElems = wsBindingsList.elements;
+            const wsBody = elems.slice(2);
+            // Evaluate all binding expressions, then match patterns
+            function evalWithSyntaxBindings(idx: number, accBindings: Map<string, SchemeVal | SchemeVal[]>): Bounce {
+              if (idx >= wsBindingsElems.length) {
+                syntaxBindingsStack.push(accBindings);
+                return evalBeginK(wsBody, env, (result) => {
+                  syntaxBindingsStack.pop();
+                  return k(result);
+                });
+              }
+              const binding = wsBindingsElems[idx];
+              if (binding.tag !== 'list' || binding.elements.length !== 2)
+                throw errAt('with-syntax: bad binding', expr.pos);
+              const pat = binding.elements[0];
+              return evalK(binding.elements[1], env, (val) => {
+                const matched = matchSyntaxCasePattern(pat, val, []);
+                if (matched === null) throw errAt('with-syntax: pattern match failed', expr.pos);
+                for (const [k2, v] of matched) accBindings.set(k2, v);
+                return evalWithSyntaxBindings(idx + 1, accBindings);
+              });
+            }
+            return evalWithSyntaxBindings(0, new Map());
           }
           case 'dynamic-wind': {
             if (elems.length !== 4) throw errAt('dynamic-wind: expected 3 arguments', expr.pos);
@@ -1036,6 +1219,14 @@ function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
           if (resolved.tag === 'macro') {
             const expanded = expandMacro(resolved, elems, env, expr.pos);
             return bounce(() => evalK(expanded, env, k));
+          }
+          if (resolved.tag === 'syntax-transformer') {
+            // Call the transformer proc with the form as a syntax object (list)
+            const formAsList: SchemeVal = { tag: 'list', elements: elems, pos: expr.pos };
+            return bounce(() => applyK(resolved.proc, [formAsList], (expanded) =>
+              bounce(() => evalK(expanded, env, k)),
+              expr.pos
+            ));
           }
         } catch (e) { /* not bound, fall through */ }
       }
@@ -1319,6 +1510,7 @@ const BUILTINS = new Set([
   'call/cc', 'call-with-current-continuation',
   'raise', 'with-exception-handler',
   'values', 'call-with-values',
+  'syntax->datum', 'datum->syntax',
 ]);
 
 function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
@@ -1970,6 +2162,16 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       if (!isNumeric(args[0])) throw errAt('ceiling: expected number', pos);
       return { tag: 'number', value: Math.ceil(toFloat(args[0])), exact: isExact(args[0]) };
     }
+    case 'syntax->datum': {
+      if (args.length !== 1) throw errAt('syntax->datum: expected 1 argument', pos);
+      // In our simplified implementation, syntax objects are just SchemeVals
+      return args[0];
+    }
+    case 'datum->syntax': {
+      if (args.length !== 2) throw errAt('datum->syntax: expected 2 arguments', pos);
+      // In our simplified implementation, just return the datum as-is
+      return args[1];
+    }
     default:
       throw errAt(`unbound variable: ${name}`, pos);
   }
@@ -2066,6 +2268,7 @@ function display(val: SchemeVal): string {
     case 'builtin': return '#<procedure>';
     case 'continuation': return '#<procedure>';
     case 'macro': return '#<macro>';
+    case 'syntax-transformer': return '#<macro>';
     case 'vector': return `#(${val.elements.map(display).join(' ')})`;
     case 'record': return `#<record ${val.typeName}>`;
     case 'values': return val.vals.map(display).join('\n');
@@ -2112,6 +2315,7 @@ export function evalStr(input: string): string {
   if (exprs.length === 0) throw new EvalError('no expressions');
   windStack = [];
   exceptionHandlers = [];
+  syntaxBindingsStack = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
   return display(result);
@@ -2124,6 +2328,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   outputBuffer = [];
   windStack = [];
   exceptionHandlers = [];
+  syntaxBindingsStack = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
   return { result: display(result), output: outputBuffer.join('') };
