@@ -1,13 +1,21 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Scheme interpreter entry point.
  * Agents implement this class.
  */
 public class Evaluator {
+    private final Environment globalEnv;
+
+    public Evaluator() {
+        globalEnv = createGlobalEnv();
+    }
+
     /**
      * Evaluate one or more Scheme expressions and return the string
      * representation of the last result.
@@ -17,7 +25,7 @@ public class Evaluator {
         Value lastValue = null;
 
         while (parser.hasMore()) {
-            lastValue = eval(parser.parseExpr());
+            lastValue = eval(parser.parseExpr(), globalEnv);
         }
 
         if (lastValue == null) {
@@ -35,50 +43,158 @@ public class Evaluator {
         return new EvalResult(evalStr(input), "");
     }
 
-    private Value eval(Expr expr) throws EvalError {
+    private Environment createGlobalEnv() {
+        Environment env = new Environment(null);
+
+        env.define("+", builtin("+", args -> new IntValue(sum(args))));
+        env.define("-", builtin("-", args -> new IntValue(subtract(args))));
+        env.define("*", builtin("*", args -> new IntValue(multiply(args))));
+        env.define("/", builtin("/", args -> new IntValue(divide(args))));
+        env.define("<", builtin("<",
+                args -> BoolValue.of(compareIncreasing(args, Comparison.STRICTLY_LESS))));
+        env.define(">", builtin(">",
+                args -> BoolValue.of(compareIncreasing(args, Comparison.STRICTLY_GREATER))));
+        env.define("=", builtin("=",
+                args -> BoolValue.of(compareIncreasing(args, Comparison.EQUAL))));
+        env.define("<=", builtin("<=",
+                args -> BoolValue.of(compareIncreasing(args, Comparison.LESS_OR_EQUAL))));
+        env.define("not", builtin("not", args -> {
+            requireArity("not", args.size(), 1);
+            return BoolValue.of(!isTruthy(args.getFirst()));
+        }));
+
+        return env;
+    }
+
+    private ProcedureValue builtin(String name, BuiltinAction action) {
+        return new BuiltinProcedure(name, action);
+    }
+
+    private Value eval(Expr expr, Environment env) throws EvalError {
         return switch (expr) {
             case IntExpr intExpr -> new IntValue(intExpr.value());
             case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
-            case SymbolExpr symbolExpr ->
-                    throw new EvalError("unbound variable: " + symbolExpr.name());
-            case ListExpr listExpr -> evalList(listExpr);
+            case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
+            case ListExpr listExpr -> evalList(listExpr, env);
         };
     }
 
-    private Value evalList(ListExpr listExpr) throws EvalError {
+    private Value evalList(ListExpr listExpr, Environment env) throws EvalError {
         List<Expr> elements = listExpr.elements();
         if (elements.isEmpty()) {
             throw new EvalError("cannot evaluate empty list");
         }
 
         Expr head = elements.getFirst();
-        if (!(head instanceof SymbolExpr symbolExpr)) {
-            throw new EvalError("operator must be a symbol");
-        }
-
-        String name = symbolExpr.name();
         List<Expr> argExprs = elements.subList(1, elements.size());
 
-        return switch (name) {
-            case "and" -> evalAnd(argExprs);
-            case "or" -> evalOr(argExprs);
-            default -> applyBuiltin(name, evalArgs(argExprs));
-        };
+        if (head instanceof SymbolExpr symbolExpr) {
+            return switch (symbolExpr.name()) {
+                case "define" -> evalDefine(argExprs, env);
+                case "if" -> evalIf(argExprs, env);
+                case "quote" -> evalQuote(argExprs);
+                case "lambda" -> evalLambda(argExprs, env);
+                case "and" -> evalAnd(argExprs, env);
+                case "or" -> evalOr(argExprs, env);
+                default -> applyProcedure(eval(head, env), evalArgs(argExprs, env));
+            };
+        }
+
+        return applyProcedure(eval(head, env), evalArgs(argExprs, env));
     }
 
-    private List<Value> evalArgs(List<Expr> argExprs) throws EvalError {
+    private Value evalDefine(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.size() < 2) {
+            throw new EvalError("define requires a name and a value");
+        }
+
+        Expr target = argExprs.getFirst();
+        if (target instanceof SymbolExpr symbolExpr) {
+            requireArity("define", argExprs.size(), 2);
+            Value value = eval(argExprs.get(1), env);
+            env.define(symbolExpr.name(), value);
+            return VoidValue.INSTANCE;
+        }
+
+        if (target instanceof ListExpr signatureExpr) {
+            List<Expr> signature = signatureExpr.elements();
+            if (signature.isEmpty()) {
+                throw new EvalError("define requires a function name");
+            }
+            if (!(signature.getFirst() instanceof SymbolExpr nameExpr)) {
+                throw new EvalError("function name must be a symbol");
+            }
+
+            List<String> parameterNames = parseParameterNames(
+                    signature.subList(1, signature.size()));
+            List<Expr> body = parseBody("define", argExprs.subList(1, argExprs.size()));
+            ProcedureValue procedure =
+                    new UserProcedure(nameExpr.name(), parameterNames, body, env);
+            env.define(nameExpr.name(), procedure);
+            return VoidValue.INSTANCE;
+        }
+
+        throw new EvalError("invalid define");
+    }
+
+    private Value evalIf(List<Expr> argExprs, Environment env) throws EvalError {
+        requireArity("if", argExprs.size(), 3);
+        Value condition = eval(argExprs.get(0), env);
+        if (isTruthy(condition)) {
+            return eval(argExprs.get(1), env);
+        }
+        return eval(argExprs.get(2), env);
+    }
+
+    private Value evalQuote(List<Expr> argExprs) throws EvalError {
+        requireArity("quote", argExprs.size(), 1);
+        return quoteToValue(argExprs.getFirst());
+    }
+
+    private Value evalLambda(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.size() < 2) {
+            throw new EvalError("lambda requires parameters and a body");
+        }
+        if (!(argExprs.getFirst() instanceof ListExpr paramsExpr)) {
+            throw new EvalError("lambda parameters must be a list");
+        }
+
+        List<String> parameterNames = parseParameterNames(paramsExpr.elements());
+        List<Expr> body = parseBody("lambda", argExprs.subList(1, argExprs.size()));
+        return new UserProcedure(null, parameterNames, body, env);
+    }
+
+    private List<String> parseParameterNames(List<Expr> params) throws EvalError {
+        List<String> parameterNames = new ArrayList<>(params.size());
+        for (Expr param : params) {
+            if (!(param instanceof SymbolExpr symbolExpr)) {
+                throw new EvalError("parameter must be a symbol");
+            }
+            parameterNames.add(symbolExpr.name());
+        }
+        return parameterNames;
+    }
+
+    private List<Expr> parseBody(String formName, List<Expr> body) throws EvalError {
+        if (body.isEmpty()) {
+            throw new EvalError(formName + " requires a body");
+        }
+        return List.copyOf(body);
+    }
+
+    private List<Value> evalArgs(List<Expr> argExprs, Environment env) throws EvalError {
         List<Value> values = new ArrayList<>(argExprs.size());
         for (Expr argExpr : argExprs) {
-            values.add(eval(argExpr));
+            values.add(eval(argExpr, env));
         }
         return values;
     }
 
-    private Value evalAnd(List<Expr> argExprs) throws EvalError {
+    private Value evalAnd(List<Expr> argExprs, Environment env) throws EvalError {
         Value result = BoolValue.TRUE;
         for (Expr argExpr : argExprs) {
-            result = eval(argExpr);
+            result = eval(argExpr, env);
             if (!isTruthy(result)) {
                 return result;
             }
@@ -86,10 +202,10 @@ public class Evaluator {
         return result;
     }
 
-    private Value evalOr(List<Expr> argExprs) throws EvalError {
+    private Value evalOr(List<Expr> argExprs, Environment env) throws EvalError {
         Value lastValue = BoolValue.FALSE;
         for (Expr argExpr : argExprs) {
-            Value value = eval(argExpr);
+            Value value = eval(argExpr, env);
             if (isTruthy(value)) {
                 return value;
             }
@@ -98,22 +214,38 @@ public class Evaluator {
         return lastValue;
     }
 
-    private Value applyBuiltin(String name, List<Value> args) throws EvalError {
-        return switch (name) {
-            case "+" -> new IntValue(sum(args));
-            case "-" -> new IntValue(subtract(args));
-            case "*" -> new IntValue(multiply(args));
-            case "/" -> new IntValue(divide(args));
-            case "<" -> BoolValue.of(compareIncreasing(args, Comparison.STRICTLY_LESS));
-            case ">" -> BoolValue.of(compareIncreasing(args, Comparison.STRICTLY_GREATER));
-            case "=" -> BoolValue.of(compareIncreasing(args, Comparison.EQUAL));
-            case "<=" -> BoolValue.of(compareIncreasing(args, Comparison.LESS_OR_EQUAL));
-            case "not" -> {
-                requireArity(name, args, 1);
-                yield BoolValue.of(!isTruthy(args.getFirst()));
-            }
-            default -> throw new EvalError("unknown builtin: " + name);
+    private Value evalSequence(List<Expr> exprs, Environment env) throws EvalError {
+        Value result = VoidValue.INSTANCE;
+        for (Expr expr : exprs) {
+            result = eval(expr, env);
+        }
+        return result;
+    }
+
+    private Value applyProcedure(Value procedureValue, List<Value> argumentValues)
+            throws EvalError {
+        if (!(procedureValue instanceof ProcedureValue procedure)) {
+            throw new EvalError("not a procedure");
+        }
+        return procedure.apply(argumentValues);
+    }
+
+    private Value quoteToValue(Expr expr) throws EvalError {
+        return switch (expr) {
+            case IntExpr intExpr -> new IntValue(intExpr.value());
+            case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
+            case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
+            case ListExpr listExpr -> quoteListToValue(listExpr.elements());
         };
+    }
+
+    private Value quoteListToValue(List<Expr> elements) throws EvalError {
+        Value result = EmptyListValue.INSTANCE;
+        for (int index = elements.size() - 1; index >= 0; index--) {
+            result = new PairValue(quoteToValue(elements.get(index)), result);
+        }
+        return result;
     }
 
     private int sum(List<Value> args) throws EvalError {
@@ -125,7 +257,7 @@ public class Evaluator {
     }
 
     private int subtract(List<Value> args) throws EvalError {
-        requireAtLeast("-", args, 1);
+        requireAtLeast("-", args.size(), 1);
 
         if (args.size() == 1) {
             return -expectInt(args.getFirst());
@@ -147,7 +279,7 @@ public class Evaluator {
     }
 
     private int divide(List<Value> args) throws EvalError {
-        requireAtLeast("/", args, 2);
+        requireAtLeast("/", args.size(), 2);
 
         int result = expectInt(args.getFirst());
         for (int index = 1; index < args.size(); index++) {
@@ -162,7 +294,7 @@ public class Evaluator {
 
     private boolean compareIncreasing(List<Value> args, Comparison comparison)
             throws EvalError {
-        requireAtLeast(comparison.symbol, args, 2);
+        requireAtLeast(comparison.symbol, args.size(), 2);
 
         int previous = expectInt(args.getFirst());
         for (int index = 1; index < args.size(); index++) {
@@ -182,22 +314,22 @@ public class Evaluator {
         throw new EvalError("expected number");
     }
 
-    private void requireArity(String name, List<Value> args, int expected)
+    private void requireArity(String name, int actual, int expected)
             throws EvalError {
-        if (args.size() != expected) {
+        if (actual != expected) {
             throw new EvalError(
                     "wrong number of arguments for " + name + ": expected " + expected
-                            + ", got " + args.size()
+                            + ", got " + actual
             );
         }
     }
 
-    private void requireAtLeast(String name, List<Value> args, int minimum)
+    private void requireAtLeast(String name, int actual, int minimum)
             throws EvalError {
-        if (args.size() < minimum) {
+        if (actual < minimum) {
             throw new EvalError(
                     "wrong number of arguments for " + name + ": expected at least "
-                            + minimum + ", got " + args.size()
+                            + minimum + ", got " + actual
             );
         }
     }
@@ -224,7 +356,7 @@ public class Evaluator {
     private record ListExpr(List<Expr> elements) implements Expr {
     }
 
-    private sealed interface Value permits IntValue, BoolValue, StringValue {
+    private interface Value {
         String render();
     }
 
@@ -253,6 +385,129 @@ public class Evaluator {
         @Override
         public String render() {
             return "\"" + escapeString(value) + "\"";
+        }
+    }
+
+    private record SymbolValue(String name) implements Value {
+        @Override
+        public String render() {
+            return name;
+        }
+    }
+
+    private record PairValue(Value car, Value cdr) implements Value {
+        @Override
+        public String render() {
+            StringBuilder builder = new StringBuilder();
+            builder.append('(');
+            appendListContents(builder, this);
+            builder.append(')');
+            return builder.toString();
+        }
+    }
+
+    private enum EmptyListValue implements Value {
+        INSTANCE;
+
+        @Override
+        public String render() {
+            return "()";
+        }
+    }
+
+    private enum VoidValue implements Value {
+        INSTANCE;
+
+        @Override
+        public String render() {
+            return "#<void>";
+        }
+    }
+
+    private abstract class ProcedureValue implements Value {
+        @Override
+        public String render() {
+            return "#<procedure>";
+        }
+
+        abstract Value apply(List<Value> args) throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface BuiltinAction {
+        Value apply(List<Value> args) throws EvalError;
+    }
+
+    private final class BuiltinProcedure extends ProcedureValue {
+        private final String name;
+        private final BuiltinAction action;
+
+        private BuiltinProcedure(String name, BuiltinAction action) {
+            this.name = name;
+            this.action = action;
+        }
+
+        @Override
+        Value apply(List<Value> args) throws EvalError {
+            return action.apply(args);
+        }
+
+        @Override
+        public String render() {
+            return "#<procedure:" + name + ">";
+        }
+    }
+
+    private final class UserProcedure extends ProcedureValue {
+        private final String name;
+        private final List<String> parameterNames;
+        private final List<Expr> body;
+        private final Environment closureEnv;
+
+        private UserProcedure(String name, List<String> parameterNames,
+                              List<Expr> body, Environment closureEnv) {
+            this.name = name;
+            this.parameterNames = List.copyOf(parameterNames);
+            this.body = List.copyOf(body);
+            this.closureEnv = closureEnv;
+        }
+
+        @Override
+        Value apply(List<Value> args) throws EvalError {
+            requireArity(displayName(), args.size(), parameterNames.size());
+
+            Environment callEnv = new Environment(closureEnv);
+            for (int index = 0; index < parameterNames.size(); index++) {
+                callEnv.define(parameterNames.get(index), args.get(index));
+            }
+            return evalSequence(body, callEnv);
+        }
+
+        private String displayName() {
+            return name == null ? "lambda" : name;
+        }
+    }
+
+    private static final class Environment {
+        private final Environment parent;
+        private final Map<String, Value> bindings = new HashMap<>();
+
+        private Environment(Environment parent) {
+            this.parent = parent;
+        }
+
+        private void define(String name, Value value) {
+            bindings.put(name, value);
+        }
+
+        private Value lookup(String name) throws EvalError {
+            if (bindings.containsKey(name)) {
+                return bindings.get(name);
+            }
+            if (parent != null) {
+                return parent.lookup(name);
+            }
+            throw new EvalError("unbound variable: " + name);
         }
     }
 
@@ -289,6 +544,27 @@ public class Evaluator {
         }
 
         abstract boolean matches(int left, int right);
+    }
+
+    private static void appendListContents(StringBuilder builder, Value value) {
+        Value current = value;
+        boolean first = true;
+
+        while (current instanceof PairValue pairValue) {
+            if (!first) {
+                builder.append(' ');
+            }
+            builder.append(pairValue.car().render());
+            current = pairValue.cdr();
+            first = false;
+        }
+
+        if (!(current instanceof EmptyListValue)) {
+            if (!first) {
+                builder.append(" . ");
+            }
+            builder.append(current.render());
+        }
     }
 
     private static String escapeString(String value) {
