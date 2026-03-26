@@ -506,6 +506,9 @@ function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
 
 let _outputBuf: string[] = [];
 
+// Forward-declared; set after evaluate is defined
+let _callProc: (proc: SchemeVal, args: SchemeVal[], callPos?: Pos) => SchemeVal;
+
 function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal {
   // Check native functions (record constructors, predicates, accessors)
   const nativeFn = _nativeFns.get(name);
@@ -910,10 +913,7 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       const result: SchemeVal[] = [];
       for (let i = 0; i < len; i++) {
         const fnArgs = lists.map(l => l[i]);
-        if (fn.tag === 'builtin') result.push(evalBuiltin(fn.name, fnArgs, callPos));
-        else if (fn.tag === 'lambda') result.push(applyLambda(fn, fnArgs, callPos));
-        else if (fn.tag === 'case-lambda') result.push(applyCaseLambda(fn, fnArgs, callPos));
-        else throw new EvalError(`${posStr(callPos)}map: not a procedure`);
+        result.push(_callProc(fn, fnArgs, callPos));
       }
       return arrayToSchemeList(result);
     }
@@ -1100,16 +1100,7 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       const prefixArgs = args.slice(1, -1);
       const tailArgs = schemeListToArray(lastArg);
       const allArgs = [...prefixArgs, ...tailArgs];
-      if (fn.tag === 'builtin') {
-        return evalBuiltin(fn.name, allArgs, callPos);
-      }
-      if (fn.tag === 'lambda') {
-        return applyLambda(fn, allArgs, callPos);
-      }
-      if (fn.tag === 'case-lambda') {
-        return applyCaseLambda(fn, allArgs, callPos);
-      }
-      throw new EvalError(`${posStr(callPos)}apply: not a procedure`);
+      return _callProc(fn, allArgs, callPos);
     }
     default:
       throw new EvalError(`${posStr(callPos)}unknown builtin: ${name}`);
@@ -1145,7 +1136,7 @@ const BUILTIN_NAMES = new Set([
   'vector->list', 'list->vector',
 ]);
 
-function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], callPos?: Pos): SchemeVal {
+function bindLambdaArgs(proc: { params: string[]; rest?: string; body: SchemeVal[] }, args: SchemeVal[], procEnv: Env, callPos?: Pos): Env {
   if (proc.rest) {
     if (args.length < proc.params.length) {
       throw new EvalError(`${posStr(callPos)}lambda: expected at least ${proc.params.length} arguments, got ${args.length}`);
@@ -1155,53 +1146,19 @@ function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], cal
       throw new EvalError(`${posStr(callPos)}lambda: expected ${proc.params.length} arguments, got ${args.length}`);
     }
   }
-  const callEnv = new Env(proc.env);
+  const callEnv = new Env(procEnv);
   for (let i = 0; i < proc.params.length; i++) {
     callEnv.set(proc.params[i], args[i]);
   }
   if (proc.rest) {
     callEnv.set(proc.rest, arrayToSchemeList(args.slice(proc.params.length)));
   }
-  let result: SchemeVal = { tag: 'void' };
-  for (const bodyExpr of proc.body) {
-    result = evaluate(bodyExpr, callEnv);
-  }
-  return result;
-}
-
-function applyCaseLambda(proc: SchemeVal & { tag: 'case-lambda' }, args: SchemeVal[], callPos?: Pos): SchemeVal {
-  for (const clause of proc.clauses) {
-    if (clause.rest) {
-      if (args.length >= clause.params.length) {
-        const callEnv = new Env(proc.env);
-        for (let i = 0; i < clause.params.length; i++) {
-          callEnv.set(clause.params[i], args[i]);
-        }
-        callEnv.set(clause.rest, arrayToSchemeList(args.slice(clause.params.length)));
-        let result: SchemeVal = { tag: 'void' };
-        for (const bodyExpr of clause.body) {
-          result = evaluate(bodyExpr, callEnv);
-        }
-        return result;
-      }
-    } else {
-      if (args.length === clause.params.length) {
-        const callEnv = new Env(proc.env);
-        for (let i = 0; i < clause.params.length; i++) {
-          callEnv.set(clause.params[i], args[i]);
-        }
-        let result: SchemeVal = { tag: 'void' };
-        for (const bodyExpr of clause.body) {
-          result = evaluate(bodyExpr, callEnv);
-        }
-        return result;
-      }
-    }
-  }
-  throw new EvalError(`${posStr(callPos)}case-lambda: no matching clause for ${args.length} arguments`);
+  return callEnv;
 }
 
 function evaluate(expr: SchemeVal, env: Env): SchemeVal {
+  // Trampoline loop for TCO
+  trampoline: for (;;) {
   if (expr.tag === 'number' || expr.tag === 'rational' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') return expr;
   if (expr.tag === 'nil' || expr.tag === 'pair') return expr;
 
@@ -1226,8 +1183,8 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       case 'if': {
         if (elems.length < 3 || elems.length > 4) throw new EvalError(`${posStr(expr.pos)}if: wrong number of arguments`);
         const cond = evaluate(elems[1], env);
-        if (isTruthy(cond)) return evaluate(elems[2], env);
-        if (elems.length === 4) return evaluate(elems[3], env);
+        if (isTruthy(cond)) { expr = elems[2]; continue; }
+        if (elems.length === 4) { expr = elems[3]; continue; }
         return { tag: 'void' };
       }
       case 'define': {
@@ -1278,11 +1235,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       }
       case 'begin': {
         if (elems.length < 2) throw new EvalError(`${posStr(expr.pos)}begin: need at least 1 expression`);
-        let result: SchemeVal = { tag: 'void' };
-        for (let i = 1; i < elems.length; i++) {
-          result = evaluate(elems[i], env);
+        for (let i = 1; i < elems.length - 1; i++) {
+          evaluate(elems[i], env);
         }
-        return result;
+        expr = elems[elems.length - 1]; continue;
       }
       case 'let': {
         // Named let: (let name ((var init) ...) body...)
@@ -1308,11 +1264,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           for (let i = 0; i < paramNames.length; i++) {
             callEnv.set(paramNames[i], initVals[i]);
           }
-          let result: SchemeVal = { tag: 'void' };
-          for (const bodyExpr of body) {
-            result = evaluate(bodyExpr, callEnv);
+          for (let i = 0; i < body.length - 1; i++) {
+            evaluate(body[i], callEnv);
           }
-          return result;
+          expr = body[body.length - 1]; env = callEnv; continue;
         }
         // Regular let: (let ((var init) ...) body...)
         if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}let: wrong number of arguments`);
@@ -1325,11 +1280,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           const val = evaluate(b.value[1], env);
           letEnv.set(b.value[0].value, val);
         }
-        let result: SchemeVal = { tag: 'void' };
-        for (let i = 2; i < elems.length; i++) {
-          result = evaluate(elems[i], letEnv);
+        for (let i = 2; i < elems.length - 1; i++) {
+          evaluate(elems[i], letEnv);
         }
-        return result;
+        expr = elems[elems.length - 1]; env = letEnv; continue;
       }
       case 'letrec': {
         if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}letrec: wrong number of arguments`);
@@ -1350,11 +1304,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           const val = evaluate(b.value[1], letrecEnv);
           letrecEnv.set(names[i], val);
         }
-        let result: SchemeVal = { tag: 'void' };
-        for (let i = 2; i < elems.length; i++) {
-          result = evaluate(elems[i], letrecEnv);
+        for (let i = 2; i < elems.length - 1; i++) {
+          evaluate(elems[i], letrecEnv);
         }
-        return result;
+        expr = elems[elems.length - 1]; env = letrecEnv; continue;
       }
       case 'letrec*': {
         if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}letrec*: wrong number of arguments`);
@@ -1367,39 +1320,39 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           const val = evaluate(b.value[1], letrecEnv);
           letrecEnv.set(b.value[0].value, val);
         }
-        let result: SchemeVal = { tag: 'void' };
-        for (let i = 2; i < elems.length; i++) {
-          result = evaluate(elems[i], letrecEnv);
+        for (let i = 2; i < elems.length - 1; i++) {
+          evaluate(elems[i], letrecEnv);
         }
-        return result;
+        expr = elems[elems.length - 1]; env = letrecEnv; continue;
       }
       case 'case': {
         if (elems.length < 2) throw new EvalError(`${posStr(expr.pos)}case: wrong number of arguments`);
         const key = evaluate(elems[1], env);
+        let matched = false;
         for (let i = 2; i < elems.length; i++) {
           const clause = elems[i];
           if (clause.tag !== 'list' || clause.value.length < 2)
             throw new EvalError(`${posStr(expr.pos)}case: invalid clause`);
           const datums = clause.value[0];
+          let isMatch = false;
           if (datums.tag === 'symbol' && datums.value === 'else') {
-            let result: SchemeVal = { tag: 'void' };
-            for (let j = 1; j < clause.value.length; j++) {
-              result = evaluate(clause.value[j], env);
+            isMatch = true;
+          } else if (datums.tag === 'list') {
+            for (const datum of datums.value) {
+              const d = quoteDatum(datum);
+              if (schemeEq(key, d)) { isMatch = true; break; }
             }
-            return result;
+          } else {
+            throw new EvalError(`${posStr(expr.pos)}case: datums must be a list`);
           }
-          if (datums.tag !== 'list') throw new EvalError(`${posStr(expr.pos)}case: datums must be a list`);
-          for (const datum of datums.value) {
-            const d = quoteDatum(datum);
-            if (schemeEq(key, d)) {
-              let result: SchemeVal = { tag: 'void' };
-              for (let j = 1; j < clause.value.length; j++) {
-                result = evaluate(clause.value[j], env);
-              }
-              return result;
+          if (isMatch) {
+            for (let j = 1; j < clause.value.length - 1; j++) {
+              evaluate(clause.value[j], env);
             }
+            expr = clause.value[clause.value.length - 1]; matched = true; break;
           }
         }
+        if (matched) continue;
         return { tag: 'void' };
       }
       case 'do': {
@@ -1429,11 +1382,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           if (isTruthy(testVal)) {
             // Test is true — evaluate result expressions
             if (testClause.value.length === 1) return { tag: 'void' };
-            let result: SchemeVal = { tag: 'void' };
-            for (let j = 1; j < testClause.value.length; j++) {
-              result = evaluate(testClause.value[j], doEnv);
+            for (let j = 1; j < testClause.value.length - 1; j++) {
+              evaluate(testClause.value[j], doEnv);
             }
-            return result;
+            expr = testClause.value[testClause.value.length - 1]; env = doEnv; break;
           }
           // Execute body
           for (let i = 3; i < elems.length; i++) {
@@ -1454,6 +1406,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             }
           }
         }
+        continue;
       }
       case 'cond': {
         for (let i = 1; i < elems.length; i++) {
@@ -1462,40 +1415,37 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             throw new EvalError(`${posStr(expr.pos)}cond: invalid clause`);
           const test = clause.value[0];
           if (test.tag === 'symbol' && test.value === 'else') {
-            let result: SchemeVal = { tag: 'void' };
-            for (let j = 1; j < clause.value.length; j++) {
-              result = evaluate(clause.value[j], env);
+            for (let j = 1; j < clause.value.length - 1; j++) {
+              evaluate(clause.value[j], env);
             }
-            return result;
+            expr = clause.value[clause.value.length - 1]; continue trampoline;
           }
           const testVal = evaluate(test, env);
           if (isTruthy(testVal)) {
-            let result: SchemeVal = testVal;
-            for (let j = 1; j < clause.value.length; j++) {
-              result = evaluate(clause.value[j], env);
+            if (clause.value.length === 1) return testVal;
+            for (let j = 1; j < clause.value.length - 1; j++) {
+              evaluate(clause.value[j], env);
             }
-            return result;
+            expr = clause.value[clause.value.length - 1]; continue trampoline;
           }
         }
         return { tag: 'void' };
       }
       case 'and': {
         if (elems.length === 1) return { tag: 'boolean', value: true };
-        let result: SchemeVal = { tag: 'boolean', value: true };
-        for (let i = 1; i < elems.length; i++) {
-          result = evaluate(elems[i], env);
-          if (!isTruthy(result)) return result;
+        for (let i = 1; i < elems.length - 1; i++) {
+          const val = evaluate(elems[i], env);
+          if (!isTruthy(val)) return val;
         }
-        return result;
+        expr = elems[elems.length - 1]; continue;
       }
       case 'or': {
         if (elems.length === 1) return { tag: 'boolean', value: false };
-        let result: SchemeVal = { tag: 'boolean', value: false };
-        for (let i = 1; i < elems.length; i++) {
-          result = evaluate(elems[i], env);
-          if (isTruthy(result)) return result;
+        for (let i = 1; i < elems.length - 1; i++) {
+          const val = evaluate(elems[i], env);
+          if (isTruthy(val)) return val;
         }
-        return result;
+        expr = elems[elems.length - 1]; continue;
       }
       case 'define-record-type': {
         // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
@@ -1589,7 +1539,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       const val = env.lookup(head.value);
       if (val && val.tag === 'syntax') {
         const expanded = expandMacro(val, expr as SchemeVal & { tag: 'list' }, env);
-        return evaluate(expanded, env);
+        expr = expanded; continue;
       }
     }
   }
@@ -1603,15 +1553,56 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
   }
 
   if (proc.tag === 'lambda') {
-    return applyLambda(proc, args, expr.pos);
+    const callEnv = bindLambdaArgs(proc, args, proc.env, expr.pos);
+    for (let i = 0; i < proc.body.length - 1; i++) {
+      evaluate(proc.body[i], callEnv);
+    }
+    expr = proc.body[proc.body.length - 1]; env = callEnv; continue;
   }
 
   if (proc.tag === 'case-lambda') {
-    return applyCaseLambda(proc, args, expr.pos);
+    let matched = false;
+    for (const clause of proc.clauses) {
+      const ok = clause.rest ? args.length >= clause.params.length : args.length === clause.params.length;
+      if (ok) {
+        const callEnv = bindLambdaArgs(clause, args, proc.env, expr.pos);
+        for (let i = 0; i < clause.body.length - 1; i++) {
+          evaluate(clause.body[i], callEnv);
+        }
+        expr = clause.body[clause.body.length - 1]; env = callEnv; matched = true; break;
+      }
+    }
+    if (matched) continue;
+    throw new EvalError(`${posStr(expr.pos)}case-lambda: no matching clause for ${args.length} arguments`);
   }
 
   throw new EvalError(`${posStr(expr.pos)}not a procedure`);
+  } // end for(;;)
 }
+
+// Initialize _callProc now that evaluate is defined
+_callProc = function callProc(proc: SchemeVal, args: SchemeVal[], callPos?: Pos): SchemeVal {
+  if (proc.tag === 'builtin') return evalBuiltin(proc.name, args, callPos);
+  if (proc.tag === 'lambda') {
+    const callEnv = bindLambdaArgs(proc, args, proc.env, callPos);
+    let result: SchemeVal = { tag: 'void' };
+    for (const bodyExpr of proc.body) result = evaluate(bodyExpr, callEnv);
+    return result;
+  }
+  if (proc.tag === 'case-lambda') {
+    for (const clause of proc.clauses) {
+      const ok = clause.rest ? args.length >= clause.params.length : args.length === clause.params.length;
+      if (ok) {
+        const callEnv = bindLambdaArgs(clause, args, proc.env, callPos);
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of clause.body) result = evaluate(bodyExpr, callEnv);
+        return result;
+      }
+    }
+    throw new EvalError(`${posStr(callPos)}case-lambda: no matching clause for ${args.length} arguments`);
+  }
+  throw new EvalError(`${posStr(callPos)}not a procedure`);
+};
 
 // ── Display ────────────────────────────────────────────────────────
 
