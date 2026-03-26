@@ -32,6 +32,8 @@ object SchemeTypes:
       clauses: List[(List[String], Option[String], List[Expr], Env)]
     )
 
+    case VVector(elems: Array[Value])
+
     case VRecord(
       typeName: String,
       fields: Map[String, Value]
@@ -52,11 +54,13 @@ object SchemeTypes:
       "(" + elems.map(display).mkString(" ") + ")"
     case Value.VDottedList(elems, last) =>
       "(" + elems.map(display).mkString(" ") + " . " + display(last) + ")"
-    case Value.VSymbol(n)           => n
-    case Value.VBuiltin(n)          => s"#<procedure $n>"
-    case Value.VLambda(_, _, _, _)  => "#<procedure>"
-    case Value.VCaseLambda(_)       => "#<procedure>"
-    case Value.VMacro(_, _, _)      => "#<macro>"
+    case Value.VSymbol(n)          => n
+    case Value.VBuiltin(n)         => s"#<procedure $n>"
+    case Value.VLambda(_, _, _, _) => "#<procedure>"
+    case Value.VCaseLambda(_)      => "#<procedure>"
+    case Value.VMacro(_, _, _)     => "#<macro>"
+    case Value.VVector(elems) =>
+      "#(" + elems.map(display).mkString(" ") + ")"
     case Value.VRecord(typeName, _) => s"#<record:$typeName>"
     case Value.VVoid                => ""
 
@@ -79,6 +83,8 @@ object SchemeTypes:
       "(" + elems.map(displayStr).mkString(" ") + " . " + displayStr(
         last
       ) + ")"
+    case Value.VVector(elems) =>
+      "#(" + elems.map(displayStr).mkString(" ") + ")"
     case other => display(other)
 
   def errAt(pos: Pos, msg: String): EvalError =
@@ -174,6 +180,8 @@ object SchemeTypes:
       xs.length == ys.length && xs
         .zip(ys)
         .forall((a, b) => valuesEqual(a, b)) && valuesEqual(xl, yl)
+    case (Value.VVector(xs), Value.VVector(ys)) =>
+      xs.length == ys.length && xs.zip(ys).forall((a, b) => valuesEqual(a, b))
     case (Value.VVoid, Value.VVoid) => true
     case _                          => false
 
@@ -253,5 +261,14 @@ object SchemeTypes:
     "denominator",
     "rational?",
     "integer?",
-    "procedure?"
+    "procedure?",
+    "eqv?",
+    "vector",
+    "make-vector",
+    "vector-ref",
+    "vector-set!",
+    "vector-length",
+    "vector?",
+    "vector->list",
+    "list->vector"
   )

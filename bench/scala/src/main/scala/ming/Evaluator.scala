@@ -61,6 +61,14 @@ object Evaluator:
       EvalForms.evalCaseLambda(clauses, env, p)
     case Expr.SList(Expr.Symbol("define-record-type", _) :: rest, p) =>
       EvalForms.evalDefineRecordType(rest, env, p)
+    case Expr.SList(Expr.Symbol("letrec", _) :: rest, p) =>
+      EvalCompound.evalLetrec(rest, env, p, eval, evalBody)
+    case Expr.SList(Expr.Symbol("letrec*", _) :: rest, p) =>
+      EvalCompound.evalLetrecStar(rest, env, p, eval, evalBody)
+    case Expr.SList(Expr.Symbol("case", _) :: rest, p) =>
+      EvalCompound.evalCase(rest, env, p, eval, evalBody, posOf)
+    case Expr.SList(Expr.Symbol("do", _) :: rest, p) =>
+      EvalCompound.evalDo(rest, env, p, eval, evalBody, posOf)
     case Expr.SList(head :: args, p) =>
       val macroOpt = head match
         case Expr.Symbol(name, _) => env.lookupOpt(name).collect { case m: Value.VMacro => m }

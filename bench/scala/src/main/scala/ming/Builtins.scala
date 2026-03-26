@@ -18,8 +18,11 @@ object Builtins:
       ArithmeticBuiltins.applyNumericPredicates(name, args, pos)
     case "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append" =>
       applyListOps(name, args, pos)
-    case "list-ref" | "list-tail" | "list?" | "assoc" | "map" | "equal?" | "eq?" =>
+    case "list-ref" | "list-tail" | "list?" | "assoc" | "map" | "equal?" | "eq?" | "eqv?" =>
       applyListUtils(name, args, pos, env)
+    case "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" | "vector?" | "vector->list" |
+        "list->vector" =>
+      applyVectorOps(name, args, pos)
     case "number?" | "string?" | "boolean?" | "pair?" | "symbol?" | "char?" | "integer?" | "rational?" | "procedure?" =>
       applyTypeCheck(name, args, pos)
     case "exact?" | "inexact?" | "exact->inexact" | "inexact->exact" | "numerator" | "denominator" =>
@@ -204,7 +207,62 @@ object Builtins:
         case (Value.VList(Nil), Value.VList(Nil)) => true
         case (a, b)                               => a eq b
       Value.VBool(result)
+    case "eqv?" =>
+      if args.length != 2 then throw errAt(pos, "eqv? requires 2 arguments")
+      val result = (args(0), args(1)) match
+        case (Value.VSymbol(a), Value.VSymbol(b))               => a == b
+        case (Value.VNum(a), Value.VNum(b))                     => a == b
+        case (Value.VFloat(a), Value.VFloat(b))                 => a == b
+        case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
+        case (Value.VBool(a), Value.VBool(b))                   => a == b
+        case (Value.VChar(a), Value.VChar(b))                   => a == b
+        case (Value.VList(Nil), Value.VList(Nil))               => true
+        case (a, b)                                             => a eq b
+      Value.VBool(result)
     case _ => throw errAt(pos, s"unknown list util: $name")
+
+  private def applyVectorOps(
+    name: String,
+    args: List[Value],
+    pos: Pos
+  ): Value = name match
+    case "vector" => Value.VVector(args.toArray)
+    case "make-vector" =>
+      args match
+        case Value.VNum(n) :: Nil         => Value.VVector(Array.fill(n.toInt)(Value.VNum(0)))
+        case Value.VNum(n) :: fill :: Nil => Value.VVector(Array.fill(n.toInt)(fill))
+        case _                            => throw errAt(pos, "make-vector: invalid arguments")
+    case "vector-ref" =>
+      if args.length != 2 then throw errAt(pos, "vector-ref requires 2 arguments")
+      (args(0), args(1)) match
+        case (Value.VVector(elems), Value.VNum(i)) => elems(i.toInt)
+        case _                                     => throw errAt(pos, "vector-ref: invalid arguments")
+    case "vector-set!" =>
+      if args.length != 3 then throw errAt(pos, "vector-set! requires 3 arguments")
+      (args(0), args(1)) match
+        case (Value.VVector(elems), Value.VNum(i)) =>
+          elems(i.toInt) = args(2)
+          Value.VVoid
+        case _ => throw errAt(pos, "vector-set!: invalid arguments")
+    case "vector-length" =>
+      if args.length != 1 then throw errAt(pos, "vector-length requires 1 argument")
+      args.head match
+        case Value.VVector(elems) => Value.VNum(elems.length.toLong)
+        case _                    => throw errAt(pos, "vector-length: not a vector")
+    case "vector?" =>
+      if args.length != 1 then throw errAt(pos, "vector? requires 1 argument")
+      Value.VBool(args.head.isInstanceOf[Value.VVector])
+    case "vector->list" =>
+      if args.length != 1 then throw errAt(pos, "vector->list requires 1 argument")
+      args.head match
+        case Value.VVector(elems) => Value.VList(elems.toList)
+        case _                    => throw errAt(pos, "vector->list: not a vector")
+    case "list->vector" =>
+      if args.length != 1 then throw errAt(pos, "list->vector requires 1 argument")
+      args.head match
+        case Value.VList(elems) => Value.VVector(elems.toArray)
+        case _                  => throw errAt(pos, "list->vector: not a list")
+    case _ => throw errAt(pos, s"unknown vector op: $name")
 
   private def applyApply(
     args: List[Value],
