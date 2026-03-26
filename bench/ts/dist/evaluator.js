@@ -114,6 +114,7 @@ const BUILTIN_NAMES = [
     'apply',
     'call/cc',
     'call-with-current-continuation',
+    'dynamic-wind',
     'error',
 ];
 const NIL_VALUE = { kind: 'nil' };
@@ -415,7 +416,8 @@ function evaluateExpr(expr, env, context) {
 }
 function runEvaluation(initialAction, context) {
     let action = initialAction;
-    let stack = [];
+    const stack = [];
+    const winds = [];
     while (true) {
         let errorPos;
         try {
@@ -430,7 +432,7 @@ function runEvaluation(initialAction, context) {
                             return action.value;
                         }
                         errorPos = frame.pos;
-                        action = continueWithFrame(frame, action.value, stack);
+                        action = continueWithFrame(frame, action.value, stack, winds);
                     }
                     break;
                 case 'expr':
@@ -452,7 +454,29 @@ function runEvaluation(initialAction, context) {
                         action = {
                             kind: 'apply',
                             procedure: action.args[0],
-                            args: [{ kind: 'continuation', stack: stack.slice() }],
+                            args: [{ kind: 'continuation', stack: stack.slice(), winds: winds.slice() }],
+                            pos: action.pos,
+                        };
+                        break;
+                    }
+                    if (action.procedure.kind === 'builtin' && action.procedure.name === 'dynamic-wind') {
+                        if (action.args.length !== 3) {
+                            throw new EvalError('dynamic-wind expects exactly 3 arguments');
+                        }
+                        const [beforeThunk, bodyThunk, afterThunk] = action.args;
+                        stack.push({
+                            kind: 'dynamic-wind-enter',
+                            wind: {
+                                before: beforeThunk,
+                                after: afterThunk,
+                            },
+                            bodyThunk,
+                            pos: action.pos ?? DEFAULT_SOURCE_POS,
+                        });
+                        action = {
+                            kind: 'apply',
+                            procedure: beforeThunk,
+                            args: [],
                             pos: action.pos,
                         };
                         break;
@@ -461,8 +485,10 @@ function runEvaluation(initialAction, context) {
                         if (action.args.length !== 1) {
                             throw new EvalError('continuation expects exactly 1 argument');
                         }
-                        stack = action.procedure.stack.slice();
-                        action = { kind: 'value', value: action.args[0] };
+                        const sharedPrefixLength = sharedDynamicWindPrefixLength(winds, action.procedure.winds);
+                        const exiting = winds.slice(sharedPrefixLength).reverse();
+                        const entering = action.procedure.winds.slice(sharedPrefixLength);
+                        action = startWindTransferAction(exiting, entering, action.procedure.stack, action.procedure.winds, action.args[0], stack, winds, action.pos ?? DEFAULT_SOURCE_POS);
                         break;
                     }
                     action = applyProcedureAction(action.procedure, action.args, context);
@@ -491,7 +517,7 @@ function startSequenceAction(exprs, env, stack, pos) {
     }
     return { kind: 'expr', expr: exprs[0], env };
 }
-function continueWithFrame(frame, value, stack) {
+function continueWithFrame(frame, value, stack, winds) {
     switch (frame.kind) {
         case 'sequence':
             return startSequenceAction(frame.remainingExprs, frame.env, stack, frame.pos);
@@ -571,7 +597,100 @@ function continueWithFrame(frame, value, stack) {
                 return { kind: 'value', value };
             }
             return startSequenceAction(frame.body, frame.env, stack, frame.pos);
+        case 'dynamic-wind-enter':
+            winds.push(frame.wind);
+            stack.push({
+                kind: 'dynamic-wind-body',
+                wind: frame.wind,
+                pos: frame.pos,
+            });
+            return {
+                kind: 'apply',
+                procedure: frame.bodyThunk,
+                args: [],
+                pos: frame.pos,
+            };
+        case 'dynamic-wind-body': {
+            const currentWind = winds.pop();
+            if (currentWind !== frame.wind) {
+                throw new EvalError('internal error: dynamic-wind stack mismatch');
+            }
+            stack.push({
+                kind: 'dynamic-wind-after',
+                result: value,
+                pos: frame.pos,
+            });
+            return {
+                kind: 'apply',
+                procedure: frame.wind.after,
+                args: [],
+                pos: frame.pos,
+            };
+        }
+        case 'dynamic-wind-after':
+            return { kind: 'value', value: frame.result };
+        case 'wind-transfer-after':
+            return startWindTransferAction(frame.exiting, frame.entering, frame.targetStack, frame.targetWinds, frame.value, stack, winds, frame.pos);
+        case 'wind-transfer-before':
+            winds.push(frame.wind);
+            return startWindTransferAction([], frame.entering, frame.targetStack, frame.targetWinds, frame.value, stack, winds, frame.pos);
     }
+}
+function replaceArrayContents(target, source) {
+    target.length = 0;
+    target.push(...source);
+}
+function sharedDynamicWindPrefixLength(left, right) {
+    let index = 0;
+    while (index < left.length && index < right.length && left[index] === right[index]) {
+        index += 1;
+    }
+    return index;
+}
+function startWindTransferAction(exiting, entering, targetStack, targetWinds, value, stack, winds, pos) {
+    if (exiting.length > 0) {
+        const [wind, ...remainingExits] = exiting;
+        const currentWind = winds.pop();
+        if (currentWind !== wind) {
+            throw new EvalError('internal error: dynamic-wind stack mismatch');
+        }
+        stack.push({
+            kind: 'wind-transfer-after',
+            exiting: remainingExits,
+            entering,
+            targetStack,
+            targetWinds,
+            value,
+            pos,
+        });
+        return {
+            kind: 'apply',
+            procedure: wind.after,
+            args: [],
+            pos,
+        };
+    }
+    if (entering.length > 0) {
+        const [wind, ...remainingEntries] = entering;
+        stack.push({
+            kind: 'wind-transfer-before',
+            wind,
+            entering: remainingEntries,
+            targetStack,
+            targetWinds,
+            value,
+            pos,
+        });
+        return {
+            kind: 'apply',
+            procedure: wind.before,
+            args: [],
+            pos,
+        };
+    }
+    replaceArrayContents(stack, targetStack);
+    replaceArrayContents(winds, targetWinds);
+    return { kind: 'value', value };
 }
 function startShortCircuitAction(kind, exprs, env, stack, pos) {
     if (exprs.length === 0) {
@@ -2127,6 +2246,7 @@ function applyBuiltin(name, args, context) {
             return applyApply(args, context);
         case 'call/cc':
         case 'call-with-current-continuation':
+        case 'dynamic-wind':
             throw new EvalError('internal error: continuation application must be handled by the evaluator');
         case 'error':
             return applyError(args);
