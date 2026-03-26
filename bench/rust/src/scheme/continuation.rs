@@ -1,9 +1,10 @@
 use std::rc::Rc;
 
 use super::{
-    attach_call_position, expr_plain_symbol_name, expr_symbol_name, expand_macro_call, list_from_values,
-    lookup_symbol_value, lookup_syntax, make_string, ControlProc, Continuation, ContinuationFrame,
-    Env, EnvRef, EvalContext, EvalError, Expr, ExprKind, SourcePos, Value,
+    attach_call_position, expand_macro_call, expr_plain_symbol_name, expr_symbol_name,
+    list_from_values, lookup_symbol_value, lookup_syntax, make_string, Continuation,
+    ContinuationFrame, ControlProc, DynamicWindContext, DynamicWindRef, Env, EnvRef, EvalContext,
+    EvalError, Expr, ExprKind, SourcePos, Value,
 };
 
 enum MachineState {
@@ -18,16 +19,12 @@ pub(super) fn program_uses_first_class_continuations(exprs: &[Expr]) -> bool {
 fn expr_uses_first_class_continuations(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => {
-            matches!(
-                name.as_str(),
-                "call/cc" | "call-with-current-continuation"
-            )
+            matches!(name.as_str(), "call/cc" | "call-with-current-continuation")
         }
         ExprKind::List(items) => items.iter().any(expr_uses_first_class_continuations),
-        ExprKind::Number(_)
-        | ExprKind::Boolean(_)
-        | ExprKind::Char(_)
-        | ExprKind::String(_) => false,
+        ExprKind::Number(_) | ExprKind::Boolean(_) | ExprKind::Char(_) | ExprKind::String(_) => {
+            false
+        }
     }
 }
 
@@ -81,8 +78,10 @@ fn eval_expr(
         ExprKind::String(value) => Ok(MachineState::Return(make_string(value), frames)),
         ExprKind::Symbol(name) => lookup_symbol_value(&name, &env, expr.pos)
             .map(|value| MachineState::Return(value, frames)),
-        ExprKind::CapturedSymbol(name, captured_env) => lookup_symbol_value(&name, &captured_env, expr.pos)
-            .map(|value| MachineState::Return(value, frames)),
+        ExprKind::CapturedSymbol(name, captured_env) => {
+            lookup_symbol_value(&name, &captured_env, expr.pos)
+                .map(|value| MachineState::Return(value, frames))
+        }
         ExprKind::List(items) => eval_list(expr.pos, items, env, frames, ctx),
     }
 }
@@ -442,7 +441,11 @@ fn continue_with_frame(
             });
             Ok(MachineState::Eval(next.clone(), env, next_frames))
         }
-        ContinuationFrame::CondTest { body, remaining, env } => {
+        ContinuationFrame::CondTest {
+            body,
+            remaining,
+            env,
+        } => {
             if value.is_truthy() {
                 if body.is_empty() {
                     Ok(MachineState::Return(value, frames))
@@ -514,6 +517,75 @@ fn continue_with_frame(
                 Ok(MachineState::Eval(first.clone(), env, next_frames))
             }
         }
+        ContinuationFrame::DynamicWindStart { context } => {
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::DynamicWindMarker {
+                context: context.clone(),
+            });
+            next_frames.push(ContinuationFrame::DynamicWindBody {
+                context: context.clone(),
+            });
+            apply_value(
+                context.body_thunk.clone(),
+                Vec::new(),
+                None,
+                next_frames,
+                ctx,
+            )
+        }
+        ContinuationFrame::DynamicWindBody { context } => {
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::DynamicWindCleanup {
+                context: context.clone(),
+                result: value,
+            });
+            apply_value(
+                context.out_thunk.clone(),
+                Vec::new(),
+                None,
+                next_frames,
+                ctx,
+            )
+        }
+        ContinuationFrame::DynamicWindCleanup { context, result } => {
+            let mut next_frames = frames;
+            let Some(ContinuationFrame::DynamicWindMarker {
+                context: marker_context,
+            }) = next_frames.pop()
+            else {
+                return Err(EvalError::InvalidSyntax {
+                    message: "internal dynamic-wind stack mismatch".to_string(),
+                });
+            };
+
+            if !Rc::ptr_eq(&marker_context, &context) {
+                return Err(EvalError::InvalidSyntax {
+                    message: "internal dynamic-wind marker mismatch".to_string(),
+                });
+            }
+
+            Ok(MachineState::Return(result, next_frames))
+        }
+        ContinuationFrame::DynamicWindTransition {
+            remaining,
+            final_value,
+            target_frames,
+        } => {
+            let Some((next, rest)) = remaining.split_first() else {
+                return Ok(MachineState::Return(final_value, target_frames));
+            };
+
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::DynamicWindTransition {
+                remaining: rest.to_vec(),
+                final_value,
+                target_frames,
+            });
+            apply_value(next.clone(), Vec::new(), None, next_frames, ctx)
+        }
+        ContinuationFrame::DynamicWindMarker { .. } => Err(EvalError::InvalidSyntax {
+            message: "internal dynamic-wind marker reached unexpectedly".to_string(),
+        }),
     }
 }
 
@@ -587,6 +659,28 @@ fn apply_value(
     ctx: &EvalContext,
 ) -> Result<MachineState, EvalError> {
     match procedure {
+        Value::ControlProc(ControlProc::DynamicWind) => {
+            if args.len() != 3 {
+                return Err(attach_call_position(
+                    EvalError::WrongArgCount {
+                        name: "dynamic-wind",
+                        expected: "exactly 3",
+                        got: args.len(),
+                    },
+                    pos,
+                ));
+            }
+
+            let context = Rc::new(DynamicWindContext {
+                in_thunk: args[0].clone(),
+                body_thunk: args[1].clone(),
+                out_thunk: args[2].clone(),
+            });
+
+            let mut next_frames = frames;
+            next_frames.push(ContinuationFrame::DynamicWindStart { context });
+            apply_value(args[0].clone(), Vec::new(), pos, next_frames, ctx)
+        }
         Value::ControlProc(ControlProc::CallCc) => {
             if args.len() != 1 {
                 return Err(attach_call_position(
@@ -639,10 +733,7 @@ fn apply_value(
                 ));
             }
 
-            Ok(MachineState::Return(
-                args[0].clone(),
-                continuation.frames.clone(),
-            ))
+            start_dynamic_wind_transition(args[0].clone(), frames, continuation.frames.clone(), ctx)
         }
         other => Err(attach_call_position(
             EvalError::NotAProcedure {
@@ -651,6 +742,63 @@ fn apply_value(
             pos,
         )),
     }
+}
+
+fn start_dynamic_wind_transition(
+    final_value: Value,
+    current_frames: Vec<ContinuationFrame>,
+    target_frames: Vec<ContinuationFrame>,
+    ctx: &EvalContext,
+) -> Result<MachineState, EvalError> {
+    let current_winders = active_dynamic_winders(&current_frames);
+    let target_winders = active_dynamic_winders(&target_frames);
+
+    let shared_prefix = current_winders
+        .iter()
+        .zip(target_winders.iter())
+        .take_while(|(current, target)| Rc::ptr_eq(current, target))
+        .count();
+
+    let mut steps = current_winders[shared_prefix..]
+        .iter()
+        .rev()
+        .map(|context| context.out_thunk.clone())
+        .collect::<Vec<_>>();
+    steps.extend(
+        target_winders[shared_prefix..]
+            .iter()
+            .map(|context| context.in_thunk.clone()),
+    );
+
+    start_transition_steps(steps, final_value, target_frames, ctx)
+}
+
+fn start_transition_steps(
+    steps: Vec<Value>,
+    final_value: Value,
+    target_frames: Vec<ContinuationFrame>,
+    ctx: &EvalContext,
+) -> Result<MachineState, EvalError> {
+    let Some((first, rest)) = steps.split_first() else {
+        return Ok(MachineState::Return(final_value, target_frames));
+    };
+
+    let frames = vec![ContinuationFrame::DynamicWindTransition {
+        remaining: rest.to_vec(),
+        final_value,
+        target_frames,
+    }];
+    apply_value(first.clone(), Vec::new(), None, frames, ctx)
+}
+
+fn active_dynamic_winders(frames: &[ContinuationFrame]) -> Vec<DynamicWindRef> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ContinuationFrame::DynamicWindMarker { context } => Some(context.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn require_body(form_name: &str, body: &[Expr]) -> Result<(), EvalError> {

@@ -50,11 +50,18 @@ type RecordTypeRef = Rc<RecordType>;
 type RecordProcRef = Rc<RecordProcedure>;
 type StringRef = Rc<StringCell>;
 type ContinuationRef = Rc<Continuation>;
+type DynamicWindRef = Rc<DynamicWindContext>;
 type VectorRef = Rc<RefCell<Vec<Value>>>;
 
 struct StringCell {
     chars: RefCell<Vec<char>>,
     mutable: bool,
+}
+
+struct DynamicWindContext {
+    in_thunk: Value,
+    body_thunk: Value,
+    out_thunk: Value,
 }
 
 struct RecordType {
@@ -83,12 +90,14 @@ enum RecordProcedureKind {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ControlProc {
     CallCc,
+    DynamicWind,
 }
 
 impl ControlProc {
     fn name(self) -> &'static str {
         match self {
             Self::CallCc => "call/cc",
+            Self::DynamicWind => "dynamic-wind",
         }
     }
 }
@@ -227,6 +236,24 @@ enum ContinuationFrame {
     Or {
         rest: Vec<Expr>,
         env: EnvRef,
+    },
+    DynamicWindStart {
+        context: DynamicWindRef,
+    },
+    DynamicWindMarker {
+        context: DynamicWindRef,
+    },
+    DynamicWindBody {
+        context: DynamicWindRef,
+    },
+    DynamicWindCleanup {
+        context: DynamicWindRef,
+        result: Value,
+    },
+    DynamicWindTransition {
+        remaining: Vec<Value>,
+        final_value: Value,
+        target_frames: Vec<ContinuationFrame>,
     },
 }
 
@@ -762,7 +789,45 @@ fn apply_call(mut call: CallRequest, ctx: &EvalContext) -> Result<Value, EvalErr
         } = call;
 
         match procedure {
-            Value::ControlProc(_) | Value::Continuation(_) => {
+            Value::ControlProc(ControlProc::DynamicWind) => {
+                if args.len() != 3 {
+                    return Err(attach_call_position(
+                        EvalError::WrongArgCount {
+                            name: "dynamic-wind",
+                            expected: "exactly 3",
+                            got: args.len(),
+                        },
+                        pos,
+                    ));
+                }
+
+                apply_call(
+                    CallRequest {
+                        procedure: args[0].clone(),
+                        args: Vec::new(),
+                        pos,
+                    },
+                    ctx,
+                )?;
+                let result = apply_call(
+                    CallRequest {
+                        procedure: args[1].clone(),
+                        args: Vec::new(),
+                        pos,
+                    },
+                    ctx,
+                )?;
+                apply_call(
+                    CallRequest {
+                        procedure: args[2].clone(),
+                        args: Vec::new(),
+                        pos,
+                    },
+                    ctx,
+                )?;
+                return Ok(result);
+            }
+            Value::ControlProc(ControlProc::CallCc) | Value::Continuation(_) => {
                 return Err(attach_call_position(
                     EvalError::InvalidSyntax {
                         message: "continuations require the continuation-aware evaluator"

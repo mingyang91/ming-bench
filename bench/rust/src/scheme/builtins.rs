@@ -123,10 +123,17 @@ pub(super) fn default_env() -> EnvRef {
     ] {
         env.define(name.to_string(), Value::NativeProc { name, func });
     }
-    env.define("call/cc".to_string(), Value::ControlProc(ControlProc::CallCc));
+    env.define(
+        "call/cc".to_string(),
+        Value::ControlProc(ControlProc::CallCc),
+    );
     env.define(
         "call-with-current-continuation".to_string(),
         Value::ControlProc(ControlProc::CallCc),
+    );
+    env.define(
+        "dynamic-wind".to_string(),
+        Value::ControlProc(ControlProc::DynamicWind),
     );
     env
 }
