@@ -115,6 +115,13 @@ final class SyntaxRulesMacro implements MacroBinding {
         return switch (pattern) {
             case IntExpr intExpr ->
                     input instanceof IntExpr inputInt && inputInt.value() == intExpr.value();
+            case RationalExpr rationalExpr ->
+                    input instanceof RationalExpr inputRational
+                            && rationalExpr.numerator().equals(inputRational.numerator())
+                            && rationalExpr.denominator().equals(inputRational.denominator());
+            case InexactExpr inexactExpr ->
+                    input instanceof InexactExpr inputInexact
+                            && Double.compare(inexactExpr.value(), inputInexact.value()) == 0;
             case BoolExpr boolExpr ->
                     input instanceof BoolExpr inputBool && inputBool.value() == boolExpr.value();
             case StringExpr stringExpr ->
@@ -219,6 +226,10 @@ final class SyntaxRulesMacro implements MacroBinding {
             }
             case IntExpr intExpr -> {
             }
+            case RationalExpr rationalExpr -> {
+            }
+            case InexactExpr inexactExpr -> {
+            }
             case BoolExpr boolExpr -> {
             }
             case StringExpr stringExpr -> {
@@ -232,6 +243,8 @@ final class SyntaxRulesMacro implements MacroBinding {
                                 Integer repeatIndex, boolean datumContext) throws EvalError {
         return switch (template) {
             case IntExpr intExpr -> intExpr;
+            case RationalExpr rationalExpr -> rationalExpr;
+            case InexactExpr inexactExpr -> inexactExpr;
             case BoolExpr boolExpr -> boolExpr;
             case StringExpr stringExpr -> stringExpr;
             case CharExpr charExpr -> charExpr;
@@ -496,6 +509,10 @@ final class SyntaxRulesMacro implements MacroBinding {
             }
             case IntExpr intExpr -> {
             }
+            case RationalExpr rationalExpr -> {
+            }
+            case InexactExpr inexactExpr -> {
+            }
             case BoolExpr boolExpr -> {
             }
             case StringExpr stringExpr -> {
@@ -520,6 +537,11 @@ final class SyntaxRulesMacro implements MacroBinding {
         return switch (left) {
             case IntExpr intExpr -> right instanceof IntExpr rightInt
                     && intExpr.value() == rightInt.value();
+            case RationalExpr rationalExpr -> right instanceof RationalExpr rightRational
+                    && rationalExpr.numerator().equals(rightRational.numerator())
+                    && rationalExpr.denominator().equals(rightRational.denominator());
+            case InexactExpr inexactExpr -> right instanceof InexactExpr rightInexact
+                    && Double.compare(inexactExpr.value(), rightInexact.value()) == 0;
             case BoolExpr boolExpr -> right instanceof BoolExpr rightBool
                     && boolExpr.value() == rightBool.value();
             case StringExpr stringExpr -> right instanceof StringExpr rightString

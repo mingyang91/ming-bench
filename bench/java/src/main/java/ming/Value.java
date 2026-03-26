@@ -1,8 +1,10 @@
 package ming;
 
+import java.math.BigInteger;
 import java.util.List;
 
-sealed interface Value permits IntValue, BoolValue, StringValue, CharValue, SymbolValue,
+sealed interface Value permits IntValue, RationalValue, InexactValue,
+        BoolValue, StringValue, CharValue, SymbolValue,
         PairValue, EmptyListValue, VoidValue, ProcedureValue {
     String render();
 }
@@ -11,6 +13,43 @@ record IntValue(int value) implements Value {
     @Override
     public String render() {
         return Integer.toString(value);
+    }
+}
+
+record RationalValue(BigInteger numerator, BigInteger denominator) implements Value {
+    RationalValue {
+        if (denominator.signum() == 0) {
+            throw new IllegalArgumentException("denominator cannot be zero");
+        }
+
+        if (numerator.signum() == 0) {
+            numerator = BigInteger.ZERO;
+            denominator = BigInteger.ONE;
+        } else {
+            if (denominator.signum() < 0) {
+                numerator = numerator.negate();
+                denominator = denominator.negate();
+            }
+
+            BigInteger gcd = numerator.gcd(denominator);
+            numerator = numerator.divide(gcd);
+            denominator = denominator.divide(gcd);
+        }
+    }
+
+    @Override
+    public String render() {
+        if (denominator.equals(BigInteger.ONE)) {
+            return numerator.toString();
+        }
+        return numerator + "/" + denominator;
+    }
+}
+
+record InexactValue(double value) implements Value {
+    @Override
+    public String render() {
+        return Double.toString(value);
     }
 }
 
@@ -139,26 +178,26 @@ interface ValuePredicate {
 enum Comparison {
     STRICTLY_LESS("<") {
         @Override
-        boolean matches(int left, int right) {
-            return left < right;
+        boolean matches(int relation) {
+            return relation < 0;
         }
     },
     STRICTLY_GREATER(">") {
         @Override
-        boolean matches(int left, int right) {
-            return left > right;
+        boolean matches(int relation) {
+            return relation > 0;
         }
     },
     EQUAL("=") {
         @Override
-        boolean matches(int left, int right) {
-            return left == right;
+        boolean matches(int relation) {
+            return relation == 0;
         }
     },
     LESS_OR_EQUAL("<=") {
         @Override
-        boolean matches(int left, int right) {
-            return left <= right;
+        boolean matches(int relation) {
+            return relation <= 0;
         }
     };
 
@@ -172,7 +211,7 @@ enum Comparison {
         return symbol;
     }
 
-    abstract boolean matches(int left, int right);
+    abstract boolean matches(int relation);
 }
 
 enum CharComparison {

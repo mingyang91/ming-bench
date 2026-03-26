@@ -1,13 +1,22 @@
 package ming;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
-sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
+sealed interface Expr permits IntExpr, RationalExpr, InexactExpr,
+        BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
     SourcePos position();
 }
 
 record IntExpr(int value, SourcePos position) implements Expr {
+}
+
+record RationalExpr(BigInteger numerator, BigInteger denominator, SourcePos position)
+        implements Expr {
+}
+
+record InexactExpr(double value, SourcePos position) implements Expr {
 }
 
 record BoolExpr(boolean value, SourcePos position) implements Expr {
@@ -163,7 +172,7 @@ final class Parser {
         };
     }
 
-    private Expr parseAtom(SourcePos position) {
+    private Expr parseAtom(SourcePos position) throws EvalError {
         int start = index;
         while (index < input.length()) {
             char ch = input.charAt(index);
@@ -180,8 +189,23 @@ final class Parser {
         if (token.equals("#f")) {
             return new BoolExpr(false, position);
         }
-        if (token.matches("[+-]?\\d+")) {
-            return new IntExpr(Integer.parseInt(token), position);
+
+        ParsedNumber parsedNumber;
+        try {
+            parsedNumber = NumericSupport.parseLiteral(token);
+        } catch (IllegalArgumentException error) {
+            throw errorAt(position, error.getMessage());
+        }
+
+        if (parsedNumber instanceof ParsedInteger parsedInteger) {
+            return new IntExpr(parsedInteger.value(), position);
+        }
+        if (parsedNumber instanceof ParsedRational parsedRational) {
+            return new RationalExpr(parsedRational.numerator(), parsedRational.denominator(),
+                    position);
+        }
+        if (parsedNumber instanceof ParsedInexact parsedInexact) {
+            return new InexactExpr(parsedInexact.value(), position);
         }
         return new SymbolExpr(token, position);
     }

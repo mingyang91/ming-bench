@@ -1,5 +1,6 @@
 package ming;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -60,19 +61,16 @@ public class Evaluator {
     private Environment createGlobalEnv() {
         Environment env = new Environment(null);
 
-        env.define("+", builtin("+", args -> new IntValue(sum(args))));
-        env.define("-", builtin("-", args -> new IntValue(subtract(args))));
-        env.define("*", builtin("*", args -> new IntValue(multiply(args))));
-        env.define("/", builtin("/", args -> new IntValue(divide(args))));
-        env.define("abs", builtin("abs", args -> {
-            requireArity("abs", args.size(), 1);
-            return new IntValue(Math.abs(expectInt(args.getFirst())));
-        }));
+        env.define("+", builtin("+", this::addNumbers));
+        env.define("-", builtin("-", this::subtractNumbers));
+        env.define("*", builtin("*", this::multiplyNumbers));
+        env.define("/", builtin("/", this::divideNumbers));
+        env.define("abs", builtin("abs", this::absBuiltin));
         env.define("quotient", builtin("quotient", args -> new IntValue(quotient(args))));
         env.define("remainder", builtin("remainder", args -> new IntValue(remainder(args))));
         env.define("modulo", builtin("modulo", args -> new IntValue(modulo(args))));
-        env.define("min", builtin("min", args -> new IntValue(min(args))));
-        env.define("max", builtin("max", args -> new IntValue(max(args))));
+        env.define("min", builtin("min", this::minBuiltin));
+        env.define("max", builtin("max", this::maxBuiltin));
         env.define("expt", builtin("expt", args -> new IntValue(expt(args))));
         env.define("<", builtin("<",
                 args -> BoolValue.of(compareIncreasing(args, Comparison.STRICTLY_LESS))));
@@ -102,18 +100,9 @@ public class Evaluator {
             requireArity("null?", args.size(), 1);
             return BoolValue.of(args.getFirst() instanceof EmptyListValue);
         }));
-        env.define("zero?", builtin("zero?", args -> {
-            requireArity("zero?", args.size(), 1);
-            return BoolValue.of(expectInt(args.getFirst()) == 0);
-        }));
-        env.define("positive?", builtin("positive?", args -> {
-            requireArity("positive?", args.size(), 1);
-            return BoolValue.of(expectInt(args.getFirst()) > 0);
-        }));
-        env.define("negative?", builtin("negative?", args -> {
-            requireArity("negative?", args.size(), 1);
-            return BoolValue.of(expectInt(args.getFirst()) < 0);
-        }));
+        env.define("zero?", builtin("zero?", args -> signPredicate("zero?", args, 0)));
+        env.define("positive?", builtin("positive?", args -> signPredicate("positive?", args, 1)));
+        env.define("negative?", builtin("negative?", args -> signPredicate("negative?", args, -1)));
         env.define("odd?", builtin("odd?", args -> {
             requireArity("odd?", args.size(), 1);
             return BoolValue.of(expectInt(args.getFirst()) % 2 != 0);
@@ -148,13 +137,21 @@ public class Evaluator {
         env.define("string?", builtin("string?",
                 args -> typePredicate("string?", args, value -> value instanceof StringValue)));
         env.define("number?", builtin("number?",
-                args -> typePredicate("number?", args, value -> value instanceof IntValue)));
+                args -> typePredicate("number?", args, NumericSupport::isNumber)));
         env.define("boolean?", builtin("boolean?",
                 args -> typePredicate("boolean?", args, value -> value instanceof BoolValue)));
         env.define("pair?", builtin("pair?",
                 args -> typePredicate("pair?", args, value -> value instanceof PairValue)));
         env.define("symbol?", builtin("symbol?",
                 args -> typePredicate("symbol?", args, value -> value instanceof SymbolValue)));
+        env.define("integer?", builtin("integer?",
+                args -> typePredicate("integer?", args, NumericSupport::isInteger)));
+        env.define("rational?", builtin("rational?",
+                args -> typePredicate("rational?", args, NumericSupport::isRational)));
+        env.define("exact?", builtin("exact?",
+                args -> typePredicate("exact?", args, NumericSupport::isExact)));
+        env.define("inexact?", builtin("inexact?",
+                args -> typePredicate("inexact?", args, NumericSupport::isInexact)));
         env.define("display", builtin("display", args -> {
             requireArity("display", args.size(), 1);
             appendOutput(renderForDisplay(args.getFirst()));
@@ -188,16 +185,11 @@ public class Evaluator {
         }));
         env.define("string->number", builtin("string->number", args -> {
             requireArity("string->number", args.size(), 1);
-            String value = expectString(args.getFirst());
-            try {
-                return new IntValue(Integer.parseInt(value));
-            } catch (NumberFormatException error) {
-                return BoolValue.FALSE;
-            }
+            return stringToNumber(expectString(args.getFirst()));
         }));
         env.define("number->string", builtin("number->string", args -> {
             requireArity("number->string", args.size(), 1);
-            return new StringValue(Integer.toString(expectInt(args.getFirst())));
+            return new StringValue(expectNumber(args.getFirst()).render());
         }));
         env.define("symbol->string", builtin("symbol->string", args -> {
             requireArity("symbol->string", args.size(), 1);
@@ -277,6 +269,16 @@ public class Evaluator {
                 args -> BoolValue.of(compareChars(args, "char=?", CharComparison.EQUAL))));
         env.define("char<?", builtin("char<?",
                 args -> BoolValue.of(compareChars(args, "char<?", CharComparison.LESS))));
+        env.define("exact->inexact", builtin("exact->inexact", args -> {
+            requireArity("exact->inexact", args.size(), 1);
+            return exactToInexact(expectNumber(args.getFirst()));
+        }));
+        env.define("inexact->exact", builtin("inexact->exact", args -> {
+            requireArity("inexact->exact", args.size(), 1);
+            return NumericSupport.inexactToExact(args.getFirst());
+        }));
+        env.define("numerator", builtin("numerator", this::numeratorBuiltin));
+        env.define("denominator", builtin("denominator", this::denominatorBuiltin));
 
         return env;
     }
@@ -305,6 +307,9 @@ public class Evaluator {
         try {
             return switch (expr) {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
+                case RationalExpr rationalExpr -> NumericSupport.exactToValue(
+                        new ExactFraction(rationalExpr.numerator(), rationalExpr.denominator()));
+                case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
                 case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
                 case StringExpr stringExpr -> new StringValue(stringExpr.value());
                 case CharExpr charExpr -> new CharValue(charExpr.value());
@@ -652,6 +657,9 @@ public class Evaluator {
     private Value quoteToValue(Expr expr) throws EvalError {
         return switch (expr) {
             case IntExpr intExpr -> new IntValue(intExpr.value());
+            case RationalExpr rationalExpr -> NumericSupport.exactToValue(
+                    new ExactFraction(rationalExpr.numerator(), rationalExpr.denominator()));
+            case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
             case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
             case CharExpr charExpr -> new CharValue(charExpr.value());
@@ -668,48 +676,99 @@ public class Evaluator {
         return result;
     }
 
-    private int sum(List<Value> args) throws EvalError {
-        int total = 0;
-        for (Value arg : args) {
-            total += expectInt(arg);
+    private Value addNumbers(List<Value> args) throws EvalError {
+        if (containsInexact(args)) {
+            double total = 0.0;
+            for (Value arg : args) {
+                total += NumericSupport.toDouble(arg);
+            }
+            return new InexactValue(total);
         }
-        return total;
+
+        ExactFraction total = ExactFraction.of(0);
+        for (Value arg : args) {
+            total = total.add(NumericSupport.toExactFraction(arg));
+        }
+        return NumericSupport.exactToValue(total);
     }
 
-    private int subtract(List<Value> args) throws EvalError {
+    private Value subtractNumbers(List<Value> args) throws EvalError {
         requireAtLeast("-", args.size(), 1);
 
+        if (containsInexact(args)) {
+            double result = NumericSupport.toDouble(args.getFirst());
+            if (args.size() == 1) {
+                return new InexactValue(-result);
+            }
+
+            for (int index = 1; index < args.size(); index++) {
+                result -= NumericSupport.toDouble(args.get(index));
+            }
+            return new InexactValue(result);
+        }
+
+        ExactFraction result = NumericSupport.toExactFraction(args.getFirst());
         if (args.size() == 1) {
-            return -expectInt(args.getFirst());
+            return NumericSupport.exactToValue(result.negate());
         }
 
-        int result = expectInt(args.getFirst());
         for (int index = 1; index < args.size(); index++) {
-            result -= expectInt(args.get(index));
+            result = result.subtract(NumericSupport.toExactFraction(args.get(index)));
         }
-        return result;
+        return NumericSupport.exactToValue(result);
     }
 
-    private int multiply(List<Value> args) throws EvalError {
-        int total = 1;
+    private Value multiplyNumbers(List<Value> args) throws EvalError {
+        if (containsInexact(args)) {
+            double total = 1.0;
+            for (Value arg : args) {
+                total *= NumericSupport.toDouble(arg);
+            }
+            return new InexactValue(total);
+        }
+
+        ExactFraction total = ExactFraction.of(1);
         for (Value arg : args) {
-            total *= expectInt(arg);
+            total = total.multiply(NumericSupport.toExactFraction(arg));
         }
-        return total;
+        return NumericSupport.exactToValue(total);
     }
 
-    private int divide(List<Value> args) throws EvalError {
+    private Value divideNumbers(List<Value> args) throws EvalError {
         requireAtLeast("/", args.size(), 2);
 
-        int result = expectInt(args.getFirst());
-        for (int index = 1; index < args.size(); index++) {
-            int divisor = expectInt(args.get(index));
-            if (divisor == 0) {
-                throw new EvalError("division by zero");
+        if (containsInexact(args)) {
+            double result = NumericSupport.toDouble(args.getFirst());
+            for (int index = 1; index < args.size(); index++) {
+                double divisor = NumericSupport.toDouble(args.get(index));
+                if (divisor == 0.0) {
+                    throw new EvalError("division by zero");
+                }
+                result /= divisor;
             }
-            result /= divisor;
+            return new InexactValue(result);
         }
-        return result;
+
+        ExactFraction result = NumericSupport.toExactFraction(args.getFirst());
+        for (int index = 1; index < args.size(); index++) {
+            result = result.divide(NumericSupport.toExactFraction(args.get(index)));
+        }
+        return NumericSupport.exactToValue(result);
+    }
+
+    private Value absBuiltin(List<Value> args) throws EvalError {
+        requireArity("abs", args.size(), 1);
+
+        Value value = expectNumber(args.getFirst());
+        if (value instanceof InexactValue inexactValue) {
+            return new InexactValue(Math.abs(inexactValue.value()));
+        }
+
+        ExactFraction fraction = NumericSupport.toExactFraction(value);
+        if (fraction.signum() < 0) {
+            fraction = fraction.negate();
+        }
+        return NumericSupport.exactToValue(fraction);
     }
 
     private int quotient(List<Value> args) throws EvalError {
@@ -745,22 +804,38 @@ public class Evaluator {
         return Math.floorMod(dividend, divisor);
     }
 
-    private int min(List<Value> args) throws EvalError {
+    private Value minBuiltin(List<Value> args) throws EvalError {
         requireAtLeast("min", args.size(), 1);
 
-        int result = expectInt(args.getFirst());
+        Value result = expectNumber(args.getFirst());
+        boolean sawInexact = NumericSupport.isInexact(result);
         for (int index = 1; index < args.size(); index++) {
-            result = Math.min(result, expectInt(args.get(index)));
+            Value current = expectNumber(args.get(index));
+            if (NumericSupport.compare(current, result) < 0) {
+                result = current;
+            }
+            sawInexact |= NumericSupport.isInexact(current);
+        }
+        if (sawInexact && NumericSupport.isExact(result)) {
+            return exactToInexact(result);
         }
         return result;
     }
 
-    private int max(List<Value> args) throws EvalError {
+    private Value maxBuiltin(List<Value> args) throws EvalError {
         requireAtLeast("max", args.size(), 1);
 
-        int result = expectInt(args.getFirst());
+        Value result = expectNumber(args.getFirst());
+        boolean sawInexact = NumericSupport.isInexact(result);
         for (int index = 1; index < args.size(); index++) {
-            result = Math.max(result, expectInt(args.get(index)));
+            Value current = expectNumber(args.get(index));
+            if (NumericSupport.compare(current, result) > 0) {
+                result = current;
+            }
+            sawInexact |= NumericSupport.isInexact(current);
+        }
+        if (sawInexact && NumericSupport.isExact(result)) {
+            return exactToInexact(result);
         }
         return result;
     }
@@ -785,10 +860,10 @@ public class Evaluator {
             throws EvalError {
         requireAtLeast(comparison.symbol(), args.size(), 2);
 
-        int previous = expectInt(args.getFirst());
+        Value previous = expectNumber(args.getFirst());
         for (int index = 1; index < args.size(); index++) {
-            int current = expectInt(args.get(index));
-            if (!comparison.matches(previous, current)) {
+            Value current = expectNumber(args.get(index));
+            if (!comparison.matches(NumericSupport.compare(previous, current))) {
                 return false;
             }
             previous = current;
@@ -796,11 +871,30 @@ public class Evaluator {
         return true;
     }
 
-    private int expectInt(Value value) throws EvalError {
-        if (value instanceof IntValue intValue) {
-            return intValue.value();
+    private boolean containsInexact(List<Value> args) throws EvalError {
+        for (Value arg : args) {
+            expectNumber(arg);
+            if (NumericSupport.isInexact(arg)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Value expectNumber(Value value) throws EvalError {
+        if (NumericSupport.isNumber(value)) {
+            return value;
         }
         throw new EvalError("expected number");
+    }
+
+    private int expectInt(Value value) throws EvalError {
+        BigInteger integer = NumericSupport.expectExactInteger(value);
+        try {
+            return integer.intValueExact();
+        } catch (ArithmeticException error) {
+            throw new EvalError("integer out of range");
+        }
     }
 
     private int expectIndex(Value value, String operationName) throws EvalError {
@@ -996,6 +1090,60 @@ public class Evaluator {
         return builder.toString();
     }
 
+    private Value stringToNumber(String token) {
+        ParsedNumber parsedNumber;
+        try {
+            parsedNumber = NumericSupport.parseLiteral(token);
+        } catch (IllegalArgumentException error) {
+            return BoolValue.FALSE;
+        }
+
+        if (parsedNumber == null) {
+            return BoolValue.FALSE;
+        }
+        return parsedNumberToValue(parsedNumber);
+    }
+
+    private Value parsedNumberToValue(ParsedNumber parsedNumber) {
+        return switch (parsedNumber) {
+            case ParsedInteger parsedInteger -> new IntValue(parsedInteger.value());
+            case ParsedRational parsedRational -> NumericSupport.exactToValue(
+                    new ExactFraction(parsedRational.numerator(), parsedRational.denominator()));
+            case ParsedInexact parsedInexact -> new InexactValue(parsedInexact.value());
+        };
+    }
+
+    private Value exactToInexact(Value value) throws EvalError {
+        return new InexactValue(NumericSupport.toDouble(value));
+    }
+
+    private Value numeratorBuiltin(List<Value> args) throws EvalError {
+        requireArity("numerator", args.size(), 1);
+        ExactFraction fraction = NumericSupport.toExactFraction(args.getFirst());
+        return NumericSupport.integerToValue(fraction.numerator());
+    }
+
+    private Value denominatorBuiltin(List<Value> args) throws EvalError {
+        requireArity("denominator", args.size(), 1);
+        ExactFraction fraction = NumericSupport.toExactFraction(args.getFirst());
+        return NumericSupport.integerToValue(fraction.denominator());
+    }
+
+    private BoolValue signPredicate(String name, List<Value> args, int expectedSign)
+            throws EvalError {
+        requireArity(name, args.size(), 1);
+
+        Value value = expectNumber(args.getFirst());
+        int sign;
+        if (NumericSupport.isExact(value)) {
+            sign = NumericSupport.toExactFraction(value).signum();
+        } else {
+            sign = Double.compare(((InexactValue) value).value(), 0.0);
+        }
+        return BoolValue.of(sign == expectedSign || (expectedSign == 1 && sign > 0)
+                || (expectedSign == -1 && sign < 0));
+    }
+
     private boolean compareChars(List<Value> args, String name, CharComparison comparison)
             throws EvalError {
         requireAtLeast(name, args.size(), 2);
@@ -1026,12 +1174,12 @@ public class Evaluator {
         return true;
     }
 
-    private boolean isEq(Value left, Value right) {
+    private boolean isEq(Value left, Value right) throws EvalError {
         if (left == right) {
             return true;
         }
-        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
-            return leftInt.value() == rightInt.value();
+        if (NumericSupport.isNumber(left) && NumericSupport.isNumber(right)) {
+            return NumericSupport.compare(left, right) == 0;
         }
         if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
             return leftBool.value() == rightBool.value();
@@ -1045,12 +1193,12 @@ public class Evaluator {
         return false;
     }
 
-    private boolean isEqual(Value left, Value right) {
+    private boolean isEqual(Value left, Value right) throws EvalError {
         if (left == right) {
             return true;
         }
-        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
-            return leftInt.value() == rightInt.value();
+        if (NumericSupport.isNumber(left) && NumericSupport.isNumber(right)) {
+            return NumericSupport.compare(left, right) == 0;
         }
         if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
             return leftBool.value() == rightBool.value();
