@@ -32,7 +32,7 @@ public class Evaluator {
         WIND_STACK.get().clear();
         try {
             Object result = runCEK(exprs, env);
-            return new EvalResult(SchemeValue.toStr(result), outputBuf.toString());
+            return new EvalResult(SchemeValue.display(result), outputBuf.toString());
         } finally {
             OUTPUT.remove();
             WIND_STACK.get().clear();
@@ -397,7 +397,7 @@ public class Evaluator {
         record Def(String name, Env env, Kont next) implements Kont {}
         record Set(String name, Env env, Kont next) implements Kont {}
         record If(Object thenE, Object elseE, boolean hasElse, Env env, Kont next) implements Kont {}
-        record Arg(List<Object> evald, List<Object> todo, List<?> form, Env env, Kont next) implements Kont {}
+        record Arg(List<Object> evald, List<Object> todo, int todoIdx, List<?> form, Env env, Kont next) implements Kont {}
         record And(List<?> form, int idx, Env env, Kont next) implements Kont {}
         record Or(List<?> form, int idx, Env env, Kont next) implements Kont {}
         record CondTest(List<?> clause, int nextCI, List<?> form, Env env, Kont next) implements Kont {}
@@ -406,6 +406,7 @@ public class Evaluator {
         record DynWindBody(Object inThunk, Object outThunk, Kont next) implements Kont {}
         record CallWithValues(Object consumer, Kont next) implements Kont {}
         record Guard(String varName, List<List<?>> clauses, Env env, Kont next) implements Kont {}
+        record CaseKey(List<?> form, Env env, Kont next) implements Kont {}
     }
 
     private static Kont nextKont(Kont k) {
@@ -424,7 +425,27 @@ public class Evaluator {
             case Kont.DynWindBody d -> d.next();
             case Kont.CallWithValues c -> c.next();
             case Kont.Guard g -> g.next();
+            case Kont.CaseKey c -> c.next();
         };
+    }
+
+    /** True if expr can be evaluated without the CEK machine (self-evaluating or variable). */
+    private static boolean isSimple(Object expr) {
+        return expr instanceof Long || expr instanceof Boolean || expr instanceof Character
+                || expr instanceof Double || expr instanceof Rational || expr instanceof MutableString
+                || expr instanceof String;
+    }
+
+    /** Evaluate a simple (atom) expression directly. */
+    private static Object evalAtom(Object expr, Env env) throws EvalError {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof Character
+                || expr instanceof Double || expr instanceof Rational || expr instanceof MutableString) {
+            return expr;
+        }
+        if (expr instanceof String s) {
+            return s.startsWith("\"") ? s : env.lookup(s);
+        }
+        throw new EvalError("not an atom: " + expr);
     }
 
     // ===== CEK Machine =====
@@ -443,10 +464,11 @@ public class Evaluator {
         List<Object> fa = null;
         SourceList lastSrc = null;
 
+        long[] stepLim = STEP_LIMIT.get();
+
         try { mainLoop: while (true) { try {
 
             // Step limit check
-            long[] stepLim = STEP_LIMIT.get();
             if (stepLim != null) {
                 if (stepLim[0] <= 0) throw new EvalError("step limit exceeded");
                 stepLim[0]--;
@@ -644,9 +666,7 @@ public class Evaluator {
                         List<Object> revInits = new ArrayList<>(initExprs);
                         Collections.reverse(revInits);
                         ctrl = revInits.get(0);
-                        k = new Kont.Arg(List.of(lam),
-                            revInits.size() > 1 ? new ArrayList<>(revInits.subList(1, revInits.size())) : List.of(),
-                            null, env, k);
+                        k = new Kont.Arg(List.of(lam), revInits, 1, null, env, k);
                         continue mainLoop;
                     }
                     case "let*" -> {
@@ -720,9 +740,10 @@ public class Evaluator {
                         ev = false; continue mainLoop;
                     }
                     case "case" -> {
-                        try { val = evalCase(list, env); }
-                        catch (ContinuationReturn cr) { val = cr.value; k = cr.kont; }
-                        ev = false; continue mainLoop;
+                        if (list.size() < 2) throw new EvalError("case: bad syntax");
+                        ctrl = list.get(1);
+                        k = new Kont.CaseKey(list, env, k);
+                        continue mainLoop;
                     }
                     case "guard" -> {
                         if (list.size() < 3) throw new EvalError("guard: bad syntax");
@@ -750,11 +771,35 @@ public class Evaluator {
                     default -> { /* fall through to application */ }
                 }}
 
-                // ---- function application (args evaluated right-to-left) ----
+                // ---- function application ----
+                // Fast path: if all elements are simple (self-evaluating or variables),
+                // skip the Kont.Arg chain and apply directly.
+                boolean allSimple = isSimple(first);
+                if (allSimple) {
+                    for (int i = 1; i < list.size(); i++) {
+                        if (!isSimple(list.get(i))) { allSimple = false; break; }
+                    }
+                }
+                if (allSimple) {
+                    Object operator = evalAtom(first, env);
+                    if (operator instanceof SyntaxRules sr) {
+                        Object[] expanded = sr.expandToForm(list, env);
+                        ctrl = expanded[0]; env = (Env) expanded[1]; ev = true; continue mainLoop;
+                    }
+                    if (operator instanceof MacroTransformer mt) {
+                        Object result = applyProc(mt.procedure, List.of(list));
+                        Object[] expanded = handleMacroResult(result, env);
+                        ctrl = expanded[0]; env = (Env) expanded[1]; ev = true; continue mainLoop;
+                    }
+                    List<Object> args = new ArrayList<>(list.size() - 1);
+                    for (int i = 1; i < list.size(); i++) args.add(evalAtom(list.get(i), env));
+                    fn = operator; fa = args; continue mainLoop;
+                }
+                // Slow path: evaluate args via Kont.Arg chain (right-to-left)
                 ctrl = first;
                 List<Object> remaining = new ArrayList<>(list.size() - 1);
                 for (int i = list.size() - 1; i >= 1; i--) remaining.add(list.get(i));
-                k = new Kont.Arg(List.of(), remaining, list, env, k);
+                k = new Kont.Arg(List.of(), remaining, 0, list, env, k);
                 continue;
             }
 
@@ -782,8 +827,9 @@ public class Evaluator {
                     else { val = null; k = next; }
                 }
 
-                case Kont.Arg(var evald, var todo, var form, var e, var next) -> {
-                    List<Object> ne = new ArrayList<>(evald);
+                case Kont.Arg(var evald, var todo, var todoIdx, var form, var e, var next) -> {
+                    List<Object> ne = new ArrayList<>(evald.size() + 1);
+                    ne.addAll(evald);
                     ne.add(val);
                     // macro expansion: operator is SyntaxRules
                     if (evald.isEmpty() && val instanceof SyntaxRules sr && form != null) {
@@ -798,18 +844,17 @@ public class Evaluator {
                         ctrl = expanded[0]; env = (Env) expanded[1]; k = next; ev = true;
                         continue mainLoop;
                     }
-                    if (todo.isEmpty()) {
+                    if (todoIdx >= todo.size()) {
                         fn = ne.get(0);
                         // args were collected in reverse order; reverse back
-                        List<Object> args = new ArrayList<>(ne.subList(1, ne.size()));
-                        Collections.reverse(args);
+                        int sz = ne.size() - 1;
+                        List<Object> args = new ArrayList<>(sz);
+                        for (int ri = ne.size() - 1; ri >= 1; ri--) args.add(ne.get(ri));
                         fa = args;
                         k = next;
                     } else {
-                        ctrl = todo.get(0);
-                        k = new Kont.Arg(new ArrayList<>(ne),
-                            todo.size() > 1 ? new ArrayList<>(todo.subList(1, todo.size())) : List.of(),
-                            form, e, next);
+                        ctrl = todo.get(todoIdx);
+                        k = new Kont.Arg(ne, todo, todoIdx + 1, form, e, next);
                         env = e; ev = true;
                     }
                 }
@@ -836,7 +881,7 @@ public class Evaluator {
                             quoted.add("quote");
                             quoted.add(testVal);
                             ctrl = clause.get(2);
-                            k = new Kont.Arg(new ArrayList<>(), List.of(quoted), null, e, next);
+                            k = new Kont.Arg(new ArrayList<>(), List.of(quoted), 0, null, e, next);
                             env = e; ev = true;
                         }
                         else {
@@ -923,6 +968,43 @@ public class Evaluator {
                     // Body completed normally — skip through consecutive Guard frames
                     k = next;
                     while (k instanceof Kont.Guard g2) k = g2.next();
+                }
+
+                case Kont.CaseKey(var form, var e, var next) -> {
+                    Object key = val;
+                    boolean matched = false;
+                    for (int i = 2; i < form.size(); i++) {
+                        if (!(form.get(i) instanceof List<?> clause) || clause.isEmpty())
+                            throw new EvalError("case: bad clause");
+                        Object datums = clause.get(0);
+                        boolean isMatch;
+                        if (datums instanceof String cs && cs.equals("else")) {
+                            isMatch = true;
+                        } else if (datums instanceof List<?> datumList) {
+                            isMatch = false;
+                            for (Object datum : datumList) {
+                                Object d = SchemeValue.quotedToScheme(datum);
+                                if (Env.schemeEqv(key, d)) { isMatch = true; break; }
+                            }
+                        } else {
+                            throw new EvalError("case: bad clause");
+                        }
+                        if (isMatch) {
+                            matched = true;
+                            if (clause.size() == 1) { val = null; k = next; }
+                            else {
+                                ctrl = clause.get(1);
+                                if (clause.size() > 2) {
+                                    List<Object> rest = new ArrayList<>();
+                                    for (int j = 2; j < clause.size(); j++) rest.add(clause.get(j));
+                                    k = new Kont.Seq(rest, 0, e, next);
+                                } else { k = next; }
+                                env = e; ev = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (!matched) { val = null; k = next; }
                 }
             }
 

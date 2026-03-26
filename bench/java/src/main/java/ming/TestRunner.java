@@ -167,6 +167,29 @@ public class TestRunner {
             }
         }
 
+        // Run standalone L28 tests if level includes 28
+        if (levelArg.equals("all") || benchLevel >= 28) {
+            try {
+                L28Tests.passed = 0;
+                L28Tests.failed = 0;
+                L28Tests.testSequentialStateLeak();
+                L28Tests.testSequentialOutputLeak();
+                L28Tests.testConcurrentIndependentEval();
+                L28Tests.testConcurrentOutputIsolation();
+                L28Tests.testConcurrentClosuresAndMutation();
+                L28Tests.testConcurrentStress();
+                L28Tests.testConcurrentCallccCollision();
+                L28Tests.testConcurrentMacroHygiene();
+                passed += L28Tests.passed;
+                failed += L28Tests.failed;
+                total += L28Tests.passed + L28Tests.failed;
+            } catch (Exception e) {
+                System.out.println("FAIL l28_unexpected: " + e);
+                failed++;
+                total++;
+            }
+        }
+
         System.out.println(passed + " passed, " + failed + " failed out of " + total + " tests");
         System.exit(failed > 0 ? 1 : 0);
     }

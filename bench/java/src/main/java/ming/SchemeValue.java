@@ -12,6 +12,15 @@ class SchemeValue {
         return toStr(val, new IdentityHashMap<>());
     }
 
+    /** Display representation: like toStr but without quotes around strings. */
+    static String display(Object val) {
+        if (val instanceof String s && s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) {
+            return s.substring(1, s.length() - 1);
+        }
+        if (val instanceof MutableString ms) return ms.inner();
+        return toStr(val);
+    }
+
     private static String toStr(Object val, IdentityHashMap<Object, Boolean> seen) {
         if (val == null) return "void";
         if (val == NIL) return "()";
