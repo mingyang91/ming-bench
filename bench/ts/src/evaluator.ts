@@ -37,7 +37,80 @@ interface SchemeString {
   value: string;
 }
 
-type Value = number | boolean | SchemeString;
+interface SchemeSymbol {
+  kind: 'symbol';
+  value: string;
+}
+
+interface EmptyListValue {
+  kind: 'empty-list';
+}
+
+interface PairValue {
+  kind: 'pair';
+  car: Value;
+  cdr: Value;
+}
+
+interface VoidValue {
+  kind: 'void';
+}
+
+interface EvaluatedArg {
+  expr: Expr;
+  value: Value;
+}
+
+interface BuiltinProcedure {
+  kind: 'procedure';
+  name: string;
+  call(args: EvaluatedArg[], loc: SourceLoc): Value;
+}
+
+interface ClosureProcedure {
+  kind: 'procedure';
+  name?: string;
+  params: string[];
+  body: Expr[];
+  env: Environment;
+}
+
+type ProcedureValue = BuiltinProcedure | ClosureProcedure;
+
+type Value =
+  | number
+  | boolean
+  | SchemeString
+  | SchemeSymbol
+  | EmptyListValue
+  | PairValue
+  | VoidValue
+  | ProcedureValue;
+
+const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
+const VOID_VALUE: VoidValue = { kind: 'void' };
+
+class Environment {
+  private readonly bindings = new Map<string, Value>();
+
+  constructor(private readonly parent?: Environment) {}
+
+  define(name: string, value: Value): void {
+    this.bindings.set(name, value);
+  }
+
+  lookup(name: string, loc: SourceLoc): Value {
+    if (this.bindings.has(name)) {
+      return this.bindings.get(name) as Value;
+    }
+
+    if (this.parent !== undefined) {
+      return this.parent.lookup(name, loc);
+    }
+
+    throw new EvalError(`${loc.line}:${loc.col}: unbound variable ${name}`);
+  }
+}
 
 class Reader {
   private index = 0;
@@ -245,9 +318,11 @@ export function evalStr(input: string): string {
     throw new EvalError('1:1: expected expression');
   }
 
-  let result: Value = false;
+  const env = createGlobalEnv();
+  let result: Value = VOID_VALUE;
+
   for (const expr of program) {
-    result = evaluate(expr);
+    result = evaluate(expr, env);
   }
 
   return formatValue(result);
@@ -261,7 +336,103 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   return { result: evalStr(input), output: '' };
 }
 
-function evaluate(expr: Expr): Value {
+function createGlobalEnv(): Environment {
+  const env = new Environment();
+
+  env.define('+', builtin('+', (args) => {
+    let result = 0;
+    for (const arg of args) {
+      result += expectNumber(arg);
+    }
+    return result;
+  }));
+
+  env.define('*', builtin('*', (args) => {
+    let result = 1;
+    for (const arg of args) {
+      result *= expectNumber(arg);
+    }
+    return result;
+  }));
+
+  env.define('-', builtin('-', (args, loc) => {
+    if (args.length === 0) {
+      throw new EvalError(`${loc.line}:${loc.col}: - expects at least 1 argument`);
+    }
+
+    const first = expectNumber(args[0]);
+    if (args.length === 1) {
+      return -first;
+    }
+
+    let result = first;
+    for (const arg of args.slice(1)) {
+      result -= expectNumber(arg);
+    }
+    return result;
+  }));
+
+  env.define('/', builtin('/', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: / expects at least 2 arguments`);
+    }
+
+    let result = expectNumber(args[0]);
+    for (const arg of args.slice(1)) {
+      const value = expectNumber(arg);
+      if (value === 0) {
+        throw new EvalError(`${arg.expr.line}:${arg.expr.col}: division by zero`);
+      }
+      result /= value;
+    }
+    return result;
+  }));
+
+  env.define('<', comparisonBuiltin('<', (left, right) => left < right));
+  env.define('>', comparisonBuiltin('>', (left, right) => left > right));
+  env.define('=', comparisonBuiltin('=', (left, right) => left === right));
+  env.define('<=', comparisonBuiltin('<=', (left, right) => left <= right));
+
+  env.define('not', builtin('not', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: not expects exactly 1 argument`);
+    }
+
+    return !isTruthy(args[0].value);
+  }));
+
+  return env;
+}
+
+function comparisonBuiltin(
+  name: string,
+  predicate: (left: number, right: number) => boolean,
+): BuiltinProcedure {
+  return builtin(name, (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: ${name} expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      const left = expectNumber(args[index]);
+      const right = expectNumber(args[index + 1]);
+      if (!predicate(left, right)) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+}
+
+function builtin(
+  name: string,
+  call: (args: EvaluatedArg[], loc: SourceLoc) => Value,
+): BuiltinProcedure {
+  return { kind: 'procedure', name, call };
+}
+
+function evaluate(expr: Expr, env: Environment): Value {
   switch (expr.type) {
     case 'number':
     case 'boolean':
@@ -269,127 +440,124 @@ function evaluate(expr: Expr): Value {
     case 'string':
       return { kind: 'string', value: expr.value };
     case 'symbol':
-      throw new EvalError(`${expr.line}:${expr.col}: unbound variable ${expr.value}`);
+      return env.lookup(expr.value, expr);
     case 'list':
-      return evaluateList(expr);
+      return evaluateList(expr, env);
   }
 }
 
-function evaluateList(expr: ListExpr): Value {
+function evaluateList(expr: ListExpr, env: Environment): Value {
   if (expr.elements.length === 0) {
     throw new EvalError(`${expr.line}:${expr.col}: cannot evaluate empty list`);
   }
 
   const [head, ...args] = expr.elements;
-  if (head.type !== 'symbol') {
-    throw new EvalError(`${head.line}:${head.col}: operator must be a symbol`);
-  }
 
-  switch (head.value) {
-    case '+':
-      return evalNumericFold(args, head, 0, (left, right) => left + right);
-    case '*':
-      return evalNumericFold(args, head, 1, (left, right) => left * right);
-    case '-':
-      return evalSubtraction(args, head);
-    case '/':
-      return evalDivision(args, head);
-    case '<':
-      return evalComparison(args, head, (left, right) => left < right);
-    case '>':
-      return evalComparison(args, head, (left, right) => left > right);
-    case '=':
-      return evalComparison(args, head, (left, right) => left === right);
-    case '<=':
-      return evalComparison(args, head, (left, right) => left <= right);
-    case 'not':
-      return evalNot(args, head);
-    case 'and':
-      return evalAnd(args);
-    case 'or':
-      return evalOr(args);
-    default:
-      throw new EvalError(`${head.line}:${head.col}: unknown procedure ${head.value}`);
-  }
-}
-
-function evalNumericFold(
-  args: Expr[],
-  head: SymbolExpr,
-  initial: number,
-  op: (left: number, right: number) => number,
-): number {
-  let result = initial;
-  for (const arg of args) {
-    result = op(result, expectNumber(evaluate(arg), arg));
-  }
-  return result;
-}
-
-function evalSubtraction(args: Expr[], head: SymbolExpr): number {
-  if (args.length === 0) {
-    throw new EvalError(`${head.line}:${head.col}: - expects at least 1 argument`);
-  }
-
-  const first = expectNumber(evaluate(args[0]), args[0]);
-  if (args.length === 1) {
-    return -first;
-  }
-
-  let result = first;
-  for (const arg of args.slice(1)) {
-    result -= expectNumber(evaluate(arg), arg);
-  }
-  return result;
-}
-
-function evalDivision(args: Expr[], head: SymbolExpr): number {
-  if (args.length < 2) {
-    throw new EvalError(`${head.line}:${head.col}: / expects at least 2 arguments`);
-  }
-
-  let result = expectNumber(evaluate(args[0]), args[0]);
-  for (const arg of args.slice(1)) {
-    const value = expectNumber(evaluate(arg), arg);
-    if (value === 0) {
-      throw new EvalError(`${arg.line}:${arg.col}: division by zero`);
-    }
-    result /= value;
-  }
-  return result;
-}
-
-function evalComparison(
-  args: Expr[],
-  head: SymbolExpr,
-  predicate: (left: number, right: number) => boolean,
-): boolean {
-  if (args.length < 2) {
-    throw new EvalError(`${head.line}:${head.col}: ${head.value} expects at least 2 arguments`);
-  }
-
-  const values = args.map((arg) => expectNumber(evaluate(arg), arg));
-  for (let index = 0; index < values.length - 1; index += 1) {
-    if (!predicate(values[index], values[index + 1])) {
-      return false;
+  if (head.type === 'symbol') {
+    switch (head.value) {
+      case 'define':
+        return evalDefine(args, head, env);
+      case 'if':
+        return evalIf(args, head, env);
+      case 'quote':
+        return evalQuote(args, head);
+      case 'lambda':
+        return evalLambda(args, head, env);
+      case 'and':
+        return evalAnd(args, env);
+      case 'or':
+        return evalOr(args, env);
     }
   }
-  return true;
+
+  const operator = evaluate(head, env);
+  const evaluatedArgs = args.map((arg) => ({ expr: arg, value: evaluate(arg, env) }));
+  return applyProcedure(operator, evaluatedArgs, head);
 }
 
-function evalNot(args: Expr[], head: SymbolExpr): boolean {
+function evalDefine(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  if (args.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: define expects a name and value`);
+  }
+
+  const target = args[0];
+
+  if (target.type === 'symbol') {
+    if (args.length !== 2) {
+      throw new EvalError(`${head.line}:${head.col}: define expects exactly 2 arguments`);
+    }
+
+    env.define(target.value, evaluate(args[1], env));
+    return VOID_VALUE;
+  }
+
+  if (target.type !== 'list' || target.elements.length === 0) {
+    throw new EvalError(`${head.line}:${head.col}: invalid define target`);
+  }
+
+  const [nameExpr, ...paramExprs] = target.elements;
+  if (nameExpr.type !== 'symbol') {
+    throw new EvalError(`${nameExpr.line}:${nameExpr.col}: function name must be a symbol`);
+  }
+
+  const params = paramExprs.map(expectParameterSymbol);
+  const body = args.slice(1);
+  const proc: ClosureProcedure = {
+    kind: 'procedure',
+    name: nameExpr.value,
+    params,
+    body,
+    env,
+  };
+
+  env.define(nameExpr.value, proc);
+  return VOID_VALUE;
+}
+
+function evalIf(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  if (args.length !== 3) {
+    throw new EvalError(`${head.line}:${head.col}: if expects exactly 3 arguments`);
+  }
+
+  const condition = evaluate(args[0], env);
+  if (isTruthy(condition)) {
+    return evaluate(args[1], env);
+  }
+
+  return evaluate(args[2], env);
+}
+
+function evalQuote(args: Expr[], head: SymbolExpr): Value {
   if (args.length !== 1) {
-    throw new EvalError(`${head.line}:${head.col}: not expects exactly 1 argument`);
+    throw new EvalError(`${head.line}:${head.col}: quote expects exactly 1 argument`);
   }
 
-  return !isTruthy(evaluate(args[0]));
+  return quoteExpr(args[0]);
 }
 
-function evalAnd(args: Expr[]): Value {
+function evalLambda(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  if (args.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: lambda expects parameters and a body`);
+  }
+
+  const paramsExpr = args[0];
+  if (paramsExpr.type !== 'list') {
+    throw new EvalError(`${paramsExpr.line}:${paramsExpr.col}: lambda parameters must be a list`);
+  }
+
+  return {
+    kind: 'procedure',
+    params: paramsExpr.elements.map(expectParameterSymbol),
+    body: args.slice(1),
+    env,
+  };
+}
+
+function evalAnd(args: Expr[], env: Environment): Value {
   let result: Value = true;
 
   for (const arg of args) {
-    result = evaluate(arg);
+    result = evaluate(arg, env);
     if (!isTruthy(result)) {
       return result;
     }
@@ -398,11 +566,11 @@ function evalAnd(args: Expr[]): Value {
   return result;
 }
 
-function evalOr(args: Expr[]): Value {
+function evalOr(args: Expr[], env: Environment): Value {
   let result: Value = false;
 
   for (const arg of args) {
-    result = evaluate(arg);
+    result = evaluate(arg, env);
     if (isTruthy(result)) {
       return result;
     }
@@ -411,15 +579,95 @@ function evalOr(args: Expr[]): Value {
   return result;
 }
 
-function expectNumber(value: Value, expr: Expr): number {
-  if (typeof value !== 'number') {
-    throw new EvalError(`${expr.line}:${expr.col}: expected number`);
+function applyProcedure(operator: Value, args: EvaluatedArg[], loc: SourceLoc): Value {
+  if (!isProcedure(operator)) {
+    throw new EvalError(`${loc.line}:${loc.col}: not a procedure`);
   }
-  return value;
+
+  if (isBuiltinProcedure(operator)) {
+    return operator.call(args, loc);
+  }
+
+  if (args.length !== operator.params.length) {
+    throw new EvalError(
+      `${loc.line}:${loc.col}: ${procedureDisplayName(operator)} expects exactly ${operator.params.length} arguments`,
+    );
+  }
+
+  const callEnv = new Environment(operator.env);
+  for (let index = 0; index < operator.params.length; index += 1) {
+    callEnv.define(operator.params[index], args[index].value);
+  }
+
+  let result: Value = VOID_VALUE;
+  for (const expr of operator.body) {
+    result = evaluate(expr, callEnv);
+  }
+  return result;
+}
+
+function quoteExpr(expr: Expr): Value {
+  switch (expr.type) {
+    case 'number':
+    case 'boolean':
+      return expr.value;
+    case 'string':
+      return { kind: 'string', value: expr.value };
+    case 'symbol':
+      return { kind: 'symbol', value: expr.value };
+    case 'list':
+      return quoteList(expr.elements);
+  }
+}
+
+function quoteList(elements: Expr[]): Value {
+  let result: Value = EMPTY_LIST;
+
+  for (let index = elements.length - 1; index >= 0; index -= 1) {
+    result = { kind: 'pair', car: quoteExpr(elements[index]), cdr: result };
+  }
+
+  return result;
+}
+
+function expectParameterSymbol(expr: Expr): string {
+  if (expr.type !== 'symbol') {
+    throw new EvalError(`${expr.line}:${expr.col}: parameter must be a symbol`);
+  }
+
+  return expr.value;
+}
+
+function expectNumber(arg: EvaluatedArg): number {
+  if (typeof arg.value !== 'number') {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected number`);
+  }
+
+  return arg.value;
 }
 
 function isTruthy(value: Value): boolean {
   return value !== false;
+}
+
+function isProcedure(value: Value): value is ProcedureValue {
+  return typeof value === 'object' && value !== null && value.kind === 'procedure';
+}
+
+function isBuiltinProcedure(value: ProcedureValue): value is BuiltinProcedure {
+  return 'call' in value;
+}
+
+function isPair(value: Value): value is PairValue {
+  return typeof value === 'object' && value !== null && value.kind === 'pair';
+}
+
+function isEmptyList(value: Value): value is EmptyListValue {
+  return typeof value === 'object' && value !== null && value.kind === 'empty-list';
+}
+
+function procedureDisplayName(proc: ClosureProcedure): string {
+  return proc.name ?? 'lambda';
 }
 
 function formatValue(value: Value): string {
@@ -431,7 +679,36 @@ function formatValue(value: Value): string {
     return value ? '#t' : '#f';
   }
 
-  return `"${escapeString(value.value)}"`;
+  switch (value.kind) {
+    case 'string':
+      return `"${escapeString(value.value)}"`;
+    case 'symbol':
+      return value.value;
+    case 'empty-list':
+      return '()';
+    case 'pair':
+      return formatPair(value);
+    case 'void':
+      return '#<void>';
+    case 'procedure':
+      return '#<procedure>';
+  }
+}
+
+function formatPair(value: PairValue): string {
+  const parts: string[] = [];
+  let tail: Value = value;
+
+  while (isPair(tail)) {
+    parts.push(formatValue(tail.car));
+    tail = tail.cdr;
+  }
+
+  if (isEmptyList(tail)) {
+    return `(${parts.join(' ')})`;
+  }
+
+  return `(${parts.join(' ')} . ${formatValue(tail)})`;
 }
 
 function escapeString(value: string): string {
