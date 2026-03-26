@@ -12,6 +12,7 @@ use macros::{
 use number::Number;
 use std::{
     cell::RefCell,
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     panic::{catch_unwind, panic_any, resume_unwind, AssertUnwindSafe},
     rc::Rc,
@@ -46,9 +47,9 @@ struct SchemeString {
 }
 
 #[derive(Debug)]
-struct SchemeStringInner {
-    chars: RefCell<Vec<char>>,
-    mutable: bool,
+enum SchemeStringInner {
+    Immutable { text: String, char_len: usize },
+    Mutable(RefCell<Vec<char>>),
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +86,9 @@ struct DynamicWind {
 
 impl SchemeString {
     fn new_immutable(value: impl AsRef<str>) -> Self {
-        Self::from_chars(value.as_ref().chars().collect(), false)
+        let text = value.as_ref().to_owned();
+        let char_len = text.chars().count();
+        Self::from_immutable_parts(text, char_len)
     }
 
     fn new_mutable(value: impl AsRef<str>) -> Self {
@@ -101,11 +104,13 @@ impl SchemeString {
     }
 
     fn from_chars(chars: Vec<char>, mutable: bool) -> Self {
-        Self {
-            inner: Rc::new(SchemeStringInner {
-                chars: RefCell::new(chars),
-                mutable,
-            }),
+        if mutable {
+            Self {
+                inner: Rc::new(SchemeStringInner::Mutable(RefCell::new(chars))),
+            }
+        } else {
+            let char_len = chars.len();
+            Self::from_immutable_parts(chars.into_iter().collect(), char_len)
         }
     }
 
@@ -114,32 +119,125 @@ impl SchemeString {
     }
 
     fn copy_runtime(&self) -> Self {
-        Self::from_chars(self.chars(), strings_are_mutable_in_current_level())
+        if strings_are_mutable_in_current_level() {
+            Self::from_chars(self.chars(), true)
+        } else {
+            match self.inner.as_ref() {
+                SchemeStringInner::Immutable { text, char_len } => {
+                    Self::from_immutable_parts(text.clone(), *char_len)
+                }
+                SchemeStringInner::Mutable(chars) => {
+                    Self::from_chars(chars.borrow().clone(), false)
+                }
+            }
+        }
+    }
+
+    fn from_immutable_parts(text: String, char_len: usize) -> Self {
+        Self {
+            inner: Rc::new(SchemeStringInner::Immutable { text, char_len }),
+        }
     }
 
     fn chars(&self) -> Vec<char> {
-        self.inner.chars.borrow().clone()
+        match self.inner.as_ref() {
+            SchemeStringInner::Immutable { text, .. } => text.chars().collect(),
+            SchemeStringInner::Mutable(chars) => chars.borrow().clone(),
+        }
     }
 
     fn len(&self) -> usize {
-        self.inner.chars.borrow().len()
+        match self.inner.as_ref() {
+            SchemeStringInner::Immutable { char_len, .. } => *char_len,
+            SchemeStringInner::Mutable(chars) => chars.borrow().len(),
+        }
     }
 
     fn get(&self, index: usize) -> char {
-        self.inner.chars.borrow()[index]
+        match self.inner.as_ref() {
+            SchemeStringInner::Immutable { text, .. } => text
+                .chars()
+                .nth(index)
+                .expect("string-ref index already validated"),
+            SchemeStringInner::Mutable(chars) => chars.borrow()[index],
+        }
     }
 
     fn set(&self, index: usize, value: char, name: &'static str) -> Result<(), EvalError> {
-        if !self.inner.mutable {
-            return Err(EvalError::ImmutableString { name });
+        match self.inner.as_ref() {
+            SchemeStringInner::Immutable { .. } => Err(EvalError::ImmutableString { name }),
+            SchemeStringInner::Mutable(chars) => {
+                chars.borrow_mut()[index] = value;
+                Ok(())
+            }
         }
-
-        self.inner.chars.borrow_mut()[index] = value;
-        Ok(())
     }
 
     fn to_plain_string(&self) -> String {
-        self.inner.chars.borrow().iter().collect()
+        match self.inner.as_ref() {
+            SchemeStringInner::Immutable { text, .. } => text.clone(),
+            SchemeStringInner::Mutable(chars) => chars.borrow().iter().collect(),
+        }
+    }
+
+    fn append_to(&self, output: &mut String) {
+        match self.inner.as_ref() {
+            SchemeStringInner::Immutable { text, .. } => output.push_str(text),
+            SchemeStringInner::Mutable(chars) => output.extend(chars.borrow().iter().copied()),
+        }
+    }
+
+    fn for_each_char(&self, mut visit: impl FnMut(char)) {
+        match self.inner.as_ref() {
+            SchemeStringInner::Immutable { text, .. } => text.chars().for_each(visit),
+            SchemeStringInner::Mutable(chars) => {
+                for ch in chars.borrow().iter().copied() {
+                    visit(ch);
+                }
+            }
+        }
+    }
+
+    fn content_eq(&self, other: &Self) -> bool {
+        match (self.inner.as_ref(), other.inner.as_ref()) {
+            (
+                SchemeStringInner::Immutable { text: left, .. },
+                SchemeStringInner::Immutable { text: right, .. },
+            ) => left == right,
+            (
+                SchemeStringInner::Immutable { text: left, .. },
+                SchemeStringInner::Mutable(right),
+            ) => left.chars().eq(right.borrow().iter().copied()),
+            (
+                SchemeStringInner::Mutable(left),
+                SchemeStringInner::Immutable { text: right, .. },
+            ) => left.borrow().iter().copied().eq(right.chars()),
+            (SchemeStringInner::Mutable(left), SchemeStringInner::Mutable(right)) => {
+                left.borrow().as_slice() == right.borrow().as_slice()
+            }
+        }
+    }
+
+    fn content_cmp(&self, other: &Self) -> Ordering {
+        match (self.inner.as_ref(), other.inner.as_ref()) {
+            (
+                SchemeStringInner::Immutable { text: left, .. },
+                SchemeStringInner::Immutable { text: right, .. },
+            ) => left.cmp(right),
+            (
+                SchemeStringInner::Immutable { text: left, .. },
+                SchemeStringInner::Mutable(right),
+            ) => left.chars().cmp(right.borrow().iter().copied()),
+            (
+                SchemeStringInner::Mutable(left),
+                SchemeStringInner::Immutable { text: right, .. },
+            ) => left.borrow().iter().copied().cmp(right.chars()),
+            (SchemeStringInner::Mutable(left), SchemeStringInner::Mutable(right)) => left
+                .borrow()
+                .iter()
+                .copied()
+                .cmp(right.borrow().iter().copied()),
+        }
     }
 }
 
@@ -1550,9 +1648,11 @@ fn eval_top_level_state(
     let mut expressions = state.remaining.into_iter();
 
     while let Some(expression) = expressions.next() {
-        if register_top_level_macro_definition(&expression.expr, &state.env, &mut state.macros).map_err(
-            |error| error.with_position(expression.position.line, expression.position.column),
-        )? {
+        if register_top_level_macro_definition(&expression.expr, &state.env, &mut state.macros)
+            .map_err(|error| {
+                error.with_position(expression.position.line, expression.position.column)
+            })?
+        {
             last_value = Value::Void;
             continue;
         }
@@ -3270,7 +3370,8 @@ fn eval_syntax_case_step(
             });
         }
 
-        let result = expect_single_value(eval_sequence(&items[body_index..], &clause_env, context)?)?;
+        let result =
+            expect_single_value(eval_sequence(&items[body_index..], &clause_env, context)?)?;
         let syntax = expect_syntax("syntax-case", &result)?;
         return Ok(EvalStep::Value(Value::Syntax(syntax)));
     }
@@ -3324,7 +3425,10 @@ fn eval_with_syntax_step(
 
             let produced = eval_expr_in_env_single(&items[1], env, context)?;
             let produced = expect_syntax("with-syntax", &produced)?;
-            Ok((items[0].clone(), expr_from_syntax(produced.as_ref().clone())))
+            Ok((
+                items[0].clone(),
+                expr_from_syntax(produced.as_ref().clone()),
+            ))
         })
         .collect::<Result<Vec<_>, EvalError>>()?;
 
@@ -3844,17 +3948,14 @@ fn clear_active_pairs(active: &mut HashSet<usize>, inserted: &mut Vec<usize>) {
 }
 
 fn render_string_literal(value: &SchemeString) -> String {
-    let escaped = value
-        .to_plain_string()
-        .chars()
-        .flat_map(|ch| match ch {
-            '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
-            '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
-            '\n' => ['\\', 'n'].into_iter().collect::<Vec<_>>(),
-            '\t' => ['\\', 't'].into_iter().collect::<Vec<_>>(),
-            other => [other].into_iter().collect::<Vec<_>>(),
-        })
-        .collect::<String>();
+    let mut escaped = String::new();
+    value.for_each_char(|ch| match ch {
+        '\\' => escaped.push_str("\\\\"),
+        '"' => escaped.push_str("\\\""),
+        '\n' => escaped.push_str("\\n"),
+        '\t' => escaped.push_str("\\t"),
+        other => escaped.push(other),
+    });
 
     format!("\"{escaped}\"")
 }
@@ -4392,9 +4493,11 @@ fn apply_builtin(
         }
         "for-each" => apply_for_each(args, context),
         "gcd" => apply_gcd(args),
-        "identifier?" => predicate_builtin("identifier?", args, |value| {
-            matches!(value, Value::Syntax(syntax) if matches!(syntax.as_ref(), SyntaxExpr::Symbol(_)))
-        }),
+        "identifier?" => predicate_builtin(
+            "identifier?",
+            args,
+            |value| matches!(value, Value::Syntax(syntax) if matches!(syntax.as_ref(), SyntaxExpr::Symbol(_))),
+        ),
         "length" => {
             let list = collect_list_arg("length", args)?;
             Ok(Value::Number(Number::integer(list.len() as i64)))
@@ -4731,7 +4834,7 @@ fn apply_builtin(
         "string-append" => {
             let mut result = String::new();
             for arg in args {
-                result.push_str(&expect_string("string-append", arg)?.to_plain_string());
+                expect_string("string-append", arg)?.append_to(&mut result);
             }
             Ok(Value::String(SchemeString::new_runtime(result)))
         }
@@ -4740,7 +4843,7 @@ fn apply_builtin(
             Ok(Value::String(value.copy_runtime()))
         }
         "string-ci=?" => compare_strings("string-ci=?", args, |left, right| {
-            left.to_lowercase() == right.to_lowercase()
+            left.to_plain_string().to_lowercase() == right.to_plain_string().to_lowercase()
         }),
         "string-downcase" => {
             let value = expect_string_arg("string-downcase", args)?;
@@ -4748,15 +4851,23 @@ fn apply_builtin(
                 value.to_plain_string().to_lowercase(),
             )))
         }
-        "string=?" => compare_strings("string=?", args, |left, right| left == right),
-        "string<=?" => compare_strings("string<=?", args, |left, right| left <= right),
+        "string=?" => compare_strings("string=?", args, SchemeString::content_eq),
+        "string<=?" => compare_strings("string<=?", args, |left, right| {
+            left.content_cmp(right) != Ordering::Greater
+        }),
         "string-length" => {
             let value = expect_string_arg("string-length", args)?;
             Ok(Value::Number(Number::integer(value.len() as i64)))
         }
-        "string>=?" => compare_strings("string>=?", args, |left, right| left >= right),
-        "string>?" => compare_strings("string>?", args, |left, right| left > right),
-        "string<?" => compare_strings("string<?", args, |left, right| left < right),
+        "string>=?" => compare_strings("string>=?", args, |left, right| {
+            left.content_cmp(right) != Ordering::Less
+        }),
+        "string>?" => compare_strings("string>?", args, |left, right| {
+            left.content_cmp(right) == Ordering::Greater
+        }),
+        "string<?" => compare_strings("string<?", args, |left, right| {
+            left.content_cmp(right) == Ordering::Less
+        }),
         "string-ref" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount {
@@ -5016,11 +5127,11 @@ fn compare_characters(
 fn compare_strings(
     name: &'static str,
     args: &[Value],
-    predicate: impl Fn(&str, &str) -> bool,
+    predicate: impl Fn(&SchemeString, &SchemeString) -> bool,
 ) -> Result<Value, EvalError> {
     let strings = args
         .iter()
-        .map(|value| expect_string(name, value).map(|string| string.to_plain_string()))
+        .map(|value| expect_string(name, value))
         .collect::<Result<Vec<_>, EvalError>>()?;
 
     if strings.len() < 2 {
@@ -5421,9 +5532,7 @@ fn equal_values_inner(
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => left.numeric_eq(right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
-        (Value::String(left), Value::String(right)) => {
-            left.to_plain_string() == right.to_plain_string()
-        }
+        (Value::String(left), Value::String(right)) => left.content_eq(right),
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::List(left), Value::List(right)) => {
