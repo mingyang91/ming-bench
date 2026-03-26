@@ -13,7 +13,8 @@ type SchemeVal =
   | { tag: 'nil'; pos?: Pos }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
   | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }  // parse-time only
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos };
+  | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'builtin'; name: string; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}: ` : '';
@@ -186,6 +187,24 @@ function parse(tokens: Token[]): SchemeVal[] {
 
 // ── Evaluator ──────────────────────────────────────────────────────────
 
+function parseParams(elements: SchemeVal[], pos?: Pos): { params: string[]; restParam?: string } {
+  const params: string[] = [];
+  let restParam: string | undefined;
+  for (let i = 0; i < elements.length; i++) {
+    const p = elements[i];
+    if (p.tag === 'symbol' && p.value === '.') {
+      if (i + 1 >= elements.length) throw errAt('bad dot syntax in params', pos);
+      const rest = elements[i + 1];
+      if (rest.tag !== 'symbol') throw errAt('rest param must be symbol', pos);
+      restParam = rest.value;
+      break;
+    }
+    if (p.tag !== 'symbol') throw errAt('param must be symbol', pos);
+    params.push(p.value);
+  }
+  return { params, restParam };
+}
+
 function isTruthy(val: SchemeVal): boolean {
   return !(val.tag === 'boolean' && val.value === false);
 }
@@ -232,12 +251,9 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             }
             if (target.tag === 'list' && target.elements.length > 0 && target.elements[0].tag === 'symbol') {
               const name = target.elements[0].value;
-              const params = target.elements.slice(1).map(p => {
-                if (p.tag !== 'symbol') throw errAt('define: param must be symbol', expr.pos);
-                return p.value;
-              });
+              const { params, restParam } = parseParams(target.elements.slice(1), expr.pos);
               const body = elems.slice(2);
-              const lambda: SchemeVal = { tag: 'lambda', params, body, env };
+              const lambda: SchemeVal = { tag: 'lambda', params, restParam, body, env };
               env.set(name, lambda);
               return lambda;
             }
@@ -246,13 +262,15 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
           case 'lambda': {
             if (elems.length < 3) throw errAt('lambda: bad syntax', expr.pos);
             const paramList = elems[1];
+            // (lambda args body) — single symbol captures all args
+            if (paramList.tag === 'symbol') {
+              const body = elems.slice(2);
+              return { tag: 'lambda', params: [], restParam: paramList.value, body, env };
+            }
             if (paramList.tag !== 'list') throw errAt('lambda: params must be a list', expr.pos);
-            const params = paramList.elements.map(p => {
-              if (p.tag !== 'symbol') throw errAt('lambda: param must be symbol', expr.pos);
-              return p.value;
-            });
+            const { params, restParam } = parseParams(paramList.elements, expr.pos);
             const body = elems.slice(2);
-            return { tag: 'lambda', params, body, env };
+            return { tag: 'lambda', params, restParam, body, env };
           }
           case 'and': {
             let result: SchemeVal = SCM_TRUE;
@@ -367,25 +385,14 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
       // Function application
       const args = elems.slice(1).map(a => evalExpr(a, env));
 
-      // Try builtin first for bare symbols
-      if (head.tag === 'symbol' && isBuiltin(head.value)) {
-        return applyBuiltin(head.value, args, expr.pos);
-      }
-
       const proc = evalExpr(head, env);
 
       if (proc.tag === 'lambda') {
-        if (args.length !== proc.params.length)
-          throw errAt(`expected ${proc.params.length} arguments, got ${args.length}`, expr.pos);
-        const callEnv = new Env(proc.env);
-        for (let i = 0; i < proc.params.length; i++) {
-          callEnv.set(proc.params[i], args[i]);
-        }
-        let result: SchemeVal = SCM_FALSE;
-        for (const bodyExpr of proc.body) {
-          result = evalExpr(bodyExpr, callEnv);
-        }
-        return result;
+        return applyLambda(proc, args, expr.pos);
+      }
+
+      if (proc.tag === 'builtin') {
+        return applyBuiltin(proc.name, args, expr.pos);
       }
 
       throw errAt(`not a procedure: ${display(proc)}`, expr.pos);
@@ -393,6 +400,34 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
     default:
       throw errAt(`cannot evaluate: ${display(expr)}`, expr.pos);
   }
+}
+
+function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], pos?: Pos): SchemeVal {
+  if (proc.restParam) {
+    if (args.length < proc.params.length)
+      throw errAt(`expected at least ${proc.params.length} arguments, got ${args.length}`, pos);
+  } else {
+    if (args.length !== proc.params.length)
+      throw errAt(`expected ${proc.params.length} arguments, got ${args.length}`, pos);
+  }
+  const callEnv = new Env(proc.env);
+  for (let i = 0; i < proc.params.length; i++) {
+    callEnv.set(proc.params[i], args[i]);
+  }
+  if (proc.restParam) {
+    callEnv.set(proc.restParam, arrayToList(args.slice(proc.params.length)));
+  }
+  let result: SchemeVal = SCM_FALSE;
+  for (const bodyExpr of proc.body) {
+    result = evalExpr(bodyExpr, callEnv);
+  }
+  return result;
+}
+
+function applyProc(proc: SchemeVal, args: SchemeVal[], pos?: Pos): SchemeVal {
+  if (proc.tag === 'lambda') return applyLambda(proc, args, pos);
+  if (proc.tag === 'builtin') return applyBuiltin(proc.name, args, pos);
+  throw errAt(`not a procedure: ${display(proc)}`, pos);
 }
 
 function requireNumbers(name: string, args: SchemeVal[], pos?: Pos): number[] {
@@ -412,6 +447,7 @@ const BUILTINS = new Set([
   'symbol->string', 'string->symbol',
   'string-ref',
   'string-copy', 'string-set!',
+  'apply',
 ]);
 
 function isBuiltin(name: string): boolean {
@@ -598,6 +634,17 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       (args[0] as any).value = args[0].value.substring(0, si) + args[2].value + args[0].value.substring(si + 1);
       return SCM_FALSE;
     }
+    case 'apply': {
+      if (args.length < 2) throw errAt('apply: expected at least 2 arguments', pos);
+      const proc = args[0];
+      const lastArg = args[args.length - 1];
+      const tailList = pairToArray(lastArg);
+      if (tailList === null && lastArg.tag !== 'nil')
+        throw errAt('apply: last argument must be a proper list', pos);
+      const prefixArgs = args.slice(1, args.length - 1);
+      const allArgs = prefixArgs.concat(tailList ?? []);
+      return applyProc(proc, allArgs, pos);
+    }
     default:
       throw errAt(`unbound variable: ${name}`, pos);
   }
@@ -633,6 +680,7 @@ function display(val: SchemeVal): string {
     case 'list': return `(${val.elements.map(display).join(' ')})`;
     case 'char': return `#\\${val.value === ' ' ? 'space' : val.value === '\n' ? 'newline' : val.value}`;
     case 'lambda': return '#<procedure>';
+    case 'builtin': return '#<procedure>';
   }
 }
 
@@ -659,7 +707,11 @@ function displayFormat(val: SchemeVal): string {
 // ── Public API ─────────────────────────────────────────────────────────
 
 function makeGlobalEnv(): Env {
-  return new Env();
+  const env = new Env();
+  for (const name of BUILTINS) {
+    env.set(name, { tag: 'builtin', name });
+  }
+  return env;
 }
 
 export function evalStr(input: string): string {
