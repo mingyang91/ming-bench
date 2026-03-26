@@ -22,6 +22,11 @@ pub enum EvalError {
     RaisedValue(Box<crate::scheme::Value>),
     #[error("step limit exceeded")]
     StepLimitExceeded,
+    /// Internal: CPS trampoline bounce — carries body, env, and continuation
+    /// to avoid stack overflow in deep CPS recursion.
+    #[error("cps bounce")]
+    #[allow(private_interfaces)]
+    CpsBounce(Vec<crate::scheme::Expr>, crate::scheme::Env, crate::scheme::ContFn),
 }
 
 impl PartialEq for EvalError {
@@ -35,6 +40,7 @@ impl PartialEq for EvalError {
             (EvalError::ContinuationEscape(a, _), EvalError::ContinuationEscape(b, _)) => a == b,
             (EvalError::RaisedValue(_), EvalError::RaisedValue(_)) => true,
             (EvalError::StepLimitExceeded, EvalError::StepLimitExceeded) => true,
+            (EvalError::CpsBounce(_, _, _), EvalError::CpsBounce(_, _, _)) => true,
             _ => false,
         }
     }

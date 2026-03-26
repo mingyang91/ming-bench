@@ -8,26 +8,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A RefCell wrapper that is Sync. Safe because values are never shared
-/// between threads — each eval_str call creates its own independent value graph.
-struct SyncCell<T>(RefCell<T>);
-
-unsafe impl<T: Send> Sync for SyncCell<T> {}
-
-impl<T> SyncCell<T> {
-    fn new(val: T) -> Self { SyncCell(RefCell::new(val)) }
-    fn borrow(&self) -> std::cell::Ref<'_, T> { self.0.borrow() }
-    fn borrow_mut(&self) -> std::cell::RefMut<'_, T> { self.0.borrow_mut() }
-}
-
-impl<T: fmt::Debug> fmt::Debug for SyncCell<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-type VecRef = Arc<SyncCell<Vec<Value>>>;
-type PairRef = Arc<SyncCell<(Value, Value)>>;
+type VecRef = Arc<RefCell<Vec<Value>>>;
+type PairRef = Arc<RefCell<(Value, Value)>>;
 
 // Continuation support
 static CC_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -145,7 +127,7 @@ enum Value {
 }
 
 fn make_pair(car: Value, cdr: Value) -> Value {
-    Value::Pair(Arc::new(SyncCell::new((car, cdr))))
+    Value::Pair(Arc::new(RefCell::new((car, cdr))))
 }
 
 static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -174,8 +156,6 @@ struct RestartCtx {
 
 thread_local! {
     static OUTPUT: RefCell<String> = RefCell::new(String::new());
-    // CPS recursion depth counter for trampoline bounce
-    static CPS_DEPTH: RefCell<usize> = RefCell::new(0);
     // Stack of active call/cc IDs (for escape detection)
     static ACTIVE_CC: RefCell<Vec<usize>> = RefCell::new(Vec::new());
     // Override stack: when a reentrant continuation is invoked, it pushes the value here.
@@ -224,7 +204,7 @@ fn display_value(val: &Value) -> String {
     }
 }
 
-type Env = Arc<SyncCell<EnvInner>>;
+type Env = Rc<RefCell<EnvInner>>;
 
 #[derive(Debug)]
 struct EnvInner {
@@ -233,7 +213,7 @@ struct EnvInner {
 }
 
 fn new_env(parent: Option<Env>) -> Env {
-    Arc::new(SyncCell::new(EnvInner {
+    Arc::new(RefCell::new(EnvInner {
         bindings: HashMap::new(),
         parent,
     }))
@@ -1508,7 +1488,7 @@ fn expr_to_value(expr: &Expr) -> Value {
             let tail_val = expr_to_value(tail);
             let mut result = tail_val;
             for e in elems.iter().rev() {
-                result = Value::Pair(Arc::new(SyncCell::new((expr_to_value(e), result))));
+                result = Value::Pair(Arc::new(RefCell::new((expr_to_value(e), result))));
             }
             result
         }
@@ -1602,7 +1582,7 @@ fn eval_quasiquote(expr: &Expr, env: &Env, depth: usize) -> Result<Value, EvalEr
             // Build dotted list
             let mut cur = tail_val;
             for v in result.into_iter().rev() {
-                cur = Value::Pair(Arc::new(SyncCell::new((v, cur))));
+                cur = Value::Pair(Arc::new(RefCell::new((v, cur))));
             }
             Ok(cur)
         }
@@ -2845,14 +2825,9 @@ fn eval_case(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             Expr::List(parts, _) if !parts.is_empty() => {
                 if let Expr::Symbol(s, _) = &parts[0] {
                     if s == "else" {
-                        let body = &parts[1..];
                         let mut result = Value::Boolean(false);
-                        for (i, expr) in body.iter().enumerate() {
-                            if i == body.len() - 1 {
-                                result = eval_step(expr, env)?;
-                            } else {
-                                result = eval(expr, env)?;
-                            }
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
                         }
                         return Ok(result);
                     }
@@ -2861,14 +2836,9 @@ fn eval_case(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
                     for datum in datums {
                         let dval = expr_to_value(datum);
                         if eqv_values(&key, &dval) {
-                            let body = &parts[1..];
                             let mut result = Value::Boolean(false);
-                            for (i, expr) in body.iter().enumerate() {
-                                if i == body.len() - 1 {
-                                    result = eval_step(expr, env)?;
-                                } else {
-                                    result = eval(expr, env)?;
-                                }
+                            for expr in &parts[1..] {
+                                result = eval(expr, env)?;
                             }
                             return Ok(result);
                         }
@@ -3663,7 +3633,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             Ok(Value::Boolean(eqv_values(&args[0], &args[1])))
         }
         "vector" => {
-            Ok(Value::Vector(Arc::new(SyncCell::new(args.to_vec()))))
+            Ok(Value::Vector(Arc::new(RefCell::new(args.to_vec()))))
         }
         "make-vector" => {
             if args.is_empty() || args.len() > 2 {
@@ -3671,7 +3641,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             }
             let len = args[0].as_integer_at(p)? as usize;
             let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
-            Ok(Value::Vector(Arc::new(SyncCell::new(vec![fill; len]))))
+            Ok(Value::Vector(Arc::new(RefCell::new(vec![fill; len]))))
         }
         "vector-ref" => {
             ensure_args(op, args, 2, p)?;
@@ -3737,7 +3707,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                     _ => return Err(EvalError::Type(format!("list->vector: expected list at {}", p))),
                 }
             }
-            Ok(Value::Vector(Arc::new(SyncCell::new(elems))))
+            Ok(Value::Vector(Arc::new(RefCell::new(elems))))
         }
         "assq" => {
             ensure_args(op, args, 2, p)?;
@@ -4368,7 +4338,7 @@ fn eval_cps(expr: &Expr, env: &Env, k: ContFn) -> Result<Value, EvalError> {
 
                         // Call body-thunk via CPS; body_k handles normal completion
                         let out_thunk2 = out_thunk.clone();
-                        let cleaned_up = Arc::new(SyncCell::new(false));
+                        let cleaned_up = Arc::new(RefCell::new(false));
                         let cleaned_up2 = cleaned_up.clone();
                         let body_k = ContFn::new(move |body_val| {
                             *cleaned_up2.borrow_mut() = true;
@@ -4381,7 +4351,6 @@ fn eval_cps(expr: &Expr, env: &Env, k: ContFn) -> Result<Value, EvalError> {
 
                         match result {
                             Ok(v) => return Ok(v),
-                            Err(EvalError::CpsBounce(..)) => return result,
                             Err(EvalError::ContinuationEscape(id, val)) => {
                                 if !*cleaned_up.borrow() {
                                     WIND_STACK.with(|ws| ws.borrow_mut().pop());
@@ -4719,7 +4688,7 @@ fn apply_cps_callcc(f: Value, pos: Pos, outer_k: ContFn) -> Result<Value, EvalEr
     // (the CPS chain extended past the lambda return). In that case, use restart_fn
     // for correct dynamic-wind handling. If the lambda hasn't returned, it's a true
     // escape and outer_k is used for stack efficiency (important for ctak-style code).
-    let lambda_returned = Arc::new(SyncCell::new(false));
+    let lambda_returned = Arc::new(RefCell::new(false));
     let lambda_returned2 = lambda_returned.clone();
     let outer_k_for_escape = outer_k.clone();
     let tracked_outer_k = ContFn::new(move |v| {
@@ -4814,22 +4783,7 @@ fn apply_cps_value(func: Value, args: Vec<Value>, pos: Pos, k: ContFn) -> Result
             if body.is_empty() {
                 return k.call(Value::Boolean(false));
             }
-            let depth = CPS_DEPTH.with(|d| {
-                let mut d = d.borrow_mut();
-                *d += 1;
-                *d
-            });
-            if depth > 16 {
-                CPS_DEPTH.with(|d| *d.borrow_mut() = 0);
-                Err(EvalError::CpsBounce(body.clone(), local_env, k))
-            } else {
-                let result = eval_body_cps(body, &local_env, k);
-                CPS_DEPTH.with(|d| {
-                    let mut d = d.borrow_mut();
-                    if *d > 0 { *d -= 1; }
-                });
-                result
-            }
+            eval_body_cps(body, &local_env, k)
         }
         Value::CaseLambda { clauses, env } => {
             for (params, rest_param, body) in clauses {
@@ -4850,22 +4804,7 @@ fn apply_cps_value(func: Value, args: Vec<Value>, pos: Pos, k: ContFn) -> Result
                     if body.is_empty() {
                         return k.call(Value::Boolean(false));
                     }
-                    let depth = CPS_DEPTH.with(|d| {
-                        let mut d = d.borrow_mut();
-                        *d += 1;
-                        *d
-                    });
-                    if depth > 16 {
-                        CPS_DEPTH.with(|d| *d.borrow_mut() = 0);
-                        return Err(EvalError::CpsBounce(body.clone(), local_env, k));
-                    } else {
-                        let result = eval_body_cps(body, &local_env, k);
-                        CPS_DEPTH.with(|d| {
-                            let mut d = d.borrow_mut();
-                            if *d > 0 { *d -= 1; }
-                        });
-                        return result;
-                    }
+                    return eval_body_cps(body, &local_env, k);
                 }
             }
             Err(EvalError::Arity(format!(
@@ -4911,16 +4850,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     // Check if any expression contains call/cc; if so, use the CPS evaluator.
     if exprs.iter().any(contains_callcc) {
         let k = ContFn::new(|v| Ok(v));
-        let mut result = eval_body_cps(&exprs, &env, k);
-        loop {
-            match result {
-                Err(EvalError::CpsBounce(body, bounce_env, bounce_k)) => {
-                    result = eval_body_cps(&body, &bounce_env, bounce_k);
-                }
-                _ => break,
-            }
-        }
-        return Ok(result?.to_string());
+        let result = eval_body_cps(&exprs, &env, k)?;
+        return Ok(result.to_string());
     }
     let mut result = Value::Boolean(false);
     for expr in &exprs {
@@ -4952,16 +4883,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     // Check if any expression contains call/cc; if so, use the CPS evaluator.
     let result = if exprs.iter().any(contains_callcc) {
         let k = ContFn::new(|v| Ok(v));
-        let mut cps_result = eval_body_cps(&exprs, &env, k);
-        loop {
-            match cps_result {
-                Err(EvalError::CpsBounce(body, bounce_env, bounce_k)) => {
-                    cps_result = eval_body_cps(&body, &bounce_env, bounce_k);
-                }
-                _ => break,
-            }
-        }
-        cps_result?
+        eval_body_cps(&exprs, &env, k)?
     } else {
         let mut result = Value::Boolean(false);
         for expr in &exprs {
@@ -4970,7 +4892,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         result
     };
     let output = OUTPUT.with(|out| out.borrow().clone());
-    Ok((display_value(&result), output))
+    Ok((result.to_string(), output))
 }
 
 #[cfg(test)]
