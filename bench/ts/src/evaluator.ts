@@ -42,6 +42,7 @@ type StringValue = { kind: 'string'; value: string; mutable: boolean };
 type SymbolValue = { kind: 'symbol'; name: string };
 type NilValue = { kind: 'nil' };
 type PairValue = { kind: 'pair'; car: RuntimeValue; cdr: RuntimeValue };
+type VectorValue = { kind: 'vector'; elements: RuntimeValue[] };
 type RecordTypeDescriptor = {
   name: string;
   fieldNames: string[];
@@ -106,6 +107,7 @@ type RuntimeValue =
   | SymbolValue
   | NilValue
   | PairValue
+  | VectorValue
   | RecordValue
   | BuiltinProcedure
   | ClosureProcedure
@@ -171,6 +173,7 @@ const BUILTIN_NAMES = [
   'symbol?',
   'procedure?',
   'eq?',
+  'eqv?',
   'equal?',
   'display',
   'write',
@@ -201,6 +204,14 @@ const BUILTIN_NAMES = [
   'char-downcase',
   'char=?',
   'char<?',
+  'vector',
+  'make-vector',
+  'vector-ref',
+  'vector-set!',
+  'vector-length',
+  'vector?',
+  'vector->list',
+  'list->vector',
   'apply',
 ] as const;
 type BuiltinName = (typeof BUILTIN_NAMES)[number];
@@ -611,8 +622,16 @@ function evaluateList(elements: Expr[], env: Environment, context: EvalContext):
         return evaluateBegin(argExprs, env, context);
       case 'let':
         return evaluateLet(argExprs, env, context);
+      case 'letrec':
+        return evaluateLetrec(argExprs, env, context, false);
+      case 'letrec*':
+        return evaluateLetrec(argExprs, env, context, true);
       case 'cond':
         return evaluateCond(argExprs, env, context);
+      case 'case':
+        return evaluateCase(argExprs, env, context);
+      case 'do':
+        return evaluateDo(argExprs, env, context);
     }
 
     const macroRules = env.lookupMacro(head.name);
@@ -800,14 +819,20 @@ function evaluateSet(argExprs: Expr[], env: Environment, context: EvalContext): 
 }
 
 function evaluateIf(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
-  if (argExprs.length !== 3) {
-    throw new EvalError('if expects exactly 3 arguments');
+  if (argExprs.length !== 2 && argExprs.length !== 3) {
+    throw new EvalError('if expects exactly 2 or 3 arguments');
   }
 
   const condition = evaluateExpr(argExprs[0], env, context);
-  return isTruthy(condition)
-    ? evaluateExpr(argExprs[1], env, context)
-    : evaluateExpr(argExprs[2], env, context);
+  if (isTruthy(condition)) {
+    return evaluateExpr(argExprs[1], env, context);
+  }
+
+  if (argExprs[2] === undefined) {
+    return VOID_VALUE;
+  }
+
+  return evaluateExpr(argExprs[2], env, context);
 }
 
 function evaluateQuote(argExprs: Expr[]): RuntimeValue {
@@ -1876,8 +1901,12 @@ function isSpecialFormName(name: string): boolean {
     case 'and':
     case 'or':
     case 'let':
+    case 'letrec':
+    case 'letrec*':
     case 'begin':
     case 'cond':
+    case 'case':
+    case 'do':
     case 'syntax-rules':
     case 'else':
     case '.':
@@ -1996,6 +2025,40 @@ function readLetBindings(bindingsExpr: Expr): { names: string[]; initExprs: Expr
   return { names, initExprs };
 }
 
+function evaluateLetrec(
+  argExprs: Expr[],
+  env: Environment,
+  context: EvalContext,
+  sequential: boolean,
+): RuntimeValue {
+  if (argExprs.length < 2) {
+    throw new EvalError(`${sequential ? 'letrec*' : 'letrec'} expects bindings and a body`);
+  }
+
+  const bindings = readLetBindings(argExprs[0]);
+  const body = argExprs.slice(1);
+  const letEnv = new Environment(env);
+
+  if (sequential) {
+    for (let index = 0; index < bindings.names.length; index += 1) {
+      const name = bindings.names[index];
+      letEnv.define(name, VOID_VALUE);
+      letEnv.assign(name, evaluateExpr(bindings.initExprs[index], letEnv, context));
+    }
+  } else {
+    for (const name of bindings.names) {
+      letEnv.define(name, VOID_VALUE);
+    }
+
+    const values = bindings.initExprs.map((expr) => evaluateExpr(expr, letEnv, context));
+    for (let index = 0; index < bindings.names.length; index += 1) {
+      letEnv.assign(bindings.names[index], values[index]);
+    }
+  }
+
+  return evaluateSequence(body, letEnv, context);
+}
+
 function evaluateCond(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
   for (let index = 0; index < argExprs.length; index += 1) {
     const clauseExpr = argExprs[index];
@@ -2029,6 +2092,120 @@ function evaluateCond(argExprs: Expr[], env: Environment, context: EvalContext):
   }
 
   return VOID_VALUE;
+}
+
+function evaluateCase(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
+  if (argExprs.length < 1) {
+    throw new EvalError('case expects a key and at least 1 clause');
+  }
+
+  const [keyExpr, ...clauseExprs] = argExprs;
+  if (clauseExprs.length === 0) {
+    throw new EvalError('case expects at least 1 clause');
+  }
+
+  const key = evaluateExpr(keyExpr, env, context);
+
+  for (let index = 0; index < clauseExprs.length; index += 1) {
+    const clauseExpr = clauseExprs[index];
+    if (clauseExpr.kind !== 'list' || clauseExpr.elements.length === 0) {
+      throw new EvalError('case clauses must be non-empty lists');
+    }
+
+    const [datumExpr, ...body] = clauseExpr.elements;
+    const isElseClause = datumExpr.kind === 'symbol' && datumExpr.name === 'else';
+
+    if (isElseClause) {
+      if (index !== clauseExprs.length - 1) {
+        throw new EvalError('case else clause must be last');
+      }
+      if (body.length === 0) {
+        throw new EvalError('case else clause expects at least 1 expression');
+      }
+      return evaluateSequence(body, env, context);
+    }
+
+    if (datumExpr.kind !== 'list') {
+      throw new EvalError('case clauses must start with a datum list or else');
+    }
+
+    for (const datum of datumExpr.elements) {
+      if (eqValues(key, quoteExpr(datum))) {
+        return body.length === 0 ? VOID_VALUE : evaluateSequence(body, env, context);
+      }
+    }
+  }
+
+  return VOID_VALUE;
+}
+
+function evaluateDo(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
+  if (argExprs.length < 2) {
+    throw new EvalError('do expects bindings, a termination clause, and optional body expressions');
+  }
+
+  const bindings = readDoBindings(argExprs[0]);
+  const terminationExpr = argExprs[1];
+  const body = argExprs.slice(2);
+
+  if (terminationExpr.kind !== 'list' || terminationExpr.elements.length === 0) {
+    throw new EvalError('do termination clause must be a non-empty list');
+  }
+
+  const [testExpr, ...resultExprs] = terminationExpr.elements;
+  const initialValues = bindings.map((binding) => evaluateExpr(binding.initExpr, env, context));
+  const doEnv = new Environment(env);
+
+  for (let index = 0; index < bindings.length; index += 1) {
+    doEnv.define(bindings[index].name, initialValues[index]);
+  }
+
+  while (true) {
+    if (isTruthy(evaluateExpr(testExpr, doEnv, context))) {
+      return resultExprs.length === 0 ? VOID_VALUE : evaluateSequence(resultExprs, doEnv, context);
+    }
+
+    if (body.length > 0) {
+      evaluateSequence(body, doEnv, context);
+    }
+
+    const nextValues = bindings.map((binding) =>
+      binding.stepExpr === undefined ? doEnv.lookup(binding.name) : evaluateExpr(binding.stepExpr, doEnv, context),
+    );
+
+    for (let index = 0; index < bindings.length; index += 1) {
+      doEnv.assign(bindings[index].name, nextValues[index]);
+    }
+  }
+}
+
+function readDoBindings(
+  bindingsExpr: Expr,
+): Array<{ name: string; initExpr: Expr; stepExpr?: Expr }> {
+  if (bindingsExpr.kind !== 'list') {
+    throw new EvalError('do bindings must be a list');
+  }
+
+  return bindingsExpr.elements.map((bindingExpr) => {
+    if (
+      bindingExpr.kind !== 'list' ||
+      bindingExpr.elements.length < 2 ||
+      bindingExpr.elements.length > 3
+    ) {
+      throw new EvalError('do bindings must contain (name init [step]) entries');
+    }
+
+    const [nameExpr, initExpr, stepExpr] = bindingExpr.elements;
+    if (nameExpr.kind !== 'symbol') {
+      throw new EvalError('do binding name must be a symbol');
+    }
+
+    return {
+      name: nameExpr.name,
+      initExpr,
+      stepExpr,
+    };
+  });
 }
 
 function applyProcedure(
@@ -2291,6 +2468,11 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
         throw new EvalError('eq? expects exactly 2 arguments');
       }
       return makeBoolean(eqValues(args[0], args[1]));
+    case 'eqv?':
+      if (args.length !== 2) {
+        throw new EvalError('eqv? expects exactly 2 arguments');
+      }
+      return makeBoolean(eqValues(args[0], args[1]));
     case 'equal?':
       if (args.length !== 2) {
         throw new EvalError('equal? expects exactly 2 arguments');
@@ -2401,9 +2583,76 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return applyCharComparison(args, 'char=?', (left, right) => left === right);
     case 'char<?':
       return applyCharComparison(args, 'char<?', (left, right) => left < right);
+    case 'vector':
+      return { kind: 'vector', elements: [...args] };
+    case 'make-vector':
+      return applyMakeVector(args);
+    case 'vector-ref':
+      return applyVectorRef(args);
+    case 'vector-set!':
+      return applyVectorSet(args);
+    case 'vector-length':
+      if (args.length !== 1) {
+        throw new EvalError('vector-length expects exactly 1 argument');
+      }
+      return makeNumber(expectVector(args[0], 'vector-length').elements.length);
+    case 'vector?':
+      return applyTypePredicate(args, 'vector?', (value) => value.kind === 'vector');
+    case 'vector->list':
+      if (args.length !== 1) {
+        throw new EvalError('vector->list expects exactly 1 argument');
+      }
+      return buildList([...expectVector(args[0], 'vector->list').elements]);
+    case 'list->vector':
+      if (args.length !== 1) {
+        throw new EvalError('list->vector expects exactly 1 argument');
+      }
+      return { kind: 'vector', elements: listToArray(args[0], 'list->vector') };
     case 'apply':
       return applyApply(args, context);
   }
+}
+
+function applyMakeVector(args: RuntimeValue[]): RuntimeValue {
+  if (args.length !== 1 && args.length !== 2) {
+    throw new EvalError('make-vector expects 1 or 2 arguments');
+  }
+
+  const length = expectIndex(args[0], 'make-vector');
+  const fill = args[1] ?? VOID_VALUE;
+  return {
+    kind: 'vector',
+    elements: Array.from({ length }, () => fill),
+  };
+}
+
+function applyVectorRef(args: RuntimeValue[]): RuntimeValue {
+  if (args.length !== 2) {
+    throw new EvalError('vector-ref expects exactly 2 arguments');
+  }
+
+  const vector = expectVector(args[0], 'vector-ref');
+  const index = expectIndex(args[1], 'vector-ref');
+  if (index >= vector.elements.length) {
+    throw new EvalError('vector-ref index out of range');
+  }
+
+  return vector.elements[index];
+}
+
+function applyVectorSet(args: RuntimeValue[]): RuntimeValue {
+  if (args.length !== 3) {
+    throw new EvalError('vector-set! expects exactly 3 arguments');
+  }
+
+  const vector = expectVector(args[0], 'vector-set!');
+  const index = expectIndex(args[1], 'vector-set!');
+  if (index >= vector.elements.length) {
+    throw new EvalError('vector-set! index out of range');
+  }
+
+  vector.elements[index] = args[2];
+  return VOID_VALUE;
 }
 
 function applyApply(args: RuntimeValue[], context: EvalContext): RuntimeValue {
@@ -2778,6 +3027,14 @@ function expectPair(value: RuntimeValue, procedure: string): PairValue {
   return value;
 }
 
+function expectVector(value: RuntimeValue, procedure: string): VectorValue {
+  if (value.kind !== 'vector') {
+    throw new EvalError(`${procedure} expects a vector`);
+  }
+
+  return value;
+}
+
 function expectRecord(
   value: RuntimeValue,
   procedure: string,
@@ -2931,8 +3188,12 @@ function eqValues(left: RuntimeValue, right: RuntimeValue): boolean {
 function equalValues(
   left: RuntimeValue,
   right: RuntimeValue,
-  seen: WeakMap<PairValue, WeakSet<PairValue>> = new WeakMap(),
+  seen: WeakMap<object, WeakSet<object>> = new WeakMap(),
 ): boolean {
+  if (left === right) {
+    return true;
+  }
+
   if (left.kind === 'pair' && right.kind === 'pair') {
     let seenRights = seen.get(left);
     if (seenRights?.has(right)) {
@@ -2946,6 +3207,31 @@ function equalValues(
 
     seenRights.add(right);
     return equalValues(left.car, right.car, seen) && equalValues(left.cdr, right.cdr, seen);
+  }
+
+  if (left.kind === 'vector' && right.kind === 'vector') {
+    if (left.elements.length !== right.elements.length) {
+      return false;
+    }
+
+    let seenRights = seen.get(left);
+    if (seenRights?.has(right)) {
+      return true;
+    }
+
+    if (seenRights === undefined) {
+      seenRights = new WeakSet<object>();
+      seen.set(left, seenRights);
+    }
+
+    seenRights.add(right);
+    for (let index = 0; index < left.elements.length; index += 1) {
+      if (!equalValues(left.elements[index], right.elements[index], seen)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   if (left.kind === 'string' && right.kind === 'string') {
@@ -3045,6 +3331,8 @@ function formatValueWithMode(value: RuntimeValue, mode: 'write' | 'display'): st
       return '()';
     case 'pair':
       return formatPair(value, mode);
+    case 'vector':
+      return formatVector(value, mode);
     case 'record':
       return `#<record ${value.recordType.name}>`;
     case 'builtin':
@@ -3091,6 +3379,10 @@ function formatPair(value: PairValue, mode: 'write' | 'display'): string {
   }
 
   return `(${parts.join(' ')} . ${formatValueWithMode(current, mode)})`;
+}
+
+function formatVector(value: VectorValue, mode: 'write' | 'display'): string {
+  return `#(${value.elements.map((element) => formatValueWithMode(element, mode)).join(' ')})`;
 }
 
 function formatChar(value: string): string {
