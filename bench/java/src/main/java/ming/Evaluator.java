@@ -73,6 +73,12 @@ public class Evaluator {
         @Override public String toString() { return "#<procedure:dynamic-wind>"; }
     };
 
+    static final Object CALL_WITH_VALUES_SENTINEL = new Object() {
+        @Override public String toString() { return "#<procedure:call-with-values>"; }
+    };
+
+    private record MultipleValues(List<Object> values) {}
+
     private static class ContinuationInvoked extends RuntimeException {
         final Object value;
         final SchemeContinuation continuation;
@@ -335,6 +341,17 @@ public class Evaluator {
         // Normal exit: call out-thunk
         apply(outThunk, List.of());
         return result;
+    }
+
+    private Object doCallWithValues(Object producer, Object consumer) throws EvalError {
+        Object produced = apply(producer, List.of());
+        List<Object> args;
+        if (produced instanceof MultipleValues mv) {
+            args = mv.values();
+        } else {
+            args = List.of(produced);
+        }
+        return apply(consumer, args);
     }
 
     private Env makeGlobalEnv() {
@@ -614,6 +631,10 @@ public class Evaluator {
                 if (proc == DYNAMIC_WIND_SENTINEL) {
                     if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
                     return doDynamicWind(args.get(0), args.get(1), args.get(2));
+                }
+                if (proc == CALL_WITH_VALUES_SENTINEL) {
+                    if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+                    return doCallWithValues(args.get(0), args.get(1));
                 }
                 if (proc instanceof Lambda lam) {
                     return tailApplyLambda(lam, args);
@@ -1095,6 +1116,10 @@ public class Evaluator {
             if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
             return doDynamicWind(args.get(0), args.get(1), args.get(2));
         }
+        if (proc == CALL_WITH_VALUES_SENTINEL) {
+            if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+            return doCallWithValues(args.get(0), args.get(1));
+        }
         if (proc instanceof Lambda lam) {
             if (lam.restParam != null) {
                 if (args.size() < lam.params.size()) {
@@ -1530,7 +1555,7 @@ public class Evaluator {
         env.define("procedure?", new BuiltinProc("procedure?", args -> {
             requireArgCount("procedure?", args, 1);
             Object v = args.get(0);
-            return v instanceof Lambda || v instanceof CaseLambda || v instanceof BuiltinProc || v == CALLCC_SENTINEL;
+            return v instanceof Lambda || v instanceof CaseLambda || v instanceof BuiltinProc || v == CALLCC_SENTINEL || v == DYNAMIC_WIND_SENTINEL || v == CALL_WITH_VALUES_SENTINEL;
         }));
 
         // L18: call/cc
@@ -1539,6 +1564,13 @@ public class Evaluator {
 
         // L19: dynamic-wind
         env.define("dynamic-wind", DYNAMIC_WIND_SENTINEL);
+
+        // L21: values & call-with-values
+        env.define("values", new BuiltinProc("values", args -> {
+            if (args.size() == 1) return args.get(0);
+            return new MultipleValues(new ArrayList<>(args));
+        }));
+        env.define("call-with-values", CALL_WITH_VALUES_SENTINEL);
 
         // L20: raise, with-exception-handler
         env.define("raise", new BuiltinProc("raise", args -> {
@@ -2439,6 +2471,8 @@ public class Evaluator {
         if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         if (val == CALLCC_SENTINEL) return "#<procedure>";
+        if (val == DYNAMIC_WIND_SENTINEL) return "#<procedure>";
+        if (val == CALL_WITH_VALUES_SENTINEL) return "#<procedure>";
         if (val instanceof SchemeVector v) {
             if (!seen.add(v)) return "#(...)";
             StringBuilder sb = new StringBuilder("#(");
