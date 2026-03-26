@@ -61,6 +61,14 @@ public class Evaluator {
         static long numerOf(Object o) { return o instanceof Rational r ? r.num : (Long) o; }
         static long denomOf(Object o) { return o instanceof Rational r ? r.den : 1L; }
     }
+    static class SchemeRecord {
+        final String typeName;
+        final Map<String, Object> fields;
+        SchemeRecord(String typeName, Map<String, Object> fields) {
+            this.typeName = typeName;
+            this.fields = fields;
+        }
+    }
     record Builtin(String name) {}
     record SyntaxRules(List<String> literals, List<Object> patterns, List<Object> templates, Env defEnv) {}
     record Token(Object value, int line, int col) {}
@@ -106,8 +114,13 @@ public class Evaluator {
     };
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "define", "set!", "if", "quote", "lambda", "and", "or", "begin", "let", "cond", "define-syntax"
+        "define", "set!", "if", "quote", "lambda", "and", "or", "begin", "let", "cond", "define-syntax", "define-record-type"
     );
+
+    record RecordType(String typeName, List<String> fields) {}
+    private final Map<String, RecordType> recordTypes = new HashMap<>();
+    private final Map<String, String> recordPredicates = new HashMap<>();
+    private final Map<String, String> recordAccessors = new HashMap<>();
 
     private final Env globalEnv;
     private StringBuilder outputBuffer;
@@ -559,6 +572,63 @@ public class Evaluator {
                             templates.add(stripLocated(clause.get(1)));
                         }
                         env.define(macroName, new SyntaxRules(literals, patterns, templates, env));
+                        return null;
+                    }
+                    case "define-record-type" -> {
+                        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+                        Object typeNameRaw = list.get(1);
+                        if (typeNameRaw instanceof Located lt) typeNameRaw = lt.expr();
+                        String typeName = (String) typeNameRaw;
+
+                        Object ctorRaw = list.get(2);
+                        if (ctorRaw instanceof Located lc) ctorRaw = lc.expr();
+                        List<?> ctorSpec = (List<?>) ctorRaw;
+                        Object ctorNameRaw = ctorSpec.getFirst();
+                        if (ctorNameRaw instanceof Located ln) ctorNameRaw = ln.expr();
+                        String ctorName = (String) ctorNameRaw;
+                        List<String> ctorFields = new ArrayList<>();
+                        for (int i = 1; i < ctorSpec.size(); i++) {
+                            Object f = ctorSpec.get(i);
+                            if (f instanceof Located lf) f = lf.expr();
+                            ctorFields.add((String) f);
+                        }
+
+                        Object predRaw = list.get(3);
+                        if (predRaw instanceof Located lp) predRaw = lp.expr();
+                        String predName = (String) predRaw;
+
+                        // Field accessors: (field accessor) from index 4 onward
+                        Map<String, String> fieldToAccessor = new HashMap<>();
+                        for (int i = 4; i < list.size(); i++) {
+                            Object fieldSpecRaw = list.get(i);
+                            if (fieldSpecRaw instanceof Located lfs) fieldSpecRaw = lfs.expr();
+                            List<?> fieldSpec = (List<?>) fieldSpecRaw;
+                            Object fn = fieldSpec.get(0);
+                            if (fn instanceof Located lfn) fn = lfn.expr();
+                            Object an = fieldSpec.get(1);
+                            if (an instanceof Located lan) an = lan.expr();
+                            fieldToAccessor.put((String) fn, (String) an);
+                        }
+
+                        // Define constructor
+                        final List<String> cFields = ctorFields;
+                        final String tName = typeName;
+                        env.define(ctorName, new Builtin(ctorName));
+
+                        // Define predicate
+                        env.define(predName, new Builtin(predName));
+
+                        // Define accessors
+                        for (var entry : fieldToAccessor.entrySet()) {
+                            env.define(entry.getValue(), new Builtin(entry.getValue()));
+                        }
+
+                        // Store record type info for use in apply
+                        recordTypes.put(ctorName, new RecordType(tName, cFields));
+                        recordPredicates.put(predName, tName);
+                        for (var entry : fieldToAccessor.entrySet()) {
+                            recordAccessors.put(entry.getValue(), entry.getKey());
+                        }
                         return null;
                     }
                 }
@@ -1155,7 +1225,36 @@ public class Evaluator {
                 Object a = args.get(0);
                 yield (a instanceof Long || a instanceof Rational) ? Boolean.TRUE : Boolean.FALSE;
             }
-            default -> throw new EvalError("unbound variable: " + op);
+            default -> {
+                // Check for record type operations
+                if (recordTypes.containsKey(op)) {
+                    RecordType rt = recordTypes.get(op);
+                    if (args.size() != rt.fields().size())
+                        throw new EvalError(op + ": expected " + rt.fields().size() + " arguments, got " + args.size());
+                    Map<String, Object> fields = new HashMap<>();
+                    for (int i = 0; i < rt.fields().size(); i++) {
+                        fields.put(rt.fields().get(i), args.get(i));
+                    }
+                    yield new SchemeRecord(rt.typeName(), fields);
+                }
+                if (recordPredicates.containsKey(op)) {
+                    String typeName = recordPredicates.get(op);
+                    if (args.size() != 1) throw new EvalError(op + ": expected 1 argument");
+                    Object a = args.getFirst();
+                    yield (a instanceof SchemeRecord sr && sr.typeName.equals(typeName)) ? Boolean.TRUE : Boolean.FALSE;
+                }
+                if (recordAccessors.containsKey(op)) {
+                    String fieldName = recordAccessors.get(op);
+                    if (args.size() != 1) throw new EvalError(op + ": expected 1 argument");
+                    Object a = args.getFirst();
+                    if (!(a instanceof SchemeRecord sr))
+                        throw new EvalError(op + ": not a record");
+                    if (!sr.fields.containsKey(fieldName))
+                        throw new EvalError(op + ": no such field: " + fieldName);
+                    yield sr.fields.get(fieldName);
+                }
+                throw new EvalError("unbound variable: " + op);
+            }
         };
     }
 
@@ -1441,6 +1540,7 @@ public class Evaluator {
             sb.append(")");
             return sb.toString();
         }
+        if (val instanceof SchemeRecord sr) return "#<record:" + sr.typeName + ">";
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof SyntaxRules) return "#<macro>";
         return val.toString();
