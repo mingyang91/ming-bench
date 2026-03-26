@@ -3,6 +3,7 @@ package ming
 import SchemeBuiltinSupport.*
 import SchemeModel.*
 import SchemeNumbers.*
+import SchemeRuntime.*
 
 private[ming] object SchemePredicateBuiltins:
 
@@ -30,5 +31,6 @@ private[ming] object SchemePredicateBuiltins:
     "symbol?" -> predicateBuiltin("symbol?") {
       case Value.SymbolValue(_) => true
       case _                    => false
-    }
+    },
+    "procedure?" -> predicateBuiltin("procedure?")(isProcedure)
   )

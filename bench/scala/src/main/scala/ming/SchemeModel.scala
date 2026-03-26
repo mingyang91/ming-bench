@@ -68,6 +68,13 @@ private[ming] object SchemeModel:
     def fieldCount: Int =
       fieldNames.length
 
+  final case class CaseLambdaClause(
+    fixedParams: List[String],
+    restParam: Option[String],
+    body: List[Expr],
+    env: Env
+  )
+
   enum Value:
     case IntegerValue(value: BigInt)
     case RationalValue(numerator: BigInt, denominator: BigInt)
@@ -88,6 +95,7 @@ private[ming] object SchemeModel:
       body: List[Expr],
       env: Env
     )
+    case CaseClosure(clauses: List[CaseLambdaClause])
     case VoidValue
 
   final class BindingCell(var value: Value)

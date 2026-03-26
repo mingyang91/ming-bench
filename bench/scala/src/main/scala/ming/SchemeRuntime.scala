@@ -19,6 +19,14 @@ private[ming] object SchemeRuntime:
       case Value.BooleanValue(false) => false
       case _                         => true
 
+  def isProcedure(value: Value): Boolean =
+    value match
+      case Value.Builtin(_, _) => true
+      case Value.Closure(_, _, _, _, _) =>
+        true
+      case Value.CaseClosure(_) => true
+      case _                    => false
+
   def render(value: Value): String =
     value match
       case number @ (Value.IntegerValue(_) | Value.RationalValue(_, _) | Value.InexactValue(_)) =>
@@ -35,6 +43,8 @@ private[ming] object SchemeRuntime:
       case Value.Closure(Some(name), _, _, _, _) =>
         s"#<procedure:$name>"
       case Value.Closure(None, _, _, _, _) =>
+        "#<procedure>"
+      case Value.CaseClosure(_) =>
         "#<procedure>"
       case Value.VoidValue =>
         "#<void>"

@@ -26,10 +26,13 @@ private[ming] object SchemeEvaluatorSupport:
     body: List[Expr],
     env: Env,
     name: Option[String]
-  ): Value =
-    val (fixedParams, restParam) = parseClosureParams(paramsExpr)
-    ensureDistinct(fixedParams ++ restParam.toList, "lambda parameters")
-    Value.Closure(name, fixedParams, restParam, body, env)
+  ): Value.Closure =
+    val clause = buildCaseLambdaClause(paramsExpr, body, env)
+    Value.Closure(name, clause.fixedParams, clause.restParam, clause.body, clause.env)
+
+  def buildCaseClosure(clausesExpr: List[Expr], env: Env): Value.CaseClosure =
+    if clausesExpr.isEmpty then throw new EvalError("case-lambda expected at least 1 clause")
+    Value.CaseClosure(clausesExpr.map(parseCaseLambdaClause(_, env)))
 
   def quoteExpr(expr: Expr): Value =
     expr match
@@ -58,6 +61,22 @@ private[ming] object SchemeEvaluatorSupport:
           (fixedParams, Some(restName))
         case _ =>
           throw new EvalError("invalid lambda parameter list")
+
+  private def parseCaseLambdaClause(clauseExpr: Expr, env: Env): CaseLambdaClause =
+    clauseExpr match
+      case Expr.ListExpr(Expr.ListExpr(params, _) :: body, _) if body.nonEmpty =>
+        buildCaseLambdaClause(params, body, env)
+      case _ =>
+        throw new EvalError("invalid case-lambda clause")
+
+  private def buildCaseLambdaClause(
+    paramsExpr: List[Expr],
+    body: List[Expr],
+    env: Env
+  ): CaseLambdaClause =
+    val (fixedParams, restParam) = parseClosureParams(paramsExpr)
+    ensureDistinct(fixedParams ++ restParam.toList, "lambda parameters")
+    CaseLambdaClause(fixedParams, restParam, body, env)
 
   private def requireParamName(expr: Expr): String =
     expr match

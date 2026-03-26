@@ -17,6 +17,7 @@ private[ming] object SchemeEvaluator:
   def applyProcedure(procedure: Value, args: List[Value]): Value =
     procedure match
       case Value.Builtin(_, implementation) => implementation(args)
+      case caseClosure: Value.CaseClosure   => applyCaseClosure(caseClosure, args)
       case closure: Value.Closure           => applyClosure(closure, args)
       case other =>
         throw new EvalError(s"not a procedure: ${SchemeRuntime.render(other)}")
@@ -69,6 +70,8 @@ private[ming] object SchemeEvaluator:
         defineRecordType(args, env)
       case Expr.Symbol("lambda", _) =>
         evalLambda(args, env)
+      case Expr.Symbol("case-lambda", _) =>
+        evalCaseLambda(args, env)
       case Expr.Symbol("set!", _) =>
         evalSet(args, env)
       case Expr.Symbol("and", _) =>
@@ -129,6 +132,9 @@ private[ming] object SchemeEvaluator:
         buildClosure(params, body, env, None)
       case _ =>
         throw new EvalError("invalid lambda form")
+
+  private def evalCaseLambda(args: List[Expr], env: Env): Value =
+    buildCaseClosure(args, env)
 
   private def evalSet(args: List[Expr], env: Env): Value =
     args match
@@ -220,18 +226,53 @@ private[ming] object SchemeEvaluator:
     loop(args, Value.BooleanValue(false))
 
   private def applyClosure(closure: Value.Closure, args: List[Value]): Value =
-    val name = closure.name.getOrElse("lambda")
-    closure.restParam match
-      case Some(_) =>
-        requireMinArgCount(name, args, closure.fixedParams.length)
-      case None =>
-        requireArgCount(name, args, closure.fixedParams.length)
+    applyProcedureBody(
+      closure.name.getOrElse("lambda"),
+      closure.fixedParams,
+      closure.restParam,
+      closure.body,
+      closure.env,
+      args
+    )
 
-    val callEnv = new Env(Some(closure.env))
-    closure.fixedParams.zip(args).foreach { case (paramName, value) =>
+  private def applyCaseClosure(caseClosure: Value.CaseClosure, args: List[Value]): Value =
+    caseClosure.clauses.find(clauseMatchesArgCount(_, args.length)) match
+      case Some(clause) =>
+        applyProcedureBody(
+          "case-lambda",
+          clause.fixedParams,
+          clause.restParam,
+          clause.body,
+          clause.env,
+          args
+        )
+      case None =>
+        throw new EvalError(s"case-lambda expected a matching clause for ${args.length} argument(s)")
+
+  private def clauseMatchesArgCount(clause: CaseLambdaClause, argCount: Int): Boolean =
+    clause.restParam match
+      case Some(_) => argCount >= clause.fixedParams.length
+      case None    => argCount == clause.fixedParams.length
+
+  private def applyProcedureBody(
+    name: String,
+    fixedParams: List[String],
+    restParam: Option[String],
+    body: List[Expr],
+    closureEnv: Env,
+    args: List[Value]
+  ): Value =
+    restParam match
+      case Some(_) =>
+        requireMinArgCount(name, args, fixedParams.length)
+      case None =>
+        requireArgCount(name, args, fixedParams.length)
+
+    val callEnv = new Env(Some(closureEnv))
+    fixedParams.zip(args).foreach { case (paramName, value) =>
       callEnv.define(paramName, value)
     }
-    closure.restParam.foreach { restName =>
-      callEnv.define(restName, makeList(args.drop(closure.fixedParams.length)))
+    restParam.foreach { restName =>
+      callEnv.define(restName, makeList(args.drop(fixedParams.length)))
     }
-    evalSequence(closure.body, callEnv)
+    evalSequence(body, callEnv)
