@@ -418,6 +418,7 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Env env) throws EvalError {
+      while (true) {
         // Unwrap Located and update current position
         if (expr instanceof Located loc) {
             currentLine = loc.line;
@@ -454,109 +455,82 @@ public class Evaluator {
                             throw posError("if: expected 2 or 3 arguments");
                         Object cond = eval(list.get(1), env);
                         if (!isFalse(cond)) {
-                            return eval(list.get(2), env);
+                            expr = list.get(2); continue;
                         } else if (list.size() == 4) {
-                            return eval(list.get(3), env);
+                            expr = list.get(3); continue;
                         }
                         return null; // void
                     }
-                    case "define" -> {
-                        if (list.size() < 3) throw posError("define: bad syntax");
-                        Object target = unwrap(list.get(1));
-                        if (target instanceof String name) {
-                            Object val = eval(list.get(2), env);
-                            env.define(name, val);
-                            return null;
+                    case "define" -> { return evalDefine(list, env); }
+                    case "lambda" -> { return evalLambda(list, env); }
+                    case "case-lambda" -> { return evalCaseLambda(list, env); }
+                    case "and" -> {
+                        if (list.size() == 1) return Boolean.TRUE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object val = eval(list.get(i), env);
+                            if (isFalse(val)) return val;
                         }
-                        if (target instanceof List<?> sig) {
-                            // (define (f params...) body...) or (define (f x . rest) body...)
-                            if (sig.isEmpty()) throw posError("define: bad syntax");
-                            String name = (String) unwrap(sig.get(0));
-                            List<String> params = new ArrayList<>();
-                            String restParam = null;
-                            for (int i = 1; i < sig.size(); i++) {
-                                String p = (String) unwrap(sig.get(i));
-                                if (p.equals(".")) {
-                                    if (i + 1 < sig.size()) {
-                                        restParam = (String) unwrap(sig.get(i + 1));
-                                    }
-                                    break;
-                                }
-                                params.add(p);
-                            }
-                            List<Object> body = new ArrayList<>();
-                            for (int i = 2; i < list.size(); i++) {
-                                body.add(list.get(i));
-                            }
-                            env.define(name, new Lambda(params, restParam, body, env));
-                            return null;
-                        }
-                        throw posError("define: bad syntax");
+                        expr = list.get(list.size() - 1); continue;
                     }
-                    case "lambda" -> {
-                        if (list.size() < 3) throw posError("lambda: bad syntax");
-                        Object paramListRaw = unwrap(list.get(1));
-                        List<String> params = new ArrayList<>();
-                        String restParam = null;
-                        if (paramListRaw instanceof List<?> paramList) {
-                            for (int i = 0; i < paramList.size(); i++) {
-                                String p = (String) unwrap(paramList.get(i));
-                                if (p.equals(".")) {
-                                    if (i + 1 < paramList.size()) {
-                                        restParam = (String) unwrap(paramList.get(i + 1));
-                                    }
-                                    break;
-                                }
-                                params.add(p);
-                            }
-                        } else if (paramListRaw instanceof String sym) {
-                            // (lambda args body...) — single rest param
-                            restParam = sym;
+                    case "or" -> {
+                        if (list.size() == 1) return Boolean.FALSE;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            Object val = eval(list.get(i), env);
+                            if (!isFalse(val)) return val;
                         }
-                        List<Object> body = new ArrayList<>();
-                        for (int i = 2; i < list.size(); i++) body.add(list.get(i));
-                        return new Lambda(params, restParam, body, env);
+                        expr = list.get(list.size() - 1); continue;
                     }
-                    case "case-lambda" -> {
-                        if (list.size() < 2) throw posError("case-lambda: bad syntax");
-                        List<Lambda> clauses = new ArrayList<>();
-                        for (int ci = 1; ci < list.size(); ci++) {
-                            Object clauseRaw = unwrap(list.get(ci));
-                            if (!(clauseRaw instanceof List<?> clause) || clause.size() < 2)
-                                throw posError("case-lambda: bad clause");
-                            Object paramListRaw = unwrap(clause.get(0));
-                            List<String> params = new ArrayList<>();
-                            String restParam = null;
-                            if (paramListRaw instanceof List<?> paramList) {
-                                for (int i = 0; i < paramList.size(); i++) {
-                                    String p = (String) unwrap(paramList.get(i));
-                                    if (p.equals(".")) {
-                                        if (i + 1 < paramList.size()) {
-                                            restParam = (String) unwrap(paramList.get(i + 1));
-                                        }
-                                        break;
-                                    }
-                                    params.add(p);
-                                }
-                            } else if (paramListRaw instanceof String sym) {
-                                restParam = sym;
-                            }
-                            List<Object> body = new ArrayList<>();
-                            for (int i = 1; i < clause.size(); i++) body.add(clause.get(i));
-                            clauses.add(new Lambda(params, restParam, body, env));
-                        }
-                        return new CaseLambda(clauses);
-                    }
-                    case "and" -> { return evalAnd((List<Object>) list, env); }
-                    case "or" -> { return evalOr((List<Object>) list, env); }
                     case "begin" -> {
-                        Object result2 = null;
-                        for (int i = 1; i < list.size(); i++) {
-                            result2 = eval(list.get(i), env);
+                        if (list.size() == 1) return null;
+                        for (int i = 1; i < list.size() - 1; i++) {
+                            eval(list.get(i), env);
                         }
-                        return result2;
+                        expr = list.get(list.size() - 1); continue;
                     }
-                    case "let" -> { return evalLet(list, env); }
+                    case "let" -> {
+                        if (list.size() < 3) throw posError("let: bad syntax");
+                        Object second = unwrap(list.get(1));
+                        if (second instanceof String namedLetName) {
+                            if (list.size() < 4) throw posError("let: bad syntax");
+                            List<?> bindings = (List<?>) unwrap(list.get(2));
+                            List<String> params = new ArrayList<>();
+                            List<Object> inits = new ArrayList<>();
+                            for (Object b : bindings) {
+                                List<?> binding = (List<?>) unwrap(b);
+                                params.add((String) unwrap(binding.get(0)));
+                                inits.add(binding.get(1));
+                            }
+                            List<Object> body = new ArrayList<>();
+                            for (int i = 3; i < list.size(); i++) body.add(list.get(i));
+                            Env letEnv = new Env(env);
+                            Lambda loopLam = new Lambda(params, null, body, letEnv);
+                            letEnv.define(namedLetName, loopLam);
+                            Env callEnv = new Env(letEnv);
+                            for (int i = 0; i < params.size(); i++) {
+                                callEnv.define(params.get(i), eval(inits.get(i), env));
+                            }
+                            for (int i = 0; i < body.size() - 1; i++) {
+                                eval(body.get(i), callEnv);
+                            }
+                            expr = body.get(body.size() - 1);
+                            env = callEnv;
+                            continue;
+                        }
+                        List<?> bindings = (List<?>) second;
+                        Env letEnv = new Env(env);
+                        for (Object b : bindings) {
+                            List<?> binding = (List<?>) unwrap(b);
+                            String bname = (String) unwrap(binding.get(0));
+                            Object bval = eval(binding.get(1), env);
+                            letEnv.define(bname, bval);
+                        }
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letEnv);
+                        }
+                        expr = list.get(list.size() - 1);
+                        env = letEnv;
+                        continue;
+                    }
                     case "set!" -> {
                         if (list.size() != 3) throw posError("set!: bad syntax");
                         Object varName = unwrap(list.get(1));
@@ -573,7 +547,6 @@ public class Evaluator {
                         if (list.size() < 3) throw posError("letrec: bad syntax");
                         List<?> bindings = (List<?>) unwrap(list.get(1));
                         Env letrecEnv = new Env(env);
-                        // First define all vars with undefined placeholder
                         List<String> names = new ArrayList<>();
                         for (Object b : bindings) {
                             List<?> binding = (List<?>) unwrap(b);
@@ -581,65 +554,67 @@ public class Evaluator {
                             names.add(bname);
                             letrecEnv.define(bname, null);
                         }
-                        // Then evaluate inits in the letrec env
                         for (int i = 0; i < bindings.size(); i++) {
                             List<?> binding = (List<?>) unwrap(bindings.get(i));
                             Object bval = eval(binding.get(1), letrecEnv);
                             letrecEnv.set(names.get(i), bval);
                         }
-                        Object result2 = null;
-                        for (int i = 2; i < list.size(); i++) {
-                            result2 = eval(list.get(i), letrecEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letrecEnv);
                         }
-                        return result2;
+                        expr = list.get(list.size() - 1);
+                        env = letrecEnv;
+                        continue;
                     }
                     case "letrec*" -> {
                         if (list.size() < 3) throw posError("letrec*: bad syntax");
                         List<?> bindings = (List<?>) unwrap(list.get(1));
                         Env letrecEnv = new Env(env);
-                        // Define all vars with undefined first
                         for (Object b : bindings) {
                             List<?> binding = (List<?>) unwrap(b);
                             String bname = (String) unwrap(binding.get(0));
                             letrecEnv.define(bname, null);
                         }
-                        // Then evaluate each init sequentially, setting as we go
                         for (Object b : bindings) {
                             List<?> binding = (List<?>) unwrap(b);
                             String bname = (String) unwrap(binding.get(0));
                             Object bval = eval(binding.get(1), letrecEnv);
                             letrecEnv.set(bname, bval);
                         }
-                        Object result2 = null;
-                        for (int i = 2; i < list.size(); i++) {
-                            result2 = eval(list.get(i), letrecEnv);
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letrecEnv);
                         }
-                        return result2;
+                        expr = list.get(list.size() - 1);
+                        env = letrecEnv;
+                        continue;
                     }
                     case "case" -> { return evalCase(list, env); }
                     case "do" -> { return evalDo(list, env); }
                     case "cond" -> {
+                        boolean matched = false;
                         for (int i = 1; i < list.size(); i++) {
                             List<?> clause = (List<?>) unwrap(list.get(i));
                             Object clauseHead = unwrap(clause.get(0));
                             if (clauseHead instanceof String s && s.equals("else")) {
-                                Object result2 = null;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result2 = eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) {
+                                    eval(clause.get(j), env);
                                 }
-                                return result2;
+                                if (clause.size() > 1) {
+                                    expr = clause.get(clause.size() - 1); matched = true; break;
+                                }
+                                return null;
                             }
                             Object test = eval(clause.get(0), env);
                             if (!isFalse(test)) {
                                 if (clause.size() == 1) return test;
-                                Object result2 = null;
-                                for (int j = 1; j < clause.size(); j++) {
-                                    result2 = eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) {
+                                    eval(clause.get(j), env);
                                 }
-                                return result2;
+                                expr = clause.get(clause.size() - 1); matched = true; break;
                             }
                         }
-                        return null; // void if no clause matches
+                        if (matched) continue;
+                        return null;
                     }
                     case "define-syntax" -> {
                         if (list.size() != 3) throw posError("define-syntax: bad syntax");
@@ -659,7 +634,7 @@ public class Evaluator {
                         @SuppressWarnings("unchecked")
                         List<Object> formList = (List<Object>) list;
                         Object expanded = expandMacro(sr, formList);
-                        return eval(expanded, env);
+                        expr = expanded; continue;
                     }
                 } catch (EvalError ignored) {}
             }
@@ -671,18 +646,21 @@ public class Evaluator {
                     @SuppressWarnings("unchecked")
                     List<Object> formList = (List<Object>) list;
                     Object expanded = expandMacro(sr, formList);
-                    return eval(expanded, env);
+                    expr = expanded; continue;
                 }
-                // Procedure call
                 List<Object> args = new ArrayList<>();
                 for (int i = 1; i < list.size(); i++) {
                     args.add(eval(list.get(i), env));
+                }
+                if (resolved instanceof Lambda lam) {
+                    env = applyLambdaEnv(lam, args);
+                    for (int i = 0; i < lam.body.size() - 1; i++) eval(lam.body.get(i), env);
+                    expr = lam.body.get(lam.body.size() - 1); continue;
                 }
                 return apply(resolved, args);
             }
 
             // General application
-            // Save position of the call expression before evaluating subexpressions
             int callLine = currentLine;
             int callCol = currentCol;
             Object proc = eval(head, env);
@@ -690,12 +668,119 @@ public class Evaluator {
             for (int i = 1; i < list.size(); i++) {
                 args.add(eval(list.get(i), env));
             }
-            // Restore call position for error reporting in apply
             currentLine = callLine;
             currentCol = callCol;
+            if (proc instanceof Lambda lam) {
+                env = applyLambdaEnv(lam, args);
+                for (int i = 0; i < lam.body.size() - 1; i++) eval(lam.body.get(i), env);
+                expr = lam.body.get(lam.body.size() - 1); continue;
+            }
+            if (proc instanceof CaseLambda cl) {
+                Lambda matched = null;
+                for (Lambda lam : cl.clauses) {
+                    if (lam.restParam != null) {
+                        if (args.size() >= lam.params.size()) { matched = lam; break; }
+                    } else {
+                        if (args.size() == lam.params.size()) { matched = lam; break; }
+                    }
+                }
+                if (matched == null) throw posError("no matching clause for " + args.size() + " arguments");
+                env = applyLambdaEnv(matched, args);
+                for (int i = 0; i < matched.body.size() - 1; i++) eval(matched.body.get(i), env);
+                expr = matched.body.get(matched.body.size() - 1); continue;
+            }
             return apply(proc, args);
         }
         throw posError("unknown expression type");
+      } // end while
+    }
+
+    // Helper: parse parameter list with optional dot-rest notation
+    private record ParamSpec(List<String> params, String restParam) {}
+
+    private ParamSpec parseParamList(Object paramListRaw) {
+        List<String> params = new ArrayList<>();
+        String restParam = null;
+        if (paramListRaw instanceof List<?> paramList) {
+            for (int i = 0; i < paramList.size(); i++) {
+                String p = (String) unwrap(paramList.get(i));
+                if (p.equals(".")) {
+                    if (i + 1 < paramList.size()) {
+                        restParam = (String) unwrap(paramList.get(i + 1));
+                    }
+                    break;
+                }
+                params.add(p);
+            }
+        } else if (paramListRaw instanceof String sym) {
+            restParam = sym;
+        }
+        return new ParamSpec(params, restParam);
+    }
+
+    private Object evalDefine(List<?> list, Env env) throws EvalError {
+        if (list.size() < 3) throw posError("define: bad syntax");
+        Object target = unwrap(list.get(1));
+        if (target instanceof String name) {
+            Object val = eval(list.get(2), env);
+            env.define(name, val);
+            return null;
+        }
+        if (target instanceof List<?> sig) {
+            if (sig.isEmpty()) throw posError("define: bad syntax");
+            String name = (String) unwrap(sig.get(0));
+            ParamSpec ps = parseParamList(sig.subList(1, sig.size()));
+            List<Object> body = new ArrayList<>();
+            for (int i = 2; i < list.size(); i++) body.add(list.get(i));
+            env.define(name, new Lambda(ps.params, ps.restParam, body, env));
+            return null;
+        }
+        throw posError("define: bad syntax");
+    }
+
+    private Lambda evalLambda(List<?> list, Env env) throws EvalError {
+        if (list.size() < 3) throw posError("lambda: bad syntax");
+        ParamSpec ps = parseParamList(unwrap(list.get(1)));
+        List<Object> body = new ArrayList<>();
+        for (int i = 2; i < list.size(); i++) body.add(list.get(i));
+        return new Lambda(ps.params, ps.restParam, body, env);
+    }
+
+    private CaseLambda evalCaseLambda(List<?> list, Env env) throws EvalError {
+        if (list.size() < 2) throw posError("case-lambda: bad syntax");
+        List<Lambda> clauses = new ArrayList<>();
+        for (int ci = 1; ci < list.size(); ci++) {
+            Object clauseRaw = unwrap(list.get(ci));
+            if (!(clauseRaw instanceof List<?> clause) || clause.size() < 2)
+                throw posError("case-lambda: bad clause");
+            ParamSpec ps = parseParamList(unwrap(clause.get(0)));
+            List<Object> body = new ArrayList<>();
+            for (int i = 1; i < clause.size(); i++) body.add(clause.get(i));
+            clauses.add(new Lambda(ps.params, ps.restParam, body, env));
+        }
+        return new CaseLambda(clauses);
+    }
+
+    private Env applyLambdaEnv(Lambda lam, List<Object> args) throws EvalError {
+        if (lam.restParam != null) {
+            if (args.size() < lam.params.size())
+                throw posError("wrong number of arguments: expected at least " + lam.params.size() + ", got " + args.size());
+        } else {
+            if (args.size() != lam.params.size())
+                throw posError("wrong number of arguments: expected " + lam.params.size() + ", got " + args.size());
+        }
+        Env callEnv = new Env(lam.closureEnv);
+        for (int i = 0; i < lam.params.size(); i++) {
+            callEnv.define(lam.params.get(i), args.get(i));
+        }
+        if (lam.restParam != null) {
+            Object rest = NIL;
+            for (int i = args.size() - 1; i >= lam.params.size(); i--) {
+                rest = new Pair(args.get(i), rest);
+            }
+            callEnv.define(lam.restParam, rest);
+        }
+        return callEnv;
     }
 
     private Object evalDo(List<?> list, Env env) throws EvalError {
@@ -749,43 +834,6 @@ public class Evaluator {
         }
     }
 
-    private Object evalLet(List<?> list, Env env) throws EvalError {
-        if (list.size() < 3) throw posError("let: bad syntax");
-        Object second = unwrap(list.get(1));
-        if (second instanceof String namedLetName) {
-            if (list.size() < 4) throw posError("let: bad syntax");
-            Object bindingsRaw = unwrap(list.get(2));
-            List<?> bindings = (List<?>) bindingsRaw;
-            List<String> params = new ArrayList<>();
-            List<Object> inits = new ArrayList<>();
-            for (Object b : bindings) {
-                List<?> binding = (List<?>) unwrap(b);
-                params.add((String) unwrap(binding.get(0)));
-                inits.add(binding.get(1));
-            }
-            List<Object> body = new ArrayList<>();
-            for (int i = 3; i < list.size(); i++) body.add(list.get(i));
-            Env letEnv = new Env(env);
-            Lambda loopLam = new Lambda(params, null, body, letEnv);
-            letEnv.define(namedLetName, loopLam);
-            List<Object> args = new ArrayList<>();
-            for (Object init : inits) args.add(eval(init, env));
-            return apply(loopLam, args);
-        }
-        List<?> bindings = (List<?>) second;
-        Env letEnv = new Env(env);
-        for (Object b : bindings) {
-            List<?> binding = (List<?>) unwrap(b);
-            String bname = (String) unwrap(binding.get(0));
-            Object bval = eval(binding.get(1), env);
-            letEnv.define(bname, bval);
-        }
-        Object result = null;
-        for (int i = 2; i < list.size(); i++) {
-            result = eval(list.get(i), letEnv);
-        }
-        return result;
-    }
 
     private Object evalCase(List<?> list, Env env) throws EvalError {
         if (list.size() < 2) throw posError("case: bad syntax");
@@ -926,23 +974,6 @@ public class Evaluator {
         throw posError("not a procedure: " + schemeToString(proc));
     }
 
-    private Object evalAnd(List<Object> expr, Env env) throws EvalError {
-        Object result = Boolean.TRUE;
-        for (int i = 1; i < expr.size(); i++) {
-            result = eval(expr.get(i), env);
-            if (isFalse(result)) return result;
-        }
-        return result;
-    }
-
-    private Object evalOr(List<Object> expr, Env env) throws EvalError {
-        Object result = Boolean.FALSE;
-        for (int i = 1; i < expr.size(); i++) {
-            result = eval(expr.get(i), env);
-            if (!isFalse(result)) return result;
-        }
-        return result;
-    }
 
     private boolean isFalse(Object val) {
         return val instanceof Boolean b && !b;
