@@ -56,6 +56,8 @@ public class Evaluator {
         }
         globalEnv.define("call/cc", new BuiltinProcedure("call/cc"));
         globalEnv.define("call-with-current-continuation", new BuiltinProcedure("call/cc"));
+        globalEnv.define("raise", new BuiltinProcedure("raise"));
+        globalEnv.define("with-exception-handler", new BuiltinProcedure("with-exception-handler"));
     }
 
     private final SchemeReader reader = new SchemeReader();
@@ -153,6 +155,8 @@ public class Evaluator {
             } catch (ContinuationException ce) {
                 throwTopLevelIndex = topLevelIndex;
                 pendingContinuation = ce;
+            } catch (SchemeRaiseException re) {
+                throw new EvalError("unhandled exception: " + schemeToString(re.value));
             }
         }
     }
@@ -190,7 +194,7 @@ public class Evaluator {
     }
 
     // Resolve a TailCall chain (trampoline)
-    private Object trampoline(Object result) throws EvalError, ContinuationException {
+    private Object trampoline(Object result) throws EvalError, ContinuationException, SchemeRaiseException {
         while (result instanceof TailCall tc) {
             result = evalStep(tc.expr, tc.env);
         }
@@ -198,7 +202,7 @@ public class Evaluator {
     }
 
     // Apply that fully resolves (for non-tail contexts like map, builtin apply)
-    private Object applyResolved(Object proc, List<Object> args) throws EvalError, ContinuationException {
+    private Object applyResolved(Object proc, List<Object> args) throws EvalError, ContinuationException, SchemeRaiseException {
         return trampoline(apply(proc, args));
     }
 
@@ -217,13 +221,13 @@ public class Evaluator {
 
     // eval() is the public trampoline entry point
     @SuppressWarnings("unchecked")
-    private Object eval(Object expr, Environment env) throws EvalError, ContinuationException {
+    private Object eval(Object expr, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         return trampoline(evalStep(expr, env));
     }
 
     // evalStep does one step of evaluation; returns TailCall for tail positions
     @SuppressWarnings("unchecked")
-    private Object evalStep(Object expr, Environment env) throws EvalError, ContinuationException {
+    private Object evalStep(Object expr, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         // Unwrap Located and add position to any errors
         if (expr instanceof SchemeReader.Located loc) {
             try {
@@ -416,6 +420,9 @@ public class Evaluator {
                         Object outThunk = eval(args.get(2), env);
                         return evalDynamicWind(inThunk, bodyThunk, outThunk);
                     }
+                    case "guard" -> {
+                        return evalGuard(args, env);
+                    }
                     case "define-syntax" -> {
                         if (args.size() != 2) throw new EvalError("define-syntax: bad syntax");
                         String macroName = ((SchemeSymbol) unwrap(args.get(0))).name();
@@ -463,7 +470,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalLet(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalLet(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.size() < 2) throw new EvalError("let: bad syntax");
         Object first2 = unwrap(args.get(0));
         if (first2 instanceof SchemeSymbol loopName) {
@@ -516,7 +523,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalLetStar(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalLetStar(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.size() < 2) throw new EvalError("let*: bad syntax");
         List<?> bindings = (List<?>) unwrap(args.get(0));
         Environment letEnv = new Environment(env);
@@ -536,7 +543,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalLetrec(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalLetrec(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.size() < 2) throw new EvalError("letrec: bad syntax");
         List<?> bindings = (List<?>) unwrap(args.get(0));
         Environment letEnv = new Environment(env);
@@ -566,7 +573,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalLetrecStar(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalLetrecStar(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.size() < 2) throw new EvalError("letrec*: bad syntax");
         List<?> bindings = (List<?>) unwrap(args.get(0));
         Environment letEnv = new Environment(env);
@@ -590,7 +597,7 @@ public class Evaluator {
         return VOID;
     }
 
-    private Object evalCase(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalCase(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.isEmpty()) throw new EvalError("case: bad syntax");
         Object key = eval(args.get(0), env);
         for (int i = 1; i < args.size(); i++) {
@@ -623,7 +630,7 @@ public class Evaluator {
         return VOID;
     }
 
-    private Object evalDo(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalDo(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.size() < 2) throw new EvalError("do: bad syntax");
         List<?> varSpecs = (List<?>) unwrap(args.get(0));
         List<?> testClause = (List<?>) unwrap(args.get(1));
@@ -667,7 +674,7 @@ public class Evaluator {
         }
     }
 
-    private Object evalCond(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalCond(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         for (Object clause : args) {
             List<?> cl = (List<?>) unwrap(clause);
             if (cl.isEmpty()) throw new EvalError("cond: empty clause");
@@ -695,7 +702,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalDefine(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalDefine(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.size() < 2) throw new EvalError("define: bad syntax");
         Object target = unwrap(args.get(0));
         if (target instanceof SchemeSymbol s) {
@@ -725,7 +732,7 @@ public class Evaluator {
         throw new EvalError("define: bad syntax");
     }
 
-    private Object evalDefineRecordType(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalDefineRecordType(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.size() < 3) throw new EvalError("define-record-type: bad syntax");
         String typeName = ((SchemeSymbol) unwrap(args.get(0))).name();
         List<?> ctorSpec = (List<?>) unwrap(args.get(1));
@@ -750,13 +757,13 @@ public class Evaluator {
         return VOID;
     }
 
-    private Object evalCallCC(List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalCallCC(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
         Object proc = eval(args.get(0), env);
         return doCallCC(proc);
     }
 
-    private Object doCallCC(Object proc) throws EvalError, ContinuationException {
+    private Object doCallCC(Object proc) throws EvalError, ContinuationException, SchemeRaiseException {
         // Check if we're replaying a continuation
         if (activeContinuationId != null) {
             Object val = activeContinuationValue;
@@ -793,7 +800,7 @@ public class Evaluator {
         }
     }
 
-    private Object evalDynamicWind(Object inThunk, Object bodyThunk, Object outThunk) throws EvalError, ContinuationException {
+    private Object evalDynamicWind(Object inThunk, Object bodyThunk, Object outThunk) throws EvalError, ContinuationException, SchemeRaiseException, SchemeRaiseException {
         // Run in-thunk
         applyResolved(inThunk, List.of());
         // Push wind entry
@@ -807,11 +814,76 @@ public class Evaluator {
             windStack.remove(windStack.size() - 1);
             applyResolved(outThunk, List.of());
             throw ce;
+        } catch (SchemeRaiseException re) {
+            // Exception: pop and run out-thunk before re-throwing
+            windStack.remove(windStack.size() - 1);
+            applyResolved(outThunk, List.of());
+            throw re;
         }
         // Normal exit: pop and run out-thunk
         windStack.remove(windStack.size() - 1);
         applyResolved(outThunk, List.of());
         return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalGuard(List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
+        // (guard (var clause1 clause2 ...) body ...)
+        if (args.size() < 2) throw new EvalError("guard: bad syntax");
+        List<?> clauseSpec = (List<?>) unwrap(args.get(0));
+        if (clauseSpec.isEmpty()) throw new EvalError("guard: bad syntax");
+        String exnVar = ((SchemeSymbol) unwrap(clauseSpec.get(0))).name();
+        List<Object> clauses = new ArrayList<>();
+        for (int i = 1; i < clauseSpec.size(); i++) {
+            clauses.add(clauseSpec.get(i));
+        }
+        // Body expressions
+        List<Object> bodyExprs = args.subList(1, args.size());
+        Object body = wrapBodyInBegin(bodyExprs, 0);
+
+        // Evaluate body, catching SchemeRaiseException
+        try {
+            return eval(body, env);
+        } catch (SchemeRaiseException re) {
+            // Test clauses against the raised value
+            Environment guardEnv = new Environment(env);
+            guardEnv.define(exnVar, re.value);
+            for (Object clause : clauses) {
+                List<?> cl = (List<?>) unwrap(clause);
+                if (cl.isEmpty()) continue;
+                Object test = unwrap(cl.get(0));
+                if (test instanceof SchemeSymbol sym && sym.name().equals("else")) {
+                    // else clause: evaluate body
+                    if (cl.size() == 1) return VOID;
+                    Object result = null;
+                    for (int i = 1; i < cl.size(); i++) {
+                        result = eval(cl.get(i), guardEnv);
+                    }
+                    return result;
+                }
+                Object testResult = eval(cl.get(0), guardEnv);
+                if (!testResult.equals(Boolean.FALSE)) {
+                    if (cl.size() == 1) return testResult;
+                    Object result = null;
+                    for (int i = 1; i < cl.size(); i++) {
+                        result = eval(cl.get(i), guardEnv);
+                    }
+                    return result;
+                }
+            }
+            // No clause matched — re-raise
+            throw re;
+        }
+    }
+
+    private Object evalWithExceptionHandler(Object handler, Object thunk) throws EvalError, ContinuationException, SchemeRaiseException {
+        try {
+            return applyResolved(thunk, List.of());
+        } catch (SchemeRaiseException re) {
+            // Call handler with the raised value; handler must escape (via continuation)
+            // or it's an error for 'raise'. We call it and if it returns, re-raise.
+            return applyResolved(handler, List.of(re.value));
+        }
     }
 
     private Object wrapBodyInBegin(List<Object> args, int bodyStart) {
@@ -845,7 +917,7 @@ public class Evaluator {
     }
 
     // apply returns TailCall for lambda bodies (for TCO)
-    private Object apply(Object proc, List<Object> args) throws EvalError, ContinuationException {
+    private Object apply(Object proc, List<Object> args) throws EvalError, ContinuationException, SchemeRaiseException {
         if (proc instanceof SchemeContinuation cont) {
             if (args.size() != 1) throw new EvalError("continuation: expected 1 argument");
             throw new ContinuationException(cont.id, args.get(0));
@@ -894,11 +966,19 @@ public class Evaluator {
     }
 
 
-    private Object applyBuiltin(String name, List<Object> args) throws EvalError, ContinuationException {
+    private Object applyBuiltin(String name, List<Object> args) throws EvalError, ContinuationException, SchemeRaiseException {
         return switch (name) {
             case "call/cc" -> {
                 if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
                 yield doCallCC(args.get(0));
+            }
+            case "raise" -> {
+                if (args.size() != 1) throw new EvalError("raise: expected 1 argument");
+                throw new SchemeRaiseException(args.get(0));
+            }
+            case "with-exception-handler" -> {
+                if (args.size() != 2) throw new EvalError("with-exception-handler: expected 2 arguments");
+                yield evalWithExceptionHandler(args.get(0), args.get(1));
             }
             case "+", "-", "*", "/", "abs", "modulo", "remainder", "quotient",
                  "min", "max", "expt", "zero?", "positive?", "negative?", "odd?", "even?",
@@ -1024,7 +1104,7 @@ public class Evaluator {
         return val;
     }
 
-    private Object applyListBuiltin(String name, List<Object> args) throws EvalError, ContinuationException {
+    private Object applyListBuiltin(String name, List<Object> args) throws EvalError, ContinuationException, SchemeRaiseException {
         return switch (name) {
             case "cons" -> new SchemePair(args.get(0), args.get(1));
             case "car" -> {
@@ -1308,7 +1388,7 @@ public class Evaluator {
         return StringCharBuiltins.applyCharBuiltin(name, args);
     }
 
-    private Object evalBuiltin(String name, List<Object> args, Environment env) throws EvalError, ContinuationException {
+    private Object evalBuiltin(String name, List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
         List<Object> evaluated = new ArrayList<>();
         for (Object arg : args) {
             evaluated.add(eval(arg, env));
