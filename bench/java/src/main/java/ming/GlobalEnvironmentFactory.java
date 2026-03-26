@@ -118,7 +118,10 @@ final class GlobalEnvironmentFactory {
         define("apply", collections::applyBuiltin);
         define("map", collections::mapBuiltin);
         define("for-each", collections::forEachBuiltin);
+        define("memq", collections::memqBuiltin);
+        define("memv", collections::memvBuiltin);
         define("member", collections::memberBuiltin);
+        define("assq", collections::assqBuiltin);
         define("assv", collections::assvBuiltin);
         define("assoc", collections::assocBuiltin);
         installCxrProcedures();

@@ -231,18 +231,18 @@ final class WithExceptionHandlerProcedure extends ProcedureValue {
 }
 
 final class ContinuationProcedure extends ProcedureValue {
-    private final Evaluator.Continuation continuation;
+    private final Continuation continuation;
     private final WindFrame windContext;
     private final ExceptionHandlerFrame exceptionHandlerContext;
 
-    ContinuationProcedure(Evaluator.Continuation continuation, WindFrame windContext,
+    ContinuationProcedure(Continuation continuation, WindFrame windContext,
                           ExceptionHandlerFrame exceptionHandlerContext) {
         this.continuation = continuation;
         this.windContext = windContext;
         this.exceptionHandlerContext = exceptionHandlerContext;
     }
 
-    Evaluator.Continuation continuation() {
+    Continuation continuation() {
         return continuation;
     }
 

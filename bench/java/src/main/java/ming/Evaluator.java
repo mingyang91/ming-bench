@@ -9,81 +9,10 @@ import java.util.Set;
  * Agents implement this class.
  */
 public class Evaluator {
-    @FunctionalInterface
-    interface Bounce {
-        Bounce run() throws EvalError;
-    }
-
-    @FunctionalInterface
-    interface Continuation {
-        Bounce resume(List<Value> values) throws EvalError;
-    }
-
-    @FunctionalInterface
-    private interface SingleValueContinuation {
-        Bounce resume(Value value) throws EvalError;
-    }
-
-    @FunctionalInterface
-    private interface ValueListContinuation {
-        Bounce resume(List<Value> values) throws EvalError;
-    }
-
-    @FunctionalInterface
-    private interface BounceFactory {
-        Bounce create(Continuation halt) throws EvalError;
-    }
-
-    private static final class ResultBox {
-        private Value value;
-    }
-
-    private final class SequenceState {
-        private final List<Expr> exprs;
-        private final Environment env;
-        private final Continuation cont;
-        private final Set<Integer> committedCallCcIndexes = new java.util.HashSet<>();
-
-        SequenceState(List<Expr> exprs, Environment env, Continuation cont) {
-            this.exprs = List.copyOf(exprs);
-            this.env = env;
-            this.cont = cont;
-        }
-
-        Bounce resumeFrom(int index) throws EvalError {
-            int nextIndex = index;
-            while (nextIndex < exprs.size() && committedCallCcIndexes.contains(nextIndex)) {
-                nextIndex++;
-            }
-
-            if (nextIndex >= exprs.size()) {
-                return deliver(cont, VoidValue.INSTANCE);
-            }
-
-            Expr expr = exprs.get(nextIndex);
-            int sequenceIndex = nextIndex;
-            if (nextIndex == exprs.size() - 1) {
-                return evalExpr(expr, env, values -> withPosition(expr.position(), () -> {
-                    markCommitted(sequenceIndex);
-                    return cont.resume(values);
-                }));
-            }
-
-            return evalExpr(expr, env, positionedCont(expr.position(), ignored -> {
-                markCommitted(sequenceIndex);
-                return resumeFrom(sequenceIndex + 1);
-            }));
-        }
-
-        private void markCommitted(int index) {
-            if (isCallCcExpr(exprs.get(index))) {
-                committedCallCcIndexes.add(index);
-            }
-        }
-    }
-
     private final CollectionProcedures collectionProcedures;
     private final DynamicWindSupport dynamicWindSupport;
+    private final ContinuationValueSupport continuationValueSupport =
+            new ContinuationValueSupport();
     private final ValueSupport valueSupport = new ValueSupport();
     private final NumericProcedures numericProcedures = new NumericProcedures(valueSupport);
     private final Environment globalEnv;
@@ -91,21 +20,12 @@ public class Evaluator {
     private StringBuilder activeOutput;
     private Environment activeTransformerDefinitionEnv;
     private long syntheticCounter;
-    private final RecordProcedureSupport recordProcedureSupport = new RecordProcedureSupport() {
-        @Override
-        public void requireArity(String name, int actual, int expected) throws EvalError {
-            Evaluator.this.requireArity(name, actual, expected);
-        }
-
-        @Override
-        public RecordValue expectRecord(Value value, RecordType recordType) throws EvalError {
-            return Evaluator.this.expectRecord(value, recordType);
-        }
-    };
+    private final RecordProcedureSupport recordProcedureSupport;
 
     public Evaluator() {
         collectionProcedures = new CollectionProcedures(this);
         dynamicWindSupport = new DynamicWindSupport(this::invokeThunk);
+        recordProcedureSupport = new EvaluatorRecordProcedureSupport(this);
         globalEnv = GlobalEnvironmentFactory.create(this);
     }
 
@@ -187,34 +107,20 @@ public class Evaluator {
         return value.render();
     }
 
-    private Value packValues(List<Value> values) {
-        if (values.size() == 1) {
-            return values.getFirst();
-        }
-        return new MultiValueValue(values);
-    }
-
-    private Value requireSingleValue(List<Value> values) throws EvalError {
-        if (values.size() != 1) {
-            throw new EvalError("expected single value, got " + values.size());
-        }
-        return values.getFirst();
-    }
-
     private Value run(BounceFactory factory) throws EvalError {
-        ResultBox result = new ResultBox();
+        Value[] result = new Value[1];
         Bounce current = factory.create(values -> {
-            result.value = packValues(values);
+            result[0] = continuationValueSupport.pack(values);
             return null;
         });
 
         while (current != null) {
             current = current.run();
         }
-        return result.value;
+        return result[0];
     }
 
-    private Bounce deliver(Continuation cont, Value value) {
+    Bounce deliver(Continuation cont, Value value) {
         return deliverValues(cont, List.of(value));
     }
 
@@ -230,7 +136,7 @@ public class Evaluator {
         return applyProcedureCps(thunk, List.of(), cont);
     }
 
-    private Bounce withPosition(SourcePos position, Bounce bounce) {
+    Bounce withPosition(SourcePos position, Bounce bounce) {
         return () -> {
             try {
                 return bounce.run();
@@ -240,33 +146,20 @@ public class Evaluator {
         };
     }
 
-    private Continuation positionedCont(SourcePos position, SingleValueContinuation cont) {
-        return values -> withPosition(position, () -> cont.resume(requireSingleValue(values)));
+    Continuation positionedCont(SourcePos position, SingleValueContinuation cont) {
+        return values -> withPosition(position,
+                () -> cont.resume(continuationValueSupport.requireSingle(values)));
     }
 
     private ValueListContinuation positionedValues(SourcePos position, ValueListContinuation cont) {
         return values -> withPosition(position, () -> cont.resume(values));
     }
 
-    private List<Value> appendValue(List<Value> values, Value value) {
-        List<Value> next = new ArrayList<>(values.size() + 1);
-        next.addAll(values);
-        next.add(value);
-        return List.copyOf(next);
-    }
-
-    private List<Value> prependValue(Value value, List<Value> values) {
-        List<Value> next = new ArrayList<>(values.size() + 1);
-        next.add(value);
-        next.addAll(values);
-        return List.copyOf(next);
-    }
-
     private Value eval(Expr expr, Environment env) throws EvalError {
         return run(halt -> evalExpr(expr, env, halt));
     }
 
-    private Bounce evalExpr(Expr expr, Environment env, Continuation cont) {
+    Bounce evalExpr(Expr expr, Environment env, Continuation cont) {
         return withPosition(expr.position(), () -> switch (expr) {
             case IntExpr intExpr -> deliver(cont, new IntValue(intExpr.value()));
             case RationalExpr rationalExpr -> deliver(cont, NumericSupport.exactToValue(
@@ -299,6 +192,7 @@ public class Evaluator {
                 case "set!" -> evalSet(position, argExprs, env, cont);
                 case "if" -> evalIf(position, argExprs, env, cont);
                 case "quote" -> evalQuote(argExprs, cont);
+                case "quasiquote" -> evalQuasiquote(argExprs, env, cont);
                 case "syntax" -> evalSyntax(argExprs, env, cont);
                 case "syntax-case" -> evalSyntaxCase(position, argExprs, env, cont);
                 case "with-syntax" -> evalWithSyntax(position, argExprs, env, cont);
@@ -398,6 +292,12 @@ public class Evaluator {
     private Bounce evalQuote(List<Expr> argExprs, Continuation cont) throws EvalError {
         requireArity("quote", argExprs.size(), 1);
         return deliver(cont, quoteToValue(argExprs.getFirst()));
+    }
+
+    private Bounce evalQuasiquote(List<Expr> argExprs, Environment env, Continuation cont)
+            throws EvalError {
+        requireArity("quasiquote", argExprs.size(), 1);
+        return deliver(cont, quasiquoteToValue(argExprs.getFirst(), env, 1));
     }
 
     private Bounce evalSyntax(List<Expr> argExprs, Environment env, Continuation cont)
@@ -726,7 +626,8 @@ public class Evaluator {
 
         return evalExpr(bindings.get(index).valueExpr(), valueEnv,
                 positionedCont(position, value -> evalBindingValues(bindings, index + 1,
-                        appendValue(values, value), valueEnv, position, cont)));
+                        continuationValueSupport.append(values, value), valueEnv, position,
+                        cont)));
     }
 
     private Bounce evalLetStarBindings(SourcePos position, List<LetBinding> bindings, int index,
@@ -844,7 +745,7 @@ public class Evaluator {
 
         return evalExpr(bindings.get(index).initExpr(), env,
                 positionedCont(position, value -> evalDoInitialBindings(bindings, index + 1,
-                        appendValue(values, value), env, position, cont)));
+                        continuationValueSupport.append(values, value), env, position, cont)));
     }
 
     private Bounce evalDoIteration(SourcePos position, List<FormParser.DoBinding> bindings,
@@ -880,13 +781,13 @@ public class Evaluator {
         Expr stepExpr = bindings.get(index).stepExpr();
         if (stepExpr == null) {
             return evalDoStepValues(position, bindings, index + 1,
-                    appendValue(nextValues, bindingCells.get(index).value()), loopEnv,
-                    bindingCells, terminationParts, body, cont);
+                    continuationValueSupport.append(nextValues, bindingCells.get(index).value()),
+                    loopEnv, bindingCells, terminationParts, body, cont);
         }
 
         return evalExpr(stepExpr, loopEnv, positionedCont(position,
                 value -> evalDoStepValues(position, bindings, index + 1,
-                        appendValue(nextValues, value), loopEnv, bindingCells,
+                        continuationValueSupport.append(nextValues, value), loopEnv, bindingCells,
                         terminationParts, body, cont)));
     }
 
@@ -997,14 +898,30 @@ public class Evaluator {
             }
             return evalClauseBody("cond", clause.subList(1, clause.size()), env, null, cont);
         }
+        if (isCondArrowClause(clause) && clause.size() != 3) {
+            throw new EvalError("cond => clause requires exactly one recipient expression");
+        }
 
         return evalExpr(testExpr, env, positionedCont(position, testValue -> {
             if (isTruthy(testValue)) {
+                if (isCondArrowClause(clause)) {
+                    Expr recipientExpr = clause.get(2);
+                    return evalExpr(recipientExpr, env,
+                            positionedCont(recipientExpr.position(),
+                                    recipient -> applyProcedureCps(recipient,
+                                            List.of(testValue), cont)));
+                }
                 return evalClauseBody("cond", clause.subList(1, clause.size()), env, testValue,
                         cont);
             }
             return evalCond(position, clauses, index + 1, env, cont);
         }));
+    }
+
+    private boolean isCondArrowClause(List<Expr> clause) {
+        return clause.size() >= 2
+                && clause.get(1) instanceof SymbolExpr symbolExpr
+                && symbolExpr.name().equals("=>");
     }
 
     private Bounce evalClauseBody(String formName, List<Expr> body, Environment env,
@@ -1071,7 +988,7 @@ public class Evaluator {
 
         return evalExpr(argExprs.get(index), env, positionedCont(position,
                 value -> evalArgumentValues(argExprs, index - 1,
-                        prependValue(value, values), env, position, cont)));
+                        continuationValueSupport.prepend(value, values), env, position, cont)));
     }
 
     private Value evalSequence(List<Expr> exprs, Environment env) throws EvalError {
@@ -1082,33 +999,101 @@ public class Evaluator {
         return run(halt -> evalSequenceBounce(exprs, env, halt));
     }
 
-    private Bounce evalSequenceBounce(List<Expr> exprs, Environment env, Continuation cont)
-            throws EvalError {
-        if (exprs.isEmpty()) {
-            return deliver(cont, VoidValue.INSTANCE);
+    private Value quasiquoteToValue(Expr expr, Environment env, int depth) throws EvalError {
+        if (expr instanceof ListExpr listExpr) {
+            List<Expr> elements = listExpr.elements();
+            if (matchesQuasiquoteForm(elements, "unquote")) {
+                return evalNestedQuasiquoteForm("unquote", elements, env, depth - 1);
+            }
+            if (matchesQuasiquoteForm(elements, "unquote-splicing")) {
+                if (depth == 1) {
+                    throw new EvalError("unquote-splicing must appear within a list");
+                }
+                return evalNestedQuasiquoteForm("unquote-splicing", elements, env, depth - 1);
+            }
+            if (matchesQuasiquoteForm(elements, "quasiquote")) {
+                return evalNestedQuasiquoteForm("quasiquote", elements, env, depth + 1);
+            }
+            return quasiquoteListToValue(elements, env, depth);
         }
-        if (exprs.size() == 1) {
-            return evalExpr(exprs.getFirst(), env, cont);
-        }
-        return new SequenceState(exprs, env, cont).resumeFrom(0);
+        return quoteToValue(expr);
     }
 
-    private boolean isCallCcExpr(Expr expr) {
-        if (!(expr instanceof ListExpr listExpr)) {
-            return false;
+    private Value evalNestedQuasiquoteForm(String name, List<Expr> elements, Environment env,
+                                           int nestedDepth) throws EvalError {
+        requireQuasiquoteFormArity(name, elements);
+        if (name.equals("unquote") && nestedDepth == 0) {
+            return evalSingleValue(elements.get(1), env);
+        }
+        Value argument = quasiquoteToValue(elements.get(1), env, nestedDepth);
+        return new PairValue(new SymbolValue(name),
+                new PairValue(argument, EmptyListValue.INSTANCE));
+    }
+
+    private Value quasiquoteListToValue(List<Expr> elements, Environment env, int depth)
+            throws EvalError {
+        int dotIndex = dottedTailIndex(elements);
+        int prefixEnd = dotIndex >= 0 ? dotIndex : elements.size();
+        Value result = dotIndex >= 0
+                ? quasiquoteToValue(elements.get(dotIndex + 1), env, depth)
+                : EmptyListValue.INSTANCE;
+
+        for (int index = prefixEnd - 1; index >= 0; index--) {
+            Expr element = elements.get(index);
+            if (depth == 1 && element instanceof ListExpr spliceExpr
+                    && matchesQuasiquoteForm(spliceExpr.elements(), "unquote-splicing")) {
+                requireQuasiquoteFormArity("unquote-splicing", spliceExpr.elements());
+                List<Value> splicedValues = collectionProcedures.listElements(
+                        evalSingleValue(spliceExpr.elements().get(1), env));
+                for (int spliceIndex = splicedValues.size() - 1; spliceIndex >= 0; spliceIndex--) {
+                    result = new PairValue(splicedValues.get(spliceIndex), result);
+                }
+                continue;
+            }
+            result = new PairValue(quasiquoteToValue(element, env, depth), result);
         }
 
-        List<Expr> elements = listExpr.elements();
-        if (elements.isEmpty()) {
-            return false;
-        }
+        return result;
+    }
 
-        if (!(elements.getFirst() instanceof SymbolExpr symbolExpr)) {
-            return false;
+    private Value evalSingleValue(Expr expr, Environment env) throws EvalError {
+        Value value = eval(expr, env);
+        if (value instanceof MultiValueValue multiValue) {
+            throw new EvalError("expected single value, got " + multiValue.values().size());
         }
+        return value;
+    }
 
-        return symbolExpr.name().equals("call/cc")
-                || symbolExpr.name().equals("call-with-current-continuation");
+    private boolean matchesQuasiquoteForm(List<Expr> elements, String name) {
+        return elements.size() == 2
+                && elements.getFirst() instanceof SymbolExpr symbolExpr
+                && symbolExpr.name().equals(name);
+    }
+
+    private void requireQuasiquoteFormArity(String name, List<Expr> elements) throws EvalError {
+        if (elements.size() != 2) {
+            throw new EvalError(name + " requires exactly one argument");
+        }
+    }
+
+    private int dottedTailIndex(List<Expr> elements) throws EvalError {
+        int dotIndex = -1;
+        for (int index = 0; index < elements.size(); index++) {
+            if (!(elements.get(index) instanceof SymbolExpr symbolExpr)
+                    || !symbolExpr.name().equals(".")) {
+                continue;
+            }
+            if (dotIndex >= 0 || index == 0 || index != elements.size() - 2) {
+                throw new EvalError("invalid dotted list");
+            }
+            dotIndex = index;
+        }
+        return dotIndex;
+    }
+
+    private Bounce evalSequenceBounce(List<Expr> exprs, Environment env, Continuation cont)
+            throws EvalError {
+        return SequenceEvaluator.evaluate(this, exprs, env, cont);
     }
 
     Value applyUserProcedure(String displayName, ParameterSpec parameters,
@@ -1384,7 +1369,7 @@ public class Evaluator {
         return valueSupport.expectVectorValue(value);
     }
 
-    private RecordValue expectRecord(Value value, RecordType recordType) throws EvalError {
+    RecordValue expectRecord(Value value, RecordType recordType) throws EvalError {
         return valueSupport.expectRecord(value, recordType);
     }
 

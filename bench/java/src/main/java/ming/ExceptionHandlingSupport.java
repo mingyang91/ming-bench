@@ -2,7 +2,7 @@ package ming;
 
 @FunctionalInterface
 interface ExceptionHandlerAction {
-    Evaluator.Bounce handle(Value exceptionValue) throws EvalError;
+    Bounce handle(Value exceptionValue) throws EvalError;
 }
 
 final class ExceptionHandlerFrame {

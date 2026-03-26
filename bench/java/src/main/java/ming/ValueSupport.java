@@ -21,8 +21,13 @@ final class ValueSupport {
     }
 
     private Value quoteListToValue(List<Expr> elements) throws EvalError {
-        Value result = EmptyListValue.INSTANCE;
-        for (int index = elements.size() - 1; index >= 0; index--) {
+        int dotIndex = dottedTailIndex(elements);
+        Value result = dotIndex >= 0
+                ? quoteToValue(elements.get(dotIndex + 1))
+                : EmptyListValue.INSTANCE;
+
+        int lastPairElement = dotIndex >= 0 ? dotIndex - 1 : elements.size() - 1;
+        for (int index = lastPairElement; index >= 0; index--) {
             result = new PairValue(quoteToValue(elements.get(index)), result);
         }
         return result;
@@ -153,9 +158,25 @@ final class ValueSupport {
             current = pair.cdr();
         }
         if (!(current instanceof EmptyListValue)) {
-            throw new EvalError("cannot convert dotted pair to syntax");
+            elements.add(new SymbolExpr(".", position));
+            elements.add(datumToExpr(current, position));
         }
         return new ListExpr(elements, position);
+    }
+
+    private int dottedTailIndex(List<Expr> elements) throws EvalError {
+        int dotIndex = -1;
+        for (int index = 0; index < elements.size(); index++) {
+            if (!(elements.get(index) instanceof SymbolExpr symbolExpr)
+                    || !symbolExpr.name().equals(".")) {
+                continue;
+            }
+            if (dotIndex >= 0 || index == 0 || index != elements.size() - 2) {
+                throw new EvalError("invalid dotted list");
+            }
+            dotIndex = index;
+        }
+        return dotIndex;
     }
 
     boolean compareChars(List<Value> args, String name, CharComparison comparison)

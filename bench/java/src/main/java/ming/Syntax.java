@@ -72,6 +72,8 @@ final class Parser {
         return switch (ch) {
             case '(' -> parseList(position);
             case '\'' -> parseQuoted(position);
+            case '`' -> parseAbbreviation(position, "quasiquote", 1);
+            case ',' -> parseUnquote(position);
             case '#' -> parseHashPrefixed(position);
             case '"' -> parseString(position);
             case ')' -> throw errorAt(position, "unexpected ')'");
@@ -80,8 +82,22 @@ final class Parser {
     }
 
     private Expr parseQuoted(SourcePos position) throws EvalError {
-        advance();
-        return new ListExpr(List.of(new SymbolExpr("quote", position), parseExpr()), position);
+        return parseAbbreviation(position, "quote", 1);
+    }
+
+    private Expr parseUnquote(SourcePos position) throws EvalError {
+        if (index + 1 < input.length() && input.charAt(index + 1) == '@') {
+            return parseAbbreviation(position, "unquote-splicing", 2);
+        }
+        return parseAbbreviation(position, "unquote", 1);
+    }
+
+    private Expr parseAbbreviation(SourcePos position, String formName, int prefixLength)
+            throws EvalError {
+        for (int count = 0; count < prefixLength; count++) {
+            advance();
+        }
+        return new ListExpr(List.of(new SymbolExpr(formName, position), parseExpr()), position);
     }
 
     private Expr parseHashPrefixed(SourcePos position) throws EvalError {
@@ -223,7 +239,8 @@ final class Parser {
     }
 
     private boolean isTokenDelimiter(char ch) {
-        return Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';';
+        return Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';'
+                || ch == '\'' || ch == '`' || ch == ',';
     }
 
     private void skipWhitespace() {

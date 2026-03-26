@@ -105,6 +105,7 @@ impl Interpreter {
             ("boolean?", Self::builtin_boolean_predicate),
             ("procedure?", Self::builtin_procedure_predicate),
             ("char?", Self::builtin_char_predicate),
+            ("char=?", Self::builtin_char_equal),
             ("string-append", Self::builtin_string_append),
             ("string-length", Self::builtin_string_length),
             ("substring", Self::builtin_substring),
@@ -251,6 +252,7 @@ impl Interpreter {
             ExprKind::String(value) => Ok(Step::Value(Value::String(SchemeString::new(value)))),
             ExprKind::Char(value) => Ok(Step::Value(Value::Char(*value))),
             ExprKind::Symbol(name) => Ok(Step::Value(env.lookup(name)?)),
+            ExprKind::Vector(_) => Ok(Step::Value(Self::quote_to_value(&expr)?)),
             ExprKind::DottedList(_, _) => Err(EvalError::new("cannot evaluate dotted list")),
             ExprKind::List(elements) => self.eval_list(elements, env),
         }
@@ -268,6 +270,7 @@ impl Interpreter {
                 "define-record-type" => self.eval_define_record_type(args, env),
                 "if" => self.eval_if(args, env),
                 "quote" => self.eval_quote(args),
+                "quasiquote" => self.eval_quasiquote(args, env),
                 "lambda" => self.eval_lambda(args, env),
                 "begin" => self.eval_begin(args, env),
                 "let" => self.eval_let(args, env),
@@ -553,6 +556,15 @@ impl Interpreter {
     fn eval_quote(&mut self, args: &[Expr]) -> Result<Step, EvalError> {
         Self::require_arity("quote", args.len(), 1)?;
         Ok(Step::Value(Self::quote_to_value(&args[0])?))
+    }
+
+    fn eval_quasiquote(
+        &mut self,
+        args: &[Expr],
+        env: Rc<Environment>,
+    ) -> Result<Step, EvalError> {
+        Self::require_arity("quasiquote", args.len(), 1)?;
+        Ok(Step::Value(self.eval_quasiquote_expr(&args[0], env, 1)?))
     }
 
     fn eval_lambda(&mut self, args: &[Expr], env: Rc<Environment>) -> Result<Step, EvalError> {
@@ -847,6 +859,120 @@ impl Interpreter {
     fn fresh_symbol(&mut self, prefix: &str) -> String {
         self.synthetic_counter += 1;
         format!("__ming${prefix}${}", self.synthetic_counter)
+    }
+
+    fn eval_quasiquote_expr(
+        &mut self,
+        expr: &Expr,
+        env: Rc<Environment>,
+        depth: usize,
+    ) -> Result<Value, EvalError> {
+        if let Some((special, inner)) = Self::quasiquote_special_form(expr) {
+            return match special {
+                QuasiquoteSpecial::Quasiquote => Ok(Self::make_list(&[
+                    Value::Symbol("quasiquote".to_owned()),
+                    self.eval_quasiquote_expr(inner, env, depth + 1)?,
+                ])),
+                QuasiquoteSpecial::Unquote if depth == 1 => self.eval_expr(inner.clone(), env),
+                QuasiquoteSpecial::Unquote => Ok(Self::make_list(&[
+                    Value::Symbol("unquote".to_owned()),
+                    self.eval_quasiquote_expr(inner, env, depth - 1)?,
+                ])),
+                QuasiquoteSpecial::UnquoteSplicing if depth == 1 => Err(EvalError::new(
+                    "unquote-splicing outside list or vector",
+                )),
+                QuasiquoteSpecial::UnquoteSplicing => Ok(Self::make_list(&[
+                    Value::Symbol("unquote-splicing".to_owned()),
+                    self.eval_quasiquote_expr(inner, env, depth - 1)?,
+                ])),
+            };
+        }
+
+        match expr.kind() {
+            ExprKind::List(items) => self.eval_quasiquote_list(items, None, env, depth),
+            ExprKind::DottedList(items, tail) => {
+                self.eval_quasiquote_list(items, Some(tail), env, depth)
+            }
+            ExprKind::Vector(items) => {
+                let mut values = Vec::new();
+                for item in items {
+                    if depth == 1 {
+                        if let Some((QuasiquoteSpecial::UnquoteSplicing, inner)) =
+                            Self::quasiquote_special_form(item)
+                        {
+                            values.extend(Self::list_elements(
+                                &self.eval_expr(inner.clone(), env.clone())?,
+                            )?);
+                            continue;
+                        }
+                    }
+
+                    values.push(self.eval_quasiquote_expr(item, env.clone(), depth)?);
+                }
+                Ok(Value::Vector(Rc::new(RefCell::new(values))))
+            }
+            _ => Self::quote_to_value(expr),
+        }
+    }
+
+    fn eval_quasiquote_list(
+        &mut self,
+        items: &[Expr],
+        tail: Option<&Expr>,
+        env: Rc<Environment>,
+        depth: usize,
+    ) -> Result<Value, EvalError> {
+        let mut values = Vec::new();
+
+        for item in items {
+            if depth == 1 {
+                if let Some((QuasiquoteSpecial::UnquoteSplicing, inner)) =
+                    Self::quasiquote_special_form(item)
+                {
+                    values.extend(Self::list_elements(
+                        &self.eval_expr(inner.clone(), env.clone())?,
+                    )?);
+                    continue;
+                }
+            }
+
+            values.push(self.eval_quasiquote_expr(item, env.clone(), depth)?);
+        }
+
+        let tail_value = match tail {
+            Some(tail_expr)
+                if depth == 1
+                    && matches!(
+                        Self::quasiquote_special_form(tail_expr),
+                        Some((QuasiquoteSpecial::UnquoteSplicing, _))
+                    ) =>
+            {
+                let (_, inner) = Self::quasiquote_special_form(tail_expr).expect("checked above");
+                self.eval_expr(inner.clone(), env)?
+            }
+            Some(tail_expr) => self.eval_quasiquote_expr(tail_expr, env, depth)?,
+            None => Value::EmptyList,
+        };
+
+        Ok(Self::make_improper_list(values, tail_value))
+    }
+
+    fn quasiquote_special_form(expr: &Expr) -> Option<(QuasiquoteSpecial, &Expr)> {
+        let ExprKind::List(items) = expr.kind() else {
+            return None;
+        };
+        if items.len() != 2 {
+            return None;
+        }
+
+        let special = match items[0].symbol_name()? {
+            "quasiquote" => QuasiquoteSpecial::Quasiquote,
+            "unquote" => QuasiquoteSpecial::Unquote,
+            "unquote-splicing" => QuasiquoteSpecial::UnquoteSplicing,
+            _ => return None,
+        };
+
+        Some((special, &items[1]))
     }
 
     fn symbol_expr(position: SourcePos, name: &str) -> Expr {
@@ -1240,21 +1366,34 @@ impl Interpreter {
             ExprKind::String(value) => Ok(Value::String(SchemeString::new(value))),
             ExprKind::Char(value) => Ok(Value::Char(*value)),
             ExprKind::Symbol(name) => Ok(Value::Symbol(name.clone())),
-            ExprKind::List(items) => {
-                let mut result = Value::EmptyList;
-                for item in items.iter().rev() {
-                    result = Value::Pair(PairCell::new_rc(Self::quote_to_value(item)?, result));
-                }
-                Ok(result)
-            }
+            ExprKind::List(items) => Ok(Self::make_improper_list(
+                items.iter()
+                    .map(Self::quote_to_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+                Value::EmptyList,
+            )),
             ExprKind::DottedList(items, tail) => {
-                let mut result = Self::quote_to_value(tail)?;
-                for item in items.iter().rev() {
-                    result = Value::Pair(PairCell::new_rc(Self::quote_to_value(item)?, result));
-                }
-                Ok(result)
+                Ok(Self::make_improper_list(
+                    items.iter()
+                        .map(Self::quote_to_value)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Self::quote_to_value(tail)?,
+                ))
             }
+            ExprKind::Vector(items) => Ok(Value::Vector(Rc::new(RefCell::new(
+                items.iter()
+                    .map(Self::quote_to_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )))),
         }
+    }
+
+    fn make_improper_list(values: Vec<Value>, tail: Value) -> Value {
+        let mut result = tail;
+        for value in values.into_iter().rev() {
+            result = Value::Pair(PairCell::new_rc(value, result));
+        }
+        result
     }
 
     fn take_output(&mut self) -> String {
@@ -1767,6 +1906,16 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, EvalError> {
         Self::type_predicate("char?", args, |value| matches!(value, Value::Char(_)))
+    }
+
+    fn builtin_char_equal(
+        _interpreter: &mut Interpreter,
+        args: &[Value],
+    ) -> Result<Value, EvalError> {
+        Self::require_arity("char=?", args.len(), 2)?;
+        Ok(Value::Bool(
+            Self::expect_char(&args[0])? == Self::expect_char(&args[1])?,
+        ))
     }
 
     fn builtin_string_append(
@@ -2360,11 +2509,7 @@ impl Interpreter {
     }
 
     fn make_list(values: &[Value]) -> Value {
-        let mut result = Value::EmptyList;
-        for value in values.iter().rev() {
-            result = Value::Pair(PairCell::new_rc(value.clone(), result));
-        }
-        result
+        Self::make_improper_list(values.to_vec(), Value::EmptyList)
     }
 
     fn list_length(value: &Value) -> Result<usize, EvalError> {
@@ -2645,6 +2790,13 @@ struct ExprNode {
     position: SourcePos,
 }
 
+#[derive(Copy, Clone)]
+enum QuasiquoteSpecial {
+    Quasiquote,
+    Unquote,
+    UnquoteSplicing,
+}
+
 #[derive(Clone)]
 enum ExprKind {
     Int(i64),
@@ -2655,6 +2807,7 @@ enum ExprKind {
     Symbol(String),
     List(Vec<Expr>),
     DottedList(Vec<Expr>, Expr),
+    Vector(Vec<Expr>),
 }
 
 #[derive(Clone)]
@@ -3321,6 +3474,18 @@ impl SyntaxRulesMacro {
             (ExprKind::String(left), ExprKind::String(right)) => Ok(left == right),
             (ExprKind::Char(left), ExprKind::Char(right)) => Ok(left == right),
             (ExprKind::Symbol(symbol), _) => self.match_pattern_symbol(symbol, input, bindings),
+            (ExprKind::Vector(pattern_items), ExprKind::Vector(input_items)) => {
+                if pattern_items.len() != input_items.len() {
+                    return Ok(false);
+                }
+
+                for (pattern_item, input_item) in pattern_items.iter().zip(input_items) {
+                    if !self.match_pattern(pattern_item, input_item, bindings)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             (ExprKind::List(pattern_items), ExprKind::List(input_items)) => {
                 if pattern_items.len() != input_items.len() {
                     return Ok(false);
@@ -3391,6 +3556,14 @@ impl SyntaxRulesMacro {
                 ),
                 template.position(),
             ),
+            ExprKind::Vector(items) => Expr::new(
+                ExprKind::Vector(
+                    items.iter()
+                        .map(|item| self.expand_template(item, bindings))
+                        .collect(),
+                ),
+                template.position(),
+            ),
             _ => template.clone(),
         }
     }
@@ -3404,6 +3577,13 @@ fn expr_equal(left: &Expr, right: &Expr) -> bool {
         (ExprKind::String(left), ExprKind::String(right)) => left == right,
         (ExprKind::Char(left), ExprKind::Char(right)) => left == right,
         (ExprKind::Symbol(left), ExprKind::Symbol(right)) => left == right,
+        (ExprKind::Vector(left), ExprKind::Vector(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| expr_equal(left, right))
+        }
         (ExprKind::List(left), ExprKind::List(right)) => {
             left.len() == right.len()
                 && left
@@ -3540,6 +3720,9 @@ impl<'a> Parser<'a> {
         match self.current_char() {
             Some('(') => self.parse_list(position),
             Some('\'') => self.parse_quote(position),
+            Some('`') => self.parse_quasiquote(position),
+            Some(',') => self.parse_unquote(position),
+            Some('#') if self.peek_char() == Some('(') => self.parse_vector(position),
             Some('"') => self.parse_string(position),
             Some(')') => Err(self.error_at(position, "unexpected ')'")),
             Some(_) => self.parse_atom(position),
@@ -3581,14 +3764,68 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_quote(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
+        self.parse_shorthand(position, "quote", 1)
+    }
+
+    fn parse_quasiquote(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
+        self.parse_shorthand(position, "quasiquote", 1)
+    }
+
+    fn parse_unquote(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
         self.advance();
+        let form_name = if self.current_char() == Some('@') {
+            self.advance();
+            "unquote-splicing"
+        } else {
+            "unquote"
+        };
+
         Ok(Expr::new(
             ExprKind::List(vec![
-                Expr::new(ExprKind::Symbol("quote".to_owned()), position),
+                Expr::new(ExprKind::Symbol(form_name.to_owned()), position),
                 self.parse_expr()?,
             ]),
             position,
         ))
+    }
+
+    fn parse_shorthand(
+        &mut self,
+        position: SourcePos,
+        form_name: &str,
+        prefix_len: usize,
+    ) -> Result<Expr, EvalError> {
+        for _ in 0..prefix_len {
+            self.advance();
+        }
+        Ok(Expr::new(
+            ExprKind::List(vec![
+                Expr::new(ExprKind::Symbol(form_name.to_owned()), position),
+                self.parse_expr()?,
+            ]),
+            position,
+        ))
+    }
+
+    fn parse_vector(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
+        self.advance();
+        self.advance();
+        let mut elements = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+            if self.index >= self.input.len() {
+                return Err(self.error_at(position, "unterminated vector"));
+            }
+
+            match self.current_char() {
+                Some(')') => {
+                    self.advance();
+                    return Ok(Expr::new(ExprKind::Vector(elements), position));
+                }
+                _ => elements.push(self.parse_expr()?),
+            }
+        }
     }
 
     fn parse_string(&mut self, position: SourcePos) -> Result<Expr, EvalError> {

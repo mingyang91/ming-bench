@@ -5,6 +5,11 @@ import java.util.IdentityHashMap;
 import java.util.List;
 
 final class CollectionProcedures {
+    @FunctionalInterface
+    private interface MatchPredicate {
+        boolean matches(Value left, Value right) throws EvalError;
+    }
+
     private final Evaluator evaluator;
 
     CollectionProcedures(Evaluator evaluator) {
@@ -198,38 +203,45 @@ final class CollectionProcedures {
         return makeList(results);
     }
 
+    Value assqBuiltin(List<Value> args) throws EvalError {
+        evaluator.requireArity("assq", args.size(), 2);
+        return assocBuiltin(args.get(0), args.get(1), evaluator::isEq);
+    }
+
     Value assocBuiltin(List<Value> args) throws EvalError {
         evaluator.requireArity("assoc", args.size(), 2);
-
-        Value key = args.get(0);
-        Value current = args.get(1);
-        IdentityHashMap<PairValue, Boolean> seenPairs = new IdentityHashMap<>();
-        while (current instanceof PairValue pairValue) {
-            ensureAcyclicListPair(pairValue, seenPairs);
-            Value entry = pairValue.car();
-            PairValue association = evaluator.expectPair(entry);
-            if (evaluator.isEqual(key, association.car())) {
-                return entry;
-            }
-            current = pairValue.cdr();
-        }
-        if (current instanceof EmptyListValue) {
-            return BoolValue.FALSE;
-        }
-        throw new EvalError("expected list");
+        return assocBuiltin(args.get(0), args.get(1), evaluator::isEqual);
     }
 
     Value assvBuiltin(List<Value> args) throws EvalError {
         evaluator.requireArity("assv", args.size(), 2);
+        return assocBuiltin(args.get(0), args.get(1), evaluator::isEqv);
+    }
 
-        Value key = args.get(0);
-        Value current = args.get(1);
+    Value memqBuiltin(List<Value> args) throws EvalError {
+        evaluator.requireArity("memq", args.size(), 2);
+        return memberBuiltin(args.get(0), args.get(1), evaluator::isEq);
+    }
+
+    Value memvBuiltin(List<Value> args) throws EvalError {
+        evaluator.requireArity("memv", args.size(), 2);
+        return memberBuiltin(args.get(0), args.get(1), evaluator::isEqv);
+    }
+
+    Value memberBuiltin(List<Value> args) throws EvalError {
+        evaluator.requireArity("member", args.size(), 2);
+        return memberBuiltin(args.get(0), args.get(1), evaluator::isEqual);
+    }
+
+    private Value assocBuiltin(Value key, Value list, MatchPredicate predicate)
+            throws EvalError {
+        Value current = list;
         IdentityHashMap<PairValue, Boolean> seenPairs = new IdentityHashMap<>();
         while (current instanceof PairValue pairValue) {
             ensureAcyclicListPair(pairValue, seenPairs);
             Value entry = pairValue.car();
             PairValue association = evaluator.expectPair(entry);
-            if (evaluator.isEqv(key, association.car())) {
+            if (predicate.matches(key, association.car())) {
                 return entry;
             }
             current = pairValue.cdr();
@@ -240,15 +252,13 @@ final class CollectionProcedures {
         throw new EvalError("expected list");
     }
 
-    Value memberBuiltin(List<Value> args) throws EvalError {
-        evaluator.requireArity("member", args.size(), 2);
-
-        Value key = args.get(0);
-        Value current = args.get(1);
+    private Value memberBuiltin(Value key, Value list, MatchPredicate predicate)
+            throws EvalError {
+        Value current = list;
         IdentityHashMap<PairValue, Boolean> seenPairs = new IdentityHashMap<>();
         while (current instanceof PairValue pairValue) {
             ensureAcyclicListPair(pairValue, seenPairs);
-            if (evaluator.isEqual(key, pairValue.car())) {
+            if (predicate.matches(key, pairValue.car())) {
                 return current;
             }
             current = pairValue.cdr();
