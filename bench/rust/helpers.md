@@ -10,7 +10,10 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### apply_procedure (src/scheme/mod.rs:705) — Invoke builtins and closures with fixed/rest arity checks and lexical environments
+### tokenize (src/scheme/mod.rs:955) — Convert Scheme source into positioned tokens with comment, string, char, and quote handling
+### parse_formal_parameter_list (src/scheme/mod.rs:1297) — Parse fixed and dotted rest-parameter lists for lambdas and function defines
+### list_to_vec (src/scheme/mod.rs:1370) — Validate a proper list and collect its elements for builtins like length, append, and apply
 
 ## Python Helpers (scripts/)
 

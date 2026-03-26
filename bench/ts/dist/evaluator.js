@@ -127,6 +127,17 @@ function createBuiltins(context) {
             }),
         ],
         [
+            'apply',
+            builtin('apply', (args, pos) => {
+                expectAtLeastArity('apply', args, 2, pos);
+                const [procedure, ...rest] = args;
+                const listArg = rest[rest.length - 1];
+                const prefixArgs = rest.slice(0, -1);
+                const listArgs = listToArray(listArg, 'apply', pos);
+                return applyProcedure(procedure, [...prefixArgs, ...listArgs], pos);
+            }),
+        ],
+        [
             'string-append',
             builtin('string-append', (args, pos) => makeString(args.map((arg) => expectStringContent(arg, 'string-append', pos)).join(''))),
         ],
@@ -386,7 +397,7 @@ function evaluateDefine(expressions, env, pos) {
     }
     const [nameExpr, ...paramExprs] = targetExpr.elements;
     const name = expectSymbolExpr(nameExpr, 'define');
-    const params = paramExprs.map((expr) => expectSymbolExpr(expr, 'define'));
+    const { params, restParam } = parseFormalParameters(paramExprs, 'define');
     if (valueExprs.length === 0) {
         throw new EvalError('define expected at least one function body expression', pos);
     }
@@ -394,6 +405,7 @@ function evaluateDefine(expressions, env, pos) {
         kind: 'closure',
         name,
         params,
+        restParam,
         body: valueExprs,
         env,
     };
@@ -424,10 +436,11 @@ function evaluateLambda(expressions, env, pos) {
     if (paramsExpr.kind !== 'list') {
         throw new EvalError('lambda expected a parameter list', paramsExpr.pos);
     }
-    const params = paramsExpr.elements.map((expr) => expectSymbolExpr(expr, 'lambda'));
+    const { params, restParam } = parseFormalParameters(paramsExpr.elements, 'lambda');
     return {
         kind: 'closure',
         params,
+        restParam,
         body,
         env,
     };
@@ -497,12 +510,18 @@ function applyProcedure(value, args, pos) {
     if (!isClosure(value)) {
         throw new EvalError('attempted to call a non-procedure value', pos);
     }
-    if (args.length !== value.params.length) {
+    if (value.restParam === undefined && args.length !== value.params.length) {
         throw new EvalError(`${value.name ?? 'lambda'} expected ${value.params.length} argument(s), got ${args.length}`, pos);
+    }
+    if (value.restParam !== undefined && args.length < value.params.length) {
+        throw new EvalError(`${value.name ?? 'lambda'} expected at least ${value.params.length} argument(s), got ${args.length}`, pos);
     }
     const callEnv = new Environment(value.env);
     for (let index = 0; index < value.params.length; index += 1) {
         callEnv.define(value.params[index], args[index]);
+    }
+    if (value.restParam !== undefined) {
+        callEnv.define(value.restParam, listToPairs(args.slice(value.params.length)));
     }
     return evaluateSequence(value.body, callEnv);
 }
@@ -809,6 +828,23 @@ function expectSymbolExpr(expression, name) {
         throw new EvalError(`${name} expected a symbol`, expression.pos);
     }
     return expression.name;
+}
+function parseFormalParameters(parameterExprs, name) {
+    const params = [];
+    for (let index = 0; index < parameterExprs.length; index += 1) {
+        const parameterExpr = parameterExprs[index];
+        if (parameterExpr.kind === 'symbol' && parameterExpr.name === '.') {
+            if (index !== parameterExprs.length - 2) {
+                throw new EvalError(`${name} expected a valid dotted parameter list`, parameterExpr.pos);
+            }
+            return {
+                params,
+                restParam: expectSymbolExpr(parameterExprs[index + 1], name),
+            };
+        }
+        params.push(expectSymbolExpr(parameterExpr, name));
+    }
+    return { params };
 }
 function parseBindings(bindingsExpr, name) {
     if (bindingsExpr.kind !== 'list') {
