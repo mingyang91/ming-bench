@@ -1,16 +1,16 @@
-import { EvalError } from './evalError.js';
+import { EvalError, type SourcePosition } from './evalError.js';
 
 type Expr =
-  | { kind: 'number'; value: number }
-  | { kind: 'boolean'; value: boolean }
-  | { kind: 'string'; value: string }
-  | { kind: 'symbol'; name: string }
-  | { kind: 'list'; elements: Expr[] };
+  | { kind: 'number'; value: number; pos: SourcePosition }
+  | { kind: 'boolean'; value: boolean; pos: SourcePosition }
+  | { kind: 'string'; value: string; pos: SourcePosition }
+  | { kind: 'symbol'; name: string; pos: SourcePosition }
+  | { kind: 'list'; elements: Expr[]; pos: SourcePosition };
 
 type BuiltinValue = {
   kind: 'builtin';
   name: string;
-  apply: (args: SchemeValue[]) => SchemeValue;
+  apply: (args: SchemeValue[], pos: SourcePosition) => SchemeValue;
 };
 
 type ClosureValue = {
@@ -53,102 +53,119 @@ type SchemeValue =
   | ProcedureValue;
 
 type Token =
-  | { kind: 'lparen' }
-  | { kind: 'rparen' }
-  | { kind: 'quote' }
-  | { kind: 'number'; value: number }
-  | { kind: 'boolean'; value: boolean }
-  | { kind: 'string'; value: string }
-  | { kind: 'symbol'; value: string };
+  | { kind: 'lparen'; pos: SourcePosition }
+  | { kind: 'rparen'; pos: SourcePosition }
+  | { kind: 'quote'; pos: SourcePosition }
+  | { kind: 'number'; value: number; pos: SourcePosition }
+  | { kind: 'boolean'; value: boolean; pos: SourcePosition }
+  | { kind: 'string'; value: string; pos: SourcePosition }
+  | { kind: 'symbol'; value: string; pos: SourcePosition };
+
+type TokenStream = {
+  tokens: Token[];
+  eofPosition: SourcePosition;
+};
 
 const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
 
 const builtins = new Map<string, BuiltinValue>([
-  ['+', builtin('+', (args) => sum(args, 0))],
-  ['-', builtin('-', (args) => subtract(args))],
-  ['*', builtin('*', (args) => product(args, 1))],
-  ['/', builtin('/', (args) => divide(args))],
-  ['<', builtin('<', (args) => compareChain('<', args, (left, right) => left < right))],
-  ['>', builtin('>', (args) => compareChain('>', args, (left, right) => left > right))],
-  ['=', builtin('=', (args) => compareChain('=', args, (left, right) => left === right))],
-  ['<=', builtin('<=', (args) => compareChain('<=', args, (left, right) => left <= right))],
+  ['+', builtin('+', (args, pos) => sum(args, 0, pos))],
+  ['-', builtin('-', (args, pos) => subtract(args, pos))],
+  ['*', builtin('*', (args, pos) => product(args, 1, pos))],
+  ['/', builtin('/', (args, pos) => divide(args, pos))],
+  [
+    '<',
+    builtin('<', (args, pos) => compareChain('<', args, (left, right) => left < right, pos)),
+  ],
+  [
+    '>',
+    builtin('>', (args, pos) => compareChain('>', args, (left, right) => left > right, pos)),
+  ],
+  [
+    '=',
+    builtin('=', (args, pos) => compareChain('=', args, (left, right) => left === right, pos)),
+  ],
+  [
+    '<=',
+    builtin('<=', (args, pos) => compareChain('<=', args, (left, right) => left <= right, pos)),
+  ],
   [
     'not',
-    builtin('not', (args) => {
-      expectArity('not', args, 1);
+    builtin('not', (args, pos) => {
+      expectArity('not', args, 1, pos);
       return isFalse(args[0]);
     }),
   ],
   [
     'cons',
-    builtin('cons', (args) => {
-      expectArity('cons', args, 2);
+    builtin('cons', (args, pos) => {
+      expectArity('cons', args, 2, pos);
       return { kind: 'pair', car: args[0], cdr: args[1] };
     }),
   ],
   [
     'car',
-    builtin('car', (args) => {
-      expectArity('car', args, 1);
-      return expectPair(args[0], 'car').car;
+    builtin('car', (args, pos) => {
+      expectArity('car', args, 1, pos);
+      return expectPair(args[0], 'car', pos).car;
     }),
   ],
   [
     'cdr',
-    builtin('cdr', (args) => {
-      expectArity('cdr', args, 1);
-      return expectPair(args[0], 'cdr').cdr;
+    builtin('cdr', (args, pos) => {
+      expectArity('cdr', args, 1, pos);
+      return expectPair(args[0], 'cdr', pos).cdr;
     }),
   ],
   [
     'null?',
-    builtin('null?', (args) => {
-      expectArity('null?', args, 1);
+    builtin('null?', (args, pos) => {
+      expectArity('null?', args, 1, pos);
       return isEmptyList(args[0]);
     }),
   ],
   ['list', builtin('list', (args) => listToPairs(args))],
   [
     'length',
-    builtin('length', (args) => {
-      expectArity('length', args, 1);
-      return listToArray(args[0], 'length').length;
+    builtin('length', (args, pos) => {
+      expectArity('length', args, 1, pos);
+      return listToArray(args[0], 'length', pos).length;
     }),
   ],
-  ['append', builtin('append', (args) => appendLists(args))],
+  ['append', builtin('append', (args, pos) => appendLists(args, pos))],
   [
     'string?',
-    builtin('string?', (args) => {
-      expectArity('string?', args, 1);
+    builtin('string?', (args, pos) => {
+      expectArity('string?', args, 1, pos);
       return typeof args[0] === 'string';
     }),
   ],
   [
     'number?',
-    builtin('number?', (args) => {
-      expectArity('number?', args, 1);
+    builtin('number?', (args, pos) => {
+      expectArity('number?', args, 1, pos);
       return typeof args[0] === 'number';
     }),
   ],
   [
     'boolean?',
-    builtin('boolean?', (args) => {
-      expectArity('boolean?', args, 1);
+    builtin('boolean?', (args, pos) => {
+      expectArity('boolean?', args, 1, pos);
       return typeof args[0] === 'boolean';
     }),
   ],
   [
     'pair?',
-    builtin('pair?', (args) => {
-      expectArity('pair?', args, 1);
+    builtin('pair?', (args, pos) => {
+      expectArity('pair?', args, 1, pos);
       return isPair(args[0]);
     }),
   ],
   [
     'symbol?',
-    builtin('symbol?', (args) => {
-      expectArity('symbol?', args, 1);
+    builtin('symbol?', (args, pos) => {
+      expectArity('symbol?', args, 1, pos);
       return isSymbolValue(args[0]);
     }),
   ],
@@ -159,7 +176,7 @@ export function evalStr(input: string): string {
   const expressions = parser.parseProgram();
 
   if (expressions.length === 0) {
-    throw new EvalError('expected at least one expression');
+    throw new EvalError('expected at least one expression', { line: 1, col: 1 });
   }
 
   const env = createGlobalEnvironment();
@@ -191,16 +208,16 @@ class Environment {
     this.bindings.set(name, value);
   }
 
-  lookup(name: string): SchemeValue {
+  lookup(name: string, pos: SourcePosition): SchemeValue {
     if (this.bindings.has(name)) {
       return this.bindings.get(name) as SchemeValue;
     }
 
     if (this.parent !== undefined) {
-      return this.parent.lookup(name);
+      return this.parent.lookup(name, pos);
     }
 
-    throw new EvalError(`unbound symbol: ${name}`);
+    throw new EvalError(`unbound symbol: ${name}`, pos);
   }
 }
 
@@ -215,21 +232,25 @@ function createGlobalEnvironment(): Environment {
 }
 
 function evaluate(expression: Expr, env: Environment): SchemeValue {
-  switch (expression.kind) {
-    case 'number':
-    case 'boolean':
-    case 'string':
-      return expression.value;
-    case 'symbol':
-      return env.lookup(expression.name);
-    case 'list':
-      return evaluateList(expression.elements, env);
+  try {
+    switch (expression.kind) {
+      case 'number':
+      case 'boolean':
+      case 'string':
+        return expression.value;
+      case 'symbol':
+        return env.lookup(expression.name, expression.pos);
+      case 'list':
+        return evaluateList(expression.elements, env, expression.pos);
+    }
+  } catch (error) {
+    throw errorWithPosition(error, expression.pos);
   }
 }
 
-function evaluateList(elements: Expr[], env: Environment): SchemeValue {
+function evaluateList(elements: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
   if (elements.length === 0) {
-    throw new EvalError('cannot evaluate empty list');
+    throw new EvalError('cannot evaluate empty list', pos);
   }
 
   const [operatorExpr, ...argumentExprs] = elements;
@@ -241,25 +262,25 @@ function evaluateList(elements: Expr[], env: Environment): SchemeValue {
       case 'or':
         return evaluateOr(argumentExprs, env);
       case 'if':
-        return evaluateIf(argumentExprs, env);
+        return evaluateIf(argumentExprs, env, operatorExpr.pos);
       case 'define':
-        return evaluateDefine(argumentExprs, env);
+        return evaluateDefine(argumentExprs, env, operatorExpr.pos);
       case 'quote':
-        return evaluateQuote(argumentExprs);
+        return evaluateQuote(argumentExprs, operatorExpr.pos);
       case 'lambda':
-        return evaluateLambda(argumentExprs, env);
+        return evaluateLambda(argumentExprs, env, operatorExpr.pos);
       case 'begin':
         return evaluateBegin(argumentExprs, env);
       case 'cond':
-        return evaluateCond(argumentExprs, env);
+        return evaluateCond(argumentExprs, env, operatorExpr.pos);
       case 'let':
-        return evaluateLet(argumentExprs, env);
+        return evaluateLet(argumentExprs, env, operatorExpr.pos);
     }
   }
 
   const operator = evaluate(operatorExpr, env);
   const args = argumentExprs.map((argument) => evaluate(argument, env));
-  return applyProcedure(operator, args);
+  return applyProcedure(operator, args, operatorExpr.pos);
 }
 
 function evaluateAnd(expressions: Expr[], env: Environment): SchemeValue {
@@ -288,9 +309,9 @@ function evaluateOr(expressions: Expr[], env: Environment): SchemeValue {
   return result;
 }
 
-function evaluateIf(expressions: Expr[], env: Environment): SchemeValue {
+function evaluateIf(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
   if (expressions.length !== 3) {
-    throw new EvalError(`if expected 3 argument(s), got ${expressions.length}`);
+    throw new EvalError(`if expected 3 argument(s), got ${expressions.length}`, pos);
   }
 
   const [conditionExpr, thenExpr, elseExpr] = expressions;
@@ -303,16 +324,16 @@ function evaluateIf(expressions: Expr[], env: Environment): SchemeValue {
   return evaluate(thenExpr, env);
 }
 
-function evaluateDefine(expressions: Expr[], env: Environment): SchemeValue {
+function evaluateDefine(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
   if (expressions.length < 2) {
-    throw new EvalError(`define expected at least 2 argument(s), got ${expressions.length}`);
+    throw new EvalError(`define expected at least 2 argument(s), got ${expressions.length}`, pos);
   }
 
   const [targetExpr, ...valueExprs] = expressions;
 
   if (targetExpr.kind === 'symbol') {
     if (valueExprs.length !== 1) {
-      throw new EvalError(`define expected 1 value expression, got ${valueExprs.length}`);
+      throw new EvalError(`define expected 1 value expression, got ${valueExprs.length}`, pos);
     }
 
     const value = evaluate(valueExprs[0], env);
@@ -321,7 +342,7 @@ function evaluateDefine(expressions: Expr[], env: Environment): SchemeValue {
   }
 
   if (targetExpr.kind !== 'list' || targetExpr.elements.length === 0) {
-    throw new EvalError('define expected a symbol or function signature');
+    throw new EvalError('define expected a symbol or function signature', targetExpr.pos);
   }
 
   const [nameExpr, ...paramExprs] = targetExpr.elements;
@@ -329,7 +350,7 @@ function evaluateDefine(expressions: Expr[], env: Environment): SchemeValue {
   const params = paramExprs.map((expr) => expectSymbolExpr(expr, 'define'));
 
   if (valueExprs.length === 0) {
-    throw new EvalError('define expected at least one function body expression');
+    throw new EvalError('define expected at least one function body expression', pos);
   }
 
   const closure: ClosureValue = {
@@ -344,23 +365,23 @@ function evaluateDefine(expressions: Expr[], env: Environment): SchemeValue {
   return VOID;
 }
 
-function evaluateQuote(expressions: Expr[]): SchemeValue {
+function evaluateQuote(expressions: Expr[], pos: SourcePosition): SchemeValue {
   if (expressions.length !== 1) {
-    throw new EvalError(`quote expected 1 argument(s), got ${expressions.length}`);
+    throw new EvalError(`quote expected 1 argument(s), got ${expressions.length}`, pos);
   }
 
   return quoteExpr(expressions[0]);
 }
 
-function evaluateLambda(expressions: Expr[], env: Environment): SchemeValue {
+function evaluateLambda(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
   if (expressions.length < 2) {
-    throw new EvalError(`lambda expected at least 2 argument(s), got ${expressions.length}`);
+    throw new EvalError(`lambda expected at least 2 argument(s), got ${expressions.length}`, pos);
   }
 
   const [paramsExpr, ...body] = expressions;
 
   if (paramsExpr.kind !== 'list') {
-    throw new EvalError('lambda expected a parameter list');
+    throw new EvalError('lambda expected a parameter list', paramsExpr.pos);
   }
 
   const params = paramsExpr.elements.map((expr) => expectSymbolExpr(expr, 'lambda'));
@@ -377,12 +398,12 @@ function evaluateBegin(expressions: Expr[], env: Environment): SchemeValue {
   return evaluateSequence(expressions, env);
 }
 
-function evaluateCond(clauses: Expr[], env: Environment): SchemeValue {
+function evaluateCond(clauses: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
   for (let index = 0; index < clauses.length; index += 1) {
     const clause = clauses[index];
 
     if (clause.kind !== 'list' || clause.elements.length === 0) {
-      throw new EvalError('cond expected a non-empty clause');
+      throw new EvalError('cond expected a non-empty clause', clause.pos);
     }
 
     const [testExpr, ...bodyExprs] = clause.elements;
@@ -390,7 +411,7 @@ function evaluateCond(clauses: Expr[], env: Environment): SchemeValue {
 
     if (isElseClause) {
       if (index !== clauses.length - 1) {
-        throw new EvalError('cond else clause must be last');
+        throw new EvalError('cond else clause must be last', clause.pos);
       }
 
       return evaluateSequence(bodyExprs, env);
@@ -409,16 +430,16 @@ function evaluateCond(clauses: Expr[], env: Environment): SchemeValue {
   return VOID;
 }
 
-function evaluateLet(expressions: Expr[], env: Environment): SchemeValue {
+function evaluateLet(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
   if (expressions.length < 2) {
-    throw new EvalError(`let expected at least 2 argument(s), got ${expressions.length}`);
+    throw new EvalError(`let expected at least 2 argument(s), got ${expressions.length}`, pos);
   }
 
   if (expressions[0].kind === 'symbol') {
     const [nameExpr, bindingsExpr, ...bodyExprs] = expressions;
 
     if (bindingsExpr === undefined || bodyExprs.length === 0) {
-      throw new EvalError('let expected bindings and a body');
+      throw new EvalError('let expected bindings and a body', pos);
     }
 
     const bindings = parseBindings(bindingsExpr, 'let');
@@ -433,7 +454,7 @@ function evaluateLet(expressions: Expr[], env: Environment): SchemeValue {
     };
 
     letEnv.define(nameExpr.name, closure);
-    return applyProcedure(closure, values);
+    return applyProcedure(closure, values, nameExpr.pos);
   }
 
   const [bindingsExpr, ...bodyExprs] = expressions;
@@ -448,18 +469,19 @@ function evaluateLet(expressions: Expr[], env: Environment): SchemeValue {
   return evaluateSequence(bodyExprs, letEnv);
 }
 
-function applyProcedure(value: SchemeValue, args: SchemeValue[]): SchemeValue {
+function applyProcedure(value: SchemeValue, args: SchemeValue[], pos: SourcePosition): SchemeValue {
   if (isBuiltin(value)) {
-    return value.apply(args);
+    return value.apply(args, pos);
   }
 
   if (!isClosure(value)) {
-    throw new EvalError('attempted to call a non-procedure value');
+    throw new EvalError('attempted to call a non-procedure value', pos);
   }
 
   if (args.length !== value.params.length) {
     throw new EvalError(
       `${value.name ?? 'lambda'} expected ${value.params.length} argument(s), got ${args.length}`,
+      pos,
     );
   }
 
@@ -499,101 +521,118 @@ function listToPairs(elements: SchemeValue[]): SchemeValue {
   return result;
 }
 
-function tokenize(input: string): Token[] {
+function tokenize(input: string): TokenStream {
   const tokens: Token[] = [];
   let index = 0;
+  let line = 1;
+  let col = 1;
+
+  const currentPosition = (): SourcePosition => ({ line, col });
+  const peekChar = (): string | undefined => input[index];
+  const advanceChar = (): string => {
+    const char = input[index];
+    index += 1;
+
+    if (char === '\n') {
+      line += 1;
+      col = 1;
+    } else {
+      col += 1;
+    }
+
+    return char;
+  };
 
   while (index < input.length) {
-    const char = input[index];
+    const char = peekChar() as string;
 
     if (isWhitespace(char)) {
-      index += 1;
+      advanceChar();
       continue;
     }
 
     if (char === ';') {
-      while (index < input.length && input[index] !== '\n') {
-        index += 1;
+      while (index < input.length && peekChar() !== '\n') {
+        advanceChar();
       }
       continue;
     }
 
+    const pos = currentPosition();
+
     if (char === '(') {
-      tokens.push({ kind: 'lparen' });
-      index += 1;
+      advanceChar();
+      tokens.push({ kind: 'lparen', pos });
       continue;
     }
 
     if (char === ')') {
-      tokens.push({ kind: 'rparen' });
-      index += 1;
+      advanceChar();
+      tokens.push({ kind: 'rparen', pos });
       continue;
     }
 
     if (char === '\'') {
-      tokens.push({ kind: 'quote' });
-      index += 1;
+      advanceChar();
+      tokens.push({ kind: 'quote', pos });
       continue;
     }
 
     if (char === '"') {
-      const { value, nextIndex } = readStringLiteral(input, index);
-      tokens.push({ kind: 'string', value });
-      index = nextIndex;
+      const value = readStringLiteral(peekChar, advanceChar, pos);
+      tokens.push({ kind: 'string', value, pos });
       continue;
     }
 
-    let end = index;
+    let rawToken = '';
 
-    while (end < input.length) {
-      const next = input[end];
+    while (index < input.length) {
+      const next = peekChar() as string;
       if (isWhitespace(next) || next === '(' || next === ')' || next === ';') {
         break;
       }
-      end += 1;
+      rawToken += advanceChar();
     }
 
-    const rawToken = input.slice(index, end);
-
     if (rawToken.length === 0) {
-      throw new EvalError('unexpected token');
+      throw new EvalError('unexpected token', pos);
     }
 
     if (rawToken === '#t') {
-      tokens.push({ kind: 'boolean', value: true });
+      tokens.push({ kind: 'boolean', value: true, pos });
     } else if (rawToken === '#f') {
-      tokens.push({ kind: 'boolean', value: false });
+      tokens.push({ kind: 'boolean', value: false, pos });
     } else if (/^[+-]?\d+$/.test(rawToken)) {
-      tokens.push({ kind: 'number', value: Number(rawToken) });
+      tokens.push({ kind: 'number', value: Number(rawToken), pos });
     } else {
-      tokens.push({ kind: 'symbol', value: rawToken });
+      tokens.push({ kind: 'symbol', value: rawToken, pos });
     }
-
-    index = end;
   }
 
-  return tokens;
+  return { tokens, eofPosition: currentPosition() };
 }
 
-function readStringLiteral(input: string, startIndex: number): { value: string; nextIndex: number } {
-  let index = startIndex + 1;
+function readStringLiteral(
+  peekChar: () => string | undefined,
+  advanceChar: () => string,
+  startPosition: SourcePosition,
+): string {
+  advanceChar();
   let value = '';
 
-  while (index < input.length) {
-    const char = input[index];
+  while (peekChar() !== undefined) {
+    const char = advanceChar();
 
     if (char === '"') {
-      return { value, nextIndex: index + 1 };
+      return value;
     }
 
     if (char === '\\') {
-      index += 1;
-
-      if (index >= input.length) {
-        throw new EvalError('unterminated string literal');
+      if (peekChar() === undefined) {
+        throw new EvalError('unterminated string literal', startPosition);
       }
 
-      const escaped = input[index];
+      const escaped = advanceChar();
       if (escaped === 'n') {
         value += '\n';
       } else if (escaped === 't') {
@@ -604,23 +643,23 @@ function readStringLiteral(input: string, startIndex: number): { value: string; 
         value += escaped;
       }
 
-      index += 1;
       continue;
     }
 
     value += char;
-    index += 1;
   }
 
-  throw new EvalError('unterminated string literal');
+  throw new EvalError('unterminated string literal', startPosition);
 }
 
 class Parser {
   private readonly tokens: Token[];
+  private readonly eofPosition: SourcePosition;
   private index = 0;
 
-  constructor(tokens: Token[]) {
-    this.tokens = tokens;
+  constructor(tokenStream: TokenStream) {
+    this.tokens = tokenStream.tokens;
+    this.eofPosition = tokenStream.eofPosition;
   }
 
   parseProgram(): Expr[] {
@@ -637,23 +676,24 @@ class Parser {
     const token = this.advance();
 
     if (token === undefined) {
-      throw new EvalError('unexpected end of input');
+      throw new EvalError('unexpected end of input', this.eofPosition);
     }
 
     switch (token.kind) {
       case 'number':
-        return { kind: 'number', value: token.value };
+        return { kind: 'number', value: token.value, pos: token.pos };
       case 'boolean':
-        return { kind: 'boolean', value: token.value };
+        return { kind: 'boolean', value: token.value, pos: token.pos };
       case 'string':
-        return { kind: 'string', value: token.value };
+        return { kind: 'string', value: token.value, pos: token.pos };
       case 'symbol':
-        return { kind: 'symbol', name: token.value };
+        return { kind: 'symbol', name: token.value, pos: token.pos };
       case 'quote':
         return {
           kind: 'list',
+          pos: token.pos,
           elements: [
-            { kind: 'symbol', name: 'quote' },
+            { kind: 'symbol', name: 'quote', pos: token.pos },
             this.parseExpr(),
           ],
         };
@@ -664,19 +704,19 @@ class Parser {
           const next = this.peek();
 
           if (next === undefined) {
-            throw new EvalError('unterminated list');
+            throw new EvalError('unterminated list', this.eofPosition);
           }
 
           if (next.kind === 'rparen') {
             this.advance();
-            return { kind: 'list', elements };
+            return { kind: 'list', elements, pos: token.pos };
           }
 
           elements.push(this.parseExpr());
         }
       }
       case 'rparen':
-        throw new EvalError('unexpected )');
+        throw new EvalError('unexpected )', token.pos);
     }
   }
 
@@ -695,8 +735,23 @@ class Parser {
   }
 }
 
-function builtin(name: string, apply: (args: SchemeValue[]) => SchemeValue): BuiltinValue {
+function builtin(
+  name: string,
+  apply: (args: SchemeValue[], pos: SourcePosition) => SchemeValue,
+): BuiltinValue {
   return { kind: 'builtin', name, apply };
+}
+
+function errorWithPosition(error: unknown, pos: SourcePosition): EvalError {
+  if (error instanceof EvalError) {
+    return error.position === undefined ? new EvalError(error.message, pos) : error;
+  }
+
+  if (error instanceof Error) {
+    return new EvalError(error.message, pos);
+  }
+
+  return new EvalError(String(error), pos);
 }
 
 function isBuiltin(value: SchemeValue): value is BuiltinValue {
@@ -719,29 +774,39 @@ function isEmptyList(value: SchemeValue): value is EmptyListValue {
   return typeof value === 'object' && value !== null && value.kind === 'empty-list';
 }
 
-function expectArity(name: string, args: SchemeValue[], expected: number): void {
+function expectArity(
+  name: string,
+  args: SchemeValue[],
+  expected: number,
+  pos: SourcePosition,
+): void {
   if (args.length !== expected) {
-    throw new EvalError(`${name} expected ${expected} argument(s), got ${args.length}`);
+    throw new EvalError(`${name} expected ${expected} argument(s), got ${args.length}`, pos);
   }
 }
 
-function expectAtLeastArity(name: string, args: SchemeValue[], min: number): void {
+function expectAtLeastArity(
+  name: string,
+  args: SchemeValue[],
+  min: number,
+  pos: SourcePosition,
+): void {
   if (args.length < min) {
-    throw new EvalError(`${name} expected at least ${min} argument(s), got ${args.length}`);
+    throw new EvalError(`${name} expected at least ${min} argument(s), got ${args.length}`, pos);
   }
 }
 
-function expectNumber(value: SchemeValue, name: string): number {
+function expectNumber(value: SchemeValue, name: string, pos: SourcePosition): number {
   if (typeof value !== 'number') {
-    throw new EvalError(`${name} expected a number`);
+    throw new EvalError(`${name} expected a number`, pos);
   }
 
   return value;
 }
 
-function expectPair(value: SchemeValue, name: string): PairValue {
+function expectPair(value: SchemeValue, name: string, pos: SourcePosition): PairValue {
   if (!isPair(value)) {
-    throw new EvalError(`${name} expected a pair`);
+    throw new EvalError(`${name} expected a pair`, pos);
   }
 
   return value;
@@ -749,7 +814,7 @@ function expectPair(value: SchemeValue, name: string): PairValue {
 
 function expectSymbolExpr(expression: Expr, name: string): string {
   if (expression.kind !== 'symbol') {
-    throw new EvalError(`${name} expected a symbol`);
+    throw new EvalError(`${name} expected a symbol`, expression.pos);
   }
 
   return expression.name;
@@ -757,12 +822,12 @@ function expectSymbolExpr(expression: Expr, name: string): string {
 
 function parseBindings(bindingsExpr: Expr, name: string): Array<{ name: string; valueExpr: Expr }> {
   if (bindingsExpr.kind !== 'list') {
-    throw new EvalError(`${name} expected a bindings list`);
+    throw new EvalError(`${name} expected a bindings list`, bindingsExpr.pos);
   }
 
   return bindingsExpr.elements.map((bindingExpr) => {
     if (bindingExpr.kind !== 'list' || bindingExpr.elements.length !== 2) {
-      throw new EvalError(`${name} expected bindings of the form (name value)`);
+      throw new EvalError(`${name} expected bindings of the form (name value)`, bindingExpr.pos);
     }
 
     const [nameExpr, valueExpr] = bindingExpr.elements;
@@ -783,7 +848,7 @@ function evaluateSequence(expressions: Expr[], env: Environment): SchemeValue {
   return result;
 }
 
-function listToArray(value: SchemeValue, name: string): SchemeValue[] {
+function listToArray(value: SchemeValue, name: string, pos: SourcePosition): SchemeValue[] {
   const elements: SchemeValue[] = [];
   let current = value;
 
@@ -793,68 +858,68 @@ function listToArray(value: SchemeValue, name: string): SchemeValue[] {
   }
 
   if (!isEmptyList(current)) {
-    throw new EvalError(`${name} expected a list`);
+    throw new EvalError(`${name} expected a list`, pos);
   }
 
   return elements;
 }
 
-function appendLists(args: SchemeValue[]): SchemeValue {
+function appendLists(args: SchemeValue[], pos: SourcePosition): SchemeValue {
   const elements: SchemeValue[] = [];
 
   for (const arg of args) {
-    elements.push(...listToArray(arg, 'append'));
+    elements.push(...listToArray(arg, 'append', pos));
   }
 
   return listToPairs(elements);
 }
 
-function sum(args: SchemeValue[], identity: number): number {
+function sum(args: SchemeValue[], identity: number, pos: SourcePosition): number {
   let total = identity;
 
   for (const arg of args) {
-    total += expectNumber(arg, '+');
+    total += expectNumber(arg, '+', pos);
   }
 
   return normalizeNumber(total);
 }
 
-function subtract(args: SchemeValue[]): number {
-  expectAtLeastArity('-', args, 1);
+function subtract(args: SchemeValue[], pos: SourcePosition): number {
+  expectAtLeastArity('-', args, 1, pos);
 
   if (args.length === 1) {
-    return normalizeNumber(-expectNumber(args[0], '-'));
+    return normalizeNumber(-expectNumber(args[0], '-', pos));
   }
 
-  let total = expectNumber(args[0], '-');
+  let total = expectNumber(args[0], '-', pos);
 
   for (const arg of args.slice(1)) {
-    total -= expectNumber(arg, '-');
+    total -= expectNumber(arg, '-', pos);
   }
 
   return normalizeNumber(total);
 }
 
-function product(args: SchemeValue[], identity: number): number {
+function product(args: SchemeValue[], identity: number, pos: SourcePosition): number {
   let total = identity;
 
   for (const arg of args) {
-    total *= expectNumber(arg, '*');
+    total *= expectNumber(arg, '*', pos);
   }
 
   return normalizeNumber(total);
 }
 
-function divide(args: SchemeValue[]): number {
-  expectAtLeastArity('/', args, 2);
+function divide(args: SchemeValue[], pos: SourcePosition): number {
+  expectAtLeastArity('/', args, 2, pos);
 
-  let total = expectNumber(args[0], '/');
+  let total = expectNumber(args[0], '/', pos);
 
   for (const arg of args.slice(1)) {
-    const divisor = expectNumber(arg, '/');
+    const divisor = expectNumber(arg, '/', pos);
 
     if (divisor === 0) {
-      throw new EvalError('division by zero');
+      throw new EvalError('division by zero', pos);
     }
 
     total /= divisor;
@@ -867,10 +932,11 @@ function compareChain(
   name: string,
   args: SchemeValue[],
   predicate: (left: number, right: number) => boolean,
+  pos: SourcePosition,
 ): boolean {
-  expectAtLeastArity(name, args, 2);
+  expectAtLeastArity(name, args, 2, pos);
 
-  const numbers = args.map((arg) => expectNumber(arg, name));
+  const numbers = args.map((arg) => expectNumber(arg, name, pos));
 
   for (let index = 0; index < numbers.length - 1; index += 1) {
     if (!predicate(numbers[index], numbers[index + 1])) {
