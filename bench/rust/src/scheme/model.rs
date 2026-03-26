@@ -138,6 +138,8 @@ pub(super) enum Builtin {
     Raise,
     WithExceptionHandler,
     DynamicWind,
+    Values,
+    CallWithValues,
     Apply,
     CallCc,
 }
@@ -252,6 +254,8 @@ impl Builtin {
             Builtin::Raise => "raise",
             Builtin::WithExceptionHandler => "with-exception-handler",
             Builtin::DynamicWind => "dynamic-wind",
+            Builtin::Values => "values",
+            Builtin::CallWithValues => "call-with-values",
             Builtin::Apply => "apply",
             Builtin::CallCc => "call/cc",
         }
@@ -421,6 +425,7 @@ pub(super) enum Value {
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
     Continuation(ContinuationProc),
+    MultipleValues(Vec<Value>),
     Record(Rc<RecordInstance>),
     RecordProcedure(Rc<RecordProcedure>),
     Void,
@@ -441,6 +446,7 @@ impl Value {
             | Value::Procedure(_)
             | Value::Continuation(_)
             | Value::RecordProcedure(_) => "procedure",
+            Value::MultipleValues(_) => "values",
             Value::Record(_) => "record",
             Value::Void => "void",
         }
@@ -456,6 +462,23 @@ impl Value {
 
     pub(super) fn render_display(&self) -> String {
         render_value(self, RenderMode::Display)
+    }
+
+    pub(super) fn from_values(values: Vec<Value>) -> Value {
+        match values.len() {
+            1 => values
+                .into_iter()
+                .next()
+                .expect("single-value vector contains one item"),
+            _ => Value::MultipleValues(values),
+        }
+    }
+
+    pub(super) fn into_values(self) -> Vec<Value> {
+        match self {
+            Value::MultipleValues(values) => values,
+            value => vec![value],
+        }
     }
 }
 
@@ -863,6 +886,7 @@ fn render_value_with_state(value: &Value, mode: RenderMode, state: &mut RenderSt
         | Value::Procedure(_)
         | Value::Continuation(_)
         | Value::RecordProcedure(_) => "#<procedure>".into(),
+        Value::MultipleValues(_) => "#<values>".into(),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Void => String::new(),
     }

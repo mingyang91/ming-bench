@@ -215,6 +215,10 @@ pub(super) fn apply_cps(
             _ => Err(wrong_arg_count("call/cc", "1", args.len())),
         },
         Value::Builtin(Builtin::DynamicWind) => apply_dynamic_wind_cps(args, output, k, runtime),
+        Value::Builtin(Builtin::Values) => k(Value::from_values(args), output),
+        Value::Builtin(Builtin::CallWithValues) => {
+            apply_call_with_values_cps(args, output, k, runtime)
+        }
         Value::Builtin(Builtin::Apply) => apply_apply_cps(args, output, k, runtime),
         Value::Builtin(Builtin::Map) => apply_map_cps(args, output, k, runtime),
         Value::Builtin(Builtin::ForEach) => apply_for_each_cps(args, output, k, runtime),
@@ -235,6 +239,36 @@ pub(super) fn apply_cps(
             got: value.type_name().into(),
         }),
     }
+}
+
+fn apply_call_with_values_cps(
+    args: Vec<Value>,
+    output: &mut String,
+    k: Continuation,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
+    let [producer, consumer] = args.as_slice() else {
+        return Err(wrong_arg_count("call-with-values", "2", args.len()));
+    };
+
+    let consumer = consumer.clone();
+    let consumer_k = k.clone();
+    let consumer_runtime = runtime.clone();
+    apply_cps(
+        producer.clone(),
+        Vec::new(),
+        output,
+        Rc::new(move |produced, output| {
+            apply_cps(
+                consumer.clone(),
+                produced.into_values(),
+                output,
+                consumer_k.clone(),
+                consumer_runtime.clone(),
+            )
+        }),
+        runtime,
+    )
 }
 
 fn apply_raise_cps(

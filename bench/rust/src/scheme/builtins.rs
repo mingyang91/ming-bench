@@ -188,11 +188,23 @@ pub(super) fn apply_builtin(
         Builtin::DynamicWind => Err(EvalError::Syntax {
             message: "dynamic-wind requires continuation-aware evaluation".into(),
         }),
+        Builtin::Values => Ok(Value::from_values(args.to_vec())),
+        Builtin::CallWithValues => builtin_call_with_values(args, output),
         Builtin::Apply => builtin_apply(args, output),
         Builtin::CallCc => Err(EvalError::Syntax {
             message: "call/cc requires continuation-aware evaluation".into(),
         }),
     }
+}
+
+fn builtin_call_with_values(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+    let [producer, consumer] = args else {
+        return Err(wrong_arg_count("call-with-values", "2", args.len()));
+    };
+
+    let produced = apply(producer.clone(), &[], output)?;
+    let consumer_args = produced.into_values();
+    apply(consumer.clone(), &consumer_args, output)
 }
 
 fn builtin_apply(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
@@ -1266,6 +1278,13 @@ pub(super) fn eqv_values(left: &Value, right: &Value) -> bool {
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
+        (Value::MultipleValues(left), Value::MultipleValues(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| eqv_values(left, right))
+        }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::RecordProcedure(left), Value::RecordProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
@@ -1321,6 +1340,13 @@ fn equal_values_inner(
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
+        (Value::MultipleValues(left), Value::MultipleValues(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| equal_values_inner(left, right, seen_pairs, seen_vectors))
+        }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::RecordProcedure(left), Value::RecordProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,

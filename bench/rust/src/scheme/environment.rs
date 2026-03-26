@@ -111,6 +111,8 @@ pub(super) fn initial_env() -> EnvRef {
         Builtin::Raise,
         Builtin::WithExceptionHandler,
         Builtin::DynamicWind,
+        Builtin::Values,
+        Builtin::CallWithValues,
         Builtin::Apply,
         Builtin::CallCc,
     ] {
