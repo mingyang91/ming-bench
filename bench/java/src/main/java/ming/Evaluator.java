@@ -30,6 +30,8 @@ public class Evaluator {
                 "symbol->string", "string->symbol",
                 "string-ref", "char?",
                 "string-copy", "string-set!",
+                "string->list", "list->string",
+                "char->integer", "integer->char",
                 "apply", "map", "for-each",
                 "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
                 "zero?", "positive?", "negative?", "odd?", "even?",
@@ -78,7 +80,9 @@ public class Evaluator {
 
     static final class SchemeString {
         String value;
-        SchemeString(String value) { this.value = value; }
+        boolean mutable;
+        SchemeString(String value) { this.value = value; this.mutable = false; }
+        SchemeString(String value, boolean mutable) { this.value = value; this.mutable = mutable; }
     }
 
     static final class SchemeChar {

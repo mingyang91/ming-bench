@@ -50,13 +50,15 @@ final class Builtins {
             case "string-append", "string-length", "substring",
                  "string->number", "number->string", "symbol->string", "string->symbol",
                  "string-ref", "string-copy", "string-set!",
+                 "string->list", "list->string",
                  "string=?", "string<?", "string-ci=?",
                  "string-upcase", "string-downcase" ->
                 applyString(name, args);
 
             // Char operations
             case "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
-                 "char=?", "char<?" ->
+                 "char=?", "char<?",
+                 "char->integer", "integer->char" ->
                 applyChar(name, args);
 
             // Exact/inexact
@@ -432,17 +434,39 @@ final class Builtins {
             case "string-copy" -> {
                 requireArgCount(args, 1, "string-copy");
                 if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-copy: expected string");
-                yield new Evaluator.SchemeString(s.value);
+                yield new Evaluator.SchemeString(s.value, true);
             }
             case "string-set!" -> {
                 requireArgCount(args, 3, "string-set!");
                 if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-set!: expected string");
+                if (!s.mutable) throw evaluator.posError("string-set!: strings are immutable");
                 int idx = (int) requireLong(args.get(1), "string-set!");
                 if (!(args.get(2) instanceof Evaluator.SchemeChar c)) throw evaluator.posError("string-set!: expected char");
+                if (idx < 0 || idx >= s.value.length()) throw evaluator.posError("string-set!: index out of range");
                 char[] chars = s.value.toCharArray();
                 chars[idx] = c.value;
                 s.value = new String(chars);
-                yield null;
+                yield null; // void
+            }
+            case "string->list" -> {
+                requireArgCount(args, 1, "string->list");
+                if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string->list: expected string");
+                Object result = NIL;
+                for (int i = s.value.length() - 1; i >= 0; i--) {
+                    result = new Evaluator.Pair(new Evaluator.SchemeChar(s.value.charAt(i)), result);
+                }
+                yield result;
+            }
+            case "list->string" -> {
+                requireArgCount(args, 1, "list->string");
+                StringBuilder sb = new StringBuilder();
+                Object lst = args.get(0);
+                while (lst instanceof Evaluator.Pair p) {
+                    if (!(p.car instanceof Evaluator.SchemeChar c)) throw evaluator.posError("list->string: expected list of chars");
+                    sb.append(c.value);
+                    lst = p.cdr;
+                }
+                yield new Evaluator.SchemeString(sb.toString());
             }
             case "string=?" -> {
                 requireArgCount(args, 2, "string=?");
@@ -511,6 +535,16 @@ final class Builtins {
                 if (!(args.get(0) instanceof Evaluator.SchemeChar a)) throw evaluator.posError("char<?: expected char");
                 if (!(args.get(1) instanceof Evaluator.SchemeChar b)) throw evaluator.posError("char<?: expected char");
                 yield a.value < b.value;
+            }
+            case "char->integer" -> {
+                requireArgCount(args, 1, "char->integer");
+                if (!(args.get(0) instanceof Evaluator.SchemeChar c)) throw evaluator.posError("char->integer: expected char");
+                yield (long) c.value;
+            }
+            case "integer->char" -> {
+                requireArgCount(args, 1, "integer->char");
+                long n = requireLong(args.get(0), "integer->char");
+                yield new Evaluator.SchemeChar((char) n);
             }
             default -> throw evaluator.posError("unknown char op: " + name);
         };
