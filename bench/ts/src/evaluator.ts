@@ -7,9 +7,25 @@ interface SourceLoc {
   col: number;
 }
 
+interface ExactNumberValue {
+  kind: 'number';
+  exact: true;
+  numerator: number;
+  denominator: number;
+}
+
+interface InexactNumberValue {
+  kind: 'number';
+  exact: false;
+  value: number;
+  forceDecimal: boolean;
+}
+
+type NumberValue = ExactNumberValue | InexactNumberValue;
+
 interface NumberExpr extends SourceLoc {
   type: 'number';
-  value: number;
+  value: NumberValue;
 }
 
 interface BooleanExpr extends SourceLoc {
@@ -122,7 +138,7 @@ type MacroBinding =
 type ProcedureValue = BuiltinProcedure | ClosureProcedure;
 
 type Value =
-  | number
+  | NumberValue
   | boolean
   | SchemeString
   | SchemeSymbol
@@ -398,8 +414,13 @@ class Reader {
       return { type: 'boolean', value: false, ...loc };
     }
 
-    if (/^-?\d+$/.test(token)) {
-      return { type: 'number', value: Number(token), ...loc };
+    const parsedNumber = parseNumberToken(token);
+    if (parsedNumber !== undefined) {
+      if (parsedNumber === null) {
+        this.raise('invalid rational literal', loc);
+      }
+
+      return { type: 'number', value: parsedNumber, ...loc };
     }
 
     if (token.startsWith('#\\')) {
@@ -499,19 +520,11 @@ function createGlobalEnv(runtime: Runtime): Environment {
   const env = new Environment();
 
   env.define('+', builtin('+', (args) => {
-    let result = 0;
-    for (const arg of args) {
-      result += expectNumber(arg);
-    }
-    return result;
+    return addNumbers(args.map(expectNumber));
   }));
 
   env.define('*', builtin('*', (args) => {
-    let result = 1;
-    for (const arg of args) {
-      result *= expectNumber(arg);
-    }
-    return result;
+    return multiplyNumbers(args.map(expectNumber));
   }));
 
   env.define('-', builtin('-', (args, loc) => {
@@ -521,14 +534,10 @@ function createGlobalEnv(runtime: Runtime): Environment {
 
     const first = expectNumber(args[0]);
     if (args.length === 1) {
-      return -first;
+      return negateNumber(first);
     }
 
-    let result = first;
-    for (const arg of args.slice(1)) {
-      result -= expectNumber(arg);
-    }
-    return result;
+    return subtractNumbers(first, args.slice(1).map(expectNumber));
   }));
 
   env.define('/', builtin('/', (args, loc) => {
@@ -539,10 +548,10 @@ function createGlobalEnv(runtime: Runtime): Environment {
     let result = expectNumber(args[0]);
     for (const arg of args.slice(1)) {
       const value = expectNumber(arg);
-      if (value === 0) {
+      if (isZeroNumber(value)) {
         throw new EvalError(`${arg.expr.line}:${arg.expr.col}: division by zero`);
       }
-      result /= value;
+      result = divideTwoNumbers(result, value);
     }
     return result;
   }));
@@ -552,7 +561,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: abs expects exactly 1 argument`);
     }
 
-    return Math.abs(expectNumber(args[0]));
+    return absNumber(expectNumber(args[0]));
   }));
 
   env.define('quotient', builtin('quotient', (args, loc) => {
@@ -560,13 +569,18 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: quotient expects exactly 2 arguments`);
     }
 
-    const dividend = expectIndexArg(args[0]);
-    const divisor = expectIndexArg(args[1]);
+    const dividendValue = expectNumber(args[0]);
+    const divisorValue = expectNumber(args[1]);
+    const dividend = expectIntegerNumber(dividendValue, args[0].expr);
+    const divisor = expectIntegerNumber(divisorValue, args[1].expr);
     if (divisor === 0) {
       throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: division by zero`);
     }
 
-    return Math.trunc(dividend / divisor);
+    const result = Math.trunc(dividend / divisor);
+    return dividendValue.exact && divisorValue.exact
+      ? makeExactNumber(result)
+      : makeInexactNumber(result);
   }));
 
   env.define('remainder', builtin('remainder', (args, loc) => {
@@ -574,13 +588,18 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: remainder expects exactly 2 arguments`);
     }
 
-    const dividend = expectIndexArg(args[0]);
-    const divisor = expectIndexArg(args[1]);
+    const dividendValue = expectNumber(args[0]);
+    const divisorValue = expectNumber(args[1]);
+    const dividend = expectIntegerNumber(dividendValue, args[0].expr);
+    const divisor = expectIntegerNumber(divisorValue, args[1].expr);
     if (divisor === 0) {
       throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: division by zero`);
     }
 
-    return dividend % divisor;
+    const result = dividend % divisor;
+    return dividendValue.exact && divisorValue.exact
+      ? makeExactNumber(result)
+      : makeInexactNumber(result);
   }));
 
   env.define('modulo', builtin('modulo', (args, loc) => {
@@ -588,13 +607,18 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: modulo expects exactly 2 arguments`);
     }
 
-    const dividend = expectIndexArg(args[0]);
-    const divisor = expectIndexArg(args[1]);
+    const dividendValue = expectNumber(args[0]);
+    const divisorValue = expectNumber(args[1]);
+    const dividend = expectIntegerNumber(dividendValue, args[0].expr);
+    const divisor = expectIntegerNumber(divisorValue, args[1].expr);
     if (divisor === 0) {
       throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: division by zero`);
     }
 
-    return dividend - (divisor * Math.floor(dividend / divisor));
+    const result = dividend - (divisor * Math.floor(dividend / divisor));
+    return dividendValue.exact && divisorValue.exact
+      ? makeExactNumber(result)
+      : makeInexactNumber(result);
   }));
 
   env.define('min', builtin('min', (args, loc) => {
@@ -602,15 +626,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: min expects at least 1 argument`);
     }
 
-    let result = expectNumber(args[0]);
-    for (const arg of args.slice(1)) {
-      const value = expectNumber(arg);
-      if (value < result) {
-        result = value;
-      }
-    }
-
-    return result;
+    return minNumbers(args.map(expectNumber));
   }));
 
   env.define('max', builtin('max', (args, loc) => {
@@ -618,15 +634,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: max expects at least 1 argument`);
     }
 
-    let result = expectNumber(args[0]);
-    for (const arg of args.slice(1)) {
-      const value = expectNumber(arg);
-      if (value > result) {
-        result = value;
-      }
-    }
-
-    return result;
+    return maxNumbers(args.map(expectNumber));
   }));
 
   env.define('expt', builtin('expt', (args, loc) => {
@@ -634,20 +642,25 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: expt expects exactly 2 arguments`);
     }
 
-    return Math.pow(expectNumber(args[0]), expectIndexArg(args[1]));
+    const base = expectNumber(args[0]);
+    const exponentValue = expectNumber(args[1]);
+    const exponent = expectIntegerNumber(exponentValue, args[1].expr);
+    return exponentValue.exact
+      ? exactAwarePower(base, exponent)
+      : makeInexactNumber(Math.pow(numberToJs(base), exponent));
   }));
 
-  env.define('<', comparisonBuiltin('<', (left, right) => left < right));
-  env.define('>', comparisonBuiltin('>', (left, right) => left > right));
-  env.define('=', comparisonBuiltin('=', (left, right) => left === right));
-  env.define('<=', comparisonBuiltin('<=', (left, right) => left <= right));
+  env.define('<', comparisonBuiltin('<', (left, right) => compareNumbers(left, right) < 0));
+  env.define('>', comparisonBuiltin('>', (left, right) => compareNumbers(left, right) > 0));
+  env.define('=', comparisonBuiltin('=', numbersEqual));
+  env.define('<=', comparisonBuiltin('<=', (left, right) => compareNumbers(left, right) <= 0));
 
   env.define('zero?', builtin('zero?', (args, loc) => {
     if (args.length !== 1) {
       throw new EvalError(`${loc.line}:${loc.col}: zero? expects exactly 1 argument`);
     }
 
-    return expectNumber(args[0]) === 0;
+    return isZeroNumber(expectNumber(args[0]));
   }));
 
   env.define('positive?', builtin('positive?', (args, loc) => {
@@ -655,7 +668,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: positive? expects exactly 1 argument`);
     }
 
-    return expectNumber(args[0]) > 0;
+    return compareNumbers(expectNumber(args[0]), makeExactNumber(0)) > 0;
   }));
 
   env.define('negative?', builtin('negative?', (args, loc) => {
@@ -663,7 +676,42 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: negative? expects exactly 1 argument`);
     }
 
-    return expectNumber(args[0]) < 0;
+    return compareNumbers(expectNumber(args[0]), makeExactNumber(0)) < 0;
+  }));
+
+  env.define('exact?', predicateBuiltin('exact?', (value) => isNumberValue(value) && value.exact));
+  env.define('inexact?', predicateBuiltin('inexact?', (value) => isNumberValue(value) && !value.exact));
+
+  env.define('exact->inexact', builtin('exact->inexact', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: exact->inexact expects exactly 1 argument`);
+    }
+
+    return exactToInexact(expectNumber(args[0]));
+  }));
+
+  env.define('inexact->exact', builtin('inexact->exact', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: inexact->exact expects exactly 1 argument`);
+    }
+
+    return inexactToExact(expectNumber(args[0]));
+  }));
+
+  env.define('numerator', builtin('numerator', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: numerator expects exactly 1 argument`);
+    }
+
+    return makeExactNumber(expectExactNumber(args[0]).numerator);
+  }));
+
+  env.define('denominator', builtin('denominator', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: denominator expects exactly 1 argument`);
+    }
+
+    return makeExactNumber(expectExactNumber(args[0]).denominator);
   }));
 
   env.define('odd?', builtin('odd?', (args, loc) => {
@@ -729,7 +777,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: length expects exactly 1 argument`);
     }
 
-    return expectProperList(args[0].value, args[0].expr).length;
+    return makeExactNumber(expectProperList(args[0].value, args[0].expr).length);
   }));
 
   env.define('list-ref', builtin('list-ref', (args, loc) => {
@@ -885,7 +933,11 @@ function createGlobalEnv(runtime: Runtime): Environment {
   }));
 
   env.define('string?', predicateBuiltin('string?', isSchemeStringValue));
-  env.define('number?', predicateBuiltin('number?', (value) => typeof value === 'number'));
+  env.define('number?', predicateBuiltin('number?', isNumberValue));
+  env.define('integer?', predicateBuiltin('integer?', (value) => (
+    isNumberValue(value) && isIntegerNumberValue(value)
+  )));
+  env.define('rational?', predicateBuiltin('rational?', isNumberValue));
   env.define('boolean?', predicateBuiltin('boolean?', (value) => typeof value === 'boolean'));
   env.define('pair?', predicateBuiltin('pair?', isPair));
   env.define('list?', predicateBuiltin('list?', isProperList));
@@ -936,7 +988,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
       throw new EvalError(`${loc.line}:${loc.col}: string-length expects exactly 1 argument`);
     }
 
-    return stringChars(expectStringArg(args[0])).length;
+    return makeExactNumber(stringChars(expectStringArg(args[0])).length);
   }));
 
   env.define('substring', builtin('substring', (args, loc) => {
@@ -1142,7 +1194,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
 
 function comparisonBuiltin(
   name: string,
-  predicate: (left: number, right: number) => boolean,
+  predicate: (left: NumberValue, right: NumberValue) => boolean,
 ): BuiltinProcedure {
   return builtin(name, (args, loc) => {
     if (args.length < 2) {
@@ -1697,6 +1749,7 @@ function matchPatternOnce(
 ): boolean {
   switch (pattern.type) {
     case 'number':
+      return datum.type === 'number' && numbersEqual(pattern.value, datum.value);
     case 'boolean':
     case 'string':
     case 'char':
@@ -1788,7 +1841,7 @@ function syntaxEq(left: Expr, right: Expr): boolean {
 
   switch (left.type) {
     case 'number':
-      return right.type === 'number' && left.value === right.value;
+      return right.type === 'number' && numbersEqual(left.value, right.value);
     case 'boolean':
       return right.type === 'boolean' && left.value === right.value;
     case 'string':
@@ -2190,12 +2243,21 @@ function isSpecialFormName(name: string): boolean {
   ].includes(name);
 }
 
-function expectNumber(arg: EvaluatedArg): number {
-  if (typeof arg.value !== 'number') {
+function expectNumber(arg: EvaluatedArg): NumberValue {
+  if (!isNumberValue(arg.value)) {
     throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected number`);
   }
 
   return arg.value;
+}
+
+function expectExactNumber(arg: EvaluatedArg): ExactNumberValue {
+  const value = expectNumber(arg);
+  if (!value.exact) {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected exact number`);
+  }
+
+  return value;
 }
 
 function expectPairArg(arg: EvaluatedArg): PairValue {
@@ -2231,12 +2293,7 @@ function expectSymbolArg(arg: EvaluatedArg): SchemeSymbol {
 }
 
 function expectIndexArg(arg: EvaluatedArg): number {
-  const value = expectNumber(arg);
-  if (!Number.isInteger(value)) {
-    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected integer`);
-  }
-
-  return value;
+  return expectIntegerNumber(expectNumber(arg), arg.expr);
 }
 
 function expectCharArg(arg: EvaluatedArg): SchemeChar {
@@ -2264,11 +2321,15 @@ function expectProperList(value: Value, loc: SourceLoc): Value[] {
 }
 
 function isEq(left: Value, right: Value): boolean {
-  if (typeof left === 'number' || typeof left === 'boolean') {
+  if (isNumberValue(left)) {
+    return isNumberValue(right) && numbersEqual(left, right);
+  }
+
+  if (typeof left === 'boolean') {
     return left === right;
   }
 
-  if (typeof right === 'number' || typeof right === 'boolean') {
+  if (isNumberValue(right) || typeof right === 'boolean') {
     return false;
   }
 
@@ -2304,11 +2365,11 @@ function isEqual(left: Value, right: Value): boolean {
     return true;
   }
 
-  if (typeof left === 'number' || typeof left === 'boolean') {
+  if (isNumberValue(left) || typeof left === 'boolean') {
     return false;
   }
 
-  if (typeof right === 'number' || typeof right === 'boolean') {
+  if (isNumberValue(right) || typeof right === 'boolean') {
     return false;
   }
 
@@ -2353,6 +2414,14 @@ function isTruthy(value: Value): boolean {
   return value !== false;
 }
 
+function isNumberValue(value: Value): value is NumberValue {
+  return typeof value === 'object' && value !== null && value.kind === 'number';
+}
+
+function isExactNumberValue(value: NumberValue): value is ExactNumberValue {
+  return value.exact;
+}
+
 function isProcedure(value: Value): value is ProcedureValue {
   return typeof value === 'object' && value !== null && value.kind === 'procedure';
 }
@@ -2394,7 +2463,7 @@ function schemeStringText(value: SchemeString): string {
 }
 
 function formatValue(value: Value): string {
-  if (typeof value === 'number') {
+  if (isNumberValue(value)) {
     return formatNumber(value);
   }
 
@@ -2421,7 +2490,7 @@ function formatValue(value: Value): string {
 }
 
 function formatDisplayValue(value: Value): string {
-  if (typeof value === 'number' || typeof value === 'boolean') {
+  if (isNumberValue(value) || typeof value === 'boolean') {
     return formatValue(value);
   }
 
@@ -2475,8 +2544,323 @@ function formatDisplayPair(value: PairValue): string {
   return `(${parts.join(' ')} . ${formatDisplayValue(tail)})`;
 }
 
-function formatNumber(value: number): string {
-  return Object.is(value, -0) ? '0' : String(value);
+function makeExactNumber(numerator: number, denominator = 1): ExactNumberValue {
+  if (denominator === 0) {
+    throw new EvalError('invalid rational literal');
+  }
+
+  if (Object.is(numerator, -0)) {
+    numerator = 0;
+  }
+
+  if (denominator < 0) {
+    numerator = -numerator;
+    denominator = -denominator;
+  }
+
+  if (numerator === 0) {
+    return { kind: 'number', exact: true, numerator: 0, denominator: 1 };
+  }
+
+  const gcdValue = gcd(Math.abs(numerator), denominator);
+  return {
+    kind: 'number',
+    exact: true,
+    numerator: numerator / gcdValue,
+    denominator: denominator / gcdValue,
+  };
+}
+
+function makeInexactNumber(value: number, forceDecimal = Number.isInteger(value)): InexactNumberValue {
+  return {
+    kind: 'number',
+    exact: false,
+    value: Object.is(value, -0) ? 0 : value,
+    forceDecimal,
+  };
+}
+
+function gcd(left: number, right: number): number {
+  let a = Math.abs(left);
+  let b = Math.abs(right);
+
+  while (b !== 0) {
+    const next = a % b;
+    a = b;
+    b = next;
+  }
+
+  return a === 0 ? 1 : a;
+}
+
+function isIntegerNumberValue(value: NumberValue): boolean {
+  return value.exact ? value.denominator === 1 : Number.isInteger(value.value);
+}
+
+function expectIntegerNumber(value: NumberValue, loc: SourceLoc): number {
+  if (!isIntegerNumberValue(value)) {
+    throw new EvalError(`${loc.line}:${loc.col}: expected integer`);
+  }
+
+  return value.exact ? value.numerator : value.value;
+}
+
+function numberToJs(value: NumberValue): number {
+  return value.exact ? value.numerator / value.denominator : value.value;
+}
+
+function isZeroNumber(value: NumberValue): boolean {
+  return value.exact ? value.numerator === 0 : value.value === 0;
+}
+
+function numbersEqual(left: NumberValue, right: NumberValue): boolean {
+  if (left.exact && right.exact) {
+    return left.numerator === right.numerator && left.denominator === right.denominator;
+  }
+
+  return numberToJs(left) === numberToJs(right);
+}
+
+function compareNumbers(left: NumberValue, right: NumberValue): number {
+  if (left.exact && right.exact) {
+    const leftScaled = left.numerator * right.denominator;
+    const rightScaled = right.numerator * left.denominator;
+    if (leftScaled < rightScaled) {
+      return -1;
+    }
+    if (leftScaled > rightScaled) {
+      return 1;
+    }
+    return 0;
+  }
+
+  const leftValue = numberToJs(left);
+  const rightValue = numberToJs(right);
+  if (leftValue < rightValue) {
+    return -1;
+  }
+  if (leftValue > rightValue) {
+    return 1;
+  }
+  return 0;
+}
+
+function addExactNumbers(left: ExactNumberValue, right: ExactNumberValue): ExactNumberValue {
+  return makeExactNumber(
+    (left.numerator * right.denominator) + (right.numerator * left.denominator),
+    left.denominator * right.denominator,
+  );
+}
+
+function multiplyExactNumbers(left: ExactNumberValue, right: ExactNumberValue): ExactNumberValue {
+  return makeExactNumber(
+    left.numerator * right.numerator,
+    left.denominator * right.denominator,
+  );
+}
+
+function divideExactNumbers(left: ExactNumberValue, right: ExactNumberValue): ExactNumberValue {
+  return makeExactNumber(
+    left.numerator * right.denominator,
+    left.denominator * right.numerator,
+  );
+}
+
+function addNumbers(values: NumberValue[]): NumberValue {
+  if (values.every(isExactNumberValue)) {
+    let result = makeExactNumber(0);
+    for (const value of values) {
+      result = addExactNumbers(result, value);
+    }
+    return result;
+  }
+
+  let result = 0;
+  for (const value of values) {
+    result += numberToJs(value);
+  }
+  return makeInexactNumber(result);
+}
+
+function multiplyNumbers(values: NumberValue[]): NumberValue {
+  if (values.every(isExactNumberValue)) {
+    let result = makeExactNumber(1);
+    for (const value of values) {
+      result = multiplyExactNumbers(result, value);
+    }
+    return result;
+  }
+
+  let result = 1;
+  for (const value of values) {
+    result *= numberToJs(value);
+  }
+  return makeInexactNumber(result);
+}
+
+function negateNumber(value: NumberValue): NumberValue {
+  return value.exact
+    ? makeExactNumber(-value.numerator, value.denominator)
+    : makeInexactNumber(-value.value, value.forceDecimal);
+}
+
+function subtractNumbers(first: NumberValue, rest: NumberValue[]): NumberValue {
+  if (first.exact && rest.every(isExactNumberValue)) {
+    let result = first;
+    for (const value of rest) {
+      result = addExactNumbers(result, makeExactNumber(-value.numerator, value.denominator));
+    }
+    return result;
+  }
+
+  let result = numberToJs(first);
+  for (const value of rest) {
+    result -= numberToJs(value);
+  }
+  return makeInexactNumber(result);
+}
+
+function divideTwoNumbers(left: NumberValue, right: NumberValue): NumberValue {
+  if (left.exact && right.exact) {
+    return divideExactNumbers(left, right);
+  }
+
+  return makeInexactNumber(numberToJs(left) / numberToJs(right));
+}
+
+function minNumbers(values: NumberValue[]): NumberValue {
+  if (values.every(isExactNumberValue)) {
+    let result = values[0];
+    for (const value of values.slice(1)) {
+      if (compareNumbers(value, result) < 0) {
+        result = value;
+      }
+    }
+    return result;
+  }
+
+  let result = numberToJs(values[0]);
+  for (const value of values.slice(1)) {
+    const candidate = numberToJs(value);
+    if (candidate < result) {
+      result = candidate;
+    }
+  }
+  return makeInexactNumber(result);
+}
+
+function maxNumbers(values: NumberValue[]): NumberValue {
+  if (values.every(isExactNumberValue)) {
+    let result = values[0];
+    for (const value of values.slice(1)) {
+      if (compareNumbers(value, result) > 0) {
+        result = value;
+      }
+    }
+    return result;
+  }
+
+  let result = numberToJs(values[0]);
+  for (const value of values.slice(1)) {
+    const candidate = numberToJs(value);
+    if (candidate > result) {
+      result = candidate;
+    }
+  }
+  return makeInexactNumber(result);
+}
+
+function absNumber(value: NumberValue): NumberValue {
+  return value.exact
+    ? makeExactNumber(Math.abs(value.numerator), value.denominator)
+    : makeInexactNumber(Math.abs(value.value), value.forceDecimal);
+}
+
+function exactAwarePower(base: NumberValue, exponent: number): NumberValue {
+  if (base.exact) {
+    const absExponent = Math.abs(exponent);
+    const numerator = Math.pow(base.numerator, absExponent);
+    const denominator = Math.pow(base.denominator, absExponent);
+    return exponent >= 0
+      ? makeExactNumber(numerator, denominator)
+      : makeExactNumber(denominator, numerator);
+  }
+
+  return makeInexactNumber(Math.pow(base.value, exponent));
+}
+
+function exactToInexact(value: NumberValue): InexactNumberValue {
+  if (!value.exact) {
+    return value;
+  }
+
+  return makeInexactNumber(numberToJs(value));
+}
+
+function inexactToExact(value: NumberValue): ExactNumberValue {
+  if (value.exact) {
+    return value;
+  }
+
+  return exactFromDecimalText(String(value.value));
+}
+
+function exactFromDecimalText(text: string): ExactNumberValue {
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(text);
+  if (match === null) {
+    throw new EvalError('invalid inexact number');
+  }
+
+  const sign = match[1] === '-' ? -1 : 1;
+  const integerPart = match[2];
+  const fractionPart = match[3] ?? '';
+  const exponent = match[4] === undefined ? 0 : Number(match[4]);
+  const digits = Number(`${integerPart}${fractionPart}` || '0');
+  const scale = fractionPart.length - exponent;
+
+  if (scale <= 0) {
+    return makeExactNumber(sign * digits * (10 ** -scale));
+  }
+
+  return makeExactNumber(sign * digits, 10 ** scale);
+}
+
+function parseNumberToken(token: string): NumberValue | null | undefined {
+  const rationalMatch = /^([+-]?\d+)\/(\d+)$/.exec(token);
+  if (rationalMatch !== null) {
+    const numerator = Number(rationalMatch[1]);
+    const denominator = Number(rationalMatch[2]);
+    if (denominator === 0) {
+      return null;
+    }
+
+    return makeExactNumber(numerator, denominator);
+  }
+
+  if (/^[+-]?\d+$/.test(token)) {
+    return makeExactNumber(Number(token));
+  }
+
+  if (/^[+-]?(?:\d+\.\d+|\.\d+)$/.test(token)) {
+    return makeInexactNumber(Number(token), true);
+  }
+
+  return undefined;
+}
+
+function formatNumber(value: NumberValue): string {
+  if (value.exact) {
+    return value.denominator === 1
+      ? String(value.numerator)
+      : `${value.numerator}/${value.denominator}`;
+  }
+
+  const numeric = Object.is(value.value, -0) ? 0 : value.value;
+  if (value.forceDecimal && Number.isInteger(numeric)) {
+    return numeric.toFixed(1);
+  }
+
+  return String(numeric);
 }
 
 function formatChar(value: string): string {
@@ -2521,12 +2905,9 @@ function parseCharLiteral(token: string, loc: SourceLoc): string {
   throw new EvalError(`${loc.line}:${loc.col}: invalid character literal`);
 }
 
-function parseStringNumber(value: string): number | false {
-  if (!/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(value)) {
-    return false;
-  }
-
-  return Number(value);
+function parseStringNumber(value: string): NumberValue | false {
+  const parsed = parseNumberToken(value);
+  return parsed === undefined || parsed === null ? false : parsed;
 }
 
 function isWhitespace(ch: string): boolean {
