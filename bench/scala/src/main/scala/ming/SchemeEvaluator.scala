@@ -26,7 +26,7 @@ private[ming] object SchemeEvaluator extends SchemeEvaluatorSpecialForms:
           SchemeNumbers.exactRational(numerator, denominator)
         case Expr.InexactLiteral(value, _) => Value.InexactValue(value)
         case Expr.BooleanLiteral(value, _) => Value.BooleanValue(value)
-        case Expr.StringLiteral(value, _)  => Value.StringValue(SchemeString.fromText(value))
+        case Expr.StringLiteral(value, _)  => Value.StringValue(SchemeString.fromLiteral(value))
         case Expr.CharLiteral(value, _)    => Value.CharValue(value)
         case Expr.Symbol(name, _)          => env.lookup(name)
         case Expr.ListExpr(Nil, _) =>

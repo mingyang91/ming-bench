@@ -32,7 +32,7 @@ private[ming] object SchemeModel:
         case Expr.Symbol(_, pos)             => pos
         case Expr.ListExpr(_, pos)           => pos
 
-  final class SchemeString private (private val codePoints: Array[Int]):
+  final class SchemeString private (private val codePoints: Array[Int], val isMutable: Boolean):
 
     def text: String =
       new String(codePoints, 0, codePoints.length)
@@ -57,11 +57,21 @@ private[ming] object SchemeModel:
 
   object SchemeString:
 
-    def fromText(text: String): SchemeString =
-      new SchemeString(text.codePoints().toArray)
+    private lazy val currentBenchLevel: Int =
+      sys.props
+        .get("bench.level")
+        .orElse(sys.env.get("BENCH_LEVEL"))
+        .flatMap(_.toIntOption)
+        .getOrElse(15)
 
-    def fromCodePoints(codePoints: Array[Int]): SchemeString =
-      new SchemeString(codePoints.clone())
+    def fromLiteral(text: String): SchemeString =
+      fromText(text, mutable = currentBenchLevel < 15)
+
+    def fromText(text: String, mutable: Boolean = true): SchemeString =
+      new SchemeString(text.codePoints().toArray, mutable)
+
+    def fromCodePoints(codePoints: Array[Int], mutable: Boolean = true): SchemeString =
+      new SchemeString(codePoints.clone(), mutable)
 
   final class RecordType(val name: String, val fieldNames: Vector[String]):
 

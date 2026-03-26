@@ -56,11 +56,23 @@ private[ming] object SchemeTextBuiltins:
         val index = requireIndex("string-ref", args(1), text.length)
         Value.CharValue(text.codePointAt(index))
     ),
+    "string->list" -> unaryStringBuiltin("string->list") { text =>
+      makeList(stringCodePoints(text).iterator.map(Value.CharValue.apply).toList)
+    },
+    "list->string" -> Value.Builtin(
+      "list->string",
+      args =>
+        requireArgCount("list->string", args, 1)
+        val chars = properListElements("list->string", args.head).map(requireChar("list->string", _))
+        Value.StringValue(SchemeString.fromCodePoints(chars.toArray))
+    ),
     "string-set!" -> Value.Builtin(
       "string-set!",
       args =>
         requireArgCount("string-set!", args, 3)
-        val text  = requireString("string-set!", args.head)
+        val text = requireString("string-set!", args.head)
+        if !text.isMutable then
+          throw new EvalError("string-set! is not supported on immutable strings")
         val index = requireIndex("string-set!", args(1), text.length)
         text.setCodePoint(index, requireChar("string-set!", args(2)))
         Value.VoidValue
@@ -83,6 +95,21 @@ private[ming] object SchemeTextBuiltins:
     },
     "char-alphabetic?" -> unaryCharPredicate("char-alphabetic?")(codePoint => Character.isLetter(codePoint)),
     "char-numeric?"    -> unaryCharPredicate("char-numeric?")(codePoint => Character.isDigit(codePoint)),
+    "char->integer" -> Value.Builtin(
+      "char->integer",
+      args =>
+        requireArgCount("char->integer", args, 1)
+        Value.IntegerValue(BigInt(requireChar("char->integer", args.head)))
+    ),
+    "integer->char" -> Value.Builtin(
+      "integer->char",
+      args =>
+        requireArgCount("integer->char", args, 1)
+        val codePoint = requireExactInteger("integer->char", args.head)
+        if !codePoint.isValidInt || !isScalarValue(codePoint.toInt) then
+          throw new EvalError("integer->char expected a valid Unicode scalar value")
+        Value.CharValue(codePoint.toInt)
+    ),
     "char-upcase"      -> unaryCharTransform("char-upcase")(codePoint => Character.toUpperCase(codePoint)),
     "char-downcase"    -> unaryCharTransform("char-downcase")(codePoint => Character.toLowerCase(codePoint)),
     "char=?"           -> charComparator("char=?")(_ == _),
@@ -125,3 +152,7 @@ private[ming] object SchemeTextBuiltins:
         val chars = args.map(arg => requireChar(name, arg))
         Value.BooleanValue(chars.zip(chars.tail).forall(predicate.tupled))
     )
+
+  private def isScalarValue(codePoint: Int): Boolean =
+    Character.isValidCodePoint(codePoint) &&
+    !(codePoint >= Character.MIN_SURROGATE.toInt && codePoint <= Character.MAX_SURROGATE.toInt)

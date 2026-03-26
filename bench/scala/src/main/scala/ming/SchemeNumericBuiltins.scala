@@ -33,6 +33,7 @@ private[ming] object SchemeNumericBuiltins:
     "<"  -> numericComparator("<")(_ < 0),
     ">"  -> numericComparator(">")(_ > 0),
     "="  -> numericComparator("=")(_ == 0),
+    ">=" -> numericComparator(">=")(_ >= 0),
     "<=" -> numericComparator("<=")(_ <= 0),
     "abs" -> Value.Builtin(
       "abs",
