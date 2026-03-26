@@ -4,11 +4,19 @@ import SchemeModel.*
 
 private[ming] object SchemeEvaluatorState:
 
-  enum EvalState:
-    case ExprState(expr: Expr, env: Env)
-    case SequenceState(expressions: List[Expr], env: Env)
-    case CallState(procedure: Value, args: List[Value], pos: Option[SourcePos])
+  sealed trait Computation
 
-  enum StepResult:
-    case Final(value: Value)
-    case Continue(state: EvalState)
+  object Computation:
+    final case class Done(value: Value)               extends Computation
+    final case class Suspend(step: () => Computation) extends Computation
+
+  type Continuation = Value => Computation
+
+  def done(value: Value): Computation =
+    Computation.Done(value)
+
+  def suspend(step: => Computation): Computation =
+    Computation.Suspend(() => step)
+
+  def resume(continuation: Continuation, value: Value): Computation =
+    suspend(continuation(value))

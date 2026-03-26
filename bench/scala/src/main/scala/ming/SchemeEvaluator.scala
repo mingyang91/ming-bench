@@ -6,189 +6,236 @@ import SchemeModel.*
 import SchemeRecords.*
 import SchemeRuntime.*
 
-private[ming] object SchemeEvaluator extends SchemeEvaluatorSpecialForms:
+private[ming] object SchemeEvaluator
+    extends SchemeEvaluatorSpecialForms
+    with SchemeEvaluatorBindingForms
+    with SchemeEvaluatorProcedureSupport:
+
+  private val finalContinuation: Continuation = value => done(value)
 
   def evalSequence(expressions: List[Expr], env: Env): Value =
-    run(EvalState.SequenceState(expressions, env))
+    run(evalSequence(expressions, env, finalContinuation))
 
   def applyProcedure(procedure: Value, args: List[Value]): Value =
-    run(EvalState.CallState(procedure, args, None))
+    run(applyProcedure(procedure, args, finalContinuation, None))
 
-  override protected def eval(expr: Expr, env: Env): Value =
-    run(EvalState.ExprState(expr, env))
+  override protected def eval(expr: Expr, env: Env, continuation: Continuation): Computation =
+    evalExpr(expr, env, continuation)
 
-  // The evaluator runs a small explicit state machine so tail-position calls
-  // bounce through this loop instead of consuming the JVM stack.
-  private def run(initialState: EvalState): Value =
-    var state = initialState
+  override protected def evalSequence(
+    expressions: List[Expr],
+    env: Env,
+    continuation: Continuation
+  ): Computation =
+    evalSequenceCps(expressions, env, continuation)
+
+  override protected def applyProcedure(
+    procedure: Value,
+    args: List[Value],
+    continuation: Continuation,
+    pos: Option[SourcePos]
+  ): Computation =
+    applyProcedureCps(procedure, args, continuation, pos)
+
+  override protected def withErrorContext[T](pos: SourcePos)(thunk: => T): T =
+    try thunk
+    catch
+      case error: EvalError if error.position.isEmpty =>
+        throw error.withPosition(pos)
+
+  private def run(initial: Computation): Value =
+    var current = initial
 
     while true do
-      val step =
-        state match
-          case EvalState.ExprState(expr, env) =>
-            withErrorContext(expr.pos) {
-              evalExprStep(expr, env)
-            }
-          case EvalState.SequenceState(expressions, env) =>
-            evalSequenceStep(expressions, env)
-          case EvalState.CallState(procedure, args, pos) =>
-            withOptionalErrorContext(pos) {
-              applyProcedureStep(procedure, args)
-            }
-
-      step match
-        case StepResult.Final(value) =>
+      current match
+        case Computation.Done(value) =>
           return value
-        case StepResult.Continue(nextState) =>
-          state = nextState
+        case Computation.Suspend(step) =>
+          current = step()
 
     throw new IllegalStateException("unreachable")
 
-  private def evalExprStep(expr: Expr, env: Env): StepResult =
+  private def evalExpr(expr: Expr, env: Env, continuation: Continuation): Computation =
+    suspend {
+      withErrorContext(expr.pos) {
+        evalExprStep(expr, env, continuation)
+      }
+    }
+
+  private def evalExprStep(expr: Expr, env: Env, continuation: Continuation): Computation =
     expr match
       case Expr.IntegerLiteral(value, _) =>
-        StepResult.Final(Value.IntegerValue(value))
+        resume(continuation, Value.IntegerValue(value))
       case Expr.RationalLiteral(numerator, denominator, _) =>
-        StepResult.Final(SchemeNumbers.exactRational(numerator, denominator))
+        resume(continuation, SchemeNumbers.exactRational(numerator, denominator))
       case Expr.InexactLiteral(value, _) =>
-        StepResult.Final(Value.InexactValue(value))
+        resume(continuation, Value.InexactValue(value))
       case Expr.BooleanLiteral(value, _) =>
-        StepResult.Final(Value.BooleanValue(value))
+        resume(continuation, Value.BooleanValue(value))
       case Expr.StringLiteral(value, _) =>
-        StepResult.Final(Value.StringValue(SchemeString.fromLiteral(value)))
+        resume(continuation, Value.StringValue(SchemeString.fromLiteral(value)))
       case Expr.CharLiteral(value, _) =>
-        StepResult.Final(Value.CharValue(value))
+        resume(continuation, Value.CharValue(value))
       case Expr.Symbol(name, _) =>
-        StepResult.Final(env.lookup(name))
+        resume(continuation, env.lookup(name))
       case Expr.ListExpr(Nil, _) =>
         throw new EvalError("cannot evaluate an empty list")
       case list @ Expr.ListExpr(operator :: args, _) =>
-        evalCompoundExpression(list, operator, args, env)
+        evalCompoundExpression(list, operator, args, env, continuation)
 
-  private def evalSequenceStep(expressions: List[Expr], env: Env): StepResult =
-    var remaining = expressions
-
-    while remaining match
-        case _ :: _ :: _ => true
-        case _           => false
-    do
-      eval(remaining.head, env)
-      remaining = remaining.tail
-
-    remaining match
+  private def evalSequenceCps(
+    expressions: List[Expr],
+    env: Env,
+    continuation: Continuation
+  ): Computation =
+    expressions match
       case Nil =>
-        StepResult.Final(Value.VoidValue)
+        resume(continuation, Value.VoidValue)
       case last :: Nil =>
-        StepResult.Continue(EvalState.ExprState(last, env))
-      case _ =>
-        throw new IllegalStateException("unexpected sequence shape")
+        eval(last, env, continuation)
+      case head :: tail =>
+        eval(head, env, _ => suspend(evalSequenceCps(tail, env, continuation)))
 
-  private def applyProcedureStep(procedure: Value, args: List[Value]): StepResult =
-    procedure match
-      case Value.Builtin(_, implementation) =>
-        StepResult.Final(implementation(args))
-      case closure: Value.Closure =>
-        StepResult.Continue(buildCallState(closure.name.getOrElse("lambda"), closure, args))
-      case caseClosure: Value.CaseClosure =>
-        val clause = caseClosure.clauses.find(clauseMatchesArgCount(_, args.length)).getOrElse {
-          throw new EvalError(s"case-lambda expected a matching clause for ${args.length} argument(s)")
-        }
-        StepResult.Continue(buildCallState("case-lambda", clause, args))
-      case other =>
-        throw new EvalError(s"not a procedure: ${SchemeRuntime.render(other)}")
+  private def applyProcedureCps(
+    procedure: Value,
+    args: List[Value],
+    continuation: Continuation,
+    pos: Option[SourcePos]
+  ): Computation =
+    suspend {
+      withOptionalErrorContext(pos) {
+        procedure match
+          case builtin @ Value.Builtin(name, implementation) =>
+            capturedContinuation(builtin) match
+              case Some(saved) =>
+                requireArgCount(name, args, 1)
+                suspend(saved(args.head))
+              case None =>
+                name match
+                  case "call/cc" | "call-with-current-continuation" =>
+                    applyCallWithCurrentContinuation(name, args, continuation, pos)
+                  case "apply" =>
+                    applyBuiltinApply(args, continuation, pos)
+                  case "map" =>
+                    applyBuiltinMap(args, continuation, pos)
+                  case "for-each" =>
+                    applyBuiltinForEach(args, continuation, pos)
+                  case _ =>
+                    resume(continuation, implementation(args))
+          case closure: Value.Closure =>
+            applyClosure(
+              closure.name.getOrElse("lambda"),
+              closure.fixedParams,
+              closure.restParam,
+              closure.body,
+              closure.env,
+              args,
+              continuation
+            )
+          case caseClosure: Value.CaseClosure =>
+            val clause = caseClosure.clauses.find(clauseMatchesArgCount(_, args.length)).getOrElse {
+              throw new EvalError(s"case-lambda expected a matching clause for ${args.length} argument(s)")
+            }
+            applyClosure(
+              "case-lambda",
+              clause.fixedParams,
+              clause.restParam,
+              clause.body,
+              clause.env,
+              args,
+              continuation
+            )
+          case other =>
+            throw new EvalError(s"not a procedure: ${SchemeRuntime.render(other)}")
+      }
+    }
 
   private def evalCompoundExpression(
     list: Expr.ListExpr,
     operator: Expr,
     args: List[Expr],
-    env: Env
-  ): StepResult =
+    env: Env,
+    continuation: Continuation
+  ): Computation =
     operator match
       case Expr.Symbol(name, _) =>
         env.lookupSyntax(name) match
           case Some(transformer) =>
             val expanded = transformer.expand(list, env)
-            StepResult.Continue(EvalState.ExprState(expanded.expr, expanded.env))
+            eval(expanded.expr, expanded.env, continuation)
           case None =>
-            evalApplication(list.pos, operator, args, env)
+            evalApplication(list.pos, operator, args, env, continuation)
       case _ =>
-        evalApplication(list.pos, operator, args, env)
+        evalApplication(list.pos, operator, args, env, continuation)
 
   private def evalApplication(
     callPos: SourcePos,
     operator: Expr,
     args: List[Expr],
-    env: Env
-  ): StepResult =
+    env: Env,
+    continuation: Continuation
+  ): Computation =
     operator match
       case Expr.Symbol("quote", _) =>
-        evalQuote(args)
+        evalQuote(args, continuation, callPos)
       case Expr.Symbol("if", _) =>
-        evalIf(args, env)
+        evalIf(args, env, continuation, callPos)
       case Expr.Symbol("case", _) =>
-        evalCase(args, env)
+        evalCase(args, env, continuation, callPos)
       case Expr.Symbol("define", _) =>
-        evalDefine(args, env)
+        evalDefine(args, env, continuation, callPos)
       case Expr.Symbol("define-syntax", _) =>
-        evalDefineSyntax(args, env)
+        evalDefineSyntax(args, env, continuation, callPos)
       case Expr.Symbol("define-record-type", _) =>
-        StepResult.Final(defineRecordType(args, env))
+        resume(continuation, defineRecordType(args, env))
       case Expr.Symbol("lambda", _) =>
-        evalLambda(args, env)
+        evalLambda(args, env, continuation, callPos)
       case Expr.Symbol("case-lambda", _) =>
-        evalCaseLambda(args, env)
+        evalCaseLambda(args, env, continuation, callPos)
       case Expr.Symbol("set!", _) =>
-        evalSet(args, env)
+        evalSet(args, env, continuation, callPos)
       case Expr.Symbol("and", _) =>
-        evalAnd(args, env)
+        evalAnd(args, env, continuation, callPos)
       case Expr.Symbol("or", _) =>
-        evalOr(args, env)
+        evalOr(args, env, continuation, callPos)
       case Expr.Symbol("begin", _) =>
-        StepResult.Continue(EvalState.SequenceState(args, env))
+        evalSequence(args, env, continuation)
       case Expr.Symbol("cond", _) =>
-        evalCond(args, env)
+        evalCond(args, env, continuation, callPos)
       case Expr.Symbol("let", _) =>
-        evalLet(args, env, callPos)
+        evalLet(args, env, continuation, callPos)
       case Expr.Symbol("let*", _) =>
-        evalLetStar(args, env)
+        evalLetStar(args, env, continuation, callPos)
       case Expr.Symbol("letrec", _) =>
-        evalLetRec(args, env, sequential = false)
+        evalLetRec(args, env, continuation, sequential = false, callPos)
       case Expr.Symbol("letrec*", _) =>
-        evalLetRec(args, env, sequential = true)
+        evalLetRec(args, env, continuation, sequential = true, callPos)
       case Expr.Symbol("do", _) =>
-        evalDo(args, env)
+        evalDo(args, env, continuation, callPos)
       case _ =>
-        val procedure     = eval(operator, env)
-        val evaluatedArgs = args.map(arg => eval(arg, env))
-        StepResult.Continue(EvalState.CallState(procedure, evaluatedArgs, Some(callPos)))
+        eval(
+          operator,
+          env,
+          procedure =>
+            evalExprList(args.reverse, env) { reversedArgs =>
+              applyProcedure(procedure, reversedArgs.reverse, continuation, Some(callPos))
+            }
+        )
 
   private def clauseMatchesArgCount(clause: CaseLambdaClause, argCount: Int): Boolean =
     clause.restParam match
       case Some(_) => argCount >= clause.fixedParams.length
       case None    => argCount == clause.fixedParams.length
 
-  private def buildCallState(
-    name: String,
-    closure: Value.Closure,
-    args: List[Value]
-  ): EvalState =
-    buildCallState(name, closure.fixedParams, closure.restParam, closure.body, closure.env, args)
-
-  private def buildCallState(
-    name: String,
-    clause: CaseLambdaClause,
-    args: List[Value]
-  ): EvalState =
-    buildCallState(name, clause.fixedParams, clause.restParam, clause.body, clause.env, args)
-
-  private def buildCallState(
+  private def applyClosure(
     name: String,
     fixedParams: List[String],
     restParam: Option[String],
     body: List[Expr],
     closureEnv: Env,
-    args: List[Value]
-  ): EvalState =
+    args: List[Value],
+    continuation: Continuation
+  ): Computation =
     restParam match
       case Some(_) =>
         requireMinArgCount(name, args, fixedParams.length)
@@ -202,7 +249,7 @@ private[ming] object SchemeEvaluator extends SchemeEvaluatorSpecialForms:
     restParam.foreach { restName =>
       callEnv.define(restName, makeList(args.drop(fixedParams.length)))
     }
-    EvalState.SequenceState(body, callEnv)
+    evalSequence(body, callEnv, continuation)
 
   private def withOptionalErrorContext[T](pos: Option[SourcePos])(thunk: => T): T =
     pos match
@@ -210,9 +257,3 @@ private[ming] object SchemeEvaluator extends SchemeEvaluatorSpecialForms:
         withErrorContext(sourcePos)(thunk)
       case None =>
         thunk
-
-  private def withErrorContext[T](pos: SourcePos)(thunk: => T): T =
-    try thunk
-    catch
-      case error: EvalError if error.position.isEmpty =>
-        throw error.withPosition(pos)

@@ -88,6 +88,8 @@ private[ming] object SchemeCoreBuiltins:
         val listArgs   = properListElements("apply", args.last)
         SchemeInterpreter.applyProcedure(procedure, prefixArgs ++ listArgs)
     ),
+    "call/cc"                        -> controlPlaceholder("call/cc"),
+    "call-with-current-continuation" -> controlPlaceholder("call-with-current-continuation"),
     "eq?" -> Value.Builtin(
       "eq?",
       args =>
@@ -229,6 +231,12 @@ private[ming] object SchemeCoreBuiltins:
           throw new EvalError(s"$name expected an association list")
 
     loop(alist)
+
+  private def controlPlaceholder(name: String): Value =
+    Value.Builtin(
+      name,
+      _ => throw new IllegalStateException(s"$name should be handled by the evaluator")
+    )
 
   private def mapValues(procedure: Value, lists: List[Value]): Value =
     @tailrec
