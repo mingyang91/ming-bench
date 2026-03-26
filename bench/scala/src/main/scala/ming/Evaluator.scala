@@ -52,20 +52,35 @@ object Evaluator:
 
   private def evalApplication(elems: List[Expr], env: Env): SchemeVal =
     elems.head match
-      case Symbol("and", _)    => evalAnd(elems.tail, env)
-      case Symbol("or", _)     => evalOr(elems.tail, env)
-      case Symbol("define", _) => evalDefine(elems.tail, env)
-      case Symbol("if", _)     => evalIf(elems.tail, env)
-      case Symbol("quote", _)  => evalQuote(elems.tail)
-      case Symbol("lambda", _) => evalLambda(elems.tail, env)
-      case Symbol("begin", _)  => evalBegin(elems.tail, env)
-      case Symbol("let", _)    => evalLet(elems.tail, env)
-      case Symbol("cond", _)   => evalCond(elems.tail, env)
-      case Symbol("set!", _)   => evalSet(elems.tail, env)
-      case _ =>
-        val op   = eval(elems.head, env)
-        val args = elems.tail.map(e => eval(e, env))
-        applyProc(op, args)
+      case Symbol("and", _)           => evalAnd(elems.tail, env)
+      case Symbol("or", _)            => evalOr(elems.tail, env)
+      case Symbol("define", _)        => evalDefine(elems.tail, env)
+      case Symbol("if", _)            => evalIf(elems.tail, env)
+      case Symbol("quote", _)         => evalQuote(elems.tail)
+      case Symbol("lambda", _)        => evalLambda(elems.tail, env)
+      case Symbol("begin", _)         => evalBegin(elems.tail, env)
+      case Symbol("let", _)           => evalLet(elems.tail, env)
+      case Symbol("cond", _)          => evalCond(elems.tail, env)
+      case Symbol("set!", _)          => evalSet(elems.tail, env)
+      case Symbol("define-syntax", _) => evalDefineSyntax(elems.tail, env)
+      case _                          =>
+        // Check for macro call
+        val macroVal = elems.head match
+          case Symbol(name, _) =>
+            try
+              env.get(name) match
+                case m: SchemeMacro => Some(m)
+                case _              => None
+            catch case _: EvalError => None
+          case _ => None
+        macroVal match
+          case Some(m) =>
+            val expanded = Macros.expand(m, SList(elems, elems.head.pos), env)
+            eval(expanded, env)
+          case None =>
+            val op   = eval(elems.head, env)
+            val args = elems.tail.map(e => eval(e, env))
+            applyProc(op, args)
 
   private def evalAnd(exprs: List[Expr], env: Env): SchemeVal =
     if exprs.isEmpty then return SchemeBool(true)
@@ -224,6 +239,21 @@ object Evaluator:
         env.update(name, eval(valueExpr, env))
         SchemeVoid
       case _ => throw new EvalError("set!: bad syntax")
+
+  private def evalDefineSyntax(args: List[Expr], env: Env): SchemeVal =
+    args match
+      case Symbol(name, _) :: SList(Symbol("syntax-rules", _) :: SList(literals, _) :: rules, _) :: Nil =>
+        val litNames = literals.map {
+          case Symbol(n, _) => n
+          case _            => throw new EvalError("syntax-rules: expected literal name")
+        }
+        val parsedRules = rules.map {
+          case SList(pattern :: template :: Nil, _) => (pattern, template)
+          case _                                    => throw new EvalError("syntax-rules: bad rule")
+        }
+        env.set(name, SchemeMacro(litNames, parsedRules, env))
+        SchemeVoid
+      case _ => throw new EvalError("define-syntax: bad syntax")
 
   private def evalBody(exprs: List[Expr], env: Env): SchemeVal =
     var result: SchemeVal = SchemeVoid
