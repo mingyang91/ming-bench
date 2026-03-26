@@ -44,8 +44,13 @@ type PairRef = Rc<RefCell<PairCell>>;
 type RecordRef = Rc<RecordInstance>;
 type RecordTypeRef = Rc<RecordType>;
 type RecordProcRef = Rc<RecordProcedure>;
-type StringRef = Rc<RefCell<Vec<char>>>;
+type StringRef = Rc<StringCell>;
 type VectorRef = Rc<RefCell<Vec<Value>>>;
+
+struct StringCell {
+    chars: RefCell<Vec<char>>,
+    mutable: bool,
+}
 
 struct RecordType {
     name: String,
@@ -148,11 +153,22 @@ struct Env {
 }
 
 fn make_string(value: impl AsRef<str>) -> Value {
-    Value::String(Rc::new(RefCell::new(value.as_ref().chars().collect())))
+    make_string_with_mutability(value, false)
+}
+
+fn make_mutable_string(value: impl AsRef<str>) -> Value {
+    make_string_with_mutability(value, true)
+}
+
+fn make_string_with_mutability(value: impl AsRef<str>, mutable: bool) -> Value {
+    Value::String(Rc::new(StringCell {
+        chars: RefCell::new(value.as_ref().chars().collect()),
+        mutable,
+    }))
 }
 
 fn render_string(value: &StringRef) -> String {
-    value.borrow().iter().collect()
+    value.chars.borrow().iter().collect()
 }
 
 impl Value {

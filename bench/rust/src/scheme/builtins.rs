@@ -1,6 +1,6 @@
 use super::{
-    apply_procedure, list_from_values, list_to_vec, make_pair, make_string, make_vector,
-    number::Number, Env, EnvRef, EvalContext, EvalError, NativeFunc, Value,
+    apply_procedure, list_from_values, list_to_vec, make_mutable_string, make_pair, make_string,
+    make_vector, number::Number, Env, EnvRef, EvalContext, EvalError, NativeFunc, Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -23,6 +23,7 @@ pub(super) fn default_env() -> EnvRef {
         (">", native_gt as NativeFunc),
         ("=", native_num_eq as NativeFunc),
         ("<=", native_lte as NativeFunc),
+        (">=", native_gte as NativeFunc),
         ("not", native_not as NativeFunc),
         ("zero?", native_zero_pred as NativeFunc),
         ("positive?", native_positive_pred as NativeFunc),
@@ -58,6 +59,8 @@ pub(super) fn default_env() -> EnvRef {
         ("string-copy", native_string_copy as NativeFunc),
         ("string-append", native_string_append as NativeFunc),
         ("string-length", native_string_length as NativeFunc),
+        ("string->list", native_string_to_list as NativeFunc),
+        ("list->string", native_list_to_string as NativeFunc),
         ("string=?", native_string_eq as NativeFunc),
         ("string<?", native_string_lt as NativeFunc),
         ("string-ci=?", native_string_ci_eq as NativeFunc),
@@ -89,6 +92,8 @@ pub(super) fn default_env() -> EnvRef {
         ("char-numeric?", native_char_numeric_pred as NativeFunc),
         ("char-upcase", native_char_upcase as NativeFunc),
         ("char-downcase", native_char_downcase as NativeFunc),
+        ("char->integer", native_char_to_integer as NativeFunc),
+        ("integer->char", native_integer_to_char as NativeFunc),
         ("char=?", native_char_eq as NativeFunc),
         ("char<?", native_char_lt as NativeFunc),
         ("pair?", native_pair_pred as NativeFunc),
@@ -548,7 +553,7 @@ fn native_string_copy(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalE
         });
     }
 
-    Ok(make_string(args[0].as_string("string-copy")?))
+    Ok(make_mutable_string(args[0].as_string("string-copy")?))
 }
 
 fn native_string_append(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -572,6 +577,41 @@ fn native_string_length(args: &[Value], _ctx: &EvalContext) -> Result<Value, Eva
     Ok(exact_integer(
         args[0].as_string("string-length")?.chars().count() as i64,
     ))
+}
+
+fn native_string_to_list(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "string->list",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(list_from_values(
+        args[0]
+            .as_string("string->list")?
+            .chars()
+            .map(Value::Char)
+            .collect(),
+    ))
+}
+
+fn native_list_to_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "list->string",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    let chars = list_to_vec(&args[0], "list->string")?
+        .into_iter()
+        .map(|value| value.as_char("list->string"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let string = chars.into_iter().collect::<String>();
+    Ok(make_string(string))
 }
 
 fn native_string_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -628,8 +668,7 @@ fn native_string_set(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalEr
     let string = args[0].as_string_ref("string-set!")?;
     let index = args[1].as_integer("string-set!")?;
     let value = args[2].as_char("string-set!")?;
-    let mut string = string.borrow_mut();
-    let len = string.len();
+    let len = string.chars.borrow().len();
     let Some(index) = usize::try_from(index).ok().filter(|index| *index < len) else {
         return Err(EvalError::IndexOutOfBounds {
             name: "string-set!",
@@ -638,7 +677,13 @@ fn native_string_set(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalEr
         });
     };
 
-    string[index] = value;
+    if !string.mutable {
+        return Err(EvalError::ImmutableString {
+            name: "string-set!",
+        });
+    }
+
+    string.chars.borrow_mut()[index] = value;
     Ok(Value::Void)
 }
 
@@ -920,6 +965,43 @@ fn native_char_downcase(args: &[Value], _ctx: &EvalContext) -> Result<Value, Eva
     Ok(Value::Char(
         args[0].as_char("char-downcase")?.to_ascii_lowercase(),
     ))
+}
+
+fn native_char_to_integer(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "char->integer",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(exact_integer(args[0].as_char("char->integer")? as i64))
+}
+
+fn native_integer_to_char(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "integer->char",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    let value = args[0].as_integer("integer->char")?;
+    let Ok(value) = u32::try_from(value) else {
+        return Err(EvalError::InvalidCharCode {
+            name: "integer->char",
+            value,
+        });
+    };
+    let Some(ch) = char::from_u32(value) else {
+        return Err(EvalError::InvalidCharCode {
+            name: "integer->char",
+            value: i64::from(value),
+        });
+    };
+    Ok(Value::Char(ch))
 }
 
 fn native_char_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -1219,6 +1301,10 @@ fn native_lte(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     native_compare(args, "<=", |left, right| !left.compare(right).is_gt())
 }
 
+fn native_gte(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_compare(args, ">=", |left, right| !left.compare(right).is_lt())
+}
+
 fn native_zero_pred(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
@@ -1402,7 +1488,9 @@ fn value_equal(left: &Value, right: &Value) -> bool {
         (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
-        (Value::String(left), Value::String(right)) => *left.borrow() == *right.borrow(),
+        (Value::String(left), Value::String(right)) => {
+            *left.chars.borrow() == *right.chars.borrow()
+        }
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Nil, Value::Nil) => true,
         (Value::Vector(left), Value::Vector(right)) => {

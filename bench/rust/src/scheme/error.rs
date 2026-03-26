@@ -99,6 +99,9 @@ pub enum EvalError {
         found: String,
     },
 
+    #[error("{name}: strings are immutable")]
+    ImmutableString { name: &'static str },
+
     #[error("{name}: index out of bounds: {index} (length {len})")]
     IndexOutOfBounds {
         name: &'static str,
@@ -113,6 +116,9 @@ pub enum EvalError {
         end: i64,
         len: usize,
     },
+
+    #[error("{name}: invalid character code: {value}")]
+    InvalidCharCode { name: &'static str, value: i64 },
 
     #[error("division by zero")]
     DivisionByZero,
