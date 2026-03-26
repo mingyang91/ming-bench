@@ -1159,6 +1159,18 @@ pub(super) fn apply_builtin_by_name(
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Symbol(_))))
         }
+        "procedure?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: procedure? requires 1 argument"
+                )));
+            }
+            Ok(Value::Boolean(matches!(&args[0],
+                Value::Lambda { .. } | Value::CaseLambda { .. }
+                | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
+                | Value::RecordAccessor { .. }
+            )))
+        }
         "display" => {
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!(

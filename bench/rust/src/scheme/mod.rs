@@ -26,6 +26,14 @@ struct EnvFrame {
 
 type EnvRef = Rc<RefCell<EnvFrame>>;
 
+#[derive(Debug, Clone)]
+struct CaseLambdaClause {
+    params: Vec<String>,
+    rest_param: Option<String>,
+    body: Vec<Expr>,
+    env: EnvRef,
+}
+
 type ApplyFn = fn(&Value, &[Value], Pos, &RefCell<String>) -> Result<Value, EvalError>;
 
 #[derive(Debug, Clone)]
@@ -66,6 +74,9 @@ enum Value {
         type_id: usize,
         field_index: usize,
     },
+    CaseLambda {
+        clauses: Vec<CaseLambdaClause>,
+    },
 }
 
 impl PartialEq for Value {
@@ -82,6 +93,7 @@ impl PartialEq for Value {
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
+            (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
             (Value::Record { type_id: a, fields: af }, Value::Record { type_id: b, fields: bf }) => a == b && af == bf,
             _ => false,
@@ -136,7 +148,7 @@ impl Value {
                 }
                 format!("({})", parts.join(" "))
             }
-            Value::Lambda { .. } => "#<procedure>".to_string(),
+            Value::Lambda { .. } | Value::CaseLambda { .. } => "#<procedure>".to_string(),
             Value::Macro { .. } => "#<macro>".to_string(),
             Value::Record { .. } => "#<record>".to_string(),
             Value::RecordConstructor { .. }
@@ -486,6 +498,7 @@ fn eval_expr(expr: &Expr, env: &EnvRef, out: &RefCell<String>) -> Result<Value, 
                     "string-set!" => return eval_string_set(&items[1..], env, p, out),
                     "define-syntax" => return eval_define_syntax(&items[1..], env, p),
                     "define-record-type" => return eval_define_record_type(&items[1..], env, p),
+                    "case-lambda" => return eval_case_lambda(&items[1..], env, p),
                     _ => {
                         // Check if op is a macro
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
@@ -620,6 +633,24 @@ fn eval_lambda(args: &[Expr], env: &EnvRef, p: Pos) -> Result<Value, EvalError> 
     };
     let body = args[1..].to_vec();
     Ok(Value::Lambda { params, rest_param, body, env: env.clone() })
+}
+
+fn eval_case_lambda(clauses: &[Expr], env: &EnvRef, p: Pos) -> Result<Value, EvalError> {
+    let mut parsed_clauses = Vec::new();
+    for clause in clauses {
+        let items = match &clause.kind {
+            ExprKind::List(items) if items.len() >= 2 => items,
+            _ => return Err(EvalError::Type(format!("{p}: case-lambda: invalid clause"))),
+        };
+        let (params, rest_param) = match &items[0].kind {
+            ExprKind::List(sig) => parse_params(sig, p)?,
+            ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+            _ => return Err(EvalError::Type(format!("{p}: case-lambda: expected parameter list"))),
+        };
+        let body = items[1..].to_vec();
+        parsed_clauses.push(CaseLambdaClause { params, rest_param, body, env: env.clone() });
+    }
+    Ok(Value::CaseLambda { clauses: parsed_clauses })
 }
 
 fn eval_let(args: &[Expr], env: &EnvRef, p: Pos, out: &RefCell<String>) -> Result<Value, EvalError> {
@@ -768,6 +799,38 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos, out: &RefCell<String>
                 result = eval_expr(expr, &local_env, out)?;
             }
             Ok(result)
+        }
+        Value::CaseLambda { clauses } => {
+            for clause in clauses {
+                let CaseLambdaClause { params, rest_param, body, env } = clause;
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let local_env = new_env(Some(env.clone()));
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        env_set(&local_env, param.clone(), arg.clone());
+                    }
+                    if let Some(rest) = rest_param {
+                        let rest_args = if args.len() > params.len() {
+                            args[params.len()..].to_vec()
+                        } else {
+                            vec![]
+                        };
+                        env_set(&local_env, rest.clone(), Value::List(rest_args));
+                    }
+                    let mut result = Value::Void;
+                    for expr in body {
+                        result = eval_expr(expr, &local_env, out)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "{call_pos}: case-lambda: no matching clause for {} args", args.len()
+            )))
         }
         Value::RecordConstructor { type_id, num_fields } => {
             if args.len() != *num_fields {
@@ -1171,7 +1234,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let env = new_env(None);
     for name in ["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
                   "cons", "car", "cdr", "list", "length", "null?",
-                  "number?", "boolean?", "pair?", "string?", "symbol?", "append",
+                  "number?", "boolean?", "pair?", "string?", "symbol?", "procedure?", "append",
                   "display", "write", "newline",
                   "string-append", "string-length", "substring",
                   "string->number", "number->string",
@@ -1207,7 +1270,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let env = new_env(None);
     for name in ["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
                   "cons", "car", "cdr", "list", "length", "null?",
-                  "number?", "boolean?", "pair?", "string?", "symbol?", "append",
+                  "number?", "boolean?", "pair?", "string?", "symbol?", "procedure?", "append",
                   "display", "write", "newline",
                   "string-append", "string-length", "substring",
                   "string->number", "number->string",
