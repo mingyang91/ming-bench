@@ -421,6 +421,9 @@ func valuesEq(left, right any) bool {
 	case builtinProc:
 		rhs, ok := right.(builtinProc)
 		return ok && lhs.name == rhs.name
+	case *recordValue:
+		rhs, ok := right.(*recordValue)
+		return ok && lhs == rhs
 	case voidValue:
 		_, ok := right.(voidValue)
 		return ok
@@ -474,6 +477,9 @@ func valuesEqual(left, right any) bool {
 	case builtinProc:
 		rhs, ok := right.(builtinProc)
 		return ok && lhs.name == rhs.name
+	case *recordValue:
+		rhs, ok := right.(*recordValue)
+		return ok && lhs == rhs
 	case voidValue:
 		_, ok := right.(voidValue)
 		return ok

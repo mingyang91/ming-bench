@@ -654,6 +654,8 @@ func evalList(scope *env, expr listExpr) (any, error) {
 			return evalDefine(scope, args)
 		case "define-syntax":
 			return evalDefineSyntax(scope, args)
+		case "define-record-type":
+			return evalDefineRecordType(scope, args)
 		case "set!":
 			return evalSet(scope, args)
 		case "if":
@@ -1561,6 +1563,8 @@ func typeName(value any) string {
 		return "procedure"
 	case voidValue:
 		return "void"
+	case *recordValue:
+		return "record"
 	default:
 		return "value"
 	}
@@ -1589,6 +1593,8 @@ func formatValue(value any) string {
 		return "()"
 	case pairValue:
 		return formatPairValue(v)
+	case *recordValue:
+		return fmt.Sprintf("#<record %s>", v.typ.name)
 	case listExpr:
 		if len(v.elements) == 0 {
 			return "()"
