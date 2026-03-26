@@ -34,6 +34,10 @@ final class GlobalEnvironmentFactory {
         env.define(name, evaluator.builtin(name, action));
     }
 
+    private void defineValue(String name, Value value) {
+        env.define(name, value);
+    }
+
     private void installNumericProcedures() {
         define("+", evaluator::addNumbers);
         define("-", evaluator::subtractNumbers);
@@ -432,5 +436,8 @@ final class GlobalEnvironmentFactory {
 
     private void installUtilityProcedures() {
         define("error", evaluator::errorBuiltin);
+        defineValue("call/cc", new CallCcProcedure("call/cc"));
+        defineValue("call-with-current-continuation",
+                new CallCcProcedure("call-with-current-continuation"));
     }
 }

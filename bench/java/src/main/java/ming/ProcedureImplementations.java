@@ -97,3 +97,47 @@ final class CaseLambdaProcedure extends ProcedureValue {
         return closureEnv;
     }
 }
+
+final class CallCcProcedure extends ProcedureValue {
+    private final String name;
+
+    CallCcProcedure(String name) {
+        this.name = name;
+    }
+
+    String name() {
+        return name;
+    }
+
+    @Override
+    Value apply(List<Value> args) throws EvalError {
+        throw new EvalError(name + " cannot be applied directly");
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:" + name + ">";
+    }
+}
+
+final class ContinuationProcedure extends ProcedureValue {
+    private final Evaluator.Continuation continuation;
+
+    ContinuationProcedure(Evaluator.Continuation continuation) {
+        this.continuation = continuation;
+    }
+
+    Evaluator.Continuation continuation() {
+        return continuation;
+    }
+
+    @Override
+    Value apply(List<Value> args) throws EvalError {
+        throw new EvalError("continuation cannot be applied directly");
+    }
+
+    @Override
+    public String render() {
+        return "#<continuation>";
+    }
+}
