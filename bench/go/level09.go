@@ -418,6 +418,9 @@ func valuesEq(left, right any) bool {
 	case emptyListValue:
 		_, ok := right.(emptyListValue)
 		return ok
+	case *vectorValue:
+		rhs, ok := right.(*vectorValue)
+		return ok && lhs == rhs
 	case builtinProc:
 		rhs, ok := right.(builtinProc)
 		return ok && lhs.name == rhs.name
@@ -474,6 +477,17 @@ func valuesEqual(left, right any) bool {
 	case pairValue:
 		rhs, ok := right.(pairValue)
 		return ok && valuesEqual(lhs.car, rhs.car) && valuesEqual(lhs.cdr, rhs.cdr)
+	case *vectorValue:
+		rhs, ok := right.(*vectorValue)
+		if !ok || len(lhs.elements) != len(rhs.elements) {
+			return false
+		}
+		for i := range lhs.elements {
+			if !valuesEqual(lhs.elements[i], rhs.elements[i]) {
+				return false
+			}
+		}
+		return true
 	case builtinProc:
 		rhs, ok := right.(builtinProc)
 		return ok && lhs.name == rhs.name

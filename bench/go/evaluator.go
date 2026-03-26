@@ -56,11 +56,17 @@ type mutableString struct {
 	runes []rune
 }
 
+type vectorValue struct {
+	elements []any
+}
+
 type charValue rune
 
 type emptyListValue struct{}
 
 type voidValue struct{}
+
+type uninitializedValue struct{}
 
 type parser struct {
 	input string
@@ -300,9 +306,18 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("list-tail", builtinProc{name: "list-tail", fn: builtinListTail})
 	scope.define("list?", builtinProc{name: "list?", fn: builtinListP})
 	scope.define("eq?", builtinProc{name: "eq?", fn: builtinEq})
+	scope.define("eqv?", builtinProc{name: "eqv?", fn: builtinEqv})
 	scope.define("equal?", builtinProc{name: "equal?", fn: builtinEqual})
 	scope.define("assoc", builtinProc{name: "assoc", fn: builtinAssoc})
 	scope.define("map", builtinProc{name: "map", fn: builtinMap})
+	scope.define("vector", builtinProc{name: "vector", fn: builtinVector})
+	scope.define("make-vector", builtinProc{name: "make-vector", fn: builtinMakeVector})
+	scope.define("vector-ref", builtinProc{name: "vector-ref", fn: builtinVectorRef})
+	scope.define("vector-set!", builtinProc{name: "vector-set!", fn: builtinVectorSet})
+	scope.define("vector-length", builtinProc{name: "vector-length", fn: builtinVectorLength})
+	scope.define("vector?", builtinProc{name: "vector?", fn: builtinVectorPredicate})
+	scope.define("vector->list", builtinProc{name: "vector->list", fn: builtinVectorToList})
+	scope.define("list->vector", builtinProc{name: "list->vector", fn: builtinListToVector})
 	scope.define("char?", builtinProc{name: "char?", fn: func(args []any) (any, error) {
 		return builtinPredicate("char?", args, func(value any) bool {
 			_, ok := value.(charValue)
@@ -621,6 +636,9 @@ func eval(scope *env, expr any) (any, error) {
 		if !ok {
 			return nil, node.pos.errorf("unbound variable: %s", node.name)
 		}
+		if _, ok := value.(uninitializedValue); ok {
+			return nil, node.pos.errorf("uninitialized variable: %s", node.name)
+		}
 		return value, nil
 	case listExpr:
 		value, err := evalList(scope, node)
@@ -631,6 +649,8 @@ func eval(scope *env, expr any) (any, error) {
 	case string:
 		return node, nil
 	case *mutableString:
+		return node, nil
+	case *vectorValue:
 		return node, nil
 	case builtinProc:
 		return node, nil
@@ -681,8 +701,16 @@ func evalList(scope *env, expr listExpr) (any, error) {
 			return evalBegin(scope, args)
 		case "let":
 			return evalLet(scope, args)
+		case "letrec":
+			return evalLetrec(scope, args, false)
+		case "letrec*":
+			return evalLetrec(scope, args, true)
 		case "cond":
 			return evalCond(scope, args)
+		case "case":
+			return evalCase(scope, args)
+		case "do":
+			return evalDo(scope, args)
 		}
 
 		if macro, ok := scope.lookupMacroSymbol(head); ok {
@@ -799,8 +827,8 @@ func evalSet(scope *env, args []any) (any, error) {
 }
 
 func evalIf(scope *env, args []any) (any, error) {
-	if len(args) != 3 {
-		return nil, &EvalError{Message: "if expects exactly 3 arguments"}
+	if len(args) != 2 && len(args) != 3 {
+		return nil, &EvalError{Message: "if expects 2 or 3 arguments"}
 	}
 
 	cond, err := eval(scope, args[0])
@@ -810,6 +838,9 @@ func evalIf(scope *env, args []any) (any, error) {
 
 	if isTruthy(cond) {
 		return eval(scope, args[1])
+	}
+	if len(args) == 2 {
+		return voidValue{}, nil
 	}
 	return eval(scope, args[2])
 }
@@ -1625,6 +1656,8 @@ func typeName(value any) string {
 		return "list"
 	case listExpr:
 		return "list"
+	case *vectorValue:
+		return "vector"
 	case builtinProc, closure, caseClosure:
 		return "procedure"
 	case voidValue:
@@ -1668,6 +1701,8 @@ func formatValue(value any) string {
 		return "()"
 	case pairValue:
 		return formatPairValue(v)
+	case *vectorValue:
+		return formatVectorValue(v)
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", v.typ.name)
 	case listExpr:
@@ -1730,4 +1765,12 @@ func formatPairValue(pair pairValue) string {
 			return "(" + strings.Join(parts, " ") + " . " + formatValue(value) + ")"
 		}
 	}
+}
+
+func formatVectorValue(vector *vectorValue) string {
+	parts := make([]string, len(vector.elements))
+	for i, elem := range vector.elements {
+		parts[i] = formatValue(elem)
+	}
+	return "#(" + strings.Join(parts, " ") + ")"
 }

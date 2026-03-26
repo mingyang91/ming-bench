@@ -571,7 +571,7 @@ func isEllipsisExpr(expr any) bool {
 
 func isCoreSyntaxName(name string) bool {
 	switch name {
-	case "begin", "cond", "define", "define-record-type", "define-syntax", "if", "lambda", "let", "or", "quote", "set!", "syntax-rules":
+	case "and", "begin", "case", "case-lambda", "cond", "define", "define-record-type", "define-syntax", "do", "if", "lambda", "let", "letrec", "letrec*", "or", "quote", "set!", "syntax-rules":
 		return true
 	default:
 		return false
