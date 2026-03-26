@@ -2,8 +2,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod builtins;
 pub mod error;
 
+use builtins::default_env;
 pub use error::EvalError;
 use error::SourcePos;
 
@@ -14,6 +16,7 @@ enum TokenKind {
     Quote,
     Integer(i64),
     Boolean(bool),
+    Char(char),
     String(String),
     Symbol(String),
 }
@@ -28,6 +31,7 @@ struct Token {
 enum ExprKind {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     String(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -48,6 +52,7 @@ impl Expr {
 type NativeFunc = fn(&[Value], &EvalContext) -> Result<Value, EvalError>;
 type EnvRef = Rc<Env>;
 type PairRef = Rc<RefCell<PairCell>>;
+type StringRef = Rc<RefCell<Vec<char>>>;
 
 struct EvalContext {
     output: RefCell<String>,
@@ -73,7 +78,7 @@ impl EvalContext {
 enum Value {
     Integer(i64),
     Boolean(bool),
-    String(String),
+    String(StringRef),
     Char(char),
     Symbol(String),
     Nil,
@@ -102,6 +107,14 @@ struct Env {
     parent: Option<EnvRef>,
 }
 
+fn make_string(value: impl AsRef<str>) -> Value {
+    Value::String(Rc::new(RefCell::new(value.as_ref().chars().collect())))
+}
+
+fn render_string(value: &StringRef) -> String {
+    value.borrow().iter().collect()
+}
+
 impl Value {
     fn render(&self) -> String {
         match self {
@@ -109,7 +122,7 @@ impl Value {
             Self::Boolean(true) => "#t".to_string(),
             Self::Boolean(false) => "#f".to_string(),
             Self::String(value) => {
-                let escaped = value
+                let escaped = render_string(value)
                     .replace('\\', "\\\\")
                     .replace('"', "\\\"")
                     .replace('\n', "\\n")
@@ -128,7 +141,7 @@ impl Value {
 
     fn display_render(&self) -> String {
         match self {
-            Self::String(value) => value.clone(),
+            Self::String(value) => render_string(value),
             Self::Char(value) => value.to_string(),
             _ => self.render(),
         }
@@ -162,10 +175,30 @@ impl Value {
         }
     }
 
-    fn as_string<'a>(&'a self, name: &'static str) -> Result<&'a str, EvalError> {
+    fn as_string(&self, name: &'static str) -> Result<String, EvalError> {
         match self {
-            Self::String(value) => Ok(value),
+            Self::String(value) => Ok(render_string(value)),
             other => Err(EvalError::ExpectedString {
+                name,
+                found: other.render(),
+            }),
+        }
+    }
+
+    fn as_string_ref(&self, name: &'static str) -> Result<StringRef, EvalError> {
+        match self {
+            Self::String(value) => Ok(value.clone()),
+            other => Err(EvalError::ExpectedString {
+                name,
+                found: other.render(),
+            }),
+        }
+    }
+
+    fn as_char(&self, name: &'static str) -> Result<char, EvalError> {
+        match self {
+            Self::Char(value) => Ok(*value),
+            other => Err(EvalError::ExpectedChar {
                 name,
                 found: other.render(),
             }),
@@ -286,6 +319,7 @@ impl Parser {
             .with_position(token.pos)),
             TokenKind::Integer(value) => Ok(Expr::new(ExprKind::Integer(value), token.pos)),
             TokenKind::Boolean(value) => Ok(Expr::new(ExprKind::Boolean(value), token.pos)),
+            TokenKind::Char(value) => Ok(Expr::new(ExprKind::Char(value), token.pos)),
             TokenKind::String(value) => Ok(Expr::new(ExprKind::String(value), token.pos)),
             TokenKind::Symbol(value) => Ok(Expr::new(ExprKind::Symbol(value), token.pos)),
             TokenKind::Quote => Ok(Expr::new(
@@ -327,48 +361,6 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let ctx = EvalContext::new();
     let last = eval_sequence(&exprs, env, &ctx)?;
     Ok((last.render(), ctx.into_output()))
-}
-
-fn default_env() -> EnvRef {
-    let env = Env::new(None);
-    for (name, func) in [
-        ("+", native_add as NativeFunc),
-        ("-", native_sub as NativeFunc),
-        ("*", native_mul as NativeFunc),
-        ("/", native_div as NativeFunc),
-        ("<", native_lt as NativeFunc),
-        (">", native_gt as NativeFunc),
-        ("=", native_num_eq as NativeFunc),
-        ("<=", native_lte as NativeFunc),
-        ("not", native_not as NativeFunc),
-        ("cons", native_cons as NativeFunc),
-        ("car", native_car as NativeFunc),
-        ("cdr", native_cdr as NativeFunc),
-        ("null?", native_null_pred as NativeFunc),
-        ("list", native_list as NativeFunc),
-        ("length", native_length as NativeFunc),
-        ("append", native_append as NativeFunc),
-        ("display", native_display as NativeFunc),
-        ("write", native_write as NativeFunc),
-        ("newline", native_newline as NativeFunc),
-        ("string-append", native_string_append as NativeFunc),
-        ("string-length", native_string_length as NativeFunc),
-        ("substring", native_substring as NativeFunc),
-        ("string->number", native_string_to_number as NativeFunc),
-        ("number->string", native_number_to_string as NativeFunc),
-        ("symbol->string", native_symbol_to_string as NativeFunc),
-        ("string->symbol", native_string_to_symbol as NativeFunc),
-        ("string-ref", native_string_ref as NativeFunc),
-        ("string?", native_string_pred as NativeFunc),
-        ("number?", native_number_pred as NativeFunc),
-        ("boolean?", native_boolean_pred as NativeFunc),
-        ("char?", native_char_pred as NativeFunc),
-        ("pair?", native_pair_pred as NativeFunc),
-        ("symbol?", native_symbol_pred as NativeFunc),
-    ] {
-        env.define(name.to_string(), Value::NativeProc { name, func });
-    }
-    env
 }
 
 fn tokenize(input: &str) -> Result<(Vec<Token>, SourcePos), EvalError> {
@@ -418,7 +410,7 @@ fn tokenize(input: &str) -> Result<(Vec<Token>, SourcePos), EvalError> {
                 index = next_index;
             }
             b'#' => {
-                if let Some((kind, next_index)) = parse_boolean(input, index) {
+                if let Some((kind, next_index)) = parse_hash_literal(input, index) {
                     tokens.push(Token { kind, pos });
                     index = next_index;
                 } else {
@@ -491,6 +483,10 @@ fn parse_string(input: &str, mut index: usize) -> Result<(String, usize), EvalEr
     Err(EvalError::UnterminatedString)
 }
 
+fn parse_hash_literal(input: &str, index: usize) -> Option<(TokenKind, usize)> {
+    parse_boolean(input, index).or_else(|| parse_char_literal(input, index))
+}
+
 fn parse_boolean(input: &str, index: usize) -> Option<(TokenKind, usize)> {
     let remainder = &input[index..];
     if remainder.starts_with("#t") && is_delimiter(input, index + 2) {
@@ -500,6 +496,36 @@ fn parse_boolean(input: &str, index: usize) -> Option<(TokenKind, usize)> {
     } else {
         None
     }
+}
+
+fn parse_char_literal(input: &str, index: usize) -> Option<(TokenKind, usize)> {
+    let remainder = input.get(index..)?;
+    if !remainder.starts_with("#\\") {
+        return None;
+    }
+
+    let bytes = input.as_bytes();
+    let start = index + 2;
+    let mut end = start;
+    while end < bytes.len() && !is_token_boundary(bytes[end]) {
+        end += 1;
+    }
+
+    let literal = input.get(start..end)?;
+    let value = match literal {
+        "space" => ' ',
+        "newline" => '\n',
+        _ => {
+            let mut chars = literal.chars();
+            let value = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            value
+        }
+    };
+
+    Some((TokenKind::Char(value), end))
 }
 
 fn pos_from_index(input: &str, index: usize) -> SourcePos {
@@ -545,7 +571,8 @@ fn eval(expr: &Expr, env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError>
     match &expr.kind {
         ExprKind::Integer(value) => Ok(Value::Integer(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
-        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::Char(value) => Ok(Value::Char(*value)),
+        ExprKind::String(value) => Ok(make_string(value)),
         ExprKind::Symbol(name) => env.lookup(name).ok_or_else(|| {
             EvalError::UnboundVariable { name: name.clone() }.with_position(expr.pos)
         }),
@@ -905,7 +932,8 @@ fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(value) => Ok(Value::Integer(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
-        ExprKind::String(value) => Ok(Value::String(value.clone())),
+        ExprKind::Char(value) => Ok(Value::Char(*value)),
+        ExprKind::String(value) => Ok(make_string(value)),
         ExprKind::Symbol(value) => Ok(Value::Symbol(value.clone())),
         ExprKind::List(items) => {
             let mut values = Vec::with_capacity(items.len());
@@ -982,427 +1010,6 @@ fn render_char(value: char) -> String {
         '\n' => "#\\newline".to_string(),
         _ => format!("#\\{value}"),
     }
-}
-
-fn native_not(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "not",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    Ok(Value::Boolean(!args[0].is_truthy()))
-}
-
-fn native_cons(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::WrongArgCount {
-            name: "cons",
-            expected: "exactly 2",
-            got: args.len(),
-        });
-    }
-
-    Ok(make_pair(args[0].clone(), args[1].clone()))
-}
-
-fn native_car(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "car",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    let pair = args[0].as_pair("car")?;
-    let car = pair.borrow().car.clone();
-    Ok(car)
-}
-
-fn native_cdr(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "cdr",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    let pair = args[0].as_pair("cdr")?;
-    let cdr = pair.borrow().cdr.clone();
-    Ok(cdr)
-}
-
-fn native_null_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("null?", args, ctx, |value| matches!(value, Value::Nil))
-}
-
-fn native_list(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    Ok(list_from_values(args.to_vec()))
-}
-
-fn native_length(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "length",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    Ok(Value::Integer(list_to_vec(&args[0], "length")?.len() as i64))
-}
-
-fn native_append(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let Some(last) = args.last().cloned() else {
-        return Ok(Value::Nil);
-    };
-
-    let mut result = last;
-    for list in args[..args.len() - 1].iter().rev() {
-        let mut items = list_to_vec(list, "append")?;
-        while let Some(item) = items.pop() {
-            result = make_pair(item, result);
-        }
-    }
-
-    Ok(result)
-}
-
-fn native_display(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "display",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    ctx.push_output(&args[0].display_render());
-    Ok(Value::Void)
-}
-
-fn native_write(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "write",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    ctx.push_output(&args[0].render());
-    Ok(Value::Void)
-}
-
-fn native_newline(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    if !args.is_empty() {
-        return Err(EvalError::WrongArgCount {
-            name: "newline",
-            expected: "exactly 0",
-            got: args.len(),
-        });
-    }
-
-    ctx.push_output("\n");
-    Ok(Value::Void)
-}
-
-fn native_string_append(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let mut result = String::new();
-    for value in args {
-        result.push_str(value.as_string("string-append")?);
-    }
-    Ok(Value::String(result))
-}
-
-fn native_string_length(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "string-length",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    Ok(Value::Integer(
-        args[0].as_string("string-length")?.chars().count() as i64,
-    ))
-}
-
-fn native_substring(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 3 {
-        return Err(EvalError::WrongArgCount {
-            name: "substring",
-            expected: "exactly 3",
-            got: args.len(),
-        });
-    }
-
-    let string = args[0].as_string("substring")?;
-    let start = args[1].as_number("substring")?;
-    let end = args[2].as_number("substring")?;
-    let chars: Vec<char> = string.chars().collect();
-    let len = chars.len();
-    let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
-        return Err(EvalError::InvalidRange {
-            name: "substring",
-            start,
-            end,
-            len,
-        });
-    };
-
-    if start > end || end > len {
-        return Err(EvalError::InvalidRange {
-            name: "substring",
-            start: start as i64,
-            end: end as i64,
-            len,
-        });
-    }
-
-    Ok(Value::String(chars[start..end].iter().copied().collect()))
-}
-
-fn native_string_to_number(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "string->number",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    let string = args[0].as_string("string->number")?;
-    match string.parse::<i64>() {
-        Ok(value) => Ok(Value::Integer(value)),
-        Err(_) => Ok(Value::Boolean(false)),
-    }
-}
-
-fn native_number_to_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "number->string",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    Ok(Value::String(
-        args[0].as_number("number->string")?.to_string(),
-    ))
-}
-
-fn native_symbol_to_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "symbol->string",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    Ok(Value::String(
-        args[0].as_symbol("symbol->string")?.to_string(),
-    ))
-}
-
-fn native_string_to_symbol(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name: "string->symbol",
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    Ok(Value::Symbol(
-        args[0].as_string("string->symbol")?.to_string(),
-    ))
-}
-
-fn native_string_ref(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 2 {
-        return Err(EvalError::WrongArgCount {
-            name: "string-ref",
-            expected: "exactly 2",
-            got: args.len(),
-        });
-    }
-
-    let string = args[0].as_string("string-ref")?;
-    let index = args[1].as_number("string-ref")?;
-    let chars: Vec<char> = string.chars().collect();
-    let len = chars.len();
-    let Some(index) = usize::try_from(index).ok().filter(|index| *index < len) else {
-        return Err(EvalError::IndexOutOfBounds {
-            name: "string-ref",
-            index,
-            len,
-        });
-    };
-
-    Ok(Value::Char(chars[index]))
-}
-
-fn native_string_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("string?", args, ctx, |value| {
-        matches!(value, Value::String(_))
-    })
-}
-
-fn native_number_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("number?", args, ctx, |value| {
-        matches!(value, Value::Integer(_))
-    })
-}
-
-fn native_boolean_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("boolean?", args, ctx, |value| {
-        matches!(value, Value::Boolean(_))
-    })
-}
-
-fn native_char_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("char?", args, ctx, |value| matches!(value, Value::Char(_)))
-}
-
-fn native_pair_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("pair?", args, ctx, |value| matches!(value, Value::Pair(_)))
-}
-
-fn native_symbol_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_predicate("symbol?", args, ctx, |value| {
-        matches!(value, Value::Symbol(_))
-    })
-}
-
-fn native_predicate<F>(
-    name: &'static str,
-    args: &[Value],
-    _ctx: &EvalContext,
-    predicate: F,
-) -> Result<Value, EvalError>
-where
-    F: Fn(&Value) -> bool,
-{
-    if args.len() != 1 {
-        return Err(EvalError::WrongArgCount {
-            name,
-            expected: "exactly 1",
-            got: args.len(),
-        });
-    }
-
-    Ok(Value::Boolean(predicate(&args[0])))
-}
-
-fn native_add(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let mut sum = 0_i64;
-    for value in values_as_numbers("+", args)? {
-        sum += value;
-    }
-    Ok(Value::Integer(sum))
-}
-
-fn native_sub(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let values = values_as_numbers("-", args)?;
-    let (first, rest) = values.split_first().ok_or(EvalError::WrongArgCount {
-        name: "-",
-        expected: "at least 1",
-        got: 0,
-    })?;
-
-    let result = if rest.is_empty() {
-        -*first
-    } else {
-        rest.iter().fold(*first, |acc, value| acc - value)
-    };
-
-    Ok(Value::Integer(result))
-}
-
-fn native_mul(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let mut product = 1_i64;
-    for value in values_as_numbers("*", args)? {
-        product *= value;
-    }
-    Ok(Value::Integer(product))
-}
-
-fn native_div(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    let values = values_as_numbers("/", args)?;
-    let (first, rest) = values.split_first().ok_or(EvalError::WrongArgCount {
-        name: "/",
-        expected: "at least 1",
-        got: 0,
-    })?;
-
-    if rest.is_empty() {
-        if *first == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        return Ok(Value::Integer(1 / first));
-    }
-
-    let mut result = *first;
-    for value in rest {
-        if *value == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        result /= value;
-    }
-    Ok(Value::Integer(result))
-}
-
-fn native_lt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_compare(args, "<", |left, right| left < right)
-}
-
-fn native_gt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_compare(args, ">", |left, right| left > right)
-}
-
-fn native_num_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_compare(args, "=", |left, right| left == right)
-}
-
-fn native_lte(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
-    native_compare(args, "<=", |left, right| left <= right)
-}
-
-fn native_compare<F>(args: &[Value], name: &'static str, cmp: F) -> Result<Value, EvalError>
-where
-    F: Fn(i64, i64) -> bool,
-{
-    let values = values_as_numbers(name, args)?;
-    if values.len() < 2 {
-        return Err(EvalError::WrongArgCount {
-            name,
-            expected: "at least 2",
-            got: values.len(),
-        });
-    }
-
-    for pair in values.windows(2) {
-        if !cmp(pair[0], pair[1]) {
-            return Ok(Value::Boolean(false));
-        }
-    }
-    Ok(Value::Boolean(true))
-}
-
-fn values_as_numbers(name: &'static str, args: &[Value]) -> Result<Vec<i64>, EvalError> {
-    let mut values = Vec::with_capacity(args.len());
-    for value in args {
-        values.push(value.as_number(name)?);
-    }
-    Ok(values)
 }
 
 #[cfg(test)]
