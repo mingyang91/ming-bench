@@ -2,153 +2,6 @@ package ming
 
 import scala.collection.mutable
 
-// ── AST ──────────────────────────────────────────────────────────────
-sealed trait Expr
-case class IntLit(value: Long)      extends Expr
-case class BoolLit(value: Boolean)  extends Expr
-case class StringLit(value: String) extends Expr
-case class Symbol(name: String)     extends Expr
-case class SList(elems: List[Expr]) extends Expr
-
-// ── Scheme values ────────────────────────────────────────────────────
-sealed trait SchemeVal:
-  def display: String
-
-case class SchemeInt(value: Long) extends SchemeVal:
-  def display: String = value.toString
-
-case class SchemeBool(value: Boolean) extends SchemeVal:
-  def display: String = if value then "#t" else "#f"
-
-case class SchemeString(value: String) extends SchemeVal:
-  def display: String = s"\"$value\""
-
-case class SchemeBuiltin(name: String, fn: List[SchemeVal] => SchemeVal) extends SchemeVal:
-  def display: String = s"#<procedure:$name>"
-
-case object SchemeVoid extends SchemeVal:
-  def display: String = "#<void>"
-
-// ── Tokenizer ────────────────────────────────────────────────────────
-private object Tokenizer:
-  sealed trait Token
-  case class TOpen()              extends Token
-  case class TClose()             extends Token
-  case class TStr(value: String)  extends Token
-  case class TAtom(value: String) extends Token
-
-  private def readString(input: String, start: Int): (String, Int) =
-    var i  = start
-    val sb = new StringBuilder
-    while i < input.length && input(i) != '"' do
-      if input(i) == '\\' then
-        i += 1
-        if i < input.length then
-          input(i) match
-            case 'n'   => sb += '\n'
-            case 't'   => sb += '\t'
-            case '\\'  => sb += '\\'
-            case '"'   => sb += '"'
-            case other => sb += '\\'; sb += other
-          i += 1
-      else
-        sb += input(i)
-        i += 1
-    val end = if i < input.length then i + 1 else i
-    (sb.toString, end)
-
-  private def isAtomChar(c: Char): Boolean =
-    !c.isWhitespace && c != '(' && c != ')' && c != ';' && c != '"'
-
-  private def readAtom(input: String, start: Int): (String, Int) =
-    var i  = start
-    val sb = new StringBuilder
-    while i < input.length && isAtomChar(input(i)) do
-      sb += input(i)
-      i += 1
-    (sb.toString, i)
-
-  def tokenize(input: String): List[Token] =
-    val tokens = mutable.ListBuffer[Token]()
-    var i      = 0
-    while i < input.length do
-      input(i) match
-        case c if c.isWhitespace => i += 1
-        case ';' =>
-          while i < input.length && input(i) != '\n' do i += 1
-        case '(' => tokens += TOpen(); i += 1
-        case ')' => tokens += TClose(); i += 1
-        case '"' =>
-          val (str, end) = readString(input, i + 1)
-          tokens += TStr(str)
-          i = end
-        case _ =>
-          val (atom, end) = readAtom(input, i)
-          tokens += TAtom(atom)
-          i = end
-    tokens.toList
-
-// ── Parser ───────────────────────────────────────────────────────────
-private object Parser:
-  import Tokenizer.*
-
-  def parseAll(tokens: List[Token]): List[Expr] =
-    val exprs = mutable.ListBuffer[Expr]()
-    var rest  = tokens
-    while rest.nonEmpty do
-      val (expr, remaining) = parseExpr(rest)
-      exprs += expr
-      rest = remaining
-    exprs.toList
-
-  private def parseExpr(tokens: List[Token]): (Expr, List[Token]) =
-    tokens match
-      case TOpen() :: rest =>
-        val (elems, remaining) = parseList(rest)
-        (SList(elems), remaining)
-      case TStr(v) :: rest =>
-        (StringLit(v), rest)
-      case TAtom(v) :: rest =>
-        (parseAtom(v), rest)
-      case TClose() :: _ =>
-        throw new EvalError("unexpected )")
-      case Nil =>
-        throw new EvalError("unexpected end of input")
-
-  private def parseList(tokens: List[Token]): (List[Expr], List[Token]) =
-    val elems = mutable.ListBuffer[Expr]()
-    var rest  = tokens
-    while rest.nonEmpty && !rest.head.isInstanceOf[TClose] do
-      val (expr, remaining) = parseExpr(rest)
-      elems += expr
-      rest = remaining
-    rest match
-      case TClose() :: tail => (elems.toList, tail)
-      case _                => throw new EvalError("missing )")
-
-  private def parseAtom(s: String): Expr =
-    if s == "#t" then BoolLit(true)
-    else if s == "#f" then BoolLit(false)
-    else
-      s.toLongOption match
-        case Some(n) => IntLit(n)
-        case None    => Symbol(s)
-
-// ── Environment ──────────────────────────────────────────────────────
-private class Env(val bindings: mutable.Map[String, SchemeVal], val parent: Option[Env]):
-
-  def get(name: String): SchemeVal =
-    bindings.get(name) match
-      case Some(v) => v
-      case None =>
-        parent match
-          case Some(p) => p.get(name)
-          case None    => throw new EvalError(s"unbound variable: $name")
-
-  def set(name: String, value: SchemeVal): Unit =
-    bindings(name) = value
-
-// ── Evaluator ────────────────────────────────────────────────────────
 object Evaluator:
 
   def evalStr(input: String): String =
@@ -169,16 +22,6 @@ object Evaluator:
 
   private def makeGlobalEnv(): Env =
     val env = new Env(mutable.Map.empty, None)
-
-    def arith(name: String, op: (Long, Long) => Long, identity: Long): SchemeBuiltin =
-      SchemeBuiltin(
-        name,
-        args =>
-          if name == "-" && args.size == 1 then SchemeInt(-asLong(args.head, name))
-          else if args.size < 2 && name != "+" && name != "*" then
-            throw new EvalError(s"$name: expected at least 2 arguments")
-          else SchemeInt(args.map(a => asLong(a, name)).reduce(op))
-      )
 
     env.set("+", SchemeBuiltin("+", args => SchemeInt(args.map(a => asLong(a, "+")).sum)))
     env.set(
@@ -247,33 +90,88 @@ object Evaluator:
 
   private def evalApplication(elems: List[Expr], env: Env): SchemeVal =
     elems.head match
-      case Symbol("and") => evalAnd(elems.tail, env)
-      case Symbol("or")  => evalOr(elems.tail, env)
+      case Symbol("and")    => evalAnd(elems.tail, env)
+      case Symbol("or")     => evalOr(elems.tail, env)
+      case Symbol("define") => evalDefine(elems.tail, env)
+      case Symbol("if")     => evalIf(elems.tail, env)
+      case Symbol("quote")  => evalQuote(elems.tail)
+      case Symbol("lambda") => evalLambda(elems.tail, env)
       case _ =>
         val op   = eval(elems.head, env)
         val args = elems.tail.map(e => eval(e, env))
-        op match
-          case SchemeBuiltin(_, fn) => fn(args)
-          case _                    => throw new EvalError(s"not a procedure: ${op.display}")
+        applyProc(op, args)
 
   private def evalAnd(exprs: List[Expr], env: Env): SchemeVal =
-    if exprs.isEmpty then SchemeBool(true)
-    else
-      var result: SchemeVal = SchemeBool(true)
-      val iter              = exprs.iterator
-      var done              = false
-      while iter.hasNext && !done do
-        result = eval(iter.next(), env)
-        if isFalsy(result) then done = true
-      result
+    if exprs.isEmpty then return SchemeBool(true)
+    var result: SchemeVal = SchemeBool(true)
+    val iter              = exprs.iterator
+    var done              = false
+    while iter.hasNext && !done do
+      result = eval(iter.next(), env)
+      if isFalsy(result) then done = true
+    result
 
   private def evalOr(exprs: List[Expr], env: Env): SchemeVal =
-    if exprs.isEmpty then SchemeBool(false)
-    else
-      var result: SchemeVal = SchemeBool(false)
-      val iter              = exprs.iterator
-      var done              = false
-      while iter.hasNext && !done do
-        result = eval(iter.next(), env)
-        if !isFalsy(result) then done = true
-      result
+    if exprs.isEmpty then return SchemeBool(false)
+    var result: SchemeVal = SchemeBool(false)
+    val iter              = exprs.iterator
+    var done              = false
+    while iter.hasNext && !done do
+      result = eval(iter.next(), env)
+      if !isFalsy(result) then done = true
+    result
+
+  private def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
+    op match
+      case SchemeBuiltin(_, fn) => fn(args)
+      case SchemeLambda(params, body, closureEnv) =>
+        if params.size != args.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
+        val localEnv          = new Env(mutable.Map.from(params.zip(args)), Some(closureEnv))
+        var result: SchemeVal = SchemeVoid
+        for expr <- body do result = eval(expr, localEnv)
+        result
+      case _ => throw new EvalError(s"not a procedure: ${op.display}")
+
+  private def evalDefine(args: List[Expr], env: Env): SchemeVal =
+    args match
+      case SList(Symbol(name) :: params) :: body =>
+        val paramNames = params.map {
+          case Symbol(n) => n
+          case other     => throw new EvalError("define: expected parameter name")
+        }
+        env.set(name, SchemeLambda(paramNames, body, env))
+        SchemeVoid
+      case Symbol(name) :: expr :: Nil =>
+        env.set(name, eval(expr, env))
+        SchemeVoid
+      case _ => throw new EvalError("define: bad syntax")
+
+  private def evalIf(args: List[Expr], env: Env): SchemeVal =
+    args match
+      case cond :: thenExpr :: elseExpr :: Nil =>
+        if !isFalsy(eval(cond, env)) then eval(thenExpr, env) else eval(elseExpr, env)
+      case cond :: thenExpr :: Nil =>
+        if !isFalsy(eval(cond, env)) then eval(thenExpr, env) else SchemeVoid
+      case _ => throw new EvalError("if: bad syntax")
+
+  private def evalQuote(args: List[Expr]): SchemeVal =
+    if args.size != 1 then throw new EvalError("quote: expected 1 argument")
+    exprToVal(args.head)
+
+  private def exprToVal(expr: Expr): SchemeVal =
+    expr match
+      case IntLit(v)    => SchemeInt(v)
+      case BoolLit(v)   => SchemeBool(v)
+      case StringLit(v) => SchemeString(v)
+      case Symbol(name) => SchemeSymbol(name)
+      case SList(elems) => SchemeList(elems.map(exprToVal))
+
+  private def evalLambda(args: List[Expr], env: Env): SchemeVal =
+    args match
+      case SList(paramExprs) :: body if body.nonEmpty =>
+        val params = paramExprs.map {
+          case Symbol(n) => n
+          case _         => throw new EvalError("lambda: expected parameter name")
+        }
+        SchemeLambda(params, body, env)
+      case _ => throw new EvalError("lambda: bad syntax")
