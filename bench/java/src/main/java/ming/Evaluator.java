@@ -21,7 +21,7 @@ public class Evaluator {
     private final MacroExpander macroExpander;
     private final boolean immutableStringsEnabled;
     private List<DynamicWindFrame> dynamicWindStack;
-    private List<ExceptionHandlerFrame> exceptionHandlerStack;
+    private ExceptionHandlerFrame exceptionHandlerStack;
     private StringBuilder outputBuffer;
 
     @FunctionalInterface
@@ -36,7 +36,7 @@ public class Evaluator {
         this.globalEnv = createGlobalEnv();
         this.macroExpander = new MacroExpander(this::applyProcedure);
         this.dynamicWindStack = new ArrayList<>();
-        this.exceptionHandlerStack = new ArrayList<>();
+        this.exceptionHandlerStack = null;
     }
 
     /**
@@ -1036,7 +1036,7 @@ public class Evaluator {
                 guardList.elements().size()));
         ExceptionHandlerFrame frame = new ExceptionHandlerFrame(
                 List.copyOf(dynamicWindStack),
-                List.copyOf(exceptionHandlerStack),
+                exceptionHandlerStack,
                 exception -> evalGuardClauses(
                         clauses,
                         0,
@@ -1150,13 +1150,12 @@ public class Evaluator {
     private CapturedContinuation captureContinuation(Kont kont) {
         return new CapturedContinuation(kont,
                 List.copyOf(dynamicWindStack),
-                List.copyOf(exceptionHandlerStack));
+                exceptionHandlerStack);
     }
 
     private Value makeContinuationValue(CapturedContinuation continuation) {
         return new BuiltinValue("continuation", arguments -> {
-            requireExactArgs("continuation", arguments, 1);
-            throw new ContinuationJump(continuation, arguments.get(0));
+            throw new ContinuationJump(continuation, packValues(arguments));
         });
     }
 
@@ -1189,13 +1188,13 @@ public class Evaluator {
     }
 
     private Step jumpToContinuation(CapturedContinuation continuation, Value value) {
-        exceptionHandlerStack = new ArrayList<>(continuation.exceptionHandlerStack());
+        exceptionHandlerStack = continuation.exceptionHandlerStack();
         return transitionDynamicWind(continuation.dynamicStack(),
                 new ReturnStep(value, continuation.target()));
     }
 
     private Step handleRaisedException(RaisedException exception) throws EvalError {
-        if (exceptionHandlerStack.isEmpty()) {
+        if (exceptionHandlerStack == null) {
             EvalError error = new EvalError(
                     "uncaught exception: " + ValueRenderer.render(exception.value()));
             if (exception.hasPosition()) {
@@ -1204,8 +1203,8 @@ public class Evaluator {
             throw error;
         }
 
-        ExceptionHandlerFrame frame = exceptionHandlerStack.get(exceptionHandlerStack.size() - 1);
-        exceptionHandlerStack = new ArrayList<>(frame.outerHandlers());
+        ExceptionHandlerFrame frame = exceptionHandlerStack;
+        exceptionHandlerStack = frame.parent();
         return transitionDynamicWind(frame.dynamicStack(),
                 new ThunkStep(() -> frame.body().apply(exception)));
     }
@@ -1266,15 +1265,14 @@ public class Evaluator {
     }
 
     private void pushExceptionHandlerFrame(ExceptionHandlerFrame frame) {
-        exceptionHandlerStack.add(frame);
+        exceptionHandlerStack = frame;
     }
 
     private void popExceptionHandlerFrame(ExceptionHandlerFrame frame) {
-        int lastIndex = exceptionHandlerStack.size() - 1;
-        if (lastIndex < 0 || exceptionHandlerStack.get(lastIndex) != frame) {
+        if (exceptionHandlerStack != frame) {
             throw new IllegalStateException("exception handler stack out of sync");
         }
-        exceptionHandlerStack.remove(lastIndex);
+        exceptionHandlerStack = frame.parent();
     }
 
     private Step exitExceptionHandler(ExceptionHandlerFrame frame, Value value, Kont kont) {
@@ -1293,7 +1291,7 @@ public class Evaluator {
 
         ExceptionHandlerFrame frame = new ExceptionHandlerFrame(
                 List.copyOf(dynamicWindStack),
-                List.copyOf(exceptionHandlerStack),
+                exceptionHandlerStack,
                 exception -> new ApplyStep(arguments.get(0), List.of(exception.value()), kont, line,
                         column));
         pushExceptionHandlerFrame(frame);

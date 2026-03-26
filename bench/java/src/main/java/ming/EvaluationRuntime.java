@@ -68,11 +68,11 @@ interface ExceptionHandlerBody {
 }
 
 record ExceptionHandlerFrame(List<DynamicWindFrame> dynamicStack,
-        List<ExceptionHandlerFrame> outerHandlers, ExceptionHandlerBody body) {
+        ExceptionHandlerFrame parent, ExceptionHandlerBody body) {
 }
 
 record CapturedContinuation(Kont target, List<DynamicWindFrame> dynamicStack,
-        List<ExceptionHandlerFrame> exceptionHandlerStack) {
+        ExceptionHandlerFrame exceptionHandlerStack) {
 }
 
 final class ContinuationJump extends RuntimeException {

@@ -1,6 +1,8 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::panic::{catch_unwind, panic_any, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 pub mod error;
@@ -30,6 +32,32 @@ struct Evaluator {
     gensym_counter: RefCell<usize>,
 }
 
+thread_local! {
+    static CONTROL_SIGNALS: RefCell<HashMap<usize, ControlSignal>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone)]
+enum ControlSignal {
+    Raised {
+        value: Value,
+        position: Option<SourceLoc>,
+    },
+    Jump {
+        prompt_id: usize,
+        values: Vec<Value>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ControlPanic {
+    id: usize,
+}
+
+enum TailResult {
+    Value(Value),
+    TailCall(Value, Vec<Value>),
+}
+
 impl Evaluator {
     fn new() -> Self {
         Self {
@@ -50,12 +78,21 @@ impl Evaluator {
 
         let mut result = Value::Void;
         for expression in &expressions {
-            result = self.eval(expression, self.global_env.clone())?;
+            result = match catch_unwind(AssertUnwindSafe(|| {
+                self.eval_preserving_values(expression, self.global_env.clone())
+            })) {
+                Ok(value) => normalize_single_value(value?)?,
+                Err(payload) => return Err(self.handle_unwind(payload)),
+            };
         }
         Ok(render(&result))
     }
 
     fn eval(&self, expr: &Expr, env: Rc<Env>) -> Result<Value, EvalError> {
+        normalize_single_value(self.eval_preserving_values(expr, env)?)
+    }
+
+    fn eval_preserving_values(&self, expr: &Expr, env: Rc<Env>) -> Result<Value, EvalError> {
         let result = match &expr.kind {
             ExprKind::Int(value) => Ok(Value::Int(*value)),
             ExprKind::Rational(numerator, denominator) => {
@@ -63,6 +100,7 @@ impl Evaluator {
             }
             ExprKind::Inexact(value) => Ok(Value::Inexact(*value)),
             ExprKind::Bool(value) => Ok(Value::Bool(*value)),
+            ExprKind::Char(value) => Ok(Value::Char(*value)),
             ExprKind::String(value) => Ok(Value::String(value.clone())),
             ExprKind::Symbol(name) => env.lookup(name),
             ExprKind::Vector(elements) => {
@@ -72,6 +110,47 @@ impl Evaluator {
         };
 
         result.map_err(|error| ensure_position(error, expr.position))
+    }
+
+    fn next_control_id(&self) -> usize {
+        let mut counter = self.gensym_counter.borrow_mut();
+        *counter += 1;
+        *counter
+    }
+
+    fn raise_signal(&self, signal: ControlSignal) -> ! {
+        let id = self.next_control_id();
+        CONTROL_SIGNALS.with(|signals| {
+            signals.borrow_mut().insert(id, signal);
+        });
+        panic_any(ControlPanic { id });
+    }
+
+    fn get_control_signal(&self, id: usize) -> Option<ControlSignal> {
+        CONTROL_SIGNALS.with(|signals| signals.borrow().get(&id).cloned())
+    }
+
+    fn take_control_signal(&self, id: usize) -> Option<ControlSignal> {
+        CONTROL_SIGNALS.with(|signals| signals.borrow_mut().remove(&id))
+    }
+
+    fn handle_unwind(&self, payload: Box<dyn Any + Send>) -> EvalError {
+        let control = match payload.downcast::<ControlPanic>() {
+            Ok(control) => control,
+            Err(payload) => resume_unwind(payload),
+        };
+
+        match self.take_control_signal(control.id) {
+            Some(ControlSignal::Raised { value, position }) => {
+                let error = EvalError::message(format!("uncaught exception: {}", render(&value)));
+                match position {
+                    Some(position) => ensure_position(error, position),
+                    None => error,
+                }
+            }
+            Some(ControlSignal::Jump { .. }) => EvalError::message("invalid continuation escape"),
+            None => EvalError::message("invalid control transfer"),
+        }
     }
 
     fn eval_list(&self, expr: &Expr, elements: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
@@ -104,9 +183,10 @@ impl Evaluator {
                 "cond" => self.eval_cond(arguments, env),
                 "case" => self.eval_case(arguments, env),
                 "do" => self.eval_do(arguments, env),
+                "guard" => self.eval_guard(arguments, env),
                 _ => {
                     if let Some(expanded) = self.expand_macro_call(expr, name, env.clone())? {
-                        return self.eval(&expanded, env);
+                        return self.eval_preserving_values(&expanded, env);
                     }
                     let operator = self.eval(operator_expr, env.clone())?;
                     let values = self.eval_all(arguments, env)?;
@@ -172,6 +252,11 @@ impl Evaluator {
             return Err(EvalError::message("define-syntax name must be a symbol"));
         };
 
+        if let Some(transformer) = parse_syntax_rules_transformer(name, &arguments[1])? {
+            env.define_macro(name.clone(), MacroBinding::SyntaxRules(Rc::new(transformer)));
+            return Ok(Value::Void);
+        }
+
         let transformer = self.eval(&arguments[1], env.clone())?;
         let Value::Closure(transformer) = transformer else {
             return Err(EvalError::message(
@@ -179,7 +264,7 @@ impl Evaluator {
             ));
         };
 
-        env.define_macro(name.clone(), transformer);
+        env.define_macro(name.clone(), MacroBinding::Closure(transformer));
         Ok(Value::Void)
     }
 
@@ -456,6 +541,97 @@ impl Evaluator {
 
     fn eval_begin(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
         self.eval_sequence(arguments, env)
+    }
+
+    fn eval_guard(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        if arguments.len() < 2 {
+            return Err(EvalError::message("guard requires clauses and a body"));
+        }
+
+        let ExprKind::List(guard_elements) = &arguments[0].kind else {
+            return Err(EvalError::message(
+                "guard expects an exception variable and clauses",
+            ));
+        };
+        if guard_elements.is_empty() {
+            return Err(EvalError::message(
+                "guard expects an exception variable and clauses",
+            ));
+        }
+
+        let ExprKind::Symbol(variable_name) = &guard_elements[0].kind else {
+            return Err(EvalError::message("guard exception variable must be a symbol"));
+        };
+
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.eval_sequence_preserving_values(&arguments[1..], env.clone())
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let control = match payload.downcast::<ControlPanic>() {
+                    Ok(control) => control,
+                    Err(payload) => resume_unwind(payload),
+                };
+
+                match self.get_control_signal(control.id) {
+                    Some(ControlSignal::Raised { value, position }) => {
+                        self.take_control_signal(control.id);
+                        let guard_env = Env::new(Some(env));
+                        guard_env.define(variable_name.clone(), value.clone());
+                        self.eval_guard_clauses(
+                            &guard_elements[1..],
+                            guard_env,
+                            value,
+                            position,
+                        )
+                    }
+                    Some(_) => resume_unwind(Box::new(*control)),
+                    None => Err(EvalError::message("invalid control transfer")),
+                }
+            }
+        }
+    }
+
+    fn eval_guard_clauses(
+        &self,
+        clauses: &[Expr],
+        guard_env: Rc<Env>,
+        exception_value: Value,
+        position: Option<SourceLoc>,
+    ) -> Result<Value, EvalError> {
+        for (index, clause_expr) in clauses.iter().enumerate() {
+            let ExprKind::List(elements) = &clause_expr.kind else {
+                return Err(EvalError::message("guard clause must be a non-empty list"));
+            };
+            if elements.is_empty() {
+                return Err(EvalError::message("guard clause must be a non-empty list"));
+            }
+
+            if let ExprKind::Symbol(name) = &elements[0].kind {
+                if name == "else" {
+                    if index != clauses.len() - 1 {
+                        return Err(EvalError::message("guard else clause must be last"));
+                    }
+                    if elements.len() == 1 {
+                        return Ok(Value::Bool(true));
+                    }
+                    return self.eval_sequence_preserving_values(&elements[1..], guard_env);
+                }
+            }
+
+            let test_value = self.eval(&elements[0], guard_env.clone())?;
+            if is_truthy(&test_value) {
+                if elements.len() == 1 {
+                    return Ok(test_value);
+                }
+                return self.eval_sequence_preserving_values(&elements[1..], guard_env);
+            }
+        }
+
+        self.raise_signal(ControlSignal::Raised {
+            value: exception_value,
+            position,
+        });
     }
 
     fn eval_let(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
@@ -744,11 +920,13 @@ impl Evaluator {
 
     fn apply_continuation(
         &self,
-        _continuation: &ContinuationValue,
+        continuation: &ContinuationValue,
         arguments: Vec<Value>,
     ) -> Result<Value, EvalError> {
-        require_exact_args("continuation", arguments.len(), 1)?;
-        Ok(arguments[0].clone())
+        self.raise_signal(ControlSignal::Jump {
+            prompt_id: continuation.prompt_id,
+            values: arguments,
+        });
     }
 
     fn apply_parameterized_procedure(
@@ -759,28 +937,266 @@ impl Evaluator {
         arguments: Vec<Value>,
         procedure_name: &str,
     ) -> Result<Value, EvalError> {
-        let required = parameters.required.len();
-        if parameters.rest.is_some() {
-            require_min_args(procedure_name, arguments.len(), required)?;
-        } else {
-            require_exact_args(procedure_name, arguments.len(), required)?;
+        let mut current_parameters = parameters.clone();
+        let mut current_body = body.to_vec();
+        let mut current_env = env;
+        let mut current_arguments = arguments;
+        let mut current_name = procedure_name.to_string();
+
+        loop {
+            let required = current_parameters.required.len();
+            if current_parameters.rest.is_some() {
+                require_min_args(&current_name, current_arguments.len(), required)?;
+            } else {
+                require_exact_args(&current_name, current_arguments.len(), required)?;
+            }
+
+            let call_env = Env::new(Some(current_env.clone()));
+            for (name, value) in current_parameters
+                .required
+                .iter()
+                .zip(current_arguments.iter().take(required).cloned())
+            {
+                call_env.define(name.clone(), value);
+            }
+            if let Some(rest_name) = &current_parameters.rest {
+                call_env.define(
+                    rest_name.clone(),
+                    list_value(current_arguments[required..].to_vec()),
+                );
+            }
+
+            match self.eval_sequence_tail(&current_body, call_env)? {
+                TailResult::Value(value) => return Ok(value),
+                TailResult::TailCall(operator, arguments) => match operator {
+                    Value::Closure(closure) => {
+                        current_parameters = closure.parameters.clone();
+                        current_body = closure.body.clone();
+                        current_env = closure.env.clone();
+                        current_arguments = arguments;
+                        current_name = "lambda".to_string();
+                    }
+                    Value::CaseLambda(case_lambda) => {
+                        let Some(clause) = case_lambda
+                            .clauses
+                            .iter()
+                            .find(|clause| {
+                                parameter_spec_accepts_arity(&clause.parameters, arguments.len())
+                            })
+                        else {
+                            return Err(EvalError::message(format!(
+                                "case-lambda has no matching clause for {} argument(s)",
+                                arguments.len()
+                            )));
+                        };
+
+                        current_parameters = clause.parameters.clone();
+                        current_body = clause.body.clone();
+                        current_env = case_lambda.env.clone();
+                        current_arguments = arguments;
+                        current_name = "case-lambda".to_string();
+                    }
+                    operator => return self.apply_procedure(operator, arguments),
+                },
+            }
+        }
+    }
+
+    fn eval_sequence_tail(
+        &self,
+        expressions: &[Expr],
+        env: Rc<Env>,
+    ) -> Result<TailResult, EvalError> {
+        if expressions.is_empty() {
+            return Ok(TailResult::Value(Value::Void));
         }
 
-        let call_env = Env::new(Some(env));
-        for (name, value) in parameters
-            .required
-            .iter()
-            .zip(arguments.iter().take(required).cloned())
-        {
-            call_env.define(name.clone(), value);
+        for expression in &expressions[..expressions.len() - 1] {
+            self.eval(expression, env.clone())?;
         }
-        if let Some(rest_name) = &parameters.rest {
-            call_env.define(
-                rest_name.clone(),
-                list_value(arguments[required..].to_vec()),
-            );
+        self.eval_tail_expr(&expressions[expressions.len() - 1], env)
+    }
+
+    fn eval_tail_expr(&self, expr: &Expr, env: Rc<Env>) -> Result<TailResult, EvalError> {
+        let result = match &expr.kind {
+            ExprKind::List(elements) => self.eval_tail_list(expr, elements, env),
+            _ => self
+                .eval_preserving_values(expr, env)
+                .map(TailResult::Value),
+        };
+
+        result.map_err(|error| ensure_position(error, expr.position))
+    }
+
+    fn eval_tail_list(
+        &self,
+        expr: &Expr,
+        elements: &[Expr],
+        env: Rc<Env>,
+    ) -> Result<TailResult, EvalError> {
+        if elements.is_empty() {
+            return Err(EvalError::message("cannot evaluate an empty list"));
         }
-        self.eval_sequence(body, call_env)
+
+        let operator_expr = &elements[0];
+        let arguments = &elements[1..];
+
+        if let ExprKind::Symbol(name) = &operator_expr.kind {
+            match name.as_str() {
+                "define" => return self.eval_define(arguments, env).map(TailResult::Value),
+                "define-syntax" => {
+                    return self.eval_define_syntax(arguments, env).map(TailResult::Value)
+                }
+                "define-record-type" => {
+                    return self
+                        .eval_define_record_type(arguments, env)
+                        .map(TailResult::Value)
+                }
+                "set!" => return self.eval_set(arguments, env).map(TailResult::Value),
+                "if" => {
+                    if arguments.len() != 2 && arguments.len() != 3 {
+                        return Err(EvalError::message("if expected 2 or 3 argument(s)"));
+                    }
+                    let condition = self.eval(&arguments[0], env.clone())?;
+                    if is_truthy(&condition) {
+                        return self.eval_tail_expr(&arguments[1], env);
+                    }
+                    if arguments.len() == 3 {
+                        return self.eval_tail_expr(&arguments[2], env);
+                    }
+                    return Ok(TailResult::Value(Value::Void));
+                }
+                "quote" => return self.eval_quote(arguments).map(TailResult::Value),
+                "lambda" => return self.eval_lambda(arguments, env).map(TailResult::Value),
+                "case-lambda" => {
+                    return self.eval_case_lambda(arguments, env).map(TailResult::Value)
+                }
+                "syntax" => return self.eval_syntax(arguments, env).map(TailResult::Value),
+                "syntax-case" => {
+                    return self.eval_syntax_case(arguments, env).map(TailResult::Value)
+                }
+                "with-syntax" => {
+                    return self.eval_with_syntax(arguments, env).map(TailResult::Value)
+                }
+                "and" => return self.eval_and(arguments, env).map(TailResult::Value),
+                "or" => return self.eval_or(arguments, env).map(TailResult::Value),
+                "begin" => return self.eval_sequence_tail(arguments, env),
+                "let" => return self.eval_let(arguments, env).map(TailResult::Value),
+                "letrec" => {
+                    return self
+                        .eval_letrec(arguments, env, false)
+                        .map(TailResult::Value)
+                }
+                "letrec*" => {
+                    return self
+                        .eval_letrec(arguments, env, true)
+                        .map(TailResult::Value)
+                }
+                "cond" => return self.eval_cond(arguments, env).map(TailResult::Value),
+                "case" => return self.eval_case(arguments, env).map(TailResult::Value),
+                "do" => return self.eval_do(arguments, env).map(TailResult::Value),
+                "guard" => return self.eval_guard_tail(arguments, env),
+                _ => {
+                    if let Some(expanded) = self.expand_macro_call(expr, name, env.clone())? {
+                        return self.eval_tail_expr(&expanded, env);
+                    }
+                }
+            }
+        }
+
+        let operator = self.eval(operator_expr, env.clone())?;
+        let values = self.eval_all(arguments, env)?;
+        Ok(TailResult::TailCall(operator, values))
+    }
+
+    fn eval_guard_tail(&self, arguments: &[Expr], env: Rc<Env>) -> Result<TailResult, EvalError> {
+        if arguments.len() < 2 {
+            return Err(EvalError::message("guard requires clauses and a body"));
+        }
+
+        let ExprKind::List(guard_elements) = &arguments[0].kind else {
+            return Err(EvalError::message(
+                "guard expects an exception variable and clauses",
+            ));
+        };
+        if guard_elements.is_empty() {
+            return Err(EvalError::message(
+                "guard expects an exception variable and clauses",
+            ));
+        }
+        let ExprKind::Symbol(variable_name) = &guard_elements[0].kind else {
+            return Err(EvalError::message("guard exception variable must be a symbol"));
+        };
+
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.eval_sequence_tail(&arguments[1..], env.clone())
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let control = match payload.downcast::<ControlPanic>() {
+                    Ok(control) => control,
+                    Err(payload) => resume_unwind(payload),
+                };
+
+                match self.get_control_signal(control.id) {
+                    Some(ControlSignal::Raised { value, position }) => {
+                        self.take_control_signal(control.id);
+                        let guard_env = Env::new(Some(env));
+                        guard_env.define(variable_name.clone(), value.clone());
+                        self.eval_guard_clauses_tail(
+                            &guard_elements[1..],
+                            guard_env,
+                            value,
+                            position,
+                        )
+                    }
+                    Some(_) => resume_unwind(Box::new(*control)),
+                    None => Err(EvalError::message("invalid control transfer")),
+                }
+            }
+        }
+    }
+
+    fn eval_guard_clauses_tail(
+        &self,
+        clauses: &[Expr],
+        guard_env: Rc<Env>,
+        exception_value: Value,
+        position: Option<SourceLoc>,
+    ) -> Result<TailResult, EvalError> {
+        for (index, clause_expr) in clauses.iter().enumerate() {
+            let ExprKind::List(elements) = &clause_expr.kind else {
+                return Err(EvalError::message("guard clause must be a non-empty list"));
+            };
+            if elements.is_empty() {
+                return Err(EvalError::message("guard clause must be a non-empty list"));
+            }
+
+            if let ExprKind::Symbol(name) = &elements[0].kind {
+                if name == "else" {
+                    if index != clauses.len() - 1 {
+                        return Err(EvalError::message("guard else clause must be last"));
+                    }
+                    if elements.len() == 1 {
+                        return Ok(TailResult::Value(Value::Bool(true)));
+                    }
+                    return self.eval_sequence_tail(&elements[1..], guard_env);
+                }
+            }
+
+            let test_value = self.eval(&elements[0], guard_env.clone())?;
+            if is_truthy(&test_value) {
+                if elements.len() == 1 {
+                    return Ok(TailResult::Value(test_value));
+                }
+                return self.eval_sequence_tail(&elements[1..], guard_env);
+            }
+        }
+
+        self.raise_signal(ControlSignal::Raised {
+            value: exception_value,
+            position,
+        });
     }
 
     fn apply_record_procedure(
@@ -842,6 +1258,18 @@ impl Evaluator {
         }
     }
 
+    fn eval_sequence_preserving_values(
+        &self,
+        expressions: &[Expr],
+        env: Rc<Env>,
+    ) -> Result<Value, EvalError> {
+        let mut result = Value::Void;
+        for expression in expressions {
+            result = self.eval_preserving_values(expression, env.clone())?;
+        }
+        Ok(result)
+    }
+
     fn eval_sequence(&self, expressions: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
         let mut result = Value::Void;
         for expression in expressions {
@@ -860,13 +1288,48 @@ impl Evaluator {
             return Ok(None);
         };
 
-        let expanded = self.apply_closure(&transformer, vec![Value::Syntax(expr.clone())])?;
-        let Value::Syntax(expanded_expr) = expanded else {
-            return Err(EvalError::message(
-                "macro transformer must produce a syntax object",
-            ));
-        };
-        Ok(Some(expanded_expr))
+        match transformer {
+            MacroBinding::Closure(transformer) => {
+                let expanded = self.apply_closure(&transformer, vec![Value::Syntax(expr.clone())])?;
+                let Value::Syntax(expanded_expr) = expanded else {
+                    return Err(EvalError::message(
+                        "macro transformer must produce a syntax object",
+                    ));
+                };
+                Ok(Some(expanded_expr))
+            }
+            MacroBinding::SyntaxRules(transformer) => {
+                Ok(Some(self.expand_syntax_rules_macro(expr, transformer.as_ref())?))
+            }
+        }
+    }
+
+    fn expand_syntax_rules_macro(
+        &self,
+        expr: &Expr,
+        transformer: &SyntaxRulesMacro,
+    ) -> Result<Expr, EvalError> {
+        let extended_literals = transformer
+            .literals
+            .iter()
+            .cloned()
+            .chain(std::iter::once(transformer.name.clone()))
+            .collect::<Vec<_>>();
+
+        for rule in &transformer.rules {
+            let mut bindings = HashMap::new();
+            if !match_syntax_case_pattern(&rule.pattern, expr, &extended_literals, &mut bindings)? {
+                continue;
+            }
+
+            let syntax_env = Env::new(None);
+            bind_pattern_bindings(&syntax_env, bindings);
+            return self.expand_syntax_template(&rule.template, &syntax_env, &HashMap::new());
+        }
+
+        Err(EvalError::message(
+            "macro invocation did not match any macro clause",
+        ))
     }
 
     fn expand_syntax_template(
@@ -954,16 +1417,37 @@ impl Evaluator {
         let ExprKind::Symbol(name) = &elements[0].kind else {
             return Ok(None);
         };
-        if name != "let" || elements.len() < 3 {
+        if name != "let" {
             return Ok(None);
         }
+        if elements.len() < 3 {
+            return Err(EvalError::message("syntax let requires bindings and a body"));
+        };
 
-        let ExprKind::List(binding_exprs) = &elements[1].kind else {
+        let (loop_name, bindings_expr, body_start) = match &elements[1].kind {
+            ExprKind::List(_) => (None, &elements[1], 2),
+            ExprKind::Symbol(_) => {
+                if elements.len() < 4 {
+                    return Err(EvalError::message(
+                        "syntax named let requires bindings and a body",
+                    ));
+                }
+                (Some(&elements[1]), &elements[2], 3)
+            }
+            _ => return Err(EvalError::message("syntax let bindings must be a list")),
+        };
+
+        let ExprKind::List(binding_exprs) = &bindings_expr.kind else {
             return Err(EvalError::message("syntax let bindings must be a list"));
         };
 
-        let mut expanded_bindings = Vec::with_capacity(binding_exprs.len());
         let mut body_renamed = renamed.clone();
+        let mut expanded = vec![elements[0].clone()];
+        if let Some(loop_name) = loop_name {
+            expanded.push(self.expand_template_binder(loop_name, env, &mut body_renamed)?);
+        }
+
+        let mut expanded_bindings = Vec::with_capacity(binding_exprs.len());
         for binding in binding_exprs {
             let ExprKind::List(binding_parts) = &binding.kind else {
                 return Err(EvalError::message("syntax let binding must be a list"));
@@ -982,14 +1466,11 @@ impl Evaluator {
             });
         }
 
-        let mut expanded = vec![
-            elements[0].clone(),
-            Expr {
-                kind: ExprKind::List(expanded_bindings),
-                position: elements[1].position,
-            },
-        ];
-        for body_expr in &elements[2..] {
+        expanded.push(Expr {
+            kind: ExprKind::List(expanded_bindings),
+            position: bindings_expr.position,
+        });
+        for body_expr in &elements[body_start..] {
             expanded.push(self.expand_syntax_template(body_expr, env, &body_renamed)?);
         }
 
@@ -1060,19 +1541,26 @@ fn create_global_env() -> Rc<Env> {
     env.define_builtin("cons", |_, arguments| builtin_cons(arguments));
     env.define_builtin("car", |_, arguments| builtin_car(arguments));
     env.define_builtin("cdr", |_, arguments| builtin_cdr(arguments));
+    env.define_builtin("set-car!", |_, arguments| builtin_set_car(arguments));
+    env.define_builtin("set-cdr!", |_, arguments| builtin_set_cdr(arguments));
     env.define_builtin("null?", |_, arguments| builtin_is_null(arguments));
     env.define_builtin("list", |_, arguments| builtin_list(arguments));
     env.define_builtin("length", |_, arguments| builtin_length(arguments));
     env.define_builtin("append", |_, arguments| builtin_append(arguments));
+    env.define_builtin("reverse", |_, arguments| builtin_reverse(arguments));
     env.define_builtin("string-append", |_, arguments| {
         builtin_string_append(arguments)
     });
     env.define_builtin("number->string", |_, arguments| {
         builtin_number_to_string(arguments)
     });
+    env.define_builtin("symbol->string", |_, arguments| {
+        builtin_symbol_to_string(arguments)
+    });
     env.define_builtin("string->symbol", |_, arguments| {
         builtin_string_to_symbol(arguments)
     });
+    env.define_builtin("string-ref", |_, arguments| builtin_string_ref(arguments));
     env.define_builtin("syntax->datum", |_, arguments| {
         builtin_syntax_to_datum(arguments)
     });
@@ -1085,6 +1573,7 @@ fn create_global_env() -> Rc<Env> {
     env.define_builtin("pair?", |_, arguments| builtin_is_pair(arguments));
     env.define_builtin("symbol?", |_, arguments| builtin_is_symbol(arguments));
     env.define_builtin("procedure?", |_, arguments| builtin_is_procedure(arguments));
+    env.define_builtin("char?", |_, arguments| builtin_is_char(arguments));
     env.define_builtin("vector", |_, arguments| builtin_vector(arguments));
     env.define_builtin("make-vector", |_, arguments| builtin_make_vector(arguments));
     env.define_builtin("vector-ref", |_, arguments| builtin_vector_ref(arguments));
@@ -1104,8 +1593,14 @@ fn create_global_env() -> Rc<Env> {
         "call-with-current-continuation",
         builtin_call_with_current_continuation,
     );
+    env.define_builtin("values", builtin_values);
+    env.define_builtin("call-with-values", builtin_call_with_values);
+    env.define_builtin("dynamic-wind", builtin_dynamic_wind);
+    env.define_builtin("raise", builtin_raise);
+    env.define_builtin("with-exception-handler", builtin_with_exception_handler);
     env.define_builtin("apply", builtin_apply);
     env.define_builtin("map", builtin_map);
+    env.define_builtin("for-each", builtin_for_each);
     env
 }
 
@@ -1264,6 +1759,56 @@ fn parse_record_fields(field_exprs: &[Expr]) -> Result<Vec<RecordFieldSpec>, Eva
     Ok(fields)
 }
 
+fn parse_syntax_rules_transformer(
+    name: &str,
+    expr: &Expr,
+) -> Result<Option<SyntaxRulesMacro>, EvalError> {
+    let ExprKind::List(elements) = &expr.kind else {
+        return Ok(None);
+    };
+    let Some(Expr {
+        kind: ExprKind::Symbol(operator),
+        ..
+    }) = elements.first()
+    else {
+        return Ok(None);
+    };
+
+    if operator != "syntax-rules" {
+        return Ok(None);
+    }
+    if elements.len() < 3 {
+        return Err(EvalError::message(
+            "define-syntax expects a syntax-rules transformer",
+        ));
+    }
+
+    let literals = parse_syntax_literals(&elements[1])?;
+    let mut rules = Vec::with_capacity(elements.len() - 2);
+    for clause in &elements[2..] {
+        let ExprKind::List(rule) = &clause.kind else {
+            return Err(EvalError::message(
+                "syntax-rules clause must contain a pattern and template",
+            ));
+        };
+        if rule.len() != 2 {
+            return Err(EvalError::message(
+                "syntax-rules clause must contain a pattern and template",
+            ));
+        }
+        rules.push(SyntaxRulesRule {
+            pattern: rule[0].clone(),
+            template: rule[1].clone(),
+        });
+    }
+
+    Ok(Some(SyntaxRulesMacro {
+        name: name.to_string(),
+        literals,
+        rules,
+    }))
+}
+
 fn parse_parameter_names(parameter_expr: &Expr) -> Result<ParameterSpec, EvalError> {
     match &parameter_expr.kind {
         ExprKind::List(parameter_list) => parse_parameter_names_list(parameter_list),
@@ -1392,6 +1937,9 @@ fn match_syntax_case_pattern(
         ExprKind::Bool(value) => {
             Ok(matches!(&input.kind, ExprKind::Bool(other) if *other == *value))
         }
+        ExprKind::Char(value) => {
+            Ok(matches!(&input.kind, ExprKind::Char(other) if *other == *value))
+        }
         ExprKind::String(value) => {
             Ok(matches!(&input.kind, ExprKind::String(other) if other == value))
         }
@@ -1517,6 +2065,7 @@ fn exprs_equal(left: &Expr, right: &Expr) -> bool {
         (ExprKind::Rational(ln, ld), ExprKind::Rational(rn, rd)) => ln == rn && ld == rd,
         (ExprKind::Inexact(left), ExprKind::Inexact(right)) => left == right,
         (ExprKind::Bool(left), ExprKind::Bool(right)) => left == right,
+        (ExprKind::Char(left), ExprKind::Char(right)) => left == right,
         (ExprKind::String(left), ExprKind::String(right)) => left == right,
         (ExprKind::Symbol(left), ExprKind::Symbol(right)) => left == right,
         (ExprKind::Vector(left), ExprKind::Vector(right))
@@ -1556,6 +2105,7 @@ fn datum_to_expr(value: &Value, position: SourceLoc, operator: &str) -> Result<E
         Value::Rational(number) => ExprKind::Rational(number.numerator, number.denominator),
         Value::Inexact(number) => ExprKind::Inexact(*number),
         Value::Bool(value) => ExprKind::Bool(*value),
+        Value::Char(value) => ExprKind::Char(*value),
         Value::String(text) => ExprKind::String(text.clone()),
         Value::Symbol(name) => ExprKind::Symbol(name.clone()),
         Value::EmptyList => ExprKind::List(Vec::new()),
@@ -1590,8 +2140,8 @@ fn datum_pair_to_exprs(
     loop {
         match current {
             Value::Pair(pair) => {
-                exprs.push(datum_to_expr(&pair.car, position, operator)?);
-                current = pair.cdr.clone();
+                exprs.push(datum_to_expr(&pair.car.borrow(), position, operator)?);
+                current = pair.cdr.borrow().clone();
             }
             Value::EmptyList => return Ok(exprs),
             _ => {
@@ -1611,6 +2161,7 @@ fn quote_to_value(expr: &Expr) -> Value {
         }
         ExprKind::Inexact(value) => Value::Inexact(*value),
         ExprKind::Bool(value) => Value::Bool(*value),
+        ExprKind::Char(value) => Value::Char(*value),
         ExprKind::String(value) => Value::String(value.clone()),
         ExprKind::Symbol(name) => Value::Symbol(name.clone()),
         ExprKind::Vector(elements) => vector_value(elements.iter().map(quote_to_value).collect()),
@@ -1622,8 +2173,8 @@ fn list_value(values: Vec<Value>) -> Value {
     let mut result = Value::EmptyList;
     for value in values.into_iter().rev() {
         result = Value::Pair(Rc::new(PairValue {
-            car: value,
-            cdr: result,
+            car: RefCell::new(value),
+            cdr: RefCell::new(result),
         }));
     }
     result
@@ -1747,6 +2298,20 @@ fn require_index(value: &Value, operator: &str) -> Result<usize, EvalError> {
         .map_err(|_| EvalError::message(format!("{operator} expects a valid index")))
 }
 
+fn require_string<'a>(value: &'a Value, operator: &str) -> Result<&'a str, EvalError> {
+    match value {
+        Value::String(text) => Ok(text),
+        _ => Err(EvalError::message(format!("{operator} expects a string"))),
+    }
+}
+
+fn require_char(value: &Value, operator: &str) -> Result<char, EvalError> {
+    match value {
+        Value::Char(ch) => Ok(*ch),
+        _ => Err(EvalError::message(format!("{operator} expects a character"))),
+    }
+}
+
 fn require_record_field(
     value: &Value,
     expected_type: &Rc<RecordType>,
@@ -1773,8 +2338,8 @@ fn require_proper_list(value: &Value, operator: &str) -> Result<Vec<Value>, Eval
     loop {
         match current {
             Value::Pair(pair) => {
-                elements.push(pair.car.clone());
-                current = pair.cdr.clone();
+                elements.push(pair.car.borrow().clone());
+                current = pair.cdr.borrow().clone();
             }
             Value::EmptyList => return Ok(elements),
             _ => {
@@ -1807,6 +2372,7 @@ fn eqv_values(left: &Value, right: &Value) -> bool {
         (Value::Rational(left), Value::Rational(right)) => left == right,
         (Value::Inexact(left), Value::Inexact(right)) => left == right,
         (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Char(left), Value::Char(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::EmptyList, Value::EmptyList) => true,
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
@@ -1869,6 +2435,7 @@ fn equal_values_inner(left: &Value, right: &Value, visited: &mut Vec<(usize, usi
 
     match (left, right) {
         (Value::String(left), Value::String(right)) => left == right,
+        (Value::Char(left), Value::Char(right)) => left == right,
         (Value::Pair(left), Value::Pair(right)) => {
             let key = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
             if visited.contains(&key) {
@@ -1876,8 +2443,8 @@ fn equal_values_inner(left: &Value, right: &Value, visited: &mut Vec<(usize, usi
             }
             visited.push(key);
 
-            equal_values_inner(&left.car, &right.car, visited)
-                && equal_values_inner(&left.cdr, &right.cdr, visited)
+            equal_values_inner(&left.car.borrow(), &right.car.borrow(), visited)
+                && equal_values_inner(&left.cdr.borrow(), &right.cdr.borrow(), visited)
         }
         (Value::Vector(left), Value::Vector(right)) => {
             let key = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
@@ -1934,9 +2501,11 @@ fn render(value: &Value) -> String {
         Value::Inexact(number) => render_inexact(*number),
         Value::Bool(true) => "#t".to_string(),
         Value::Bool(false) => "#f".to_string(),
+        Value::Char(value) => render_char(*value),
         Value::String(text) => quote_string(text),
         Value::Symbol(name) => name.clone(),
         Value::Syntax(_) | Value::SyntaxSequence(_) => "#<syntax>".to_string(),
+        Value::Values(_) => "#<values>".to_string(),
         Value::EmptyList => "()".to_string(),
         Value::Pair(pair) => render_pair(pair.as_ref()),
         Value::Vector(vector) => render_vector(vector.as_ref()),
@@ -2000,8 +2569,8 @@ fn render_pair(pair: &PairValue) -> String {
                 if !first {
                     result.push(' ');
                 }
-                result.push_str(&render(&pair.car));
-                current = pair.cdr.clone();
+                result.push_str(&render(&pair.car.borrow()));
+                current = pair.cdr.borrow().clone();
                 first = false;
             }
             Value::EmptyList => {
@@ -2045,6 +2614,44 @@ fn quote_string(value: &str) -> String {
     }
     result.push('"');
     result
+}
+
+fn render_char(value: char) -> String {
+    match value {
+        ' ' => "#\\space".to_string(),
+        '\n' => "#\\newline".to_string(),
+        value => format!("#\\{value}"),
+    }
+}
+
+fn pack_values(values: Vec<Value>) -> Value {
+    match values.len() {
+        0 => Value::Values(Vec::new()),
+        1 => Value::Values(values),
+        _ => Value::Values(values),
+    }
+}
+
+fn unpack_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Values(values) => values,
+        value => vec![value],
+    }
+}
+
+fn normalize_single_value(value: Value) -> Result<Value, EvalError> {
+    match value {
+        Value::Values(mut values) => {
+            if values.len() == 1 {
+                Ok(values.remove(0))
+            } else {
+                Err(EvalError::message(
+                    "multiple values used in a single-value context",
+                ))
+            }
+        }
+        value => Ok(value),
+    }
 }
 
 fn gcd(mut left: i64, mut right: i64) -> i64 {
@@ -2308,19 +2915,31 @@ fn builtin_denominator(arguments: &[Value]) -> Result<Value, EvalError> {
 fn builtin_cons(arguments: &[Value]) -> Result<Value, EvalError> {
     require_exact_args("cons", arguments.len(), 2)?;
     Ok(Value::Pair(Rc::new(PairValue {
-        car: arguments[0].clone(),
-        cdr: arguments[1].clone(),
+        car: RefCell::new(arguments[0].clone()),
+        cdr: RefCell::new(arguments[1].clone()),
     })))
 }
 
 fn builtin_car(arguments: &[Value]) -> Result<Value, EvalError> {
     require_exact_args("car", arguments.len(), 1)?;
-    Ok(require_pair(&arguments[0], "car")?.car.clone())
+    Ok(require_pair(&arguments[0], "car")?.car.borrow().clone())
 }
 
 fn builtin_cdr(arguments: &[Value]) -> Result<Value, EvalError> {
     require_exact_args("cdr", arguments.len(), 1)?;
-    Ok(require_pair(&arguments[0], "cdr")?.cdr.clone())
+    Ok(require_pair(&arguments[0], "cdr")?.cdr.borrow().clone())
+}
+
+fn builtin_set_car(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("set-car!", arguments.len(), 2)?;
+    *require_pair(&arguments[0], "set-car!")?.car.borrow_mut() = arguments[1].clone();
+    Ok(Value::Void)
+}
+
+fn builtin_set_cdr(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("set-cdr!", arguments.len(), 2)?;
+    *require_pair(&arguments[0], "set-cdr!")?.cdr.borrow_mut() = arguments[1].clone();
+    Ok(Value::Void)
 }
 
 fn builtin_is_null(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -2349,21 +2968,25 @@ fn builtin_append(arguments: &[Value]) -> Result<Value, EvalError> {
         let items = require_proper_list(prefix, "append")?;
         for item in items.into_iter().rev() {
             result = Value::Pair(Rc::new(PairValue {
-                car: item,
-                cdr: result,
+                car: RefCell::new(item),
+                cdr: RefCell::new(result),
             }));
         }
     }
     Ok(result)
 }
 
+fn builtin_reverse(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("reverse", arguments.len(), 1)?;
+    let mut items = require_proper_list(&arguments[0], "reverse")?;
+    items.reverse();
+    Ok(list_value(items))
+}
+
 fn builtin_string_append(arguments: &[Value]) -> Result<Value, EvalError> {
     let mut result = String::new();
     for argument in arguments {
-        let Value::String(text) = argument else {
-            return Err(EvalError::message("string-append expects string arguments"));
-        };
-        result.push_str(text);
+        result.push_str(require_string(argument, "string-append")?);
     }
     Ok(Value::String(result))
 }
@@ -2374,6 +2997,16 @@ fn builtin_number_to_string(arguments: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::String(render(value)))
 }
 
+fn builtin_symbol_to_string(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("symbol->string", arguments.len(), 1)?;
+    let Value::Symbol(name) = &arguments[0] else {
+        return Err(EvalError::message(
+            "symbol->string expects a symbol argument",
+        ));
+    };
+    Ok(Value::String(name.clone()))
+}
+
 fn builtin_string_to_symbol(arguments: &[Value]) -> Result<Value, EvalError> {
     require_exact_args("string->symbol", arguments.len(), 1)?;
     let Value::String(text) = &arguments[0] else {
@@ -2382,6 +3015,16 @@ fn builtin_string_to_symbol(arguments: &[Value]) -> Result<Value, EvalError> {
         ));
     };
     Ok(Value::Symbol(text.clone()))
+}
+
+fn builtin_string_ref(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("string-ref", arguments.len(), 2)?;
+    let text = require_string(&arguments[0], "string-ref")?;
+    let index = require_index(&arguments[1], "string-ref")?;
+    let Some(ch) = text.chars().nth(index) else {
+        return Err(EvalError::message("string-ref index out of bounds"));
+    };
+    Ok(Value::Char(ch))
 }
 
 fn builtin_syntax_to_datum(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -2436,10 +3079,99 @@ fn builtin_call_with_current_continuation_impl(
     arguments: &[Value],
 ) -> Result<Value, EvalError> {
     require_exact_args(operator, arguments.len(), 1)?;
-    evaluator.apply_procedure(
-        arguments[0].clone(),
-        vec![Value::Continuation(Rc::new(ContinuationValue))],
-    )
+    let prompt_id = evaluator.next_control_id();
+    match catch_unwind(AssertUnwindSafe(|| {
+        evaluator.apply_procedure(
+            arguments[0].clone(),
+            vec![Value::Continuation(Rc::new(ContinuationValue { prompt_id }))],
+        )
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            let control = match payload.downcast::<ControlPanic>() {
+                Ok(control) => control,
+                Err(payload) => resume_unwind(payload),
+            };
+
+            match evaluator.get_control_signal(control.id) {
+                Some(ControlSignal::Jump {
+                    prompt_id: target_prompt,
+                    values,
+                }) if target_prompt == prompt_id => {
+                    evaluator.take_control_signal(control.id);
+                    Ok(pack_values(values))
+                }
+                Some(_) => resume_unwind(Box::new(*control)),
+                None => Err(EvalError::message("invalid control transfer")),
+            }
+        }
+    }
+}
+
+fn builtin_values(_evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
+    Ok(pack_values(arguments.to_vec()))
+}
+
+fn builtin_call_with_values(
+    evaluator: &Evaluator,
+    arguments: &[Value],
+) -> Result<Value, EvalError> {
+    require_exact_args("call-with-values", arguments.len(), 2)?;
+    let produced = evaluator.apply_procedure(arguments[0].clone(), Vec::new())?;
+    evaluator.apply_procedure(arguments[1].clone(), unpack_values(produced))
+}
+
+fn builtin_dynamic_wind(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("dynamic-wind", arguments.len(), 3)?;
+    evaluator.apply_procedure(arguments[0].clone(), Vec::new())?;
+
+    match catch_unwind(AssertUnwindSafe(|| evaluator.apply_procedure(arguments[1].clone(), Vec::new())))
+    {
+        Ok(result) => {
+            let value = result?;
+            evaluator.apply_procedure(arguments[2].clone(), Vec::new())?;
+            Ok(value)
+        }
+        Err(payload) => {
+            let cleanup = evaluator.apply_procedure(arguments[2].clone(), Vec::new());
+            cleanup?;
+            resume_unwind(payload);
+        }
+    }
+}
+
+fn builtin_raise(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("raise", arguments.len(), 1)?;
+    evaluator.raise_signal(ControlSignal::Raised {
+        value: arguments[0].clone(),
+        position: None,
+    });
+}
+
+fn builtin_with_exception_handler(
+    evaluator: &Evaluator,
+    arguments: &[Value],
+) -> Result<Value, EvalError> {
+    require_exact_args("with-exception-handler", arguments.len(), 2)?;
+    match catch_unwind(AssertUnwindSafe(|| evaluator.apply_procedure(arguments[1].clone(), Vec::new())))
+    {
+        Ok(result) => result,
+        Err(payload) => {
+            let control = match payload.downcast::<ControlPanic>() {
+                Ok(control) => control,
+                Err(payload) => resume_unwind(payload),
+            };
+
+            match evaluator.get_control_signal(control.id) {
+                Some(ControlSignal::Raised { value, .. }) => {
+                    evaluator.take_control_signal(control.id);
+                    evaluator.apply_procedure(arguments[0].clone(), vec![value])
+                }
+                Some(_) => resume_unwind(Box::new(*control)),
+                None => Err(EvalError::message("invalid control transfer")),
+            }
+        }
+    }
 }
 
 fn builtin_map(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
@@ -2463,6 +3195,27 @@ fn builtin_map(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, Eval
     }
 
     Ok(list_value(results))
+}
+
+fn builtin_for_each(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
+    require_min_args("for-each", arguments.len(), 2)?;
+
+    let operator = arguments[0].clone();
+    let lists = arguments[1..]
+        .iter()
+        .map(|value| require_proper_list(value, "for-each"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let result_len = lists.iter().map(Vec::len).min().unwrap_or(0);
+    for index in 0..result_len {
+        let call_arguments = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        evaluator.apply_procedure(operator.clone(), call_arguments)?;
+    }
+
+    Ok(Value::Void)
 }
 
 fn builtin_is_string(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -2489,6 +3242,10 @@ fn builtin_is_symbol(arguments: &[Value]) -> Result<Value, EvalError> {
     type_predicate("symbol?", arguments, |value| {
         matches!(value, Value::Symbol(_))
     })
+}
+
+fn builtin_is_char(arguments: &[Value]) -> Result<Value, EvalError> {
+    type_predicate("char?", arguments, |value| matches!(value, Value::Char(_)))
 }
 
 fn builtin_is_procedure(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -2584,6 +3341,7 @@ enum ExprKind {
     Rational(i64, i64),
     Inexact(f64),
     Bool(bool),
+    Char(char),
     String(String),
     Symbol(String),
     Vector(Vec<Expr>),
@@ -2602,10 +3360,12 @@ enum Value {
     Rational(ExactNumber),
     Inexact(f64),
     Bool(bool),
+    Char(char),
     String(String),
     Symbol(String),
     Syntax(Expr),
     SyntaxSequence(Vec<Expr>),
+    Values(Vec<Value>),
     EmptyList,
     Pair(Rc<PairValue>),
     Vector(Rc<VectorValue>),
@@ -2621,8 +3381,8 @@ enum Value {
 
 #[derive(Clone)]
 struct PairValue {
-    car: Value,
-    cdr: Value,
+    car: RefCell<Value>,
+    cdr: RefCell<Value>,
 }
 
 #[derive(Clone)]
@@ -2639,6 +3399,25 @@ struct VectorValue {
 struct Builtin {
     name: &'static str,
     implementation: BuiltinFn,
+}
+
+#[derive(Clone)]
+enum MacroBinding {
+    Closure(Rc<ClosureValue>),
+    SyntaxRules(Rc<SyntaxRulesMacro>),
+}
+
+#[derive(Clone)]
+struct SyntaxRulesMacro {
+    name: String,
+    literals: Vec<String>,
+    rules: Vec<SyntaxRulesRule>,
+}
+
+#[derive(Clone)]
+struct SyntaxRulesRule {
+    pattern: Expr,
+    template: Expr,
 }
 
 #[derive(Clone)]
@@ -2675,7 +3454,9 @@ struct CaseLambdaClause {
 }
 
 #[derive(Clone)]
-struct ContinuationValue;
+struct ContinuationValue {
+    prompt_id: usize,
+}
 
 #[derive(Clone)]
 struct BindingSpec {
@@ -2808,7 +3589,7 @@ impl ExactNumber {
 struct Env {
     parent: Option<Rc<Env>>,
     bindings: RefCell<HashMap<String, Cell>>,
-    macro_bindings: RefCell<HashMap<String, Rc<ClosureValue>>>,
+    macro_bindings: RefCell<HashMap<String, MacroBinding>>,
 }
 
 impl Env {
@@ -2842,11 +3623,11 @@ impl Env {
         cell
     }
 
-    fn define_macro(&self, name: String, transformer: Rc<ClosureValue>) {
+    fn define_macro(&self, name: String, transformer: MacroBinding) {
         self.macro_bindings.borrow_mut().insert(name, transformer);
     }
 
-    fn lookup_macro(&self, name: &str) -> Option<Rc<ClosureValue>> {
+    fn lookup_macro(&self, name: &str) -> Option<MacroBinding> {
         if let Some(transformer) = self.macro_bindings.borrow().get(name).cloned() {
             return Some(transformer);
         }
@@ -2942,6 +3723,7 @@ impl<'input> Parser<'input> {
                     position,
                 })
             }
+            '#' if self.peek_char() == Some('\\') => self.parse_char(),
             '#' if self.peek_char() == Some('\'') => self.parse_syntax_quote(),
             '#' if self.peek_char() == Some('(') => self.parse_vector(),
             '"' => self.parse_string(),
@@ -3006,6 +3788,38 @@ impl<'input> Parser<'input> {
                 },
                 self.parse_expression()?,
             ]),
+            position,
+        })
+    }
+
+    fn parse_char(&mut self) -> Result<Expr, EvalError> {
+        let position = self.current_loc();
+        self.consume('#')?;
+        self.consume('\\')?;
+
+        let start = self.index;
+        while !self.is_at_end() && !self.is_delimiter(self.current_char().unwrap_or_default()) {
+            self.advance();
+        }
+
+        let token = &self.input[start..self.index];
+        let value = match token {
+            "space" => ' ',
+            "newline" => '\n',
+            _ => {
+                let mut chars = token.chars();
+                let Some(ch) = chars.next() else {
+                    return Err(self.error("invalid character literal"));
+                };
+                if chars.next().is_some() {
+                    return Err(self.error("invalid character literal"));
+                }
+                ch
+            }
+        };
+
+        Ok(Expr {
+            kind: ExprKind::Char(value),
             position,
         })
     }
