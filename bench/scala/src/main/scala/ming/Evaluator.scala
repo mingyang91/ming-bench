@@ -51,9 +51,22 @@ object Evaluator:
       evalCond(clauses, env)
     case Expr.SList(Expr.Symbol("set!", _) :: rest, p) =>
       evalSet(rest, env, p)
+    case Expr.SList(Expr.Symbol("define-syntax", _) :: rest, p) =>
+      evalDefineSyntax(rest, env, p)
     case Expr.SList(head :: args, p) =>
-      val func = eval(head, env)
-      applyFunc(func, args.map(a => eval(a, env)), p, env)
+      val macroOpt = head match
+        case Expr.Symbol(name, _) => env.lookupOpt(name).collect { case m: Value.VMacro => m }
+        case _                    => None
+      macroOpt match
+        case Some(m) =>
+          val (expanded, injections) =
+            MacroExpander.expand(m, Expr.SList(head :: args, p), p)
+          val macroEnv = env.child()
+          injections.foreach((k, v) => macroEnv.define(k, v))
+          eval(expanded, macroEnv)
+        case None =>
+          val func = eval(head, env)
+          applyFunc(func, args.map(a => eval(a, env)), p, env)
 
   private def evalBody(body: List[Expr], env: Env): Value =
     body.foldLeft(Value.VVoid: Value)((_, e) => eval(e, env))
@@ -228,6 +241,30 @@ object Evaluator:
       if isTruthy(eval(test, env)) then evalBody(body, env)
       else evalCond(rest, env)
     case e :: _ => throw errAt(posOf(e), "invalid cond")
+
+  // ── Macros ──────────────────────────────────────────────────────────
+
+  private def evalDefineSyntax(
+    rest: List[Expr],
+    env: Env,
+    pos: Pos
+  ): Value =
+    rest match
+      case Expr.Symbol(name, _) :: Expr.SList(
+            Expr.Symbol("syntax-rules", _) :: Expr.SList(lits, _) :: rules,
+            _
+          ) :: Nil =>
+        val literals = lits.map {
+          case Expr.Symbol(s, _) => s
+          case _                 => throw errAt(pos, "invalid syntax-rules")
+        }
+        val parsedRules = rules.map {
+          case Expr.SList(pat :: tmpl :: Nil, _) => (pat, tmpl)
+          case _                                 => throw errAt(pos, "invalid syntax-rules")
+        }
+        env.define(name, Value.VMacro(literals, parsedRules, env))
+        Value.VVoid
+      case _ => throw errAt(pos, "invalid define-syntax")
 
   // ── Public API ───────────────────────────────────────────────────────
   def evalStr(input: String): String =

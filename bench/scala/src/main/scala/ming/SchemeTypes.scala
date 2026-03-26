@@ -19,6 +19,12 @@ object SchemeTypes:
       body: List[Expr],
       closure: Env
     )
+
+    case VMacro(
+      literals: List[String],
+      rules: List[(Expr, Expr)],
+      defEnv: Env
+    )
     case VVoid
 
   type Pos = ming.Pos
@@ -36,6 +42,7 @@ object SchemeTypes:
     case Value.VSymbol(n)          => n
     case Value.VBuiltin(n)         => s"#<procedure $n>"
     case Value.VLambda(_, _, _, _) => "#<procedure>"
+    case Value.VMacro(_, _, _)     => "#<macro>"
     case Value.VVoid               => ""
 
   private def displayChar(c: Char): String = c match
@@ -81,6 +88,9 @@ object SchemeTypes:
         parent match
           case Some(p) => p.set(name, value, pos)
           case None    => throw errAt(pos, s"unbound variable: $name")
+
+    def lookupOpt(name: String): Option[Value] =
+      bindings.get(name).orElse(parent.flatMap(_.lookupOpt(name)))
 
     def child(): Env =
       Env(scala.collection.mutable.Map.empty, Some(this), output)
