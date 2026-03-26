@@ -23,6 +23,7 @@ const (
 	TypeFloat
 	TypeSyntax
 	TypeRecord
+	TypeVector
 )
 
 // Value represents a Scheme value.
@@ -49,6 +50,8 @@ type Value struct {
 	// Record fields
 	RecordTag    string
 	RecordFields map[string]*Value
+	// Vector fields
+	VecElems []*Value
 }
 
 var Void = &Value{Type: TypeVoid}
@@ -163,6 +166,12 @@ func (v *Value) String() string {
 		return "(" + pairInner(v) + ")"
 	case TypeRecord:
 		return fmt.Sprintf("#<%s>", v.RecordTag)
+	case TypeVector:
+		parts := make([]string, len(v.VecElems))
+		for i, e := range v.VecElems {
+			parts[i] = e.String()
+		}
+		return "#(" + strings.Join(parts, " ") + ")"
 	default:
 		return "<unknown>"
 	}
@@ -189,6 +198,12 @@ func (v *Value) DisplayString() string {
 		return string(rune(v.IntVal))
 	case TypePair:
 		return "(" + pairInnerDisplay(v) + ")"
+	case TypeVector:
+		parts := make([]string, len(v.VecElems))
+		for i, e := range v.VecElems {
+			parts[i] = e.DisplayString()
+		}
+		return "#(" + strings.Join(parts, " ") + ")"
 	default:
 		return v.String()
 	}

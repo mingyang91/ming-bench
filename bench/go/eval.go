@@ -125,6 +125,14 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalDefineRecordType(expr, env)
 		case "case-lambda":
 			return evalCaseLambda(expr, env)
+		case "letrec":
+			return evalLetrec(expr, env)
+		case "letrec*":
+			return evalLetrecStar(expr, env)
+		case "case":
+			return evalCase(expr, env)
+		case "do":
+			return evalDo(expr, env)
 		}
 
 		// Check if head is a macro
@@ -366,6 +374,16 @@ func MakeDefaultEnv() *Env {
 		"integer?":         builtinIntegerQ,
 		"rational?":        builtinRationalQ,
 		"procedure?":       builtinProcedureQ,
+		// L14 builtins
+		"eqv?":           builtinEqvQ,
+		"vector":         builtinVector,
+		"make-vector":    builtinMakeVector,
+		"vector-ref":     builtinVectorRef,
+		"vector-set!":    builtinVectorSet,
+		"vector-length":  builtinVectorLength,
+		"vector?":        builtinVectorQ,
+		"vector->list":   builtinVectorToList,
+		"list->vector":   builtinListToVector,
 	}
 
 	for name, fn := range builtins {
@@ -1440,6 +1458,16 @@ func valuesEqual(a, b *Value) bool {
 		return true
 	case TypePair:
 		return valuesEqual(a.Car, b.Car) && valuesEqual(a.Cdr, b.Cdr)
+	case TypeVector:
+		if len(a.VecElems) != len(b.VecElems) {
+			return false
+		}
+		for i := range a.VecElems {
+			if !valuesEqual(a.VecElems[i], b.VecElems[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return a == b
 	}
@@ -1837,4 +1865,322 @@ func dispatchRecordCtor(info string, args []*Value, expr *Expr) (*Value, error) 
 		fields[name] = args[i]
 	}
 	return &Value{Type: TypeRecord, RecordTag: tag, RecordFields: fields}, nil
+}
+
+// --- L14: letrec ---
+
+func evalLetrec(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, fmt.Errorf("%d:%d: letrec: too few arguments", expr.Line, expr.Col)
+	}
+	bindingExpr := expr.List[1]
+	body := expr.List[2:]
+	if bindingExpr.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: letrec: bindings must be a list", bindingExpr.Line, bindingExpr.Col)
+	}
+	letEnv := NewEnv(env)
+	// First, bind all variables to undefined (Void)
+	for _, b := range bindingExpr.List {
+		if b.Type != ExprList || len(b.List) != 2 || b.List[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: letrec: bad binding", b.Line, b.Col)
+		}
+		letEnv.Set(b.List[0].StrVal, Void)
+	}
+	// Then evaluate init expressions in the letrec env (all mutually visible)
+	for _, b := range bindingExpr.List {
+		v, err := Eval(b.List[1], letEnv)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.Set(b.List[0].StrVal, v)
+	}
+	var result *Value
+	for _, bodyExpr := range body {
+		var err error
+		result, err = Eval(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalLetrecStar(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, fmt.Errorf("%d:%d: letrec*: too few arguments", expr.Line, expr.Col)
+	}
+	bindingExpr := expr.List[1]
+	body := expr.List[2:]
+	if bindingExpr.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: letrec*: bindings must be a list", bindingExpr.Line, bindingExpr.Col)
+	}
+	letEnv := NewEnv(env)
+	// Bind sequentially — each init can see previous bindings
+	for _, b := range bindingExpr.List {
+		if b.Type != ExprList || len(b.List) != 2 || b.List[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: letrec*: bad binding", b.Line, b.Col)
+		}
+		v, err := Eval(b.List[1], letEnv)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.Set(b.List[0].StrVal, v)
+	}
+	var result *Value
+	for _, bodyExpr := range body {
+		var err error
+		result, err = Eval(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// --- L14: case ---
+
+func eqvCompare(a, b *Value) bool {
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeBool:
+		return a.BoolVal == b.BoolVal
+	case TypeInt:
+		return a.IntVal == b.IntVal
+	case TypeChar:
+		return a.IntVal == b.IntVal
+	case TypeNil:
+		return true
+	default:
+		return a == b
+	}
+}
+
+func evalCase(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, fmt.Errorf("%d:%d: case: too few arguments", expr.Line, expr.Col)
+	}
+	key, err := Eval(expr.List[1], env)
+	if err != nil {
+		return nil, err
+	}
+	for _, clause := range expr.List[2:] {
+		if clause.Type != ExprList || len(clause.List) < 2 {
+			return nil, fmt.Errorf("%d:%d: case: bad clause", clause.Line, clause.Col)
+		}
+		datums := clause.List[0]
+		// Check for else
+		if datums.Type == ExprSymbol && datums.StrVal == "else" {
+			var result *Value
+			for _, bodyExpr := range clause.List[1:] {
+				result, err = Eval(bodyExpr, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// datums should be a list of values
+		if datums.Type == ExprList {
+			for _, d := range datums.List {
+				dv := exprToValue(d)
+				if eqvCompare(key, dv) {
+					var result *Value
+					for _, bodyExpr := range clause.List[1:] {
+						result, err = Eval(bodyExpr, env)
+						if err != nil {
+							return nil, err
+						}
+					}
+					return result, nil
+				}
+			}
+		}
+	}
+	return Void, nil
+}
+
+// --- L14: do ---
+
+func evalDo(expr *Expr, env *Env) (*Value, error) {
+	// (do ((var init step) ...) (test expr ...) body ...)
+	if len(expr.List) < 3 {
+		return nil, fmt.Errorf("%d:%d: do: too few arguments", expr.Line, expr.Col)
+	}
+	varSpecs := expr.List[1]
+	testClause := expr.List[2]
+	body := expr.List[3:]
+
+	if varSpecs.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: do: variable specs must be a list", varSpecs.Line, varSpecs.Col)
+	}
+	if testClause.Type != ExprList || len(testClause.List) < 1 {
+		return nil, fmt.Errorf("%d:%d: do: bad test clause", testClause.Line, testClause.Col)
+	}
+
+	type doVar struct {
+		name    string
+		stepExpr *Expr // nil if no step
+	}
+	var vars []doVar
+
+	doEnv := NewEnv(env)
+	// Initialize variables
+	for _, spec := range varSpecs.List {
+		if spec.Type != ExprList || len(spec.List) < 2 || spec.List[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: do: bad variable spec", spec.Line, spec.Col)
+		}
+		name := spec.List[0].StrVal
+		initVal, err := Eval(spec.List[1], env)
+		if err != nil {
+			return nil, err
+		}
+		doEnv.Set(name, initVal)
+		var step *Expr
+		if len(spec.List) >= 3 {
+			step = spec.List[2]
+		}
+		vars = append(vars, doVar{name: name, stepExpr: step})
+	}
+
+	for {
+		// Test
+		testVal, err := Eval(testClause.List[0], doEnv)
+		if err != nil {
+			return nil, err
+		}
+		if testVal.IsTruthy() {
+			// Evaluate result expressions
+			if len(testClause.List) > 1 {
+				var result *Value
+				for _, e := range testClause.List[1:] {
+					result, err = Eval(e, doEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return result, nil
+			}
+			return Void, nil
+		}
+		// Execute body
+		for _, b := range body {
+			_, err := Eval(b, doEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Parallel step: evaluate all steps using current values, then update
+		newVals := make([]*Value, len(vars))
+		for i, v := range vars {
+			if v.stepExpr != nil {
+				newVals[i], err = Eval(v.stepExpr, doEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		for i, v := range vars {
+			if v.stepExpr != nil {
+				doEnv.Set(v.name, newVals[i])
+			}
+		}
+	}
+}
+
+// --- L14: eqv? ---
+
+func builtinEqvQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: eqv?: expected 2 arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(eqvCompare(args[0], args[1])), nil
+}
+
+// --- L14: vector builtins ---
+
+func builtinVector(args []*Value, expr *Expr) (*Value, error) {
+	elems := make([]*Value, len(args))
+	copy(elems, args)
+	return &Value{Type: TypeVector, VecElems: elems}, nil
+}
+
+func builtinMakeVector(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) < 1 || len(args) > 2 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: make-vector: expected int [fill]", expr.Line, expr.Col)
+	}
+	n := int(args[0].IntVal)
+	fill := IntValue(0)
+	if len(args) == 2 {
+		fill = args[1]
+	}
+	elems := make([]*Value, n)
+	for i := range elems {
+		elems[i] = fill
+	}
+	return &Value{Type: TypeVector, VecElems: elems}, nil
+}
+
+func builtinVectorRef(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeVector || args[1].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: vector-ref: expected vector and int", expr.Line, expr.Col)
+	}
+	idx := int(args[1].IntVal)
+	if idx < 0 || idx >= len(args[0].VecElems) {
+		return nil, fmt.Errorf("%d:%d: vector-ref: index out of range", expr.Line, expr.Col)
+	}
+	return args[0].VecElems[idx], nil
+}
+
+func builtinVectorSet(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 3 || args[0].Type != TypeVector || args[1].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: vector-set!: expected vector, int, value", expr.Line, expr.Col)
+	}
+	idx := int(args[1].IntVal)
+	if idx < 0 || idx >= len(args[0].VecElems) {
+		return nil, fmt.Errorf("%d:%d: vector-set!: index out of range", expr.Line, expr.Col)
+	}
+	args[0].VecElems[idx] = args[2]
+	return Void, nil
+}
+
+func builtinVectorLength(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeVector {
+		return nil, fmt.Errorf("%d:%d: vector-length: expected vector", expr.Line, expr.Col)
+	}
+	return IntValue(int64(len(args[0].VecElems))), nil
+}
+
+func builtinVectorQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: vector?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeVector), nil
+}
+
+func builtinVectorToList(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeVector {
+		return nil, fmt.Errorf("%d:%d: vector->list: expected vector", expr.Line, expr.Col)
+	}
+	result := Nil
+	for i := len(args[0].VecElems) - 1; i >= 0; i-- {
+		result = &Value{Type: TypePair, Car: args[0].VecElems[i], Cdr: result}
+	}
+	return result, nil
+}
+
+func builtinListToVector(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: list->vector: expected 1 argument", expr.Line, expr.Col)
+	}
+	var elems []*Value
+	v := args[0]
+	for v.Type == TypePair {
+		elems = append(elems, v.Car)
+		v = v.Cdr
+	}
+	return &Value{Type: TypeVector, VecElems: elems}, nil
 }
