@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type VecRef = Rc<RefCell<Vec<Value>>>;
+type PairRef = Rc<RefCell<(Value, Value)>>;
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -39,7 +40,7 @@ enum Value {
     Symbol(String),
     Char(char),
     Nil,
-    Pair(Rc<Value>, Rc<Value>),
+    Pair(PairRef),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -77,6 +78,10 @@ enum Value {
         expr: Box<Expr>,
         env: Env,
     },
+}
+
+fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new((car, cdr))))
 }
 
 static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -167,6 +172,44 @@ fn default_env() -> Env {
     env
 }
 
+fn fmt_pair(pr: &PairRef, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "(")?;
+    let mut seen = Vec::new();
+    let mut cur_ref = pr.clone();
+    let mut first = true;
+    loop {
+        let ptr = Rc::as_ptr(&cur_ref) as usize;
+        if seen.contains(&ptr) {
+            write!(f, " ...")?;
+            break;
+        }
+        seen.push(ptr);
+        let car;
+        let cdr;
+        {
+            let p = cur_ref.borrow();
+            car = p.0.clone();
+            cdr = p.1.clone();
+        }
+        if !first {
+            write!(f, " ")?;
+        }
+        first = false;
+        write!(f, "{}", car)?;
+        match cdr {
+            Value::Pair(ref next) => {
+                cur_ref = next.clone();
+            }
+            Value::Nil => break,
+            other => {
+                write!(f, " . {}", other)?;
+                break;
+            }
+        }
+    }
+    write!(f, ")")
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -190,29 +233,7 @@ impl fmt::Display for Value {
             },
             Value::Symbol(s) => write!(f, "{}", s),
             Value::Nil => write!(f, "()"),
-            Value::Pair(_, _) => {
-                write!(f, "(")?;
-                let mut cur = self;
-                let mut first = true;
-                loop {
-                    match cur {
-                        Value::Pair(car, cdr) => {
-                            if !first {
-                                write!(f, " ")?;
-                            }
-                            first = false;
-                            write!(f, "{}", car)?;
-                            cur = cdr;
-                        }
-                        Value::Nil => break,
-                        other => {
-                            write!(f, " . {}", other)?;
-                            break;
-                        }
-                    }
-                }
-                write!(f, ")")
-            }
+            Value::Pair(pr) => fmt_pair(pr, f),
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::CaseLambda { .. } => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
@@ -266,7 +287,7 @@ impl Value {
 fn vec_to_list(vals: Vec<Value>) -> Value {
     let mut result = Value::Nil;
     for v in vals.into_iter().rev() {
-        result = Value::Pair(Rc::new(v), Rc::new(result));
+        result = make_pair(v, result);
     }
     result
 }
@@ -384,7 +405,6 @@ fn float_to_rational(f: f64) -> (i64, i64) {
     }
     let sign = if f < 0.0 { -1 } else { 1 };
     let f = f.abs();
-    // Use continued fraction to find best rational approximation
     let mut p0: i64 = 0;
     let mut q0: i64 = 1;
     let mut p1: i64 = 1;
@@ -618,12 +638,10 @@ impl Parser {
         } else if let Ok(n) = tok.parse::<i64>() {
             Ok(Expr::Integer(n, tpos))
         } else if let Some(idx) = tok.find('/') {
-            // Try rational literal: n/d
             let num_str = &tok[..idx];
             let den_str = &tok[idx+1..];
             if let (Ok(n), Ok(d)) = (num_str.parse::<i64>(), den_str.parse::<i64>()) {
                 if d != 0 {
-                    // Simplify at parse time
                     let sign = if (n < 0) ^ (d < 0) { -1 } else { 1 };
                     let na = n.abs();
                     let da = d.abs();
@@ -692,6 +710,12 @@ fn is_builtin(name: &str) -> bool {
             | "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
             | "vector?" | "vector->list" | "list->vector"
             | "assq" | "memq" | "for-each"
+            | "set-car!" | "set-cdr!"
+            | "cddr" | "cadr" | "cdar" | "caar" | "caddr" | "cdddr" | "cdadr"
+            | "cadar" | "caddar"
+            | "reverse" | "member" | "memv" | "assv" | "sort" | "error"
+            | "gcd" | "lcm" | "truncate" | "round" | "floor" | "ceiling"
+            | "make-string" | "string" | "string>?" | "string<=?" | "string>=?"
     )
 }
 
@@ -915,7 +939,6 @@ fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eva
 }
 
 /// Parse a parameter list, detecting dot notation for rest params.
-/// e.g. `(x y . rest)` → (["x", "y"], Some("rest"))
 fn parse_params(param_exprs: &[Expr], p: Pos) -> Result<(Vec<String>, Option<String>), EvalError> {
     let mut params = Vec::new();
     let mut rest_param = None;
@@ -1023,7 +1046,6 @@ fn eval_lambda(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     let (params, rest_param) = match &args[0] {
         Expr::List(param_exprs, _) => parse_params(param_exprs, p)?,
         Expr::Symbol(s, _) => {
-            // (lambda args body) — single symbol captures all args
             (vec![], Some(s.clone()))
         }
         _ => {
@@ -1178,7 +1200,6 @@ fn eval_let(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             }
         }
         let body = args[2..].to_vec();
-        // Create a new env with the loop function bound
         let loop_env = new_env(Some(env.clone()));
         let lambda = Value::Lambda {
             params: param_names,
@@ -1187,16 +1208,14 @@ fn eval_let(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             env: loop_env.clone(),
         };
         env_set(&loop_env, name.clone(), lambda);
-        // Evaluate initial values in the outer env
         let init_vals: Vec<Value> = init_exprs
             .iter()
             .map(|e| eval(e, env))
             .collect::<Result<_, _>>()?;
-        // Call the loop function
         let func = env_get(&loop_env, name).unwrap();
         return apply_value(&func, &init_vals, p);
     }
-    // Regular let: (let ((var init) ...) body ...)
+    // Regular let
     let bindings_expr = match &args[0] {
         Expr::List(b, _) => b,
         _ => {
@@ -1254,7 +1273,6 @@ fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
     for clause in clauses {
         match clause {
             Expr::List(parts, _) if !parts.is_empty() => {
-                // Check for else clause
                 if let Expr::Symbol(s, _) = &parts[0] {
                     if s == "else" {
                         let body = &parts[1..];
@@ -1296,7 +1314,6 @@ fn eval_string_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError>
             "string-set! requires 3 arguments at {}", p
         )));
     }
-    // String literals are immutable
     if matches!(&args[0], Expr::Str(_, _)) {
         return Err(EvalError::Type(format!(
             "string-set!: strings are immutable at {}", p
@@ -1334,7 +1351,6 @@ fn eval_string_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError>
             "string-set!: index out of range at {}", p
         )));
     }
-    // Replace char at index (assumes ASCII-safe for single-byte chars)
     let bytes = unsafe { s.as_bytes_mut() };
     bytes[idx] = ch as u8;
     env_set_existing(env, &name, Value::Str(s));
@@ -1353,7 +1369,6 @@ fn eval_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             "set!: expected symbol at {}", p
         ))),
     };
-    // Check that the variable exists
     if env_get(env, &name).is_none() {
         return Err(EvalError::UnboundVariable(format!("{} at {}", name, p)));
     }
@@ -1365,14 +1380,12 @@ fn eval_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
 // --- Records (define-record-type) ---
 
 fn eval_define_record_type(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
-    // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
     if args.len() < 3 {
         return Err(EvalError::Arity(format!(
             "define-record-type requires at least 3 arguments at {}", p
         )));
     }
 
-    // Parse type name
     let _type_name = match &args[0] {
         Expr::Symbol(s, _) => s.clone(),
         _ => return Err(EvalError::Type(format!(
@@ -1380,7 +1393,6 @@ fn eval_define_record_type(args: &[Expr], env: &Env, p: Pos) -> Result<Value, Ev
         ))),
     };
 
-    // Parse constructor: (constructor-name field1 field2 ...)
     let (ctor_name, ctor_fields) = match &args[1] {
         Expr::List(elems, _) if !elems.is_empty() => {
             let name = match &elems[0] {
@@ -1402,7 +1414,6 @@ fn eval_define_record_type(args: &[Expr], env: &Env, p: Pos) -> Result<Value, Ev
         ))),
     };
 
-    // Parse predicate name
     let pred_name = match &args[2] {
         Expr::Symbol(s, _) => s.clone(),
         _ => return Err(EvalError::Type(format!(
@@ -1410,10 +1421,8 @@ fn eval_define_record_type(args: &[Expr], env: &Env, p: Pos) -> Result<Value, Ev
         ))),
     };
 
-    // Allocate unique type id
     let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-    // Parse field specs: (field-name accessor-name)
     for field_spec in &args[3..] {
         match field_spec {
             Expr::List(elems, _) if elems.len() >= 2 => {
@@ -1440,14 +1449,12 @@ fn eval_define_record_type(args: &[Expr], env: &Env, p: Pos) -> Result<Value, Ev
         }
     }
 
-    // Bind constructor
     env_set(env, ctor_name, Value::RecordConstructor {
         type_id,
         type_name: _type_name.clone(),
         field_names: ctor_fields,
     });
 
-    // Bind predicate
     env_set(env, pred_name, Value::RecordPredicate { type_id });
 
     Ok(Value::Nil)
@@ -1571,7 +1578,6 @@ fn match_list(
     let mut pi = 0;
     let mut ii = 0;
     while pi < pattern.len() {
-        // Check if current element is followed by ...
         if pi + 1 < pattern.len() {
             if let Expr::Symbol(s, _) = &pattern[pi + 1] {
                 if s == "..." {
@@ -1794,7 +1800,6 @@ fn eval_letrec(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
         _ => return Err(EvalError::Type(format!("letrec: expected bindings list at {}", p))),
     };
     let local_env = new_env(Some(env.clone()));
-    // First pass: bind all names to undefined (we use Boolean(false) as placeholder)
     let mut names = Vec::new();
     let mut init_exprs = Vec::new();
     for b in bindings_expr {
@@ -1811,7 +1816,6 @@ fn eval_letrec(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             _ => return Err(EvalError::Type(format!("letrec: invalid binding at {}", p))),
         }
     }
-    // Second pass: evaluate init exprs in the local env (all names visible)
     for (name, init) in names.iter().zip(init_exprs.iter()) {
         let val = eval(init, &local_env)?;
         env_set(&local_env, name.clone(), val);
@@ -1919,6 +1923,7 @@ fn eqv_values(a: &Value, b: &Value) -> bool {
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Nil, Value::Nil) => true,
         (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }
@@ -1931,7 +1936,6 @@ fn eval_case(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     for clause in &args[1..] {
         match clause {
             Expr::List(parts, _) if !parts.is_empty() => {
-                // Check for else
                 if let Expr::Symbol(s, _) = &parts[0] {
                     if s == "else" {
                         let mut result = Value::Boolean(false);
@@ -1941,7 +1945,6 @@ fn eval_case(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
                         return Ok(result);
                     }
                 }
-                // Datum list: ((datum ...) expr ...)
                 if let Expr::List(datums, _) = &parts[0] {
                     for datum in datums {
                         let dval = expr_to_value(datum);
@@ -1958,12 +1961,10 @@ fn eval_case(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             _ => return Err(EvalError::Type(format!("case: invalid clause at {}", p))),
         }
     }
-    // No match, no else — return void (unspecified). Use (if #f #f) convention.
     Ok(Value::Boolean(false))
 }
 
 fn eval_do(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
-    // (do ((var init step) ...) (test expr ...) body ...)
     if args.len() < 2 {
         return Err(EvalError::Arity(format!("do requires vars and test at {}", p)));
     }
@@ -1979,7 +1980,6 @@ fn eval_do(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
         return Err(EvalError::Type(format!("do: empty test clause at {}", p)));
     }
 
-    // Parse variable specs
     struct DoVar {
         name: String,
         step: Option<Expr>,
@@ -2004,17 +2004,14 @@ fn eval_do(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
 
     let body = &args[2..];
 
-    // Create loop env with initial values
     let loop_env = new_env(Some(env.clone()));
     for (def, val) in var_defs.iter().zip(init_vals.into_iter()) {
         env_set(&loop_env, def.name.clone(), val);
     }
 
     loop {
-        // Test
         let test_result = eval(&test_clause[0], &loop_env)?;
         if test_result.is_truthy() {
-            // Evaluate result expressions
             if test_clause.len() > 1 {
                 let mut result = Value::Boolean(false);
                 for expr in &test_clause[1..] {
@@ -2024,11 +2021,9 @@ fn eval_do(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             }
             return Ok(test_result);
         }
-        // Execute body
         for expr in body {
             eval(expr, &loop_env)?;
         }
-        // Parallel step: evaluate all steps with current values, then update
         let new_vals: Vec<Option<Result<Value, EvalError>>> = var_defs.iter().map(|def| {
             if let Some(ref step) = def.step {
                 Some(eval(step, &loop_env))
@@ -2036,12 +2031,26 @@ fn eval_do(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
                 None
             }
         }).collect();
-        // Now apply
         for (def, new_val) in var_defs.iter().zip(new_vals.into_iter()) {
             if let Some(val_result) = new_val {
                 env_set(&loop_env, def.name.clone(), val_result?);
             }
         }
+    }
+}
+
+// Helper: extract car/cdr from a pair value, cloning them out
+fn pair_car(v: &Value, p: Pos) -> Result<Value, EvalError> {
+    match v {
+        Value::Pair(pr) => Ok(pr.borrow().0.clone()),
+        _ => Err(EvalError::Type(format!("car: expected pair, got {} at {}", v, p))),
+    }
+}
+
+fn pair_cdr(v: &Value, p: Pos) -> Result<Value, EvalError> {
+    match v {
+        Value::Pair(pr) => Ok(pr.borrow().1.clone()),
+        _ => Err(EvalError::Type(format!("cdr: expected pair, got {} at {}", v, p))),
     }
 }
 
@@ -2153,30 +2162,15 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         }
         "cons" => {
             ensure_args(op, args, 2, p)?;
-            Ok(Value::Pair(
-                Rc::new(args[0].clone()),
-                Rc::new(args[1].clone()),
-            ))
+            Ok(make_pair(args[0].clone(), args[1].clone()))
         }
         "car" => {
             ensure_args(op, args, 1, p)?;
-            match &args[0] {
-                Value::Pair(car, _) => Ok(car.as_ref().clone()),
-                _ => Err(EvalError::Type(format!(
-                    "car: expected pair, got {} at {}",
-                    args[0], p
-                ))),
-            }
+            pair_car(&args[0], p)
         }
         "cdr" => {
             ensure_args(op, args, 1, p)?;
-            match &args[0] {
-                Value::Pair(_, cdr) => Ok(cdr.as_ref().clone()),
-                _ => Err(EvalError::Type(format!(
-                    "cdr: expected pair, got {} at {}",
-                    args[0], p
-                ))),
-            }
+            pair_cdr(&args[0], p)
         }
         "null?" => {
             ensure_args(op, args, 1, p)?;
@@ -2186,13 +2180,13 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         "length" => {
             ensure_args(op, args, 1, p)?;
             let mut count = 0i64;
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             loop {
                 match cur {
                     Value::Nil => break,
-                    Value::Pair(_, cdr) => {
+                    Value::Pair(pr) => {
                         count += 1;
-                        cur = cdr;
+                        cur = pr.borrow().1.clone();
                     }
                     _ => {
                         return Err(EvalError::Type(format!(
@@ -2208,16 +2202,19 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             if args.is_empty() {
                 return Ok(Value::Nil);
             }
-            // Append all lists together
             let mut result = args.last().unwrap().clone();
             for arg in args[..args.len() - 1].iter().rev() {
                 let mut elems = Vec::new();
-                let mut cur = arg;
+                let mut cur = arg.clone();
                 loop {
                     match cur {
                         Value::Nil => break,
-                        Value::Pair(car, cdr) => {
-                            elems.push(car.as_ref().clone());
+                        Value::Pair(pr) => {
+                            let p = pr.borrow();
+                            let car = p.0.clone();
+                            let cdr = p.1.clone();
+                            drop(p);
+                            elems.push(car);
                             cur = cdr;
                         }
                         _ => {
@@ -2229,7 +2226,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                     }
                 }
                 for e in elems.into_iter().rev() {
-                    result = Value::Pair(Rc::new(e), Rc::new(result));
+                    result = make_pair(e, result);
                 }
             }
             Ok(result)
@@ -2248,7 +2245,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         }
         "pair?" => {
             ensure_args(op, args, 1, p)?;
-            Ok(Value::Boolean(matches!(args[0], Value::Pair(_, _))))
+            Ok(Value::Boolean(matches!(args[0], Value::Pair(_))))
         }
         "symbol?" => {
             ensure_args(op, args, 1, p)?;
@@ -2351,24 +2348,27 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             ensure_args(op, args, 1, p)?;
             let s = args[0].as_string_at(p)?;
             let list = s.chars().rev().fold(Value::Nil, |acc, c| {
-                Value::Pair(Rc::new(Value::Char(c)), Rc::new(acc))
+                make_pair(Value::Char(c), acc)
             });
             Ok(list)
         }
         "list->string" => {
             ensure_args(op, args, 1, p)?;
             let mut chars = Vec::new();
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             loop {
                 match cur {
-                    Value::Pair(car, cdr) => {
-                        match car.as_ref() {
+                    Value::Pair(pr) => {
+                        let pair = pr.borrow();
+                        match &pair.0 {
                             Value::Char(c) => chars.push(*c),
                             other => return Err(EvalError::Type(format!(
                                 "list->string: expected char, got {} at {}", other, p
                             ))),
                         }
-                        cur = cdr.as_ref();
+                        let next = pair.1.clone();
+                        drop(pair);
+                        cur = next;
                     }
                     Value::Nil => break,
                     _ => return Err(EvalError::Type(format!(
@@ -2399,17 +2399,18 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                 )));
             }
             let func = &args[0];
-            // Last argument must be a list; prefix args come before it
             let last = &args[args.len() - 1];
             let mut call_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-            // Flatten the last argument (a list) into call_args
-            let mut cur = last;
+            let mut cur = last.clone();
             loop {
                 match cur {
                     Value::Nil => break,
-                    Value::Pair(car, cdr) => {
-                        call_args.push(car.as_ref().clone());
-                        cur = cdr;
+                    Value::Pair(pr) => {
+                        let pair = pr.borrow();
+                        call_args.push(pair.0.clone());
+                        let next = pair.1.clone();
+                        drop(pair);
+                        cur = next;
                     }
                     _ => return Err(EvalError::Type(format!(
                         "apply: last argument must be a list at {}", p
@@ -2503,15 +2504,15 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         "list-ref" => {
             ensure_args(op, args, 2, p)?;
             let idx = args[1].as_integer_at(p)? as usize;
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             for _ in 0..idx {
                 match cur {
-                    Value::Pair(_, cdr) => cur = cdr,
+                    Value::Pair(pr) => cur = pr.borrow().1.clone(),
                     _ => return Err(EvalError::Type(format!("list-ref: index out of range at {}", p))),
                 }
             }
             match cur {
-                Value::Pair(car, _) => Ok(car.as_ref().clone()),
+                Value::Pair(pr) => Ok(pr.borrow().0.clone()),
                 _ => Err(EvalError::Type(format!("list-ref: index out of range at {}", p))),
             }
         }
@@ -2521,7 +2522,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             let mut cur = args[0].clone();
             for _ in 0..idx {
                 match cur {
-                    Value::Pair(_, cdr) => cur = cdr.as_ref().clone(),
+                    Value::Pair(pr) => cur = pr.borrow().1.clone(),
                     _ => return Err(EvalError::Type(format!("list-tail: index out of range at {}", p))),
                 }
             }
@@ -2529,12 +2530,31 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         }
         "list?" => {
             ensure_args(op, args, 1, p)?;
-            let mut cur = &args[0];
+            // Floyd's tortoise-and-hare cycle detection
+            let mut slow = args[0].clone();
+            let mut fast = args[0].clone();
             let result = loop {
-                match cur {
-                    Value::Nil => break true,
-                    Value::Pair(_, cdr) => cur = cdr,
-                    _ => break false,
+                // Advance fast by 2
+                for _ in 0..2 {
+                    match fast {
+                        Value::Nil => { fast = Value::Nil; break; }
+                        Value::Pair(pr) => fast = pr.borrow().1.clone(),
+                        _ => { return Ok(Value::Boolean(false)); }
+                    }
+                }
+                if matches!(fast, Value::Nil) {
+                    break true;
+                }
+                // Advance slow by 1
+                match slow {
+                    Value::Pair(pr) => slow = pr.borrow().1.clone(),
+                    _ => { break false; }
+                }
+                // Check if they point to the same pair (cycle)
+                if let (Value::Pair(ref s), Value::Pair(ref f)) = (&slow, &fast) {
+                    if Rc::ptr_eq(s, f) {
+                        break false; // cycle detected
+                    }
                 }
             };
             Ok(Value::Boolean(result))
@@ -2542,14 +2562,19 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         "assoc" => {
             ensure_args(op, args, 2, p)?;
             let key = &args[0];
-            let mut cur = &args[1];
+            let mut cur = args[1].clone();
             loop {
                 match cur {
                     Value::Nil => return Ok(Value::Boolean(false)),
-                    Value::Pair(car, cdr) => {
-                        if let Value::Pair(k, _) = car.as_ref() {
-                            if values_equal(k, key) {
-                                return Ok(car.as_ref().clone());
+                    Value::Pair(pr) => {
+                        let pair = pr.borrow();
+                        let car = pair.0.clone();
+                        let cdr = pair.1.clone();
+                        drop(pair);
+                        if let Value::Pair(ref inner) = car {
+                            let k = inner.borrow().0.clone();
+                            if values_equal(&k, key) {
+                                return Ok(car);
                             }
                         }
                         cur = cdr;
@@ -2569,6 +2594,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                 (Value::Char(a), Value::Char(b)) => a == b,
                 (Value::Nil, Value::Nil) => true,
                 (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
                 _ => false,
             };
             Ok(Value::Boolean(result))
@@ -2585,15 +2611,16 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             let mut current_lists: Vec<Value> = args[1..].to_vec();
             let mut results = Vec::new();
             loop {
-                let all_pairs = current_lists.iter().all(|l| matches!(l, Value::Pair(_, _)));
+                let all_pairs = current_lists.iter().all(|l| matches!(l, Value::Pair(_)));
                 if !all_pairs { break; }
                 let mut call_args = Vec::new();
                 let mut next_lists = Vec::new();
                 for list in &current_lists {
                     match list {
-                        Value::Pair(car, cdr) => {
-                            call_args.push(car.as_ref().clone());
-                            next_lists.push(cdr.as_ref().clone());
+                        Value::Pair(pr) => {
+                            let pair = pr.borrow();
+                            call_args.push(pair.0.clone());
+                            next_lists.push(pair.1.clone());
                         }
                         _ => unreachable!(),
                     }
@@ -2694,7 +2721,6 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                 NumVal::Int(i) => Ok(Value::Integer(i)),
                 NumVal::Rat(n, d) => Ok(make_rational(n, d)),
                 NumVal::Flt(f) => {
-                    // Convert float to exact rational via continued fraction approximation
                     let (n, d) = float_to_rational(f);
                     Ok(make_rational(n, d))
                 }
@@ -2794,13 +2820,16 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         "list->vector" => {
             ensure_args(op, args, 1, p)?;
             let mut elems = Vec::new();
-            let mut cur = &args[0];
+            let mut cur = args[0].clone();
             loop {
                 match cur {
                     Value::Nil => break,
-                    Value::Pair(car, cdr) => {
-                        elems.push(car.as_ref().clone());
-                        cur = cdr;
+                    Value::Pair(pr) => {
+                        let pair = pr.borrow();
+                        elems.push(pair.0.clone());
+                        let next = pair.1.clone();
+                        drop(pair);
+                        cur = next;
                     }
                     _ => return Err(EvalError::Type(format!("list->vector: expected list at {}", p))),
                 }
@@ -2810,14 +2839,19 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         "assq" => {
             ensure_args(op, args, 2, p)?;
             let key = &args[0];
-            let mut cur = &args[1];
+            let mut cur = args[1].clone();
             loop {
                 match cur {
                     Value::Nil => return Ok(Value::Boolean(false)),
-                    Value::Pair(car, cdr) => {
-                        if let Value::Pair(k, _) = car.as_ref() {
-                            if eqv_values(k, key) {
-                                return Ok(car.as_ref().clone());
+                    Value::Pair(pr) => {
+                        let pair = pr.borrow();
+                        let car = pair.0.clone();
+                        let cdr = pair.1.clone();
+                        drop(pair);
+                        if let Value::Pair(ref inner) = car {
+                            let k = inner.borrow().0.clone();
+                            if eqv_values(&k, key) {
+                                return Ok(car);
                             }
                         }
                         cur = cdr;
@@ -2829,15 +2863,17 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
         "memq" => {
             ensure_args(op, args, 2, p)?;
             let key = &args[0];
-            let mut cur = &args[1];
+            let mut cur = args[1].clone();
             loop {
                 match cur {
                     Value::Nil => return Ok(Value::Boolean(false)),
-                    Value::Pair(car, cdr) => {
-                        if eqv_values(car, key) {
-                            return Ok(cur.clone());
+                    Value::Pair(ref pr) => {
+                        let car = pr.borrow().0.clone();
+                        if eqv_values(&car, key) {
+                            return Ok(cur);
                         }
-                        cur = cdr;
+                        let next = pr.borrow().1.clone();
+                        cur = next;
                     }
                     _ => return Err(EvalError::Type(format!("memq: expected list at {}", p))),
                 }
@@ -2850,15 +2886,16 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             let func = &args[0];
             let mut current_lists: Vec<Value> = args[1..].to_vec();
             loop {
-                let all_pairs = current_lists.iter().all(|l| matches!(l, Value::Pair(_, _)));
+                let all_pairs = current_lists.iter().all(|l| matches!(l, Value::Pair(_)));
                 if !all_pairs { break; }
                 let mut call_args = Vec::new();
                 let mut next_lists = Vec::new();
                 for list in &current_lists {
                     match list {
-                        Value::Pair(car, cdr) => {
-                            call_args.push(car.as_ref().clone());
-                            next_lists.push(cdr.as_ref().clone());
+                        Value::Pair(pr) => {
+                            let pair = pr.borrow();
+                            call_args.push(pair.0.clone());
+                            next_lists.push(pair.1.clone());
                         }
                         _ => unreachable!(),
                     }
@@ -2868,11 +2905,290 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             }
             Ok(Value::Nil)
         }
+        "set-car!" => {
+            ensure_args(op, args, 2, p)?;
+            match &args[0] {
+                Value::Pair(pr) => {
+                    pr.borrow_mut().0 = args[1].clone();
+                    Ok(Value::Nil)
+                }
+                _ => Err(EvalError::Type(format!("set-car!: expected pair, got {} at {}", args[0], p))),
+            }
+        }
+        "set-cdr!" => {
+            ensure_args(op, args, 2, p)?;
+            match &args[0] {
+                Value::Pair(pr) => {
+                    pr.borrow_mut().1 = args[1].clone();
+                    Ok(Value::Nil)
+                }
+                _ => Err(EvalError::Type(format!("set-cdr!: expected pair, got {} at {}", args[0], p))),
+            }
+        }
+        "caar" => {
+            ensure_args(op, args, 1, p)?;
+            pair_car(&pair_car(&args[0], p)?, p)
+        }
+        "cadr" => {
+            ensure_args(op, args, 1, p)?;
+            pair_car(&pair_cdr(&args[0], p)?, p)
+        }
+        "cdar" => {
+            ensure_args(op, args, 1, p)?;
+            pair_cdr(&pair_car(&args[0], p)?, p)
+        }
+        "cddr" => {
+            ensure_args(op, args, 1, p)?;
+            pair_cdr(&pair_cdr(&args[0], p)?, p)
+        }
+        "caddr" => {
+            ensure_args(op, args, 1, p)?;
+            pair_car(&pair_cdr(&pair_cdr(&args[0], p)?, p)?, p)
+        }
+        "cdddr" => {
+            ensure_args(op, args, 1, p)?;
+            pair_cdr(&pair_cdr(&pair_cdr(&args[0], p)?, p)?, p)
+        }
+        "cdadr" => {
+            ensure_args(op, args, 1, p)?;
+            pair_cdr(&pair_car(&pair_cdr(&args[0], p)?, p)?, p)
+        }
+        "cadar" => {
+            ensure_args(op, args, 1, p)?;
+            pair_car(&pair_cdr(&pair_car(&args[0], p)?, p)?, p)
+        }
+        "caddar" => {
+            ensure_args(op, args, 1, p)?;
+            pair_car(&pair_cdr(&pair_cdr(&pair_car(&args[0], p)?, p)?, p)?, p)
+        }
+        "reverse" => {
+            ensure_args(op, args, 1, p)?;
+            let mut result = Value::Nil;
+            let mut cur = args[0].clone();
+            loop {
+                match cur {
+                    Value::Nil => break,
+                    Value::Pair(pr) => {
+                        let pair = pr.borrow();
+                        let car = pair.0.clone();
+                        let cdr = pair.1.clone();
+                        drop(pair);
+                        result = make_pair(car, result);
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type(format!("reverse: expected list at {}", p))),
+                }
+            }
+            Ok(result)
+        }
+        "member" => {
+            ensure_args(op, args, 2, p)?;
+            let key = &args[0];
+            let mut cur = args[1].clone();
+            loop {
+                match cur {
+                    Value::Nil => return Ok(Value::Boolean(false)),
+                    Value::Pair(ref pr) => {
+                        let car = pr.borrow().0.clone();
+                        if values_equal(&car, key) {
+                            return Ok(cur);
+                        }
+                        let next = pr.borrow().1.clone();
+                        cur = next;
+                    }
+                    _ => return Err(EvalError::Type(format!("member: expected list at {}", p))),
+                }
+            }
+        }
+        "sort" => {
+            ensure_args(op, args, 2, p)?;
+            let cmp_func = &args[0];
+            let mut elems = Vec::new();
+            let mut cur = args[1].clone();
+            loop {
+                match cur {
+                    Value::Nil => break,
+                    Value::Pair(pr) => {
+                        let pair = pr.borrow();
+                        elems.push(pair.0.clone());
+                        let next = pair.1.clone();
+                        drop(pair);
+                        cur = next;
+                    }
+                    _ => return Err(EvalError::Type(format!("sort: expected list at {}", p))),
+                }
+            }
+            // Simple insertion sort using the comparison function
+            for i in 1..elems.len() {
+                let mut j = i;
+                while j > 0 {
+                    let cmp_result = force(apply_value(cmp_func, &[elems[j].clone(), elems[j-1].clone()], p)?)?;
+                    if cmp_result.is_truthy() {
+                        elems.swap(j, j - 1);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Ok(vec_to_list(elems))
+        }
+        "memv" => {
+            ensure_args(op, args, 2, p)?;
+            let key = &args[0];
+            let mut cur = args[1].clone();
+            loop {
+                match cur {
+                    Value::Nil => return Ok(Value::Boolean(false)),
+                    Value::Pair(ref pr) => {
+                        let car = pr.borrow().0.clone();
+                        if eqv_values(&car, key) {
+                            return Ok(cur);
+                        }
+                        let next = pr.borrow().1.clone();
+                        cur = next;
+                    }
+                    _ => return Err(EvalError::Type(format!("memv: expected list at {}", p))),
+                }
+            }
+        }
+        "assv" => {
+            ensure_args(op, args, 2, p)?;
+            let key = &args[0];
+            let mut cur = args[1].clone();
+            loop {
+                match cur {
+                    Value::Nil => return Ok(Value::Boolean(false)),
+                    Value::Pair(pr) => {
+                        let pair = pr.borrow();
+                        let car = pair.0.clone();
+                        let cdr = pair.1.clone();
+                        drop(pair);
+                        if let Value::Pair(ref inner) = car {
+                            let k = inner.borrow().0.clone();
+                            if eqv_values(&k, key) {
+                                return Ok(car);
+                            }
+                        }
+                        cur = cdr;
+                    }
+                    _ => return Err(EvalError::Type(format!("assv: expected list at {}", p))),
+                }
+            }
+        }
+        "gcd" => {
+            if args.is_empty() {
+                return Ok(Value::Integer(0));
+            }
+            let mut result = args[0].as_integer_at(p)?.abs();
+            for a in &args[1..] {
+                result = gcd(result, a.as_integer_at(p)?.abs());
+            }
+            Ok(Value::Integer(result))
+        }
+        "lcm" => {
+            if args.is_empty() {
+                return Ok(Value::Integer(1));
+            }
+            let mut result = args[0].as_integer_at(p)?.abs();
+            for a in &args[1..] {
+                let b = a.as_integer_at(p)?.abs();
+                if result == 0 && b == 0 {
+                    result = 0;
+                } else {
+                    result = result / gcd(result, b) * b;
+                }
+            }
+            Ok(Value::Integer(result))
+        }
+        "truncate" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Float(f) => Ok(Value::Integer(f.trunc() as i64)),
+                _ => Err(EvalError::Type(format!("truncate: expected number at {}", p))),
+            }
+        }
+        "round" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Float(f) => Ok(Value::Integer(f.round() as i64)),
+                _ => Err(EvalError::Type(format!("round: expected number at {}", p))),
+            }
+        }
+        "floor" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Float(f) => Ok(Value::Integer(f.floor() as i64)),
+                _ => Err(EvalError::Type(format!("floor: expected number at {}", p))),
+            }
+        }
+        "ceiling" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Float(f) => Ok(Value::Integer(f.ceil() as i64)),
+                _ => Err(EvalError::Type(format!("ceiling: expected number at {}", p))),
+            }
+        }
+        "make-string" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::Arity(format!("make-string expects 1-2 arguments at {}", p)));
+            }
+            let len = args[0].as_integer_at(p)? as usize;
+            let ch = if args.len() == 2 {
+                match &args[1] {
+                    Value::Char(c) => *c,
+                    _ => return Err(EvalError::Type(format!("make-string: expected char at {}", p))),
+                }
+            } else {
+                '\0'
+            };
+            Ok(Value::Str(std::iter::repeat(ch).take(len).collect()))
+        }
+        "string" => {
+            let mut s = String::new();
+            for a in args {
+                match a {
+                    Value::Char(c) => s.push(*c),
+                    _ => return Err(EvalError::Type(format!("string: expected char at {}", p))),
+                }
+            }
+            Ok(Value::Str(s))
+        }
+        "string>?" => {
+            ensure_args(op, args, 2, p)?;
+            Ok(Value::Boolean(args[0].as_string_at(p)? > args[1].as_string_at(p)?))
+        }
+        "string<=?" => {
+            ensure_args(op, args, 2, p)?;
+            Ok(Value::Boolean(args[0].as_string_at(p)? <= args[1].as_string_at(p)?))
+        }
+        "string>=?" => {
+            ensure_args(op, args, 2, p)?;
+            Ok(Value::Boolean(args[0].as_string_at(p)? >= args[1].as_string_at(p)?))
+        }
+        "error" => {
+            if args.is_empty() {
+                return Err(EvalError::Type("error".to_string()));
+            }
+            let msg = format!("{}", args[0]);
+            Err(EvalError::Type(format!("error: {}", msg)))
+        }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", op, p))),
     }
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
+    values_equal_depth(a, b, 0)
+}
+
+fn values_equal_depth(a: &Value, b: &Value, depth: usize) -> bool {
+    if depth > 10000 {
+        return false; // prevent infinite recursion on circular structures
+    }
     match (a, b) {
         (Value::Integer(a), Value::Integer(b)) => a == b,
         (Value::Float(a), Value::Float(b)) => (a - b).abs() < f64::EPSILON,
@@ -2882,13 +3198,24 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Nil, Value::Nil) => true,
-        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
-            values_equal(a1, b1) && values_equal(a2, b2)
+        (Value::Pair(a), Value::Pair(b)) => {
+            if Rc::ptr_eq(a, b) {
+                return true;
+            }
+            let (a_car, a_cdr) = {
+                let p = a.borrow();
+                (p.0.clone(), p.1.clone())
+            };
+            let (b_car, b_cdr) = {
+                let p = b.borrow();
+                (p.0.clone(), p.1.clone())
+            };
+            values_equal_depth(&a_car, &b_car, depth + 1) && values_equal_depth(&a_cdr, &b_cdr, depth + 1)
         }
         (Value::Vector(a), Value::Vector(b)) => {
             let a = a.borrow();
             let b = b.borrow();
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal_depth(x, y, depth + 1))
         }
         _ => false,
     }
