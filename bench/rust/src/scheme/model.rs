@@ -60,6 +60,7 @@ pub(super) enum Builtin {
     Equal,
     LessEqual,
     EqPred,
+    EqvPred,
     EqualPred,
     Not,
     Display,
@@ -74,6 +75,14 @@ pub(super) enum Builtin {
     ListRef,
     ListTail,
     ListPred,
+    Vector,
+    MakeVector,
+    VectorRef,
+    VectorSet,
+    VectorLength,
+    VectorPred,
+    VectorToList,
+    ListToVector,
     Assoc,
     Map,
     StringAppend,
@@ -140,6 +149,7 @@ impl Builtin {
             Builtin::Equal => "=",
             Builtin::LessEqual => "<=",
             Builtin::EqPred => "eq?",
+            Builtin::EqvPred => "eqv?",
             Builtin::EqualPred => "equal?",
             Builtin::Not => "not",
             Builtin::Display => "display",
@@ -154,6 +164,14 @@ impl Builtin {
             Builtin::ListRef => "list-ref",
             Builtin::ListTail => "list-tail",
             Builtin::ListPred => "list?",
+            Builtin::Vector => "vector",
+            Builtin::MakeVector => "make-vector",
+            Builtin::VectorRef => "vector-ref",
+            Builtin::VectorSet => "vector-set!",
+            Builtin::VectorLength => "vector-length",
+            Builtin::VectorPred => "vector?",
+            Builtin::VectorToList => "vector->list",
+            Builtin::ListToVector => "list->vector",
             Builtin::Assoc => "assoc",
             Builtin::Map => "map",
             Builtin::StringAppend => "string-append",
@@ -254,6 +272,44 @@ impl SchemeString {
 }
 
 #[derive(Clone)]
+pub(super) struct SchemeVector {
+    items: Rc<RefCell<Vec<Value>>>,
+}
+
+impl SchemeVector {
+    pub(super) fn new(items: Vec<Value>) -> Self {
+        Self {
+            items: Rc::new(RefCell::new(items)),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.items.borrow().len()
+    }
+
+    pub(super) fn get(&self, index: usize) -> Option<Value> {
+        self.items.borrow().get(index).cloned()
+    }
+
+    pub(super) fn set(&self, index: usize, value: Value) -> bool {
+        let mut items = self.items.borrow_mut();
+        let Some(slot) = items.get_mut(index) else {
+            return false;
+        };
+        *slot = value;
+        true
+    }
+
+    pub(super) fn to_vec(&self) -> Vec<Value> {
+        self.items.borrow().clone()
+    }
+
+    pub(super) fn shares_storage(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.items, &other.items)
+    }
+}
+
+#[derive(Clone)]
 pub(super) enum Value {
     Number(Number),
     Boolean(bool),
@@ -262,6 +318,7 @@ pub(super) enum Value {
     Char(char),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
+    Vector(SchemeVector),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
     Record(Rc<RecordInstance>),
@@ -279,6 +336,7 @@ impl Value {
             Value::Char(_) => "char",
             Value::List(_) => "list",
             Value::Pair(_, _) => "pair",
+            Value::Vector(_) => "vector",
             Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_) => "procedure",
             Value::Record(_) => "record",
             Value::Void => "void",
@@ -625,6 +683,10 @@ pub(super) fn is_core_syntax(name: &str) -> bool {
             | "begin"
             | "cond"
             | "let"
+            | "letrec"
+            | "letrec*"
+            | "case"
+            | "do"
     )
 }
 
@@ -649,6 +711,7 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         Value::Char(ch) => render_char(*ch, mode),
         Value::List(items) => render_list(items, mode),
         Value::Pair(head, tail) => render_pair(head, tail, mode),
+        Value::Vector(vector) => render_vector(vector, mode),
         Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_) => {
             "#<procedure>".into()
         }
@@ -692,6 +755,15 @@ fn render_pair_tail(tail: &Value, mode: RenderMode, rendered: &mut String) {
             rendered.push_str(&render_value(other, mode));
         }
     }
+}
+
+fn render_vector(vector: &SchemeVector, mode: RenderMode) -> String {
+    let parts: Vec<String> = vector
+        .to_vec()
+        .iter()
+        .map(|value| render_value(value, mode))
+        .collect();
+    format!("#({})", parts.join(" "))
 }
 
 fn render_char(ch: char, mode: RenderMode) -> String {

@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use super::{
     apply,
-    model::{Builtin, SchemeString, Value},
+    model::{Builtin, SchemeString, SchemeVector, Value},
     number::Number,
     wrong_arg_count, EvalError,
 };
@@ -65,6 +65,7 @@ pub(super) fn apply_builtin(
             matches!(ordering, Ordering::Less | Ordering::Equal)
         }),
         Builtin::EqPred => builtin_eq(args),
+        Builtin::EqvPred => builtin_eqv(args),
         Builtin::EqualPred => builtin_equal(args),
         Builtin::Not => builtin_not(args),
         Builtin::Display => builtin_display(args, output),
@@ -81,6 +82,16 @@ pub(super) fn apply_builtin(
         Builtin::ListPred => {
             builtin_predicate("list?", args, |value| matches!(value, Value::List(_)))
         }
+        Builtin::Vector => builtin_vector(args),
+        Builtin::MakeVector => builtin_make_vector(args),
+        Builtin::VectorRef => builtin_vector_ref(args),
+        Builtin::VectorSet => builtin_vector_set(args),
+        Builtin::VectorLength => builtin_vector_length(args),
+        Builtin::VectorPred => {
+            builtin_predicate("vector?", args, |value| matches!(value, Value::Vector(_)))
+        }
+        Builtin::VectorToList => builtin_vector_to_list(args),
+        Builtin::ListToVector => builtin_list_to_vector(args),
         Builtin::Assoc => builtin_assoc(args),
         Builtin::Map => builtin_map(args, output),
         Builtin::StringAppend => builtin_string_append(args),
@@ -480,6 +491,112 @@ fn builtin_list_tail(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+fn builtin_vector(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(Value::Vector(SchemeVector::new(args.to_vec())))
+}
+
+fn builtin_make_vector(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [len_value] => {
+            let len = expect_exact_integer("make-vector", len_value)?;
+            if len < 0 {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: "make-vector".into(),
+                    index: len,
+                    len: 0,
+                });
+            }
+            Ok(Value::Vector(SchemeVector::new(vec![
+                Value::Boolean(false);
+                len as usize
+            ])))
+        }
+        [len_value, fill] => {
+            let len = expect_exact_integer("make-vector", len_value)?;
+            if len < 0 {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: "make-vector".into(),
+                    index: len,
+                    len: 0,
+                });
+            }
+            Ok(Value::Vector(SchemeVector::new(vec![
+                fill.clone();
+                len as usize
+            ])))
+        }
+        _ => Err(wrong_arg_count("make-vector", "1 or 2", args.len())),
+    }
+}
+
+fn builtin_vector_ref(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [vector_value, index_value] => {
+            let vector = expect_vector("vector-ref", vector_value)?;
+            let index = expect_exact_integer("vector-ref", index_value)?;
+            if index < 0 || index as usize >= vector.len() {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: "vector-ref".into(),
+                    index,
+                    len: vector.len(),
+                });
+            }
+            Ok(vector
+                .get(index as usize)
+                .expect("vector-ref index validated before access"))
+        }
+        _ => Err(wrong_arg_count("vector-ref", "2", args.len())),
+    }
+}
+
+fn builtin_vector_set(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [vector_value, index_value, value] => {
+            let vector = expect_vector("vector-set!", vector_value)?;
+            let index = expect_exact_integer("vector-set!", index_value)?;
+            let len = vector.len();
+            if index < 0 || index as usize >= len {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: "vector-set!".into(),
+                    index,
+                    len,
+                });
+            }
+            let updated = vector.set(index as usize, value.clone());
+            debug_assert!(updated, "vector-set! index already validated");
+            Ok(Value::Void)
+        }
+        _ => Err(wrong_arg_count("vector-set!", "3", args.len())),
+    }
+}
+
+fn builtin_vector_length(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [vector_value] => Ok(Value::Number(Number::exact_int(
+            expect_vector("vector-length", vector_value)?.len() as i64,
+        ))),
+        _ => Err(wrong_arg_count("vector-length", "1", args.len())),
+    }
+}
+
+fn builtin_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [vector_value] => Ok(Value::List(
+            expect_vector("vector->list", vector_value)?.to_vec(),
+        )),
+        _ => Err(wrong_arg_count("vector->list", "1", args.len())),
+    }
+}
+
+fn builtin_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [list_value] => Ok(Value::Vector(SchemeVector::new(
+            expect_list("list->vector", list_value)?.to_vec(),
+        ))),
+        _ => Err(wrong_arg_count("list->vector", "1", args.len())),
+    }
+}
+
 fn builtin_assoc(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [key, list] => {
@@ -687,6 +804,13 @@ fn builtin_eq(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+fn builtin_eqv(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [left, right] => Ok(Value::Boolean(eqv_values(left, right))),
+        _ => Err(wrong_arg_count("eqv?", "2", args.len())),
+    }
+}
+
 fn builtin_equal(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [left, right] => Ok(Value::Boolean(equal_values(left, right))),
@@ -848,6 +972,10 @@ fn is_pair(value: &Value) -> bool {
 }
 
 fn eq_values(left: &Value, right: &Value) -> bool {
+    eqv_values(left, right)
+}
+
+pub(super) fn eqv_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
             left.compare(*right) == Some(Ordering::Equal)
@@ -857,6 +985,7 @@ fn eq_values(left: &Value, right: &Value) -> bool {
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
+        (Value::Vector(left), Value::Vector(right)) => left.shares_storage(right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
@@ -886,6 +1015,15 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         }
         (Value::Pair(left_head, left_tail), Value::Pair(right_head, right_tail)) => {
             equal_values(left_head, right_head) && equal_values(left_tail, right_tail)
+        }
+        (Value::Vector(left), Value::Vector(right)) => {
+            let left = left.to_vec();
+            let right = right.to_vec();
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| equal_values(left, right))
         }
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -971,6 +1109,17 @@ fn expect_list<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalErro
         _ => Err(EvalError::TypeMismatch {
             name: name.into(),
             expected: "list".into(),
+            got: value.type_name().into(),
+        }),
+    }
+}
+
+fn expect_vector(name: &str, value: &Value) -> Result<SchemeVector, EvalError> {
+    match value {
+        Value::Vector(vector) => Ok(vector.clone()),
+        _ => Err(EvalError::TypeMismatch {
+            name: name.into(),
+            expected: "vector".into(),
             got: value.type_name().into(),
         }),
     }
