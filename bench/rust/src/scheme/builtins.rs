@@ -33,9 +33,7 @@ pub(super) fn apply_builtin(
             matches!(value.compare(Number::exact_int(0)), Some(Ordering::Less))
         }),
         Builtin::OddPred => builtin_exact_integer_predicate("odd?", args, |value| value % 2 != 0),
-        Builtin::EvenPred => {
-            builtin_exact_integer_predicate("even?", args, |value| value % 2 == 0)
-        }
+        Builtin::EvenPred => builtin_exact_integer_predicate("even?", args, |value| value % 2 == 0),
         Builtin::ExactPred => builtin_predicate(
             "exact?",
             args,
@@ -303,7 +301,9 @@ fn builtin_expt(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_exact_to_inexact(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::Number(expect_number("exact->inexact", value)?.to_inexact())),
+        [value] => Ok(Value::Number(
+            expect_number("exact->inexact", value)?.to_inexact(),
+        )),
         _ => Err(wrong_arg_count("exact->inexact", "1", args.len())),
     }
 }
@@ -717,7 +717,9 @@ where
     F: Fn(i64) -> bool,
 {
     match args {
-        [value] => Ok(Value::Boolean(predicate(expect_exact_integer(name, value)?))),
+        [value] => Ok(Value::Boolean(predicate(expect_exact_integer(
+            name, value,
+        )?))),
         _ => Err(wrong_arg_count(name, "1", args.len())),
     }
 }
@@ -841,7 +843,9 @@ fn is_pair(value: &Value) -> bool {
 
 fn eq_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.compare(*right) == Some(Ordering::Equal),
+        (Value::Number(left), Value::Number(right)) => {
+            left.compare(*right) == Some(Ordering::Equal)
+        }
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::String(left), Value::String(right)) => left.shares_storage(right),
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
@@ -849,6 +853,8 @@ fn eq_values(left: &Value, right: &Value) -> bool {
         (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::RecordProcedure(left), Value::RecordProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -877,6 +883,8 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         }
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::RecordProcedure(left), Value::RecordProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
     }

@@ -262,6 +262,8 @@ pub(super) enum Value {
     Pair(Box<Value>, Box<Value>),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
+    Record(Rc<RecordInstance>),
+    RecordProcedure(Rc<RecordProcedure>),
     Void,
 }
 
@@ -275,7 +277,8 @@ impl Value {
             Value::Char(_) => "char",
             Value::List(_) => "list",
             Value::Pair(_, _) => "pair",
-            Value::Builtin(_) | Value::Procedure(_) => "procedure",
+            Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_) => "procedure",
+            Value::Record(_) => "record",
             Value::Void => "void",
         }
     }
@@ -373,6 +376,38 @@ pub(super) struct Procedure {
     pub(super) params: Params,
     pub(super) body: Vec<Expr>,
     pub(super) env: EnvRef,
+}
+
+#[derive(Clone)]
+pub(super) struct RecordType {
+    pub(super) name: String,
+    pub(super) field_count: usize,
+}
+
+#[derive(Clone)]
+pub(super) struct RecordInstance {
+    pub(super) record_type: Rc<RecordType>,
+    pub(super) fields: Vec<Value>,
+}
+
+#[derive(Clone)]
+pub(super) struct RecordProcedure {
+    pub(super) name: String,
+    pub(super) kind: RecordProcedureKind,
+}
+
+#[derive(Clone)]
+pub(super) enum RecordProcedureKind {
+    Constructor {
+        record_type: Rc<RecordType>,
+    },
+    Predicate {
+        record_type: Rc<RecordType>,
+    },
+    Accessor {
+        record_type: Rc<RecordType>,
+        field_index: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -540,6 +575,7 @@ pub(super) fn is_core_syntax(name: &str) -> bool {
         name,
         "define"
             | "define-syntax"
+            | "define-record-type"
             | "set!"
             | "if"
             | "quote"
@@ -573,7 +609,10 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         Value::Char(ch) => render_char(*ch, mode),
         Value::List(items) => render_list(items, mode),
         Value::Pair(head, tail) => render_pair(head, tail, mode),
-        Value::Builtin(_) | Value::Procedure(_) => "#<procedure>".into(),
+        Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_) => {
+            "#<procedure>".into()
+        }
+        Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Void => String::new(),
     }
 }

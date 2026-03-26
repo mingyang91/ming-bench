@@ -13,7 +13,8 @@ use error::SourcePos;
 use model::{
     expr_datum_eq, fresh_identifier, is_core_syntax, is_ellipsis, Builtin, Env, EnvRef,
     ExpansionState, Expr, MacroExpansion, MacroRef, MacroTransformer, Params, PatternBindings,
-    Procedure, SchemeString, SyntaxRule, Value,
+    Procedure, RecordInstance, RecordProcedure, RecordProcedureKind, RecordType, SchemeString,
+    SyntaxRule, Value,
 };
 use parser::Parser;
 
@@ -170,6 +171,7 @@ fn eval_list(items: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value,
         match name.as_str() {
             "define" => return eval_define(tail, env, output),
             "define-syntax" => return eval_define_syntax(tail, env),
+            "define-record-type" => return eval_define_record_type(tail, env),
             "set!" => return eval_set(tail, env, output),
             "if" => return eval_if(tail, env, output),
             "quote" => return eval_quote(tail),
@@ -238,6 +240,123 @@ fn eval_define_syntax(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             message: "define-syntax: expected transformer name".into(),
         }),
         _ => Err(wrong_arg_count("define-syntax", "2", args.len())),
+    }
+}
+
+fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] = args else {
+        return Err(EvalError::Syntax {
+            message: "define-record-type: invalid syntax".into(),
+        });
+    };
+
+    let type_name = match type_name_expr {
+        Expr::Symbol(name, _) => name.clone(),
+        _ => {
+            return Err(EvalError::Syntax {
+                message: "define-record-type: expected type name".into(),
+            });
+        }
+    };
+
+    let (constructor_name, constructor_arity) = parse_record_constructor(constructor_expr)?;
+    let predicate_name = match predicate_expr {
+        Expr::Symbol(name, _) => name.clone(),
+        _ => {
+            return Err(EvalError::Syntax {
+                message: "define-record-type: expected predicate name".into(),
+            });
+        }
+    };
+
+    let accessor_names = field_exprs
+        .iter()
+        .map(parse_record_field)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if constructor_arity != accessor_names.len() {
+        return Err(EvalError::Syntax {
+            message: "define-record-type: constructor and field count must match".into(),
+        });
+    }
+
+    let record_type = Rc::new(RecordType {
+        name: type_name,
+        field_count: accessor_names.len(),
+    });
+
+    env.define(
+        constructor_name.clone(),
+        Value::RecordProcedure(Rc::new(RecordProcedure {
+            name: constructor_name,
+            kind: RecordProcedureKind::Constructor {
+                record_type: record_type.clone(),
+            },
+        })),
+    );
+
+    env.define(
+        predicate_name.clone(),
+        Value::RecordProcedure(Rc::new(RecordProcedure {
+            name: predicate_name,
+            kind: RecordProcedureKind::Predicate {
+                record_type: record_type.clone(),
+            },
+        })),
+    );
+
+    for (field_index, accessor_name) in accessor_names.into_iter().enumerate() {
+        env.define(
+            accessor_name.clone(),
+            Value::RecordProcedure(Rc::new(RecordProcedure {
+                name: accessor_name,
+                kind: RecordProcedureKind::Accessor {
+                    record_type: record_type.clone(),
+                    field_index,
+                },
+            })),
+        );
+    }
+
+    Ok(Value::Void)
+}
+
+fn parse_record_constructor(expr: &Expr) -> Result<(String, usize), EvalError> {
+    let Expr::List(items, _) = expr else {
+        return Err(EvalError::Syntax {
+            message: "define-record-type: expected constructor spec".into(),
+        });
+    };
+
+    let Some((Expr::Symbol(name, _), params)) = items.split_first() else {
+        return Err(EvalError::Syntax {
+            message: "define-record-type: expected constructor name".into(),
+        });
+    };
+
+    for param in params {
+        if !matches!(param, Expr::Symbol(_, _)) {
+            return Err(EvalError::Syntax {
+                message: "define-record-type: expected constructor field name".into(),
+            });
+        }
+    }
+
+    Ok((name.clone(), params.len()))
+}
+
+fn parse_record_field(expr: &Expr) -> Result<String, EvalError> {
+    let Expr::List(items, _) = expr else {
+        return Err(EvalError::Syntax {
+            message: "define-record-type: expected field spec".into(),
+        });
+    };
+
+    match items.as_slice() {
+        [Expr::Symbol(_, _), Expr::Symbol(accessor, _)] => Ok(accessor.clone()),
+        _ => Err(EvalError::Syntax {
+            message: "define-record-type: expected (field accessor)".into(),
+        }),
     }
 }
 
@@ -1162,6 +1281,7 @@ fn apply(callable: Value, args: &[Value], output: &mut String) -> Result<Value, 
     match callable {
         Value::Builtin(builtin) => apply_builtin(builtin, args, output),
         Value::Procedure(procedure) => apply_procedure(&procedure, args, output),
+        Value::RecordProcedure(procedure) => apply_record_procedure(&procedure, args),
         value => Err(EvalError::NotAProcedure {
             got: value.type_name().into(),
         }),
@@ -1191,6 +1311,46 @@ fn apply_procedure(
     }
 
     eval_sequence(&procedure.body, &call_env, output)
+}
+
+fn apply_record_procedure(procedure: &RecordProcedure, args: &[Value]) -> Result<Value, EvalError> {
+    match &procedure.kind {
+        RecordProcedureKind::Constructor { record_type } => {
+            if args.len() != record_type.field_count {
+                return Err(wrong_arg_count(
+                    &procedure.name,
+                    &record_type.field_count.to_string(),
+                    args.len(),
+                ));
+            }
+
+            Ok(Value::Record(Rc::new(RecordInstance {
+                record_type: record_type.clone(),
+                fields: args.to_vec(),
+            })))
+        }
+        RecordProcedureKind::Predicate { record_type } => match args {
+            [Value::Record(record)] => {
+                Ok(Value::Boolean(Rc::ptr_eq(&record.record_type, record_type)))
+            }
+            [_] => Ok(Value::Boolean(false)),
+            _ => Err(wrong_arg_count(&procedure.name, "1", args.len())),
+        },
+        RecordProcedureKind::Accessor {
+            record_type,
+            field_index,
+        } => match args {
+            [Value::Record(record)] if Rc::ptr_eq(&record.record_type, record_type) => {
+                Ok(record.fields[*field_index].clone())
+            }
+            [value] => Err(EvalError::TypeMismatch {
+                name: procedure.name.clone(),
+                expected: format!("{} record", record_type.name),
+                got: value.type_name().into(),
+            }),
+            _ => Err(wrong_arg_count(&procedure.name, "1", args.len())),
+        },
+    }
 }
 
 fn wrong_arg_count(name: &str, expected: &str, got: usize) -> EvalError {

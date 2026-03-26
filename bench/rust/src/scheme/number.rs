@@ -212,14 +212,9 @@ impl Number {
             .partial_cmp(&((right_num as i128) * (left_den as i128)))
     }
 
-    pub(super) fn normalize_exact(
-        name: &str,
-        numer: i128,
-        denom: i128,
-    ) -> Result<Self, EvalError> {
-        normalize_exact_parts(numer, denom).ok_or_else(|| EvalError::NumericOverflow {
-            name: name.into(),
-        })
+    pub(super) fn normalize_exact(name: &str, numer: i128, denom: i128) -> Result<Self, EvalError> {
+        normalize_exact_parts(numer, denom)
+            .ok_or_else(|| EvalError::NumericOverflow { name: name.into() })
     }
 }
 
@@ -270,11 +265,9 @@ fn exact_from_inexact(value: f64, name: &str) -> Result<Number, EvalError> {
     let rendered = format!("{value:?}");
     let (mantissa, exponent) = match rendered.find(['e', 'E']) {
         Some(index) => {
-            let exponent = rendered[index + 1..].parse::<i32>().map_err(|_| {
-                EvalError::NumericOverflow {
-                    name: name.into(),
-                }
-            })?;
+            let exponent = rendered[index + 1..]
+                .parse::<i32>()
+                .map_err(|_| EvalError::NumericOverflow { name: name.into() })?;
             (&rendered[..index], exponent)
         }
         None => (rendered.as_str(), 0),
@@ -295,9 +288,9 @@ fn exact_from_inexact(value: f64, name: &str) -> Result<Number, EvalError> {
     let mut numer = if digits.is_empty() {
         0
     } else {
-        digits.parse::<i128>().map_err(|_| EvalError::NumericOverflow {
-            name: name.into(),
-        })?
+        digits
+            .parse::<i128>()
+            .map_err(|_| EvalError::NumericOverflow { name: name.into() })?
     };
 
     if negative {
