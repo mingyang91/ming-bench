@@ -1,15 +1,55 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class Evaluator {
 
+    // --- Environment ---
+
+    private static class Env {
+        final Map<String, Object> bindings = new HashMap<>();
+        final Env parent;
+
+        Env(Env parent) {
+            this.parent = parent;
+        }
+
+        Object lookup(String name) throws EvalError {
+            if (bindings.containsKey(name)) return bindings.get(name);
+            if (parent != null) return parent.lookup(name);
+            throw new EvalError("unbound variable: " + name);
+        }
+
+        void define(String name, Object val) {
+            bindings.put(name, val);
+        }
+    }
+
+    // --- Lambda (closure) ---
+
+    private static class Lambda {
+        final List<String> params;
+        final Object body;
+        final Env closureEnv;
+
+        Lambda(List<String> params, Object body, Env closureEnv) {
+            this.params = params;
+            this.body = body;
+            this.closureEnv = closureEnv;
+        }
+    }
+
+    // --- Public API ---
+
     public String evalStr(String input) throws EvalError {
         List<Object> exprs = parse(input);
+        Env env = makeGlobalEnv();
         Object result = null;
         for (Object expr : exprs) {
-            result = eval(expr);
+            result = eval(expr, env);
         }
         return schemeToString(result);
     }
@@ -17,6 +57,12 @@ public class Evaluator {
     public EvalResult evalStrWithOutput(String input) throws EvalError {
         String result = evalStr(input);
         return new EvalResult(result, "");
+    }
+
+    private Env makeGlobalEnv() {
+        Env env = new Env(null);
+        registerBuiltins(env);
+        return env;
     }
 
     // --- Parser ---
@@ -53,6 +99,14 @@ public class Evaluator {
         skipWhitespace();
         if (pos >= src.length()) throw new EvalError("unexpected end of input");
         char c = src.charAt(pos);
+        if (c == '\'') {
+            pos++;
+            Object datum = readExpr();
+            List<Object> quoted = new ArrayList<>();
+            quoted.add(new SchemeSymbol("quote"));
+            quoted.add(datum);
+            return new SchemeList(quoted);
+        }
         if (c == '(') {
             return readList();
         } else if (c == '"') {
@@ -129,23 +183,21 @@ public class Evaluator {
         }
         String token = src.substring(start, pos);
         if (token.isEmpty()) throw new EvalError("empty token");
-        // Try integer
         try {
             return Long.parseLong(token);
         } catch (NumberFormatException e) {
-            // symbol
             return new SchemeSymbol(token);
         }
     }
 
     // --- Eval ---
 
-    private Object eval(Object expr) throws EvalError {
+    private Object eval(Object expr, Env env) throws EvalError {
         if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
             return expr;
         }
-        if (expr instanceof SchemeSymbol) {
-            throw new EvalError("unbound variable: " + ((SchemeSymbol) expr).name);
+        if (expr instanceof SchemeSymbol sym) {
+            return env.lookup(sym.name);
         }
         if (expr instanceof SchemeList list) {
             if (list.elems.isEmpty()) {
@@ -154,34 +206,90 @@ public class Evaluator {
             Object first = list.elems.get(0);
             if (first instanceof SchemeSymbol sym) {
                 switch (sym.name) {
-                    case "and" -> { return evalAnd(list.elems); }
-                    case "or" -> { return evalOr(list.elems); }
+                    case "define" -> { return evalDefine(list.elems, env); }
+                    case "if" -> { return evalIf(list.elems, env); }
+                    case "quote" -> {
+                        if (list.elems.size() != 2) throw new EvalError("quote: expected 1 argument");
+                        return list.elems.get(1);
+                    }
+                    case "lambda" -> { return evalLambda(list.elems, env); }
+                    case "and" -> { return evalAnd(list.elems, env); }
+                    case "or" -> { return evalOr(list.elems, env); }
                 }
-                // Builtin function call
-                List<Object> args = new ArrayList<>();
-                for (int i = 1; i < list.elems.size(); i++) {
-                    args.add(eval(list.elems.get(i)));
-                }
-                return applyBuiltin(sym.name, args);
             }
-            throw new EvalError("not a procedure: " + schemeToString(first));
+            // Function call: evaluate operator and arguments
+            Object proc = eval(first, env);
+            List<Object> args = new ArrayList<>();
+            for (int i = 1; i < list.elems.size(); i++) {
+                args.add(eval(list.elems.get(i), env));
+            }
+            return apply(proc, args);
         }
         throw new EvalError("cannot eval: " + expr);
     }
 
-    private Object evalAnd(List<Object> elems) throws EvalError {
+    private Object evalDefine(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() < 3) throw new EvalError("define: bad syntax");
+        Object target = elems.get(1);
+        if (target instanceof SchemeSymbol sym) {
+            // (define x expr)
+            Object val = eval(elems.get(2), env);
+            env.define(sym.name, val);
+            return null; // void
+        }
+        if (target instanceof SchemeList nameAndParams) {
+            // (define (f x y) body)
+            if (nameAndParams.elems.isEmpty()) throw new EvalError("define: bad syntax");
+            String fname = ((SchemeSymbol) nameAndParams.elems.get(0)).name;
+            List<String> params = new ArrayList<>();
+            for (int i = 1; i < nameAndParams.elems.size(); i++) {
+                params.add(((SchemeSymbol) nameAndParams.elems.get(i)).name);
+            }
+            Object body = elems.get(2);
+            Lambda lambda = new Lambda(params, body, env);
+            env.define(fname, lambda);
+            return null; // void
+        }
+        throw new EvalError("define: bad syntax");
+    }
+
+    private Object evalIf(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() < 3 || elems.size() > 4) throw new EvalError("if: bad syntax");
+        Object cond = eval(elems.get(1), env);
+        if (isTruthy(cond)) {
+            return eval(elems.get(2), env);
+        } else {
+            if (elems.size() == 4) {
+                return eval(elems.get(3), env);
+            }
+            return null; // void
+        }
+    }
+
+    private Lambda evalLambda(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() < 3) throw new EvalError("lambda: bad syntax");
+        SchemeList paramList = (SchemeList) elems.get(1);
+        List<String> params = new ArrayList<>();
+        for (Object p : paramList.elems) {
+            params.add(((SchemeSymbol) p).name);
+        }
+        Object body = elems.get(2);
+        return new Lambda(params, body, env);
+    }
+
+    private Object evalAnd(List<Object> elems, Env env) throws EvalError {
         Object result = Boolean.TRUE;
         for (int i = 1; i < elems.size(); i++) {
-            result = eval(elems.get(i));
+            result = eval(elems.get(i), env);
             if (!isTruthy(result)) return result;
         }
         return result;
     }
 
-    private Object evalOr(List<Object> elems) throws EvalError {
+    private Object evalOr(List<Object> elems, Env env) throws EvalError {
         Object result = Boolean.FALSE;
         for (int i = 1; i < elems.size(); i++) {
-            result = eval(elems.get(i));
+            result = eval(elems.get(i), env);
             if (isTruthy(result)) return result;
         }
         return result;
@@ -191,57 +299,84 @@ public class Evaluator {
         return !(val instanceof Boolean b && !b);
     }
 
-    private Object applyBuiltin(String name, List<Object> args) throws EvalError {
-        switch (name) {
-            case "+" -> {
-                long sum = 0;
-                for (Object a : args) sum += requireLong(a, "+");
-                return sum;
+    private Object apply(Object proc, List<Object> args) throws EvalError {
+        if (proc instanceof Lambda lam) {
+            if (args.size() != lam.params.size()) {
+                throw new EvalError("lambda: expected " + lam.params.size() + " arguments, got " + args.size());
             }
-            case "-" -> {
-                if (args.isEmpty()) throw new EvalError("-: need at least 1 argument");
-                if (args.size() == 1) return -requireLong(args.get(0), "-");
-                long result = requireLong(args.get(0), "-");
-                for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i), "-");
-                return result;
+            Env callEnv = new Env(lam.closureEnv);
+            for (int i = 0; i < lam.params.size(); i++) {
+                callEnv.define(lam.params.get(i), args.get(i));
             }
-            case "*" -> {
-                long product = 1;
-                for (Object a : args) product *= requireLong(a, "*");
-                return product;
-            }
-            case "/" -> {
-                if (args.isEmpty()) throw new EvalError("/: need at least 1 argument");
-                long result = requireLong(args.get(0), "/");
-                for (int i = 1; i < args.size(); i++) {
-                    long divisor = requireLong(args.get(i), "/");
-                    if (divisor == 0) throw new EvalError("division by zero");
-                    result /= divisor;
-                }
-                return result;
-            }
-            case "<" -> {
-                requireArgCount(name, args, 2);
-                return requireLong(args.get(0), "<") < requireLong(args.get(1), "<");
-            }
-            case ">" -> {
-                requireArgCount(name, args, 2);
-                return requireLong(args.get(0), ">") > requireLong(args.get(1), ">");
-            }
-            case "=" -> {
-                requireArgCount(name, args, 2);
-                return requireLong(args.get(0), "=") == requireLong(args.get(1), "=");
-            }
-            case "<=" -> {
-                requireArgCount(name, args, 2);
-                return requireLong(args.get(0), "<=") <= requireLong(args.get(1), "<=");
-            }
-            case "not" -> {
-                requireArgCount(name, args, 1);
-                return !isTruthy(args.get(0));
-            }
-            default -> throw new EvalError("unbound variable: " + name);
+            return eval(lam.body, callEnv);
         }
+        if (proc instanceof BuiltinProc bp) {
+            return bp.apply(args);
+        }
+        throw new EvalError("not a procedure: " + schemeToString(proc));
+    }
+
+    // --- Builtins ---
+
+    @FunctionalInterface
+    private interface BuiltinFn {
+        Object apply(List<Object> args) throws EvalError;
+    }
+
+    private record BuiltinProc(String name, BuiltinFn fn) {
+        Object apply(List<Object> args) throws EvalError {
+            return fn.apply(args);
+        }
+    }
+
+    private void registerBuiltins(Env env) {
+        env.define("+", new BuiltinProc("+", args -> {
+            long sum = 0;
+            for (Object a : args) sum += requireLong(a, "+");
+            return sum;
+        }));
+        env.define("-", new BuiltinProc("-", args -> {
+            if (args.isEmpty()) throw new EvalError("-: need at least 1 argument");
+            if (args.size() == 1) return -requireLong(args.get(0), "-");
+            long result = requireLong(args.get(0), "-");
+            for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i), "-");
+            return result;
+        }));
+        env.define("*", new BuiltinProc("*", args -> {
+            long product = 1;
+            for (Object a : args) product *= requireLong(a, "*");
+            return product;
+        }));
+        env.define("/", new BuiltinProc("/", args -> {
+            if (args.isEmpty()) throw new EvalError("/: need at least 1 argument");
+            long result = requireLong(args.get(0), "/");
+            for (int i = 1; i < args.size(); i++) {
+                long divisor = requireLong(args.get(i), "/");
+                if (divisor == 0) throw new EvalError("division by zero");
+                result /= divisor;
+            }
+            return result;
+        }));
+        env.define("<", new BuiltinProc("<", args -> {
+            requireArgCount("<", args, 2);
+            return requireLong(args.get(0), "<") < requireLong(args.get(1), "<");
+        }));
+        env.define(">", new BuiltinProc(">", args -> {
+            requireArgCount(">", args, 2);
+            return requireLong(args.get(0), ">") > requireLong(args.get(1), ">");
+        }));
+        env.define("=", new BuiltinProc("=", args -> {
+            requireArgCount("=", args, 2);
+            return requireLong(args.get(0), "=") == requireLong(args.get(1), "=");
+        }));
+        env.define("<=", new BuiltinProc("<=", args -> {
+            requireArgCount("<=", args, 2);
+            return requireLong(args.get(0), "<=") <= requireLong(args.get(1), "<=");
+        }));
+        env.define("not", new BuiltinProc("not", args -> {
+            requireArgCount("not", args, 1);
+            return !isTruthy(args.get(0));
+        }));
     }
 
     private long requireLong(Object val, String op) throws EvalError {
@@ -271,6 +406,8 @@ public class Evaluator {
             sb.append(")");
             return sb.toString();
         }
+        if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof BuiltinProc) return "#<procedure>";
         return val.toString();
     }
 
