@@ -15,6 +15,25 @@ import java.util.concurrent.atomic.AtomicLong;
  * Agents implement this class.
  */
 public class Evaluator {
+    private static final class StepBudget {
+        private final long maxSteps;
+        private long usedSteps;
+
+        private StepBudget(long maxSteps) throws EvalError {
+            if (maxSteps < 0) {
+                throw new EvalError("step limit must be non-negative");
+            }
+            this.maxSteps = maxSteps;
+        }
+
+        private void consume() throws EvalError {
+            if (usedSteps >= maxSteps) {
+                throw new EvalError("step limit exceeded");
+            }
+            usedSteps++;
+        }
+    }
+
     @FunctionalInterface
     private interface SyntaxScopeAction<T> {
         T run() throws EvalError;
@@ -78,6 +97,7 @@ public class Evaluator {
     private static final AtomicLong NEXT_GENSYM = new AtomicLong();
 
     private StringBuilder outputBuffer;
+    private StepBudget stepBudget;
     private MacroDefinition currentMacroDefinition;
     private Environment currentMacroUseEnvironment;
     private Map<String, MatchBinding> currentSyntaxBindings = Map.of();
@@ -91,12 +111,25 @@ public class Evaluator {
     }
 
     /**
+     * Evaluate Scheme expressions using a fixed step budget.
+     */
+    public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
+        return evalStrWithOutputInternal(input, new StepBudget(maxSteps)).result();
+    }
+
+    /**
      * Evaluate Scheme expressions and return both the result string
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
+        return evalStrWithOutputInternal(input, null);
+    }
+
+    private EvalResult evalStrWithOutputInternal(String input, StepBudget budget) throws EvalError {
         StringBuilder previousOutputBuffer = outputBuffer;
+        StepBudget previousStepBudget = stepBudget;
         outputBuffer = new StringBuilder();
+        stepBudget = budget;
         try {
             List<Expr> expressions = new Parser(input).parseProgram();
             if (expressions.isEmpty()) {
@@ -116,7 +149,14 @@ public class Evaluator {
 
             return new EvalResult(lastValue.render(), outputBuffer.toString());
         } finally {
+            stepBudget = previousStepBudget;
             outputBuffer = previousOutputBuffer;
+        }
+    }
+
+    void consumeStep() throws EvalError {
+        if (stepBudget != null) {
+            stepBudget.consume();
         }
     }
 
@@ -300,6 +340,7 @@ public class Evaluator {
 
     private Value eval(Expr expression, Environment environment) throws EvalError {
         try {
+            consumeStep();
             return switch (expression) {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
                 case NumberExpr numberExpr -> Numbers.parseLiteral(numberExpr.token());
@@ -316,6 +357,7 @@ public class Evaluator {
 
     private TailCall evalTail(Expr expression, Environment environment) throws EvalError {
         try {
+            consumeStep();
             return switch (expression) {
                 case IntExpr intExpr -> new TailCallValue(new IntValue(intExpr.value()));
                 case NumberExpr numberExpr -> new TailCallValue(Numbers.parseLiteral(numberExpr.token()));

@@ -6,6 +6,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -26,6 +27,10 @@ public class TestRunner {
                 System.err.println("Invalid level: " + levelArg);
                 System.exit(2);
             }
+        }
+
+        if (benchLevel > 26 && runStandaloneLevel(benchLevel)) {
+            return;
         }
 
         String testsJsonPath = System.getenv("TESTS_JSON");
@@ -146,5 +151,29 @@ public class TestRunner {
 
         System.out.println(passed + " passed, " + failed + " failed out of " + total + " tests");
         System.exit(failed > 0 ? 1 : 0);
+    }
+
+    private static boolean runStandaloneLevel(int level) {
+        String className = "ming.L" + level + "Tests";
+        try {
+            Class<?> runnerClass = Class.forName(className);
+            runnerClass.getMethod("main", String[].class).invoke(null, (Object) new String[0]);
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        } catch (IllegalAccessException | NoSuchMethodException e) {
+            System.err.println("Failed to invoke standalone level runner " + className + ": " + e.getMessage());
+            System.exit(2);
+            return true;
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new RuntimeException("Standalone level runner failed: " + className, cause);
+        }
     }
 }

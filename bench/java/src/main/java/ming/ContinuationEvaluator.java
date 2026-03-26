@@ -135,6 +135,7 @@ final class ContinuationEvaluator {
             switch (state) {
                 case EvalExprState evalExprState -> {
                     try {
+                        owner.consumeStep();
                         state = evalExpression(
                                 evalExprState.expression(),
                                 evalExprState.environment(),
