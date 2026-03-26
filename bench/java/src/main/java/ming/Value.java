@@ -252,7 +252,8 @@ enum VoidValue implements Value {
     }
 }
 
-sealed interface ProcedureValue extends Value permits PrimitiveProcedureValue, LambdaProcedureValue {
+sealed interface ProcedureValue extends Value
+        permits PrimitiveProcedureValue, LambdaProcedureValue, CaseLambdaProcedureValue {
     Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError;
 
     @Override
@@ -328,5 +329,47 @@ final class LambdaProcedureValue implements ProcedureValue {
             return ProcedureValue.super.render();
         }
         return "#<procedure:" + name + ">";
+    }
+}
+
+record CaseLambdaClause(ParameterSpec parameters, List<Expr> body) {
+    CaseLambdaClause {
+        body = List.copyOf(body);
+    }
+}
+
+final class CaseLambdaProcedureValue implements ProcedureValue {
+    private final List<CaseLambdaClause> clauses;
+    private final Environment definingEnvironment;
+
+    CaseLambdaProcedureValue(List<CaseLambdaClause> clauses, Environment definingEnvironment) {
+        this.clauses = List.copyOf(clauses);
+        this.definingEnvironment = definingEnvironment;
+    }
+
+    @Override
+    public Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError {
+        for (CaseLambdaClause clause : clauses) {
+            ParameterSpec parameters = clause.parameters();
+            if (!parameters.matchesArity(arguments.size())) {
+                continue;
+            }
+
+            Environment callEnvironment = new Environment(definingEnvironment);
+            for (int i = 0; i < parameters.fixedParameters().size(); i++) {
+                callEnvironment.define(parameters.fixedParameters().get(i), arguments.get(i));
+            }
+            if (parameters.restParameter() != null) {
+                callEnvironment.define(
+                        parameters.restParameter(),
+                        new ListValue(List.copyOf(arguments.subList(
+                                parameters.fixedParameters().size(),
+                                arguments.size()))));
+            }
+            return evaluator.evalSequence(clause.body(), callEnvironment);
+        }
+
+        throw new EvalError(
+                "case-lambda expected a matching clause for " + arguments.size() + " argument(s)");
     }
 }

@@ -109,6 +109,7 @@ public class Evaluator {
         environment.define("string?", new PrimitiveProcedureValue("string?", this::applyStringPredicate));
         environment.define("boolean?", new PrimitiveProcedureValue("boolean?", this::applyBooleanPredicate));
         environment.define("symbol?", new PrimitiveProcedureValue("symbol?", this::applySymbolPredicate));
+        environment.define("procedure?", new PrimitiveProcedureValue("procedure?", this::applyProcedurePredicate));
         environment.define("eq?", new PrimitiveProcedureValue("eq?", this::applyEq));
         environment.define("equal?", new PrimitiveProcedureValue("equal?", this::applyEqual));
         environment.define("display", new PrimitiveProcedureValue("display", this::applyDisplay));
@@ -206,6 +207,7 @@ public class Evaluator {
                 case "if" -> evalIf(arguments, environment);
                 case "quote" -> evalQuote(arguments);
                 case "lambda" -> evalLambda(arguments, environment);
+                case "case-lambda" -> evalCaseLambda(arguments, environment);
                 case "begin" -> evalBegin(arguments, environment);
                 case "cond" -> evalCond(arguments, environment);
                 case "let" -> evalLet(arguments, environment);
@@ -452,6 +454,30 @@ public class Evaluator {
                 parameters.restParameter(),
                 body,
                 environment);
+    }
+
+    private Value evalCaseLambda(List<Expr> clauses, Environment environment) throws EvalError {
+        if (clauses.isEmpty()) {
+            throw new EvalError("case-lambda expected at least one clause");
+        }
+
+        List<CaseLambdaClause> parsedClauses = new ArrayList<>(clauses.size());
+        for (Expr clauseExpression : clauses) {
+            if (!(clauseExpression instanceof ListExpr clauseList)) {
+                throw new EvalError("case-lambda clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.size() < 2) {
+                throw new EvalError("case-lambda clauses expected parameters and a body");
+            }
+
+            parsedClauses.add(new CaseLambdaClause(
+                    parseParameterSpec(clauseElements.getFirst(), "case-lambda"),
+                    clauseElements.subList(1, clauseElements.size())));
+        }
+
+        return new CaseLambdaProcedureValue(List.copyOf(parsedClauses), environment);
     }
 
     private Value evalBegin(List<Expr> arguments, Environment environment) throws EvalError {
@@ -865,6 +891,9 @@ public class Evaluator {
             if ("lambda".equals(headSymbol.name())) {
                 return instantiateTemplateLambda(template, elements, context, scope, repeatIndex);
             }
+            if ("case-lambda".equals(headSymbol.name())) {
+                return instantiateTemplateCaseLambda(template, elements, context, scope, repeatIndex);
+            }
         }
 
         List<Expr> expanded = new ArrayList<>(elements.size());
@@ -972,6 +1001,53 @@ public class Evaluator {
         expanded.add(parameterExpression);
         for (int i = 2; i < elements.size(); i++) {
             expanded.add(instantiateTemplate(elements.get(i), context, localScope, repeatIndex));
+        }
+        return new ListExpr(List.copyOf(expanded), template.line(), template.column());
+    }
+
+    private Expr instantiateTemplateCaseLambda(Expr template,
+                                               List<Expr> elements,
+                                               ExpansionContext context,
+                                               Map<String, String> scope,
+                                               Integer repeatIndex) throws EvalError {
+        if (elements.size() < 2) {
+            throw new EvalError("macro case-lambda template expected at least one clause");
+        }
+
+        List<Expr> expanded = new ArrayList<>(elements.size());
+        expanded.add(new SymbolExpr("case-lambda", elements.getFirst().line(), elements.getFirst().column()));
+        for (int i = 1; i < elements.size(); i++) {
+            Expr clauseExpression = elements.get(i);
+            if (!(clauseExpression instanceof ListExpr clauseList)) {
+                throw new EvalError("macro case-lambda clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.size() < 2) {
+                throw new EvalError("macro case-lambda clause expected parameters and a body");
+            }
+
+            Map<String, String> localScope = new HashMap<>(scope);
+            Expr parameterExpression = instantiateLambdaParameters(
+                    clauseElements.getFirst(),
+                    context,
+                    scope,
+                    localScope,
+                    repeatIndex);
+
+            List<Expr> expandedClause = new ArrayList<>(clauseElements.size());
+            expandedClause.add(parameterExpression);
+            for (int j = 1; j < clauseElements.size(); j++) {
+                expandedClause.add(instantiateTemplate(
+                        clauseElements.get(j),
+                        context,
+                        localScope,
+                        repeatIndex));
+            }
+            expanded.add(new ListExpr(
+                    List.copyOf(expandedClause),
+                    clauseExpression.line(),
+                    clauseExpression.column()));
         }
         return new ListExpr(List.copyOf(expanded), template.line(), template.column());
     }
@@ -1130,6 +1206,7 @@ public class Evaluator {
                     "if",
                     "quote",
                     "lambda",
+                    "case-lambda",
                     "begin",
                     "cond",
                     "let",
@@ -1312,6 +1389,11 @@ public class Evaluator {
     private Value applySymbolPredicate(List<Value> arguments) throws EvalError {
         requireExactArity("symbol?", arguments.size(), 1);
         return new BoolValue(arguments.getFirst() instanceof SymbolValue);
+    }
+
+    private Value applyProcedurePredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("procedure?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof ProcedureValue);
     }
 
     private Value applyEq(List<Value> arguments) throws EvalError {
