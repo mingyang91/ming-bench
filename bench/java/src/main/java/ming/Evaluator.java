@@ -7,7 +7,15 @@ import java.util.Map;
 
 public class Evaluator {
 
-    record SchemeString(String value) {}
+    static class SchemeString {
+        private char[] chars;
+        SchemeString(String value) { this.chars = value.toCharArray(); }
+        SchemeString(char[] chars) { this.chars = chars.clone(); }
+        String value() { return new String(chars); }
+        int length() { return chars.length; }
+        char charAt(int i) { return chars[i]; }
+        void setChar(int i, char c) { chars[i] = c; }
+    }
     record Pair(Object car, Object cdr) {}
     static final Object NIL = new Object() {
         @Override public String toString() { return "()"; }
@@ -39,7 +47,7 @@ public class Evaluator {
         "string-append", "string-length", "substring",
         "string->number", "number->string",
         "symbol->string", "string->symbol",
-        "string-ref"
+        "string-ref", "string-set!", "string-copy"
     };
 
     private final Env globalEnv;
@@ -107,7 +115,27 @@ public class Evaluator {
                 i++; col++;
             } else if (c == '#') {
                 int startCol = col;
-                if (i + 1 < len && (input.charAt(i + 1) == 't' || input.charAt(i + 1) == 'f')) {
+                if (i + 1 < len && input.charAt(i + 1) == '\\') {
+                    // Character literal: #\x, #\space, #\newline, #\tab
+                    i += 2; col += 2;
+                    if (i >= len) throw new EvalError(line + ":" + startCol + ": incomplete character literal");
+                    // Check for named characters
+                    int nameStart = i;
+                    while (i < len && !Character.isWhitespace(input.charAt(i)) && input.charAt(i) != ')' && input.charAt(i) != '(') {
+                        i++; col++;
+                    }
+                    String name = input.substring(nameStart, i);
+                    SchemeChar sc = switch (name) {
+                        case "space" -> new SchemeChar(' ');
+                        case "newline" -> new SchemeChar('\n');
+                        case "tab" -> new SchemeChar('\t');
+                        default -> {
+                            if (name.length() == 1) yield new SchemeChar(name.charAt(0));
+                            throw new EvalError(line + ":" + startCol + ": unknown character name: " + name);
+                        }
+                    };
+                    tokens.add(new Token(sc, line, startCol));
+                } else if (i + 1 < len && (input.charAt(i + 1) == 't' || input.charAt(i + 1) == 'f')) {
                     tokens.add(new Token(input.charAt(i + 1) == 't' ? Boolean.TRUE : Boolean.FALSE, line, startCol));
                     i += 2; col += 2;
                 } else {
@@ -224,7 +252,7 @@ public class Evaluator {
     }
 
     private Object evalInner(Object expr, Env env, int posLine, int posCol) throws EvalError {
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String symbol) {
@@ -634,9 +662,27 @@ public class Evaluator {
                 requireArgs(op, args, 2);
                 if (args.get(0) instanceof SchemeString ss) {
                     int idx = (int) asLong(args.get(1));
-                    yield new SchemeChar(ss.value().charAt(idx));
+                    yield new SchemeChar(ss.charAt(idx));
                 }
                 throw new EvalError("string-ref: not a string");
+            }
+            case "string-set!" -> {
+                requireArgs(op, args, 3);
+                if (args.get(0) instanceof SchemeString ss) {
+                    int idx = (int) asLong(args.get(1));
+                    if (!(args.get(2) instanceof SchemeChar sc))
+                        throw new EvalError("string-set!: not a char");
+                    ss.setChar(idx, sc.value());
+                    yield null;
+                }
+                throw new EvalError("string-set!: not a string");
+            }
+            case "string-copy" -> {
+                requireArgs(op, args, 1);
+                if (args.get(0) instanceof SchemeString ss) {
+                    yield new SchemeString(ss.value());
+                }
+                throw new EvalError("string-copy: not a string");
             }
             default -> throw new EvalError("unbound variable: " + op);
         };
