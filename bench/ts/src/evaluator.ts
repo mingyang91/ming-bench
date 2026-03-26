@@ -201,7 +201,8 @@ function makeExactInt(n: number, pos?: Pos): SchemeVal {
 
 class Env {
   private bindings: Map<string, SchemeVal> = new Map();
-  constructor(private parent?: Env) {}
+  private parent?: Env;
+  constructor(parent?: Env) { this.parent = parent; }
 
   get(name: string, pos?: Pos): SchemeVal {
     const v = this.bindings.get(name);
@@ -1598,7 +1599,7 @@ function bindLambdaArgs(proc: { params: string[]; rest?: string; body: SchemeVal
   return callEnv;
 }
 
-function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'halt' }): SchemeVal {
+function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'halt' }, maxSteps?: number): SchemeVal {
   let expr = startExpr;
   let env = startEnv;
   let k: Kont = startK;
@@ -1606,6 +1607,7 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
   let isEval = true;
   const winders: Winder[] = [];
   const exnHandlers: ExnHandler[] = [];
+  let steps = 0;
 
   function doApply(proc: SchemeVal, args: SchemeVal[], pos?: Pos, kk?: Kont): void {
     const kCont = kk!;
@@ -1763,6 +1765,9 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
   }
 
   for (;;) {
+    if (maxSteps !== undefined && ++steps > maxSteps) {
+      throw new EvalError('step limit exceeded');
+    }
     if (!isEval) {
       // ── APPLY CONTINUATION ──
       switch (k.tag) {
@@ -2703,6 +2708,20 @@ export function evalStr(input: string): string {
     k = { tag: 'seq', rest: exprs.slice(1), env: globalEnv, k: { tag: 'halt' } };
   }
   const result = evaluate(exprs[0], globalEnv, k);
+  return writeVal(result);
+}
+
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  const tokens = tokenize(input);
+  const exprs = parse(tokens);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  const globalEnv = new Env();
+  _outputBuf = [];
+  let k: Kont = { tag: 'halt' };
+  if (exprs.length > 1) {
+    k = { tag: 'seq', rest: exprs.slice(1), env: globalEnv, k: { tag: 'halt' } };
+  }
+  const result = evaluate(exprs[0], globalEnv, k, maxSteps);
   return writeVal(result);
 }
 
