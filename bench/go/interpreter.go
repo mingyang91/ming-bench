@@ -82,6 +82,25 @@ type runtime struct {
 	output strings.Builder
 }
 
+type evalStep struct {
+	value    expr
+	nextEnv  *env
+	nextForm expr
+	tail     bool
+}
+
+func doneStep(value expr) evalStep {
+	return evalStep{value: value}
+}
+
+func tailStep(environment *env, form expr) evalStep {
+	return evalStep{
+		nextEnv:  environment,
+		nextForm: form,
+		tail:     true,
+	}
+}
+
 func (r *runtime) writeString(text string) {
 	if r == nil {
 		return
@@ -533,10 +552,42 @@ func evalSequence(environment *env, forms []expr) (expr, error) {
 	return result, nil
 }
 
+func evalSequenceTail(environment *env, forms []expr) (evalStep, error) {
+	if len(forms) == 0 {
+		return doneStep(voidExpr{}), nil
+	}
+
+	for _, form := range forms[:len(forms)-1] {
+		if _, err := evalExpr(environment, form); err != nil {
+			return evalStep{}, attachPos(err, formPos(form))
+		}
+	}
+
+	return tailStep(environment, forms[len(forms)-1]), nil
+}
+
 func evalExpr(environment *env, form expr) (expr, error) {
+	currentEnv := environment
+	currentForm := form
+
+	for {
+		step, err := evalExprStep(currentEnv, currentForm)
+		if err != nil {
+			return nil, err
+		}
+		if !step.tail {
+			return step.value, nil
+		}
+
+		currentEnv = step.nextEnv
+		currentForm = step.nextForm
+	}
+}
+
+func evalExprStep(environment *env, form expr) (evalStep, error) {
 	switch v := form.(type) {
 	case intExpr, rationalExpr, inexactExpr, boolExpr, charExpr, *stringExpr:
-		return v, nil
+		return doneStep(v), nil
 	case symbolExpr:
 		lookupEnv := environment
 		if v.lookupEnv != nil {
@@ -544,77 +595,77 @@ func evalExpr(environment *env, form expr) (expr, error) {
 		}
 		value, ok := lookupEnv.lookup(v.name)
 		if !ok {
-			return nil, errorAt(v.pos, fmt.Sprintf("unbound symbol: %s", v.name))
+			return evalStep{}, errorAt(v.pos, fmt.Sprintf("unbound symbol: %s", v.name))
 		}
 		if _, ok := value.(uninitializedExpr); ok {
-			return nil, errorAt(v.pos, fmt.Sprintf("uninitialized binding: %s", v.name))
+			return evalStep{}, errorAt(v.pos, fmt.Sprintf("uninitialized binding: %s", v.name))
 		}
-		return value, nil
+		return doneStep(value), nil
 	case listExpr:
-		return evalList(environment, v)
+		return evalListStep(environment, v)
 	default:
-		return nil, &EvalError{Message: "unsupported expression"}
+		return evalStep{}, &EvalError{Message: "unsupported expression"}
 	}
 }
 
-func evalList(environment *env, items listExpr) (expr, error) {
+func evalListStep(environment *env, items listExpr) (evalStep, error) {
 	if len(items.items) == 0 {
-		return nil, errorAt(items.pos, "cannot evaluate empty list")
+		return evalStep{}, errorAt(items.pos, "cannot evaluate empty list")
 	}
 
 	if operator, ok := items.items[0].(symbolExpr); ok {
 		switch operator.name {
 		case "define":
 			value, err := evalDefine(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			return doneStep(value), attachPos(err, operator.pos)
 		case "define-record-type":
 			value, err := evalDefineRecordType(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			return doneStep(value), attachPos(err, operator.pos)
 		case "define-syntax":
 			value, err := evalDefineSyntax(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			return doneStep(value), attachPos(err, operator.pos)
 		case "set!":
 			value, err := evalSet(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			return doneStep(value), attachPos(err, operator.pos)
 		case "if":
-			value, err := evalIf(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			step, err := evalIf(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "begin":
-			value, err := evalBegin(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			step, err := evalBegin(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "cond":
-			value, err := evalCond(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			step, err := evalCond(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "do":
-			value, err := evalDo(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			step, err := evalDo(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "case":
-			value, err := evalCase(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			step, err := evalCase(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "let":
-			value, err := evalLet(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			step, err := evalLet(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "letrec":
-			value, err := evalLetrec(environment, items.items[1:], false)
-			return value, attachPos(err, operator.pos)
+			step, err := evalLetrec(environment, items.items[1:], false)
+			return step, attachPos(err, operator.pos)
 		case "letrec*":
-			value, err := evalLetrec(environment, items.items[1:], true)
-			return value, attachPos(err, operator.pos)
+			step, err := evalLetrec(environment, items.items[1:], true)
+			return step, attachPos(err, operator.pos)
 		case "quote":
 			value, err := evalQuote(items.items[1:])
-			return value, attachPos(err, operator.pos)
+			return doneStep(value), attachPos(err, operator.pos)
 		case "lambda":
 			value, err := evalLambda(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			return doneStep(value), attachPos(err, operator.pos)
 		case "case-lambda":
 			value, err := evalCaseLambda(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			return doneStep(value), attachPos(err, operator.pos)
 		case "and":
-			value, err := evalAnd(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			step, err := evalAnd(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "or":
-			value, err := evalOr(environment, items.items[1:])
-			return value, attachPos(err, operator.pos)
+			step, err := evalOr(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		}
 
 		lookupEnv := environment
@@ -625,19 +676,19 @@ func evalList(environment *env, items listExpr) (expr, error) {
 			if macro, ok := macroValue.(macroExpr); ok {
 				expanded, err := expandMacro(macro, items)
 				if err != nil {
-					return nil, attachPos(err, operator.pos)
+					return evalStep{}, attachPos(err, operator.pos)
 				}
-				return evalExpr(environment, expanded)
+				return tailStep(environment, expanded), nil
 			}
 		}
 	}
 
 	operatorValue, err := evalExpr(environment, items.items[0])
 	if err != nil {
-		return nil, err
+		return evalStep{}, err
 	}
 
-	return applyProcedure(environment, operatorValue, items.items[1:], items.pos)
+	return applyProcedureStep(environment, operatorValue, items.items[1:], items.pos)
 }
 
 func evalDefine(environment *env, forms []expr) (expr, error) {
@@ -704,62 +755,59 @@ func evalSet(environment *env, forms []expr) (expr, error) {
 	return voidExpr{}, nil
 }
 
-func evalIf(environment *env, forms []expr) (expr, error) {
+func evalIf(environment *env, forms []expr) (evalStep, error) {
 	if len(forms) != 2 && len(forms) != 3 {
-		return nil, &EvalError{Message: "if expects 2 or 3 arguments"}
+		return evalStep{}, &EvalError{Message: "if expects 2 or 3 arguments"}
 	}
 
 	condition, err := evalExpr(environment, forms[0])
 	if err != nil {
-		return nil, err
+		return evalStep{}, err
 	}
 	if isTruthy(condition) {
-		return evalExpr(environment, forms[1])
+		return tailStep(environment, forms[1]), nil
 	}
 	if len(forms) == 2 {
-		return voidExpr{}, nil
+		return doneStep(voidExpr{}), nil
 	}
-	return evalExpr(environment, forms[2])
+	return tailStep(environment, forms[2]), nil
 }
 
-func evalBegin(environment *env, forms []expr) (expr, error) {
-	if len(forms) == 0 {
-		return voidExpr{}, nil
-	}
-	return evalSequence(environment, forms)
+func evalBegin(environment *env, forms []expr) (evalStep, error) {
+	return evalSequenceTail(environment, forms)
 }
 
-func evalCond(environment *env, forms []expr) (expr, error) {
+func evalCond(environment *env, forms []expr) (evalStep, error) {
 	for i, form := range forms {
 		clause, ok := form.(listExpr)
 		if !ok || len(clause.items) == 0 {
-			return nil, &EvalError{Message: "cond clauses must be non-empty lists"}
+			return evalStep{}, &EvalError{Message: "cond clauses must be non-empty lists"}
 		}
 
 		if symbol, ok := clause.items[0].(symbolExpr); ok && symbol.name == "else" {
 			if i != len(forms)-1 {
-				return nil, &EvalError{Message: "cond else clause must be last"}
+				return evalStep{}, &EvalError{Message: "cond else clause must be last"}
 			}
 			if len(clause.items) == 1 {
-				return voidExpr{}, nil
+				return doneStep(voidExpr{}), nil
 			}
-			return evalSequence(environment, clause.items[1:])
+			return evalSequenceTail(environment, clause.items[1:])
 		}
 
 		testValue, err := evalExpr(environment, clause.items[0])
 		if err != nil {
-			return nil, err
+			return evalStep{}, err
 		}
 		if !isTruthy(testValue) {
 			continue
 		}
 		if len(clause.items) == 1 {
-			return testValue, nil
+			return doneStep(testValue), nil
 		}
-		return evalSequence(environment, clause.items[1:])
+		return evalSequenceTail(environment, clause.items[1:])
 	}
 
-	return voidExpr{}, nil
+	return doneStep(voidExpr{}), nil
 }
 
 func evalQuote(forms []expr) (expr, error) {
@@ -769,9 +817,9 @@ func evalQuote(forms []expr) (expr, error) {
 	return forms[0], nil
 }
 
-func evalLet(environment *env, forms []expr) (expr, error) {
+func evalLet(environment *env, forms []expr) (evalStep, error) {
 	if len(forms) < 2 {
-		return nil, &EvalError{Message: "let expects bindings and a body"}
+		return evalStep{}, &EvalError{Message: "let expects bindings and a body"}
 	}
 
 	if name, ok := forms[0].(symbolExpr); ok {
@@ -780,12 +828,12 @@ func evalLet(environment *env, forms []expr) (expr, error) {
 
 	bindings, ok := forms[0].(listExpr)
 	if !ok {
-		return nil, &EvalError{Message: "let bindings must be a list"}
+		return evalStep{}, &EvalError{Message: "let bindings must be a list"}
 	}
 
 	names, values, err := evalBindings(environment, bindings)
 	if err != nil {
-		return nil, err
+		return evalStep{}, err
 	}
 
 	letEnv := &env{
@@ -796,22 +844,22 @@ func evalLet(environment *env, forms []expr) (expr, error) {
 		letEnv.define(name, values[i])
 	}
 
-	return evalSequence(letEnv, forms[1:])
+	return evalSequenceTail(letEnv, forms[1:])
 }
 
-func evalNamedLet(environment *env, name string, forms []expr) (expr, error) {
+func evalNamedLet(environment *env, name string, forms []expr) (evalStep, error) {
 	if len(forms) < 2 {
-		return nil, &EvalError{Message: "named let expects bindings and a body"}
+		return evalStep{}, &EvalError{Message: "named let expects bindings and a body"}
 	}
 
 	bindings, ok := forms[0].(listExpr)
 	if !ok {
-		return nil, &EvalError{Message: "named let bindings must be a list"}
+		return evalStep{}, &EvalError{Message: "named let bindings must be a list"}
 	}
 
 	names, values, err := evalBindings(environment, bindings)
 	if err != nil {
-		return nil, err
+		return evalStep{}, err
 	}
 
 	letEnv := &env{
@@ -825,7 +873,7 @@ func evalNamedLet(environment *env, name string, forms []expr) (expr, error) {
 	}
 	letEnv.define(name, closure)
 
-	return applyCallable(closure, values)
+	return applyCallableStep(closure, values)
 }
 
 func evalLambda(environment *env, forms []expr) (expr, error) {
@@ -937,39 +985,74 @@ func evalBindings(environment *env, bindings listExpr) ([]string, []expr, error)
 	return names, values, nil
 }
 
-func applyProcedure(environment *env, proc expr, argForms []expr, callPos sourcePos) (expr, error) {
+func applyProcedureStep(environment *env, proc expr, argForms []expr, callPos sourcePos) (evalStep, error) {
 	args, err := evalArgs(environment, argForms)
 	if err != nil {
-		return nil, attachPos(err, callPos)
+		return evalStep{}, attachPos(err, callPos)
 	}
 
-	value, err := applyCallable(proc, args)
-	return value, attachPos(err, callPos)
+	step, err := applyCallableStep(proc, args)
+	return step, attachPos(err, callPos)
 }
 
 func applyCallable(proc expr, args []expr) (expr, error) {
+	step, err := applyCallableStep(proc, args)
+	if err != nil {
+		return nil, err
+	}
+	if step.tail {
+		return evalExpr(step.nextEnv, step.nextForm)
+	}
+	return step.value, nil
+}
+
+func applyCallableStep(proc expr, args []expr) (evalStep, error) {
 	switch callable := proc.(type) {
 	case builtinProc:
-		return callable.fn(args)
+		if callable.name == "apply" {
+			return applyBuiltinStep(args)
+		}
+
+		value, err := callable.fn(args)
+		if err != nil {
+			return evalStep{}, err
+		}
+		return doneStep(value), nil
 	case closureExpr:
-		return applyClosure(callable, args)
+		return prepareClosureCall(callable, args)
 	case caseClosureExpr:
 		for _, clause := range callable.clauses {
 			if closureMatchesArity(clause, len(args)) {
-				return applyClosure(clause, args)
+				return prepareClosureCall(clause, args)
 			}
 		}
-		return nil, &EvalError{Message: fmt.Sprintf("no matching case-lambda clause for %d arguments", len(args))}
+		return evalStep{}, &EvalError{Message: fmt.Sprintf("no matching case-lambda clause for %d arguments", len(args))}
 	case recordConstructorProc:
-		return applyRecordConstructor(callable, args)
+		value, err := applyRecordConstructor(callable, args)
+		if err != nil {
+			return evalStep{}, err
+		}
+		return doneStep(value), nil
 	case recordPredicateProc:
-		return applyRecordPredicate(callable, args)
+		value, err := applyRecordPredicate(callable, args)
+		if err != nil {
+			return evalStep{}, err
+		}
+		return doneStep(value), nil
 	case recordAccessorProc:
-		return applyRecordAccessor(callable, args)
+		value, err := applyRecordAccessor(callable, args)
+		if err != nil {
+			return evalStep{}, err
+		}
+		return doneStep(value), nil
 	case recordMutatorProc:
-		return applyRecordMutator(callable, args)
+		value, err := applyRecordMutator(callable, args)
+		if err != nil {
+			return evalStep{}, err
+		}
+		return doneStep(value), nil
 	default:
-		return nil, &EvalError{Message: "first list element is not a procedure"}
+		return evalStep{}, &EvalError{Message: "first list element is not a procedure"}
 	}
 }
 
@@ -980,12 +1063,12 @@ func closureMatchesArity(callable closureExpr, argc int) bool {
 	return argc == len(callable.params)
 }
 
-func applyClosure(callable closureExpr, args []expr) (expr, error) {
+func prepareClosureCall(callable closureExpr, args []expr) (evalStep, error) {
 	if !callable.variadic && len(args) != len(callable.params) {
-		return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
+		return evalStep{}, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
 	}
 	if callable.variadic && len(args) < len(callable.params) {
-		return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(callable.params), len(args))}
+		return evalStep{}, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(callable.params), len(args))}
 	}
 
 	callEnv := &env{
@@ -999,7 +1082,7 @@ func applyClosure(callable closureExpr, args []expr) (expr, error) {
 		rest := append([]expr(nil), args[len(callable.params):]...)
 		callEnv.define(callable.restParam, listExpr{items: rest})
 	}
-	return evalSequence(callEnv, callable.body)
+	return evalSequenceTail(callEnv, callable.body)
 }
 
 func evalArgs(environment *env, forms []expr) ([]expr, error) {
@@ -1014,32 +1097,56 @@ func evalArgs(environment *env, forms []expr) ([]expr, error) {
 	return args, nil
 }
 
-func evalAnd(environment *env, forms []expr) (expr, error) {
-	result := expr(boolExpr(true))
-	for _, form := range forms {
+func evalAnd(environment *env, forms []expr) (evalStep, error) {
+	if len(forms) == 0 {
+		return doneStep(boolExpr(true)), nil
+	}
+
+	for _, form := range forms[:len(forms)-1] {
 		value, err := evalExpr(environment, form)
 		if err != nil {
-			return nil, err
+			return evalStep{}, err
 		}
-		result = value
 		if !isTruthy(value) {
-			return value, nil
+			return doneStep(value), nil
 		}
 	}
-	return result, nil
+
+	return tailStep(environment, forms[len(forms)-1]), nil
 }
 
-func evalOr(environment *env, forms []expr) (expr, error) {
-	for _, form := range forms {
+func evalOr(environment *env, forms []expr) (evalStep, error) {
+	if len(forms) == 0 {
+		return doneStep(boolExpr(false)), nil
+	}
+
+	for _, form := range forms[:len(forms)-1] {
 		value, err := evalExpr(environment, form)
 		if err != nil {
-			return nil, err
+			return evalStep{}, err
 		}
 		if isTruthy(value) {
-			return value, nil
+			return doneStep(value), nil
 		}
 	}
-	return boolExpr(false), nil
+
+	return tailStep(environment, forms[len(forms)-1]), nil
+}
+
+func applyBuiltinStep(args []expr) (evalStep, error) {
+	if len(args) < 2 {
+		return evalStep{}, &EvalError{Message: "apply expects at least 2 arguments"}
+	}
+
+	tailList, ok := args[len(args)-1].(listExpr)
+	if !ok {
+		return evalStep{}, &EvalError{Message: "apply expects a list as its final argument"}
+	}
+
+	callArgs := make([]expr, 0, len(args)-2+len(tailList.items))
+	callArgs = append(callArgs, args[1:len(args)-1]...)
+	callArgs = append(callArgs, tailList.items...)
+	return applyCallableStep(args[0], callArgs)
 }
 
 func builtinAdd(args []expr) (expr, error) {

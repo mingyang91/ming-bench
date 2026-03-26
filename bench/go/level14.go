@@ -159,36 +159,36 @@ func eqvExpr(a, b expr) bool {
 	return eqExpr(a, b)
 }
 
-func evalCase(environment *env, forms []expr) (expr, error) {
+func evalCase(environment *env, forms []expr) (evalStep, error) {
 	if len(forms) < 2 {
-		return nil, &EvalError{Message: "case expects a key and at least one clause"}
+		return evalStep{}, &EvalError{Message: "case expects a key and at least one clause"}
 	}
 
 	key, err := evalExpr(environment, forms[0])
 	if err != nil {
-		return nil, err
+		return evalStep{}, err
 	}
 
 	clauses := forms[1:]
 	for i, form := range clauses {
 		clause, ok := form.(listExpr)
 		if !ok || len(clause.items) == 0 {
-			return nil, &EvalError{Message: "case clauses must be non-empty lists"}
+			return evalStep{}, &EvalError{Message: "case clauses must be non-empty lists"}
 		}
 
 		if symbol, ok := clause.items[0].(symbolExpr); ok && symbol.name == "else" {
 			if i != len(clauses)-1 {
-				return nil, &EvalError{Message: "case else clause must be last"}
+				return evalStep{}, &EvalError{Message: "case else clause must be last"}
 			}
 			if len(clause.items) == 1 {
-				return voidExpr{}, nil
+				return doneStep(voidExpr{}), nil
 			}
-			return evalSequence(environment, clause.items[1:])
+			return evalSequenceTail(environment, clause.items[1:])
 		}
 
 		datums, ok := clause.items[0].(listExpr)
 		if !ok {
-			return nil, &EvalError{Message: "case clause datums must be a list"}
+			return evalStep{}, &EvalError{Message: "case clause datums must be a list"}
 		}
 
 		matched := false
@@ -203,32 +203,32 @@ func evalCase(environment *env, forms []expr) (expr, error) {
 		}
 
 		if len(clause.items) == 1 {
-			return voidExpr{}, nil
+			return doneStep(voidExpr{}), nil
 		}
-		return evalSequence(environment, clause.items[1:])
+		return evalSequenceTail(environment, clause.items[1:])
 	}
 
-	return voidExpr{}, nil
+	return doneStep(voidExpr{}), nil
 }
 
-func evalLetrec(environment *env, forms []expr, sequential bool) (expr, error) {
+func evalLetrec(environment *env, forms []expr, sequential bool) (evalStep, error) {
 	formName := "letrec"
 	if sequential {
 		formName = "letrec*"
 	}
 
 	if len(forms) < 2 {
-		return nil, &EvalError{Message: formName + " expects bindings and a body"}
+		return evalStep{}, &EvalError{Message: formName + " expects bindings and a body"}
 	}
 
 	bindings, ok := forms[0].(listExpr)
 	if !ok {
-		return nil, &EvalError{Message: formName + " bindings must be a list"}
+		return evalStep{}, &EvalError{Message: formName + " bindings must be a list"}
 	}
 
 	names, initForms, err := parseNameValueBindings(bindings, formName)
 	if err != nil {
-		return nil, err
+		return evalStep{}, err
 	}
 
 	letEnv := &env{
@@ -242,7 +242,7 @@ func evalLetrec(environment *env, forms []expr, sequential bool) (expr, error) {
 
 			value, err := evalExpr(letEnv, initForms[i])
 			if err != nil {
-				return nil, err
+				return evalStep{}, err
 			}
 			letEnv.bindings[name] = value
 		}
@@ -253,13 +253,13 @@ func evalLetrec(environment *env, forms []expr, sequential bool) (expr, error) {
 		for i, name := range names {
 			value, err := evalExpr(letEnv, initForms[i])
 			if err != nil {
-				return nil, err
+				return evalStep{}, err
 			}
 			letEnv.bindings[name] = value
 		}
 	}
 
-	return evalSequence(letEnv, forms[1:])
+	return evalSequenceTail(letEnv, forms[1:])
 }
 
 func parseNameValueBindings(bindings listExpr, formName string) ([]string, []expr, error) {
@@ -289,19 +289,19 @@ func parseNameValueBindings(bindings listExpr, formName string) ([]string, []exp
 	return names, values, nil
 }
 
-func evalDo(environment *env, forms []expr) (expr, error) {
+func evalDo(environment *env, forms []expr) (evalStep, error) {
 	if len(forms) < 2 {
-		return nil, &EvalError{Message: "do expects bindings, a test clause, and optional body expressions"}
+		return evalStep{}, &EvalError{Message: "do expects bindings, a test clause, and optional body expressions"}
 	}
 
 	bindingList, ok := forms[0].(listExpr)
 	if !ok {
-		return nil, &EvalError{Message: "do bindings must be a list"}
+		return evalStep{}, &EvalError{Message: "do bindings must be a list"}
 	}
 
 	testClause, ok := forms[1].(listExpr)
 	if !ok || len(testClause.items) == 0 {
-		return nil, &EvalError{Message: "do test clause must be a non-empty list"}
+		return evalStep{}, &EvalError{Message: "do test clause must be a non-empty list"}
 	}
 
 	loopEnv := &env{
@@ -314,21 +314,21 @@ func evalDo(environment *env, forms []expr) (expr, error) {
 	for _, rawBinding := range bindingList.items {
 		binding, ok := rawBinding.(listExpr)
 		if !ok || len(binding.items) < 2 || len(binding.items) > 3 {
-			return nil, &EvalError{Message: "do bindings must have the form (name init [step])"}
+			return evalStep{}, &EvalError{Message: "do bindings must have the form (name init [step])"}
 		}
 
 		name, ok := binding.items[0].(symbolExpr)
 		if !ok {
-			return nil, &EvalError{Message: "do binding name must be a symbol"}
+			return evalStep{}, &EvalError{Message: "do binding name must be a symbol"}
 		}
 		if _, exists := seen[name.name]; exists {
-			return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", name.name)}
+			return evalStep{}, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", name.name)}
 		}
 		seen[name.name] = struct{}{}
 
 		initValue, err := evalExpr(environment, binding.items[1])
 		if err != nil {
-			return nil, err
+			return evalStep{}, err
 		}
 
 		var step expr
@@ -347,18 +347,18 @@ func evalDo(environment *env, forms []expr) (expr, error) {
 	for {
 		testValue, err := evalExpr(loopEnv, testClause.items[0])
 		if err != nil {
-			return nil, err
+			return evalStep{}, err
 		}
 		if isTruthy(testValue) {
 			if len(testClause.items) == 1 {
-				return voidExpr{}, nil
+				return doneStep(voidExpr{}), nil
 			}
-			return evalSequence(loopEnv, testClause.items[1:])
+			return evalSequenceTail(loopEnv, testClause.items[1:])
 		}
 
 		if len(body) > 0 {
 			if _, err := evalSequence(loopEnv, body); err != nil {
-				return nil, err
+				return evalStep{}, err
 			}
 		}
 
@@ -371,7 +371,7 @@ func evalDo(environment *env, forms []expr) (expr, error) {
 
 			value, err := evalExpr(loopEnv, binding.step)
 			if err != nil {
-				return nil, err
+				return evalStep{}, err
 			}
 			nextValues[i] = value
 		}
