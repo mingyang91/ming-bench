@@ -105,6 +105,10 @@ struct PairValue {
     cdr: Value,
 }
 
+struct VectorValue {
+    elements: RefCell<Vec<Value>>,
+}
+
 #[derive(Clone, Copy)]
 struct BuiltinProcedure {
     name: &'static str,
@@ -169,6 +173,7 @@ enum Value {
     Symbol(String),
     EmptyList,
     Pair(Rc<PairValue>),
+    Vector(Rc<VectorValue>),
     Void,
     Procedure(ProcedureValue),
     Record(Rc<RecordValue>),
@@ -185,6 +190,12 @@ struct EvaluatedArg {
 struct LetBinding {
     name: Identifier,
     value_expr: Expr,
+}
+
+struct DoBinding {
+    name: Identifier,
+    init_expr: Expr,
+    step_expr: Option<Expr>,
 }
 
 #[derive(Clone)]
@@ -592,6 +603,7 @@ fn create_global_env() -> Environment {
     env.define(">", builtin(">", builtin_gt));
     env.define("=", builtin("=", builtin_num_eq));
     env.define("<=", builtin("<=", builtin_lte));
+    env.define("zero?", builtin("zero?", builtin_zero_pred));
 
     env.define("not", builtin("not", builtin_not));
 
@@ -603,6 +615,17 @@ fn create_global_env() -> Environment {
     env.define("length", builtin("length", builtin_length));
     env.define("append", builtin("append", builtin_append));
     env.define("map", native("map", NativeProcedureKind::Map));
+    env.define("eq?", builtin("eq?", builtin_eq));
+    env.define("eqv?", builtin("eqv?", builtin_eqv));
+    env.define("equal?", builtin("equal?", builtin_equal));
+    env.define("vector", builtin("vector", builtin_vector));
+    env.define("make-vector", builtin("make-vector", builtin_make_vector));
+    env.define("vector-ref", builtin("vector-ref", builtin_vector_ref));
+    env.define("vector-set!", builtin("vector-set!", builtin_vector_set));
+    env.define("vector-length", builtin("vector-length", builtin_vector_length));
+    env.define("vector?", builtin("vector?", builtin_vector_pred));
+    env.define("vector->list", builtin("vector->list", builtin_vector_to_list));
+    env.define("list->vector", builtin("list->vector", builtin_list_to_vector));
 
     env.define("string?", builtin("string?", builtin_string_pred));
     env.define("number?", builtin("number?", builtin_number_pred));
@@ -670,6 +693,10 @@ fn evaluate_list(
             "begin" => return eval_begin(args, env, state),
             "cond" => return eval_cond(args, head, env, state),
             "let" => return eval_let(args, head, env, state),
+            "letrec" => return eval_letrec(args, head, env, state, false),
+            "letrec*" => return eval_letrec(args, head, env, state, true),
+            "case" => return eval_case(args, head, env, state),
+            "do" => return eval_do(args, head, env, state),
             _ => {}
         }
     }
@@ -921,14 +948,16 @@ fn eval_if(
     env: &Environment,
     state: &mut EvalState,
 ) -> Result<Value, EvalError> {
-    if args.len() != 3 {
-        return Err(err_at(head.loc, "if expects exactly 3 arguments"));
+    if !(2..=3).contains(&args.len()) {
+        return Err(err_at(head.loc, "if expects exactly 2 or 3 arguments"));
     }
 
     if is_truthy(&evaluate(&args[0], env, state)?) {
         evaluate(&args[1], env, state)
-    } else {
+    } else if args.len() == 3 {
         evaluate(&args[2], env, state)
+    } else {
+        Ok(Value::Void)
     }
 }
 
@@ -1060,6 +1089,90 @@ fn eval_let(
     evaluate_sequence(&args[1..], &let_env, state)
 }
 
+fn eval_letrec(
+    args: &[Expr],
+    head: &Expr,
+    env: &Environment,
+    state: &mut EvalState,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(err_at(head.loc, "letrec expects bindings and a body"));
+    }
+
+    let bindings = parse_let_bindings(&args[0], head.loc)?;
+    let let_env = Environment::child(env);
+
+    for binding in &bindings {
+        let_env.define_identifier(&binding.name, Value::Void);
+    }
+
+    if sequential {
+        for binding in &bindings {
+            let value = evaluate(&binding.value_expr, &let_env, state)?;
+            let_env.set_identifier(&binding.name, value, binding.value_expr.loc)?;
+        }
+    } else {
+        let values = bindings
+            .iter()
+            .map(|binding| evaluate(&binding.value_expr, &let_env, state))
+            .collect::<Result<Vec<_>, EvalError>>()?;
+
+        for (binding, value) in bindings.iter().zip(values) {
+            let_env.set_identifier(&binding.name, value, binding.value_expr.loc)?;
+        }
+    }
+
+    evaluate_sequence(&args[1..], &let_env, state)
+}
+
+fn eval_case(
+    args: &[Expr],
+    head: &Expr,
+    env: &Environment,
+    state: &mut EvalState,
+) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(err_at(head.loc, "case expects a key and at least 1 clause"));
+    }
+
+    let key = evaluate(&args[0], env, state)?;
+
+    for (index, clause) in args[1..].iter().enumerate() {
+        let Some(parts) = expr_list(clause) else {
+            return Err(err_at(head.loc, "case clauses must be non-empty lists"));
+        };
+
+        if parts.is_empty() {
+            return Err(err_at(head.loc, "case clauses must be non-empty lists"));
+        }
+
+        let datums_expr = &parts[0];
+        let body = &parts[1..];
+
+        if matches!(expr_plain_symbol(datums_expr), Some("else")) {
+            if index != args.len() - 2 {
+                return Err(err_at(datums_expr.loc, "else must be the last case clause"));
+            }
+
+            return evaluate_sequence(body, env, state);
+        }
+
+        let Some(datums) = expr_list(datums_expr) else {
+            return Err(err_at(datums_expr.loc, "case clause datums must be a list"));
+        };
+
+        if datums
+            .iter()
+            .any(|datum| is_eqv(&key, &quote_expr(datum)))
+        {
+            return evaluate_sequence(body, env, state);
+        }
+    }
+
+    Ok(Value::Void)
+}
+
 fn eval_named_let(
     args: &[Expr],
     head: &Expr,
@@ -1102,6 +1215,59 @@ fn eval_named_let(
 
     let_env.define_identifier(name, procedure.clone());
     apply_procedure(procedure, &evaluated_args, name_expr.loc, state)
+}
+
+fn eval_do(
+    args: &[Expr],
+    head: &Expr,
+    env: &Environment,
+    state: &mut EvalState,
+) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(err_at(head.loc, "do expects bindings and a test clause"));
+    }
+
+    let bindings = parse_do_bindings(&args[0], head.loc)?;
+    let Some(test_clause) = expr_list(&args[1]) else {
+        return Err(err_at(args[1].loc, "do test clause must be a list"));
+    };
+
+    if test_clause.is_empty() {
+        return Err(err_at(args[1].loc, "do test clause must be non-empty"));
+    }
+
+    let loop_env = Environment::child(env);
+    for binding in &bindings {
+        let value = evaluate(&binding.init_expr, env, state)?;
+        loop_env.define_identifier(&binding.name, value);
+    }
+
+    let test_expr = &test_clause[0];
+    let result_exprs = &test_clause[1..];
+    let body = &args[2..];
+
+    loop {
+        if is_truthy(&evaluate(test_expr, &loop_env, state)?) {
+            return evaluate_sequence(result_exprs, &loop_env, state);
+        }
+
+        evaluate_sequence(body, &loop_env, state)?;
+
+        let next_values = bindings
+            .iter()
+            .map(|binding| {
+                if let Some(step_expr) = &binding.step_expr {
+                    evaluate(step_expr, &loop_env, state)
+                } else {
+                    loop_env.lookup_identifier(&binding.name, binding.init_expr.loc)
+                }
+            })
+            .collect::<Result<Vec<_>, EvalError>>()?;
+
+        for (binding, value) in bindings.iter().zip(next_values) {
+            loop_env.set_identifier(&binding.name, value, binding.init_expr.loc)?;
+        }
+    }
 }
 
 fn apply_procedure(
@@ -1287,6 +1453,32 @@ fn parse_let_bindings(expr: &Expr, head_loc: SourceLoc) -> Result<Vec<LetBinding
             Ok(LetBinding {
                 name: name.clone(),
                 value_expr: parts[1].clone(),
+            })
+        })
+        .collect()
+}
+
+fn parse_do_bindings(expr: &Expr, head_loc: SourceLoc) -> Result<Vec<DoBinding>, EvalError> {
+    let Some(bindings) = expr_list(expr) else {
+        return Err(err_at(expr.loc, "do bindings must be a list"));
+    };
+
+    bindings
+        .iter()
+        .map(|binding_expr| {
+            let Some(parts) = expr_list(binding_expr) else {
+                return Err(err_at(head_loc, "do bindings must be pairs or triples"));
+            };
+
+            if !(2..=3).contains(&parts.len()) {
+                return Err(err_at(head_loc, "do bindings must be pairs or triples"));
+            }
+
+            let name = expect_bindable_identifier(&parts[0], "do binding name must be a symbol")?;
+            Ok(DoBinding {
+                name,
+                init_expr: parts[1].clone(),
+                step_expr: parts.get(2).cloned(),
             })
         })
         .collect()
@@ -1769,7 +1961,8 @@ fn hygienize_list(
         };
     }
 
-    if matches!(head_name, Some("let")) && elements.len() >= 3 {
+    if matches!(head_name, Some("let") | Some("letrec") | Some("letrec*")) && elements.len() >= 3
+    {
         if let Some(bindings) = expr_list(&elements[1]) {
             let mut body_scope = scope.clone();
             let mut hygienic_bindings = Vec::new();
@@ -1794,7 +1987,7 @@ fn hygienize_list(
 
             if hygienic_bindings.len() == bindings.len() {
                 let mut hygienic = vec![
-                    plain_symbol_expr("let", elements[0].loc),
+                    plain_symbol_expr(head_name.expect("binding form name"), elements[0].loc),
                     Expr {
                         kind: ExprKind::List(hygienic_bindings),
                         loc: elements[1].loc,
@@ -1802,6 +1995,69 @@ fn hygienize_list(
                 ];
                 hygienic.extend(
                     elements[2..]
+                        .iter()
+                        .map(|element| hygienize_expr(element, &body_scope, definition_env, state)),
+                );
+
+                return Expr {
+                    kind: ExprKind::List(hygienic),
+                    loc,
+                };
+            }
+        }
+    }
+
+    if matches!(head_name, Some("do")) && elements.len() >= 3 {
+        if let (Some(bindings), Some(test_clause)) = (expr_list(&elements[1]), expr_list(&elements[2]))
+        {
+            let mut body_scope = scope.clone();
+            let mut hygienic_bindings = Vec::new();
+
+            for binding in bindings {
+                let Some(parts) = expr_list(binding) else {
+                    break;
+                };
+
+                if !(2..=3).contains(&parts.len()) {
+                    break;
+                }
+
+                let mut hygienic_parts = vec![
+                    hygienize_binding_identifier(&parts[0], &mut body_scope, state),
+                    hygienize_expr(&parts[1], scope, definition_env, state),
+                ];
+
+                if parts.len() == 3 {
+                    hygienic_parts.push(hygienize_expr(&parts[2], &body_scope, definition_env, state));
+                }
+
+                hygienic_bindings.push(Expr {
+                    kind: ExprKind::List(hygienic_parts),
+                    loc: binding.loc,
+                });
+            }
+
+            if hygienic_bindings.len() == bindings.len() {
+                let mut hygienic = vec![
+                    plain_symbol_expr("do", elements[0].loc),
+                    Expr {
+                        kind: ExprKind::List(hygienic_bindings),
+                        loc: elements[1].loc,
+                    },
+                    Expr {
+                        kind: ExprKind::List(
+                            test_clause
+                                .iter()
+                                .map(|element| {
+                                    hygienize_expr(element, &body_scope, definition_env, state)
+                                })
+                                .collect(),
+                        ),
+                        loc: elements[2].loc,
+                    },
+                ];
+                hygienic.extend(
+                    elements[3..]
                         .iter()
                         .map(|element| hygienize_expr(element, &body_scope, definition_env, state)),
                 );
@@ -1954,6 +2210,23 @@ fn expect_pair_arg(arg: &EvaluatedArg) -> Result<Rc<PairValue>, EvalError> {
     Ok(pair.clone())
 }
 
+fn expect_vector_arg(arg: &EvaluatedArg) -> Result<Rc<VectorValue>, EvalError> {
+    let Value::Vector(vector) = &arg.value else {
+        return Err(err_at(arg.expr.loc, "expected vector"));
+    };
+
+    Ok(vector.clone())
+}
+
+fn expect_nonnegative_integer(arg: &EvaluatedArg) -> Result<usize, EvalError> {
+    let value = expect_number(arg)?;
+    if value < 0.0 || value.fract() != 0.0 {
+        return Err(err_at(arg.expr.loc, "expected non-negative integer"));
+    }
+
+    Ok(value as usize)
+}
+
 fn expect_proper_list(value: &Value, loc: SourceLoc) -> Result<Vec<Value>, EvalError> {
     let mut elements = Vec::new();
     let mut current = value.clone();
@@ -2053,6 +2326,11 @@ fn builtin_lte(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError
     comparison_builtin("<=", args, loc, |left, right| left <= right)
 }
 
+fn builtin_zero_pred(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("zero?", args, loc, 1)?;
+    Ok(Value::Boolean(expect_number(&args[0])? == 0.0))
+}
+
 fn builtin_not(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
     expect_exact_args("not", args, loc, 1)?;
     Ok(Value::Boolean(!is_truthy(&args[0].value)))
@@ -2114,6 +2392,104 @@ fn builtin_append(args: &[EvaluatedArg], _loc: SourceLoc) -> Result<Value, EvalE
     }
 
     Ok(result)
+}
+
+fn builtin_eq(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("eq?", args, loc, 2)?;
+    Ok(Value::Boolean(is_eq(&args[0].value, &args[1].value)))
+}
+
+fn builtin_eqv(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("eqv?", args, loc, 2)?;
+    Ok(Value::Boolean(is_eqv(&args[0].value, &args[1].value)))
+}
+
+fn builtin_equal(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("equal?", args, loc, 2)?;
+    Ok(Value::Boolean(is_equal(&args[0].value, &args[1].value)))
+}
+
+fn builtin_vector(args: &[EvaluatedArg], _loc: SourceLoc) -> Result<Value, EvalError> {
+    Ok(Value::Vector(Rc::new(VectorValue {
+        elements: RefCell::new(args.iter().map(|arg| arg.value.clone()).collect()),
+    })))
+}
+
+fn builtin_make_vector(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(err_at(loc, "make-vector expects 1 or 2 arguments"));
+    }
+
+    let length = expect_nonnegative_integer(&args[0])?;
+    let fill = args
+        .get(1)
+        .map(|arg| arg.value.clone())
+        .unwrap_or(Value::Void);
+
+    Ok(Value::Vector(Rc::new(VectorValue {
+        elements: RefCell::new(vec![fill; length]),
+    })))
+}
+
+fn builtin_vector_ref(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("vector-ref", args, loc, 2)?;
+
+    let vector = expect_vector_arg(&args[0])?;
+    let index = expect_nonnegative_integer(&args[1])?;
+    let elements = vector.elements.borrow();
+    let Some(value) = elements.get(index) else {
+        return Err(err_at(args[1].expr.loc, "vector index out of bounds"));
+    };
+
+    Ok(value.clone())
+}
+
+fn builtin_vector_set(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("vector-set!", args, loc, 3)?;
+
+    let vector = expect_vector_arg(&args[0])?;
+    let index = expect_nonnegative_integer(&args[1])?;
+    let mut elements = vector.elements.borrow_mut();
+    let Some(slot) = elements.get_mut(index) else {
+        return Err(err_at(args[1].expr.loc, "vector index out of bounds"));
+    };
+
+    *slot = args[2].value.clone();
+    Ok(Value::Void)
+}
+
+fn builtin_vector_length(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("vector-length", args, loc, 1)?;
+
+    Ok(Value::Number(
+        expect_vector_arg(&args[0])?.elements.borrow().len() as f64,
+    ))
+}
+
+fn builtin_vector_pred(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("vector?", args, loc, 1)?;
+    Ok(Value::Boolean(matches!(args[0].value, Value::Vector(_))))
+}
+
+fn builtin_vector_to_list(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("vector->list", args, loc, 1)?;
+
+    Ok(make_list(
+        expect_vector_arg(&args[0])?
+            .elements
+            .borrow()
+            .iter()
+            .cloned()
+            .collect(),
+    ))
+}
+
+fn builtin_list_to_vector(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
+    expect_exact_args("list->vector", args, loc, 1)?;
+
+    Ok(Value::Vector(Rc::new(VectorValue {
+        elements: RefCell::new(expect_proper_list(&args[0].value, args[0].expr.loc)?),
+    })))
 }
 
 fn builtin_string_pred(args: &[EvaluatedArg], loc: SourceLoc) -> Result<Value, EvalError> {
@@ -2190,7 +2566,65 @@ fn is_special_form_name(name: &str) -> bool {
             | "begin"
             | "cond"
             | "let"
+            | "letrec"
+            | "letrec*"
+            | "case"
+            | "do"
     )
+}
+
+fn is_eq(left: &Value, right: &Value) -> bool {
+    is_eqv(left, right)
+}
+
+fn is_eqv(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
+        (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+        (Value::Void, Value::Void) => true,
+        (Value::Procedure(a), Value::Procedure(b)) => is_same_procedure(a, b),
+        (Value::Record(a), Value::Record(b)) => Rc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+fn is_same_procedure(left: &ProcedureValue, right: &ProcedureValue) -> bool {
+    match (left, right) {
+        (ProcedureValue::Builtin(a), ProcedureValue::Builtin(b)) => a.name == b.name,
+        (ProcedureValue::Closure(a), ProcedureValue::Closure(b)) => Rc::ptr_eq(a, b),
+        (ProcedureValue::Native(a), ProcedureValue::Native(b)) => Rc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+fn is_equal(left: &Value, right: &Value) -> bool {
+    if is_eqv(left, right) {
+        return true;
+    }
+
+    match (left, right) {
+        (Value::Pair(a), Value::Pair(b)) => {
+            is_equal(&a.car, &b.car) && is_equal(&a.cdr, &b.cdr)
+        }
+        (Value::Vector(a), Value::Vector(b)) => {
+            let left_elements = a.elements.borrow();
+            let right_elements = b.elements.borrow();
+
+            left_elements.len() == right_elements.len()
+                && left_elements
+                    .iter()
+                    .zip(right_elements.iter())
+                    .all(|(left, right)| is_equal(left, right))
+        }
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn is_truthy(value: &Value) -> bool {
@@ -2215,6 +2649,7 @@ fn format_value(value: &Value) -> String {
         Value::Symbol(value) => value.clone(),
         Value::EmptyList => "()".to_string(),
         Value::Pair(value) => format_pair(value),
+        Value::Vector(value) => format_vector(value),
         Value::Void => "#<void>".to_string(),
         Value::Procedure(_) => "#<procedure>".to_string(),
         Value::Record(_) => "#<record>".to_string(),
@@ -2235,6 +2670,18 @@ fn format_pair(value: &Rc<PairValue>) -> String {
             other => return format!("({} . {})", parts.join(" "), format_value(&other)),
         }
     }
+}
+
+fn format_vector(value: &Rc<VectorValue>) -> String {
+    let elements = value.elements.borrow();
+    format!(
+        "#({})",
+        elements
+            .iter()
+            .map(format_value)
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 fn format_number(value: f64) -> String {

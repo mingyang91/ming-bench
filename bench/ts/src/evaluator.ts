@@ -82,8 +82,18 @@ interface PairValue {
   cdr: Value;
 }
 
+interface VectorValue {
+  kind: 'vector';
+  elements: Value[];
+}
+
 interface VoidValue {
   kind: 'void';
+}
+
+interface UninitializedValue {
+  kind: 'uninitialized';
+  name: string;
 }
 
 interface RecordTypeDescriptor {
@@ -110,6 +120,12 @@ interface EvaluatedArg {
 interface LetBinding {
   name: SymbolExpr;
   valueExpr: Expr;
+}
+
+interface DoBinding {
+  name: SymbolExpr;
+  initExpr: Expr;
+  stepExpr?: Expr;
 }
 
 interface RecordFieldSpec {
@@ -170,8 +186,10 @@ type Value =
   | SchemeChar
   | EmptyListValue
   | PairValue
+  | VectorValue
   | RecordValue
   | VoidValue
+  | UninitializedValue
   | ProcedureValue;
 
 const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
@@ -225,7 +243,7 @@ class Environment {
   lookup(name: string, loc: SourceLoc): Value {
     const cell = this.lookupCell(name);
     if (cell !== undefined) {
-      return cell.value;
+      return readBindingCell(cell, name, loc);
     }
 
     throw new EvalError(`${loc.line}:${loc.col}: unbound variable ${name}`);
@@ -233,12 +251,12 @@ class Environment {
 
   lookupSymbol(symbol: SymbolExpr, loc: SourceLoc): Value {
     if (symbol.capturedCell !== undefined) {
-      return symbol.capturedCell.value;
+      return readBindingCell(symbol.capturedCell, symbol.value, loc);
     }
 
     const cell = this.lookupCell(symbolLookupName(symbol));
     if (cell !== undefined) {
-      return cell.value;
+      return readBindingCell(cell, symbol.value, loc);
     }
 
     throw new EvalError(`${loc.line}:${loc.col}: unbound variable ${symbol.value}`);
@@ -903,6 +921,14 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return isEq(args[0].value, args[1].value);
   }));
 
+  env.define('eqv?', builtin('eqv?', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: eqv? expects exactly 2 arguments`);
+    }
+
+    return isEqv(args[0].value, args[1].value);
+  }));
+
   env.define('equal?', builtin('equal?', (args, loc) => {
     if (args.length !== 2) {
       throw new EvalError(`${loc.line}:${loc.col}: equal? expects exactly 2 arguments`);
@@ -970,6 +996,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
   env.define('symbol?', predicateBuiltin('symbol?', isSchemeSymbolValue));
   env.define('char?', predicateBuiltin('char?', isSchemeCharValue));
   env.define('procedure?', predicateBuiltin('procedure?', isProcedure));
+  env.define('vector?', predicateBuiltin('vector?', isVectorValue));
   env.define('char-alphabetic?', predicateBuiltin('char-alphabetic?', (value) => (
     isSchemeCharValue(value) && isAlphabeticChar(value.value)
   )));
@@ -1216,6 +1243,84 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return VOID_VALUE;
   }));
 
+  env.define('vector', builtin('vector', (args) => ({
+    kind: 'vector',
+    elements: args.map((arg) => arg.value),
+  })));
+
+  env.define('make-vector', builtin('make-vector', (args, loc) => {
+    if (args.length !== 1 && args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: make-vector expects 1 or 2 arguments`);
+    }
+
+    const length = expectIndexArg(args[0]);
+    if (length < 0) {
+      throw new EvalError(`${args[0].expr.line}:${args[0].expr.col}: make-vector length out of bounds`);
+    }
+
+    const fill = args[1]?.value ?? VOID_VALUE;
+    return {
+      kind: 'vector',
+      elements: Array.from({ length }, () => fill),
+    };
+  }));
+
+  env.define('vector-ref', builtin('vector-ref', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: vector-ref expects exactly 2 arguments`);
+    }
+
+    const vector = expectVectorArg(args[0]);
+    const index = expectIndexArg(args[1]);
+    if (index < 0 || index >= vector.elements.length) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: vector-ref index out of bounds`);
+    }
+
+    return vector.elements[index];
+  }));
+
+  env.define('vector-set!', builtin('vector-set!', (args, loc) => {
+    if (args.length !== 3) {
+      throw new EvalError(`${loc.line}:${loc.col}: vector-set! expects exactly 3 arguments`);
+    }
+
+    const vector = expectVectorArg(args[0]);
+    const index = expectIndexArg(args[1]);
+    if (index < 0 || index >= vector.elements.length) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: vector-set! index out of bounds`);
+    }
+
+    vector.elements[index] = args[2].value;
+    return VOID_VALUE;
+  }));
+
+  env.define('vector-length', builtin('vector-length', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: vector-length expects exactly 1 argument`);
+    }
+
+    return makeExactNumber(expectVectorArg(args[0]).elements.length);
+  }));
+
+  env.define('vector->list', builtin('vector->list', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: vector->list expects exactly 1 argument`);
+    }
+
+    return makeList(expectVectorArg(args[0]).elements);
+  }));
+
+  env.define('list->vector', builtin('list->vector', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: list->vector expects exactly 1 argument`);
+    }
+
+    return {
+      kind: 'vector',
+      elements: expectProperList(args[0].value, args[0].expr),
+    };
+  }));
+
   return env;
 }
 
@@ -1318,6 +1423,14 @@ function evaluateList(expr: ListExpr, env: Environment, runtime: Runtime): Value
         return evalCond(args, head, env, runtime);
       case 'let':
         return evalLet(args, head, env, runtime);
+      case 'letrec':
+        return evalLetrec(args, head, env, runtime, false);
+      case 'letrec*':
+        return evalLetrec(args, head, env, runtime, true);
+      case 'case':
+        return evalCase(args, head, env, runtime);
+      case 'do':
+        return evalDo(args, head, env, runtime);
     }
   }
 
@@ -1505,8 +1618,8 @@ function evalSet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runt
 }
 
 function evalIf(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
-  if (args.length !== 3) {
-    throw new EvalError(`${head.line}:${head.col}: if expects exactly 3 arguments`);
+  if (args.length !== 2 && args.length !== 3) {
+    throw new EvalError(`${head.line}:${head.col}: if expects 2 or 3 arguments`);
   }
 
   const condition = evaluate(args[0], env, runtime);
@@ -1514,7 +1627,7 @@ function evalIf(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runti
     return evaluate(args[1], env, runtime);
   }
 
-  return evaluate(args[2], env, runtime);
+  return args[2] === undefined ? VOID_VALUE : evaluate(args[2], env, runtime);
 }
 
 function evalQuote(args: Expr[], head: SymbolExpr): Value {
@@ -1638,6 +1751,42 @@ function evalLet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runt
   return evaluateSequence(body, letEnv, runtime);
 }
 
+function evalLetrec(
+  args: Expr[],
+  head: SymbolExpr,
+  env: Environment,
+  runtime: Runtime,
+  sequential: boolean,
+): Value {
+  if (args.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: ${head.value} expects bindings and a body`);
+  }
+
+  const bindings = parseLetBindings(args[0], head);
+  const body = args.slice(1);
+  const letrecEnv = new Environment(env);
+
+  if (sequential) {
+    for (const binding of bindings) {
+      const cell: BindingCell = { value: makeUninitialized(binding.name.value) };
+      letrecEnv.defineCell(symbolLookupName(binding.name), cell);
+      cell.value = evaluate(binding.valueExpr, letrecEnv, runtime);
+    }
+  } else {
+    const cells = bindings.map((binding) => {
+      const cell: BindingCell = { value: makeUninitialized(binding.name.value) };
+      letrecEnv.defineCell(symbolLookupName(binding.name), cell);
+      return cell;
+    });
+
+    for (let index = 0; index < bindings.length; index += 1) {
+      cells[index].value = evaluate(bindings[index].valueExpr, letrecEnv, runtime);
+    }
+  }
+
+  return evaluateSequence(body, letrecEnv, runtime);
+}
+
 function evalNamedLet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
   if (args.length < 3) {
     throw new EvalError(`${head.line}:${head.col}: named let expects a name, bindings, and a body`);
@@ -1665,6 +1814,86 @@ function evalNamedLet(args: Expr[], head: SymbolExpr, env: Environment, runtime:
 
   letEnv.define(symbolLookupName(nameExpr), procedure);
   return applyProcedure(procedure, evaluatedArgs, nameExpr, runtime);
+}
+
+function evalCase(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
+  if (args.length < 1) {
+    throw new EvalError(`${head.line}:${head.col}: case expects a key and at least 1 clause`);
+  }
+
+  const key = evaluate(args[0], env, runtime);
+
+  for (let index = 1; index < args.length; index += 1) {
+    const clause = args[index];
+    if (clause.type !== 'list' || clause.elements.length === 0) {
+      throw new EvalError(`${head.line}:${head.col}: case clauses must be non-empty lists`);
+    }
+
+    const [datumExpr, ...body] = clause.elements;
+    const isElseClause = datumExpr.type === 'symbol' && datumExpr.value === 'else';
+
+    if (isElseClause) {
+      if (index !== args.length - 1) {
+        throw new EvalError(`${datumExpr.line}:${datumExpr.col}: else must be the last case clause`);
+      }
+
+      return evaluateSequence(body, env, runtime);
+    }
+
+    if (datumExpr.type !== 'list') {
+      throw new EvalError(`${datumExpr.line}:${datumExpr.col}: case datums must be a list`);
+    }
+
+    for (const datum of datumExpr.elements) {
+      if (isEqv(key, quoteExpr(datum))) {
+        return evaluateSequence(body, env, runtime);
+      }
+    }
+  }
+
+  return VOID_VALUE;
+}
+
+function evalDo(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
+  if (args.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: do expects bindings and a termination clause`);
+  }
+
+  const bindings = parseDoBindings(args[0], head);
+  const testClause = args[1];
+  if (testClause.type !== 'list' || testClause.elements.length === 0) {
+    throw new EvalError(`${head.line}:${head.col}: do termination clause must be a non-empty list`);
+  }
+
+  const [testExpr, ...resultExprs] = testClause.elements;
+  const body = args.slice(2);
+  const loopEnv = new Environment(env);
+  const cells = bindings.map((binding) => {
+    const cell: BindingCell = {
+      value: evaluate(binding.initExpr, env, runtime),
+    };
+    loopEnv.defineCell(symbolLookupName(binding.name), cell);
+    return { binding, cell };
+  });
+
+  while (true) {
+    if (isTruthy(evaluate(testExpr, loopEnv, runtime))) {
+      return resultExprs.length === 0 ? VOID_VALUE : evaluateSequence(resultExprs, loopEnv, runtime);
+    }
+
+    evaluateSequence(body, loopEnv, runtime);
+
+    const nextValues = cells.map(({ binding }) => (
+      binding.stepExpr === undefined ? undefined : evaluate(binding.stepExpr, loopEnv, runtime)
+    ));
+
+    for (let index = 0; index < cells.length; index += 1) {
+      const nextValue = nextValues[index];
+      if (nextValue !== undefined) {
+        cells[index].cell.value = nextValue;
+      }
+    }
+  }
 }
 
 function applyProcedure(
@@ -1743,6 +1972,28 @@ function parseLetBindings(expr: Expr, head: SymbolExpr): LetBinding[] {
     }
 
     return { name: nameExpr, valueExpr };
+  });
+}
+
+function parseDoBindings(expr: Expr, head: SymbolExpr): DoBinding[] {
+  if (expr.type !== 'list') {
+    throw new EvalError(`${expr.line}:${expr.col}: do bindings must be a list`);
+  }
+
+  return expr.elements.map((bindingExpr) => {
+    if (
+      bindingExpr.type !== 'list'
+      || (bindingExpr.elements.length !== 2 && bindingExpr.elements.length !== 3)
+    ) {
+      throw new EvalError(`${head.line}:${head.col}: do bindings must have 2 or 3 parts`);
+    }
+
+    const [nameExpr, initExpr, stepExpr] = bindingExpr.elements;
+    if (nameExpr.type !== 'symbol' || nameExpr.capturedCell !== undefined) {
+      throw new EvalError(`${nameExpr.line}:${nameExpr.col}: do binding name must be a symbol`);
+    }
+
+    return { name: nameExpr, initExpr, stepExpr };
   });
 }
 
@@ -2249,10 +2500,72 @@ function hygienizeList(
     };
   }
 
-  if (headName === 'let' && expr.elements.length >= 3) {
+  if (
+    (headName === 'let' || headName === 'letrec' || headName === 'letrec*')
+    && expr.elements.length >= 3
+  ) {
     if (expr.elements[1].type === 'list') {
       const bodyScope = new Map(scope);
       const bindings: Expr[] = [];
+      const recursiveBindings = headName === 'letrec' || headName === 'letrec*';
+
+      if (recursiveBindings) {
+        for (const binding of expr.elements[1].elements) {
+          if (binding.type !== 'list' || binding.elements.length !== 2) {
+            return {
+              type: 'list',
+              elements: expr.elements.map((element) => (
+                hygienizeExpr(element, scope, definitionEnv, runtime)
+              )),
+              line: expr.line,
+              col: expr.col,
+            };
+          }
+
+          bindings.push({
+            type: 'list',
+            elements: [
+              hygienizeBindingIdentifier(binding.elements[0], bodyScope, runtime),
+              binding.elements[1],
+            ],
+            line: binding.line,
+            col: binding.col,
+          });
+        }
+
+        const rewrittenBindings = bindings.map((binding): Expr => ({
+          type: 'list',
+          elements: [
+            binding.type === 'list' ? binding.elements[0] : binding,
+            hygienizeExpr(
+              binding.type === 'list' ? binding.elements[1] : binding,
+              bodyScope,
+              definitionEnv,
+              runtime,
+            ),
+          ],
+          line: binding.line,
+          col: binding.col,
+        }));
+
+        return {
+          type: 'list',
+          elements: [
+            plainSymbolExpr(headName, expr.elements[0]),
+            {
+              type: 'list',
+              elements: rewrittenBindings,
+              line: expr.elements[1].line,
+              col: expr.elements[1].col,
+            },
+            ...expr.elements.slice(2).map((element) => (
+              hygienizeExpr(element, bodyScope, definitionEnv, runtime)
+            )),
+          ],
+          line: expr.line,
+          col: expr.col,
+        };
+      }
 
       for (const binding of expr.elements[1].elements) {
         if (binding.type !== 'list' || binding.elements.length !== 2) {
@@ -2280,7 +2593,7 @@ function hygienizeList(
       return {
         type: 'list',
         elements: [
-          plainSymbolExpr('let', expr.elements[0]),
+          plainSymbolExpr(headName, expr.elements[0]),
           {
             type: 'list',
             elements: bindings,
@@ -2460,6 +2773,10 @@ function isSpecialFormName(name: string): boolean {
     'begin',
     'cond',
     'let',
+    'letrec',
+    'letrec*',
+    'case',
+    'do',
   ].includes(name);
 }
 
@@ -2540,6 +2857,14 @@ function expectCharArg(arg: EvaluatedArg): SchemeChar {
   return arg.value;
 }
 
+function expectVectorArg(arg: EvaluatedArg): VectorValue {
+  if (!isVectorValue(arg.value)) {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected vector`);
+  }
+
+  return arg.value;
+}
+
 function expectProperList(value: Value, loc: SourceLoc): Value[] {
   const elements: Value[] = [];
   let current = value;
@@ -2562,6 +2887,10 @@ function expectRecordOfType(arg: EvaluatedArg, recordType: RecordTypeDescriptor)
   }
 
   return arg.value;
+}
+
+function isEqv(left: Value, right: Value): boolean {
+  return isEq(left, right);
 }
 
 function isEq(left: Value, right: Value): boolean {
@@ -2597,6 +2926,10 @@ function isEq(left: Value, right: Value): boolean {
     return left === right;
   }
 
+  if (isVectorValue(left) && isVectorValue(right)) {
+    return left === right;
+  }
+
   if (isProcedure(left) && isProcedure(right)) {
     return left === right;
   }
@@ -2605,7 +2938,7 @@ function isEq(left: Value, right: Value): boolean {
     return left === right;
   }
 
-  return left.kind === 'void' && right.kind === 'void';
+  return isVoidValue(left) && isVoidValue(right);
 }
 
 function isEqual(left: Value, right: Value): boolean {
@@ -2641,6 +2974,11 @@ function isEqual(left: Value, right: Value): boolean {
     return isEqual(left.car, right.car) && isEqual(left.cdr, right.cdr);
   }
 
+  if (isVectorValue(left) && isVectorValue(right)) {
+    return left.elements.length === right.elements.length
+      && left.elements.every((element, index) => isEqual(element, right.elements[index]));
+  }
+
   if (isProcedure(left) && isProcedure(right)) {
     return left === right;
   }
@@ -2649,7 +2987,7 @@ function isEqual(left: Value, right: Value): boolean {
     return left === right;
   }
 
-  return left.kind === 'void' && right.kind === 'void';
+  return isVoidValue(left) && isVoidValue(right);
 }
 
 function isProperList(value: Value): boolean {
@@ -2690,12 +3028,24 @@ function isPair(value: Value): value is PairValue {
   return typeof value === 'object' && value !== null && value.kind === 'pair';
 }
 
+function isVectorValue(value: Value): value is VectorValue {
+  return typeof value === 'object' && value !== null && value.kind === 'vector';
+}
+
 function isRecordValue(value: Value): value is RecordValue {
   return typeof value === 'object' && value !== null && value.kind === 'record';
 }
 
 function isEmptyList(value: Value): value is EmptyListValue {
   return typeof value === 'object' && value !== null && value.kind === 'empty-list';
+}
+
+function isVoidValue(value: Value): value is VoidValue {
+  return typeof value === 'object' && value !== null && value.kind === 'void';
+}
+
+function isUninitializedValue(value: Value): value is UninitializedValue {
+  return typeof value === 'object' && value !== null && value.kind === 'uninitialized';
 }
 
 function isSchemeStringValue(value: Value): value is SchemeString {
@@ -2756,6 +3106,10 @@ function makeString(value: string, mutable = true): SchemeString {
   return { kind: 'string', chars: Array.from(value), mutable };
 }
 
+function makeUninitialized(name: string): UninitializedValue {
+  return { kind: 'uninitialized', name };
+}
+
 function schemeStringText(value: SchemeString): string {
   return value.chars.join('');
 }
@@ -2780,10 +3134,14 @@ function formatValue(value: Value): string {
       return '()';
     case 'pair':
       return formatPair(value);
+    case 'vector':
+      return formatVector(value, formatValue);
     case 'record':
       return `#<record ${value.recordType.name}>`;
     case 'void':
       return '#<void>';
+    case 'uninitialized':
+      return `#<uninitialized ${value.name}>`;
     case 'procedure':
       return '#<procedure>';
   }
@@ -2805,13 +3163,24 @@ function formatDisplayValue(value: Value): string {
       return '()';
     case 'pair':
       return formatDisplayPair(value);
+    case 'vector':
+      return formatVector(value, formatDisplayValue);
     case 'record':
       return `#<record ${value.recordType.name}>`;
     case 'void':
       return '#<void>';
+    case 'uninitialized':
+      return `#<uninitialized ${value.name}>`;
     case 'procedure':
       return '#<procedure>';
   }
+}
+
+function formatVector(
+  value: VectorValue,
+  formatter: (value: Value) => string,
+): string {
+  return `#(${value.elements.map(formatter).join(' ')})`;
 }
 
 function formatPair(value: PairValue): string {
@@ -2844,6 +3213,14 @@ function formatDisplayPair(value: PairValue): string {
   }
 
   return `(${parts.join(' ')} . ${formatDisplayValue(tail)})`;
+}
+
+function readBindingCell(cell: BindingCell, name: string, loc: SourceLoc): Value {
+  if (isUninitializedValue(cell.value)) {
+    throw new EvalError(`${loc.line}:${loc.col}: uninitialized variable ${name}`);
+  }
+
+  return cell.value;
 }
 
 function makeExactNumber(numerator: number, denominator = 1): ExactNumberValue {
