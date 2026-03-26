@@ -38,7 +38,9 @@ public class Evaluator {
                 "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
                 "char=?", "char<?",
                 "string=?", "string<?", "string-ci=?",
-                "string-upcase", "string-downcase"}) {
+                "string-upcase", "string-downcase",
+                "exact?", "inexact?", "exact->inexact", "inexact->exact",
+                "numerator", "denominator", "integer?", "rational?"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
     }
@@ -79,6 +81,40 @@ public class Evaluator {
     static final class SchemeChar {
         final char value;
         SchemeChar(char value) { this.value = value; }
+    }
+
+    static final class SchemeRational {
+        final long numer;
+        final long denom;
+        SchemeRational(long numer, long denom) {
+            this.numer = numer;
+            this.denom = denom;
+        }
+        double toDouble() { return (double) numer / denom; }
+    }
+
+    static long gcd(long a, long b) {
+        a = Math.abs(a); b = Math.abs(b);
+        while (b != 0) { long t = b; b = a % b; a = t; }
+        return a;
+    }
+
+    static Object makeRational(long numer, long denom) {
+        if (denom < 0) { numer = -numer; denom = -denom; }
+        long g = gcd(numer, denom);
+        numer /= g; denom /= g;
+        if (denom == 1) return numer;
+        return new SchemeRational(numer, denom);
+    }
+
+    static Object doubleToExact(double d) {
+        if (d == Math.floor(d) && !Double.isInfinite(d)) return (long) d;
+        long denom = 1;
+        double val = d;
+        while (val != Math.floor(val) && denom <= (1L << 53)) {
+            val *= 2; denom *= 2;
+        }
+        return makeRational(Math.round(val), denom);
     }
 
     static final class Pair {
@@ -283,6 +319,17 @@ public class Evaluator {
             return new SchemeString(s);
         }
         try { return Long.parseLong(token); } catch (NumberFormatException ignored) {}
+        // Rational literal: digits/digits
+        int slashIdx = token.indexOf('/');
+        if (slashIdx > 0 && slashIdx < token.length() - 1) {
+            try {
+                long numer = Long.parseLong(token.substring(0, slashIdx));
+                long denom = Long.parseLong(token.substring(slashIdx + 1));
+                if (denom != 0) return makeRational(numer, denom);
+            } catch (NumberFormatException ignored) {}
+        }
+        // Float literal
+        try { return Double.parseDouble(token); } catch (NumberFormatException ignored) {}
         return token; // symbol
     }
 
@@ -303,7 +350,7 @@ public class Evaluator {
             expr = loc.datum;
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
+        if (expr instanceof Long || expr instanceof Double || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar || expr instanceof SchemeRational) {
             return expr;
         }
         if (expr instanceof ResolvedRef ref) {
@@ -602,7 +649,7 @@ public class Evaluator {
 
     boolean schemeEqual(Object a, Object b) {
         if (a == b) return true;
-        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (isNumber(a) && isNumber(b)) return numToDouble(a) == numToDouble(b);
         if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
         if (a instanceof String && b instanceof String) return a.equals(b);
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value.equals(sb.value);
@@ -612,6 +659,17 @@ public class Evaluator {
             return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
         }
         return false;
+    }
+
+    boolean isNumber(Object val) {
+        return val instanceof Long || val instanceof Double || val instanceof SchemeRational;
+    }
+
+    double numToDouble(Object val) {
+        if (val instanceof Long l) return l.doubleValue();
+        if (val instanceof Double d) return d;
+        if (val instanceof SchemeRational r) return r.toDouble();
+        return 0;
     }
 
     // ---- Output formatting ----
@@ -628,6 +686,8 @@ public class Evaluator {
         if (val == null) return ""; // void
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
+        if (val instanceof Double d) return Double.toString(d);
+        if (val instanceof SchemeRational r) return r.numer + "/" + r.denom;
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value + "\"";
         if (val instanceof SchemeChar c) {

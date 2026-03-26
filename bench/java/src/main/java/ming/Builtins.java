@@ -58,6 +58,11 @@ final class Builtins {
                  "char=?", "char<?" ->
                 applyChar(name, args);
 
+            // Exact/inexact
+            case "exact?", "inexact?", "exact->inexact", "inexact->exact",
+                 "numerator", "denominator", "integer?", "rational?" ->
+                applyExact(name, args);
+
             // Higher-order
             case "apply" -> applyApply(args);
             case "map" -> applyMap(args);
@@ -72,33 +77,91 @@ final class Builtins {
     private Object applyArithmetic(String name, List<Object> args) throws EvalError {
         return switch (name) {
             case "+" -> {
-                long sum = 0;
-                for (Object a : args) sum += requireLong(a, "+");
-                yield sum;
+                for (Object a : args) requireNumber(a, "+");
+                if (hasInexact(args)) {
+                    double sum = 0;
+                    for (Object a : args) sum += toDouble(a);
+                    yield sum;
+                }
+                long rn = 0, rd = 1;
+                for (Object a : args) {
+                    long[] e = toExact(a);
+                    rn = rn * e[1] + e[0] * rd;
+                    rd = rd * e[1];
+                    long g = Evaluator.gcd(rn, rd); rn /= g; rd /= g;
+                }
+                yield Evaluator.makeRational(rn, rd);
             }
             case "-" -> {
                 if (args.isEmpty()) throw evaluator.posError("-: need at least 1 argument");
-                if (args.size() == 1) yield -requireLong(args.get(0), "-");
-                long result = requireLong(args.get(0), "-");
-                for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i), "-");
-                yield result;
+                for (Object a : args) requireNumber(a, "-");
+                if (hasInexact(args)) {
+                    double result = toDouble(args.get(0));
+                    if (args.size() == 1) yield -result;
+                    for (int i = 1; i < args.size(); i++) result -= toDouble(args.get(i));
+                    yield result;
+                }
+                long[] first = toExact(args.get(0));
+                long rn = first[0], rd = first[1];
+                if (args.size() == 1) yield Evaluator.makeRational(-rn, rd);
+                for (int i = 1; i < args.size(); i++) {
+                    long[] e = toExact(args.get(i));
+                    rn = rn * e[1] - e[0] * rd;
+                    rd = rd * e[1];
+                    long g = Evaluator.gcd(rn, rd); rn /= g; rd /= g;
+                }
+                yield Evaluator.makeRational(rn, rd);
             }
             case "*" -> {
-                long product = 1;
-                for (Object a : args) product *= requireLong(a, "*");
-                yield product;
+                for (Object a : args) requireNumber(a, "*");
+                if (hasInexact(args)) {
+                    double product = 1;
+                    for (Object a : args) product *= toDouble(a);
+                    yield product;
+                }
+                long rn = 1, rd = 1;
+                for (Object a : args) {
+                    long[] e = toExact(a);
+                    rn *= e[0]; rd *= e[1];
+                    long g = Evaluator.gcd(rn, rd); rn /= g; rd /= g;
+                }
+                yield Evaluator.makeRational(rn, rd);
             }
             case "/" -> {
                 if (args.isEmpty()) throw evaluator.posError("/: need at least 1 argument");
-                long result = requireLong(args.get(0), "/");
-                for (int i = 1; i < args.size(); i++) {
-                    long divisor = requireLong(args.get(i), "/");
-                    if (divisor == 0) throw evaluator.posError("division by zero");
-                    result /= divisor;
+                for (Object a : args) requireNumber(a, "/");
+                if (hasInexact(args)) {
+                    double result = toDouble(args.get(0));
+                    if (args.size() == 1) { if (result == 0) throw evaluator.posError("division by zero"); yield 1.0 / result; }
+                    for (int i = 1; i < args.size(); i++) {
+                        double d = toDouble(args.get(i));
+                        if (d == 0) throw evaluator.posError("division by zero");
+                        result /= d;
+                    }
+                    yield result;
                 }
-                yield result;
+                long[] first = toExact(args.get(0));
+                long rn = first[0], rd = first[1];
+                if (args.size() == 1) {
+                    if (rn == 0) throw evaluator.posError("division by zero");
+                    yield Evaluator.makeRational(rd, rn);
+                }
+                for (int i = 1; i < args.size(); i++) {
+                    long[] e = toExact(args.get(i));
+                    if (e[0] == 0) throw evaluator.posError("division by zero");
+                    rn *= e[1]; rd *= e[0];
+                    long g = Evaluator.gcd(rn, rd); rn /= g; rd /= g;
+                }
+                yield Evaluator.makeRational(rn, rd);
             }
-            case "abs" -> { requireArgCount(args, 1, "abs"); yield Math.abs(requireLong(args.get(0), "abs")); }
+            case "abs" -> {
+                requireArgCount(args, 1, "abs");
+                Object a = requireNumber(args.get(0), "abs");
+                if (a instanceof Long l) yield Math.abs(l);
+                if (a instanceof Double d) yield Math.abs(d);
+                var r = (Evaluator.SchemeRational) a;
+                yield Evaluator.makeRational(Math.abs(r.numer), r.denom);
+            }
             case "modulo" -> {
                 requireArgCount(args, 2, "modulo");
                 long a = requireLong(args.get(0), "modulo"), b = requireLong(args.get(1), "modulo");
@@ -119,14 +182,20 @@ final class Builtins {
             }
             case "min" -> {
                 if (args.isEmpty()) throw evaluator.posError("min: need at least 1 argument");
-                long result = requireLong(args.get(0), "min");
-                for (int i = 1; i < args.size(); i++) { long v = requireLong(args.get(i), "min"); if (v < result) result = v; }
+                Object result = requireNumber(args.get(0), "min");
+                for (int i = 1; i < args.size(); i++) {
+                    Object v = requireNumber(args.get(i), "min");
+                    if (toDouble(v) < toDouble(result)) result = v;
+                }
                 yield result;
             }
             case "max" -> {
                 if (args.isEmpty()) throw evaluator.posError("max: need at least 1 argument");
-                long result = requireLong(args.get(0), "max");
-                for (int i = 1; i < args.size(); i++) { long v = requireLong(args.get(i), "max"); if (v > result) result = v; }
+                Object result = requireNumber(args.get(0), "max");
+                for (int i = 1; i < args.size(); i++) {
+                    Object v = requireNumber(args.get(i), "max");
+                    if (toDouble(v) > toDouble(result)) result = v;
+                }
                 yield result;
             }
             case "expt" -> {
@@ -144,13 +213,12 @@ final class Builtins {
 
     private Object applyNumericPredicate(String name, List<Object> args) throws EvalError {
         requireArgCount(args, 1, name);
-        long val = requireLong(args.get(0), name);
         return switch (name) {
-            case "zero?" -> val == 0;
-            case "positive?" -> val > 0;
-            case "negative?" -> val < 0;
-            case "odd?" -> val % 2 != 0;
-            case "even?" -> val % 2 == 0;
+            case "zero?" -> { requireNumber(args.get(0), name); yield toDouble(args.get(0)) == 0; }
+            case "positive?" -> { requireNumber(args.get(0), name); yield toDouble(args.get(0)) > 0; }
+            case "negative?" -> { requireNumber(args.get(0), name); yield toDouble(args.get(0)) < 0; }
+            case "odd?" -> { long v = requireLong(args.get(0), "odd?"); yield v % 2 != 0; }
+            case "even?" -> { long v = requireLong(args.get(0), "even?"); yield v % 2 == 0; }
             default -> throw evaluator.posError("unknown predicate: " + name);
         };
     }
@@ -159,7 +227,9 @@ final class Builtins {
 
     private Object applyComparison(String name, List<Object> args) throws EvalError {
         requireArgCount(args, 2, name);
-        long a = requireLong(args.get(0), name), b = requireLong(args.get(1), name);
+        requireNumber(args.get(0), name);
+        requireNumber(args.get(1), name);
+        double a = toDouble(args.get(0)), b = toDouble(args.get(1));
         return switch (name) {
             case "<" -> a < b;
             case ">" -> a > b;
@@ -188,7 +258,7 @@ final class Builtins {
         Object val = args.get(0);
         return switch (name) {
             case "string?" -> val instanceof Evaluator.SchemeString;
-            case "number?" -> val instanceof Long;
+            case "number?" -> val instanceof Long || val instanceof Double || val instanceof Evaluator.SchemeRational;
             case "boolean?" -> val instanceof Boolean;
             case "pair?" -> val instanceof Evaluator.Pair;
             case "symbol?" -> val instanceof String;
@@ -323,7 +393,8 @@ final class Builtins {
             }
             case "number->string" -> {
                 requireArgCount(args, 1, "number->string");
-                yield new Evaluator.SchemeString(String.valueOf(requireLong(args.get(0), "number->string")));
+                requireNumber(args.get(0), "number->string");
+                yield new Evaluator.SchemeString(evaluator.schemeToString(args.get(0)));
             }
             case "symbol->string" -> {
                 requireArgCount(args, 1, "symbol->string");
@@ -487,11 +558,70 @@ final class Builtins {
         return null;
     }
 
+    // ---- Exact/Inexact ----
+
+    private Object applyExact(String name, List<Object> args) throws EvalError {
+        requireArgCount(args, 1, name);
+        Object val = args.get(0);
+        return switch (name) {
+            case "exact?" -> val instanceof Long || val instanceof Evaluator.SchemeRational;
+            case "inexact?" -> val instanceof Double;
+            case "exact->inexact" -> {
+                requireNumber(val, name);
+                yield toDouble(val);
+            }
+            case "inexact->exact" -> {
+                requireNumber(val, name);
+                if (val instanceof Long) yield val;
+                if (val instanceof Evaluator.SchemeRational) yield val;
+                yield Evaluator.doubleToExact((Double) val);
+            }
+            case "numerator" -> {
+                requireNumber(val, name);
+                if (val instanceof Long l) yield l;
+                if (val instanceof Evaluator.SchemeRational r) yield r.numer;
+                throw evaluator.posError("numerator: expected exact number");
+            }
+            case "denominator" -> {
+                requireNumber(val, name);
+                if (val instanceof Long) yield 1L;
+                if (val instanceof Evaluator.SchemeRational r) yield r.denom;
+                throw evaluator.posError("denominator: expected exact number");
+            }
+            case "integer?" -> val instanceof Long;
+            case "rational?" -> val instanceof Long || val instanceof Evaluator.SchemeRational;
+            default -> throw evaluator.posError("unknown exact op: " + name);
+        };
+    }
+
     // ---- Helpers ----
+
+    private Object requireNumber(Object val, String context) throws EvalError {
+        if (val instanceof Long || val instanceof Double || val instanceof Evaluator.SchemeRational) return val;
+        throw evaluator.posError(context + ": expected number, got " + evaluator.schemeToString(val));
+    }
 
     private long requireLong(Object val, String context) throws EvalError {
         if (val instanceof Long l) return l;
-        throw evaluator.posError(context + ": expected number, got " + evaluator.schemeToString(val));
+        throw evaluator.posError(context + ": expected integer, got " + evaluator.schemeToString(val));
+    }
+
+    private boolean hasInexact(List<Object> args) {
+        for (Object a : args) if (a instanceof Double) return true;
+        return false;
+    }
+
+    private double toDouble(Object val) {
+        if (val instanceof Long l) return l.doubleValue();
+        if (val instanceof Double d) return d;
+        if (val instanceof Evaluator.SchemeRational r) return r.toDouble();
+        return 0;
+    }
+
+    private long[] toExact(Object val) {
+        if (val instanceof Long l) return new long[]{l, 1};
+        if (val instanceof Evaluator.SchemeRational r) return new long[]{r.numer, r.denom};
+        return new long[]{0, 1};
     }
 
     private void requireArgCount(List<Object> args, int expected, String name) throws EvalError {
