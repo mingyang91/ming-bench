@@ -1,6 +1,6 @@
 use super::{
-    list_from_values, list_to_vec, make_pair, make_string, Env, EnvRef, EvalContext, EvalError,
-    NativeFunc, Value,
+    apply_procedure, list_from_values, list_to_vec, make_pair, make_string, Env, EnvRef,
+    EvalContext, EvalError, NativeFunc, Value,
 };
 
 pub(super) fn default_env() -> EnvRef {
@@ -41,6 +41,7 @@ pub(super) fn default_env() -> EnvRef {
         ("char?", native_char_pred as NativeFunc),
         ("pair?", native_pair_pred as NativeFunc),
         ("symbol?", native_symbol_pred as NativeFunc),
+        ("apply", native_apply as NativeFunc),
     ] {
         env.define(name.to_string(), Value::NativeProc { name, func });
     }
@@ -379,6 +380,25 @@ fn native_symbol_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalEr
     native_predicate("symbol?", args, ctx, |value| {
         matches!(value, Value::Symbol(_))
     })
+}
+
+fn native_apply(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "apply",
+            expected: "at least 2",
+            got: args.len(),
+        });
+    }
+
+    let mut expanded = Vec::with_capacity(args.len().saturating_sub(2));
+    expanded.extend(args[1..args.len() - 1].iter().cloned());
+    expanded.extend(list_to_vec(
+        args.last().expect("apply requires a final list"),
+        "apply",
+    )?);
+
+    apply_procedure(args[0].clone(), &expanded, ctx)
 }
 
 fn native_predicate<F>(

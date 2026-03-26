@@ -98,6 +98,7 @@ struct PairCell {
 
 struct Closure {
     params: Vec<String>,
+    rest_param: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
 }
@@ -260,7 +261,9 @@ impl Env {
 
 impl Closure {
     fn call(&self, args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
-        if args.len() != self.params.len() {
+        if args.len() < self.params.len()
+            || (self.rest_param.is_none() && args.len() != self.params.len())
+        {
             return Err(EvalError::WrongArgCount {
                 name: "lambda",
                 expected: "the declared arity",
@@ -271,6 +274,13 @@ impl Closure {
         let frame = Env::new(Some(self.env.clone()));
         for (name, value) in self.params.iter().zip(args.iter()) {
             frame.define(name.clone(), value.clone());
+        }
+
+        if let Some(name) = &self.rest_param {
+            frame.define(
+                name.clone(),
+                list_from_values(args[self.params.len()..].to_vec()),
+            );
         }
 
         eval_sequence(&self.body, frame, ctx)
@@ -626,7 +636,7 @@ fn eval_list(
 
     let procedure = eval(head, env.clone(), ctx)?;
     let args = eval_args(tail, env, ctx)?;
-    apply(procedure, &args, ctx).map_err(|err| err.with_position(head.pos))
+    apply_procedure(procedure, &args, ctx).map_err(|err| err.with_position(head.pos))
 }
 
 fn eval_define(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -670,9 +680,10 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, E
                 });
             }
 
-            let params = parse_param_slice(params_exprs)?;
+            let (params, rest_param) = parse_param_slice(params_exprs)?;
             let closure = Value::Closure(Rc::new(Closure {
                 params,
+                rest_param,
                 body: args[1..].to_vec(),
                 env: env.clone(),
             }));
@@ -743,9 +754,10 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         });
     }
 
-    let params = parse_param_list(&args[0])?;
+    let (params, rest_param) = parse_param_list(&args[0])?;
     Ok(Value::Closure(Rc::new(Closure {
         params,
+        rest_param,
         body: args[1..].to_vec(),
         env,
     })))
@@ -870,12 +882,13 @@ fn eval_named_let(
     let frame = Env::new(Some(env));
     let closure = Value::Closure(Rc::new(Closure {
         params,
+        rest_param: None,
         body: args[1..].to_vec(),
         env: frame.clone(),
     }));
 
     frame.define(name.to_string(), closure.clone());
-    apply(closure, &values, ctx)
+    apply_procedure(closure, &values, ctx)
 }
 
 fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -931,7 +944,11 @@ fn eval_args(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Vec<Value>
     Ok(values)
 }
 
-fn apply(procedure: Value, args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+fn apply_procedure(
+    procedure: Value,
+    args: &[Value],
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
     match procedure {
         Value::NativeProc { func, .. } => func(args, ctx),
         Value::Closure(closure) => closure.call(args, ctx),
@@ -941,26 +958,49 @@ fn apply(procedure: Value, args: &[Value], ctx: &EvalContext) -> Result<Value, E
     }
 }
 
-fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
+fn parse_param_list(expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
     match &expr.kind {
         ExprKind::List(items) => parse_param_slice(items),
+        ExprKind::Symbol(name) => Ok((Vec::new(), Some(name.clone()))),
         _ => Err(EvalError::InvalidSyntax {
-            message: "lambda parameters must be a list".to_string(),
+            message: "lambda parameters must be a list or symbol".to_string(),
         }),
     }
 }
 
-fn parse_param_slice(items: &[Expr]) -> Result<Vec<String>, EvalError> {
+fn parse_param_slice(items: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
     let mut params = Vec::with_capacity(items.len());
-    for item in items {
+    let mut index = 0;
+    while let Some(item) = items.get(index) {
         let ExprKind::Symbol(name) = &item.kind else {
             return Err(EvalError::InvalidSyntax {
                 message: "parameter names must be symbols".to_string(),
             });
         };
+
+        if name == "." {
+            let Some(rest_expr) = items.get(index + 1) else {
+                return Err(EvalError::InvalidSyntax {
+                    message: "rest parameter dot must be followed by a name".to_string(),
+                });
+            };
+            let ExprKind::Symbol(rest_name) = &rest_expr.kind else {
+                return Err(EvalError::InvalidSyntax {
+                    message: "rest parameter name must be a symbol".to_string(),
+                });
+            };
+            if index + 2 != items.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "rest parameter must be the final parameter".to_string(),
+                });
+            }
+            return Ok((params, Some(rest_name.clone())));
+        }
+
         params.push(name.clone());
+        index += 1;
     }
-    Ok(params)
+    Ok((params, None))
 }
 
 fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
