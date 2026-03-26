@@ -7,6 +7,30 @@ final class ContinuationEvaluator {
     private record Binding(String name, Expr valueExpression) {
     }
 
+    static final class WindFrame {
+        private final WindFrame parent;
+        private final Value inThunk;
+        private final Value outThunk;
+
+        private WindFrame(WindFrame parent, Value inThunk, Value outThunk) {
+            this.parent = parent;
+            this.inThunk = inThunk;
+            this.outThunk = outThunk;
+        }
+
+        WindFrame parent() {
+            return parent;
+        }
+
+        Value inThunk() {
+            return inThunk;
+        }
+
+        Value outThunk() {
+            return outThunk;
+        }
+    }
+
     private sealed interface MachineState permits EvalExprState, ReturnValueState, DoneState {
     }
 
@@ -24,6 +48,7 @@ final class ContinuationEvaluator {
     private final Evaluator owner;
     private final Environment globalEnvironment;
     private final CallCcProcedureValue callCcProcedure = new CallCcProcedureValue();
+    private WindFrame activeWinds;
 
     ContinuationEvaluator(Evaluator owner) {
         this.owner = owner;
@@ -44,7 +69,8 @@ final class ContinuationEvaluator {
     private static boolean referencesContinuations(Expr expression) {
         if (expression instanceof SymbolExpr symbolExpr) {
             return "call/cc".equals(symbolExpr.name())
-                    || "call-with-current-continuation".equals(symbolExpr.name());
+                    || "call-with-current-continuation".equals(symbolExpr.name())
+                    || "dynamic-wind".equals(symbolExpr.name());
         }
         if (expression instanceof ListExpr listExpr) {
             for (Expr element : listExpr.elements()) {
@@ -60,6 +86,7 @@ final class ContinuationEvaluator {
         if (expressions.isEmpty()) {
             throw new EvalError("expected at least one expression");
         }
+        activeWinds = null;
         return run(evaluateSequence(expressions, globalEnvironment, HaltKont.INSTANCE));
     }
 
@@ -125,6 +152,8 @@ final class ContinuationEvaluator {
                 case "let" -> evalLet(arguments, environment, continuation, listExpr.line(), listExpr.column());
                 case "and" -> evalAnd(arguments, environment, continuation);
                 case "or" -> evalOr(arguments, environment, continuation);
+                case "dynamic-wind" ->
+                        evalDynamicWind(arguments, environment, continuation, listExpr.line(), listExpr.column());
                 default -> evalApplication(
                         operatorExpression,
                         arguments,
@@ -154,6 +183,114 @@ final class ContinuationEvaluator {
                 operatorExpression,
                 environment,
                 new ApplyOperatorKont(arguments, environment, continuation, line, column));
+    }
+
+    private MachineState evalDynamicWind(List<Expr> arguments,
+                                         Environment environment,
+                                         Kont continuation,
+                                         int line,
+                                         int column) throws EvalError {
+        requireExactArity("dynamic-wind", arguments.size(), 3);
+        return new EvalExprState(
+                arguments.getFirst(),
+                environment,
+                new DynamicWindInExprKont(arguments.get(1), arguments.get(2), environment, continuation, line, column));
+    }
+
+    private MachineState applyThunk(Value thunk,
+                                    Kont continuation,
+                                    int line,
+                                    int column) throws EvalError {
+        return applyProcedure(thunk, List.of(), continuation, line, column);
+    }
+
+    private MachineState continueWindTransition(Value value,
+                                                List<WindFrame> exitFrames,
+                                                List<WindFrame> enterFrames,
+                                                Kont targetContinuation,
+                                                WindFrame targetWinds,
+                                                int line,
+                                                int column) throws EvalError {
+        if (!exitFrames.isEmpty()) {
+            WindFrame frame = exitFrames.getFirst();
+            activeWinds = frame.parent();
+            return applyThunk(
+                    frame.outThunk(),
+                    new WindExitKont(
+                            value,
+                            exitFrames.subList(1, exitFrames.size()),
+                            enterFrames,
+                            targetContinuation,
+                            targetWinds,
+                            line,
+                            column),
+                    line,
+                    column);
+        }
+
+        if (!enterFrames.isEmpty()) {
+            WindFrame frame = enterFrames.getFirst();
+            return applyThunk(
+                    frame.inThunk(),
+                    new WindEnterKont(
+                            value,
+                            frame,
+                            enterFrames.subList(1, enterFrames.size()),
+                            targetContinuation,
+                            targetWinds,
+                            line,
+                            column),
+                    line,
+                    column);
+        }
+
+        activeWinds = targetWinds;
+        return new ReturnValueState(value, targetContinuation);
+    }
+
+    private MachineState transferToContinuation(Value value,
+                                                ContinuationProcedureValue continuationProcedureValue,
+                                                int line,
+                                                int column) throws EvalError {
+        List<WindFrame> currentFrames = windFramesOuterToInner(activeWinds);
+        List<WindFrame> targetFrames = windFramesOuterToInner(continuationProcedureValue.windFrame());
+        int commonPrefixLength = commonPrefixLength(currentFrames, targetFrames);
+
+        List<WindFrame> exitFrames = new ArrayList<>(currentFrames.size() - commonPrefixLength);
+        for (int i = currentFrames.size() - 1; i >= commonPrefixLength; i--) {
+            exitFrames.add(currentFrames.get(i));
+        }
+
+        List<WindFrame> enterFrames = new ArrayList<>(targetFrames.size() - commonPrefixLength);
+        for (int i = commonPrefixLength; i < targetFrames.size(); i++) {
+            enterFrames.add(targetFrames.get(i));
+        }
+
+        return continueWindTransition(
+                value,
+                List.copyOf(exitFrames),
+                List.copyOf(enterFrames),
+                continuationProcedureValue.continuation(),
+                continuationProcedureValue.windFrame(),
+                line,
+                column);
+    }
+
+    private List<WindFrame> windFramesOuterToInner(WindFrame frame) {
+        List<WindFrame> frames = new ArrayList<>();
+        for (WindFrame current = frame; current != null; current = current.parent()) {
+            frames.add(0, current);
+        }
+        return List.copyOf(frames);
+    }
+
+    private int commonPrefixLength(List<WindFrame> left, List<WindFrame> right) {
+        int length = Math.min(left.size(), right.size());
+        int index = 0;
+        while (index < length && left.get(index) == right.get(index)) {
+            index++;
+        }
+        return index;
     }
 
     private MachineState continueWithValue(Value value, Kont continuation) throws EvalError {
@@ -255,6 +392,78 @@ final class ContinuationEvaluator {
                             condKont.next());
                 }
                 yield evalCond(condKont.remainingClauses(), condKont.environment(), condKont.next());
+            }
+            case DynamicWindInExprKont dynamicWindInExprKont -> new EvalExprState(
+                    dynamicWindInExprKont.bodyThunkExpression(),
+                    dynamicWindInExprKont.environment(),
+                    new DynamicWindBodyExprKont(
+                            value,
+                            dynamicWindInExprKont.outThunkExpression(),
+                            dynamicWindInExprKont.environment(),
+                            dynamicWindInExprKont.next(),
+                            dynamicWindInExprKont.line(),
+                            dynamicWindInExprKont.column()));
+            case DynamicWindBodyExprKont dynamicWindBodyExprKont -> new EvalExprState(
+                    dynamicWindBodyExprKont.outThunkExpression(),
+                    dynamicWindBodyExprKont.environment(),
+                    new DynamicWindOutExprKont(
+                            dynamicWindBodyExprKont.inThunk(),
+                            value,
+                            dynamicWindBodyExprKont.next(),
+                            dynamicWindBodyExprKont.line(),
+                            dynamicWindBodyExprKont.column()));
+            case DynamicWindOutExprKont dynamicWindOutExprKont -> applyThunk(
+                    dynamicWindOutExprKont.inThunk(),
+                    new DynamicWindRunBodyKont(
+                            dynamicWindOutExprKont.inThunk(),
+                            dynamicWindOutExprKont.bodyThunk(),
+                            value,
+                            dynamicWindOutExprKont.next(),
+                            dynamicWindOutExprKont.line(),
+                            dynamicWindOutExprKont.column()),
+                    dynamicWindOutExprKont.line(),
+                    dynamicWindOutExprKont.column());
+            case DynamicWindRunBodyKont dynamicWindRunBodyKont -> {
+                WindFrame frame = new WindFrame(
+                        activeWinds,
+                        dynamicWindRunBodyKont.inThunk(),
+                        dynamicWindRunBodyKont.outThunk());
+                activeWinds = frame;
+                yield applyThunk(
+                        dynamicWindRunBodyKont.bodyThunk(),
+                        new DynamicWindBodyKont(frame, dynamicWindRunBodyKont.next(),
+                                dynamicWindRunBodyKont.line(), dynamicWindRunBodyKont.column()),
+                        dynamicWindRunBodyKont.line(),
+                        dynamicWindRunBodyKont.column());
+            }
+            case DynamicWindBodyKont dynamicWindBodyKont -> {
+                activeWinds = dynamicWindBodyKont.frame().parent();
+                yield applyThunk(
+                        dynamicWindBodyKont.frame().outThunk(),
+                        new DynamicWindAfterKont(value, dynamicWindBodyKont.next()),
+                        dynamicWindBodyKont.line(),
+                        dynamicWindBodyKont.column());
+            }
+            case DynamicWindAfterKont dynamicWindAfterKont ->
+                    new ReturnValueState(dynamicWindAfterKont.bodyValue(), dynamicWindAfterKont.next());
+            case WindExitKont windExitKont -> continueWindTransition(
+                    windExitKont.returnValue(),
+                    windExitKont.remainingExitFrames(),
+                    windExitKont.remainingEnterFrames(),
+                    windExitKont.targetContinuation(),
+                    windExitKont.targetWinds(),
+                    windExitKont.line(),
+                    windExitKont.column());
+            case WindEnterKont windEnterKont -> {
+                activeWinds = windEnterKont.enteredFrame();
+                yield continueWindTransition(
+                        windEnterKont.returnValue(),
+                        List.of(),
+                        windEnterKont.remainingEnterFrames(),
+                        windEnterKont.targetContinuation(),
+                        windEnterKont.targetWinds(),
+                        windEnterKont.line(),
+                        windEnterKont.column());
             }
         };
     }
@@ -517,7 +726,7 @@ final class ContinuationEvaluator {
                 requireExactArity("call/cc", arguments.size(), 1);
                 return applyProcedure(
                         arguments.getFirst(),
-                        List.of(new ContinuationProcedureValue(continuation)),
+                        List.of(new ContinuationProcedureValue(continuation, activeWinds)),
                         continuation,
                         line,
                         column);
@@ -525,7 +734,7 @@ final class ContinuationEvaluator {
 
             if (operator instanceof ContinuationProcedureValue continuationProcedureValue) {
                 requireExactArity("continuation", arguments.size(), 1);
-                return new ReturnValueState(arguments.getFirst(), continuationProcedureValue.continuation());
+                return transferToContinuation(arguments.getFirst(), continuationProcedureValue, line, column);
             }
 
             if (operator instanceof PrimitiveProcedureValue primitiveProcedureValue) {
@@ -646,7 +855,10 @@ final class ContinuationEvaluator {
 }
 
 sealed interface Kont permits HaltKont, SequenceKont, IfKont, DefineKont, SetKont,
-        ApplyOperatorKont, ApplyArgsKont, AndKont, OrKont, CondKont {
+        ApplyOperatorKont, ApplyArgsKont, AndKont, OrKont, CondKont,
+        DynamicWindInExprKont, DynamicWindBodyExprKont, DynamicWindOutExprKont,
+        DynamicWindRunBodyKont, DynamicWindBodyKont, DynamicWindAfterKont,
+        WindExitKont, WindEnterKont {
 }
 
 enum HaltKont implements Kont {
@@ -693,6 +905,64 @@ record CondKont(List<Expr> clauseElements,
                 Kont next) implements Kont {
 }
 
+record DynamicWindInExprKont(Expr bodyThunkExpression,
+                             Expr outThunkExpression,
+                             Environment environment,
+                             Kont next,
+                             int line,
+                             int column) implements Kont {
+}
+
+record DynamicWindBodyExprKont(Value inThunk,
+                               Expr outThunkExpression,
+                               Environment environment,
+                               Kont next,
+                               int line,
+                               int column) implements Kont {
+}
+
+record DynamicWindOutExprKont(Value inThunk,
+                              Value bodyThunk,
+                              Kont next,
+                              int line,
+                              int column) implements Kont {
+}
+
+record DynamicWindRunBodyKont(Value inThunk,
+                              Value bodyThunk,
+                              Value outThunk,
+                              Kont next,
+                              int line,
+                              int column) implements Kont {
+}
+
+record DynamicWindBodyKont(ContinuationEvaluator.WindFrame frame,
+                           Kont next,
+                           int line,
+                           int column) implements Kont {
+}
+
+record DynamicWindAfterKont(Value bodyValue, Kont next) implements Kont {
+}
+
+record WindExitKont(Value returnValue,
+                    List<ContinuationEvaluator.WindFrame> remainingExitFrames,
+                    List<ContinuationEvaluator.WindFrame> remainingEnterFrames,
+                    Kont targetContinuation,
+                    ContinuationEvaluator.WindFrame targetWinds,
+                    int line,
+                    int column) implements Kont {
+}
+
+record WindEnterKont(Value returnValue,
+                     ContinuationEvaluator.WindFrame enteredFrame,
+                     List<ContinuationEvaluator.WindFrame> remainingEnterFrames,
+                     Kont targetContinuation,
+                     ContinuationEvaluator.WindFrame targetWinds,
+                     int line,
+                     int column) implements Kont {
+}
+
 final class CallCcProcedureValue implements Value {
     @Override
     public String render() {
@@ -702,13 +972,20 @@ final class CallCcProcedureValue implements Value {
 
 final class ContinuationProcedureValue implements Value {
     private final Kont continuation;
+    private final ContinuationEvaluator.WindFrame windFrame;
 
-    ContinuationProcedureValue(Kont continuation) {
+    ContinuationProcedureValue(Kont continuation,
+                               ContinuationEvaluator.WindFrame windFrame) {
         this.continuation = continuation;
+        this.windFrame = windFrame;
     }
 
     Kont continuation() {
         return continuation;
+    }
+
+    ContinuationEvaluator.WindFrame windFrame() {
+        return windFrame;
     }
 
     @Override

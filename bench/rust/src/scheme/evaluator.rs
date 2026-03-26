@@ -10,6 +10,9 @@ use super::parser::parse_program;
 type EnvRef = Rc<Environment>;
 type BindingCell = Rc<RefCell<Value>>;
 type StringRef = Rc<RefCell<Vec<char>>>;
+type EvalResult = Result<Value, EvalError>;
+type Continuation = Rc<dyn Fn(Value, &mut Runtime) -> EvalResult>;
+type ValuesContinuation = Rc<dyn Fn(Vec<Value>, &mut Runtime) -> EvalResult>;
 
 pub(crate) fn eval_program(input: &str) -> Result<Value, EvalError> {
     let expressions = parse_program(input)?;
@@ -21,7 +24,13 @@ pub(crate) fn eval_program(input: &str) -> Result<Value, EvalError> {
     }
 
     let environment = global_environment();
-    eval_sequence(&expressions, &environment)
+    let mut runtime = Runtime::default();
+    eval_sequence(
+        &expressions,
+        &environment,
+        Rc::new(|value, _runtime| Ok(value)),
+        &mut runtime,
+    )
 }
 
 #[derive(Clone)]
@@ -65,6 +74,7 @@ impl Value {
 enum Procedure {
     Primitive(Primitive),
     Lambda(LambdaProcedure),
+    Continuation(ContinuationProcedure),
 }
 
 #[derive(Clone)]
@@ -73,6 +83,12 @@ struct LambdaProcedure {
     parameters: ParameterSpec,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct ContinuationProcedure {
+    continuation: Continuation,
+    wind_stack: Vec<WindFrame>,
 }
 
 #[derive(Clone)]
@@ -106,7 +122,10 @@ enum Primitive {
     SymbolPredicate,
     StringCopy,
     StringSet,
+    Reverse,
     Apply,
+    CallCc,
+    DynamicWind,
 }
 
 impl Primitive {
@@ -135,9 +154,25 @@ impl Primitive {
             Self::SymbolPredicate => "symbol?",
             Self::StringCopy => "string-copy",
             Self::StringSet => "string-set!",
+            Self::Reverse => "reverse",
             Self::Apply => "apply",
+            Self::CallCc => "call/cc",
+            Self::DynamicWind => "dynamic-wind",
         }
     }
+}
+
+#[derive(Clone)]
+struct WindFrame {
+    id: usize,
+    in_thunk: Rc<Procedure>,
+    out_thunk: Rc<Procedure>,
+    pos: Position,
+}
+
+#[derive(Default)]
+struct Runtime {
+    wind_stack: Vec<WindFrame>,
 }
 
 struct Environment {
@@ -239,6 +274,7 @@ struct ExpansionContext<'a> {
 }
 
 static NEXT_GENSYM: AtomicUsize = AtomicUsize::new(0);
+static NEXT_WIND_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn global_environment() -> EnvRef {
     let environment = Environment::new(None);
@@ -265,7 +301,15 @@ fn global_environment() -> EnvRef {
     define_primitive(&environment, "symbol?", Primitive::SymbolPredicate);
     define_primitive(&environment, "string-copy", Primitive::StringCopy);
     define_primitive(&environment, "string-set!", Primitive::StringSet);
+    define_primitive(&environment, "reverse", Primitive::Reverse);
     define_primitive(&environment, "apply", Primitive::Apply);
+    define_primitive(&environment, "call/cc", Primitive::CallCc);
+    define_primitive(
+        &environment,
+        "call-with-current-continuation",
+        Primitive::CallCc,
+    );
+    define_primitive(&environment, "dynamic-wind", Primitive::DynamicWind);
     environment
 }
 
@@ -276,33 +320,64 @@ fn define_primitive(environment: &EnvRef, name: &str, primitive: Primitive) {
     );
 }
 
-fn eval_sequence(expressions: &[Expr], environment: &EnvRef) -> Result<Value, EvalError> {
-    let mut last_value = Value::Void;
-    for expression in expressions {
-        last_value = eval(expression, environment)?;
+fn eval_sequence(
+    expressions: &[Expr],
+    environment: &EnvRef,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let Some((first, rest)) = expressions.split_first() else {
+        return cont(Value::Void, runtime);
+    };
+    if rest.is_empty() {
+        return eval(first, environment, cont, runtime);
     }
-    Ok(last_value)
+
+    let rest = rest.to_vec();
+    let current_environment = environment.clone();
+    let next_environment = current_environment.clone();
+    eval(
+        first,
+        &current_environment,
+        Rc::new(move |_value, runtime| {
+            eval_sequence(&rest, &next_environment, cont.clone(), runtime)
+        }),
+        runtime,
+    )
 }
 
-fn eval(expression: &Expr, environment: &EnvRef) -> Result<Value, EvalError> {
+fn eval(
+    expression: &Expr,
+    environment: &EnvRef,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     match &expression.kind {
-        ExprKind::Int(value) => Ok(Value::Int(*value)),
-        ExprKind::Bool(value) => Ok(Value::Bool(*value)),
-        ExprKind::String(value) => Ok(Value::String(new_string_ref(value.chars().collect()))),
-        ExprKind::Char(value) => Ok(Value::Char(*value)),
-        ExprKind::Symbol(name) => environment.lookup(name, expression.pos),
-        ExprKind::List(elements) => eval_list(expression.pos, elements, environment),
+        ExprKind::Int(value) => cont(Value::Int(*value), runtime),
+        ExprKind::Bool(value) => cont(Value::Bool(*value), runtime),
+        ExprKind::String(value) => {
+            cont(Value::String(new_string_ref(value.chars().collect())), runtime)
+        }
+        ExprKind::Char(value) => cont(Value::Char(*value), runtime),
+        ExprKind::Symbol(name) => cont(environment.lookup(name, expression.pos)?, runtime),
+        ExprKind::List(elements) => eval_list(expression.pos, elements, environment, cont, runtime),
     }
 }
 
-fn eval_list(pos: Position, elements: &[Expr], environment: &EnvRef) -> Result<Value, EvalError> {
+fn eval_list(
+    pos: Position,
+    elements: &[Expr],
+    environment: &EnvRef,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     let Some((operator, arguments)) = elements.split_first() else {
         return Err(EvalError::syntax("cannot evaluate empty list", pos));
     };
 
     if let ExprKind::Symbol(name) = &operator.kind {
         if name == "define-syntax" {
-            return eval_define_syntax(arguments, environment, pos);
+            return eval_define_syntax(arguments, environment, pos, cont, runtime);
         }
         if let Some(macro_definition) = environment.lookup_macro(name) {
             let expanded = expand_macro_call(
@@ -310,24 +385,50 @@ fn eval_list(pos: Position, elements: &[Expr], environment: &EnvRef) -> Result<V
                 &Expr::list(elements.to_vec(), pos),
                 environment,
             )?;
-            return eval(&expanded, environment);
+            return eval(&expanded, environment, cont, runtime);
         }
         return match name.as_str() {
-            "define" => eval_define(arguments, environment, pos),
-            "set!" => eval_set(arguments, environment, pos),
-            "if" => eval_if(arguments, environment, pos),
-            "quote" => eval_quote(arguments, pos),
-            "lambda" => eval_lambda(arguments, environment, pos),
-            "begin" => eval_sequence(arguments, environment),
-            "cond" => eval_cond(arguments, environment),
-            "let" => eval_let(arguments, environment, pos),
-            "and" => eval_and(arguments, environment),
-            "or" => eval_or(arguments, environment),
-            _ => apply(operator, arguments, environment, pos),
+            "define" => eval_define(arguments, environment, pos, cont, runtime),
+            "set!" => eval_set(arguments, environment, pos, cont, runtime),
+            "if" => eval_if(arguments, environment, pos, cont, runtime),
+            "quote" => eval_quote(arguments, pos, cont, runtime),
+            "lambda" => eval_lambda(arguments, environment, pos, cont, runtime),
+            "begin" => eval_sequence(arguments, environment, cont, runtime),
+            "cond" => eval_cond(arguments, environment, cont, runtime),
+            "let" => eval_let(arguments, environment, pos, cont, runtime),
+            "and" => eval_and(arguments, environment, cont, runtime),
+            "or" => eval_or(arguments, environment, cont, runtime),
+            _ => apply(operator, arguments, environment, pos, cont, runtime),
         };
     }
 
-    apply(operator, arguments, environment, pos)
+    apply(operator, arguments, environment, pos, cont, runtime)
+}
+
+fn eval_expressions(
+    expressions: &[Expr],
+    environment: &EnvRef,
+    values: Vec<Value>,
+    cont: ValuesContinuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let Some((first, rest)) = expressions.split_first() else {
+        return cont(values, runtime);
+    };
+
+    let rest = rest.to_vec();
+    let current_environment = environment.clone();
+    let next_environment = current_environment.clone();
+    eval(
+        first,
+        &current_environment,
+        Rc::new(move |value, runtime| {
+            let mut next_values = values.clone();
+            next_values.push(value);
+            eval_expressions(&rest, &next_environment, next_values, cont.clone(), runtime)
+        }),
+        runtime,
+    )
 }
 
 fn apply(
@@ -335,31 +436,57 @@ fn apply(
     argument_expressions: &[Expr],
     environment: &EnvRef,
     call_pos: Position,
-) -> Result<Value, EvalError> {
-    let operator = eval(operator_expression, environment)?;
-    let Value::Procedure(procedure) = operator else {
-        return Err(EvalError::not_a_procedure(
-            operator.render(),
-            operator_expression.pos,
-        ));
-    };
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let argument_expressions = argument_expressions.to_vec();
+    let current_environment = environment.clone();
+    let next_environment = current_environment.clone();
+    let operator_pos = operator_expression.pos;
+    eval(
+        operator_expression,
+        &current_environment,
+        Rc::new(move |operator, runtime| {
+            let Value::Procedure(procedure) = operator else {
+                return Err(EvalError::not_a_procedure(operator.render(), operator_pos));
+            };
+            let apply_cont = cont.clone();
 
-    let mut arguments = Vec::with_capacity(argument_expressions.len());
-    for argument_expression in argument_expressions {
-        arguments.push(eval(argument_expression, environment)?);
-    }
-
-    apply_procedure(procedure.as_ref(), arguments, call_pos)
+            eval_expressions(
+                &argument_expressions,
+                &next_environment,
+                Vec::new(),
+                Rc::new(move |arguments, runtime| {
+                    apply_procedure(
+                        procedure.clone(),
+                        arguments,
+                        call_pos,
+                        apply_cont.clone(),
+                        runtime,
+                    )
+                }),
+                runtime,
+            )
+        }),
+        runtime,
+    )
 }
 
 fn apply_procedure(
-    procedure: &Procedure,
+    procedure: Rc<Procedure>,
     arguments: Vec<Value>,
     call_pos: Position,
-) -> Result<Value, EvalError> {
-    match procedure {
-        Procedure::Primitive(primitive) => apply_primitive(*primitive, arguments, call_pos),
-        Procedure::Lambda(lambda) => apply_lambda(lambda, arguments, call_pos),
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    match procedure.as_ref() {
+        Procedure::Primitive(primitive) => {
+            apply_primitive(*primitive, arguments, call_pos, cont, runtime)
+        }
+        Procedure::Lambda(lambda) => apply_lambda(lambda, arguments, call_pos, cont, runtime),
+        Procedure::Continuation(continuation) => {
+            apply_continuation(continuation, arguments, call_pos, runtime)
+        }
     }
 }
 
@@ -367,7 +494,9 @@ fn apply_lambda(
     lambda: &LambdaProcedure,
     arguments: Vec<Value>,
     call_pos: Position,
-) -> Result<Value, EvalError> {
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     let name = lambda.name.as_deref().unwrap_or("lambda");
     if lambda.parameters.rest.is_some() {
         require_min_arity(
@@ -397,39 +526,56 @@ fn apply_lambda(
         call_environment.define(rest_parameter, Value::List(argument_iter.collect()));
     }
 
-    eval_sequence(&lambda.body, &call_environment)
+    eval_sequence(&lambda.body, &call_environment, cont, runtime)
+}
+
+fn apply_continuation(
+    continuation: &ContinuationProcedure,
+    arguments: Vec<Value>,
+    call_pos: Position,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    require_exact_arity("continuation", arguments.len(), 1, call_pos)?;
+    transition_winds(
+        &continuation.wind_stack,
+        arguments[0].clone(),
+        continuation.continuation.clone(),
+        runtime,
+    )
 }
 
 fn apply_primitive(
     primitive: Primitive,
     arguments: Vec<Value>,
     call_pos: Position,
-) -> Result<Value, EvalError> {
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     match primitive {
         Primitive::Add => {
             let mut total = 0_i64;
             for argument in &arguments {
                 total += expect_int(argument, primitive.name(), call_pos)?;
             }
-            Ok(Value::Int(total))
+            cont(Value::Int(total), runtime)
         }
         Primitive::Subtract => {
             require_min_arity(primitive.name(), arguments.len(), 1, call_pos)?;
             let mut result = expect_int(&arguments[0], primitive.name(), call_pos)?;
             if arguments.len() == 1 {
-                return Ok(Value::Int(-result));
+                return cont(Value::Int(-result), runtime);
             }
             for argument in &arguments[1..] {
                 result -= expect_int(argument, primitive.name(), call_pos)?;
             }
-            Ok(Value::Int(result))
+            cont(Value::Int(result), runtime)
         }
         Primitive::Multiply => {
             let mut product = 1_i64;
             for argument in &arguments {
                 product *= expect_int(argument, primitive.name(), call_pos)?;
             }
-            Ok(Value::Int(product))
+            cont(Value::Int(product), runtime)
         }
         Primitive::Divide => {
             require_min_arity(primitive.name(), arguments.len(), 2, call_pos)?;
@@ -441,14 +587,14 @@ fn apply_primitive(
                 }
                 result /= divisor;
             }
-            Ok(Value::Int(result))
+            cont(Value::Int(result), runtime)
         }
         Primitive::LessThan | Primitive::GreaterThan | Primitive::Equal | Primitive::LessEqual => {
-            apply_comparison(primitive, &arguments, call_pos)
+            cont(apply_comparison(primitive, &arguments, call_pos)?, runtime)
         }
         Primitive::Not => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
-            Ok(Value::Bool(!arguments[0].is_truthy()))
+            cont(Value::Bool(!arguments[0].is_truthy()), runtime)
         }
         Primitive::Cons => {
             require_exact_arity(primitive.name(), arguments.len(), 2, call_pos)?;
@@ -456,65 +602,68 @@ fn apply_primitive(
             let mut elements = Vec::with_capacity(tail.len() + 1);
             elements.push(arguments[0].clone());
             elements.extend_from_slice(tail);
-            Ok(Value::List(elements))
+            cont(Value::List(elements), runtime)
         }
         Primitive::Car => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
             let elements = expect_non_empty_list(&arguments[0], primitive.name(), call_pos)?;
-            Ok(elements[0].clone())
+            cont(elements[0].clone(), runtime)
         }
         Primitive::Cdr => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
             let elements = expect_non_empty_list(&arguments[0], primitive.name(), call_pos)?;
-            Ok(Value::List(elements[1..].to_vec()))
+            cont(Value::List(elements[1..].to_vec()), runtime)
         }
-        Primitive::List => Ok(Value::List(arguments)),
+        Primitive::List => cont(Value::List(arguments), runtime),
         Primitive::Append => {
             let mut appended = Vec::new();
             for argument in &arguments {
                 appended.extend_from_slice(expect_list(argument, primitive.name(), call_pos)?);
             }
-            Ok(Value::List(appended))
+            cont(Value::List(appended), runtime)
         }
         Primitive::Length => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
-            Ok(Value::Int(
-                expect_list(&arguments[0], primitive.name(), call_pos)?.len() as i64,
-            ))
+            cont(
+                Value::Int(expect_list(&arguments[0], primitive.name(), call_pos)?.len() as i64),
+                runtime,
+            )
         }
         Primitive::NullPredicate => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
-            Ok(Value::Bool(
-                matches!(&arguments[0], Value::List(elements) if elements.is_empty()),
-            ))
+            cont(
+                Value::Bool(matches!(&arguments[0], Value::List(elements) if elements.is_empty())),
+                runtime,
+            )
         }
         Primitive::PairPredicate => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
-            Ok(Value::Bool(
-                matches!(&arguments[0], Value::List(elements) if !elements.is_empty()),
-            ))
+            cont(
+                Value::Bool(matches!(&arguments[0], Value::List(elements) if !elements.is_empty())),
+                runtime,
+            )
         }
         Primitive::NumberPredicate => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
-            Ok(Value::Bool(matches!(&arguments[0], Value::Int(_))))
+            cont(Value::Bool(matches!(&arguments[0], Value::Int(_))), runtime)
         }
         Primitive::StringPredicate => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
-            Ok(Value::Bool(matches!(&arguments[0], Value::String(_))))
+            cont(Value::Bool(matches!(&arguments[0], Value::String(_))), runtime)
         }
         Primitive::BooleanPredicate => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
-            Ok(Value::Bool(matches!(&arguments[0], Value::Bool(_))))
+            cont(Value::Bool(matches!(&arguments[0], Value::Bool(_))), runtime)
         }
         Primitive::SymbolPredicate => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
-            Ok(Value::Bool(matches!(&arguments[0], Value::Symbol(_))))
+            cont(Value::Bool(matches!(&arguments[0], Value::Symbol(_))), runtime)
         }
         Primitive::StringCopy => {
             require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
             let string = expect_string(&arguments[0], primitive.name(), call_pos)?;
             let copied = string.borrow().clone();
-            Ok(Value::String(new_string_ref(copied)))
+            cont(Value::String(new_string_ref(copied)), runtime)
         }
         Primitive::StringSet => {
             require_exact_arity(primitive.name(), arguments.len(), 3, call_pos)?;
@@ -529,7 +678,13 @@ fn apply_primitive(
                 ));
             }
             string[index] = value;
-            Ok(Value::Void)
+            cont(Value::Void, runtime)
+        }
+        Primitive::Reverse => {
+            require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
+            let mut elements = expect_list(&arguments[0], primitive.name(), call_pos)?.to_vec();
+            elements.reverse();
+            cont(Value::List(elements), runtime)
         }
         Primitive::Apply => {
             require_min_arity(primitive.name(), arguments.len(), 2, call_pos)?;
@@ -538,12 +693,7 @@ fn apply_primitive(
             let procedure_value = arguments
                 .next()
                 .expect("apply arity check should ensure a procedure argument");
-            let Value::Procedure(procedure) = procedure_value else {
-                return Err(EvalError::not_a_procedure(
-                    procedure_value.render(),
-                    call_pos,
-                ));
-            };
+            let procedure = expect_procedure(&procedure_value, primitive.name(), call_pos)?;
 
             let mut applied_arguments: Vec<Value> = arguments.collect();
             let tail_arguments = match applied_arguments.pop() {
@@ -558,7 +708,52 @@ fn apply_primitive(
             };
             applied_arguments.extend(tail_arguments);
 
-            apply_procedure(procedure.as_ref(), applied_arguments, call_pos)
+            apply_procedure(procedure, applied_arguments, call_pos, cont, runtime)
+        }
+        Primitive::CallCc => {
+            require_exact_arity(primitive.name(), arguments.len(), 1, call_pos)?;
+            let procedure = expect_procedure(&arguments[0], primitive.name(), call_pos)?;
+            let continuation = Value::Procedure(Rc::new(Procedure::Continuation(
+                ContinuationProcedure {
+                    continuation: cont.clone(),
+                    wind_stack: runtime.wind_stack.clone(),
+                },
+            )));
+            apply_procedure(procedure, vec![continuation], call_pos, cont, runtime)
+        }
+        Primitive::DynamicWind => {
+            require_exact_arity(primitive.name(), arguments.len(), 3, call_pos)?;
+            let in_thunk = expect_procedure(&arguments[0], primitive.name(), call_pos)?;
+            let body_thunk = expect_procedure(&arguments[1], primitive.name(), call_pos)?;
+            let out_thunk = expect_procedure(&arguments[2], primitive.name(), call_pos)?;
+            let outer_winds = runtime.wind_stack.clone();
+            let frame = WindFrame {
+                id: NEXT_WIND_ID.fetch_add(1, Ordering::Relaxed),
+                in_thunk: in_thunk.clone(),
+                out_thunk,
+                pos: call_pos,
+            };
+            apply_procedure(
+                in_thunk,
+                Vec::new(),
+                call_pos,
+                Rc::new(move |_ignored, runtime| {
+                    runtime.wind_stack.push(frame.clone());
+                    let outer_winds = outer_winds.clone();
+                    let body_thunk = body_thunk.clone();
+                    let cont = cont.clone();
+                    apply_procedure(
+                        body_thunk,
+                        Vec::new(),
+                        call_pos,
+                        Rc::new(move |body_value, runtime| {
+                            transition_winds(&outer_winds, body_value, cont.clone(), runtime)
+                        }),
+                        runtime,
+                    )
+                }),
+                runtime,
+            )
         }
     }
 }
@@ -587,11 +782,99 @@ fn apply_comparison(
     Ok(Value::Bool(true))
 }
 
+fn transition_winds(
+    target_winds: &[WindFrame],
+    value: Value,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let shared_prefix = common_wind_prefix_len(&runtime.wind_stack, target_winds);
+    let leaving = runtime.wind_stack[shared_prefix..]
+        .iter()
+        .rev()
+        .cloned()
+        .collect();
+    let entering = target_winds[shared_prefix..].to_vec();
+    run_wind_outs(leaving, entering, value, cont, runtime)
+}
+
+fn run_wind_outs(
+    leaving: Vec<WindFrame>,
+    entering: Vec<WindFrame>,
+    value: Value,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let Some((frame, rest)) = leaving.split_first() else {
+        return run_wind_ins(entering, value, cont, runtime);
+    };
+
+    match runtime.wind_stack.pop() {
+        Some(active) if active.id == frame.id => {}
+        Some(active) => {
+            runtime.wind_stack.push(active);
+            return Err(EvalError::syntax("dynamic-wind stack mismatch", frame.pos));
+        }
+        None => return Err(EvalError::syntax("dynamic-wind stack underflow", frame.pos)),
+    }
+
+    let rest = rest.to_vec();
+    apply_procedure(
+        frame.out_thunk.clone(),
+        Vec::new(),
+        frame.pos,
+        Rc::new(move |_ignored, runtime| {
+            run_wind_outs(
+                rest.clone(),
+                entering.clone(),
+                value.clone(),
+                cont.clone(),
+                runtime,
+            )
+        }),
+        runtime,
+    )
+}
+
+fn run_wind_ins(
+    entering: Vec<WindFrame>,
+    value: Value,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let Some((frame, rest)) = entering.split_first() else {
+        return cont(value, runtime);
+    };
+
+    let frame = frame.clone();
+    let rest = rest.to_vec();
+    apply_procedure(
+        frame.in_thunk.clone(),
+        Vec::new(),
+        frame.pos,
+        Rc::new(move |_ignored, runtime| {
+            runtime.wind_stack.push(frame.clone());
+            run_wind_ins(rest.clone(), value.clone(), cont.clone(), runtime)
+        }),
+        runtime,
+    )
+}
+
+fn common_wind_prefix_len(current: &[WindFrame], target: &[WindFrame]) -> usize {
+    current
+        .iter()
+        .zip(target.iter())
+        .take_while(|(current, target)| current.id == target.id)
+        .count()
+}
+
 fn eval_define(
     arguments: &[Expr],
     environment: &EnvRef,
     pos: Position,
-) -> Result<Value, EvalError> {
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     if arguments.is_empty() {
         return Err(EvalError::syntax("define expected a binding target", pos));
     }
@@ -599,9 +882,19 @@ fn eval_define(
     match &arguments[0].kind {
         ExprKind::Symbol(name) => {
             require_exact_arity("define", arguments.len(), 2, pos)?;
-            let value = eval(&arguments[1], environment)?;
-            environment.define(name, value);
-            Ok(Value::Void)
+            let name = name.clone();
+            let value_expression = arguments[1].clone();
+            let current_environment = environment.clone();
+            let define_environment = current_environment.clone();
+            eval(
+                &value_expression,
+                &current_environment,
+                Rc::new(move |value, runtime| {
+                    define_environment.define(&name, value);
+                    cont(Value::Void, runtime)
+                }),
+                runtime,
+            )
         }
         ExprKind::List(signature) => {
             if signature.is_empty() {
@@ -630,7 +923,7 @@ fn eval_define(
                 env: environment.clone(),
             })));
             environment.define(name, procedure);
-            Ok(Value::Void)
+            cont(Value::Void, runtime)
         }
         _ => Err(EvalError::syntax(
             "define expected a symbol or function signature",
@@ -643,7 +936,9 @@ fn eval_define_syntax(
     arguments: &[Expr],
     environment: &EnvRef,
     pos: Position,
-) -> Result<Value, EvalError> {
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     require_exact_arity("define-syntax", arguments.len(), 2, pos)?;
 
     let ExprKind::Symbol(name) = &arguments[0].kind else {
@@ -655,10 +950,16 @@ fn eval_define_syntax(
 
     let macro_definition = parse_macro_definition(name, &arguments[1], environment)?;
     environment.define_macro(name, macro_definition);
-    Ok(Value::Void)
+    cont(Value::Void, runtime)
 }
 
-fn eval_set(arguments: &[Expr], environment: &EnvRef, pos: Position) -> Result<Value, EvalError> {
+fn eval_set(
+    arguments: &[Expr],
+    environment: &EnvRef,
+    pos: Position,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     require_exact_arity("set!", arguments.len(), 2, pos)?;
 
     let ExprKind::Symbol(name) = &arguments[0].kind else {
@@ -668,32 +969,70 @@ fn eval_set(arguments: &[Expr], environment: &EnvRef, pos: Position) -> Result<V
         ));
     };
 
-    let value = eval(&arguments[1], environment)?;
-    environment.set(name, value, arguments[0].pos)?;
-    Ok(Value::Void)
+    let name = name.clone();
+    let value_expression = arguments[1].clone();
+    let target_pos = arguments[0].pos;
+    let current_environment = environment.clone();
+    let set_environment = current_environment.clone();
+    eval(
+        &value_expression,
+        &current_environment,
+        Rc::new(move |value, runtime| {
+            set_environment.set(&name, value, target_pos)?;
+            cont(Value::Void, runtime)
+        }),
+        runtime,
+    )
 }
 
-fn eval_if(arguments: &[Expr], environment: &EnvRef, pos: Position) -> Result<Value, EvalError> {
-    require_exact_arity("if", arguments.len(), 3, pos)?;
-    let condition = eval(&arguments[0], environment)?;
-    let branch = if condition.is_truthy() {
-        &arguments[1]
-    } else {
-        &arguments[2]
-    };
-    eval(branch, environment)
+fn eval_if(
+    arguments: &[Expr],
+    environment: &EnvRef,
+    pos: Position,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    if !(2..=3).contains(&arguments.len()) {
+        return Err(EvalError::wrong_arg_count(
+            "if",
+            "2 or 3 argument(s)",
+            arguments.len(),
+            pos,
+        ));
+    }
+    let condition_expression = arguments[0].clone();
+    let then_expression = arguments[1].clone();
+    let else_expression = arguments.get(2).cloned();
+    let current_environment = environment.clone();
+    let branch_environment = current_environment.clone();
+    eval(
+        &condition_expression,
+        &current_environment,
+        Rc::new(move |condition, runtime| {
+            if condition.is_truthy() {
+                eval(&then_expression, &branch_environment, cont.clone(), runtime)
+            } else if let Some(else_expression) = &else_expression {
+                eval(else_expression, &branch_environment, cont.clone(), runtime)
+            } else {
+                cont(Value::Void, runtime)
+            }
+        }),
+        runtime,
+    )
 }
 
-fn eval_quote(arguments: &[Expr], pos: Position) -> Result<Value, EvalError> {
+fn eval_quote(arguments: &[Expr], pos: Position, cont: Continuation, runtime: &mut Runtime) -> EvalResult {
     require_exact_arity("quote", arguments.len(), 1, pos)?;
-    quote(&arguments[0])
+    cont(quote(&arguments[0])?, runtime)
 }
 
 fn eval_lambda(
     arguments: &[Expr],
     environment: &EnvRef,
     pos: Position,
-) -> Result<Value, EvalError> {
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     if arguments.len() < 2 {
         return Err(EvalError::syntax(
             "lambda expected parameters and a body",
@@ -702,80 +1041,132 @@ fn eval_lambda(
     }
 
     let parameters = parse_parameter_spec(&arguments[0], "lambda")?;
-    Ok(Value::Procedure(Rc::new(Procedure::Lambda(
-        LambdaProcedure {
+    cont(
+        Value::Procedure(Rc::new(Procedure::Lambda(LambdaProcedure {
             name: None,
             parameters,
             body: arguments[1..].to_vec(),
             env: environment.clone(),
-        },
-    ))))
+        }))),
+        runtime,
+    )
 }
 
-fn eval_cond(arguments: &[Expr], environment: &EnvRef) -> Result<Value, EvalError> {
-    for (index, clause_expression) in arguments.iter().enumerate() {
-        let ExprKind::List(clause_elements) = &clause_expression.kind else {
-            return Err(EvalError::syntax(
-                "cond clauses must be lists",
-                clause_expression.pos,
-            ));
-        };
+fn eval_cond(
+    arguments: &[Expr],
+    environment: &EnvRef,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    eval_cond_clauses(arguments, environment, cont, runtime)
+}
 
-        if clause_elements.is_empty() {
-            return Err(EvalError::syntax(
-                "cond clause cannot be empty",
-                clause_expression.pos,
-            ));
-        }
+fn eval_cond_clauses(
+    clauses: &[Expr],
+    environment: &EnvRef,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let Some((clause_expression, remaining_clauses)) = clauses.split_first() else {
+        return cont(Value::Void, runtime);
+    };
 
-        let test_expression = &clause_elements[0];
-        if let ExprKind::Symbol(name) = &test_expression.kind {
-            if name == "else" {
-                if index + 1 != arguments.len() {
-                    return Err(EvalError::syntax(
-                        "cond else clause must be last",
-                        test_expression.pos,
-                    ));
-                }
-                if clause_elements.len() == 1 {
-                    return Err(EvalError::syntax(
-                        "cond else clause expected a body",
-                        test_expression.pos,
-                    ));
-                }
-                return eval_sequence(&clause_elements[1..], environment);
+    let ExprKind::List(clause_elements) = &clause_expression.kind else {
+        return Err(EvalError::syntax(
+            "cond clauses must be lists",
+            clause_expression.pos,
+        ));
+    };
+    if clause_elements.is_empty() {
+        return Err(EvalError::syntax(
+            "cond clause cannot be empty",
+            clause_expression.pos,
+        ));
+    }
+
+    let test_expression = clause_elements[0].clone();
+    if let ExprKind::Symbol(name) = &test_expression.kind {
+        if name == "else" {
+            if !remaining_clauses.is_empty() {
+                return Err(EvalError::syntax(
+                    "cond else clause must be last",
+                    test_expression.pos,
+                ));
             }
-        }
-
-        let test_value = eval(test_expression, environment)?;
-        if test_value.is_truthy() {
             if clause_elements.len() == 1 {
-                return Ok(test_value);
+                return Err(EvalError::syntax(
+                    "cond else clause expected a body",
+                    test_expression.pos,
+                ));
             }
-            return eval_sequence(&clause_elements[1..], environment);
+            return eval_sequence(&clause_elements[1..], environment, cont, runtime);
         }
     }
 
-    Ok(Value::Void)
+    let clause_body = clause_elements[1..].to_vec();
+    let remaining_clauses = remaining_clauses.to_vec();
+    let current_environment = environment.clone();
+    let clause_environment = current_environment.clone();
+    eval(
+        &test_expression,
+        &current_environment,
+        Rc::new(move |test_value, runtime| {
+            if test_value.is_truthy() {
+                if clause_body.is_empty() {
+                    cont(test_value, runtime)
+                } else {
+                    eval_sequence(&clause_body, &clause_environment, cont.clone(), runtime)
+                }
+            } else {
+                eval_cond_clauses(
+                    &remaining_clauses,
+                    &clause_environment,
+                    cont.clone(),
+                    runtime,
+                )
+            }
+        }),
+        runtime,
+    )
 }
 
-fn eval_let(arguments: &[Expr], environment: &EnvRef, pos: Position) -> Result<Value, EvalError> {
+fn eval_let(
+    arguments: &[Expr],
+    environment: &EnvRef,
+    pos: Position,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     if arguments.len() < 2 {
         return Err(EvalError::syntax("let expected bindings and a body", pos));
     }
 
     if let ExprKind::Symbol(name) = &arguments[0].kind {
-        return eval_named_let(name, &arguments[1..], environment, pos);
+        return eval_named_let(name, &arguments[1..], environment, pos, cont, runtime);
     }
 
     let bindings = parse_bindings(&arguments[0], "let")?;
-    let local_environment = Environment::new(Some(environment.clone()));
-    for binding in bindings {
-        let value = eval(&binding.value_expression, environment)?;
-        local_environment.define(&binding.name, value);
-    }
+    let names: Vec<String> = bindings.iter().map(|binding| binding.name.clone()).collect();
+    let value_expressions: Vec<Expr> = bindings
+        .iter()
+        .map(|binding| binding.value_expression.clone())
+        .collect();
+    let body = arguments[1..].to_vec();
+    let parent_environment = environment.clone();
 
-    eval_sequence(&arguments[1..], &local_environment)
+    eval_expressions(
+        &value_expressions,
+        environment,
+        Vec::new(),
+        Rc::new(move |values, runtime| {
+            let local_environment = Environment::new(Some(parent_environment.clone()));
+            for (name, value) in names.iter().zip(values.into_iter()) {
+                local_environment.define(name, value);
+            }
+            eval_sequence(&body, &local_environment, cont.clone(), runtime)
+        }),
+        runtime,
+    )
 }
 
 fn eval_named_let(
@@ -783,7 +1174,9 @@ fn eval_named_let(
     arguments: &[Expr],
     environment: &EnvRef,
     pos: Position,
-) -> Result<Value, EvalError> {
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
     if arguments.len() < 2 {
         return Err(EvalError::syntax("let expected bindings and a body", pos));
     }
@@ -792,6 +1185,10 @@ fn eval_named_let(
     let parameters = bindings
         .iter()
         .map(|binding| binding.name.clone())
+        .collect();
+    let value_expressions: Vec<Expr> = bindings
+        .iter()
+        .map(|binding| binding.value_expression.clone())
         .collect();
     let local_environment = Environment::new(Some(environment.clone()));
     let procedure = Rc::new(Procedure::Lambda(LambdaProcedure {
@@ -805,12 +1202,69 @@ fn eval_named_let(
     }));
     local_environment.define(name, Value::Procedure(procedure.clone()));
 
-    let mut initial_values = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        initial_values.push(eval(&binding.value_expression, environment)?);
-    }
+    eval_expressions(
+        &value_expressions,
+        environment,
+        Vec::new(),
+        Rc::new(move |values, runtime| {
+            apply_procedure(procedure.clone(), values, pos, cont.clone(), runtime)
+        }),
+        runtime,
+    )
+}
 
-    apply_procedure(procedure.as_ref(), initial_values, pos)
+fn eval_and(
+    arguments: &[Expr],
+    environment: &EnvRef,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let Some((first, rest)) = arguments.split_first() else {
+        return cont(Value::Bool(true), runtime);
+    };
+
+    let rest = rest.to_vec();
+    let current_environment = environment.clone();
+    let next_environment = current_environment.clone();
+    eval(
+        first,
+        &current_environment,
+        Rc::new(move |value, runtime| {
+            if !value.is_truthy() || rest.is_empty() {
+                cont(value, runtime)
+            } else {
+                eval_and(&rest, &next_environment, cont.clone(), runtime)
+            }
+        }),
+        runtime,
+    )
+}
+
+fn eval_or(
+    arguments: &[Expr],
+    environment: &EnvRef,
+    cont: Continuation,
+    runtime: &mut Runtime,
+) -> EvalResult {
+    let Some((first, rest)) = arguments.split_first() else {
+        return cont(Value::Bool(false), runtime);
+    };
+
+    let rest = rest.to_vec();
+    let current_environment = environment.clone();
+    let next_environment = current_environment.clone();
+    eval(
+        first,
+        &current_environment,
+        Rc::new(move |value, runtime| {
+            if value.is_truthy() || rest.is_empty() {
+                cont(value, runtime)
+            } else {
+                eval_or(&rest, &next_environment, cont.clone(), runtime)
+            }
+        }),
+        runtime,
+    )
 }
 
 fn parse_bindings(bindings_expression: &Expr, form_name: &str) -> Result<Vec<Binding>, EvalError> {
@@ -1488,28 +1942,6 @@ fn quote(expression: &Expr) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_and(arguments: &[Expr], environment: &EnvRef) -> Result<Value, EvalError> {
-    let mut last = Value::Bool(true);
-    for argument in arguments {
-        last = eval(argument, environment)?;
-        if !last.is_truthy() {
-            return Ok(last);
-        }
-    }
-    Ok(last)
-}
-
-fn eval_or(arguments: &[Expr], environment: &EnvRef) -> Result<Value, EvalError> {
-    let mut last = Value::Bool(false);
-    for argument in arguments {
-        last = eval(argument, environment)?;
-        if last.is_truthy() {
-            return Ok(last);
-        }
-    }
-    Ok(last)
-}
-
 fn expect_int(value: &Value, operator: &str, pos: Position) -> Result<i64, EvalError> {
     let Value::Int(number) = value else {
         return Err(EvalError::type_mismatch(
@@ -1518,6 +1950,20 @@ fn expect_int(value: &Value, operator: &str, pos: Position) -> Result<i64, EvalE
         ));
     };
     Ok(*number)
+}
+
+fn expect_procedure(
+    value: &Value,
+    operator: &str,
+    pos: Position,
+) -> Result<Rc<Procedure>, EvalError> {
+    let Value::Procedure(procedure) = value else {
+        return Err(EvalError::type_mismatch(
+            format!("{operator} expects procedure arguments"),
+            pos,
+        ));
+    };
+    Ok(procedure.clone())
 }
 
 fn expect_index(value: &Value, operator: &str, pos: Position) -> Result<usize, EvalError> {
