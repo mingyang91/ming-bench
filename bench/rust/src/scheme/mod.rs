@@ -10,6 +10,14 @@ use std::rc::Rc;
 type Output = Rc<RefCell<String>>;
 
 static NEXT_CONT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_WIND_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct WindEntry {
+    id: u64,
+    in_thunk: Value,
+    out_thunk: Value,
+}
 
 #[derive(Clone)]
 struct ContinuationData {
@@ -17,6 +25,8 @@ struct ContinuationData {
     remaining_exprs: Vec<Expr>,
     env: Env,
     out: Output,
+    wind_stack: Vec<WindEntry>,
+    top_level_context: Option<(Vec<Expr>, usize, Env, Output)>,
 }
 
 thread_local! {
@@ -25,6 +35,7 @@ thread_local! {
     static TOP_LEVEL_CONTEXT: RefCell<Option<(Vec<Expr>, usize, Env, Output)>> = RefCell::new(None);
     static BODY_CONTEXT: RefCell<Option<(Vec<Expr>, usize, Env, Output)>> = RefCell::new(None);
     static CONT_RETURN_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +337,8 @@ fn global_env() -> Env {
     // call/cc
     env_set(&env, "call/cc".to_string(), Value::Builtin("call/cc".to_string()));
     env_set(&env, "call-with-current-continuation".to_string(), Value::Builtin("call/cc".to_string()));
+    // dynamic-wind
+    env_set(&env, "dynamic-wind".to_string(), Value::Builtin("dynamic-wind".to_string()));
     env
 }
 
@@ -1017,14 +1030,18 @@ fn eval_callcc(proc: Value, span: Span, out: &Output) -> Result<Value, EvalError
 
     // Capture context for reentrant continuations.
     // Prefer body-level context (inside lambda/let bodies) over top-level.
-    let ctx = BODY_CONTEXT.with(|c| c.borrow().clone())
-        .or_else(|| TOP_LEVEL_CONTEXT.with(|c| c.borrow().clone()));
+    let body_ctx = BODY_CONTEXT.with(|c| c.borrow().clone());
+    let top_ctx = TOP_LEVEL_CONTEXT.with(|c| c.borrow().clone());
+    let wind_stack = WIND_STACK.with(|ws| ws.borrow().clone());
+    let ctx = body_ctx.clone().or_else(|| top_ctx.clone());
     if let Some((exprs, idx, env, out_ref)) = ctx {
         let data = ContinuationData {
             callcc_span: callcc_key,
             remaining_exprs: exprs[idx..].to_vec(),
             env,
             out: out_ref,
+            wind_stack,
+            top_level_context: if body_ctx.is_some() { top_ctx } else { None },
         };
         CONTINUATION_REGISTRY.with(|cr| {
             cr.borrow_mut().insert(cont_id, data);
@@ -1871,6 +1888,44 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
                 return Err(err_at(span, "call/cc: expected 1 argument"));
             }
             return eval_callcc(args[0].clone(), span, out);
+        }
+        "dynamic-wind" => {
+            if args.len() != 3 {
+                return Err(err_at(span, "dynamic-wind: expected 3 arguments"));
+            }
+            let in_thunk = &args[0];
+            let body_thunk = &args[1];
+            let out_thunk = &args[2];
+
+            // Run in-thunk
+            apply_func(in_thunk, &[], span, out)?;
+
+            // Push wind entry
+            let wind_id = NEXT_WIND_ID.fetch_add(1, Ordering::Relaxed);
+            WIND_STACK.with(|ws| ws.borrow_mut().push(WindEntry {
+                id: wind_id,
+                in_thunk: in_thunk.clone(),
+                out_thunk: out_thunk.clone(),
+            }));
+
+            // Run body
+            let result = apply_func(body_thunk, &[], span, out);
+
+            // Pop wind entry
+            WIND_STACK.with(|ws| ws.borrow_mut().pop());
+
+            match result {
+                Ok(val) => {
+                    apply_func(out_thunk, &[], span, out)?;
+                    Ok(val)
+                }
+                Err(EvalError::ContinuationReturn(id)) => {
+                    // Run out-thunk even on non-local exit
+                    apply_func(out_thunk, &[], span, out)?;
+                    Err(EvalError::ContinuationReturn(id))
+                }
+                Err(e) => Err(e),
+            }
         }
         "+" => {
             if args.is_empty() { return Ok(Value::Integer(0)); }
@@ -3064,14 +3119,66 @@ fn eval_top_level(exprs: &[Expr], env: &Env, out: &Output) -> Result<Value, Eval
                     if let Some(data) = cont_data {
                         let val = CONT_RETURN_VALUE.with(|cr| cr.borrow_mut().take())
                             .unwrap_or(Value::Void);
-                        CALLCC_RESUME.with(|cr| {
-                            *cr.borrow_mut() = Some((data.callcc_span, val));
-                        });
-                        cur_exprs = data.remaining_exprs.clone();
-                        cur_env = data.env.clone();
-                        cur_out = data.out.clone();
-                        jumped = true;
-                        break;
+
+                        let target_wind = &data.wind_stack;
+                        let has_wind = !target_wind.is_empty() || WIND_STACK.with(|ws| !ws.borrow().is_empty());
+
+                        if has_wind {
+                            // Perform wind transition: current → target
+                            let current_wind = WIND_STACK.with(|ws| ws.borrow().clone());
+                            let common = current_wind.iter().zip(target_wind.iter())
+                                .take_while(|(a, b)| a.id == b.id)
+                                .count();
+
+                            // Unwind from current to common (out-thunks, reverse order)
+                            for entry in current_wind[common..].iter().rev() {
+                                apply_func(&entry.out_thunk, &[], Span::new(0, 0), &cur_out)?;
+                            }
+                            // Rewind from common to target (in-thunks, forward order)
+                            for entry in &target_wind[common..] {
+                                apply_func(&entry.in_thunk, &[], Span::new(0, 0), &cur_out)?;
+                            }
+                            WIND_STACK.with(|ws| *ws.borrow_mut() = target_wind.clone());
+
+                            // Replay body context
+                            CALLCC_RESUME.with(|cr| {
+                                *cr.borrow_mut() = Some((data.callcc_span, val));
+                            });
+                            let mut body_last = Value::Void;
+                            for bexpr in &data.remaining_exprs {
+                                body_last = eval(bexpr, &data.env, &data.out)?;
+                            }
+
+                            // Unwind back (target → empty)
+                            let after_wind = WIND_STACK.with(|ws| ws.borrow().clone());
+                            for entry in after_wind.iter().rev() {
+                                apply_func(&entry.out_thunk, &[], Span::new(0, 0), &cur_out)?;
+                            }
+                            WIND_STACK.with(|ws| ws.borrow_mut().clear());
+
+                            // Continue with top-level context if available
+                            if let Some((tl_exprs, tl_idx, tl_env, tl_out)) = &data.top_level_context {
+                                if tl_idx + 1 < tl_exprs.len() {
+                                    cur_exprs = tl_exprs[tl_idx + 1..].to_vec();
+                                    cur_env = tl_env.clone();
+                                    cur_out = tl_out.clone();
+                                    jumped = true;
+                                    break;
+                                }
+                            }
+                            last = body_last;
+                            break;
+                        } else {
+                            // No wind stack, original behavior
+                            CALLCC_RESUME.with(|cr| {
+                                *cr.borrow_mut() = Some((data.callcc_span, val));
+                            });
+                            cur_exprs = data.remaining_exprs.clone();
+                            cur_env = data.env.clone();
+                            cur_out = data.out.clone();
+                            jumped = true;
+                            break;
+                        }
                     } else {
                         return Err(EvalError::ContinuationReturn(id));
                     }
@@ -3100,6 +3207,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     CALLCC_RESUME.with(|cr| *cr.borrow_mut() = None);
     CONT_RETURN_VALUE.with(|cr| *cr.borrow_mut() = None);
     TOP_LEVEL_CONTEXT.with(|ctx| *ctx.borrow_mut() = None);
+    WIND_STACK.with(|ws| ws.borrow_mut().clear());
     let last = eval_top_level(&exprs, &env, &out)?;
     Ok(last.display())
 }
@@ -3115,6 +3223,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     CALLCC_RESUME.with(|cr| *cr.borrow_mut() = None);
     CONT_RETURN_VALUE.with(|cr| *cr.borrow_mut() = None);
     TOP_LEVEL_CONTEXT.with(|ctx| *ctx.borrow_mut() = None);
+    WIND_STACK.with(|ws| ws.borrow_mut().clear());
     let last = eval_top_level(&exprs, &env, &out)?;
     let output = out.borrow().clone();
     Ok((last.display(), output))
