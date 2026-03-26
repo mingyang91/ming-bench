@@ -233,10 +233,20 @@ public class Evaluator {
         ResolvedRef(String name, Env env) { this.name = name; this.env = env; }
     }
 
+    // ---- Dynamic wind ----
+    static final class WindFrame {
+        final Object inThunk;
+        final Object outThunk;
+        WindFrame(Object inThunk, Object outThunk) { this.inThunk = inThunk; this.outThunk = outThunk; }
+    }
+
+    final List<WindFrame> windStack = new ArrayList<>();
+
     // ---- Continuation / trampoline types ----
     static final class SchemeCont {
         final Cont k;
-        SchemeCont(Cont k) { this.k = k; }
+        final List<WindFrame> capturedWind;
+        SchemeCont(Cont k, List<WindFrame> capturedWind) { this.k = k; this.capturedWind = capturedWind; }
     }
 
     static final class CallccProc {}
@@ -597,7 +607,24 @@ public class Evaluator {
                     }
                     case "call/cc", "call-with-current-continuation": {
                         Env ccEnv = env;
-                        return new BounceStep(list.get(1), env, procVal -> applyProc(procVal, List.of(new SchemeCont(k)), k));
+                        return new BounceStep(list.get(1), env, procVal -> applyProc(procVal, List.of(new SchemeCont(k, new ArrayList<>(windStack))), k));
+                    }
+                    case "dynamic-wind": {
+                        if (list.size() != 4) throw posError("dynamic-wind: expected 3 arguments");
+                        Env dwEnv = env;
+                        return new BounceStep(list.get(1), env, inThunk ->
+                            new BounceStep(list.get(2), dwEnv, bodyThunk ->
+                                new BounceStep(list.get(3), dwEnv, outThunk -> {
+                                    WindFrame frame = new WindFrame(inThunk, outThunk);
+                                    return applyProc(inThunk, List.of(), ignored1 -> {
+                                        windStack.add(frame);
+                                        return applyProc(bodyThunk, List.of(), bodyVal -> {
+                                            windStack.remove(windStack.size() - 1);
+                                            return applyProc(outThunk, List.of(), ignored2 ->
+                                                k.apply(bodyVal));
+                                        });
+                                    });
+                                })));
                     }
                 }
                 // Check for macros
@@ -891,12 +918,14 @@ public class Evaluator {
             }
             if (proc instanceof SchemeCont sc) {
                 Object value = args.isEmpty() ? null : args.get(0);
-                if (trampolineDepth > 1) throw new ContinuationInvoked(sc.k, value);
-                return new BounceApplyK(sc.k, value);
+                return performWindTransition(sc.capturedWind, value, v -> {
+                    if (trampolineDepth > 1) throw new ContinuationInvoked(sc.k, v);
+                    return new BounceApplyK(sc.k, v);
+                });
             }
             if (proc instanceof CallccProc) {
                 Object theProc = args.get(0);
-                SchemeCont captured = new SchemeCont(k);
+                SchemeCont captured = new SchemeCont(k, new ArrayList<>(windStack));
                 args = List.of(captured);
                 proc = theProc;
                 continue;
@@ -918,6 +947,34 @@ public class Evaluator {
             }
             throw posError("not a procedure: " + schemeToString(proc));
         }
+    }
+
+    // ---- Wind transition for dynamic-wind + call/cc ----
+
+    private Object performWindTransition(List<WindFrame> target, Object value, Cont finalK) throws EvalError {
+        int common = 0;
+        int maxCommon = Math.min(windStack.size(), target.size());
+        while (common < maxCommon && windStack.get(common) == target.get(common)) {
+            common++;
+        }
+        return unwindTo(common, target, value, finalK);
+    }
+
+    private Object unwindTo(int targetSize, List<WindFrame> target, Object value, Cont finalK) throws EvalError {
+        if (windStack.size() <= targetSize) {
+            return rewindFrom(target, windStack.size(), value, finalK);
+        }
+        WindFrame frame = windStack.remove(windStack.size() - 1);
+        return applyProc(frame.outThunk, List.of(), ignored -> unwindTo(targetSize, target, value, finalK));
+    }
+
+    private Object rewindFrom(List<WindFrame> target, int idx, Object value, Cont finalK) throws EvalError {
+        if (idx >= target.size()) {
+            return finalK.apply(value);
+        }
+        WindFrame frame = target.get(idx);
+        windStack.add(frame);
+        return applyProc(frame.inThunk, List.of(), ignored -> rewindFrom(target, idx + 1, value, finalK));
     }
 
     // Synchronous apply for builtins (map/for-each callbacks)
@@ -953,7 +1010,7 @@ public class Evaluator {
                 // Limited call/cc in sync context: only escape continuations work
                 Object theProc = args.get(0);
                 Cont haltK = val -> new BounceVal(val);
-                SchemeCont captured = new SchemeCont(haltK);
+                SchemeCont captured = new SchemeCont(haltK, new ArrayList<>(windStack));
                 proc = theProc;
                 args = List.of(captured);
                 continue;
@@ -1217,7 +1274,7 @@ public class Evaluator {
             case "if", "define", "lambda", "quote", "set!", "begin", "cond",
                  "let", "let*", "and", "or", "define-syntax", "syntax-rules",
                  "define-record-type", "case-lambda",
-                 "letrec", "letrec*", "case", "do" -> true;
+                 "letrec", "letrec*", "case", "do", "dynamic-wind" -> true;
             default -> false;
         };
     }
