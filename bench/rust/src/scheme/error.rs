@@ -145,6 +145,9 @@ pub enum EvalError {
     #[error("{name} cannot mutate an immutable string")]
     ImmutableString { name: &'static str },
 
+    #[error("expected a single value, got {got}")]
+    WrongValueCount { got: usize },
+
     #[error("division by zero")]
     DivisionByZero,
 }

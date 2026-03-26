@@ -175,6 +175,7 @@ enum Value {
     Vector(SchemeVector),
     Record(Rc<RecordValue>),
     Procedure(Rc<Procedure>),
+    Values(Vec<Value>),
     Uninitialized,
     Void,
 }
@@ -592,7 +593,10 @@ fn push_exception_handler(
 ) -> ExceptionHandlerGuard {
     let active = exceptions_are_enabled_in_current_level();
     if active {
-        context.exception_handlers.borrow_mut().push(handler.clone());
+        context
+            .exception_handlers
+            .borrow_mut()
+            .push(handler.clone());
     }
     ExceptionHandlerGuard {
         handlers: context.exception_handlers.clone(),
@@ -608,7 +612,9 @@ fn push_dynamic_wind(wind: DynamicWindRef, context: &EvalContext) {
 fn pop_dynamic_wind(expected: &DynamicWindRef, context: &EvalContext) {
     let popped = context.dynamic_winds.borrow_mut().pop();
     debug_assert!(
-        popped.as_ref().is_some_and(|wind| Rc::ptr_eq(wind, expected)),
+        popped
+            .as_ref()
+            .is_some_and(|wind| Rc::ptr_eq(wind, expected)),
         "dynamic-wind stack must unwind in LIFO order",
     );
 }
@@ -639,10 +645,10 @@ fn transition_dynamic_winds(
                 .expect("current dynamic-wind stack is non-empty when unwinding")
                 .clone();
             pop_dynamic_wind(&wind, context);
-            apply_procedure(wind.out_thunk.clone(), Vec::new(), context)?;
+            apply_procedure_single(wind.out_thunk.clone(), Vec::new(), context)?;
         } else {
             let wind = target[shared].clone();
-            apply_procedure(wind.in_thunk.clone(), Vec::new(), context)?;
+            apply_procedure_single(wind.in_thunk.clone(), Vec::new(), context)?;
             push_dynamic_wind(wind, context);
         }
     }
@@ -765,6 +771,17 @@ impl Procedure {
                     }));
 
                     Ok(EvalStep::Apply(args[0].clone(), vec![continuation]))
+                } else if *name == "call-with-values" {
+                    if args.len() != 2 {
+                        return Err(EvalError::WrongArgCount {
+                            name,
+                            expected: "exactly 2 arguments",
+                            got: args.len(),
+                        });
+                    }
+
+                    let produced = apply_procedure(args[0].clone(), Vec::new(), context)?;
+                    Ok(EvalStep::Apply(args[1].clone(), unpack_values(produced)))
                 } else if *name == "dynamic-wind" {
                     if args.len() != 3 {
                         return Err(EvalError::WrongArgCount {
@@ -779,7 +796,7 @@ impl Procedure {
                         out_thunk: args[2].clone(),
                     });
 
-                    apply_procedure_with_frame(
+                    apply_procedure_with_frame_single(
                         args[0].clone(),
                         Vec::new(),
                         ContinuationFrame::DynamicWindAfterIn {
@@ -800,7 +817,7 @@ impl Procedure {
 
                     pop_dynamic_wind(&wind, context);
 
-                    apply_procedure_with_frame(
+                    apply_procedure_with_frame_single(
                         wind.out_thunk.clone(),
                         Vec::new(),
                         ContinuationFrame::DynamicWindAfterOut {
@@ -970,6 +987,7 @@ impl Value {
             Self::Vector(_) => "vector",
             Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
+            Self::Values(_) => "values",
             Self::Uninitialized => "uninitialized",
             Self::Void => "void",
         }
@@ -981,6 +999,28 @@ impl Value {
 
     fn display_render(&self) -> String {
         render_value(self, true)
+    }
+}
+
+fn pack_values(values: Vec<Value>) -> Value {
+    match values.len() {
+        1 => values.into_iter().next().unwrap(),
+        _ => Value::Values(values),
+    }
+}
+
+fn unpack_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Values(values) => values,
+        other => vec![other],
+    }
+}
+
+fn expect_single_value(value: Value) -> Result<Value, EvalError> {
+    match value {
+        Value::Values(mut values) if values.len() == 1 => Ok(values.pop().unwrap()),
+        Value::Values(values) => Err(EvalError::WrongValueCount { got: values.len() }),
+        other => Ok(other),
     }
 }
 
@@ -1260,6 +1300,14 @@ fn eval_expr_in_env(
     resolve_eval_step(EvalStep::Expr(expr.clone(), env.clone()), context)
 }
 
+fn eval_expr_in_env_single(
+    expr: &Expr,
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_single_value(eval_expr_in_env(expr, env, context)?)
+}
+
 fn eval_expr_with_frame(
     expr: &Expr,
     env: &EnvRef,
@@ -1270,6 +1318,15 @@ fn eval_expr_with_frame(
     eval_expr_in_env(expr, env, context)
 }
 
+fn eval_expr_with_frame_single(
+    expr: &Expr,
+    env: &EnvRef,
+    frame: ContinuationFrame,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_single_value(eval_expr_with_frame(expr, env, frame, context)?)
+}
+
 fn apply_procedure_with_frame(
     procedure: Value,
     args: Vec<Value>,
@@ -1278,6 +1335,23 @@ fn apply_procedure_with_frame(
 ) -> Result<Value, EvalError> {
     let _guard = push_continuation_frame(context, frame);
     apply_procedure(procedure, args, context)
+}
+
+fn apply_procedure_single(
+    procedure: Value,
+    args: Vec<Value>,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_single_value(apply_procedure(procedure, args, context)?)
+}
+
+fn apply_procedure_with_frame_single(
+    procedure: Value,
+    args: Vec<Value>,
+    frame: ContinuationFrame,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    expect_single_value(apply_procedure_with_frame(procedure, args, frame, context)?)
 }
 
 fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<Value, EvalError> {
@@ -1418,7 +1492,7 @@ fn eval_top_level_state(
             });
             let _frame_guard = push_continuation_frame(context, frame);
             let _position_guard = push_position(context, Some(expression.position));
-            eval_expr_in_env(&expanded, &state.env, context)
+            eval_expr_in_env_single(&expanded, &state.env, context)
         }
         .map_err(|error| {
             error.with_position(expression.position.line, expression.position.column)
@@ -1440,10 +1514,14 @@ fn resume_continuation_frames(
             context.frames.borrow_mut().clone_from(&frames);
         }
         value = match frame {
-            ContinuationFrame::Program(state) => eval_top_level_state(state, context)?,
+            ContinuationFrame::Program(state) => {
+                expect_single_value(value)?;
+                eval_top_level_state(state, context)?
+            }
             ContinuationFrame::ApplicationOperator { args, env } => {
-                let args = eval_application_args(value.clone(), &args, &env, context)?;
-                apply_procedure(value, args, context)?
+                let procedure = expect_single_value(value)?;
+                let args = eval_application_args(procedure.clone(), &args, &env, context)?;
+                apply_procedure(procedure, args, context)?
             }
             ContinuationFrame::ApplicationArg {
                 procedure,
@@ -1452,15 +1530,17 @@ fn resume_continuation_frames(
                 env,
             } => {
                 let mut slots = before;
-                slots.push(PendingArg::Value(value));
+                slots.push(PendingArg::Value(expect_single_value(value)?));
                 slots.extend(after);
                 let args = eval_application_slots(procedure.clone(), &slots, &env, context)?;
                 apply_procedure(procedure, args, context)?
             }
             ContinuationFrame::Sequence { remaining, env } => {
+                expect_single_value(value)?;
                 eval_sequence(&remaining, &env, context)?
             }
             ContinuationFrame::And { remaining, env } => {
+                let value = expect_single_value(value)?;
                 if value.is_truthy() {
                     eval_and_values(&remaining, &env, context)?
                 } else {
@@ -1468,6 +1548,7 @@ fn resume_continuation_frames(
                 }
             }
             ContinuationFrame::Or { remaining, env } => {
+                let value = expect_single_value(value)?;
                 if value.is_truthy() {
                     value
                 } else {
@@ -1475,13 +1556,15 @@ fn resume_continuation_frames(
                 }
             }
             ContinuationFrame::CaseKey { clauses, env } => {
-                eval_case_clauses(&value, &clauses, &env, context)?
+                let key = expect_single_value(value)?;
+                eval_case_clauses(&key, &clauses, &env, context)?
             }
             ContinuationFrame::CondTest {
                 body,
                 remaining,
                 env,
             } => {
+                let value = expect_single_value(value)?;
                 if value.is_truthy() {
                     if body.is_empty() {
                         value
@@ -1498,6 +1581,7 @@ fn resume_continuation_frames(
                 remaining,
                 env,
             } => {
+                let value = expect_single_value(value)?;
                 if value.is_truthy() {
                     if body.is_empty() {
                         value
@@ -1513,7 +1597,8 @@ fn resume_continuation_frames(
                 alternate,
                 env,
             } => {
-                if value.is_truthy() {
+                let test = expect_single_value(value)?;
+                if test.is_truthy() {
                     eval_expr_in_env(&consequent, &env, context)?
                 } else if let Some(alternate) = alternate {
                     eval_expr_in_env(&alternate, &env, context)?
@@ -1522,10 +1607,12 @@ fn resume_continuation_frames(
                 }
             }
             ContinuationFrame::Define { name, env } => {
+                let value = expect_single_value(value)?;
                 env.define(name, value);
                 Value::Void
             }
             ContinuationFrame::Set { name, env } => {
+                let value = expect_single_value(value)?;
                 env.set(&name, value)?;
                 Value::Void
             }
@@ -1537,7 +1624,7 @@ fn resume_continuation_frames(
                 env,
             } => {
                 let mut evaluated = evaluated;
-                evaluated.push((name, value));
+                evaluated.push((name, expect_single_value(value)?));
                 let let_env =
                     eval_parallel_let_bindings(evaluated, &remaining, &body, &env, context)?;
                 eval_sequence(&body, &let_env, context)?
@@ -1551,7 +1638,7 @@ fn resume_continuation_frames(
                 env,
             } => {
                 let mut args = evaluated;
-                args.push(value);
+                args.push(expect_single_value(value)?);
                 let args =
                     eval_named_let_args(&name, &params, args, &remaining, &body, &env, context)?;
                 let (procedure, args) = build_named_let_call(name, params, body, &env, args);
@@ -1563,7 +1650,7 @@ fn resume_continuation_frames(
                 remaining,
                 body,
             } => {
-                let_env.define(name, value);
+                let_env.define(name, expect_single_value(value)?);
                 let let_env = eval_let_star_bindings(&let_env, &remaining, &body, context)?;
                 eval_sequence(&body, &let_env, context)?
             }
@@ -1573,7 +1660,7 @@ fn resume_continuation_frames(
                 body,
                 letrec_env,
             } => {
-                *cell.borrow_mut() = value;
+                *cell.borrow_mut() = expect_single_value(value)?;
                 eval_letrec_sequential_bindings(&remaining, &letrec_env, &body, context)?;
                 eval_sequence(&body, &letrec_env, context)?
             }
@@ -1585,7 +1672,7 @@ fn resume_continuation_frames(
                 letrec_env,
             } => {
                 let mut values = evaluated;
-                values.push(value);
+                values.push(expect_single_value(value)?);
                 let values = eval_letrec_parallel_bindings(
                     &cells,
                     values,
@@ -1606,15 +1693,19 @@ fn resume_continuation_frames(
                 results,
             } => {
                 let mut results = results;
-                results.push(value);
+                results.push(expect_single_value(value)?);
                 apply_map_from_index(procedure, &lists, index, results, context)?
             }
             ContinuationFrame::ForEachCall {
                 procedure,
                 lists,
                 index,
-            } => apply_for_each_from_index(procedure, &lists, index, context)?,
+            } => {
+                expect_single_value(value)?;
+                apply_for_each_from_index(procedure, &lists, index, context)?
+            }
             ContinuationFrame::DynamicWindAfterIn { wind, body_thunk } => {
+                expect_single_value(value)?;
                 push_dynamic_wind(wind.clone(), context);
                 let result = apply_procedure_with_frame(
                     body_thunk,
@@ -1623,7 +1714,7 @@ fn resume_continuation_frames(
                     context,
                 )?;
                 pop_dynamic_wind(&wind, context);
-                apply_procedure_with_frame(
+                apply_procedure_with_frame_single(
                     wind.out_thunk.clone(),
                     Vec::new(),
                     ContinuationFrame::DynamicWindAfterOut {
@@ -1635,7 +1726,7 @@ fn resume_continuation_frames(
             }
             ContinuationFrame::DynamicWindAfterBody { wind } => {
                 pop_dynamic_wind(&wind, context);
-                apply_procedure_with_frame(
+                apply_procedure_with_frame_single(
                     wind.out_thunk.clone(),
                     Vec::new(),
                     ContinuationFrame::DynamicWindAfterOut {
@@ -1645,7 +1736,10 @@ fn resume_continuation_frames(
                 )?;
                 value
             }
-            ContinuationFrame::DynamicWindAfterOut { result } => result,
+            ContinuationFrame::DynamicWindAfterOut { result } => {
+                expect_single_value(value)?;
+                result
+            }
         };
     }
 
@@ -1687,7 +1781,7 @@ fn eval_application_slots(
                     after: slots[index + 1..].to_vec(),
                     env: env.clone(),
                 };
-                eval_expr_with_frame(expr, env, frame, context)?
+                eval_expr_with_frame_single(expr, env, frame, context)?
             }
         };
         evaluated.push(value);
@@ -1714,7 +1808,7 @@ fn eval_and_values(
                 .collect(),
             env: env.clone(),
         };
-        let value = eval_expr_with_frame(arg, env, frame, context)?;
+        let value = eval_expr_with_frame_single(arg, env, frame, context)?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -1741,7 +1835,7 @@ fn eval_or_values(
                 .collect(),
             env: env.clone(),
         };
-        let value = eval_expr_with_frame(arg, env, frame, context)?;
+        let value = eval_expr_with_frame_single(arg, env, frame, context)?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -1851,7 +1945,7 @@ fn eval_cond_clauses(
             remaining: clauses[index + 1..].to_vec(),
             env: env.clone(),
         };
-        let value = eval_expr_with_frame(test, env, frame, context)?;
+        let value = eval_expr_with_frame_single(test, env, frame, context)?;
         if value.is_truthy() {
             return if body.is_empty() {
                 Ok(value)
@@ -1882,7 +1976,7 @@ fn eval_parallel_let_bindings(
             body: body.to_vec(),
             env: env.clone(),
         };
-        let value = eval_expr_with_frame(expr, env, frame, context)?;
+        let value = eval_expr_with_frame_single(expr, env, frame, context)?;
         evaluated.push((name.clone(), value));
         remaining = rest;
     }
@@ -1916,7 +2010,7 @@ fn eval_named_let_args(
             body: body.to_vec(),
             env: env.clone(),
         };
-        let value = eval_expr_with_frame(expr, env, frame, context)?;
+        let value = eval_expr_with_frame_single(expr, env, frame, context)?;
         evaluated.push(value);
         remaining = rest;
     }
@@ -1961,7 +2055,7 @@ fn eval_let_star_bindings(
             remaining: rest.to_vec(),
             body: body.to_vec(),
         };
-        let value = eval_expr_with_frame(init, let_env, frame, context)?;
+        let value = eval_expr_with_frame_single(init, let_env, frame, context)?;
         let_env.define(name.clone(), value);
         remaining = rest;
     }
@@ -1987,7 +2081,7 @@ fn eval_letrec_sequential_bindings(
             body: body.to_vec(),
             letrec_env: letrec_env.clone(),
         };
-        let value = eval_expr_with_frame(init, letrec_env, frame, context)?;
+        let value = eval_expr_with_frame_single(init, letrec_env, frame, context)?;
         *cell.borrow_mut() = value;
         remaining = rest;
     }
@@ -2013,7 +2107,7 @@ fn eval_letrec_parallel_bindings(
             body: body.to_vec(),
             letrec_env: letrec_env.clone(),
         };
-        let value = eval_expr_with_frame(init, letrec_env, frame, context)?;
+        let value = eval_expr_with_frame_single(init, letrec_env, frame, context)?;
         evaluated.push(value);
         remaining = rest;
     }
@@ -2041,7 +2135,8 @@ fn apply_map_from_index(
             index: index + 1,
             results: results.clone(),
         };
-        let value = apply_procedure_with_frame(procedure.clone(), call_args, frame, context)?;
+        let value =
+            apply_procedure_with_frame_single(procedure.clone(), call_args, frame, context)?;
         results.push(value);
         index += 1;
     }
@@ -2067,7 +2162,7 @@ fn apply_for_each_from_index(
             lists: lists.to_vec(),
             index: index + 1,
         };
-        apply_procedure_with_frame(procedure.clone(), call_args, frame, context)?;
+        apply_procedure_with_frame_single(procedure.clone(), call_args, frame, context)?;
         index += 1;
     }
 
@@ -2142,7 +2237,8 @@ fn eval_application_step(
             env: env.clone(),
         },
         context,
-    )?;
+    )
+    .and_then(expect_single_value)?;
     let args = eval_application_args(procedure.clone(), tail, &env, context)?;
 
     Ok(EvalStep::Apply(procedure, args))
@@ -2179,7 +2275,8 @@ fn eval_sequence_step(
                 env: env.clone(),
             },
             context,
-        )?;
+        )
+        .and_then(expect_single_value)?;
         remaining = rest;
     }
 
@@ -2204,7 +2301,7 @@ fn eval_and_step(
                 .collect(),
             env: env.clone(),
         };
-        let result = eval_expr_with_frame(arg, env, frame, context)?;
+        let result = eval_expr_with_frame_single(arg, env, frame, context)?;
         if !result.is_truthy() {
             return Ok(EvalStep::Value(result));
         }
@@ -2231,7 +2328,7 @@ fn eval_or_step(
                 .collect(),
             env: env.clone(),
         };
-        let value = eval_expr_with_frame(arg, env, frame, context)?;
+        let value = eval_expr_with_frame_single(arg, env, frame, context)?;
         if value.is_truthy() {
             return Ok(EvalStep::Value(value));
         }
@@ -2265,7 +2362,8 @@ fn eval_case_step(
             env: env.clone(),
         },
         context,
-    )?;
+    )
+    .and_then(expect_single_value)?;
 
     for (index, clause) in clauses.iter().enumerate() {
         let Expr::List(items) = clause else {
@@ -2362,7 +2460,7 @@ fn eval_cond_step(
             remaining: args[index + 1..].to_vec(),
             env: env.clone(),
         };
-        let value = eval_expr_with_frame(test, env, frame, context)?;
+        let value = eval_expr_with_frame_single(test, env, frame, context)?;
         if value.is_truthy() {
             return if body.is_empty() {
                 Ok(EvalStep::Value(value))
@@ -2490,7 +2588,7 @@ fn eval_guard_clauses(
             remaining: clauses[index + 1..].to_vec(),
             env: env.clone(),
         };
-        let value = eval_expr_with_frame(test, env, frame, context)?;
+        let value = eval_expr_with_frame_single(test, env, frame, context)?;
         if value.is_truthy() {
             return if body.is_empty() {
                 Ok(value)
@@ -2538,7 +2636,8 @@ fn eval_define_step(
                     env: env.clone(),
                 },
                 context,
-            )?;
+            )
+            .and_then(expect_single_value)?;
             env.define(name.clone(), value);
             Ok(EvalStep::Value(Value::Void))
         }
@@ -2695,7 +2794,8 @@ fn eval_if_step(
             env: env.clone(),
         },
         context,
-    )?;
+    )
+    .and_then(expect_single_value)?;
 
     if test.is_truthy() {
         Ok(EvalStep::Expr(args[1].clone(), env.clone()))
@@ -2734,7 +2834,8 @@ fn eval_set_step(
             env: env.clone(),
         },
         context,
-    )?;
+    )
+    .and_then(expect_single_value)?;
     env.set(name, value)?;
     Ok(EvalStep::Value(Value::Void))
 }
@@ -2959,7 +3060,7 @@ fn eval_do_step(
 
     let init_values = bindings
         .iter()
-        .map(|binding| eval_expr_in_env(&binding.init, env, context))
+        .map(|binding| eval_expr_in_env_single(&binding.init, env, context))
         .collect::<Result<Vec<_>, EvalError>>()?;
 
     let do_env = Env::new(Some(env.clone()));
@@ -2971,7 +3072,7 @@ fn eval_do_step(
     }
 
     loop {
-        if eval_expr_in_env(&test, &do_env, context)?.is_truthy() {
+        if eval_expr_in_env_single(&test, &do_env, context)?.is_truthy() {
             return if result_exprs.is_empty() {
                 Ok(EvalStep::Value(Value::Void))
             } else {
@@ -2979,14 +3080,15 @@ fn eval_do_step(
             };
         }
 
-        eval_sequence(body, &do_env, context)?;
+        expect_single_value(eval_sequence(body, &do_env, context)?)?;
 
         let updates = bindings
             .iter()
             .zip(cells.iter())
             .filter_map(|(binding, cell)| {
                 binding.step.as_ref().map(|step| {
-                    eval_expr_in_env(step, &do_env, context).map(|value| (cell.clone(), value))
+                    eval_expr_in_env_single(step, &do_env, context)
+                        .map(|value| (cell.clone(), value))
                 })
             })
             .collect::<Result<Vec<_>, EvalError>>()?;
@@ -3372,6 +3474,18 @@ fn render_value_inner(value: &Value, display: bool, active: &mut HashSet<usize>)
         }
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Procedure(_) => "#<procedure>".into(),
+        Value::Values(values) => match values.as_slice() {
+            [] => "#<values>".into(),
+            [value] => render_value_inner(value, display, active),
+            _ => {
+                let rendered = values
+                    .iter()
+                    .map(|value| render_value_inner(value, display, active))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("#<values {rendered}>")
+            }
+        },
         Value::Uninitialized => "#<uninitialized>".into(),
         Value::Void => "#<void>".into(),
     }
@@ -3441,6 +3555,7 @@ fn root_env() -> EnvRef {
         "assv",
         "boolean?",
         "call-with-current-continuation",
+        "call-with-values",
         "call/cc",
         "caar",
         "cadr",
@@ -3536,6 +3651,7 @@ fn root_env() -> EnvRef {
         "vector-ref",
         "vector-set!",
         "vector?",
+        "values",
         "with-exception-handler",
         "write",
         "zero?",
@@ -4297,6 +4413,7 @@ fn apply_builtin(
             Ok(Value::Void)
         }
         "vector?" => predicate_builtin("vector?", args, |value| matches!(value, Value::Vector(_))),
+        "values" => Ok(pack_values(args.to_vec())),
         "with-exception-handler" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount {
@@ -4306,8 +4423,7 @@ fn apply_builtin(
                 });
             }
 
-            if !matches!(args[0], Value::Procedure(_)) || !matches!(args[1], Value::Procedure(_))
-            {
+            if !matches!(args[0], Value::Procedure(_)) || !matches!(args[1], Value::Procedure(_)) {
                 return Err(EvalError::NotAProcedure);
             }
 
