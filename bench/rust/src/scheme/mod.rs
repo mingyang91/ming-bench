@@ -242,6 +242,20 @@ impl Env {
 
         self.parent.as_ref().and_then(|parent| parent.lookup(name))
     }
+
+    fn set(&self, name: &str, value: Value) -> bool {
+        {
+            let mut bindings = self.bindings.borrow_mut();
+            if let Some(slot) = bindings.get_mut(name) {
+                *slot = value;
+                return true;
+            }
+        }
+
+        self.parent
+            .as_ref()
+            .is_some_and(|parent| parent.set(name, value))
+    }
 }
 
 struct Procedure {
@@ -557,6 +571,7 @@ fn eval_list(items: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value,
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => return eval_define(tail, env, output),
+            "set!" => return eval_set(tail, env, output),
             "if" => return eval_if(tail, env, output),
             "quote" => return eval_quote(tail),
             "lambda" => return build_lambda(tail, env, None),
@@ -604,6 +619,23 @@ fn eval_define(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value
         _ => Err(EvalError::Syntax {
             message: "define: invalid syntax".into(),
         }),
+    }
+}
+
+fn eval_set(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    match args {
+        [Expr::Symbol(name, _), value_expr] => {
+            let value = eval(value_expr, env, output)?;
+            if env.set(name, value) {
+                Ok(Value::Void)
+            } else {
+                Err(EvalError::UnboundVariable { name: name.clone() })
+            }
+        }
+        [_, _] => Err(EvalError::Syntax {
+            message: "set!: expected variable name".into(),
+        }),
+        _ => Err(wrong_arg_count("set!", "2", args.len())),
     }
 }
 
