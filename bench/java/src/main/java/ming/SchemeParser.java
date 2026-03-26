@@ -55,6 +55,9 @@ final class SchemeParser {
         if ("#f".equals(token)) {
             return new LiteralExpression(BoolValue.FALSE, position);
         }
+        if (token.startsWith("#\\")) {
+            return new LiteralExpression(new CharValue(parseCharacterLiteral(token, position)), position);
+        }
         if (isIntegerToken(token)) {
             return new LiteralExpression(new IntValue(parseInteger(token, position)), position);
         }
@@ -204,5 +207,22 @@ final class SchemeParser {
         } catch (NumberFormatException error) {
             throw new EvalError(position, "invalid integer: " + token);
         }
+    }
+
+    private char parseCharacterLiteral(String token, SourcePosition position) throws EvalError {
+        String character = token.substring(2);
+        if (character.isEmpty()) {
+            throw new EvalError(position, "invalid character literal: " + token);
+        }
+        return switch (character) {
+            case "space" -> ' ';
+            case "newline" -> '\n';
+            default -> {
+                if (character.length() == 1) {
+                    yield character.charAt(0);
+                }
+                throw new EvalError(position, "invalid character literal: " + token);
+            }
+        };
     }
 }

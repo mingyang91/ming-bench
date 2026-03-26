@@ -47,13 +47,49 @@ final class BoolValue implements SchemeValue {
     }
 }
 
-record StringValue(String value) implements SchemeValue {
+final class StringValue implements SchemeValue {
+    private final StringBuilder contents;
+    private final boolean mutable;
+
+    StringValue(String value) {
+        this(value, false);
+    }
+
+    StringValue(String value, boolean mutable) {
+        this.contents = new StringBuilder(value);
+        this.mutable = mutable;
+    }
+
+    String value() {
+        return contents.toString();
+    }
+
+    int length() {
+        return contents.length();
+    }
+
+    char charAt(int index) {
+        return contents.charAt(index);
+    }
+
+    boolean isMutable() {
+        return mutable;
+    }
+
+    void setCharAt(int index, char value) {
+        contents.setCharAt(index, value);
+    }
+
+    StringValue copy(boolean makeMutable) {
+        return new StringValue(value(), makeMutable);
+    }
+
     @Override
     public String render() {
         StringBuilder builder = new StringBuilder();
         builder.append('"');
-        for (int index = 0; index < value.length(); index++) {
-            appendEscaped(builder, value.charAt(index));
+        for (int index = 0; index < contents.length(); index++) {
+            appendEscaped(builder, contents.charAt(index));
         }
         builder.append('"');
         return builder.toString();
@@ -61,10 +97,10 @@ record StringValue(String value) implements SchemeValue {
 
     @Override
     public String display() {
-        return value;
+        return value();
     }
 
-    private void appendEscaped(StringBuilder builder, char current) {
+    private static void appendEscaped(StringBuilder builder, char current) {
         switch (current) {
             case '\n' -> builder.append("\\n");
             case '\r' -> builder.append("\\r");

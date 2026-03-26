@@ -196,6 +196,8 @@ public class Evaluator {
         builtins.put("symbol->string", new BuiltinProcedure("symbol->string", Evaluator::applySymbolToString));
         builtins.put("string->symbol", new BuiltinProcedure("string->symbol", Evaluator::applyStringToSymbol));
         builtins.put("string-ref", new BuiltinProcedure("string-ref", Evaluator::applyStringRef));
+        builtins.put("string-copy", new BuiltinProcedure("string-copy", Evaluator::applyStringCopy));
+        builtins.put("string-set!", new BuiltinProcedure("string-set!", Evaluator::applyStringSet));
         builtins.put("string?", new BuiltinProcedure("string?", args -> applyPredicate(args, "string?",
                 value -> value instanceof StringValue)));
         builtins.put("number?", new BuiltinProcedure("number?", args -> applyPredicate(args, "number?",
@@ -631,12 +633,33 @@ public class Evaluator {
 
     private static SchemeValue applyStringRef(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 2, "string-ref");
-        String value = requireString(arguments.getFirst(), "string-ref");
+        StringValue value = requireStringValue(arguments.getFirst(), "string-ref");
         long index = requireInteger(arguments.get(1), "string-ref");
         if (index < 0 || index >= value.length()) {
             throw new EvalError("string-ref: index out of bounds");
         }
         return new CharValue(value.charAt((int) index));
+    }
+
+    private static SchemeValue applyStringCopy(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "string-copy");
+        return requireStringValue(arguments.getFirst(), "string-copy").copy(true);
+    }
+
+    private static SchemeValue applyStringSet(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 3, "string-set!");
+        StringValue value = requireStringValue(arguments.get(0), "string-set!");
+        if (!value.isMutable()) {
+            throw new EvalError("string-set!: expected mutable string");
+        }
+
+        long index = requireInteger(arguments.get(1), "string-set!");
+        if (index < 0 || index >= value.length()) {
+            throw new EvalError("string-set!: index out of bounds");
+        }
+
+        value.setCharAt((int) index, requireChar(arguments.get(2), "string-set!"));
+        return VoidValue.INSTANCE;
     }
 
     private static SchemeValue applyPredicate(
@@ -677,8 +700,12 @@ public class Evaluator {
     }
 
     private static String requireString(SchemeValue value, String procedure) throws EvalError {
+        return requireStringValue(value, procedure).value();
+    }
+
+    private static StringValue requireStringValue(SchemeValue value, String procedure) throws EvalError {
         if (value instanceof StringValue stringValue) {
-            return stringValue.value();
+            return stringValue;
         }
         throw new EvalError(procedure + ": expected string");
     }
@@ -688,6 +715,13 @@ public class Evaluator {
             return symbolValue.name();
         }
         throw new EvalError(procedure + ": expected symbol");
+    }
+
+    private static char requireChar(SchemeValue value, String procedure) throws EvalError {
+        if (value instanceof CharValue charValue) {
+            return charValue.value();
+        }
+        throw new EvalError(procedure + ": expected char");
     }
 
     private static PairValue requirePair(SchemeValue value, String procedure) throws EvalError {
