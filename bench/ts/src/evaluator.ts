@@ -18,7 +18,8 @@ type SchemeVal =
   | { tag: 'builtin'; name: string; pos?: Pos }
   | { tag: 'macro'; rules: MacroRule[]; defEnv: Env; pos?: Pos }
   | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
-  | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[]; pos?: Pos };
+  | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[]; pos?: Pos }
+  | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (after macro name)
@@ -336,7 +337,8 @@ function isTruthy(val: SchemeVal): boolean {
 
 const SPECIAL_FORMS_SET = new Set([
   'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
-  'set!', 'cond', 'let', 'define-syntax', 'syntax-rules',
+  'set!', 'cond', 'let', 'letrec', 'letrec*', 'case', 'do',
+  'define-syntax', 'syntax-rules',
 ]);
 
 function isEllipsis(val: SchemeVal): boolean {
@@ -490,6 +492,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
     case 'char':
     case 'nil':
     case 'pair':
+    case 'vector':
       return expr;
     case 'symbol':
       try { return env.get(expr.value); }
@@ -671,6 +674,136 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
               result = evalExpr(elems[i], letEnv);
             }
             return result;
+          }
+          case 'letrec': {
+            if (elems.length < 3) throw errAt('letrec: bad syntax', expr.pos);
+            const bindings = elems[1];
+            if (bindings.tag !== 'list') throw errAt('letrec: bad syntax', expr.pos);
+            const letrecEnv = new Env(env);
+            // First set all to undefined placeholder
+            const names: string[] = [];
+            for (const b of bindings.elements) {
+              if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                throw errAt('letrec: bad binding', expr.pos);
+              names.push(b.elements[0].value);
+              letrecEnv.set(b.elements[0].value, SCM_FALSE);
+            }
+            // Then evaluate init expressions in the letrec env
+            for (let i = 0; i < bindings.elements.length; i++) {
+              const b = bindings.elements[i];
+              if (b.tag === 'list') {
+                const val = evalExpr(b.elements[1], letrecEnv);
+                letrecEnv.set(names[i], val);
+              }
+            }
+            let result: SchemeVal = SCM_FALSE;
+            for (let i = 2; i < elems.length; i++) {
+              result = evalExpr(elems[i], letrecEnv);
+            }
+            return result;
+          }
+          case 'letrec*': {
+            if (elems.length < 3) throw errAt('letrec*: bad syntax', expr.pos);
+            const bindings = elems[1];
+            if (bindings.tag !== 'list') throw errAt('letrec*: bad syntax', expr.pos);
+            const letrecStarEnv = new Env(env);
+            for (const b of bindings.elements) {
+              if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                throw errAt('letrec*: bad binding', expr.pos);
+              const val = evalExpr(b.elements[1], letrecStarEnv);
+              letrecStarEnv.set(b.elements[0].value, val);
+            }
+            let result: SchemeVal = SCM_FALSE;
+            for (let i = 2; i < elems.length; i++) {
+              result = evalExpr(elems[i], letrecStarEnv);
+            }
+            return result;
+          }
+          case 'case': {
+            if (elems.length < 2) throw errAt('case: bad syntax', expr.pos);
+            const key = evalExpr(elems[1], env);
+            for (let i = 2; i < elems.length; i++) {
+              const clause = elems[i];
+              if (clause.tag !== 'list' || clause.elements.length < 2)
+                throw errAt('case: bad clause', expr.pos);
+              const datums = clause.elements[0];
+              if (datums.tag === 'symbol' && datums.value === 'else') {
+                let result: SchemeVal = SCM_FALSE;
+                for (let j = 1; j < clause.elements.length; j++) {
+                  result = evalExpr(clause.elements[j], env);
+                }
+                return result;
+              }
+              if (datums.tag !== 'list') throw errAt('case: expected datum list', expr.pos);
+              for (const d of datums.elements) {
+                const datum = listToPairs(d);
+                if (schemeEqv(key, datum)) {
+                  let result: SchemeVal = SCM_FALSE;
+                  for (let j = 1; j < clause.elements.length; j++) {
+                    result = evalExpr(clause.elements[j], env);
+                  }
+                  return result;
+                }
+              }
+            }
+            return SCM_FALSE; // no match, no else => void (we use #f)
+          }
+          case 'do': {
+            // (do ((var init step) ...) (test expr ...) body ...)
+            if (elems.length < 3) throw errAt('do: bad syntax', expr.pos);
+            const bindingList = elems[1];
+            if (bindingList.tag !== 'list') throw errAt('do: bad syntax', expr.pos);
+            const testClause = elems[2];
+            if (testClause.tag !== 'list' || testClause.elements.length < 1)
+              throw errAt('do: bad test clause', expr.pos);
+
+            const doEnv = new Env(env);
+            const varNames: string[] = [];
+            const stepExprs: (SchemeVal | null)[] = [];
+
+            // Initialize variables
+            for (const b of bindingList.elements) {
+              if (b.tag !== 'list' || b.elements.length < 2 || b.elements[0].tag !== 'symbol')
+                throw errAt('do: bad variable spec', expr.pos);
+              const name = b.elements[0].value;
+              const init = evalExpr(b.elements[1], env);
+              varNames.push(name);
+              stepExprs.push(b.elements.length >= 3 ? b.elements[2] : null);
+              doEnv.set(name, init);
+            }
+
+            // Iteration loop
+            while (true) {
+              // Test
+              const testVal = evalExpr(testClause.elements[0], doEnv);
+              if (isTruthy(testVal)) {
+                // Evaluate result expressions
+                if (testClause.elements.length === 1) return testVal;
+                let result: SchemeVal = SCM_FALSE;
+                for (let j = 1; j < testClause.elements.length; j++) {
+                  result = evalExpr(testClause.elements[j], doEnv);
+                }
+                return result;
+              }
+              // Execute body
+              for (let j = 3; j < elems.length; j++) {
+                evalExpr(elems[j], doEnv);
+              }
+              // Parallel step: evaluate all step expressions before updating
+              const newVals: (SchemeVal | null)[] = [];
+              for (let j = 0; j < varNames.length; j++) {
+                if (stepExprs[j] !== null) {
+                  newVals.push(evalExpr(stepExprs[j]!, doEnv));
+                } else {
+                  newVals.push(null);
+                }
+              }
+              for (let j = 0; j < varNames.length; j++) {
+                if (newVals[j] !== null) {
+                  doEnv.set(varNames[j], newVals[j]!);
+                }
+              }
+            }
           }
           case 'define-record-type': {
             // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
@@ -884,6 +1017,21 @@ function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
   }
 }
 
+function schemeEqv(a: SchemeVal, b: SchemeVal): boolean {
+  if (isNumeric(a) && isNumeric(b)) return numericCompare(a, b) === 0;
+  if (a.tag !== b.tag) return false;
+  switch (a.tag) {
+    case 'number': return a.value === (b as typeof a).value;
+    case 'boolean': return a.value === (b as typeof a).value;
+    case 'string': return a.value === (b as typeof a).value;
+    case 'symbol': return a.value === (b as typeof a).value;
+    case 'char': return a.value === (b as typeof a).value;
+    case 'nil': return true;
+    case 'pair': return a === b;
+    default: return a === b;
+  }
+}
+
 function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
   if (isNumeric(a) && isNumeric(b)) return numericCompare(a, b) === 0;
   if (a.tag !== b.tag) return false;
@@ -896,6 +1044,14 @@ function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
     case 'nil': return true;
     case 'pair':
       return b.tag === 'pair' && schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    case 'vector': {
+      if (b.tag !== 'vector') return false;
+      if (a.elements.length !== b.elements.length) return false;
+      for (let i = 0; i < a.elements.length; i++) {
+        if (!schemeEqual(a.elements[i], b.elements[i])) return false;
+      }
+      return true;
+    }
     default: return a === b;
   }
 }
@@ -921,7 +1077,9 @@ const BUILTINS = new Set([
   'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
   'zero?', 'positive?', 'negative?', 'odd?', 'even?',
   'list-ref', 'list-tail', 'list?', 'assoc', 'map',
-  'eq?', 'equal?',
+  'eq?', 'eqv?', 'equal?',
+  'vector', 'make-vector', 'vector-ref', 'vector-set!',
+  'vector-length', 'vector?', 'vector->list', 'list->vector',
   'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase',
   'char=?', 'char<?',
   'string=?', 'string<?', 'string-ci=?',
@@ -1284,9 +1442,60 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       if (args.length !== 2) throw errAt('eq?: expected 2 arguments', pos);
       return schemeEq(args[0], args[1]) ? SCM_TRUE : SCM_FALSE;
     }
+    case 'eqv?': {
+      if (args.length !== 2) throw errAt('eqv?: expected 2 arguments', pos);
+      return schemeEqv(args[0], args[1]) ? SCM_TRUE : SCM_FALSE;
+    }
     case 'equal?': {
       if (args.length !== 2) throw errAt('equal?: expected 2 arguments', pos);
       return schemeEqual(args[0], args[1]) ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'vector': {
+      return { tag: 'vector', elements: [...args] };
+    }
+    case 'make-vector': {
+      if (args.length < 1 || args.length > 2) throw errAt('make-vector: expected 1-2 arguments', pos);
+      if (args[0].tag !== 'number') throw errAt('make-vector: expected number', pos);
+      const size = args[0].value;
+      const fill = args.length === 2 ? args[1] : { tag: 'number' as const, value: 0 };
+      return { tag: 'vector', elements: Array.from({ length: size }, () => fill) };
+    }
+    case 'vector-ref': {
+      if (args.length !== 2) throw errAt('vector-ref: expected 2 arguments', pos);
+      if (args[0].tag !== 'vector') throw errAt('vector-ref: expected vector', pos);
+      if (args[1].tag !== 'number') throw errAt('vector-ref: expected number index', pos);
+      const vi = args[1].value;
+      if (vi < 0 || vi >= args[0].elements.length) throw errAt('vector-ref: index out of range', pos);
+      return args[0].elements[vi];
+    }
+    case 'vector-set!': {
+      if (args.length !== 3) throw errAt('vector-set!: expected 3 arguments', pos);
+      if (args[0].tag !== 'vector') throw errAt('vector-set!: expected vector', pos);
+      if (args[1].tag !== 'number') throw errAt('vector-set!: expected number index', pos);
+      const vsi = args[1].value;
+      if (vsi < 0 || vsi >= args[0].elements.length) throw errAt('vector-set!: index out of range', pos);
+      args[0].elements[vsi] = args[2];
+      return SCM_FALSE;
+    }
+    case 'vector-length': {
+      if (args.length !== 1) throw errAt('vector-length: expected 1 argument', pos);
+      if (args[0].tag !== 'vector') throw errAt('vector-length: expected vector', pos);
+      return { tag: 'number', value: args[0].elements.length };
+    }
+    case 'vector?': {
+      if (args.length !== 1) throw errAt('vector?: expected 1 argument', pos);
+      return args[0].tag === 'vector' ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'vector->list': {
+      if (args.length !== 1) throw errAt('vector->list: expected 1 argument', pos);
+      if (args[0].tag !== 'vector') throw errAt('vector->list: expected vector', pos);
+      return arrayToList(args[0].elements);
+    }
+    case 'list->vector': {
+      if (args.length !== 1) throw errAt('list->vector: expected 1 argument', pos);
+      const items = pairToArray(args[0]);
+      if (items === null) throw errAt('list->vector: expected proper list', pos);
+      return { tag: 'vector', elements: items };
     }
     case 'char-alphabetic?': {
       if (args.length !== 1 || args[0].tag !== 'char')
@@ -1443,6 +1652,7 @@ function display(val: SchemeVal): string {
     case 'case-lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
     case 'macro': return '#<macro>';
+    case 'vector': return `#(${val.elements.map(display).join(' ')})`;
     case 'record': return `#<record ${val.typeName}>`;
   }
 }
