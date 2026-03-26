@@ -79,6 +79,7 @@ public class Evaluator {
         env.define("list", new BuiltinValue("list", this::list));
         env.define("length", new BuiltinValue("length", this::length));
         env.define("append", new BuiltinValue("append", this::append));
+        env.define("apply", new BuiltinValue("apply", this::apply));
         env.define("string?", new BuiltinValue("string?", arguments ->
                 typePredicate("string?", arguments, value -> value instanceof StringValue)));
         env.define("number?", new BuiltinValue("number?", arguments ->
@@ -176,7 +177,7 @@ public class Evaluator {
 
             Cell binding = env.definePlaceholder(nameExpr.name());
             binding.value = new ClosureValue(
-                    parseParameterNames(signature.subList(1, signature.size())),
+                    parseFormals(signature.subList(1, signature.size())),
                     List.copyOf(arguments.subList(1, arguments.size())),
                     env);
             return VOID;
@@ -217,27 +218,50 @@ public class Evaluator {
         }
 
         return new ClosureValue(
-                parseParameterNames(arguments.get(0)),
+                parseFormals(arguments.get(0)),
                 List.copyOf(arguments.subList(1, arguments.size())),
                 env);
     }
 
-    private List<String> parseParameterNames(Expr parameterExpr) throws EvalError {
-        if (!(parameterExpr instanceof ListExpr parameterList)) {
-            throw new EvalError("lambda parameters must be a list");
+    private Formals parseFormals(Expr parameterExpr) throws EvalError {
+        if (parameterExpr instanceof SymbolExpr symbolExpr) {
+            return new Formals(List.of(), symbolExpr.name());
         }
-        return parseParameterNames(parameterList.elements());
+        if (!(parameterExpr instanceof ListExpr parameterList)) {
+            throw new EvalError("lambda parameters must be a list or symbol");
+        }
+        return parseFormals(parameterList.elements());
     }
 
-    private List<String> parseParameterNames(List<Expr> parameterExprs) throws EvalError {
+    private Formals parseFormals(List<Expr> parameterExprs) throws EvalError {
         List<String> parameters = new ArrayList<>(parameterExprs.size());
-        for (Expr parameterExpr : parameterExprs) {
+        String restParameter = null;
+
+        for (int index = 0; index < parameterExprs.size(); index++) {
+            Expr parameterExpr = parameterExprs.get(index);
+            if (parameterExpr instanceof SymbolExpr symbolExpr
+                    && ".".equals(symbolExpr.name())) {
+                if (index == parameterExprs.size() - 1) {
+                    throw new EvalError("lambda rest parameter name is missing");
+                }
+
+                Expr restExpr = parameterExprs.get(index + 1);
+                if (!(restExpr instanceof SymbolExpr restSymbol)
+                        || ".".equals(restSymbol.name())) {
+                    throw new EvalError("lambda rest parameter must be a symbol");
+                }
+                if (index + 2 != parameterExprs.size()) {
+                    throw new EvalError("lambda rest parameter must be last");
+                }
+                restParameter = restSymbol.name();
+                break;
+            }
             if (!(parameterExpr instanceof SymbolExpr symbolExpr)) {
                 throw new EvalError("lambda parameter must be a symbol");
             }
             parameters.add(symbolExpr.name());
         }
-        return List.copyOf(parameters);
+        return new Formals(List.copyOf(parameters), restParameter);
     }
 
     private List<Value> evalAll(List<Expr> arguments, Env env) throws EvalError {
@@ -303,7 +327,10 @@ public class Evaluator {
         List<BindingSpec> bindings = parseBindings(bindingExpr);
         Env letEnv = new Env(env);
         Cell binding = letEnv.definePlaceholder(name);
-        ClosureValue closure = new ClosureValue(bindingNames(bindings), List.copyOf(body), letEnv);
+        ClosureValue closure = new ClosureValue(
+                new Formals(bindingNames(bindings), null),
+                List.copyOf(body),
+                letEnv);
         binding.value = closure;
         return applyClosure(closure, evalBindingValues(bindings, env));
     }
@@ -388,11 +415,22 @@ public class Evaluator {
     }
 
     private Value applyClosure(ClosureValue closure, List<Value> arguments) throws EvalError {
-        requireExactArgs("lambda", arguments, closure.parameters().size());
+        Formals formals = closure.formals();
+        int fixedCount = formals.parameters().size();
+        if (formals.restParameter() == null) {
+            requireExactArgs("lambda", arguments, fixedCount);
+        } else if (arguments.size() < fixedCount) {
+            throw new EvalError("lambda expected at least "
+                    + fixedCount + " argument(s)");
+        }
 
         Env callEnv = new Env(closure.env());
-        for (int i = 0; i < closure.parameters().size(); i++) {
-            callEnv.define(closure.parameters().get(i), arguments.get(i));
+        for (int i = 0; i < fixedCount; i++) {
+            callEnv.define(formals.parameters().get(i), arguments.get(i));
+        }
+        if (formals.restParameter() != null) {
+            callEnv.define(formals.restParameter(),
+                    listValue(arguments.subList(fixedCount, arguments.size())));
         }
         return evalSequence(closure.body(), callEnv);
     }
@@ -596,6 +634,18 @@ public class Evaluator {
             }
         }
         return result;
+    }
+
+    private Value apply(List<Value> arguments) throws EvalError {
+        requireMinArgs("apply", arguments, 2);
+
+        Value operator = arguments.get(0);
+        List<Value> appliedArguments = new ArrayList<>();
+        for (int i = 1; i < arguments.size() - 1; i++) {
+            appliedArguments.add(arguments.get(i));
+        }
+        appliedArguments.addAll(requireProperList(arguments.get(arguments.size() - 1), "apply"));
+        return applyProcedure(operator, appliedArguments);
     }
 
     private Value divide(List<Value> arguments) throws EvalError {
@@ -889,8 +939,11 @@ public class Evaluator {
     private record BuiltinValue(String name, BuiltinFunction implementation) implements Value {
     }
 
-    private record ClosureValue(List<String> parameters, List<Expr> body, Env env)
+    private record ClosureValue(Formals formals, List<Expr> body, Env env)
             implements Value {
+    }
+
+    private record Formals(List<String> parameters, String restParameter) {
     }
 
     private record BindingSpec(String name, Expr initExpr) {

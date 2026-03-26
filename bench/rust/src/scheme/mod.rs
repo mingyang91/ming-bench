@@ -210,9 +210,7 @@ impl Evaluator {
 
         if let ExprKind::Symbol(name) = &arguments[0].kind {
             if arguments.len() < 3 {
-                return Err(EvalError::message(
-                    "named let requires bindings and a body",
-                ));
+                return Err(EvalError::message("named let requires bindings and a body"));
             }
 
             return self.eval_named_let(name, &arguments[1], &arguments[2..], env);
@@ -240,7 +238,10 @@ impl Evaluator {
         let let_env = Env::new(Some(env.clone()));
         let binding = let_env.define_placeholder(name.to_string());
         let closure = Value::Closure(Rc::new(ClosureValue {
-            parameters: binding_names(&bindings),
+            parameters: ParameterSpec {
+                required: binding_names(&bindings),
+                rest: None,
+            },
             body: body.to_vec(),
             env: let_env.clone(),
         }));
@@ -298,7 +299,7 @@ impl Evaluator {
 
     fn apply_procedure(&self, operator: Value, arguments: Vec<Value>) -> Result<Value, EvalError> {
         match operator {
-            Value::Builtin(builtin) => (builtin.implementation)(&arguments),
+            Value::Builtin(builtin) => (builtin.implementation)(self, &arguments),
             Value::Closure(closure) => self.apply_closure(&closure, arguments),
             _ => Err(EvalError::message("attempted to call a non-procedure")),
         }
@@ -309,11 +310,27 @@ impl Evaluator {
         closure: &ClosureValue,
         arguments: Vec<Value>,
     ) -> Result<Value, EvalError> {
-        require_exact_args("lambda", arguments.len(), closure.parameters.len())?;
+        let required = closure.parameters.required.len();
+        if closure.parameters.rest.is_some() {
+            require_min_args("lambda", arguments.len(), required)?;
+        } else {
+            require_exact_args("lambda", arguments.len(), required)?;
+        }
 
         let call_env = Env::new(Some(closure.env.clone()));
-        for (name, value) in closure.parameters.iter().zip(arguments) {
+        for (name, value) in closure
+            .parameters
+            .required
+            .iter()
+            .zip(arguments.iter().take(required).cloned())
+        {
             call_env.define(name.clone(), value);
+        }
+        if let Some(rest_name) = &closure.parameters.rest {
+            call_env.define(
+                rest_name.clone(),
+                list_value(arguments[required..].to_vec()),
+            );
         }
         self.eval_sequence(&closure.body, call_env)
     }
@@ -329,27 +346,28 @@ impl Evaluator {
 
 fn create_global_env() -> Rc<Env> {
     let env = Env::new(None);
-    env.define_builtin("+", builtin_add);
-    env.define_builtin("-", builtin_subtract);
-    env.define_builtin("*", builtin_multiply);
-    env.define_builtin("/", builtin_divide);
-    env.define_builtin("<", builtin_less_than);
-    env.define_builtin(">", builtin_greater_than);
-    env.define_builtin("=", builtin_equal);
-    env.define_builtin("<=", builtin_less_equal);
-    env.define_builtin("not", builtin_not);
-    env.define_builtin("cons", builtin_cons);
-    env.define_builtin("car", builtin_car);
-    env.define_builtin("cdr", builtin_cdr);
-    env.define_builtin("null?", builtin_is_null);
-    env.define_builtin("list", builtin_list);
-    env.define_builtin("length", builtin_length);
-    env.define_builtin("append", builtin_append);
-    env.define_builtin("string?", builtin_is_string);
-    env.define_builtin("number?", builtin_is_number);
-    env.define_builtin("boolean?", builtin_is_boolean);
-    env.define_builtin("pair?", builtin_is_pair);
-    env.define_builtin("symbol?", builtin_is_symbol);
+    env.define_builtin("+", |_, arguments| builtin_add(arguments));
+    env.define_builtin("-", |_, arguments| builtin_subtract(arguments));
+    env.define_builtin("*", |_, arguments| builtin_multiply(arguments));
+    env.define_builtin("/", |_, arguments| builtin_divide(arguments));
+    env.define_builtin("<", |_, arguments| builtin_less_than(arguments));
+    env.define_builtin(">", |_, arguments| builtin_greater_than(arguments));
+    env.define_builtin("=", |_, arguments| builtin_equal(arguments));
+    env.define_builtin("<=", |_, arguments| builtin_less_equal(arguments));
+    env.define_builtin("not", |_, arguments| builtin_not(arguments));
+    env.define_builtin("cons", |_, arguments| builtin_cons(arguments));
+    env.define_builtin("car", |_, arguments| builtin_car(arguments));
+    env.define_builtin("cdr", |_, arguments| builtin_cdr(arguments));
+    env.define_builtin("null?", |_, arguments| builtin_is_null(arguments));
+    env.define_builtin("list", |_, arguments| builtin_list(arguments));
+    env.define_builtin("length", |_, arguments| builtin_length(arguments));
+    env.define_builtin("append", |_, arguments| builtin_append(arguments));
+    env.define_builtin("string?", |_, arguments| builtin_is_string(arguments));
+    env.define_builtin("number?", |_, arguments| builtin_is_number(arguments));
+    env.define_builtin("boolean?", |_, arguments| builtin_is_boolean(arguments));
+    env.define_builtin("pair?", |_, arguments| builtin_is_pair(arguments));
+    env.define_builtin("symbol?", |_, arguments| builtin_is_symbol(arguments));
+    env.define_builtin("apply", builtin_apply);
     env
 }
 
@@ -360,7 +378,10 @@ fn bind_values(env: &Rc<Env>, bindings: &[BindingSpec], values: Vec<Value>) {
 }
 
 fn binding_names(bindings: &[BindingSpec]) -> Vec<String> {
-    bindings.iter().map(|binding| binding.name.clone()).collect()
+    bindings
+        .iter()
+        .map(|binding| binding.name.clone())
+        .collect()
 }
 
 fn parse_bindings(binding_expr: &Expr) -> Result<Vec<BindingSpec>, EvalError> {
@@ -394,22 +415,58 @@ fn parse_bindings(binding_expr: &Expr) -> Result<Vec<BindingSpec>, EvalError> {
     Ok(bindings)
 }
 
-fn parse_parameter_names(parameter_expr: &Expr) -> Result<Vec<String>, EvalError> {
-    let ExprKind::List(parameter_list) = &parameter_expr.kind else {
-        return Err(EvalError::message("lambda parameters must be a list"));
-    };
-    parse_parameter_names_list(parameter_list)
+fn parse_parameter_names(parameter_expr: &Expr) -> Result<ParameterSpec, EvalError> {
+    match &parameter_expr.kind {
+        ExprKind::List(parameter_list) => parse_parameter_names_list(parameter_list),
+        ExprKind::Symbol(name) => Ok(ParameterSpec {
+            required: Vec::new(),
+            rest: Some(name.clone()),
+        }),
+        _ => Err(EvalError::message("lambda parameters must be a list")),
+    }
 }
 
-fn parse_parameter_names_list(parameter_exprs: &[Expr]) -> Result<Vec<String>, EvalError> {
-    let mut parameters = Vec::with_capacity(parameter_exprs.len());
+fn parse_parameter_names_list(parameter_exprs: &[Expr]) -> Result<ParameterSpec, EvalError> {
+    if let Some(dot_index) = parameter_exprs.iter().position(|parameter_expr| {
+        matches!(
+            &parameter_expr.kind,
+            ExprKind::Symbol(name) if name == "."
+        )
+    }) {
+        if dot_index + 2 != parameter_exprs.len() {
+            return Err(EvalError::message("lambda parameter list is malformed"));
+        }
+
+        let mut required = Vec::with_capacity(dot_index);
+        for parameter_expr in &parameter_exprs[..dot_index] {
+            let ExprKind::Symbol(name) = &parameter_expr.kind else {
+                return Err(EvalError::message("lambda parameter must be a symbol"));
+            };
+            required.push(name.clone());
+        }
+
+        let ExprKind::Symbol(rest) = &parameter_exprs[dot_index + 1].kind else {
+            return Err(EvalError::message("lambda parameter must be a symbol"));
+        };
+
+        return Ok(ParameterSpec {
+            required,
+            rest: Some(rest.clone()),
+        });
+    }
+
+    let mut required = Vec::with_capacity(parameter_exprs.len());
     for parameter_expr in parameter_exprs {
         let ExprKind::Symbol(name) = &parameter_expr.kind else {
             return Err(EvalError::message("lambda parameter must be a symbol"));
         };
-        parameters.push(name.clone());
+        required.push(name.clone());
     }
-    Ok(parameters)
+
+    Ok(ParameterSpec {
+        required,
+        rest: None,
+    })
 }
 
 fn quote_to_value(expr: &Expr) -> Value {
@@ -671,7 +728,9 @@ fn builtin_list(arguments: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_length(arguments: &[Value]) -> Result<Value, EvalError> {
     require_exact_args("length", arguments.len(), 1)?;
-    Ok(Value::Int(require_proper_list(&arguments[0], "length")?.len() as i64))
+    Ok(Value::Int(
+        require_proper_list(&arguments[0], "length")?.len() as i64,
+    ))
 }
 
 fn builtin_append(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -692,8 +751,23 @@ fn builtin_append(arguments: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
+fn builtin_apply(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
+    require_min_args("apply", arguments.len(), 2)?;
+
+    let operator = arguments[0].clone();
+    let mut applied_arguments = arguments[1..arguments.len() - 1].to_vec();
+    applied_arguments.extend(require_proper_list(
+        &arguments[arguments.len() - 1],
+        "apply",
+    )?);
+
+    evaluator.apply_procedure(operator, applied_arguments)
+}
+
 fn builtin_is_string(arguments: &[Value]) -> Result<Value, EvalError> {
-    type_predicate("string?", arguments, |value| matches!(value, Value::String(_)))
+    type_predicate("string?", arguments, |value| {
+        matches!(value, Value::String(_))
+    })
 }
 
 fn builtin_is_number(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -701,7 +775,9 @@ fn builtin_is_number(arguments: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn builtin_is_boolean(arguments: &[Value]) -> Result<Value, EvalError> {
-    type_predicate("boolean?", arguments, |value| matches!(value, Value::Bool(_)))
+    type_predicate("boolean?", arguments, |value| {
+        matches!(value, Value::Bool(_))
+    })
 }
 
 fn builtin_is_pair(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -709,7 +785,9 @@ fn builtin_is_pair(arguments: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn builtin_is_symbol(arguments: &[Value]) -> Result<Value, EvalError> {
-    type_predicate("symbol?", arguments, |value| matches!(value, Value::Symbol(_)))
+    type_predicate("symbol?", arguments, |value| {
+        matches!(value, Value::Symbol(_))
+    })
 }
 
 fn type_predicate<F>(name: &str, arguments: &[Value], predicate: F) -> Result<Value, EvalError>
@@ -720,7 +798,7 @@ where
     Ok(Value::Bool(predicate(&arguments[0])))
 }
 
-type BuiltinFn = fn(&[Value]) -> Result<Value, EvalError>;
+type BuiltinFn = fn(&Evaluator, &[Value]) -> Result<Value, EvalError>;
 type Cell = Rc<RefCell<Value>>;
 
 #[derive(Clone, Debug)]
@@ -772,7 +850,7 @@ struct Builtin {
 
 #[derive(Clone)]
 struct ClosureValue {
-    parameters: Vec<String>,
+    parameters: ParameterSpec,
     body: Vec<Expr>,
     env: Rc<Env>,
 }
@@ -781,6 +859,12 @@ struct ClosureValue {
 struct BindingSpec {
     name: String,
     init_expr: Expr,
+}
+
+#[derive(Clone)]
+struct ParameterSpec {
+    required: Vec<String>,
+    rest: Option<String>,
 }
 
 struct Env {
@@ -836,7 +920,9 @@ impl Env {
             return Some(cell);
         }
 
-        self.parent.as_ref().and_then(|parent| parent.lookup_cell(name))
+        self.parent
+            .as_ref()
+            .and_then(|parent| parent.lookup_cell(name))
     }
 }
 
