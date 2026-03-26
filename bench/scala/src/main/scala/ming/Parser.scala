@@ -7,6 +7,7 @@ private[ming] enum Expr:
   case Num(value: Long, pos: Pos = Pos(0, 0))
   case Bool(value: Boolean, pos: Pos = Pos(0, 0))
   case Str(value: String, pos: Pos = Pos(0, 0))
+  case Chr(value: Char, pos: Pos = Pos(0, 0))
   case Symbol(name: String, pos: Pos = Pos(0, 0))
   case SList(elems: List[Expr], pos: Pos = Pos(0, 0))
 
@@ -86,11 +87,21 @@ private[ming] object Parser:
   private def parseAtom(token: String, pos: Pos): Expr =
     if token == "#t" then Expr.Bool(true, pos)
     else if token == "#f" then Expr.Bool(false, pos)
+    else if token.startsWith("#\\") then parseCharLiteral(token.substring(2), pos)
     else if token.startsWith("\"") then Expr.Str(token.substring(1, token.length - 1), pos)
     else
       token.toLongOption match
         case Some(n) => Expr.Num(n, pos)
         case None    => Expr.Symbol(token, pos)
+
+  private def parseCharLiteral(name: String, pos: Pos): Expr =
+    val c = name match
+      case "space"            => ' '
+      case "newline"          => '\n'
+      case "tab"              => '\t'
+      case s if s.length == 1 => s.charAt(0)
+      case _                  => throw EvalError(s"$pos: unknown character name: $name")
+    Expr.Chr(c, pos)
 
   private def readWord(input: String, start: Int): (String, Int) =
     val sb = new StringBuilder
@@ -118,6 +129,13 @@ private[ming] object Parser:
     else
       val next = input(start + 1)
       if next == 't' || next == 'f' then (input.substring(start, start + 2), start + 2)
+      else if next == '\\' then
+        // Character literal: #\<char> or #\space, #\newline, etc.
+        if start + 2 >= input.length then (input.substring(start), input.length)
+        else
+          // Read the rest as a word to handle named chars like #\space
+          val (word, end) = readWord(input, start + 2)
+          (s"#\\$word", end)
       else readWord(input, start)
 
   private def skipComment(input: String, start: Int): Int =

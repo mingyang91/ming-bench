@@ -6,7 +6,7 @@ object Evaluator:
   private[ming] enum Value:
     case VNum(n: Long)
     case VBool(b: Boolean)
-    case VStr(s: String)
+    case VStr(chars: Array[Char])
     case VChar(c: Char)
     case VList(elems: List[Value])
     case VSymbol(name: String)
@@ -20,7 +20,7 @@ object Evaluator:
     case Value.VNum(n)          => n.toString
     case Value.VBool(true)      => "#t"
     case Value.VBool(false)     => "#f"
-    case Value.VStr(s)          => s"\"$s\""
+    case Value.VStr(chars)      => s"\"${new String(chars)}\""
     case Value.VChar(c)         => s"#\\$c"
     case Value.VList(elems)     => "(" + elems.map(display).mkString(" ") + ")"
     case Value.VSymbol(n)       => n
@@ -30,7 +30,7 @@ object Evaluator:
 
   /** display-style output: no quotes on strings */
   private[ming] def displayStr(v: Value): String = v match
-    case Value.VStr(s)      => s
+    case Value.VStr(chars)  => new String(chars)
     case Value.VList(elems) => "(" + elems.map(displayStr).mkString(" ") + ")"
     case other              => display(other)
 
@@ -39,6 +39,7 @@ object Evaluator:
     case Expr.Num(_, p)    => p
     case Expr.Bool(_, p)   => p
     case Expr.Str(_, p)    => p
+    case Expr.Chr(_, p)    => p
     case Expr.Symbol(_, p) => p
     case Expr.SList(_, p)  => p
 
@@ -96,7 +97,9 @@ object Evaluator:
         "number->string",
         "symbol->string",
         "string->symbol",
-        "string-ref"
+        "string-ref",
+        "string-copy",
+        "string-set!"
       )
     do env.define(name, Value.VBuiltin(name))
     env
@@ -105,7 +108,8 @@ object Evaluator:
   private def eval(expr: Expr, env: Env): Value = expr match
     case Expr.Num(n, _)                                       => Value.VNum(n)
     case Expr.Bool(b, _)                                      => Value.VBool(b)
-    case Expr.Str(s, _)                                       => Value.VStr(s)
+    case Expr.Str(s, _)                                       => Value.VStr(s.toCharArray)
+    case Expr.Chr(c, _)                                       => Value.VChar(c)
     case Expr.Symbol(name, p)                                 => env.lookup(name, p)
     case Expr.SList(Nil, p)                                   => throw errAt(p, "empty application")
     case Expr.SList(Expr.Symbol("quote", _) :: arg :: Nil, _) => quoteToValue(arg)
@@ -136,7 +140,8 @@ object Evaluator:
   private def quoteToValue(expr: Expr): Value = expr match
     case Expr.Num(n, _)       => Value.VNum(n)
     case Expr.Bool(b, _)      => Value.VBool(b)
-    case Expr.Str(s, _)       => Value.VStr(s)
+    case Expr.Str(s, _)       => Value.VStr(s.toCharArray)
+    case Expr.Chr(c, _)       => Value.VChar(c)
     case Expr.Symbol(name, _) => Value.VSymbol(name)
     case Expr.SList(elems, _) => Value.VList(elems.map(quoteToValue))
 

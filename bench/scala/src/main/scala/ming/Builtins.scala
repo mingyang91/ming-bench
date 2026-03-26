@@ -14,7 +14,7 @@ object Builtins:
     case "display" | "write" | "newline" =>
       applyIO(name, args, pos, env)
     case "string-append" | "string-length" | "substring" | "string->number" | "number->string" | "symbol->string" |
-        "string->symbol" | "string-ref" =>
+        "string->symbol" | "string-ref" | "string-copy" | "string-set!" =>
       applyStringOps(name, args, pos)
     case _ => throw errAt(pos, s"unknown builtin: $name")
 
@@ -144,46 +144,59 @@ object Builtins:
   ): Value = name match
     case "string-append" =>
       val strs = args.map {
-        case Value.VStr(s) => s
-        case _             => throw errAt(pos, "string-append: not a string")
+        case Value.VStr(chars) => new String(chars)
+        case _                 => throw errAt(pos, "string-append: not a string")
       }
-      Value.VStr(strs.mkString)
+      Value.VStr(strs.mkString.toCharArray)
     case "string-length" =>
       if args.length != 1 then throw errAt(pos, "string-length requires 1 argument")
       args.head match
-        case Value.VStr(s) => Value.VNum(s.length.toLong)
-        case _             => throw errAt(pos, "string-length: not a string")
+        case Value.VStr(chars) => Value.VNum(chars.length.toLong)
+        case _                 => throw errAt(pos, "string-length: not a string")
     case "substring" =>
       if args.length != 3 then throw errAt(pos, "substring requires 3 arguments")
       (args(0), args(1), args(2)) match
-        case (Value.VStr(s), Value.VNum(start), Value.VNum(end)) =>
-          Value.VStr(s.substring(start.toInt, end.toInt))
+        case (Value.VStr(chars), Value.VNum(start), Value.VNum(end)) =>
+          Value.VStr(new String(chars).substring(start.toInt, end.toInt).toCharArray)
         case _ => throw errAt(pos, "substring: invalid arguments")
     case "string->number" =>
       if args.length != 1 then throw errAt(pos, "string->number requires 1 argument")
       args.head match
-        case Value.VStr(s) =>
+        case Value.VStr(chars) =>
+          val s = new String(chars)
           try Value.VNum(s.toLong)
           catch case _: NumberFormatException => Value.VBool(false)
         case _ => throw errAt(pos, "string->number: not a string")
     case "number->string" =>
       if args.length != 1 then throw errAt(pos, "number->string requires 1 argument")
       args.head match
-        case Value.VNum(n) => Value.VStr(n.toString)
+        case Value.VNum(n) => Value.VStr(n.toString.toCharArray)
         case _             => throw errAt(pos, "number->string: not a number")
     case "symbol->string" =>
       if args.length != 1 then throw errAt(pos, "symbol->string requires 1 argument")
       args.head match
-        case Value.VSymbol(n) => Value.VStr(n)
+        case Value.VSymbol(n) => Value.VStr(n.toCharArray)
         case _                => throw errAt(pos, "symbol->string: not a symbol")
     case "string->symbol" =>
       if args.length != 1 then throw errAt(pos, "string->symbol requires 1 argument")
       args.head match
-        case Value.VStr(s) => Value.VSymbol(s)
-        case _             => throw errAt(pos, "string->symbol: not a string")
+        case Value.VStr(chars) => Value.VSymbol(new String(chars))
+        case _                 => throw errAt(pos, "string->symbol: not a string")
     case "string-ref" =>
       if args.length != 2 then throw errAt(pos, "string-ref requires 2 arguments")
       (args(0), args(1)) match
-        case (Value.VStr(s), Value.VNum(i)) => Value.VChar(s.charAt(i.toInt))
-        case _                              => throw errAt(pos, "string-ref: invalid arguments")
+        case (Value.VStr(chars), Value.VNum(i)) => Value.VChar(chars(i.toInt))
+        case _                                  => throw errAt(pos, "string-ref: invalid arguments")
+    case "string-copy" =>
+      if args.length != 1 then throw errAt(pos, "string-copy requires 1 argument")
+      args.head match
+        case Value.VStr(chars) => Value.VStr(chars.clone())
+        case _                 => throw errAt(pos, "string-copy: not a string")
+    case "string-set!" =>
+      if args.length != 3 then throw errAt(pos, "string-set! requires 3 arguments")
+      (args(0), args(1), args(2)) match
+        case (Value.VStr(chars), Value.VNum(i), Value.VChar(c)) =>
+          chars(i.toInt) = c
+          Value.VVoid
+        case _ => throw errAt(pos, "string-set!: invalid arguments")
     case _ => throw errAt(pos, s"unknown string op: $name")
