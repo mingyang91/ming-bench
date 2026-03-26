@@ -24,6 +24,7 @@ const BUILTIN_NAMES = [
 ];
 const NIL_VALUE = { kind: 'nil' };
 const VOID_VALUE = { kind: 'void' };
+const DEFAULT_SOURCE_POS = { line: 1, col: 1 };
 class Environment {
     parent;
     bindings = new Map();
@@ -97,49 +98,65 @@ function parseProgram(input) {
 function tokenize(input) {
     const tokens = [];
     let index = 0;
+    let line = 1;
+    let col = 1;
+    const currentPos = () => ({ line, col });
+    const advanceChar = (char) => {
+        if (char === '\n') {
+            line += 1;
+            col = 1;
+            return;
+        }
+        col += 1;
+    };
     while (index < input.length) {
         const char = input[index];
         if (isWhitespace(char)) {
+            advanceChar(char);
             index += 1;
             continue;
         }
         if (char === ';') {
-            index = skipComment(input, index);
+            while (index < input.length && input[index] !== '\n') {
+                advanceChar(input[index]);
+                index += 1;
+            }
             continue;
         }
         if (char === '(' || char === ')') {
-            tokens.push({ kind: 'paren', value: char });
+            tokens.push({ kind: 'paren', value: char, pos: currentPos() });
+            advanceChar(char);
             index += 1;
             continue;
         }
         if (char === "'") {
-            tokens.push({ kind: 'quote' });
+            tokens.push({ kind: 'quote', pos: currentPos() });
+            advanceChar(char);
             index += 1;
             continue;
         }
         if (char === '"') {
-            const parsed = parseStringToken(input, index);
-            tokens.push({ kind: 'string', value: parsed.value });
+            const pos = currentPos();
+            const parsed = parseStringToken(input, index, pos);
+            tokens.push({ kind: 'string', value: parsed.value, pos });
+            for (let scan = index; scan < parsed.nextIndex; scan += 1) {
+                advanceChar(input[scan]);
+            }
             index = parsed.nextIndex;
             continue;
         }
+        const pos = currentPos();
         let end = index;
         while (end < input.length && !isDelimiter(input[end])) {
             end += 1;
         }
-        tokens.push({ kind: 'atom', value: input.slice(index, end) });
+        tokens.push({ kind: 'atom', value: input.slice(index, end), pos });
+        col += end - index;
         index = end;
     }
     return tokens;
 }
-function skipComment(input, start) {
-    let index = start;
-    while (index < input.length && input[index] !== '\n') {
-        index += 1;
-    }
-    return index;
-}
-function parseStringToken(input, start) {
+function parseStringToken(input, start, pos) {
     let index = start + 1;
     let value = '';
     while (index < input.length) {
@@ -150,7 +167,7 @@ function parseStringToken(input, start) {
         if (char === '\\') {
             index += 1;
             if (index >= input.length) {
-                throw new EvalError('unterminated string literal');
+                throw new EvalError('unterminated string literal', pos);
             }
             const escaped = input[index];
             switch (escaped) {
@@ -179,7 +196,7 @@ function parseStringToken(input, start) {
         value += char;
         index += 1;
     }
-    throw new EvalError('unterminated string literal');
+    throw new EvalError('unterminated string literal', pos);
 }
 function parseExpr(tokens, index) {
     const token = tokens[index];
@@ -191,8 +208,9 @@ function parseExpr(tokens, index) {
         return {
             expr: {
                 kind: 'list',
+                pos: token.pos,
                 elements: [
-                    { kind: 'symbol', name: 'quote' },
+                    { kind: 'symbol', name: 'quote', pos: token.pos },
                     parsed.expr,
                 ],
             },
@@ -201,7 +219,7 @@ function parseExpr(tokens, index) {
     }
     if (token.kind === 'paren') {
         if (token.value === ')') {
-            throw new EvalError('unexpected )');
+            throw new EvalError('unexpected )', token.pos);
         }
         const elements = [];
         let nextIndex = index + 1;
@@ -209,7 +227,7 @@ function parseExpr(tokens, index) {
             const nextToken = tokens[nextIndex];
             if (nextToken.kind === 'paren' && nextToken.value === ')') {
                 return {
-                    expr: { kind: 'list', elements },
+                    expr: { kind: 'list', pos: token.pos, elements },
                     nextIndex: nextIndex + 1,
                 };
             }
@@ -217,41 +235,46 @@ function parseExpr(tokens, index) {
             elements.push(parsed.expr);
             nextIndex = parsed.nextIndex;
         }
-        throw new EvalError('unterminated list');
+        throw new EvalError('unterminated list', token.pos);
     }
     if (token.kind === 'string') {
         return {
-            expr: { kind: 'string', value: token.value },
+            expr: { kind: 'string', value: token.value, pos: token.pos },
             nextIndex: index + 1,
         };
     }
     return {
-        expr: parseAtom(token.value),
+        expr: parseAtom(token),
         nextIndex: index + 1,
     };
 }
-function parseAtom(text) {
-    if (text === '#t') {
-        return { kind: 'boolean', value: true };
+function parseAtom(token) {
+    if (token.value === '#t') {
+        return { kind: 'boolean', value: true, pos: token.pos };
     }
-    if (text === '#f') {
-        return { kind: 'boolean', value: false };
+    if (token.value === '#f') {
+        return { kind: 'boolean', value: false, pos: token.pos };
     }
-    if (/^[+-]?\d+$/.test(text)) {
-        return { kind: 'number', value: Number.parseInt(text, 10) };
+    if (/^[+-]?\d+$/.test(token.value)) {
+        return { kind: 'number', value: Number.parseInt(token.value, 10), pos: token.pos };
     }
-    return { kind: 'symbol', name: text };
+    return { kind: 'symbol', name: token.value, pos: token.pos };
 }
 function evaluateExpr(expr, env) {
-    switch (expr.kind) {
-        case 'number':
-        case 'boolean':
-        case 'string':
-            return expr;
-        case 'symbol':
-            return env.lookup(expr.name);
-        case 'list':
-            return evaluateList(expr.elements, env);
+    try {
+        switch (expr.kind) {
+            case 'number':
+            case 'boolean':
+            case 'string':
+                return expr;
+            case 'symbol':
+                return env.lookup(expr.name);
+            case 'list':
+                return evaluateList(expr.elements, env);
+        }
+    }
+    catch (error) {
+        throw attachPosition(error, expr.pos);
     }
 }
 function evaluateList(elements, env) {
@@ -366,7 +389,7 @@ function readParameterList(exprs) {
     return params;
 }
 function evaluateAnd(argExprs, env) {
-    let lastValue = { kind: 'boolean', value: true };
+    let lastValue = makeBoolean(true);
     for (const expr of argExprs) {
         lastValue = evaluateExpr(expr, env);
         if (!isTruthy(lastValue)) {
@@ -382,7 +405,7 @@ function evaluateOr(argExprs, env) {
             return value;
         }
     }
-    return { kind: 'boolean', value: false };
+    return makeBoolean(false);
 }
 function evaluateBegin(argExprs, env) {
     return evaluateSequence(argExprs, env);
@@ -521,7 +544,7 @@ function applyBuiltin(name, args) {
             if (args.length !== 1) {
                 throw new EvalError('not expects exactly 1 argument');
             }
-            return { kind: 'boolean', value: !isTruthy(args[0]) };
+            return makeBoolean(!isTruthy(args[0]));
         case 'cons':
             if (args.length !== 2) {
                 throw new EvalError('cons expects exactly 2 arguments');
@@ -541,7 +564,7 @@ function applyBuiltin(name, args) {
             if (args.length !== 1) {
                 throw new EvalError('null? expects exactly 1 argument');
             }
-            return { kind: 'boolean', value: args[0].kind === 'nil' };
+            return makeBoolean(args[0].kind === 'nil');
         case 'list':
             return buildList(args);
         case 'append':
@@ -602,10 +625,10 @@ function applyComparison(args, name, predicate) {
     const numbers = args.map((arg) => expectNumber(arg, name));
     for (let index = 0; index < numbers.length - 1; index += 1) {
         if (!predicate(numbers[index], numbers[index + 1])) {
-            return { kind: 'boolean', value: false };
+            return makeBoolean(false);
         }
     }
-    return { kind: 'boolean', value: true };
+    return makeBoolean(true);
 }
 function expectNumber(value, procedure) {
     if (value.kind !== 'number') {
@@ -666,7 +689,7 @@ function applyTypePredicate(args, name, predicate) {
     if (args.length !== 1) {
         throw new EvalError(`${name} expects exactly 1 argument`);
     }
-    return { kind: 'boolean', value: predicate(args[0]) };
+    return makeBoolean(predicate(args[0]));
 }
 function isTruthy(value) {
     return value.kind !== 'boolean' || value.value;
@@ -674,7 +697,15 @@ function isTruthy(value) {
 function makeNumber(value) {
     return {
         kind: 'number',
+        pos: DEFAULT_SOURCE_POS,
         value: Object.is(value, -0) ? 0 : value,
+    };
+}
+function makeBoolean(value) {
+    return {
+        kind: 'boolean',
+        pos: DEFAULT_SOURCE_POS,
+        value,
     };
 }
 function formatValue(value) {
@@ -732,4 +763,13 @@ function formatPair(value) {
         return `(${parts.join(' ')})`;
     }
     return `(${parts.join(' ')} . ${formatValue(current)})`;
+}
+function attachPosition(error, pos) {
+    if (error instanceof EvalError) {
+        return error.withPosition(pos);
+    }
+    if (error instanceof Error) {
+        return new EvalError(error.message, pos);
+    }
+    return new EvalError(String(error), pos);
 }
