@@ -10,7 +10,10 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### parse_expr (src/scheme/mod.rs:79) — Parse the next Scheme atom or list expression from the input stream
+### eval_application (src/scheme/mod.rs:264) — Evaluate list forms by dispatching short-circuit special forms and builtins
+### apply_builtin (src/scheme/mod.rs:309) — Execute level 01 builtin arithmetic, comparison, and boolean procedures
+### extract_numbers (src/scheme/mod.rs:406) — Validate evaluated arguments as integers and report numeric type errors
 
 ## Python Helpers (scripts/)
 
