@@ -96,6 +96,24 @@ final class Builtins {
                 yield new Evaluator.SchemeValues(new ArrayList<>(args));
             }
 
+            case "syntax->datum" -> {
+                Object stx = args.get(0);
+                if (stx instanceof Evaluator.SyntaxObject so) {
+                    Object datum = so.datum;
+                    if (datum instanceof Evaluator.Located loc) yield loc.datum;
+                    yield datum;
+                }
+                if (stx instanceof Evaluator.Located loc) yield loc.datum;
+                yield stx;
+            }
+
+            case "datum->syntax" -> {
+                Object ctxStx = args.get(0);
+                Object datum = args.get(1);
+                Evaluator.Env ctx = (ctxStx instanceof Evaluator.SyntaxObject so) ? so.context : null;
+                yield new Evaluator.SyntaxObject(datum, ctx);
+            }
+
             // Vectors
             case "vector", "make-vector", "vector-ref", "vector-set!",
                  "vector-length", "vector?", "vector->list", "list->vector" ->

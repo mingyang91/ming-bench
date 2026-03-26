@@ -52,7 +52,8 @@ public class Evaluator {
                 "gcd", "lcm", "truncate", "round",
                 "make-string", "string",
                 "string>?", "string<=?", "string>=?",
-                "procedure?", "values"}) {
+                "procedure?", "values",
+                "syntax->datum", "datum->syntax"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
         globalEnv.define("call/cc", new CallccProc());
@@ -164,6 +165,11 @@ public class Evaluator {
             if (parent != null) { parent.set(name, value); return; }
             throw new EvalError("set!: unbound variable: " + name);
         }
+        java.util.Set<String> allNames() {
+            java.util.Set<String> names = new java.util.HashSet<>(bindings.keySet());
+            if (parent != null) names.addAll(parent.allNames());
+            return names;
+        }
     }
 
     // ---- Procedure types ----
@@ -231,6 +237,37 @@ public class Evaluator {
         final Env env;
         ResolvedRef(String name, Env env) { this.name = name; this.env = env; }
     }
+
+    static final class SyntaxObject {
+        final Object datum;
+        final Env context;
+        SyntaxObject(Object datum, Env context) { this.datum = datum; this.context = context; }
+    }
+
+    static final class MacroTransformer {
+        final Object procedure;
+        final Env defEnv;
+        final java.util.Set<String> defTimeNames;
+        MacroTransformer(Object procedure, Env defEnv, java.util.Set<String> defTimeNames) {
+            this.procedure = procedure; this.defEnv = defEnv; this.defTimeNames = defTimeNames;
+        }
+    }
+
+    private static final class SyntaxCaseContext {
+        final Map<String, Object> bindings;
+        final java.util.Set<String> ellipsisVars;
+        final java.util.Set<String> patternVars;
+        final Env defEnv;
+        final java.util.Set<String> defTimeNames;
+        SyntaxCaseContext(Map<String, Object> bindings, java.util.Set<String> ellipsisVars,
+                          java.util.Set<String> patternVars, Env defEnv, java.util.Set<String> defTimeNames) {
+            this.bindings = bindings; this.ellipsisVars = ellipsisVars;
+            this.patternVars = patternVars; this.defEnv = defEnv; this.defTimeNames = defTimeNames;
+        }
+    }
+
+    private final List<SyntaxCaseContext> syntaxCaseStack = new ArrayList<>();
+    private java.util.Set<String> currentMacroDefTimeNames = null;
 
     // ---- Dynamic wind ----
     static final class WindFrame {
@@ -319,6 +356,9 @@ public class Evaluator {
             if (Character.isWhitespace(c)) { i++; col++; continue; }
             if (c == ';') { while (i < len && input.charAt(i) != '\n') { i++; col++; } continue; }
             int startLine = line, startCol = col;
+            if (c == '#' && i + 1 < len && input.charAt(i + 1) == '\'') {
+                tokens.add(new Token("#'", startLine, startCol)); i += 2; col += 2; continue;
+            }
             if (c == '#' && i + 1 < len && input.charAt(i + 1) == '(') {
                 tokens.add(new Token("#(", startLine, startCol)); i += 2; col += 2; continue;
             }
@@ -388,6 +428,12 @@ public class Evaluator {
             Object quoted = parseExpr(tokens);
             List<Object> q = new ArrayList<>();
             q.add("quote"); q.add(quoted);
+            return new Located(q, token.line, token.col);
+        }
+        if (token.value.equals("#'")) {
+            Object syntaxed = parseExpr(tokens);
+            List<Object> q = new ArrayList<>();
+            q.add("syntax"); q.add(syntaxed);
             return new Located(q, token.line, token.col);
         }
         Object atom = parseAtom(token.value);
@@ -606,9 +652,19 @@ public class Evaluator {
                     case "define-syntax": {
                         if (list.size() != 3) throw posError("define-syntax: bad syntax");
                         String name = (String) unwrap(list.get(1));
-                        SyntaxRules transformer = macroExpander.evalSyntaxRules(list.get(2), env);
-                        env.define(name, transformer);
-                        return new BounceApplyK(k, null);
+                        Object rawBody = unwrap(list.get(2));
+                        if (rawBody instanceof List<?> bodyList && !bodyList.isEmpty()
+                                && "syntax-rules".equals(unwrap(bodyList.get(0)))) {
+                            SyntaxRules transformer = macroExpander.evalSyntaxRules(list.get(2), env);
+                            env.define(name, transformer);
+                            return new BounceApplyK(k, null);
+                        }
+                        Env dsEnv = env;
+                        java.util.Set<String> defNames = env.allNames();
+                        return new BounceStep(list.get(2), env, transVal -> {
+                            dsEnv.define(name, new MacroTransformer(transVal, dsEnv, defNames));
+                            return new BounceApplyK(k, null);
+                        });
                     }
                     case "define-record-type": {
                         Object result = evalDefineRecordType(list, env);
@@ -619,36 +675,10 @@ public class Evaluator {
                         return new BounceStep(list.get(1), env, procVal -> applyProc(procVal, List.of(new SchemeCont(k, new ArrayList<>(windStack))), k));
                     }
                     case "call-with-values": {
-                        if (list.size() != 3) throw posError("call-with-values: expected 2 arguments");
-                        Env cwvEnv = env;
-                        return new BounceStep(list.get(1), env, producer ->
-                            new BounceStep(list.get(2), cwvEnv, consumer ->
-                                applyProc(producer, List.of(), producerResult -> {
-                                    List<Object> consumerArgs;
-                                    if (producerResult instanceof SchemeValues sv) {
-                                        consumerArgs = sv.values;
-                                    } else {
-                                        consumerArgs = List.of(producerResult);
-                                    }
-                                    return applyProc(consumer, consumerArgs, k);
-                                })));
+                        return evalCallWithValues(list, env, k);
                     }
                     case "dynamic-wind": {
-                        if (list.size() != 4) throw posError("dynamic-wind: expected 3 arguments");
-                        Env dwEnv = env;
-                        return new BounceStep(list.get(1), env, inThunk ->
-                            new BounceStep(list.get(2), dwEnv, bodyThunk ->
-                                new BounceStep(list.get(3), dwEnv, outThunk -> {
-                                    WindFrame frame = new WindFrame(inThunk, outThunk);
-                                    return applyProc(inThunk, List.of(), ignored1 -> {
-                                        windStack.add(frame);
-                                        return applyProc(bodyThunk, List.of(), bodyVal -> {
-                                            windStack.remove(windStack.size() - 1);
-                                            return applyProc(outThunk, List.of(), ignored2 ->
-                                                k.apply(bodyVal));
-                                        });
-                                    });
-                                })));
+                        return evalDynamicWind(list, env, k);
                     }
                     case "raise": {
                         // raise can be locally shadowed (it's a procedure, not true syntax)
@@ -684,29 +714,16 @@ public class Evaluator {
                         );
                     }
                     case "guard": {
-                        // (guard (var clause ...) body ...)
-                        List<?> spec = (List<?>) unwrap(list.get(1));
-                        String guardVar = (String) unwrap(spec.get(0));
-                        List<Object> guardClauses = new ArrayList<>();
-                        for (int i = 1; i < spec.size(); i++) guardClauses.add(spec.get(i));
-                        List<Object> guardBody = new ArrayList<>();
-                        for (int i = 2; i < list.size(); i++) guardBody.add(list.get(i));
-                        Env guardEnv = env;
-                        Cont guardK = k;
-
-                        // Create escape continuation that tests clauses after wind transition
-                        Cont clauseTestK = exnVal -> {
-                            Env clauseEnv = new Env(guardEnv);
-                            clauseEnv.define(guardVar, exnVal);
-                            return evalGuardClauses(guardClauses, exnVal, clauseEnv, guardK);
-                        };
-                        SchemeCont guardHandler = new SchemeCont(clauseTestK, new ArrayList<>(windStack));
-
-                        exceptionHandlers.add(guardHandler);
-                        return evalBody(guardBody, env, bodyVal -> {
-                            exceptionHandlers.remove(exceptionHandlers.size() - 1);
-                            return new BounceApplyK(guardK, bodyVal);
-                        });
+                        return evalGuardForm(list, env, k);
+                    }
+                    case "syntax-case": {
+                        return evalSyntaxCase(list, env, k);
+                    }
+                    case "syntax": {
+                        return evalSyntax(list, env, k);
+                    }
+                    case "with-syntax": {
+                        return evalWithSyntax(list, env, k);
                     }
                 }
                 // Check for macros
@@ -714,6 +731,9 @@ public class Evaluator {
                     Object maybeMacro = env.lookup(op);
                     if (maybeMacro instanceof SyntaxRules sr) {
                         return new BounceStep(macroExpander.expandMacro(sr, (List<Object>) list), env, k);
+                    }
+                    if (maybeMacro instanceof MacroTransformer mt) {
+                        return invokeMacroTransformer(mt, list, env, k);
                     }
                 } catch (EvalError ignored) {}
             }
@@ -723,6 +743,9 @@ public class Evaluator {
                 Object resolved = ref.env.lookup(ref.name);
                 if (resolved instanceof SyntaxRules sr) {
                     return new BounceStep(macroExpander.expandMacro(sr, (List<Object>) list), env, k);
+                }
+                if (resolved instanceof MacroTransformer mt) {
+                    return invokeMacroTransformer(mt, list, env, k);
                 }
                 return evalArgsAndApply(resolved, list, 1, env, k);
             }
@@ -754,6 +777,92 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
+    private Object invokeMacroTransformer(MacroTransformer mt, List<?> list, Env env, Cont k) throws EvalError {
+        SyntaxObject stx = new SyntaxObject(list, env);
+        Env macroCallEnv = env;
+        java.util.Set<String> savedDefNames = currentMacroDefTimeNames;
+        currentMacroDefTimeNames = mt.defTimeNames;
+        return applyProc(mt.procedure, List.of(stx), result -> {
+            currentMacroDefTimeNames = savedDefNames;
+            Object expanded;
+            if (result instanceof SyntaxObject so) {
+                expanded = so.datum;
+            } else {
+                expanded = result;
+            }
+            if (expanded instanceof List<?> && !(expanded instanceof Located)) {
+                expanded = new Located(expanded, currentLine, currentCol);
+            }
+            return new BounceStep(expanded, macroCallEnv, k);
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object matchSyntaxCaseClauses(List<?> form, int clauseIdx, Object datum,
+                                           Env defEnv, java.util.Set<String> literals, Env env, Cont k) throws EvalError {
+        if (clauseIdx >= form.size()) throw posError("syntax-case: no matching pattern");
+        List<?> clause = (List<?>) unwrap(form.get(clauseIdx));
+        if (clause.size() < 2) throw posError("syntax-case: bad clause");
+        Object pattern = clause.get(0);
+        java.util.Set<String> ellipsisVars = new java.util.HashSet<>();
+        Map<String, Object> bindings = macroExpander.matchSyntaxCasePattern(pattern, datum, literals, ellipsisVars);
+        if (bindings != null) {
+            java.util.Set<String> patternVars = new java.util.HashSet<>(bindings.keySet());
+            SyntaxCaseContext ctx = new SyntaxCaseContext(bindings, ellipsisVars, patternVars, defEnv, currentMacroDefTimeNames);
+            syntaxCaseStack.add(ctx);
+            Object body = clause.get(clause.size() - 1);
+            return new BounceStep(body, env, result -> {
+                syntaxCaseStack.remove(syntaxCaseStack.size() - 1);
+                return new BounceApplyK(k, result);
+            });
+        }
+        return matchSyntaxCaseClauses(form, clauseIdx + 1, datum, defEnv, literals, env, k);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalWithSyntaxClauses(List<?> form, List<?> clauses, int idx,
+                                          Map<String, Object> bindings, java.util.Set<String> ellipsisVars,
+                                          java.util.Set<String> patternVars, Env env, Cont k) throws EvalError {
+        if (idx >= clauses.size()) {
+            SyntaxCaseContext parentCtx = syntaxCaseStack.isEmpty() ? null :
+                    syntaxCaseStack.get(syntaxCaseStack.size() - 1);
+            Map<String, Object> merged = new HashMap<>();
+            java.util.Set<String> mergedEllipsis = new java.util.HashSet<>();
+            java.util.Set<String> mergedPattern = new java.util.HashSet<>();
+            Env defEnv = env;
+            java.util.Set<String> defNames = currentMacroDefTimeNames;
+            if (parentCtx != null) {
+                merged.putAll(parentCtx.bindings);
+                mergedEllipsis.addAll(parentCtx.ellipsisVars);
+                mergedPattern.addAll(parentCtx.patternVars);
+                defEnv = parentCtx.defEnv;
+                defNames = parentCtx.defTimeNames;
+            }
+            merged.putAll(bindings);
+            mergedEllipsis.addAll(ellipsisVars);
+            mergedPattern.addAll(patternVars);
+            SyntaxCaseContext ctx = new SyntaxCaseContext(merged, mergedEllipsis, mergedPattern, defEnv, defNames);
+            syntaxCaseStack.add(ctx);
+            List<Object> body = new ArrayList<>();
+            for (int i = 2; i < form.size(); i++) body.add(form.get(i));
+            return evalBody(body, env, result -> {
+                syntaxCaseStack.remove(syntaxCaseStack.size() - 1);
+                return new BounceApplyK(k, result);
+            });
+        }
+        List<?> clause = (List<?>) unwrap(clauses.get(idx));
+        Object expr = clause.get(1);
+        return new BounceStep(expr, env, val -> {
+            Object datum = (val instanceof SyntaxObject so) ? so.datum : val;
+            Object rawPat = unwrap(clause.get(0));
+            if (rawPat instanceof String sym) {
+                bindings.put(sym, datum);
+                patternVars.add(sym);
+            }
+            return evalWithSyntaxClauses(form, clauses, idx + 1, bindings, ellipsisVars, patternVars, env, k);
+        });
+    }
+
     private Object evalGuardClauses(List<Object> clauses, Object exnVal, Env env, Cont k) throws EvalError {
         return evalGuardClause(clauses, 0, exnVal, env, k);
     }
@@ -786,6 +895,104 @@ public class Evaluator {
             }
             return evalGuardClause(clauses, idx + 1, exnVal, env, k);
         });
+    }
+
+    private Object evalCallWithValues(List<?> list, Env env, Cont k) throws EvalError {
+        if (list.size() != 3) throw posError("call-with-values: expected 2 arguments");
+        Env cwvEnv = env;
+        return new BounceStep(list.get(1), env, producer ->
+            new BounceStep(list.get(2), cwvEnv, consumer ->
+                applyProc(producer, List.of(), producerResult -> {
+                    List<Object> consumerArgs;
+                    if (producerResult instanceof SchemeValues sv) {
+                        consumerArgs = sv.values;
+                    } else {
+                        consumerArgs = List.of(producerResult);
+                    }
+                    return applyProc(consumer, consumerArgs, k);
+                })));
+    }
+
+    private Object evalDynamicWind(List<?> list, Env env, Cont k) throws EvalError {
+        if (list.size() != 4) throw posError("dynamic-wind: expected 3 arguments");
+        Env dwEnv = env;
+        return new BounceStep(list.get(1), env, inThunk ->
+            new BounceStep(list.get(2), dwEnv, bodyThunk ->
+                new BounceStep(list.get(3), dwEnv, outThunk -> {
+                    WindFrame frame = new WindFrame(inThunk, outThunk);
+                    return applyProc(inThunk, List.of(), ignored1 -> {
+                        windStack.add(frame);
+                        return applyProc(bodyThunk, List.of(), bodyVal -> {
+                            windStack.remove(windStack.size() - 1);
+                            return applyProc(outThunk, List.of(), ignored2 ->
+                                k.apply(bodyVal));
+                        });
+                    });
+                })));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalGuardForm(List<?> list, Env env, Cont k) throws EvalError {
+        List<?> spec = (List<?>) unwrap(list.get(1));
+        String guardVar = (String) unwrap(spec.get(0));
+        List<Object> guardClauses = new ArrayList<>();
+        for (int i = 1; i < spec.size(); i++) guardClauses.add(spec.get(i));
+        List<Object> guardBody = new ArrayList<>();
+        for (int i = 2; i < list.size(); i++) guardBody.add(list.get(i));
+        Env guardEnv = env;
+        Cont guardK = k;
+        Cont clauseTestK = exnVal -> {
+            Env clauseEnv = new Env(guardEnv);
+            clauseEnv.define(guardVar, exnVal);
+            return evalGuardClauses(guardClauses, exnVal, clauseEnv, guardK);
+        };
+        SchemeCont guardHandler = new SchemeCont(clauseTestK, new ArrayList<>(windStack));
+        exceptionHandlers.add(guardHandler);
+        return evalBody(guardBody, env, bodyVal -> {
+            exceptionHandlers.remove(exceptionHandlers.size() - 1);
+            return new BounceApplyK(guardK, bodyVal);
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalSyntaxCase(List<?> list, Env env, Cont k) throws EvalError {
+        if (list.size() < 4) throw posError("syntax-case: bad syntax");
+        Env scEnv = env;
+        return new BounceStep(list.get(1), env, stxVal -> {
+            Object datum = (stxVal instanceof SyntaxObject so) ? so.datum : stxVal;
+            List<?> litsRaw = (List<?>) unwrap(list.get(2));
+            java.util.Set<String> literals = new java.util.HashSet<>();
+            for (Object lit : litsRaw) literals.add((String) unwrap(lit));
+            return matchSyntaxCaseClauses(list, 3, datum, scEnv, literals, scEnv, k);
+        });
+    }
+
+    private Object evalSyntax(List<?> list, Env env, Cont k) throws EvalError {
+        if (list.size() != 2) throw posError("syntax: expected 1 argument");
+        if (syntaxCaseStack.isEmpty()) throw posError("syntax: not in syntax-case context");
+        SyntaxCaseContext ctx = syntaxCaseStack.get(syntaxCaseStack.size() - 1);
+        Object template = list.get(1);
+        Object rawTemplate = unwrap(template);
+        if (rawTemplate instanceof String sym && ctx.patternVars.contains(sym)) {
+            Object val = ctx.bindings.get(sym);
+            return new BounceApplyK(k, new SyntaxObject(val, ctx.defEnv));
+        }
+        Object expanded = macroExpander.expandSyntaxTemplate(template, ctx.bindings,
+                ctx.patternVars, ctx.ellipsisVars, ctx.defEnv, ctx.defTimeNames);
+        return new BounceApplyK(k, new SyntaxObject(expanded, ctx.defEnv));
+    }
+
+    private Object evalWithSyntax(List<?> list, Env env, Cont k) throws EvalError {
+        if (list.size() < 3) throw posError("with-syntax: bad syntax");
+        List<?> clauses = (List<?>) unwrap(list.get(1));
+        if (clauses.isEmpty()) {
+            List<Object> body = new ArrayList<>();
+            for (int i = 2; i < list.size(); i++) body.add(list.get(i));
+            return evalBody(body, env, k);
+        }
+        Env wsEnv = env;
+        return evalWithSyntaxClauses(list, clauses, 0, new HashMap<>(),
+                new java.util.HashSet<>(), new java.util.HashSet<>(), wsEnv, k);
     }
 
     private Object evalAnd(List<?> form, int idx, Env env, Cont k) throws EvalError {
@@ -1255,133 +1462,11 @@ public class Evaluator {
         return val instanceof Boolean b && !b;
     }
 
-    boolean schemeEqual(Object a, Object b) {
-        return schemeEqualImpl(a, b, new java.util.IdentityHashMap<>());
-    }
-
-    private boolean schemeEqualImpl(Object a, Object b, java.util.IdentityHashMap<Object, Set<Object>> seen) {
-        if (a == b) return true;
-        if (isNumber(a) && isNumber(b)) return numToDouble(a) == numToDouble(b);
-        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
-        if (a instanceof String && b instanceof String) return a.equals(b);
-        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value.equals(sb.value);
-        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value == cb.value;
-        if (a == NIL && b == NIL) return true;
-        if (a instanceof Pair pa && b instanceof Pair pb) {
-            Set<Object> aSet = seen.get(a);
-            if (aSet != null && aSet.contains(b)) return true;
-            if (aSet == null) { aSet = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()); seen.put(a, aSet); }
-            aSet.add(b);
-            return schemeEqualImpl(pa.car, pb.car, seen) && schemeEqualImpl(pa.cdr, pb.cdr, seen);
-        }
-        if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
-            if (va.data.length != vb.data.length) return false;
-            Set<Object> aSet = seen.get(a);
-            if (aSet != null && aSet.contains(b)) return true;
-            if (aSet == null) { aSet = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()); seen.put(a, aSet); }
-            aSet.add(b);
-            for (int i = 0; i < va.data.length; i++) {
-                if (!schemeEqualImpl(va.data[i], vb.data[i], seen)) return false;
-            }
-            return true;
-        }
-        return false;
-    }
-
-    boolean schemeEqv(Object a, Object b) {
-        if (a == b) return true;
-        if (isNumber(a) && isNumber(b)) return numToDouble(a) == numToDouble(b);
-        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
-        if (a instanceof String && b instanceof String) return a.equals(b);
-        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value == cb.value;
-        return false;
-    }
-
-    boolean isNumber(Object val) {
-        return val instanceof Long || val instanceof Double || val instanceof SchemeRational;
-    }
-
-    double numToDouble(Object val) {
-        if (val instanceof Long l) return l.doubleValue();
-        if (val instanceof Double d) return d;
-        if (val instanceof SchemeRational r) return r.toDouble();
-        return 0;
-    }
-
-    // ---- Output formatting ----
-
-    String displayString(Object val) {
-        if (val instanceof SchemeString s) return s.value;
-        if (val instanceof SchemeChar c) return String.valueOf(c.value);
-        return schemeToStringImpl(val, new java.util.IdentityHashMap<>());
-    }
-
-    @SuppressWarnings("unchecked")
-    String schemeToString(Object val) {
-        return schemeToStringImpl(val, new java.util.IdentityHashMap<>());
-    }
-
-    private String schemeToStringImpl(Object val, java.util.IdentityHashMap<Object, Boolean> seen) {
-        if (val == null) return "";
-        if (val == NIL) return "()";
-        if (val instanceof Long l) return l.toString();
-        if (val instanceof Double d) return Double.toString(d);
-        if (val instanceof SchemeRational r) return r.numer + "/" + r.denom;
-        if (val instanceof Boolean b) return b ? "#t" : "#f";
-        if (val instanceof SchemeString s) return "\"" + s.value + "\"";
-        if (val instanceof SchemeChar c) {
-            return switch (c.value) {
-                case ' ' -> "#\\space";
-                case '\n' -> "#\\newline";
-                case '\t' -> "#\\tab";
-                default -> "#\\" + c.value;
-            };
-        }
-        if (val instanceof String s) return s;
-        if (val instanceof SchemeVector v) {
-            if (seen.containsKey(v)) return "#<cycle>";
-            seen.put(v, Boolean.TRUE);
-            StringBuilder sb = new StringBuilder("#(");
-            for (int i = 0; i < v.data.length; i++) {
-                if (i > 0) sb.append(" ");
-                sb.append(schemeToStringImpl(v.data[i], seen));
-            }
-            sb.append(")");
-            seen.remove(v);
-            return sb.toString();
-        }
-        if (val instanceof Pair) {
-            if (seen.containsKey(val)) return "#<cycle>";
-            seen.put(val, Boolean.TRUE);
-            StringBuilder sb = new StringBuilder("(");
-            Object cur = val;
-            boolean first = true;
-            while (cur instanceof Pair p) {
-                if (!first) {
-                    if (seen.containsKey(cur)) { sb.append(" . #<cycle>"); break; }
-                    seen.put(cur, Boolean.TRUE);
-                }
-                if (!first) sb.append(" ");
-                first = false;
-                sb.append(schemeToStringImpl(p.car, seen));
-                cur = p.cdr;
-            }
-            if (cur != NIL && !(cur instanceof Pair)) {
-                sb.append(" . ").append(schemeToStringImpl(cur, seen));
-            }
-            sb.append(")");
-            return sb.toString();
-        }
-        if (val instanceof List<?> list) {
-            StringBuilder sb = new StringBuilder("(");
-            for (int i = 0; i < list.size(); i++) {
-                if (i > 0) sb.append(" ");
-                sb.append(schemeToStringImpl(list.get(i), seen));
-            }
-            sb.append(")");
-            return sb.toString();
-        }
-        return val.toString();
-    }
+    boolean schemeEqual(Object a, Object b) { return SchemeFormatter.schemeEqual(a, b); }
+    boolean schemeEqv(Object a, Object b) { return SchemeFormatter.schemeEqv(a, b); }
+    boolean isNumber(Object val) { return SchemeFormatter.isNumber(val); }
+    double numToDouble(Object val) { return SchemeFormatter.numToDouble(val); }
+    String displayString(Object val) { return SchemeFormatter.displayString(val); }
+    String schemeToString(Object val) { return SchemeFormatter.schemeToString(val); }
 
 }

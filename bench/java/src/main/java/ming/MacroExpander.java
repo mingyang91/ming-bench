@@ -26,7 +26,7 @@ class MacroExpander {
                  "let", "let*", "and", "or", "define-syntax", "syntax-rules",
                  "define-record-type", "case-lambda",
                  "letrec", "letrec*", "case", "do", "dynamic-wind",
-                 "guard" -> true;
+                 "guard", "syntax-case", "syntax", "with-syntax" -> true;
             default -> false;
         };
     }
@@ -122,6 +122,10 @@ class MacroExpander {
         if (raw instanceof Boolean || raw instanceof Long ||
             raw instanceof Evaluator.SchemeString || raw instanceof Evaluator.SchemeChar) return raw;
         if (raw instanceof List<?> tmplList) {
+            // Don't expand inside quote forms
+            if (!tmplList.isEmpty() && "quote".equals(unwrap(tmplList.get(0)))) {
+                return template;
+            }
             List<Object> result = new ArrayList<>();
             for (int i = 0; i < tmplList.size(); i++) {
                 boolean hasEllipsis = (i + 1 < tmplList.size() && "...".equals(unwrap(tmplList.get(i + 1))));
@@ -146,6 +150,82 @@ class MacroExpander {
                 } else {
                     result.add(expandTemplate(tmplList.get(i), bindings, patternVars,
                                                ellipsisVars, sr, gensymMap));
+                }
+            }
+            return new Evaluator.Located(result, 0, 0);
+        }
+        return raw;
+    }
+
+    Map<String, Object> matchSyntaxCasePattern(Object patternRaw, Object datum,
+                                                  Set<String> literals, Set<String> ellipsisVars) {
+        List<?> pattern = (List<?>) unwrap(patternRaw);
+        List<?> form;
+        if (datum instanceof List<?> l) form = l;
+        else return null;
+        return matchPattern(pattern, form, literals, ellipsisVars);
+    }
+
+    Object expandSyntaxTemplate(Object template, Map<String, Object> bindings,
+                                 Set<String> patternVars, Set<String> ellipsisVars,
+                                 Evaluator.Env defEnv, Set<String> defTimeNames) throws EvalError {
+        Evaluator.SyntaxRules fakeSr = new Evaluator.SyntaxRules(List.of(), List.of(), defEnv);
+        Map<String, String> gensymMap = new HashMap<>();
+        return expandTemplateSC(template, bindings, patternVars, ellipsisVars, fakeSr, gensymMap, defTimeNames);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object expandTemplateSC(Object template, Map<String, Object> bindings,
+                                     Set<String> patternVars, Set<String> ellipsisVars,
+                                     Evaluator.SyntaxRules sr, Map<String, String> gensymMap,
+                                     Set<String> defTimeNames) throws EvalError {
+        Object raw = unwrap(template);
+        if (raw instanceof String sym) {
+            if (patternVars.contains(sym) && !ellipsisVars.contains(sym)) return bindings.get(sym);
+            if (ellipsisVars.contains(sym)) return bindings.get(sym);
+            if (isKeyword(sym) || sym.equals("...")) return sym;
+            // Resolve names that existed at definition time (proper hygiene)
+            if (defTimeNames != null && defTimeNames.contains(sym)) {
+                try {
+                    sr.defEnv.lookup(sym);
+                    return new Evaluator.ResolvedRef(sym, sr.defEnv);
+                } catch (EvalError e) {
+                    // fallthrough
+                }
+            }
+            // Leave other names as plain strings - they'll resolve at call site
+            return sym;
+        }
+        if (raw instanceof Boolean || raw instanceof Long ||
+            raw instanceof Evaluator.SchemeString || raw instanceof Evaluator.SchemeChar) return raw;
+        if (raw instanceof List<?> tmplList) {
+            if (!tmplList.isEmpty() && "quote".equals(unwrap(tmplList.get(0)))) {
+                return template;
+            }
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < tmplList.size(); i++) {
+                boolean hasEllipsis = (i + 1 < tmplList.size() && "...".equals(unwrap(tmplList.get(i + 1))));
+                if (hasEllipsis) {
+                    Set<String> usedEllipsis = findEllipsisVarsInTemplate(tmplList.get(i), ellipsisVars);
+                    if (!usedEllipsis.isEmpty()) {
+                        String anyVar = usedEllipsis.iterator().next();
+                        List<Object> varList = (List<Object>) bindings.get(anyVar);
+                        for (int j = 0; j < varList.size(); j++) {
+                            Map<String, Object> iterBindings = new HashMap<>(bindings);
+                            for (String ev : usedEllipsis) {
+                                List<Object> evList = (List<Object>) bindings.get(ev);
+                                iterBindings.put(ev, evList.get(j));
+                            }
+                            Set<String> adjustedEllipsis = new HashSet<>(ellipsisVars);
+                            adjustedEllipsis.removeAll(usedEllipsis);
+                            result.add(expandTemplateSC(tmplList.get(i), iterBindings, patternVars,
+                                                         adjustedEllipsis, sr, gensymMap, defTimeNames));
+                        }
+                    }
+                    i++;
+                } else {
+                    result.add(expandTemplateSC(tmplList.get(i), bindings, patternVars,
+                                                 ellipsisVars, sr, gensymMap, defTimeNames));
                 }
             }
             return new Evaluator.Located(result, 0, 0);
