@@ -179,6 +179,25 @@ object Evaluator:
 
   private[ming] def runCekInternal(state: CekState): Value = runCek(state)
 
+  private def runCekWithLimit(state0: CekState, maxSteps: Int): Value =
+    var state = state0
+    var steps = 0
+    while true do
+      steps += 1
+      if steps > maxSteps then throw EvalError("step limit exceeded")
+      state =
+        try
+          state match
+            case CekState.ApplyK(v, Kont.Halt) => return v
+            case CekState.Eval(expr, env, k)   => evalStep(expr, env, k)
+            case CekState.ApplyK(v, k)         => CekSteps.kontStep(v, k)
+        catch
+          case ci: ContinuationInvoke =>
+            CekState.ApplyK(ci.value, ci.kont)
+          case sr: SchemeRaise =>
+            handleRaise(sr.value)
+    throw EvalError("unreachable")
+
   private def evalBody(body: List[Expr], env: Env): Value =
     if body.isEmpty then Value.VVoid
     else runCek(bodyToCek(body, env, Kont.Halt))
@@ -191,6 +210,14 @@ object Evaluator:
     exceptionHandlers = Nil
     val env = defaultEnv()
     display(runCek(bodyToCek(exprs, env, Kont.Halt)))
+
+  def evalStrWithLimit(input: String, maxSteps: Int): String =
+    val exprs = Parser.parseAll(input)
+    if exprs.isEmpty then throw EvalError("no expressions")
+    windStack = Nil
+    exceptionHandlers = Nil
+    val env = defaultEnv()
+    display(runCekWithLimit(bodyToCek(exprs, env, Kont.Halt), maxSteps))
 
   def evalStrWithOutput(input: String): (String, String) =
     val exprs = Parser.parseAll(input)
