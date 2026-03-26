@@ -303,6 +303,7 @@ func MakeDefaultEnv() *Env {
 		">":  builtinGt,
 		"=":  builtinEq,
 		"<=": builtinLe,
+		">=": builtinGe,
 		"not":      builtinNot,
 		"cons":     builtinCons,
 		"car":      builtinCar,
@@ -328,6 +329,11 @@ func MakeDefaultEnv() *Env {
 		"char?":           builtinCharQ,
 		"string-copy":     builtinStringCopy,
 		"string-set!":     builtinStringSet,
+		// L15 builtins
+		"string->list":    builtinStringToList,
+		"list->string":    builtinListToString,
+		"char->integer":   builtinCharToInteger,
+		"integer->char":   builtinIntegerToChar,
 		// L09 builtins
 		"abs":               builtinAbs,
 		"modulo":            builtinModulo,
@@ -635,6 +641,16 @@ func builtinLe(args []*Value, expr *Expr) (*Value, error) {
 		return nil, err
 	}
 	return BoolValue(numCmp(args[0], args[1]) <= 0), nil
+}
+
+func builtinGe(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: >=: expected 2 arguments", expr.Line, expr.Col)
+	}
+	if err := requireNums(args, expr, ">="); err != nil {
+		return nil, err
+	}
+	return BoolValue(numCmp(args[0], args[1]) >= 0), nil
 }
 
 func builtinNot(args []*Value, expr *Expr) (*Value, error) {
@@ -1143,18 +1159,65 @@ func builtinStringCopy(args []*Value, expr *Expr) (*Value, error) {
 
 func builtinStringSet(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInt || args[2].Type != TypeChar {
-		return nil, fmt.Errorf("%d:%d: string-set!: expected string, int, char", expr.Line, expr.Col)
+		return nil, fmt.Errorf("%d:%d: string-set!: expected string, index, char", expr.Line, expr.Col)
 	}
-	s := args[0]
-	if s.Runes == nil {
-		return nil, fmt.Errorf("%d:%d: string-set!: string is immutable", expr.Line, expr.Col)
+	// L15: only mutable strings (from string-copy) can be modified
+	if args[0].Runes == nil {
+		return nil, fmt.Errorf("%d:%d: string-set!: strings are immutable", expr.Line, expr.Col)
 	}
-	idx := int(args[1].IntVal)
-	if idx < 0 || idx >= len(s.Runes) {
+	idx := args[1].IntVal
+	if idx < 0 || idx >= int64(len(args[0].Runes)) {
 		return nil, fmt.Errorf("%d:%d: string-set!: index out of range", expr.Line, expr.Col)
 	}
-	s.Runes[idx] = rune(args[2].IntVal)
+	args[0].Runes[idx] = rune(args[2].IntVal)
 	return Void, nil
+}
+
+// L15 builtins
+
+func builtinStringToList(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string->list: expected 1 string argument", expr.Line, expr.Col)
+	}
+	runes := []rune(args[0].StrContent())
+	result := Nil
+	for i := len(runes) - 1; i >= 0; i-- {
+		result = &Value{Type: TypePair, Car: CharValue(runes[i]), Cdr: result}
+	}
+	return result, nil
+}
+
+func builtinListToString(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: list->string: expected 1 argument", expr.Line, expr.Col)
+	}
+	var runes []rune
+	cur := args[0]
+	for cur.Type == TypePair {
+		if cur.Car.Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: list->string: expected list of characters", expr.Line, expr.Col)
+		}
+		runes = append(runes, rune(cur.Car.IntVal))
+		cur = cur.Cdr
+	}
+	if cur.Type != TypeNil {
+		return nil, fmt.Errorf("%d:%d: list->string: expected proper list", expr.Line, expr.Col)
+	}
+	return StringValue(string(runes)), nil
+}
+
+func builtinCharToInteger(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeChar {
+		return nil, fmt.Errorf("%d:%d: char->integer: expected 1 character argument", expr.Line, expr.Col)
+	}
+	return IntValue(args[0].IntVal), nil
+}
+
+func builtinIntegerToChar(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: integer->char: expected 1 integer argument", expr.Line, expr.Col)
+	}
+	return CharValue(rune(args[0].IntVal)), nil
 }
 
 // L09 builtins
