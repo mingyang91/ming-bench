@@ -3,7 +3,7 @@ package ming;
 import java.util.List;
 
 sealed interface Expr permits IntExpr, RationalExpr, InexactExpr, BoolExpr, CharExpr,
-        StringExpr, SymbolExpr, ListExpr {
+        StringExpr, SymbolExpr, ListExpr, VectorExpr {
     int line();
 
     int column();
@@ -31,4 +31,7 @@ record SymbolExpr(String name, int line, int column) implements Expr {
 }
 
 record ListExpr(List<Expr> elements, int line, int column) implements Expr {
+}
+
+record VectorExpr(List<Expr> elements, int line, int column) implements Expr {
 }

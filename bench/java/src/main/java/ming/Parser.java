@@ -35,12 +35,36 @@ final class Parser {
         if (current == '(') {
             return parseList(startLine, startColumn);
         }
+        if (current == '#' && peekNextChar() == '(') {
+            return parseVector(startLine, startColumn);
+        }
         if (current == '#' && peekNextChar() == '\'') {
             advance();
             advance();
             Expr syntaxQuoted = parseExpression();
             return new ListExpr(
                     List.of(new SymbolExpr("syntax", startLine, startColumn), syntaxQuoted),
+                    startLine,
+                    startColumn);
+        }
+        if (current == '`') {
+            advance();
+            Expr quasiquoted = parseExpression();
+            return new ListExpr(
+                    List.of(new SymbolExpr("quasiquote", startLine, startColumn), quasiquoted),
+                    startLine,
+                    startColumn);
+        }
+        if (current == ',') {
+            advance();
+            boolean splicing = !isAtEnd() && currentChar() == '@';
+            if (splicing) {
+                advance();
+            }
+            Expr unquoted = parseExpression();
+            return new ListExpr(
+                    List.of(new SymbolExpr(splicing ? "unquote-splicing" : "unquote",
+                            startLine, startColumn), unquoted),
                     startLine,
                     startColumn);
         }
@@ -76,6 +100,24 @@ final class Parser {
 
         consume(')');
         return new ListExpr(List.copyOf(elements), startLine, startColumn);
+    }
+
+    private Expr parseVector(int startLine, int startColumn) throws EvalError {
+        consume('#');
+        consume('(');
+        List<Expr> elements = new ArrayList<>();
+        skipTrivia();
+        while (!isAtEnd() && currentChar() != ')') {
+            elements.add(parseExpression());
+            skipTrivia();
+        }
+
+        if (isAtEnd()) {
+            throw error("unterminated vector");
+        }
+
+        consume(')');
+        return new VectorExpr(List.copyOf(elements), startLine, startColumn);
     }
 
     private Expr parseString(int startLine, int startColumn) throws EvalError {
@@ -268,7 +310,7 @@ final class Parser {
 
     private boolean isDelimiter(char ch) {
         return Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';'
-                || ch == '\'';
+                || ch == '\'' || ch == '`' || ch == ',';
     }
 
     private void consume(char expected) throws EvalError {

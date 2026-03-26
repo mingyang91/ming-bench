@@ -5,9 +5,7 @@ import static ming.RuntimeConstants.*;
 import static ming.ValueSupport.*;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -93,7 +91,7 @@ public class Evaluator {
                 immutableStringsEnabled,
                 this::applyProcedure,
                 this::appendOutput,
-                this::quoteToValue);
+                QuotationSupport::quoteToValue);
     }
 
     private Value run(Step initialStep) throws EvalError {
@@ -156,6 +154,8 @@ public class Evaluator {
             case StringExpr stringExpr -> new ReturnStep(immutableString(stringExpr.value()), kont);
             case SymbolExpr symbolExpr -> new ReturnStep(
                     macroExpander.lookupSymbol(symbolExpr.name(), env), kont);
+            case VectorExpr vectorExpr -> new ReturnStep(QuotationSupport.quoteToValue(vectorExpr),
+                    kont);
             case ListExpr listExpr -> evalList(listExpr, env, kont);
         };
     }
@@ -183,10 +183,11 @@ public class Evaluator {
             return switch (operatorName) {
                 case "define" -> evalDefine(arguments, env, kont, listExpr);
                 case "define-record-type" ->
-                        new ReturnStep(evalDefineRecordType(arguments, env), kont);
+                        new ReturnStep(RecordTypeSupport.evalDefineRecordType(arguments, env), kont);
                 case "set!" -> evalSet(arguments, env, kont, listExpr);
                 case "if" -> evalIf(arguments, env, kont, listExpr);
                 case "quote" -> new ReturnStep(evalQuote(arguments), kont);
+                case "quasiquote" -> new ReturnStep(evalQuasiquote(arguments, env), kont);
                 case "lambda" -> new ReturnStep(evalLambda(arguments, env), kont);
                 case "case-lambda" -> new ReturnStep(evalCaseLambda(arguments, env), kont);
                 case "and" -> evalAnd(arguments, 0, env, kont, listExpr);
@@ -200,6 +201,9 @@ public class Evaluator {
                 case "cond" -> evalCond(arguments, 0, env, kont, listExpr);
                 case "case" -> evalCase(arguments, env, kont, listExpr);
                 case "do" -> evalDo(arguments, env, kont, listExpr);
+                case "unquote" -> throw new EvalError("unquote can only appear within quasiquote");
+                case "unquote-splicing" ->
+                        throw new EvalError("unquote-splicing can only appear within quasiquote");
                 default -> evalApplication(listExpr, operatorExpr, arguments, env, kont);
             };
         }
@@ -278,133 +282,6 @@ public class Evaluator {
         throw new EvalError("define target must be a symbol or parameter list");
     }
 
-    private Value evalDefineRecordType(List<Expr> arguments, Env env) throws EvalError {
-        requireMinArgs("define-record-type", arguments, 3);
-
-        Expr typeExpr = arguments.get(0);
-        if (!(typeExpr instanceof SymbolExpr typeSymbol)) {
-            throw new EvalError("define-record-type type name must be a symbol");
-        }
-
-        Expr constructorExpr = arguments.get(1);
-        if (!(constructorExpr instanceof ListExpr constructorList)
-                || constructorList.elements().isEmpty()) {
-            throw new EvalError("define-record-type constructor spec must be a list");
-        }
-
-        Expr constructorNameExpr = constructorList.elements().get(0);
-        if (!(constructorNameExpr instanceof SymbolExpr constructorNameSymbol)) {
-            throw new EvalError("define-record-type constructor name must be a symbol");
-        }
-
-        Expr predicateExpr = arguments.get(2);
-        if (!(predicateExpr instanceof SymbolExpr predicateSymbol)) {
-            throw new EvalError("define-record-type predicate name must be a symbol");
-        }
-
-        List<RecordFieldSpec> fieldSpecs = new ArrayList<>();
-        Map<String, Integer> fieldIndexes = new HashMap<>();
-        for (int index = 3; index < arguments.size(); index++) {
-            Expr fieldExpr = arguments.get(index);
-            if (!(fieldExpr instanceof ListExpr fieldList) || fieldList.elements().size() != 2) {
-                throw new EvalError(
-                        "define-record-type field spec must contain a field and accessor");
-            }
-
-            Expr fieldNameExpr = fieldList.elements().get(0);
-            if (!(fieldNameExpr instanceof SymbolExpr fieldNameSymbol)) {
-                throw new EvalError("define-record-type field name must be a symbol");
-            }
-
-            Expr accessorExpr = fieldList.elements().get(1);
-            if (!(accessorExpr instanceof SymbolExpr accessorSymbol)) {
-                throw new EvalError("define-record-type accessor name must be a symbol");
-            }
-
-            String fieldName = fieldNameSymbol.name();
-            if (fieldIndexes.containsKey(fieldName)) {
-                throw new EvalError("define-record-type field names must be unique");
-            }
-
-            fieldIndexes.put(fieldName, fieldSpecs.size());
-            fieldSpecs.add(new RecordFieldSpec(fieldName, accessorSymbol.name()));
-        }
-
-        List<Expr> constructorFields = constructorList.elements().subList(1,
-                constructorList.elements().size());
-        if (constructorFields.size() != fieldSpecs.size()) {
-            throw new EvalError(
-                    "define-record-type constructor field count must match field specs");
-        }
-
-        int[] constructorOrder = new int[constructorFields.size()];
-        boolean[] assignedFields = new boolean[fieldSpecs.size()];
-        for (int index = 0; index < constructorFields.size(); index++) {
-            Expr fieldExpr = constructorFields.get(index);
-            if (!(fieldExpr instanceof SymbolExpr fieldSymbol)) {
-                throw new EvalError("define-record-type constructor fields must be symbols");
-            }
-
-            Integer fieldIndex = fieldIndexes.get(fieldSymbol.name());
-            if (fieldIndex == null) {
-                throw new EvalError("define-record-type constructor references an unknown field");
-            }
-            if (assignedFields[fieldIndex]) {
-                throw new EvalError("define-record-type constructor fields must be unique");
-            }
-
-            constructorOrder[index] = fieldIndex;
-            assignedFields[fieldIndex] = true;
-        }
-
-        RecordTypeValue type = new RecordTypeValue(typeSymbol.name());
-        env.define(constructorNameSymbol.name(),
-                new BuiltinValue(constructorNameSymbol.name(),
-                        values -> constructRecord(type, constructorOrder, values,
-                                constructorNameSymbol.name())));
-        env.define(predicateSymbol.name(),
-                new BuiltinValue(predicateSymbol.name(),
-                        values -> recordPredicate(type, values, predicateSymbol.name())));
-        for (int index = 0; index < fieldSpecs.size(); index++) {
-            RecordFieldSpec fieldSpec = fieldSpecs.get(index);
-            int fieldIndex = index;
-            env.define(fieldSpec.accessorName(),
-                    new BuiltinValue(fieldSpec.accessorName(),
-                            values -> recordAccessor(type, fieldIndex, values,
-                                    fieldSpec.accessorName())));
-        }
-        return VOID;
-    }
-
-    private Value constructRecord(RecordTypeValue type, int[] constructorOrder,
-            List<Value> arguments, String constructorName) throws EvalError {
-        requireExactArgs(constructorName, arguments, constructorOrder.length);
-
-        Value[] fields = new Value[constructorOrder.length];
-        for (int index = 0; index < constructorOrder.length; index++) {
-            fields[constructorOrder[index]] = arguments.get(index);
-        }
-        return new RecordInstanceValue(type, List.of(fields));
-    }
-
-    private Value recordPredicate(RecordTypeValue type, List<Value> arguments, String name)
-            throws EvalError {
-        requireExactArgs(name, arguments, 1);
-        return boolValue(arguments.get(0) instanceof RecordInstanceValue recordInstance
-                && recordInstance.type() == type);
-    }
-
-    private Value recordAccessor(RecordTypeValue type, int fieldIndex, List<Value> arguments,
-            String accessorName) throws EvalError {
-        requireExactArgs(accessorName, arguments, 1);
-        Value value = arguments.get(0);
-        if (!(value instanceof RecordInstanceValue recordInstance)
-                || recordInstance.type() != type) {
-            throw new EvalError(accessorName + " expects a " + type.name() + " record");
-        }
-        return recordInstance.field(fieldIndex);
-    }
-
     private Step evalSet(List<Expr> arguments, Env env, Kont kont, Expr context) throws EvalError {
         requireExactArgs("set!", arguments, 2);
 
@@ -446,8 +323,11 @@ public class Evaluator {
     }
 
     private Value evalQuote(List<Expr> arguments) throws EvalError {
-        requireExactArgs("quote", arguments, 1);
-        return quoteToValue(arguments.get(0));
+        return QuotationSupport.evalQuote(arguments);
+    }
+
+    private Value evalQuasiquote(List<Expr> arguments, Env env) throws EvalError {
+        return QuotationSupport.evalQuasiquote(arguments, env, this::eval);
     }
 
     private Value evalLambda(List<Expr> arguments, Env env) throws EvalError {
@@ -832,6 +712,10 @@ public class Evaluator {
         return new EvalExprStep(testExpr, env,
                 continuation(context, testValue -> {
                     if (isTruthy(testValue)) {
+                        if (isCondArrowClause(elements)) {
+                            return evalCondArrowClause(elements.get(2), testValue, env, kont,
+                                    clause);
+                        }
                         if (elements.size() == 1) {
                             return new ReturnStep(testValue, kont);
                         }
@@ -839,6 +723,23 @@ public class Evaluator {
                     }
                     return evalCond(arguments, index + 1, env, kont, context);
                 }));
+    }
+
+    private boolean isCondArrowClause(List<Expr> elements) {
+        return elements.size() == 3
+                && elements.get(1) instanceof SymbolExpr symbolExpr
+                && "=>".equals(symbolExpr.name());
+    }
+
+    private Step evalCondArrowClause(Expr procedureExpr, Value testValue, Env env, Kont kont,
+            Expr context) {
+        return new EvalExprStep(procedureExpr, env,
+                continuation(context, procedure -> new ApplyStep(
+                        procedure,
+                        List.of(testValue),
+                        kont,
+                        context.line(),
+                        context.column())));
     }
 
     private Step evalCase(List<Expr> arguments, Env env, Kont kont, Expr context)
@@ -879,7 +780,7 @@ public class Evaluator {
         }
 
         for (Expr datumExpr : datumList.elements()) {
-            if (eqValues(key, quoteToValue(datumExpr))) {
+            if (eqValues(key, QuotationSupport.quoteToValue(datumExpr))) {
                 return evalSequence(clauseElements.subList(1, clauseElements.size()), env, kont);
             }
         }
@@ -1121,6 +1022,7 @@ public class Evaluator {
                             column);
             case "dynamic-wind" -> applyDynamicWind(arguments, kont, line, column);
             case "raise" -> applyRaise(arguments, line, column);
+            case "error" -> applyError(arguments, line, column);
             case "with-exception-handler" ->
                     applyWithExceptionHandler(arguments, kont, line, column);
             case "apply" -> applyBuiltinApply(arguments, kont, line, column);
@@ -1283,6 +1185,12 @@ public class Evaluator {
     private Step applyRaise(List<Value> arguments, int line, int column) throws EvalError {
         requireExactArgs("raise", arguments, 1);
         throw new RaisedException(arguments.get(0), line, column);
+    }
+
+    private Step applyError(List<Value> arguments, int line, int column) throws EvalError {
+        requireMinArgs("error", arguments, 1);
+        Value payload = arguments.size() == 1 ? arguments.get(0) : listValue(arguments);
+        throw new RaisedException(payload, line, column);
     }
 
     private Step applyWithExceptionHandler(List<Value> arguments, Kont kont, int line, int column)
@@ -1462,28 +1370,6 @@ public class Evaluator {
         return evalSequence(body, callEnv, kont);
     }
 
-    private Value quoteToValue(Expr expr) {
-        return switch (expr) {
-            case IntExpr intExpr -> new IntValue(intExpr.value());
-            case RationalExpr rationalExpr -> exactValue(
-                    rationalExpr.numerator(), rationalExpr.denominator());
-            case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
-            case BoolExpr boolExpr -> boolValue(boolExpr.value());
-            case CharExpr charExpr -> new CharValue(charExpr.value());
-            case StringExpr stringExpr -> immutableString(stringExpr.value());
-            case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
-            case ListExpr listExpr -> listValue(quoteElements(listExpr.elements()));
-        };
-    }
-
-    private List<Value> quoteElements(List<Expr> expressions) {
-        List<Value> values = new ArrayList<>(expressions.size());
-        for (Expr expression : expressions) {
-            values.add(quoteToValue(expression));
-        }
-        return values;
-    }
-
     private void appendOutput(String value) {
         if (outputBuffer != null) {
             outputBuffer.append(value);
@@ -1491,8 +1377,5 @@ public class Evaluator {
     }
 
     private record DoBindingSpec(String name, Expr initExpr, Expr stepExpr) {
-    }
-
-    private record RecordFieldSpec(String name, String accessorName) {
     }
 }

@@ -160,6 +160,7 @@ final class EvaluatorBuiltins {
                 new BuiltinValue("call-with-current-continuation", this::specialBuiltin));
         env.define("dynamic-wind", new BuiltinValue("dynamic-wind", this::specialBuiltin));
         env.define("raise", new BuiltinValue("raise", this::specialBuiltin));
+        env.define("error", new BuiltinValue("error", this::specialBuiltin));
         env.define("with-exception-handler",
                 new BuiltinValue("with-exception-handler", this::specialBuiltin));
     }

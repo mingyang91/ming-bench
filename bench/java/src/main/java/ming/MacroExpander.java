@@ -229,6 +229,9 @@ final class MacroExpander {
                     && charExpr.value() == other.value();
             case StringExpr stringExpr -> input instanceof StringExpr other
                     && stringExpr.value().equals(other.value());
+            case VectorExpr vectorPattern -> input instanceof VectorExpr vectorInput
+                    && matchPatternList(vectorPattern.elements(), vectorInput.elements(),
+                    literals, macroName, bindings, repeatedContext);
             case ListExpr listPattern -> input instanceof ListExpr listInput
                     && matchPatternList(listPattern.elements(), listInput.elements(),
                     literals, macroName, bindings, repeatedContext);
@@ -317,6 +320,15 @@ final class MacroExpander {
                     collectPatternVariables(element, literals, macroName, variables);
                 }
             }
+            return;
+        }
+
+        if (pattern instanceof VectorExpr vectorPattern) {
+            for (Expr element : vectorPattern.elements()) {
+                if (!isEllipsis(element)) {
+                    collectPatternVariables(element, literals, macroName, variables);
+                }
+            }
         }
     }
 
@@ -336,6 +348,7 @@ final class MacroExpander {
             case BoolExpr ignored -> new TransformerDatum(syntaxToDatum(expr));
             case CharExpr ignored -> new TransformerDatum(syntaxToDatum(expr));
             case StringExpr ignored -> new TransformerDatum(syntaxToDatum(expr));
+            case VectorExpr ignored -> new TransformerDatum(syntaxToDatum(expr));
             case ListExpr listExpr -> evaluateTransformerList(listExpr, macro, bindings);
         };
     }
@@ -490,6 +503,8 @@ final class MacroExpander {
             case CharExpr charExpr -> new CharValue(charExpr.value());
             case StringExpr stringExpr -> ValueSupport.immutableString(stringExpr.value());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
+            case VectorExpr vectorExpr -> new VectorValue(
+                    syntaxElementsToDatum(vectorExpr.elements()));
             case ListExpr listExpr -> EvaluatorSupport.listValue(
                     syntaxElementsToDatum(listExpr.elements()));
         };
@@ -513,12 +528,23 @@ final class MacroExpander {
             case CharValue charValue -> new CharExpr(charValue.value(), line, column);
             case StringValue stringValue -> new StringExpr(stringValue.text(), line, column);
             case SymbolValue symbolValue -> new SymbolExpr(symbolValue.name(), line, column);
+            case VectorValue vectorValue -> new VectorExpr(
+                    datumVectorToSyntax(vectorValue, line, column), line, column);
             case EmptyListValue ignored -> new ListExpr(List.of(), line, column);
             case PairValue ignored -> new ListExpr(datumElementsToSyntax(value, line, column),
                     line, column);
             default -> throw new EvalError("datum->syntax expects a symbol, list, string, "
                     + "character, boolean, or number");
         };
+    }
+
+    private List<Expr> datumVectorToSyntax(VectorValue value, int line, int column)
+            throws EvalError {
+        List<Expr> syntaxElements = new ArrayList<>(value.length());
+        for (Value element : value.elements()) {
+            syntaxElements.add(datumToSyntax(element, line, column));
+        }
+        return syntaxElements;
     }
 
     private List<Expr> datumElementsToSyntax(Value value, int line, int column)
@@ -535,6 +561,8 @@ final class MacroExpander {
             Map<String, String> renamedBindings, Integer repetitionIndex) throws EvalError {
         return switch (template) {
             case SymbolExpr symbolExpr -> expandTemplateSymbol(symbolExpr, macro, bindings,
+                    renamedBindings, repetitionIndex);
+            case VectorExpr vectorExpr -> expandVectorTemplate(vectorExpr, macro, bindings,
                     renamedBindings, repetitionIndex);
             case ListExpr listExpr -> expandTemplateList(listExpr, macro, bindings,
                     renamedBindings, repetitionIndex);
@@ -620,6 +648,29 @@ final class MacroExpander {
         }
 
         return new ListExpr(List.copyOf(expandedElements), listExpr.line(), listExpr.column());
+    }
+
+    private Expr expandVectorTemplate(VectorExpr vectorExpr, MacroValue macro,
+            MatchBindings bindings, Map<String, String> renamedBindings,
+            Integer repetitionIndex) throws EvalError {
+        List<Expr> expandedElements = new ArrayList<>();
+        List<Expr> elements = vectorExpr.elements();
+        for (int index = 0; index < elements.size(); index++) {
+            Expr element = elements.get(index);
+            if (index + 1 < elements.size() && isEllipsis(elements.get(index + 1))) {
+                int repeatCount = templateRepeatCount(element, bindings);
+                for (int repetition = 0; repetition < repeatCount; repetition++) {
+                    expandedElements.add(expandTemplate(element, macro, bindings,
+                            renamedBindings, repetition));
+                }
+                index++;
+                continue;
+            }
+            expandedElements.add(expandTemplate(element, macro, bindings,
+                    renamedBindings, repetitionIndex));
+        }
+        return new VectorExpr(List.copyOf(expandedElements), vectorExpr.line(),
+                vectorExpr.column());
     }
 
     private Expr expandLetTemplate(ListExpr listExpr, MacroValue macro,
@@ -766,6 +817,14 @@ final class MacroExpander {
                     collectRepeatedTemplateVariables(element, bindings, repeatedVariables);
                 }
             }
+            return;
+        }
+        if (template instanceof VectorExpr vectorExpr) {
+            for (Expr element : vectorExpr.elements()) {
+                if (!isEllipsis(element)) {
+                    collectRepeatedTemplateVariables(element, bindings, repeatedVariables);
+                }
+            }
         }
     }
 
@@ -830,6 +889,8 @@ final class MacroExpander {
                     && leftString.value().equals(rightString.value());
             case SymbolExpr leftSymbol -> right instanceof SymbolExpr rightSymbol
                     && leftSymbol.name().equals(rightSymbol.name());
+            case VectorExpr leftVector -> right instanceof VectorExpr rightVector
+                    && sameSyntax(leftVector.elements(), rightVector.elements());
             case ListExpr leftList -> right instanceof ListExpr rightList
                     && sameSyntax(leftList.elements(), rightList.elements());
         };
