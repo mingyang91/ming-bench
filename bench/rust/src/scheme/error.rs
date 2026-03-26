@@ -36,6 +36,9 @@ pub enum EvalError {
     #[error("unbound variable: {name}")]
     UnboundVariable { name: String },
 
+    #[error("binding accessed before initialization: {name}")]
+    UninitializedBinding { name: String },
+
     #[error("unknown procedure: {name}")]
     UnknownProcedure { name: String },
 
@@ -94,6 +97,12 @@ pub enum EvalError {
 
     #[error("{name} expected a list, got {found}")]
     ExpectedList {
+        name: &'static str,
+        found: &'static str,
+    },
+
+    #[error("{name} expected a vector, got {found}")]
+    ExpectedVector {
         name: &'static str,
         found: &'static str,
     },

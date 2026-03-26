@@ -41,6 +41,11 @@ struct SchemeStringInner {
     mutable: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SchemeVector {
+    inner: Rc<RefCell<Vec<Value>>>,
+}
+
 #[derive(Debug)]
 struct RecordType {
     name: String,
@@ -101,6 +106,30 @@ impl SchemeString {
     }
 }
 
+impl SchemeVector {
+    fn new(values: Vec<Value>) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(values)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.inner.borrow().len()
+    }
+
+    fn get(&self, index: usize) -> Value {
+        self.inner.borrow()[index].clone()
+    }
+
+    fn set(&self, index: usize, value: Value) {
+        self.inner.borrow_mut()[index] = value;
+    }
+
+    fn values(&self) -> Vec<Value> {
+        self.inner.borrow().clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Value {
     Number(Number),
@@ -110,8 +139,10 @@ enum Value {
     Char(char),
     List(Vec<Value>),
     Pair(Box<Value>, Box<Value>),
+    Vector(SchemeVector),
     Record(Rc<RecordValue>),
     Procedure(Rc<Procedure>),
+    Uninitialized,
     Void,
 }
 
@@ -167,6 +198,13 @@ struct RecordConstructorSpec {
 struct RecordFieldSpec {
     name: String,
     accessor: String,
+}
+
+#[derive(Debug, Clone)]
+struct DoBindingSpec {
+    name: String,
+    init: Expr,
+    step: Option<Expr>,
 }
 
 impl LambdaParams {
@@ -361,8 +399,10 @@ impl Value {
             Self::Char(_) => "character",
             Self::List(_) => "list",
             Self::Pair(_, _) => "pair",
+            Self::Vector(_) => "vector",
             Self::Record(_) => "record",
             Self::Procedure(_) => "procedure",
+            Self::Uninitialized => "uninitialized",
             Self::Void => "void",
         }
     }
@@ -398,8 +438,18 @@ impl Value {
                 format!("({rendered})")
             }
             Self::Pair(car, cdr) => render_pair(car, cdr, false),
+            Self::Vector(vector) => {
+                let rendered = vector
+                    .values()
+                    .iter()
+                    .map(Value::render)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("#({rendered})")
+            }
             Self::Record(record) => format!("#<record {}>", record.record_type.name),
             Self::Procedure(_) => "#<procedure>".into(),
+            Self::Uninitialized => "#<uninitialized>".into(),
             Self::Void => "#<void>".into(),
         }
     }
@@ -689,9 +739,17 @@ fn eval_expr_in_env(
         Expr::Boolean(value) => Ok(Value::Boolean(*value)),
         Expr::Char(value) => Ok(Value::Char(*value)),
         Expr::String(value) => Ok(Value::String(SchemeString::new_immutable(value))),
-        Expr::Symbol(name) => env
-            .get(name)
-            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
+        Expr::Symbol(name) => {
+            let value = env
+                .get(name)
+                .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() })?;
+
+            if matches!(value, Value::Uninitialized) {
+                Err(EvalError::UninitializedBinding { name: name.clone() })
+            } else {
+                Ok(value)
+            }
+        }
         Expr::List(items) => eval_application(items, env, context),
     }
 }
@@ -709,13 +767,17 @@ fn eval_application(
         match name.as_str() {
             "and" => return eval_and(tail, env, context),
             "begin" => return eval_begin(tail, env, context),
+            "case" => return eval_case(tail, env, context),
             "case-lambda" => return eval_case_lambda(tail, env),
             "cond" => return eval_cond(tail, env, context),
             "define" => return eval_define(tail, env, context),
             "define-record-type" => return eval_define_record_type(tail, env),
+            "do" => return eval_do(tail, env, context),
             "if" => return eval_if(tail, env, context),
             "lambda" => return eval_lambda(tail, env),
             "let" => return eval_let(tail, env, context),
+            "letrec" => return eval_letrec(tail, env, context, false),
+            "letrec*" => return eval_letrec(tail, env, context, true),
             "or" => return eval_or(tail, env, context),
             "quote" => return eval_quote(tail),
             "set!" => return eval_set(tail, env, context),
@@ -770,6 +832,69 @@ fn eval_or(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Val
 
 fn eval_begin(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
     eval_sequence(args, env, context)
+}
+
+fn eval_case(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+    let Some((key_expr, clauses)) = args.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "case",
+            expected: "a key and at least 1 clause",
+            got: 0,
+        });
+    };
+
+    let key = eval_expr_in_env(key_expr, env, context)?;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::InvalidForm {
+                name: "case",
+                message: "expected clauses to be lists",
+            });
+        };
+
+        let Some((head, body)) = items.split_first() else {
+            return Err(EvalError::InvalidForm {
+                name: "case",
+                message: "expected each clause to contain a datum list or else",
+            });
+        };
+
+        if matches!(head, Expr::Symbol(symbol) if symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::InvalidForm {
+                    name: "case",
+                    message: "else clause must be last",
+                });
+            }
+
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(body, env, context)
+            };
+        }
+
+        let Expr::List(datums) = head else {
+            return Err(EvalError::InvalidForm {
+                name: "case",
+                message: "expected each clause to begin with a datum list or else",
+            });
+        };
+
+        if datums
+            .iter()
+            .any(|datum| eq_values(&key, &quote_expr(datum)))
+        {
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(body, env, context)
+            };
+        }
+    }
+
+    Ok(Value::Void)
 }
 
 fn eval_cond(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
@@ -974,18 +1099,20 @@ fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalErr
 }
 
 fn eval_if(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
-    if args.len() != 3 {
+    if !(2..=3).contains(&args.len()) {
         return Err(EvalError::WrongArgCount {
             name: "if",
-            expected: "exactly 3 arguments",
+            expected: "2 or 3 arguments",
             got: args.len(),
         });
     }
 
     if eval_expr_in_env(&args[0], env, context)?.is_truthy() {
         eval_expr_in_env(&args[1], env, context)
-    } else {
+    } else if args.len() == 3 {
         eval_expr_in_env(&args[2], env, context)
+    } else {
+        Ok(Value::Void)
     }
 }
 
@@ -1127,6 +1254,113 @@ fn eval_let(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Va
             name: "let",
             message: "expected a binding list or let name",
         }),
+    }
+}
+
+fn eval_letrec(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    let form_name = if sequential { "letrec*" } else { "letrec" };
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: form_name,
+            expected: "bindings and at least one body expression",
+            got: 0,
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::InvalidForm {
+            name: form_name,
+            message: "expected at least one body expression",
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings_expr, form_name)?;
+    let letrec_env = Env::new(Some(env.clone()));
+
+    if sequential {
+        for (name, init) in &bindings {
+            let cell = Rc::new(RefCell::new(Value::Uninitialized));
+            let letrec_name = name.clone();
+            letrec_env.define_cell(letrec_name, cell.clone());
+            let value = eval_expr_in_env(init, &letrec_env, context)?;
+            *cell.borrow_mut() = value;
+        }
+    } else {
+        let mut cells = Vec::with_capacity(bindings.len());
+        for (name, _) in &bindings {
+            let cell = Rc::new(RefCell::new(Value::Uninitialized));
+            letrec_env.define_cell(name.clone(), cell.clone());
+            cells.push(cell);
+        }
+
+        let values = bindings
+            .iter()
+            .map(|(_, init)| eval_expr_in_env(init, &letrec_env, context))
+            .collect::<Result<Vec<_>, EvalError>>()?;
+
+        for (cell, value) in cells.into_iter().zip(values) {
+            *cell.borrow_mut() = value;
+        }
+    }
+
+    eval_sequence(body, &letrec_env, context)
+}
+
+fn eval_do(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "do",
+            expected: "bindings and a termination clause",
+            got: args.len(),
+        });
+    }
+
+    let bindings = parse_do_bindings(&args[0])?;
+    let (test, result_exprs) = parse_do_termination_clause(&args[1])?;
+    let body = &args[2..];
+
+    let init_values = bindings
+        .iter()
+        .map(|binding| eval_expr_in_env(&binding.init, env, context))
+        .collect::<Result<Vec<_>, EvalError>>()?;
+
+    let do_env = Env::new(Some(env.clone()));
+    let mut cells = Vec::with_capacity(bindings.len());
+    for (binding, value) in bindings.iter().zip(init_values) {
+        let cell = Rc::new(RefCell::new(value));
+        do_env.define_cell(binding.name.clone(), cell.clone());
+        cells.push(cell);
+    }
+
+    loop {
+        if eval_expr_in_env(&test, &do_env, context)?.is_truthy() {
+            return if result_exprs.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(&result_exprs, &do_env, context)
+            };
+        }
+
+        eval_sequence(body, &do_env, context)?;
+
+        let updates = bindings
+            .iter()
+            .zip(cells.iter())
+            .filter_map(|(binding, cell)| {
+                binding.step.as_ref().map(|step| {
+                    eval_expr_in_env(step, &do_env, context).map(|value| (cell.clone(), value))
+                })
+            })
+            .collect::<Result<Vec<_>, EvalError>>()?;
+
+        for (cell, value) in updates {
+            *cell.borrow_mut() = value;
+        }
     }
 }
 
@@ -1284,6 +1518,65 @@ fn parse_let_bindings(expr: &Expr, name: &'static str) -> Result<Vec<(String, Ex
         .collect()
 }
 
+fn parse_do_bindings(expr: &Expr) -> Result<Vec<DoBindingSpec>, EvalError> {
+    let Expr::List(bindings) = expr else {
+        return Err(EvalError::InvalidForm {
+            name: "do",
+            message: "expected a binding list",
+        });
+    };
+
+    bindings
+        .iter()
+        .map(|binding| {
+            let Expr::List(items) = binding else {
+                return Err(EvalError::InvalidForm {
+                    name: "do",
+                    message: "expected each binding to be a list",
+                });
+            };
+
+            if !(2..=3).contains(&items.len()) {
+                return Err(EvalError::InvalidForm {
+                    name: "do",
+                    message: "expected each binding to have a name, init, and optional step",
+                });
+            }
+
+            let Expr::Symbol(name) = &items[0] else {
+                return Err(EvalError::InvalidForm {
+                    name: "do",
+                    message: "expected binding names to be symbols",
+                });
+            };
+
+            Ok(DoBindingSpec {
+                name: name.clone(),
+                init: items[1].clone(),
+                step: items.get(2).cloned(),
+            })
+        })
+        .collect()
+}
+
+fn parse_do_termination_clause(expr: &Expr) -> Result<(Expr, Vec<Expr>), EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::InvalidForm {
+            name: "do",
+            message: "expected a termination clause",
+        });
+    };
+
+    let Some((test, result_exprs)) = items.split_first() else {
+        return Err(EvalError::InvalidForm {
+            name: "do",
+            message: "expected the termination clause to contain a test",
+        });
+    };
+
+    Ok((test.clone(), result_exprs.to_vec()))
+}
+
 fn parse_param_names(items: &[Expr], name: &'static str) -> Result<LambdaParams, EvalError> {
     let mut required = Vec::new();
     let mut iter = items.iter();
@@ -1430,6 +1723,7 @@ fn root_env() -> EnvRef {
         "display",
         "denominator",
         "eq?",
+        "eqv?",
         "exact->inexact",
         "exact?",
         "equal?",
@@ -1442,7 +1736,9 @@ fn root_env() -> EnvRef {
         "list",
         "list-ref",
         "list-tail",
+        "list->vector",
         "list?",
+        "make-vector",
         "map",
         "max",
         "min",
@@ -1477,6 +1773,12 @@ fn root_env() -> EnvRef {
         "substring",
         "symbol?",
         "symbol->string",
+        "vector",
+        "vector->list",
+        "vector-length",
+        "vector-ref",
+        "vector-set!",
+        "vector?",
         "write",
         "zero?",
     ] {
@@ -1761,7 +2063,24 @@ fn apply_builtin(
             let index = expect_index_inclusive_end("list-tail", &args[1], list.len())?;
             Ok(Value::List(list[index..].to_vec()))
         }
+        "list->vector" => {
+            let list = expect_list_arg("list->vector", args)?;
+            Ok(Value::Vector(SchemeVector::new(list.to_vec())))
+        }
         "list?" => predicate_builtin("list?", args, |value| matches!(value, Value::List(_))),
+        "make-vector" => {
+            if !(1..=2).contains(&args.len()) {
+                return Err(EvalError::WrongArgCount {
+                    name: "make-vector",
+                    expected: "1 or 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let length = expect_nonnegative_length("make-vector", &args[0])?;
+            let fill = args.get(1).cloned().unwrap_or(Value::Void);
+            Ok(Value::Vector(SchemeVector::new(vec![fill; length])))
+        }
         "map" => apply_map(args, context),
         "max" => {
             let numbers = extract_numbers("max", args)?;
@@ -2029,10 +2348,58 @@ fn apply_builtin(
             let value = expect_symbol_arg("symbol->string", args)?;
             Ok(Value::String(SchemeString::new_mutable(value)))
         }
+        "vector" => Ok(Value::Vector(SchemeVector::new(args.to_vec()))),
+        "vector->list" => {
+            let vector = expect_vector_arg("vector->list", args)?;
+            Ok(Value::List(vector.values()))
+        }
+        "vector-length" => {
+            let vector = expect_vector_arg("vector-length", args)?;
+            Ok(Value::Number(Number::integer(vector.len() as i64)))
+        }
+        "vector-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "vector-ref",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let vector = expect_vector("vector-ref", &args[0])?;
+            let index = expect_index("vector-ref", &args[1], vector.len())?;
+            Ok(vector.get(index))
+        }
+        "vector-set!" => {
+            if args.len() != 3 {
+                return Err(EvalError::WrongArgCount {
+                    name: "vector-set!",
+                    expected: "exactly 3 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let vector = expect_vector("vector-set!", &args[0])?;
+            let index = expect_index("vector-set!", &args[1], vector.len())?;
+            vector.set(index, args[2].clone());
+            Ok(Value::Void)
+        }
+        "vector?" => predicate_builtin("vector?", args, |value| matches!(value, Value::Vector(_))),
         "eq?" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount {
                     name: "eq?",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            Ok(Value::Boolean(eq_values(&args[0], &args[1])))
+        }
+        "eqv?" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "eqv?",
                     expected: "exactly 2 arguments",
                     got: args.len(),
                 });
@@ -2360,6 +2727,40 @@ fn expect_list_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a [Val
     expect_list(name, &args[0])
 }
 
+fn expect_vector(name: &'static str, value: &Value) -> Result<SchemeVector, EvalError> {
+    match value {
+        Value::Vector(vector) => Ok(vector.clone()),
+        other => Err(EvalError::ExpectedVector {
+            name,
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn expect_vector_arg(name: &'static str, args: &[Value]) -> Result<SchemeVector, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exactly 1 argument",
+            got: args.len(),
+        });
+    }
+
+    expect_vector(name, &args[0])
+}
+
+fn expect_nonnegative_length(name: &'static str, value: &Value) -> Result<usize, EvalError> {
+    let length = expect_exact_integer(name, value)?;
+    if length < 0 {
+        return Err(EvalError::InvalidArgument {
+            name,
+            message: "expected a non-negative exact integer",
+        });
+    }
+
+    Ok(length as usize)
+}
+
 fn expect_pair_value<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
@@ -2397,6 +2798,7 @@ fn eq_values(left: &Value, right: &Value) -> bool {
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(&left.inner, &right.inner),
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(&left.inner, &right.inner),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
@@ -2423,6 +2825,15 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         }
         (Value::Pair(left_car, left_cdr), Value::Pair(right_car, right_cdr)) => {
             equal_values(left_car, right_car) && equal_values(left_cdr, right_cdr)
+        }
+        (Value::Vector(left), Value::Vector(right)) => {
+            let left_values = left.values();
+            let right_values = right.values();
+            left_values.len() == right_values.len()
+                && left_values
+                    .iter()
+                    .zip(right_values.iter())
+                    .all(|(left_item, right_item)| equal_values(left_item, right_item))
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
