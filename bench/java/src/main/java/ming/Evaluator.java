@@ -11,11 +11,13 @@ public class Evaluator {
 
     static class SchemeString {
         private char[] chars;
-        SchemeString(String value) { this.chars = value.toCharArray(); }
-        SchemeString(char[] chars) { this.chars = chars.clone(); }
+        private boolean immutable;
+        SchemeString(String value) { this.chars = value.toCharArray(); this.immutable = true; }
+        SchemeString(char[] chars) { this.chars = chars.clone(); this.immutable = false; }
         String value() { return new String(chars); }
         int length() { return chars.length; }
         char charAt(int i) { return chars[i]; }
+        boolean isImmutable() { return immutable; }
         void setChar(int i, char c) { chars[i] = c; }
     }
     record Pair(Object car, Object cdr) {}
@@ -110,6 +112,7 @@ public class Evaluator {
         "string->number", "number->string",
         "symbol->string", "string->symbol",
         "string-ref", "string-set!", "string-copy",
+        "string->list", "list->string", "char->integer", "integer->char",
         "apply",
         "eq?", "equal?", "map",
         "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
@@ -1108,9 +1111,11 @@ public class Evaluator {
             case "string-set!" -> {
                 requireArgs(op, args, 3);
                 if (args.get(0) instanceof SchemeString ss) {
+                    if (ss.isImmutable())
+                        throw new EvalError("string-set!: strings are immutable");
                     int idx = (int) asLong(args.get(1));
                     if (!(args.get(2) instanceof SchemeChar sc))
-                        throw new EvalError("string-set!: not a char");
+                        throw new EvalError("string-set!: third argument must be a character");
                     ss.setChar(idx, sc.value());
                     yield null;
                 }
@@ -1119,9 +1124,45 @@ public class Evaluator {
             case "string-copy" -> {
                 requireArgs(op, args, 1);
                 if (args.get(0) instanceof SchemeString ss) {
-                    yield new SchemeString(ss.value());
+                    yield new SchemeString(ss.value().toCharArray());
                 }
                 throw new EvalError("string-copy: not a string");
+            }
+            case "string->list" -> {
+                requireArgs(op, args, 1);
+                if (args.get(0) instanceof SchemeString ss) {
+                    String s = ss.value();
+                    Object result = NIL;
+                    for (int i = s.length() - 1; i >= 0; i--) {
+                        result = new Pair(new SchemeChar(s.charAt(i)), result);
+                    }
+                    yield result;
+                }
+                throw new EvalError("string->list: not a string");
+            }
+            case "list->string" -> {
+                requireArgs(op, args, 1);
+                Object cur = args.get(0);
+                StringBuilder sb = new StringBuilder();
+                while (cur instanceof Pair p) {
+                    if (!(p.car() instanceof SchemeChar sc))
+                        throw new EvalError("list->string: not a char");
+                    sb.append(sc.value());
+                    cur = p.cdr();
+                }
+                yield new SchemeString(sb.toString());
+            }
+            case "char->integer" -> {
+                requireArgs(op, args, 1);
+                if (args.get(0) instanceof SchemeChar sc) {
+                    yield (long) sc.value();
+                }
+                throw new EvalError("char->integer: not a char");
+            }
+            case "integer->char" -> {
+                requireArgs(op, args, 1);
+                long n = asLong(args.get(0));
+                yield new SchemeChar((char) n);
             }
             case "apply" -> {
                 if (args.size() < 2) throw new EvalError("apply: need at least two arguments");
