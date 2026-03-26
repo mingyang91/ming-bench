@@ -34,6 +34,9 @@ public class Evaluator {
         }
     }
 
+    private record EvaluationOutcome(Value value, String output) {
+    }
+
     @FunctionalInterface
     private interface SyntaxScopeAction<T> {
         T run() throws EvalError;
@@ -107,14 +110,14 @@ public class Evaluator {
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        return evalStrWithOutput(input).result();
+        return evaluateWithOutput(input, null).value().render();
     }
 
     /**
      * Evaluate Scheme expressions using a fixed step budget.
      */
     public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
-        return evalStrWithOutputInternal(input, new StepBudget(maxSteps)).result();
+        return evaluateWithOutput(input, new StepBudget(maxSteps)).value().render();
     }
 
     /**
@@ -122,10 +125,11 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        return evalStrWithOutputInternal(input, null);
+        EvaluationOutcome outcome = evaluateWithOutput(input, null);
+        return new EvalResult(renderForDisplay(outcome.value()), outcome.output());
     }
 
-    private EvalResult evalStrWithOutputInternal(String input, StepBudget budget) throws EvalError {
+    private EvaluationOutcome evaluateWithOutput(String input, StepBudget budget) throws EvalError {
         StringBuilder previousOutputBuffer = outputBuffer;
         StepBudget previousStepBudget = stepBudget;
         outputBuffer = new StringBuilder();
@@ -138,7 +142,7 @@ public class Evaluator {
 
             if (ContinuationEvaluator.referencesContinuations(expressions)) {
                 Value value = new ContinuationEvaluator(this).evalProgram(expressions);
-                return new EvalResult(value.render(), outputBuffer.toString());
+                return new EvaluationOutcome(value, outputBuffer.toString());
             }
 
             Environment environment = createGlobalEnvironment();
@@ -147,7 +151,7 @@ public class Evaluator {
                 lastValue = eval(expression, environment);
             }
 
-            return new EvalResult(lastValue.render(), outputBuffer.toString());
+            return new EvaluationOutcome(lastValue, outputBuffer.toString());
         } finally {
             stepBudget = previousStepBudget;
             outputBuffer = previousOutputBuffer;
