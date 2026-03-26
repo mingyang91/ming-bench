@@ -1,6 +1,10 @@
 use std::rc::Rc;
 
-use super::{apply, wrong_arg_count, Builtin, EvalError, SchemeString, Value};
+use super::{
+    apply,
+    model::{Builtin, SchemeString, Value},
+    wrong_arg_count, EvalError,
+};
 
 pub(super) fn apply_builtin(
     builtin: Builtin,
@@ -740,7 +744,7 @@ fn eq_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Integer(left), Value::Integer(right)) => left == right,
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
-        (Value::String(left), Value::String(right)) => Rc::ptr_eq(&left.chars, &right.chars),
+        (Value::String(left), Value::String(right)) => left.shares_storage(right),
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),

@@ -1,4 +1,4 @@
-use super::{error::SourcePos, EvalError, Expr};
+use super::{error::SourcePos, model::Expr, EvalError};
 
 pub(super) struct Parser<'a> {
     input: &'a str,
