@@ -46,6 +46,15 @@ class SchemeValue {
             sb.append(")");
             return sb.toString();
         }
+        if (val instanceof SchemeVector v) {
+            StringBuilder sb = new StringBuilder("#(");
+            for (int i = 0; i < v.data.length; i++) {
+                if (i > 0) sb.append(" ");
+                sb.append(toStr(v.data[i]));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
         if (val instanceof MutableString ms) return ms.toSchemeStr();
         if (val instanceof Character c) {
             if (c == ' ') return "#\\space";

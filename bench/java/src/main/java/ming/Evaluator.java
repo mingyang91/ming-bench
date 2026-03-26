@@ -130,6 +130,18 @@ public class Evaluator {
                 case "case-lambda" -> {
                     return evalCaseLambda(list, env);
                 }
+                case "letrec" -> {
+                    return evalLetrec(list, env);
+                }
+                case "letrec*" -> {
+                    return evalLetrecStar(list, env);
+                }
+                case "case" -> {
+                    return evalCase(list, env);
+                }
+                case "do" -> {
+                    return evalDo(list, env);
+                }
                 case "define-syntax" -> {
                     if (list.size() != 3) throw new EvalError("define-syntax: bad syntax");
                     if (!(list.get(1) instanceof String name) || name.startsWith("\""))
@@ -402,6 +414,145 @@ public class Evaluator {
             clauses.add(new Lambda(params, restParam, body, env));
         }
         return new CaseLambda(clauses);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object evalLetrec(List<?> list, Env env) throws EvalError {
+        if (list.size() < 3) throw new EvalError("letrec: bad syntax");
+        if (!(list.get(1) instanceof List<?> bindings))
+            throw new EvalError("letrec: bindings must be a list");
+        Env letEnv = new Env(env);
+        List<String> names = new ArrayList<>();
+        List<Object> initExprs = new ArrayList<>();
+        for (Object b : bindings) {
+            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                throw new EvalError("letrec: bad binding");
+            if (!(binding.get(0) instanceof String name))
+                throw new EvalError("letrec: binding name must be symbol");
+            names.add(name);
+            initExprs.add(binding.get(1));
+            letEnv.define(name, null); // placeholder
+        }
+        for (int i = 0; i < names.size(); i++) {
+            letEnv.set(names.get(i), eval(initExprs.get(i), letEnv));
+        }
+        Object result = null;
+        for (int i = 2; i < list.size(); i++) {
+            result = eval(list.get(i), letEnv);
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object evalLetrecStar(List<?> list, Env env) throws EvalError {
+        if (list.size() < 3) throw new EvalError("letrec*: bad syntax");
+        if (!(list.get(1) instanceof List<?> bindings))
+            throw new EvalError("letrec*: bindings must be a list");
+        Env letEnv = new Env(env);
+        for (Object b : bindings) {
+            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                throw new EvalError("letrec*: bad binding");
+            if (!(binding.get(0) instanceof String name))
+                throw new EvalError("letrec*: binding name must be symbol");
+            letEnv.define(name, eval(binding.get(1), letEnv));
+        }
+        Object result = null;
+        for (int i = 2; i < list.size(); i++) {
+            result = eval(list.get(i), letEnv);
+        }
+        return result;
+    }
+
+    private static Object evalCase(List<?> list, Env env) throws EvalError {
+        if (list.size() < 2) throw new EvalError("case: bad syntax");
+        Object key = eval(list.get(1), env);
+        for (int i = 2; i < list.size(); i++) {
+            if (!(list.get(i) instanceof List<?> clause) || clause.isEmpty())
+                throw new EvalError("case: bad clause");
+            Object datums = clause.get(0);
+            if (datums instanceof String s && s.equals("else")) {
+                Object result = null;
+                for (int j = 1; j < clause.size(); j++) {
+                    result = eval(clause.get(j), env);
+                }
+                return result;
+            }
+            if (!(datums instanceof List<?> datumList))
+                throw new EvalError("case: bad clause");
+            for (Object datum : datumList) {
+                Object d = SchemeValue.quotedToScheme(datum);
+                if (Env.schemeEqv(key, d)) {
+                    Object result = null;
+                    for (int j = 1; j < clause.size(); j++) {
+                        result = eval(clause.get(j), env);
+                    }
+                    return result;
+                }
+            }
+        }
+        return null; // void - no match
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object evalDo(List<?> list, Env env) throws EvalError {
+        // (do ((var init step) ...) (test expr ...) body ...)
+        if (list.size() < 3) throw new EvalError("do: bad syntax");
+        if (!(list.get(1) instanceof List<?> varSpecs))
+            throw new EvalError("do: variable specs must be a list");
+        if (!(list.get(2) instanceof List<?> testClause) || testClause.isEmpty())
+            throw new EvalError("do: test clause must be a non-empty list");
+
+        // Parse variable specs
+        int numVars = varSpecs.size();
+        String[] names = new String[numVars];
+        Object[] stepExprs = new Object[numVars]; // null if no step
+        boolean[] hasStep = new boolean[numVars];
+
+        Env doEnv = new Env(env);
+        for (int i = 0; i < numVars; i++) {
+            if (!(varSpecs.get(i) instanceof List<?> spec) || spec.size() < 2 || spec.size() > 3)
+                throw new EvalError("do: bad variable spec");
+            if (!(spec.get(0) instanceof String name))
+                throw new EvalError("do: variable name must be symbol");
+            names[i] = name;
+            Object initVal = eval(spec.get(1), env);
+            doEnv.define(name, initVal);
+            if (spec.size() == 3) {
+                stepExprs[i] = spec.get(2);
+                hasStep[i] = true;
+            }
+        }
+
+        // Iteration
+        while (true) {
+            // Check test
+            Object testResult = eval(testClause.get(0), doEnv);
+            if (!isFalse(testResult)) {
+                // Test is true - evaluate result expressions
+                if (testClause.size() == 1) return null; // void
+                Object result = null;
+                for (int j = 1; j < testClause.size(); j++) {
+                    result = eval(testClause.get(j), doEnv);
+                }
+                return result;
+            }
+            // Evaluate body
+            for (int i = 3; i < list.size(); i++) {
+                eval(list.get(i), doEnv);
+            }
+            // Parallel step: evaluate all steps with current values, then update
+            Object[] newVals = new Object[numVars];
+            for (int i = 0; i < numVars; i++) {
+                if (hasStep[i]) {
+                    newVals[i] = eval(stepExprs[i], doEnv);
+                }
+            }
+            for (int i = 0; i < numVars; i++) {
+                if (hasStep[i]) {
+                    doEnv.set(names[i], newVals[i]);
+                }
+            }
+        }
     }
 
     static boolean isFalse(Object val) {

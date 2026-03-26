@@ -498,6 +498,69 @@ class Env {
             return false;
         }));
 
+        // L14 — eqv?
+        env.define("eqv?", Builtin.named("eqv?", args -> {
+            requireArgCount("eqv?", args, 2);
+            return schemeEqv(args.get(0), args.get(1));
+        }));
+
+        // L14 — Vectors
+        env.define("vector", Builtin.named("vector", args -> {
+            return new SchemeVector(args.toArray());
+        }));
+        env.define("make-vector", Builtin.named("make-vector", args -> {
+            if (args.size() < 1 || args.size() > 2)
+                throw new EvalError("make-vector: expected 1-2 arguments");
+            int size = (int) requireLong("make-vector", args.get(0));
+            Object fill = args.size() == 2 ? args.get(1) : 0L;
+            return new SchemeVector(size, fill);
+        }));
+        env.define("vector?", Builtin.named("vector?", args -> {
+            requireArgCount("vector?", args, 1);
+            return args.get(0) instanceof SchemeVector;
+        }));
+        env.define("vector-ref", Builtin.named("vector-ref", args -> {
+            requireArgCount("vector-ref", args, 2);
+            if (!(args.get(0) instanceof SchemeVector v))
+                throw new EvalError("vector-ref: expected vector");
+            int idx = (int) requireLong("vector-ref", args.get(1));
+            return v.data[idx];
+        }));
+        env.define("vector-set!", Builtin.named("vector-set!", args -> {
+            requireArgCount("vector-set!", args, 3);
+            if (!(args.get(0) instanceof SchemeVector v))
+                throw new EvalError("vector-set!: expected vector");
+            int idx = (int) requireLong("vector-set!", args.get(1));
+            v.data[idx] = args.get(2);
+            return null; // void
+        }));
+        env.define("vector-length", Builtin.named("vector-length", args -> {
+            requireArgCount("vector-length", args, 1);
+            if (!(args.get(0) instanceof SchemeVector v))
+                throw new EvalError("vector-length: expected vector");
+            return (long) v.data.length;
+        }));
+        env.define("vector->list", Builtin.named("vector->list", args -> {
+            requireArgCount("vector->list", args, 1);
+            if (!(args.get(0) instanceof SchemeVector v))
+                throw new EvalError("vector->list: expected vector");
+            Object result = SchemeValue.NIL;
+            for (int i = v.data.length - 1; i >= 0; i--) {
+                result = new Pair(v.data[i], result);
+            }
+            return result;
+        }));
+        env.define("list->vector", Builtin.named("list->vector", args -> {
+            requireArgCount("list->vector", args, 1);
+            List<Object> elems = new ArrayList<>();
+            Object cur = args.get(0);
+            while (cur instanceof Pair p) {
+                elems.add(p.car);
+                cur = p.cdr;
+            }
+            return new SchemeVector(elems.toArray());
+        }));
+
         // L11 — Exact/inexact predicates and conversions
         env.define("exact?", Builtin.named("exact?", args -> {
             requireArgCount("exact?", args, 1);
@@ -644,6 +707,17 @@ class Env {
         throw new EvalError(name + ": expected character, got: " + SchemeValue.toStr(val));
     }
 
+    static boolean schemeEqv(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
+        if (a instanceof Rational ra && b instanceof Rational rb) return ra.equals(rb);
+        if (a instanceof Double da && b instanceof Double db) return da.equals(db);
+        if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
+        if (a instanceof Character ca && b instanceof Character cb) return ca.equals(cb);
+        if (a instanceof String sa && b instanceof String sb) return sa.equals(sb);
+        return false;
+    }
+
     static boolean schemeEq(Object a, Object b) {
         if (a == b) return true;
         if (a instanceof Long la && b instanceof Long lb) return la.equals(lb);
@@ -658,6 +732,13 @@ class Env {
         if (schemeEq(a, b)) return true;
         if (a instanceof Pair pa && b instanceof Pair pb) {
             return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        }
+        if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
+            if (va.data.length != vb.data.length) return false;
+            for (int i = 0; i < va.data.length; i++) {
+                if (!schemeEqual(va.data[i], vb.data[i])) return false;
+            }
+            return true;
         }
         // Compare strings (quoted strings and MutableStrings)
         String sa = toRawString(a), sb = toRawString(b);
