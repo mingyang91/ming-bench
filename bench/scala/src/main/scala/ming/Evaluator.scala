@@ -59,7 +59,14 @@ object Evaluator:
         .orElse(parent.flatMap(p => scala.util.Try(p.lookup(name, pos)).toOption))
         .getOrElse(throw errAt(pos, s"unbound variable: $name"))
     def define(name: String, value: Value): Unit = bindings(name) = value
-    def child(): Env                             = Env(scala.collection.mutable.Map.empty, Some(this), output)
+
+    def set(name: String, value: Value, pos: Pos): Unit =
+      if bindings.contains(name) then bindings(name) = value
+      else
+        parent match
+          case Some(p) => p.set(name, value, pos)
+          case None    => throw errAt(pos, s"unbound variable: $name")
+    def child(): Env = Env(scala.collection.mutable.Map.empty, Some(this), output)
 
   private def defaultEnv(output: StringBuilder = new StringBuilder): Env =
     val env = Env(scala.collection.mutable.Map.empty, None, output)
@@ -121,6 +128,7 @@ object Evaluator:
     case Expr.SList(Expr.Symbol("let", _) :: rest, p)         => evalLet(rest, env, p)
     case Expr.SList(Expr.Symbol("begin", _) :: body, _)       => evalBegin(body, env)
     case Expr.SList(Expr.Symbol("cond", _) :: clauses, _)     => evalCond(clauses, env)
+    case Expr.SList(Expr.Symbol("set!", _) :: rest, p)        => evalSet(rest, env, p)
     case Expr.SList(head :: args, p) =>
       val func = eval(head, env)
       applyFunc(func, args.map(a => eval(a, env)), p, env)
@@ -214,6 +222,12 @@ object Evaluator:
           case _ => throw errAt(pos, "invalid let binding")
       evalBody(body, letEnv)
     case _ => throw errAt(pos, "invalid let")
+
+  private def evalSet(rest: List[Expr], env: Env, pos: Pos): Value = rest match
+    case Expr.Symbol(name, p) :: valueExpr :: Nil =>
+      env.set(name, eval(valueExpr, env), p)
+      Value.VVoid
+    case _ => throw errAt(pos, "invalid set!")
 
   private def evalBegin(body: List[Expr], env: Env): Value =
     if body.isEmpty then Value.VVoid
