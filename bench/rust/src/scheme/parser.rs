@@ -15,7 +15,7 @@ fn tokenize(input: &str) -> Vec<Token> {
     while let Some(&c) = chars.peek() {
         match c {
             '\n' => { chars.next(); line += 1; col = 1; }
-            ' ' | '\t' | '\r' => { chars.next(); col += 1; }
+            ' ' | '\t' | '\r' | '\x0b' | '\x0c' => { chars.next(); col += 1; }
             ';' => {
                 while let Some(&c2) = chars.peek() {
                     chars.next();
@@ -26,6 +26,19 @@ fn tokenize(input: &str) -> Vec<Token> {
             '(' => { tokens.push(Token { text: "(".into(), span: Span::new(line, col) }); chars.next(); col += 1; }
             ')' => { tokens.push(Token { text: ")".into(), span: Span::new(line, col) }); chars.next(); col += 1; }
             '\'' => { tokens.push(Token { text: "'".into(), span: Span::new(line, col) }); chars.next(); col += 1; }
+            '`' => { tokens.push(Token { text: "`".into(), span: Span::new(line, col) }); chars.next(); col += 1; }
+            ',' => {
+                let start_span = Span::new(line, col);
+                chars.next();
+                col += 1;
+                if chars.peek() == Some(&'@') {
+                    chars.next();
+                    col += 1;
+                    tokens.push(Token { text: ",@".into(), span: start_span });
+                } else {
+                    tokens.push(Token { text: ",".into(), span: start_span });
+                }
+            }
             '"' => {
                 let start_span = Span::new(line, col);
                 chars.next();
@@ -63,7 +76,7 @@ fn tokenize(input: &str) -> Vec<Token> {
                 } else {
                     let mut tok = String::from('#');
                     while let Some(&c2) = chars.peek() {
-                        if c2 == '(' || c2 == ')' || c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '\r' || c2 == ';' || c2 == '\'' {
+                        if c2 == '(' || c2 == ')' || c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '\r' || c2 == '\x0b' || c2 == '\x0c' || c2 == ';' || c2 == '\'' || c2 == '`' || c2 == ',' || c2 == '"' {
                             break;
                         }
                         tok.push(c2);
@@ -77,7 +90,7 @@ fn tokenize(input: &str) -> Vec<Token> {
                 let start_span = Span::new(line, col);
                 let mut tok = String::new();
                 while let Some(&c2) = chars.peek() {
-                    if c2 == '(' || c2 == ')' || c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '\r' || c2 == ';' || c2 == '\'' {
+                    if c2 == '(' || c2 == ')' || c2 == ' ' || c2 == '\t' || c2 == '\n' || c2 == '\r' || c2 == '\x0b' || c2 == '\x0c' || c2 == ';' || c2 == '\'' || c2 == '`' || c2 == ',' || c2 == '"' {
                         break;
                     }
                     tok.push(c2);
@@ -103,6 +116,24 @@ fn parse(tokens: &[Token]) -> Result<(Expr, usize), EvalError> {
             Expr::new(ExprKind::Symbol("quote".into()), span),
             inner,
         ]), span), 1 + consumed))
+    } else if tok.text == "`" {
+        let (inner, consumed) = parse(&tokens[1..])?;
+        Ok((Expr::new(ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("quasiquote".into()), span),
+            inner,
+        ]), span), 1 + consumed))
+    } else if tok.text == "," {
+        let (inner, consumed) = parse(&tokens[1..])?;
+        Ok((Expr::new(ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("unquote".into()), span),
+            inner,
+        ]), span), 1 + consumed))
+    } else if tok.text == ",@" {
+        let (inner, consumed) = parse(&tokens[1..])?;
+        Ok((Expr::new(ExprKind::List(vec![
+            Expr::new(ExprKind::Symbol("unquote-splicing".into()), span),
+            inner,
+        ]), span), 1 + consumed))
     } else if tok.text == "#'" {
         let (inner, consumed) = parse(&tokens[1..])?;
         Ok((Expr::new(ExprKind::List(vec![
@@ -113,6 +144,20 @@ fn parse(tokens: &[Token]) -> Result<(Expr, usize), EvalError> {
         let mut elems = Vec::new();
         let mut i = 1;
         while i < tokens.len() && tokens[i].text != ")" {
+            // Check for dot notation: (a b . c)
+            if tokens[i].text == "." && !elems.is_empty() {
+                // Peek ahead: must have exactly one expr then ")"
+                i += 1; // skip the dot
+                if i >= tokens.len() {
+                    return Err(EvalError::Parse(format!("unexpected end after dot at {span}")));
+                }
+                let (tail, consumed) = parse(&tokens[i..])?;
+                i += consumed;
+                if i >= tokens.len() || tokens[i].text != ")" {
+                    return Err(EvalError::Parse(format!("expected ) after dotted tail at {span}")));
+                }
+                return Ok((Expr::new(ExprKind::DottedList(elems, Box::new(tail)), span), i + 1));
+            }
             let (expr, consumed) = parse(&tokens[i..])?;
             elems.push(expr);
             i += consumed;

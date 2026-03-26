@@ -252,6 +252,95 @@ pub(super) fn expr_to_val(expr: &Expr) -> Result<Val, EvalError> {
             let vals: Vec<Val> = elems.iter().map(expr_to_val).collect::<Result<_, _>>()?;
             Ok(Val::List(vals))
         }
+        ExprKind::DottedList(elems, tail) => {
+            // Build an improper list: (a b . c) → Pair(a, Pair(b, c))
+            let tail_val = expr_to_val(tail)?;
+            let mut result = tail_val;
+            for elem in elems.iter().rev() {
+                let val = expr_to_val(elem)?;
+                result = Val::Pair(std::rc::Rc::new(std::cell::RefCell::new((val, result))));
+            }
+            Ok(result)
+        }
+    }
+}
+
+pub(super) fn eval_quasiquote(expr: &Expr, env: &Env) -> Result<Val, EvalError> {
+    eval_qq(expr, env, 0)
+}
+
+fn eval_qq(expr: &Expr, env: &Env, depth: usize) -> Result<Val, EvalError> {
+    match &expr.kind {
+        ExprKind::List(elems) if !elems.is_empty() => {
+            // Check for (unquote x)
+            if matches!(&elems[0].kind, ExprKind::Symbol(s) if s == "unquote") && elems.len() == 2 {
+                if depth == 0 {
+                    return eval(&elems[1], env);
+                } else {
+                    // Nested quasiquote: decrease depth
+                    let inner = eval_qq(&elems[1], env, depth - 1)?;
+                    return Ok(Val::List(vec![Val::Symbol("unquote".into()), inner]));
+                }
+            }
+            // Check for (quasiquote x) — nested quasiquote
+            if matches!(&elems[0].kind, ExprKind::Symbol(s) if s == "quasiquote") && elems.len() == 2 {
+                let inner = eval_qq(&elems[1], env, depth + 1)?;
+                return Ok(Val::List(vec![Val::Symbol("quasiquote".into()), inner]));
+            }
+            // Process list elements, handling unquote-splicing
+            let mut result = Vec::new();
+            for elem in elems {
+                if let ExprKind::List(sub) = &elem.kind {
+                    if sub.len() == 2 && matches!(&sub[0].kind, ExprKind::Symbol(s) if s == "unquote-splicing")
+                        && depth == 0 {
+                            let val = eval(&sub[1], env)?;
+                            match val {
+                                Val::List(items) => result.extend(items),
+                                Val::Pair(_) => {
+                                    let items = super::collect_list(&val)
+                                        .map_err(|_| EvalError::Type("unquote-splicing: expected list".into()))?;
+                                    result.extend(items);
+                                }
+                                _ => return Err(EvalError::Type("unquote-splicing: expected list".into())),
+                            }
+                            continue;
+                        }
+                }
+                result.push(eval_qq(elem, env, depth)?);
+            }
+            Ok(Val::List(result))
+        }
+        ExprKind::DottedList(elems, tail) => {
+            // Handle dotted quasiquote: `(a b . ,c)
+            let mut result_elems = Vec::new();
+            for elem in elems {
+                if let ExprKind::List(sub) = &elem.kind {
+                    if sub.len() == 2 && matches!(&sub[0].kind, ExprKind::Symbol(s) if s == "unquote-splicing")
+                        && depth == 0 {
+                            let val = eval(&sub[1], env)?;
+                            match val {
+                                Val::List(items) => result_elems.extend(items),
+                                Val::Pair(_) => {
+                                    let items = super::collect_list(&val)
+                                        .map_err(|_| EvalError::Type("unquote-splicing: expected list".into()))?;
+                                    result_elems.extend(items);
+                                }
+                                _ => return Err(EvalError::Type("unquote-splicing: expected list".into())),
+                            }
+                            continue;
+                        }
+                }
+                result_elems.push(eval_qq(elem, env, depth)?);
+            }
+            let tail_val = eval_qq(tail, env, depth)?;
+            // Build improper list from result_elems and tail_val
+            let mut result = tail_val;
+            for v in result_elems.into_iter().rev() {
+                result = Val::Pair(std::rc::Rc::new(std::cell::RefCell::new((v, result))));
+            }
+            Ok(result)
+        }
+        _ => expr_to_val(expr),
     }
 }
 
@@ -264,6 +353,15 @@ pub(super) fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Val, E
         ExprKind::Symbol(s) => {
             // (lambda rest body...) — single rest param
             (vec![], Some(s.clone()))
+        }
+        ExprKind::DottedList(param_exprs, rest) => {
+            // (lambda (a b . rest) body...)
+            let (params, _) = parse_params(param_exprs, span)?;
+            let rest_name = match &rest.kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse(format!("lambda: rest param must be symbol at {span}"))),
+            };
+            (params, Some(rest_name))
         }
         _ => return Err(EvalError::Parse(format!("lambda: expected parameter list at {span}"))),
     };
@@ -287,6 +385,14 @@ pub(super) fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<V
                 let (params, rest_param) = match &elems[0].kind {
                     ExprKind::List(param_exprs) => parse_params(param_exprs, span)?,
                     ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                    ExprKind::DottedList(param_exprs, rest) => {
+                        let (params, _) = parse_params(param_exprs, span)?;
+                        let rest_name = match &rest.kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Parse(format!("case-lambda: rest param must be symbol at {span}"))),
+                        };
+                        (params, Some(rest_name))
+                    }
                     _ => return Err(EvalError::Parse(format!("case-lambda: expected parameter list at {span}"))),
                 };
                 let body = elems[1..].to_vec();

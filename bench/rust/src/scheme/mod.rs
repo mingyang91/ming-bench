@@ -282,7 +282,10 @@ pub(crate) fn collect_list(v: &Val) -> Result<Vec<Val>, EvalError> {
             let mut cur = v.clone();
             loop {
                 match &cur {
-                    Val::List(elems) if elems.is_empty() => return Ok(items),
+                    Val::List(elems) => {
+                        items.extend(elems.iter().cloned());
+                        return Ok(items);
+                    }
                     Val::Pair(rc) => {
                         let (car, cdr) = {
                             let pair = rc.borrow();
@@ -326,7 +329,7 @@ pub(crate) fn is_proper_list(v: &Val) -> bool {
                     match pair_cdr(&hare) {
                         Some(next) => hare = next,
                         None => {
-                            return matches!(hare, Val::List(ref e) if e.is_empty());
+                            return matches!(hare, Val::List(_));
                         }
                     }
                 }
@@ -608,6 +611,8 @@ pub(crate) enum ExprKind {
     Char(char),
     Symbol(String),
     List(Vec<Expr>),
+    /// Dotted list: `(a b . c)` → DottedList(vec![a, b], c)
+    DottedList(Vec<Expr>, Box<Expr>),
 }
 
 impl Expr {
@@ -708,6 +713,12 @@ fn cek_step(expr: Expr, env: Env, kont: &mut Vec<KFrame>) -> Result<CekState, Ev
                     // --- Immediate forms (no sub-expression eval in CEK spine) ---
                     "quote" => {
                         return Ok(CekState::ApplyK(eval_quote(&elems[1..], span)?));
+                    }
+                    "quasiquote" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity(format!("quasiquote: expected 1 argument at {span}")));
+                        }
+                        return Ok(CekState::ApplyK(eval_quasiquote(&elems[1], &env)?));
                     }
                     "lambda" => {
                         return Ok(CekState::ApplyK(eval_lambda(&elems[1..], &env, span)?));
@@ -890,6 +901,12 @@ fn cek_step(expr: Expr, env: Env, kont: &mut Vec<KFrame>) -> Result<CekState, Ev
             // Push CallOp frame; evaluate the operator first
             kont.push(KFrame::CallOp { args: elems[1..].to_vec(), env: env.clone(), span });
             Ok(CekState::Eval(elems[0].clone(), env))
+        }
+        ExprKind::DottedList(elems, _tail) => {
+            // Treat dotted list as a regular list for evaluation purposes
+            // (this shouldn't normally happen in well-formed code, but handle it)
+            let full = Expr::new(ExprKind::List(elems), span);
+            cek_step(full, env, kont)
         }
     }
 }
@@ -1410,7 +1427,7 @@ pub(crate) fn apply_val(func: &Val, args: &[Val], caller_env: &Env) -> Result<Va
 
 use special_forms::{
     eval_define_record_type, eval_define_syntax,
-    eval_quote, eval_lambda, eval_case_lambda,
+    eval_quote, eval_quasiquote, eval_lambda, eval_case_lambda,
     eval_string_set, eval_set_car, eval_set_cdr,
 };
 

@@ -32,6 +32,25 @@ pub(super) fn cek_define(args: &[Expr], env: Env, span: Span, kont: &mut Vec<KFr
             env.define(name, lambda);
             Ok(CekState::ApplyK(Val::Void))
         }
+        ExprKind::DottedList(sig, rest_expr) => {
+            // (define (f x . rest) body...)
+            if sig.is_empty() {
+                return Err(EvalError::Parse(format!("define: empty signature at {span}")));
+            }
+            let name = match &sig[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Parse(format!("define: expected symbol at {span}"))),
+            };
+            let (params, _) = parse_params(&sig[1..], span)?;
+            let rest_param = match &rest_expr.kind {
+                ExprKind::Symbol(s) => Some(s.clone()),
+                _ => return Err(EvalError::Parse(format!("define: rest param must be symbol at {span}"))),
+            };
+            let body = args[1..].to_vec();
+            let lambda = Val::Lambda { params, rest_param, body, env: env.clone() };
+            env.define(name, lambda);
+            Ok(CekState::ApplyK(Val::Void))
+        }
         _ => Err(EvalError::Parse(format!("define: expected symbol or list at {span}"))),
     }
 }
@@ -50,6 +69,11 @@ pub(super) fn cek_cond(clauses: &[Expr], env: &Env, kont: &mut Vec<KFrame>) -> R
         if test.is_truthy() {
             if parts.len() <= 1 {
                 return Ok(CekState::ApplyK(test));
+            }
+            // Handle (test => proc) form: call proc with test result
+            if parts.len() == 3 && matches!(&parts[1].kind, ExprKind::Symbol(s) if s == "=>") {
+                let proc = eval(&parts[2], env)?;
+                return Ok(CekState::ApplyK(super::apply_val(&proc, &[test], env)?));
             }
             return enter_body_cek(&parts[1..], env, kont);
         }
