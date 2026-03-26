@@ -8,7 +8,7 @@ object SchemeTypes:
     case VFloat(d: Double)
     case VRational(num: Long, den: Long)
     case VBool(b: Boolean)
-    case VStr(chars: Array[Char])
+    case VStr(chars: Array[Char], mutable: Boolean = true)
     case VChar(c: Char)
     case VList(elems: List[Value])
     case VDottedList(elems: List[Value], last: Value)
@@ -48,7 +48,7 @@ object SchemeTypes:
     case Value.VRational(n, d) => s"$n/$d"
     case Value.VBool(true)     => "#t"
     case Value.VBool(false)    => "#f"
-    case Value.VStr(chars)     => s"\"${new String(chars)}\""
+    case Value.VStr(chars, _)  => s"\"${new String(chars)}\""
     case Value.VChar(c)        => displayChar(c)
     case Value.VList(elems) =>
       "(" + elems.map(display).mkString(" ") + ")"
@@ -75,7 +75,7 @@ object SchemeTypes:
     case _    => s"#\\$c"
 
   def displayStr(v: Value): String = v match
-    case Value.VStr(chars) => new String(chars)
+    case Value.VStr(chars, _) => new String(chars)
     case Value.VChar(c)    => c.toString
     case Value.VList(elems) =>
       "(" + elems.map(displayStr).mkString(" ") + ")"
@@ -169,7 +169,7 @@ object SchemeTypes:
     case (Value.VFloat(x), Value.VFloat(y))                 => x == y
     case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
     case (Value.VBool(x), Value.VBool(y))                   => x == y
-    case (Value.VStr(x), Value.VStr(y))                     => java.util.Arrays.equals(x, y)
+    case (Value.VStr(x, _), Value.VStr(y, _))                => java.util.Arrays.equals(x, y)
     case (Value.VChar(x), Value.VChar(y))                   => x == y
     case (Value.VSymbol(x), Value.VSymbol(y))               => x == y
     case (Value.VList(xs), Value.VList(ys)) =>
@@ -270,5 +270,9 @@ object SchemeTypes:
     "vector-length",
     "vector?",
     "vector->list",
-    "list->vector"
+    "list->vector",
+    "string->list",
+    "list->string",
+    "char->integer",
+    "integer->char"
   )

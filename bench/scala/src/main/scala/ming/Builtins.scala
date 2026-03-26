@@ -32,9 +32,10 @@ object Builtins:
     case "apply" =>
       applyApply(args, pos, env)
     case "string-append" | "string-length" | "substring" | "string->number" | "number->string" | "symbol->string" |
-        "string->symbol" | "string-ref" | "string-copy" | "string-set!" =>
+        "string->symbol" | "string-ref" | "string-copy" | "string-set!" | "string->list" | "list->string" =>
       StringCharBuiltins.applyStringOps(name, args, pos)
-    case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
+    case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" |
+        "char->integer" | "integer->char" =>
       StringCharBuiltins.applyCharOps(name, args, pos)
     case "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
       StringCharBuiltins.applyStringCompare(name, args, pos)

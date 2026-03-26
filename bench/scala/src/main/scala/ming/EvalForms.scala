@@ -10,7 +10,7 @@ private[ming] object EvalForms:
     case Expr.Flt(d, _)       => Value.VFloat(d)
     case Expr.Rat(n, d, _)    => Value.VRational(n, d)
     case Expr.Bool(b, _)      => Value.VBool(b)
-    case Expr.Str(s, _)       => Value.VStr(s.toCharArray)
+    case Expr.Str(s, _)       => Value.VStr(s.toCharArray, mutable = false)
     case Expr.Chr(c, _)       => Value.VChar(c)
     case Expr.Symbol(name, _) => Value.VSymbol(name)
     case Expr.SList(elems, _) =>
