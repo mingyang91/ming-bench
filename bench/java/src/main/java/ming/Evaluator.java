@@ -8,7 +8,10 @@ import java.util.Map;
 public class Evaluator {
 
     record SchemeString(String value) {}
-    record SchemeList(List<Object> elements) {}
+    record Pair(Object car, Object cdr) {}
+    static final Object NIL = new Object() {
+        @Override public String toString() { return "()"; }
+    };
     record Lambda(List<String> params, List<Object> body, Env closure) {}
     record Builtin(String name) {}
 
@@ -25,7 +28,10 @@ public class Evaluator {
     }
 
     private static final String[] BUILTIN_NAMES = {
-        "+", "-", "*", "/", "<", ">", "=", "<=", ">="
+        "+", "-", "*", "/", "<", ">", "=", "<=", ">=",
+        "cons", "car", "cdr", "null?", "list", "length", "append",
+        "not",
+        "string?", "number?", "boolean?", "pair?", "symbol?"
     };
 
     private final Env globalEnv;
@@ -247,10 +253,67 @@ public class Evaluator {
                         }
                         return result;
                     }
-                    case "not" -> {
-                        if (list.size() != 2) throw new EvalError("not: wrong argument count");
-                        Object val = eval(list.get(1), env);
-                        return isFalse(val) ? Boolean.TRUE : Boolean.FALSE;
+                    case "begin" -> {
+                        Object result2 = null;
+                        for (int i = 1; i < list.size(); i++) {
+                            result2 = eval(list.get(i), env);
+                        }
+                        return result2;
+                    }
+                    case "let" -> {
+                        if (list.size() < 3) throw new EvalError("let: bad syntax");
+                        // Named let: (let name ((var init) ...) body ...)
+                        if (list.get(1) instanceof String loopName) {
+                            if (list.size() < 4) throw new EvalError("let: bad syntax");
+                            List<?> bindingsList = (List<?>) list.get(2);
+                            List<String> params = new ArrayList<>();
+                            List<Object> inits = new ArrayList<>();
+                            for (Object b : bindingsList) {
+                                List<?> binding = (List<?>) b;
+                                params.add((String) binding.get(0));
+                                inits.add(eval(binding.get(1), env));
+                            }
+                            List<Object> body = new ArrayList<>();
+                            for (int i = 3; i < list.size(); i++) body.add(list.get(i));
+                            Env letEnv = new Env(env);
+                            Lambda loopLambda = new Lambda(params, body, letEnv);
+                            letEnv.define(loopName, loopLambda);
+                            // Call with initial values
+                            return apply(loopLambda, inits);
+                        }
+                        // Regular let
+                        List<?> bindingsList2 = (List<?>) list.get(1);
+                        Env letEnv = new Env(env);
+                        for (Object b : bindingsList2) {
+                            List<?> binding = (List<?>) b;
+                            String name = (String) binding.get(0);
+                            Object val = eval(binding.get(1), env);
+                            letEnv.define(name, val);
+                        }
+                        Object result3 = null;
+                        for (int i = 2; i < list.size(); i++) {
+                            result3 = eval(list.get(i), letEnv);
+                        }
+                        return result3;
+                    }
+                    case "cond" -> {
+                        for (int i = 1; i < list.size(); i++) {
+                            List<?> clause = (List<?>) list.get(i);
+                            Object test = clause.getFirst();
+                            if (test instanceof String st && st.equals("else")) {
+                                Object r = null;
+                                for (int j = 1; j < clause.size(); j++) r = eval(clause.get(j), env);
+                                return r;
+                            }
+                            Object testVal = eval(test, env);
+                            if (!isFalse(testVal)) {
+                                if (clause.size() == 1) return testVal;
+                                Object r = null;
+                                for (int j = 1; j < clause.size(); j++) r = eval(clause.get(j), env);
+                                return r;
+                            }
+                        }
+                        return null;
                     }
                 }
             }
@@ -288,11 +351,11 @@ public class Evaluator {
 
     private Object quote(Object datum) {
         if (datum instanceof List<?> list) {
-            List<Object> quoted = new ArrayList<>();
-            for (Object el : list) {
-                quoted.add(quote(el));
+            Object result = NIL;
+            for (int i = list.size() - 1; i >= 0; i--) {
+                result = new Pair(quote(list.get(i)), result);
             }
-            return new SchemeList(quoted);
+            return result;
         }
         return datum;
     }
@@ -346,6 +409,86 @@ public class Evaluator {
                 requireArgs(op, args, 2);
                 yield asLong(args.get(0)) >= asLong(args.get(1)) ? Boolean.TRUE : Boolean.FALSE;
             }
+            case "cons" -> {
+                requireArgs(op, args, 2);
+                yield new Pair(args.get(0), args.get(1));
+            }
+            case "car" -> {
+                requireArgs(op, args, 1);
+                if (args.get(0) instanceof Pair p) yield p.car();
+                throw new EvalError("car: not a pair");
+            }
+            case "cdr" -> {
+                requireArgs(op, args, 1);
+                if (args.get(0) instanceof Pair p) yield p.cdr();
+                throw new EvalError("cdr: not a pair");
+            }
+            case "null?" -> {
+                requireArgs(op, args, 1);
+                yield args.get(0) == NIL ? Boolean.TRUE : Boolean.FALSE;
+            }
+            case "list" -> {
+                Object result = NIL;
+                for (int i = args.size() - 1; i >= 0; i--) {
+                    result = new Pair(args.get(i), result);
+                }
+                yield result;
+            }
+            case "length" -> {
+                Object obj = args.get(0);
+                long len = 0;
+                while (obj instanceof Pair p) {
+                    len++;
+                    obj = p.cdr();
+                }
+                if (obj != NIL) throw new EvalError("length: not a proper list");
+                yield len;
+            }
+            case "append" -> {
+                Object result = NIL;
+                for (int i = args.size() - 1; i >= 0; i--) {
+                    Object lst = args.get(i);
+                    if (i == args.size() - 1) {
+                        result = lst;
+                    } else {
+                        // Prepend elements of lst onto result
+                        List<Object> elems = new ArrayList<>();
+                        Object cur = lst;
+                        while (cur instanceof Pair p) {
+                            elems.add(p.car());
+                            cur = p.cdr();
+                        }
+                        for (int j = elems.size() - 1; j >= 0; j--) {
+                            result = new Pair(elems.get(j), result);
+                        }
+                    }
+                }
+                yield result;
+            }
+            case "not" -> {
+                requireArgs(op, args, 1);
+                yield isFalse(args.get(0)) ? Boolean.TRUE : Boolean.FALSE;
+            }
+            case "string?" -> {
+                requireArgs(op, args, 1);
+                yield args.get(0) instanceof SchemeString ? Boolean.TRUE : Boolean.FALSE;
+            }
+            case "number?" -> {
+                requireArgs(op, args, 1);
+                yield args.get(0) instanceof Long ? Boolean.TRUE : Boolean.FALSE;
+            }
+            case "boolean?" -> {
+                requireArgs(op, args, 1);
+                yield args.get(0) instanceof Boolean ? Boolean.TRUE : Boolean.FALSE;
+            }
+            case "pair?" -> {
+                requireArgs(op, args, 1);
+                yield args.get(0) instanceof Pair ? Boolean.TRUE : Boolean.FALSE;
+            }
+            case "symbol?" -> {
+                requireArgs(op, args, 1);
+                yield args.get(0) instanceof String ? Boolean.TRUE : Boolean.FALSE;
+            }
             default -> throw new EvalError("unbound variable: " + op);
         };
     }
@@ -368,11 +511,20 @@ public class Evaluator {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
-        if (val instanceof SchemeList sl) {
+        if (val == NIL) return "()";
+        if (val instanceof Pair) {
             StringBuilder sb = new StringBuilder("(");
-            for (int i = 0; i < sl.elements().size(); i++) {
-                if (i > 0) sb.append(" ");
-                sb.append(schemeToString(sl.elements().get(i)));
+            Object cur = val;
+            boolean first = true;
+            while (cur instanceof Pair p) {
+                if (!first) sb.append(" ");
+                first = false;
+                sb.append(schemeToString(p.car()));
+                cur = p.cdr();
+            }
+            if (cur != NIL) {
+                sb.append(" . ");
+                sb.append(schemeToString(cur));
             }
             sb.append(")");
             return sb.toString();
