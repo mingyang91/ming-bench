@@ -104,6 +104,16 @@ func (e *env) lookup(name string) (any, bool) {
 	return nil, false
 }
 
+func (e *env) set(name string, value any) bool {
+	for scope := e; scope != nil; scope = scope.parent {
+		if _, ok := scope.bindings[name]; ok {
+			scope.bindings[name] = value
+			return true
+		}
+	}
+	return false
+}
+
 func newGlobalEnv(output *strings.Builder) *env {
 	scope := newEnv(nil)
 	scope.define("+", builtinProc{name: "+", fn: builtinAdd})
@@ -517,6 +527,8 @@ func evalList(scope *env, expr listExpr) (any, error) {
 		switch head.name {
 		case "define":
 			return evalDefine(scope, args)
+		case "set!":
+			return evalSet(scope, args)
 		case "if":
 			return evalIf(scope, args)
 		case "quote":
@@ -595,6 +607,28 @@ func evalDefine(scope *env, args []any) (any, error) {
 	default:
 		return nil, &EvalError{Message: "define requires a symbol or function signature"}
 	}
+}
+
+func evalSet(scope *env, args []any) (any, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "set! expects exactly 2 arguments"}
+	}
+
+	target, ok := args[0].(symbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: "set! requires a symbol"}
+	}
+
+	value, err := eval(scope, args[1])
+	if err != nil {
+		return nil, err
+	}
+
+	if !scope.set(target.name, value) {
+		return nil, target.pos.errorf("unbound variable: %s", target.name)
+	}
+
+	return voidValue{}, nil
 }
 
 func evalIf(scope *env, args []any) (any, error) {
