@@ -368,9 +368,12 @@ fn eval_application(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     if let Expr::Symbol(name) = head {
         match name.as_str() {
             "and" => return eval_and(tail, env),
+            "begin" => return eval_begin(tail, env),
+            "cond" => return eval_cond(tail, env),
             "define" => return eval_define(tail, env),
             "if" => return eval_if(tail, env),
             "lambda" => return eval_lambda(tail, env),
+            "let" => return eval_let(tail, env),
             "or" => return eval_or(tail, env),
             "quote" => return eval_quote(tail),
             _ => {}
@@ -416,6 +419,57 @@ fn eval_or(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     }
 
     Ok(Value::Boolean(false))
+}
+
+fn eval_begin(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    eval_sequence(args, env)
+}
+
+fn eval_cond(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    for (index, clause) in args.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::InvalidForm {
+                name: "cond",
+                message: "expected clauses to be lists",
+            });
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::InvalidForm {
+                name: "cond",
+                message: "expected each clause to contain a test",
+            });
+        };
+
+        if matches!(test, Expr::Symbol(symbol) if symbol == "else") {
+            if index + 1 != args.len() {
+                return Err(EvalError::InvalidForm {
+                    name: "cond",
+                    message: "else clause must be last",
+                });
+            }
+
+            if body.is_empty() {
+                return Err(EvalError::InvalidForm {
+                    name: "cond",
+                    message: "else clause must contain a body",
+                });
+            }
+
+            return eval_sequence(body, env);
+        }
+
+        let value = eval_expr_in_env(test, env)?;
+        if value.is_truthy() {
+            return if body.is_empty() {
+                Ok(value)
+            } else {
+                eval_sequence(body, env)
+            };
+        }
+    }
+
+    Ok(Value::Void)
 }
 
 fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
@@ -520,6 +574,82 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     })))
 }
 
+fn eval_let(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let Some((first, rest)) = args.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "let",
+            expected: "bindings and at least one body expression",
+            got: 0,
+        });
+    };
+
+    match first {
+        Expr::List(_) => {
+            if rest.is_empty() {
+                return Err(EvalError::InvalidForm {
+                    name: "let",
+                    message: "expected at least one body expression",
+                });
+            }
+
+            let bindings = parse_let_bindings(first, "let")?;
+            let values = bindings
+                .iter()
+                .map(|(_, expr)| eval_expr_in_env(expr, env))
+                .collect::<Result<Vec<_>, EvalError>>()?;
+
+            let let_env = Env::new(Some(env.clone()));
+            for ((name, _), value) in bindings.into_iter().zip(values) {
+                let_env.define(name, value);
+            }
+
+            eval_sequence(rest, &let_env)
+        }
+        Expr::Symbol(name) => {
+            let Some((bindings_expr, body)) = rest.split_first() else {
+                return Err(EvalError::InvalidForm {
+                    name: "let",
+                    message: "expected bindings and at least one body expression",
+                });
+            };
+
+            if body.is_empty() {
+                return Err(EvalError::InvalidForm {
+                    name: "let",
+                    message: "expected at least one body expression",
+                });
+            }
+
+            let bindings = parse_let_bindings(bindings_expr, "let")?;
+            let args = bindings
+                .iter()
+                .map(|(_, expr)| eval_expr_in_env(expr, env))
+                .collect::<Result<Vec<_>, EvalError>>()?;
+            let params = bindings
+                .into_iter()
+                .map(|(binding_name, _)| binding_name)
+                .collect();
+
+            let let_env = Env::new(Some(env.clone()));
+            let_env.define(name.clone(), Value::Void);
+
+            let procedure = Rc::new(Procedure::Lambda {
+                params,
+                body: body.to_vec(),
+                env: let_env.clone(),
+            });
+            let value = Value::Procedure(procedure.clone());
+            let_env.define(name.clone(), value.clone());
+
+            apply_procedure(value, args)
+        }
+        _ => Err(EvalError::InvalidForm {
+            name: "let",
+            message: "expected a binding list or let name",
+        }),
+    }
+}
+
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
@@ -541,6 +671,35 @@ fn parse_params(expr: &Expr, name: &'static str) -> Result<Vec<String>, EvalErro
     };
 
     parse_param_names(items, name)
+}
+
+fn parse_let_bindings(
+    expr: &Expr,
+    name: &'static str,
+) -> Result<Vec<(String, Expr)>, EvalError> {
+    let Expr::List(bindings) = expr else {
+        return Err(EvalError::InvalidForm {
+            name,
+            message: "expected a binding list",
+        });
+    };
+
+    bindings
+        .iter()
+        .map(|binding| match binding {
+            Expr::List(items) if items.len() == 2 => match (&items[0], &items[1]) {
+                (Expr::Symbol(symbol), value) => Ok((symbol.clone(), value.clone())),
+                _ => Err(EvalError::InvalidForm {
+                    name,
+                    message: "expected binding names to be symbols",
+                }),
+            },
+            _ => Err(EvalError::InvalidForm {
+                name,
+                message: "expected each binding to have a name and value",
+            }),
+        })
+        .collect()
 }
 
 fn parse_param_names(items: &[Expr], name: &'static str) -> Result<Vec<String>, EvalError> {
@@ -568,7 +727,30 @@ fn quote_expr(expr: &Expr) -> Value {
 
 fn root_env() -> EnvRef {
     let env = Env::new(None);
-    for name in ["+", "-", "*", "/", "<", "<=", "=", ">", ">=", "not"] {
+    for name in [
+        "+",
+        "-",
+        "*",
+        "/",
+        "<",
+        "<=",
+        "=",
+        ">",
+        ">=",
+        "append",
+        "boolean?",
+        "car",
+        "cdr",
+        "cons",
+        "length",
+        "list",
+        "not",
+        "null?",
+        "number?",
+        "pair?",
+        "string?",
+        "symbol?",
+    ] {
         env.define(name, Value::Procedure(Rc::new(Procedure::Builtin { name })));
     }
 
@@ -587,6 +769,22 @@ fn apply_builtin(name: &'static str, args: &[Value]) -> Result<Value, EvalError>
         "+" => {
             let numbers = extract_numbers("+", args)?;
             Ok(Value::Integer(numbers.iter().sum()))
+        }
+        "append" => {
+            let mut values = Vec::new();
+            for arg in args {
+                match arg {
+                    Value::List(items) => values.extend(items.iter().cloned()),
+                    other => {
+                        return Err(EvalError::ExpectedList {
+                            name: "append",
+                            found: other.type_name(),
+                        });
+                    }
+                }
+            }
+
+            Ok(Value::List(values))
         }
         "*" => {
             let numbers = extract_numbers("*", args)?;
@@ -643,6 +841,41 @@ fn apply_builtin(name: &'static str, args: &[Value]) -> Result<Value, EvalError>
         "=" => compare_numbers("=", args, |left, right| left == right),
         ">" => compare_numbers(">", args, |left, right| left > right),
         ">=" => compare_numbers(">=", args, |left, right| left >= right),
+        "boolean?" => predicate_builtin("boolean?", args, |value| matches!(value, Value::Boolean(_))),
+        "car" => {
+            let list = expect_pair_arg("car", args)?;
+            Ok(list[0].clone())
+        }
+        "cdr" => {
+            let list = expect_pair_arg("cdr", args)?;
+            Ok(Value::List(list[1..].to_vec()))
+        }
+        "cons" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "cons",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let Value::List(rest) = &args[1] else {
+                return Err(EvalError::ExpectedList {
+                    name: "cons",
+                    found: args[1].type_name(),
+                });
+            };
+
+            let mut values = Vec::with_capacity(rest.len() + 1);
+            values.push(args[0].clone());
+            values.extend(rest.iter().cloned());
+            Ok(Value::List(values))
+        }
+        "length" => {
+            let list = expect_list_arg("length", args)?;
+            Ok(Value::Integer(list.len() as i64))
+        }
+        "list" => Ok(Value::List(args.to_vec())),
         "not" => {
             if args.len() != 1 {
                 return Err(EvalError::WrongArgCount {
@@ -654,6 +887,15 @@ fn apply_builtin(name: &'static str, args: &[Value]) -> Result<Value, EvalError>
 
             Ok(Value::Boolean(!args[0].is_truthy()))
         }
+        "null?" => predicate_builtin("null?", args, |value| {
+            matches!(value, Value::List(items) if items.is_empty())
+        }),
+        "number?" => predicate_builtin("number?", args, |value| matches!(value, Value::Integer(_))),
+        "pair?" => predicate_builtin("pair?", args, |value| {
+            matches!(value, Value::List(items) if !items.is_empty())
+        }),
+        "string?" => predicate_builtin("string?", args, |value| matches!(value, Value::String(_))),
+        "symbol?" => predicate_builtin("symbol?", args, |value| matches!(value, Value::Symbol(_))),
         _ => Err(EvalError::UnknownProcedure {
             name: name.to_string(),
         }),
@@ -689,6 +931,52 @@ fn extract_numbers(name: &'static str, args: &[Value]) -> Result<Vec<i64>, EvalE
             }),
         })
         .collect()
+}
+
+fn predicate_builtin(
+    name: &'static str,
+    args: &[Value],
+    predicate: impl Fn(&Value) -> bool,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exactly 1 argument",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Boolean(predicate(&args[0])))
+}
+
+fn expect_list_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a [Value], EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exactly 1 argument",
+            got: args.len(),
+        });
+    }
+
+    match &args[0] {
+        Value::List(items) => Ok(items),
+        other => Err(EvalError::ExpectedList {
+            name,
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn expect_pair_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a [Value], EvalError> {
+    let list = expect_list_arg(name, args)?;
+    if list.is_empty() {
+        return Err(EvalError::ExpectedPair {
+            name,
+            found: "list",
+        });
+    }
+
+    Ok(list)
 }
 
 /// Evaluate one or more Scheme expressions and return the string

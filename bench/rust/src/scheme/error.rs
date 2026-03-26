@@ -50,6 +50,18 @@ pub enum EvalError {
         found: &'static str,
     },
 
+    #[error("{name} expected a list, got {found}")]
+    ExpectedList {
+        name: &'static str,
+        found: &'static str,
+    },
+
+    #[error("{name} expected a pair, got {found}")]
+    ExpectedPair {
+        name: &'static str,
+        found: &'static str,
+    },
+
     #[error("division by zero")]
     DivisionByZero,
 }
