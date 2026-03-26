@@ -31,6 +31,114 @@ function createBuiltins(context) {
             }),
         ],
         [
+            'eq?',
+            builtin('eq?', (args, pos) => {
+                expectArity('eq?', args, 2, pos);
+                return isEqValue(args[0], args[1]);
+            }),
+        ],
+        [
+            'equal?',
+            builtin('equal?', (args, pos) => {
+                expectArity('equal?', args, 2, pos);
+                return isEqualValue(args[0], args[1]);
+            }),
+        ],
+        [
+            'abs',
+            builtin('abs', (args, pos) => {
+                expectArity('abs', args, 1, pos);
+                return normalizeNumber(Math.abs(expectNumber(args[0], 'abs', pos)));
+            }),
+        ],
+        [
+            'modulo',
+            builtin('modulo', (args, pos) => {
+                expectArity('modulo', args, 2, pos);
+                const dividend = expectInteger(args[0], 'modulo', pos);
+                const divisor = expectInteger(args[1], 'modulo', pos);
+                return modulo(dividend, divisor, pos);
+            }),
+        ],
+        [
+            'remainder',
+            builtin('remainder', (args, pos) => {
+                expectArity('remainder', args, 2, pos);
+                const dividend = expectInteger(args[0], 'remainder', pos);
+                const divisor = expectInteger(args[1], 'remainder', pos);
+                return remainder(dividend, divisor, pos);
+            }),
+        ],
+        [
+            'quotient',
+            builtin('quotient', (args, pos) => {
+                expectArity('quotient', args, 2, pos);
+                const dividend = expectInteger(args[0], 'quotient', pos);
+                const divisor = expectInteger(args[1], 'quotient', pos);
+                return quotient(dividend, divisor, pos);
+            }),
+        ],
+        [
+            'min',
+            builtin('min', (args, pos) => {
+                expectAtLeastArity('min', args, 1, pos);
+                const numbers = args.map((arg) => expectNumber(arg, 'min', pos));
+                return normalizeNumber(Math.min(...numbers));
+            }),
+        ],
+        [
+            'max',
+            builtin('max', (args, pos) => {
+                expectAtLeastArity('max', args, 1, pos);
+                const numbers = args.map((arg) => expectNumber(arg, 'max', pos));
+                return normalizeNumber(Math.max(...numbers));
+            }),
+        ],
+        [
+            'expt',
+            builtin('expt', (args, pos) => {
+                expectArity('expt', args, 2, pos);
+                const base = expectNumber(args[0], 'expt', pos);
+                const exponent = expectInteger(args[1], 'expt', pos);
+                return normalizeNumber(base ** exponent);
+            }),
+        ],
+        [
+            'zero?',
+            builtin('zero?', (args, pos) => {
+                expectArity('zero?', args, 1, pos);
+                return expectNumber(args[0], 'zero?', pos) === 0;
+            }),
+        ],
+        [
+            'positive?',
+            builtin('positive?', (args, pos) => {
+                expectArity('positive?', args, 1, pos);
+                return expectNumber(args[0], 'positive?', pos) > 0;
+            }),
+        ],
+        [
+            'negative?',
+            builtin('negative?', (args, pos) => {
+                expectArity('negative?', args, 1, pos);
+                return expectNumber(args[0], 'negative?', pos) < 0;
+            }),
+        ],
+        [
+            'odd?',
+            builtin('odd?', (args, pos) => {
+                expectArity('odd?', args, 1, pos);
+                return Math.abs(expectInteger(args[0], 'odd?', pos) % 2) === 1;
+            }),
+        ],
+        [
+            'even?',
+            builtin('even?', (args, pos) => {
+                expectArity('even?', args, 1, pos);
+                return expectInteger(args[0], 'even?', pos) % 2 === 0;
+            }),
+        ],
+        [
             'cons',
             builtin('cons', (args, pos) => {
                 expectArity('cons', args, 2, pos);
@@ -58,7 +166,28 @@ function createBuiltins(context) {
                 return isEmptyList(args[0]);
             }),
         ],
+        [
+            'list?',
+            builtin('list?', (args, pos) => {
+                expectArity('list?', args, 1, pos);
+                return isProperList(args[0]);
+            }),
+        ],
         ['list', builtin('list', (args) => listToPairs(args))],
+        [
+            'list-ref',
+            builtin('list-ref', (args, pos) => {
+                expectArity('list-ref', args, 2, pos);
+                return listRef(args[0], expectIndex(args[1], 'list-ref', pos), pos);
+            }),
+        ],
+        [
+            'list-tail',
+            builtin('list-tail', (args, pos) => {
+                expectArity('list-tail', args, 2, pos);
+                return listTail(args[0], expectIndex(args[1], 'list-tail', pos), pos);
+            }),
+        ],
         [
             'length',
             builtin('length', (args, pos) => {
@@ -67,6 +196,20 @@ function createBuiltins(context) {
             }),
         ],
         ['append', builtin('append', (args, pos) => appendLists(args, pos))],
+        [
+            'assoc',
+            builtin('assoc', (args, pos) => {
+                expectArity('assoc', args, 2, pos);
+                return assoc(args[0], args[1], pos);
+            }),
+        ],
+        [
+            'map',
+            builtin('map', (args, pos) => {
+                expectAtLeastArity('map', args, 2, pos);
+                return mapLists(args[0], args.slice(1), pos);
+            }),
+        ],
         [
             'string?',
             builtin('string?', (args, pos) => {
@@ -231,6 +374,68 @@ function createBuiltins(context) {
             builtin('char?', (args, pos) => {
                 expectArity('char?', args, 1, pos);
                 return isChar(args[0]);
+            }),
+        ],
+        [
+            'char-alphabetic?',
+            builtin('char-alphabetic?', (args, pos) => {
+                expectArity('char-alphabetic?', args, 1, pos);
+                return /^[A-Za-z]$/.test(expectChar(args[0], 'char-alphabetic?', pos).value);
+            }),
+        ],
+        [
+            'char-numeric?',
+            builtin('char-numeric?', (args, pos) => {
+                expectArity('char-numeric?', args, 1, pos);
+                return /^[0-9]$/.test(expectChar(args[0], 'char-numeric?', pos).value);
+            }),
+        ],
+        [
+            'char-upcase',
+            builtin('char-upcase', (args, pos) => {
+                expectArity('char-upcase', args, 1, pos);
+                return { kind: 'char', value: expectChar(args[0], 'char-upcase', pos).value.toUpperCase() };
+            }),
+        ],
+        [
+            'char-downcase',
+            builtin('char-downcase', (args, pos) => {
+                expectArity('char-downcase', args, 1, pos);
+                return { kind: 'char', value: expectChar(args[0], 'char-downcase', pos).value.toLowerCase() };
+            }),
+        ],
+        [
+            'char=?',
+            builtin('char=?', (args, pos) => compareCharChain('char=?', args, (left, right) => left === right, pos)),
+        ],
+        [
+            'char<?',
+            builtin('char<?', (args, pos) => compareCharChain('char<?', args, (left, right) => left < right, pos)),
+        ],
+        [
+            'string=?',
+            builtin('string=?', (args, pos) => compareStringChain('string=?', args, (left, right) => left === right, pos)),
+        ],
+        [
+            'string<?',
+            builtin('string<?', (args, pos) => compareStringChain('string<?', args, (left, right) => left < right, pos)),
+        ],
+        [
+            'string-ci=?',
+            builtin('string-ci=?', (args, pos) => compareStringChain('string-ci=?', args, (left, right) => left.toLowerCase() === right.toLowerCase(), pos)),
+        ],
+        [
+            'string-upcase',
+            builtin('string-upcase', (args, pos) => {
+                expectArity('string-upcase', args, 1, pos);
+                return makeString(expectStringContent(args[0], 'string-upcase', pos).toUpperCase());
+            }),
+        ],
+        [
+            'string-downcase',
+            builtin('string-downcase', (args, pos) => {
+                expectArity('string-downcase', args, 1, pos);
+                return makeString(expectStringContent(args[0], 'string-downcase', pos).toLowerCase());
             }),
         ],
     ]);
@@ -817,9 +1022,16 @@ function expectSymbolValue(value, name, pos) {
     return value;
 }
 function expectIndex(value, name, pos) {
-    const numericValue = expectNumber(value, name, pos);
-    if (!Number.isInteger(numericValue) || numericValue < 0) {
+    const numericValue = expectInteger(value, name, pos);
+    if (numericValue < 0) {
         throw new EvalError(`${name} expected a non-negative integer`, pos);
+    }
+    return numericValue;
+}
+function expectInteger(value, name, pos) {
+    const numericValue = expectNumber(value, name, pos);
+    if (!Number.isInteger(numericValue)) {
+        throw new EvalError(`${name} expected an integer`, pos);
     }
     return numericValue;
 }
@@ -868,6 +1080,36 @@ function evaluateSequence(expressions, env) {
     }
     return result;
 }
+function listRef(value, index, pos) {
+    let current = value;
+    let remaining = index;
+    while (remaining > 0) {
+        if (!isPair(current)) {
+            throw new EvalError('list-ref index out of bounds', pos);
+        }
+        current = current.cdr;
+        remaining -= 1;
+    }
+    if (!isPair(current)) {
+        throw new EvalError('list-ref index out of bounds', pos);
+    }
+    return current.car;
+}
+function listTail(value, index, pos) {
+    let current = value;
+    let remaining = index;
+    while (remaining > 0) {
+        if (!isPair(current)) {
+            throw new EvalError('list-tail index out of bounds', pos);
+        }
+        current = current.cdr;
+        remaining -= 1;
+    }
+    if (!isPair(current) && !isEmptyList(current)) {
+        throw new EvalError('list-tail index out of bounds', pos);
+    }
+    return current;
+}
 function listToArray(value, name, pos) {
     const elements = [];
     let current = value;
@@ -886,6 +1128,41 @@ function appendLists(args, pos) {
         elements.push(...listToArray(arg, 'append', pos));
     }
     return listToPairs(elements);
+}
+function isProperList(value) {
+    let current = value;
+    while (isPair(current)) {
+        current = current.cdr;
+    }
+    return isEmptyList(current);
+}
+function assoc(key, value, pos) {
+    let current = value;
+    while (isPair(current)) {
+        const entry = expectPair(current.car, 'assoc', pos);
+        if (isEqualValue(key, entry.car)) {
+            return entry;
+        }
+        current = current.cdr;
+    }
+    if (!isEmptyList(current)) {
+        throw new EvalError('assoc expected a list', pos);
+    }
+    return false;
+}
+function mapLists(procedure, lists, pos) {
+    const arrays = lists.map((list) => listToArray(list, 'map', pos));
+    const length = arrays[0].length;
+    for (const array of arrays) {
+        if (array.length !== length) {
+            throw new EvalError('map expected lists of equal length', pos);
+        }
+    }
+    const results = [];
+    for (let index = 0; index < length; index += 1) {
+        results.push(applyProcedure(procedure, arrays.map((array) => array[index]), pos));
+    }
+    return listToPairs(results);
 }
 function sum(args, identity, pos) {
     let total = identity;
@@ -924,11 +1201,50 @@ function divide(args, pos) {
     }
     return normalizeNumber(total);
 }
+function quotient(dividend, divisor, pos) {
+    if (divisor === 0) {
+        throw new EvalError('division by zero', pos);
+    }
+    return normalizeNumber(Math.trunc(dividend / divisor));
+}
+function remainder(dividend, divisor, pos) {
+    if (divisor === 0) {
+        throw new EvalError('division by zero', pos);
+    }
+    return normalizeNumber(dividend % divisor);
+}
+function modulo(dividend, divisor, pos) {
+    const result = remainder(dividend, divisor, pos);
+    if (result !== 0 && Math.sign(result) !== Math.sign(divisor)) {
+        return normalizeNumber(result + divisor);
+    }
+    return result;
+}
 function compareChain(name, args, predicate, pos) {
     expectAtLeastArity(name, args, 2, pos);
     const numbers = args.map((arg) => expectNumber(arg, name, pos));
     for (let index = 0; index < numbers.length - 1; index += 1) {
         if (!predicate(numbers[index], numbers[index + 1])) {
+            return false;
+        }
+    }
+    return true;
+}
+function compareCharChain(name, args, predicate, pos) {
+    expectAtLeastArity(name, args, 2, pos);
+    const codes = args.map((arg) => charCode(expectChar(arg, name, pos).value));
+    for (let index = 0; index < codes.length - 1; index += 1) {
+        if (!predicate(codes[index], codes[index + 1])) {
+            return false;
+        }
+    }
+    return true;
+}
+function compareStringChain(name, args, predicate, pos) {
+    expectAtLeastArity(name, args, 2, pos);
+    const values = args.map((arg) => expectStringContent(arg, name, pos));
+    for (let index = 0; index < values.length - 1; index += 1) {
+        if (!predicate(values[index], values[index + 1])) {
             return false;
         }
     }
@@ -965,6 +1281,36 @@ function parseCharLiteral(rawToken, pos) {
         return literal;
     }
     throw new EvalError('invalid character literal', pos);
+}
+function isEqValue(left, right) {
+    if (typeof left === 'number' || typeof left === 'boolean') {
+        return left === right;
+    }
+    if (isEmptyList(left) && isEmptyList(right)) {
+        return true;
+    }
+    if (isSymbolValue(left) && isSymbolValue(right)) {
+        return left.name === right.name;
+    }
+    if (isChar(left) && isChar(right)) {
+        return left.value === right.value;
+    }
+    return left === right;
+}
+function isEqualValue(left, right) {
+    if (isEqValue(left, right)) {
+        return true;
+    }
+    if (isStringValue(left) && isStringValue(right)) {
+        return left.chars.join('') === right.chars.join('');
+    }
+    if (isPair(left) && isPair(right)) {
+        return isEqualValue(left.car, right.car) && isEqualValue(left.cdr, right.cdr);
+    }
+    return false;
+}
+function charCode(value) {
+    return value.codePointAt(0);
 }
 function formatValue(value) {
     if (typeof value === 'number') {
