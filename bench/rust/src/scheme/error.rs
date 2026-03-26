@@ -74,6 +74,9 @@ pub enum EvalError {
         len: usize,
     },
 
+    #[error("string is immutable")]
+    ImmutableString,
+
     #[error("{inner} at {position}")]
     WithPosition {
         inner: Box<EvalError>,
