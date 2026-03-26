@@ -6,10 +6,14 @@ import java.util.List;
 class Parser {
     private final String input;
     private int pos;
+    private int line;
+    private int col;
 
     private Parser(String input) {
         this.input = input;
         this.pos = 0;
+        this.line = 1;
+        this.col = 1;
     }
 
     static List<Object> parse(String input) throws EvalError {
@@ -23,13 +27,25 @@ class Parser {
         return exprs;
     }
 
+    private void advance() {
+        if (pos < input.length()) {
+            if (input.charAt(pos) == '\n') {
+                line++;
+                col = 1;
+            } else {
+                col++;
+            }
+            pos++;
+        }
+    }
+
     private void skipWhitespace() {
         while (pos < input.length()) {
             char c = input.charAt(pos);
             if (c == ';') {
-                while (pos < input.length() && input.charAt(pos) != '\n') pos++;
+                while (pos < input.length() && input.charAt(pos) != '\n') advance();
             } else if (Character.isWhitespace(c)) {
-                pos++;
+                advance();
             } else {
                 break;
             }
@@ -45,9 +61,10 @@ class Parser {
         if (c == '"') return readString();
         if (c == '#') return readHash();
         if (c == '\'') {
-            pos++;
+            int qLine = line, qCol = col;
+            advance();
             Object quoted = readExpr();
-            List<Object> q = new ArrayList<>();
+            SourceList q = new SourceList(qLine, qCol);
             q.add("quote");
             q.add(quoted);
             return q;
@@ -55,14 +72,15 @@ class Parser {
         return readAtom();
     }
 
-    private List<Object> readList() throws EvalError {
-        pos++; // skip '('
-        List<Object> list = new ArrayList<>();
+    private SourceList readList() throws EvalError {
+        int startLine = line, startCol = col;
+        advance(); // skip '('
+        SourceList list = new SourceList(startLine, startCol);
         while (true) {
             skipWhitespace();
             if (pos >= input.length()) throw new EvalError("unterminated list");
             if (input.charAt(pos) == ')') {
-                pos++;
+                advance();
                 return list;
             }
             list.add(readExpr());
@@ -70,13 +88,13 @@ class Parser {
     }
 
     private String readString() throws EvalError {
-        pos++; // skip opening "
+        advance(); // skip opening "
         StringBuilder sb = new StringBuilder();
         sb.append('"');
         while (pos < input.length()) {
             char c = input.charAt(pos);
             if (c == '\\') {
-                pos++;
+                advance();
                 if (pos >= input.length()) throw new EvalError("unterminated string");
                 char esc = input.charAt(pos);
                 switch (esc) {
@@ -86,25 +104,25 @@ class Parser {
                     case '"' -> sb.append('"');
                     default -> { sb.append('\\'); sb.append(esc); }
                 }
-                pos++;
+                advance();
             } else if (c == '"') {
-                pos++;
+                advance();
                 sb.append('"');
                 return sb.toString();
             } else {
                 sb.append(c);
-                pos++;
+                advance();
             }
         }
         throw new EvalError("unterminated string");
     }
 
     private Object readHash() throws EvalError {
-        pos++; // skip '#'
+        advance(); // skip '#'
         if (pos >= input.length()) throw new EvalError("unexpected end after #");
         char c = input.charAt(pos);
-        if (c == 't') { pos++; return Boolean.TRUE; }
-        if (c == 'f') { pos++; return Boolean.FALSE; }
+        if (c == 't') { advance(); return Boolean.TRUE; }
+        if (c == 'f') { advance(); return Boolean.FALSE; }
         throw new EvalError("unknown # literal: #" + c);
     }
 
@@ -113,7 +131,7 @@ class Parser {
         while (pos < input.length()) {
             char c = input.charAt(pos);
             if (Character.isWhitespace(c) || c == '(' || c == ')' || c == '"' || c == ';') break;
-            pos++;
+            advance();
         }
         String token = input.substring(start, pos);
         try {

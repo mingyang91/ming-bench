@@ -34,65 +34,77 @@ public class Evaluator {
         }
         if (expr instanceof List<?> list) {
             if (list.isEmpty()) throw new EvalError("empty application");
-            Object first = list.get(0);
-
-            // Special forms
-            if (first instanceof String op) {
-                switch (op) {
-                    case "define" -> {
-                        return evalDefine(list, env);
-                    }
-                    case "if" -> {
-                        return evalIf(list, env);
-                    }
-                    case "quote" -> {
-                        if (list.size() != 2) throw new EvalError("quote: expected 1 argument");
-                        return SchemeValue.quotedToScheme(list.get(1));
-                    }
-                    case "lambda" -> {
-                        return evalLambda(list, env);
-                    }
-                    case "and" -> {
-                        Object result = Boolean.TRUE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
-                            if (isFalse(result)) return result;
-                        }
-                        return result;
-                    }
-                    case "or" -> {
-                        Object result = Boolean.FALSE;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
-                            if (!isFalse(result)) return result;
-                        }
-                        return result;
-                    }
-                    case "begin" -> {
-                        Object result = null;
-                        for (int i = 1; i < list.size(); i++) {
-                            result = eval(list.get(i), env);
-                        }
-                        return result;
-                    }
-                    case "let" -> {
-                        return evalLet(list, env);
-                    }
-                    case "cond" -> {
-                        return evalCond(list, env);
-                    }
+            try {
+                return evalList(list, env);
+            } catch (EvalError e) {
+                if (list instanceof SourceList sl && !e.getMessage().matches(".*\\d+:\\d+.*")) {
+                    throw new EvalError(e.getMessage() + " [" + sl.line + ":" + sl.col + "]");
                 }
+                throw e;
             }
-
-            // Function application
-            Object func = eval(first, env);
-            List<Object> args = new ArrayList<>();
-            for (int i = 1; i < list.size(); i++) {
-                args.add(eval(list.get(i), env));
-            }
-            return applyProc(func, args);
         }
         throw new EvalError("cannot evaluate: " + expr);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object evalList(List<?> list, Env env) throws EvalError {
+        Object first = list.get(0);
+
+        // Special forms
+        if (first instanceof String op) {
+            switch (op) {
+                case "define" -> {
+                    return evalDefine(list, env);
+                }
+                case "if" -> {
+                    return evalIf(list, env);
+                }
+                case "quote" -> {
+                    if (list.size() != 2) throw new EvalError("quote: expected 1 argument");
+                    return SchemeValue.quotedToScheme(list.get(1));
+                }
+                case "lambda" -> {
+                    return evalLambda(list, env);
+                }
+                case "and" -> {
+                    Object result = Boolean.TRUE;
+                    for (int i = 1; i < list.size(); i++) {
+                        result = eval(list.get(i), env);
+                        if (isFalse(result)) return result;
+                    }
+                    return result;
+                }
+                case "or" -> {
+                    Object result = Boolean.FALSE;
+                    for (int i = 1; i < list.size(); i++) {
+                        result = eval(list.get(i), env);
+                        if (!isFalse(result)) return result;
+                    }
+                    return result;
+                }
+                case "begin" -> {
+                    Object result = null;
+                    for (int i = 1; i < list.size(); i++) {
+                        result = eval(list.get(i), env);
+                    }
+                    return result;
+                }
+                case "let" -> {
+                    return evalLet(list, env);
+                }
+                case "cond" -> {
+                    return evalCond(list, env);
+                }
+            }
+        }
+
+        // Function application
+        Object func = eval(first, env);
+        List<Object> args = new ArrayList<>();
+        for (int i = 1; i < list.size(); i++) {
+            args.add(eval(list.get(i), env));
+        }
+        return applyProc(func, args);
     }
 
     private static Object evalDefine(List<?> list, Env env) throws EvalError {
