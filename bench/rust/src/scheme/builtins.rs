@@ -138,7 +138,10 @@ pub(super) fn apply_builtin(
         Builtin::ProcedurePred => builtin_predicate("procedure?", args, |value| {
             matches!(
                 value,
-                Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_)
+                Value::Builtin(_)
+                    | Value::Procedure(_)
+                    | Value::Continuation(_)
+                    | Value::RecordProcedure(_)
             )
         }),
         Builtin::PairPred => builtin_predicate("pair?", args, is_pair),
@@ -177,6 +180,9 @@ pub(super) fn apply_builtin(
             builtin_string_map("string-downcase", args, |value| value.to_ascii_lowercase())
         }
         Builtin::Apply => builtin_apply(args, output),
+        Builtin::CallCc => Err(EvalError::Syntax {
+            message: "call/cc requires continuation-aware evaluation".into(),
+        }),
     }
 }
 
@@ -1250,6 +1256,7 @@ pub(super) fn eqv_values(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => left.shares_storage(right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::RecordProcedure(left), Value::RecordProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
@@ -1304,6 +1311,7 @@ fn equal_values_inner(
         }
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::RecordProcedure(left), Value::RecordProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,

@@ -136,6 +136,7 @@ pub(super) enum Builtin {
     StringUpcase,
     StringDowncase,
     Apply,
+    CallCc,
 }
 
 impl Builtin {
@@ -246,6 +247,7 @@ impl Builtin {
             Builtin::StringUpcase => "string-upcase",
             Builtin::StringDowncase => "string-downcase",
             Builtin::Apply => "apply",
+            Builtin::CallCc => "call/cc",
         }
     }
 }
@@ -398,6 +400,8 @@ impl SchemePair {
     }
 }
 
+pub(super) type ContinuationProc = Rc<dyn Fn(Value, &mut String) -> Result<Value, EvalError>>;
+
 #[derive(Clone)]
 pub(super) enum Value {
     Number(Number),
@@ -410,6 +414,7 @@ pub(super) enum Value {
     Vector(SchemeVector),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
+    Continuation(ContinuationProc),
     Record(Rc<RecordInstance>),
     RecordProcedure(Rc<RecordProcedure>),
     Void,
@@ -426,7 +431,10 @@ impl Value {
             Value::EmptyList => "list",
             Value::Pair(_) => "pair",
             Value::Vector(_) => "vector",
-            Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_) => "procedure",
+            Value::Builtin(_)
+            | Value::Procedure(_)
+            | Value::Continuation(_)
+            | Value::RecordProcedure(_) => "procedure",
             Value::Record(_) => "record",
             Value::Void => "void",
         }
@@ -845,9 +853,10 @@ fn render_value_with_state(value: &Value, mode: RenderMode, state: &mut RenderSt
         Value::EmptyList => "()".into(),
         Value::Pair(pair) => render_pair(pair, mode, state),
         Value::Vector(vector) => render_vector(vector, mode, state),
-        Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_) => {
-            "#<procedure>".into()
-        }
+        Value::Builtin(_)
+        | Value::Procedure(_)
+        | Value::Continuation(_)
+        | Value::RecordProcedure(_) => "#<procedure>".into(),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Void => String::new(),
     }
