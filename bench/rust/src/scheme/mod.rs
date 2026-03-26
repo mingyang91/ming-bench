@@ -344,6 +344,20 @@ fn eval_expr(expr: &Expr, env: &EnvRef, out: &RefCell<String>) -> Result<Value, 
                     "let" => return eval_let(&items[1..], env, p, out),
                     "begin" => return eval_begin(&items[1..], env, out),
                     "cond" => return eval_cond(&items[1..], env, out),
+                    "set!" => {
+                        if items.len() != 3 {
+                            return Err(EvalError::Arity(format!("{p}: set! requires 2 arguments")));
+                        }
+                        let name = match &items[1].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Type(format!("{p}: set!: expected symbol"))),
+                        };
+                        let val = eval_expr(&items[2], env, out)?;
+                        if !env_set_existing(env, &name, val) {
+                            return Err(EvalError::UnboundVariable(format!("{p}: {name}")));
+                        }
+                        return Ok(Value::Void);
+                    }
                     "string-set!" => return eval_string_set(&items[1..], env, p, out),
                     _ => {}
                 }
