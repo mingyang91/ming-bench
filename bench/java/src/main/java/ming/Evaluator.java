@@ -85,6 +85,9 @@ public class Evaluator {
             if ("define".equals(name)) {
                 return evalDefine(elements, environment);
             }
+            if ("set!".equals(name)) {
+                return evalSet(elements, environment);
+            }
             if ("if".equals(name)) {
                 return evalIf(elements, environment);
             }
@@ -160,6 +163,19 @@ public class Evaluator {
         }
 
         throw new EvalError("define: invalid definition target");
+    }
+
+    private SchemeValue evalSet(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() != 3) {
+            throw new EvalError("set!: expected a variable and value");
+        }
+        if (!(elements.get(1) instanceof SymbolExpression symbol)) {
+            throw new EvalError("set!: expected variable name");
+        }
+
+        SchemeValue value = eval(elements.get(2), environment);
+        environment.set(symbol.name(), value);
+        return VoidValue.INSTANCE;
     }
 
     private Map<String, BuiltinProcedure> createBuiltins() {
