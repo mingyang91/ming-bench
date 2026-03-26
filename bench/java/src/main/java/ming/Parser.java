@@ -1,0 +1,195 @@
+package ming;
+
+import java.util.ArrayList;
+import java.util.List;
+
+final class Parser {
+    private final String input;
+    private int index;
+    private int line;
+    private int column;
+
+    Parser(String input) {
+        this.input = input;
+        this.index = 0;
+        this.line = 1;
+        this.column = 1;
+    }
+
+    List<Expr> parseProgram() throws EvalError {
+        List<Expr> expressions = new ArrayList<>();
+        skipIgnored();
+        while (!isAtEnd()) {
+            expressions.add(parseExpr());
+            skipIgnored();
+        }
+        return List.copyOf(expressions);
+    }
+
+    private Expr parseExpr() throws EvalError {
+        skipIgnored();
+        if (isAtEnd()) {
+            throw error("unexpected end of input");
+        }
+
+        char ch = peek();
+        return switch (ch) {
+            case '(' -> parseList();
+            case '"' -> parseString();
+            case ')' -> throw error("unexpected ')'");
+            default -> parseAtom();
+        };
+    }
+
+    private Expr parseList() throws EvalError {
+        advance();
+        List<Expr> elements = new ArrayList<>();
+        skipIgnored();
+
+        while (!isAtEnd() && peek() != ')') {
+            elements.add(parseExpr());
+            skipIgnored();
+        }
+
+        if (isAtEnd()) {
+            throw error("unterminated list");
+        }
+
+        advance();
+        return new ListExpr(List.copyOf(elements));
+    }
+
+    private Expr parseString() throws EvalError {
+        advance();
+        StringBuilder builder = new StringBuilder();
+
+        while (!isAtEnd()) {
+            char ch = advance();
+            if (ch == '"') {
+                return new StringExpr(builder.toString());
+            }
+
+            if (ch == '\\') {
+                if (isAtEnd()) {
+                    throw error("unterminated string literal");
+                }
+
+                char escaped = advance();
+                switch (escaped) {
+                    case 'n' -> builder.append('\n');
+                    case 'r' -> builder.append('\r');
+                    case 't' -> builder.append('\t');
+                    case '"' -> builder.append('"');
+                    case '\\' -> builder.append('\\');
+                    default -> builder.append(escaped);
+                }
+            } else {
+                builder.append(ch);
+            }
+        }
+
+        throw error("unterminated string literal");
+    }
+
+    private Expr parseAtom() throws EvalError {
+        String token = readToken();
+        if (token.isEmpty()) {
+            throw error("expected expression");
+        }
+
+        return switch (token) {
+            case "#t" -> new BoolExpr(true);
+            case "#f" -> new BoolExpr(false);
+            default -> parseNumberOrSymbol(token);
+        };
+    }
+
+    private Expr parseNumberOrSymbol(String token) throws EvalError {
+        if (isIntegerToken(token)) {
+            try {
+                return new IntExpr(Long.parseLong(token));
+            } catch (NumberFormatException e) {
+                throw error("invalid integer literal: " + token);
+            }
+        }
+        return new SymbolExpr(token);
+    }
+
+    private boolean isIntegerToken(String token) {
+        if (token.isEmpty()) {
+            return false;
+        }
+
+        int start = 0;
+        char first = token.charAt(0);
+        if (first == '+' || first == '-') {
+            if (token.length() == 1) {
+                return false;
+            }
+            start = 1;
+        }
+
+        for (int i = start; i < token.length(); i++) {
+            if (!Character.isDigit(token.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String readToken() {
+        StringBuilder builder = new StringBuilder();
+        while (!isAtEnd()) {
+            char ch = peek();
+            if (Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';') {
+                break;
+            }
+            builder.append(advance());
+        }
+        return builder.toString();
+    }
+
+    private void skipIgnored() {
+        while (!isAtEnd()) {
+            char ch = peek();
+            if (Character.isWhitespace(ch)) {
+                advance();
+                continue;
+            }
+            if (ch == ';') {
+                skipComment();
+                continue;
+            }
+            break;
+        }
+    }
+
+    private void skipComment() {
+        while (!isAtEnd() && peek() != '\n') {
+            advance();
+        }
+    }
+
+    private boolean isAtEnd() {
+        return index >= input.length();
+    }
+
+    private char peek() {
+        return input.charAt(index);
+    }
+
+    private char advance() {
+        char ch = input.charAt(index++);
+        if (ch == '\n') {
+            line++;
+            column = 1;
+        } else {
+            column++;
+        }
+        return ch;
+    }
+
+    private EvalError error(String message) {
+        return new EvalError(message, line, column);
+    }
+}
