@@ -176,7 +176,7 @@ func applyCPS(proc any, args []any, k any, runtime *runtimeState) (any, error) {
 		return nil, err
 	}
 	if next != nil {
-		return eval(next.scope, next.expr)
+		return evalRaw(next.scope, next.expr)
 	}
 	return value, nil
 }
@@ -201,7 +201,7 @@ func evalCPSProgram(scope *env, expr any) (result any, err error) {
 				}
 			}()
 
-			result, err = eval(currentScope, currentExpr)
+			result, err = evalRaw(currentScope, currentExpr)
 		}()
 
 		if err != nil {
@@ -225,6 +225,8 @@ func prepareApplyCPSCall(proc any, args []any, k any, runtime *runtimeState) (an
 		switch callable.name {
 		case "apply":
 			return prepareBuiltinApplyRuntimeCPS(args, k, runtime)
+		case "call-with-values":
+			return prepareCallWithValuesCPS(args, k, runtime)
 		case "raise":
 			return prepareRaiseCallCPS(args, runtime)
 		case "with-exception-handler":
@@ -275,7 +277,7 @@ func builtinApplyRuntimeCPS(args []any, k any, runtime *runtimeState) (any, erro
 		return nil, err
 	}
 	if next != nil {
-		return eval(next.scope, next.expr)
+		return evalRaw(next.scope, next.expr)
 	}
 	return value, nil
 }

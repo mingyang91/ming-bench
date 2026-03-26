@@ -15,6 +15,10 @@ func EvalStr(input string) (string, error) {
 	if err != nil {
 		return "", ensureSourcePos(err)
 	}
+	result, err = consumeSingleValue(result)
+	if err != nil {
+		return "", ensureSourcePos(err)
+	}
 	return formatValue(result), nil
 }
 
@@ -22,6 +26,10 @@ func EvalStr(input string) (string, error) {
 // string and any captured output from display/write/newline.
 func EvalStrWithOutput(input string) (result string, output string, err error) {
 	value, output, err := evalStrInternal(input)
+	if err != nil {
+		return "", output, ensureSourcePos(err)
+	}
+	value, err = consumeSingleValue(value)
 	if err != nil {
 		return "", output, ensureSourcePos(err)
 	}
@@ -404,6 +412,8 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("string-ci=?", builtinProc{name: "string-ci=?", fn: builtinStringCIEqual})
 	scope.define("string-upcase", builtinProc{name: "string-upcase", fn: builtinStringUpcase})
 	scope.define("string-downcase", builtinProc{name: "string-downcase", fn: builtinStringDowncase})
+	scope.define("values", builtinProc{name: "values", fn: builtinValues})
+	scope.define("call-with-values", builtinProc{name: "call-with-values", fn: builtinCallWithValues})
 	scope.define("apply", builtinProc{name: "apply", fn: builtinApply})
 	scope.define("procedure?", builtinProc{name: "procedure?", fn: builtinProcedurePredicate})
 	raiseProc := builtinProc{name: "raise", fn: builtinRaise}
@@ -733,6 +743,19 @@ func isDelimiter(ch byte) bool {
 }
 
 func eval(scope *env, expr any) (any, error) {
+	value, err := evalRaw(scope, expr)
+	if err != nil {
+		return nil, err
+	}
+
+	value, err = consumeSingleValue(value)
+	if err != nil {
+		return nil, attachSourcePos(err, exprSourcePos(expr))
+	}
+	return value, nil
+}
+
+func evalRaw(scope *env, expr any) (any, error) {
 	for {
 		switch node := expr.(type) {
 		case int64:
@@ -973,6 +996,8 @@ func prepareProcedureCall(proc any, args []any) (any, *tailEvalState, error) {
 		return prepareDynamicWindPopCall(callable, args)
 	case dynamicWindReenterProc:
 		return prepareDynamicWindReenterCall(callable, args)
+	case callWithValuesProducerProc:
+		return prepareCallWithValuesProducerCall(callable, args)
 	case exceptionHandlerReturnProc:
 		return prepareExceptionHandlerReturnCall(callable, args)
 	case exceptionHandlerInvokeProc:
@@ -2188,7 +2213,7 @@ func builtinApply(args []any) (any, error) {
 	callArgs = append(callArgs, args[1:len(args)-1]...)
 	callArgs = append(callArgs, restArgs...)
 
-	return applyProcedure(args[0], callArgs)
+	return applyProcedureRaw(args[0], callArgs)
 }
 
 func builtinProcedurePredicate(args []any) (any, error) {
@@ -2338,12 +2363,14 @@ func typeName(value any) string {
 		return "list"
 	case *vectorValue:
 		return "vector"
-	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, callWithValuesProducerProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
 		return "procedure"
 	case voidValue:
 		return "void"
 	case *recordValue:
 		return "record"
+	case multipleValues:
+		return "values"
 	default:
 		return "value"
 	}
@@ -2351,7 +2378,7 @@ func typeName(value any) string {
 
 func isProcedureValue(value any) bool {
 	switch value.(type) {
-	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc, dynamicWindEnterProc, dynamicWindExitProc, dynamicWindCompleteProc, dynamicWindPopProc, dynamicWindReenterProc, callWithValuesProducerProc, exceptionHandlerReturnProc, exceptionHandlerInvokeProc, uncaughtExceptionProc:
 		return true
 	default:
 		return false
@@ -2393,6 +2420,8 @@ func formatValueWithState(value any, state *formatState) string {
 		return formatVectorValueWithState(v, state)
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", v.typ.name)
+	case multipleValues:
+		return "#<values>"
 	case listExpr:
 		if len(v.elements) == 0 {
 			return "()"
