@@ -21,7 +21,8 @@ type SchemeVal =
   | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
   | { tag: 'vector'; value: SchemeVal[]; pos?: Pos }
-  | { tag: 'continuation'; k: Kont; winders: Winder[]; pos?: Pos };
+  | { tag: 'continuation'; k: Kont; winders: Winder[]; pos?: Pos }
+  | { tag: 'values'; vals: SchemeVal[]; pos?: Pos };
 
 type DoVar = { name: string; step?: SchemeVal };
 
@@ -58,7 +59,8 @@ type Kont =
   | { tag: 'guard-body'; k: Kont }
   | { tag: 'guard-start'; gVar: string; clauses: SchemeVal[]; exnVal: SchemeVal; gEnv: Env; k: Kont }
   | { tag: 'guard-test'; gVar: string; clauses: SchemeVal[]; ci: number; exnVal: SchemeVal; gEnv: Env; k: Kont }
-  | { tag: 'raise-err'; k: Kont };
+  | { tag: 'raise-err'; k: Kont }
+  | { tag: 'cwv'; consumer: SchemeVal; pos?: Pos; k: Kont };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}: ` : '';
@@ -1345,6 +1347,8 @@ const BUILTIN_NAMES = new Set([
   'dynamic-wind',
   // L20
   'raise', 'with-exception-handler',
+  // L21
+  'values', 'call-with-values',
 ]);
 
 function bindLambdaArgs(proc: { params: string[]; rest?: string; body: SchemeVal[] }, args: SchemeVal[], procEnv: Env, callPos?: Pos): Env {
@@ -1431,6 +1435,17 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
         exnHandlers.push({ tag: 'proc', handler });
         const wehK: Kont = { tag: 'weh', k: kCont };
         doApply(thunk, [], pos, wehK);
+        return;
+      }
+      if (proc.name === 'values') {
+        if (args.length === 1) { val = args[0]; k = kCont; isEval = false; return; }
+        val = { tag: 'values', vals: args }; k = kCont; isEval = false; return;
+      }
+      if (proc.name === 'call-with-values') {
+        if (args.length !== 2) throw new EvalError(`${posStr(pos)}call-with-values: expected 2 arguments, got ${args.length}`);
+        const [producer, consumer] = args;
+        const cwvK: Kont = { tag: 'cwv', consumer, pos, k: kCont };
+        doApply(producer, [], pos, cwvK);
         return;
       }
       if (proc.name === 'apply') {
@@ -1835,6 +1850,13 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
 
         case 'raise-err': {
           throw new EvalError('exception handler returned from raise');
+        }
+
+        case 'cwv': {
+          const consumer = k.consumer;
+          const cArgs = val.tag === 'values' ? val.vals : [val];
+          doApply(consumer, cArgs, k.pos, k.k);
+          break;
         }
       }
       continue;
@@ -2259,6 +2281,7 @@ function writeVal(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'syntax': return '#<syntax>';
     case 'record': return '#<record>';
     case 'vector': return `#(${val.value.map(v => writeVal(v, seen)).join(' ')})`;
+    case 'values': return val.vals.map(v => writeVal(v, seen)).join('\n');
   }
 }
 
