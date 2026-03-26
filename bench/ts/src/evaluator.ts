@@ -2506,5 +2506,5 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   syntaxBindingsStack = [];
   const env = makeGlobalEnv();
   const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
-  return { result: display(result), output: outputBuffer.join('') };
+  return { result: displayFormat(result), output: outputBuffer.join('') };
 }
