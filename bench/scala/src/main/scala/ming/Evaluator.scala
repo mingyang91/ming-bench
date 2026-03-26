@@ -16,11 +16,18 @@ object Evaluator:
     result.display
 
   def evalStrWithOutput(input: String): (String, String) =
-    throw new EvalError("not implemented")
+    val tokens = Tokenizer.tokenize(input)
+    val exprs  = Parser.parseAll(tokens)
+    if exprs.isEmpty then throw new EvalError("empty input")
+    val output            = new StringBuilder
+    val env               = makeGlobalEnv(output)
+    var result: SchemeVal = SchemeVoid
+    for expr <- exprs do result = eval(expr, env)
+    (result.display, output.toString)
 
-  private def makeGlobalEnv(): Env =
+  private def makeGlobalEnv(output: StringBuilder = new StringBuilder): Env =
     val env = new Env(mutable.Map.empty, None)
-    Builtins.install(env)
+    Builtins.install(env, output)
     env
 
   private def isFalsy(v: SchemeVal): Boolean = v match

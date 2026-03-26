@@ -46,6 +46,9 @@ case class SchemeList(elems: List[SchemeVal]) extends SchemeVal:
   def display: String =
     "(" + elems.map(_.display).mkString(" ") + ")"
 
+case class SchemeChar(value: Char) extends SchemeVal:
+  def display: String = s"#\\$value"
+
 case object SchemeVoid extends SchemeVal:
   def display: String = "#<void>"
 
