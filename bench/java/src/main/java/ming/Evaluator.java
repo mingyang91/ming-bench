@@ -89,6 +89,11 @@ public class Evaluator {
                 throw new EvalError("expected at least one expression");
             }
 
+            if (ContinuationEvaluator.referencesContinuations(expressions)) {
+                Value value = new ContinuationEvaluator(this).evalProgram(expressions);
+                return new EvalResult(value.render(), outputBuffer.toString());
+            }
+
             Environment environment = createGlobalEnvironment();
             Value lastValue = VoidValue.INSTANCE;
             for (Expr expression : expressions) {
@@ -133,7 +138,7 @@ public class Evaluator {
         }
     }
 
-    private Environment createGlobalEnvironment() {
+    Environment createGlobalEnvironment() {
         Environment environment = new Environment(null);
         environment.define("+", new PrimitiveProcedureValue("+", this::applyAdd));
         environment.define("-", new PrimitiveProcedureValue("-", this::applySubtract));

@@ -1,0 +1,718 @@
+package ming;
+
+import java.util.ArrayList;
+import java.util.List;
+
+final class ContinuationEvaluator {
+    private record Binding(String name, Expr valueExpression) {
+    }
+
+    private sealed interface MachineState permits EvalExprState, ReturnValueState, DoneState {
+    }
+
+    private record EvalExprState(Expr expression,
+                                 Environment environment,
+                                 Kont continuation) implements MachineState {
+    }
+
+    private record ReturnValueState(Value value, Kont continuation) implements MachineState {
+    }
+
+    private record DoneState(Value value) implements MachineState {
+    }
+
+    private final Evaluator owner;
+    private final Environment globalEnvironment;
+    private final CallCcProcedureValue callCcProcedure = new CallCcProcedureValue();
+
+    ContinuationEvaluator(Evaluator owner) {
+        this.owner = owner;
+        this.globalEnvironment = owner.createGlobalEnvironment();
+        globalEnvironment.define("call/cc", callCcProcedure);
+        globalEnvironment.define("call-with-current-continuation", callCcProcedure);
+    }
+
+    static boolean referencesContinuations(List<Expr> expressions) {
+        for (Expr expression : expressions) {
+            if (referencesContinuations(expression)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean referencesContinuations(Expr expression) {
+        if (expression instanceof SymbolExpr symbolExpr) {
+            return "call/cc".equals(symbolExpr.name())
+                    || "call-with-current-continuation".equals(symbolExpr.name());
+        }
+        if (expression instanceof ListExpr listExpr) {
+            for (Expr element : listExpr.elements()) {
+                if (referencesContinuations(element)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    Value evalProgram(List<Expr> expressions) throws EvalError {
+        if (expressions.isEmpty()) {
+            throw new EvalError("expected at least one expression");
+        }
+        return run(evaluateSequence(expressions, globalEnvironment, HaltKont.INSTANCE));
+    }
+
+    private Value run(MachineState initialState) throws EvalError {
+        MachineState state = initialState;
+        while (true) {
+            switch (state) {
+                case EvalExprState evalExprState -> {
+                    try {
+                        state = evalExpression(
+                                evalExprState.expression(),
+                                evalExprState.environment(),
+                                evalExprState.continuation());
+                    } catch (EvalError error) {
+                        throw error.withPosition(
+                                evalExprState.expression().line(),
+                                evalExprState.expression().column());
+                    }
+                }
+                case ReturnValueState returnValueState ->
+                        state = continueWithValue(returnValueState.value(), returnValueState.continuation());
+                case DoneState doneState -> {
+                    return doneState.value();
+                }
+            }
+        }
+    }
+
+    private MachineState evalExpression(Expr expression,
+                                        Environment environment,
+                                        Kont continuation) throws EvalError {
+        return switch (expression) {
+            case IntExpr intExpr -> new ReturnValueState(new IntValue(intExpr.value()), continuation);
+            case NumberExpr numberExpr -> new ReturnValueState(Numbers.parseLiteral(numberExpr.token()), continuation);
+            case BoolExpr boolExpr -> new ReturnValueState(new BoolValue(boolExpr.value()), continuation);
+            case StringExpr stringExpr -> new ReturnValueState(new StringValue(stringExpr.value(), false), continuation);
+            case CharExpr charExpr -> new ReturnValueState(new CharValue(charExpr.value()), continuation);
+            case SymbolExpr symbolExpr -> new ReturnValueState(environment.lookup(symbolExpr.name()), continuation);
+            case ListExpr listExpr -> evalList(listExpr, environment, continuation);
+        };
+    }
+
+    private MachineState evalList(ListExpr listExpr,
+                                  Environment environment,
+                                  Kont continuation) throws EvalError {
+        List<Expr> elements = listExpr.elements();
+        if (elements.isEmpty()) {
+            throw new EvalError("cannot evaluate empty list");
+        }
+
+        Expr operatorExpression = elements.getFirst();
+        List<Expr> arguments = elements.subList(1, elements.size());
+
+        if (operatorExpression instanceof SymbolExpr symbolExpr) {
+            return switch (symbolExpr.name()) {
+                case "define" -> evalDefine(arguments, environment, continuation);
+                case "set!" -> evalSet(arguments, environment, continuation);
+                case "if" -> evalIf(arguments, environment, continuation);
+                case "quote" -> evalQuote(arguments, continuation);
+                case "lambda" -> evalLambda(arguments, environment, continuation);
+                case "begin" -> evaluateSequence(arguments, environment, continuation);
+                case "cond" -> evalCond(arguments, environment, continuation);
+                case "let" -> evalLet(arguments, environment, continuation, listExpr.line(), listExpr.column());
+                case "and" -> evalAnd(arguments, environment, continuation);
+                case "or" -> evalOr(arguments, environment, continuation);
+                default -> evalApplication(
+                        operatorExpression,
+                        arguments,
+                        environment,
+                        continuation,
+                        listExpr.line(),
+                        listExpr.column());
+            };
+        }
+
+        return evalApplication(
+                operatorExpression,
+                arguments,
+                environment,
+                continuation,
+                listExpr.line(),
+                listExpr.column());
+    }
+
+    private MachineState evalApplication(Expr operatorExpression,
+                                         List<Expr> arguments,
+                                         Environment environment,
+                                         Kont continuation,
+                                         int line,
+                                         int column) {
+        return new EvalExprState(
+                operatorExpression,
+                environment,
+                new ApplyOperatorKont(arguments, environment, continuation, line, column));
+    }
+
+    private MachineState continueWithValue(Value value, Kont continuation) throws EvalError {
+        return switch (continuation) {
+            case HaltKont ignored -> new DoneState(value);
+            case SequenceKont sequenceKont ->
+                    evaluateSequence(sequenceKont.remaining(), sequenceKont.environment(), sequenceKont.next());
+            case IfKont ifKont -> {
+                Expr alternate = ifKont.alternate();
+                if (value.isTruthy()) {
+                    yield new EvalExprState(ifKont.consequent(), ifKont.environment(), ifKont.next());
+                }
+                if (alternate == null) {
+                    yield new ReturnValueState(VoidValue.INSTANCE, ifKont.next());
+                }
+                yield new EvalExprState(alternate, ifKont.environment(), ifKont.next());
+            }
+            case DefineKont defineKont -> {
+                defineKont.environment().define(defineKont.name(), value);
+                yield new ReturnValueState(VoidValue.INSTANCE, defineKont.next());
+            }
+            case SetKont setKont -> {
+                setKont.environment().set(setKont.name(), value);
+                yield new ReturnValueState(VoidValue.INSTANCE, setKont.next());
+            }
+            case ApplyOperatorKont applyOperatorKont -> {
+                List<Expr> arguments = applyOperatorKont.arguments();
+                if (arguments.isEmpty()) {
+                    yield applyProcedure(
+                            value,
+                            List.of(),
+                            applyOperatorKont.next(),
+                            applyOperatorKont.line(),
+                            applyOperatorKont.column());
+                }
+                yield new EvalExprState(
+                        arguments.getLast(),
+                        applyOperatorKont.environment(),
+                        new ApplyArgsKont(
+                                value,
+                                List.of(),
+                                arguments.subList(0, arguments.size() - 1),
+                                applyOperatorKont.environment(),
+                                applyOperatorKont.next(),
+                                applyOperatorKont.line(),
+                                applyOperatorKont.column()));
+            }
+            case ApplyArgsKont applyArgsKont -> {
+                List<Value> evaluatedArguments = prependArgument(value, applyArgsKont.evaluatedArguments());
+                if (applyArgsKont.remainingArguments().isEmpty()) {
+                    yield applyProcedure(
+                            applyArgsKont.operator(),
+                            evaluatedArguments,
+                            applyArgsKont.next(),
+                            applyArgsKont.line(),
+                            applyArgsKont.column());
+                }
+                List<Expr> remainingArguments = applyArgsKont.remainingArguments();
+                yield new EvalExprState(
+                        remainingArguments.getLast(),
+                        applyArgsKont.environment(),
+                        new ApplyArgsKont(
+                                applyArgsKont.operator(),
+                                evaluatedArguments,
+                                remainingArguments.subList(0, remainingArguments.size() - 1),
+                                applyArgsKont.environment(),
+                                applyArgsKont.next(),
+                                applyArgsKont.line(),
+                                applyArgsKont.column()));
+            }
+            case AndKont andKont -> {
+                if (!value.isTruthy() || andKont.remaining().isEmpty()) {
+                    yield new ReturnValueState(value, andKont.next());
+                }
+                List<Expr> remaining = andKont.remaining();
+                yield new EvalExprState(
+                        remaining.getFirst(),
+                        andKont.environment(),
+                        new AndKont(remaining.subList(1, remaining.size()), andKont.environment(), andKont.next()));
+            }
+            case OrKont orKont -> {
+                if (value.isTruthy() || orKont.remaining().isEmpty()) {
+                    yield new ReturnValueState(value, orKont.next());
+                }
+                List<Expr> remaining = orKont.remaining();
+                yield new EvalExprState(
+                        remaining.getFirst(),
+                        orKont.environment(),
+                        new OrKont(remaining.subList(1, remaining.size()), orKont.environment(), orKont.next()));
+            }
+            case CondKont condKont -> {
+                if (value.isTruthy()) {
+                    if (condKont.clauseElements().size() == 1) {
+                        yield new ReturnValueState(value, condKont.next());
+                    }
+                    yield evaluateSequence(
+                            condKont.clauseElements().subList(1, condKont.clauseElements().size()),
+                            condKont.environment(),
+                            condKont.next());
+                }
+                yield evalCond(condKont.remainingClauses(), condKont.environment(), condKont.next());
+            }
+        };
+    }
+
+    private MachineState evaluateSequence(List<Expr> expressions,
+                                          Environment environment,
+                                          Kont continuation) {
+        if (expressions.isEmpty()) {
+            return new ReturnValueState(VoidValue.INSTANCE, continuation);
+        }
+        if (expressions.size() == 1) {
+            return new EvalExprState(expressions.getFirst(), environment, continuation);
+        }
+        return new EvalExprState(
+                expressions.getFirst(),
+                environment,
+                new SequenceKont(expressions.subList(1, expressions.size()), environment, continuation));
+    }
+
+    private MachineState evalDefine(List<Expr> arguments,
+                                    Environment environment,
+                                    Kont continuation) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw new EvalError("define expected a binding target");
+        }
+
+        Expr target = arguments.getFirst();
+        if (target instanceof SymbolExpr symbolExpr) {
+            requireExactArity("define", arguments.size(), 2);
+            return new EvalExprState(arguments.get(1), environment, new DefineKont(symbolExpr.name(), environment, continuation));
+        }
+
+        if (target instanceof ListExpr signature) {
+            List<Expr> signatureElements = signature.elements();
+            if (signatureElements.isEmpty()) {
+                throw new EvalError("define expected a function name");
+            }
+
+            Expr nameExpression = signatureElements.getFirst();
+            if (!(nameExpression instanceof SymbolExpr functionName)) {
+                throw new EvalError("define expected a function name");
+            }
+
+            if (arguments.size() < 2) {
+                throw new EvalError("define expected a function body");
+            }
+
+            ParameterSpec parameters = parseParameterSpec(
+                    signatureElements.subList(1, signatureElements.size()),
+                    "define");
+            Value procedure = new LambdaProcedureValue(
+                    functionName.name(),
+                    parameters.fixedParameters(),
+                    parameters.restParameter(),
+                    arguments.subList(1, arguments.size()),
+                    environment);
+            environment.define(functionName.name(), procedure);
+            return new ReturnValueState(VoidValue.INSTANCE, continuation);
+        }
+
+        throw new EvalError("define expected a symbol or function signature");
+    }
+
+    private MachineState evalSet(List<Expr> arguments,
+                                 Environment environment,
+                                 Kont continuation) throws EvalError {
+        requireExactArity("set!", arguments.size(), 2);
+        Expr target = arguments.getFirst();
+        if (!(target instanceof SymbolExpr symbolExpr)) {
+            throw new EvalError("set! expected a symbol");
+        }
+        return new EvalExprState(arguments.get(1), environment, new SetKont(symbolExpr.name(), environment, continuation));
+    }
+
+    private MachineState evalIf(List<Expr> arguments,
+                                Environment environment,
+                                Kont continuation) throws EvalError {
+        if (arguments.size() < 2 || arguments.size() > 3) {
+            throw new EvalError("if expected 2 or 3 argument(s)");
+        }
+        Expr alternate = arguments.size() == 3 ? arguments.get(2) : null;
+        return new EvalExprState(arguments.getFirst(), environment, new IfKont(arguments.get(1), alternate, environment, continuation));
+    }
+
+    private MachineState evalQuote(List<Expr> arguments, Kont continuation) throws EvalError {
+        requireExactArity("quote", arguments.size(), 1);
+        return new ReturnValueState(quote(arguments.getFirst()), continuation);
+    }
+
+    private MachineState evalLambda(List<Expr> arguments,
+                                    Environment environment,
+                                    Kont continuation) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("lambda expected parameters and a body");
+        }
+        ParameterSpec parameters = parseParameterSpec(arguments.getFirst(), "lambda");
+        return new ReturnValueState(
+                new LambdaProcedureValue(
+                        null,
+                        parameters.fixedParameters(),
+                        parameters.restParameter(),
+                        arguments.subList(1, arguments.size()),
+                        environment),
+                continuation);
+    }
+
+    private MachineState evalCond(List<Expr> clauses,
+                                  Environment environment,
+                                  Kont continuation) throws EvalError {
+        if (clauses.isEmpty()) {
+            return new ReturnValueState(VoidValue.INSTANCE, continuation);
+        }
+
+        Expr clauseExpression = clauses.getFirst();
+        if (!(clauseExpression instanceof ListExpr clauseList)) {
+            throw new EvalError("cond clauses must be lists");
+        }
+
+        List<Expr> clauseElements = clauseList.elements();
+        if (clauseElements.isEmpty()) {
+            throw new EvalError("cond clause cannot be empty");
+        }
+
+        Expr testExpression = clauseElements.getFirst();
+        if (testExpression instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+            if (clauses.size() != 1) {
+                throw new EvalError("cond else clause must be last");
+            }
+            if (clauseElements.size() == 1) {
+                throw new EvalError("cond else clause expected a body");
+            }
+            return evaluateSequence(clauseElements.subList(1, clauseElements.size()), environment, continuation);
+        }
+
+        return new EvalExprState(
+                testExpression,
+                environment,
+                new CondKont(clauseElements, clauses.subList(1, clauses.size()), environment, continuation));
+    }
+
+    private MachineState evalLet(List<Expr> arguments,
+                                 Environment environment,
+                                 Kont continuation,
+                                 int line,
+                                 int column) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("let expected bindings and a body");
+        }
+
+        Expr firstArgument = arguments.getFirst();
+        if (firstArgument instanceof SymbolExpr name) {
+            return evalNamedLet(name.name(), arguments.subList(1, arguments.size()), environment, continuation, line, column);
+        }
+
+        List<Binding> bindings = parseBindings(firstArgument, "let");
+        List<String> parameters = new ArrayList<>(bindings.size());
+        List<Expr> initExpressions = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            parameters.add(binding.name());
+            initExpressions.add(binding.valueExpression());
+        }
+
+        Value procedure = new LambdaProcedureValue(
+                null,
+                List.copyOf(parameters),
+                null,
+                arguments.subList(1, arguments.size()),
+                environment);
+        return evaluateArgumentsAndApply(procedure, List.copyOf(initExpressions), environment, continuation, line, column);
+    }
+
+    private MachineState evalNamedLet(String name,
+                                      List<Expr> arguments,
+                                      Environment environment,
+                                      Kont continuation,
+                                      int line,
+                                      int column) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("let expected bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(arguments.getFirst(), "let");
+        List<String> parameters = new ArrayList<>(bindings.size());
+        List<Expr> initExpressions = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            parameters.add(binding.name());
+            initExpressions.add(binding.valueExpression());
+        }
+
+        Environment localEnvironment = new Environment(environment);
+        Value procedure = new LambdaProcedureValue(
+                name,
+                List.copyOf(parameters),
+                null,
+                arguments.subList(1, arguments.size()),
+                localEnvironment);
+        localEnvironment.define(name, procedure);
+        return evaluateArgumentsAndApply(
+                procedure,
+                List.copyOf(initExpressions),
+                localEnvironment,
+                continuation,
+                line,
+                column);
+    }
+
+    private MachineState evalAnd(List<Expr> arguments,
+                                 Environment environment,
+                                 Kont continuation) {
+        if (arguments.isEmpty()) {
+            return new ReturnValueState(new BoolValue(true), continuation);
+        }
+        return new EvalExprState(
+                arguments.getFirst(),
+                environment,
+                new AndKont(arguments.subList(1, arguments.size()), environment, continuation));
+    }
+
+    private MachineState evalOr(List<Expr> arguments,
+                                Environment environment,
+                                Kont continuation) {
+        if (arguments.isEmpty()) {
+            return new ReturnValueState(new BoolValue(false), continuation);
+        }
+        return new EvalExprState(
+                arguments.getFirst(),
+                environment,
+                new OrKont(arguments.subList(1, arguments.size()), environment, continuation));
+    }
+
+    private MachineState evaluateArgumentsAndApply(Value operator,
+                                                   List<Expr> arguments,
+                                                   Environment environment,
+                                                   Kont continuation,
+                                                   int line,
+                                                   int column) throws EvalError {
+        if (arguments.isEmpty()) {
+            return applyProcedure(operator, List.of(), continuation, line, column);
+        }
+        return new EvalExprState(
+                arguments.getLast(),
+                environment,
+                new ApplyArgsKont(
+                        operator,
+                        List.of(),
+                        arguments.subList(0, arguments.size() - 1),
+                        environment,
+                        continuation,
+                        line,
+                        column));
+    }
+
+    private MachineState applyProcedure(Value operator,
+                                        List<Value> arguments,
+                                        Kont continuation,
+                                        int line,
+                                        int column) throws EvalError {
+        try {
+            if (operator instanceof CallCcProcedureValue) {
+                requireExactArity("call/cc", arguments.size(), 1);
+                return applyProcedure(
+                        arguments.getFirst(),
+                        List.of(new ContinuationProcedureValue(continuation)),
+                        continuation,
+                        line,
+                        column);
+            }
+
+            if (operator instanceof ContinuationProcedureValue continuationProcedureValue) {
+                requireExactArity("continuation", arguments.size(), 1);
+                return new ReturnValueState(arguments.getFirst(), continuationProcedureValue.continuation());
+            }
+
+            if (operator instanceof PrimitiveProcedureValue primitiveProcedureValue) {
+                return new ReturnValueState(primitiveProcedureValue.implementation().apply(arguments), continuation);
+            }
+
+            if (operator instanceof LambdaProcedureValue lambdaProcedureValue) {
+                return evaluateSequence(
+                        lambdaProcedureValue.bodyExpressions(),
+                        lambdaProcedureValue.createCallEnvironment(arguments),
+                        continuation);
+            }
+
+            if (operator instanceof ProcedureValue procedureValue) {
+                return new ReturnValueState(procedureValue.apply(arguments, owner), continuation);
+            }
+
+            throw new EvalError("attempted to call non-procedure");
+        } catch (EvalError error) {
+            throw error.withPosition(line, column);
+        }
+    }
+
+    private List<Value> prependArgument(Value next, List<Value> existing) {
+        List<Value> values = new ArrayList<>(existing.size() + 1);
+        values.add(next);
+        values.addAll(existing);
+        return List.copyOf(values);
+    }
+
+    private List<Binding> parseBindings(Expr bindingsExpression, String formName) throws EvalError {
+        if (!(bindingsExpression instanceof ListExpr bindingsList)) {
+            throw new EvalError(formName + " bindings must be a list");
+        }
+
+        List<Binding> bindings = new ArrayList<>(bindingsList.elements().size());
+        for (Expr bindingExpression : bindingsList.elements()) {
+            if (!(bindingExpression instanceof ListExpr bindingList)) {
+                throw new EvalError(formName + " bindings must be lists");
+            }
+
+            List<Expr> bindingElements = bindingList.elements();
+            if (bindingElements.size() != 2) {
+                throw new EvalError(formName + " bindings must have a name and value");
+            }
+
+            Expr nameExpression = bindingElements.getFirst();
+            if (!(nameExpression instanceof SymbolExpr symbolExpr)) {
+                throw new EvalError(formName + " bindings must start with a symbol");
+            }
+
+            bindings.add(new Binding(symbolExpr.name(), bindingElements.get(1)));
+        }
+
+        return List.copyOf(bindings);
+    }
+
+    private ParameterSpec parseParameterSpec(Expr parametersExpression, String formName)
+            throws EvalError {
+        if (!(parametersExpression instanceof ListExpr parametersList)) {
+            throw new EvalError(formName + " parameters must be a list");
+        }
+        return parseParameterSpec(parametersList.elements(), formName);
+    }
+
+    private ParameterSpec parseParameterSpec(List<Expr> parameterExpressions, String formName)
+            throws EvalError {
+        List<String> parameterNames = new ArrayList<>(parameterExpressions.size());
+        String restParameter = null;
+
+        for (int i = 0; i < parameterExpressions.size(); i++) {
+            Expr parameterExpression = parameterExpressions.get(i);
+            if (parameterExpression instanceof SymbolExpr symbolExpr && ".".equals(symbolExpr.name())) {
+                if (i != parameterExpressions.size() - 2) {
+                    throw new EvalError(formName + " parameters use invalid dotted form");
+                }
+
+                Expr restExpression = parameterExpressions.get(i + 1);
+                if (!(restExpression instanceof SymbolExpr restSymbol) || ".".equals(restSymbol.name())) {
+                    throw new EvalError(formName + " parameters must be symbols");
+                }
+                restParameter = restSymbol.name();
+                break;
+            }
+
+            if (!(parameterExpression instanceof SymbolExpr symbolExpr)) {
+                throw new EvalError(formName + " parameters must be symbols");
+            }
+            parameterNames.add(symbolExpr.name());
+        }
+
+        return new ParameterSpec(List.copyOf(parameterNames), restParameter);
+    }
+
+    private Value quote(Expr expression) throws EvalError {
+        return switch (expression) {
+            case IntExpr intExpr -> new IntValue(intExpr.value());
+            case NumberExpr numberExpr -> Numbers.parseLiteral(numberExpr.token());
+            case BoolExpr boolExpr -> new BoolValue(boolExpr.value());
+            case StringExpr stringExpr -> new StringValue(stringExpr.value(), false);
+            case CharExpr charExpr -> new CharValue(charExpr.value());
+            case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
+            case ListExpr listExpr -> {
+                List<Value> elements = new ArrayList<>(listExpr.elements().size());
+                for (Expr element : listExpr.elements()) {
+                    elements.add(quote(element));
+                }
+                yield SchemeLists.fromElements(elements);
+            }
+        };
+    }
+
+    private void requireExactArity(String name, int actual, int expected) throws EvalError {
+        if (actual != expected) {
+            throw new EvalError(name + " expected " + expected + " argument(s)");
+        }
+    }
+}
+
+sealed interface Kont permits HaltKont, SequenceKont, IfKont, DefineKont, SetKont,
+        ApplyOperatorKont, ApplyArgsKont, AndKont, OrKont, CondKont {
+}
+
+enum HaltKont implements Kont {
+    INSTANCE
+}
+
+record SequenceKont(List<Expr> remaining, Environment environment, Kont next) implements Kont {
+}
+
+record IfKont(Expr consequent, Expr alternate, Environment environment, Kont next) implements Kont {
+}
+
+record DefineKont(String name, Environment environment, Kont next) implements Kont {
+}
+
+record SetKont(String name, Environment environment, Kont next) implements Kont {
+}
+
+record ApplyOperatorKont(List<Expr> arguments,
+                         Environment environment,
+                         Kont next,
+                         int line,
+                         int column) implements Kont {
+}
+
+record ApplyArgsKont(Value operator,
+                     List<Value> evaluatedArguments,
+                     List<Expr> remainingArguments,
+                     Environment environment,
+                     Kont next,
+                     int line,
+                     int column) implements Kont {
+}
+
+record AndKont(List<Expr> remaining, Environment environment, Kont next) implements Kont {
+}
+
+record OrKont(List<Expr> remaining, Environment environment, Kont next) implements Kont {
+}
+
+record CondKont(List<Expr> clauseElements,
+                List<Expr> remainingClauses,
+                Environment environment,
+                Kont next) implements Kont {
+}
+
+final class CallCcProcedureValue implements Value {
+    @Override
+    public String render() {
+        return "#<procedure:call/cc>";
+    }
+}
+
+final class ContinuationProcedureValue implements Value {
+    private final Kont continuation;
+
+    ContinuationProcedureValue(Kont continuation) {
+        this.continuation = continuation;
+    }
+
+    Kont continuation() {
+        return continuation;
+    }
+
+    @Override
+    public String render() {
+        return "#<continuation>";
+    }
+}

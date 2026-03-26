@@ -5,7 +5,8 @@ import java.util.IdentityHashMap;
 import java.util.List;
 
 sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue, ListValue,
-        PairValue, CharValue, VectorValue, VoidValue, ProcedureValue, RecordValue, UninitializedValue {
+        PairValue, CharValue, VectorValue, VoidValue, ProcedureValue, RecordValue, UninitializedValue,
+        CallCcProcedureValue, ContinuationProcedureValue {
     String render();
 
     default boolean isTruthy() {
@@ -471,7 +472,7 @@ final class LambdaProcedureValue implements ProcedureValue {
         this.definingEnvironment = definingEnvironment;
     }
 
-    private Environment createCallEnvironment(List<Value> arguments) throws EvalError {
+    Environment createCallEnvironment(List<Value> arguments) throws EvalError {
         if (restParameter == null && arguments.size() != parameters.size()) {
             String procedureName = name == null ? "lambda" : name;
             throw new EvalError(procedureName + " expected " + parameters.size() + " argument(s)");
@@ -510,6 +511,10 @@ final class LambdaProcedureValue implements ProcedureValue {
             return ProcedureValue.super.render();
         }
         return "#<procedure:" + name + ">";
+    }
+
+    List<Expr> bodyExpressions() {
+        return body;
     }
 }
 
