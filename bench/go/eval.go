@@ -114,6 +114,20 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalCond(expr, env)
 		case "set!":
 			return evalSetBang(expr, env)
+		case "define-syntax":
+			return evalDefineSyntax(expr, env)
+		}
+
+		// Check if head is a macro
+		if v, ok := env.Get(head.StrVal); ok && v.Type == TypeSyntax {
+			expanded, err := expandMacro(v.Syntax, expr, env)
+			if err != nil {
+				return nil, err
+			}
+			// Inject definition-site bindings for gensym'd references
+			evalEnv := NewEnv(env)
+			injectDefSiteBindings(expanded, v.Syntax.DefEnv, evalEnv)
+			return Eval(expanded, evalEnv)
 		}
 	}
 
@@ -321,6 +335,34 @@ var builtinRegistry = map[string]BuiltinFunc{}
 
 func init() {
 	// Will be populated by MakeDefaultEnv
+}
+
+// injectDefSiteBindings walks an expanded macro expression and, for any gensym'd
+// symbol (##prefix.N), resolves the original name from the definition-site environment
+// and binds it in evalEnv. This preserves definition-site binding semantics.
+func injectDefSiteBindings(expr *Expr, defEnv *Env, evalEnv *Env) {
+	if expr.Type == ExprSymbol {
+		name := expr.StrVal
+		if len(name) > 2 && name[0] == '#' && name[1] == '#' {
+			// Extract original name: ##name.N -> name
+			orig := name[2:]
+			for i := len(orig) - 1; i >= 0; i-- {
+				if orig[i] == '.' {
+					orig = orig[:i]
+					break
+				}
+			}
+			if v, ok := defEnv.Get(orig); ok {
+				evalEnv.Set(name, v)
+			}
+		}
+		return
+	}
+	if expr.Type == ExprList {
+		for _, sub := range expr.List {
+			injectDefSiteBindings(sub, defEnv, evalEnv)
+		}
+	}
 }
 
 func requireInts(args []*Value, expr *Expr, name string) error {

@@ -15,6 +15,7 @@ const (
 	TypeVoid
 	TypeLambda
 	TypeChar
+	TypeSyntax
 )
 
 // Value represents a Scheme value.
@@ -31,6 +32,8 @@ type Value struct {
 	RestParam string // variadic rest parameter (dot notation)
 	Body      []*Expr
 	ClosureEnv *Env
+	// Macro fields
+	Syntax *SyntaxRules
 }
 
 var Void = &Value{Type: TypeVoid}
