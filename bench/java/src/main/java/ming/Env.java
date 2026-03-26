@@ -270,15 +270,55 @@ class Env {
         }));
         env.define("string-set!", Builtin.named("string-set!", args -> {
             requireArgCount("string-set!", args, 3);
-            Object target = args.get(0);
-            if (!(target instanceof MutableString ms))
-                throw new EvalError("string-set!: expected mutable string");
+            if (!(args.get(0) instanceof MutableString)) {
+                throw new EvalError("string-set!: strings are immutable");
+            }
+            MutableString ms = (MutableString) args.get(0);
             int idx = (int) requireLong("string-set!", args.get(1));
-            Object chObj = args.get(2);
-            if (!(chObj instanceof Character ch))
-                throw new EvalError("string-set!: expected character, got: " + SchemeValue.toStr(chObj));
-            ms.chars[idx] = ch;
+            if (idx < 0 || idx >= ms.chars.length) {
+                throw new EvalError("string-set!: index out of bounds");
+            }
+            if (!(args.get(2) instanceof Character)) {
+                throw new EvalError("string-set!: expected character");
+            }
+            ms.chars[idx] = (Character) args.get(2);
             return null; // void
+        }));
+
+        // L15 — String immutability, string<->list, char<->integer
+        env.define("string->list", Builtin.named("string->list", args -> {
+            requireArgCount("string->list", args, 1);
+            String s = requireString("string->list", args.get(0));
+            Object result = SchemeValue.NIL;
+            for (int i = s.length() - 1; i >= 0; i--) {
+                result = new Pair(s.charAt(i), result);
+            }
+            return result;
+        }));
+        env.define("list->string", Builtin.named("list->string", args -> {
+            requireArgCount("list->string", args, 1);
+            StringBuilder sb = new StringBuilder();
+            sb.append('"');
+            Object cur = args.get(0);
+            while (cur instanceof Pair p) {
+                if (!(p.car instanceof Character ch))
+                    throw new EvalError("list->string: expected character, got: " + SchemeValue.toStr(p.car));
+                sb.append(ch);
+                cur = p.cdr;
+            }
+            sb.append('"');
+            return sb.toString();
+        }));
+        env.define("char->integer", Builtin.named("char->integer", args -> {
+            requireArgCount("char->integer", args, 1);
+            if (!(args.get(0) instanceof Character ch))
+                throw new EvalError("char->integer: expected character");
+            return (long) ch;
+        }));
+        env.define("integer->char", Builtin.named("integer->char", args -> {
+            requireArgCount("integer->char", args, 1);
+            long n = requireLong("integer->char", args.get(0));
+            return (char) n;
         }));
 
         // L09 — Numeric utilities
