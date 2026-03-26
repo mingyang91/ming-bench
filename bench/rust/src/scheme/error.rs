@@ -81,6 +81,9 @@ pub enum EvalError {
     #[error("{name}: cannot mutate immutable string")]
     ImmutableString { name: String },
 
+    #[error("{name}: invalid character code {code}")]
+    InvalidCharCode { name: String, code: i64 },
+
     #[error("application: expected procedure, got {got}")]
     NotAProcedure { got: String },
 }

@@ -59,6 +59,7 @@ pub(super) enum Builtin {
     Greater,
     Equal,
     LessEqual,
+    GreaterEqual,
     EqPred,
     EqvPred,
     EqualPred,
@@ -95,6 +96,8 @@ pub(super) enum Builtin {
     StringRef,
     StringSet,
     StringCopy,
+    StringToList,
+    ListToString,
     NullPred,
     NumberPred,
     StringPred,
@@ -105,6 +108,8 @@ pub(super) enum Builtin {
     CharPred,
     CharAlphabeticPred,
     CharNumericPred,
+    CharToInteger,
+    IntegerToChar,
     CharUpcase,
     CharDowncase,
     CharEqual,
@@ -148,6 +153,7 @@ impl Builtin {
             Builtin::Greater => ">",
             Builtin::Equal => "=",
             Builtin::LessEqual => "<=",
+            Builtin::GreaterEqual => ">=",
             Builtin::EqPred => "eq?",
             Builtin::EqvPred => "eqv?",
             Builtin::EqualPred => "equal?",
@@ -184,6 +190,8 @@ impl Builtin {
             Builtin::StringRef => "string-ref",
             Builtin::StringSet => "string-set!",
             Builtin::StringCopy => "string-copy",
+            Builtin::StringToList => "string->list",
+            Builtin::ListToString => "list->string",
             Builtin::NullPred => "null?",
             Builtin::NumberPred => "number?",
             Builtin::StringPred => "string?",
@@ -194,6 +202,8 @@ impl Builtin {
             Builtin::CharPred => "char?",
             Builtin::CharAlphabeticPred => "char-alphabetic?",
             Builtin::CharNumericPred => "char-numeric?",
+            Builtin::CharToInteger => "char->integer",
+            Builtin::IntegerToChar => "integer->char",
             Builtin::CharUpcase => "char-upcase",
             Builtin::CharDowncase => "char-downcase",
             Builtin::CharEqual => "char=?",
@@ -228,6 +238,13 @@ impl SchemeString {
 
     pub(super) fn fresh(value: String) -> Self {
         Self::from_owned(value, true)
+    }
+
+    pub(super) fn copy(&self) -> Self {
+        Self {
+            chars: Rc::new(RefCell::new(self.chars.borrow().clone())),
+            mutable: false,
+        }
     }
 
     pub(super) fn mutable_copy(&self) -> Self {

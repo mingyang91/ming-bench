@@ -64,6 +64,9 @@ pub(super) fn apply_builtin(
         Builtin::LessEqual => compare_numbers("<=", args, |ordering| {
             matches!(ordering, Ordering::Less | Ordering::Equal)
         }),
+        Builtin::GreaterEqual => compare_numbers(">=", args, |ordering| {
+            matches!(ordering, Ordering::Greater | Ordering::Equal)
+        }),
         Builtin::EqPred => builtin_eq(args),
         Builtin::EqvPred => builtin_eqv(args),
         Builtin::EqualPred => builtin_equal(args),
@@ -104,6 +107,8 @@ pub(super) fn apply_builtin(
         Builtin::StringRef => builtin_string_ref(args),
         Builtin::StringSet => builtin_string_set(args),
         Builtin::StringCopy => builtin_string_copy(args),
+        Builtin::StringToList => builtin_string_to_list(args),
+        Builtin::ListToString => builtin_list_to_string(args),
         Builtin::NullPred => builtin_predicate(
             "null?",
             args,
@@ -137,6 +142,8 @@ pub(super) fn apply_builtin(
         Builtin::CharNumericPred => {
             builtin_char_predicate("char-numeric?", args, |ch| ch.is_ascii_digit())
         }
+        Builtin::CharToInteger => builtin_char_to_integer(args),
+        Builtin::IntegerToChar => builtin_integer_to_char(args),
         Builtin::CharUpcase => builtin_char_map("char-upcase", args, |ch| ch.to_ascii_uppercase()),
         Builtin::CharDowncase => {
             builtin_char_map("char-downcase", args, |ch| ch.to_ascii_lowercase())
@@ -797,6 +804,34 @@ fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+fn builtin_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::List(
+            expect_string("string->list", value)?
+                .chars()
+                .into_iter()
+                .map(Value::Char)
+                .collect(),
+        )),
+        _ => Err(wrong_arg_count("string->list", "1", args.len())),
+    }
+}
+
+fn builtin_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => {
+            let chars = expect_list("list->string", value)?
+                .iter()
+                .map(|item| expect_char("list->string", item))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::String(SchemeString::fresh(
+                chars.into_iter().collect::<String>(),
+            )))
+        }
+        _ => Err(wrong_arg_count("list->string", "1", args.len())),
+    }
+}
+
 fn builtin_eq(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [left, right] => Ok(Value::Boolean(eq_values(left, right))),
@@ -871,6 +906,32 @@ where
     match args {
         [value] => Ok(Value::Char(map(expect_char(name, value)?))),
         _ => Err(wrong_arg_count(name, "1", args.len())),
+    }
+}
+
+fn builtin_char_to_integer(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::Number(Number::exact_int(i64::from(u32::from(
+            expect_char("char->integer", value)?,
+        ))))),
+        _ => Err(wrong_arg_count("char->integer", "1", args.len())),
+    }
+}
+
+fn builtin_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => {
+            let code = expect_exact_integer("integer->char", value)?;
+            let ch = u32::try_from(code)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| EvalError::InvalidCharCode {
+                    name: "integer->char".into(),
+                    code,
+                })?;
+            Ok(Value::Char(ch))
+        }
+        _ => Err(wrong_arg_count("integer->char", "1", args.len())),
     }
 }
 
