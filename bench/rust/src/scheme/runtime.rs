@@ -5,6 +5,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::scheme::error::{EvalError, EvalResult};
+use crate::scheme::macros::{parse_define_syntax, SyntaxRulesMacro};
 use crate::scheme::parser::{parse_program, Expr, ExprKind, Span};
 
 type BuiltinFn = fn(&mut Evaluator, &[Value], Span) -> EvalResult<Value>;
@@ -14,6 +15,7 @@ type ContinuationFrame = dyn Fn(&mut Evaluator, Value) -> EvalResult<Value>;
 
 pub(crate) struct Evaluator {
     global: EnvRef,
+    macros: HashMap<String, SyntaxRulesMacro>,
     output: String,
     current_continuation: Option<Rc<ContinuationContext>>,
     wind_stack: Vec<Rc<WindFrame>>,
@@ -62,6 +64,7 @@ struct LambdaProc {
     rest: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
+    self_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -147,11 +150,17 @@ struct PendingJump {
 #[derive(Debug)]
 struct ContinuationSignal;
 
+enum TailOutcome {
+    Value(Value),
+    SelfCall(Vec<Value>),
+}
+
 impl Evaluator {
     pub(crate) fn new() -> Self {
         let global = Env::new(None);
         let mut evaluator = Self {
             global: global.clone(),
+            macros: HashMap::new(),
             output: String::new(),
             current_continuation: None,
             wind_stack: Vec::new(),
@@ -251,6 +260,13 @@ impl Evaluator {
         };
 
         if let Some(name) = symbol_name(first) {
+            if name == "define-syntax" {
+                return self.eval_define_syntax(items, span);
+            }
+            if let Some(macro_rules) = self.macros.get(name).cloned() {
+                let expanded = macro_rules.expand(items, span)?;
+                return self.eval_expr(&expanded, env);
+            }
             match name {
                 "quote" => return self.eval_quote(items, span),
                 "if" => return self.eval_if(items, span, env),
@@ -268,12 +284,7 @@ impl Evaluator {
             }
         }
 
-        let procedure = self.eval_expr(first, env.clone())?;
-        let mut args = Vec::with_capacity(items.len().saturating_sub(1));
-        for item in &items[1..] {
-            args.push(self.eval_expr(item, env.clone())?);
-        }
-        self.apply(procedure, &args, span)
+        self.eval_application(items, span, env)
     }
 
     fn eval_quote(&mut self, items: &[Expr], span: Span) -> EvalResult<Value> {
@@ -335,6 +346,7 @@ impl Evaluator {
                     rest: params.rest,
                     body: items[2..].to_vec(),
                     env: env.clone(),
+                    self_name: Some(name.to_string()),
                 })));
                 Env::define(&env, name.to_string(), lambda);
             }
@@ -349,6 +361,12 @@ impl Evaluator {
         Ok(Value::Void)
     }
 
+    fn eval_define_syntax(&mut self, items: &[Expr], span: Span) -> EvalResult<Value> {
+        let (name, macro_rules) = parse_define_syntax(items, span)?;
+        self.macros.insert(name, macro_rules);
+        Ok(Value::Void)
+    }
+
     fn eval_lambda(&mut self, items: &[Expr], span: Span, env: EnvRef) -> EvalResult<Value> {
         if items.len() < 3 {
             return Err(runtime_error("lambda expects parameters and body", span));
@@ -359,6 +377,7 @@ impl Evaluator {
             rest: params.rest,
             body: items[2..].to_vec(),
             env,
+            self_name: None,
         }))))
     }
 
@@ -384,6 +403,7 @@ impl Evaluator {
                 rest: params.rest,
                 body: parts[1..].to_vec(),
                 env: env.clone(),
+                self_name: None,
             });
         }
 
@@ -401,32 +421,103 @@ impl Evaluator {
             if items.len() < 4 {
                 return Err(runtime_error("named let expects bindings and body", span));
             }
-            let bindings = parse_bindings(&items[2])?;
-            let mut args = Vec::with_capacity(bindings.len());
-            let mut params = Vec::with_capacity(bindings.len());
-            for (param, expr) in bindings {
-                params.push(param);
-                args.push(self.eval_expr(&expr, env.clone())?);
-            }
+            return self.eval_named_let(
+                name.clone(),
+                parse_bindings(&items[2])?,
+                items[3..].to_vec(),
+                span,
+                env,
+            );
+        }
 
+        self.eval_regular_let(parse_bindings(&items[1])?, items[2..].to_vec(), env)
+    }
+
+    fn eval_regular_let(
+        &mut self,
+        bindings: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    ) -> EvalResult<Value> {
+        let child_env = Env::new(Some(env.clone()));
+        self.eval_regular_let_bindings(bindings, body, env, child_env, 0)
+    }
+
+    fn eval_regular_let_bindings(
+        &mut self,
+        bindings: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        env: EnvRef,
+        child_env: EnvRef,
+        index: usize,
+    ) -> EvalResult<Value> {
+        let Some((name, expr)) = bindings.get(index).cloned() else {
+            return self.eval_sequence(&body, child_env);
+        };
+
+        self.eval_non_tail_with_continuation(&expr, env.clone(), move |evaluator, value| {
+            Env::define(&child_env, name.clone(), value);
+            evaluator.eval_regular_let_bindings(
+                bindings.clone(),
+                body.clone(),
+                env.clone(),
+                child_env.clone(),
+                index + 1,
+            )
+        })
+    }
+
+    fn eval_named_let(
+        &mut self,
+        name: String,
+        bindings: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        span: Span,
+        env: EnvRef,
+    ) -> EvalResult<Value> {
+        self.eval_named_let_args(name, bindings, body, span, env, 0, Vec::new(), Vec::new())
+    }
+
+    fn eval_named_let_args(
+        &mut self,
+        name: String,
+        bindings: Vec<(String, Expr)>,
+        body: Vec<Expr>,
+        span: Span,
+        env: EnvRef,
+        index: usize,
+        params: Vec<String>,
+        values: Vec<Value>,
+    ) -> EvalResult<Value> {
+        let Some((param, expr)) = bindings.get(index).cloned() else {
             let recursion_env = Env::new(Some(env));
             let lambda = Value::Procedure(Procedure::Lambda(Rc::new(LambdaProc {
                 params,
                 rest: None,
-                body: items[3..].to_vec(),
+                body,
                 env: recursion_env.clone(),
+                self_name: Some(name.clone()),
             })));
-            Env::define(&recursion_env, name.clone(), lambda.clone());
-            return self.apply(lambda, &args, span);
-        }
+            Env::define(&recursion_env, name, lambda.clone());
+            return self.apply(lambda, &values, span);
+        };
 
-        let bindings = parse_bindings(&items[1])?;
-        let child_env = Env::new(Some(env.clone()));
-        for (name, value_expr) in bindings {
-            let value = self.eval_expr(&value_expr, env.clone())?;
-            Env::define(&child_env, name, value);
-        }
-        self.eval_sequence(&items[2..], child_env)
+        let mut next_params = params;
+        next_params.push(param);
+        self.eval_non_tail_with_continuation(&expr, env.clone(), move |evaluator, value| {
+            let mut next_values = values.clone();
+            next_values.push(value);
+            evaluator.eval_named_let_args(
+                name.clone(),
+                bindings.clone(),
+                body.clone(),
+                span,
+                env.clone(),
+                index + 1,
+                next_params.clone(),
+                next_values,
+            )
+        })
     }
 
     fn eval_cond(&mut self, items: &[Expr], span: Span, env: EnvRef) -> EvalResult<Value> {
@@ -564,20 +655,68 @@ impl Evaluator {
     }
 
     fn eval_sequence(&mut self, expressions: &[Expr], env: EnvRef) -> EvalResult<Value> {
-        if expressions.is_empty() {
+        let Some((first, rest)) = expressions.split_first() else {
             return Ok(Value::Void);
+        };
+        if rest.is_empty() {
+            return self.eval_expr(first, env);
         }
 
-        let last_index = expressions.len() - 1;
-        for (index, expression) in expressions.iter().take(last_index).enumerate() {
-            let rest = expressions[index + 1..].to_vec();
-            let env_for_frame = env.clone();
-            self.eval_non_tail_with_continuation(expression, env.clone(), move |evaluator, _| {
-                evaluator.eval_sequence(&rest, env_for_frame.clone())
-            })?;
-        }
+        let rest = rest.to_vec();
+        let env_for_frame = env.clone();
+        self.eval_non_tail_with_continuation(first, env, move |evaluator, _| {
+            evaluator.eval_sequence(&rest, env_for_frame.clone())
+        })
+    }
 
-        self.eval_expr(&expressions[last_index], env)
+    fn eval_plain_sequence(&mut self, expressions: &[Expr], env: EnvRef) -> EvalResult<Value> {
+        let mut result = Value::Void;
+        for expression in expressions {
+            result = self.eval_expr(expression, env.clone())?;
+        }
+        Ok(result)
+    }
+
+    fn eval_application(&mut self, items: &[Expr], span: Span, env: EnvRef) -> EvalResult<Value> {
+        let procedure_expr = items[0].clone();
+        let arg_exprs = items[1..].to_vec();
+
+        self.eval_non_tail_with_continuation(&procedure_expr, env.clone(), move |evaluator, procedure| {
+            evaluator.eval_application_args(
+                procedure,
+                arg_exprs.clone(),
+                Vec::new(),
+                span,
+                env.clone(),
+            )
+        })
+    }
+
+    fn eval_application_args(
+        &mut self,
+        procedure: Value,
+        remaining: Vec<Expr>,
+        evaluated: Vec<Value>,
+        span: Span,
+        env: EnvRef,
+    ) -> EvalResult<Value> {
+        let Some((expr, rest)) = remaining.split_first() else {
+            return self.apply(procedure, &evaluated, span);
+        };
+        let expr = expr.clone();
+        let rest = rest.to_vec();
+
+        self.eval_non_tail_with_continuation(&expr, env.clone(), move |evaluator, value| {
+            let mut next_values = evaluated.clone();
+            next_values.push(value);
+            evaluator.eval_application_args(
+                procedure.clone(),
+                rest.clone(),
+                next_values,
+                span,
+                env.clone(),
+            )
+        })
     }
 
     fn apply(&mut self, procedure: Value, args: &[Value], span: Span) -> EvalResult<Value> {
@@ -704,13 +843,17 @@ impl Evaluator {
     where
         F: Fn(&mut Evaluator, Value) -> EvalResult<Value> + 'static,
     {
+        let parent = self.current_continuation.clone();
+        let frame = Rc::new(frame);
         let continuation = Rc::new(ContinuationContext {
-            frame: Rc::new(frame),
-            parent: self.current_continuation.clone(),
+            frame: frame.clone(),
+            parent: parent.clone(),
         });
-        self.with_current_continuation(Some(continuation), |evaluator| {
+        let value = self.with_current_continuation(Some(continuation), |evaluator| {
             evaluator.eval_expr(expr, env)
-        })
+        })?;
+
+        self.with_current_continuation(parent, move |evaluator| (frame)(evaluator, value))
     }
 
     fn with_current_continuation<T, F>(
@@ -863,6 +1006,80 @@ impl Evaluator {
                 self.wind_stack.push(active);
             }
         }
+    }
+
+    fn eval_self_tail_expr(
+        &mut self,
+        expr: &Expr,
+        env: EnvRef,
+        self_name: &str,
+    ) -> EvalResult<TailOutcome> {
+        let ExprKind::List(items) = &expr.kind else {
+            return self.eval_expr(expr, env).map(TailOutcome::Value);
+        };
+
+        let Some(first) = items.first() else {
+            return Err(runtime_error("cannot evaluate empty list", expr.span));
+        };
+
+        if let Some(name) = symbol_name(first) {
+            if let Some(macro_rules) = self.macros.get(name).cloned() {
+                let expanded = macro_rules.expand(items, expr.span)?;
+                return self.eval_self_tail_expr(&expanded, env, self_name);
+            }
+
+            match name {
+                "if" => return self.eval_self_tail_if(items, expr.span, env, self_name),
+                "begin" => return self.eval_self_tail_begin(&items[1..], env, self_name),
+                _ if name == self_name => {
+                    let mut args = Vec::with_capacity(items.len().saturating_sub(1));
+                    for item in &items[1..] {
+                        args.push(self.eval_expr(item, env.clone())?);
+                    }
+                    return Ok(TailOutcome::SelfCall(args));
+                }
+                _ => {}
+            }
+        }
+
+        self.eval_list(items, expr.span, env).map(TailOutcome::Value)
+    }
+
+    fn eval_self_tail_if(
+        &mut self,
+        items: &[Expr],
+        span: Span,
+        env: EnvRef,
+        self_name: &str,
+    ) -> EvalResult<TailOutcome> {
+        if !(items.len() == 3 || items.len() == 4) {
+            return Err(wrong_arg_count("if", "2 or 3", items.len() - 1, span));
+        }
+
+        let condition = self.eval_expr(&items[1], env.clone())?;
+        if condition.is_truthy() {
+            self.eval_self_tail_expr(&items[2], env, self_name)
+        } else if let Some(alternate) = items.get(3) {
+            self.eval_self_tail_expr(alternate, env, self_name)
+        } else {
+            Ok(TailOutcome::Value(Value::Void))
+        }
+    }
+
+    fn eval_self_tail_begin(
+        &mut self,
+        expressions: &[Expr],
+        env: EnvRef,
+        self_name: &str,
+    ) -> EvalResult<TailOutcome> {
+        let Some((last, prefix)) = expressions.split_last() else {
+            return Ok(TailOutcome::Value(Value::Void));
+        };
+
+        for expression in prefix {
+            self.eval_expr(expression, env.clone())?;
+        }
+        self.eval_self_tail_expr(last, env, self_name)
     }
 }
 
@@ -1183,22 +1400,50 @@ fn apply_lambda(
     span: Span,
     name: &str,
 ) -> EvalResult<Value> {
-    if args.len() < lambda.params.len() {
+    if let Some(self_name) = &lambda.self_name {
+        if lambda.rest.is_none() && lambda.body.len() == 1 {
+            let mut pending_args = args.to_vec();
+            loop {
+                validate_lambda_arity(lambda, pending_args.len(), span, name)?;
+                let call_env = bind_lambda_env(lambda, &pending_args);
+                match evaluator.eval_self_tail_expr(&lambda.body[0], call_env, self_name)? {
+                    TailOutcome::Value(value) => return Ok(value),
+                    TailOutcome::SelfCall(next_args) => pending_args = next_args,
+                }
+            }
+        }
+    }
+
+    validate_lambda_arity(lambda, args.len(), span, name)?;
+    let call_env = bind_lambda_env(lambda, args);
+    evaluator.eval_plain_sequence(&lambda.body, call_env)
+}
+
+fn validate_lambda_arity(
+    lambda: &LambdaProc,
+    arg_count: usize,
+    span: Span,
+    name: &str,
+) -> EvalResult<()> {
+    if arg_count < lambda.params.len() {
         let expected = match lambda.rest {
             Some(_) => format!("at least {}", lambda.params.len()),
             None => lambda.params.len().to_string(),
         };
-        return Err(wrong_arg_count(name, &expected, args.len(), span));
+        return Err(wrong_arg_count(name, &expected, arg_count, span));
     }
-    if lambda.rest.is_none() && args.len() != lambda.params.len() {
+    if lambda.rest.is_none() && arg_count != lambda.params.len() {
         return Err(wrong_arg_count(
             name,
             &lambda.params.len().to_string(),
-            args.len(),
+            arg_count,
             span,
         ));
     }
+    Ok(())
+}
 
+fn bind_lambda_env(lambda: &LambdaProc, args: &[Value]) -> EnvRef {
     let call_env = Env::new(Some(lambda.env.clone()));
     for (param, value) in lambda.params.iter().zip(args.iter()) {
         Env::define(&call_env, param.clone(), value.clone());
@@ -1210,7 +1455,7 @@ fn apply_lambda(
             list_from_vec(args[lambda.params.len()..].to_vec()),
         );
     }
-    evaluator.eval_sequence(&lambda.body, call_env)
+    call_env
 }
 
 fn describe_case_lambda_arities(clauses: &[LambdaProc]) -> String {

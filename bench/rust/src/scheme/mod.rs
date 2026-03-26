@@ -1,5 +1,6 @@
 pub mod error;
 
+mod macros;
 mod parser;
 mod runtime;
 

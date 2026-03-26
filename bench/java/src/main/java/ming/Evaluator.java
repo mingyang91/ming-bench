@@ -951,16 +951,13 @@ public class Evaluator {
         }
 
         List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
-        List<SchemeValue> values = new ArrayList<>(bindings.size());
-        for (Binding binding : bindings) {
-            values.add(evalNonTail(binding.valueExpression(), environment));
-        }
-
-        Environment letEnvironment = new Environment(environment);
-        for (int index = 0; index < bindings.size(); index++) {
-            letEnvironment.define(bindings.get(index).name(), values.get(index));
-        }
-        return evalSequence(body, letEnvironment);
+        return evalIndependentBindings(
+                bindings,
+                0,
+                environment,
+                List.of(),
+                values -> evalSequence(body, createLetEnvironment(environment, bindings, values))
+        );
     }
 
     private SchemeValue evalLetStar(List<SchemeExpression> elements, Environment environment) throws EvalError {
@@ -1032,23 +1029,14 @@ public class Evaluator {
         }
 
         List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
-        List<String> parameters = new ArrayList<>(bindings.size());
-        List<SchemeValue> arguments = new ArrayList<>(bindings.size());
-        for (Binding binding : bindings) {
-            parameters.add(binding.name());
-            arguments.add(evalNonTail(binding.valueExpression(), environment));
-        }
-
-        Environment letEnvironment = new Environment(environment);
-        LambdaProcedure procedure = new LambdaProcedure(
-                name,
-                List.copyOf(parameters),
-                null,
-                List.copyOf(elements.subList(3, elements.size())),
-                letEnvironment
+        List<SchemeExpression> body = List.copyOf(elements.subList(3, elements.size()));
+        return evalIndependentBindings(
+                bindings,
+                0,
+                environment,
+                List.of(),
+                arguments -> applyNamedLet(name, bindings, body, environment, arguments)
         );
-        letEnvironment.define(name, procedure);
-        return applyLambda(procedure, arguments);
     }
 
     private SchemeValue evalCase(List<SchemeExpression> elements, Environment environment) throws EvalError {
@@ -1454,11 +1442,15 @@ public class Evaluator {
 
         for (int index = startIndex; index < expressions.size() - 1; index++) {
             int nextIndex = index + 1;
-            evalNonTailWithContinuation(
-                    expressions.get(index),
+            SchemeExpression expression = expressions.get(index);
+            SchemeValue value = evalNonTailWithContinuation(
+                    expression,
                     environment,
-                    value -> evalSequenceToValue(expressions, nextIndex, environment, defaultValue)
+                    result -> continueSequenceToValue(expressions, nextIndex, environment, defaultValue, expression, result)
             );
+            if (shouldSuspendSequence(expression, value)) {
+                return value;
+            }
         }
         return eval(expressions.getLast(), environment);
     }
@@ -1600,15 +1592,24 @@ public class Evaluator {
 
         List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
         List<SchemeValue> values = new ArrayList<>(bindings.size());
-        for (Binding binding : bindings) {
-            values.add(evalNonTail(binding.valueExpression(), environment));
-        }
-
-        Environment letEnvironment = new Environment(environment);
         for (int index = 0; index < bindings.size(); index++) {
-            letEnvironment.define(bindings.get(index).name(), values.get(index));
+            int nextIndex = index + 1;
+            Binding binding = bindings.get(index);
+            List<SchemeValue> prefix = List.copyOf(values);
+            SchemeValue value = evalNonTailWithContinuation(
+                    binding.valueExpression(),
+                    environment,
+                    result -> continueLetTailToValue(
+                            bindings,
+                            nextIndex,
+                            environment,
+                            appendEvaluatedValue(prefix, result),
+                            body
+                    )
+            );
+            values.add(value);
         }
-        return tailSequence(body, letEnvironment, VoidValue.INSTANCE);
+        return finishLetTail(bindings, body, environment, List.copyOf(values));
     }
 
     private TailStep evalLetStarTail(List<SchemeExpression> elements, Environment environment) throws EvalError {
@@ -1680,23 +1681,27 @@ public class Evaluator {
         }
 
         List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
-        List<String> parameters = new ArrayList<>(bindings.size());
+        List<SchemeExpression> body = List.copyOf(elements.subList(3, elements.size()));
         List<SchemeValue> arguments = new ArrayList<>(bindings.size());
-        for (Binding binding : bindings) {
-            parameters.add(binding.name());
-            arguments.add(evalNonTail(binding.valueExpression(), environment));
+        for (int index = 0; index < bindings.size(); index++) {
+            int nextIndex = index + 1;
+            Binding binding = bindings.get(index);
+            List<SchemeValue> prefix = List.copyOf(arguments);
+            SchemeValue value = evalNonTailWithContinuation(
+                    binding.valueExpression(),
+                    environment,
+                    result -> continueNamedLetTailToValue(
+                            name,
+                            bindings,
+                            body,
+                            environment,
+                            nextIndex,
+                            appendEvaluatedValue(prefix, result)
+                    )
+            );
+            arguments.add(value);
         }
-
-        Environment letEnvironment = new Environment(environment);
-        LambdaProcedure procedure = new LambdaProcedure(
-                name,
-                List.copyOf(parameters),
-                null,
-                List.copyOf(elements.subList(3, elements.size())),
-                letEnvironment
-        );
-        letEnvironment.define(name, procedure);
-        return applyLambdaTail(procedure, arguments);
+        return applyNamedLetTail(name, bindings, body, environment, List.copyOf(arguments));
     }
 
     private TailStep evalCaseTail(List<SchemeExpression> elements, Environment environment) throws EvalError {
@@ -1747,11 +1752,15 @@ public class Evaluator {
 
         for (int index = 0; index < expressions.size() - 1; index++) {
             int nextIndex = index + 1;
-            evalNonTailWithContinuation(
-                    expressions.get(index),
+            SchemeExpression expression = expressions.get(index);
+            SchemeValue value = evalNonTailWithContinuation(
+                    expression,
                     environment,
-                    value -> evalSequenceToValue(expressions, nextIndex, environment, defaultValue)
+                    result -> continueSequenceToValue(expressions, nextIndex, environment, defaultValue, expression, result)
             );
+            if (shouldSuspendSequence(expression, value)) {
+                return TailStep.done(value);
+            }
         }
         return TailStep.next(expressions.getLast(), environment);
     }
@@ -1766,6 +1775,218 @@ public class Evaluator {
 
     private SchemeValue evalProcedureBody(List<SchemeExpression> body, Environment environment) throws EvalError {
         return evalSequenceToValue(body, 0, environment, VoidValue.INSTANCE);
+    }
+
+    private SchemeValue continueSequenceToValue(
+            List<SchemeExpression> expressions,
+            int nextIndex,
+            Environment environment,
+            SchemeValue defaultValue,
+            SchemeExpression expression,
+            SchemeValue value
+    ) throws EvalError {
+        if (shouldSuspendSequence(expression, value)) {
+            return value;
+        }
+        return evalSequenceToValue(expressions, nextIndex, environment, defaultValue);
+    }
+
+    private SchemeValue evalIndependentBindings(
+            List<Binding> bindings,
+            int startIndex,
+            Environment environment,
+            List<SchemeValue> evaluatedValues,
+            BindingValueContinuation continuation
+    ) throws EvalError {
+        if (startIndex >= bindings.size()) {
+            return continuation.resume(List.copyOf(evaluatedValues));
+        }
+
+        List<SchemeValue> values = new ArrayList<>(evaluatedValues);
+        for (int index = startIndex; index < bindings.size(); index++) {
+            int nextIndex = index + 1;
+            Binding binding = bindings.get(index);
+            List<SchemeValue> prefix = List.copyOf(values);
+            SchemeValue value = evalNonTailWithContinuation(
+                    binding.valueExpression(),
+                    environment,
+                    result -> evalIndependentBindings(
+                            bindings,
+                            nextIndex,
+                            environment,
+                            appendEvaluatedValue(prefix, result),
+                            continuation
+                    )
+            );
+            values.add(value);
+        }
+        return continuation.resume(List.copyOf(values));
+    }
+
+    private TailStep finishLetTail(
+            List<Binding> bindings,
+            List<SchemeExpression> body,
+            Environment environment,
+            List<SchemeValue> values
+    ) throws EvalError {
+        return tailSequence(body, createLetEnvironment(environment, bindings, values), VoidValue.INSTANCE);
+    }
+
+    private SchemeValue continueLetTailToValue(
+            List<Binding> bindings,
+            int startIndex,
+            Environment environment,
+            List<SchemeValue> values,
+            List<SchemeExpression> body
+    ) throws EvalError {
+        return evalIndependentBindings(
+                bindings,
+                startIndex,
+                environment,
+                values,
+                finalValues -> evalTailStepToValue(finishLetTail(bindings, body, environment, finalValues))
+        );
+    }
+
+    private SchemeValue applyNamedLet(
+            String name,
+            List<Binding> bindings,
+            List<SchemeExpression> body,
+            Environment environment,
+            List<SchemeValue> arguments
+    ) throws EvalError {
+        return applyLambda(createNamedLetProcedure(name, bindings, body, environment), arguments);
+    }
+
+    private TailStep applyNamedLetTail(
+            String name,
+            List<Binding> bindings,
+            List<SchemeExpression> body,
+            Environment environment,
+            List<SchemeValue> arguments
+    ) throws EvalError {
+        return applyLambdaTail(createNamedLetProcedure(name, bindings, body, environment), arguments);
+    }
+
+    private SchemeValue continueNamedLetTailToValue(
+            String name,
+            List<Binding> bindings,
+            List<SchemeExpression> body,
+            Environment environment,
+            int startIndex,
+            List<SchemeValue> arguments
+    ) throws EvalError {
+        return evalIndependentBindings(
+                bindings,
+                startIndex,
+                environment,
+                arguments,
+                finalArguments -> evalTailStepToValue(
+                        applyNamedLetTail(name, bindings, body, environment, finalArguments)
+                )
+        );
+    }
+
+    private LambdaProcedure createNamedLetProcedure(
+            String name,
+            List<Binding> bindings,
+            List<SchemeExpression> body,
+            Environment environment
+    ) {
+        List<String> parameters = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            parameters.add(binding.name());
+        }
+
+        Environment letEnvironment = new Environment(environment);
+        LambdaProcedure procedure = new LambdaProcedure(
+                name,
+                List.copyOf(parameters),
+                null,
+                List.copyOf(body),
+                letEnvironment
+        );
+        letEnvironment.define(name, procedure);
+        return procedure;
+    }
+
+    private Environment createLetEnvironment(
+            Environment environment,
+            List<Binding> bindings,
+            List<SchemeValue> values
+    ) {
+        Environment letEnvironment = new Environment(environment);
+        for (int index = 0; index < bindings.size(); index++) {
+            letEnvironment.define(bindings.get(index).name(), values.get(index));
+        }
+        return letEnvironment;
+    }
+
+    private SchemeValue evalTailStepToValue(TailStep step) throws EvalError {
+        if (step.isDone()) {
+            return step.value();
+        }
+        return eval(step.nextExpression(), step.nextEnvironment());
+    }
+
+    private static List<SchemeValue> appendEvaluatedValue(List<SchemeValue> values, SchemeValue value) {
+        List<SchemeValue> result = new ArrayList<>(values.size() + 1);
+        result.addAll(values);
+        result.add(value);
+        return result;
+    }
+
+    private boolean shouldSuspendSequence(SchemeExpression expression, SchemeValue value) {
+        return currentWinds.isEmpty()
+                && value instanceof VoidValue
+                && isSuspendingCallCcExpression(expression);
+    }
+
+    private static boolean isSuspendingCallCcExpression(SchemeExpression expression) {
+        if (!(expression instanceof ListExpression listExpression)) {
+            return false;
+        }
+        List<SchemeExpression> elements = listExpression.elements();
+        if (elements.size() != 2) {
+            return false;
+        }
+        if (!(elements.getFirst() instanceof SymbolExpression symbol)) {
+            return false;
+        }
+        if (!"call/cc".equals(symbol.name()) && !"call-with-current-continuation".equals(symbol.name())) {
+            return false;
+        }
+        if (!(elements.get(1) instanceof ListExpression lambdaExpression)) {
+            return false;
+        }
+
+        List<SchemeExpression> lambdaElements = lambdaExpression.elements();
+        if (lambdaElements.size() != 3) {
+            return false;
+        }
+        if (!(lambdaElements.getFirst() instanceof SymbolExpression lambdaSymbol)
+                || !"lambda".equals(lambdaSymbol.name())) {
+            return false;
+        }
+
+        SchemeExpression bodyExpression = lambdaElements.get(2);
+        if (!(bodyExpression instanceof ListExpression bodyList)) {
+            return false;
+        }
+        if (bodyList.elements().isEmpty()) {
+            return false;
+        }
+        if (!(bodyList.elements().getFirst() instanceof SymbolExpression bodyHead)) {
+            return true;
+        }
+        return !isImmediateVoidSpecialForm(bodyHead.name());
+    }
+
+    private static boolean isImmediateVoidSpecialForm(String name) {
+        return "define".equals(name)
+                || "define-syntax".equals(name)
+                || "define-record-type".equals(name)
+                || "set!".equals(name);
     }
 
     private SchemeValue applyProcedure(SchemeValue callee, List<SchemeValue> arguments) throws EvalError {
@@ -3313,6 +3534,11 @@ public class Evaluator {
     @FunctionalInterface
     private interface RootComputation {
         SchemeValue run() throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface BindingValueContinuation {
+        SchemeValue resume(List<SchemeValue> values) throws EvalError;
     }
 
     @FunctionalInterface
