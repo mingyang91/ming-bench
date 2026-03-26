@@ -66,6 +66,7 @@ object Evaluator:
       case Symbol("set!", _)               => evalSet(elems.tail, env)
       case Symbol("define-syntax", _)      => evalDefineSyntax(elems.tail, env)
       case Symbol("define-record-type", _) => Records.evalDefineRecordType(elems.tail, env)
+      case Symbol("case-lambda", _)        => evalCaseLambda(elems.tail, env)
       case _                               =>
         // Check for macro call
         val macroVal = elems.head match
@@ -126,6 +127,15 @@ object Evaluator:
             var result: SchemeVal = SchemeVoid
             for expr <- body do result = eval(expr, localEnv)
             result
+      case SchemeCaseLambda(clauses) =>
+        val matching = clauses.find { lam =>
+          lam.restParam match
+            case None    => args.size == lam.params.size
+            case Some(_) => args.size >= lam.params.size
+        }
+        matching match
+          case Some(lam) => applyProc(lam, args)
+          case None      => throw new EvalError(s"no matching clause for ${args.size} arguments")
       case _ => throw new EvalError(s"not a procedure: ${op.display}")
 
   private def evalDefine(args: List[Expr], env: Env): SchemeVal =
@@ -259,6 +269,15 @@ object Evaluator:
         env.set(name, SchemeMacro(litNames, parsedRules, env))
         SchemeVoid
       case _ => throw new EvalError("define-syntax: bad syntax")
+
+  private def evalCaseLambda(clauses: List[Expr], env: Env): SchemeVal =
+    val lambdas = clauses.map {
+      case SList(SList(paramExprs, _) :: body, _) if body.nonEmpty =>
+        val (params, rest) = parseParams(paramExprs)
+        SchemeLambda(params, rest, body, env)
+      case _ => throw new EvalError("case-lambda: bad clause")
+    }
+    SchemeCaseLambda(lambdas)
 
   private def evalBody(exprs: List[Expr], env: Env): SchemeVal =
     var result: SchemeVal = SchemeVoid

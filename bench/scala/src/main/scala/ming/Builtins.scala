@@ -221,6 +221,15 @@ private[ming] object Builtins:
     )
     env.set("symbol?", typeCheck("symbol?") { case _: SchemeSymbol => true; case _ => false })
     env.set("char?", typeCheck("char?") { case _: SchemeChar => true; case _ => false })
+    env.set(
+      "procedure?",
+      typeCheck("procedure?") {
+        case _: SchemeBuiltin    => true
+        case _: SchemeLambda     => true
+        case _: SchemeCaseLambda => true
+        case _                   => false
+      }
+    )
 
   private def displayVal(v: SchemeVal): String = v match
     case SchemeString(s)   => s

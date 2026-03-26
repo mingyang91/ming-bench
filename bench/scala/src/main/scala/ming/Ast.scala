@@ -100,6 +100,9 @@ case object SchemeVoid extends SchemeVal:
 case class SchemeMacro(literals: List[String], rules: List[(Expr, Expr)], defEnv: Env) extends SchemeVal:
   def display: String = "#<macro>"
 
+case class SchemeCaseLambda(clauses: List[SchemeLambda]) extends SchemeVal:
+  def display: String = "#<procedure>"
+
 case class SchemeRecord(typeName: String, fields: mutable.Map[String, SchemeVal]) extends SchemeVal:
   def display: String = s"#<$typeName>"
 
