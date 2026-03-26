@@ -245,6 +245,17 @@ impl Env {
 
         self.parent.as_ref().and_then(|parent| parent.lookup(name))
     }
+
+    fn set(&self, name: &str, value: Value) -> bool {
+        if self.bindings.borrow().contains_key(name) {
+            self.bindings.borrow_mut().insert(name.to_string(), value);
+            true
+        } else {
+            self.parent
+                .as_ref()
+                .is_some_and(|parent| parent.set(name, value))
+        }
+    }
 }
 
 impl Closure {
@@ -598,6 +609,7 @@ fn eval_list(
             "define" => {
                 return eval_define(tail, env, ctx).map_err(|err| err.with_position(head.pos))
             }
+            "set!" => return eval_set(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             "if" => return eval_if(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             "quote" => return eval_quote(tail).map_err(|err| err.with_position(head.pos)),
             "lambda" => return eval_lambda(tail, env).map_err(|err| err.with_position(head.pos)),
@@ -670,6 +682,29 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, E
         _ => Err(EvalError::InvalidSyntax {
             message: "define requires a symbol or function signature".to_string(),
         }),
+    }
+}
+
+fn eval_set(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "set!",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    let ExprKind::Symbol(name) = &args[0].kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "set! requires a symbol target".to_string(),
+        });
+    };
+
+    let value = eval(&args[1], env.clone(), ctx)?;
+    if env.set(name, value) {
+        Ok(Value::Void)
+    } else {
+        Err(EvalError::UnboundVariable { name: name.clone() }.with_position(args[0].pos))
     }
 }
 
