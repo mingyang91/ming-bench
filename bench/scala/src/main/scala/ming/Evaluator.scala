@@ -158,8 +158,8 @@ object Evaluator:
         CekState.ApplyK(SyntaxCaseSupport.evalWithSyntax(bindings, body, env, evalExpr, evalBody), k)
 
       // ── Application ────────────────────────────────────────────────
-      case Expr.SList(head :: args, p) =>
-        CekSteps.stepApp(head, args, env, p, k)
+      case expr @ Expr.SList(head :: args, p) =>
+        CekSteps.stepApp(expr, head, args, env, p, k)
 
   // ── Function application (CEK) ────────────────────────────────────
   private[ming] def cekApply(

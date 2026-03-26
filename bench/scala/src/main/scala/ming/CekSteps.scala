@@ -248,7 +248,11 @@ object CekSteps:
         CekState.Eval(test, env, Kont.CondTest(body, rest, env, k))
       case e :: _ => throw errAt(posOf(e), "invalid cond")
 
+  // Macro expansion cache: keyed by (SList identity, macro identity) → (expanded, injections)
+  private val macroCache = new java.util.IdentityHashMap[Expr, (Value.VMacro, Expr, Map[String, Value])]()
+
   private[ming] def stepApp(
+    originalExpr: Expr,
     head: Expr,
     args: List[Expr],
     env: Env,
@@ -259,11 +263,18 @@ object CekSteps:
       case Expr.Symbol(name, _) =>
         env.lookupOpt(name) match
           case Some(m: Value.VMacro) =>
+            val cached = macroCache.get(originalExpr)
             val (expanded, injections) =
-              MacroExpander.expand(m, Expr.SList(head :: args, pos), pos)
-            val macroEnv = env.child()
-            injections.foreach((key, v) => macroEnv.define(key, v))
-            CekState.Eval(expanded, macroEnv, k)
+              if cached != null && (cached._1 eq m) then (cached._2, cached._3)
+              else
+                val result = MacroExpander.expand(m, Expr.SList(head :: args, pos), pos)
+                macroCache.put(originalExpr, (m, result._1, result._2))
+                result
+            if injections.isEmpty then CekState.Eval(expanded, env, k)
+            else
+              val macroEnv = env.child()
+              injections.foreach((key, v) => macroEnv.define(key, v))
+              CekState.Eval(expanded, macroEnv, k)
           case Some(Value.VMacroTransformer(proc, defEnv)) =>
             val inputSyntax = Value.VSyntax(Expr.SList(head :: args, pos))
             val afterK      = Kont.MacroTransformerResult(env, defEnv, pos, k)
