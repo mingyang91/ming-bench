@@ -35,9 +35,11 @@ type builtinProc struct {
 }
 
 type closureExpr struct {
-	params []string
-	body   []expr
-	env    *env
+	params    []string
+	restParam string
+	variadic  bool
+	body      []expr
+	env       *env
 }
 
 type env struct {
@@ -167,6 +169,7 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("=", builtinProc{name: "=", fn: comparisonBuiltin("=", func(a, b int) bool { return a == b })})
 	root.define("<=", builtinProc{name: "<=", fn: comparisonBuiltin("<=", func(a, b int) bool { return a <= b })})
 	root.define("not", builtinProc{name: "not", fn: builtinNot})
+	root.define("apply", builtinProc{name: "apply", fn: builtinApply})
 	root.define("append", builtinProc{name: "append", fn: builtinAppend})
 	root.define("car", builtinProc{name: "car", fn: builtinCar})
 	root.define("cdr", builtinProc{name: "cdr", fn: builtinCdr})
@@ -543,14 +546,16 @@ func evalDefine(environment *env, forms []expr) (expr, error) {
 		if !ok {
 			return nil, &EvalError{Message: "define function name must be a symbol"}
 		}
-		params, err := parseParamList(target.items[1:])
+		params, restParam, variadic, err := parseParamList(target.items[1:])
 		if err != nil {
 			return nil, err
 		}
 		closure := closureExpr{
-			params: params,
-			body:   append([]expr(nil), forms[1:]...),
-			env:    environment,
+			params:    params,
+			restParam: restParam,
+			variadic:  variadic,
+			body:      append([]expr(nil), forms[1:]...),
+			env:       environment,
 		}
 		environment.define(name.name, closure)
 		return voidExpr{}, nil
@@ -707,33 +712,52 @@ func evalLambda(environment *env, forms []expr) (expr, error) {
 		return nil, &EvalError{Message: "lambda expects parameters and a body"}
 	}
 
-	paramList, ok := forms[0].(listExpr)
-	if !ok {
-		return nil, &EvalError{Message: "lambda parameters must be a list"}
-	}
-
-	params, err := parseParamList(paramList.items)
+	params, restParam, variadic, err := parseLambdaParams(forms[0])
 	if err != nil {
 		return nil, err
 	}
 
 	return closureExpr{
-		params: params,
-		body:   append([]expr(nil), forms[1:]...),
-		env:    environment,
+		params:    params,
+		restParam: restParam,
+		variadic:  variadic,
+		body:      append([]expr(nil), forms[1:]...),
+		env:       environment,
 	}, nil
 }
 
-func parseParamList(items []expr) ([]string, error) {
+func parseLambdaParams(form expr) ([]string, string, bool, error) {
+	switch params := form.(type) {
+	case symbolExpr:
+		return nil, params.name, true, nil
+	case listExpr:
+		return parseParamList(params.items)
+	default:
+		return nil, "", false, &EvalError{Message: "lambda parameters must be a list or symbol"}
+	}
+}
+
+func parseParamList(items []expr) ([]string, string, bool, error) {
 	params := make([]string, 0, len(items))
-	for _, item := range items {
+	for i, item := range items {
 		symbol, ok := item.(symbolExpr)
 		if !ok {
-			return nil, &EvalError{Message: "parameter name must be a symbol"}
+			return nil, "", false, &EvalError{Message: "parameter name must be a symbol"}
+		}
+		if symbol.name == "." {
+			if i != len(items)-2 {
+				return nil, "", false, &EvalError{Message: "invalid dotted parameter list"}
+			}
+
+			restSymbol, ok := items[i+1].(symbolExpr)
+			if !ok || restSymbol.name == "." {
+				return nil, "", false, &EvalError{Message: "rest parameter name must be a symbol"}
+			}
+			return params, restSymbol.name, true, nil
 		}
 		params = append(params, symbol.name)
 	}
-	return params, nil
+	return params, "", false, nil
 }
 
 func evalBindings(environment *env, bindings listExpr) ([]string, []expr, error) {
@@ -778,8 +802,11 @@ func applyCallable(proc expr, args []expr) (expr, error) {
 	case builtinProc:
 		return callable.fn(args)
 	case closureExpr:
-		if len(args) != len(callable.params) {
+		if !callable.variadic && len(args) != len(callable.params) {
 			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
+		}
+		if callable.variadic && len(args) < len(callable.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(callable.params), len(args))}
 		}
 
 		callEnv := &env{
@@ -788,6 +815,10 @@ func applyCallable(proc expr, args []expr) (expr, error) {
 		}
 		for i, name := range callable.params {
 			callEnv.define(name, args[i])
+		}
+		if callable.variadic {
+			rest := append([]expr(nil), args[len(callable.params):]...)
+			callEnv.define(callable.restParam, listExpr{items: rest})
 		}
 		return evalSequence(callEnv, callable.body)
 	default:
@@ -923,6 +954,22 @@ func builtinAppend(args []expr) (expr, error) {
 		result = append(result, list.items...)
 	}
 	return listExpr{items: result}, nil
+}
+
+func builtinApply(args []expr) (expr, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "apply expects at least 2 arguments"}
+	}
+
+	tailList, ok := args[len(args)-1].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "apply expects a list as its final argument"}
+	}
+
+	callArgs := make([]expr, 0, len(args)-2+len(tailList.items))
+	callArgs = append(callArgs, args[1:len(args)-1]...)
+	callArgs = append(callArgs, tailList.items...)
+	return applyCallable(args[0], callArgs)
 }
 
 func builtinCar(args []expr) (expr, error) {
