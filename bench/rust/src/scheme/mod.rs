@@ -106,6 +106,8 @@ struct SyntaxRulesMacro {
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    Rational(i64, i64), // numerator, denominator (always simplified, denom > 0)
+    Float(f64),
     Boolean(bool),
     Str(String),
     Symbol(String),
@@ -118,10 +120,33 @@ pub enum Value {
     Void,
 }
 
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+fn make_rational(n: i64, d: i64) -> Value {
+    if d == 0 { panic!("division by zero in make_rational"); }
+    let sign = if (n < 0) ^ (d < 0) { -1 } else { 1 };
+    let n = n.abs();
+    let d = d.abs();
+    let g = gcd(n, d);
+    let n = sign * (n / g);
+    let d = d / g;
+    if d == 1 { Value::Integer(n) } else { Value::Rational(n, d) }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Rational(an, ad), Value::Rational(bn, bd)) => an == bn && ad == bd,
+            (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
@@ -139,6 +164,14 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "{}", n),
+            Value::Rational(n, d) => write!(f, "{}/{}", n, d),
+            Value::Float(v) => {
+                if v.fract() == 0.0 && v.is_finite() {
+                    write!(f, "{:.1}", v)
+                } else {
+                    write!(f, "{}", v)
+                }
+            }
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Str(s) => write!(f, "\"{}\"", s),
@@ -174,6 +207,8 @@ enum Token {
     RParen,
     Symbol(String),
     Integer(i64),
+    Rational(i64, i64),
+    Float(f64),
     Boolean(bool),
     Str(String),
     Char(char),
@@ -296,6 +331,22 @@ fn tokenize(input: &str) -> Result<Vec<SpannedToken>, EvalError> {
                 let word: String = chars[start..i].iter().collect();
                 if let Ok(n) = word.parse::<i64>() {
                     tokens.push(SpannedToken { token: Token::Integer(n), span: start_span });
+                } else if let Some(slash_pos) = word.find('/') {
+                    if slash_pos > 0 && slash_pos < word.len() - 1 {
+                        if let (Ok(n), Ok(d)) = (word[..slash_pos].parse::<i64>(), word[slash_pos+1..].parse::<i64>()) {
+                            tokens.push(SpannedToken { token: Token::Rational(n, d), span: start_span });
+                        } else {
+                            tokens.push(SpannedToken { token: Token::Symbol(word), span: start_span });
+                        }
+                    } else {
+                        tokens.push(SpannedToken { token: Token::Symbol(word), span: start_span });
+                    }
+                } else if word.contains('.') {
+                    if let Ok(f) = word.parse::<f64>() {
+                        tokens.push(SpannedToken { token: Token::Float(f), span: start_span });
+                    } else {
+                        tokens.push(SpannedToken { token: Token::Symbol(word), span: start_span });
+                    }
                 } else {
                     tokens.push(SpannedToken { token: Token::Symbol(word), span: start_span });
                 }
@@ -316,6 +367,8 @@ struct Expr {
 #[derive(Debug, Clone)]
 enum ExprKind {
     Integer(i64),
+    Rational(i64, i64),
+    Float(f64),
     Boolean(bool),
     Str(String),
     Symbol(String),
@@ -331,6 +384,8 @@ fn parse(tokens: &[SpannedToken], pos: &mut usize) -> Result<Expr, EvalError> {
     let span = st.span;
     match &st.token {
         Token::Integer(n) => { let n = *n; *pos += 1; Ok(Expr { kind: ExprKind::Integer(n), span }) }
+        Token::Rational(n, d) => { let (n, d) = (*n, *d); *pos += 1; Ok(Expr { kind: ExprKind::Rational(n, d), span }) }
+        Token::Float(f) => { let f = *f; *pos += 1; Ok(Expr { kind: ExprKind::Float(f), span }) }
         Token::Boolean(b) => { let b = *b; *pos += 1; Ok(Expr { kind: ExprKind::Boolean(b), span }) }
         Token::Str(s) => { let s = s.clone(); *pos += 1; Ok(Expr { kind: ExprKind::Str(s), span }) }
         Token::Symbol(s) => { let s = s.clone(); *pos += 1; Ok(Expr { kind: ExprKind::Symbol(s), span }) }
@@ -376,6 +431,8 @@ fn parse_all(tokens: &[SpannedToken]) -> Result<Vec<Expr>, EvalError> {
 fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Rational(n, d) => make_rational(*n, *d),
+        ExprKind::Float(f) => Value::Float(*f),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Str(s) => Value::Str(s.clone()),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
@@ -401,6 +458,8 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
 fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Rational(n, d) => Ok(make_rational(*n, *d)),
+        ExprKind::Float(f) => Ok(Value::Float(*f)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Str(s) => Ok(Value::Str(s.clone())),
         ExprKind::Char(c) => Ok(Value::Char(*c)),
@@ -438,11 +497,11 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "-" => return eval_sub(&items[1..], env),
                     "*" => return eval_mul(&items[1..], env),
                     "/" => return eval_div(&items[1..], env),
-                    "<" => return eval_cmp(&items[1..], env, |a, b| a < b),
-                    ">" => return eval_cmp(&items[1..], env, |a, b| a > b),
-                    "=" => return eval_cmp(&items[1..], env, |a, b| a == b),
-                    "<=" => return eval_cmp(&items[1..], env, |a, b| a <= b),
-                    ">=" => return eval_cmp(&items[1..], env, |a, b| a >= b),
+                    "<" => return eval_cmp(&items[1..], env, |a: f64, b: f64| a < b),
+                    ">" => return eval_cmp(&items[1..], env, |a: f64, b: f64| a > b),
+                    "=" => return eval_cmp(&items[1..], env, |a: f64, b: f64| a == b),
+                    "<=" => return eval_cmp(&items[1..], env, |a: f64, b: f64| a <= b),
+                    ">=" => return eval_cmp(&items[1..], env, |a: f64, b: f64| a >= b),
                     "not" => return eval_not(&items[1..], env),
                     "and" => return eval_and(&items[1..], env),
                     "or" => return eval_or(&items[1..], env),
@@ -566,66 +625,59 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
 fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
         "+" => {
-            let mut sum = 0i64;
-            for a in args { sum += require_int(a)?; }
-            Ok(Value::Integer(sum))
+            let mut acc = NumVal::Int(0);
+            for a in args { acc = num_add(acc, to_num(a)?); }
+            Ok(num_to_value(acc))
         }
         "-" => {
             if args.is_empty() { return Err(EvalError::Arity("- requires at least 1 argument".into())); }
-            let first = require_int(&args[0])?;
-            if args.len() == 1 { return Ok(Value::Integer(-first)); }
-            let mut result = first;
-            for a in &args[1..] { result -= require_int(a)?; }
-            Ok(Value::Integer(result))
+            let first = to_num(&args[0])?;
+            if args.len() == 1 { return Ok(num_to_value(match first { NumVal::Int(n) => NumVal::Int(-n), NumVal::Rat(n,d) => NumVal::Rat(-n,d), NumVal::Flt(f) => NumVal::Flt(-f) })); }
+            let mut acc = first;
+            for a in &args[1..] { acc = num_sub(acc, to_num(a)?); }
+            Ok(num_to_value(acc))
         }
         "*" => {
-            let mut product = 1i64;
-            for a in args { product *= require_int(a)?; }
-            Ok(Value::Integer(product))
+            let mut acc = NumVal::Int(1);
+            for a in args { acc = num_mul(acc, to_num(a)?); }
+            Ok(num_to_value(acc))
         }
         "/" => {
             if args.is_empty() { return Err(EvalError::Arity("/ requires at least 1 argument".into())); }
-            let first = require_int(&args[0])?;
-            if args.len() == 1 {
-                if first == 0 { return Err(EvalError::DivisionByZero); }
-                return Ok(Value::Integer(1 / first));
-            }
-            let mut result = first;
-            for a in &args[1..] {
-                let d = require_int(a)?;
-                if d == 0 { return Err(EvalError::DivisionByZero); }
-                result /= d;
-            }
-            Ok(Value::Integer(result))
+            let first = to_num(&args[0])?;
+            if args.len() == 1 { return Ok(num_to_value(num_div(NumVal::Int(1), first)?)); }
+            let mut acc = first;
+            for a in &args[1..] { acc = num_div(acc, to_num(a)?)?; }
+            Ok(num_to_value(acc))
         }
         "=" => {
             if args.len() < 2 { return Err(EvalError::Arity("= requires at least 2 arguments".into())); }
-            let mut prev = require_int(&args[0])?;
-            for a in &args[1..] { let c = require_int(a)?; if prev != c { return Ok(Value::Boolean(false)); } prev = c; }
+            let mut prev = num_to_f64(to_num(&args[0])?);
+            for a in &args[1..] { let c = num_to_f64(to_num(a)?); if prev != c { return Ok(Value::Boolean(false)); } prev = c; }
             Ok(Value::Boolean(true))
         }
         "<" => {
             if args.len() < 2 { return Err(EvalError::Arity("< requires at least 2 arguments".into())); }
-            let mut prev = require_int(&args[0])?;
-            for a in &args[1..] { let c = require_int(a)?; if !(prev < c) { return Ok(Value::Boolean(false)); } prev = c; }
+            let mut prev = num_to_f64(to_num(&args[0])?);
+            for a in &args[1..] { let c = num_to_f64(to_num(a)?); if !(prev < c) { return Ok(Value::Boolean(false)); } prev = c; }
             Ok(Value::Boolean(true))
         }
         ">" => {
             if args.len() < 2 { return Err(EvalError::Arity("> requires at least 2 arguments".into())); }
-            let mut prev = require_int(&args[0])?;
-            for a in &args[1..] { let c = require_int(a)?; if !(prev > c) { return Ok(Value::Boolean(false)); } prev = c; }
+            let mut prev = num_to_f64(to_num(&args[0])?);
+            for a in &args[1..] { let c = num_to_f64(to_num(a)?); if !(prev > c) { return Ok(Value::Boolean(false)); } prev = c; }
             Ok(Value::Boolean(true))
         }
         "<=" => {
             if args.len() < 2 { return Err(EvalError::Arity("<= requires at least 2 arguments".into())); }
-            let mut prev = require_int(&args[0])?;
-            for a in &args[1..] { let c = require_int(a)?; if !(prev <= c) { return Ok(Value::Boolean(false)); } prev = c; }
+            let mut prev = num_to_f64(to_num(&args[0])?);
+            for a in &args[1..] { let c = num_to_f64(to_num(a)?); if !(prev <= c) { return Ok(Value::Boolean(false)); } prev = c; }
             Ok(Value::Boolean(true))
         }
         ">=" => {
             if args.len() < 2 { return Err(EvalError::Arity(">= requires at least 2 arguments".into())); }
-            let mut prev = require_int(&args[0])?;
-            for a in &args[1..] { let c = require_int(a)?; if !(prev >= c) { return Ok(Value::Boolean(false)); } prev = c; }
+            let mut prev = num_to_f64(to_num(&args[0])?);
+            for a in &args[1..] { let c = num_to_f64(to_num(a)?); if !(prev >= c) { return Ok(Value::Boolean(false)); } prev = c; }
             Ok(Value::Boolean(true))
         }
         "not" => {
@@ -712,12 +764,67 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             all_args.extend(tail);
             apply(proc, &all_args)
         }
-        "number?" => { if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Integer(_)))) }
+        "number?" => { if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Integer(_) | Value::Rational(_, _) | Value::Float(_)))) }
         "string?" => { if args.len() != 1 { return Err(EvalError::Arity("string? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Str(_)))) }
         "boolean?" => { if args.len() != 1 { return Err(EvalError::Arity("boolean? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Boolean(_)))) }
         "pair?" => { if args.len() != 1 { return Err(EvalError::Arity("pair? requires 1 argument".into())); } Ok(Value::Boolean(matches!(&args[0], Value::List(items) if !items.is_empty()) || matches!(&args[0], Value::Pair(_, _)))) }
         "symbol?" => { if args.len() != 1 { return Err(EvalError::Arity("symbol? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Symbol(_)))) }
         "char?" => { if args.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Char(_)))) }
+        "exact?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("exact? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(args[0], Value::Integer(_) | Value::Rational(_, _))))
+        }
+        "inexact?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("inexact? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(args[0], Value::Float(_))))
+        }
+        "integer?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("integer? requires 1 argument".into())); }
+            match &args[0] {
+                Value::Integer(_) => Ok(Value::Boolean(true)),
+                Value::Rational(_, d) => Ok(Value::Boolean(*d == 1)),
+                Value::Float(f) => Ok(Value::Boolean(f.fract() == 0.0)),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "rational?" => {
+            if args.len() != 1 { return Err(EvalError::Arity("rational? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(args[0], Value::Integer(_) | Value::Rational(_, _))))
+        }
+        "exact->inexact" => {
+            if args.len() != 1 { return Err(EvalError::Arity("exact->inexact requires 1 argument".into())); }
+            let n = to_num(&args[0])?;
+            Ok(Value::Float(num_to_f64(n)))
+        }
+        "inexact->exact" => {
+            if args.len() != 1 { return Err(EvalError::Arity("inexact->exact requires 1 argument".into())); }
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, d) => Ok(make_rational(*n, *d)),
+                Value::Float(f) => {
+                    // Convert float to rational via continued fraction approximation
+                    let (n, d) = float_to_rational(*f);
+                    Ok(make_rational(n, d))
+                }
+                other => Err(EvalError::Type(format!("inexact->exact: expected number, got {}", other))),
+            }
+        }
+        "numerator" => {
+            if args.len() != 1 { return Err(EvalError::Arity("numerator requires 1 argument".into())); }
+            match &args[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, _) => Ok(Value::Integer(*n)),
+                other => Err(EvalError::Type(format!("numerator: expected rational, got {}", other))),
+            }
+        }
+        "denominator" => {
+            if args.len() != 1 { return Err(EvalError::Arity("denominator requires 1 argument".into())); }
+            match &args[0] {
+                Value::Integer(_) => Ok(Value::Integer(1)),
+                Value::Rational(_, d) => Ok(Value::Integer(*d)),
+                other => Err(EvalError::Type(format!("denominator: expected rational, got {}", other))),
+            }
+        }
         "string-append" => {
             let mut result = String::new();
             for a in args {
@@ -731,7 +838,7 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         }
         "number->string" => {
             if args.len() != 1 { return Err(EvalError::Arity("number->string requires 1 argument".into())); }
-            Ok(Value::Str(require_int(&args[0])?.to_string()))
+            Ok(Value::Str(args[0].to_string()))
         }
         "symbol->string" => {
             if args.len() != 1 { return Err(EvalError::Arity("symbol->string requires 1 argument".into())); }
@@ -994,6 +1101,139 @@ fn eval_if(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     }
 }
 
+// ── Numeric Tower ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+enum NumVal {
+    Int(i64),
+    Rat(i64, i64),
+    Flt(f64),
+}
+
+fn to_num(v: &Value) -> Result<NumVal, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(NumVal::Int(*n)),
+        Value::Rational(n, d) => Ok(NumVal::Rat(*n, *d)),
+        Value::Float(f) => Ok(NumVal::Flt(*f)),
+        other => Err(EvalError::Type(format!("expected number, got {}", other))),
+    }
+}
+
+fn num_to_value(n: NumVal) -> Value {
+    match n {
+        NumVal::Int(i) => Value::Integer(i),
+        NumVal::Rat(n, d) => make_rational(n, d),
+        NumVal::Flt(f) => Value::Float(f),
+    }
+}
+
+fn num_to_f64(n: NumVal) -> f64 {
+    match n {
+        NumVal::Int(i) => i as f64,
+        NumVal::Rat(n, d) => n as f64 / d as f64,
+        NumVal::Flt(f) => f,
+    }
+}
+
+fn num_add(a: NumVal, b: NumVal) -> NumVal {
+    match (a, b) {
+        (NumVal::Int(x), NumVal::Int(y)) => NumVal::Int(x + y),
+        (NumVal::Rat(an, ad), NumVal::Rat(bn, bd)) => {
+            let n = an * bd + bn * ad;
+            let d = ad * bd;
+            let g = gcd(n.abs(), d.abs());
+            let d2 = d / g;
+            let n2 = n / g;
+            if d2 == 1 { NumVal::Int(n2) } else if d2 < 0 { NumVal::Rat(-n2, -d2) } else { NumVal::Rat(n2, d2) }
+        }
+        (NumVal::Int(x), NumVal::Rat(bn, bd)) | (NumVal::Rat(bn, bd), NumVal::Int(x)) => {
+            num_add(NumVal::Rat(x, 1), NumVal::Rat(bn, bd))
+        }
+        (NumVal::Flt(x), b) => NumVal::Flt(x + num_to_f64(b)),
+        (a, NumVal::Flt(y)) => NumVal::Flt(num_to_f64(a) + y),
+    }
+}
+
+fn num_sub(a: NumVal, b: NumVal) -> NumVal {
+    match (a, b) {
+        (NumVal::Int(x), NumVal::Int(y)) => NumVal::Int(x - y),
+        (a, b) => {
+            let neg_b = match b {
+                NumVal::Int(y) => NumVal::Int(-y),
+                NumVal::Rat(n, d) => NumVal::Rat(-n, d),
+                NumVal::Flt(f) => NumVal::Flt(-f),
+            };
+            num_add(a, neg_b)
+        }
+    }
+}
+
+fn num_mul(a: NumVal, b: NumVal) -> NumVal {
+    match (a, b) {
+        (NumVal::Int(x), NumVal::Int(y)) => NumVal::Int(x * y),
+        (NumVal::Rat(an, ad), NumVal::Rat(bn, bd)) => {
+            let n = an * bn;
+            let d = ad * bd;
+            let g = gcd(n.abs(), d.abs());
+            let d2 = d / g;
+            let n2 = n / g;
+            if d2 == 1 { NumVal::Int(n2) } else if d2 < 0 { NumVal::Rat(-n2, -d2) } else { NumVal::Rat(n2, d2) }
+        }
+        (NumVal::Int(x), NumVal::Rat(bn, bd)) | (NumVal::Rat(bn, bd), NumVal::Int(x)) => {
+            num_mul(NumVal::Rat(x, 1), NumVal::Rat(bn, bd))
+        }
+        (NumVal::Flt(x), b) => NumVal::Flt(x * num_to_f64(b)),
+        (a, NumVal::Flt(y)) => NumVal::Flt(num_to_f64(a) * y),
+    }
+}
+
+fn simplify_rat(n: i64, d: i64) -> NumVal {
+    let sign = if (n < 0) ^ (d < 0) { -1 } else { 1 };
+    let n = n.abs();
+    let d = d.abs();
+    let g = gcd(n, d);
+    let n = sign * (n / g);
+    let d = d / g;
+    if d == 1 { NumVal::Int(n) } else { NumVal::Rat(n, d) }
+}
+
+fn num_div(a: NumVal, b: NumVal) -> Result<NumVal, EvalError> {
+    match (a, b) {
+        (_, NumVal::Int(0)) | (_, NumVal::Rat(0, _)) => Err(EvalError::DivisionByZero),
+        (NumVal::Int(x), NumVal::Int(y)) => Ok(simplify_rat(x, y)),
+        (NumVal::Rat(an, ad), NumVal::Rat(bn, bd)) => {
+            // (an/ad) / (bn/bd) = an*bd / ad*bn
+            Ok(simplify_rat(an * bd, ad * bn))
+        }
+        (NumVal::Int(x), NumVal::Rat(bn, bd)) => {
+            Ok(simplify_rat(x * bd, bn))
+        }
+        (NumVal::Rat(an, ad), NumVal::Int(y)) => {
+            Ok(simplify_rat(an, ad * y))
+        }
+        (_, NumVal::Flt(f)) if f == 0.0 => Err(EvalError::DivisionByZero),
+        (NumVal::Flt(x), b) => Ok(NumVal::Flt(x / num_to_f64(b))),
+        (a, NumVal::Flt(y)) => Ok(NumVal::Flt(num_to_f64(a) / y)),
+    }
+}
+
+fn float_to_rational(f: f64) -> (i64, i64) {
+    if f == 0.0 { return (0, 1); }
+    let sign = if f < 0.0 { -1 } else { 1 };
+    let f = f.abs();
+    // Simple approach: multiply by powers of 2 until we get an integer, then simplify
+    let mut n = f;
+    let mut d = 1i64;
+    for _ in 0..53 {
+        if n == n.floor() { break; }
+        n *= 2.0;
+        d *= 2;
+    }
+    let ni = n.round() as i64;
+    let g = gcd(ni, d);
+    (sign * ni / g, d / g)
+}
+
 fn require_int(v: &Value) -> Result<i64, EvalError> {
     match v {
         Value::Integer(n) => Ok(*n),
@@ -1024,7 +1264,12 @@ fn require_list(v: &Value) -> Result<Vec<Value>, EvalError> {
 
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Integer(_) | Value::Rational(_, _) | Value::Float(_),
+         Value::Integer(_) | Value::Rational(_, _) | Value::Float(_)) => {
+            let na = to_num(a).unwrap();
+            let nb = to_num(b).unwrap();
+            num_to_f64(na) == num_to_f64(nb)
+        }
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
@@ -1041,65 +1286,62 @@ fn is_truthy(v: &Value) -> bool {
 }
 
 fn eval_add(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut sum = 0i64;
+    let mut acc = NumVal::Int(0);
     for a in args {
-        sum += require_int(&eval(a, env)?)?;
+        acc = num_add(acc, to_num(&eval(a, env)?)?);
     }
-    Ok(Value::Integer(sum))
+    Ok(num_to_value(acc))
 }
 
 fn eval_sub(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("- requires at least 1 argument".into()));
     }
-    let first = require_int(&eval(&args[0], env)?)?;
+    let first = to_num(&eval(&args[0], env)?)?;
     if args.len() == 1 {
-        return Ok(Value::Integer(-first));
+        return Ok(num_to_value(match first {
+            NumVal::Int(n) => NumVal::Int(-n),
+            NumVal::Rat(n, d) => NumVal::Rat(-n, d),
+            NumVal::Flt(f) => NumVal::Flt(-f),
+        }));
     }
-    let mut result = first;
+    let mut acc = first;
     for a in &args[1..] {
-        result -= require_int(&eval(a, env)?)?;
+        acc = num_sub(acc, to_num(&eval(a, env)?)?);
     }
-    Ok(Value::Integer(result))
+    Ok(num_to_value(acc))
 }
 
 fn eval_mul(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut product = 1i64;
+    let mut acc = NumVal::Int(1);
     for a in args {
-        product *= require_int(&eval(a, env)?)?;
+        acc = num_mul(acc, to_num(&eval(a, env)?)?);
     }
-    Ok(Value::Integer(product))
+    Ok(num_to_value(acc))
 }
 
 fn eval_div(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("/ requires at least 1 argument".into()));
     }
-    let first = require_int(&eval(&args[0], env)?)?;
+    let first = to_num(&eval(&args[0], env)?)?;
     if args.len() == 1 {
-        if first == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        return Ok(Value::Integer(1 / first));
+        return Ok(num_to_value(num_div(NumVal::Int(1), first)?));
     }
-    let mut result = first;
+    let mut acc = first;
     for a in &args[1..] {
-        let d = require_int(&eval(a, env)?)?;
-        if d == 0 {
-            return Err(EvalError::DivisionByZero);
-        }
-        result /= d;
+        acc = num_div(acc, to_num(&eval(a, env)?)?)?;
     }
-    Ok(Value::Integer(result))
+    Ok(num_to_value(acc))
 }
 
-fn eval_cmp(args: &[Expr], env: &Env, cmp: fn(i64, i64) -> bool) -> Result<Value, EvalError> {
+fn eval_cmp(args: &[Expr], env: &Env, cmp: fn(f64, f64) -> bool) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("comparison requires at least 2 arguments".into()));
     }
-    let mut prev = require_int(&eval(&args[0], env)?)?;
+    let mut prev = num_to_f64(to_num(&eval(&args[0], env)?)?);
     for a in &args[1..] {
-        let curr = require_int(&eval(a, env)?)?;
+        let curr = num_to_f64(to_num(&eval(a, env)?)?);
         if !cmp(prev, curr) {
             return Ok(Value::Boolean(false));
         }
@@ -1318,7 +1560,7 @@ fn eval_type_pred(args: &[Expr], env: &Env, kind: &str) -> Result<Value, EvalErr
     }
     let val = eval(&args[0], env)?;
     let result = match kind {
-        "number" => matches!(val, Value::Integer(_)),
+        "number" => matches!(val, Value::Integer(_) | Value::Rational(_, _) | Value::Float(_)),
         "string" => matches!(val, Value::Str(_)),
         "boolean" => matches!(val, Value::Boolean(_)),
         "pair" => matches!(val, Value::List(ref items) if !items.is_empty()) || matches!(val, Value::Pair(_, _)),
@@ -1424,8 +1666,8 @@ fn eval_number_to_string(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::Arity("number->string requires exactly 1 argument".into()));
     }
-    let n = require_int(&eval(&args[0], env)?)?;
-    Ok(Value::Str(n.to_string()))
+    let v = eval(&args[0], env)?;
+    Ok(Value::Str(v.to_string()))
 }
 
 fn eval_symbol_to_string(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
@@ -1621,6 +1863,8 @@ fn match_pat_single(pat: &Expr, inp: &Expr, literals: &[String], bindings: &mut 
             }
         }
         ExprKind::Integer(n) => matches!(&inp.kind, ExprKind::Integer(m) if n == m),
+        ExprKind::Rational(n, d) => matches!(&inp.kind, ExprKind::Rational(n2, d2) if n == n2 && d == d2),
+        ExprKind::Float(f) => matches!(&inp.kind, ExprKind::Float(g) if f == g),
         ExprKind::Boolean(b) => matches!(&inp.kind, ExprKind::Boolean(c) if b == c),
         ExprKind::Str(s) => matches!(&inp.kind, ExprKind::Str(t) if s == t),
         ExprKind::Char(c) => matches!(&inp.kind, ExprKind::Char(d) if c == d),
@@ -1745,6 +1989,10 @@ fn seed_builtins(env: &Env) {
         "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
         "char=?", "char<?",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+        // L11
+        "exact?", "inexact?", "integer?", "rational?",
+        "exact->inexact", "inexact->exact",
+        "numerator", "denominator",
     ] {
         env.set(name.to_string(), Value::Builtin(name.to_string()));
     }
