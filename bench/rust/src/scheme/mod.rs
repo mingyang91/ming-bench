@@ -7,6 +7,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
+thread_local! {
+    static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+}
+
+fn output_write(s: &str) {
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().push_str(s));
+}
+
 // ── Environment ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -71,6 +79,7 @@ pub enum Value {
     Boolean(bool),
     Str(String),
     Symbol(String),
+    Char(char),
     List(Vec<Value>),
     Lambda(Vec<String>, Vec<Expr>, Env),
     Void,
@@ -83,6 +92,7 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
+            (Value::Char(a), Value::Char(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Void, Value::Void) => true,
             _ => false,
@@ -98,6 +108,7 @@ impl fmt::Display for Value {
             Value::Boolean(false) => write!(f, "#f"),
             Value::Str(s) => write!(f, "\"{}\"", s),
             Value::Symbol(s) => write!(f, "{}", s),
+            Value::Char(c) => write!(f, "#\\{}", c),
             Value::List(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
@@ -382,6 +393,18 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "boolean?" => return eval_type_pred(&items[1..], env, "boolean"),
                     "pair?" => return eval_type_pred(&items[1..], env, "pair"),
                     "symbol?" => return eval_type_pred(&items[1..], env, "symbol"),
+                    "char?" => return eval_type_pred(&items[1..], env, "char"),
+                    "display" => return eval_display(&items[1..], env),
+                    "write" => return eval_write(&items[1..], env),
+                    "newline" => return eval_newline(&items[1..]),
+                    "string-append" => return eval_string_append(&items[1..], env),
+                    "string-length" => return eval_string_length(&items[1..], env),
+                    "substring" => return eval_substring(&items[1..], env),
+                    "string->number" => return eval_string_to_number(&items[1..], env),
+                    "number->string" => return eval_number_to_string(&items[1..], env),
+                    "symbol->string" => return eval_symbol_to_string(&items[1..], env),
+                    "string->symbol" => return eval_string_to_symbol(&items[1..], env),
+                    "string-ref" => return eval_string_ref(&items[1..], env),
                     _ => {}
                 }
             }
@@ -759,16 +782,161 @@ fn eval_type_pred(args: &[Expr], env: &Env, kind: &str) -> Result<Value, EvalErr
         "boolean" => matches!(val, Value::Boolean(_)),
         "pair" => matches!(val, Value::List(ref items) if !items.is_empty()),
         "symbol" => matches!(val, Value::Symbol(_)),
+        "char" => matches!(val, Value::Char(_)),
         _ => false,
     };
     Ok(Value::Boolean(result))
 }
 
+// ── Display / Write / Newline ────────────────────────────────────────
+
+fn display_value(val: &Value) -> String {
+    match val {
+        Value::Str(s) => s.clone(), // no quotes
+        Value::Char(c) => c.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn eval_display(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("display requires exactly 1 argument".into()));
+    }
+    let val = eval(&args[0], env)?;
+    output_write(&display_value(&val));
+    Ok(Value::Void)
+}
+
+fn eval_write(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("write requires exactly 1 argument".into()));
+    }
+    let val = eval(&args[0], env)?;
+    output_write(&val.to_string());
+    Ok(Value::Void)
+}
+
+fn eval_newline(args: &[Expr]) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Arity("newline takes no arguments".into()));
+    }
+    output_write("\n");
+    Ok(Value::Void)
+}
+
+// ── String / Symbol / Char operations ───────────────────────────────
+
+fn eval_string_append(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut result = String::new();
+    for a in args {
+        match eval(a, env)? {
+            Value::Str(s) => result.push_str(&s),
+            other => return Err(EvalError::Type(format!("string-append: expected string, got {}", other))),
+        }
+    }
+    Ok(Value::Str(result))
+}
+
+fn eval_string_length(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string-length requires exactly 1 argument".into()));
+    }
+    match eval(&args[0], env)? {
+        Value::Str(s) => Ok(Value::Integer(s.len() as i64)),
+        other => Err(EvalError::Type(format!("string-length: expected string, got {}", other))),
+    }
+}
+
+fn eval_substring(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity("substring requires exactly 3 arguments".into()));
+    }
+    let s = match eval(&args[0], env)? {
+        Value::Str(s) => s,
+        other => return Err(EvalError::Type(format!("substring: expected string, got {}", other))),
+    };
+    let start = require_int(&eval(&args[1], env)?)? as usize;
+    let end = require_int(&eval(&args[2], env)?)? as usize;
+    if start > end || end > s.len() {
+        return Err(EvalError::Generic(format!("substring: index out of range")));
+    }
+    Ok(Value::Str(s[start..end].to_string()))
+}
+
+fn eval_string_to_number(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->number requires exactly 1 argument".into()));
+    }
+    match eval(&args[0], env)? {
+        Value::Str(s) => {
+            match s.parse::<i64>() {
+                Ok(n) => Ok(Value::Integer(n)),
+                Err(_) => Ok(Value::Boolean(false)),
+            }
+        }
+        other => Err(EvalError::Type(format!("string->number: expected string, got {}", other))),
+    }
+}
+
+fn eval_number_to_string(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("number->string requires exactly 1 argument".into()));
+    }
+    let n = require_int(&eval(&args[0], env)?)?;
+    Ok(Value::Str(n.to_string()))
+}
+
+fn eval_symbol_to_string(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("symbol->string requires exactly 1 argument".into()));
+    }
+    match eval(&args[0], env)? {
+        Value::Symbol(s) => Ok(Value::Str(s)),
+        other => Err(EvalError::Type(format!("symbol->string: expected symbol, got {}", other))),
+    }
+}
+
+fn eval_string_to_symbol(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->symbol requires exactly 1 argument".into()));
+    }
+    match eval(&args[0], env)? {
+        Value::Str(s) => Ok(Value::Symbol(s)),
+        other => Err(EvalError::Type(format!("string->symbol: expected string, got {}", other))),
+    }
+}
+
+fn eval_string_ref(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("string-ref requires exactly 2 arguments".into()));
+    }
+    let s = match eval(&args[0], env)? {
+        Value::Str(s) => s,
+        other => return Err(EvalError::Type(format!("string-ref: expected string, got {}", other))),
+    };
+    let idx = require_int(&eval(&args[1], env)?)? as usize;
+    match s.chars().nth(idx) {
+        Some(c) => Ok(Value::Char(c)),
+        None => Err(EvalError::Generic(format!("string-ref: index {} out of range", idx))),
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────
 
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    let result = eval_str(input)?;
-    Ok((result, String::new()))
+    OUTPUT_BUFFER.with(|buf| buf.borrow_mut().clear());
+    let tokens = tokenize(input)?;
+    let exprs = parse_all(&tokens)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("no expressions".into()));
+    }
+    let env = Env::new();
+    let mut last = Value::Void;
+    for expr in &exprs {
+        last = eval(expr, &env)?;
+    }
+    let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
+    Ok((last.to_string(), output))
 }
 
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
