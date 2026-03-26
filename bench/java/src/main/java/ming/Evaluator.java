@@ -201,6 +201,7 @@ public class Evaluator {
 
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, environment);
+                case "define-record-type" -> evalDefineRecordType(arguments, environment);
                 case "set!" -> evalSet(arguments, environment);
                 case "if" -> evalIf(arguments, environment);
                 case "quote" -> evalQuote(arguments);
@@ -288,6 +289,128 @@ public class Evaluator {
         environment.defineMacro(
                 symbolExpr.name(),
                 parseMacroDefinition(symbolExpr.name(), arguments.get(1), environment));
+        return VoidValue.INSTANCE;
+    }
+
+    private Value evalDefineRecordType(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.size() < 3) {
+            throw new EvalError(
+                    "define-record-type expected a type name, constructor, predicate, and fields");
+        }
+
+        Expr typeNameExpression = arguments.get(0);
+        if (!(typeNameExpression instanceof SymbolExpr typeNameSymbol)) {
+            throw new EvalError("define-record-type expected a type name");
+        }
+
+        Expr constructorExpression = arguments.get(1);
+        if (!(constructorExpression instanceof ListExpr constructorList)) {
+            throw new EvalError("define-record-type expected a constructor specification");
+        }
+
+        List<Expr> constructorElements = constructorList.elements();
+        if (constructorElements.isEmpty()) {
+            throw new EvalError("define-record-type expected a constructor name");
+        }
+
+        Expr constructorNameExpression = constructorElements.getFirst();
+        if (!(constructorNameExpression instanceof SymbolExpr constructorSymbol)) {
+            throw new EvalError("define-record-type expected a constructor name");
+        }
+
+        for (int i = 1; i < constructorElements.size(); i++) {
+            if (!(constructorElements.get(i) instanceof SymbolExpr)) {
+                throw new EvalError("define-record-type constructor fields must be symbols");
+            }
+        }
+
+        Expr predicateExpression = arguments.get(2);
+        if (!(predicateExpression instanceof SymbolExpr predicateSymbol)) {
+            throw new EvalError("define-record-type expected a predicate name");
+        }
+
+        List<String> accessorNames = new ArrayList<>(arguments.size() - 3);
+        List<String> mutatorNames = new ArrayList<>(arguments.size() - 3);
+        for (int i = 3; i < arguments.size(); i++) {
+            Expr fieldExpression = arguments.get(i);
+            if (!(fieldExpression instanceof ListExpr fieldList)) {
+                throw new EvalError("define-record-type field specifications must be lists");
+            }
+
+            List<Expr> fieldElements = fieldList.elements();
+            if (fieldElements.size() < 2 || fieldElements.size() > 3) {
+                throw new EvalError(
+                        "define-record-type fields must have a name, accessor, and optional mutator");
+            }
+
+            if (!(fieldElements.getFirst() instanceof SymbolExpr)) {
+                throw new EvalError("define-record-type field names must be symbols");
+            }
+            if (!(fieldElements.get(1) instanceof SymbolExpr accessorSymbol)) {
+                throw new EvalError("define-record-type accessor names must be symbols");
+            }
+
+            String mutatorName = null;
+            if (fieldElements.size() == 3) {
+                if (!(fieldElements.get(2) instanceof SymbolExpr mutatorSymbol)) {
+                    throw new EvalError("define-record-type mutator names must be symbols");
+                }
+                mutatorName = mutatorSymbol.name();
+            }
+
+            accessorNames.add(accessorSymbol.name());
+            mutatorNames.add(mutatorName);
+        }
+
+        int fieldCount = accessorNames.size();
+        if (constructorElements.size() - 1 != fieldCount) {
+            throw new EvalError("define-record-type constructor arity does not match field count");
+        }
+
+        String constructorName = constructorSymbol.name();
+        String predicateName = predicateSymbol.name();
+        RecordTypeDescriptor recordType = new RecordTypeDescriptor(typeNameSymbol.name(), fieldCount);
+
+        environment.define(
+                constructorName,
+                new PrimitiveProcedureValue(constructorName, values -> {
+                    requireExactArity(constructorName, values.size(), fieldCount);
+                    return new RecordValue(recordType, values);
+                }));
+
+        environment.define(
+                predicateName,
+                new PrimitiveProcedureValue(predicateName, values -> {
+                    requireExactArity(predicateName, values.size(), 1);
+                    return new BoolValue(values.getFirst() instanceof RecordValue recordValue
+                            && recordValue.type() == recordType);
+                }));
+
+        for (int i = 0; i < fieldCount; i++) {
+            int fieldIndex = i;
+            String accessorName = accessorNames.get(i);
+            environment.define(
+                    accessorName,
+                    new PrimitiveProcedureValue(accessorName, values -> {
+                        requireExactArity(accessorName, values.size(), 1);
+                        return expectRecord(values.getFirst(), recordType, accessorName).field(fieldIndex);
+                    }));
+
+            String mutatorName = mutatorNames.get(i);
+            if (mutatorName == null) {
+                continue;
+            }
+
+            environment.define(
+                    mutatorName,
+                    new PrimitiveProcedureValue(mutatorName, values -> {
+                        requireExactArity(mutatorName, values.size(), 2);
+                        RecordValue recordValue = expectRecord(values.getFirst(), recordType, mutatorName);
+                        recordValue.setField(fieldIndex, values.get(1));
+                        return VoidValue.INSTANCE;
+                    }));
+        }
+
         return VoidValue.INSTANCE;
     }
 
@@ -1003,6 +1126,7 @@ public class Evaluator {
         return switch (name) {
             case "define",
                     "define-syntax",
+                    "define-record-type",
                     "if",
                     "quote",
                     "lambda",
@@ -1706,6 +1830,15 @@ public class Evaluator {
                     && equalValue(leftPair.cdr(), rightPair.cdr());
         }
         return false;
+    }
+
+    private RecordValue expectRecord(Value value,
+                                     RecordTypeDescriptor recordType,
+                                     String operator) throws EvalError {
+        if (value instanceof RecordValue recordValue && recordValue.type() == recordType) {
+            return recordValue;
+        }
+        throw new EvalError(operator + " expects a " + recordType.name() + " record");
     }
 
     private void requireNonZeroDivisor(String operator, long divisor) throws EvalError {

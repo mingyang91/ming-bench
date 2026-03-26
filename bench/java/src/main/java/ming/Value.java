@@ -1,9 +1,10 @@
 package ming;
 
+import java.util.ArrayList;
 import java.util.List;
 
 sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue, ListValue,
-        PairValue, CharValue, VoidValue, ProcedureValue {
+        PairValue, CharValue, VoidValue, ProcedureValue, RecordValue {
     String render();
 
     default boolean isTruthy() {
@@ -201,6 +202,44 @@ record PairValue(Value car, Value cdr) implements Value {
         }
 
         builder.append(value.render());
+    }
+}
+
+record RecordTypeDescriptor(String name, int fieldCount) {
+    RecordTypeDescriptor {
+        if (fieldCount < 0) {
+            throw new IllegalArgumentException("field count must be non-negative");
+        }
+    }
+}
+
+final class RecordValue implements Value {
+    private final RecordTypeDescriptor type;
+    private final List<Value> fields;
+
+    RecordValue(RecordTypeDescriptor type, List<Value> fields) {
+        if (type.fieldCount() != fields.size()) {
+            throw new IllegalArgumentException("field count does not match record type");
+        }
+        this.type = type;
+        this.fields = new ArrayList<>(fields);
+    }
+
+    RecordTypeDescriptor type() {
+        return type;
+    }
+
+    Value field(int index) {
+        return fields.get(index);
+    }
+
+    void setField(int index, Value value) {
+        fields.set(index, value);
+    }
+
+    @Override
+    public String render() {
+        return "#<record:" + type.name() + ">";
     }
 }
 
