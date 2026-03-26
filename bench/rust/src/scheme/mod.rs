@@ -219,6 +219,7 @@ enum Builtin {
     StringToSymbol,
     StringRef,
     CharPred,
+    Apply,
 }
 
 impl Builtin {
@@ -259,12 +260,19 @@ impl Builtin {
             Self::StringToSymbol => "string->symbol",
             Self::StringRef => "string-ref",
             Self::CharPred => "char?",
+            Self::Apply => "apply",
         }
     }
 }
 
+#[derive(Clone)]
+struct ParameterSpec {
+    required: Vec<String>,
+    rest: Option<String>,
+}
+
 struct Closure {
-    params: Vec<String>,
+    params: ParameterSpec,
     body: Vec<Expr>,
     env: EnvRef,
 }
@@ -321,6 +329,7 @@ impl Env {
             ("string->symbol", Builtin::StringToSymbol),
             ("string-ref", Builtin::StringRef),
             ("char?", Builtin::CharPred),
+            ("apply", Builtin::Apply),
         ] {
             env.define(name.into(), Value::Builtin(builtin));
         }
@@ -708,6 +717,7 @@ fn eval_builtin(
         Builtin::CharPred => eval_type_predicate(arguments, env, "char?", call_pos, |value| {
             matches!(value, Value::Char(_))
         }),
+        Builtin::Apply => eval_apply_builtin(arguments, env, call_pos),
     }
 }
 
@@ -726,19 +736,36 @@ fn apply_closure_values(
     argument_values: Vec<Value>,
     call_pos: SourcePos,
 ) -> Result<Value, EvalError> {
-    if argument_values.len() != closure.params.len() {
+    let required = closure.params.required.len();
+    let has_rest = closure.params.rest.is_some();
+
+    if (!has_rest && argument_values.len() != required)
+        || (has_rest && argument_values.len() < required)
+    {
         return Err(EvalError::WrongArgCount {
             name: "procedure".into(),
-            expected: format!("exactly {}", closure.params.len()),
+            expected: if has_rest {
+                format!("at least {required}")
+            } else {
+                format!("exactly {required}")
+            },
             got: argument_values.len(),
         }
         .with_offset(call_pos.offset));
     }
 
     let call_env = Env::child(&closure.env);
+    let mut argument_values = argument_values.into_iter();
 
-    for (param, value) in closure.params.iter().cloned().zip(argument_values) {
-        call_env.define(param, value);
+    for param in &closure.params.required {
+        let value = argument_values
+            .next()
+            .expect("required argument count already validated");
+        call_env.define(param.clone(), value);
+    }
+
+    if let Some(rest_param) = &closure.params.rest {
+        call_env.define(rest_param.clone(), Value::List(argument_values.collect()));
     }
 
     eval_sequence(&closure.body, &call_env)
@@ -971,7 +998,10 @@ fn eval_named_let(
         .map(|(binding, _)| binding.clone())
         .collect();
     let closure = Rc::new(Closure {
-        params,
+        params: ParameterSpec {
+            required: params,
+            rest: None,
+        },
         body: body.to_vec(),
         env: named_env.clone(),
     });
@@ -1059,28 +1089,138 @@ fn eval_cond(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
-fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
-    let ExprKind::List(params) = &expr.kind else {
-        return Err(EvalError::InvalidSyntax {
+fn parse_param_list(expr: &Expr) -> Result<ParameterSpec, EvalError> {
+    match &expr.kind {
+        ExprKind::List(params) => parse_params(params),
+        ExprKind::Symbol(name) => Ok(ParameterSpec {
+            required: Vec::new(),
+            rest: Some(name.clone()),
+        }),
+        _ => Err(EvalError::InvalidSyntax {
             message: "lambda: expected parameter list".into(),
         }
-        .with_offset(expr.pos.offset));
-    };
-
-    parse_params(params)
+        .with_offset(expr.pos.offset)),
+    }
 }
 
-fn parse_params(params: &[Expr]) -> Result<Vec<String>, EvalError> {
-    params
-        .iter()
-        .map(|param| match &param.kind {
-            ExprKind::Symbol(name) => Ok(name.clone()),
-            _ => Err(EvalError::InvalidSyntax {
-                message: "lambda: parameters must be symbols".into(),
+fn parse_params(params: &[Expr]) -> Result<ParameterSpec, EvalError> {
+    let mut required = Vec::new();
+    let mut index = 0;
+
+    while index < params.len() {
+        match &params[index].kind {
+            ExprKind::Symbol(name) if name == "." => {
+                if index + 2 != params.len() {
+                    return Err(EvalError::InvalidSyntax {
+                        message: "lambda: invalid parameter list".into(),
+                    }
+                    .with_offset(params[index].pos.offset));
+                }
+
+                let rest_param = match &params[index + 1].kind {
+                    ExprKind::Symbol(name) if name != "." => name.clone(),
+                    _ => {
+                        return Err(EvalError::InvalidSyntax {
+                            message: "lambda: parameters must be symbols".into(),
+                        }
+                        .with_offset(params[index + 1].pos.offset))
+                    }
+                };
+
+                return Ok(ParameterSpec {
+                    required,
+                    rest: Some(rest_param),
+                });
             }
-            .with_offset(param.pos.offset)),
-        })
-        .collect()
+            ExprKind::Symbol(name) => required.push(name.clone()),
+            _ => {
+                return Err(EvalError::InvalidSyntax {
+                    message: "lambda: parameters must be symbols".into(),
+                }
+                .with_offset(params[index].pos.offset))
+            }
+        }
+
+        index += 1;
+    }
+
+    Ok(ParameterSpec {
+        required,
+        rest: None,
+    })
+}
+
+fn eval_apply_builtin(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let Some((procedure_expr, rest_arguments)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "apply".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    if rest_arguments.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "apply".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(call_pos.offset));
+    }
+
+    let procedure = eval_expr(procedure_expr, env)?;
+    let (list_expr, prefix_exprs) = rest_arguments
+        .split_last()
+        .expect("rest arguments are known to be non-empty");
+    let mut values = eval_args(prefix_exprs, env)?;
+
+    match eval_expr(list_expr, env)? {
+        Value::List(mut rest_values) => values.append(&mut rest_values),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                expected: "list".into(),
+                found: other.kind().into(),
+            }
+            .with_offset(list_expr.pos.offset))
+        }
+    }
+
+    apply_value_with_values(procedure, values, env, procedure_expr.pos)
+}
+
+fn apply_value_with_values(
+    value: Value,
+    argument_values: Vec<Value>,
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    match value {
+        Value::Builtin(_) | Value::Procedure(_) => {
+            let apply_env = Env::child(env);
+            let procedure_name = "__apply_procedure".to_string();
+            apply_env.define(procedure_name.clone(), value);
+
+            let mut application = Vec::with_capacity(argument_values.len() + 1);
+            application.push(Expr::symbol(procedure_name, call_pos));
+
+            for (index, argument) in argument_values.into_iter().enumerate() {
+                let arg_name = format!("__apply_arg_{index}");
+                apply_env.define(arg_name.clone(), argument);
+                application.push(Expr::symbol(arg_name, call_pos));
+            }
+
+            eval_application(call_pos, &application, &apply_env)
+        }
+        other => Err(EvalError::NotAProcedure {
+            found: other.kind().into(),
+        }
+        .with_offset(call_pos.offset)),
+    }
 }
 
 fn eval_add(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
