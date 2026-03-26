@@ -1,15 +1,35 @@
 package ming
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // Env represents a Scheme environment (scope).
 type Env struct {
 	bindings map[string]*Value
 	parent   *Env
+	output   *strings.Builder // shared output buffer for display/write/newline
 }
 
 func NewEnv(parent *Env) *Env {
-	return &Env{bindings: make(map[string]*Value), parent: parent}
+	e := &Env{bindings: make(map[string]*Value), parent: parent}
+	if parent != nil {
+		e.output = parent.output
+	}
+	return e
+}
+
+// GetOutput returns the shared output buffer, walking up to the root.
+func (e *Env) GetOutput() *strings.Builder {
+	if e.output != nil {
+		return e.output
+	}
+	if e.parent != nil {
+		return e.parent.GetOutput()
+	}
+	return nil
 }
 
 func (e *Env) Get(name string) (*Value, bool) {
@@ -98,6 +118,15 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 	// Dispatch builtins
 	if op.Type == TypeSymbol && len(op.StrVal) > 10 && op.StrVal[:10] == "__builtin:" {
 		name := op.StrVal[10:]
+		// I/O builtins need env access for output buffer
+		switch name {
+		case "display":
+			return builtinDisplay(args, expr, env)
+		case "write":
+			return builtinWrite(args, expr, env)
+		case "newline":
+			return builtinNewline(args, expr, env)
+		}
 		if fn, ok := builtinRegistry[name]; ok {
 			return fn(args, expr)
 		}
@@ -185,6 +214,20 @@ func MakeDefaultEnv() *Env {
 		"boolean?": builtinBooleanQ,
 		"pair?":    builtinPairQ,
 		"symbol?":  builtinSymbolQ,
+		// L05 builtins
+		"string-append":   builtinStringAppend,
+		"string-length":   builtinStringLength,
+		"substring":       builtinSubstring,
+		"string->number":  builtinStringToNumber,
+		"number->string":  builtinNumberToString,
+		"symbol->string":  builtinSymbolToString,
+		"string->symbol":  builtinStringToSymbol,
+		"string-ref":      builtinStringRef,
+		"char?":           builtinCharQ,
+		// I/O builtins (dispatch is special-cased in evalList, but need env registration)
+		"display": nil,
+		"write":   nil,
+		"newline": nil,
 	}
 
 	for name, fn := range builtins {
@@ -638,6 +681,120 @@ func builtinSymbolQ(args []*Value, expr *Expr) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: symbol?: expected 1 argument", expr.Line, expr.Col)
 	}
 	return BoolValue(args[0].Type == TypeSymbol), nil
+}
+
+// L05 builtins
+
+func builtinDisplay(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: display: expected 1 argument", expr.Line, expr.Col)
+	}
+	if buf := env.GetOutput(); buf != nil {
+		buf.WriteString(args[0].DisplayString())
+	}
+	return Void, nil
+}
+
+func builtinWrite(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: write: expected 1 argument", expr.Line, expr.Col)
+	}
+	if buf := env.GetOutput(); buf != nil {
+		buf.WriteString(args[0].String())
+	}
+	return Void, nil
+}
+
+func builtinNewline(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) != 0 {
+		return nil, fmt.Errorf("%d:%d: newline: expected 0 arguments", expr.Line, expr.Col)
+	}
+	if buf := env.GetOutput(); buf != nil {
+		buf.WriteString("\n")
+	}
+	return Void, nil
+}
+
+func builtinStringAppend(args []*Value, expr *Expr) (*Value, error) {
+	var sb strings.Builder
+	for _, a := range args {
+		if a.Type != TypeString {
+			return nil, fmt.Errorf("%d:%d: string-append: expected string", expr.Line, expr.Col)
+		}
+		sb.WriteString(a.StrVal)
+	}
+	return StringValue(sb.String()), nil
+}
+
+func builtinStringLength(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string-length: expected 1 string argument", expr.Line, expr.Col)
+	}
+	return IntValue(int64(len([]rune(args[0].StrVal)))), nil
+}
+
+func builtinSubstring(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 3 || args[0].Type != TypeString || args[1].Type != TypeInt || args[2].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: substring: expected string, int, int", expr.Line, expr.Col)
+	}
+	runes := []rune(args[0].StrVal)
+	start := int(args[1].IntVal)
+	end := int(args[2].IntVal)
+	if start < 0 || end < start || end > len(runes) {
+		return nil, fmt.Errorf("%d:%d: substring: index out of range", expr.Line, expr.Col)
+	}
+	return StringValue(string(runes[start:end])), nil
+}
+
+func builtinStringToNumber(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string->number: expected 1 string argument", expr.Line, expr.Col)
+	}
+	n, err := strconv.ParseInt(args[0].StrVal, 10, 64)
+	if err != nil {
+		return BoolValue(false), nil
+	}
+	return IntValue(n), nil
+}
+
+func builtinNumberToString(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: number->string: expected 1 number argument", expr.Line, expr.Col)
+	}
+	return StringValue(strconv.FormatInt(args[0].IntVal, 10)), nil
+}
+
+func builtinSymbolToString(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeSymbol {
+		return nil, fmt.Errorf("%d:%d: symbol->string: expected 1 symbol argument", expr.Line, expr.Col)
+	}
+	return StringValue(args[0].StrVal), nil
+}
+
+func builtinStringToSymbol(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string->symbol: expected 1 string argument", expr.Line, expr.Col)
+	}
+	return SymbolValue(args[0].StrVal), nil
+}
+
+func builtinStringRef(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: string-ref: expected string and int", expr.Line, expr.Col)
+	}
+	runes := []rune(args[0].StrVal)
+	idx := int(args[1].IntVal)
+	if idx < 0 || idx >= len(runes) {
+		return nil, fmt.Errorf("%d:%d: string-ref: index out of range", expr.Line, expr.Col)
+	}
+	return CharValue(runes[idx]), nil
+}
+
+func builtinCharQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: char?: expected 1 argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].Type == TypeChar), nil
 }
 
 func evalLambda(expr *Expr, env *Env) (*Value, error) {

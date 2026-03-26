@@ -14,6 +14,7 @@ const (
 	TypeNil // empty list
 	TypeVoid
 	TypeLambda
+	TypeChar
 )
 
 // Value represents a Scheme value.
@@ -33,10 +34,11 @@ type Value struct {
 var Void = &Value{Type: TypeVoid}
 var Nil = &Value{Type: TypeNil}
 
-func IntValue(n int64) *Value   { return &Value{Type: TypeInt, IntVal: n} }
-func BoolValue(b bool) *Value   { return &Value{Type: TypeBool, BoolVal: b} }
+func IntValue(n int64) *Value    { return &Value{Type: TypeInt, IntVal: n} }
+func BoolValue(b bool) *Value    { return &Value{Type: TypeBool, BoolVal: b} }
 func StringValue(s string) *Value { return &Value{Type: TypeString, StrVal: s} }
 func SymbolValue(s string) *Value { return &Value{Type: TypeSymbol, StrVal: s} }
+func CharValue(r rune) *Value    { return &Value{Type: TypeChar, IntVal: int64(r)} }
 
 func (v *Value) String() string {
 	switch v.Type {
@@ -57,6 +59,8 @@ func (v *Value) String() string {
 		return ""
 	case TypeLambda:
 		return "#<procedure>"
+	case TypeChar:
+		return fmt.Sprintf("#\\%c", rune(v.IntVal))
 	case TypePair:
 		return "(" + pairInner(v) + ")"
 	default:
@@ -73,6 +77,32 @@ func pairInner(v *Value) string {
 		return s + " " + pairInner(v.Cdr)
 	default:
 		return s + " . " + v.Cdr.String()
+	}
+}
+
+// DisplayString returns the display representation (no quotes on strings).
+func (v *Value) DisplayString() string {
+	switch v.Type {
+	case TypeString:
+		return v.StrVal
+	case TypeChar:
+		return string(rune(v.IntVal))
+	case TypePair:
+		return "(" + pairInnerDisplay(v) + ")"
+	default:
+		return v.String()
+	}
+}
+
+func pairInnerDisplay(v *Value) string {
+	s := v.Car.DisplayString()
+	switch v.Cdr.Type {
+	case TypeNil:
+		return s
+	case TypePair:
+		return s + " " + pairInnerDisplay(v.Cdr)
+	default:
+		return s + " . " + v.Cdr.DisplayString()
 	}
 }
 
