@@ -12,7 +12,10 @@ type expr interface{}
 
 type intExpr int
 type boolExpr bool
-type stringExpr string
+type stringExpr struct {
+	runes   []rune
+	mutable bool
+}
 type charExpr rune
 type symbolExpr struct {
 	name string
@@ -72,6 +75,36 @@ func (r *runtime) writeString(text string) {
 		return
 	}
 	r.output.WriteString(text)
+}
+
+func newStringExpr(text string, mutable bool) *stringExpr {
+	return &stringExpr{
+		runes:   []rune(text),
+		mutable: mutable,
+	}
+}
+
+func (s *stringExpr) text() string {
+	if s == nil {
+		return ""
+	}
+	return string(s.runes)
+}
+
+func (s *stringExpr) copy(mutable bool) *stringExpr {
+	if s == nil {
+		return newStringExpr("", mutable)
+	}
+	runes := append([]rune(nil), s.runes...)
+	return &stringExpr{
+		runes:   runes,
+		mutable: mutable,
+	}
+}
+
+func asString(value expr) (*stringExpr, bool) {
+	text, ok := value.(*stringExpr)
+	return text, ok
 }
 
 func (p sourcePos) advance(r rune) sourcePos {
@@ -161,12 +194,14 @@ func newGlobalEnv(rt *runtime) *env {
 	})})
 	root.define("number->string", builtinProc{name: "number->string", fn: builtinNumberToString})
 	root.define("string?", builtinProc{name: "string?", fn: typePredicate(func(value expr) bool {
-		_, ok := value.(stringExpr)
+		_, ok := asString(value)
 		return ok
 	})})
 	root.define("string-append", builtinProc{name: "string-append", fn: builtinStringAppend})
+	root.define("string-copy", builtinProc{name: "string-copy", fn: builtinStringCopy})
 	root.define("string-length", builtinProc{name: "string-length", fn: builtinStringLength})
 	root.define("string-ref", builtinProc{name: "string-ref", fn: builtinStringRef})
+	root.define("string-set!", builtinProc{name: "string-set!", fn: builtinStringSet})
 	root.define("string->number", builtinProc{name: "string->number", fn: builtinStringToNumber})
 	root.define("string->symbol", builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
 	root.define("substring", builtinProc{name: "substring", fn: builtinSubstring})
@@ -350,7 +385,7 @@ func (p *parser) parseExpr() (expr, error) {
 			pos: tok.pos,
 		}, nil
 	case tokenString:
-		return stringExpr(tok.text), nil
+		return newStringExpr(tok.text, false), nil
 	case tokenAtom:
 		return parseAtom(tok), nil
 	default:
@@ -366,11 +401,35 @@ func parseAtom(tok token) expr {
 		return boolExpr(false)
 	}
 
+	if value, ok := parseCharLiteral(tok.text); ok {
+		return charExpr(value)
+	}
+
 	if n, err := strconv.Atoi(tok.text); err == nil {
 		return intExpr(n)
 	}
 
 	return symbolExpr{name: tok.text, pos: tok.pos}
+}
+
+func parseCharLiteral(text string) (rune, bool) {
+	if !strings.HasPrefix(text, "#\\") {
+		return 0, false
+	}
+
+	literal := text[2:]
+	switch literal {
+	case "space":
+		return ' ', true
+	case "newline":
+		return '\n', true
+	}
+
+	runes := []rune(literal)
+	if len(runes) != 1 {
+		return 0, false
+	}
+	return runes[0], true
 }
 
 func evalSequence(environment *env, forms []expr) (expr, error) {
@@ -387,7 +446,7 @@ func evalSequence(environment *env, forms []expr) (expr, error) {
 
 func evalExpr(environment *env, form expr) (expr, error) {
 	switch v := form.(type) {
-	case intExpr, boolExpr, stringExpr:
+	case intExpr, boolExpr, charExpr, *stringExpr:
 		return v, nil
 	case symbolExpr:
 		value, ok := environment.lookup(v.name)
@@ -932,13 +991,25 @@ func makeNewlineBuiltin(rt *runtime) builtinFunc {
 func builtinStringAppend(args []expr) (expr, error) {
 	var b strings.Builder
 	for _, arg := range args {
-		text, ok := arg.(stringExpr)
+		text, ok := asString(arg)
 		if !ok {
 			return nil, &EvalError{Message: "string-append expects string arguments"}
 		}
-		b.WriteString(string(text))
+		b.WriteString(text.text())
 	}
-	return stringExpr(b.String()), nil
+	return newStringExpr(b.String(), false), nil
+}
+
+func builtinStringCopy(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string-copy expects exactly 1 argument"}
+	}
+
+	text, ok := asString(args[0])
+	if !ok {
+		return nil, &EvalError{Message: "string-copy expects a string"}
+	}
+	return text.copy(true), nil
 }
 
 func builtinStringLength(args []expr) (expr, error) {
@@ -946,11 +1017,11 @@ func builtinStringLength(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "string-length expects exactly 1 argument"}
 	}
 
-	text, ok := args[0].(stringExpr)
+	text, ok := asString(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "string-length expects a string"}
 	}
-	return intExpr(len([]rune(string(text)))), nil
+	return intExpr(len(text.runes)), nil
 }
 
 func builtinSubstring(args []expr) (expr, error) {
@@ -958,7 +1029,7 @@ func builtinSubstring(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "substring expects exactly 3 arguments"}
 	}
 
-	text, ok := args[0].(stringExpr)
+	text, ok := asString(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "substring expects a string as its first argument"}
 	}
@@ -972,14 +1043,13 @@ func builtinSubstring(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "substring expects numeric start and end indexes"}
 	}
 
-	runes := []rune(string(text))
 	startIdx := int(start)
 	endIdx := int(end)
-	if startIdx < 0 || endIdx < startIdx || endIdx > len(runes) {
+	if startIdx < 0 || endIdx < startIdx || endIdx > len(text.runes) {
 		return nil, &EvalError{Message: "substring index out of range"}
 	}
 
-	return stringExpr(string(runes[startIdx:endIdx])), nil
+	return newStringExpr(string(text.runes[startIdx:endIdx]), false), nil
 }
 
 func builtinStringToNumber(args []expr) (expr, error) {
@@ -987,12 +1057,12 @@ func builtinStringToNumber(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "string->number expects exactly 1 argument"}
 	}
 
-	text, ok := args[0].(stringExpr)
+	text, ok := asString(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "string->number expects a string"}
 	}
 
-	n, err := strconv.Atoi(string(text))
+	n, err := strconv.Atoi(text.text())
 	if err != nil {
 		return boolExpr(false), nil
 	}
@@ -1008,7 +1078,7 @@ func builtinNumberToString(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "number->string expects a number"}
 	}
-	return stringExpr(strconv.Itoa(int(n))), nil
+	return newStringExpr(strconv.Itoa(int(n)), false), nil
 }
 
 func builtinSymbolToString(args []expr) (expr, error) {
@@ -1020,7 +1090,7 @@ func builtinSymbolToString(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "symbol->string expects a symbol"}
 	}
-	return stringExpr(symbol.name), nil
+	return newStringExpr(symbol.name, false), nil
 }
 
 func builtinStringToSymbol(args []expr) (expr, error) {
@@ -1028,11 +1098,11 @@ func builtinStringToSymbol(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "string->symbol expects exactly 1 argument"}
 	}
 
-	text, ok := args[0].(stringExpr)
+	text, ok := asString(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "string->symbol expects a string"}
 	}
-	return symbolExpr{name: string(text)}, nil
+	return symbolExpr{name: text.text()}, nil
 }
 
 func builtinStringRef(args []expr) (expr, error) {
@@ -1040,7 +1110,7 @@ func builtinStringRef(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "string-ref expects exactly 2 arguments"}
 	}
 
-	text, ok := args[0].(stringExpr)
+	text, ok := asString(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "string-ref expects a string as its first argument"}
 	}
@@ -1050,13 +1120,44 @@ func builtinStringRef(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "string-ref expects a numeric index"}
 	}
 
-	runes := []rune(string(text))
 	idx := int(index)
-	if idx < 0 || idx >= len(runes) {
+	if idx < 0 || idx >= len(text.runes) {
 		return nil, &EvalError{Message: "string-ref index out of range"}
 	}
 
-	return charExpr(runes[idx]), nil
+	return charExpr(text.runes[idx]), nil
+}
+
+func builtinStringSet(args []expr) (expr, error) {
+	if len(args) != 3 {
+		return nil, &EvalError{Message: "string-set! expects exactly 3 arguments"}
+	}
+
+	text, ok := asString(args[0])
+	if !ok {
+		return nil, &EvalError{Message: "string-set! expects a string as its first argument"}
+	}
+	if !text.mutable {
+		return nil, &EvalError{Message: "string-set! expects a mutable string"}
+	}
+
+	index, ok := args[1].(intExpr)
+	if !ok {
+		return nil, &EvalError{Message: "string-set! expects a numeric index"}
+	}
+
+	ch, ok := args[2].(charExpr)
+	if !ok {
+		return nil, &EvalError{Message: "string-set! expects a character as its third argument"}
+	}
+
+	idx := int(index)
+	if idx < 0 || idx >= len(text.runes) {
+		return nil, &EvalError{Message: "string-set! index out of range"}
+	}
+
+	text.runes[idx] = rune(ch)
+	return voidExpr{}, nil
 }
 
 func comparisonBuiltin(name string, cmp func(int, int) bool) builtinFunc {
@@ -1113,8 +1214,8 @@ func renderExpr(value expr) string {
 			return "#t"
 		}
 		return "#f"
-	case stringExpr:
-		return strconv.Quote(string(v))
+	case *stringExpr:
+		return strconv.Quote(v.text())
 	case charExpr:
 		return renderChar(v)
 	case symbolExpr:
@@ -1138,8 +1239,8 @@ func renderExpr(value expr) string {
 
 func displayExpr(value expr) string {
 	switch v := value.(type) {
-	case stringExpr:
-		return string(v)
+	case *stringExpr:
+		return v.text()
 	case charExpr:
 		return string(rune(v))
 	case listExpr:
