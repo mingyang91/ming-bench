@@ -1038,12 +1038,16 @@ enum Builtin {
     ListPred,
     Length,
     Append,
+    Assq,
     Reverse,
     Assoc,
     Assv,
     Member,
+    Memq,
+    Memv,
     Map,
     ForEach,
+    Error,
     StringPred,
     NumberPred,
     ExactPred,
@@ -1159,12 +1163,16 @@ impl Builtin {
             Self::ListPred => "list?",
             Self::Length => "length",
             Self::Append => "append",
+            Self::Assq => "assq",
             Self::Reverse => "reverse",
             Self::Assoc => "assoc",
             Self::Assv => "assv",
             Self::Member => "member",
+            Self::Memq => "memq",
+            Self::Memv => "memv",
             Self::Map => "map",
             Self::ForEach => "for-each",
+            Self::Error => "error",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
             Self::ExactPred => "exact?",
@@ -1335,12 +1343,16 @@ impl Env {
             ("list?", Builtin::ListPred),
             ("length", Builtin::Length),
             ("append", Builtin::Append),
+            ("assq", Builtin::Assq),
             ("assoc", Builtin::Assoc),
             ("assv", Builtin::Assv),
             ("member", Builtin::Member),
+            ("memq", Builtin::Memq),
+            ("memv", Builtin::Memv),
             ("reverse", Builtin::Reverse),
             ("map", Builtin::Map),
             ("for-each", Builtin::ForEach),
+            ("error", Builtin::Error),
             ("string?", Builtin::StringPred),
             ("number?", Builtin::NumberPred),
             ("exact?", Builtin::ExactPred),
@@ -1551,6 +1563,8 @@ impl<'a> Parser<'a> {
         match self.peek_char() {
             Some('(') => self.parse_list(),
             Some('\'') => self.parse_quote(),
+            Some('`') => self.parse_quasiquote(),
+            Some(',') => self.parse_unquote(),
             Some('#') if self.peek_next_char() == Some('\'') => self.parse_syntax_quote(),
             Some(')') => Err(EvalError::UnexpectedCloseParen.with_offset(pos.offset)),
             Some('"') => self.parse_string(),
@@ -1564,6 +1578,31 @@ impl<'a> Parser<'a> {
         self.next_char();
         Ok(Expr::new(
             ExprKind::List(vec![Expr::symbol("quote", pos), self.parse_expr()?]),
+            pos,
+        ))
+    }
+
+    fn parse_quasiquote(&mut self) -> Result<Expr, EvalError> {
+        let pos = self.current_pos();
+        self.next_char();
+        Ok(Expr::new(
+            ExprKind::List(vec![Expr::symbol("quasiquote", pos), self.parse_expr()?]),
+            pos,
+        ))
+    }
+
+    fn parse_unquote(&mut self) -> Result<Expr, EvalError> {
+        let pos = self.current_pos();
+        self.next_char();
+        let name = if self.peek_char() == Some('@') {
+            self.next_char();
+            "unquote-splicing"
+        } else {
+            "unquote"
+        };
+
+        Ok(Expr::new(
+            ExprKind::List(vec![Expr::symbol(name, pos), self.parse_expr()?]),
             pos,
         ))
     }
@@ -1768,7 +1807,14 @@ fn expr_mentions_continuations(expr: &Expr) -> bool {
                     | "with-exception-handler"
             )
         }
-        ExprKind::List(items) => items.iter().any(expr_mentions_continuations),
+        ExprKind::List(items) => {
+            if matches!(items.as_slice(), [head, ..] if expr_is_symbol(head, "quote") || expr_is_symbol(head, "syntax"))
+            {
+                return false;
+            }
+
+            items.iter().any(expr_mentions_continuations)
+        }
         _ => false,
     }
 }
@@ -2183,6 +2229,7 @@ fn eval_list_cps(
             "set!" => return eval_set_cps(operator.pos, &arguments, env, k),
             "if" => return eval_if_cps(operator.pos, &arguments, env, k),
             "quote" => return k(eval_quote(operator.pos, &arguments)?),
+            "quasiquote" => return k(eval_quasiquote(operator.pos, &arguments, &env)?),
             "lambda" => return k(eval_lambda(operator.pos, &arguments, &env)?),
             "case-lambda" => return k(eval_case_lambda(&arguments, &env)?),
             "and" => return eval_and_cps(&arguments, env, k),
@@ -2943,6 +2990,7 @@ fn eval_guard_clause_cps(
         };
     }
 
+    let arrow_recipient = cond_arrow_recipient(body, "guard")?.cloned();
     let body = rc_exprs(body.to_vec());
     let next_clauses = clauses.clone();
     let next_env = env.clone();
@@ -2953,6 +3001,24 @@ fn eval_guard_clause_cps(
         env,
         Rc::new(move |value| {
             if value.is_truthy() {
+                if let Some(recipient) = arrow_recipient.clone() {
+                    let apply_env = next_env.clone();
+                    let apply_k = next_k.clone();
+                    return eval_expr_cps(
+                        recipient.clone(),
+                        apply_env.clone(),
+                        Rc::new(move |procedure| {
+                            apply_value_cps(
+                                procedure,
+                                vec![value.clone()],
+                                apply_env.clone(),
+                                recipient.pos,
+                                apply_k.clone(),
+                            )
+                        }),
+                    );
+                }
+
                 if body.is_empty() {
                     next_k.clone()(value)
                 } else {
@@ -3012,6 +3078,7 @@ fn eval_cond_clause_cps(
         };
     }
 
+    let arrow_recipient = cond_arrow_recipient(body, "cond")?.cloned();
     let body = rc_exprs(body.to_vec());
     let next_clauses = clauses.clone();
     let next_env = env.clone();
@@ -3021,6 +3088,24 @@ fn eval_cond_clause_cps(
         env,
         Rc::new(move |value| {
             if value.is_truthy() {
+                if let Some(recipient) = arrow_recipient.clone() {
+                    let apply_env = next_env.clone();
+                    let apply_k = next_k.clone();
+                    return eval_expr_cps(
+                        recipient.clone(),
+                        apply_env.clone(),
+                        Rc::new(move |procedure| {
+                            apply_value_cps(
+                                procedure,
+                                vec![value.clone()],
+                                apply_env.clone(),
+                                recipient.pos,
+                                apply_k.clone(),
+                            )
+                        }),
+                    );
+                }
+
                 if body.is_empty() {
                     next_k.clone()(value)
                 } else {
@@ -3367,6 +3452,7 @@ fn apply_value_cps(
         Value::Builtin(Builtin::Apply) => eval_apply_builtin_cps(argument_values, env, call_pos, k),
         Value::Builtin(Builtin::Map) => eval_map_cps(argument_values, env, call_pos, k),
         Value::Builtin(Builtin::ForEach) => eval_for_each_cps(argument_values, env, call_pos, k),
+        Value::Builtin(Builtin::Error) => eval_error_cps(argument_values, call_pos),
         Value::Builtin(builtin) => k(eval_builtin_from_values(
             builtin,
             argument_values,
@@ -3780,6 +3866,10 @@ fn eval_for_each_rows_cps(
     )
 }
 
+fn eval_error_cps(argument_values: Vec<Value>, call_pos: SourcePos) -> Result<Value, EvalError> {
+    raise_exception_cps(make_proper_list(argument_values), call_pos)
+}
+
 fn eval_builtin_from_values(
     builtin: Builtin,
     argument_values: Vec<Value>,
@@ -3797,6 +3887,7 @@ fn eval_builtin_from_values(
             | Builtin::Apply
             | Builtin::Map
             | Builtin::ForEach
+            | Builtin::Error
     ));
 
     let apply_env = Env::child(env);
@@ -4085,6 +4176,13 @@ where
             "set!" => return Ok(TailControl::Return(eval_set(operator.pos, arguments, env)?)),
             "if" => return eval_if_control(operator.pos, arguments, env, make_expr_target),
             "quote" => return Ok(TailControl::Return(eval_quote(operator.pos, arguments)?)),
+            "quasiquote" => {
+                return Ok(TailControl::Return(eval_quasiquote(
+                    operator.pos,
+                    arguments,
+                    env,
+                )?))
+            }
             "lambda" => {
                 return Ok(TailControl::Return(eval_lambda(
                     operator.pos,
@@ -4430,6 +4528,54 @@ fn eval_named_let_control(
     })
 }
 
+fn cond_arrow_recipient<'a>(body: &'a [Expr], label: &str) -> Result<Option<&'a Expr>, EvalError> {
+    match body {
+        [arrow, recipient] if expr_is_symbol(arrow, "=>") => Ok(Some(recipient)),
+        [arrow, ..] if expr_is_symbol(arrow, "=>") => Err(EvalError::InvalidSyntax {
+            message: format!("{label}: => clause must be (test => procedure)"),
+        }
+        .with_offset(arrow.pos.offset)),
+        _ => Ok(None),
+    }
+}
+
+fn tail_apply_value_with_values(
+    value: Value,
+    argument_values: Vec<Value>,
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<TailControl<'static>, EvalError> {
+    match value {
+        Value::Builtin(_)
+        | Value::NativeProcedure(_)
+        | Value::Procedure(_)
+        | Value::CaseProcedure(_)
+        | Value::Continuation(_) => {
+            let apply_env = Env::child(env);
+            let procedure_name = "__tail_apply_procedure".to_string();
+            apply_env.define(procedure_name.clone(), value);
+
+            let mut application = Vec::with_capacity(argument_values.len() + 1);
+            application.push(Expr::symbol(procedure_name, call_pos));
+
+            for (index, argument) in argument_values.into_iter().enumerate() {
+                let arg_name = format!("__tail_apply_arg_{index}");
+                apply_env.define(arg_name.clone(), argument);
+                application.push(Expr::symbol(arg_name, call_pos));
+            }
+
+            Ok(TailControl::Continue {
+                target: TailTarget::OwnedExpr(Expr::new(ExprKind::List(application), call_pos)),
+                env: apply_env,
+            })
+        }
+        other => Err(EvalError::NotAProcedure {
+            found: other.kind().into(),
+        }
+        .with_offset(call_pos.offset)),
+    }
+}
+
 fn eval_cond_control<'a, F>(
     arguments: &'a [Expr],
     env: &EnvRef,
@@ -4471,8 +4617,19 @@ where
             };
         }
 
+        let arrow_recipient = cond_arrow_recipient(body, "cond")?;
         let value = eval_expr(test, env)?;
         if value.is_truthy() {
+            if let Some(recipient) = arrow_recipient {
+                let procedure = eval_expr(recipient, env)?;
+                return tail_apply_value_with_values(
+                    procedure,
+                    vec![value],
+                    env,
+                    recipient.pos,
+                );
+            }
+
             return if body.is_empty() {
                 Ok(TailControl::Return(value))
             } else {
@@ -4580,8 +4737,19 @@ fn eval_guard_handler_control<'a>(
             };
         }
 
+        let arrow_recipient = cond_arrow_recipient(body, "guard")?;
         let value = eval_expr(test, &clause_env)?;
         if value.is_truthy() {
+            if let Some(recipient) = arrow_recipient {
+                let procedure = eval_expr(recipient, &clause_env)?;
+                return tail_apply_value_with_values(
+                    procedure,
+                    vec![value],
+                    &clause_env,
+                    recipient.pos,
+                );
+            }
+
             return if body.is_empty() {
                 Ok(TailControl::Return(value))
             } else {
@@ -4790,12 +4958,16 @@ fn eval_builtin(
         Builtin::ListPred => eval_type_predicate(arguments, env, "list?", call_pos, is_proper_list),
         Builtin::Length => eval_length(arguments, env, call_pos),
         Builtin::Append => eval_append(arguments, env),
+        Builtin::Assq => eval_assq(arguments, env, call_pos),
         Builtin::Reverse => eval_reverse(arguments, env, call_pos),
         Builtin::Assoc => eval_assoc(arguments, env, call_pos),
         Builtin::Assv => eval_assv(arguments, env, call_pos),
         Builtin::Member => eval_member(arguments, env, call_pos),
+        Builtin::Memq => eval_memq(arguments, env, call_pos),
+        Builtin::Memv => eval_memv(arguments, env, call_pos),
         Builtin::Map => eval_map(arguments, env, call_pos),
         Builtin::ForEach => eval_for_each(arguments, env, call_pos),
+        Builtin::Error => eval_error(arguments, env, call_pos),
         Builtin::StringPred => eval_type_predicate(arguments, env, "string?", call_pos, |value| {
             matches!(value, Value::String(_))
         }),
@@ -6558,6 +6730,120 @@ fn eval_quote(pos: SourcePos, arguments: &[Expr]) -> Result<Value, EvalError> {
     Ok(quote_expr(quoted))
 }
 
+fn eval_quasiquote(
+    pos: SourcePos,
+    arguments: &[Expr],
+    env: &EnvRef,
+) -> Result<Value, EvalError> {
+    let [template] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "quasiquote".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(pos.offset));
+    };
+
+    eval_quasiquote_expr(template, env, 1)
+}
+
+fn eval_quasiquote_expr(expr: &Expr, env: &EnvRef, depth: usize) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::Number(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::String(_)
+        | ExprKind::Char(_)
+        | ExprKind::Symbol(_) => Ok(quote_expr(expr)),
+        ExprKind::List(items) => {
+            if let Some(argument) = quasiquote_form_argument(items, "unquote") {
+                return if depth == 1 {
+                    eval_expr(argument, env)
+                } else {
+                    Ok(make_quasiquote_form(
+                        "unquote",
+                        eval_quasiquote_expr(argument, env, depth - 1)?,
+                    ))
+                };
+            }
+
+            if let Some(argument) = quasiquote_form_argument(items, "unquote-splicing") {
+                return if depth == 1 {
+                    Err(EvalError::InvalidSyntax {
+                        message: "quasiquote: unquote-splicing outside list context".into(),
+                    }
+                    .with_offset(expr.pos.offset))
+                } else {
+                    Ok(make_quasiquote_form(
+                        "unquote-splicing",
+                        eval_quasiquote_expr(argument, env, depth - 1)?,
+                    ))
+                };
+            }
+
+            if let Some(argument) = quasiquote_form_argument(items, "quasiquote") {
+                return Ok(make_quasiquote_form(
+                    "quasiquote",
+                    eval_quasiquote_expr(argument, env, depth + 1)?,
+                ));
+            }
+
+            eval_quasiquote_list(items, env, depth)
+        }
+    }
+}
+
+fn eval_quasiquote_list(items: &[Expr], env: &EnvRef, depth: usize) -> Result<Value, EvalError> {
+    if let Some((heads, tail)) = split_quoted_dotted_list(items) {
+        let mut result = eval_quasiquote_expr(tail, env, depth)?;
+        for value in eval_quasiquote_list_items(heads, env, depth)?.into_iter().rev() {
+            result = Value::Pair(SchemePair::new(value, result));
+        }
+        return Ok(result);
+    }
+
+    Ok(make_proper_list(eval_quasiquote_list_items(items, env, depth)?))
+}
+
+fn eval_quasiquote_list_items(
+    items: &[Expr],
+    env: &EnvRef,
+    depth: usize,
+) -> Result<Vec<Value>, EvalError> {
+    let mut values = Vec::new();
+
+    for item in items {
+        if depth == 1 {
+            if let Some(argument) = quasiquote_form_argument_expr(item, "unquote-splicing") {
+                let spliced = eval_expr(argument, env)?;
+                values.extend(
+                    collect_list_items(&spliced)
+                        .map_err(|error| list_access_error(error, item.pos))?,
+                );
+                continue;
+            }
+        }
+
+        values.push(eval_quasiquote_expr(item, env, depth)?);
+    }
+
+    Ok(values)
+}
+
+fn quasiquote_form_argument<'a>(items: &'a [Expr], name: &str) -> Option<&'a Expr> {
+    match items {
+        [head, argument] if expr_is_symbol(head, name) => Some(argument),
+        _ => None,
+    }
+}
+
+fn quasiquote_form_argument_expr<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
+    quasiquote_form_argument(expr_list(expr)?, name)
+}
+
+fn make_quasiquote_form(name: &str, value: Value) -> Value {
+    make_proper_list(vec![Value::Symbol(name.into()), value])
+}
+
 fn quote_expr(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Number(value) => Value::Number(*value),
@@ -6565,8 +6851,38 @@ fn quote_expr(expr: &Expr) -> Value {
         ExprKind::String(value) => Value::String(SchemeString::immutable(value.clone())),
         ExprKind::Char(value) => Value::Char(*value),
         ExprKind::Symbol(name) => Value::Symbol(name.clone()),
-        ExprKind::List(items) => make_proper_list(items.iter().map(quote_expr).collect()),
+        ExprKind::List(items) => quote_list_expr(items),
     }
+}
+
+fn quote_list_expr(items: &[Expr]) -> Value {
+    if let Some((heads, tail)) = split_quoted_dotted_list(items) {
+        return heads.iter().rev().fold(quote_expr(tail), |tail_value, head| {
+            Value::Pair(SchemePair::new(quote_expr(head), tail_value))
+        });
+    }
+
+    make_proper_list(items.iter().map(quote_expr).collect())
+}
+
+fn split_quoted_dotted_list(items: &[Expr]) -> Option<(&[Expr], &Expr)> {
+    let mut dot_index = None;
+
+    for (index, item) in items.iter().enumerate() {
+        if matches!(&item.kind, ExprKind::Symbol(name) if name == ".") {
+            if dot_index.is_some() {
+                return None;
+            }
+            dot_index = Some(index);
+        }
+    }
+
+    let dot_index = dot_index?;
+    if dot_index == 0 || dot_index + 2 != items.len() {
+        return None;
+    }
+
+    Some((&items[..dot_index], &items[dot_index + 1]))
 }
 
 fn eval_syntax_to_datum(
@@ -8080,16 +8396,24 @@ fn eval_length(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<
 }
 
 fn eval_append(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let mut items = Vec::new();
+    let Some((last_argument, initial_arguments)) = arguments.split_last() else {
+        return Ok(Value::List(Vec::new()));
+    };
 
-    for argument in arguments {
+    let mut items = Vec::new();
+    for argument in initial_arguments {
         let value = eval_expr(argument, env)?;
         items.extend(
             collect_list_items(&value).map_err(|error| list_access_error(error, argument.pos))?,
         );
     }
 
-    Ok(make_proper_list(items))
+    let mut tail = eval_expr(last_argument, env)?;
+    for item in items.into_iter().rev() {
+        tail = Value::Pair(SchemePair::new(item, tail));
+    }
+
+    Ok(tail)
 }
 
 fn eval_reverse(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
@@ -8109,6 +8433,10 @@ fn eval_reverse(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result
 
 fn eval_assoc(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     eval_assoc_like(arguments, env, call_pos, "assoc", value_equal)
+}
+
+fn eval_assq(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    eval_assoc_like(arguments, env, call_pos, "assq", value_eqv)
 }
 
 fn eval_assv(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
@@ -8146,9 +8474,27 @@ fn eval_assoc_like(
 }
 
 fn eval_member(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    eval_member_like(arguments, env, call_pos, "member", value_equal)
+}
+
+fn eval_memq(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    eval_member_like(arguments, env, call_pos, "memq", value_eqv)
+}
+
+fn eval_memv(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    eval_member_like(arguments, env, call_pos, "memv", value_eqv)
+}
+
+fn eval_member_like(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+    name: &str,
+    predicate: fn(&Value, &Value) -> bool,
+) -> Result<Value, EvalError> {
     let [key_expr, list_expr] = arguments else {
         return Err(EvalError::WrongArgCount {
-            name: "member".into(),
+            name: name.into(),
             expected: "exactly 2".into(),
             got: arguments.len(),
         }
@@ -8168,7 +8514,7 @@ fn eval_member(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<
                 }
 
                 let car = pair.car();
-                if value_equal(&key, &car) {
+                if predicate(&key, &car) {
                     return Ok(current);
                 }
 
@@ -8176,7 +8522,7 @@ fn eval_member(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<
             }
             Value::List(items) => {
                 for (index, item) in items.iter().enumerate() {
-                    if value_equal(&key, item) {
+                    if predicate(&key, item) {
                         return Ok(make_proper_list(items[index..].to_vec()));
                     }
                 }
@@ -8290,6 +8636,13 @@ fn eval_for_each(
     }
 
     Ok(Value::Void)
+}
+
+fn eval_error(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    Err(queue_raised_exception(
+        make_proper_list(eval_args(arguments, env)?),
+        call_pos,
+    ))
 }
 
 fn eval_display(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
