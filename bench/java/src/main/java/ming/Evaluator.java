@@ -170,9 +170,12 @@ public class Evaluator {
     private int currentBodyIndex = 0;
     private Environment currentBodyEnv = null;
 
+    // dynamic-wind stack: each entry is {inThunk, outThunk}
+    private final List<Object[]> windStack = new ArrayList<>();
+
     // --- Evaluator ---
 
-    private static final Object VOID = new Object() {
+    static final Object VOID = new Object() {
         @Override public String toString() { return "#<void>"; }
     };
 
@@ -405,6 +408,13 @@ public class Evaluator {
                     }
                     case "call/cc", "call-with-current-continuation" -> {
                         return evalCallCC(args, env);
+                    }
+                    case "dynamic-wind" -> {
+                        if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+                        Object inThunk = eval(args.get(0), env);
+                        Object bodyThunk = eval(args.get(1), env);
+                        Object outThunk = eval(args.get(2), env);
+                        return evalDynamicWind(inThunk, bodyThunk, outThunk);
                     }
                     case "define-syntax" -> {
                         if (args.size() != 2) throw new EvalError("define-syntax: bad syntax");
@@ -781,6 +791,27 @@ public class Evaluator {
             }
             throw ce;
         }
+    }
+
+    private Object evalDynamicWind(Object inThunk, Object bodyThunk, Object outThunk) throws EvalError, ContinuationException {
+        // Run in-thunk
+        applyResolved(inThunk, List.of());
+        // Push wind entry
+        Object[] entry = {inThunk, outThunk};
+        windStack.add(entry);
+        Object result;
+        try {
+            result = applyResolved(bodyThunk, List.of());
+        } catch (ContinuationException ce) {
+            // Non-local exit: pop and run out-thunk before re-throwing
+            windStack.remove(windStack.size() - 1);
+            applyResolved(outThunk, List.of());
+            throw ce;
+        }
+        // Normal exit: pop and run out-thunk
+        windStack.remove(windStack.size() - 1);
+        applyResolved(outThunk, List.of());
+        return result;
     }
 
     private Object wrapBodyInBegin(List<Object> args, int bodyStart) {
@@ -1270,124 +1301,11 @@ public class Evaluator {
     }
 
     private Object applyStringBuiltin(String name, List<Object> args) throws EvalError {
-        return switch (name) {
-            case "string-append" -> {
-                StringBuilder sb = new StringBuilder();
-                for (Object arg : args) sb.append(requireString(arg));
-                yield "\"" + sb + "\"";
-            }
-            case "string-length" -> (long) requireString(args.get(0)).length();
-            case "substring" -> {
-                String s = requireString(args.get(0));
-                int start = (int) requireLong(args.get(1));
-                int end = args.size() == 3 ? (int) requireLong(args.get(2)) : s.length();
-                yield "\"" + s.substring(start, end) + "\"";
-            }
-            case "string-ref" -> new SchemeChar(requireString(args.get(0)).charAt((int) requireLong(args.get(1))));
-            case "string->number" -> {
-                try { yield Long.parseLong(requireString(args.get(0))); }
-                catch (NumberFormatException e) { yield Boolean.FALSE; }
-            }
-            case "number->string" -> "\"" + schemeToString(args.get(0)) + "\"";
-            case "symbol->string" -> {
-                if (!(args.get(0) instanceof SchemeSymbol sym)) throw new EvalError("symbol->string: not a symbol");
-                yield "\"" + sym.name() + "\"";
-            }
-            case "string->symbol" -> new SchemeSymbol(requireString(args.get(0)));
-            case "string-copy" -> new SchemeString(requireString(args.get(0)));
-            case "string-set!" -> {
-                Object target = args.get(0);
-                if (target instanceof SchemeString ss) {
-                    int idx = (int) requireLong(args.get(1));
-                    if (!(args.get(2) instanceof SchemeChar ch)) throw new EvalError("string-set!: expected char");
-                    ss.setCharAt(idx, ch.value());
-                    yield VOID;
-                }
-                throw new EvalError("string-set!: strings are immutable");
-            }
-            case "string->list" -> {
-                String s = requireString(args.get(0));
-                Object result = null;
-                for (int i = s.length() - 1; i >= 0; i--) {
-                    result = new SchemePair(new SchemeChar(s.charAt(i)), result == null ? SchemeNil.INSTANCE : result);
-                }
-                yield result == null ? SchemeNil.INSTANCE : result;
-            }
-            case "list->string" -> {
-                StringBuilder sb = new StringBuilder();
-                Object lst = args.get(0);
-                while (lst instanceof SchemePair p) {
-                    if (!(p.car instanceof SchemeChar ch)) throw new EvalError("list->string: expected char");
-                    sb.append(ch.value());
-                    lst = p.cdr;
-                }
-                yield "\"" + sb.toString() + "\"";
-            }
-            case "string=?" -> requireString(args.get(0)).equals(requireString(args.get(1)));
-            case "string<?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) < 0;
-            case "string-ci=?" -> requireString(args.get(0)).equalsIgnoreCase(requireString(args.get(1)));
-            case "string-upcase" -> "\"" + requireString(args.get(0)).toUpperCase() + "\"";
-            case "string-downcase" -> "\"" + requireString(args.get(0)).toLowerCase() + "\"";
-            case "make-string" -> {
-                int len = (int) requireLong(args.get(0));
-                char ch = args.size() > 1 && args.get(1) instanceof SchemeChar sc ? sc.value() : ' ';
-                StringBuilder sb = new StringBuilder(len);
-                for (int i = 0; i < len; i++) sb.append(ch);
-                yield new SchemeString(sb.toString());
-            }
-            case "string" -> {
-                StringBuilder sb = new StringBuilder();
-                for (Object arg : args) {
-                    if (!(arg instanceof SchemeChar ch)) throw new EvalError("string: expected char");
-                    sb.append(ch.value());
-                }
-                yield "\"" + sb + "\"";
-            }
-            case "string>?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) > 0;
-            case "string<=?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) <= 0;
-            case "string>=?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) >= 0;
-            default -> throw new EvalError("unknown string procedure: " + name);
-        };
+        return StringCharBuiltins.applyStringBuiltin(name, args);
     }
 
     private Object applyCharBuiltin(String name, List<Object> args) throws EvalError {
-        return switch (name) {
-            case "char-alphabetic?" -> {
-                if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-alphabetic?: expected char");
-                yield Character.isLetter(ch.value());
-            }
-            case "char-numeric?" -> {
-                if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-numeric?: expected char");
-                yield Character.isDigit(ch.value());
-            }
-            case "char=?" -> {
-                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b))
-                    throw new EvalError("char=?: expected chars");
-                yield a.value() == b.value();
-            }
-            case "char<?" -> {
-                if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b))
-                    throw new EvalError("char<?: expected chars");
-                yield a.value() < b.value();
-            }
-            case "char-upcase" -> {
-                if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-upcase: expected char");
-                yield new SchemeChar(Character.toUpperCase(ch.value()));
-            }
-            case "char-downcase" -> {
-                if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-downcase: expected char");
-                yield new SchemeChar(Character.toLowerCase(ch.value()));
-            }
-            case "char->integer" -> {
-                if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char->integer: expected char");
-                yield (long) ch.value();
-            }
-            case "integer->char" -> {
-                long n = requireLong(args.get(0));
-                yield new SchemeChar((char) n);
-            }
-            default -> throw new EvalError("unknown char procedure: " + name);
-        };
+        return StringCharBuiltins.applyCharBuiltin(name, args);
     }
 
     private Object evalBuiltin(String name, List<Object> args, Environment env) throws EvalError, ContinuationException {
