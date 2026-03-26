@@ -141,11 +141,41 @@ final class Parser {
         };
     }
 
-    private Expr parseNumberOrSymbol(String token, int startLine, int startColumn) {
+    private Expr parseNumberOrSymbol(String token, int startLine, int startColumn)
+            throws EvalError {
         if (isIntegerToken(token)) {
             return new IntExpr(Long.parseLong(token), startLine, startColumn);
         }
+        if (isRationalToken(token)) {
+            return parseRationalToken(token, startLine, startColumn);
+        }
+        if (isInexactToken(token)) {
+            return new InexactExpr(Double.parseDouble(token), startLine, startColumn);
+        }
         return new SymbolExpr(token, startLine, startColumn);
+    }
+
+    private Expr parseRationalToken(String token, int startLine, int startColumn)
+            throws EvalError {
+        int slashIndex = token.indexOf('/');
+        long numerator = Long.parseLong(token.substring(0, slashIndex));
+        long denominator = Long.parseLong(token.substring(slashIndex + 1));
+        if (denominator == 0L) {
+            throw new EvalError("invalid rational literal", startLine, startColumn);
+        }
+
+        if (denominator < 0L) {
+            numerator = -numerator;
+            denominator = -denominator;
+        }
+
+        long divisor = gcd(numerator, denominator);
+        numerator /= divisor;
+        denominator /= divisor;
+        if (denominator == 1L) {
+            return new IntExpr(numerator, startLine, startColumn);
+        }
+        return new RationalExpr(numerator, denominator, startLine, startColumn);
     }
 
     private boolean isIntegerToken(String token) {
@@ -168,6 +198,42 @@ final class Parser {
             }
         }
         return true;
+    }
+
+    private boolean isRationalToken(String token) {
+        int slashIndex = token.indexOf('/');
+        if (slashIndex <= 0 || slashIndex != token.lastIndexOf('/')
+                || slashIndex == token.length() - 1) {
+            return false;
+        }
+        return isIntegerToken(token.substring(0, slashIndex))
+                && isIntegerToken(token.substring(slashIndex + 1));
+    }
+
+    private boolean isInexactToken(String token) {
+        if (!(token.contains(".") || token.contains("e") || token.contains("E"))) {
+            return false;
+        }
+        try {
+            Double.parseDouble(token);
+            return true;
+        } catch (NumberFormatException error) {
+            return false;
+        }
+    }
+
+    private long gcd(long left, long right) {
+        long a = Math.abs(left);
+        long b = Math.abs(right);
+        if (a == 0L) {
+            return b == 0L ? 1L : b;
+        }
+        while (b != 0L) {
+            long next = a % b;
+            a = b;
+            b = next;
+        }
+        return a;
     }
 
     private void skipTrivia() {

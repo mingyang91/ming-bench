@@ -1,9 +1,9 @@
 package ming;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.function.Predicate;
 
@@ -16,7 +16,6 @@ public class Evaluator {
     private static final BoolValue FALSE = new BoolValue(false);
     private static final EmptyListValue EMPTY_LIST = new EmptyListValue();
     private static final VoidValue VOID = new VoidValue();
-    private static final UninitializedValue UNINITIALIZED = new UninitializedValue();
 
     private final Env globalEnv;
     private final MacroExpander macroExpander;
@@ -57,7 +56,7 @@ public class Evaluator {
                 result = eval(expression, globalEnv);
             }
             String output = outputBuffer == null ? "" : outputBuffer.toString();
-            return new EvalResult(render(result), output);
+            return new EvalResult(ValueRenderer.render(result), output);
         } finally {
             outputBuffer = previousOutput;
         }
@@ -82,15 +81,17 @@ public class Evaluator {
         env.define("<=", new BuiltinValue("<=", arguments -> compare(arguments, "<=")));
         env.define("not", new BuiltinValue("not", this::not));
         env.define("zero?", new BuiltinValue("zero?",
-                arguments -> numericPredicate("zero?", arguments, value -> value == 0L)));
+                arguments -> signPredicate("zero?", arguments, value -> value == 0)));
         env.define("positive?", new BuiltinValue("positive?",
-                arguments -> numericPredicate("positive?", arguments, value -> value > 0L)));
+                arguments -> signPredicate("positive?", arguments, value -> value > 0)));
         env.define("negative?", new BuiltinValue("negative?",
-                arguments -> numericPredicate("negative?", arguments, value -> value < 0L)));
+                arguments -> signPredicate("negative?", arguments, value -> value < 0)));
         env.define("odd?", new BuiltinValue("odd?",
-                arguments -> numericPredicate("odd?", arguments, value -> value % 2L != 0L)));
+                arguments -> integerNumericPredicate("odd?", arguments,
+                        value -> value % 2L != 0L)));
         env.define("even?", new BuiltinValue("even?",
-                arguments -> numericPredicate("even?", arguments, value -> value % 2L == 0L)));
+                arguments -> integerNumericPredicate("even?", arguments,
+                        value -> value % 2L == 0L)));
         env.define("cons", new BuiltinValue("cons", this::cons));
         env.define("car", new BuiltinValue("car", this::car));
         env.define("cdr", new BuiltinValue("cdr", this::cdr));
@@ -107,8 +108,11 @@ public class Evaluator {
         env.define("apply", new BuiltinValue("apply", this::apply));
         env.define("string?", new BuiltinValue("string?", arguments ->
                 typePredicate("string?", arguments, value -> value instanceof StringValue)));
-        env.define("number?", new BuiltinValue("number?", arguments ->
-                typePredicate("number?", arguments, value -> value instanceof IntValue)));
+        env.define("number?", new BuiltinValue("number?", this::numberPredicate));
+        env.define("integer?", new BuiltinValue("integer?", this::integerPredicate));
+        env.define("rational?", new BuiltinValue("rational?", this::rationalPredicate));
+        env.define("exact?", new BuiltinValue("exact?", this::exactPredicate));
+        env.define("inexact?", new BuiltinValue("inexact?", this::inexactPredicate));
         env.define("boolean?", new BuiltinValue("boolean?", arguments ->
                 typePredicate("boolean?", arguments, value -> value instanceof BoolValue)));
         env.define("pair?", new BuiltinValue("pair?", arguments ->
@@ -120,6 +124,10 @@ public class Evaluator {
         env.define("display", new BuiltinValue("display", this::display));
         env.define("write", new BuiltinValue("write", this::write));
         env.define("newline", new BuiltinValue("newline", this::newline));
+        env.define("exact->inexact", new BuiltinValue("exact->inexact", this::exactToInexact));
+        env.define("inexact->exact", new BuiltinValue("inexact->exact", this::inexactToExact));
+        env.define("numerator", new BuiltinValue("numerator", this::numerator));
+        env.define("denominator", new BuiltinValue("denominator", this::denominator));
         env.define("string-append", new BuiltinValue("string-append", this::stringAppend));
         env.define("string-length", new BuiltinValue("string-length", this::stringLength));
         env.define("substring", new BuiltinValue("substring", this::substring));
@@ -156,6 +164,9 @@ public class Evaluator {
         try {
             return switch (expr) {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
+                case RationalExpr rationalExpr -> exactValue(
+                        rationalExpr.numerator(), rationalExpr.denominator());
+                case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
                 case BoolExpr boolExpr -> boolValue(boolExpr.value());
                 case CharExpr charExpr -> new CharValue(charExpr.value());
                 case StringExpr stringExpr -> immutableString(stringExpr.value());
@@ -216,7 +227,7 @@ public class Evaluator {
                 throw new EvalError("define expects exactly one value expression");
             }
             Cell binding = env.definePlaceholder(symbolExpr.name());
-            binding.value = eval(arguments.get(1), env);
+            binding.set(eval(arguments.get(1), env));
             return VOID;
         }
 
@@ -231,10 +242,10 @@ public class Evaluator {
             }
 
             Cell binding = env.definePlaceholder(nameExpr.name());
-            binding.value = new ClosureValue(
+            binding.set(new ClosureValue(
                     parseFormals(signature.subList(1, signature.size())),
                     List.copyOf(arguments.subList(1, arguments.size())),
-                    env);
+                    env));
             return VOID;
         }
 
@@ -393,7 +404,7 @@ public class Evaluator {
                 new Formals(bindingNames(bindings), null),
                 List.copyOf(body),
                 letEnv);
-        binding.value = closure;
+        binding.set(closure);
         return applyClosure(closure, evalBindingValues(bindings, env));
     }
 
@@ -507,13 +518,13 @@ public class Evaluator {
 
     private Value display(List<Value> arguments) throws EvalError {
         requireExactArgs("display", arguments, 1);
-        appendOutput(renderDisplay(arguments.get(0)));
+        appendOutput(ValueRenderer.renderDisplay(arguments.get(0)));
         return VOID;
     }
 
     private Value write(List<Value> arguments) throws EvalError {
         requireExactArgs("write", arguments, 1);
-        appendOutput(render(arguments.get(0)));
+        appendOutput(ValueRenderer.render(arguments.get(0)));
         return VOID;
     }
 
@@ -526,6 +537,9 @@ public class Evaluator {
     private Value quoteToValue(Expr expr) {
         return switch (expr) {
             case IntExpr intExpr -> new IntValue(intExpr.value());
+            case RationalExpr rationalExpr -> exactValue(
+                    rationalExpr.numerator(), rationalExpr.denominator());
+            case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
             case BoolExpr boolExpr -> boolValue(boolExpr.value());
             case CharExpr charExpr -> new CharValue(charExpr.value());
             case StringExpr stringExpr -> immutableString(stringExpr.value());
@@ -551,37 +565,71 @@ public class Evaluator {
     }
 
     private Value add(List<Value> arguments) throws EvalError {
-        long total = 0L;
-        for (Value argument : arguments) {
-            total += requireInt(argument, "+");
+        if (containsInexact(arguments)) {
+            double total = 0.0;
+            for (Value argument : arguments) {
+                total += requireNumberAsDouble(argument, "+");
+            }
+            return new InexactValue(total);
         }
-        return new IntValue(total);
+
+        ExactRational total = new ExactRational(0L, 1L);
+        for (Value argument : arguments) {
+            total = addExact(total, requireExactRational(argument, "+"));
+        }
+        return exactValue(total);
     }
 
     private Value abs(List<Value> arguments) throws EvalError {
         requireExactArgs("abs", arguments, 1);
-        return new IntValue(Math.abs(requireInt(arguments.get(0), "abs")));
+        Value argument = requireNumericValue(arguments.get(0), "abs");
+        if (argument instanceof InexactValue inexactValue) {
+            return new InexactValue(Math.abs(inexactValue.value()));
+        }
+
+        ExactRational rational = requireExactRational(argument, "abs");
+        return exactValue(Math.abs(rational.numerator()), rational.denominator());
     }
 
     private Value subtract(List<Value> arguments) throws EvalError {
         requireMinArgs("-", arguments, 1);
-        long result = requireInt(arguments.get(0), "-");
+        if (containsInexact(arguments)) {
+            double result = requireNumberAsDouble(arguments.get(0), "-");
+            if (arguments.size() == 1) {
+                return new InexactValue(-result);
+            }
+
+            for (int index = 1; index < arguments.size(); index++) {
+                result -= requireNumberAsDouble(arguments.get(index), "-");
+            }
+            return new InexactValue(result);
+        }
+
+        ExactRational result = requireExactRational(arguments.get(0), "-");
         if (arguments.size() == 1) {
-            return new IntValue(-result);
+            return exactValue(-result.numerator(), result.denominator());
         }
 
         for (int index = 1; index < arguments.size(); index++) {
-            result -= requireInt(arguments.get(index), "-");
+            result = subtractExact(result, requireExactRational(arguments.get(index), "-"));
         }
-        return new IntValue(result);
+        return exactValue(result);
     }
 
     private Value multiply(List<Value> arguments) throws EvalError {
-        long total = 1L;
-        for (Value argument : arguments) {
-            total *= requireInt(argument, "*");
+        if (containsInexact(arguments)) {
+            double total = 1.0;
+            for (Value argument : arguments) {
+                total *= requireNumberAsDouble(argument, "*");
+            }
+            return new InexactValue(total);
         }
-        return new IntValue(total);
+
+        ExactRational total = new ExactRational(1L, 1L);
+        for (Value argument : arguments) {
+            total = multiplyExact(total, requireExactRational(argument, "*"));
+        }
+        return exactValue(total);
     }
 
     private Value map(List<Value> arguments) throws EvalError {
@@ -658,15 +706,27 @@ public class Evaluator {
         requireExactArgs("string->number", arguments, 1);
         String value = requireString(arguments.get(0), "string->number");
         try {
-            return new IntValue(Long.parseLong(value));
-        } catch (NumberFormatException error) {
+            List<Expr> expressions = new Parser(value).parseProgram();
+            if (expressions.size() != 1) {
+                return FALSE;
+            }
+
+            Expr expression = expressions.get(0);
+            if (expression instanceof IntExpr
+                    || expression instanceof RationalExpr
+                    || expression instanceof InexactExpr) {
+                return quoteToValue(expression);
+            }
+            return FALSE;
+        } catch (EvalError error) {
             return FALSE;
         }
     }
 
     private Value numberToString(List<Value> arguments) throws EvalError {
         requireExactArgs("number->string", arguments, 1);
-        return immutableString(Long.toString(requireInt(arguments.get(0), "number->string")));
+        return immutableString(ValueRenderer.render(
+                requireNumericValue(arguments.get(0), "number->string")));
     }
 
     private Value symbolToString(List<Value> arguments) throws EvalError {
@@ -812,15 +872,27 @@ public class Evaluator {
 
     private Value divide(List<Value> arguments) throws EvalError {
         requireMinArgs("/", arguments, 2);
-        long result = requireInt(arguments.get(0), "/");
+        if (containsInexact(arguments)) {
+            double result = requireNumberAsDouble(arguments.get(0), "/");
+            for (int index = 1; index < arguments.size(); index++) {
+                double divisor = requireNumberAsDouble(arguments.get(index), "/");
+                if (divisor == 0.0) {
+                    throw new EvalError("division by zero");
+                }
+                result /= divisor;
+            }
+            return new InexactValue(result);
+        }
+
+        ExactRational result = requireExactRational(arguments.get(0), "/");
         for (int index = 1; index < arguments.size(); index++) {
-            long divisor = requireInt(arguments.get(index), "/");
-            if (divisor == 0L) {
+            ExactRational divisor = requireExactRational(arguments.get(index), "/");
+            if (divisor.numerator() == 0L) {
                 throw new EvalError("division by zero");
             }
-            result /= divisor;
+            result = divideExact(result, divisor);
         }
-        return new IntValue(result);
+        return exactValue(result);
     }
 
     private Value modulo(List<Value> arguments) throws EvalError {
@@ -897,10 +969,21 @@ public class Evaluator {
 
     private Value compare(List<Value> arguments, String operator) throws EvalError {
         requireMinArgs(operator, arguments, 2);
+        if (containsInexact(arguments)) {
+            for (int index = 0; index < arguments.size() - 1; index++) {
+                double left = requireNumberAsDouble(arguments.get(index), operator);
+                double right = requireNumberAsDouble(arguments.get(index + 1), operator);
+                if (!comparePair(Double.compare(left, right), operator)) {
+                    return FALSE;
+                }
+            }
+            return TRUE;
+        }
+
         for (int index = 0; index < arguments.size() - 1; index++) {
-            long left = requireInt(arguments.get(index), operator);
-            long right = requireInt(arguments.get(index + 1), operator);
-            if (!comparePair(left, right, operator)) {
+            ExactRational left = requireExactRational(arguments.get(index), operator);
+            ExactRational right = requireExactRational(arguments.get(index + 1), operator);
+            if (!comparePair(compareExact(left, right), operator)) {
                 return FALSE;
             }
         }
@@ -940,13 +1023,13 @@ public class Evaluator {
         return TRUE;
     }
 
-    private boolean comparePair(long left, long right, String operator)
+    private boolean comparePair(int comparison, String operator)
             throws EvalError {
         return switch (operator) {
-            case "<" -> left < right;
-            case ">" -> left > right;
-            case "=" -> left == right;
-            case "<=" -> left <= right;
+            case "<" -> comparison < 0;
+            case ">" -> comparison > 0;
+            case "=" -> comparison == 0;
+            case "<=" -> comparison <= 0;
             default -> throw new EvalError("unknown comparison operator: " + operator);
         };
     }
@@ -956,7 +1039,13 @@ public class Evaluator {
         return boolValue(!isTruthy(arguments.get(0)));
     }
 
-    private Value numericPredicate(String name, List<Value> arguments,
+    private Value signPredicate(String name, List<Value> arguments,
+            java.util.function.IntPredicate predicate) throws EvalError {
+        requireExactArgs(name, arguments, 1);
+        return boolValue(predicate.test(numberSign(arguments.get(0), name)));
+    }
+
+    private Value integerNumericPredicate(String name, List<Value> arguments,
             java.util.function.LongPredicate predicate) throws EvalError {
         requireExactArgs(name, arguments, 1);
         return boolValue(predicate.test(requireInt(arguments.get(0), name)));
@@ -992,6 +1081,57 @@ public class Evaluator {
         return boolValue(equalValues(arguments.get(0), arguments.get(1)));
     }
 
+    private Value numberPredicate(List<Value> arguments) throws EvalError {
+        requireExactArgs("number?", arguments, 1);
+        return boolValue(isNumber(arguments.get(0)));
+    }
+
+    private Value integerPredicate(List<Value> arguments) throws EvalError {
+        requireExactArgs("integer?", arguments, 1);
+        return boolValue(isInteger(arguments.get(0)));
+    }
+
+    private Value rationalPredicate(List<Value> arguments) throws EvalError {
+        requireExactArgs("rational?", arguments, 1);
+        return boolValue(isExactNumber(arguments.get(0)));
+    }
+
+    private Value exactPredicate(List<Value> arguments) throws EvalError {
+        requireExactArgs("exact?", arguments, 1);
+        return boolValue(isExactNumber(arguments.get(0)));
+    }
+
+    private Value inexactPredicate(List<Value> arguments) throws EvalError {
+        requireExactArgs("inexact?", arguments, 1);
+        return boolValue(arguments.get(0) instanceof InexactValue);
+    }
+
+    private Value exactToInexact(List<Value> arguments) throws EvalError {
+        requireExactArgs("exact->inexact", arguments, 1);
+        return new InexactValue(requireNumberAsDouble(arguments.get(0), "exact->inexact"));
+    }
+
+    private Value inexactToExact(List<Value> arguments) throws EvalError {
+        requireExactArgs("inexact->exact", arguments, 1);
+        Value value = requireNumericValue(arguments.get(0), "inexact->exact");
+        if (value instanceof InexactValue inexactValue) {
+            return inexactToExactValue(inexactValue.value());
+        }
+        return value;
+    }
+
+    private Value numerator(List<Value> arguments) throws EvalError {
+        requireExactArgs("numerator", arguments, 1);
+        ExactRational rational = requireRationalParts(arguments.get(0), "numerator");
+        return exactValue(rational.numerator(), 1L);
+    }
+
+    private Value denominator(List<Value> arguments) throws EvalError {
+        requireExactArgs("denominator", arguments, 1);
+        ExactRational rational = requireRationalParts(arguments.get(0), "denominator");
+        return exactValue(rational.denominator(), 1L);
+    }
+
     private Value typePredicate(String name, List<Value> arguments, Predicate<Value> predicate)
             throws EvalError {
         requireExactArgs(name, arguments, 1);
@@ -1019,6 +1159,42 @@ public class Evaluator {
             return intValue.value();
         }
         throw new EvalError(operator + " expects numeric arguments");
+    }
+
+    private Value requireNumericValue(Value value, String operator) throws EvalError {
+        if (isNumber(value)) {
+            return value;
+        }
+        throw new EvalError(operator + " expects numeric arguments");
+    }
+
+    private double requireNumberAsDouble(Value value, String operator) throws EvalError {
+        return switch (requireNumericValue(value, operator)) {
+            case IntValue intValue -> (double) intValue.value();
+            case RationalValue rationalValue ->
+                    (double) rationalValue.numerator() / (double) rationalValue.denominator();
+            case InexactValue inexactValue -> inexactValue.value();
+            default -> throw new IllegalStateException("non-numeric value");
+        };
+    }
+
+    private ExactRational requireExactRational(Value value, String operator) throws EvalError {
+        return switch (value) {
+            case IntValue intValue -> new ExactRational(intValue.value(), 1L);
+            case RationalValue rationalValue ->
+                    new ExactRational(rationalValue.numerator(), rationalValue.denominator());
+            case InexactValue ignored -> throw new EvalError(operator + " expects numeric arguments");
+            default -> throw new EvalError(operator + " expects numeric arguments");
+        };
+    }
+
+    private ExactRational requireRationalParts(Value value, String operator) throws EvalError {
+        return switch (value) {
+            case IntValue intValue -> new ExactRational(intValue.value(), 1L);
+            case RationalValue rationalValue ->
+                    new ExactRational(rationalValue.numerator(), rationalValue.denominator());
+            default -> throw new EvalError(operator + " expects an exact rational");
+        };
     }
 
     private String requireString(Value value, String operator) throws EvalError {
@@ -1082,12 +1258,53 @@ public class Evaluator {
         return current instanceof EmptyListValue;
     }
 
+    private boolean isNumber(Value value) {
+        return value instanceof IntValue
+                || value instanceof RationalValue
+                || value instanceof InexactValue;
+    }
+
+    private boolean isExactNumber(Value value) {
+        return value instanceof IntValue || value instanceof RationalValue;
+    }
+
+    private boolean isInteger(Value value) {
+        if (value instanceof IntValue) {
+            return true;
+        }
+        if (value instanceof RationalValue rationalValue) {
+            return rationalValue.denominator() == 1L;
+        }
+        if (value instanceof InexactValue inexactValue) {
+            return Double.isFinite(inexactValue.value())
+                    && Math.rint(inexactValue.value()) == inexactValue.value();
+        }
+        return false;
+    }
+
+    private boolean containsInexact(List<Value> values) {
+        for (Value value : values) {
+            if (value instanceof InexactValue) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean eqValues(Value left, Value right) {
         if (left == right) {
             return true;
         }
         if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
             return leftInt.value() == rightInt.value();
+        }
+        if (left instanceof RationalValue leftRational
+                && right instanceof RationalValue rightRational) {
+            return leftRational.numerator() == rightRational.numerator()
+                    && leftRational.denominator() == rightRational.denominator();
+        }
+        if (left instanceof InexactValue leftInexact && right instanceof InexactValue rightInexact) {
+            return Double.compare(leftInexact.value(), rightInexact.value()) == 0;
         }
         if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
             return leftBool.value() == rightBool.value();
@@ -1123,63 +1340,101 @@ public class Evaluator {
         return value ? TRUE : FALSE;
     }
 
-    private String render(Value value) {
-        return renderValue(value, false);
+    private int numberSign(Value value, String operator) throws EvalError {
+        if (value instanceof InexactValue inexactValue) {
+            return Double.compare(inexactValue.value(), 0.0);
+        }
+        return Long.compare(requireExactRational(value, operator).numerator(), 0L);
     }
 
-    private String renderDisplay(Value value) {
-        return renderValue(value, true);
+    private Value exactValue(ExactRational rational) {
+        return exactValue(rational.numerator(), rational.denominator());
     }
 
-    private String renderValue(Value value, boolean displayMode) {
-        return switch (value) {
-            case IntValue intValue -> Long.toString(intValue.value());
-            case BoolValue boolValue -> boolValue.value() ? "#t" : "#f";
-            case StringValue stringValue ->
-                    displayMode ? stringValue.text() : quote(stringValue.text());
-            case SymbolValue symbolValue -> symbolValue.name();
-            case EmptyListValue ignored -> "()";
-            case CharValue charValue -> displayMode
-                    ? Character.toString(charValue.value())
-                    : renderChar(charValue.value());
-            case PairValue pairValue -> renderPair(pairValue, displayMode);
-            case BuiltinValue ignored -> "#<procedure>";
-            case ClosureValue ignored -> "#<procedure>";
-            case VoidValue ignored -> "#<void>";
-            case UninitializedValue ignored -> "#<uninitialized>";
-        };
+    private Value exactValue(long numerator, long denominator) {
+        ExactRational normalized = normalizeExactRational(numerator, denominator);
+        if (normalized.denominator() == 1L) {
+            return new IntValue(normalized.numerator());
+        }
+        return new RationalValue(normalized.numerator(), normalized.denominator());
     }
 
-    private String renderPair(PairValue pairValue, boolean displayMode) {
-        StringBuilder builder = new StringBuilder();
-        builder.append('(');
-
-        Value current = pairValue;
-        boolean first = true;
-        while (current instanceof PairValue pair) {
-            if (!first) {
-                builder.append(' ');
-            }
-            builder.append(renderValue(pair.car(), displayMode));
-            current = pair.cdr();
-            first = false;
+    private ExactRational normalizeExactRational(long numerator, long denominator) {
+        if (denominator == 0L) {
+            throw new IllegalArgumentException("exact rationals cannot have zero denominator");
+        }
+        if (denominator < 0L) {
+            numerator = -numerator;
+            denominator = -denominator;
         }
 
-        if (!(current instanceof EmptyListValue)) {
-            builder.append(" . ");
-            builder.append(renderValue(current, displayMode));
-        }
-
-        builder.append(')');
-        return builder.toString();
+        long divisor = gcd(numerator, denominator);
+        return new ExactRational(numerator / divisor, denominator / divisor);
     }
 
-    private String renderChar(char value) {
-        return switch (value) {
-            case ' ' -> "#\\space";
-            case '\n' -> "#\\newline";
-            default -> "#\\" + value;
-        };
+    private ExactRational addExact(ExactRational left, ExactRational right) {
+        return normalizeExactRational(
+                left.numerator() * right.denominator() + right.numerator() * left.denominator(),
+                left.denominator() * right.denominator());
+    }
+
+    private ExactRational subtractExact(ExactRational left, ExactRational right) {
+        return normalizeExactRational(
+                left.numerator() * right.denominator() - right.numerator() * left.denominator(),
+                left.denominator() * right.denominator());
+    }
+
+    private ExactRational multiplyExact(ExactRational left, ExactRational right) {
+        return normalizeExactRational(
+                left.numerator() * right.numerator(),
+                left.denominator() * right.denominator());
+    }
+
+    private ExactRational divideExact(ExactRational left, ExactRational right) {
+        return normalizeExactRational(
+                left.numerator() * right.denominator(),
+                left.denominator() * right.numerator());
+    }
+
+    private int compareExact(ExactRational left, ExactRational right) {
+        return Long.compare(
+                left.numerator() * right.denominator(),
+                right.numerator() * left.denominator());
+    }
+
+    private long gcd(long left, long right) {
+        long a = Math.abs(left);
+        long b = Math.abs(right);
+        if (a == 0L) {
+            return b == 0L ? 1L : b;
+        }
+        while (b != 0L) {
+            long next = a % b;
+            a = b;
+            b = next;
+        }
+        return a;
+    }
+
+    private Value inexactToExactValue(double value) throws EvalError {
+        if (!Double.isFinite(value)) {
+            throw new EvalError("inexact->exact expects a finite inexact number");
+        }
+
+        BigDecimal decimal = BigDecimal.valueOf(value);
+        BigInteger numerator = decimal.unscaledValue();
+        BigInteger denominator = BigInteger.ONE;
+        if (decimal.scale() >= 0) {
+            denominator = BigInteger.TEN.pow(decimal.scale());
+        } else {
+            numerator = numerator.multiply(BigInteger.TEN.pow(-decimal.scale()));
+        }
+
+        try {
+            return exactValue(numerator.longValueExact(), denominator.longValueExact());
+        } catch (ArithmeticException error) {
+            throw new EvalError("inexact->exact overflow");
+        }
     }
 
     private void appendOutput(String value) {
@@ -1188,159 +1443,7 @@ public class Evaluator {
         }
     }
 
-    private String quote(String value) {
-        StringBuilder builder = new StringBuilder();
-        builder.append('"');
-        for (int index = 0; index < value.length(); index++) {
-            char ch = value.charAt(index);
-            switch (ch) {
-                case '\\' -> builder.append("\\\\");
-                case '"' -> builder.append("\\\"");
-                case '\n' -> builder.append("\\n");
-                case '\r' -> builder.append("\\r");
-                case '\t' -> builder.append("\\t");
-                default -> builder.append(ch);
-            }
-        }
-        builder.append('"');
-        return builder.toString();
-    }
-
     private StringValue immutableString(String value) {
         return new StringValue(new StringBuilder(value), false);
-    }
-
-    sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
-            CharValue, EmptyListValue, PairValue, BuiltinValue, ClosureValue, VoidValue,
-            UninitializedValue {
-    }
-
-    private record IntValue(long value) implements Value {
-    }
-
-    private record BoolValue(boolean value) implements Value {
-    }
-
-    private record StringValue(StringBuilder contents, boolean mutable) implements Value {
-        private String text() {
-            return contents.toString();
-        }
-
-        private int length() {
-            return contents.length();
-        }
-
-        private char charAt(int index) {
-            return contents.charAt(index);
-        }
-
-        private void setCharAt(int index, char value) {
-            contents.setCharAt(index, value);
-        }
-
-        private StringValue copy(boolean mutableCopy) {
-            return new StringValue(new StringBuilder(text()), mutableCopy);
-        }
-    }
-
-    private record SymbolValue(String name) implements Value {
-    }
-
-    private record CharValue(char value) implements Value {
-    }
-
-    private record EmptyListValue() implements Value {
-    }
-
-    private record PairValue(Value car, Value cdr) implements Value {
-    }
-
-    private record BuiltinValue(String name, BuiltinFunction implementation) implements Value {
-    }
-
-    private record ClosureValue(Formals formals, List<Expr> body, Env env)
-            implements Value {
-    }
-
-    private record Formals(List<String> parameters, String restParameter) {
-    }
-
-    private record BindingSpec(String name, Expr initExpr) {
-    }
-
-    private record VoidValue() implements Value {
-    }
-
-    private record UninitializedValue() implements Value {
-    }
-
-    @FunctionalInterface
-    private interface BuiltinFunction {
-        Value apply(List<Value> arguments) throws EvalError;
-    }
-
-    static final class Cell {
-        private Value value;
-
-        private Cell(Value value) {
-            this.value = value;
-        }
-
-        Value get() {
-            return value;
-        }
-
-        void set(Value newValue) {
-            value = newValue;
-        }
-
-        boolean isUninitialized() {
-            return value == UNINITIALIZED;
-        }
-    }
-
-    static final class Env {
-        private final Env parent;
-        private final Map<String, Cell> bindings = new HashMap<>();
-
-        private Env(Env parent) {
-            this.parent = parent;
-        }
-
-        void define(String name, Value value) {
-            bindings.put(name, new Cell(value));
-        }
-
-        Cell definePlaceholder(String name) {
-            Cell cell = new Cell(UNINITIALIZED);
-            bindings.put(name, cell);
-            return cell;
-        }
-
-        Value lookup(String name) throws EvalError {
-            Cell cell = lookupCell(name);
-            if (cell == null || cell.isUninitialized()) {
-                throw new EvalError("unbound variable: " + name);
-            }
-            return cell.get();
-        }
-
-        void set(String name, Value value) throws EvalError {
-            Cell cell = lookupCell(name);
-            if (cell == null || cell.isUninitialized()) {
-                throw new EvalError("unbound variable: " + name);
-            }
-            cell.set(value);
-        }
-
-        Cell lookupCell(String name) {
-            if (bindings.containsKey(name)) {
-                return bindings.get(name);
-            }
-            if (parent != null) {
-                return parent.lookupCell(name);
-            }
-            return null;
-        }
     }
 }

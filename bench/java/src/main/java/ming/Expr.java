@@ -2,13 +2,20 @@ package ming;
 
 import java.util.List;
 
-sealed interface Expr permits IntExpr, BoolExpr, CharExpr, StringExpr, SymbolExpr, ListExpr {
+sealed interface Expr permits IntExpr, RationalExpr, InexactExpr, BoolExpr, CharExpr,
+        StringExpr, SymbolExpr, ListExpr {
     int line();
 
     int column();
 }
 
 record IntExpr(long value, int line, int column) implements Expr {
+}
+
+record RationalExpr(long numerator, long denominator, int line, int column) implements Expr {
+}
+
+record InexactExpr(double value, int line, int column) implements Expr {
 }
 
 record BoolExpr(boolean value, int line, int column) implements Expr {

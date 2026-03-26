@@ -10,10 +10,10 @@ import java.util.Set;
 
 final class MacroExpander {
     private final Map<String, MacroValue> macros = new HashMap<>();
-    private final Map<String, Evaluator.Cell> capturedBindings = new HashMap<>();
+    private final Map<String, Cell> capturedBindings = new HashMap<>();
     private long generatedNameCounter;
 
-    void defineSyntax(List<Expr> arguments, Evaluator.Env env) throws EvalError {
+    void defineSyntax(List<Expr> arguments, Env env) throws EvalError {
         requireExactArgs("define-syntax", arguments, 2);
 
         Expr target = arguments.get(0);
@@ -32,8 +32,8 @@ final class MacroExpander {
         return Optional.of(expandMacro(invocation, macro));
     }
 
-    Evaluator.Value lookupSymbol(String name, Evaluator.Env env) throws EvalError {
-        Evaluator.Cell capturedCell = capturedBindings.get(name);
+    Value lookupSymbol(String name, Env env) throws EvalError {
+        Cell capturedCell = capturedBindings.get(name);
         if (capturedCell != null) {
             if (capturedCell.isUninitialized()) {
                 throw new EvalError("unbound variable: " + name);
@@ -43,8 +43,8 @@ final class MacroExpander {
         return env.lookup(name);
     }
 
-    void setSymbol(String name, Evaluator.Value value, Evaluator.Env env) throws EvalError {
-        Evaluator.Cell capturedCell = capturedBindings.get(name);
+    void setSymbol(String name, Value value, Env env) throws EvalError {
+        Cell capturedCell = capturedBindings.get(name);
         if (capturedCell != null) {
             if (capturedCell.isUninitialized()) {
                 throw new EvalError("unbound variable: " + name);
@@ -55,7 +55,7 @@ final class MacroExpander {
         env.set(name, value);
     }
 
-    private MacroValue parseMacro(String name, Expr transformerExpr, Evaluator.Env env)
+    private MacroValue parseMacro(String name, Expr transformerExpr, Env env)
             throws EvalError {
         if (!(transformerExpr instanceof ListExpr transformerList)) {
             throw new EvalError("define-syntax expects a syntax-rules transformer");
@@ -129,6 +129,11 @@ final class MacroExpander {
                     "symbol patterns are handled before the switch");
             case IntExpr intExpr -> input instanceof IntExpr other
                     && intExpr.value() == other.value();
+            case RationalExpr rationalExpr -> input instanceof RationalExpr other
+                    && rationalExpr.numerator() == other.numerator()
+                    && rationalExpr.denominator() == other.denominator();
+            case InexactExpr inexactExpr -> input instanceof InexactExpr other
+                    && Double.compare(inexactExpr.value(), other.value()) == 0;
             case BoolExpr boolExpr -> input instanceof BoolExpr other
                     && boolExpr.value() == other.value();
             case CharExpr charExpr -> input instanceof CharExpr other
@@ -233,6 +238,8 @@ final class MacroExpander {
             case ListExpr listExpr -> expandTemplateList(listExpr, macro, bindings,
                     renamedBindings, repetitionIndex);
             case IntExpr ignored -> template;
+            case RationalExpr ignored -> template;
+            case InexactExpr ignored -> template;
             case BoolExpr ignored -> template;
             case CharExpr ignored -> template;
             case StringExpr ignored -> template;
@@ -266,7 +273,7 @@ final class MacroExpander {
             return symbolExpr;
         }
 
-        Evaluator.Cell cell = macro.definitionEnv().lookupCell(name);
+        Cell cell = macro.definitionEnv().lookupCell(name);
         if (cell != null && !cell.isUninitialized()) {
             return new SymbolExpr(captureDefinitionSiteName(name, cell),
                     symbolExpr.line(), symbolExpr.column());
@@ -487,7 +494,7 @@ final class MacroExpander {
         return null;
     }
 
-    private String captureDefinitionSiteName(String originalName, Evaluator.Cell cell) {
+    private String captureDefinitionSiteName(String originalName, Cell cell) {
         String capturedName = nextGeneratedName("captured$" + originalName);
         capturedBindings.put(capturedName, cell);
         return capturedName;
@@ -508,6 +515,11 @@ final class MacroExpander {
         return switch (left) {
             case IntExpr leftInt -> right instanceof IntExpr rightInt
                     && leftInt.value() == rightInt.value();
+            case RationalExpr leftRational -> right instanceof RationalExpr rightRational
+                    && leftRational.numerator() == rightRational.numerator()
+                    && leftRational.denominator() == rightRational.denominator();
+            case InexactExpr leftInexact -> right instanceof InexactExpr rightInexact
+                    && Double.compare(leftInexact.value(), rightInexact.value()) == 0;
             case BoolExpr leftBool -> right instanceof BoolExpr rightBool
                     && leftBool.value() == rightBool.value();
             case CharExpr leftChar -> right instanceof CharExpr rightChar
@@ -534,7 +546,7 @@ final class MacroExpander {
     }
 
     private record MacroValue(String name, Set<String> literals, List<MacroRule> rules,
-            Evaluator.Env definitionEnv) {
+            Env definitionEnv) {
     }
 
     private record MacroRule(Expr pattern, Expr template) {
