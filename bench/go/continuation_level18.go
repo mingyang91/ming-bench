@@ -467,7 +467,7 @@ func (m *level18Machine) stepList(items listExpr) error {
 		case "or":
 			return m.stepOr(environment, items.items[1:])
 		case "cond":
-			expanded, err := level18ExpandCond(items.pos, items.items[1:])
+			expanded, err := level18ExpandCond(environment, items.pos, items.items[1:])
 			if err != nil {
 				return attachPos(err, operator.pos)
 			}
@@ -975,7 +975,7 @@ func level18ExpandSimpleLet(pos sourcePos, forms []expr) (expr, error) {
 	return listExpr{items: appItems, pos: pos}, nil
 }
 
-func level18ExpandCond(pos sourcePos, clauses []expr) (expr, error) {
+func level18ExpandCond(environment *env, pos sourcePos, clauses []expr) (expr, error) {
 	if len(clauses) == 0 {
 		return voidExpr{}, nil
 	}
@@ -996,7 +996,7 @@ func level18ExpandCond(pos sourcePos, clauses []expr) (expr, error) {
 		}
 
 		if isCondArrowClause(clause) {
-			tmp := symbolExpr{name: freshMacroName("%cond_value"), pos: clause.pos}
+			tmp := symbolExpr{name: freshMacroName(environment, "%cond_value"), pos: clause.pos}
 			result = listExpr{
 				pos: clause.pos,
 				items: []expr{

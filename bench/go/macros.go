@@ -26,8 +26,6 @@ type templateContext struct {
 	renamed  map[string]string
 }
 
-var macroExpansionCounter int
-
 func evalDefineSyntax(environment *env, forms []expr) (expr, error) {
 	if len(forms) != 2 {
 		return nil, &EvalError{Message: "define-syntax expects exactly 2 arguments"}
@@ -754,7 +752,7 @@ func expandBindingIdentifier(binding expr, ctx templateContext, repeatIndex *int
 		return cloneSyntax(value), nil
 	}
 
-	fresh := freshMacroName(symbol.name)
+	fresh := freshMacroName(ctx.defEnv, symbol.name)
 	renamed[symbol.name] = fresh
 	return symbolExpr{name: fresh, pos: symbol.pos}, nil
 }
@@ -826,9 +824,12 @@ func copyRenameMap(src map[string]string) map[string]string {
 	return dst
 }
 
-func freshMacroName(base string) string {
-	macroExpansionCounter++
-	return fmt.Sprintf("__ming_macro_%s_%d", base, macroExpansionCounter)
+func freshMacroName(environment *env, base string) string {
+	if rt := runtimeForEnv(environment); rt != nil {
+		rt.macroCounter++
+		return fmt.Sprintf("__ming_macro_%s_%d", base, rt.macroCounter)
+	}
+	return fmt.Sprintf("__ming_macro_%s", base)
 }
 
 func cloneSyntax(value expr) expr {

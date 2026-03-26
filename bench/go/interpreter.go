@@ -56,6 +56,7 @@ type env struct {
 	parent   *env
 	bindings map[string]expr
 	budget   *stepBudget
+	runtime  *runtime
 }
 
 type tokenKind int
@@ -85,8 +86,9 @@ type parser struct {
 }
 
 type runtime struct {
-	output strings.Builder
-	budget *stepBudget
+	output       strings.Builder
+	budget       *stepBudget
+	macroCounter int
 }
 
 type evalStep struct {
@@ -168,32 +170,42 @@ func formPos(form expr) sourcePos {
 }
 
 func evalProgram(input string) (string, error) {
-	result, _, err := evalProgramInternal(input, nil)
-	return result, err
+	result, _, err := evalProgramValueInternal(input, nil)
+	if err != nil {
+		return "", err
+	}
+	return renderExpr(result), nil
 }
 
 func evalProgramWithOutput(input string) (string, string, error) {
-	return evalProgramInternal(input, nil)
+	result, output, err := evalProgramValueInternal(input, nil)
+	if err != nil {
+		return "", output, err
+	}
+	return renderEvalWithOutputResult(result), output, nil
 }
 
 func evalProgramWithLimit(input string, maxSteps int) (string, error) {
-	result, _, err := evalProgramInternal(input, newStepBudget(maxSteps))
-	return result, err
+	result, _, err := evalProgramValueInternal(input, newStepBudget(maxSteps))
+	if err != nil {
+		return "", err
+	}
+	return renderExpr(result), nil
 }
 
-func evalProgramInternal(input string, budget *stepBudget) (string, string, error) {
+func evalProgramValueInternal(input string, budget *stepBudget) (expr, string, error) {
 	tokens, err := tokenize(input)
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 
 	p := parser{tokens: tokens}
 	program, err := p.parseProgram()
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	if len(program) == 0 {
-		return "", "", errorAt(sourcePos{Line: 1, Col: 1}, "empty program")
+		return nil, "", errorAt(sourcePos{Line: 1, Col: 1}, "empty program")
 	}
 
 	rt := &runtime{budget: budget}
@@ -205,15 +217,16 @@ func evalProgramInternal(input string, budget *stepBudget) (string, string, erro
 		result, err = evalSequence(environment, program)
 	}
 	if err != nil {
-		return "", rt.output.String(), err
+		return nil, rt.output.String(), err
 	}
 
-	return renderExpr(result), rt.output.String(), nil
+	return result, rt.output.String(), nil
 }
 
 func newGlobalEnv(rt *runtime) *env {
 	root := &env{
 		bindings: map[string]expr{},
+		runtime:  rt,
 	}
 	if rt != nil {
 		root.budget = rt.budget
@@ -398,6 +411,15 @@ func (e *env) lookup(name string) (expr, bool) {
 		}
 	}
 	return nil, false
+}
+
+func runtimeForEnv(environment *env) *runtime {
+	for current := environment; current != nil; current = current.parent {
+		if current.runtime != nil {
+			return current.runtime
+		}
+	}
+	return nil
 }
 
 func tokenize(input string) ([]token, error) {
@@ -2389,6 +2411,13 @@ func displayExpr(value expr) string {
 	default:
 		return renderExpr(value)
 	}
+}
+
+func renderEvalWithOutputResult(value expr) string {
+	if text, ok := asString(value); ok {
+		return text.text()
+	}
+	return renderExpr(value)
 }
 
 func renderPair(pair *pairExpr, render func(expr) string) string {

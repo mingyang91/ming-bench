@@ -465,7 +465,7 @@ func expandSyntaxBindingIdentifier(binding expr, templateEnv *env, defEnv *env, 
 		return value, nil
 	}
 
-	fresh := freshMacroName(symbol.name)
+	fresh := freshMacroName(defEnv, symbol.name)
 	renamed[symbol.name] = fresh
 	return symbolExpr{name: fresh, pos: symbol.pos}, nil
 }
