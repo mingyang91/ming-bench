@@ -61,6 +61,11 @@ interface EvaluatedArg {
   value: Value;
 }
 
+interface LetBinding {
+  name: string;
+  valueExpr: Expr;
+}
+
 interface BuiltinProcedure {
   kind: 'procedure';
   name: string;
@@ -145,6 +150,10 @@ class Reader {
       return this.parseList(loc);
     }
 
+    if (ch === '\'') {
+      return this.parseQuoted(loc);
+    }
+
     if (ch === ')') {
       this.raise('unexpected )', loc);
     }
@@ -173,6 +182,19 @@ class Reader {
 
     this.advance();
     return { type: 'list', elements, ...loc };
+  }
+
+  private parseQuoted(loc: SourceLoc): ListExpr {
+    this.advance();
+
+    return {
+      type: 'list',
+      elements: [
+        { type: 'symbol', value: 'quote', ...loc },
+        this.parseExpr(),
+      ],
+      ...loc,
+    };
   }
 
   private parseString(loc: SourceLoc): StringExpr {
@@ -230,7 +252,7 @@ class Reader {
 
     while (!this.isEof()) {
       const ch = this.peek();
-      if (isWhitespace(ch) || ch === '(' || ch === ')' || ch === ';') {
+      if (isWhitespace(ch) || ch === '(' || ch === ')' || ch === '\'' || ch === ';') {
         break;
       }
 
@@ -401,6 +423,71 @@ function createGlobalEnv(): Environment {
     return !isTruthy(args[0].value);
   }));
 
+  env.define('cons', builtin('cons', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: cons expects exactly 2 arguments`);
+    }
+
+    return { kind: 'pair', car: args[0].value, cdr: args[1].value };
+  }));
+
+  env.define('car', builtin('car', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: car expects exactly 1 argument`);
+    }
+
+    return expectPairArg(args[0]).car;
+  }));
+
+  env.define('cdr', builtin('cdr', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: cdr expects exactly 1 argument`);
+    }
+
+    return expectPairArg(args[0]).cdr;
+  }));
+
+  env.define('null?', builtin('null?', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: null? expects exactly 1 argument`);
+    }
+
+    return isEmptyList(args[0].value);
+  }));
+
+  env.define('list', builtin('list', (args) => makeList(args.map((arg) => arg.value))));
+
+  env.define('length', builtin('length', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: length expects exactly 1 argument`);
+    }
+
+    return expectProperList(args[0].value, args[0].expr).length;
+  }));
+
+  env.define('append', builtin('append', (args) => {
+    if (args.length === 0) {
+      return EMPTY_LIST;
+    }
+
+    let result = args[args.length - 1].value;
+
+    for (let index = args.length - 2; index >= 0; index -= 1) {
+      const elements = expectProperList(args[index].value, args[index].expr);
+      for (let elementIndex = elements.length - 1; elementIndex >= 0; elementIndex -= 1) {
+        result = { kind: 'pair', car: elements[elementIndex], cdr: result };
+      }
+    }
+
+    return result;
+  }));
+
+  env.define('string?', predicateBuiltin('string?', isSchemeStringValue));
+  env.define('number?', predicateBuiltin('number?', (value) => typeof value === 'number'));
+  env.define('boolean?', predicateBuiltin('boolean?', (value) => typeof value === 'boolean'));
+  env.define('pair?', predicateBuiltin('pair?', isPair));
+  env.define('symbol?', predicateBuiltin('symbol?', isSchemeSymbolValue));
+
   return env;
 }
 
@@ -422,6 +509,19 @@ function comparisonBuiltin(
     }
 
     return true;
+  });
+}
+
+function predicateBuiltin(
+  name: string,
+  predicate: (value: Value) => boolean,
+): BuiltinProcedure {
+  return builtin(name, (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: ${name} expects exactly 1 argument`);
+    }
+
+    return predicate(args[0].value);
   });
 }
 
@@ -467,6 +567,12 @@ function evaluateList(expr: ListExpr, env: Environment): Value {
         return evalAnd(args, env);
       case 'or':
         return evalOr(args, env);
+      case 'begin':
+        return evalBegin(args, env);
+      case 'cond':
+        return evalCond(args, head, env);
+      case 'let':
+        return evalLet(args, head, env);
     }
   }
 
@@ -579,6 +685,90 @@ function evalOr(args: Expr[], env: Environment): Value {
   return result;
 }
 
+function evalBegin(args: Expr[], env: Environment): Value {
+  return evaluateSequence(args, env);
+}
+
+function evalCond(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  for (let index = 0; index < args.length; index += 1) {
+    const clause = args[index];
+    if (clause.type !== 'list' || clause.elements.length === 0) {
+      throw new EvalError(`${head.line}:${head.col}: cond clauses must be non-empty lists`);
+    }
+
+    const [testExpr, ...body] = clause.elements;
+    const isElseClause = testExpr.type === 'symbol' && testExpr.value === 'else';
+
+    if (isElseClause) {
+      if (index !== args.length - 1) {
+        throw new EvalError(`${testExpr.line}:${testExpr.col}: else must be the last cond clause`);
+      }
+
+      return evaluateSequence(body, env);
+    }
+
+    const testValue = evaluate(testExpr, env);
+    if (isTruthy(testValue)) {
+      if (body.length === 0) {
+        return testValue;
+      }
+
+      return evaluateSequence(body, env);
+    }
+  }
+
+  return VOID_VALUE;
+}
+
+function evalLet(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  if (args.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: let expects bindings and a body`);
+  }
+
+  if (args[0].type === 'symbol') {
+    return evalNamedLet(args, head, env);
+  }
+
+  const bindings = parseLetBindings(args[0], head);
+  const body = args.slice(1);
+  const letEnv = new Environment(env);
+
+  for (const binding of bindings) {
+    letEnv.define(binding.name, evaluate(binding.valueExpr, env));
+  }
+
+  return evaluateSequence(body, letEnv);
+}
+
+function evalNamedLet(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  if (args.length < 3) {
+    throw new EvalError(`${head.line}:${head.col}: named let expects a name, bindings, and a body`);
+  }
+
+  const nameExpr = args[0];
+  if (nameExpr.type !== 'symbol') {
+    throw new EvalError(`${nameExpr.line}:${nameExpr.col}: named let name must be a symbol`);
+  }
+
+  const bindings = parseLetBindings(args[1], head);
+  const evaluatedArgs = bindings.map((binding) => ({
+    expr: binding.valueExpr,
+    value: evaluate(binding.valueExpr, env),
+  }));
+
+  const letEnv = new Environment(env);
+  const procedure: ClosureProcedure = {
+    kind: 'procedure',
+    name: nameExpr.value,
+    params: bindings.map((binding) => binding.name),
+    body: args.slice(2),
+    env: letEnv,
+  };
+
+  letEnv.define(nameExpr.value, procedure);
+  return applyProcedure(procedure, evaluatedArgs, nameExpr);
+}
+
 function applyProcedure(operator: Value, args: EvaluatedArg[], loc: SourceLoc): Value {
   if (!isProcedure(operator)) {
     throw new EvalError(`${loc.line}:${loc.col}: not a procedure`);
@@ -599,11 +789,7 @@ function applyProcedure(operator: Value, args: EvaluatedArg[], loc: SourceLoc): 
     callEnv.define(operator.params[index], args[index].value);
   }
 
-  let result: Value = VOID_VALUE;
-  for (const expr of operator.body) {
-    result = evaluate(expr, callEnv);
-  }
-  return result;
+  return evaluateSequence(operator.body, callEnv);
 }
 
 function quoteExpr(expr: Expr): Value {
@@ -621,10 +807,43 @@ function quoteExpr(expr: Expr): Value {
 }
 
 function quoteList(elements: Expr[]): Value {
+  return makeList(elements.map(quoteExpr));
+}
+
+function parseLetBindings(expr: Expr, head: SymbolExpr): LetBinding[] {
+  if (expr.type !== 'list') {
+    throw new EvalError(`${expr.line}:${expr.col}: let bindings must be a list`);
+  }
+
+  return expr.elements.map((bindingExpr) => {
+    if (bindingExpr.type !== 'list' || bindingExpr.elements.length !== 2) {
+      throw new EvalError(`${head.line}:${head.col}: let bindings must be pairs`);
+    }
+
+    const [nameExpr, valueExpr] = bindingExpr.elements;
+    if (nameExpr.type !== 'symbol') {
+      throw new EvalError(`${nameExpr.line}:${nameExpr.col}: let binding name must be a symbol`);
+    }
+
+    return { name: nameExpr.value, valueExpr };
+  });
+}
+
+function evaluateSequence(exprs: Expr[], env: Environment): Value {
+  let result: Value = VOID_VALUE;
+
+  for (const expr of exprs) {
+    result = evaluate(expr, env);
+  }
+
+  return result;
+}
+
+function makeList(elements: Value[]): Value {
   let result: Value = EMPTY_LIST;
 
   for (let index = elements.length - 1; index >= 0; index -= 1) {
-    result = { kind: 'pair', car: quoteExpr(elements[index]), cdr: result };
+    result = { kind: 'pair', car: elements[index], cdr: result };
   }
 
   return result;
@@ -646,6 +865,30 @@ function expectNumber(arg: EvaluatedArg): number {
   return arg.value;
 }
 
+function expectPairArg(arg: EvaluatedArg): PairValue {
+  if (!isPair(arg.value)) {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected pair`);
+  }
+
+  return arg.value;
+}
+
+function expectProperList(value: Value, loc: SourceLoc): Value[] {
+  const elements: Value[] = [];
+  let current = value;
+
+  while (isPair(current)) {
+    elements.push(current.car);
+    current = current.cdr;
+  }
+
+  if (!isEmptyList(current)) {
+    throw new EvalError(`${loc.line}:${loc.col}: expected proper list`);
+  }
+
+  return elements;
+}
+
 function isTruthy(value: Value): boolean {
   return value !== false;
 }
@@ -664,6 +907,14 @@ function isPair(value: Value): value is PairValue {
 
 function isEmptyList(value: Value): value is EmptyListValue {
   return typeof value === 'object' && value !== null && value.kind === 'empty-list';
+}
+
+function isSchemeStringValue(value: Value): value is SchemeString {
+  return typeof value === 'object' && value !== null && value.kind === 'string';
+}
+
+function isSchemeSymbolValue(value: Value): value is SchemeSymbol {
+  return typeof value === 'object' && value !== null && value.kind === 'symbol';
 }
 
 function procedureDisplayName(proc: ClosureProcedure): string {
