@@ -324,8 +324,9 @@ public class Evaluator {
         );
 
         BuiltinProc kProc = new BuiltinProc("continuation", kArgs -> {
-            if (kArgs.size() != 1) throw new EvalError("continuation: expected 1 argument");
-            throw new ContinuationInvoked(kArgs.get(0), cont);
+            if (kArgs.isEmpty()) throw new EvalError("continuation: expected at least 1 argument");
+            Object val = kArgs.size() == 1 ? kArgs.get(0) : new MultipleValues(new ArrayList<>(kArgs));
+            throw new ContinuationInvoked(val, cont);
         });
 
         try {
@@ -1062,51 +1063,71 @@ public class Evaluator {
 
     // L20: guard
     // (guard (var clause ...) body ...)
-    private Object evalGuard(List<Object> elems, Env env) throws EvalError {
-        if (elems.size() < 3) throw new EvalError("guard: bad syntax");
-        SchemeList clauseList = (SchemeList) elems.get(1);
-        if (clauseList.elems.isEmpty()) throw new EvalError("guard: bad syntax");
-        String var = ((SchemeSymbol) clauseList.elems.get(0)).name;
-        List<Object> clauses = clauseList.elems.subList(1, clauseList.elems.size());
-        List<Object> body = elems.subList(2, elems.size());
+    // Uses iterative trampoline within try/catch to support TCO through guard bodies.
+    private Object evalGuard(List<Object> elemsParam, Env envParam) throws EvalError {
+        List<Object> elems = elemsParam;
+        Env env = envParam;
 
-        try {
-            // Evaluate body
-            Object result = null;
-            for (Object expr : body) {
-                result = eval(expr, env);
-            }
-            return result;
-        } catch (SchemeException se) {
-            // Bind exception value to var
-            Env guardEnv = new Env(env);
-            guardEnv.define(var, se.value);
+        guardLoop:
+        while (true) {
+            if (elems.size() < 3) throw new EvalError("guard: bad syntax");
+            SchemeList clauseList = (SchemeList) elems.get(1);
+            if (clauseList.elems.isEmpty()) throw new EvalError("guard: bad syntax");
+            String var = ((SchemeSymbol) clauseList.elems.get(0)).name;
+            List<Object> clauses = clauseList.elems.subList(1, clauseList.elems.size());
+            List<Object> body = elems.subList(2, elems.size());
 
-            // Test cond-like clauses
-            for (Object clause : clauses) {
-                SchemeList cl = (SchemeList) clause;
-                if (cl.elems.isEmpty()) continue;
-                Object test = cl.elems.get(0);
-                if (test instanceof SchemeSymbol s && s.name.equals("else")) {
-                    // else clause
-                    Object result = null;
-                    for (int i = 1; i < cl.elems.size(); i++) {
-                        result = eval(cl.elems.get(i), guardEnv);
-                    }
-                    return result;
+            try {
+                // Evaluate non-tail body expressions
+                Object result = null;
+                for (int i = 0; i < body.size() - 1; i++) {
+                    result = eval(body.get(i), env);
                 }
-                Object testVal = eval(test, guardEnv);
-                if (isTruthy(testVal)) {
-                    if (cl.elems.size() == 1) return testVal;
-                    Object result = null;
-                    for (int i = 1; i < cl.elems.size(); i++) {
-                        result = eval(cl.elems.get(i), guardEnv);
+                // Last body expression in tail position — trampoline within try/catch
+                result = evalTail(body.get(body.size() - 1), env);
+                while (result instanceof TailCall tc) {
+                    // Detect guard form re-entry to iterate instead of recurse
+                    if (tc.expr instanceof SchemeList sl && !sl.elems.isEmpty()
+                        && sl.elems.get(0) instanceof SchemeSymbol sym
+                        && sym.name.equals("guard")) {
+                        elems = sl.elems;
+                        env = tc.env;
+                        continue guardLoop;
                     }
-                    return result;
+                    result = evalTail(tc.expr, tc.env);
                 }
+                return result;
+            } catch (SchemeException se) {
+                // Bind exception value to var
+                Env guardEnv = new Env(env);
+                guardEnv.define(var, se.value);
+
+                // Test cond-like clauses
+                for (Object clause : clauses) {
+                    SchemeList cl = (SchemeList) clause;
+                    if (cl.elems.isEmpty()) continue;
+                    Object test = cl.elems.get(0);
+                    if (test instanceof SchemeSymbol s && s.name.equals("else")) {
+                        // else clause
+                        Object res = null;
+                        for (int i = 1; i < cl.elems.size(); i++) {
+                            res = eval(cl.elems.get(i), guardEnv);
+                        }
+                        return res;
+                    }
+                    Object testVal = eval(test, guardEnv);
+                    if (isTruthy(testVal)) {
+                        if (cl.elems.size() == 1) return testVal;
+                        Object res = null;
+                        for (int i = 1; i < cl.elems.size(); i++) {
+                            res = eval(cl.elems.get(i), guardEnv);
+                        }
+                        return res;
+                    }
+                }
+                // No clause matched — re-raise
+                throw se;
             }
-            // No clause matched — re-raise
-            throw se;
         }
     }
 
