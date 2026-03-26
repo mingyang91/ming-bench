@@ -246,6 +246,14 @@ struct EvalContext {
     output: String,
 }
 
+#[derive(Debug, Clone)]
+enum EvalStep {
+    Value(Value),
+    Expr(Expr, EnvRef),
+    Sequence(Vec<Expr>, EnvRef),
+    Apply(Value, Vec<Value>),
+}
+
 fn current_bench_level() -> u32 {
     static BENCH_LEVEL: OnceLock<u32> = OnceLock::new();
 
@@ -308,9 +316,42 @@ impl Env {
 }
 
 impl Procedure {
-    fn call(&self, args: Vec<Value>, context: &mut EvalContext) -> Result<Value, EvalError> {
+    fn call_step(
+        &self,
+        args: Vec<Value>,
+        context: &mut EvalContext,
+    ) -> Result<EvalStep, EvalError> {
         match self {
-            Self::Builtin { name } => apply_builtin(name, &args, context),
+            Self::Builtin { name } => {
+                if *name == "apply" {
+                    if args.len() < 2 {
+                        return Err(EvalError::WrongArgCount {
+                            name: "apply",
+                            expected: "at least 2 arguments",
+                            got: args.len(),
+                        });
+                    }
+
+                    let mut applied_args = args[1..args.len() - 1].to_vec();
+                    let tail = args
+                        .last()
+                        .expect("apply arity checked before reading tail");
+
+                    match tail {
+                        Value::List(items) => applied_args.extend(items.iter().cloned()),
+                        other => {
+                            return Err(EvalError::ExpectedList {
+                                name: "apply",
+                                found: other.type_name(),
+                            });
+                        }
+                    }
+
+                    Ok(EvalStep::Apply(args[0].clone(), applied_args))
+                } else {
+                    Ok(EvalStep::Value(apply_builtin(name, &args, context)?))
+                }
+            }
             Self::RecordConstructor {
                 name,
                 record_type,
@@ -329,10 +370,10 @@ impl Procedure {
                     fields[index] = value;
                 }
 
-                Ok(Value::Record(Rc::new(RecordValue {
+                Ok(EvalStep::Value(Value::Record(Rc::new(RecordValue {
                     record_type: record_type.clone(),
                     fields,
-                })))
+                }))))
             }
             Self::RecordPredicate { name, record_type } => {
                 if args.len() != 1 {
@@ -343,10 +384,10 @@ impl Procedure {
                     });
                 }
 
-                Ok(Value::Boolean(matches!(
+                Ok(EvalStep::Value(Value::Boolean(matches!(
                     &args[0],
                     Value::Record(record) if Rc::ptr_eq(&record.record_type, record_type)
-                )))
+                ))))
             }
             Self::RecordAccessor {
                 name,
@@ -363,7 +404,7 @@ impl Procedure {
 
                 match &args[0] {
                     Value::Record(record) if Rc::ptr_eq(&record.record_type, record_type) => {
-                        Ok(record.fields[*field_index].clone())
+                        Ok(EvalStep::Value(record.fields[*field_index].clone()))
                     }
                     Value::Record(record) => Err(EvalError::ExpectedRecordType {
                         name: name.clone(),
@@ -391,7 +432,7 @@ impl Procedure {
                 }
 
                 let call_env = bind_lambda_args(params, args, env);
-                eval_sequence(body, &call_env, context)
+                Ok(EvalStep::Sequence(body.clone(), call_env))
             }
             Self::CaseLambda { clauses, env } => {
                 let Some(clause) = clauses
@@ -406,7 +447,7 @@ impl Procedure {
                 };
 
                 let call_env = bind_lambda_args(&clause.params, args, env);
-                eval_sequence(&clause.body, &call_env, context)
+                Ok(EvalStep::Sequence(clause.body.clone(), call_env))
             }
         }
     }
@@ -756,69 +797,90 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn resolve_eval_step(mut step: EvalStep, context: &mut EvalContext) -> Result<Value, EvalError> {
+    loop {
+        step = match step {
+            EvalStep::Value(value) => return Ok(value),
+            EvalStep::Expr(expr, env) => eval_expr_step(expr, env, context)?,
+            EvalStep::Sequence(expressions, env) => eval_sequence_step(expressions, env, context)?,
+            EvalStep::Apply(procedure, args) => apply_procedure_step(procedure, args, context)?,
+        };
+    }
+}
+
 fn eval_expr_in_env(
     expr: &Expr,
     env: &EnvRef,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
+    resolve_eval_step(EvalStep::Expr(expr.clone(), env.clone()), context)
+}
+
+fn eval_expr_step(
+    expr: Expr,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     match expr {
-        Expr::Number(value) => Ok(Value::Number(value.clone())),
-        Expr::Boolean(value) => Ok(Value::Boolean(*value)),
-        Expr::Char(value) => Ok(Value::Char(*value)),
-        Expr::String(value) => Ok(Value::String(SchemeString::new_immutable(value))),
+        Expr::Number(value) => Ok(EvalStep::Value(Value::Number(value))),
+        Expr::Boolean(value) => Ok(EvalStep::Value(Value::Boolean(value))),
+        Expr::Char(value) => Ok(EvalStep::Value(Value::Char(value))),
+        Expr::String(value) => Ok(EvalStep::Value(Value::String(SchemeString::new_immutable(
+            value,
+        )))),
         Expr::Symbol(name) => {
             let value = env
-                .get(name)
+                .get(&name)
                 .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() })?;
 
             if matches!(value, Value::Uninitialized) {
-                Err(EvalError::UninitializedBinding { name: name.clone() })
+                Err(EvalError::UninitializedBinding { name })
             } else {
-                Ok(value)
+                Ok(EvalStep::Value(value))
             }
         }
-        Expr::List(items) => eval_application(items, env, context),
+        Expr::List(items) => eval_application_step(items, env, context),
     }
 }
 
-fn eval_application(
-    items: &[Expr],
-    env: &EnvRef,
+fn eval_application_step(
+    items: Vec<Expr>,
+    env: EnvRef,
     context: &mut EvalContext,
-) -> Result<Value, EvalError> {
+) -> Result<EvalStep, EvalError> {
     let Some((head, tail)) = items.split_first() else {
         return Err(EvalError::NotAProcedure);
     };
 
     if let Expr::Symbol(name) = head {
         match name.as_str() {
-            "and" => return eval_and(tail, env, context),
-            "begin" => return eval_begin(tail, env, context),
-            "case" => return eval_case(tail, env, context),
-            "case-lambda" => return eval_case_lambda(tail, env),
-            "cond" => return eval_cond(tail, env, context),
-            "define" => return eval_define(tail, env, context),
-            "define-record-type" => return eval_define_record_type(tail, env),
-            "do" => return eval_do(tail, env, context),
-            "if" => return eval_if(tail, env, context),
-            "lambda" => return eval_lambda(tail, env),
-            "let" => return eval_let(tail, env, context),
-            "letrec" => return eval_letrec(tail, env, context, false),
-            "letrec*" => return eval_letrec(tail, env, context, true),
-            "or" => return eval_or(tail, env, context),
-            "quote" => return eval_quote(tail),
-            "set!" => return eval_set(tail, env, context),
+            "and" => return eval_and_step(tail, &env, context),
+            "begin" => return eval_begin_step(tail, &env),
+            "case" => return eval_case_step(tail, &env, context),
+            "case-lambda" => return eval_case_lambda_step(tail, &env),
+            "cond" => return eval_cond_step(tail, &env, context),
+            "define" => return eval_define_step(tail, &env, context),
+            "define-record-type" => return eval_define_record_type_step(tail, &env),
+            "do" => return eval_do_step(tail, &env, context),
+            "if" => return eval_if_step(tail, &env, context),
+            "lambda" => return eval_lambda_step(tail, &env),
+            "let" => return eval_let_step(tail, &env, context),
+            "letrec" => return eval_letrec_step(tail, &env, context, false),
+            "letrec*" => return eval_letrec_step(tail, &env, context, true),
+            "or" => return eval_or_step(tail, &env, context),
+            "quote" => return eval_quote_step(tail),
+            "set!" => return eval_set_step(tail, &env, context),
             _ => {}
         }
     }
 
-    let procedure = eval_expr_in_env(head, env, context)?;
+    let procedure = eval_expr_in_env(head, &env, context)?;
     let args = tail
         .iter()
-        .map(|expr| eval_expr_in_env(expr, env, context))
+        .map(|expr| eval_expr_in_env(expr, &env, context))
         .collect::<Result<Vec<_>, EvalError>>()?;
 
-    apply_procedure(procedure, args, context)
+    Ok(EvalStep::Apply(procedure, args))
 }
 
 fn eval_sequence(
@@ -826,42 +888,75 @@ fn eval_sequence(
     env: &EnvRef,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
-    let mut last = Value::Void;
-    for expression in expressions {
-        last = eval_expr_in_env(expression, env, context)?;
-    }
-
-    Ok(last)
+    resolve_eval_step(
+        EvalStep::Sequence(expressions.to_vec(), env.clone()),
+        context,
+    )
 }
 
-fn eval_and(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for arg in args {
-        result = eval_expr_in_env(arg, env, context)?;
+fn eval_sequence_step(
+    expressions: Vec<Expr>,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
+    let Some((last, initial)) = expressions.split_last() else {
+        return Ok(EvalStep::Value(Value::Void));
+    };
+
+    for expression in initial {
+        eval_expr_in_env(expression, &env, context)?;
+    }
+
+    Ok(EvalStep::Expr(last.clone(), env))
+}
+
+fn eval_and_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
+    let Some((last, initial)) = args.split_last() else {
+        return Ok(EvalStep::Value(Value::Boolean(true)));
+    };
+
+    for arg in initial {
+        let result = eval_expr_in_env(arg, env, context)?;
         if !result.is_truthy() {
-            return Ok(result);
+            return Ok(EvalStep::Value(result));
         }
     }
 
-    Ok(result)
+    Ok(EvalStep::Expr(last.clone(), env.clone()))
 }
 
-fn eval_or(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
-    for arg in args {
+fn eval_or_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
+    let Some((last, initial)) = args.split_last() else {
+        return Ok(EvalStep::Value(Value::Boolean(false)));
+    };
+
+    for arg in initial {
         let value = eval_expr_in_env(arg, env, context)?;
         if value.is_truthy() {
-            return Ok(value);
+            return Ok(EvalStep::Value(value));
         }
     }
 
-    Ok(Value::Boolean(false))
+    Ok(EvalStep::Expr(last.clone(), env.clone()))
 }
 
-fn eval_begin(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
-    eval_sequence(args, env, context)
+fn eval_begin_step(args: &[Expr], env: &EnvRef) -> Result<EvalStep, EvalError> {
+    Ok(EvalStep::Sequence(args.to_vec(), env.clone()))
 }
 
-fn eval_case(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+fn eval_case_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     let Some((key_expr, clauses)) = args.split_first() else {
         return Err(EvalError::WrongArgCount {
             name: "case",
@@ -896,9 +991,9 @@ fn eval_case(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<V
             }
 
             return if body.is_empty() {
-                Ok(Value::Void)
+                Ok(EvalStep::Value(Value::Void))
             } else {
-                eval_sequence(body, env, context)
+                Ok(EvalStep::Sequence(body.to_vec(), env.clone()))
             };
         }
 
@@ -914,17 +1009,21 @@ fn eval_case(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<V
             .any(|datum| eq_values(&key, &quote_expr(datum)))
         {
             return if body.is_empty() {
-                Ok(Value::Void)
+                Ok(EvalStep::Value(Value::Void))
             } else {
-                eval_sequence(body, env, context)
+                Ok(EvalStep::Sequence(body.to_vec(), env.clone()))
             };
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
-fn eval_cond(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+fn eval_cond_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     for (index, clause) in args.iter().enumerate() {
         let Expr::List(items) = clause else {
             return Err(EvalError::InvalidForm {
@@ -955,23 +1054,27 @@ fn eval_cond(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<V
                 });
             }
 
-            return eval_sequence(body, env, context);
+            return Ok(EvalStep::Sequence(body.to_vec(), env.clone()));
         }
 
         let value = eval_expr_in_env(test, env, context)?;
         if value.is_truthy() {
             return if body.is_empty() {
-                Ok(value)
+                Ok(EvalStep::Value(value))
             } else {
-                eval_sequence(body, env, context)
+                Ok(EvalStep::Sequence(body.to_vec(), env.clone()))
             };
         }
     }
 
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
-fn eval_define(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+fn eval_define_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     let Some((target, rest)) = args.split_first() else {
         return Err(EvalError::WrongArgCount {
             name: "define",
@@ -992,7 +1095,7 @@ fn eval_define(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result
 
             let value = eval_expr_in_env(&rest[0], env, context)?;
             env.define(name.clone(), value);
-            Ok(Value::Void)
+            Ok(EvalStep::Value(Value::Void))
         }
         Expr::List(signature) => {
             let Some((name_expr, params_exprs)) = signature.split_first() else {
@@ -1024,7 +1127,7 @@ fn eval_define(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result
             }));
 
             env.define(name.clone(), procedure);
-            Ok(Value::Void)
+            Ok(EvalStep::Value(Value::Void))
         }
         _ => Err(EvalError::InvalidForm {
             name: "define",
@@ -1033,7 +1136,7 @@ fn eval_define(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result
     }
 }
 
-fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_define_record_type_step(args: &[Expr], env: &EnvRef) -> Result<EvalStep, EvalError> {
     if args.len() < 3 {
         return Err(EvalError::WrongArgCount {
             name: "define-record-type",
@@ -1122,10 +1225,14 @@ fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalErr
         );
     }
 
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
-fn eval_if(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+fn eval_if_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     if !(2..=3).contains(&args.len()) {
         return Err(EvalError::WrongArgCount {
             name: "if",
@@ -1135,15 +1242,19 @@ fn eval_if(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Val
     }
 
     if eval_expr_in_env(&args[0], env, context)?.is_truthy() {
-        eval_expr_in_env(&args[1], env, context)
+        Ok(EvalStep::Expr(args[1].clone(), env.clone()))
     } else if args.len() == 3 {
-        eval_expr_in_env(&args[2], env, context)
+        Ok(EvalStep::Expr(args[2].clone(), env.clone()))
     } else {
-        Ok(Value::Void)
+        Ok(EvalStep::Value(Value::Void))
     }
 }
 
-fn eval_set(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+fn eval_set_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::WrongArgCount {
             name: "set!",
@@ -1161,10 +1272,10 @@ fn eval_set(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Va
 
     let value = eval_expr_in_env(&args[1], env, context)?;
     env.set(name, value)?;
-    Ok(Value::Void)
+    Ok(EvalStep::Value(Value::Void))
 }
 
-fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_lambda_step(args: &[Expr], env: &EnvRef) -> Result<EvalStep, EvalError> {
     let Some((params_expr, body)) = args.split_first() else {
         return Err(EvalError::WrongArgCount {
             name: "lambda",
@@ -1181,14 +1292,16 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     }
 
     let params = parse_params(params_expr, "lambda")?;
-    Ok(Value::Procedure(Rc::new(Procedure::Lambda {
-        params,
-        body: body.to_vec(),
-        env: env.clone(),
-    })))
+    Ok(EvalStep::Value(Value::Procedure(Rc::new(
+        Procedure::Lambda {
+            params,
+            body: body.to_vec(),
+            env: env.clone(),
+        },
+    ))))
 }
 
-fn eval_case_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_case_lambda_step(args: &[Expr], env: &EnvRef) -> Result<EvalStep, EvalError> {
     if args.is_empty() {
         return Err(EvalError::WrongArgCount {
             name: "case-lambda",
@@ -1202,13 +1315,19 @@ fn eval_case_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         .map(parse_case_lambda_clause)
         .collect::<Result<Vec<_>, EvalError>>()?;
 
-    Ok(Value::Procedure(Rc::new(Procedure::CaseLambda {
-        clauses,
-        env: env.clone(),
-    })))
+    Ok(EvalStep::Value(Value::Procedure(Rc::new(
+        Procedure::CaseLambda {
+            clauses,
+            env: env.clone(),
+        },
+    ))))
 }
 
-fn eval_let(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+fn eval_let_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     let Some((first, rest)) = args.split_first() else {
         return Err(EvalError::WrongArgCount {
             name: "let",
@@ -1237,7 +1356,7 @@ fn eval_let(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Va
                 let_env.define(name, value);
             }
 
-            eval_sequence(rest, &let_env, context)
+            Ok(EvalStep::Sequence(rest.to_vec(), let_env))
         }
         Expr::Symbol(name) => {
             let Some((bindings_expr, body)) = rest.split_first() else {
@@ -1275,7 +1394,7 @@ fn eval_let(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Va
             let value = Value::Procedure(procedure.clone());
             let_env.define(name.clone(), value.clone());
 
-            apply_procedure(value, args, context)
+            Ok(EvalStep::Apply(value, args))
         }
         _ => Err(EvalError::InvalidForm {
             name: "let",
@@ -1290,6 +1409,15 @@ fn eval_letrec(
     context: &mut EvalContext,
     sequential: bool,
 ) -> Result<Value, EvalError> {
+    resolve_eval_step(eval_letrec_step(args, env, context, sequential)?, context)
+}
+
+fn eval_letrec_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+    sequential: bool,
+) -> Result<EvalStep, EvalError> {
     let form_name = if sequential { "letrec*" } else { "letrec" };
     let Some((bindings_expr, body)) = args.split_first() else {
         return Err(EvalError::WrongArgCount {
@@ -1335,10 +1463,14 @@ fn eval_letrec(
         }
     }
 
-    eval_sequence(body, &letrec_env, context)
+    Ok(EvalStep::Sequence(body.to_vec(), letrec_env))
 }
 
-fn eval_do(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+fn eval_do_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             name: "do",
@@ -1367,9 +1499,9 @@ fn eval_do(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Val
     loop {
         if eval_expr_in_env(&test, &do_env, context)?.is_truthy() {
             return if result_exprs.is_empty() {
-                Ok(Value::Void)
+                Ok(EvalStep::Value(Value::Void))
             } else {
-                eval_sequence(&result_exprs, &do_env, context)
+                Ok(EvalStep::Sequence(result_exprs.clone(), do_env.clone()))
             };
         }
 
@@ -1391,7 +1523,7 @@ fn eval_do(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Val
     }
 }
 
-fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_quote_step(args: &[Expr]) -> Result<EvalStep, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name: "quote",
@@ -1400,7 +1532,7 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
         });
     }
 
-    Ok(quote_expr(&args[0]))
+    Ok(EvalStep::Value(quote_expr(&args[0])))
 }
 
 fn parse_params(expr: &Expr, name: &'static str) -> Result<LambdaParams, EvalError> {
@@ -1824,8 +1956,16 @@ fn apply_procedure(
     args: Vec<Value>,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
+    resolve_eval_step(EvalStep::Apply(procedure, args), context)
+}
+
+fn apply_procedure_step(
+    procedure: Value,
+    args: Vec<Value>,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
     match procedure {
-        Value::Procedure(procedure) => procedure.call(args, context),
+        Value::Procedure(procedure) => procedure.call_step(args, context),
         _ => Err(EvalError::NotAProcedure),
     }
 }
