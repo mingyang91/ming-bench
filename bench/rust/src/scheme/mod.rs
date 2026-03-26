@@ -2010,14 +2010,15 @@ fn collect_template_symbols(
     }
 }
 
-fn eval_macro(
+/// Expand a syntax-rules macro without evaluating. Returns (expanded_expr, wrapper_env).
+fn expand_macro_only(
     literals: &[String],
     rules: &[(Expr, Expr)],
     def_env: &Env,
     input: &[Expr],
     env: &Env,
     p: Pos,
-) -> Result<Value, EvalError> {
+) -> Result<(Expr, Env), EvalError> {
     for (pattern, template) in rules {
         let mut bindings = HashMap::new();
         if let Expr::List(pat_elems, _) = pattern {
@@ -2035,13 +2036,25 @@ fn eval_macro(
                     }
                 }
 
-                return eval(&expanded, &wrapper_env);
+                return Ok((expanded, wrapper_env));
             }
         }
     }
     Err(EvalError::Type(format!(
         "no matching macro pattern at {}", p
     )))
+}
+
+fn eval_macro(
+    literals: &[String],
+    rules: &[(Expr, Expr)],
+    def_env: &Env,
+    input: &[Expr],
+    env: &Env,
+    p: Pos,
+) -> Result<Value, EvalError> {
+    let (expanded, wrapper_env) = expand_macro_only(literals, rules, def_env, input, env, p)?;
+    eval(&expanded, &wrapper_env)
 }
 
 // --- syntax-case support ---
@@ -4034,8 +4047,8 @@ fn eval_cps(expr: &Expr, env: &Env, k: ContFn) -> Result<Value, EvalError> {
                         // Check if this is a macro
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
                             // Expand macro and re-evaluate via CPS
-                            let expanded = eval_macro(&literals, &rules, &def_env, elems, env, pos)?;
-                            return k.call(force(expanded)?);
+                            let (expanded, wrapper_env) = expand_macro_only(&literals, &rules, &def_env, elems, env, pos)?;
+                            return eval_cps(&expanded, &wrapper_env, k);
                         }
                         // Check if this is a transformer macro
                         if let Some(Value::TransformerMacro { transformer, def_env }) = env_get(env, op) {
@@ -4085,7 +4098,8 @@ fn eval_cps_let(args: &[Expr], env: &Env, p: Pos, k: ContFn) -> Result<Value, Ev
         Expr::List(b, _) => b,
         _ => return Err(EvalError::Type(format!("let: expected bindings list at {}", p))),
     };
-    let local_env = new_env(Some(env.clone()));
+    // Parse bindings into (name, init_expr) pairs
+    let mut parsed_bindings: Vec<(String, Expr)> = Vec::new();
     for b in bindings_expr {
         match b {
             Expr::List(pair, _) if pair.len() == 2 => {
@@ -4093,18 +4107,49 @@ fn eval_cps_let(args: &[Expr], env: &Env, p: Pos, k: ContFn) -> Result<Value, Ev
                     Expr::Symbol(s, _) => s.clone(),
                     _ => return Err(EvalError::Type(format!("let: expected symbol in binding at {}", p))),
                 };
-                let val = eval(&pair[1], env)?;
-                let val = force(val)?;
-                env_set(&local_env, name, val);
+                parsed_bindings.push((name, pair[1].clone()));
             }
             _ => return Err(EvalError::Type(format!("let: invalid binding at {}", p))),
         }
     }
-    let body = &args[1..];
-    if body.is_empty() {
-        return k.call(Value::Boolean(false));
+    let local_env = new_env(Some(env.clone()));
+    let body: Vec<Expr> = args[1..].to_vec();
+    eval_cps_let_bindings(&parsed_bindings, 0, env, &local_env, &body, k)
+}
+
+/// Evaluate let bindings one at a time via CPS, then evaluate body.
+fn eval_cps_let_bindings(
+    bindings: &[(String, Expr)],
+    idx: usize,
+    outer_env: &Env,
+    local_env: &Env,
+    body: &[Expr],
+    k: ContFn,
+) -> Result<Value, EvalError> {
+    if idx >= bindings.len() {
+        if body.is_empty() {
+            return k.call(Value::Boolean(false));
+        }
+        return eval_body_cps(body, local_env, k);
     }
-    eval_body_cps(body, &local_env, k)
+    let (name, init) = &bindings[idx];
+    if contains_callcc(init) {
+        let name2 = name.clone();
+        let local_env2 = local_env.clone();
+        let body2 = body.to_vec();
+        let bindings2 = bindings.to_vec();
+        let outer_env2 = outer_env.clone();
+        let k_bind = ContFn::new(move |v| {
+            env_set(&local_env2, name2.clone(), v);
+            eval_cps_let_bindings(&bindings2, idx + 1, &outer_env2, &local_env2, &body2, k.clone())
+        });
+        eval_cps(init, outer_env, k_bind)
+    } else {
+        let val = eval(init, outer_env)?;
+        let val = force(val)?;
+        env_set(local_env, name.clone(), val);
+        eval_cps_let_bindings(bindings, idx + 1, outer_env, local_env, body, k)
+    }
 }
 
 /// CPS variant of letrec/letrec* evaluation.
