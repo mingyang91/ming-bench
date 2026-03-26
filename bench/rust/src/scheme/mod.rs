@@ -73,6 +73,10 @@ enum Value {
         env: Env,
     },
     Vector(VecRef),
+    TailCall {
+        expr: Box<Expr>,
+        env: Env,
+    },
 }
 
 static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -227,6 +231,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::TailCall { .. } => write!(f, "#<tailcall>"),
         }
     }
 }
@@ -690,7 +695,22 @@ fn is_builtin(name: &str) -> bool {
     )
 }
 
+fn force(mut result: Value) -> Result<Value, EvalError> {
+    loop {
+        match result {
+            Value::TailCall { expr, env } => {
+                result = eval_step(&expr, &env)?;
+            }
+            v => return Ok(v),
+        }
+    }
+}
+
 fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+    force(eval_step(expr, env)?)
+}
+
+fn eval_step(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     let p = expr.pos();
     match expr {
         Expr::Integer(n, _) => Ok(Value::Integer(*n)),
@@ -779,11 +799,13 @@ fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                 }
                 let rest_list = vec_to_list(args[params.len()..].to_vec());
                 env_set(&local_env, rest.clone(), rest_list);
-                let mut result = Value::Boolean(false);
-                for expr in body {
-                    result = eval(expr, &local_env)?;
+                if body.is_empty() {
+                    return Ok(Value::Boolean(false));
                 }
-                return Ok(result);
+                for expr in &body[..body.len() - 1] {
+                    eval(expr, &local_env)?;
+                }
+                return Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: local_env });
             }
             if args.len() != params.len() {
                 return Err(EvalError::Arity(format!(
@@ -797,11 +819,13 @@ fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eva
             for (p, a) in params.iter().zip(args.iter()) {
                 env_set(&local_env, p.clone(), a.clone());
             }
-            let mut result = Value::Boolean(false);
-            for expr in body {
-                result = eval(expr, &local_env)?;
+            if body.is_empty() {
+                return Ok(Value::Boolean(false));
             }
-            Ok(result)
+            for expr in &body[..body.len() - 1] {
+                eval(expr, &local_env)?;
+            }
+            Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: local_env })
         }
         Value::RecordConstructor { type_id, type_name, field_names } => {
             if args.len() != field_names.len() {
@@ -869,11 +893,13 @@ fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                         let rest_list = vec_to_list(args[params.len()..].to_vec());
                         env_set(&local_env, rest.clone(), rest_list);
                     }
-                    let mut result = Value::Boolean(false);
-                    for expr in body {
-                        result = eval(expr, &local_env)?;
+                    if body.is_empty() {
+                        return Ok(Value::Boolean(false));
                     }
-                    return Ok(result);
+                    for expr in &body[..body.len() - 1] {
+                        eval(expr, &local_env)?;
+                    }
+                    return Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: local_env });
                 }
             }
             Err(EvalError::Arity(format!(
@@ -979,9 +1005,9 @@ fn eval_if(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     }
     let cond = eval(&args[0], env)?;
     if cond.is_truthy() {
-        eval(&args[1], env)
+        Ok(Value::TailCall { expr: Box::new(args[1].clone()), env: env.clone() })
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        Ok(Value::TailCall { expr: Box::new(args[2].clone()), env: env.clone() })
     } else {
         Ok(Value::Boolean(false))
     }
@@ -1075,27 +1101,32 @@ fn eval_and(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Boolean(true));
     }
-    let mut result = Value::Boolean(true);
-    for expr in exprs {
-        result = eval(expr, env)?;
+    for (i, expr) in exprs.iter().enumerate() {
+        if i == exprs.len() - 1 {
+            return Ok(Value::TailCall { expr: Box::new(expr.clone()), env: env.clone() });
+        }
+        let result = eval(expr, env)?;
         if !result.is_truthy() {
             return Ok(result);
         }
     }
-    Ok(result)
+    unreachable!()
 }
 
 fn eval_or(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Boolean(false));
     }
-    for expr in exprs {
+    for (i, expr) in exprs.iter().enumerate() {
+        if i == exprs.len() - 1 {
+            return Ok(Value::TailCall { expr: Box::new(expr.clone()), env: env.clone() });
+        }
         let result = eval(expr, env)?;
         if result.is_truthy() {
             return Ok(result);
         }
     }
-    Ok(Value::Boolean(false))
+    unreachable!()
 }
 
 fn eval_let(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
@@ -1199,19 +1230,24 @@ fn eval_let(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             }
         }
     }
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, &local_env)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Value::Boolean(false));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local_env)?;
+    }
+    Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: local_env })
 }
 
 fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for expr in args {
-        result = eval(expr, env)?;
+    if args.is_empty() {
+        return Ok(Value::Boolean(false));
     }
-    Ok(result)
+    for expr in &args[..args.len() - 1] {
+        eval(expr, env)?;
+    }
+    Ok(Value::TailCall { expr: Box::new(args.last().unwrap().clone()), env: env.clone() })
 }
 
 fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
@@ -1221,20 +1257,26 @@ fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
                 // Check for else clause
                 if let Expr::Symbol(s, _) = &parts[0] {
                     if s == "else" {
-                        let mut result = Value::Boolean(false);
-                        for expr in &parts[1..] {
-                            result = eval(expr, env)?;
+                        let body = &parts[1..];
+                        if body.is_empty() {
+                            return Ok(Value::Boolean(false));
                         }
-                        return Ok(result);
+                        for expr in &body[..body.len() - 1] {
+                            eval(expr, env)?;
+                        }
+                        return Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: env.clone() });
                     }
                 }
                 let test = eval(&parts[0], env)?;
                 if test.is_truthy() {
-                    let mut result = test;
-                    for expr in &parts[1..] {
-                        result = eval(expr, env)?;
+                    let body = &parts[1..];
+                    if body.is_empty() {
+                        return Ok(test);
                     }
-                    return Ok(result);
+                    for expr in &body[..body.len() - 1] {
+                        eval(expr, env)?;
+                    }
+                    return Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: env.clone() });
                 }
             }
             _ => {
@@ -1774,11 +1816,14 @@ fn eval_letrec(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
         let val = eval(init, &local_env)?;
         env_set(&local_env, name.clone(), val);
     }
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, &local_env)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Value::Boolean(false));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local_env)?;
+    }
+    Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: local_env })
 }
 
 fn eval_letrec_star(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
@@ -1803,11 +1848,14 @@ fn eval_letrec_star(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError
             _ => return Err(EvalError::Type(format!("letrec*: invalid binding at {}", p))),
         }
     }
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, &local_env)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Value::Boolean(false));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local_env)?;
+    }
+    Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: local_env })
 }
 
 fn eval_let_star(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
@@ -1832,11 +1880,14 @@ fn eval_let_star(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             _ => return Err(EvalError::Type(format!("let*: invalid binding at {}", p))),
         }
     }
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, &local_env)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Value::Boolean(false));
     }
-    Ok(result)
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &local_env)?;
+    }
+    Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: local_env })
 }
 
 fn eval_when(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
@@ -1845,11 +1896,14 @@ fn eval_when(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     }
     let test = eval(&args[0], env)?;
     if test.is_truthy() {
-        let mut result = Value::Boolean(false);
-        for expr in &args[1..] {
-            result = eval(expr, env)?;
+        let body = &args[1..];
+        if body.is_empty() {
+            return Ok(Value::Boolean(false));
         }
-        Ok(result)
+        for expr in &body[..body.len() - 1] {
+            eval(expr, env)?;
+        }
+        Ok(Value::TailCall { expr: Box::new(body.last().unwrap().clone()), env: env.clone() })
     } else {
         Ok(Value::Boolean(false))
     }
@@ -2544,7 +2598,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                         _ => unreachable!(),
                     }
                 }
-                results.push(apply_value(func, &call_args, p)?);
+                results.push(force(apply_value(func, &call_args, p)?)?);
                 current_lists = next_lists;
             }
             Ok(vec_to_list(results))
@@ -2809,7 +2863,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                         _ => unreachable!(),
                     }
                 }
-                apply_value(func, &call_args, p)?;
+                force(apply_value(func, &call_args, p)?)?;
                 current_lists = next_lists;
             }
             Ok(Value::Nil)
