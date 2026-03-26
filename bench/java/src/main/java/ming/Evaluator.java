@@ -55,6 +55,32 @@ public class Evaluator {
     }
 
     private SchemeValue eval(SchemeExpression expression, Environment environment) throws EvalError {
+        SchemeExpression currentExpression = expression;
+        Environment currentEnvironment = environment;
+        while (true) {
+            try {
+                if (currentExpression instanceof LiteralExpression literal) {
+                    return literal.value();
+                }
+
+                if (currentExpression instanceof SymbolExpression symbol) {
+                    return currentEnvironment.lookup(symbol.name());
+                }
+
+                TailStep step = evalListTail((ListExpression) currentExpression, currentEnvironment);
+                if (step.isDone()) {
+                    return step.value();
+                }
+
+                currentExpression = step.nextExpression();
+                currentEnvironment = step.nextEnvironment();
+            } catch (EvalError error) {
+                throw error.withPosition(currentExpression.position());
+            }
+        }
+    }
+
+    private SchemeValue evalNonTail(SchemeExpression expression, Environment environment) throws EvalError {
         try {
             if (expression instanceof LiteralExpression literal) {
                 return literal.value();
@@ -64,13 +90,101 @@ public class Evaluator {
                 return environment.lookup(symbol.name());
             }
 
-            return evalList((ListExpression) expression, environment);
+            return evalListNonTail((ListExpression) expression, environment);
         } catch (EvalError error) {
             throw error.withPosition(expression.position());
         }
     }
 
-    private SchemeValue evalList(ListExpression expression, Environment environment) throws EvalError {
+    private TailStep evalListTail(ListExpression expression, Environment environment) throws EvalError {
+        List<SchemeExpression> elements = expression.elements();
+        if (elements.isEmpty()) {
+            throw new EvalError("cannot evaluate an empty list");
+        }
+
+        SchemeExpression head = elements.getFirst();
+        if (head instanceof SymbolExpression symbol) {
+            String name = symbol.name();
+            if ("and".equals(name)) {
+                return evalAndTail(elements.subList(1, elements.size()), environment);
+            }
+            if ("or".equals(name)) {
+                return evalOrTail(elements.subList(1, elements.size()), environment);
+            }
+            if ("define".equals(name)) {
+                return TailStep.done(evalDefine(elements, environment));
+            }
+            if ("define-syntax".equals(name)) {
+                return TailStep.done(evalDefineSyntax(elements, environment));
+            }
+            if ("define-record-type".equals(name)) {
+                return TailStep.done(evalDefineRecordType(elements, environment));
+            }
+            if ("set!".equals(name)) {
+                return TailStep.done(evalSet(elements, environment));
+            }
+            if ("if".equals(name)) {
+                return evalIfTail(elements, environment);
+            }
+            if ("begin".equals(name)) {
+                return tailSequence(elements.subList(1, elements.size()), environment, VoidValue.INSTANCE);
+            }
+            if ("cond".equals(name)) {
+                return evalCondTail(elements.subList(1, elements.size()), environment);
+            }
+            if ("let".equals(name)) {
+                return evalLetTail(elements, environment);
+            }
+            if ("letrec".equals(name)) {
+                return evalLetrecTail(elements, environment, false);
+            }
+            if ("letrec*".equals(name)) {
+                return evalLetrecTail(elements, environment, true);
+            }
+            if ("quote".equals(name)) {
+                return TailStep.done(evalQuote(elements));
+            }
+            if ("case".equals(name)) {
+                return evalCaseTail(elements, environment);
+            }
+            if ("lambda".equals(name)) {
+                return TailStep.done(evalLambda(elements, environment));
+            }
+            if ("case-lambda".equals(name)) {
+                return TailStep.done(evalCaseLambda(elements, environment));
+            }
+            if ("do".equals(name)) {
+                return TailStep.done(evalDo(elements, environment));
+            }
+
+            SyntaxRulesMacro macro = environment.lookupMacro(name);
+            if (macro != null) {
+                return TailStep.next(macro.expand(expression), environment);
+            }
+        }
+
+        SchemeValue callee = evalNonTail(head, environment);
+        if (!(callee instanceof ProcedureValue)) {
+            throw new EvalError("not a procedure");
+        }
+
+        List<SchemeValue> arguments = new ArrayList<>(elements.size() - 1);
+        for (int index = 1; index < elements.size(); index++) {
+            arguments.add(evalNonTail(elements.get(index), environment));
+        }
+        if (callee instanceof BuiltinProcedure builtinProcedure) {
+            return TailStep.done(builtinProcedure.apply(arguments));
+        }
+        if (callee instanceof LambdaProcedure lambdaProcedure) {
+            return applyLambdaTail(lambdaProcedure, arguments);
+        }
+        if (callee instanceof CaseLambdaProcedure caseLambdaProcedure) {
+            return applyCaseLambdaTail(caseLambdaProcedure, arguments);
+        }
+        throw new EvalError("not a procedure");
+    }
+
+    private SchemeValue evalListNonTail(ListExpression expression, Environment environment) throws EvalError {
         List<SchemeExpression> elements = expression.elements();
         if (elements.isEmpty()) {
             throw new EvalError("cannot evaluate an empty list");
@@ -133,18 +247,18 @@ public class Evaluator {
 
             SyntaxRulesMacro macro = environment.lookupMacro(name);
             if (macro != null) {
-                return eval(macro.expand(expression), environment);
+                return evalNonTail(macro.expand(expression), environment);
             }
         }
 
-        SchemeValue callee = eval(head, environment);
+        SchemeValue callee = evalNonTail(head, environment);
         if (!(callee instanceof ProcedureValue)) {
             throw new EvalError("not a procedure");
         }
 
         List<SchemeValue> arguments = new ArrayList<>(elements.size() - 1);
         for (int index = 1; index < elements.size(); index++) {
-            arguments.add(eval(elements.get(index), environment));
+            arguments.add(evalNonTail(elements.get(index), environment));
         }
         return applyProcedure(callee, arguments);
     }
@@ -152,7 +266,7 @@ public class Evaluator {
     private SchemeValue evalAnd(List<SchemeExpression> expressions, Environment environment) throws EvalError {
         SchemeValue result = BoolValue.TRUE;
         for (SchemeExpression expression : expressions) {
-            result = eval(expression, environment);
+            result = evalNonTail(expression, environment);
             if (!isTruthy(result)) {
                 return result;
             }
@@ -163,7 +277,7 @@ public class Evaluator {
     private SchemeValue evalOr(List<SchemeExpression> expressions, Environment environment) throws EvalError {
         SchemeValue result = BoolValue.FALSE;
         for (SchemeExpression expression : expressions) {
-            result = eval(expression, environment);
+            result = evalNonTail(expression, environment);
             if (isTruthy(result)) {
                 return result;
             }
@@ -182,7 +296,7 @@ public class Evaluator {
                 throw new EvalError("define: expected exactly 2 arguments for variable definition");
             }
 
-            SchemeValue value = eval(elements.get(2), environment);
+            SchemeValue value = evalNonTail(elements.get(2), environment);
             environment.define(symbol.name(), value);
             return VoidValue.INSTANCE;
         }
@@ -202,7 +316,7 @@ public class Evaluator {
             throw new EvalError("set!: expected variable name");
         }
 
-        SchemeValue value = eval(elements.get(2), environment);
+        SchemeValue value = evalNonTail(elements.get(2), environment);
         environment.set(symbol.name(), value);
         return VoidValue.INSTANCE;
     }
@@ -473,12 +587,12 @@ public class Evaluator {
             throw new EvalError("if: expected 2 or 3 arguments");
         }
 
-        SchemeValue condition = eval(elements.get(1), environment);
+        SchemeValue condition = evalNonTail(elements.get(1), environment);
         if (isTruthy(condition)) {
-            return eval(elements.get(2), environment);
+            return evalNonTail(elements.get(2), environment);
         }
         if (elements.size() == 4) {
-            return eval(elements.get(3), environment);
+            return evalNonTail(elements.get(3), environment);
         }
         return VoidValue.INSTANCE;
     }
@@ -503,7 +617,7 @@ public class Evaluator {
                 return evalClauseBody(clause.subList(1, clause.size()), environment, BoolValue.TRUE);
             }
 
-            SchemeValue testValue = eval(testExpression, environment);
+            SchemeValue testValue = evalNonTail(testExpression, environment);
             if (isTruthy(testValue)) {
                 return evalClauseBody(clause.subList(1, clause.size()), environment, testValue);
             }
@@ -532,7 +646,7 @@ public class Evaluator {
         List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
         List<SchemeValue> values = new ArrayList<>(bindings.size());
         for (Binding binding : bindings) {
-            values.add(eval(binding.valueExpression(), environment));
+            values.add(evalNonTail(binding.valueExpression(), environment));
         }
 
         Environment letEnvironment = new Environment(environment);
@@ -565,12 +679,12 @@ public class Evaluator {
 
         if (sequential) {
             for (Binding binding : bindings) {
-                letrecEnvironment.set(binding.name(), eval(binding.valueExpression(), letrecEnvironment));
+                letrecEnvironment.set(binding.name(), evalNonTail(binding.valueExpression(), letrecEnvironment));
             }
         } else {
             List<SchemeValue> values = new ArrayList<>(bindings.size());
             for (Binding binding : bindings) {
-                values.add(eval(binding.valueExpression(), letrecEnvironment));
+                values.add(evalNonTail(binding.valueExpression(), letrecEnvironment));
             }
             for (int index = 0; index < bindings.size(); index++) {
                 letrecEnvironment.set(bindings.get(index).name(), values.get(index));
@@ -594,7 +708,7 @@ public class Evaluator {
         List<SchemeValue> arguments = new ArrayList<>(bindings.size());
         for (Binding binding : bindings) {
             parameters.add(binding.name());
-            arguments.add(eval(binding.valueExpression(), environment));
+            arguments.add(evalNonTail(binding.valueExpression(), environment));
         }
 
         Environment letEnvironment = new Environment(environment);
@@ -614,7 +728,7 @@ public class Evaluator {
             throw new EvalError("case: expected key and clauses");
         }
 
-        SchemeValue key = eval(elements.get(1), environment);
+        SchemeValue key = evalNonTail(elements.get(1), environment);
         for (int index = 2; index < elements.size(); index++) {
             if (!(elements.get(index) instanceof ListExpression clauseExpression)) {
                 throw new EvalError("case: expected clause");
@@ -685,7 +799,7 @@ public class Evaluator {
         List<DoBinding> bindings = parseDoBindings(bindingsExpression.elements());
         List<SchemeValue> initialValues = new ArrayList<>(bindings.size());
         for (DoBinding binding : bindings) {
-            initialValues.add(eval(binding.initExpression(), environment));
+            initialValues.add(evalNonTail(binding.initExpression(), environment));
         }
 
         Environment doEnvironment = new Environment(environment);
@@ -697,7 +811,7 @@ public class Evaluator {
         List<SchemeExpression> body = elements.subList(3, elements.size());
 
         while (true) {
-            if (isTruthy(eval(terminationClause.getFirst(), doEnvironment))) {
+            if (isTruthy(evalNonTail(terminationClause.getFirst(), doEnvironment))) {
                 return evalClauseBody(terminationClause.subList(1, terminationClause.size()),
                         doEnvironment, VoidValue.INSTANCE);
             }
@@ -709,7 +823,7 @@ public class Evaluator {
                 if (binding.stepExpression() == null) {
                     nextValues.add(doEnvironment.lookup(binding.name()));
                 } else {
-                    nextValues.add(eval(binding.stepExpression(), doEnvironment));
+                    nextValues.add(evalNonTail(binding.stepExpression(), doEnvironment));
                 }
             }
             for (int index = 0; index < bindings.size(); index++) {
@@ -799,7 +913,7 @@ public class Evaluator {
     private SchemeValue evalSequence(List<SchemeExpression> expressions, Environment environment) throws EvalError {
         SchemeValue result = VoidValue.INSTANCE;
         for (SchemeExpression expression : expressions) {
-            result = eval(expression, environment);
+            result = evalNonTail(expression, environment);
         }
         return result;
     }
@@ -813,6 +927,244 @@ public class Evaluator {
             return defaultValue;
         }
         return evalSequence(expressions, environment);
+    }
+
+    private TailStep evalAndTail(List<SchemeExpression> expressions, Environment environment) throws EvalError {
+        if (expressions.isEmpty()) {
+            return TailStep.done(BoolValue.TRUE);
+        }
+
+        for (int index = 0; index < expressions.size() - 1; index++) {
+            SchemeValue result = evalNonTail(expressions.get(index), environment);
+            if (!isTruthy(result)) {
+                return TailStep.done(result);
+            }
+        }
+
+        return TailStep.next(expressions.getLast(), environment);
+    }
+
+    private TailStep evalOrTail(List<SchemeExpression> expressions, Environment environment) throws EvalError {
+        if (expressions.isEmpty()) {
+            return TailStep.done(BoolValue.FALSE);
+        }
+
+        for (int index = 0; index < expressions.size() - 1; index++) {
+            SchemeValue result = evalNonTail(expressions.get(index), environment);
+            if (isTruthy(result)) {
+                return TailStep.done(result);
+            }
+        }
+
+        return TailStep.next(expressions.getLast(), environment);
+    }
+
+    private TailStep evalIfTail(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() != 3 && elements.size() != 4) {
+            throw new EvalError("if: expected 2 or 3 arguments");
+        }
+
+        SchemeValue condition = evalNonTail(elements.get(1), environment);
+        if (isTruthy(condition)) {
+            return TailStep.next(elements.get(2), environment);
+        }
+        if (elements.size() == 4) {
+            return TailStep.next(elements.get(3), environment);
+        }
+        return TailStep.done(VoidValue.INSTANCE);
+    }
+
+    private TailStep evalCondTail(List<SchemeExpression> clauses, Environment environment) throws EvalError {
+        for (int index = 0; index < clauses.size(); index++) {
+            if (!(clauses.get(index) instanceof ListExpression clauseExpression)) {
+                throw new EvalError("cond: expected clause");
+            }
+
+            List<SchemeExpression> clause = clauseExpression.elements();
+            if (clause.isEmpty()) {
+                throw new EvalError("cond: expected non-empty clause");
+            }
+
+            SchemeExpression testExpression = clause.getFirst();
+            if (testExpression instanceof SymbolExpression symbol && "else".equals(symbol.name())) {
+                return evalClauseBodyTail(clause.subList(1, clause.size()), environment, BoolValue.TRUE);
+            }
+
+            SchemeValue testValue = evalNonTail(testExpression, environment);
+            if (isTruthy(testValue)) {
+                return evalClauseBodyTail(clause.subList(1, clause.size()), environment, testValue);
+            }
+        }
+        return TailStep.done(VoidValue.INSTANCE);
+    }
+
+    private TailStep evalLetTail(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("let: expected bindings and body");
+        }
+
+        SchemeExpression second = elements.get(1);
+        if (second instanceof SymbolExpression nameSymbol) {
+            return evalNamedLetTail(nameSymbol.name(), elements, environment);
+        }
+        if (!(second instanceof ListExpression bindingsExpression)) {
+            throw new EvalError("let: expected bindings");
+        }
+
+        List<SchemeExpression> body = elements.subList(2, elements.size());
+        if (body.isEmpty()) {
+            throw new EvalError("let: expected body");
+        }
+
+        List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
+        List<SchemeValue> values = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            values.add(evalNonTail(binding.valueExpression(), environment));
+        }
+
+        Environment letEnvironment = new Environment(environment);
+        for (int index = 0; index < bindings.size(); index++) {
+            letEnvironment.define(bindings.get(index).name(), values.get(index));
+        }
+        return tailSequence(body, letEnvironment, VoidValue.INSTANCE);
+    }
+
+    private TailStep evalLetrecTail(List<SchemeExpression> elements, Environment environment, boolean sequential)
+            throws EvalError {
+        String formName = sequential ? "letrec*" : "letrec";
+        if (elements.size() < 3) {
+            throw new EvalError(formName + ": expected bindings and body");
+        }
+        if (!(elements.get(1) instanceof ListExpression bindingsExpression)) {
+            throw new EvalError(formName + ": expected bindings");
+        }
+
+        List<SchemeExpression> body = elements.subList(2, elements.size());
+        if (body.isEmpty()) {
+            throw new EvalError(formName + ": expected body");
+        }
+
+        List<Binding> bindings = parseBindings(bindingsExpression.elements(), formName);
+        Environment letrecEnvironment = new Environment(environment);
+        for (Binding binding : bindings) {
+            letrecEnvironment.defineUninitialized(binding.name());
+        }
+
+        if (sequential) {
+            for (Binding binding : bindings) {
+                letrecEnvironment.set(binding.name(), evalNonTail(binding.valueExpression(), letrecEnvironment));
+            }
+        } else {
+            List<SchemeValue> values = new ArrayList<>(bindings.size());
+            for (Binding binding : bindings) {
+                values.add(evalNonTail(binding.valueExpression(), letrecEnvironment));
+            }
+            for (int index = 0; index < bindings.size(); index++) {
+                letrecEnvironment.set(bindings.get(index).name(), values.get(index));
+            }
+        }
+
+        return tailSequence(body, letrecEnvironment, VoidValue.INSTANCE);
+    }
+
+    private TailStep evalNamedLetTail(String name, List<SchemeExpression> elements, Environment environment)
+            throws EvalError {
+        if (elements.size() < 4) {
+            throw new EvalError("let: expected named let bindings and body");
+        }
+        if (!(elements.get(2) instanceof ListExpression bindingsExpression)) {
+            throw new EvalError("let: expected bindings");
+        }
+
+        List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
+        List<String> parameters = new ArrayList<>(bindings.size());
+        List<SchemeValue> arguments = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            parameters.add(binding.name());
+            arguments.add(evalNonTail(binding.valueExpression(), environment));
+        }
+
+        Environment letEnvironment = new Environment(environment);
+        LambdaProcedure procedure = new LambdaProcedure(
+                name,
+                List.copyOf(parameters),
+                null,
+                List.copyOf(elements.subList(3, elements.size())),
+                letEnvironment
+        );
+        letEnvironment.define(name, procedure);
+        return applyLambdaTail(procedure, arguments);
+    }
+
+    private TailStep evalCaseTail(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("case: expected key and clauses");
+        }
+
+        SchemeValue key = evalNonTail(elements.get(1), environment);
+        for (int index = 2; index < elements.size(); index++) {
+            if (!(elements.get(index) instanceof ListExpression clauseExpression)) {
+                throw new EvalError("case: expected clause");
+            }
+
+            List<SchemeExpression> clause = clauseExpression.elements();
+            if (clause.isEmpty()) {
+                throw new EvalError("case: expected non-empty clause");
+            }
+
+            SchemeExpression clauseHead = clause.getFirst();
+            if (clauseHead instanceof SymbolExpression symbol && "else".equals(symbol.name())) {
+                if (index != elements.size() - 1) {
+                    throw new EvalError("case: else clause must be last");
+                }
+                return evalClauseBodyTail(clause.subList(1, clause.size()), environment, VoidValue.INSTANCE);
+            }
+
+            if (!(clauseHead instanceof ListExpression datumList)) {
+                throw new EvalError("case: expected datum list");
+            }
+
+            for (SchemeExpression datumExpression : datumList.elements()) {
+                if (eqvValues(key, quote(datumExpression))) {
+                    return evalClauseBodyTail(clause.subList(1, clause.size()), environment, VoidValue.INSTANCE);
+                }
+            }
+        }
+        return TailStep.done(VoidValue.INSTANCE);
+    }
+
+    private TailStep tailSequence(
+            List<SchemeExpression> expressions,
+            Environment environment,
+            SchemeValue defaultValue
+    ) throws EvalError {
+        if (expressions.isEmpty()) {
+            return TailStep.done(defaultValue);
+        }
+
+        for (int index = 0; index < expressions.size() - 1; index++) {
+            evalNonTail(expressions.get(index), environment);
+        }
+        return TailStep.next(expressions.getLast(), environment);
+    }
+
+    private TailStep evalClauseBodyTail(
+            List<SchemeExpression> expressions,
+            Environment environment,
+            SchemeValue defaultValue
+    ) throws EvalError {
+        return tailSequence(expressions, environment, defaultValue);
+    }
+
+    private SchemeValue evalProcedureBody(List<SchemeExpression> body, Environment environment) throws EvalError {
+        if (body.isEmpty()) {
+            return VoidValue.INSTANCE;
+        }
+
+        for (int index = 0; index < body.size() - 1; index++) {
+            evalNonTail(body.get(index), environment);
+        }
+        return eval(body.getLast(), environment);
     }
 
     private SchemeValue applyProcedure(SchemeValue callee, List<SchemeValue> arguments) throws EvalError {
@@ -856,10 +1208,74 @@ public class Evaluator {
                 + " arguments");
     }
 
+    private TailStep applyLambdaTail(LambdaProcedure procedure, List<SchemeValue> arguments) throws EvalError {
+        return applyClosureTail(
+                procedure.parameters(),
+                procedure.restParameter(),
+                procedure.body(),
+                procedure.closureEnvironment(),
+                arguments,
+                procedure.render()
+        );
+    }
+
+    private TailStep applyCaseLambdaTail(CaseLambdaProcedure procedure, List<SchemeValue> arguments)
+            throws EvalError {
+        for (CaseLambdaClause clause : procedure.clauses()) {
+            if (matchesArity(clause.parameters().size(), clause.restParameter(), arguments.size())) {
+                return applyClosureTail(
+                        clause.parameters(),
+                        clause.restParameter(),
+                        clause.body(),
+                        procedure.closureEnvironment(),
+                        arguments,
+                        procedure.render()
+                );
+            }
+        }
+        throw new EvalError(procedure.render() + ": expected a matching clause for " + arguments.size()
+                + " arguments");
+    }
+
     private SchemeValue applyClosure(
             List<String> parameters,
             String restParameter,
             List<SchemeExpression> body,
+            Environment closureEnvironment,
+            List<SchemeValue> arguments,
+            String procedureName
+    ) throws EvalError {
+        Environment invocationEnvironment = createInvocationEnvironment(
+                parameters,
+                restParameter,
+                closureEnvironment,
+                arguments,
+                procedureName
+        );
+        return evalProcedureBody(body, invocationEnvironment);
+    }
+
+    private TailStep applyClosureTail(
+            List<String> parameters,
+            String restParameter,
+            List<SchemeExpression> body,
+            Environment closureEnvironment,
+            List<SchemeValue> arguments,
+            String procedureName
+    ) throws EvalError {
+        Environment invocationEnvironment = createInvocationEnvironment(
+                parameters,
+                restParameter,
+                closureEnvironment,
+                arguments,
+                procedureName
+        );
+        return tailSequence(body, invocationEnvironment, VoidValue.INSTANCE);
+    }
+
+    private Environment createInvocationEnvironment(
+            List<String> parameters,
+            String restParameter,
             Environment closureEnvironment,
             List<SchemeValue> arguments,
             String procedureName
@@ -883,8 +1299,7 @@ public class Evaluator {
                     buildList(arguments.subList(requiredCount, arguments.size()))
             );
         }
-
-        return evalSequence(body, invocationEnvironment);
+        return invocationEnvironment;
     }
 
     private ParameterSpec parseParameters(SchemeExpression parameterExpression, String formName)
@@ -1802,6 +2217,20 @@ public class Evaluator {
     }
 
     private record DoBinding(String name, SchemeExpression initExpression, SchemeExpression stepExpression) {
+    }
+
+    private record TailStep(SchemeExpression nextExpression, Environment nextEnvironment, SchemeValue value) {
+        private static TailStep next(SchemeExpression expression, Environment environment) {
+            return new TailStep(expression, environment, null);
+        }
+
+        private static TailStep done(SchemeValue value) {
+            return new TailStep(null, null, value);
+        }
+
+        private boolean isDone() {
+            return nextExpression == null;
+        }
     }
 
     private record ParameterSpec(List<String> fixedParameters, String restParameter) {
