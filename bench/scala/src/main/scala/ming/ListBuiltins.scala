@@ -226,7 +226,7 @@ private[ming] object ListBuiltins:
           val len = lists.head.size
           val result = (0 until len).map { i =>
             val elems = lists.map(_(i))
-            Evaluator.applyProc(proc, elems)
+            Evaluator.applyProcSafe(proc, elems)
           }.toList
           SchemeList(result)
       )

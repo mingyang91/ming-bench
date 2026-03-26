@@ -6,6 +6,14 @@ import scala.util.boundary.break
 
 object Evaluator:
 
+  // ── Tail-call trampoline signal ──────────────────────────────────────
+  private class TailCallSignal(val expr: Expr, val env: Env) extends Exception(null, null, true, false)
+
+  private def throwTailCall(expr: Expr, env: Env): Nothing =
+    throw new TailCallSignal(expr, env)
+
+  // ── Public API ───────────────────────────────────────────────────────
+
   def evalStr(input: String): String =
     val tokens = Tokenizer.tokenize(input)
     val exprs  = Parser.parseAll(tokens)
@@ -34,23 +42,35 @@ object Evaluator:
     case SchemeBool(false) => true
     case _                 => false
 
+  // ── Core eval with trampoline ────────────────────────────────────────
+
   private[ming] def eval(expr: Expr, env: Env): SchemeVal =
-    try
-      expr match
-        case IntLit(v, _)         => SchemeInt(v)
-        case FloatLit(v, _)       => SchemeFloat(v)
-        case RationalLit(n, d, _) => SchemeRational(n, d)
-        case BoolLit(v, _)        => SchemeBool(v)
-        case StringLit(v, _)      => SchemeString(v)
-        case CharLit(v, _)        => SchemeChar(v)
-        case Symbol(name, _)      => env.get(name)
-        case SList(Nil, _)        => throw new EvalError("empty application")
-        case SList(elems, _)      => evalApplication(elems, env)
-    catch
-      case e: EvalError =>
-        val msg = e.getMessage
-        if msg.matches(".*\\d+:\\d+.*") then throw e
-        else throw new EvalError(s"${expr.pos}: $msg")
+    var curExpr = expr
+    var curEnv  = env
+    while true do
+      try
+        val result = curExpr match
+          case IntLit(v, _)         => SchemeInt(v)
+          case FloatLit(v, _)       => SchemeFloat(v)
+          case RationalLit(n, d, _) => SchemeRational(n, d)
+          case BoolLit(v, _)        => SchemeBool(v)
+          case StringLit(v, _)      => SchemeString(v)
+          case CharLit(v, _)        => SchemeChar(v)
+          case Symbol(name, _)      => curEnv.get(name)
+          case SList(Nil, _)        => throw new EvalError("empty application")
+          case SList(elems, _)      => evalApplication(elems, curEnv)
+        return result
+      catch
+        case tc: TailCallSignal =>
+          curExpr = tc.expr
+          curEnv = tc.env
+        case e: EvalError =>
+          val msg = e.getMessage
+          if msg.matches(".*\\d+:\\d+.*") then throw e
+          else throw new EvalError(s"${curExpr.pos}: $msg")
+    throw new AssertionError("unreachable")
+
+  // ── Application dispatch ─────────────────────────────────────────────
 
   private def evalApplication(elems: List[Expr], env: Env): SchemeVal =
     elems.head match
@@ -86,53 +106,45 @@ object Evaluator:
         macroVal match
           case Some(m) =>
             val expanded = Macros.expand(m, SList(elems, elems.head.pos), env)
-            eval(expanded, env)
+            throwTailCall(expanded, env)
           case None =>
             val op   = eval(elems.head, env)
             val args = elems.tail.map(e => eval(e, env))
             applyProc(op, args)
 
+  // ── Special forms with TCO ───────────────────────────────────────────
+
   private def evalAnd(exprs: List[Expr], env: Env): SchemeVal =
     if exprs.isEmpty then return SchemeBool(true)
-    var result: SchemeVal = SchemeBool(true)
-    val iter              = exprs.iterator
-    var done              = false
-    while iter.hasNext && !done do
-      result = eval(iter.next(), env)
-      if isFalsy(result) then done = true
-    result
+    for expr <- exprs.init do
+      val v = eval(expr, env)
+      if isFalsy(v) then return v
+    throwTailCall(exprs.last, env)
 
   private def evalOr(exprs: List[Expr], env: Env): SchemeVal =
     if exprs.isEmpty then return SchemeBool(false)
-    var result: SchemeVal = SchemeBool(false)
-    val iter              = exprs.iterator
-    var done              = false
-    while iter.hasNext && !done do
-      result = eval(iter.next(), env)
-      if !isFalsy(result) then done = true
-    result
+    for expr <- exprs.init do
+      val v = eval(expr, env)
+      if !isFalsy(v) then return v
+    throwTailCall(exprs.last, env)
 
   private[ming] def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
     op match
       case SchemeBuiltin(_, fn) => fn(args)
       case SchemeLambda(params, restParam, body, closureEnv) =>
-        restParam match
+        val localEnv = restParam match
           case None =>
             if params.size != args.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
-            val localEnv          = new Env(mutable.Map.from(params.zip(args)), Some(closureEnv))
-            var result: SchemeVal = SchemeVoid
-            for expr <- body do result = eval(expr, localEnv)
-            result
+            new Env(mutable.Map.from(params.zip(args)), Some(closureEnv))
           case Some(rest) =>
             if args.size < params.size then
               throw new EvalError(s"expected at least ${params.size} arguments, got ${args.size}")
             val (required, extra) = args.splitAt(params.size)
             val bindings          = mutable.Map.from(params.zip(required))
             bindings(rest) = SchemeList(extra)
-            val localEnv          = new Env(bindings, Some(closureEnv))
-            var result: SchemeVal = SchemeVoid
-            for expr <- body do result = eval(expr, localEnv)
-            result
+            new Env(bindings, Some(closureEnv))
+        for expr <- body.init do eval(expr, localEnv)
+        throwTailCall(body.last, localEnv)
       case SchemeCaseLambda(clauses) =>
         val matching = clauses.find { lam =>
           lam.restParam match
@@ -143,6 +155,13 @@ object Evaluator:
           case Some(lam) => applyProc(lam, args)
           case None      => throw new EvalError(s"no matching clause for ${args.size} arguments")
       case _ => throw new EvalError(s"not a procedure: ${op.display}")
+
+  /** Like applyProc but always returns a resolved value (catches tail calls). */
+  private[ming] def applyProcSafe(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
+    try applyProc(op, args)
+    catch
+      case tc: TailCallSignal =>
+        eval(tc.expr, tc.env)
 
   private def evalDefine(args: List[Expr], env: Env): SchemeVal =
     args match
@@ -158,9 +177,11 @@ object Evaluator:
   private def evalIf(args: List[Expr], env: Env): SchemeVal =
     args match
       case cond :: thenExpr :: elseExpr :: Nil =>
-        if !isFalsy(eval(cond, env)) then eval(thenExpr, env) else eval(elseExpr, env)
+        if !isFalsy(eval(cond, env)) then throwTailCall(thenExpr, env)
+        else throwTailCall(elseExpr, env)
       case cond :: thenExpr :: Nil =>
-        if !isFalsy(eval(cond, env)) then eval(thenExpr, env) else SchemeVoid
+        if !isFalsy(eval(cond, env)) then throwTailCall(thenExpr, env)
+        else SchemeVoid
       case _ => throw new EvalError("if: bad syntax")
 
   private def evalQuote(args: List[Expr]): SchemeVal =
@@ -209,9 +230,8 @@ object Evaluator:
   private def evalBegin(exprs: List[Expr], env: Env): SchemeVal =
     if exprs.isEmpty then SchemeVoid
     else
-      var result: SchemeVal = SchemeVoid
-      for expr <- exprs do result = eval(expr, env)
-      result
+      for expr <- exprs.init do eval(expr, env)
+      throwTailCall(exprs.last, env)
 
   private def evalSet(args: List[Expr], env: Env): SchemeVal =
     args match
@@ -248,6 +268,7 @@ object Evaluator:
     SchemeCaseLambda(lambdas)
 
   private[ming] def evalBody(exprs: List[Expr], env: Env): SchemeVal =
-    var result: SchemeVal = SchemeVoid
-    for expr <- exprs do result = eval(expr, env)
-    result
+    if exprs.isEmpty then SchemeVoid
+    else
+      for expr <- exprs.init do eval(expr, env)
+      throwTailCall(exprs.last, env)
