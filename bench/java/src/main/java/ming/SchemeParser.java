@@ -47,6 +47,25 @@ final class SchemeParser {
                     position
             );
         }
+        if (current == '`') {
+            advance();
+            return new ListExpression(
+                    List.of(new SymbolExpression("quasiquote", position), parseExpression()),
+                    position
+            );
+        }
+        if (current == ',') {
+            advance();
+            String name = "unquote";
+            if (!isAtEnd() && currentChar() == '@') {
+                advance();
+                name = "unquote-splicing";
+            }
+            return new ListExpression(
+                    List.of(new SymbolExpression(name, position), parseExpression()),
+                    position
+            );
+        }
         if (current == '#' && peekChar('\'', 1)) {
             advance();
             advance();

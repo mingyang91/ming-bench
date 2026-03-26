@@ -27,11 +27,14 @@ final class SyntaxMatcher {
             "letrec",
             "letrec*",
             "or",
+            "quasiquote",
             "quote",
             "set!",
             "syntax",
             "syntax-case",
             "syntax-rules",
+            "unquote",
+            "unquote-splicing",
             "with-syntax",
             "."
     );

@@ -214,6 +214,7 @@ public class Evaluator {
 
     private TailStep evalListTail(ListExpression expression, Environment environment) throws EvalError {
         List<SchemeExpression> elements = expression.elements();
+        ensureEvaluableList(elements);
         if (elements.isEmpty()) {
             throw new EvalError("cannot evaluate an empty list");
         }
@@ -263,6 +264,9 @@ public class Evaluator {
             if ("quote".equals(name)) {
                 return TailStep.done(evalQuote(elements));
             }
+            if ("quasiquote".equals(name)) {
+                return TailStep.done(evalQuasiquote(elements, environment));
+            }
             if ("syntax".equals(name)) {
                 return TailStep.done(evalSyntax(elements, environment));
             }
@@ -299,6 +303,7 @@ public class Evaluator {
 
     private SchemeValue evalListNonTail(ListExpression expression, Environment environment) throws EvalError {
         List<SchemeExpression> elements = expression.elements();
+        ensureEvaluableList(elements);
         if (elements.isEmpty()) {
             throw new EvalError("cannot evaluate an empty list");
         }
@@ -347,6 +352,9 @@ public class Evaluator {
             }
             if ("quote".equals(name)) {
                 return evalQuote(elements);
+            }
+            if ("quasiquote".equals(name)) {
+                return evalQuasiquote(elements, environment);
             }
             if ("syntax".equals(name)) {
                 return evalSyntax(elements, environment);
@@ -845,8 +853,11 @@ public class Evaluator {
         builtins.put("list-tail", new BuiltinProcedure("list-tail", Evaluator::applyListTail));
         builtins.put("list?", new BuiltinProcedure("list?", Evaluator::applyListPredicate));
         builtins.put("assoc", new BuiltinProcedure("assoc", Evaluator::applyAssoc));
+        builtins.put("assq", new BuiltinProcedure("assq", Evaluator::applyAssq));
         builtins.put("assv", new BuiltinProcedure("assv", Evaluator::applyAssv));
         builtins.put("member", new BuiltinProcedure("member", Evaluator::applyMember));
+        builtins.put("memq", new BuiltinProcedure("memq", Evaluator::applyMemq));
+        builtins.put("memv", new BuiltinProcedure("memv", Evaluator::applyMemv));
         builtins.put("eq?", new BuiltinProcedure("eq?", Evaluator::applyEq));
         builtins.put("eqv?", new BuiltinProcedure("eqv?", Evaluator::applyEqv));
         builtins.put("equal?", new BuiltinProcedure("equal?", Evaluator::applyEqual));
@@ -938,7 +949,7 @@ public class Evaluator {
 
             SchemeValue testValue = evalNonTail(testExpression, environment);
             if (isTruthy(testValue)) {
-                return evalClauseBody(clause.subList(1, clause.size()), environment, testValue);
+                return evalMatchedCondClause("cond", clause, environment, testValue);
             }
         }
         return VoidValue.INSTANCE;
@@ -1093,6 +1104,13 @@ public class Evaluator {
             throw new EvalError("quote: expected 1 argument");
         }
         return quote(elements.get(1));
+    }
+
+    private SchemeValue evalQuasiquote(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() != 2) {
+            throw new EvalError("quasiquote: expected 1 argument");
+        }
+        return quasiquote(elements.get(1), environment, 1);
     }
 
     private SchemeValue evalLambda(List<SchemeExpression> elements, Environment environment) throws EvalError {
@@ -1482,6 +1500,30 @@ public class Evaluator {
         return evalSequence(expressions, environment);
     }
 
+    private SchemeValue evalMatchedCondClause(
+            String formName,
+            List<SchemeExpression> clause,
+            Environment environment,
+            SchemeValue testValue
+    ) throws EvalError {
+        if (clause.size() == 1) {
+            return testValue;
+        }
+        if (startsWithRecipientArrow(clause)) {
+            if (clause.size() != 3) {
+                throw new EvalError(formName + ": expected single recipient after =>");
+            }
+
+            SchemeValue recipient = evalNonTailWithContinuation(
+                    clause.get(2),
+                    environment,
+                    callee -> applyProcedure(callee, List.of(testValue))
+            );
+            return applyProcedure(recipient, List.of(testValue));
+        }
+        return evalSequence(clause.subList(1, clause.size()), environment);
+    }
+
     private SchemeValue evalGuardClauses(
             String exceptionVariable,
             List<SchemeExpression> clauses,
@@ -1508,7 +1550,7 @@ public class Evaluator {
 
             SchemeValue testValue = evalNonTail(testExpression, guardEnvironment);
             if (isTruthy(testValue)) {
-                return evalClauseBody(clause.subList(1, clause.size()), guardEnvironment, testValue);
+                return evalMatchedCondClause("guard", clause, guardEnvironment, testValue);
             }
         }
 
@@ -1541,7 +1583,7 @@ public class Evaluator {
 
             SchemeValue testValue = evalNonTail(testExpression, guardEnvironment);
             if (isTruthy(testValue)) {
-                return evalClauseBodyTail(clause.subList(1, clause.size()), guardEnvironment, testValue);
+                return evalMatchedCondClauseTail("guard", clause, guardEnvironment, testValue);
             }
         }
 
@@ -1656,7 +1698,7 @@ public class Evaluator {
 
             SchemeValue testValue = evalNonTail(testExpression, environment);
             if (isTruthy(testValue)) {
-                return evalClauseBodyTail(clause.subList(1, clause.size()), environment, testValue);
+                return evalMatchedCondClauseTail("cond", clause, environment, testValue);
             }
         }
         return TailStep.done(VoidValue.INSTANCE);
@@ -1861,6 +1903,30 @@ public class Evaluator {
             SchemeValue defaultValue
     ) throws EvalError {
         return tailSequence(expressions, environment, defaultValue);
+    }
+
+    private TailStep evalMatchedCondClauseTail(
+            String formName,
+            List<SchemeExpression> clause,
+            Environment environment,
+            SchemeValue testValue
+    ) throws EvalError {
+        if (clause.size() == 1) {
+            return TailStep.done(testValue);
+        }
+        if (startsWithRecipientArrow(clause)) {
+            if (clause.size() != 3) {
+                throw new EvalError(formName + ": expected single recipient after =>");
+            }
+
+            SchemeValue recipient = evalNonTailWithContinuation(
+                    clause.get(2),
+                    environment,
+                    callee -> applyProcedureTailToValue(callee, List.of(testValue))
+            );
+            return applyProcedureTail(recipient, List.of(testValue));
+        }
+        return tailSequence(clause.subList(1, clause.size()), environment, testValue);
     }
 
     private SchemeValue evalProcedureBody(List<SchemeExpression> body, Environment environment) throws EvalError {
@@ -2331,9 +2397,74 @@ public class Evaluator {
             return new SymbolValue(symbol.name());
         }
         List<SchemeExpression> elements = ((ListExpression) expression).elements();
-        SchemeValue result = EmptyListValue.INSTANCE;
-        for (int index = elements.size() - 1; index >= 0; index--) {
+        int dottedTailIndex = dottedTailIndex(elements, "quote");
+        SchemeValue result = dottedTailIndex < 0
+                ? EmptyListValue.INSTANCE
+                : quote(elements.getLast());
+        int limit = dottedTailIndex < 0 ? elements.size() : dottedTailIndex;
+        for (int index = limit - 1; index >= 0; index--) {
             result = new PairValue(quote(elements.get(index)), result);
+        }
+        return result;
+    }
+
+    private SchemeValue quasiquote(SchemeExpression expression, Environment environment, int depth) throws EvalError {
+        if (expression instanceof LiteralExpression literal) {
+            return literal.value();
+        }
+        if (expression instanceof SymbolExpression symbol) {
+            return new SymbolValue(symbol.name());
+        }
+
+        ListExpression listExpression = (ListExpression) expression;
+        if (isReaderForm(listExpression, "unquote")) {
+            if (depth == 1) {
+                return evalNonTail(listExpression.elements().get(1), environment);
+            }
+            return buildList(List.of(
+                    new SymbolValue("unquote"),
+                    quasiquote(listExpression.elements().get(1), environment, depth - 1)
+            ));
+        }
+        if (isReaderForm(listExpression, "unquote-splicing")) {
+            if (depth == 1) {
+                throw new EvalError("quasiquote: unquote-splicing not in list");
+            }
+            return buildList(List.of(
+                    new SymbolValue("unquote-splicing"),
+                    quasiquote(listExpression.elements().get(1), environment, depth - 1)
+            ));
+        }
+        if (isReaderForm(listExpression, "quasiquote")) {
+            return buildList(List.of(
+                    new SymbolValue("quasiquote"),
+                    quasiquote(listExpression.elements().get(1), environment, depth + 1)
+            ));
+        }
+        return quasiquoteList(listExpression.elements(), environment, depth);
+    }
+
+    private SchemeValue quasiquoteList(
+            List<SchemeExpression> elements,
+            Environment environment,
+            int depth
+    ) throws EvalError {
+        int dottedTailIndex = dottedTailIndex(elements, "quasiquote");
+        SchemeValue result = dottedTailIndex < 0
+                ? EmptyListValue.INSTANCE
+                : quasiquote(elements.getLast(), environment, depth);
+        int limit = dottedTailIndex < 0 ? elements.size() : dottedTailIndex;
+        for (int index = limit - 1; index >= 0; index--) {
+            SchemeExpression element = elements.get(index);
+            if (depth == 1 && isReaderForm(element, "unquote-splicing")) {
+                SchemeValue spliced = evalNonTail(((ListExpression) element).elements().get(1), environment);
+                List<SchemeValue> items = requireProperList(spliced, "quasiquote");
+                for (int itemIndex = items.size() - 1; itemIndex >= 0; itemIndex--) {
+                    result = new PairValue(items.get(itemIndex), result);
+                }
+            } else {
+                result = new PairValue(quasiquote(element, environment, depth), result);
+            }
         }
         return result;
     }
@@ -2376,10 +2507,15 @@ public class Evaluator {
             return new ListExpression(List.of(), position);
         }
         if (value instanceof PairValue) {
-            List<SchemeValue> elements = requireProperList(value, procedure);
-            List<SchemeExpression> expressions = new ArrayList<>(elements.size());
-            for (SchemeValue element : elements) {
-                expressions.add(datumToExpression(element, procedure));
+            List<SchemeExpression> expressions = new ArrayList<>();
+            SchemeValue current = value;
+            while (current instanceof PairValue pair) {
+                expressions.add(datumToExpression(pair.car(), procedure));
+                current = pair.cdr();
+            }
+            if (!(current instanceof EmptyListValue)) {
+                expressions.add(new SymbolExpression(".", position));
+                expressions.add(datumToExpression(current, procedure));
             }
             return new ListExpression(List.copyOf(expressions), position);
         }
@@ -3045,6 +3181,28 @@ public class Evaluator {
         throw new EvalError("assoc: expected list");
     }
 
+    private static SchemeValue applyAssq(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "assq");
+        SchemeValue key = arguments.get(0);
+        SchemeValue current = arguments.get(1);
+        Set<PairValue> seen = new HashSet<>();
+        while (current instanceof PairValue pair) {
+            if (!seen.add(pair)) {
+                throw new EvalError("assq: expected list");
+            }
+            SchemeValue candidate = pair.car();
+            PairValue association = requirePair(candidate, "assq");
+            if (eqValues(key, association.car())) {
+                return candidate;
+            }
+            current = pair.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return BoolValue.FALSE;
+        }
+        throw new EvalError("assq: expected list");
+    }
+
     private static SchemeValue applyAssv(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 2, "assv");
         SchemeValue key = arguments.get(0);
@@ -3085,6 +3243,46 @@ public class Evaluator {
             return BoolValue.FALSE;
         }
         throw new EvalError("member: expected list");
+    }
+
+    private static SchemeValue applyMemq(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "memq");
+        SchemeValue key = arguments.get(0);
+        SchemeValue current = arguments.get(1);
+        Set<PairValue> seen = new HashSet<>();
+        while (current instanceof PairValue pair) {
+            if (!seen.add(pair)) {
+                throw new EvalError("memq: expected list");
+            }
+            if (eqValues(key, pair.car())) {
+                return current;
+            }
+            current = pair.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return BoolValue.FALSE;
+        }
+        throw new EvalError("memq: expected list");
+    }
+
+    private static SchemeValue applyMemv(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "memv");
+        SchemeValue key = arguments.get(0);
+        SchemeValue current = arguments.get(1);
+        Set<PairValue> seen = new HashSet<>();
+        while (current instanceof PairValue pair) {
+            if (!seen.add(pair)) {
+                throw new EvalError("memv: expected list");
+            }
+            if (eqvValues(key, pair.car())) {
+                return current;
+            }
+            current = pair.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return BoolValue.FALSE;
+        }
+        throw new EvalError("memv: expected list");
     }
 
     private static SchemeValue applyEq(List<SchemeValue> arguments) throws EvalError {
@@ -3440,6 +3638,58 @@ public class Evaluator {
             return leftSymbol.name().equals(rightSymbol.name());
         }
         return false;
+    }
+
+    private static boolean startsWithRecipientArrow(List<SchemeExpression> clause) {
+        return clause.size() >= 2
+                && clause.get(1) instanceof SymbolExpression symbol
+                && "=>".equals(symbol.name());
+    }
+
+    private static boolean isReaderForm(SchemeExpression expression, String name) {
+        if (!(expression instanceof ListExpression listExpression)) {
+            return false;
+        }
+        List<SchemeExpression> elements = listExpression.elements();
+        return elements.size() == 2
+                && elements.getFirst() instanceof SymbolExpression symbol
+                && name.equals(symbol.name());
+    }
+
+    private static void ensureEvaluableList(List<SchemeExpression> elements) throws EvalError {
+        if (dottedTailIndex(elements, null) >= 0) {
+            throw new EvalError("cannot evaluate an improper list");
+        }
+    }
+
+    private static int dottedTailIndex(List<SchemeExpression> elements, String context) throws EvalError {
+        int dotIndex = -1;
+        for (int index = 0; index < elements.size(); index++) {
+            if (isDotSymbol(elements.get(index))) {
+                if (dotIndex >= 0) {
+                    throw invalidDottedList(context);
+                }
+                dotIndex = index;
+            }
+        }
+        if (dotIndex < 0) {
+            return -1;
+        }
+        if (dotIndex == 0 || dotIndex != elements.size() - 2) {
+            throw invalidDottedList(context);
+        }
+        return dotIndex;
+    }
+
+    private static EvalError invalidDottedList(String context) {
+        if (context == null || context.isEmpty()) {
+            return new EvalError("invalid dotted list");
+        }
+        return new EvalError(context + ": invalid dotted list");
+    }
+
+    private static boolean isDotSymbol(SchemeExpression expression) {
+        return expression instanceof SymbolExpression symbol && ".".equals(symbol.name());
     }
 
     private static boolean eqvValues(SchemeValue left, SchemeValue right) {
