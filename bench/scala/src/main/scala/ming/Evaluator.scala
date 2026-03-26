@@ -11,22 +11,22 @@ object Evaluator:
     case VList(elems: List[Value])
     case VSymbol(name: String)
     case VBuiltin(name: String)
-    case VLambda(params: List[String], body: List[Expr], closure: Env)
+    case VLambda(params: List[String], restParam: Option[String], body: List[Expr], closure: Env)
     case VVoid
 
   private[ming] type Pos = ming.Pos
 
   private[ming] def display(v: Value): String = v match
-    case Value.VNum(n)          => n.toString
-    case Value.VBool(true)      => "#t"
-    case Value.VBool(false)     => "#f"
-    case Value.VStr(chars)      => s"\"${new String(chars)}\""
-    case Value.VChar(c)         => s"#\\$c"
-    case Value.VList(elems)     => "(" + elems.map(display).mkString(" ") + ")"
-    case Value.VSymbol(n)       => n
-    case Value.VBuiltin(n)      => s"#<procedure $n>"
-    case Value.VLambda(_, _, _) => "#<procedure>"
-    case Value.VVoid            => ""
+    case Value.VNum(n)             => n.toString
+    case Value.VBool(true)         => "#t"
+    case Value.VBool(false)        => "#f"
+    case Value.VStr(chars)         => s"\"${new String(chars)}\""
+    case Value.VChar(c)            => s"#\\$c"
+    case Value.VList(elems)        => "(" + elems.map(display).mkString(" ") + ")"
+    case Value.VSymbol(n)          => n
+    case Value.VBuiltin(n)         => s"#<procedure $n>"
+    case Value.VLambda(_, _, _, _) => "#<procedure>"
+    case Value.VVoid               => ""
 
   /** display-style output: no quotes on strings */
   private[ming] def displayStr(v: Value): String = v match
@@ -106,7 +106,8 @@ object Evaluator:
         "string->symbol",
         "string-ref",
         "string-copy",
-        "string-set!"
+        "string-set!",
+        "apply"
       )
     do env.define(name, Value.VBuiltin(name))
     env
@@ -136,13 +137,21 @@ object Evaluator:
   private def evalBody(body: List[Expr], env: Env): Value =
     body.foldLeft(Value.VVoid: Value)((_, e) => eval(e, env))
 
-  private def applyFunc(func: Value, args: List[Value], pos: Pos, env: Env): Value = func match
+  private[ming] def applyFunc(func: Value, args: List[Value], pos: Pos, env: Env): Value = func match
     case Value.VBuiltin(name) => Builtins(name, args, pos, env)
-    case Value.VLambda(params, body, closure) =>
-      if args.length != params.length then throw errAt(pos, "wrong number of arguments")
-      val callEnv = closure.child()
-      params.zip(args).foreach((p, a) => callEnv.define(p, a))
-      evalBody(body, callEnv)
+    case Value.VLambda(params, restParam, body, closure) =>
+      restParam match
+        case None =>
+          if args.length != params.length then throw errAt(pos, "wrong number of arguments")
+          val callEnv = closure.child()
+          params.zip(args).foreach((p, a) => callEnv.define(p, a))
+          evalBody(body, callEnv)
+        case Some(rest) =>
+          if args.length < params.length then throw errAt(pos, "wrong number of arguments")
+          val callEnv = closure.child()
+          params.zip(args).foreach((p, a) => callEnv.define(p, a))
+          callEnv.define(rest, Value.VList(args.drop(params.length)))
+          evalBody(body, callEnv)
     case _ => throw errAt(pos, "not a procedure")
 
   private def quoteToValue(expr: Expr): Value = expr match
@@ -158,11 +167,8 @@ object Evaluator:
       env.define(name, eval(valueExpr, env))
       Value.VVoid
     case Expr.SList(Expr.Symbol(name, _) :: params, _) :: body =>
-      val paramNames = params.map {
-        case Expr.Symbol(n, _) => n
-        case _                 => throw errAt(pos, "invalid parameter")
-      }
-      env.define(name, Value.VLambda(paramNames, body, env))
+      val (paramNames, restParam) = parseParams(params, pos)
+      env.define(name, Value.VLambda(paramNames, restParam, body, env))
       Value.VVoid
     case _ => throw errAt(pos, "invalid define")
 
@@ -173,13 +179,24 @@ object Evaluator:
       if isTruthy(eval(cond, env)) then eval(thenExpr, env) else Value.VVoid
     case _ => throw errAt(pos, "invalid if")
 
+  private def parseParams(params: List[Expr], pos: Pos): (List[String], Option[String]) =
+    val dotIdx = params.indexWhere { case Expr.Symbol(".", _) => true; case _ => false }
+    if dotIdx < 0 then
+      val names = params.map { case Expr.Symbol(n, _) => n; case _ => throw errAt(pos, "invalid parameter") }
+      (names, None)
+    else
+      val fixed =
+        params.take(dotIdx).map { case Expr.Symbol(n, _) => n; case _ => throw errAt(pos, "invalid parameter") }
+      params.drop(dotIdx + 1) match
+        case Expr.Symbol(rest, _) :: Nil => (fixed, Some(rest))
+        case _                           => throw errAt(pos, "invalid rest parameter")
+
   private def evalLambda(rest: List[Expr], env: Env, pos: Pos): Value = rest match
     case Expr.SList(params, _) :: body =>
-      val paramNames = params.map {
-        case Expr.Symbol(n, _) => n
-        case _                 => throw errAt(pos, "invalid parameter")
-      }
-      Value.VLambda(paramNames, body, env)
+      val (paramNames, restParam) = parseParams(params, pos)
+      Value.VLambda(paramNames, restParam, body, env)
+    case Expr.Symbol(name, _) :: body =>
+      Value.VLambda(Nil, Some(name), body, env)
     case _ => throw errAt(pos, "invalid lambda")
 
   private def evalAnd(args: List[Expr], env: Env): Value =
@@ -210,7 +227,7 @@ object Evaluator:
         case _                                   => throw errAt(pos, "invalid let binding")
       }
       val loopEnv = env.child()
-      val lambda  = Value.VLambda(paramNames, body, loopEnv)
+      val lambda  = Value.VLambda(paramNames, None, body, loopEnv)
       loopEnv.define(name, lambda)
       applyFunc(lambda, initVals, pos, loopEnv)
     case Expr.SList(bindings, _) :: body if body.nonEmpty =>

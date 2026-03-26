@@ -13,6 +13,8 @@ object Builtins:
       applyTypeCheck(name, args, pos)
     case "display" | "write" | "newline" =>
       applyIO(name, args, pos, env)
+    case "apply" =>
+      applyApply(args, pos, env)
     case "string-append" | "string-length" | "substring" | "string->number" | "number->string" | "symbol->string" |
         "string->symbol" | "string-ref" | "string-copy" | "string-set!" =>
       applyStringOps(name, args, pos)
@@ -200,3 +202,13 @@ object Builtins:
           Value.VVoid
         case _ => throw errAt(pos, "string-set!: invalid arguments")
     case _ => throw errAt(pos, s"unknown string op: $name")
+
+  private def applyApply(args: List[Value], pos: Pos, env: Env): Value =
+    if args.length < 2 then throw errAt(pos, "apply requires at least 2 arguments")
+    val func = args.head
+    val lastArg = args.last match
+      case Value.VList(elems) => elems
+      case _                  => throw errAt(pos, "apply: last argument must be a list")
+    val prefixArgs = args.slice(1, args.length - 1)
+    val allArgs    = prefixArgs ++ lastArg
+    Evaluator.applyFunc(func, allArgs, pos, env)
