@@ -966,17 +966,21 @@ fn eval_guard(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     let clauses = &header[1..];
     let body = &args[1..];
 
-    // Evaluate body
+    // Evaluate body with TCO support: use eval_step for the last expression
+    // so that tail calls can escape the guard (the recursive call will establish
+    // its own guard). This prevents stack overflow for recursive guards.
     let body_result = (|| -> Result<Value, EvalError> {
-        let mut result = Value::Boolean(false);
-        for expr in body {
-            result = eval(expr, env)?;
+        if body.is_empty() {
+            return Ok(Value::Boolean(false));
         }
-        Ok(result)
+        for expr in &body[..body.len() - 1] {
+            eval(expr, env)?;
+        }
+        eval_step(body.last().unwrap(), env)
     })();
 
     match body_result {
-        Ok(v) => Ok(v),
+        Ok(v) => Ok(v), // TailCall values propagate to caller's force loop
         Err(EvalError::RaisedValue(val)) => {
             // Bind var to raised value, evaluate clauses
             let guard_env = new_env(Some(env.clone()));
@@ -1151,13 +1155,12 @@ fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eva
             )))
         }
         Value::Continuation { id, func } => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!(
-                    "continuation expects 1 argument, got {} at {}",
-                    args.len(), call_pos
-                )));
-            }
-            let val = args[0].clone();
+            // Continuations accept multiple arguments: wrap as Values
+            let val = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Value::Values(args.to_vec())
+            };
             // Check if this continuation is currently active (escape path)
             let is_active = ACTIVE_CC.with(|ac| ac.borrow().contains(id));
             if is_active {
@@ -1705,6 +1708,7 @@ fn is_special_form(name: &str) -> bool {
         "define" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "begin"
             | "cond" | "string-set!" | "set!" | "define-syntax" | "define-record-type"
             | "letrec" | "letrec*" | "case" | "do" | "let*" | "when"
+            | "guard" | "dynamic-wind"
             | "syntax-case" | "syntax" | "with-syntax"
     )
 }
@@ -2054,7 +2058,15 @@ fn eval_macro(
     p: Pos,
 ) -> Result<Value, EvalError> {
     let (expanded, wrapper_env) = expand_macro_only(literals, rules, def_env, input, env, p)?;
-    eval(&expanded, &wrapper_env)
+    // Copy gensym bindings from wrapper_env into the use-site env so that
+    // defines in the expansion bind in the use-site scope (not a throwaway wrapper).
+    {
+        let wrapper = wrapper_env.borrow();
+        for (k, v) in &wrapper.bindings {
+            env_set(env, k.clone(), v.clone());
+        }
+    }
+    eval(&expanded, env)
 }
 
 // --- syntax-case support ---
@@ -4388,6 +4400,25 @@ fn apply_cps_value(func: Value, args: Vec<Value>, pos: Pos, k: ContFn) -> Result
             }
             apply_cps_callcc(args.into_iter().next().unwrap(), pos, k)
         }
+        Value::Symbol(op) if op == "call-with-values" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity(format!(
+                    "call-with-values expects 2 arguments at {}", pos
+                )));
+            }
+            let producer = args[0].clone();
+            let consumer = args[1].clone();
+            // Call producer via CPS so call/cc inside works
+            let consumer = Rc::new(consumer);
+            let producer_k = ContFn::new(move |produced| {
+                let call_args = match produced {
+                    Value::Values(vals) => vals,
+                    single => vec![single],
+                };
+                apply_cps_value((*consumer).clone(), call_args, pos, k.clone())
+            });
+            apply_cps_value(producer, vec![], pos, producer_k)
+        }
         Value::Lambda { params, rest_param, body, env } => {
             // Apply lambda with CPS body evaluation
             let local_env = new_env(Some(env.clone()));
@@ -4447,12 +4478,12 @@ fn apply_cps_value(func: Value, args: Vec<Value>, pos: Pos, k: ContFn) -> Result
             )))
         }
         Value::Continuation { id, func } => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity(format!(
-                    "continuation expects 1 argument, got {} at {}", args.len(), pos
-                )));
-            }
-            let val = args.into_iter().next().unwrap();
+            // Continuations accept multiple arguments: wrap as Values
+            let val = if args.len() == 1 {
+                args.into_iter().next().unwrap()
+            } else {
+                Value::Values(args)
+            };
             let is_active = ACTIVE_CC.with(|ac| ac.borrow().contains(id));
             if is_active {
                 Err(EvalError::ContinuationEscape(*id, Box::new(val)))
