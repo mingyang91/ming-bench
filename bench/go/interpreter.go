@@ -96,6 +96,10 @@ func newStringExpr(text string, mutable bool) *stringExpr {
 	}
 }
 
+func newAllocatedString(text string) *stringExpr {
+	return newStringExpr(text, !stringsImmutableEnabled())
+}
+
 func (s *stringExpr) text() string {
 	if s == nil {
 		return ""
@@ -178,6 +182,7 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define(">", builtinProc{name: ">", fn: comparisonBuiltin(">", func(a, b int) bool { return a > b })})
 	root.define("=", builtinProc{name: "=", fn: comparisonBuiltin("=", func(a, b int) bool { return a == b })})
 	root.define("<=", builtinProc{name: "<=", fn: comparisonBuiltin("<=", func(a, b int) bool { return a <= b })})
+	root.define(">=", builtinProc{name: ">=", fn: comparisonBuiltin(">=", func(a, b int) bool { return a >= b })})
 	root.define("abs", builtinProc{name: "abs", fn: builtinAbs})
 	root.define("assoc", builtinProc{name: "assoc", fn: builtinAssoc})
 	root.define("not", builtinProc{name: "not", fn: builtinNot})
@@ -186,6 +191,7 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("car", builtinProc{name: "car", fn: builtinCar})
 	root.define("cdr", builtinProc{name: "cdr", fn: builtinCdr})
 	root.define("char-alphabetic?", builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabetic})
+	root.define("char->integer", builtinProc{name: "char->integer", fn: builtinCharToInteger})
 	root.define("char-downcase", builtinProc{name: "char-downcase", fn: builtinCharDowncase})
 	root.define("char-numeric?", builtinProc{name: "char-numeric?", fn: builtinCharNumeric})
 	root.define("char-upcase", builtinProc{name: "char-upcase", fn: builtinCharUpcase})
@@ -206,11 +212,13 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("expt", builtinProc{name: "expt", fn: builtinExpt})
 	root.define("inexact?", builtinProc{name: "inexact?", fn: builtinInexact})
 	root.define("inexact->exact", builtinProc{name: "inexact->exact", fn: builtinInexactToExact})
+	root.define("integer->char", builtinProc{name: "integer->char", fn: builtinIntegerToChar})
 	root.define("integer?", builtinProc{name: "integer?", fn: builtinInteger})
 	root.define("length", builtinProc{name: "length", fn: builtinLength})
 	root.define("list", builtinProc{name: "list", fn: builtinList})
 	root.define("list?", builtinProc{name: "list?", fn: builtinListPred})
 	root.define("list-ref", builtinProc{name: "list-ref", fn: builtinListRef})
+	root.define("list->string", builtinProc{name: "list->string", fn: builtinListToString})
 	root.define("list-tail", builtinProc{name: "list-tail", fn: builtinListTail})
 	root.define("map", builtinProc{name: "map", fn: builtinMap})
 	root.define("max", builtinProc{name: "max", fn: builtinMax})
@@ -262,6 +270,7 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("string-length", builtinProc{name: "string-length", fn: builtinStringLength})
 	root.define("string-ref", builtinProc{name: "string-ref", fn: builtinStringRef})
 	root.define("string-set!", builtinProc{name: "string-set!", fn: builtinStringSet})
+	root.define("string->list", builtinProc{name: "string->list", fn: builtinStringToList})
 	root.define("string->number", builtinProc{name: "string->number", fn: builtinStringToNumber})
 	root.define("string->symbol", builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
 	root.define("string-upcase", builtinProc{name: "string-upcase", fn: builtinStringUpcase})
@@ -1566,7 +1575,7 @@ func builtinStringAppend(args []expr) (expr, error) {
 		}
 		b.WriteString(text.text())
 	}
-	return newStringExpr(b.String(), false), nil
+	return newAllocatedString(b.String()), nil
 }
 
 func builtinStringCopy(args []expr) (expr, error) {
@@ -1578,7 +1587,7 @@ func builtinStringCopy(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "string-copy expects a string"}
 	}
-	return text.copy(true), nil
+	return text.copy(!stringsImmutableEnabled()), nil
 }
 
 func builtinStringDowncase(args []expr) (expr, error) {
@@ -1590,7 +1599,7 @@ func builtinStringDowncase(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "string-downcase expects a string"}
 	}
-	return newStringExpr(strings.ToLower(text.text()), false), nil
+	return newAllocatedString(strings.ToLower(text.text())), nil
 }
 
 func builtinStringLength(args []expr) (expr, error) {
@@ -1630,7 +1639,7 @@ func builtinSubstring(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "substring index out of range"}
 	}
 
-	return newStringExpr(string(text.runes[startIdx:endIdx]), false), nil
+	return newAllocatedString(string(text.runes[startIdx:endIdx])), nil
 }
 
 func builtinStringToNumber(args []expr) (expr, error) {
@@ -1659,7 +1668,7 @@ func builtinNumberToString(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "number->string expects a number"}
 	}
-	return newStringExpr(text, false), nil
+	return newAllocatedString(text), nil
 }
 
 func builtinSymbolToString(args []expr) (expr, error) {
@@ -1671,7 +1680,7 @@ func builtinSymbolToString(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "symbol->string expects a symbol"}
 	}
-	return newStringExpr(symbol.name, false), nil
+	return newAllocatedString(symbol.name), nil
 }
 
 func builtinStringToSymbol(args []expr) (expr, error) {
@@ -1718,6 +1727,9 @@ func builtinStringSet(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "string-set! expects a string as its first argument"}
 	}
+	if stringsImmutableEnabled() {
+		return nil, &EvalError{Message: "string-set! expects a mutable string"}
+	}
 	if !text.mutable {
 		return nil, &EvalError{Message: "string-set! expects a mutable string"}
 	}
@@ -1750,7 +1762,7 @@ func builtinStringUpcase(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "string-upcase expects a string"}
 	}
-	return newStringExpr(strings.ToUpper(text.text()), false), nil
+	return newAllocatedString(strings.ToUpper(text.text())), nil
 }
 
 func builtinCharAlphabetic(args []expr) (expr, error) {
