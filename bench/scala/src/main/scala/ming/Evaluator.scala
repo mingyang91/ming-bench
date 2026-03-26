@@ -1,6 +1,6 @@
 package ming
 
-import SchemeTypes.{builtinNames, display, displayStr, errAt, isTruthy, Env, Pos, Value}
+import SchemeTypes.{builtinNames, display, errAt, isTruthy, Env, Pos, Value}
 
 object Evaluator:
 
@@ -24,65 +24,61 @@ object Evaluator:
     for name <- builtinNames do env.define(name, Value.VBuiltin(name))
     env
 
-  // ── Eval ─────────────────────────────────────────────────────────────
-  private def eval(expr: Expr, env: Env): Value = expr match
-    case Expr.Num(n, _)       => Value.VNum(n)
-    case Expr.Flt(d, _)       => Value.VFloat(d)
-    case Expr.Rat(n, d, _)    => Value.VRational(n, d)
-    case Expr.Bool(b, _)      => Value.VBool(b)
-    case Expr.Str(s, _)       => Value.VStr(s.toCharArray, mutable = false)
-    case Expr.Chr(c, _)       => Value.VChar(c)
-    case Expr.Symbol(name, p) => env.lookup(name, p)
-    case Expr.SList(Nil, p) =>
-      throw errAt(p, "empty application")
-    case Expr.SList(Expr.Symbol("quote", _) :: arg :: Nil, _) =>
-      EvalForms.quoteToValue(arg)
-    case Expr.SList(Expr.Symbol("define", _) :: rest, p) =>
-      evalDefine(rest, env, p)
-    case Expr.SList(Expr.Symbol("if", _) :: rest, p) =>
-      evalIf(rest, env, p)
-    case Expr.SList(Expr.Symbol("lambda", _) :: rest, p) =>
-      evalLambda(rest, env, p)
-    case Expr.SList(Expr.Symbol("and", _) :: args, _) =>
-      evalAnd(args, env)
-    case Expr.SList(Expr.Symbol("or", _) :: args, _) =>
-      evalOr(args, env)
-    case Expr.SList(Expr.Symbol("let", _) :: rest, p) =>
-      evalLet(rest, env, p)
-    case Expr.SList(Expr.Symbol("begin", _) :: body, _) =>
-      evalBegin(body, env)
-    case Expr.SList(Expr.Symbol("cond", _) :: clauses, _) =>
-      evalCond(clauses, env)
-    case Expr.SList(Expr.Symbol("set!", _) :: rest, p) =>
-      evalSet(rest, env, p)
-    case Expr.SList(Expr.Symbol("define-syntax", _) :: rest, p) =>
-      EvalForms.evalDefineSyntax(rest, env, p)
-    case Expr.SList(Expr.Symbol("case-lambda", _) :: clauses, p) =>
-      EvalForms.evalCaseLambda(clauses, env, p)
-    case Expr.SList(Expr.Symbol("define-record-type", _) :: rest, p) =>
-      EvalForms.evalDefineRecordType(rest, env, p)
-    case Expr.SList(Expr.Symbol("letrec", _) :: rest, p) =>
-      EvalCompound.evalLetrec(rest, env, p, eval, evalBody)
-    case Expr.SList(Expr.Symbol("letrec*", _) :: rest, p) =>
-      EvalCompound.evalLetrecStar(rest, env, p, eval, evalBody)
-    case Expr.SList(Expr.Symbol("case", _) :: rest, p) =>
-      EvalCompound.evalCase(rest, env, p, eval, evalBody, posOf)
-    case Expr.SList(Expr.Symbol("do", _) :: rest, p) =>
-      EvalCompound.evalDo(rest, env, p, eval, evalBody, posOf)
-    case Expr.SList(head :: args, p) =>
-      val macroOpt = head match
-        case Expr.Symbol(name, _) => env.lookupOpt(name).collect { case m: Value.VMacro => m }
-        case _                    => None
-      macroOpt match
-        case Some(m) =>
-          val (expanded, injections) =
-            MacroExpander.expand(m, Expr.SList(head :: args, p), p)
-          val macroEnv = env.child()
-          injections.foreach((k, v) => macroEnv.define(k, v))
-          eval(expanded, macroEnv)
-        case None =>
-          val func = eval(head, env)
-          applyFunc(func, args.map(a => eval(a, env)), p, env)
+  // ── Eval (trampoline for TCO) ─────────────────────────────────────
+  private def eval(expr0: Expr, env0: Env): Value =
+    var curExpr: Expr = expr0
+    var curEnv: Env   = env0
+
+    while true do
+      val tco: TcoResult = curExpr match
+        case Expr.Num(n, _)       => return Value.VNum(n)
+        case Expr.Flt(d, _)       => return Value.VFloat(d)
+        case Expr.Rat(n, d, _)    => return Value.VRational(n, d)
+        case Expr.Bool(b, _)      => return Value.VBool(b)
+        case Expr.Str(s, _)       => return Value.VStr(s.toCharArray, mutable = false)
+        case Expr.Chr(c, _)       => return Value.VChar(c)
+        case Expr.Symbol(name, p) => return curEnv.lookup(name, p)
+        case Expr.SList(Nil, p)   => throw errAt(p, "empty application")
+        case Expr.SList(Expr.Symbol("quote", _) :: arg :: Nil, _) =>
+          return EvalForms.quoteToValue(arg)
+        case Expr.SList(Expr.Symbol("define", _) :: rest, p) =>
+          return evalDefine(rest, curEnv, p)
+        case Expr.SList(Expr.Symbol("if", _) :: rest, p) =>
+          EvalTail.evalIf(rest, curEnv, p, eval)
+        case Expr.SList(Expr.Symbol("lambda", _) :: rest, p) =>
+          return evalLambda(rest, curEnv, p)
+        case Expr.SList(Expr.Symbol("and", _) :: args, _) =>
+          EvalTail.evalAnd(args, curEnv, eval)
+        case Expr.SList(Expr.Symbol("or", _) :: args, _) =>
+          EvalTail.evalOr(args, curEnv, eval)
+        case Expr.SList(Expr.Symbol("let", _) :: rest, p) =>
+          EvalTail.evalLet(rest, curEnv, p, eval)
+        case Expr.SList(Expr.Symbol("begin", _) :: body, _) =>
+          EvalTail.evalBegin(body, curEnv, eval)
+        case Expr.SList(Expr.Symbol("cond", _) :: clauses, _) =>
+          EvalTail.evalCond(clauses, curEnv, eval, posOf)
+        case Expr.SList(Expr.Symbol("set!", _) :: rest, p) =>
+          return evalSet(rest, curEnv, p)
+        case Expr.SList(Expr.Symbol("define-syntax", _) :: rest, p) =>
+          return EvalForms.evalDefineSyntax(rest, curEnv, p)
+        case Expr.SList(Expr.Symbol("case-lambda", _) :: clauses, p) =>
+          return EvalForms.evalCaseLambda(clauses, curEnv, p)
+        case Expr.SList(Expr.Symbol("define-record-type", _) :: rest, p) =>
+          return EvalForms.evalDefineRecordType(rest, curEnv, p)
+        case Expr.SList(Expr.Symbol("letrec", _) :: rest, p) =>
+          return EvalCompound.evalLetrec(rest, curEnv, p, eval, evalBody)
+        case Expr.SList(Expr.Symbol("letrec*", _) :: rest, p) =>
+          return EvalCompound.evalLetrecStar(rest, curEnv, p, eval, evalBody)
+        case Expr.SList(Expr.Symbol("case", _) :: rest, p) =>
+          return EvalCompound.evalCase(rest, curEnv, p, eval, evalBody, posOf)
+        case Expr.SList(Expr.Symbol("do", _) :: rest, p) =>
+          return EvalCompound.evalDo(rest, curEnv, p, eval, evalBody, posOf)
+        case Expr.SList(head :: args, p) =>
+          EvalTail.evalApp(head, args, curEnv, p, eval)
+      tco match
+        case TcoResult.Done(v)        => return v
+        case TcoResult.Bounce(e, env) => curExpr = e; curEnv = env
+    throw EvalError("unreachable")
 
   private def evalBody(body: List[Expr], env: Env): Value =
     body.foldLeft(Value.VVoid: Value)((_, e) => eval(e, env))
@@ -95,18 +91,9 @@ object Evaluator:
   ): Value = func match
     case Value.VBuiltin(name) => Builtins(name, args, pos, env)
     case Value.VLambda(params, restParam, body, closure) =>
-      restParam match
-        case None =>
-          if args.length != params.length then throw errAt(pos, "wrong number of arguments")
-          val callEnv = closure.child()
-          params.zip(args).foreach((p, a) => callEnv.define(p, a))
-          evalBody(body, callEnv)
-        case Some(rest) =>
-          if args.length < params.length then throw errAt(pos, "wrong number of arguments")
-          val callEnv = closure.child()
-          params.zip(args).foreach((p, a) => callEnv.define(p, a))
-          callEnv.define(rest, Value.VList(args.drop(params.length)))
-          evalBody(body, callEnv)
+      val callEnv = closure.child()
+      EvalTail.bindArgs(params, restParam, args, callEnv, pos)
+      evalBody(body, callEnv)
     case Value.VCaseLambda(clauses) =>
       val matched = clauses.find { case (params, restParam, _, _) =>
         restParam match
@@ -116,8 +103,7 @@ object Evaluator:
       matched match
         case Some((params, restParam, body, closure)) =>
           val callEnv = closure.child()
-          params.zip(args).foreach((p, a) => callEnv.define(p, a))
-          restParam.foreach(rest => callEnv.define(rest, Value.VList(args.drop(params.length))))
+          EvalTail.bindArgs(params, restParam, args, callEnv, pos)
           evalBody(body, callEnv)
         case None => throw errAt(pos, "wrong number of arguments")
     case _ => throw errAt(pos, "not a procedure")
@@ -139,19 +125,6 @@ object Evaluator:
       Value.VVoid
     case _ => throw errAt(pos, "invalid define")
 
-  private def evalIf(
-    rest: List[Expr],
-    env: Env,
-    pos: Pos
-  ): Value = rest match
-    case cond :: thenExpr :: elseExpr :: Nil =>
-      if isTruthy(eval(cond, env)) then eval(thenExpr, env)
-      else eval(elseExpr, env)
-    case cond :: thenExpr :: Nil =>
-      if isTruthy(eval(cond, env)) then eval(thenExpr, env)
-      else Value.VVoid
-    case _ => throw errAt(pos, "invalid if")
-
   private def evalLambda(
     rest: List[Expr],
     env: Env,
@@ -164,56 +137,6 @@ object Evaluator:
       Value.VLambda(Nil, Some(name), body, env)
     case _ => throw errAt(pos, "invalid lambda")
 
-  private def evalAnd(args: List[Expr], env: Env): Value =
-    args match
-      case Nil         => Value.VBool(true)
-      case last :: Nil => eval(last, env)
-      case head :: tail =>
-        eval(head, env) match
-          case Value.VBool(false) => Value.VBool(false)
-          case _                  => evalAnd(tail, env)
-
-  private def evalOr(args: List[Expr], env: Env): Value =
-    args match
-      case Nil         => Value.VBool(false)
-      case last :: Nil => eval(last, env)
-      case head :: tail =>
-        val result = eval(head, env)
-        if isTruthy(result) then result else evalOr(tail, env)
-
-  private def evalLet(
-    rest: List[Expr],
-    env: Env,
-    pos: Pos
-  ): Value = rest match
-    case Expr.Symbol(name, _) :: Expr.SList(bindings, _) :: body if body.nonEmpty =>
-      val paramNames = bindings.map {
-        case Expr.SList(Expr.Symbol(n, _) :: _ :: Nil, _) => n
-        case _                                            => throw errAt(pos, "invalid let binding")
-      }
-      val initVals = bindings.map {
-        case Expr.SList(_ :: initExpr :: Nil, _) =>
-          eval(initExpr, env)
-        case _ => throw errAt(pos, "invalid let binding")
-      }
-      val loopEnv = env.child()
-      val lambda =
-        Value.VLambda(paramNames, None, body, loopEnv)
-      loopEnv.define(name, lambda)
-      applyFunc(lambda, initVals, pos, loopEnv)
-    case Expr.SList(bindings, _) :: body if body.nonEmpty =>
-      val letEnv = env.child()
-      for b <- bindings do
-        b match
-          case Expr.SList(
-                Expr.Symbol(name, _) :: initExpr :: Nil,
-                _
-              ) =>
-            letEnv.define(name, eval(initExpr, env))
-          case _ => throw errAt(pos, "invalid let binding")
-      evalBody(body, letEnv)
-    case _ => throw errAt(pos, "invalid let")
-
   private def evalSet(
     rest: List[Expr],
     env: Env,
@@ -223,22 +146,6 @@ object Evaluator:
       env.set(name, eval(valueExpr, env), p)
       Value.VVoid
     case _ => throw errAt(pos, "invalid set!")
-
-  private def evalBegin(body: List[Expr], env: Env): Value =
-    if body.isEmpty then Value.VVoid
-    else evalBody(body, env)
-
-  private def evalCond(
-    clauses: List[Expr],
-    env: Env
-  ): Value = clauses match
-    case Nil => Value.VVoid
-    case Expr.SList(Expr.Symbol("else", _) :: body, _) :: _ =>
-      evalBody(body, env)
-    case Expr.SList(test :: body, _) :: rest =>
-      if isTruthy(eval(test, env)) then evalBody(body, env)
-      else evalCond(rest, env)
-    case e :: _ => throw errAt(posOf(e), "invalid cond")
 
   // ── Public API ───────────────────────────────────────────────────────
   def evalStr(input: String): String =
