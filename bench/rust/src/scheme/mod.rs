@@ -449,6 +449,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "begin" => return eval_begin(&elems[1..], env),
                     "cond" => return eval_cond(&elems[1..], env),
                     "string-set!" => return eval_string_set(&elems[1..], env, p),
+                    "set!" => return eval_set(&elems[1..], env, p),
                     _ => {}
                 }
             }
@@ -834,6 +835,27 @@ fn eval_string_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError>
     new_chars[idx] = ch;
     s = new_chars.into_iter().collect();
     env_set_existing(env, &var_name, Value::Str(s));
+    Ok(Value::Nil)
+}
+
+fn eval_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!(
+            "set! requires 2 arguments at {}", p
+        )));
+    }
+    let name = match &args[0] {
+        Expr::Symbol(s, _) => s.clone(),
+        _ => return Err(EvalError::Type(format!(
+            "set!: expected symbol at {}", p
+        ))),
+    };
+    // Check that the variable exists
+    if env_get(env, &name).is_none() {
+        return Err(EvalError::UnboundVariable(format!("{} at {}", name, p)));
+    }
+    let val = eval(&args[1], env)?;
+    env_set_existing(env, &name, val);
     Ok(Value::Nil)
 }
 
