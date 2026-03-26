@@ -10,7 +10,8 @@ final private[ming] class SchemeMacroTemplateExpander(
   override protected val bindings: PatternBindings,
   useSiteEnv: Env,
   override protected val definitionEnv: Env
-) extends SchemeMacroTemplateBindingSupport:
+) extends SchemeMacroTemplateBindingSupport
+    with SchemeMacroTemplateScopeSupport:
 
   def expand(template: Expr): ExpandedExpr =
     val initialState = ExpansionState(useSiteEnv, Map.empty)
@@ -21,6 +22,22 @@ final private[ming] class SchemeMacroTemplateExpander(
       repetitionIndex = None
     )
     ExpandedExpr(expanded, finalState.expansionEnv)
+
+  override protected def instantiateTemplateExpr(
+    template: Expr,
+    state: ExpansionState,
+    renamedBindings: Map[String, String],
+    repetitionIndex: Option[Int]
+  ): (Expr, ExpansionState) =
+    instantiate(template, state, renamedBindings, repetitionIndex)
+
+  override protected def instantiateRepeatedTemplateItem(
+    template: Expr,
+    count: Int,
+    state: ExpansionState,
+    renamedBindings: Map[String, String]
+  ): (List[Expr], ExpansionState) =
+    instantiateRepeatedItem(template, count, state, renamedBindings)
 
   private def instantiate(
     template: Expr,
@@ -115,7 +132,7 @@ final private[ming] class SchemeMacroTemplateExpander(
         val (instantiatedParams, extendedRenamed) =
           instantiateParameterList(rawParams, renamedWithName, repetitionIndex)
         val (instantiatedBody, nextState) =
-          instantiateItems(body, state, extendedRenamed, repetitionIndex)
+          instantiateBodyItems(body, state, extendedRenamed, repetitionIndex)
 
         (
           Expr.ListExpr(
@@ -187,11 +204,35 @@ final private[ming] class SchemeMacroTemplateExpander(
     repetitionIndex: Option[Int]
   ): (Expr, ExpansionState) =
     rest match
+      case (nameExpr @ Expr.Symbol(_, _)) :: Expr.ListExpr(rawBindings, bindingsPos) :: body if body.nonEmpty =>
+        val (instantiatedName, nameRename) =
+          instantiateBinderName(nameExpr, renamedBindings, repetitionIndex)
+        val renamedWithName = nameRename match
+          case Some((originalName, freshName)) =>
+            renamedBindings.updated(originalName, freshName)
+          case None =>
+            renamedBindings
+        val (instantiatedBindings, bindingsRenamed, afterBindingsState) =
+          instantiateLetBindings(rawBindings, state, renamedBindings, repetitionIndex)
+        val bodyRenamed = bindingsRenamed ++ renamedWithName
+        val (instantiatedBody, afterBodyState) =
+          instantiateBodyItems(body, afterBindingsState, bodyRenamed, repetitionIndex)
+
+        (
+          Expr.ListExpr(
+            Expr.Symbol("let", headPos) ::
+              instantiatedName ::
+              Expr.ListExpr(instantiatedBindings, bindingsPos) ::
+              instantiatedBody,
+            pos
+          ),
+          afterBodyState
+        )
       case Expr.ListExpr(rawBindings, bindingsPos) :: body if body.nonEmpty =>
         val (instantiatedBindings, extendedRenamed, afterBindingsState) =
           instantiateLetBindings(rawBindings, state, renamedBindings, repetitionIndex)
         val (instantiatedBody, afterBodyState) =
-          instantiateItems(body, afterBindingsState, extendedRenamed, repetitionIndex)
+          instantiateBodyItems(body, afterBindingsState, extendedRenamed, repetitionIndex)
 
         (
           Expr.ListExpr(
@@ -207,41 +248,6 @@ final private[ming] class SchemeMacroTemplateExpander(
           instantiateItems(rest, state, renamedBindings, repetitionIndex)
         (Expr.ListExpr(Expr.Symbol("let", headPos) :: instantiatedRest, pos), nextState)
 
-  private def instantiateLetBindings(
-    rawBindings: List[Expr],
-    state: ExpansionState,
-    renamedBindings: Map[String, String],
-    repetitionIndex: Option[Int]
-  ): (List[Expr], Map[String, String], ExpansionState) =
-    @tailrec
-    def loop(
-      remaining: List[Expr],
-      currentState: ExpansionState,
-      collectedRenames: Map[String, String],
-      reversedBindings: List[Expr]
-    ): (List[Expr], Map[String, String], ExpansionState) =
-      remaining match
-        case Expr.ListExpr(List(nameExpr, valueExpr), bindingPos) :: tail =>
-          val (instantiatedName, nextRename) =
-            instantiateBinderName(nameExpr, renamedBindings, repetitionIndex)
-          val (instantiatedValue, nextState) =
-            instantiate(valueExpr, currentState, renamedBindings, repetitionIndex)
-          val updatedRenames = nextRename match
-            case Some((originalName, freshName)) =>
-              collectedRenames.updated(originalName, freshName)
-            case None =>
-              collectedRenames
-          val instantiatedBinding =
-            Expr.ListExpr(List(instantiatedName, instantiatedValue), bindingPos)
-
-          loop(tail, nextState, updatedRenames, instantiatedBinding :: reversedBindings)
-        case _ :: _ =>
-          throw new EvalError("macro-generated let bindings must contain (name value) pairs")
-        case Nil =>
-          (reversedBindings.reverse, renamedBindings ++ collectedRenames, currentState)
-
-    loop(rawBindings, state, Map.empty, Nil)
-
   private def instantiateLambda(
     headPos: SourcePos,
     rest: List[Expr],
@@ -255,7 +261,7 @@ final private[ming] class SchemeMacroTemplateExpander(
         val (instantiatedParams, extendedRenamed) =
           instantiateParameterList(rawParams, renamedBindings, repetitionIndex)
         val (instantiatedBody, nextState) =
-          instantiateItems(body, state, extendedRenamed, repetitionIndex)
+          instantiateBodyItems(body, state, extendedRenamed, repetitionIndex)
 
         (
           Expr.ListExpr(
