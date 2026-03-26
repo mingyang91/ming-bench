@@ -44,9 +44,16 @@ function makePair(car: SchemeVal, cdr: SchemeVal): SchemeVal {
 function schemeListToArray(val: SchemeVal): SchemeVal[] {
   const result: SchemeVal[] = [];
   let cur = val;
+  let slow = val;
+  let step = 0;
   while (cur.tag === 'pair') {
     result.push(cur.car);
     cur = cur.cdr;
+    step++;
+    if (step % 2 === 0) {
+      slow = (slow as any).cdr;
+      if (slow === cur) throw new EvalError('not a proper list (circular)');
+    }
   }
   if (cur.tag !== 'nil') throw new EvalError('not a proper list');
   return result;
@@ -469,8 +476,9 @@ function toNumber(v: SchemeVal, op: string, callPos?: Pos): number {
   throw new EvalError(`${posStr(callPos)}${op}: expected number`);
 }
 
-function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+function schemeEqual(a: SchemeVal, b: SchemeVal, seen?: Set<string>): boolean {
   if (isNumeric(a) && isNumeric(b)) return toFloat(a) === toFloat(b);
+  if (a === b) return true;
   if (a.tag !== b.tag) return false;
   switch (a.tag) {
     case 'boolean': return a.value === (b as typeof a).value;
@@ -478,17 +486,34 @@ function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
     case 'symbol': return a.value === (b as typeof a).value;
     case 'char': return a.value === (b as typeof a).value;
     case 'nil': return true;
-    case 'pair': return b.tag === 'pair' && schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    case 'pair': {
+      if (b.tag !== 'pair') return false;
+      if (!seen) seen = new Set();
+      // Use object identity pair as key for cycle detection
+      const key = _pairId(a) + ',' + _pairId(b);
+      if (seen.has(key)) return true; // assume equal for cycles
+      seen.add(key);
+      return schemeEqual(a.car, b.car, seen) && schemeEqual(a.cdr, b.cdr, seen);
+    }
     case 'vector': {
       if (b.tag !== 'vector') return false;
       if (a.value.length !== b.value.length) return false;
       for (let i = 0; i < a.value.length; i++) {
-        if (!schemeEqual(a.value[i], b.value[i])) return false;
+        if (!schemeEqual(a.value[i], b.value[i], seen)) return false;
       }
       return true;
     }
     default: return a === b;
   }
+}
+
+// Unique identity for pair objects (for cycle detection in equal?)
+let _pairIdCounter = 0;
+const _pairIdMap = new WeakMap<object, number>();
+function _pairId(v: SchemeVal): number {
+  let id = _pairIdMap.get(v as object);
+  if (id === undefined) { id = ++_pairIdCounter; _pairIdMap.set(v as object, id); }
+  return id;
 }
 
 function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
@@ -625,6 +650,38 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}cdr: need 1 argument`);
       if (args[0].tag !== 'pair') throw new EvalError(`${posStr(callPos)}cdr: not a pair`);
       return args[0].cdr;
+    }
+    case 'caar': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}caar: need 1 argument`);
+      if (args[0].tag !== 'pair' || args[0].car.tag !== 'pair') throw new EvalError(`${posStr(callPos)}caar: not a pair`);
+      return args[0].car.car;
+    }
+    case 'cadr': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}cadr: need 1 argument`);
+      if (args[0].tag !== 'pair' || args[0].cdr.tag !== 'pair') throw new EvalError(`${posStr(callPos)}cadr: not a pair`);
+      return args[0].cdr.car;
+    }
+    case 'cdar': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}cdar: need 1 argument`);
+      if (args[0].tag !== 'pair' || args[0].car.tag !== 'pair') throw new EvalError(`${posStr(callPos)}cdar: not a pair`);
+      return args[0].car.cdr;
+    }
+    case 'cddr': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}cddr: need 1 argument`);
+      if (args[0].tag !== 'pair' || args[0].cdr.tag !== 'pair') throw new EvalError(`${posStr(callPos)}cddr: not a pair`);
+      return args[0].cdr.cdr;
+    }
+    case 'set-car!': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}set-car!: need 2 arguments`);
+      if (args[0].tag !== 'pair') throw new EvalError(`${posStr(callPos)}set-car!: not a pair`);
+      (args[0] as any).car = args[1];
+      return { tag: 'void' };
+    }
+    case 'set-cdr!': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}set-cdr!: need 2 arguments`);
+      if (args[0].tag !== 'pair') throw new EvalError(`${posStr(callPos)}set-cdr!: not a pair`);
+      (args[0] as any).cdr = args[1];
+      return { tag: 'void' };
     }
     case 'null?': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}null?: need 1 argument`);
@@ -891,8 +948,17 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
     }
     case 'list?': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}list?: need 1 argument`);
-      let cur = args[0];
-      while (cur.tag === 'pair') cur = cur.cdr;
+      // Tortoise-and-hare cycle detection
+      let slow = args[0];
+      let fast = args[0];
+      while (fast.tag === 'pair') {
+        slow = (slow as any).cdr;
+        fast = fast.cdr;
+        if (fast.tag !== 'pair') break;
+        fast = fast.cdr;
+        if (slow === fast) return { tag: 'boolean', value: false }; // cycle detected
+      }
+      let cur = fast;
       return { tag: 'boolean', value: cur.tag === 'nil' };
     }
     case 'assoc': {
@@ -916,6 +982,90 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
         result.push(_callProc(fn, fnArgs, callPos));
       }
       return arrayToSchemeList(result);
+    }
+    case 'member': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}member: need 2 arguments`);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        if (schemeEqual(args[0], cur.car)) return cur;
+        cur = cur.cdr;
+      }
+      return { tag: 'boolean', value: false };
+    }
+    case 'reverse': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}reverse: need 1 argument`);
+      const items = schemeListToArray(args[0]);
+      return arrayToSchemeList(items.reverse());
+    }
+    case 'for-each': {
+      if (args.length < 2) throw new EvalError(`${posStr(callPos)}for-each: need at least 2 arguments`);
+      const fn = args[0];
+      const lists = args.slice(1).map(a => schemeListToArray(a));
+      const len = lists[0].length;
+      for (let i = 0; i < len; i++) {
+        const fnArgs = lists.map(l => l[i]);
+        _callProc(fn, fnArgs, callPos);
+      }
+      return { tag: 'void' };
+    }
+    case 'assv': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}assv: need 2 arguments`);
+      const key = args[0];
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        if (cur.car.tag === 'pair' && schemeEq(key, cur.car.car)) return cur.car;
+        cur = cur.cdr;
+      }
+      return { tag: 'boolean', value: false };
+    }
+    case 'gcd': {
+      if (args.length === 0) return makeExactInt(0);
+      let result = Math.abs(toNumber(args[0], 'gcd', callPos));
+      for (let i = 1; i < args.length; i++) result = gcd(result, Math.abs(toNumber(args[i], 'gcd', callPos)));
+      return makeExactInt(result);
+    }
+    case 'lcm': {
+      if (args.length === 0) return makeExactInt(1);
+      let result = Math.abs(toNumber(args[0], 'lcm', callPos));
+      for (let i = 1; i < args.length; i++) {
+        const b = Math.abs(toNumber(args[i], 'lcm', callPos));
+        result = (result / gcd(result, b)) * b;
+      }
+      return makeExactInt(result);
+    }
+    case 'truncate': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}truncate: need 1 argument`);
+      return makeExactInt(Math.trunc(toFloat(args[0])));
+    }
+    case 'round': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}round: need 1 argument`);
+      const v = toFloat(args[0]);
+      // Banker's rounding
+      const rounded = Math.round(v);
+      if (Math.abs(v - Math.floor(v) - 0.5) < 1e-15) {
+        const floor = Math.floor(v);
+        return makeExactInt(floor % 2 === 0 ? floor : floor + 1);
+      }
+      return makeExactInt(rounded);
+    }
+    case 'make-string': {
+      if (args.length < 1 || args.length > 2) throw new EvalError(`${posStr(callPos)}make-string: need 1-2 arguments`);
+      const k = toNumber(args[0], 'make-string', callPos);
+      const ch = args.length === 2 ? (args[1].tag === 'char' ? args[1].value : '\0') : '\0';
+      return { tag: 'string', value: ch.repeat(k), mutable: true };
+    }
+    case 'string': {
+      // (string char1 char2 ...) -> string from chars
+      let s = '';
+      for (const a of args) {
+        if (a.tag !== 'char') throw new EvalError(`${posStr(callPos)}string: expected char`);
+        s += a.value;
+      }
+      return { tag: 'string', value: s };
+    }
+    case 'error': {
+      const msg = args.map(a => displayVal(a)).join(' ');
+      throw new EvalError(msg);
     }
     case 'equal?': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}equal?: need 2 arguments`);
@@ -1014,6 +1164,21 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError(`${posStr(callPos)}string<?: expected strings`);
       return { tag: 'boolean', value: args[0].value < args[1].value };
     }
+    case 'string>?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}string>?: need 2 arguments`);
+      if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError(`${posStr(callPos)}string>?: expected strings`);
+      return { tag: 'boolean', value: args[0].value > args[1].value };
+    }
+    case 'string<=?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}string<=?: need 2 arguments`);
+      if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError(`${posStr(callPos)}string<=?: expected strings`);
+      return { tag: 'boolean', value: args[0].value <= args[1].value };
+    }
+    case 'string>=?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}string>=?: need 2 arguments`);
+      if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError(`${posStr(callPos)}string>=?: expected strings`);
+      return { tag: 'boolean', value: args[0].value >= args[1].value };
+    }
     case 'string-ci=?': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}string-ci=?: need 2 arguments`);
       if (args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError(`${posStr(callPos)}string-ci=?: expected strings`);
@@ -1109,7 +1274,8 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
 
 const BUILTIN_NAMES = new Set([
   '+', '-', '*', '/', '<', '>', '=', '<=', '>=',
-  'cons', 'car', 'cdr', 'null?', 'pair?', 'list', 'length', 'append',
+  'cons', 'car', 'cdr', 'caar', 'cadr', 'cdar', 'cddr', 'null?', 'pair?', 'list', 'length', 'append',
+  'set-car!', 'set-cdr!',
   'number?', 'boolean?', 'string?', 'symbol?', 'not',
   'display', 'write', 'newline',
   'string-append', 'string-length', 'substring',
@@ -1123,7 +1289,9 @@ const BUILTIN_NAMES = new Set([
   // L09
   'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
   'zero?', 'positive?', 'negative?', 'odd?', 'even?',
-  'list-ref', 'list-tail', 'list?', 'assoc', 'map', 'equal?', 'eq?',
+  'list-ref', 'list-tail', 'list?', 'assoc', 'assv', 'map', 'for-each', 'reverse', 'member', 'equal?', 'eq?',
+  'error', 'gcd', 'lcm', 'truncate', 'round', 'make-string', 'string',
+  'string>?', 'string<=?', 'string>=?',
   'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase', 'char=?', 'char<?',
   'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase',
   // L11
@@ -1163,8 +1331,11 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
   if (expr.tag === 'nil' || expr.tag === 'pair') return expr;
 
   if (expr.tag === 'symbol') {
+    // Check environment first so user bindings can shadow builtins
+    const envVal = env.lookup(expr.value);
+    if (envVal !== undefined) return envVal;
     if (BUILTIN_NAMES.has(expr.value)) return { tag: 'builtin', name: expr.value, pos: expr.pos };
-    return env.get(expr.value, expr.pos);
+    throw new EvalError(`${posStr(expr.pos)}unbound variable: ${expr.value}`);
   }
 
   if (expr.tag !== 'list') return expr;
@@ -1284,6 +1455,24 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           evaluate(elems[i], letEnv);
         }
         expr = elems[elems.length - 1]; env = letEnv; continue;
+      }
+      case 'let*': {
+        if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}let*: wrong number of arguments`);
+        const lsBindings = elems[1];
+        if (lsBindings.tag !== 'list') throw new EvalError(`${posStr(expr.pos)}let*: invalid bindings`);
+        let lsEnv = new Env(env);
+        for (const b of lsBindings.value) {
+          if (b.tag !== 'list' || b.value.length !== 2 || b.value[0].tag !== 'symbol')
+            throw new EvalError(`${posStr(expr.pos)}let*: invalid binding`);
+          const val = evaluate(b.value[1], lsEnv);
+          const nextEnv = new Env(lsEnv);
+          nextEnv.set(b.value[0].value, val);
+          lsEnv = nextEnv;
+        }
+        for (let i = 2; i < elems.length - 1; i++) {
+          evaluate(elems[i], lsEnv);
+        }
+        expr = elems[elems.length - 1]; env = lsEnv; continue;
       }
       case 'letrec': {
         if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}letrec: wrong number of arguments`);
@@ -1411,7 +1600,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       case 'cond': {
         for (let i = 1; i < elems.length; i++) {
           const clause = elems[i];
-          if (clause.tag !== 'list' || clause.value.length < 2)
+          if (clause.tag !== 'list' || clause.value.length < 1)
             throw new EvalError(`${posStr(expr.pos)}cond: invalid clause`);
           const test = clause.value[0];
           if (test.tag === 'symbol' && test.value === 'else') {
@@ -1607,7 +1796,7 @@ _callProc = function callProc(proc: SchemeVal, args: SchemeVal[], callPos?: Pos)
 // ── Display ────────────────────────────────────────────────────────
 
 // writeVal: like Scheme's `write` — strings get quotes
-function writeVal(val: SchemeVal): string {
+function writeVal(val: SchemeVal, seen?: Set<SchemeVal>): string {
   switch (val.tag) {
     case 'number': {
       const s = String(val.value);
@@ -1623,25 +1812,30 @@ function writeVal(val: SchemeVal): string {
     case 'void': return '';
     case 'nil': return '()';
     case 'pair': {
-      let result = '(' + writeVal(val.car);
+      if (!seen) seen = new Set();
+      if (seen.has(val)) return '(...)';
+      seen.add(val);
+      let result = '(' + writeVal(val.car, seen);
       let cur: SchemeVal = val.cdr;
       while (cur.tag === 'pair') {
-        result += ' ' + writeVal(cur.car);
+        if (seen.has(cur)) { result += ' ...'; break; }
+        seen.add(cur);
+        result += ' ' + writeVal(cur.car, seen);
         cur = cur.cdr;
       }
-      if (cur.tag !== 'nil') {
-        result += ' . ' + writeVal(cur);
+      if (cur.tag !== 'nil' && !(cur.tag === 'pair' && seen.has(cur))) {
+        result += ' . ' + writeVal(cur, seen);
       }
       result += ')';
       return result;
     }
-    case 'list': return `(${val.value.map(writeVal).join(' ')})`;
+    case 'list': return `(${val.value.map(v => writeVal(v, seen)).join(' ')})`;
     case 'lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
     case 'case-lambda': return '#<procedure>';
     case 'syntax': return '#<syntax>';
     case 'record': return '#<record>';
-    case 'vector': return `#(${val.value.map(writeVal).join(' ')})`;
+    case 'vector': return `#(${val.value.map(v => writeVal(v, seen)).join(' ')})`;
   }
 }
 
