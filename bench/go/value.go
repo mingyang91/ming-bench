@@ -24,6 +24,7 @@ const (
 	TypeSyntax
 	TypeRecord
 	TypeVector
+	TypeTailCall // trampoline marker for TCO
 )
 
 // Value represents a Scheme value.
@@ -52,6 +53,9 @@ type Value struct {
 	RecordFields map[string]*Value
 	// Vector fields
 	VecElems []*Value
+	// TailCall fields (trampoline for TCO)
+	TailExpr *Expr
+	TailEnv  *Env
 }
 
 var Void = &Value{Type: TypeVoid}

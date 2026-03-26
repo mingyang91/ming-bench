@@ -61,8 +61,28 @@ func (e *Env) SetExisting(name string, val *Value) bool {
 	return false
 }
 
-// Eval evaluates an expression in the given environment.
+// tailCall creates a trampoline marker for tail call optimization.
+func tailCall(expr *Expr, env *Env) *Value {
+	return &Value{Type: TypeTailCall, TailExpr: expr, TailEnv: env}
+}
+
+// Eval evaluates an expression in the given environment, with trampoline for TCO.
 func Eval(expr *Expr, env *Env) (*Value, error) {
+	for {
+		v, err := evalInner(expr, env)
+		if err != nil {
+			return nil, err
+		}
+		if v.Type == TypeTailCall {
+			expr = v.TailExpr
+			env = v.TailEnv
+			continue
+		}
+		return v, nil
+	}
+}
+
+func evalInner(expr *Expr, env *Env) (*Value, error) {
 	switch expr.Type {
 	case ExprInt:
 		return IntValue(expr.IntVal), nil
@@ -144,7 +164,7 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			// Inject definition-site bindings for gensym'd references
 			evalEnv := NewEnv(env)
 			injectDefSiteBindings(expanded, v.Syntax.DefEnv, evalEnv)
-			return Eval(expanded, evalEnv)
+			return tailCall(expanded, evalEnv), nil
 		}
 	}
 
@@ -246,20 +266,23 @@ func callLambda(op *Value, args []*Value, expr *Expr) (*Value, error) {
 		}
 		callEnv.Set(op.RestParam, rest)
 	}
-	var result *Value
-	for _, bodyExpr := range op.Body {
-		var err error
-		result, err = Eval(bodyExpr, callEnv)
+	// Evaluate all but the last body expression normally
+	for _, bodyExpr := range op.Body[:len(op.Body)-1] {
+		_, err := Eval(bodyExpr, callEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	// Return tail call for the last body expression
+	return tailCall(op.Body[len(op.Body)-1], callEnv), nil
 }
 
 func evalAnd(expr *Expr, env *Env) (*Value, error) {
-	result := BoolValue(true)
-	for _, e := range expr.List[1:] {
+	args := expr.List[1:]
+	if len(args) == 0 {
+		return BoolValue(true), nil
+	}
+	for _, e := range args[:len(args)-1] {
 		v, err := Eval(e, env)
 		if err != nil {
 			return nil, err
@@ -267,14 +290,16 @@ func evalAnd(expr *Expr, env *Env) (*Value, error) {
 		if !v.IsTruthy() {
 			return v, nil
 		}
-		result = v
 	}
-	return result, nil
+	return tailCall(args[len(args)-1], env), nil
 }
 
 func evalOr(expr *Expr, env *Env) (*Value, error) {
-	result := BoolValue(false)
-	for _, e := range expr.List[1:] {
+	args := expr.List[1:]
+	if len(args) == 0 {
+		return BoolValue(false), nil
+	}
+	for _, e := range args[:len(args)-1] {
 		v, err := Eval(e, env)
 		if err != nil {
 			return nil, err
@@ -282,9 +307,8 @@ func evalOr(expr *Expr, env *Env) (*Value, error) {
 		if v.IsTruthy() {
 			return v, nil
 		}
-		result = v
 	}
-	return result, nil
+	return tailCall(args[len(args)-1], env), nil
 }
 
 // BuiltinFunc is a builtin function type.
@@ -704,10 +728,10 @@ func evalIf(expr *Expr, env *Env) (*Value, error) {
 		return nil, err
 	}
 	if cond.IsTruthy() {
-		return Eval(expr.List[2], env)
+		return tailCall(expr.List[2], env), nil
 	}
 	if len(expr.List) == 4 {
-		return Eval(expr.List[3], env)
+		return tailCall(expr.List[3], env), nil
 	}
 	return Void, nil
 }
@@ -793,15 +817,13 @@ func evalLet(expr *Expr, env *Env) (*Value, error) {
 		for i, p := range params {
 			callEnv.Set(p, initVals[i])
 		}
-		var result *Value
-		for _, bodyExpr := range body {
-			var err error
-			result, err = Eval(bodyExpr, callEnv)
+		for _, bodyExpr := range body[:len(body)-1] {
+			_, err := Eval(bodyExpr, callEnv)
 			if err != nil {
 				return nil, err
 			}
 		}
-		return result, nil
+		return tailCall(body[len(body)-1], callEnv), nil
 	}
 
 	if bindingExpr.Type != ExprList {
@@ -818,27 +840,27 @@ func evalLet(expr *Expr, env *Env) (*Value, error) {
 		}
 		letEnv.Set(b.List[0].StrVal, v)
 	}
-	var result *Value
-	for _, bodyExpr := range body {
-		var err error
-		result, err = Eval(bodyExpr, letEnv)
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, letEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return tailCall(body[len(body)-1], letEnv), nil
 }
 
 func evalBegin(expr *Expr, env *Env) (*Value, error) {
-	var result *Value = Void
-	for _, e := range expr.List[1:] {
-		var err error
-		result, err = Eval(e, env)
+	body := expr.List[1:]
+	if len(body) == 0 {
+		return Void, nil
+	}
+	for _, e := range body[:len(body)-1] {
+		_, err := Eval(e, env)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return tailCall(body[len(body)-1], env), nil
 }
 
 func evalCond(expr *Expr, env *Env) (*Value, error) {
@@ -848,29 +870,28 @@ func evalCond(expr *Expr, env *Env) (*Value, error) {
 		}
 		test := clause.List[0]
 		if test.Type == ExprSymbol && test.StrVal == "else" {
-			var result *Value
-			for _, bodyExpr := range clause.List[1:] {
-				var err error
-				result, err = Eval(bodyExpr, env)
+			body := clause.List[1:]
+			for _, bodyExpr := range body[:len(body)-1] {
+				_, err := Eval(bodyExpr, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return tailCall(body[len(body)-1], env), nil
 		}
 		cond, err := Eval(test, env)
 		if err != nil {
 			return nil, err
 		}
 		if cond.IsTruthy() {
-			var result *Value
-			for _, bodyExpr := range clause.List[1:] {
-				result, err = Eval(bodyExpr, env)
+			body := clause.List[1:]
+			for _, bodyExpr := range body[:len(body)-1] {
+				_, err = Eval(bodyExpr, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return tailCall(body[len(body)-1], env), nil
 		}
 	}
 	return Void, nil
@@ -1606,6 +1627,13 @@ func builtinMap(args []*Value, expr *Expr, env *Env) (*Value, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Resolve trampoline tail calls
+		for val.Type == TypeTailCall {
+			val, err = evalInner(val.TailExpr, val.TailEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
 		result = append(result, val)
 		// Advance all lists
 		for i := range lists {
@@ -1957,15 +1985,13 @@ func evalLetrec(expr *Expr, env *Env) (*Value, error) {
 		}
 		letEnv.Set(b.List[0].StrVal, v)
 	}
-	var result *Value
-	for _, bodyExpr := range body {
-		var err error
-		result, err = Eval(bodyExpr, letEnv)
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, letEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return tailCall(body[len(body)-1], letEnv), nil
 }
 
 func evalLetrecStar(expr *Expr, env *Env) (*Value, error) {
@@ -1989,15 +2015,13 @@ func evalLetrecStar(expr *Expr, env *Env) (*Value, error) {
 		}
 		letEnv.Set(b.List[0].StrVal, v)
 	}
-	var result *Value
-	for _, bodyExpr := range body {
-		var err error
-		result, err = Eval(bodyExpr, letEnv)
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, letEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return tailCall(body[len(body)-1], letEnv), nil
 }
 
 // --- L14: case ---
