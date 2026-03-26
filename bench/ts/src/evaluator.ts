@@ -13,7 +13,7 @@ type SchemeVal =
   | { tag: 'list'; value: SchemeVal[]; pos?: Pos }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
   | { tag: 'nil'; pos?: Pos }
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos }
+  | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; pos?: Pos }
   | { tag: 'void'; pos?: Pos };
 
@@ -176,6 +176,30 @@ function parse(tokens: Token[]): SchemeVal[] {
     exprs.push(parseExpr());
   }
   return exprs;
+}
+
+// ── Parameter parsing ───────────────────────────────────────────────
+
+function parseParams(paramList: SchemeVal, pos?: Pos): { params: string[]; rest?: string } {
+  if (paramList.tag === 'symbol') {
+    // (lambda args body) — single rest param
+    return { params: [], rest: paramList.value };
+  }
+  if (paramList.tag !== 'list') throw new EvalError(`${posStr(pos)}parameters must be a list`);
+  const items = paramList.value;
+  const params: string[] = [];
+  let rest: string | undefined;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].tag === 'symbol' && items[i].value === '.') {
+      if (i + 1 >= items.length || items[i + 1].tag !== 'symbol')
+        throw new EvalError(`${posStr(pos)}invalid dot syntax in parameters`);
+      rest = (items[i + 1] as any).value;
+      break;
+    }
+    if (items[i].tag !== 'symbol') throw new EvalError(`${posStr(pos)}parameter must be a symbol`);
+    params.push((items[i] as any).value);
+  }
+  return { params, rest };
 }
 
 // ── Evaluator ──────────────────────────────────────────────────────
@@ -384,6 +408,21 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       (args[0] as any).value = args[0].value.substring(0, idx) + args[2].value + args[0].value.substring(idx + 1);
       return { tag: 'void' };
     }
+    case 'apply': {
+      if (args.length < 2) throw new EvalError(`${posStr(callPos)}apply: need at least 2 arguments`);
+      const fn = args[0];
+      const lastArg = args[args.length - 1];
+      const prefixArgs = args.slice(1, -1);
+      const tailArgs = schemeListToArray(lastArg);
+      const allArgs = [...prefixArgs, ...tailArgs];
+      if (fn.tag === 'builtin') {
+        return evalBuiltin(fn.name, allArgs, callPos);
+      }
+      if (fn.tag === 'lambda') {
+        return applyLambda(fn, allArgs, callPos);
+      }
+      throw new EvalError(`${posStr(callPos)}apply: not a procedure`);
+    }
     default:
       throw new EvalError(`${posStr(callPos)}unknown builtin: ${name}`);
   }
@@ -399,7 +438,32 @@ const BUILTIN_NAMES = new Set([
   'symbol->string', 'string->symbol',
   'string-ref', 'char?',
   'string-copy', 'string-set!',
+  'apply',
 ]);
+
+function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], callPos?: Pos): SchemeVal {
+  if (proc.rest) {
+    if (args.length < proc.params.length) {
+      throw new EvalError(`${posStr(callPos)}lambda: expected at least ${proc.params.length} arguments, got ${args.length}`);
+    }
+  } else {
+    if (args.length !== proc.params.length) {
+      throw new EvalError(`${posStr(callPos)}lambda: expected ${proc.params.length} arguments, got ${args.length}`);
+    }
+  }
+  const callEnv = new Env(proc.env);
+  for (let i = 0; i < proc.params.length; i++) {
+    callEnv.set(proc.params[i], args[i]);
+  }
+  if (proc.rest) {
+    callEnv.set(proc.rest, arrayToSchemeList(args.slice(proc.params.length)));
+  }
+  let result: SchemeVal = { tag: 'void' };
+  for (const bodyExpr of proc.body) {
+    result = evaluate(bodyExpr, callEnv);
+  }
+  return result;
+}
 
 function evaluate(expr: SchemeVal, env: Env): SchemeVal {
   if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string' || expr.tag === 'char') return expr;
@@ -440,12 +504,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         }
         if (target.tag === 'list' && target.value.length > 0 && target.value[0].tag === 'symbol') {
           const name = target.value[0].value;
-          const params = target.value.slice(1).map(p => {
-            if (p.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}define: parameter must be a symbol`);
-            return p.value;
-          });
+          const paramList: SchemeVal = { tag: 'list', value: target.value.slice(1) };
+          const { params, rest } = parseParams(paramList, expr.pos);
           const body = elems.slice(2);
-          const lam: SchemeVal = { tag: 'lambda', params, body, env };
+          const lam: SchemeVal = { tag: 'lambda', params, rest, body, env };
           env.set(name, lam);
           return { tag: 'void' };
         }
@@ -453,14 +515,9 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       }
       case 'lambda': {
         if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}lambda: wrong number of arguments`);
-        const paramList = elems[1];
-        if (paramList.tag !== 'list') throw new EvalError(`${posStr(expr.pos)}lambda: parameters must be a list`);
-        const params = paramList.value.map(p => {
-          if (p.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}lambda: parameter must be a symbol`);
-          return p.value;
-        });
+        const { params, rest } = parseParams(elems[1], expr.pos);
         const body = elems.slice(2);
-        return { tag: 'lambda', params, body, env };
+        return { tag: 'lambda', params, rest, body, env };
       }
       case 'set!': {
         if (elems.length !== 3) throw new EvalError(`${posStr(expr.pos)}set!: wrong number of arguments`);
@@ -579,18 +636,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
   }
 
   if (proc.tag === 'lambda') {
-    if (args.length !== proc.params.length) {
-      throw new EvalError(`${posStr(expr.pos)}lambda: expected ${proc.params.length} arguments, got ${args.length}`);
-    }
-    const callEnv = new Env(proc.env);
-    for (let i = 0; i < proc.params.length; i++) {
-      callEnv.set(proc.params[i], args[i]);
-    }
-    let result: SchemeVal = { tag: 'void' };
-    for (const bodyExpr of proc.body) {
-      result = evaluate(bodyExpr, callEnv);
-    }
-    return result;
+    return applyLambda(proc, args, expr.pos);
   }
 
   throw new EvalError(`${posStr(expr.pos)}not a procedure`);
