@@ -182,7 +182,12 @@ func evalProgramWithOutput(input string) (string, string, error) {
 
 	rt := &runtime{}
 	environment := newGlobalEnv(rt)
-	result, err := evalSequence(environment, program)
+	var result expr
+	if currentBenchLevel() >= 18 {
+		result, err = evalSequenceLevel18(environment, program)
+	} else {
+		result, err = evalSequence(environment, program)
+	}
 	if err != nil {
 		return "", rt.output.String(), err
 	}
@@ -211,6 +216,8 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("append", builtinProc{name: "append", fn: builtinAppend})
 	root.define("car", builtinProc{name: "car", fn: builtinCar})
 	root.define("cdr", builtinProc{name: "cdr", fn: builtinCdr})
+	root.define("call/cc", builtinProc{name: "call/cc", fn: builtinContinuationSentinel})
+	root.define("call-with-current-continuation", builtinProc{name: "call-with-current-continuation", fn: builtinContinuationSentinel})
 	root.define("char-alphabetic?", builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabetic})
 	root.define("char->integer", builtinProc{name: "char->integer", fn: builtinCharToInteger})
 	root.define("char-downcase", builtinProc{name: "char-downcase", fn: builtinCharDowncase})
@@ -1020,6 +1027,10 @@ func applyProcedureStep(environment *env, proc expr, argForms []expr, callPos so
 }
 
 func applyCallable(proc expr, args []expr) (expr, error) {
+	if currentBenchLevel() >= 18 {
+		return applyCallableLevel18(proc, args)
+	}
+
 	step, err := applyCallableStep(proc, args)
 	if err != nil {
 		return nil, err
@@ -2025,7 +2036,7 @@ func typePredicate(test func(expr) bool) builtinFunc {
 
 func isProcedure(value expr) bool {
 	switch value.(type) {
-	case builtinProc, closureExpr, caseClosureExpr, recordConstructorProc, recordPredicateProc, recordAccessorProc, recordMutatorProc:
+	case builtinProc, closureExpr, caseClosureExpr, *continuationExpr, recordConstructorProc, recordPredicateProc, recordAccessorProc, recordMutatorProc:
 		return true
 	default:
 		return false
@@ -2131,6 +2142,8 @@ func renderExpr(value expr) string {
 		return "#<procedure>"
 	case caseClosureExpr:
 		return "#<procedure>"
+	case *continuationExpr:
+		return "#<continuation>"
 	case recordConstructorProc:
 		return "#<procedure:" + v.recordType.constructorName + ">"
 	case recordPredicateProc:
