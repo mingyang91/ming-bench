@@ -2,6 +2,7 @@ package ming;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Scheme interpreter entry point.
@@ -77,6 +78,8 @@ public class Evaluator {
         environment.define("string?", new PrimitiveProcedureValue("string?", this::applyStringPredicate));
         environment.define("boolean?", new PrimitiveProcedureValue("boolean?", this::applyBooleanPredicate));
         environment.define("symbol?", new PrimitiveProcedureValue("symbol?", this::applySymbolPredicate));
+        environment.define("eq?", new PrimitiveProcedureValue("eq?", this::applyEq));
+        environment.define("equal?", new PrimitiveProcedureValue("equal?", this::applyEqual));
         environment.define("display", new PrimitiveProcedureValue("display", this::applyDisplay));
         environment.define("write", new PrimitiveProcedureValue("write", this::applyWrite));
         environment.define("newline", new PrimitiveProcedureValue("newline", this::applyNewline));
@@ -90,8 +93,38 @@ public class Evaluator {
         environment.define("string-ref", new PrimitiveProcedureValue("string-ref", this::applyStringRef));
         environment.define("string-copy", new PrimitiveProcedureValue("string-copy", this::applyStringCopy));
         environment.define("string-set!", new PrimitiveProcedureValue("string-set!", this::applyStringSet));
+        environment.define("string=?", new PrimitiveProcedureValue("string=?", this::applyStringEquality));
+        environment.define("string<?", new PrimitiveProcedureValue("string<?", this::applyStringLessThan));
+        environment.define("string-ci=?", new PrimitiveProcedureValue("string-ci=?", this::applyStringCiEquality));
+        environment.define("string-upcase", new PrimitiveProcedureValue("string-upcase", this::applyStringUpcase));
+        environment.define("string-downcase", new PrimitiveProcedureValue("string-downcase", this::applyStringDowncase));
         environment.define("char?", new PrimitiveProcedureValue("char?", this::applyCharPredicate));
+        environment.define("char-alphabetic?", new PrimitiveProcedureValue("char-alphabetic?",
+                this::applyCharAlphabeticPredicate));
+        environment.define("char-numeric?", new PrimitiveProcedureValue("char-numeric?",
+                this::applyCharNumericPredicate));
+        environment.define("char-upcase", new PrimitiveProcedureValue("char-upcase", this::applyCharUpcase));
+        environment.define("char-downcase", new PrimitiveProcedureValue("char-downcase", this::applyCharDowncase));
+        environment.define("char=?", new PrimitiveProcedureValue("char=?", this::applyCharEquality));
+        environment.define("char<?", new PrimitiveProcedureValue("char<?", this::applyCharLessThan));
+        environment.define("abs", new PrimitiveProcedureValue("abs", this::applyAbs));
+        environment.define("modulo", new PrimitiveProcedureValue("modulo", this::applyModulo));
+        environment.define("remainder", new PrimitiveProcedureValue("remainder", this::applyRemainder));
+        environment.define("quotient", new PrimitiveProcedureValue("quotient", this::applyQuotient));
+        environment.define("min", new PrimitiveProcedureValue("min", this::applyMin));
+        environment.define("max", new PrimitiveProcedureValue("max", this::applyMax));
+        environment.define("expt", new PrimitiveProcedureValue("expt", this::applyExpt));
+        environment.define("zero?", new PrimitiveProcedureValue("zero?", this::applyZeroPredicate));
+        environment.define("positive?", new PrimitiveProcedureValue("positive?", this::applyPositivePredicate));
+        environment.define("negative?", new PrimitiveProcedureValue("negative?", this::applyNegativePredicate));
+        environment.define("odd?", new PrimitiveProcedureValue("odd?", this::applyOddPredicate));
+        environment.define("even?", new PrimitiveProcedureValue("even?", this::applyEvenPredicate));
+        environment.define("list?", new PrimitiveProcedureValue("list?", this::applyListPredicate));
+        environment.define("list-ref", new PrimitiveProcedureValue("list-ref", this::applyListRef));
+        environment.define("list-tail", new PrimitiveProcedureValue("list-tail", this::applyListTail));
+        environment.define("assoc", new PrimitiveProcedureValue("assoc", this::applyAssoc));
         environment.define("apply", new PrimitiveProcedureValue("apply", this::applyApply));
+        environment.define("map", new PrimitiveProcedureValue("map", this::applyMap));
         return environment;
     }
 
@@ -437,23 +470,24 @@ public class Evaluator {
 
     private Value applyCons(List<Value> arguments) throws EvalError {
         requireExactArity("cons", arguments.size(), 2);
-        List<Value> tail = expectList(arguments.get(1), "cons");
-        List<Value> elements = new ArrayList<>(tail.size() + 1);
-        elements.add(arguments.getFirst());
-        elements.addAll(tail);
-        return new ListValue(List.copyOf(elements));
+        Value tail = arguments.get(1);
+        if (tail instanceof ListValue listValue) {
+            List<Value> elements = new ArrayList<>(listValue.elements().size() + 1);
+            elements.add(arguments.getFirst());
+            elements.addAll(listValue.elements());
+            return new ListValue(List.copyOf(elements));
+        }
+        return new PairValue(arguments.getFirst(), tail);
     }
 
     private Value applyCar(List<Value> arguments) throws EvalError {
         requireExactArity("car", arguments.size(), 1);
-        List<Value> elements = expectNonEmptyList(arguments.getFirst(), "car");
-        return elements.getFirst();
+        return car(arguments.getFirst(), "car");
     }
 
     private Value applyCdr(List<Value> arguments) throws EvalError {
         requireExactArity("cdr", arguments.size(), 1);
-        List<Value> elements = expectNonEmptyList(arguments.getFirst(), "cdr");
-        return new ListValue(List.copyOf(elements.subList(1, elements.size())));
+        return cdr(arguments.getFirst(), "cdr");
     }
 
     private Value applyList(List<Value> arguments) {
@@ -481,8 +515,8 @@ public class Evaluator {
 
     private Value applyPairPredicate(List<Value> arguments) throws EvalError {
         requireExactArity("pair?", arguments.size(), 1);
-        return new BoolValue(arguments.getFirst() instanceof ListValue listValue
-                && !listValue.elements().isEmpty());
+        return new BoolValue(arguments.getFirst() instanceof PairValue
+                || arguments.getFirst() instanceof ListValue listValue && !listValue.elements().isEmpty());
     }
 
     private Value applyNumberPredicate(List<Value> arguments) throws EvalError {
@@ -503,6 +537,53 @@ public class Evaluator {
     private Value applySymbolPredicate(List<Value> arguments) throws EvalError {
         requireExactArity("symbol?", arguments.size(), 1);
         return new BoolValue(arguments.getFirst() instanceof SymbolValue);
+    }
+
+    private Value applyEq(List<Value> arguments) throws EvalError {
+        requireExactArity("eq?", arguments.size(), 2);
+        return new BoolValue(eqValue(arguments.get(0), arguments.get(1)));
+    }
+
+    private Value applyEqual(List<Value> arguments) throws EvalError {
+        requireExactArity("equal?", arguments.size(), 2);
+        return new BoolValue(equalValue(arguments.get(0), arguments.get(1)));
+    }
+
+    private Value applyListPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("list?", arguments.size(), 1);
+        return new BoolValue(isProperList(arguments.getFirst()));
+    }
+
+    private Value applyListRef(List<Value> arguments) throws EvalError {
+        requireExactArity("list-ref", arguments.size(), 2);
+        List<Value> elements = expectList(arguments.getFirst(), "list-ref");
+        int index = expectIndex(arguments.get(1), "list-ref");
+        if (index >= elements.size()) {
+            throw new EvalError("list-ref index out of range");
+        }
+        return elements.get(index);
+    }
+
+    private Value applyListTail(List<Value> arguments) throws EvalError {
+        requireExactArity("list-tail", arguments.size(), 2);
+        List<Value> elements = expectList(arguments.getFirst(), "list-tail");
+        int index = expectIndex(arguments.get(1), "list-tail");
+        if (index > elements.size()) {
+            throw new EvalError("list-tail index out of range");
+        }
+        return new ListValue(List.copyOf(elements.subList(index, elements.size())));
+    }
+
+    private Value applyAssoc(List<Value> arguments) throws EvalError {
+        requireExactArity("assoc", arguments.size(), 2);
+        Value key = arguments.getFirst();
+        List<Value> entries = expectList(arguments.get(1), "assoc");
+        for (Value entry : entries) {
+            if (equalValue(key, car(entry, "assoc"))) {
+                return entry;
+            }
+        }
+        return new BoolValue(false);
     }
 
     private Value applyDisplay(List<Value> arguments) throws EvalError {
@@ -602,9 +683,104 @@ public class Evaluator {
         return VoidValue.INSTANCE;
     }
 
+    private Value applyStringEquality(List<Value> arguments) throws EvalError {
+        requireMinimumArity("string=?", arguments.size(), 2);
+        String previous = expectString(arguments.getFirst(), "string=?");
+        for (int i = 1; i < arguments.size(); i++) {
+            String current = expectString(arguments.get(i), "string=?");
+            if (!previous.equals(current)) {
+                return new BoolValue(false);
+            }
+            previous = current;
+        }
+        return new BoolValue(true);
+    }
+
+    private Value applyStringLessThan(List<Value> arguments) throws EvalError {
+        requireMinimumArity("string<?", arguments.size(), 2);
+        String previous = expectString(arguments.getFirst(), "string<?");
+        for (int i = 1; i < arguments.size(); i++) {
+            String current = expectString(arguments.get(i), "string<?");
+            if (previous.compareTo(current) >= 0) {
+                return new BoolValue(false);
+            }
+            previous = current;
+        }
+        return new BoolValue(true);
+    }
+
+    private Value applyStringCiEquality(List<Value> arguments) throws EvalError {
+        requireMinimumArity("string-ci=?", arguments.size(), 2);
+        String previous = expectString(arguments.getFirst(), "string-ci=?");
+        for (int i = 1; i < arguments.size(); i++) {
+            String current = expectString(arguments.get(i), "string-ci=?");
+            if (!previous.equalsIgnoreCase(current)) {
+                return new BoolValue(false);
+            }
+            previous = current;
+        }
+        return new BoolValue(true);
+    }
+
+    private Value applyStringUpcase(List<Value> arguments) throws EvalError {
+        requireExactArity("string-upcase", arguments.size(), 1);
+        return new StringValue(expectString(arguments.getFirst(), "string-upcase").toUpperCase(Locale.ROOT));
+    }
+
+    private Value applyStringDowncase(List<Value> arguments) throws EvalError {
+        requireExactArity("string-downcase", arguments.size(), 1);
+        return new StringValue(expectString(arguments.getFirst(), "string-downcase").toLowerCase(Locale.ROOT));
+    }
+
     private Value applyCharPredicate(List<Value> arguments) throws EvalError {
         requireExactArity("char?", arguments.size(), 1);
         return new BoolValue(arguments.getFirst() instanceof CharValue);
+    }
+
+    private Value applyCharAlphabeticPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("char-alphabetic?", arguments.size(), 1);
+        return new BoolValue(Character.isLetter(expectChar(arguments.getFirst(), "char-alphabetic?")));
+    }
+
+    private Value applyCharNumericPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("char-numeric?", arguments.size(), 1);
+        return new BoolValue(Character.isDigit(expectChar(arguments.getFirst(), "char-numeric?")));
+    }
+
+    private Value applyCharUpcase(List<Value> arguments) throws EvalError {
+        requireExactArity("char-upcase", arguments.size(), 1);
+        return new CharValue(Character.toUpperCase(expectChar(arguments.getFirst(), "char-upcase")));
+    }
+
+    private Value applyCharDowncase(List<Value> arguments) throws EvalError {
+        requireExactArity("char-downcase", arguments.size(), 1);
+        return new CharValue(Character.toLowerCase(expectChar(arguments.getFirst(), "char-downcase")));
+    }
+
+    private Value applyCharEquality(List<Value> arguments) throws EvalError {
+        requireMinimumArity("char=?", arguments.size(), 2);
+        char previous = expectChar(arguments.getFirst(), "char=?");
+        for (int i = 1; i < arguments.size(); i++) {
+            char current = expectChar(arguments.get(i), "char=?");
+            if (previous != current) {
+                return new BoolValue(false);
+            }
+            previous = current;
+        }
+        return new BoolValue(true);
+    }
+
+    private Value applyCharLessThan(List<Value> arguments) throws EvalError {
+        requireMinimumArity("char<?", arguments.size(), 2);
+        char previous = expectChar(arguments.getFirst(), "char<?");
+        for (int i = 1; i < arguments.size(); i++) {
+            char current = expectChar(arguments.get(i), "char<?");
+            if (previous >= current) {
+                return new BoolValue(false);
+            }
+            previous = current;
+        }
+        return new BoolValue(true);
     }
 
     private Value applyApply(List<Value> arguments) throws EvalError {
@@ -622,6 +798,32 @@ public class Evaluator {
         }
         flattenedArguments.addAll(spreadArguments);
         return procedure.apply(List.copyOf(flattenedArguments), this);
+    }
+
+    private Value applyMap(List<Value> arguments) throws EvalError {
+        requireMinimumArity("map", arguments.size(), 2);
+        if (!(arguments.getFirst() instanceof ProcedureValue procedure)) {
+            throw new EvalError("attempted to call non-procedure");
+        }
+
+        List<List<Value>> lists = new ArrayList<>(arguments.size() - 1);
+        int resultLength = Integer.MAX_VALUE;
+        for (int i = 1; i < arguments.size(); i++) {
+            List<Value> list = expectList(arguments.get(i), "map");
+            lists.add(list);
+            resultLength = Math.min(resultLength, list.size());
+        }
+
+        List<Value> results = new ArrayList<>(resultLength);
+        for (int elementIndex = 0; elementIndex < resultLength; elementIndex++) {
+            List<Value> invocationArguments = new ArrayList<>(lists.size());
+            for (List<Value> list : lists) {
+                invocationArguments.add(list.get(elementIndex));
+            }
+            results.add(procedure.apply(List.copyOf(invocationArguments), this));
+        }
+
+        return new ListValue(List.copyOf(results));
     }
 
     private Value applyAdd(List<Value> arguments) throws EvalError {
@@ -664,6 +866,99 @@ public class Evaluator {
             result /= divisor;
         }
         return new IntValue(result);
+    }
+
+    private Value applyAbs(List<Value> arguments) throws EvalError {
+        requireExactArity("abs", arguments.size(), 1);
+        return new IntValue(Math.abs(expectInt(arguments.getFirst(), "abs")));
+    }
+
+    private Value applyModulo(List<Value> arguments) throws EvalError {
+        requireExactArity("modulo", arguments.size(), 2);
+        long dividend = expectInt(arguments.getFirst(), "modulo");
+        long divisor = expectInt(arguments.get(1), "modulo");
+        requireNonZeroDivisor("modulo", divisor);
+        return new IntValue(Math.floorMod(dividend, divisor));
+    }
+
+    private Value applyRemainder(List<Value> arguments) throws EvalError {
+        requireExactArity("remainder", arguments.size(), 2);
+        long dividend = expectInt(arguments.getFirst(), "remainder");
+        long divisor = expectInt(arguments.get(1), "remainder");
+        requireNonZeroDivisor("remainder", divisor);
+        return new IntValue(dividend % divisor);
+    }
+
+    private Value applyQuotient(List<Value> arguments) throws EvalError {
+        requireExactArity("quotient", arguments.size(), 2);
+        long dividend = expectInt(arguments.getFirst(), "quotient");
+        long divisor = expectInt(arguments.get(1), "quotient");
+        requireNonZeroDivisor("quotient", divisor);
+        return new IntValue(dividend / divisor);
+    }
+
+    private Value applyMin(List<Value> arguments) throws EvalError {
+        requireMinimumArity("min", arguments.size(), 1);
+        long result = expectInt(arguments.getFirst(), "min");
+        for (int i = 1; i < arguments.size(); i++) {
+            result = Math.min(result, expectInt(arguments.get(i), "min"));
+        }
+        return new IntValue(result);
+    }
+
+    private Value applyMax(List<Value> arguments) throws EvalError {
+        requireMinimumArity("max", arguments.size(), 1);
+        long result = expectInt(arguments.getFirst(), "max");
+        for (int i = 1; i < arguments.size(); i++) {
+            result = Math.max(result, expectInt(arguments.get(i), "max"));
+        }
+        return new IntValue(result);
+    }
+
+    private Value applyExpt(List<Value> arguments) throws EvalError {
+        requireExactArity("expt", arguments.size(), 2);
+        long base = expectInt(arguments.getFirst(), "expt");
+        long exponent = expectInt(arguments.get(1), "expt");
+        if (exponent < 0L) {
+            throw new EvalError("expt expects a non-negative exponent");
+        }
+
+        long result = 1L;
+        long factor = base;
+        long power = exponent;
+        while (power > 0L) {
+            if ((power & 1L) == 1L) {
+                result *= factor;
+            }
+            factor *= factor;
+            power >>= 1;
+        }
+        return new IntValue(result);
+    }
+
+    private Value applyZeroPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("zero?", arguments.size(), 1);
+        return new BoolValue(expectInt(arguments.getFirst(), "zero?") == 0L);
+    }
+
+    private Value applyPositivePredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("positive?", arguments.size(), 1);
+        return new BoolValue(expectInt(arguments.getFirst(), "positive?") > 0L);
+    }
+
+    private Value applyNegativePredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("negative?", arguments.size(), 1);
+        return new BoolValue(expectInt(arguments.getFirst(), "negative?") < 0L);
+    }
+
+    private Value applyOddPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("odd?", arguments.size(), 1);
+        return new BoolValue((expectInt(arguments.getFirst(), "odd?") & 1L) != 0L);
+    }
+
+    private Value applyEvenPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("even?", arguments.size(), 1);
+        return new BoolValue((expectInt(arguments.getFirst(), "even?") & 1L) == 0L);
     }
 
     private Value applyComparison(String operator, List<Value> arguments) throws EvalError {
@@ -731,6 +1026,78 @@ public class Evaluator {
         throw new EvalError(operator + " expects list arguments");
     }
 
+    private Value car(Value value, String operator) throws EvalError {
+        if (value instanceof PairValue pairValue) {
+            return pairValue.car();
+        }
+
+        List<Value> elements = expectNonEmptyList(value, operator);
+        return elements.getFirst();
+    }
+
+    private Value cdr(Value value, String operator) throws EvalError {
+        if (value instanceof PairValue pairValue) {
+            return pairValue.cdr();
+        }
+
+        List<Value> elements = expectNonEmptyList(value, operator);
+        return new ListValue(List.copyOf(elements.subList(1, elements.size())));
+    }
+
+    private boolean isProperList(Value value) {
+        return value instanceof ListValue;
+    }
+
+    private boolean eqValue(Value left, Value right) {
+        if (left == right) {
+            return true;
+        }
+        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
+            return leftInt.value() == rightInt.value();
+        }
+        if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
+            return leftBool.value() == rightBool.value();
+        }
+        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
+            return leftChar.value() == rightChar.value();
+        }
+        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
+            return leftSymbol.name().equals(rightSymbol.name());
+        }
+        return false;
+    }
+
+    private boolean equalValue(Value left, Value right) {
+        if (eqValue(left, right)) {
+            return true;
+        }
+        if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
+            return leftString.value().equals(rightString.value());
+        }
+        if (left instanceof ListValue leftList && right instanceof ListValue rightList) {
+            if (leftList.elements().size() != rightList.elements().size()) {
+                return false;
+            }
+            for (int i = 0; i < leftList.elements().size(); i++) {
+                if (!equalValue(leftList.elements().get(i), rightList.elements().get(i))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
+            return equalValue(leftPair.car(), rightPair.car())
+                    && equalValue(leftPair.cdr(), rightPair.cdr());
+        }
+        return false;
+    }
+
+    private void requireNonZeroDivisor(String operator, long divisor) throws EvalError {
+        if (divisor == 0L) {
+            throw new EvalError(operator + " division by zero");
+        }
+    }
+
     private void appendOutput(String output) {
         if (outputBuffer != null) {
             outputBuffer.append(output);
@@ -742,6 +1109,7 @@ public class Evaluator {
             case StringValue stringValue -> stringValue.value();
             case CharValue charValue -> Character.toString(charValue.value());
             case ListValue listValue -> renderListForDisplay(listValue.elements());
+            case PairValue pairValue -> renderPairForDisplay(pairValue);
             default -> value.render();
         };
     }
@@ -757,6 +1125,37 @@ public class Evaluator {
         }
         builder.append(')');
         return builder.toString();
+    }
+
+    private String renderPairForDisplay(PairValue pairValue) {
+        StringBuilder builder = new StringBuilder();
+        builder.append('(');
+        appendPairForDisplay(builder, pairValue);
+        builder.append(')');
+        return builder.toString();
+    }
+
+    private void appendPairForDisplay(StringBuilder builder, Value value) {
+        if (value instanceof PairValue pairValue) {
+            builder.append(renderForDisplay(pairValue.car()));
+            if (pairValue.cdr() instanceof PairValue nextPair) {
+                builder.append(' ');
+                appendPairForDisplay(builder, nextPair);
+                return;
+            }
+            if (pairValue.cdr() instanceof ListValue listValue) {
+                for (Value element : listValue.elements()) {
+                    builder.append(' ');
+                    builder.append(renderForDisplay(element));
+                }
+                return;
+            }
+            builder.append(" . ");
+            builder.append(renderForDisplay(pairValue.cdr()));
+            return;
+        }
+
+        builder.append(renderForDisplay(value));
     }
 
     private List<Value> expectNonEmptyList(Value value, String operator) throws EvalError {

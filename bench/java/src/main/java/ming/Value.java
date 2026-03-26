@@ -3,7 +3,7 @@ package ming;
 import java.util.List;
 
 sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue, ListValue,
-        CharValue, VoidValue, ProcedureValue {
+        PairValue, CharValue, VoidValue, ProcedureValue {
     String render();
 
     default boolean isTruthy() {
@@ -104,6 +104,40 @@ record ListValue(List<Value> elements) implements Value {
         }
         builder.append(')');
         return builder.toString();
+    }
+}
+
+record PairValue(Value car, Value cdr) implements Value {
+    @Override
+    public String render() {
+        StringBuilder builder = new StringBuilder();
+        builder.append('(');
+        appendRender(builder, this);
+        builder.append(')');
+        return builder.toString();
+    }
+
+    private static void appendRender(StringBuilder builder, Value value) {
+        if (value instanceof PairValue pairValue) {
+            builder.append(pairValue.car().render());
+            if (pairValue.cdr() instanceof ListValue listValue) {
+                for (Value element : listValue.elements()) {
+                    builder.append(' ');
+                    builder.append(element.render());
+                }
+                return;
+            }
+            if (pairValue.cdr() instanceof PairValue nextPair) {
+                builder.append(' ');
+                appendRender(builder, nextPair);
+                return;
+            }
+            builder.append(" . ");
+            builder.append(pairValue.cdr().render());
+            return;
+        }
+
+        builder.append(value.render());
     }
 }
 
