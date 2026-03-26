@@ -135,6 +135,7 @@ pub(super) enum Builtin {
     StringCiEqual,
     StringUpcase,
     StringDowncase,
+    DynamicWind,
     Apply,
     CallCc,
 }
@@ -246,6 +247,7 @@ impl Builtin {
             Builtin::StringCiEqual => "string-ci=?",
             Builtin::StringUpcase => "string-upcase",
             Builtin::StringDowncase => "string-downcase",
+            Builtin::DynamicWind => "dynamic-wind",
             Builtin::Apply => "apply",
             Builtin::CallCc => "call/cc",
         }

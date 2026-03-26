@@ -179,6 +179,9 @@ pub(super) fn apply_builtin(
         Builtin::StringDowncase => {
             builtin_string_map("string-downcase", args, |value| value.to_ascii_lowercase())
         }
+        Builtin::DynamicWind => Err(EvalError::Syntax {
+            message: "dynamic-wind requires continuation-aware evaluation".into(),
+        }),
         Builtin::Apply => builtin_apply(args, output),
         Builtin::CallCc => Err(EvalError::Syntax {
             message: "call/cc requires continuation-aware evaluation".into(),

@@ -1,7 +1,8 @@
-use std::collections::HashSet;
 use std::rc::Rc;
 
 mod builtins;
+mod continuation_runtime;
+mod environment;
 pub mod error;
 mod evaluator;
 mod macros;
@@ -10,8 +11,8 @@ mod number;
 mod parser;
 mod records;
 
-use builtins::{apply_builtin, eqv_values};
-use error::ContinuationJumpData;
+use builtins::eqv_values;
+use continuation_runtime::{apply_cps, CpsRuntime, CpsRuntimeRef};
 pub use error::EvalError;
 use evaluator::{
     apply, build_case_lambda, build_lambda, case_lambda_clauses, eval_define_syntax, eval_quote,
@@ -19,12 +20,9 @@ use evaluator::{
     parse_let_bindings, parse_param_list, quote_expr, wrong_arg_count, DoLoopState,
 };
 use macros::{env_with_expansion_aliases, expand_macro_call};
-use model::{
-    list_from_values, Builtin, ContinuationProc, Env, EnvRef, Expr, Params, Procedure,
-    SchemeString, Value,
-};
+use model::{ContinuationProc, Env, EnvRef, Expr, Params, SchemeString, Value};
 use parser::Parser;
-use records::{apply_record_procedure, eval_define_record_type};
+use records::eval_define_record_type;
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -49,7 +47,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
-    let env = initial_env();
+    let env = environment::initial_env();
     let mut output = String::new();
     let value = if program_uses_continuations(&exprs) {
         run_cps_program(exprs.clone(), env.clone(), &mut output)?
@@ -59,130 +57,17 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     Ok((value, output))
 }
 
-fn initial_env() -> EnvRef {
-    let env = Env::new(None);
-
-    for builtin in [
-        Builtin::Add,
-        Builtin::Sub,
-        Builtin::Mul,
-        Builtin::Div,
-        Builtin::Abs,
-        Builtin::Modulo,
-        Builtin::Remainder,
-        Builtin::Quotient,
-        Builtin::Gcd,
-        Builtin::Lcm,
-        Builtin::Min,
-        Builtin::Max,
-        Builtin::Expt,
-        Builtin::Truncate,
-        Builtin::Round,
-        Builtin::ZeroPred,
-        Builtin::PositivePred,
-        Builtin::NegativePred,
-        Builtin::OddPred,
-        Builtin::EvenPred,
-        Builtin::ExactPred,
-        Builtin::InexactPred,
-        Builtin::IntegerPred,
-        Builtin::RationalPred,
-        Builtin::ExactToInexact,
-        Builtin::InexactToExact,
-        Builtin::Numerator,
-        Builtin::Denominator,
-        Builtin::Less,
-        Builtin::Greater,
-        Builtin::Equal,
-        Builtin::LessEqual,
-        Builtin::GreaterEqual,
-        Builtin::EqPred,
-        Builtin::EqvPred,
-        Builtin::EqualPred,
-        Builtin::Not,
-        Builtin::Display,
-        Builtin::Write,
-        Builtin::Newline,
-        Builtin::Cons,
-        Builtin::Car,
-        Builtin::Cdr,
-        Builtin::Cddr,
-        Builtin::SetCar,
-        Builtin::SetCdr,
-        Builtin::Append,
-        Builtin::Reverse,
-        Builtin::List,
-        Builtin::Length,
-        Builtin::ListRef,
-        Builtin::ListTail,
-        Builtin::ListPred,
-        Builtin::Member,
-        Builtin::Vector,
-        Builtin::MakeVector,
-        Builtin::VectorRef,
-        Builtin::VectorSet,
-        Builtin::VectorLength,
-        Builtin::VectorPred,
-        Builtin::VectorToList,
-        Builtin::ListToVector,
-        Builtin::Assoc,
-        Builtin::Assv,
-        Builtin::Map,
-        Builtin::ForEach,
-        Builtin::MakeString,
-        Builtin::String,
-        Builtin::StringAppend,
-        Builtin::StringLength,
-        Builtin::Substring,
-        Builtin::StringToNumber,
-        Builtin::NumberToString,
-        Builtin::SymbolToString,
-        Builtin::StringToSymbol,
-        Builtin::StringRef,
-        Builtin::StringSet,
-        Builtin::StringCopy,
-        Builtin::StringToList,
-        Builtin::ListToString,
-        Builtin::NullPred,
-        Builtin::NumberPred,
-        Builtin::StringPred,
-        Builtin::BooleanPred,
-        Builtin::ProcedurePred,
-        Builtin::PairPred,
-        Builtin::SymbolPred,
-        Builtin::CharPred,
-        Builtin::CharAlphabeticPred,
-        Builtin::CharNumericPred,
-        Builtin::CharToInteger,
-        Builtin::IntegerToChar,
-        Builtin::CharUpcase,
-        Builtin::CharDowncase,
-        Builtin::CharEqual,
-        Builtin::CharLess,
-        Builtin::StringEqual,
-        Builtin::StringLess,
-        Builtin::StringGreater,
-        Builtin::StringLessEqual,
-        Builtin::StringGreaterEqual,
-        Builtin::StringCiEqual,
-        Builtin::StringUpcase,
-        Builtin::StringDowncase,
-        Builtin::Apply,
-        Builtin::CallCc,
-    ] {
-        env.define(builtin.name().into(), Value::Builtin(builtin));
-    }
-
-    let call_cc = env
-        .lookup_cell("call/cc")
-        .expect("call/cc is defined in the initial environment");
-    env.define_alias("call-with-current-continuation".into(), call_cc);
-
-    env
-}
-
 type Continuation = ContinuationProc;
 type ValuesContinuation = Rc<dyn Fn(Vec<Value>, &mut String) -> Result<Value, EvalError>>;
+
+#[derive(Clone)]
+struct LetrecBindingsState {
+    bindings: Vec<(String, Expr)>,
+    body: Vec<Expr>,
+    letrec_env: EnvRef,
+    k: Continuation,
+    runtime: CpsRuntimeRef,
+}
 
 enum CpsWork {
     EvalSequence {
@@ -201,19 +86,22 @@ fn terminal_continuation() -> Continuation {
 }
 
 fn run_cps_program(exprs: Vec<Expr>, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    let runtime = CpsRuntime::new();
+    runtime.reset_winders();
+
     let mut work = CpsWork::EvalSequence {
         exprs,
         env,
         continuation: terminal_continuation(),
     };
 
-    loop {
+    let result = loop {
         let result = match work {
             CpsWork::EvalSequence {
                 exprs,
                 env,
                 continuation,
-            } => eval_sequence_cps(exprs, env, output, continuation),
+            } => eval_sequence_cps(exprs, env, output, continuation, runtime.clone()),
             CpsWork::InvokeContinuation {
                 continuation,
                 value,
@@ -228,9 +116,12 @@ fn run_cps_program(exprs: Vec<Expr>, env: EnvRef, output: &mut String) -> Result
                     value,
                 };
             }
-            other => return other,
+            other => break other,
         }
-    }
+    };
+
+    runtime.reset_winders();
+    result
 }
 
 fn program_uses_continuations(exprs: &[Expr]) -> bool {
@@ -240,7 +131,10 @@ fn program_uses_continuations(exprs: &[Expr]) -> bool {
 fn expr_uses_continuations(expr: &Expr) -> bool {
     match expr {
         Expr::Symbol(name, _) => {
-            matches!(name.as_str(), "call/cc" | "call-with-current-continuation")
+            matches!(
+                name.as_str(),
+                "call/cc" | "call-with-current-continuation" | "dynamic-wind"
+            )
         }
         Expr::List(items, _) => items.iter().any(expr_uses_continuations),
         _ => false,
@@ -252,25 +146,34 @@ fn eval_sequence_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let Some((first, rest)) = exprs.split_first() else {
         return k(Value::Void, output);
     };
 
     if rest.is_empty() {
-        return eval_cps(first.clone(), env, output, k);
+        return eval_cps(first.clone(), env, output, k, runtime);
     }
 
     let rest_exprs = rest.to_vec();
     let rest_env = env.clone();
     let rest_k = k.clone();
+    let next_runtime = runtime.clone();
     eval_cps(
         first.clone(),
         env,
         output,
         Rc::new(move |_value, output| {
-            eval_sequence_cps(rest_exprs.clone(), rest_env.clone(), output, rest_k.clone())
+            eval_sequence_cps(
+                rest_exprs.clone(),
+                rest_env.clone(),
+                output,
+                rest_k.clone(),
+                next_runtime.clone(),
+            )
         }),
+        runtime,
     )
 }
 
@@ -279,8 +182,9 @@ fn eval_exprs_to_values_cps(
     env: EnvRef,
     output: &mut String,
     k: ValuesContinuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
-    eval_exprs_to_values_acc_cps(Vec::new(), exprs, env, output, k)
+    eval_exprs_to_values_acc_cps(Vec::new(), exprs, env, output, k, runtime)
 }
 
 fn eval_exprs_to_values_acc_cps(
@@ -289,6 +193,7 @@ fn eval_exprs_to_values_acc_cps(
     env: EnvRef,
     output: &mut String,
     k: ValuesContinuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let Some((last, prefix)) = exprs.split_last() else {
         return k(values, output);
@@ -297,6 +202,7 @@ fn eval_exprs_to_values_acc_cps(
     let prefix_exprs = prefix.to_vec();
     let rest_env = env.clone();
     let rest_k = k.clone();
+    let next_runtime = runtime.clone();
     eval_cps(
         last.clone(),
         env,
@@ -311,8 +217,10 @@ fn eval_exprs_to_values_acc_cps(
                 rest_env.clone(),
                 output,
                 rest_k.clone(),
+                next_runtime.clone(),
             )
         }),
+        runtime,
     )
 }
 
@@ -321,6 +229,7 @@ fn eval_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     match expr {
         Expr::Number(value, _) => k(Value::Number(value), output),
@@ -333,7 +242,7 @@ fn eval_cps(
             .map_err(|error| error.with_position(pos))
             .and_then(|value| k(value, output)),
         Expr::List(items, pos) => {
-            eval_list_cps(items, env, output, k).map_err(|error| error.with_position(pos))
+            eval_list_cps(items, env, output, k, runtime).map_err(|error| error.with_position(pos))
         }
     }
 }
@@ -343,6 +252,7 @@ fn eval_list_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let Some((head, tail)) = items.split_first() else {
         return Err(EvalError::Syntax {
@@ -352,15 +262,15 @@ fn eval_list_cps(
 
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
-            "define" => return eval_define_cps(tail.to_vec(), env, output, k),
+            "define" => return eval_define_cps(tail.to_vec(), env, output, k, runtime),
             "define-syntax" => {
                 return eval_define_syntax(tail, &env).and_then(|value| k(value, output));
             }
             "define-record-type" => {
                 return eval_define_record_type(tail, &env).and_then(|value| k(value, output));
             }
-            "set!" => return eval_set_cps(tail.to_vec(), env, output, k),
-            "if" => return eval_if_cps(tail.to_vec(), env, output, k),
+            "set!" => return eval_set_cps(tail.to_vec(), env, output, k, runtime),
+            "if" => return eval_if_cps(tail.to_vec(), env, output, k, runtime),
             "quote" => return eval_quote(tail).and_then(|value| k(value, output)),
             "lambda" => {
                 return build_lambda(tail, &env, None).and_then(|value| k(value, output));
@@ -368,29 +278,30 @@ fn eval_list_cps(
             "case-lambda" => {
                 return build_case_lambda(tail, &env, None).and_then(|value| k(value, output));
             }
-            "and" => return eval_and_cps(tail.to_vec(), env, output, k),
-            "or" => return eval_or_cps(tail.to_vec(), env, output, k),
-            "begin" => return eval_sequence_cps(tail.to_vec(), env, output, k),
-            "cond" => return eval_cond_cps(tail.to_vec(), env, output, k),
-            "let" => return eval_let_cps(tail.to_vec(), env, output, k),
-            "let*" => return eval_let_star_cps(tail.to_vec(), env, output, k),
-            "letrec" => return eval_letrec_cps(tail.to_vec(), env, output, k, false),
-            "letrec*" => return eval_letrec_cps(tail.to_vec(), env, output, k, true),
-            "case" => return eval_case_cps(tail.to_vec(), env, output, k),
-            "do" => return eval_do_cps(tail.to_vec(), env, output, k),
+            "and" => return eval_and_cps(tail.to_vec(), env, output, k, runtime),
+            "or" => return eval_or_cps(tail.to_vec(), env, output, k, runtime),
+            "begin" => return eval_sequence_cps(tail.to_vec(), env, output, k, runtime),
+            "cond" => return eval_cond_cps(tail.to_vec(), env, output, k, runtime),
+            "let" => return eval_let_cps(tail.to_vec(), env, output, k, runtime),
+            "let*" => return eval_let_star_cps(tail.to_vec(), env, output, k, runtime),
+            "letrec" => return eval_letrec_cps(tail.to_vec(), env, output, k, runtime, false),
+            "letrec*" => return eval_letrec_cps(tail.to_vec(), env, output, k, runtime, true),
+            "case" => return eval_case_cps(tail.to_vec(), env, output, k, runtime),
+            "do" => return eval_do_cps(tail.to_vec(), env, output, k, runtime),
             _ => {}
         }
 
         if let Some(transformer) = env.lookup_macro(name) {
             let expansion = expand_macro_call(&items, &transformer)?;
             let expanded_env = env_with_expansion_aliases(&env, &expansion);
-            return eval_cps(expansion.expr, expanded_env, output, k);
+            return eval_cps(expansion.expr, expanded_env, output, k, runtime);
         }
     }
 
     let arg_exprs = tail.to_vec();
     let arg_env = env.clone();
     let arg_k = k.clone();
+    let arg_runtime = runtime.clone();
     eval_cps(
         head.clone(),
         env,
@@ -398,15 +309,25 @@ fn eval_list_cps(
         Rc::new(move |callable, output| {
             let callable_for_apply = callable.clone();
             let apply_k = arg_k.clone();
+            let eval_args_runtime = arg_runtime.clone();
+            let apply_runtime = arg_runtime.clone();
             eval_exprs_to_values_cps(
                 arg_exprs.clone(),
                 arg_env.clone(),
                 output,
                 Rc::new(move |args, output| {
-                    apply_cps(callable_for_apply.clone(), args, output, apply_k.clone())
+                    apply_cps(
+                        callable_for_apply.clone(),
+                        args,
+                        output,
+                        apply_k.clone(),
+                        apply_runtime.clone(),
+                    )
                 }),
+                eval_args_runtime,
             )
         }),
+        runtime,
     )
 }
 
@@ -415,6 +336,7 @@ fn eval_define_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     match args.as_slice() {
         [Expr::Symbol(name, _), value_expr] => {
@@ -438,6 +360,7 @@ fn eval_define_cps(
                         define_env.define(define_name.clone(), value);
                         define_k.clone()(Value::Void, output)
                     }),
+                    runtime,
                 )
             }
         }
@@ -468,6 +391,7 @@ fn eval_set_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     match args.as_slice() {
         [Expr::Symbol(name, _), value_expr] => {
@@ -487,6 +411,7 @@ fn eval_set_cps(
                         })
                     }
                 }),
+                runtime,
             )
         }
         [_, _] => Err(EvalError::Syntax {
@@ -501,12 +426,14 @@ fn eval_if_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     match args.as_slice() {
         [condition, then_branch] => {
             let then_expr = then_branch.clone();
             let branch_env = env.clone();
             let branch_k = k.clone();
+            let branch_runtime = runtime.clone();
             eval_cps(
                 condition.clone(),
                 env,
@@ -518,11 +445,13 @@ fn eval_if_cps(
                             branch_env.clone(),
                             output,
                             branch_k.clone(),
+                            branch_runtime.clone(),
                         )
                     } else {
                         branch_k.clone()(Value::Void, output)
                     }
                 }),
+                runtime,
             )
         }
         [condition, then_branch, else_branch] => {
@@ -530,6 +459,7 @@ fn eval_if_cps(
             let else_expr = else_branch.clone();
             let branch_env = env.clone();
             let branch_k = k.clone();
+            let branch_runtime = runtime.clone();
             eval_cps(
                 condition.clone(),
                 env,
@@ -540,8 +470,15 @@ fn eval_if_cps(
                     } else {
                         else_expr.clone()
                     };
-                    eval_cps(branch, branch_env.clone(), output, branch_k.clone())
+                    eval_cps(
+                        branch,
+                        branch_env.clone(),
+                        output,
+                        branch_k.clone(),
+                        branch_runtime.clone(),
+                    )
                 }),
+                runtime,
             )
         }
         _ => Err(wrong_arg_count("if", "2 or 3", args.len())),
@@ -553,6 +490,7 @@ fn eval_and_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let Some((first, rest)) = args.split_first() else {
         return k(Value::Boolean(true), output);
@@ -561,6 +499,7 @@ fn eval_and_cps(
     let rest_exprs = rest.to_vec();
     let rest_env = env.clone();
     let rest_k = k.clone();
+    let rest_runtime = runtime.clone();
     eval_cps(
         first.clone(),
         env,
@@ -569,9 +508,16 @@ fn eval_and_cps(
             if !value.is_truthy() || rest_exprs.is_empty() {
                 rest_k.clone()(value, output)
             } else {
-                eval_and_cps(rest_exprs.clone(), rest_env.clone(), output, rest_k.clone())
+                eval_and_cps(
+                    rest_exprs.clone(),
+                    rest_env.clone(),
+                    output,
+                    rest_k.clone(),
+                    rest_runtime.clone(),
+                )
             }
         }),
+        runtime,
     )
 }
 
@@ -580,6 +526,7 @@ fn eval_or_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let Some((first, rest)) = args.split_first() else {
         return k(Value::Boolean(false), output);
@@ -588,6 +535,7 @@ fn eval_or_cps(
     let rest_exprs = rest.to_vec();
     let rest_env = env.clone();
     let rest_k = k.clone();
+    let rest_runtime = runtime.clone();
     eval_cps(
         first.clone(),
         env,
@@ -598,9 +546,16 @@ fn eval_or_cps(
             } else if rest_exprs.is_empty() {
                 rest_k.clone()(Value::Boolean(false), output)
             } else {
-                eval_or_cps(rest_exprs.clone(), rest_env.clone(), output, rest_k.clone())
+                eval_or_cps(
+                    rest_exprs.clone(),
+                    rest_env.clone(),
+                    output,
+                    rest_k.clone(),
+                    rest_runtime.clone(),
+                )
             }
         }),
+        runtime,
     )
 }
 
@@ -609,6 +564,7 @@ fn eval_cond_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let Some((clause, rest)) = clauses.split_first() else {
         return k(Value::Void, output);
@@ -631,13 +587,14 @@ fn eval_cond_cps(
                 message: "cond: else must be last".into(),
             });
         }
-        return eval_sequence_cps(body.to_vec(), env, output, k);
+        return eval_sequence_cps(body.to_vec(), env, output, k, runtime);
     }
 
     let clause_body = body.to_vec();
     let rest_clauses = rest.to_vec();
     let cond_env = env.clone();
     let cond_k = k.clone();
+    let cond_runtime = runtime.clone();
     eval_cps(
         test.clone(),
         env,
@@ -652,6 +609,7 @@ fn eval_cond_cps(
                         cond_env.clone(),
                         output,
                         cond_k.clone(),
+                        cond_runtime.clone(),
                     )
                 }
             } else {
@@ -660,9 +618,11 @@ fn eval_cond_cps(
                     cond_env.clone(),
                     output,
                     cond_k.clone(),
+                    cond_runtime.clone(),
                 )
             }
         }),
+        runtime,
     )
 }
 
@@ -671,13 +631,14 @@ fn eval_let_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     match args.as_slice() {
         [Expr::Symbol(name, _), bindings, body @ ..] => {
-            eval_named_let_cps(name, bindings.clone(), body.to_vec(), env, output, k)
+            eval_named_let_cps(name, bindings.clone(), body.to_vec(), env, output, k, runtime)
         }
         [bindings, body @ ..] => {
-            eval_plain_let_cps(bindings.clone(), body.to_vec(), env, output, k)
+            eval_plain_let_cps(bindings.clone(), body.to_vec(), env, output, k, runtime)
         }
         _ => Err(EvalError::Syntax {
             message: "let: invalid syntax".into(),
@@ -691,6 +652,7 @@ fn eval_plain_let_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Err(EvalError::Syntax {
@@ -707,6 +669,7 @@ fn eval_plain_let_cps(
     let let_bindings = bindings.clone();
     let let_body = body.clone();
     let let_k = k.clone();
+    let let_runtime = runtime.clone();
     eval_exprs_to_values_cps(
         value_exprs,
         env,
@@ -716,8 +679,15 @@ fn eval_plain_let_cps(
             for ((name, _), value) in let_bindings.iter().cloned().zip(values.into_iter()) {
                 let_env.define(name, value);
             }
-            eval_sequence_cps(let_body.clone(), let_env, output, let_k.clone())
+            eval_sequence_cps(
+                let_body.clone(),
+                let_env,
+                output,
+                let_k.clone(),
+                let_runtime.clone(),
+            )
         }),
+        runtime,
     )
 }
 
@@ -728,6 +698,7 @@ fn eval_named_let_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Err(EvalError::Syntax {
@@ -748,6 +719,7 @@ fn eval_named_let_cps(
     let let_name = name.to_string();
     let let_body = body.clone();
     let let_k = k.clone();
+    let let_runtime = runtime.clone();
     eval_exprs_to_values_cps(
         value_exprs,
         env,
@@ -761,8 +733,9 @@ fn eval_named_let_cps(
                 &let_env,
             );
             let_env.define(let_name.clone(), procedure.clone());
-            apply_cps(procedure, values, output, let_k.clone())
+            apply_cps(procedure, values, output, let_k.clone(), let_runtime.clone())
         }),
+        runtime,
     )
 }
 
@@ -771,6 +744,7 @@ fn eval_let_star_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let [bindings_expr, body @ ..] = args.as_slice() else {
         return Err(EvalError::Syntax {
@@ -786,7 +760,7 @@ fn eval_let_star_cps(
 
     let bindings = parse_let_bindings(bindings_expr)?;
     let let_env = Env::new(Some(env));
-    eval_let_star_bindings_cps(bindings, 0, let_env, body.to_vec(), output, k)
+    eval_let_star_bindings_cps(bindings, 0, let_env, body.to_vec(), output, k, runtime)
 }
 
 fn eval_let_star_bindings_cps(
@@ -796,9 +770,10 @@ fn eval_let_star_bindings_cps(
     body: Vec<Expr>,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     if index == bindings.len() {
-        return eval_sequence_cps(body, let_env, output, k);
+        return eval_sequence_cps(body, let_env, output, k, runtime);
     }
 
     let (name, value_expr) = bindings[index].clone();
@@ -806,6 +781,7 @@ fn eval_let_star_bindings_cps(
     let rest_env = let_env.clone();
     let rest_body = body.clone();
     let rest_k = k.clone();
+    let rest_runtime = runtime.clone();
     eval_cps(
         value_expr,
         let_env.clone(),
@@ -819,8 +795,10 @@ fn eval_let_star_bindings_cps(
                 rest_body.clone(),
                 output,
                 rest_k.clone(),
+                rest_runtime.clone(),
             )
         }),
+        runtime,
     )
 }
 
@@ -829,6 +807,7 @@ fn eval_letrec_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
     sequential: bool,
 ) -> Result<Value, EvalError> {
     let [bindings_expr, body @ ..] = args.as_slice() else {
@@ -847,20 +826,19 @@ fn eval_letrec_cps(
     let letrec_env = Env::new(Some(env));
 
     if sequential {
-        eval_letrec_star_bindings_cps(bindings, 0, letrec_env, body.to_vec(), output, k)
+        eval_letrec_star_bindings_cps(bindings, 0, letrec_env, body.to_vec(), output, k, runtime)
     } else {
-        for (name, _) in &bindings {
-            letrec_env.define(name.clone(), Value::Void);
-        }
-        eval_letrec_bindings_cps(
+        let state = LetrecBindingsState {
             bindings,
-            0,
-            Vec::new(),
-            letrec_env,
-            body.to_vec(),
-            output,
+            body: body.to_vec(),
+            letrec_env: letrec_env.clone(),
             k,
-        )
+            runtime,
+        };
+        for (name, _) in &state.bindings {
+            state.letrec_env.define(name.clone(), Value::Void);
+        }
+        eval_letrec_bindings_cps(state, 0, Vec::new(), output)
     }
 }
 
@@ -871,9 +849,10 @@ fn eval_letrec_star_bindings_cps(
     body: Vec<Expr>,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     if index == bindings.len() {
-        return eval_sequence_cps(body, letrec_env, output, k);
+        return eval_sequence_cps(body, letrec_env, output, k, runtime);
     }
 
     let (name, value_expr) = bindings[index].clone();
@@ -883,6 +862,7 @@ fn eval_letrec_star_bindings_cps(
     let rest_env = letrec_env.clone();
     let rest_body = body.clone();
     let rest_k = k.clone();
+    let rest_runtime = runtime.clone();
     eval_letrec_initializer_cps(
         name.clone(),
         value_expr,
@@ -898,51 +878,46 @@ fn eval_letrec_star_bindings_cps(
                 rest_body.clone(),
                 output,
                 rest_k.clone(),
+                rest_runtime.clone(),
             )
         }),
+        runtime,
     )
 }
 
 fn eval_letrec_bindings_cps(
-    bindings: Vec<(String, Expr)>,
+    state: LetrecBindingsState,
     index: usize,
     values: Vec<Value>,
-    letrec_env: EnvRef,
-    body: Vec<Expr>,
     output: &mut String,
-    k: Continuation,
 ) -> Result<Value, EvalError> {
-    if index == bindings.len() {
-        for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
-            let updated = letrec_env.set(name, value);
+    if index == state.bindings.len() {
+        for ((name, _), value) in state.bindings.iter().zip(values.into_iter()) {
+            let updated = state.letrec_env.set(name, value);
             debug_assert!(updated, "letrec binding defined before initialization");
         }
-        return eval_sequence_cps(body, letrec_env, output, k);
+        return eval_sequence_cps(
+            state.body.clone(),
+            state.letrec_env.clone(),
+            output,
+            state.k.clone(),
+            state.runtime.clone(),
+        );
     }
 
-    let (name, value_expr) = bindings[index].clone();
-    let rest_bindings = bindings.clone();
-    let rest_env = letrec_env.clone();
-    let rest_body = body.clone();
-    let rest_k = k.clone();
+    let (name, value_expr) = state.bindings[index].clone();
+    let next_state = state.clone();
     eval_letrec_initializer_cps(
         name,
         value_expr,
-        letrec_env,
+        state.letrec_env.clone(),
         output,
         Rc::new(move |value, output| {
             let mut next_values = values.clone();
             next_values.push(value);
-            eval_letrec_bindings_cps(
-                rest_bindings.clone(),
-                index + 1,
-                next_values,
-                rest_env.clone(),
-                rest_body.clone(),
-                output,
-                rest_k.clone(),
-            )
+            eval_letrec_bindings_cps(next_state.clone(), index + 1, next_values, output)
         }),
+        state.runtime,
     )
 }
 
@@ -952,6 +927,7 @@ fn eval_letrec_initializer_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     if let Some(parts) = lambda_parts(&value_expr) {
         let value = build_lambda(parts, &env, Some(name))?;
@@ -960,7 +936,7 @@ fn eval_letrec_initializer_cps(
         let value = build_case_lambda(clauses, &env, Some(name))?;
         k(value, output)
     } else {
-        eval_cps(value_expr, env, output, k)
+        eval_cps(value_expr, env, output, k, runtime)
     }
 }
 
@@ -969,6 +945,7 @@ fn eval_case_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let [key_expr, clauses @ ..] = args.as_slice() else {
         return Err(EvalError::Syntax {
@@ -979,6 +956,7 @@ fn eval_case_cps(
     let case_clauses = clauses.to_vec();
     let case_env = env.clone();
     let case_k = k.clone();
+    let case_runtime = runtime.clone();
     eval_cps(
         key_expr.clone(),
         env,
@@ -990,8 +968,10 @@ fn eval_case_cps(
                 case_env.clone(),
                 output,
                 case_k.clone(),
+                case_runtime.clone(),
             )
         }),
+        runtime,
     )
 }
 
@@ -1001,6 +981,7 @@ fn eval_case_clauses_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let Some((clause, rest)) = clauses.split_first() else {
         return k(Value::Void, output);
@@ -1026,7 +1007,7 @@ fn eval_case_clauses_cps(
         return if body.is_empty() {
             k(Value::Void, output)
         } else {
-            eval_sequence_cps(body.to_vec(), env, output, k)
+            eval_sequence_cps(body.to_vec(), env, output, k, runtime)
         };
     }
 
@@ -1044,10 +1025,10 @@ fn eval_case_clauses_cps(
         if body.is_empty() {
             k(Value::Void, output)
         } else {
-            eval_sequence_cps(body.to_vec(), env, output, k)
+            eval_sequence_cps(body.to_vec(), env, output, k, runtime)
         }
     } else {
-        eval_case_clauses_cps(key, rest.to_vec(), env, output, k)
+        eval_case_clauses_cps(key, rest.to_vec(), env, output, k, runtime)
     }
 }
 
@@ -1056,6 +1037,7 @@ fn eval_do_cps(
     env: EnvRef,
     output: &mut String,
     k: Continuation,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     let [bindings_expr, test_clause_expr, body @ ..] = args.as_slice() else {
         return Err(EvalError::Syntax {
@@ -1080,24 +1062,31 @@ fn eval_do_cps(
         .map(|binding| binding.init.clone())
         .collect::<Vec<_>>();
     let initial_state = loop_state.clone();
+    let loop_runtime = runtime.clone();
     eval_exprs_to_values_cps(
         init_exprs,
         env,
         output,
         Rc::new(move |values, output| {
             initial_state.define_initial_values(values);
-            run_do_loop_cps(initial_state.clone(), output)
+            run_do_loop_cps(initial_state.clone(), output, loop_runtime.clone())
         }),
+        runtime,
     )
 }
 
-fn run_do_loop_cps(state: DoLoopState, output: &mut String) -> Result<Value, EvalError> {
+fn run_do_loop_cps(
+    state: DoLoopState,
+    output: &mut String,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
     let test_expr = state.test_expr.clone();
     let test_results = state.result_exprs.clone();
     let test_body = state.body.clone();
     let test_env = state.loop_env.clone();
     let test_k = state.k.clone();
     let continue_state = state.clone();
+    let test_runtime = runtime.clone();
     eval_cps(
         test_expr.clone(),
         state.loop_env,
@@ -1112,20 +1101,35 @@ fn run_do_loop_cps(state: DoLoopState, output: &mut String) -> Result<Value, Eva
                         test_env.clone(),
                         output,
                         test_k.clone(),
+                        test_runtime.clone(),
                     )
                 }
             } else {
                 let next_loop_state = continue_state.clone();
+                let continue_runtime = test_runtime.clone();
                 let continue_loop: Continuation = Rc::new(move |_value, output| {
-                    eval_do_steps_cps(next_loop_state.clone(), 0, Vec::new(), output)
+                    eval_do_steps_cps(
+                        next_loop_state.clone(),
+                        0,
+                        Vec::new(),
+                        output,
+                        continue_runtime.clone(),
+                    )
                 });
                 if test_body.is_empty() {
                     continue_loop(Value::Void, output)
                 } else {
-                    eval_sequence_cps(test_body.clone(), test_env.clone(), output, continue_loop)
+                    eval_sequence_cps(
+                        test_body.clone(),
+                        test_env.clone(),
+                        output,
+                        continue_loop,
+                        test_runtime.clone(),
+                    )
                 }
             }
         }),
+        runtime,
     )
 }
 
@@ -1134,10 +1138,11 @@ fn eval_do_steps_cps(
     index: usize,
     next_values: Vec<Value>,
     output: &mut String,
+    runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     if index == state.bindings.len() {
         state.update_step_values(next_values);
-        return run_do_loop_cps(state, output);
+        return run_do_loop_cps(state, output, runtime);
     }
 
     let binding = state.bindings[index].clone();
@@ -1145,6 +1150,7 @@ fn eval_do_steps_cps(
         Some(step_expr) => {
             let step_env = state.loop_env.clone();
             let next_state = state.clone();
+            let next_runtime = runtime.clone();
             eval_cps(
                 step_expr,
                 step_env,
@@ -1152,8 +1158,15 @@ fn eval_do_steps_cps(
                 Rc::new(move |value, output| {
                     let mut updated_values = next_values.clone();
                     updated_values.push(value);
-                    eval_do_steps_cps(next_state.clone(), index + 1, updated_values, output)
+                    eval_do_steps_cps(
+                        next_state.clone(),
+                        index + 1,
+                        updated_values,
+                        output,
+                        next_runtime.clone(),
+                    )
                 }),
+                runtime,
             )
         }
         None => {
@@ -1163,246 +1176,7 @@ fn eval_do_steps_cps(
                 .expect("do binding is always present");
             let mut updated_values = next_values;
             updated_values.push(current);
-            eval_do_steps_cps(state, index + 1, updated_values, output)
-        }
-    }
-}
-
-fn apply_cps(
-    callable: Value,
-    args: Vec<Value>,
-    output: &mut String,
-    k: Continuation,
-) -> Result<Value, EvalError> {
-    match callable {
-        Value::Builtin(Builtin::CallCc) => match args.as_slice() {
-            [procedure] => apply_cps(
-                procedure.clone(),
-                vec![Value::Continuation(k.clone())],
-                output,
-                k,
-            ),
-            _ => Err(wrong_arg_count("call/cc", "1", args.len())),
-        },
-        Value::Builtin(Builtin::Apply) => apply_apply_cps(args, output, k),
-        Value::Builtin(Builtin::Map) => apply_map_cps(args, output, k),
-        Value::Builtin(Builtin::ForEach) => apply_for_each_cps(args, output, k),
-        Value::Builtin(builtin) => {
-            apply_builtin(builtin, &args, output).and_then(|value| k(value, output))
-        }
-        Value::Procedure(procedure) => apply_procedure_cps(&procedure, args, output, k),
-        Value::Continuation(continuation) => match args.as_slice() {
-            [value] => Err(EvalError::ContinuationJump {
-                jump: ContinuationJumpData::new(continuation, value.clone()),
-            }),
-            _ => Err(wrong_arg_count("continuation", "1", args.len())),
-        },
-        Value::RecordProcedure(procedure) => {
-            apply_record_procedure(&procedure, &args).and_then(|value| k(value, output))
-        }
-        value => Err(EvalError::NotAProcedure {
-            got: value.type_name().into(),
-        }),
-    }
-}
-
-fn apply_procedure_cps(
-    procedure: &Procedure,
-    args: Vec<Value>,
-    output: &mut String,
-    k: Continuation,
-) -> Result<Value, EvalError> {
-    let Some(clause) = procedure
-        .clauses
-        .iter()
-        .find(|clause| clause.params.matches_arity(args.len()))
-    else {
-        let expected = procedure.expected_args();
-        return Err(wrong_arg_count(
-            procedure.error_name(),
-            &expected,
-            args.len(),
-        ));
-    };
-
-    let call_env = Env::new(Some(procedure.env.clone()));
-    for (param, arg) in clause.params.required.iter().zip(args.iter()) {
-        call_env.define(param.clone(), arg.clone());
-    }
-    if let Some(rest) = &clause.params.rest {
-        call_env.define(
-            rest.clone(),
-            list_from_values(args[clause.params.required.len()..].iter().cloned()),
-        );
-    }
-
-    eval_sequence_cps(clause.body.clone(), call_env, output, k)
-}
-
-fn apply_apply_cps(
-    args: Vec<Value>,
-    output: &mut String,
-    k: Continuation,
-) -> Result<Value, EvalError> {
-    let [callable, prefix_and_list @ ..] = args.as_slice() else {
-        return Err(wrong_arg_count("apply", "at least 2", 0));
-    };
-
-    if prefix_and_list.is_empty() {
-        return Err(wrong_arg_count("apply", "at least 2", 1));
-    }
-
-    let (list_arg, prefix_args) = prefix_and_list
-        .split_last()
-        .expect("prefix_and_list is known to be non-empty");
-    let list_items = collect_list_cps("apply", list_arg)?;
-
-    let mut applied_args = Vec::with_capacity(prefix_args.len() + list_items.len());
-    applied_args.extend(prefix_args.iter().cloned());
-    applied_args.extend(list_items);
-    apply_cps(callable.clone(), applied_args, output, k)
-}
-
-fn apply_map_cps(
-    args: Vec<Value>,
-    output: &mut String,
-    k: Continuation,
-) -> Result<Value, EvalError> {
-    let [callable, list_args @ ..] = args.as_slice() else {
-        return Err(wrong_arg_count("map", "at least 2", 0));
-    };
-
-    if list_args.is_empty() {
-        return Err(wrong_arg_count("map", "at least 2", 1));
-    }
-
-    let mut lists = Vec::with_capacity(list_args.len());
-    for list in list_args {
-        lists.push(collect_list_cps("map", list)?);
-    }
-
-    apply_map_loop_cps(callable.clone(), lists, 0, Vec::new(), output, k)
-}
-
-fn apply_map_loop_cps(
-    callable: Value,
-    lists: Vec<Vec<Value>>,
-    index: usize,
-    results: Vec<Value>,
-    output: &mut String,
-    k: Continuation,
-) -> Result<Value, EvalError> {
-    let len = lists.iter().map(Vec::len).min().unwrap_or(0);
-    if index >= len {
-        return k(list_from_values(results), output);
-    }
-
-    let mut mapped_args = Vec::with_capacity(lists.len());
-    for list in &lists {
-        mapped_args.push(list[index].clone());
-    }
-
-    let loop_callable = callable.clone();
-    let loop_lists = lists.clone();
-    let loop_k = k.clone();
-    apply_cps(
-        callable,
-        mapped_args,
-        output,
-        Rc::new(move |value, output| {
-            let mut next_results = results.clone();
-            next_results.push(value);
-            apply_map_loop_cps(
-                loop_callable.clone(),
-                loop_lists.clone(),
-                index + 1,
-                next_results,
-                output,
-                loop_k.clone(),
-            )
-        }),
-    )
-}
-
-fn apply_for_each_cps(
-    args: Vec<Value>,
-    output: &mut String,
-    k: Continuation,
-) -> Result<Value, EvalError> {
-    let [callable, list_args @ ..] = args.as_slice() else {
-        return Err(wrong_arg_count("for-each", "at least 2", 0));
-    };
-
-    if list_args.is_empty() {
-        return Err(wrong_arg_count("for-each", "at least 2", 1));
-    }
-
-    let mut lists = Vec::with_capacity(list_args.len());
-    for list in list_args {
-        lists.push(collect_list_cps("for-each", list)?);
-    }
-
-    apply_for_each_loop_cps(callable.clone(), lists, 0, output, k)
-}
-
-fn apply_for_each_loop_cps(
-    callable: Value,
-    lists: Vec<Vec<Value>>,
-    index: usize,
-    output: &mut String,
-    k: Continuation,
-) -> Result<Value, EvalError> {
-    let len = lists.iter().map(Vec::len).min().unwrap_or(0);
-    if index >= len {
-        return k(Value::Void, output);
-    }
-
-    let mut call_args = Vec::with_capacity(lists.len());
-    for list in &lists {
-        call_args.push(list[index].clone());
-    }
-
-    let loop_callable = callable.clone();
-    let loop_lists = lists.clone();
-    let loop_k = k.clone();
-    apply_cps(
-        callable,
-        call_args,
-        output,
-        Rc::new(move |_value, output| {
-            apply_for_each_loop_cps(
-                loop_callable.clone(),
-                loop_lists.clone(),
-                index + 1,
-                output,
-                loop_k.clone(),
-            )
-        }),
-    )
-}
-
-fn collect_list_cps(name: &str, value: &Value) -> Result<Vec<Value>, EvalError> {
-    let mut items = Vec::new();
-    let mut current = value.clone();
-    let mut seen = HashSet::new();
-
-    loop {
-        match current {
-            Value::EmptyList => return Ok(items),
-            Value::Pair(pair) => {
-                if !seen.insert(pair.id()) {
-                    return Err(EvalError::CircularList { name: name.into() });
-                }
-                items.push(pair.car());
-                current = pair.cdr();
-            }
-            other => {
-                return Err(EvalError::TypeMismatch {
-                    name: name.into(),
-                    expected: "list".into(),
-                    got: other.type_name().into(),
-                });
-            }
+            eval_do_steps_cps(state, index + 1, updated_values, output, runtime)
         }
     }
 }
