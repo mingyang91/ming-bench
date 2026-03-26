@@ -19,7 +19,7 @@ object StringCharBuiltins:
       if args.length != 1 then throw errAt(pos, "string-length requires 1 argument")
       args.head match
         case Value.VStr(chars, _) => Value.VNum(chars.length.toLong)
-        case _                 => throw errAt(pos, "string-length: not a string")
+        case _                    => throw errAt(pos, "string-length: not a string")
     case "substring" =>
       if args.length != 3 then throw errAt(pos, "substring requires 3 arguments")
       (args(0), args(1), args(2)) match
@@ -53,7 +53,7 @@ object StringCharBuiltins:
       if args.length != 1 then throw errAt(pos, "string->symbol requires 1 argument")
       args.head match
         case Value.VStr(chars, _) => Value.VSymbol(new String(chars))
-        case _                 => throw errAt(pos, "string->symbol: not a string")
+        case _                    => throw errAt(pos, "string->symbol: not a string")
     case "string-ref" =>
       if args.length != 2 then throw errAt(pos, "string-ref requires 2 arguments")
       (args(0), args(1)) match
@@ -79,7 +79,7 @@ object StringCharBuiltins:
       if args.length != 1 then throw errAt(pos, "string->list requires 1 argument")
       args.head match
         case Value.VStr(chars, _) => Value.VList(chars.map(Value.VChar(_)).toList)
-        case _                 => throw errAt(pos, "string->list: not a string")
+        case _                    => throw errAt(pos, "string->list: not a string")
     case "list->string" =>
       if args.length != 1 then throw errAt(pos, "list->string requires 1 argument")
       args.head match

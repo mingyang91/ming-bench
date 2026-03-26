@@ -76,7 +76,7 @@ object SchemeTypes:
 
   def displayStr(v: Value): String = v match
     case Value.VStr(chars, _) => new String(chars)
-    case Value.VChar(c)    => c.toString
+    case Value.VChar(c)       => c.toString
     case Value.VList(elems) =>
       "(" + elems.map(displayStr).mkString(" ") + ")"
     case Value.VDottedList(elems, last) =>
@@ -169,7 +169,7 @@ object SchemeTypes:
     case (Value.VFloat(x), Value.VFloat(y))                 => x == y
     case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
     case (Value.VBool(x), Value.VBool(y))                   => x == y
-    case (Value.VStr(x, _), Value.VStr(y, _))                => java.util.Arrays.equals(x, y)
+    case (Value.VStr(x, _), Value.VStr(y, _))               => java.util.Arrays.equals(x, y)
     case (Value.VChar(x), Value.VChar(y))                   => x == y
     case (Value.VSymbol(x), Value.VSymbol(y))               => x == y
     case (Value.VList(xs), Value.VList(ys)) =>
