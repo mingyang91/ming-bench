@@ -91,6 +91,11 @@ final class Builtins {
                     || val instanceof Evaluator.CallccProc;
             }
 
+            case "values" -> {
+                if (args.size() == 1) yield args.get(0);
+                yield new Evaluator.SchemeValues(new ArrayList<>(args));
+            }
+
             // Vectors
             case "vector", "make-vector", "vector-ref", "vector-set!",
                  "vector-length", "vector?", "vector->list", "list->vector" ->

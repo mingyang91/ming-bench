@@ -52,7 +52,7 @@ public class Evaluator {
                 "gcd", "lcm", "truncate", "round",
                 "make-string", "string",
                 "string>?", "string<=?", "string>=?",
-                "procedure?"}) {
+                "procedure?", "values"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
         globalEnv.define("call/cc", new CallccProc());
@@ -252,6 +252,11 @@ public class Evaluator {
     }
 
     static final class CallccProc {}
+
+    static final class SchemeValues {
+        final List<Object> values;
+        SchemeValues(List<Object> values) { this.values = values; }
+    }
 
     static final class TailCall {
         final Object proc;
@@ -612,6 +617,21 @@ public class Evaluator {
                     case "call/cc", "call-with-current-continuation": {
                         Env ccEnv = env;
                         return new BounceStep(list.get(1), env, procVal -> applyProc(procVal, List.of(new SchemeCont(k, new ArrayList<>(windStack))), k));
+                    }
+                    case "call-with-values": {
+                        if (list.size() != 3) throw posError("call-with-values: expected 2 arguments");
+                        Env cwvEnv = env;
+                        return new BounceStep(list.get(1), env, producer ->
+                            new BounceStep(list.get(2), cwvEnv, consumer ->
+                                applyProc(producer, List.of(), producerResult -> {
+                                    List<Object> consumerArgs;
+                                    if (producerResult instanceof SchemeValues sv) {
+                                        consumerArgs = sv.values;
+                                    } else {
+                                        consumerArgs = List.of(producerResult);
+                                    }
+                                    return applyProc(consumer, consumerArgs, k);
+                                })));
                     }
                     case "dynamic-wind": {
                         if (list.size() != 4) throw posError("dynamic-wind: expected 3 arguments");
