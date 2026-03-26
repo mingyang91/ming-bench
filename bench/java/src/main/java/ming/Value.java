@@ -7,7 +7,8 @@ import java.util.List;
 sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue, ListValue,
         PairValue, CharValue, VectorValue, VoidValue, ProcedureValue, RecordValue, UninitializedValue,
         ValuesBundleValue,
-        CallCcProcedureValue, RaiseProcedureValue, WithExceptionHandlerProcedureValue, ContinuationProcedureValue {
+        CallCcProcedureValue, RaiseProcedureValue, WithExceptionHandlerProcedureValue,
+        ContinuationProcedureValue, SyntaxValue {
     String render();
 
     default boolean isTruthy() {
@@ -154,6 +155,13 @@ record SymbolValue(String name) implements Value {
     @Override
     public String render() {
         return name;
+    }
+}
+
+record SyntaxValue(Expr expression) implements Value {
+    @Override
+    public String render() {
+        return "#<syntax>";
     }
 }
 

@@ -32,6 +32,10 @@ final class Parser {
             throw error("unexpected end of input");
         }
 
+        if (peek() == '#' && peekNext() == '\'') {
+            return parseSyntaxQuote();
+        }
+
         char ch = peek();
         return switch (ch) {
             case '(' -> parseList();
@@ -48,6 +52,17 @@ final class Parser {
         advance();
         return new ListExpr(
                 List.of(new SymbolExpr("quote", startLine, startColumn), parseExpr()),
+                startLine,
+                startColumn);
+    }
+
+    private Expr parseSyntaxQuote() throws EvalError {
+        int startLine = line;
+        int startColumn = column;
+        advance();
+        advance();
+        return new ListExpr(
+                List.of(new SymbolExpr("syntax", startLine, startColumn), parseExpr()),
                 startLine,
                 startColumn);
     }
@@ -207,6 +222,10 @@ final class Parser {
             column++;
         }
         return ch;
+    }
+
+    private char peekNext() {
+        return index + 1 < input.length() ? input.charAt(index + 1) : '\0';
     }
 
     private EvalError error(String message) {

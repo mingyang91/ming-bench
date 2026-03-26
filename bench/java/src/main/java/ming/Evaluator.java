@@ -15,10 +15,21 @@ import java.util.concurrent.atomic.AtomicLong;
  * Agents implement this class.
  */
 public class Evaluator {
+    @FunctionalInterface
+    private interface SyntaxScopeAction<T> {
+        T run() throws EvalError;
+    }
+
     private record Binding(String name, Expr valueExpression) {
     }
 
     private record DoBinding(String name, Expr initExpression, Expr stepExpression) {
+    }
+
+    private record PatternContext(String keyword, Set<String> literals) {
+        boolean isLiteral(String name) {
+            return (keyword != null && keyword.equals(name)) || literals.contains(name);
+        }
     }
 
     private sealed interface MatchBinding permits SingleMatchBinding, RepeatedMatchBinding {
@@ -67,6 +78,9 @@ public class Evaluator {
     private static final AtomicLong NEXT_GENSYM = new AtomicLong();
 
     private StringBuilder outputBuffer;
+    private MacroDefinition currentMacroDefinition;
+    private Environment currentMacroUseEnvironment;
+    private Map<String, MatchBinding> currentSyntaxBindings = Map.of();
 
     /**
      * Evaluate one or more Scheme expressions and return the string
@@ -242,6 +256,8 @@ public class Evaluator {
         environment.define("map", new PrimitiveProcedureValue("map", this::applyMap));
         environment.define("for-each", new PrimitiveProcedureValue("for-each", this::applyForEach));
         environment.define("error", new PrimitiveProcedureValue("error", this::applyError));
+        environment.define("syntax->datum", new PrimitiveProcedureValue("syntax->datum", this::applySyntaxToDatum));
+        environment.define("datum->syntax", new PrimitiveProcedureValue("datum->syntax", this::applyDatumToSyntax));
         environment.define("vector", new PrimitiveProcedureValue("vector", this::applyVector));
         environment.define("make-vector", new PrimitiveProcedureValue("make-vector", this::applyMakeVector));
         environment.define("vector-ref", new PrimitiveProcedureValue("vector-ref", this::applyVectorRef));
@@ -337,6 +353,9 @@ public class Evaluator {
                 case "set!" -> new TailCallValue(evalSet(arguments, environment));
                 case "if" -> evalTailIf(arguments, environment);
                 case "quote" -> new TailCallValue(evalQuote(arguments));
+                case "syntax" -> new TailCallValue(evalSyntax(arguments));
+                case "syntax-case" -> new TailCallValue(evalSyntaxCase(arguments, environment));
+                case "with-syntax" -> new TailCallValue(evalWithSyntax(arguments, environment));
                 case "lambda" -> new TailCallValue(evalLambda(arguments, environment));
                 case "case-lambda" -> new TailCallValue(evalCaseLambda(arguments, environment));
                 case "begin" -> evalTailBegin(arguments, environment);
@@ -393,6 +412,9 @@ public class Evaluator {
                 case "set!" -> evalSet(arguments, environment);
                 case "if" -> evalIf(arguments, environment);
                 case "quote" -> evalQuote(arguments);
+                case "syntax" -> evalSyntax(arguments);
+                case "syntax-case" -> evalSyntaxCase(arguments, environment);
+                case "with-syntax" -> evalWithSyntax(arguments, environment);
                 case "lambda" -> evalLambda(arguments, environment);
                 case "case-lambda" -> evalCaseLambda(arguments, environment);
                 case "begin" -> evalBegin(arguments, environment);
@@ -909,6 +931,109 @@ public class Evaluator {
         return quote(arguments.getFirst());
     }
 
+    private Value evalSyntax(List<Expr> arguments) throws EvalError {
+        requireExactArity("syntax", arguments.size(), 1);
+        Expr template = arguments.getFirst();
+        if (currentMacroDefinition == null || currentMacroUseEnvironment == null) {
+            return new SyntaxValue(template);
+        }
+
+        ExpansionContext context = new ExpansionContext(
+                currentMacroDefinition,
+                currentMacroUseEnvironment,
+                currentSyntaxBindings,
+                new HashMap<>());
+        return new SyntaxValue(instantiateTemplate(template, context, Map.of(), null));
+    }
+
+    private Value evalSyntaxCase(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.size() < 3) {
+            throw new EvalError("syntax-case expected input, literals, and at least one clause");
+        }
+
+        SyntaxValue input = expectSyntaxValue(eval(arguments.getFirst(), environment), "syntax-case");
+        Set<String> literals = parseLiteralIdentifiers(arguments.get(1), "syntax-case");
+        PatternContext patternContext = new PatternContext(null, literals);
+
+        for (int i = 2; i < arguments.size(); i++) {
+            Expr clauseExpression = arguments.get(i);
+            if (!(clauseExpression instanceof ListExpr clauseList)) {
+                throw new EvalError("syntax-case clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.size() < 2) {
+                throw new EvalError("syntax-case clauses expected a pattern and a template");
+            }
+
+            Map<String, MatchBinding> bindings = new HashMap<>();
+            if (!matchPattern(clauseElements.getFirst(), input.expression(), patternContext, bindings)) {
+                continue;
+            }
+
+            Environment clauseEnvironment = bindSyntaxVariables(environment, bindings);
+            Map<String, MatchBinding> scopedBindings = extendSyntaxBindings(bindings);
+
+            int bodyIndex = 1;
+            if (clauseElements.size() > 2) {
+                Value fender = withSyntaxBindings(scopedBindings,
+                        () -> eval(clauseElements.get(1), clauseEnvironment));
+                if (!fender.isTruthy()) {
+                    continue;
+                }
+                bodyIndex = 2;
+            }
+
+            List<Expr> body = clauseElements.subList(bodyIndex, clauseElements.size());
+            if (body.isEmpty()) {
+                throw new EvalError("syntax-case clause expected a body");
+            }
+
+            return withSyntaxBindings(scopedBindings, () -> evalSequence(body, clauseEnvironment));
+        }
+
+        throw new EvalError("syntax-case found no matching clause");
+    }
+
+    private Value evalWithSyntax(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("with-syntax expected bindings and a body");
+        }
+
+        Expr bindingsExpression = arguments.getFirst();
+        if (!(bindingsExpression instanceof ListExpr bindingList)) {
+            throw new EvalError("with-syntax expected a binding list");
+        }
+
+        Map<String, MatchBinding> newBindings = new HashMap<>();
+        for (Expr bindingExpression : bindingList.elements()) {
+            if (!(bindingExpression instanceof ListExpr binding)) {
+                throw new EvalError("with-syntax bindings must be lists");
+            }
+
+            List<Expr> bindingElements = binding.elements();
+            if (bindingElements.size() != 2) {
+                throw new EvalError("with-syntax bindings must contain a pattern and expression");
+            }
+
+            SyntaxValue syntaxValue = expectSyntaxValue(eval(bindingElements.get(1), environment), "with-syntax");
+            Map<String, MatchBinding> bindingMatches = new HashMap<>();
+            if (!matchPattern(
+                    bindingElements.getFirst(),
+                    syntaxValue.expression(),
+                    new PatternContext(null, Set.of()),
+                    bindingMatches)) {
+                throw new EvalError("with-syntax pattern did not match");
+            }
+
+            newBindings.putAll(bindingMatches);
+        }
+
+        Environment bodyEnvironment = bindSyntaxVariables(environment, newBindings);
+        return withSyntaxBindings(extendSyntaxBindings(newBindings),
+                () -> evalSequence(arguments.subList(1, arguments.size()), bodyEnvironment));
+    }
+
     private Value evalLambda(List<Expr> arguments, Environment environment) throws EvalError {
         if (arguments.size() < 2) {
             throw new EvalError("lambda expected parameters and a body");
@@ -1279,36 +1404,30 @@ public class Evaluator {
     private MacroDefinition parseMacroDefinition(String name,
                                                  Expr transformer,
                                                  Environment environment) throws EvalError {
-        if (!(transformer instanceof ListExpr transformerList)) {
-            throw new EvalError("define-syntax expected a syntax-rules transformer");
+        if (transformer instanceof ListExpr transformerList && !transformerList.elements().isEmpty()) {
+            Expr headExpression = transformerList.elements().getFirst();
+            if (headExpression instanceof SymbolExpr headSymbol
+                    && "syntax-rules".equals(headSymbol.name())) {
+                return parseSyntaxRulesDefinition(name, transformerList, environment);
+            }
         }
 
+        Value transformerValue = eval(transformer, environment);
+        if (transformerValue instanceof ProcedureValue procedureValue) {
+            return MacroDefinition.transformer(name, procedureValue, environment);
+        }
+        throw new EvalError("define-syntax expected syntax-rules or a transformer procedure");
+    }
+
+    private MacroDefinition parseSyntaxRulesDefinition(String name,
+                                                       ListExpr transformerList,
+                                                       Environment environment) throws EvalError {
         List<Expr> elements = transformerList.elements();
-        if (elements.isEmpty()) {
-            throw new EvalError("define-syntax expected a syntax-rules transformer");
-        }
-
-        Expr headExpression = elements.getFirst();
-        if (!(headExpression instanceof SymbolExpr headSymbol)
-                || !"syntax-rules".equals(headSymbol.name())) {
-            throw new EvalError("define-syntax expected syntax-rules");
-        }
         if (elements.size() < 3) {
             throw new EvalError("syntax-rules expected literals and at least one rule");
         }
 
-        Expr literalsExpression = elements.get(1);
-        if (!(literalsExpression instanceof ListExpr literalList)) {
-            throw new EvalError("syntax-rules literals must be a list");
-        }
-
-        Set<String> literals = new HashSet<>();
-        for (Expr literalExpression : literalList.elements()) {
-            if (!(literalExpression instanceof SymbolExpr literalSymbol)) {
-                throw new EvalError("syntax-rules literals must be identifiers");
-            }
-            literals.add(literalSymbol.name());
-        }
+        Set<String> literals = parseLiteralIdentifiers(elements.get(1), "syntax-rules");
 
         List<SyntaxRule> rules = new ArrayList<>(elements.size() - 2);
         for (int i = 2; i < elements.size(); i++) {
@@ -1323,15 +1442,20 @@ public class Evaluator {
             rules.add(new SyntaxRule(ruleElements.get(0), ruleElements.get(1)));
         }
 
-        return new MacroDefinition(name, literals, rules, environment);
+        return MacroDefinition.syntaxRules(name, literals, rules, environment);
     }
 
     private Expr expandMacroCall(MacroDefinition macroDefinition,
                                  Expr callExpression,
                                  Environment useEnvironment) throws EvalError {
+        if (!macroDefinition.isSyntaxRules()) {
+            return expandTransformerMacro(macroDefinition, callExpression, useEnvironment);
+        }
+
+        PatternContext patternContext = new PatternContext(macroDefinition.name(), macroDefinition.literals());
         for (SyntaxRule rule : macroDefinition.rules()) {
             Map<String, MatchBinding> bindings = new HashMap<>();
-            if (matchPattern(rule.pattern(), callExpression, macroDefinition, bindings)) {
+            if (matchPattern(rule.pattern(), callExpression, patternContext, bindings)) {
                 ExpansionContext context = new ExpansionContext(
                         macroDefinition,
                         useEnvironment,
@@ -1344,9 +1468,22 @@ public class Evaluator {
         throw new EvalError("no matching syntax-rules clause for " + macroDefinition.name());
     }
 
+    private Expr expandTransformerMacro(MacroDefinition macroDefinition,
+                                        Expr callExpression,
+                                        Environment useEnvironment) throws EvalError {
+        Value expanded = withTransformerContext(
+                macroDefinition,
+                useEnvironment,
+                Map.of(),
+                () -> applyProcedureValue(
+                        macroDefinition.transformer(),
+                        List.of(new SyntaxValue(callExpression))));
+        return expectSyntaxValue(expanded, macroDefinition.name()).expression();
+    }
+
     private boolean matchPattern(Expr pattern,
                                  Expr input,
-                                 MacroDefinition macroDefinition,
+                                 PatternContext patternContext,
                                  Map<String, MatchBinding> bindings) throws EvalError {
         if (pattern instanceof IntExpr expected && input instanceof IntExpr found) {
             return expected.value() == found.value();
@@ -1371,7 +1508,7 @@ public class Evaluator {
             if ("_".equals(name)) {
                 return true;
             }
-            if (macroDefinition.name().equals(name) || macroDefinition.literals().contains(name)) {
+            if (patternContext.isLiteral(name)) {
                 return input instanceof SymbolExpr found && name.equals(found.name());
             }
 
@@ -1390,7 +1527,7 @@ public class Evaluator {
             return matchPatternList(
                     patternList.elements(),
                     inputList.elements(),
-                    macroDefinition,
+                    patternContext,
                     bindings);
         }
 
@@ -1399,7 +1536,7 @@ public class Evaluator {
 
     private boolean matchPatternList(List<Expr> patternElements,
                                      List<Expr> inputElements,
-                                     MacroDefinition macroDefinition,
+                                     PatternContext patternContext,
                                      Map<String, MatchBinding> bindings) throws EvalError {
         if (patternElements.size() >= 2 && isEllipsis(patternElements.getLast())) {
             List<Expr> fixedPatterns = patternElements.subList(0, patternElements.size() - 2);
@@ -1410,15 +1547,15 @@ public class Evaluator {
             }
 
             for (int i = 0; i < fixedPatterns.size(); i++) {
-                if (!matchPattern(fixedPatterns.get(i), inputElements.get(i), macroDefinition, bindings)) {
+                if (!matchPattern(fixedPatterns.get(i), inputElements.get(i), patternContext, bindings)) {
                     return false;
                 }
             }
 
-            initializeRepeatedBindings(repeatedPattern, macroDefinition, bindings);
+            initializeRepeatedBindings(repeatedPattern, patternContext, bindings);
             for (int i = fixedPatterns.size(); i < inputElements.size(); i++) {
                 Map<String, MatchBinding> iterationBindings = new HashMap<>();
-                if (!matchPattern(repeatedPattern, inputElements.get(i), macroDefinition, iterationBindings)) {
+                if (!matchPattern(repeatedPattern, inputElements.get(i), patternContext, iterationBindings)) {
                     return false;
                 }
                 if (!mergeRepeatedBindings(bindings, iterationBindings)) {
@@ -1433,7 +1570,7 @@ public class Evaluator {
         }
 
         for (int i = 0; i < patternElements.size(); i++) {
-            if (!matchPattern(patternElements.get(i), inputElements.get(i), macroDefinition, bindings)) {
+            if (!matchPattern(patternElements.get(i), inputElements.get(i), patternContext, bindings)) {
                 return false;
             }
         }
@@ -1441,10 +1578,10 @@ public class Evaluator {
     }
 
     private void initializeRepeatedBindings(Expr pattern,
-                                            MacroDefinition macroDefinition,
+                                            PatternContext patternContext,
                                             Map<String, MatchBinding> bindings) throws EvalError {
         Set<String> variables = new HashSet<>();
-        collectPatternVariables(pattern, macroDefinition, variables);
+        collectPatternVariables(pattern, patternContext, variables);
 
         for (String variable : variables) {
             MatchBinding existing = bindings.get(variable);
@@ -1480,14 +1617,13 @@ public class Evaluator {
     }
 
     private void collectPatternVariables(Expr pattern,
-                                         MacroDefinition macroDefinition,
+                                         PatternContext patternContext,
                                          Set<String> variables) {
         if (pattern instanceof SymbolExpr symbolExpr) {
             String name = symbolExpr.name();
             if (!"...".equals(name)
                     && !"_".equals(name)
-                    && !macroDefinition.name().equals(name)
-                    && !macroDefinition.literals().contains(name)) {
+                    && !patternContext.isLiteral(name)) {
                 variables.add(name);
             }
             return;
@@ -1496,7 +1632,7 @@ public class Evaluator {
         if (pattern instanceof ListExpr listExpr) {
             for (Expr element : listExpr.elements()) {
                 if (!isEllipsis(element)) {
-                    collectPatternVariables(element, macroDefinition, variables);
+                    collectPatternVariables(element, patternContext, variables);
                 }
             }
         }
@@ -1528,6 +1664,9 @@ public class Evaluator {
                                          Map<String, String> scope,
                                          Integer repeatIndex) throws EvalError {
         if (!elements.isEmpty() && elements.getFirst() instanceof SymbolExpr headSymbol) {
+            if ("quote".equals(headSymbol.name())) {
+                return template;
+            }
             if ("let".equals(headSymbol.name())) {
                 return instantiateTemplateLet(template, elements, context, scope, repeatIndex);
             }
@@ -1861,6 +2000,9 @@ public class Evaluator {
                     "and",
                     "or",
                     "set!",
+                    "syntax",
+                    "syntax-case",
+                    "with-syntax",
                     "syntax-rules" -> true;
             default -> false;
         };
@@ -2184,6 +2326,20 @@ public class Evaluator {
             builder.append(arguments.get(i).render());
         }
         throw new EvalError(builder.toString());
+    }
+
+    private Value applySyntaxToDatum(List<Value> arguments) throws EvalError {
+        requireExactArity("syntax->datum", arguments.size(), 1);
+        return quote(expectSyntaxValue(arguments.getFirst(), "syntax->datum").expression());
+    }
+
+    private Value applyDatumToSyntax(List<Value> arguments) throws EvalError {
+        requireExactArity("datum->syntax", arguments.size(), 2);
+        SyntaxValue context = expectSyntaxValue(arguments.getFirst(), "datum->syntax");
+        return new SyntaxValue(datumToExpr(
+                arguments.get(1),
+                context.expression().line(),
+                context.expression().column()));
     }
 
     private Value applyNewline(List<Value> arguments) throws EvalError {
@@ -2806,6 +2962,13 @@ public class Evaluator {
         throw new EvalError(operator + " expects character arguments");
     }
 
+    private SyntaxValue expectSyntaxValue(Value value, String operator) throws EvalError {
+        if (value instanceof SyntaxValue syntaxValue) {
+            return syntaxValue;
+        }
+        throw new EvalError(operator + " expects syntax arguments");
+    }
+
     private List<Value> expectList(Value value, String operator) throws EvalError {
         if (value instanceof ListValue listValue) {
             return listValue.elements();
@@ -2887,6 +3050,95 @@ public class Evaluator {
                 return false;
             }
         }
+    }
+
+    private Set<String> parseLiteralIdentifiers(Expr literalsExpression, String formName) throws EvalError {
+        if (!(literalsExpression instanceof ListExpr literalList)) {
+            throw new EvalError(formName + " literals must be a list");
+        }
+
+        Set<String> literals = new HashSet<>();
+        for (Expr literalExpression : literalList.elements()) {
+            if (!(literalExpression instanceof SymbolExpr literalSymbol)) {
+                throw new EvalError(formName + " literals must be identifiers");
+            }
+            literals.add(literalSymbol.name());
+        }
+        return literals;
+    }
+
+    private Environment bindSyntaxVariables(Environment parent,
+                                           Map<String, MatchBinding> bindings) {
+        Environment environment = new Environment(parent);
+        for (Map.Entry<String, MatchBinding> entry : bindings.entrySet()) {
+            environment.define(entry.getKey(), syntaxBindingValue(entry.getValue()));
+        }
+        return environment;
+    }
+
+    private Value syntaxBindingValue(MatchBinding binding) {
+        return switch (binding) {
+            case SingleMatchBinding singleMatchBinding -> new SyntaxValue(singleMatchBinding.value());
+            case RepeatedMatchBinding repeatedMatchBinding -> {
+                List<Value> values = new ArrayList<>(repeatedMatchBinding.values().size());
+                for (Expr value : repeatedMatchBinding.values()) {
+                    values.add(new SyntaxValue(value));
+                }
+                yield SchemeLists.fromElements(values);
+            }
+        };
+    }
+
+    private Map<String, MatchBinding> extendSyntaxBindings(Map<String, MatchBinding> additions) {
+        Map<String, MatchBinding> bindings = new HashMap<>(currentSyntaxBindings);
+        bindings.putAll(additions);
+        return Map.copyOf(bindings);
+    }
+
+    private <T> T withSyntaxBindings(Map<String, MatchBinding> bindings,
+                                     SyntaxScopeAction<T> action) throws EvalError {
+        return withTransformerContext(currentMacroDefinition, currentMacroUseEnvironment, bindings, action);
+    }
+
+    private <T> T withTransformerContext(MacroDefinition macroDefinition,
+                                         Environment useEnvironment,
+                                         Map<String, MatchBinding> bindings,
+                                         SyntaxScopeAction<T> action) throws EvalError {
+        MacroDefinition previousMacroDefinition = currentMacroDefinition;
+        Environment previousUseEnvironment = currentMacroUseEnvironment;
+        Map<String, MatchBinding> previousBindings = currentSyntaxBindings;
+
+        currentMacroDefinition = macroDefinition;
+        currentMacroUseEnvironment = useEnvironment;
+        currentSyntaxBindings = bindings == null ? Map.of() : bindings;
+        try {
+            return action.run();
+        } finally {
+            currentMacroDefinition = previousMacroDefinition;
+            currentMacroUseEnvironment = previousUseEnvironment;
+            currentSyntaxBindings = previousBindings;
+        }
+    }
+
+    private Expr datumToExpr(Value datum, int line, int column) throws EvalError {
+        return switch (datum) {
+            case IntValue intValue -> new IntExpr(intValue.value(), line, column);
+            case RationalValue rationalValue -> new NumberExpr(rationalValue.render(), line, column);
+            case InexactValue inexactValue -> new NumberExpr(inexactValue.render(), line, column);
+            case BoolValue boolValue -> new BoolExpr(boolValue.value(), line, column);
+            case StringValue stringValue -> new StringExpr(stringValue.value(), line, column);
+            case CharValue charValue -> new CharExpr(charValue.value(), line, column);
+            case SymbolValue symbolValue -> new SymbolExpr(symbolValue.name(), line, column);
+            case SyntaxValue syntaxValue -> syntaxValue.expression();
+            default -> {
+                List<Value> values = expectList(datum, "datum->syntax");
+                List<Expr> expressions = new ArrayList<>(values.size());
+                for (Value value : values) {
+                    expressions.add(datumToExpr(value, line, column));
+                }
+                yield new ListExpr(List.copyOf(expressions), line, column);
+            }
+        };
     }
 
     private boolean eqValue(Value left, Value right) {
