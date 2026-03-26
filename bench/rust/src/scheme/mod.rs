@@ -1,14 +1,16 @@
 pub mod error;
 mod macros;
+mod number;
 
 pub use error::EvalError;
 
 use macros::{register_macro_definition, MacroEnv, MacroExpander};
+use number::Number;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     Char(char),
     String(String),
@@ -89,7 +91,7 @@ impl SchemeString {
 
 #[derive(Debug, Clone)]
 enum Value {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     String(SchemeString),
     Symbol(String),
@@ -232,7 +234,7 @@ impl Value {
 
     fn type_name(&self) -> &'static str {
         match self {
-            Self::Integer(_) => "number",
+            Self::Number(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
             Self::Symbol(_) => "symbol",
@@ -246,7 +248,7 @@ impl Value {
 
     fn render(&self) -> String {
         match self {
-            Self::Integer(value) => value.to_string(),
+            Self::Number(value) => value.render(),
             Self::Boolean(true) => "#t".into(),
             Self::Boolean(false) => "#f".into(),
             Self::String(value) => {
@@ -455,28 +457,18 @@ impl<'a> Parser<'a> {
 
     fn parse_number(&mut self) -> Result<Expr, EvalError> {
         let start = self.offset;
-        if self.peek_char() == Some('-') {
-            self.bump_char();
-        }
-
-        let mut saw_digit = false;
-        while self.peek_char().is_some_and(|ch| ch.is_ascii_digit()) {
-            saw_digit = true;
+        while self.peek_char().is_some_and(|ch| !is_token_delimiter(ch)) {
             self.bump_char();
         }
 
         let literal = &self.input[start..self.offset];
-        if !saw_digit {
-            return Err(self.error(EvalError::InvalidNumber {
-                literal: literal.into(),
-            }));
-        }
-
-        literal.parse::<i64>().map(Expr::Integer).map_err(|_| {
-            self.error(EvalError::InvalidNumber {
-                literal: literal.into(),
+        Number::parse_literal(literal)
+            .map(Expr::Number)
+            .map_err(|_| {
+                self.error(EvalError::InvalidNumber {
+                    literal: literal.into(),
+                })
             })
-        })
     }
 
     fn parse_symbol(&mut self) -> Result<Expr, EvalError> {
@@ -571,7 +563,7 @@ fn eval_expr_in_env(
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     match expr {
-        Expr::Integer(value) => Ok(Value::Integer(*value)),
+        Expr::Number(value) => Ok(Value::Number(value.clone())),
         Expr::Boolean(value) => Ok(Value::Boolean(*value)),
         Expr::Char(value) => Ok(Value::Char(*value)),
         Expr::String(value) => Ok(Value::String(SchemeString::new_immutable(value))),
@@ -995,7 +987,7 @@ fn parse_param_names(items: &[Expr], name: &'static str) -> Result<LambdaParams,
 
 fn quote_expr(expr: &Expr) -> Value {
     match expr {
-        Expr::Integer(value) => Value::Integer(*value),
+        Expr::Number(value) => Value::Number(value.clone()),
         Expr::Boolean(value) => Value::Boolean(*value),
         Expr::Char(value) => Value::Char(*value),
         Expr::String(value) => Value::String(SchemeString::new_immutable(value)),
@@ -1080,10 +1072,16 @@ fn root_env() -> EnvRef {
         "cdr",
         "cons",
         "display",
+        "denominator",
         "eq?",
+        "exact->inexact",
+        "exact?",
         "equal?",
         "even?",
         "expt",
+        "inexact->exact",
+        "inexact?",
+        "integer?",
         "length",
         "list",
         "list-ref",
@@ -1096,6 +1094,7 @@ fn root_env() -> EnvRef {
         "negative?",
         "newline",
         "not",
+        "numerator",
         "number->string",
         "null?",
         "number?",
@@ -1103,6 +1102,7 @@ fn root_env() -> EnvRef {
         "pair?",
         "positive?",
         "quotient",
+        "rational?",
         "remainder",
         "string-ci=?",
         "string-downcase",
@@ -1148,17 +1148,14 @@ fn apply_builtin(
     match name {
         "+" => {
             let numbers = extract_numbers("+", args)?;
-            Ok(Value::Integer(numbers.iter().sum()))
+            let sum = numbers
+                .iter()
+                .try_fold(Number::integer(0), |acc, value| acc.add(value, "+"))?;
+            Ok(Value::Number(sum))
         }
         "abs" => {
             let number = expect_number_arg("abs", args)?;
-            number
-                .checked_abs()
-                .map(Value::Integer)
-                .ok_or(EvalError::InvalidArgument {
-                    name: "abs",
-                    message: "overflow",
-                })
+            Ok(Value::Number(number.abs("abs")?))
         }
         "apply" => {
             if args.len() < 2 {
@@ -1229,7 +1226,10 @@ fn apply_builtin(
         }
         "*" => {
             let numbers = extract_numbers("*", args)?;
-            Ok(Value::Integer(numbers.iter().product()))
+            let product = numbers
+                .iter()
+                .try_fold(Number::integer(1), |acc, value| acc.multiply(value, "*"))?;
+            Ok(Value::Number(product))
         }
         "-" => {
             let numbers = extract_numbers("-", args)?;
@@ -1242,12 +1242,13 @@ fn apply_builtin(
             };
 
             let value = if rest.is_empty() {
-                -*first
+                first.negate("-")?
             } else {
-                rest.iter().fold(*first, |acc, value| acc - value)
+                rest.iter()
+                    .try_fold(first.clone(), |acc, value| acc.subtract(value, "-"))?
             };
 
-            Ok(Value::Integer(value))
+            Ok(Value::Number(value))
         }
         "/" => {
             let numbers = extract_numbers("/", args)?;
@@ -1267,21 +1268,29 @@ fn apply_builtin(
                 });
             }
 
-            let mut result = *first;
-            for value in rest {
-                if *value == 0 {
-                    return Err(EvalError::DivisionByZero);
-                }
-                result /= value;
-            }
+            let result = rest
+                .iter()
+                .try_fold(first.clone(), |acc, value| acc.divide(value, "/"))?;
 
-            Ok(Value::Integer(result))
+            Ok(Value::Number(result))
         }
-        "<" => compare_numbers("<", args, |left, right| left < right),
-        "<=" => compare_numbers("<=", args, |left, right| left <= right),
-        "=" => compare_numbers("=", args, |left, right| left == right),
-        ">" => compare_numbers(">", args, |left, right| left > right),
-        ">=" => compare_numbers(">=", args, |left, right| left >= right),
+        "<" => compare_numbers("<", args, |left, right| {
+            left.partial_cmp(right)
+                .is_some_and(|ordering| ordering.is_lt())
+        }),
+        "<=" => compare_numbers("<=", args, |left, right| {
+            left.partial_cmp(right)
+                .is_some_and(|ordering| !ordering.is_gt())
+        }),
+        "=" => compare_numbers("=", args, |left, right| left.numeric_eq(right)),
+        ">" => compare_numbers(">", args, |left, right| {
+            left.partial_cmp(right)
+                .is_some_and(|ordering| ordering.is_gt())
+        }),
+        ">=" => compare_numbers(">=", args, |left, right| {
+            left.partial_cmp(right)
+                .is_some_and(|ordering| !ordering.is_lt())
+        }),
         "boolean?" => {
             predicate_builtin("boolean?", args, |value| matches!(value, Value::Boolean(_)))
         }
@@ -1356,9 +1365,17 @@ fn apply_builtin(
             context.output.push_str(&args[0].display_render());
             Ok(Value::Void)
         }
+        "denominator" => {
+            let number = expect_exact_number_arg("denominator", args)?;
+            Ok(Value::Number(Number::integer(
+                number
+                    .denominator()
+                    .expect("exact numbers always have a denominator"),
+            )))
+        }
         "length" => {
             let list = expect_list_arg("length", args)?;
-            Ok(Value::Integer(list.len() as i64))
+            Ok(Value::Number(Number::integer(list.len() as i64)))
         }
         "list" => Ok(Value::List(args.to_vec())),
         "list-ref" => {
@@ -1391,7 +1408,7 @@ fn apply_builtin(
         "map" => apply_map(args, context),
         "max" => {
             let numbers = extract_numbers("max", args)?;
-            let Some(maximum) = numbers.into_iter().max() else {
+            let Some(first) = numbers.first() else {
                 return Err(EvalError::WrongArgCount {
                     name: "max",
                     expected: "at least 1 argument",
@@ -1399,11 +1416,22 @@ fn apply_builtin(
                 });
             };
 
-            Ok(Value::Integer(maximum))
+            let maximum = numbers.iter().skip(1).fold(first.clone(), |best, value| {
+                if value
+                    .partial_cmp(&best)
+                    .is_some_and(|ordering| ordering.is_gt())
+                {
+                    value.clone()
+                } else {
+                    best
+                }
+            });
+
+            Ok(Value::Number(maximum))
         }
         "min" => {
             let numbers = extract_numbers("min", args)?;
-            let Some(minimum) = numbers.into_iter().min() else {
+            let Some(first) = numbers.first() else {
                 return Err(EvalError::WrongArgCount {
                     name: "min",
                     expected: "at least 1 argument",
@@ -1411,10 +1439,21 @@ fn apply_builtin(
                 });
             };
 
-            Ok(Value::Integer(minimum))
+            let minimum = numbers.iter().skip(1).fold(first.clone(), |best, value| {
+                if value
+                    .partial_cmp(&best)
+                    .is_some_and(|ordering| ordering.is_lt())
+                {
+                    value.clone()
+                } else {
+                    best
+                }
+            });
+
+            Ok(Value::Number(minimum))
         }
         "modulo" => {
-            let (left, right) = expect_two_numbers("modulo", args)?;
+            let (left, right) = expect_two_exact_integers("modulo", args)?;
             if right == 0 {
                 return Err(EvalError::DivisionByZero);
             }
@@ -1424,11 +1463,11 @@ fn apply_builtin(
                 remainder += right;
             }
 
-            Ok(Value::Integer(remainder))
+            Ok(Value::Number(Number::integer(remainder)))
         }
         "negative?" => {
             let number = expect_number_arg("negative?", args)?;
-            Ok(Value::Boolean(number < 0))
+            Ok(Value::Boolean(number.is_negative()))
         }
         "newline" => {
             if !args.is_empty() {
@@ -1453,18 +1492,26 @@ fn apply_builtin(
 
             Ok(Value::Boolean(!args[0].is_truthy()))
         }
+        "numerator" => {
+            let number = expect_exact_number_arg("numerator", args)?;
+            Ok(Value::Number(Number::integer(
+                number
+                    .numerator()
+                    .expect("exact numbers always have a numerator"),
+            )))
+        }
         "number->string" => {
             let number = expect_number_arg("number->string", args)?;
-            Ok(Value::String(SchemeString::new_mutable(number.to_string())))
+            Ok(Value::String(SchemeString::new_mutable(number.render())))
         }
         "null?" => predicate_builtin(
             "null?",
             args,
             |value| matches!(value, Value::List(items) if items.is_empty()),
         ),
-        "number?" => predicate_builtin("number?", args, |value| matches!(value, Value::Integer(_))),
+        "number?" => predicate_builtin("number?", args, |value| matches!(value, Value::Number(_))),
         "odd?" => {
-            let number = expect_number_arg("odd?", args)?;
+            let number = expect_exact_integer_arg("odd?", args)?;
             Ok(Value::Boolean(number.rem_euclid(2) == 1))
         }
         "pair?" => predicate_builtin("pair?", args, |value| match value {
@@ -1474,28 +1521,56 @@ fn apply_builtin(
         }),
         "positive?" => {
             let number = expect_number_arg("positive?", args)?;
-            Ok(Value::Boolean(number > 0))
+            Ok(Value::Boolean(number.is_positive()))
         }
         "quotient" => {
-            let (left, right) = expect_two_numbers("quotient", args)?;
+            let (left, right) = expect_two_exact_integers("quotient", args)?;
             if right == 0 {
                 return Err(EvalError::DivisionByZero);
             }
 
-            Ok(Value::Integer(left / right))
+            Ok(Value::Number(Number::integer(left / right)))
         }
+        "rational?" => predicate_builtin(
+            "rational?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_rational()),
+        ),
+        "exact->inexact" => {
+            let number = expect_number_arg("exact->inexact", args)?;
+            Ok(Value::Number(number.exact_to_inexact()))
+        }
+        "exact?" => predicate_builtin(
+            "exact?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_exact()),
+        ),
+        "inexact->exact" => {
+            let number = expect_number_arg("inexact->exact", args)?;
+            Ok(Value::Number(number.inexact_to_exact("inexact->exact")?))
+        }
+        "inexact?" => predicate_builtin(
+            "inexact?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_inexact()),
+        ),
+        "integer?" => predicate_builtin(
+            "integer?",
+            args,
+            |value| matches!(value, Value::Number(number) if number.is_integer()),
+        ),
         "remainder" => {
-            let (left, right) = expect_two_numbers("remainder", args)?;
+            let (left, right) = expect_two_exact_integers("remainder", args)?;
             if right == 0 {
                 return Err(EvalError::DivisionByZero);
             }
 
-            Ok(Value::Integer(left % right))
+            Ok(Value::Number(Number::integer(left % right)))
         }
         "string->number" => {
             let value = expect_string_arg("string->number", args)?;
-            match value.to_plain_string().parse::<i64>() {
-                Ok(number) => Ok(Value::Integer(number)),
+            match Number::parse_literal(&value.to_plain_string()) {
+                Ok(number) => Ok(Value::Number(number)),
                 Err(_) => Ok(Value::Boolean(false)),
             }
         }
@@ -1526,7 +1601,7 @@ fn apply_builtin(
         "string=?" => compare_strings("string=?", args, |left, right| left == right),
         "string-length" => {
             let value = expect_string_arg("string-length", args)?;
-            Ok(Value::Integer(value.len() as i64))
+            Ok(Value::Number(Number::integer(value.len() as i64)))
         }
         "string<?" => compare_strings("string<?", args, |left, right| left < right),
         "string-ref" => {
@@ -1617,24 +1692,21 @@ fn apply_builtin(
             Ok(Value::Boolean(equal_values(&args[0], &args[1])))
         }
         "even?" => {
-            let number = expect_number_arg("even?", args)?;
+            let number = expect_exact_integer_arg("even?", args)?;
             Ok(Value::Boolean(number.rem_euclid(2) == 0))
         }
         "expt" => {
-            let (base, exponent) = expect_two_numbers("expt", args)?;
-            if exponent < 0 {
-                return Err(EvalError::InvalidArgument {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
                     name: "expt",
-                    message: "expected a non-negative exponent",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
                 });
             }
 
-            base.checked_pow(exponent as u32).map(Value::Integer).ok_or(
-                EvalError::InvalidArgument {
-                    name: "expt",
-                    message: "overflow",
-                },
-            )
+            let base = expect_number("expt", &args[0])?;
+            let exponent = expect_exact_integer("expt", &args[1])?;
+            Ok(Value::Number(base.expt(exponent, "expt")?))
         }
         "write" => {
             if args.len() != 1 {
@@ -1650,7 +1722,7 @@ fn apply_builtin(
         }
         "zero?" => {
             let number = expect_number_arg("zero?", args)?;
-            Ok(Value::Boolean(number == 0))
+            Ok(Value::Boolean(number.is_zero()))
         }
         _ => Err(EvalError::UnknownProcedure {
             name: name.to_string(),
@@ -1661,7 +1733,7 @@ fn apply_builtin(
 fn compare_numbers(
     name: &'static str,
     args: &[Value],
-    predicate: impl Fn(i64, i64) -> bool,
+    predicate: impl Fn(&Number, &Number) -> bool,
 ) -> Result<Value, EvalError> {
     let numbers = extract_numbers(name, args)?;
     if numbers.len() < 2 {
@@ -1672,7 +1744,7 @@ fn compare_numbers(
         });
     }
 
-    let is_match = numbers.windows(2).all(|pair| predicate(pair[0], pair[1]));
+    let is_match = numbers.windows(2).all(|pair| predicate(&pair[0], &pair[1]));
 
     Ok(Value::Boolean(is_match))
 }
@@ -1723,10 +1795,10 @@ fn compare_strings(
     ))
 }
 
-fn extract_numbers(name: &'static str, args: &[Value]) -> Result<Vec<i64>, EvalError> {
+fn extract_numbers(name: &'static str, args: &[Value]) -> Result<Vec<Number>, EvalError> {
     args.iter()
         .map(|value| match value {
-            Value::Integer(number) => Ok(*number),
+            Value::Number(number) => Ok(number.clone()),
             other => Err(EvalError::ExpectedNumber {
                 name,
                 found: other.type_name(),
@@ -1735,7 +1807,17 @@ fn extract_numbers(name: &'static str, args: &[Value]) -> Result<Vec<i64>, EvalE
         .collect()
 }
 
-fn expect_two_numbers(name: &'static str, args: &[Value]) -> Result<(i64, i64), EvalError> {
+fn expect_number(name: &'static str, value: &Value) -> Result<Number, EvalError> {
+    match value {
+        Value::Number(number) => Ok(number.clone()),
+        other => Err(EvalError::ExpectedNumber {
+            name,
+            found: other.type_name(),
+        }),
+    }
+}
+
+fn expect_two_exact_integers(name: &'static str, args: &[Value]) -> Result<(i64, i64), EvalError> {
     if args.len() != 2 {
         return Err(EvalError::WrongArgCount {
             name,
@@ -1744,29 +1826,13 @@ fn expect_two_numbers(name: &'static str, args: &[Value]) -> Result<(i64, i64), 
         });
     }
 
-    let left = match args[0] {
-        Value::Integer(number) => number,
-        ref other => {
-            return Err(EvalError::ExpectedNumber {
-                name,
-                found: other.type_name(),
-            });
-        }
-    };
-    let right = match args[1] {
-        Value::Integer(number) => number,
-        ref other => {
-            return Err(EvalError::ExpectedNumber {
-                name,
-                found: other.type_name(),
-            });
-        }
-    };
+    let left = expect_exact_integer(name, &args[0])?;
+    let right = expect_exact_integer(name, &args[1])?;
 
     Ok((left, right))
 }
 
-fn expect_number_arg(name: &'static str, args: &[Value]) -> Result<i64, EvalError> {
+fn expect_number_arg(name: &'static str, args: &[Value]) -> Result<Number, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name,
@@ -1775,13 +1841,39 @@ fn expect_number_arg(name: &'static str, args: &[Value]) -> Result<i64, EvalErro
         });
     }
 
-    match args[0] {
-        Value::Integer(number) => Ok(number),
-        ref other => Err(EvalError::ExpectedNumber {
+    expect_number(name, &args[0])
+}
+
+fn expect_exact_number_arg(name: &'static str, args: &[Value]) -> Result<Number, EvalError> {
+    let number = expect_number_arg(name, args)?;
+    if number.is_exact() {
+        Ok(number)
+    } else {
+        Err(EvalError::InvalidArgument {
             name,
-            found: other.type_name(),
-        }),
+            message: "expected an exact number",
+        })
     }
+}
+
+fn expect_exact_integer(name: &'static str, value: &Value) -> Result<i64, EvalError> {
+    let number = expect_number(name, value)?;
+    number.as_exact_integer().ok_or(EvalError::InvalidArgument {
+        name,
+        message: "expected an exact integer",
+    })
+}
+
+fn expect_exact_integer_arg(name: &'static str, args: &[Value]) -> Result<i64, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exactly 1 argument",
+            got: args.len(),
+        });
+    }
+
+    expect_exact_integer(name, &args[0])
 }
 
 fn expect_string(name: &'static str, value: &Value) -> Result<SchemeString, EvalError> {
@@ -1847,15 +1939,7 @@ fn expect_symbol_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a st
 }
 
 fn expect_index(name: &'static str, value: &Value, len: usize) -> Result<usize, EvalError> {
-    let index = match value {
-        Value::Integer(index) => *index,
-        other => {
-            return Err(EvalError::ExpectedNumber {
-                name,
-                found: other.type_name(),
-            });
-        }
-    };
+    let index = expect_exact_integer(name, value)?;
 
     if index < 0 || index as usize >= len {
         return Err(EvalError::IndexOutOfBounds { name, index });
@@ -1869,15 +1953,7 @@ fn expect_index_inclusive_end(
     value: &Value,
     len: usize,
 ) -> Result<usize, EvalError> {
-    let index = match value {
-        Value::Integer(index) => *index,
-        other => {
-            return Err(EvalError::ExpectedNumber {
-                name,
-                found: other.type_name(),
-            });
-        }
-    };
+    let index = expect_exact_integer(name, value)?;
 
     if index < 0 || index as usize > len {
         return Err(EvalError::IndexOutOfBounds { name, index });
@@ -1956,7 +2032,7 @@ fn pair_first(value: &Value) -> Option<&Value> {
 
 fn eq_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.numeric_eq(right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
@@ -1970,7 +2046,7 @@ fn eq_values(left: &Value, right: &Value) -> bool {
 
 fn equal_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.numeric_eq(right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::String(left), Value::String(right)) => {
             left.to_plain_string() == right.to_plain_string()

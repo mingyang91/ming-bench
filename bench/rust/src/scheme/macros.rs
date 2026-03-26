@@ -1,4 +1,4 @@
-use super::{EnvRef, EvalError, Expr};
+use super::{number::Number, EnvRef, EvalError, Expr};
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -28,7 +28,7 @@ enum PatternBinding {
 
 #[derive(Debug, Clone)]
 enum SyntaxExpr {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     Char(char),
     String(String),
@@ -295,7 +295,7 @@ impl MacroExpander {
         macro_name: &str,
     ) -> Result<SyntaxExpr, EvalError> {
         Ok(match template {
-            Expr::Integer(value) => SyntaxExpr::Integer(*value),
+            Expr::Number(value) => SyntaxExpr::Number(value.clone()),
             Expr::Boolean(value) => SyntaxExpr::Boolean(*value),
             Expr::Char(value) => SyntaxExpr::Char(*value),
             Expr::String(value) => SyntaxExpr::String(value.clone()),
@@ -666,7 +666,7 @@ fn match_pattern(
     context: &PatternContext<'_>,
 ) -> Option<HashMap<String, PatternBinding>> {
     match (pattern, input) {
-        (Expr::Integer(left), Expr::Integer(right)) if left == right => Some(HashMap::new()),
+        (Expr::Number(left), Expr::Number(right)) if left == right => Some(HashMap::new()),
         (Expr::Boolean(left), Expr::Boolean(right)) if left == right => Some(HashMap::new()),
         (Expr::Char(left), Expr::Char(right)) if left == right => Some(HashMap::new()),
         (Expr::String(left), Expr::String(right)) if left == right => Some(HashMap::new()),
@@ -840,7 +840,7 @@ fn collect_repeated_bindings(
 
 fn syntax_from_use_expr(expr: &Expr) -> SyntaxExpr {
     match expr {
-        Expr::Integer(value) => SyntaxExpr::Integer(*value),
+        Expr::Number(value) => SyntaxExpr::Number(value.clone()),
         Expr::Boolean(value) => SyntaxExpr::Boolean(*value),
         Expr::Char(value) => SyntaxExpr::Char(*value),
         Expr::String(value) => SyntaxExpr::String(value.clone()),
@@ -854,7 +854,7 @@ fn syntax_from_use_expr(expr: &Expr) -> SyntaxExpr {
 
 fn expr_from_syntax(expr: SyntaxExpr) -> Expr {
     match expr {
-        SyntaxExpr::Integer(value) => Expr::Integer(value),
+        SyntaxExpr::Number(value) => Expr::Number(value),
         SyntaxExpr::Boolean(value) => Expr::Boolean(value),
         SyntaxExpr::Char(value) => Expr::Char(value),
         SyntaxExpr::String(value) => Expr::String(value),
