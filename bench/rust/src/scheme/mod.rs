@@ -3,9 +3,17 @@ pub mod error;
 pub use error::EvalError;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn gensym(base: &str) -> String {
+    let n = GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("#{}#{}", base, n)
+}
 
 thread_local! {
     static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
@@ -84,6 +92,15 @@ impl fmt::Display for Span {
     }
 }
 
+// ── Macros ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct SyntaxRulesMacro {
+    literals: Vec<String>,
+    rules: Vec<(Expr, Expr)>, // (pattern, template) pairs
+    def_env: Env,
+}
+
 // ── Values ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -97,6 +114,7 @@ pub enum Value {
     Pair(Box<Value>, Box<Value>),
     Lambda(Vec<String>, Option<String>, Vec<Expr>, Env),
     Builtin(String),
+    Macro(SyntaxRulesMacro),
     Void,
 }
 
@@ -111,6 +129,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Void, Value::Void) => true,
+            (Value::Macro(_), Value::Macro(_)) => false,
             _ => false,
         }
     }
@@ -141,6 +160,7 @@ impl fmt::Display for Value {
             }
             Value::Lambda(..) => write!(f, "#<procedure>"),
             Value::Builtin(..) => write!(f, "#<procedure>"),
+            Value::Macro(_) => write!(f, "#<macro>"),
             Value::Void => Ok(()),
         }
     }
@@ -456,6 +476,7 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "string-copy" => return eval_string_copy(&items[1..], env),
                     "string-set!" => return eval_string_set(&items[1..], env),
                     "set!" => return eval_set(&items[1..], env),
+                    "define-syntax" => return eval_define_syntax(&items[1..], env),
                     "eq?" | "equal?" | "abs" | "modulo" | "remainder" | "quotient"
                     | "min" | "max" | "expt" | "zero?" | "positive?" | "negative?"
                     | "odd?" | "even?" | "list-ref" | "list-tail" | "list?" | "assoc"
@@ -468,6 +489,12 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         return apply_builtin(op, &args?);
                     }
                     _ => {}
+                }
+            }
+            // Check for macro invocation
+            if let ExprKind::Symbol(op) = &items[0].kind {
+                if let Some(Value::Macro(mac)) = env.get(op) {
+                    return expand_and_eval_macro(&mac, items, env);
                 }
             }
             // Function application
@@ -1475,6 +1502,231 @@ fn eval_string_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         env.set(var_name, Value::Str(new_s));
     }
     Ok(Value::Void)
+}
+
+// ── Macros (define-syntax / syntax-rules) ───────────────────────────
+
+fn eval_define_syntax(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("define-syntax requires exactly 2 arguments".into()));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Parse("define-syntax: name must be a symbol".into())),
+    };
+    let sr = match &args[1].kind {
+        ExprKind::List(items) => items,
+        _ => return Err(EvalError::Parse("define-syntax: expected syntax-rules".into())),
+    };
+    if sr.is_empty() || !matches!(&sr[0].kind, ExprKind::Symbol(s) if s == "syntax-rules") {
+        return Err(EvalError::Parse("define-syntax: expected syntax-rules".into()));
+    }
+    if sr.len() < 2 {
+        return Err(EvalError::Parse("syntax-rules: expected literals list".into()));
+    }
+    let literals = match &sr[1].kind {
+        ExprKind::List(lits) => lits.iter().map(|l| match &l.kind {
+            ExprKind::Symbol(s) => Ok(s.clone()),
+            _ => Err(EvalError::Parse("syntax-rules: literals must be symbols".into())),
+        }).collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(EvalError::Parse("syntax-rules: expected literals list".into())),
+    };
+    let mut rules = Vec::new();
+    for rule in &sr[2..] {
+        match &rule.kind {
+            ExprKind::List(parts) if parts.len() == 2 => {
+                rules.push((parts[0].clone(), parts[1].clone()));
+            }
+            _ => return Err(EvalError::Parse("syntax-rules: each rule must be (pattern template)".into())),
+        }
+    }
+    env.set(name, Value::Macro(SyntaxRulesMacro {
+        literals,
+        rules,
+        def_env: env.clone(),
+    }));
+    Ok(Value::Void)
+}
+
+#[derive(Debug, Clone)]
+struct MacroBindings {
+    single: HashMap<String, Expr>,
+    ellipsis: HashMap<String, Vec<Expr>>,
+}
+
+fn match_macro_pattern(pattern: &Expr, input: &[Expr], literals: &[String]) -> Option<MacroBindings> {
+    let pat_items = match &pattern.kind {
+        ExprKind::List(items) => items,
+        _ => return None,
+    };
+    // Skip first element (macro name) in both
+    let pat = &pat_items[1..];
+    let inp = &input[1..];
+    let mut bindings = MacroBindings { single: HashMap::new(), ellipsis: HashMap::new() };
+    if match_pat_elements(pat, inp, literals, &mut bindings) {
+        Some(bindings)
+    } else {
+        None
+    }
+}
+
+fn match_pat_elements(pat: &[Expr], inp: &[Expr], literals: &[String], bindings: &mut MacroBindings) -> bool {
+    let ellipsis_pos = pat.iter().position(|p| matches!(&p.kind, ExprKind::Symbol(s) if s == "..."));
+
+    if let Some(epos) = ellipsis_pos {
+        if epos == 0 { return false; }
+        let before = &pat[..epos - 1];
+        let ellipsis_var = &pat[epos - 1];
+        let after = &pat[epos + 1..];
+        let min_len = before.len() + after.len();
+        if inp.len() < min_len { return false; }
+
+        for (p, i) in before.iter().zip(inp.iter()) {
+            if !match_pat_single(p, i, literals, bindings) { return false; }
+        }
+        let ellipsis_start = before.len();
+        let ellipsis_end = inp.len() - after.len();
+        if let ExprKind::Symbol(var_name) = &ellipsis_var.kind {
+            bindings.ellipsis.insert(var_name.clone(), inp[ellipsis_start..ellipsis_end].to_vec());
+        } else {
+            return false;
+        }
+        for (p, i) in after.iter().zip(inp[ellipsis_end..].iter()) {
+            if !match_pat_single(p, i, literals, bindings) { return false; }
+        }
+        true
+    } else {
+        if pat.len() != inp.len() { return false; }
+        for (p, i) in pat.iter().zip(inp.iter()) {
+            if !match_pat_single(p, i, literals, bindings) { return false; }
+        }
+        true
+    }
+}
+
+fn match_pat_single(pat: &Expr, inp: &Expr, literals: &[String], bindings: &mut MacroBindings) -> bool {
+    match &pat.kind {
+        ExprKind::Symbol(s) if s == "_" => true,
+        ExprKind::Symbol(s) if literals.contains(s) => {
+            matches!(&inp.kind, ExprKind::Symbol(s2) if s == s2)
+        }
+        ExprKind::Symbol(s) => {
+            bindings.single.insert(s.clone(), inp.clone());
+            true
+        }
+        ExprKind::List(pat_items) => {
+            match &inp.kind {
+                ExprKind::List(inp_items) => match_pat_elements(pat_items, inp_items, literals, bindings),
+                _ => false,
+            }
+        }
+        ExprKind::Integer(n) => matches!(&inp.kind, ExprKind::Integer(m) if n == m),
+        ExprKind::Boolean(b) => matches!(&inp.kind, ExprKind::Boolean(c) if b == c),
+        ExprKind::Str(s) => matches!(&inp.kind, ExprKind::Str(t) if s == t),
+        ExprKind::Char(c) => matches!(&inp.kind, ExprKind::Char(d) if c == d),
+    }
+}
+
+fn collect_pattern_vars(pattern: &Expr) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    collect_pattern_vars_inner(pattern, &mut vars);
+    vars
+}
+
+fn collect_pattern_vars_inner(expr: &Expr, vars: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Symbol(s) if s != "..." && s != "_" => { vars.insert(s.clone()); }
+        ExprKind::List(items) => { for item in items { collect_pattern_vars_inner(item, vars); } }
+        _ => {}
+    }
+}
+
+fn collect_template_free_vars(template: &Expr, pattern_vars: &HashSet<String>, free: &mut HashSet<String>) {
+    match &template.kind {
+        ExprKind::Symbol(s) if s != "..." && !pattern_vars.contains(s) => { free.insert(s.clone()); }
+        ExprKind::List(items) => { for item in items { collect_template_free_vars(item, pattern_vars, free); } }
+        _ => {}
+    }
+}
+
+fn find_ellipsis_var(expr: &Expr, ellipsis_vars: &HashMap<String, Vec<Expr>>) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Symbol(s) if ellipsis_vars.contains_key(s) => Some(s.clone()),
+        ExprKind::List(items) => {
+            for item in items {
+                if let Some(v) = find_ellipsis_var(item, ellipsis_vars) { return Some(v); }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn expand_template(template: &Expr, bindings: &MacroBindings, gensym_map: &HashMap<String, String>) -> Expr {
+    match &template.kind {
+        ExprKind::Symbol(s) => {
+            if let Some(expr) = bindings.single.get(s) {
+                expr.clone()
+            } else if let Some(gs) = gensym_map.get(s) {
+                Expr { kind: ExprKind::Symbol(gs.clone()), span: template.span }
+            } else {
+                template.clone()
+            }
+        }
+        ExprKind::List(items) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < items.len() {
+                if i + 1 < items.len() && matches!(&items[i + 1].kind, ExprKind::Symbol(s) if s == "...") {
+                    // Ellipsis expansion
+                    if let Some(var_name) = find_ellipsis_var(&items[i], &bindings.ellipsis) {
+                        let values = &bindings.ellipsis[&var_name];
+                        for v in values {
+                            let mut sub_bindings = bindings.clone();
+                            sub_bindings.single.insert(var_name.clone(), v.clone());
+                            result.push(expand_template(&items[i], &sub_bindings, gensym_map));
+                        }
+                    }
+                    i += 2;
+                } else {
+                    result.push(expand_template(&items[i], bindings, gensym_map));
+                    i += 1;
+                }
+            }
+            Expr { kind: ExprKind::List(result), span: template.span }
+        }
+        _ => template.clone(),
+    }
+}
+
+fn expand_and_eval_macro(mac: &SyntaxRulesMacro, input: &[Expr], use_env: &Env) -> Result<Value, EvalError> {
+    for (pattern, template) in &mac.rules {
+        if let Some(bindings) = match_macro_pattern(pattern, input, &mac.literals) {
+            let pattern_vars = collect_pattern_vars(pattern);
+            let mut free_vars = HashSet::new();
+            collect_template_free_vars(template, &pattern_vars, &mut free_vars);
+
+            // Gensym free vars that are bound in definition env (hygiene)
+            let mut gensym_map = HashMap::new();
+            for fv in &free_vars {
+                if mac.def_env.get(fv).is_some() {
+                    gensym_map.insert(fv.clone(), gensym(fv));
+                }
+            }
+
+            let expanded = expand_template(template, &bindings, &gensym_map);
+
+            // Inject definition-site bindings for gensymed vars
+            for (orig, gs) in &gensym_map {
+                if let Some(val) = mac.def_env.get(orig) {
+                    use_env.set(gs.clone(), val);
+                }
+            }
+
+            return eval(&expanded, use_env);
+        }
+    }
+    Err(EvalError::Generic("no matching syntax-rules pattern".into()))
 }
 
 fn seed_builtins(env: &Env) {
