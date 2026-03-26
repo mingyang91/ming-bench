@@ -153,6 +153,7 @@ struct NativeProcedure {
 struct ContinuationProcedure {
     continuation: ContinuationRef,
     winders: Winders,
+    handlers: ExceptionHandlers,
 }
 
 #[derive(Clone)]
@@ -162,6 +163,8 @@ enum NativeProcedureKind {
     ForEach,
     CallCc,
     DynamicWind,
+    Raise,
+    WithExceptionHandler,
     RecordConstructor(Rc<RecordType>),
     RecordPredicate(Rc<RecordType>),
     RecordAccessor {
@@ -200,6 +203,8 @@ type BindingCell = Rc<RefCell<Value>>;
 
 type Winders = Option<WindFrameRef>;
 type WindFrameRef = Rc<WindFrame>;
+type ExceptionHandlers = Option<ExceptionHandlerRef>;
+type ExceptionHandlerRef = Rc<ExceptionHandlerFrame>;
 
 #[derive(Clone)]
 struct WindFrame {
@@ -207,6 +212,12 @@ struct WindFrame {
     in_thunk: Value,
     out_thunk: Value,
     parent: Winders,
+}
+
+#[derive(Clone)]
+struct ExceptionHandlerFrame {
+    handler: Value,
+    parent: ExceptionHandlers,
 }
 
 #[derive(Clone)]
@@ -242,6 +253,7 @@ struct MacroTransformer {
 struct EvalState {
     syntax_rules: HashMap<String, MacroTransformer>,
     next_unique: u64,
+    current_handlers: ExceptionHandlers,
 }
 
 enum TailAction {
@@ -319,6 +331,9 @@ enum ContinuationFrame {
     DynamicWindExit {
         result: Value,
     },
+    WithExceptionHandler {
+        previous_handlers: ExceptionHandlers,
+    },
     WindTransition {
         value: Value,
         target_continuation: ContinuationRef,
@@ -342,6 +357,7 @@ impl EvalState {
         Self {
             syntax_rules: HashMap::new(),
             next_unique: 1,
+            current_handlers: None,
         }
     }
 
@@ -772,6 +788,14 @@ fn create_global_env() -> Environment {
     env.define(
         "dynamic-wind",
         native("dynamic-wind", NativeProcedureKind::DynamicWind),
+    );
+    env.define("raise", native("raise", NativeProcedureKind::Raise));
+    env.define(
+        "with-exception-handler",
+        native(
+            "with-exception-handler",
+            NativeProcedureKind::WithExceptionHandler,
+        ),
     );
     env.define("eq?", builtin("eq?", builtin_eq));
     env.define("eqv?", builtin("eqv?", builtin_eqv));
@@ -1409,6 +1433,10 @@ fn run_machine(
                     ContinuationFrame::DynamicWindExit { result } => {
                         control = MachineControl::Value(result);
                     }
+                    ContinuationFrame::WithExceptionHandler { previous_handlers } => {
+                        state.current_handlers = previous_handlers;
+                        control = MachineControl::Value(value);
+                    }
                     ContinuationFrame::WindTransition {
                         value,
                         target_continuation,
@@ -1474,6 +1502,7 @@ fn continue_with_application(
         ),
         ProcedureValue::Continuation(procedure) => {
             expect_exact_args("continuation", &args, loc, 1)?;
+            state.current_handlers = procedure.handlers.clone();
             let (outs, ins) = compute_wind_transition(current_winders, &procedure.winders);
             continue_wind_transition(
                 args[0].value.clone(),
@@ -1643,6 +1672,7 @@ fn continue_with_native_procedure(
                 ContinuationProcedure {
                     continuation: continuation.clone(),
                     winders: current_winders.clone(),
+                    handlers: state.current_handlers.clone(),
                 },
             )));
 
@@ -1686,6 +1716,56 @@ fn continue_with_native_procedure(
                 current_winders,
                 state,
             )
+        }
+        NativeProcedureKind::Raise => {
+            expect_exact_args(&procedure.name, &args, loc, 1)?;
+            let Some(handler_frame) = state.current_handlers.clone() else {
+                return Err(err_at(
+                    loc,
+                    format!("uncaught exception {}", format_value(&args[0].value)),
+                ));
+            };
+
+            state.current_handlers = handler_frame.parent.clone();
+            continue_with_application(
+                handler_frame.handler.clone(),
+                vec![args[0].clone()],
+                args[0].expr.loc,
+                continuation,
+                current_winders,
+                state,
+            )
+        }
+        NativeProcedureKind::WithExceptionHandler => {
+            expect_exact_args(&procedure.name, &args, loc, 2)?;
+
+            let previous_handlers = state.current_handlers.clone();
+            state.current_handlers = Some(Rc::new(ExceptionHandlerFrame {
+                handler: args[0].value.clone(),
+                parent: previous_handlers.clone(),
+            }));
+
+            let next_continuation = push_continuation(
+                &continuation,
+                ContinuationFrame::WithExceptionHandler {
+                    previous_handlers: previous_handlers.clone(),
+                },
+            );
+
+            match continue_with_application(
+                args[1].value.clone(),
+                Vec::new(),
+                args[1].expr.loc,
+                next_continuation,
+                current_winders,
+                state,
+            ) {
+                Ok(next) => Ok(next),
+                Err(error) => {
+                    state.current_handlers = previous_handlers;
+                    Err(error)
+                }
+            }
         }
         NativeProcedureKind::RecordConstructor(type_info) => {
             expect_exact_args(&procedure.name, &args, loc, type_info.field_count)?;
@@ -1787,6 +1867,7 @@ fn desugar_special_form(
         "letrec*" => Ok(Some(desugar_letrec(args, head_loc, state, true)?)),
         "case" => Ok(Some(desugar_case(args, head_loc, state)?)),
         "do" => Ok(Some(desugar_do(args, head_loc, state)?)),
+        "guard" => Ok(Some(desugar_guard(args, head_loc, state)?)),
         _ => Ok(None),
     }
 }
@@ -2227,6 +2308,195 @@ fn desugar_do(
             let_bindings,
             if_expr,
         ],
+        head_loc,
+    ))
+}
+
+fn desugar_guard(
+    args: &[Expr],
+    head_loc: SourceLoc,
+    state: &mut EvalState,
+) -> Result<Expr, EvalError> {
+    if args.len() < 2 {
+        return Err(err_at(head_loc, "guard expects a clause list and a body"));
+    }
+
+    let Some(spec_parts) = expr_list(&args[0]) else {
+        return Err(err_at(
+            args[0].loc,
+            "guard expects a clause list and a body",
+        ));
+    };
+
+    let Some((variable_expr, clauses)) = spec_parts.split_first() else {
+        return Err(err_at(
+            args[0].loc,
+            "guard expects a variable and at least 1 clause",
+        ));
+    };
+
+    let variable =
+        expect_bindable_identifier(variable_expr, "guard variable must be a symbol")?;
+    let guard_tag = state.fresh_identifier("guard-tag");
+    let guard_exit = state.fresh_identifier("guard-exit");
+    let guard_result = state.fresh_identifier("guard-result");
+    let raised_value = state.fresh_identifier("guard-raised");
+
+    let has_else = clauses.iter().any(|clause| {
+        expr_list(clause)
+            .and_then(|parts| parts.first())
+            .and_then(expr_plain_symbol)
+            == Some("else")
+    });
+
+    let mut cond_clauses = clauses.to_vec();
+    if !has_else {
+        cond_clauses.push(list_expr(
+            vec![
+                plain_symbol_expr("else", head_loc),
+                list_expr(
+                    vec![
+                        plain_symbol_expr("raise", head_loc),
+                        identifier_expr(variable.clone(), variable_expr.loc),
+                    ],
+                    head_loc,
+                ),
+            ],
+            head_loc,
+        ));
+    }
+
+    let cond_expr = list_expr(
+        std::iter::once(plain_symbol_expr("cond", head_loc))
+            .chain(cond_clauses)
+            .collect(),
+        head_loc,
+    );
+
+    let bind_exception = list_expr(
+        vec![
+            plain_symbol_expr("lambda", head_loc),
+            list_expr(vec![identifier_expr(variable, variable_expr.loc)], head_loc),
+            cond_expr,
+        ],
+        head_loc,
+    );
+
+    let handled_value = list_expr(
+        vec![
+            bind_exception,
+            list_expr(
+                vec![
+                    plain_symbol_expr("cdr", head_loc),
+                    identifier_expr(guard_result.clone(), head_loc),
+                ],
+                head_loc,
+            ),
+        ],
+        head_loc,
+    );
+
+    let handler = list_expr(
+        vec![
+            plain_symbol_expr("lambda", head_loc),
+            list_expr(vec![identifier_expr(raised_value.clone(), head_loc)], head_loc),
+            list_expr(
+                vec![
+                    identifier_expr(guard_exit.clone(), head_loc),
+                    list_expr(
+                        vec![
+                            plain_symbol_expr("cons", head_loc),
+                            identifier_expr(guard_tag.clone(), head_loc),
+                            identifier_expr(raised_value.clone(), head_loc),
+                        ],
+                        head_loc,
+                    ),
+                ],
+                head_loc,
+            ),
+        ],
+        head_loc,
+    );
+
+    let thunk = list_expr(
+        std::iter::once(plain_symbol_expr("lambda", head_loc))
+            .chain(std::iter::once(list_expr(Vec::new(), head_loc)))
+            .chain(args[1..].iter().cloned())
+            .collect(),
+        head_loc,
+    );
+
+    let result_is_exception = make_and_expr(
+        &[
+            list_expr(
+                vec![
+                    plain_symbol_expr("pair?", head_loc),
+                    identifier_expr(guard_result.clone(), head_loc),
+                ],
+                head_loc,
+            ),
+            list_expr(
+                vec![
+                    plain_symbol_expr("eq?", head_loc),
+                    list_expr(
+                        vec![
+                            plain_symbol_expr("car", head_loc),
+                            identifier_expr(guard_result.clone(), head_loc),
+                        ],
+                        head_loc,
+                    ),
+                    identifier_expr(guard_tag.clone(), head_loc),
+                ],
+                head_loc,
+            ),
+        ],
+        head_loc,
+        state,
+    );
+
+    let callcc_expr = list_expr(
+        vec![
+            plain_symbol_expr("call/cc", head_loc),
+            list_expr(
+                vec![
+                    plain_symbol_expr("lambda", head_loc),
+                    list_expr(vec![identifier_expr(guard_exit, head_loc)], head_loc),
+                    list_expr(
+                        vec![
+                            plain_symbol_expr("with-exception-handler", head_loc),
+                            handler,
+                            thunk,
+                        ],
+                        head_loc,
+                    ),
+                ],
+                head_loc,
+            ),
+        ],
+        head_loc,
+    );
+
+    let result_dispatch = list_expr(
+        vec![
+            plain_symbol_expr("if", head_loc),
+            result_is_exception,
+            handled_value,
+            identifier_expr(guard_result.clone(), head_loc),
+        ],
+        head_loc,
+    );
+
+    Ok(wrap_with_temp_binding(
+        guard_tag,
+        list_expr(
+            vec![
+                plain_symbol_expr("lambda", head_loc),
+                list_expr(Vec::new(), head_loc),
+                boolean_expr(false, head_loc),
+            ],
+            head_loc,
+        ),
+        wrap_with_temp_binding(guard_result, callcc_expr, result_dispatch, head_loc),
         head_loc,
     ))
 }
@@ -2680,7 +2950,14 @@ fn evaluate_tail(
                             return Ok(Value::Void);
                         }
                         "do" => return eval_do(args, head, &env, state),
-                        _ => {}
+                        _ => {
+                            if let Some(desugared) =
+                                desugar_special_form(symbol, args, head.loc, state)?
+                            {
+                                expr = desugared;
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -3318,8 +3595,9 @@ fn apply_procedure_action(
             let call_env = bind_closure_arguments(&procedure, args, loc)?;
             prepare_tail_sequence(&procedure.body, &call_env, state)
         }
-        ProcedureValue::Continuation(_) => {
+        ProcedureValue::Continuation(procedure) => {
             expect_exact_args("continuation", args, loc, 1)?;
+            state.current_handlers = procedure.handlers.clone();
             Ok(TailAction::Return(args[0].value.clone()))
         }
     }
@@ -3445,6 +3723,7 @@ fn apply_native_procedure(
                         ContinuationProcedure {
                             continuation: done_continuation(),
                             winders: None,
+                            handlers: state.current_handlers.clone(),
                         },
                     ))),
                 }],
@@ -3459,6 +3738,36 @@ fn apply_native_procedure(
             let result = apply_procedure(args[1].value.clone(), &[], args[1].expr.loc, state)?;
             apply_procedure(args[2].value.clone(), &[], args[2].expr.loc, state)?;
             Ok(result)
+        }
+        NativeProcedureKind::Raise => {
+            expect_exact_args(&procedure.name, args, loc, 1)?;
+            let Some(handler_frame) = state.current_handlers.clone() else {
+                return Err(err_at(
+                    loc,
+                    format!("uncaught exception {}", format_value(&args[0].value)),
+                ));
+            };
+
+            state.current_handlers = handler_frame.parent.clone();
+            apply_procedure(
+                handler_frame.handler.clone(),
+                &[args[0].clone()],
+                args[0].expr.loc,
+                state,
+            )
+        }
+        NativeProcedureKind::WithExceptionHandler => {
+            expect_exact_args(&procedure.name, args, loc, 2)?;
+
+            let previous_handlers = state.current_handlers.clone();
+            state.current_handlers = Some(Rc::new(ExceptionHandlerFrame {
+                handler: args[0].value.clone(),
+                parent: previous_handlers.clone(),
+            }));
+
+            let result = apply_procedure(args[1].value.clone(), &[], args[1].expr.loc, state);
+            state.current_handlers = previous_handlers;
+            result
         }
         NativeProcedureKind::RecordConstructor(type_info) => {
             expect_exact_args(&procedure.name, args, loc, type_info.field_count)?;
@@ -5298,6 +5607,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "letrec*"
             | "case"
             | "do"
+            | "guard"
     )
 }
 

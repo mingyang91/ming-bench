@@ -7,6 +7,7 @@ class Runtime {
     syntaxRules = new Map();
     nextUnique = 1;
     windStack = [];
+    exceptionHandlers = [];
     write(value) {
         this.output.push(value);
     }
@@ -40,6 +41,33 @@ class Runtime {
     }
     setWindStack(stack) {
         this.windStack = [...stack];
+    }
+    snapshotExceptionHandlers() {
+        return [...this.exceptionHandlers];
+    }
+    pushExceptionHandler(frame) {
+        this.exceptionHandlers = [...this.exceptionHandlers, frame];
+    }
+    popExceptionHandler() {
+        const popped = this.exceptionHandlers[this.exceptionHandlers.length - 1];
+        this.exceptionHandlers = this.exceptionHandlers.slice(0, -1);
+        return popped;
+    }
+    popExceptionHandlerFrame(frame) {
+        if (this.exceptionHandlers[this.exceptionHandlers.length - 1] === frame) {
+            this.exceptionHandlers = this.exceptionHandlers.slice(0, -1);
+        }
+    }
+    setExceptionHandlers(stack) {
+        this.exceptionHandlers = [...stack];
+    }
+}
+class RaisedSignal {
+    value;
+    loc;
+    constructor(value, loc) {
+        this.value = value;
+        this.loc = loc;
     }
 }
 class Environment {
@@ -780,6 +808,7 @@ function createGlobalEnv(runtime) {
                 name: 'continuation',
                 resume: cont,
                 windStack: runtime.snapshotWindStack(),
+                handlerStack: runtime.snapshotExceptionHandlers(),
             };
             return applyProcedure(args[0].value, [{ expr: plainSymbolExpr(name, loc), value: continuation }], loc, runtime, cont);
         }));
@@ -803,6 +832,30 @@ function createGlobalEnv(runtime) {
                 runtime.popWindFrame();
                 return invokeThunk(frame.outThunk, frame.outLoc, runtime, (_ignoredOut) => cont(value));
             });
+        });
+    }));
+    env.define('raise', controlBuiltin('raise', (args, loc, _runtime, _cont) => {
+        if (args.length !== 1) {
+            throw new EvalError(`${loc.line}:${loc.col}: raise expects exactly 1 argument`);
+        }
+        throw new RaisedSignal(args[0].value, loc);
+    }));
+    env.define('with-exception-handler', controlBuiltin('with-exception-handler', (args, loc, runtime, cont) => {
+        if (args.length !== 2) {
+            throw new EvalError(`${loc.line}:${loc.col}: with-exception-handler expects exactly 2 arguments`);
+        }
+        const frame = {
+            kind: 'procedure',
+            handler: expectProcedureArg(args[0]),
+            cont,
+            windStack: runtime.snapshotWindStack(),
+            loc,
+        };
+        const thunk = expectProcedureArg(args[1]);
+        runtime.pushExceptionHandler(frame);
+        return invokeThunk(thunk, args[1].expr, runtime, (value) => {
+            runtime.popExceptionHandlerFrame(frame);
+            return cont(value);
         });
     }));
     env.define('string?', predicateBuiltin('string?', isSchemeStringValue));
@@ -1239,6 +1292,8 @@ function evaluateList(expr, env, runtime, cont) {
                 return evalCase(args, head, env, runtime, cont);
             case 'do':
                 return evalDo(args, head, env, runtime, cont);
+            case 'guard':
+                return evalGuard(args, head, env, runtime, cont);
         }
     }
     return makeEvalAction(head, env, (operator) => (evaluateArguments(args, env, (evaluatedArgs) => (applyProcedure(operator, evaluatedArgs, head, runtime, cont)))));
@@ -1647,6 +1702,55 @@ function evalDoSteps(cells, loopEnv, cont, index = 0, values = []) {
     }
     return makeEvalAction(stepExpr, loopEnv, (value) => (evalDoSteps(cells, loopEnv, cont, index + 1, [...values, value])));
 }
+function evalGuard(args, head, env, runtime, cont) {
+    if (args.length < 2) {
+        throw new EvalError(`${head.line}:${head.col}: guard expects a clause spec and a body`);
+    }
+    const spec = args[0];
+    if (spec.type !== 'list' || spec.elements.length === 0) {
+        throw new EvalError(`${head.line}:${head.col}: guard expects a variable and clauses`);
+    }
+    const frame = {
+        kind: 'guard',
+        variable: expectBindableSymbol(spec.elements[0], 'guard variable must be a symbol'),
+        clauses: spec.elements.slice(1),
+        env,
+        cont,
+        windStack: runtime.snapshotWindStack(),
+        loc: head,
+    };
+    runtime.pushExceptionHandler(frame);
+    return makeSequenceAction(args.slice(1), 0, env, (value) => {
+        runtime.popExceptionHandlerFrame(frame);
+        return cont(value);
+    });
+}
+function evalGuardClauses(clauses, env, signal, cont, index = 0) {
+    if (index >= clauses.length) {
+        throw signal;
+    }
+    const clauseExpr = clauses[index];
+    if (clauseExpr.type !== 'list' || clauseExpr.elements.length === 0) {
+        throw new EvalError(`${clauseExpr.line}:${clauseExpr.col}: guard clauses must be non-empty lists`);
+    }
+    const [testExpr, ...body] = clauseExpr.elements;
+    const isElseClause = testExpr.type === 'symbol' && testExpr.value === 'else';
+    if (isElseClause) {
+        if (index !== clauses.length - 1) {
+            throw new EvalError(`${testExpr.line}:${testExpr.col}: else must be the last guard clause`);
+        }
+        return body.length === 0 ? cont(VOID_VALUE) : makeSequenceAction(body, 0, env, cont);
+    }
+    return makeEvalAction(testExpr, env, (testValue) => {
+        if (!isTruthy(testValue)) {
+            return evalGuardClauses(clauses, env, signal, cont, index + 1);
+        }
+        if (body.length === 0) {
+            return cont(testValue);
+        }
+        return makeSequenceAction(body, 0, env, cont);
+    });
+}
 function applyProcedure(operator, args, loc, runtime, cont) {
     if (!isProcedure(operator)) {
         throw new EvalError(`${loc.line}:${loc.col}: not a procedure`);
@@ -1779,12 +1883,31 @@ function invokeThunk(thunk, loc, runtime, cont) {
     return applyProcedure(thunk, [], loc, runtime, cont);
 }
 function resumeContinuation(continuation, value, runtime) {
+    return switchWindFrames(continuation.windStack, runtime, () => {
+        runtime.setExceptionHandlers(continuation.handlerStack);
+        return continuation.resume(value);
+    });
+}
+function dispatchRaisedSignal(signal, runtime) {
+    const frame = runtime.popExceptionHandler();
+    if (frame === undefined) {
+        throw new EvalError(`${signal.loc.line}:${signal.loc.col}: uncaught exception: ${formatDisplayValue(signal.value)}`);
+    }
+    return switchWindFrames(frame.windStack, runtime, () => {
+        if (frame.kind === 'procedure') {
+            return applyProcedure(frame.handler, [{ expr: plainSymbolExpr('raise', signal.loc), value: signal.value }], frame.loc, runtime, frame.cont);
+        }
+        const handlerEnv = new Environment(frame.env);
+        handlerEnv.define(symbolLookupName(frame.variable), signal.value);
+        return evalGuardClauses(frame.clauses, handlerEnv, signal, frame.cont);
+    });
+}
+function switchWindFrames(targetStack, runtime, cont) {
     const currentStack = runtime.snapshotWindStack();
-    const targetStack = continuation.windStack;
     const sharedLength = sharedWindPrefixLength(currentStack, targetStack);
     return unwindWindFrames(currentStack, sharedLength, runtime, () => (rewindWindFrames(targetStack, sharedLength, runtime, () => {
         runtime.setWindStack(targetStack);
-        return continuation.resume(value);
+        return cont();
     })));
 }
 function sharedWindPrefixLength(left, right) {
@@ -1817,12 +1940,23 @@ function rewindWindFrames(targetStack, sharedLength, runtime, cont, index = shar
 }
 function runMachine(initial, runtime) {
     let action = initial;
-    while (action.action !== 'done') {
-        action = action.action === 'eval'
-            ? evaluateExpr(action.expr, action.env, runtime, action.cont)
-            : stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
+    for (;;) {
+        try {
+            while (action.action !== 'done') {
+                action = action.action === 'eval'
+                    ? evaluateExpr(action.expr, action.env, runtime, action.cont)
+                    : stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
+            }
+            return action.value;
+        }
+        catch (error) {
+            if (error instanceof RaisedSignal) {
+                action = dispatchRaisedSignal(error, runtime);
+                continue;
+            }
+            throw error;
+        }
     }
-    return action.value;
 }
 function finishWithValue(value) {
     return { action: 'done', value };
@@ -2390,6 +2524,7 @@ function isSpecialFormName(name) {
         'letrec*',
         'case',
         'do',
+        'guard',
     ].includes(name);
 }
 function expectSymbolExpr(expr, message) {

@@ -151,6 +151,26 @@ interface WindFrame {
   outLoc: SourceLoc;
 }
 
+interface ProcedureExceptionHandlerFrame {
+  kind: 'procedure';
+  handler: ProcedureValue;
+  cont: Continuation;
+  windStack: WindFrame[];
+  loc: SourceLoc;
+}
+
+interface GuardExceptionHandlerFrame {
+  kind: 'guard';
+  variable: SymbolExpr;
+  clauses: Expr[];
+  env: Environment;
+  cont: Continuation;
+  windStack: WindFrame[];
+  loc: SourceLoc;
+}
+
+type ExceptionHandlerFrame = ProcedureExceptionHandlerFrame | GuardExceptionHandlerFrame;
+
 interface PureBuiltinProcedure {
   kind: 'procedure';
   name: string;
@@ -201,6 +221,7 @@ interface ContinuationProcedure {
   name: 'continuation';
   resume: Continuation;
   windStack: WindFrame[];
+  handlerStack: ExceptionHandlerFrame[];
 }
 
 type BuiltinProcedure = PureBuiltinProcedure | ControlBuiltinProcedure;
@@ -256,6 +277,7 @@ class Runtime {
   private readonly syntaxRules = new Map<string, MacroTransformer>();
   private nextUnique = 1;
   private windStack: WindFrame[] = [];
+  private exceptionHandlers: ExceptionHandlerFrame[] = [];
 
   write(value: string): void {
     this.output.push(value);
@@ -300,6 +322,37 @@ class Runtime {
   setWindStack(stack: WindFrame[]): void {
     this.windStack = [...stack];
   }
+
+  snapshotExceptionHandlers(): ExceptionHandlerFrame[] {
+    return [...this.exceptionHandlers];
+  }
+
+  pushExceptionHandler(frame: ExceptionHandlerFrame): void {
+    this.exceptionHandlers = [...this.exceptionHandlers, frame];
+  }
+
+  popExceptionHandler(): ExceptionHandlerFrame | undefined {
+    const popped = this.exceptionHandlers[this.exceptionHandlers.length - 1];
+    this.exceptionHandlers = this.exceptionHandlers.slice(0, -1);
+    return popped;
+  }
+
+  popExceptionHandlerFrame(frame: ExceptionHandlerFrame): void {
+    if (this.exceptionHandlers[this.exceptionHandlers.length - 1] === frame) {
+      this.exceptionHandlers = this.exceptionHandlers.slice(0, -1);
+    }
+  }
+
+  setExceptionHandlers(stack: ExceptionHandlerFrame[]): void {
+    this.exceptionHandlers = [...stack];
+  }
+}
+
+class RaisedSignal {
+  constructor(
+    readonly value: Value,
+    readonly loc: SourceLoc,
+  ) {}
 }
 
 class Environment {
@@ -1243,6 +1296,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
         name: 'continuation',
         resume: cont,
         windStack: runtime.snapshotWindStack(),
+        handlerStack: runtime.snapshotExceptionHandlers(),
       };
 
       return applyProcedure(
@@ -1277,6 +1331,35 @@ function createGlobalEnv(runtime: Runtime): Environment {
         runtime.popWindFrame();
         return invokeThunk(frame.outThunk, frame.outLoc, runtime, (_ignoredOut) => cont(value));
       });
+    });
+  }));
+
+  env.define('raise', controlBuiltin('raise', (args, loc, _runtime, _cont) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: raise expects exactly 1 argument`);
+    }
+
+    throw new RaisedSignal(args[0].value, loc);
+  }));
+
+  env.define('with-exception-handler', controlBuiltin('with-exception-handler', (args, loc, runtime, cont) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: with-exception-handler expects exactly 2 arguments`);
+    }
+
+    const frame: ProcedureExceptionHandlerFrame = {
+      kind: 'procedure',
+      handler: expectProcedureArg(args[0]),
+      cont,
+      windStack: runtime.snapshotWindStack(),
+      loc,
+    };
+    const thunk = expectProcedureArg(args[1]);
+
+    runtime.pushExceptionHandler(frame);
+    return invokeThunk(thunk, args[1].expr, runtime, (value) => {
+      runtime.popExceptionHandlerFrame(frame);
+      return cont(value);
     });
   }));
 
@@ -1863,6 +1946,8 @@ function evaluateList(
         return evalCase(args, head, env, runtime, cont);
       case 'do':
         return evalDo(args, head, env, runtime, cont);
+      case 'guard':
+        return evalGuard(args, head, env, runtime, cont);
     }
   }
 
@@ -2521,6 +2606,79 @@ function evalDoSteps(
   ));
 }
 
+function evalGuard(
+  args: Expr[],
+  head: SymbolExpr,
+  env: Environment,
+  runtime: Runtime,
+  cont: Continuation,
+): MachineAction {
+  if (args.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: guard expects a clause spec and a body`);
+  }
+
+  const spec = args[0];
+  if (spec.type !== 'list' || spec.elements.length === 0) {
+    throw new EvalError(`${head.line}:${head.col}: guard expects a variable and clauses`);
+  }
+
+  const frame: GuardExceptionHandlerFrame = {
+    kind: 'guard',
+    variable: expectBindableSymbol(spec.elements[0], 'guard variable must be a symbol'),
+    clauses: spec.elements.slice(1),
+    env,
+    cont,
+    windStack: runtime.snapshotWindStack(),
+    loc: head,
+  };
+
+  runtime.pushExceptionHandler(frame);
+  return makeSequenceAction(args.slice(1), 0, env, (value) => {
+    runtime.popExceptionHandlerFrame(frame);
+    return cont(value);
+  });
+}
+
+function evalGuardClauses(
+  clauses: Expr[],
+  env: Environment,
+  signal: RaisedSignal,
+  cont: Continuation,
+  index = 0,
+): MachineAction {
+  if (index >= clauses.length) {
+    throw signal;
+  }
+
+  const clauseExpr = clauses[index];
+  if (clauseExpr.type !== 'list' || clauseExpr.elements.length === 0) {
+    throw new EvalError(`${clauseExpr.line}:${clauseExpr.col}: guard clauses must be non-empty lists`);
+  }
+
+  const [testExpr, ...body] = clauseExpr.elements;
+  const isElseClause = testExpr.type === 'symbol' && testExpr.value === 'else';
+
+  if (isElseClause) {
+    if (index !== clauses.length - 1) {
+      throw new EvalError(`${testExpr.line}:${testExpr.col}: else must be the last guard clause`);
+    }
+
+    return body.length === 0 ? cont(VOID_VALUE) : makeSequenceAction(body, 0, env, cont);
+  }
+
+  return makeEvalAction(testExpr, env, (testValue) => {
+    if (!isTruthy(testValue)) {
+      return evalGuardClauses(clauses, env, signal, cont, index + 1);
+    }
+
+    if (body.length === 0) {
+      return cont(testValue);
+    }
+
+    return makeSequenceAction(body, 0, env, cont);
+  });
+}
+
 function applyProcedure(
   operator: Value,
   args: EvaluatedArg[],
@@ -2737,14 +2895,47 @@ function resumeContinuation(
   value: Value,
   runtime: Runtime,
 ): MachineAction {
+  return switchWindFrames(continuation.windStack, runtime, () => {
+    runtime.setExceptionHandlers(continuation.handlerStack);
+    return continuation.resume(value);
+  });
+}
+
+function dispatchRaisedSignal(signal: RaisedSignal, runtime: Runtime): MachineAction {
+  const frame = runtime.popExceptionHandler();
+  if (frame === undefined) {
+    throw new EvalError(`${signal.loc.line}:${signal.loc.col}: uncaught exception: ${formatDisplayValue(signal.value)}`);
+  }
+
+  return switchWindFrames(frame.windStack, runtime, () => {
+    if (frame.kind === 'procedure') {
+      return applyProcedure(
+        frame.handler,
+        [{ expr: plainSymbolExpr('raise', signal.loc), value: signal.value }],
+        frame.loc,
+        runtime,
+        frame.cont,
+      );
+    }
+
+    const handlerEnv = new Environment(frame.env);
+    handlerEnv.define(symbolLookupName(frame.variable), signal.value);
+    return evalGuardClauses(frame.clauses, handlerEnv, signal, frame.cont);
+  });
+}
+
+function switchWindFrames(
+  targetStack: WindFrame[],
+  runtime: Runtime,
+  cont: () => MachineAction,
+): MachineAction {
   const currentStack = runtime.snapshotWindStack();
-  const targetStack = continuation.windStack;
   const sharedLength = sharedWindPrefixLength(currentStack, targetStack);
 
   return unwindWindFrames(currentStack, sharedLength, runtime, () => (
     rewindWindFrames(targetStack, sharedLength, runtime, () => {
       runtime.setWindStack(targetStack);
-      return continuation.resume(value);
+      return cont();
     })
   ));
 }
@@ -2801,13 +2992,24 @@ function rewindWindFrames(
 function runMachine(initial: MachineAction, runtime: Runtime): Value {
   let action = initial;
 
-  while (action.action !== 'done') {
-    action = action.action === 'eval'
-      ? evaluateExpr(action.expr, action.env, runtime, action.cont)
-      : stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
-  }
+  for (;;) {
+    try {
+      while (action.action !== 'done') {
+        action = action.action === 'eval'
+          ? evaluateExpr(action.expr, action.env, runtime, action.cont)
+          : stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
+      }
 
-  return action.value;
+      return action.value;
+    } catch (error) {
+      if (error instanceof RaisedSignal) {
+        action = dispatchRaisedSignal(error, runtime);
+        continue;
+      }
+
+      throw error;
+    }
+  }
 }
 
 function finishWithValue(value: Value): MachineAction {
@@ -3570,6 +3772,7 @@ function isSpecialFormName(name: string): boolean {
     'letrec*',
     'case',
     'do',
+    'guard',
   ].includes(name);
 }
 
