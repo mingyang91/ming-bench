@@ -701,27 +701,28 @@ impl RecordProcedure {
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let (result, _) = eval_str_with_output(input)?;
-    Ok(result)
+    let (result, _) = eval_value_with_output_and_limit(input, None)?;
+    Ok(result.render())
 }
 
 /// Evaluate Scheme expressions with a maximum number of evaluation
 /// dispatches.
 pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
-    let (result, _) = eval_str_with_output_and_limit(input, Some(max_steps))?;
-    Ok(result)
+    let (result, _) = eval_value_with_output_and_limit(input, Some(max_steps))?;
+    Ok(result.render())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    eval_str_with_output_and_limit(input, None)
+    let (result, output) = eval_value_with_output_and_limit(input, None)?;
+    Ok((result.display_render(), output))
 }
 
-fn eval_str_with_output_and_limit(
+fn eval_value_with_output_and_limit(
     input: &str,
     max_steps: Option<usize>,
-) -> Result<(String, String), EvalError> {
+) -> Result<(Value, String), EvalError> {
     let exprs = parse_program(input)?;
 
     if exprs.is_empty() {
@@ -730,13 +731,12 @@ fn eval_str_with_output_and_limit(
 
     let env = default_env();
     let ctx = EvalContext::with_step_limit(max_steps);
-    if program_uses_first_class_continuations(&exprs) {
-        let last = eval_program_with_continuations(&exprs, env, &ctx)?;
-        return Ok((last.render(), ctx.into_output()));
-    }
-
-    let last = eval_sequence(&exprs, env, &ctx)?;
-    Ok((last.render(), ctx.into_output()))
+    let last = if program_uses_first_class_continuations(&exprs) {
+        eval_program_with_continuations(&exprs, env, &ctx)?
+    } else {
+        eval_sequence(&exprs, env, &ctx)?
+    };
+    Ok((last, ctx.into_output()))
 }
 
 fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
