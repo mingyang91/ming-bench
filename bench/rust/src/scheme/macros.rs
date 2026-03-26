@@ -221,13 +221,14 @@ pub(super) fn expand_macro(
             if renames.is_empty() {
                 return Ok((expanded, use_env.clone()));
             } else {
-                let new_env = use_env.push();
+                // Define gensym names directly in use_env so that any `define`
+                // in the expanded form binds in the correct (caller) scope.
                 for (orig, gs) in &renames {
                     if let Some(val) = def_env.get(orig) {
-                        new_env.define(gs.clone(), val);
+                        use_env.define(gs.clone(), val);
                     }
                 }
-                return Ok((expanded, new_env));
+                return Ok((expanded, use_env.clone()));
             }
         }
     }

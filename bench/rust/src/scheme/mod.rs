@@ -816,6 +816,13 @@ fn cek_step(expr: Expr, env: Env, kont: &mut Vec<KFrame>) -> Result<CekState, Ev
                     "do" => return cek_do(&elems[1..], &env, span, kont),
                     "case" => return cek_case(&elems[1..], &env, span, kont),
                     "guard" => {
+                        // TCO: eagerly pop accumulated PopExcHandler frames so that
+                        // tail-recursive calls through guard don't grow the kont.
+                        while matches!(kont.last(), Some(KFrame::PopExcHandler { .. })) {
+                            if let Some(KFrame::PopExcHandler { env: penv }) = kont.pop() {
+                                penv.exception_handlers.borrow_mut().pop();
+                            }
+                        }
                         // (guard (var clause ...) body ...)
                         if elems.len() < 3 {
                             return Err(EvalError::Parse(format!("guard: expected at least 2 arguments at {span}")));
@@ -1167,12 +1174,16 @@ fn apply_function_cek(
             apply_function_cek(producer, vec![], kont, span, caller_env)
         }
         Val::Continuation(saved_kont, saved_winders) => {
-            if args.len() != 1 {
+            if args.is_empty() {
                 return Err(EvalError::Arity(format!(
-                    "continuation: expected 1 argument, got {} at {span}", args.len()
+                    "continuation: expected at least 1 argument, got 0 at {span}"
                 )));
             }
-            let value = args.into_iter().next().expect("args len verified == 1");
+            let value = if args.len() == 1 {
+                args.into_iter().next().expect("len==1 guarantees element")
+            } else {
+                Val::MultipleValues(args)
+            };
             let current_winders = caller_env.winders.borrow().clone();
             let actions = compute_wind_actions(&current_winders, &saved_winders);
             if actions.is_empty() {
