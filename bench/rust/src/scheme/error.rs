@@ -20,6 +20,8 @@ pub enum EvalError {
     #[error("raised exception")]
     #[allow(private_interfaces)]
     RaisedValue(Box<crate::scheme::Value>),
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }
 
 impl PartialEq for EvalError {
@@ -32,6 +34,7 @@ impl PartialEq for EvalError {
             (EvalError::DivisionByZero(a), EvalError::DivisionByZero(b)) => a == b,
             (EvalError::ContinuationEscape(a, _), EvalError::ContinuationEscape(b, _)) => a == b,
             (EvalError::RaisedValue(_), EvalError::RaisedValue(_)) => true,
+            (EvalError::StepLimitExceeded, EvalError::StepLimitExceeded) => true,
             _ => false,
         }
     }

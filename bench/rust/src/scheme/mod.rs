@@ -168,6 +168,8 @@ thread_local! {
     static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
     // Stack of syntax-case pattern bindings (for syntax template expansion)
     static SYNTAX_BINDINGS: RefCell<Vec<HashMap<String, PatBinding>>> = RefCell::new(Vec::new());
+    // Step limit counter: None = unlimited, Some(n) = n steps remaining
+    static STEP_LIMIT: RefCell<Option<u64>> = RefCell::new(None);
 }
 
 fn write_output(s: &str) {
@@ -891,6 +893,16 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
 }
 
 fn eval_step(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+    STEP_LIMIT.with(|sl| {
+        let mut lim = sl.borrow_mut();
+        if let Some(ref mut n) = *lim {
+            if *n == 0 {
+                return Err(EvalError::StepLimitExceeded);
+            }
+            *n -= 1;
+        }
+        Ok(())
+    })?;
     let p = expr.pos();
     match expr {
         Expr::Integer(n, _) => Ok(Value::Integer(*n)),
@@ -4846,6 +4858,15 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         result = eval(expr, &env)?;
     }
     Ok(result.to_string())
+}
+
+/// Evaluate Scheme expressions with a step budget.
+/// Each eval dispatch counts as one step. Exceeding the budget returns an error.
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    STEP_LIMIT.with(|sl| *sl.borrow_mut() = Some(max_steps));
+    let result = eval_str(input);
+    STEP_LIMIT.with(|sl| *sl.borrow_mut() = None);
+    result
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
