@@ -71,8 +71,7 @@ private[ming] object SchemeTextBuiltins:
       args =>
         requireArgCount("string-set!", args, 3)
         val text = requireString("string-set!", args.head)
-        if !text.isMutable then
-          throw new EvalError("string-set! is not supported on immutable strings")
+        if !text.isMutable then throw new EvalError("string-set! is not supported on immutable strings")
         val index = requireIndex("string-set!", args(1), text.length)
         text.setCodePoint(index, requireChar("string-set!", args(2)))
         Value.VoidValue
@@ -110,10 +109,10 @@ private[ming] object SchemeTextBuiltins:
           throw new EvalError("integer->char expected a valid Unicode scalar value")
         Value.CharValue(codePoint.toInt)
     ),
-    "char-upcase"      -> unaryCharTransform("char-upcase")(codePoint => Character.toUpperCase(codePoint)),
-    "char-downcase"    -> unaryCharTransform("char-downcase")(codePoint => Character.toLowerCase(codePoint)),
-    "char=?"           -> charComparator("char=?")(_ == _),
-    "char<?"           -> charComparator("char<?")(_ < _)
+    "char-upcase"   -> unaryCharTransform("char-upcase")(codePoint => Character.toUpperCase(codePoint)),
+    "char-downcase" -> unaryCharTransform("char-downcase")(codePoint => Character.toLowerCase(codePoint)),
+    "char=?"        -> charComparator("char=?")(_ == _),
+    "char<?"        -> charComparator("char<?")(_ < _)
   )
 
   private def stringComparator(
@@ -155,4 +154,4 @@ private[ming] object SchemeTextBuiltins:
 
   private def isScalarValue(codePoint: Int): Boolean =
     Character.isValidCodePoint(codePoint) &&
-    !(codePoint >= Character.MIN_SURROGATE.toInt && codePoint <= Character.MAX_SURROGATE.toInt)
+      !(codePoint >= Character.MIN_SURROGATE.toInt && codePoint <= Character.MAX_SURROGATE.toInt)
