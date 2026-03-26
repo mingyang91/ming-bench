@@ -236,6 +236,7 @@ public class Evaluator {
         if (head instanceof SymbolExpr symbolExpr) {
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(argExprs, env);
+                case "set!" -> evalSet(argExprs, env);
                 case "if" -> evalIf(argExprs, env);
                 case "quote" -> evalQuote(argExprs);
                 case "lambda" -> evalLambda(argExprs, env);
@@ -283,6 +284,17 @@ public class Evaluator {
         }
 
         throw new EvalError("invalid define");
+    }
+
+    private Value evalSet(List<Expr> argExprs, Environment env) throws EvalError {
+        requireArity("set!", argExprs.size(), 2);
+        if (!(argExprs.getFirst() instanceof SymbolExpr symbolExpr)) {
+            throw new EvalError("set! target must be a symbol");
+        }
+
+        Value value = eval(argExprs.get(1), env);
+        env.set(symbolExpr.name(), value);
+        return VoidValue.INSTANCE;
     }
 
     private Value evalIf(List<Expr> argExprs, Environment env) throws EvalError {
@@ -919,24 +931,49 @@ public class Evaluator {
 
     private static final class Environment {
         private final Environment parent;
-        private final Map<String, Value> bindings = new HashMap<>();
+        private final Map<String, Cell> bindings = new HashMap<>();
 
         private Environment(Environment parent) {
             this.parent = parent;
         }
 
         private void define(String name, Value value) {
-            bindings.put(name, value);
+            bindings.put(name, new Cell(value));
         }
 
         private Value lookup(String name) throws EvalError {
-            if (bindings.containsKey(name)) {
-                return bindings.get(name);
+            return lookupCell(name).value();
+        }
+
+        private void set(String name, Value value) throws EvalError {
+            lookupCell(name).set(value);
+        }
+
+        private Cell lookupCell(String name) throws EvalError {
+            Cell binding = bindings.get(name);
+            if (binding != null) {
+                return binding;
             }
             if (parent != null) {
-                return parent.lookup(name);
+                return parent.lookupCell(name);
             }
             throw new EvalError("unbound variable: " + name);
+        }
+    }
+
+    private static final class Cell {
+        private Value value;
+
+        private Cell(Value value) {
+            this.value = value;
+        }
+
+        private Value value() {
+            return value;
+        }
+
+        private void set(Value value) {
+            this.value = value;
         }
     }
 
