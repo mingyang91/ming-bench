@@ -38,6 +38,12 @@ pub enum EvalError {
     #[error("{name}: expected number, found {found}")]
     ExpectedNumber { name: &'static str, found: String },
 
+    #[error("{name}: expected pair, found {found}")]
+    ExpectedPair { name: &'static str, found: String },
+
+    #[error("{name}: expected list, found {found}")]
+    ExpectedList { name: &'static str, found: String },
+
     #[error("division by zero")]
     DivisionByZero,
 }

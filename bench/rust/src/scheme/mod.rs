@@ -10,6 +10,7 @@ pub use error::EvalError;
 enum Token {
     LParen,
     RParen,
+    Quote,
     Integer(i64),
     Boolean(bool),
     String(String),
@@ -27,6 +28,7 @@ enum Expr {
 
 type NativeFunc = fn(&[Value]) -> Result<Value, EvalError>;
 type EnvRef = Rc<Env>;
+type PairRef = Rc<RefCell<PairCell>>;
 
 #[derive(Clone)]
 enum Value {
@@ -34,13 +36,19 @@ enum Value {
     Boolean(bool),
     String(String),
     Symbol(String),
-    List(Vec<Value>),
+    Nil,
+    Pair(PairRef),
     NativeProc {
         name: &'static str,
         func: NativeFunc,
     },
     Closure(Rc<Closure>),
     Void,
+}
+
+struct PairCell {
+    car: Value,
+    cdr: Value,
 }
 
 struct Closure {
@@ -69,14 +77,8 @@ impl Value {
                 format!("\"{escaped}\"")
             }
             Self::Symbol(value) => value.clone(),
-            Self::List(items) => {
-                let rendered = items
-                    .iter()
-                    .map(Value::render)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("({rendered})")
-            }
+            Self::Nil => "()".to_string(),
+            Self::Pair(pair) => render_pair(pair.clone()),
             Self::NativeProc { name, .. } => format!("#<procedure:{name}>"),
             Self::Closure(_) => "#<procedure>".to_string(),
             Self::Void => "#<void>".to_string(),
@@ -93,7 +95,8 @@ impl Value {
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
             Self::Symbol(_) => "symbol",
-            Self::List(_) => "list",
+            Self::Nil => "null",
+            Self::Pair(_) => "pair",
             Self::NativeProc { .. } | Self::Closure(_) => "procedure",
             Self::Void => "void",
         }
@@ -105,6 +108,16 @@ impl Value {
             other => Err(EvalError::ExpectedNumber {
                 name,
                 found: other.type_name().to_string(),
+            }),
+        }
+    }
+
+    fn as_pair(&self, name: &'static str) -> Result<PairRef, EvalError> {
+        match self {
+            Self::Pair(pair) => Ok(pair.clone()),
+            other => Err(EvalError::ExpectedPair {
+                name,
+                found: other.render(),
             }),
         }
     }
@@ -195,6 +208,10 @@ impl Parser {
             Token::Boolean(value) => Ok(Expr::Boolean(value)),
             Token::String(value) => Ok(Expr::String(value)),
             Token::Symbol(value) => Ok(Expr::Symbol(value)),
+            Token::Quote => Ok(Expr::List(vec![
+                Expr::Symbol("quote".to_string()),
+                self.parse_expr()?,
+            ])),
         }
     }
 }
@@ -241,6 +258,18 @@ fn default_env() -> EnvRef {
         ("=", native_num_eq as NativeFunc),
         ("<=", native_lte as NativeFunc),
         ("not", native_not as NativeFunc),
+        ("cons", native_cons as NativeFunc),
+        ("car", native_car as NativeFunc),
+        ("cdr", native_cdr as NativeFunc),
+        ("null?", native_null_pred as NativeFunc),
+        ("list", native_list as NativeFunc),
+        ("length", native_length as NativeFunc),
+        ("append", native_append as NativeFunc),
+        ("string?", native_string_pred as NativeFunc),
+        ("number?", native_number_pred as NativeFunc),
+        ("boolean?", native_boolean_pred as NativeFunc),
+        ("pair?", native_pair_pred as NativeFunc),
+        ("symbol?", native_symbol_pred as NativeFunc),
     ] {
         env.define(name.to_string(), Value::NativeProc { name, func });
     }
@@ -257,12 +286,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             b' ' | b'\n' | b'\r' | b'\t' => {
                 index += 1;
             }
+            b';' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
             b'(' => {
                 tokens.push(Token::LParen);
                 index += 1;
             }
             b')' => {
                 tokens.push(Token::RParen);
+                index += 1;
+            }
+            b'\'' => {
+                tokens.push(Token::Quote);
                 index += 1;
             }
             b'"' => {
@@ -282,9 +320,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
             }
             _ => {
                 let start = index;
-                while index < bytes.len()
-                    && !matches!(bytes[index], b' ' | b'\n' | b'\r' | b'\t' | b'(' | b')')
-                {
+                while index < bytes.len() && !is_token_boundary(bytes[index]) {
                     index += 1;
                 }
 
@@ -351,9 +387,16 @@ fn parse_boolean(input: &str, index: usize) -> Option<(Token, usize)> {
 fn is_delimiter(input: &str, index: usize) -> bool {
     match input.as_bytes().get(index) {
         None => true,
-        Some(b' ' | b'\n' | b'\r' | b'\t' | b'(' | b')') => true,
+        Some(byte) if is_token_boundary(*byte) => true,
         Some(_) => false,
     }
+}
+
+fn is_token_boundary(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\n' | b'\r' | b'\t' | b'(' | b')' | b'\'' | b';'
+    )
 }
 
 fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -391,6 +434,9 @@ fn eval_list(items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
             "lambda" => return eval_lambda(tail, env),
             "and" => return eval_and(tail, env),
             "or" => return eval_or(tail, env),
+            "begin" => return eval_begin(tail, env),
+            "cond" => return eval_cond(tail, env),
+            "let" => return eval_let(tail, env),
             _ => {}
         }
     }
@@ -521,6 +567,142 @@ fn eval_or(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Boolean(false))
 }
 
+fn eval_begin(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    eval_sequence(args, env)
+}
+
+fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    for (index, clause) in args.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::InvalidSyntax {
+                message: "cond clauses must be lists".to_string(),
+            });
+        };
+
+        let (test, body) = items
+            .split_first()
+            .ok_or_else(|| EvalError::InvalidSyntax {
+                message: "cond clauses cannot be empty".to_string(),
+            })?;
+
+        if matches!(test, Expr::Symbol(name) if name == "else") {
+            if index + 1 != args.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "cond else clause must be last".to_string(),
+                });
+            }
+            return eval_sequence(body, env);
+        }
+
+        let test_value = eval(test, env.clone())?;
+        if test_value.is_truthy() {
+            return if body.is_empty() {
+                Ok(test_value)
+            } else {
+                eval_sequence(body, env)
+            };
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_let(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let Some(first) = args.first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "let requires bindings".to_string(),
+        });
+    };
+
+    match first {
+        Expr::Symbol(name) => eval_named_let(name, &args[1..], env),
+        bindings => eval_plain_let(bindings, &args[1..], env),
+    }
+}
+
+fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::InvalidSyntax {
+            message: "let requires a body".to_string(),
+        });
+    }
+
+    let bindings = parse_bindings(bindings_expr)?;
+    let values = eval_binding_values(&bindings, env.clone())?;
+    let frame = Env::new(Some(env));
+
+    for ((name, _), value) in bindings.into_iter().zip(values.into_iter()) {
+        frame.define(name, value);
+    }
+
+    eval_sequence(body, frame)
+}
+
+fn eval_named_let(name: &str, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::InvalidSyntax {
+            message: "named let requires bindings and a body".to_string(),
+        });
+    }
+
+    let bindings = parse_bindings(&args[0])?;
+    let values = eval_binding_values(&bindings, env.clone())?;
+    let params = bindings
+        .iter()
+        .map(|(binding, _)| binding.clone())
+        .collect();
+    let frame = Env::new(Some(env));
+    let closure = Value::Closure(Rc::new(Closure {
+        params,
+        body: args[1..].to_vec(),
+        env: frame.clone(),
+    }));
+
+    frame.define(name.to_string(), closure.clone());
+    apply(closure, &values)
+}
+
+fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
+    let Expr::List(bindings) = expr else {
+        return Err(EvalError::InvalidSyntax {
+            message: "let bindings must be a list".to_string(),
+        });
+    };
+
+    let mut parsed = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let Expr::List(items) = binding else {
+            return Err(EvalError::InvalidSyntax {
+                message: "let bindings must be pairs".to_string(),
+            });
+        };
+
+        if items.len() != 2 {
+            return Err(EvalError::InvalidSyntax {
+                message: "let bindings must contain exactly 2 items".to_string(),
+            });
+        }
+
+        let Expr::Symbol(name) = &items[0] else {
+            return Err(EvalError::InvalidSyntax {
+                message: "let binding names must be symbols".to_string(),
+            });
+        };
+
+        parsed.push((name.clone(), items[1].clone()));
+    }
+
+    Ok(parsed)
+}
+
+fn eval_binding_values(bindings: &[(String, Expr)], env: EnvRef) -> Result<Vec<Value>, EvalError> {
+    let mut values = Vec::with_capacity(bindings.len());
+    for (_, expr) in bindings {
+        values.push(eval(expr, env.clone())?);
+    }
+    Ok(values)
+}
+
 fn eval_args(args: &[Expr], env: EnvRef) -> Result<Vec<Value>, EvalError> {
     let mut values = Vec::with_capacity(args.len());
     for expr in args {
@@ -572,7 +754,66 @@ fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
             for item in items {
                 values.push(quote_expr(item)?);
             }
-            Ok(Value::List(values))
+            Ok(list_from_values(values))
+        }
+    }
+}
+
+fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new(PairCell { car, cdr })))
+}
+
+fn list_from_values(values: Vec<Value>) -> Value {
+    values
+        .into_iter()
+        .rev()
+        .fold(Value::Nil, |tail, head| make_pair(head, tail))
+}
+
+fn list_to_vec(value: &Value, name: &'static str) -> Result<Vec<Value>, EvalError> {
+    let mut items = Vec::new();
+    let mut cursor = value.clone();
+
+    loop {
+        match cursor {
+            Value::Nil => return Ok(items),
+            Value::Pair(pair) => {
+                let (car, cdr) = {
+                    let borrowed = pair.borrow();
+                    (borrowed.car.clone(), borrowed.cdr.clone())
+                };
+                items.push(car);
+                cursor = cdr;
+            }
+            other => {
+                return Err(EvalError::ExpectedList {
+                    name,
+                    found: other.render(),
+                });
+            }
+        }
+    }
+}
+
+fn render_pair(pair: PairRef) -> String {
+    let mut rendered = Vec::new();
+    let mut cursor = Value::Pair(pair);
+
+    loop {
+        match cursor {
+            Value::Pair(pair) => {
+                let (car, cdr) = {
+                    let borrowed = pair.borrow();
+                    (borrowed.car.clone(), borrowed.cdr.clone())
+                };
+                rendered.push(car.render());
+                cursor = cdr;
+            }
+            Value::Nil => return format!("({})", rendered.join(" ")),
+            other => {
+                let prefix = rendered.join(" ");
+                return format!("({prefix} . {})", other.render());
+            }
         }
     }
 }
@@ -587,6 +828,117 @@ fn native_not(args: &[Value]) -> Result<Value, EvalError> {
     }
 
     Ok(Value::Boolean(!args[0].is_truthy()))
+}
+
+fn native_cons(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "cons",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    Ok(make_pair(args[0].clone(), args[1].clone()))
+}
+
+fn native_car(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "car",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    let pair = args[0].as_pair("car")?;
+    let car = pair.borrow().car.clone();
+    Ok(car)
+}
+
+fn native_cdr(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "cdr",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    let pair = args[0].as_pair("cdr")?;
+    let cdr = pair.borrow().cdr.clone();
+    Ok(cdr)
+}
+
+fn native_null_pred(args: &[Value]) -> Result<Value, EvalError> {
+    native_predicate("null?", args, |value| matches!(value, Value::Nil))
+}
+
+fn native_list(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(list_from_values(args.to_vec()))
+}
+
+fn native_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "length",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Integer(list_to_vec(&args[0], "length")?.len() as i64))
+}
+
+fn native_append(args: &[Value]) -> Result<Value, EvalError> {
+    let Some(last) = args.last().cloned() else {
+        return Ok(Value::Nil);
+    };
+
+    let mut result = last;
+    for list in args[..args.len() - 1].iter().rev() {
+        let mut items = list_to_vec(list, "append")?;
+        while let Some(item) = items.pop() {
+            result = make_pair(item, result);
+        }
+    }
+
+    Ok(result)
+}
+
+fn native_string_pred(args: &[Value]) -> Result<Value, EvalError> {
+    native_predicate("string?", args, |value| matches!(value, Value::String(_)))
+}
+
+fn native_number_pred(args: &[Value]) -> Result<Value, EvalError> {
+    native_predicate("number?", args, |value| matches!(value, Value::Integer(_)))
+}
+
+fn native_boolean_pred(args: &[Value]) -> Result<Value, EvalError> {
+    native_predicate("boolean?", args, |value| matches!(value, Value::Boolean(_)))
+}
+
+fn native_pair_pred(args: &[Value]) -> Result<Value, EvalError> {
+    native_predicate("pair?", args, |value| matches!(value, Value::Pair(_)))
+}
+
+fn native_symbol_pred(args: &[Value]) -> Result<Value, EvalError> {
+    native_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
+}
+
+fn native_predicate<F>(name: &'static str, args: &[Value], predicate: F) -> Result<Value, EvalError>
+where
+    F: Fn(&Value) -> bool,
+{
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Boolean(predicate(&args[0])))
 }
 
 fn native_add(args: &[Value]) -> Result<Value, EvalError> {
