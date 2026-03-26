@@ -70,6 +70,11 @@ type voidValue struct{}
 
 type uninitializedValue struct{}
 
+type tailEvalState struct {
+	scope *env
+	expr  any
+}
+
 type parser struct {
 	input string
 	pos   int
@@ -655,54 +660,488 @@ func isDelimiter(ch byte) bool {
 }
 
 func eval(scope *env, expr any) (any, error) {
-	switch node := expr.(type) {
-	case int64:
-		return node, nil
-	case rationalValue:
-		return node, nil
-	case float64:
-		return node, nil
-	case bool:
-		return node, nil
-	case stringExpr:
-		return node.value, nil
-	case charValue:
-		return node, nil
-	case symbolExpr:
-		value, ok := scope.lookupSymbol(node)
-		if !ok {
-			return nil, node.pos.errorf("unbound variable: %s", node.name)
+	for {
+		switch node := expr.(type) {
+		case int64:
+			return node, nil
+		case rationalValue:
+			return node, nil
+		case float64:
+			return node, nil
+		case bool:
+			return node, nil
+		case stringExpr:
+			return node.value, nil
+		case charValue:
+			return node, nil
+		case symbolExpr:
+			value, ok := scope.lookupSymbol(node)
+			if !ok {
+				return nil, node.pos.errorf("unbound variable: %s", node.name)
+			}
+			if _, ok := value.(uninitializedValue); ok {
+				return nil, node.pos.errorf("uninitialized variable: %s", node.name)
+			}
+			return value, nil
+		case listExpr:
+			value, next, err := evalListTail(scope, node)
+			if err != nil {
+				return nil, attachSourcePos(err, node.pos)
+			}
+			if next != nil {
+				scope = next.scope
+				expr = next.expr
+				continue
+			}
+			return value, nil
+		case string:
+			return node, nil
+		case *mutableString:
+			return node, nil
+		case *vectorValue:
+			return node, nil
+		case builtinProc:
+			return node, nil
+		case closure:
+			return node, nil
+		case caseClosure:
+			return node, nil
+		case pairValue:
+			return node, nil
+		case emptyListValue:
+			return node, nil
+		case voidValue:
+			return node, nil
+		default:
+			return nil, &EvalError{Message: "unsupported expression"}
 		}
-		if _, ok := value.(uninitializedValue); ok {
-			return nil, node.pos.errorf("uninitialized variable: %s", node.name)
+	}
+}
+
+func evalListTail(scope *env, expr listExpr) (any, *tailEvalState, error) {
+	if len(expr.elements) == 0 {
+		return nil, nil, &EvalError{Message: "cannot evaluate empty list"}
+	}
+
+	if head, ok := expr.elements[0].(symbolExpr); ok {
+		args := expr.elements[1:]
+		switch head.name {
+		case "define":
+			value, err := evalDefine(scope, args)
+			return value, nil, err
+		case "define-syntax":
+			value, err := evalDefineSyntax(scope, args)
+			return value, nil, err
+		case "define-record-type":
+			value, err := evalDefineRecordType(scope, args)
+			return value, nil, err
+		case "set!":
+			value, err := evalSet(scope, args)
+			return value, nil, err
+		case "if":
+			if len(args) != 2 && len(args) != 3 {
+				return nil, nil, &EvalError{Message: "if expects 2 or 3 arguments"}
+			}
+
+			cond, err := eval(scope, args[0])
+			if err != nil {
+				return nil, nil, err
+			}
+
+			if isTruthy(cond) {
+				return nil, &tailEvalState{scope: scope, expr: args[1]}, nil
+			}
+			if len(args) == 2 {
+				return voidValue{}, nil, nil
+			}
+			return nil, &tailEvalState{scope: scope, expr: args[2]}, nil
+		case "quote":
+			value, err := evalQuote(args)
+			return value, nil, err
+		case "lambda":
+			value, err := evalLambda(scope, args)
+			return value, nil, err
+		case "case-lambda":
+			value, err := evalCaseLambda(scope, args)
+			return value, nil, err
+		case "and":
+			if len(args) == 0 {
+				return true, nil, nil
+			}
+			for i, arg := range args {
+				if i == len(args)-1 {
+					return nil, &tailEvalState{scope: scope, expr: arg}, nil
+				}
+
+				value, err := eval(scope, arg)
+				if err != nil {
+					return nil, nil, err
+				}
+				if !isTruthy(value) {
+					return value, nil, nil
+				}
+			}
+			return true, nil, nil
+		case "or":
+			if len(args) == 0 {
+				return false, nil, nil
+			}
+			for i, arg := range args {
+				if i == len(args)-1 {
+					return nil, &tailEvalState{scope: scope, expr: arg}, nil
+				}
+
+				value, err := eval(scope, arg)
+				if err != nil {
+					return nil, nil, err
+				}
+				if isTruthy(value) {
+					return value, nil, nil
+				}
+			}
+			return false, nil, nil
+		case "begin":
+			return prepareTailSequence(scope, args)
+		case "let":
+			return evalLetTail(scope, args)
+		case "letrec":
+			return evalLetrecTail(scope, args, false)
+		case "letrec*":
+			return evalLetrecTail(scope, args, true)
+		case "cond":
+			return evalCondTail(scope, args)
+		case "case":
+			return evalCaseTail(scope, args)
+		case "do":
+			return evalDoTail(scope, args)
 		}
-		return value, nil
-	case listExpr:
-		value, err := evalList(scope, node)
+
+		if macro, ok := scope.lookupMacroSymbol(head); ok {
+			expanded, err := macro.expand(expr)
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, &tailEvalState{scope: scope, expr: expanded}, nil
+		}
+	}
+
+	proc, err := eval(scope, expr.elements[0])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	args := make([]any, 0, len(expr.elements)-1)
+	for _, argExpr := range expr.elements[1:] {
+		arg, err := eval(scope, argExpr)
 		if err != nil {
-			return nil, attachSourcePos(err, node.pos)
+			return nil, nil, err
 		}
-		return value, nil
-	case string:
-		return node, nil
-	case *mutableString:
-		return node, nil
-	case *vectorValue:
-		return node, nil
+		args = append(args, arg)
+	}
+
+	return prepareProcedureCall(proc, args)
+}
+
+func prepareTailSequence(scope *env, exprs []any) (any, *tailEvalState, error) {
+	if len(exprs) == 0 {
+		return voidValue{}, nil, nil
+	}
+
+	for _, expr := range exprs[:len(exprs)-1] {
+		if _, err := eval(scope, expr); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return nil, &tailEvalState{
+		scope: scope,
+		expr:  exprs[len(exprs)-1],
+	}, nil
+}
+
+func prepareProcedureCall(proc any, args []any) (any, *tailEvalState, error) {
+	switch callable := proc.(type) {
 	case builtinProc:
-		return node, nil
+		value, err := callable.fn(args)
+		return value, nil, err
 	case closure:
-		return node, nil
+		return prepareClosureCall(callable, args)
 	case caseClosure:
-		return node, nil
-	case pairValue:
-		return node, nil
-	case emptyListValue:
-		return node, nil
-	case voidValue:
-		return node, nil
+		for _, clause := range callable.clauses {
+			if closureMatchesArity(clause, len(args)) {
+				return prepareClosureCall(clause, args)
+			}
+		}
+		return nil, nil, &EvalError{Message: fmt.Sprintf("no matching case-lambda clause for %d arguments", len(args))}
 	default:
-		return nil, &EvalError{Message: "unsupported expression"}
+		return nil, nil, &EvalError{Message: fmt.Sprintf("expected procedure, got %s", typeName(proc))}
+	}
+}
+
+func prepareClosureCall(callable closure, args []any) (any, *tailEvalState, error) {
+	if !closureMatchesArity(callable, len(args)) {
+		return nil, nil, closureArgCountError(callable, len(args))
+	}
+
+	callScope := bindClosureArgs(callable, args)
+	return prepareTailSequence(callScope, callable.body)
+}
+
+func bindClosureArgs(callable closure, args []any) *env {
+	callScope := newEnv(callable.env)
+	for i, param := range callable.params {
+		callScope.defineSymbol(param, args[i])
+	}
+	if callable.hasRest {
+		callScope.defineSymbol(callable.restParam, makeListValue(args[len(callable.params):]))
+	}
+	return callScope
+}
+
+func evalLetTail(scope *env, args []any) (any, *tailEvalState, error) {
+	if len(args) < 2 {
+		return nil, nil, &EvalError{Message: "let expects bindings and a body"}
+	}
+
+	if name, ok := args[0].(symbolExpr); ok {
+		if len(args) < 3 {
+			return nil, nil, &EvalError{Message: "named let expects bindings and a body"}
+		}
+
+		bindingsExpr, ok := args[1].(listExpr)
+		if !ok {
+			return nil, nil, &EvalError{Message: "let bindings must be a list"}
+		}
+
+		params, values, err := evalBindings(scope, bindingsExpr.elements)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		letScope := newEnv(scope)
+		proc := closure{
+			params: params,
+			body:   args[2:],
+			env:    letScope,
+		}
+		letScope.defineSymbol(name, proc)
+		return prepareClosureCall(proc, values)
+	}
+
+	bindingsExpr, ok := args[0].(listExpr)
+	if !ok {
+		return nil, nil, &EvalError{Message: "let bindings must be a list"}
+	}
+
+	params, values, err := evalBindings(scope, bindingsExpr.elements)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	letScope := newEnv(scope)
+	for i, param := range params {
+		letScope.defineSymbol(param, values[i])
+	}
+
+	return prepareTailSequence(letScope, args[1:])
+}
+
+func evalLetrecTail(scope *env, args []any, sequential bool) (any, *tailEvalState, error) {
+	formName := "letrec"
+	if sequential {
+		formName = "letrec*"
+	}
+
+	if len(args) < 2 {
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%s expects bindings and a body", formName)}
+	}
+
+	bindingsExpr, ok := args[0].(listExpr)
+	if !ok {
+		return nil, nil, &EvalError{Message: fmt.Sprintf("%s bindings must be a list", formName)}
+	}
+
+	bindings, err := parseLetBindingSpecs(bindingsExpr.elements, formName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	letrecScope := newEnv(scope)
+	for _, binding := range bindings {
+		letrecScope.defineSymbol(binding.name, uninitializedValue{})
+	}
+
+	if sequential {
+		for _, binding := range bindings {
+			value, err := eval(letrecScope, binding.value)
+			if err != nil {
+				return nil, nil, err
+			}
+			letrecScope.setSymbol(binding.name, value)
+		}
+	} else {
+		values := make([]any, len(bindings))
+		for i, binding := range bindings {
+			value, err := eval(letrecScope, binding.value)
+			if err != nil {
+				return nil, nil, err
+			}
+			values[i] = value
+		}
+		for i, binding := range bindings {
+			letrecScope.setSymbol(binding.name, values[i])
+		}
+	}
+
+	return prepareTailSequence(letrecScope, args[1:])
+}
+
+func evalCondTail(scope *env, args []any) (any, *tailEvalState, error) {
+	for i, clauseExpr := range args {
+		clause, ok := clauseExpr.(listExpr)
+		if !ok || len(clause.elements) == 0 {
+			return nil, nil, &EvalError{Message: "cond clauses must be non-empty lists"}
+		}
+
+		if symbol, ok := clause.elements[0].(symbolExpr); ok && symbol.name == "else" {
+			if i != len(args)-1 {
+				return nil, nil, &EvalError{Message: "cond else clause must be last"}
+			}
+			if len(clause.elements) == 1 {
+				return voidValue{}, nil, nil
+			}
+			return prepareTailSequence(scope, clause.elements[1:])
+		}
+
+		testValue, err := eval(scope, clause.elements[0])
+		if err != nil {
+			return nil, nil, err
+		}
+		if !isTruthy(testValue) {
+			continue
+		}
+		if len(clause.elements) == 1 {
+			return testValue, nil, nil
+		}
+		return prepareTailSequence(scope, clause.elements[1:])
+	}
+
+	return voidValue{}, nil, nil
+}
+
+func evalCaseTail(scope *env, args []any) (any, *tailEvalState, error) {
+	if len(args) < 1 {
+		return nil, nil, &EvalError{Message: "case expects a key and clauses"}
+	}
+
+	key, err := eval(scope, args[0])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for i, clauseExpr := range args[1:] {
+		clause, ok := clauseExpr.(listExpr)
+		if !ok || len(clause.elements) == 0 {
+			return nil, nil, exprSourcePos(clauseExpr).errorf("case clauses must be non-empty lists")
+		}
+
+		if symbol, ok := clause.elements[0].(symbolExpr); ok && symbol.name == "else" {
+			if i != len(args)-2 {
+				return nil, nil, symbol.pos.errorf("case else clause must be last")
+			}
+			if len(clause.elements) == 1 {
+				return voidValue{}, nil, nil
+			}
+			return prepareTailSequence(scope, clause.elements[1:])
+		}
+
+		datums, ok := clause.elements[0].(listExpr)
+		if !ok {
+			return nil, nil, exprSourcePos(clause.elements[0]).errorf("case clause datums must be a list")
+		}
+
+		for _, datumExpr := range datums.elements {
+			if valuesEqv(key, quoteDatum(datumExpr)) {
+				if len(clause.elements) == 1 {
+					return voidValue{}, nil, nil
+				}
+				return prepareTailSequence(scope, clause.elements[1:])
+			}
+		}
+	}
+
+	return voidValue{}, nil, nil
+}
+
+func evalDoTail(scope *env, args []any) (any, *tailEvalState, error) {
+	if len(args) < 2 {
+		return nil, nil, &EvalError{Message: "do expects bindings, a test clause, and optional body expressions"}
+	}
+
+	bindingsExpr, ok := args[0].(listExpr)
+	if !ok {
+		return nil, nil, &EvalError{Message: "do bindings must be a list"}
+	}
+
+	testClause, ok := args[1].(listExpr)
+	if !ok || len(testClause.elements) == 0 {
+		return nil, nil, exprSourcePos(args[1]).errorf("do test clause must be a non-empty list")
+	}
+
+	bindings, err := parseDoBindings(bindingsExpr.elements)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	loopScope := newEnv(scope)
+	initValues := make([]any, len(bindings))
+	for i, binding := range bindings {
+		value, err := eval(scope, binding.init)
+		if err != nil {
+			return nil, nil, err
+		}
+		initValues[i] = value
+	}
+	for i, binding := range bindings {
+		loopScope.defineSymbol(binding.name, initValues[i])
+	}
+
+	for {
+		testValue, err := eval(loopScope, testClause.elements[0])
+		if err != nil {
+			return nil, nil, err
+		}
+		if isTruthy(testValue) {
+			if len(testClause.elements) == 1 {
+				return voidValue{}, nil, nil
+			}
+			return prepareTailSequence(loopScope, testClause.elements[1:])
+		}
+
+		if _, err := evalSequence(loopScope, args[2:]); err != nil {
+			return nil, nil, err
+		}
+
+		nextValues := make([]any, len(bindings))
+		for i, binding := range bindings {
+			if binding.hasStep {
+				value, err := eval(loopScope, binding.step)
+				if err != nil {
+					return nil, nil, err
+				}
+				nextValues[i] = value
+				continue
+			}
+
+			value, ok := loopScope.lookupSymbol(binding.name)
+			if !ok {
+				return nil, nil, binding.name.pos.errorf("unbound variable: %s", binding.name.name)
+			}
+			nextValues[i] = value
+		}
+		for i, binding := range bindings {
+			loopScope.setSymbol(binding.name, nextValues[i])
+		}
 	}
 }
 
@@ -1117,36 +1556,25 @@ func parseParamList(params []any) ([]symbolExpr, symbolExpr, bool, error) {
 }
 
 func applyProcedure(proc any, args []any) (any, error) {
-	switch callable := proc.(type) {
-	case builtinProc:
-		return callable.fn(args)
-	case closure:
-		if !closureMatchesArity(callable, len(args)) {
-			return nil, closureArgCountError(callable, len(args))
-		}
-		return applyClosure(callable, args)
-	case caseClosure:
-		for _, clause := range callable.clauses {
-			if closureMatchesArity(clause, len(args)) {
-				return applyClosure(clause, args)
-			}
-		}
-		return nil, &EvalError{Message: fmt.Sprintf("no matching case-lambda clause for %d arguments", len(args))}
-	default:
-		return nil, &EvalError{Message: fmt.Sprintf("expected procedure, got %s", typeName(proc))}
+	value, next, err := prepareProcedureCall(proc, args)
+	if err != nil {
+		return nil, err
 	}
+	if next != nil {
+		return eval(next.scope, next.expr)
+	}
+	return value, nil
 }
 
 func applyClosure(callable closure, args []any) (any, error) {
-	callScope := newEnv(callable.env)
-	for i, param := range callable.params {
-		callScope.defineSymbol(param, args[i])
+	value, next, err := prepareClosureCall(callable, args)
+	if err != nil {
+		return nil, err
 	}
-	if callable.hasRest {
-		callScope.defineSymbol(callable.restParam, makeListValue(args[len(callable.params):]))
+	if next != nil {
+		return eval(next.scope, next.expr)
 	}
-
-	return evalSequence(callScope, callable.body)
+	return value, nil
 }
 
 func closureMatchesArity(callable closure, argCount int) bool {
@@ -1164,15 +1592,14 @@ func closureArgCountError(callable closure, argCount int) error {
 }
 
 func evalSequence(scope *env, exprs []any) (any, error) {
-	result := any(voidValue{})
-	for _, expr := range exprs {
-		value, err := eval(scope, expr)
-		if err != nil {
-			return nil, err
-		}
-		result = value
+	value, next, err := prepareTailSequence(scope, exprs)
+	if err != nil {
+		return nil, err
 	}
-	return result, nil
+	if next != nil {
+		return eval(next.scope, next.expr)
+	}
+	return value, nil
 }
 
 func builtinNot(args []any) (any, error) {
