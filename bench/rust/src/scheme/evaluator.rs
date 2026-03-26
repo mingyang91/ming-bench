@@ -1293,10 +1293,9 @@ pub(super) fn apply(
     match callable {
         Value::Builtin(builtin) => apply_builtin(builtin, args, output),
         Value::Procedure(procedure) => apply_procedure(&procedure, args, output),
-        Value::Continuation(continuation) => match args {
-            [value] => continuation(value.clone(), output),
-            _ => Err(wrong_arg_count("continuation", "1", args.len())),
-        },
+        Value::Continuation(continuation) => {
+            continuation(Value::from_values(args.to_vec()), output)
+        }
         Value::RecordProcedure(procedure) => apply_record_procedure(&procedure, args),
         value => Err(EvalError::NotAProcedure {
             got: value.type_name().into(),
@@ -1312,10 +1311,9 @@ fn apply_tail(
     match callable {
         Value::Builtin(builtin) => apply_builtin(builtin, args, output).map(TailAction::Return),
         Value::Procedure(procedure) => prepare_tail_procedure(&procedure, args, output),
-        Value::Continuation(continuation) => match args {
-            [value] => continuation(value.clone(), output).map(TailAction::Return),
-            _ => Err(wrong_arg_count("continuation", "1", args.len())),
-        },
+        Value::Continuation(continuation) => {
+            continuation(Value::from_values(args.to_vec()), output).map(TailAction::Return)
+        }
         Value::RecordProcedure(procedure) => {
             apply_record_procedure(&procedure, args).map(TailAction::Return)
         }

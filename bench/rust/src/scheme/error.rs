@@ -21,7 +21,15 @@ impl fmt::Display for SourcePos {
 }
 
 #[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContinuationJumpKind {
+    User,
+    Trampoline,
+}
+
+#[doc(hidden)]
 pub struct ContinuationJumpData {
+    kind: ContinuationJumpKind,
     continuation: ContinuationProc,
     value: Value,
 }
@@ -29,9 +37,22 @@ pub struct ContinuationJumpData {
 impl ContinuationJumpData {
     pub(super) fn new(continuation: ContinuationProc, value: Value) -> Self {
         Self {
+            kind: ContinuationJumpKind::User,
             continuation,
             value,
         }
+    }
+
+    pub(super) fn trampoline(continuation: ContinuationProc, value: Value) -> Self {
+        Self {
+            kind: ContinuationJumpKind::Trampoline,
+            continuation,
+            value,
+        }
+    }
+
+    pub(super) fn is_trampoline(&self) -> bool {
+        matches!(self.kind, ContinuationJumpKind::Trampoline)
     }
 
     pub(super) fn into_parts(self) -> (ContinuationProc, Value) {

@@ -4,10 +4,12 @@ use std::rc::Rc;
 
 use super::builtins::apply_builtin;
 use super::error::{ContinuationJumpData, EvalError};
-use super::eval_sequence_cps;
 use super::evaluator::wrong_arg_count;
-use super::model::{list_from_values, Builtin, ContinuationProc, Env, Procedure, Value};
+use super::model::{
+    list_from_values, Builtin, ContinuationProc, Env, EnvRef, Expr, Procedure, Value,
+};
 use super::records::apply_record_procedure;
+use super::{eval_cps, eval_sequence_cps};
 
 type Continuation = ContinuationProc;
 type WindFrameRef = Rc<WindFrame>;
@@ -78,6 +80,55 @@ impl CpsRuntime {
             handlers.pop();
         }
     }
+}
+
+pub(super) fn bounce_continuation(
+    continuation: Continuation,
+    value: Value,
+) -> Result<Value, EvalError> {
+    Err(EvalError::ContinuationJump {
+        jump: ContinuationJumpData::trampoline(continuation, value),
+    })
+}
+
+pub(super) fn bounce_eval(
+    expr: Expr,
+    env: EnvRef,
+    k: Continuation,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
+    bounce_continuation(
+        Rc::new(move |_ignored, output| {
+            eval_cps(
+                expr.clone(),
+                env.clone(),
+                output,
+                k.clone(),
+                runtime.clone(),
+            )
+        }),
+        Value::Void,
+    )
+}
+
+pub(super) fn bounce_sequence(
+    exprs: Vec<Expr>,
+    env: EnvRef,
+    k: Continuation,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
+    bounce_continuation(
+        Rc::new(move |_ignored, output| {
+            eval_sequence_cps(
+                exprs.clone(),
+                env.clone(),
+                output,
+                k.clone(),
+                runtime.clone(),
+            )
+        }),
+        Value::Void,
+    )
 }
 
 fn shared_winder_prefix_len(left: &[WindFrameRef], right: &[WindFrameRef]) -> usize {
@@ -226,12 +277,9 @@ pub(super) fn apply_cps(
             apply_builtin(builtin, &args, output).and_then(|value| k(value, output))
         }
         Value::Procedure(procedure) => apply_procedure_cps(&procedure, args, output, k, runtime),
-        Value::Continuation(continuation) => match args.as_slice() {
-            [value] => Err(EvalError::ContinuationJump {
-                jump: ContinuationJumpData::new(continuation, value.clone()),
-            }),
-            _ => Err(wrong_arg_count("continuation", "1", args.len())),
-        },
+        Value::Continuation(continuation) => Err(EvalError::ContinuationJump {
+            jump: ContinuationJumpData::new(continuation, Value::from_values(args)),
+        }),
         Value::RecordProcedure(procedure) => {
             apply_record_procedure(&procedure, &args).and_then(|value| k(value, output))
         }
@@ -338,12 +386,19 @@ fn apply_with_exception_handler_cps(
         thunk.clone(),
         Vec::new(),
         output,
-        Rc::new(move |value, output| {
+        Rc::new(move |value, _output| {
             pop_runtime.pop_handler_if_current(&frame_for_normal_return);
-            normal_k.clone()(value, output)
+            bounce_continuation(normal_k.clone(), value)
         }),
         runtime.clone(),
     );
+
+    if matches!(
+        result,
+        Err(EvalError::ContinuationJump { ref jump }) if jump.is_trampoline()
+    ) {
+        return result;
+    }
 
     if result.is_err() {
         runtime.pop_handler_if_current(&frame);
@@ -355,7 +410,7 @@ fn apply_with_exception_handler_cps(
 fn apply_procedure_cps(
     procedure: &Procedure,
     args: Vec<Value>,
-    output: &mut String,
+    _output: &mut String,
     k: Continuation,
     runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
@@ -382,8 +437,7 @@ fn apply_procedure_cps(
             list_from_values(args[clause.params.required.len()..].iter().cloned()),
         );
     }
-
-    eval_sequence_cps(clause.body.clone(), call_env, output, k, runtime)
+    bounce_sequence(clause.body.clone(), call_env, k, runtime)
 }
 
 fn apply_apply_cps(

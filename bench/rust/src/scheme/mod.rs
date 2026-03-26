@@ -12,7 +12,9 @@ mod parser;
 mod records;
 
 use builtins::eqv_values;
-use continuation_runtime::{apply_cps, CpsRuntime, CpsRuntimeRef};
+use continuation_runtime::{
+    apply_cps, bounce_continuation, bounce_eval, CpsRuntime, CpsRuntimeRef,
+};
 pub use error::EvalError;
 use error::SourcePos;
 use evaluator::{
@@ -554,17 +556,16 @@ fn eval_if_cps(
                 condition.clone(),
                 env,
                 output,
-                Rc::new(move |value, output| {
+                Rc::new(move |value, _output| {
                     if value.is_truthy() {
-                        eval_cps(
+                        bounce_eval(
                             then_expr.clone(),
                             branch_env.clone(),
-                            output,
                             branch_k.clone(),
                             branch_runtime.clone(),
                         )
                     } else {
-                        branch_k.clone()(Value::Void, output)
+                        bounce_continuation(branch_k.clone(), Value::Void)
                     }
                 }),
                 runtime,
@@ -580,16 +581,15 @@ fn eval_if_cps(
                 condition.clone(),
                 env,
                 output,
-                Rc::new(move |value, output| {
+                Rc::new(move |value, _output| {
                     let branch = if value.is_truthy() {
                         then_expr.clone()
                     } else {
                         else_expr.clone()
                     };
-                    eval_cps(
+                    bounce_eval(
                         branch,
                         branch_env.clone(),
-                        output,
                         branch_k.clone(),
                         branch_runtime.clone(),
                     )
