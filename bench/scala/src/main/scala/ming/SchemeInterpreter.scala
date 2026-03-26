@@ -37,6 +37,8 @@ object SchemeInterpreter:
           evalDefine(args, env)
         case Expr.ListExpr(Expr.Symbol("lambda", _) :: args, _) =>
           evalLambda(args, env)
+        case Expr.ListExpr(Expr.Symbol("set!", _) :: args, _) =>
+          evalSet(args, env)
         case Expr.ListExpr(Expr.Symbol("and", _) :: rest, _) =>
           evalAnd(rest, env)
         case Expr.ListExpr(Expr.Symbol("or", _) :: rest, _) =>
@@ -88,6 +90,14 @@ object SchemeInterpreter:
         buildClosure(params, body, env, None)
       case _ =>
         throw new EvalError("invalid lambda form")
+
+  private def evalSet(args: List[Expr], env: Env): Value =
+    args match
+      case Expr.Symbol(name, _) :: valueExpr :: Nil =>
+        env.set(name, eval(valueExpr, env))
+        Value.VoidValue
+      case _ =>
+        throw new EvalError("invalid set! form")
 
   private def evalBegin(args: List[Expr], env: Env): Value =
     evalSequence(args, env)

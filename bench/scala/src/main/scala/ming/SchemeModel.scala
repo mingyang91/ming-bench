@@ -72,6 +72,13 @@ private[ming] object SchemeModel:
     def define(name: String, value: Value): Unit =
       bindings(name) = value
 
+    def set(name: String, value: Value): Unit =
+      if bindings.contains(name) then bindings(name) = value
+      else
+        parent match
+          case Some(outer) => outer.set(name, value)
+          case None        => throw new EvalError(s"unbound variable: $name")
+
     def lookup(name: String): Value =
       bindings.get(name) match
         case Some(value) => value
