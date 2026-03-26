@@ -187,6 +187,12 @@ func (m *level18Machine) run() (expr, error) {
 		case nil:
 			return m.value, nil
 		case *level18SeqCont:
+			if currentBenchLevel() >= 24 {
+				if nextForm, ok := advanceSeqContCallCC(cont); ok {
+					m.eval(cont.env, nextForm, cont)
+					continue
+				}
+			}
 			m.evalSequence(cont.env, cont.rest, cont.next)
 		case *level18DefineCont:
 			value, err := expectSingleValue(m.value, "define")
@@ -364,6 +370,29 @@ func (m *level18Machine) run() (expr, error) {
 			return nil, &EvalError{Message: "unsupported continuation"}
 		}
 	}
+}
+
+func advanceSeqContCallCC(cont *level18SeqCont) (expr, bool) {
+	if cont == nil || len(cont.rest) == 0 {
+		return nil, false
+	}
+
+	call, ok := cont.rest[0].(listExpr)
+	if !ok || len(call.items) == 0 {
+		return nil, false
+	}
+
+	head, ok := call.items[0].(symbolExpr)
+	if !ok {
+		return nil, false
+	}
+	if head.name != "call/cc" && head.name != "call-with-current-continuation" {
+		return nil, false
+	}
+
+	nextForm := cont.rest[0]
+	cont.rest = append([]expr(nil), cont.rest[1:]...)
+	return nextForm, true
 }
 
 func (m *level18Machine) stepEval() error {

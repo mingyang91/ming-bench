@@ -372,7 +372,7 @@ func expandTemplate(template expr, ctx templateContext, repeatIndex *int) (expr,
 	case symbolExpr:
 		return expandTemplateSymbol(value, ctx, repeatIndex)
 	case listExpr:
-		if expanded, handled, err := expandIntroducedLet(value, ctx, repeatIndex); handled || err != nil {
+		if expanded, handled, err := expandIntroducedBindingForm(value, ctx, repeatIndex); handled || err != nil {
 			return expanded, err
 		}
 		return expandTemplateList(value, ctx, repeatIndex)
@@ -428,13 +428,21 @@ func expandTemplateList(list listExpr, ctx templateContext, repeatIndex *int) (e
 	return listExpr{items: items, pos: list.pos}, nil
 }
 
-func expandIntroducedLet(list listExpr, ctx templateContext, repeatIndex *int) (expr, bool, error) {
-	if len(list.items) < 3 || !isPlainTemplateIdentifier(list.items[0], "let", ctx.bindings) {
-		return nil, false, nil
+func expandIntroducedBindingForm(list listExpr, ctx templateContext, repeatIndex *int) (expr, bool, error) {
+	if expanded, handled, err := expandIntroducedLambda(list, ctx, repeatIndex); handled || err != nil {
+		return expanded, handled, err
 	}
+	if expanded, handled, err := expandIntroducedCaseLambda(list, ctx, repeatIndex); handled || err != nil {
+		return expanded, handled, err
+	}
+	if expanded, handled, err := expandIntroducedLet(list, ctx, repeatIndex); handled || err != nil {
+		return expanded, handled, err
+	}
+	return nil, false, nil
+}
 
-	rawBindings, ok := list.items[1].(listExpr)
-	if !ok {
+func expandIntroducedLambda(list listExpr, ctx templateContext, repeatIndex *int) (expr, bool, error) {
+	if len(list.items) < 3 || !isPlainTemplateIdentifier(list.items[0], "lambda", ctx.bindings) {
 		return nil, false, nil
 	}
 
@@ -444,21 +452,121 @@ func expandIntroducedLet(list listExpr, ctx templateContext, repeatIndex *int) (
 	}
 
 	renamed := copyRenameMap(ctx.renamed)
+	params, err := expandParamSpec(list.items[1], ctx, repeatIndex, renamed)
+	if err != nil {
+		return nil, true, err
+	}
+
+	body, err := expandBodyForms(list.items[2:], ctxWithRenamed(ctx, renamed), repeatIndex)
+	if err != nil {
+		return nil, true, err
+	}
+
+	items := make([]expr, 0, len(body)+2)
+	items = append(items, head, params)
+	items = append(items, body...)
+	return listExpr{items: items, pos: list.pos}, true, nil
+}
+
+func expandIntroducedCaseLambda(list listExpr, ctx templateContext, repeatIndex *int) (expr, bool, error) {
+	if len(list.items) < 2 || !isPlainTemplateIdentifier(list.items[0], "case-lambda", ctx.bindings) {
+		return nil, false, nil
+	}
+
+	head, err := expandTemplate(list.items[0], ctx, repeatIndex)
+	if err != nil {
+		return nil, true, err
+	}
+
+	items := make([]expr, 0, len(list.items))
+	items = append(items, head)
+	for _, rawClause := range list.items[1:] {
+		clause, ok := rawClause.(listExpr)
+		if !ok || len(clause.items) < 2 {
+			return nil, true, &EvalError{Message: "macro-generated case-lambda clauses must include parameters and a body"}
+		}
+
+		renamed := copyRenameMap(ctx.renamed)
+		params, err := expandParamSpec(clause.items[0], ctx, repeatIndex, renamed)
+		if err != nil {
+			return nil, true, err
+		}
+
+		body, err := expandBodyForms(clause.items[1:], ctxWithRenamed(ctx, renamed), repeatIndex)
+		if err != nil {
+			return nil, true, err
+		}
+
+		clauseItems := make([]expr, 0, len(body)+1)
+		clauseItems = append(clauseItems, params)
+		clauseItems = append(clauseItems, body...)
+		items = append(items, listExpr{items: clauseItems, pos: clause.pos})
+	}
+
+	return listExpr{items: items, pos: list.pos}, true, nil
+}
+
+func expandIntroducedLet(list listExpr, ctx templateContext, repeatIndex *int) (expr, bool, error) {
+	if len(list.items) < 3 || !isPlainTemplateIdentifier(list.items[0], "let", ctx.bindings) {
+		return nil, false, nil
+	}
+
+	head, err := expandTemplate(list.items[0], ctx, repeatIndex)
+	if err != nil {
+		return nil, true, err
+	}
+
+	renamed := copyRenameMap(ctx.renamed)
+	items := make([]expr, 0, len(list.items))
+	items = append(items, head)
+
+	bindingIndex := 1
+	if _, ok := list.items[1].(symbolExpr); ok {
+		name, err := expandBindingIdentifier(list.items[1], ctx, repeatIndex, renamed)
+		if err != nil {
+			return nil, true, err
+		}
+		items = append(items, name)
+		bindingIndex = 2
+	}
+
+	rawBindings, ok := list.items[bindingIndex].(listExpr)
+	if !ok {
+		return nil, false, nil
+	}
+
+	bindings, err := expandLetBindings(rawBindings, ctx, repeatIndex, renamed)
+	if err != nil {
+		return nil, true, err
+	}
+
+	items = append(items, listExpr{items: bindings, pos: rawBindings.pos})
+
+	body, err := expandBodyForms(list.items[bindingIndex+1:], ctxWithRenamed(ctx, renamed), repeatIndex)
+	if err != nil {
+		return nil, true, err
+	}
+	items = append(items, body...)
+
+	return listExpr{items: items, pos: list.pos}, true, nil
+}
+
+func expandLetBindings(rawBindings listExpr, ctx templateContext, repeatIndex *int, renamed map[string]string) ([]expr, error) {
 	bindings := make([]expr, 0, len(rawBindings.items))
 	for _, rawBinding := range rawBindings.items {
 		binding, ok := rawBinding.(listExpr)
 		if !ok || len(binding.items) != 2 {
-			return nil, true, &EvalError{Message: "macro-generated let bindings must have the form (name value)"}
+			return nil, &EvalError{Message: "macro-generated let bindings must have the form (name value)"}
 		}
 
 		name, err := expandBindingIdentifier(binding.items[0], ctx, repeatIndex, renamed)
 		if err != nil {
-			return nil, true, err
+			return nil, err
 		}
 
 		value, err := expandTemplate(binding.items[1], ctx, repeatIndex)
 		if err != nil {
-			return nil, true, err
+			return nil, err
 		}
 
 		bindings = append(bindings, listExpr{
@@ -466,22 +574,129 @@ func expandIntroducedLet(list listExpr, ctx templateContext, repeatIndex *int) (
 			pos:   binding.pos,
 		})
 	}
+	return bindings, nil
+}
 
-	bodyCtx := ctx
-	bodyCtx.renamed = renamed
+func expandBodyForms(forms []expr, ctx templateContext, repeatIndex *int) ([]expr, error) {
+	body := make([]expr, 0, len(forms))
+	renamed := copyRenameMap(ctx.renamed)
 
-	items := make([]expr, 0, len(list.items))
-	items = append(items, head)
-	items = append(items, listExpr{items: bindings, pos: rawBindings.pos})
-	for _, rawBody := range list.items[2:] {
-		body, err := expandTemplate(rawBody, bodyCtx, repeatIndex)
-		if err != nil {
-			return nil, true, err
+	for _, rawForm := range forms {
+		currentCtx := ctxWithRenamed(ctx, renamed)
+		if list, ok := rawForm.(listExpr); ok {
+			expanded, nextRenamed, handled, err := expandIntroducedDefine(list, currentCtx, repeatIndex)
+			if err != nil {
+				return nil, err
+			}
+			if handled {
+				body = append(body, expanded)
+				renamed = nextRenamed
+				continue
+			}
 		}
-		items = append(items, body)
+
+		expanded, err := expandTemplate(rawForm, currentCtx, repeatIndex)
+		if err != nil {
+			return nil, err
+		}
+		body = append(body, expanded)
 	}
 
-	return listExpr{items: items, pos: list.pos}, true, nil
+	return body, nil
+}
+
+func expandIntroducedDefine(list listExpr, ctx templateContext, repeatIndex *int) (expr, map[string]string, bool, error) {
+	if len(list.items) < 3 || !isPlainTemplateIdentifier(list.items[0], "define", ctx.bindings) {
+		return nil, nil, false, nil
+	}
+
+	head, err := expandTemplate(list.items[0], ctx, repeatIndex)
+	if err != nil {
+		return nil, nil, true, err
+	}
+
+	renamed := copyRenameMap(ctx.renamed)
+	switch target := list.items[1].(type) {
+	case symbolExpr:
+		name, err := expandBindingIdentifier(target, ctx, repeatIndex, renamed)
+		if err != nil {
+			return nil, nil, true, err
+		}
+
+		value, err := expandTemplate(list.items[2], ctx, repeatIndex)
+		if err != nil {
+			return nil, nil, true, err
+		}
+
+		return listExpr{
+			items: []expr{head, name, value},
+			pos:   list.pos,
+		}, renamed, true, nil
+	case listExpr:
+		if len(target.items) == 0 {
+			return nil, nil, true, &EvalError{Message: "macro-generated define target cannot be empty"}
+		}
+
+		name, err := expandBindingIdentifier(target.items[0], ctx, repeatIndex, renamed)
+		if err != nil {
+			return nil, nil, true, err
+		}
+
+		funcRenamed := copyRenameMap(renamed)
+		params, err := expandParamItems(target.items[1:], ctx, repeatIndex, funcRenamed)
+		if err != nil {
+			return nil, nil, true, err
+		}
+
+		body, err := expandBodyForms(list.items[2:], ctxWithRenamed(ctx, funcRenamed), repeatIndex)
+		if err != nil {
+			return nil, nil, true, err
+		}
+
+		targetItems := make([]expr, 0, len(params)+1)
+		targetItems = append(targetItems, name)
+		targetItems = append(targetItems, params...)
+
+		items := make([]expr, 0, len(body)+2)
+		items = append(items, head)
+		items = append(items, listExpr{items: targetItems, pos: target.pos})
+		items = append(items, body...)
+		return listExpr{items: items, pos: list.pos}, renamed, true, nil
+	default:
+		return nil, nil, false, nil
+	}
+}
+
+func expandParamSpec(form expr, ctx templateContext, repeatIndex *int, renamed map[string]string) (expr, error) {
+	switch params := form.(type) {
+	case symbolExpr:
+		return expandBindingIdentifier(params, ctx, repeatIndex, renamed)
+	case listExpr:
+		items, err := expandParamItems(params.items, ctx, repeatIndex, renamed)
+		if err != nil {
+			return nil, err
+		}
+		return listExpr{items: items, pos: params.pos}, nil
+	default:
+		return expandTemplate(form, ctx, repeatIndex)
+	}
+}
+
+func expandParamItems(items []expr, ctx templateContext, repeatIndex *int, renamed map[string]string) ([]expr, error) {
+	params := make([]expr, 0, len(items))
+	for _, item := range items {
+		if symbol, ok := item.(symbolExpr); ok && symbol.name == "." {
+			params = append(params, symbol)
+			continue
+		}
+
+		expanded, err := expandBindingIdentifier(item, ctx, repeatIndex, renamed)
+		if err != nil {
+			return nil, err
+		}
+		params = append(params, expanded)
+	}
+	return params, nil
 }
 
 func expandBindingIdentifier(binding expr, ctx templateContext, repeatIndex *int, renamed map[string]string) (expr, error) {
@@ -499,6 +714,11 @@ func expandBindingIdentifier(binding expr, ctx templateContext, repeatIndex *int
 	fresh := freshMacroName(symbol.name)
 	renamed[symbol.name] = fresh
 	return symbolExpr{name: fresh, pos: symbol.pos}, nil
+}
+
+func ctxWithRenamed(ctx templateContext, renamed map[string]string) templateContext {
+	ctx.renamed = renamed
+	return ctx
 }
 
 func templateRepeatCount(template expr, bindings *syntaxBindings) (int, error) {
