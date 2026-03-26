@@ -124,6 +124,9 @@ public class Evaluator {
                 case "cond" -> {
                     return evalCond(list, env);
                 }
+                case "define-record-type" -> {
+                    return evalDefineRecordType(list, env);
+                }
                 case "define-syntax" -> {
                     if (list.size() != 3) throw new EvalError("define-syntax: bad syntax");
                     if (!(list.get(1) instanceof String name) || name.startsWith("\""))
@@ -302,6 +305,67 @@ public class Evaluator {
                 return result;
             }
         }
+        return null; // void
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object evalDefineRecordType(List<?> list, Env env) throws EvalError {
+        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+        if (list.size() < 4) throw new EvalError("define-record-type: bad syntax");
+        // Type name (e.g. <point>)
+        if (!(list.get(1) instanceof String typeName))
+            throw new EvalError("define-record-type: expected type name");
+        // Constructor spec: (make-point x y)
+        if (!(list.get(2) instanceof List<?> ctorSpec) || ctorSpec.isEmpty())
+            throw new EvalError("define-record-type: expected constructor spec");
+        String ctorName = (String) ctorSpec.get(0);
+        List<String> ctorFields = new ArrayList<>();
+        for (int i = 1; i < ctorSpec.size(); i++) {
+            ctorFields.add((String) ctorSpec.get(i));
+        }
+        // Predicate name
+        if (!(list.get(3) instanceof String predName))
+            throw new EvalError("define-record-type: expected predicate name");
+        // Field specs: (field accessor)
+        List<String> fieldNames = new ArrayList<>();
+        List<String> accessorNames = new ArrayList<>();
+        for (int i = 4; i < list.size(); i++) {
+            if (!(list.get(i) instanceof List<?> fieldSpec) || fieldSpec.size() != 2)
+                throw new EvalError("define-record-type: bad field spec");
+            fieldNames.add((String) fieldSpec.get(0));
+            accessorNames.add((String) fieldSpec.get(1));
+        }
+
+        Record.RecordType recordType = new Record.RecordType(typeName, ctorFields);
+
+        // Define constructor
+        env.define(ctorName, Builtin.named(ctorName, args -> {
+            if (args.size() != ctorFields.size())
+                throw new EvalError(ctorName + ": expected " + ctorFields.size() + " arguments, got " + args.size());
+            return new Record(recordType, args.toArray());
+        }));
+
+        // Define predicate
+        env.define(predName, Builtin.named(predName, args -> {
+            if (args.size() != 1) throw new EvalError(predName + ": expected 1 argument");
+            return args.get(0) instanceof Record r && r.type == recordType;
+        }));
+
+        // Define accessors
+        for (int i = 0; i < fieldNames.size(); i++) {
+            String fieldName = fieldNames.get(i);
+            String accessorName = accessorNames.get(i);
+            int fieldIndex = ctorFields.indexOf(fieldName);
+            if (fieldIndex < 0)
+                throw new EvalError("define-record-type: field " + fieldName + " not in constructor");
+            env.define(accessorName, Builtin.named(accessorName, args -> {
+                if (args.size() != 1) throw new EvalError(accessorName + ": expected 1 argument");
+                if (!(args.get(0) instanceof Record r) || r.type != recordType)
+                    throw new EvalError(accessorName + ": not a " + typeName);
+                return r.fields[fieldIndex];
+            }));
+        }
+
         return null; // void
     }
 
