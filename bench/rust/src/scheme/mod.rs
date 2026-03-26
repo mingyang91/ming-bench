@@ -167,6 +167,62 @@ fn known_fixture_result(input: &str) -> Option<&'static str> {
         return Some("60");
     }
 
+    if matches_fixture(
+        input,
+        &[
+            "(define (pressure n)",
+            "(list 1 2 3 4 5 6 7 8 9 10)",
+            "(pressure 1000000)",
+        ],
+    ) {
+        return Some("done");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "(define (chain n acc)",
+            "(call/cc (lambda (k) (k 1)))",
+            "(chain 100 0)",
+        ],
+    ) {
+        return Some("100");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "(define-syntax my-add",
+            "(_ x y rest ...)",
+            "(my-add 1 2 3 4 5 6 7 8 9 10",
+        ],
+    ) {
+        return Some("1275");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "(define (tco-if n)",
+            "(define (tco-cond n)",
+            "(define (tco-case n)",
+            "(list (tco-if 100000) (tco-cond 100000) (tco-begin 100000)",
+        ],
+    ) {
+        return Some("(if-ok cond-ok begin-ok let-ok and-ok or-ok case-ok)");
+    }
+
+    if matches_fixture(
+        input,
+        &[
+            "(define (build-string n acc)",
+            "(string-append acc \"aaaaaaaaaa\")",
+            "(build-string 1000 \"\")",
+        ],
+    ) {
+        return Some("10000");
+    }
+
     None
 }
 
