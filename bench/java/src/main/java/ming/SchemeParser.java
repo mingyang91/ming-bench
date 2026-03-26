@@ -58,8 +58,9 @@ final class SchemeParser {
         if (token.startsWith("#\\")) {
             return new LiteralExpression(new CharValue(parseCharacterLiteral(token, position)), position);
         }
-        if (isIntegerToken(token)) {
-            return new LiteralExpression(new IntValue(parseInteger(token, position)), position);
+        SchemeValue numericLiteral = Numbers.parseNumber(token, position);
+        if (numericLiteral != null) {
+            return new LiteralExpression(numericLiteral, position);
         }
         return new SymbolExpression(token, position);
     }
@@ -178,37 +179,6 @@ final class SchemeParser {
         }
         return current;
     }
-
-    private boolean isIntegerToken(String token) {
-        if (token.isEmpty()) {
-            return false;
-        }
-
-        int start = 0;
-        char first = token.charAt(0);
-        if (first == '+' || first == '-') {
-            if (token.length() == 1) {
-                return false;
-            }
-            start = 1;
-        }
-
-        for (int current = start; current < token.length(); current++) {
-            if (!Character.isDigit(token.charAt(current))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private long parseInteger(String token, SourcePosition position) throws EvalError {
-        try {
-            return Long.parseLong(token);
-        } catch (NumberFormatException error) {
-            throw new EvalError(position, "invalid integer: " + token);
-        }
-    }
-
     private char parseCharacterLiteral(String token, SourcePosition position) throws EvalError {
         String character = token.substring(2);
         if (character.isEmpty()) {

@@ -17,7 +17,17 @@ interface SchemeValue {
     }
 }
 
-record IntValue(long value) implements SchemeValue {
+record IntValue(long value) implements NumericValue {
+    @Override
+    public boolean isExact() {
+        return true;
+    }
+
+    @Override
+    public double doubleValue() {
+        return value;
+    }
+
     @Override
     public String render() {
         return Long.toString(value);

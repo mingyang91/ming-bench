@@ -207,14 +207,10 @@ public class Evaluator {
         builtins.put("-", new BuiltinProcedure("-", Evaluator::applySubtract));
         builtins.put("*", new BuiltinProcedure("*", Evaluator::applyMultiply));
         builtins.put("/", new BuiltinProcedure("/", Evaluator::applyDivide));
-        builtins.put("<", new BuiltinProcedure("<", args -> compare(args, "<",
-                (left, right) -> left < right)));
-        builtins.put(">", new BuiltinProcedure(">", args -> compare(args, ">",
-                (left, right) -> left > right)));
-        builtins.put("=", new BuiltinProcedure("=", args -> compare(args, "=",
-                (left, right) -> left == right)));
-        builtins.put("<=", new BuiltinProcedure("<=", args -> compare(args, "<=",
-                (left, right) -> left <= right)));
+        builtins.put("<", new BuiltinProcedure("<", args -> compare(args, "<", ordering -> ordering < 0)));
+        builtins.put(">", new BuiltinProcedure(">", args -> compare(args, ">", ordering -> ordering > 0)));
+        builtins.put("=", new BuiltinProcedure("=", args -> compare(args, "=", ordering -> ordering == 0)));
+        builtins.put("<=", new BuiltinProcedure("<=", args -> compare(args, "<=", ordering -> ordering <= 0)));
         builtins.put("not", new BuiltinProcedure("not", Evaluator::applyNot));
         builtins.put("cons", new BuiltinProcedure("cons", Evaluator::applyCons));
         builtins.put("car", new BuiltinProcedure("car", Evaluator::applyCar));
@@ -247,7 +243,19 @@ public class Evaluator {
         builtins.put("string?", new BuiltinProcedure("string?", args -> applyPredicate(args, "string?",
                 value -> value instanceof StringValue)));
         builtins.put("number?", new BuiltinProcedure("number?", args -> applyPredicate(args, "number?",
-                value -> value instanceof IntValue)));
+                Numbers::isNumber)));
+        builtins.put("integer?", new BuiltinProcedure("integer?", args -> applyPredicate(args, "integer?",
+                Numbers::isIntegerValue)));
+        builtins.put("rational?", new BuiltinProcedure("rational?", args -> applyPredicate(args, "rational?",
+                Numbers::isRationalValue)));
+        builtins.put("exact?", new BuiltinProcedure("exact?", args -> applyPredicate(args, "exact?",
+                Numbers::isExactNumber)));
+        builtins.put("inexact?", new BuiltinProcedure("inexact?", args -> applyPredicate(args, "inexact?",
+                Numbers::isInexactNumber)));
+        builtins.put("exact->inexact", new BuiltinProcedure("exact->inexact", Evaluator::applyExactToInexact));
+        builtins.put("inexact->exact", new BuiltinProcedure("inexact->exact", Evaluator::applyInexactToExact));
+        builtins.put("numerator", new BuiltinProcedure("numerator", Evaluator::applyNumerator));
+        builtins.put("denominator", new BuiltinProcedure("denominator", Evaluator::applyDenominator));
         builtins.put("boolean?", new BuiltinProcedure("boolean?", args -> applyPredicate(args, "boolean?",
                 value -> value instanceof BoolValue)));
         builtins.put("pair?", new BuiltinProcedure("pair?", args -> applyPredicate(args, "pair?",
@@ -634,51 +642,19 @@ public class Evaluator {
     }
 
     private static SchemeValue applyAdd(List<SchemeValue> arguments) throws EvalError {
-        long total = 0L;
-        for (SchemeValue argument : arguments) {
-            total += requireInteger(argument, "+");
-        }
-        return new IntValue(total);
+        return Numbers.add(arguments, "+");
     }
 
     private static SchemeValue applySubtract(List<SchemeValue> arguments) throws EvalError {
-        if (arguments.isEmpty()) {
-            throw new EvalError("-: expected at least 1 argument");
-        }
-
-        long result = requireInteger(arguments.getFirst(), "-");
-        if (arguments.size() == 1) {
-            return new IntValue(-result);
-        }
-
-        for (int index = 1; index < arguments.size(); index++) {
-            result -= requireInteger(arguments.get(index), "-");
-        }
-        return new IntValue(result);
+        return Numbers.subtract(arguments, "-");
     }
 
     private static SchemeValue applyMultiply(List<SchemeValue> arguments) throws EvalError {
-        long total = 1L;
-        for (SchemeValue argument : arguments) {
-            total *= requireInteger(argument, "*");
-        }
-        return new IntValue(total);
+        return Numbers.multiply(arguments, "*");
     }
 
     private static SchemeValue applyDivide(List<SchemeValue> arguments) throws EvalError {
-        if (arguments.size() < 2) {
-            throw new EvalError("/: expected at least 2 arguments");
-        }
-
-        long result = requireInteger(arguments.getFirst(), "/");
-        for (int index = 1; index < arguments.size(); index++) {
-            long divisor = requireInteger(arguments.get(index), "/");
-            if (divisor == 0L) {
-                throw new EvalError("division by zero");
-            }
-            result /= divisor;
-        }
-        return new IntValue(result);
+        return Numbers.divide(arguments, "/");
     }
 
     private static SchemeValue applyNot(List<SchemeValue> arguments) throws EvalError {
@@ -819,16 +795,16 @@ public class Evaluator {
     private static SchemeValue applyStringToNumber(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 1, "string->number");
         String value = requireString(arguments.getFirst(), "string->number");
-        try {
-            return new IntValue(Long.parseLong(value));
-        } catch (NumberFormatException error) {
+        SchemeValue parsed = Numbers.tryParseNumber(value);
+        if (parsed == null) {
             return BoolValue.FALSE;
         }
+        return parsed;
     }
 
     private static SchemeValue applyNumberToString(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 1, "number->string");
-        return new StringValue(Long.toString(requireInteger(arguments.getFirst(), "number->string")));
+        return new StringValue(Numbers.requireNumeric(arguments.getFirst(), "number->string").render());
     }
 
     private static SchemeValue applySymbolToString(List<SchemeValue> arguments) throws EvalError {
@@ -907,7 +883,27 @@ public class Evaluator {
 
     private static SchemeValue applyAbs(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 1, "abs");
-        return new IntValue(Math.abs(requireInteger(arguments.getFirst(), "abs")));
+        return Numbers.abs(arguments.getFirst(), "abs");
+    }
+
+    private static SchemeValue applyExactToInexact(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "exact->inexact");
+        return Numbers.exactToInexact(arguments.getFirst(), "exact->inexact");
+    }
+
+    private static SchemeValue applyInexactToExact(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "inexact->exact");
+        return Numbers.inexactToExact(arguments.getFirst(), "inexact->exact");
+    }
+
+    private static SchemeValue applyNumerator(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "numerator");
+        return Numbers.numerator(arguments.getFirst(), "numerator");
+    }
+
+    private static SchemeValue applyDenominator(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "denominator");
+        return Numbers.denominator(arguments.getFirst(), "denominator");
     }
 
     private static SchemeValue applyModulo(List<SchemeValue> arguments) throws EvalError {
@@ -1057,10 +1053,12 @@ public class Evaluator {
             throw new EvalError(name + ": expected at least 2 arguments");
         }
 
-        long previous = requireInteger(arguments.getFirst(), name);
+        SchemeValue previous = arguments.getFirst();
+        Numbers.requireNumeric(previous, name);
         for (int index = 1; index < arguments.size(); index++) {
-            long current = requireInteger(arguments.get(index), name);
-            if (!comparator.test(previous, current)) {
+            SchemeValue current = arguments.get(index);
+            int ordering = Numbers.compareValues(previous, current, name);
+            if (!comparator.test(ordering)) {
                 return BoolValue.FALSE;
             }
             previous = current;
@@ -1118,11 +1116,7 @@ public class Evaluator {
     }
 
     private static long requireInteger(SchemeValue value, String procedure) throws EvalError {
-        if (value instanceof IntValue intValue) {
-            return intValue.value();
-        }
-
-        throw new EvalError(procedure + ": expected integer");
+        return Numbers.requireInteger(value, procedure);
     }
 
     private static String requireString(SchemeValue value, String procedure) throws EvalError {
@@ -1228,11 +1222,11 @@ public class Evaluator {
         if (left == right) {
             return true;
         }
+        if (Numbers.numericEquals(left, right)) {
+            return true;
+        }
         if (left == null || right == null || left.getClass() != right.getClass()) {
             return false;
-        }
-        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
-            return leftInt.value() == rightInt.value();
         }
         if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
             return leftBool.value() == rightBool.value();
@@ -1296,7 +1290,7 @@ public class Evaluator {
 
     @FunctionalInterface
     private interface NumericComparator {
-        boolean test(long left, long right);
+        boolean test(int ordering);
     }
 
     @FunctionalInterface
