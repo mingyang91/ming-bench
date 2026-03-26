@@ -11,6 +11,38 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 type VecRef = Rc<RefCell<Vec<Value>>>;
 type PairRef = Rc<RefCell<(Value, Value)>>;
 
+// Continuation support
+static CC_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+fn next_cc_id() -> usize {
+    CC_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+// A continuation value: a function from Value to Result<Value, EvalError>
+// Wrapped in Rc so it's Clone.
+struct ContFn(Rc<dyn Fn(Value) -> Result<Value, EvalError>>);
+
+impl ContFn {
+    fn new(f: impl Fn(Value) -> Result<Value, EvalError> + 'static) -> Self {
+        ContFn(Rc::new(f))
+    }
+    fn call(&self, v: Value) -> Result<Value, EvalError> {
+        (self.0)(v)
+    }
+}
+
+impl Clone for ContFn {
+    fn clone(&self) -> Self {
+        ContFn(self.0.clone())
+    }
+}
+
+impl fmt::Debug for ContFn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#<continuation>")
+    }
+}
+
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn gensym(base: &str) -> String {
@@ -78,6 +110,11 @@ enum Value {
         expr: Box<Expr>,
         env: Env,
     },
+    // A captured continuation (call/cc)
+    Continuation {
+        id: usize,
+        func: ContFn,
+    },
 }
 
 fn make_pair(car: Value, cdr: Value) -> Value {
@@ -86,8 +123,25 @@ fn make_pair(car: Value, cdr: Value) -> Value {
 
 static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+// Restart context: the body context captured when a call/cc continuation is created.
+// Used by reentrant continuations to replay from the correct position.
+struct RestartCtx {
+    body_exprs: Vec<Expr>,
+    body_idx: usize,  // index of the expression CONTAINING the call/cc
+    body_env: Env,
+    outer_k: ContFn,
+}
+
 thread_local! {
     static OUTPUT: RefCell<String> = RefCell::new(String::new());
+    // Stack of active call/cc IDs (for escape detection)
+    static ACTIVE_CC: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+    // Override stack: when a reentrant continuation is invoked, it pushes the value here.
+    // The next call/cc evaluation that's part of the replay pops and returns this value.
+    static CC_OVERRIDE_STACK: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+    // Current body context: set by eval_body_cps before evaluating each expression.
+    // read by apply_cps_callcc to build the restart function.
+    static BODY_CTX: RefCell<Option<RestartCtx>> = RefCell::new(None);
 }
 
 fn write_output(s: &str) {
@@ -253,6 +307,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::TailCall { .. } => write!(f, "#<tailcall>"),
+            Value::Continuation { .. } => write!(f, "#<continuation>"),
         }
     }
 }
@@ -716,6 +771,7 @@ fn is_builtin(name: &str) -> bool {
             | "reverse" | "member" | "memv" | "assv" | "sort" | "error"
             | "gcd" | "lcm" | "truncate" | "round" | "floor" | "ceiling"
             | "make-string" | "string" | "string>?" | "string<=?" | "string>=?"
+            | "call/cc" | "call-with-current-continuation"
     )
 }
 
@@ -930,6 +986,24 @@ fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                 "case-lambda: no matching clause for {} arguments at {}",
                 args.len(), call_pos
             )))
+        }
+        Value::Continuation { id, func } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "continuation expects 1 argument, got {} at {}",
+                    args.len(), call_pos
+                )));
+            }
+            let val = args[0].clone();
+            // Check if this continuation is currently active (escape path)
+            let is_active = ACTIVE_CC.with(|ac| ac.borrow().contains(id));
+            if is_active {
+                // Escape: propagate as an error through the call stack
+                Err(EvalError::ContinuationEscape(*id, Box::new(val)))
+            } else {
+                // Reentrant: call the stored restart function
+                func.call(val)
+            }
         }
         _ => Err(EvalError::Type(format!(
             "not a procedure: {} at {}",
@@ -2749,7 +2823,8 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
                 | Value::CaseLambda { .. }
                 | Value::RecordConstructor { .. }
                 | Value::RecordPredicate { .. }
-                | Value::RecordAccessor { .. } => true,
+                | Value::RecordAccessor { .. }
+                | Value::Continuation { .. } => true,
                 Value::Symbol(s) => is_builtin(s),
                 _ => false,
             };
@@ -3233,6 +3308,535 @@ fn ensure_args(op: &str, args: &[Value], expected: usize, p: Pos) -> Result<(), 
     Ok(())
 }
 
+// ── CPS evaluator for call/cc support ──────────────────────────────────────
+
+/// Check if an expression (or any sub-expression) contains an actual call/cc invocation.
+/// Used to decide whether to use CPS evaluation.
+/// Quoted forms are skipped to avoid false positives on `'call-with-current-continuation`.
+fn contains_callcc(expr: &Expr) -> bool {
+    match expr {
+        Expr::List(elems, _) => {
+            if let Some(Expr::Symbol(s, _)) = elems.first() {
+                // Skip quoted forms — 'call-with-current-continuation is data, not a call
+                if s == "quote" {
+                    return false;
+                }
+                // This IS a call/cc invocation
+                if s == "call/cc" || s == "call-with-current-continuation" {
+                    return true;
+                }
+            }
+            elems.iter().any(contains_callcc)
+        }
+        // A bare call/cc symbol reference (e.g., passed as first-class value)
+        Expr::Symbol(s, _) => s == "call/cc" || s == "call-with-current-continuation",
+        _ => false,
+    }
+}
+
+/// CPS body evaluator: evaluate a sequence of expressions. k receives the last value.
+/// Always uses CPS evaluation to properly thread continuations.
+fn eval_body_cps(exprs: &[Expr], env: &Env, k: ContFn) -> Result<Value, EvalError> {
+    eval_body_cps_from(exprs, 0, env, k)
+}
+
+fn eval_body_cps_from(exprs: &[Expr], start: usize, env: &Env, k: ContFn) -> Result<Value, EvalError> {
+    if start >= exprs.len() {
+        return k.call(Value::Boolean(false));
+    }
+    // Set BODY_CTX: captures the restart context for any call/cc in this expression.
+    // The outer_k is `k` (the continuation of the WHOLE body from here), NOT k_rest.
+    // The restart function will call eval_body_cps_from(exprs, start, env, k) again.
+    let exprs_rc = exprs.to_vec();
+    let env2 = env.clone();
+    let k2 = k.clone();
+    BODY_CTX.with(|ctx| {
+        *ctx.borrow_mut() = Some(RestartCtx {
+            body_exprs: exprs_rc,
+            body_idx: start,
+            body_env: env2,
+            outer_k: k2,
+        });
+    });
+
+    let result = if start == exprs.len() - 1 {
+        // Last expression: continuation is k
+        eval_cps(&exprs[start], env, k)
+    } else {
+        // Not last: continuation discards result and continues with rest
+        let exprs3 = exprs.to_vec();
+        let env3 = env.clone();
+        let k_rest = ContFn::new(move |_v| {
+            eval_body_cps_from(&exprs3, start + 1, &env3, k.clone())
+        });
+        eval_cps(&exprs[start], env, k_rest)
+    };
+
+    // Clear BODY_CTX after evaluation (it may have been updated by nested evals)
+    // Only clear if it's still "ours" — actually, just leave it; it'll be overwritten by next call
+    // We don't need to clear because BODY_CTX is always set before any call/cc is reached.
+    result
+}
+
+/// CPS evaluator: evaluate expr in env, then call k with the result.
+fn eval_cps(expr: &Expr, env: &Env, k: ContFn) -> Result<Value, EvalError> {
+    match expr {
+        Expr::List(elems, p) if !elems.is_empty() => {
+            let pos = *p;
+            // Check for special forms first
+            if let Expr::Symbol(op, _) = &elems[0] {
+                match op.as_str() {
+                    "call/cc" | "call-with-current-continuation" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity(format!(
+                                "call/cc expects 1 argument at {}", pos
+                            )));
+                        }
+                        let f = eval(&elems[1], env)?;
+                        // apply_cps_callcc checks CC_OVERRIDE_STACK internally
+                        return apply_cps_callcc(f, pos, k);
+                    }
+                    "define" => {
+                        // (define name value) — use CPS for value evaluation to capture continuations
+                        if elems.len() >= 3 {
+                            if let Expr::Symbol(name, _) = &elems[1] {
+                                let name2 = name.clone();
+                                let env2 = env.clone();
+                                let k_define = ContFn::new(move |v| {
+                                    env_set(&env2, name2.clone(), v);
+                                    k.call(Value::Symbol(name2.clone()))
+                                });
+                                return eval_cps(&elems[2], env, k_define);
+                            }
+                        }
+                        // (define (f ...) body) or other forms — evaluate eagerly (creates lambda)
+                        let v = eval(expr, env)?;
+                        let v = force(v)?;
+                        return k.call(v);
+                    }
+                    "set!" => {
+                        // (set! name value) — CPS for value if it contains call/cc
+                        if elems.len() == 3 {
+                            if let Expr::Symbol(name, _) = &elems[1] {
+                                let name2 = name.clone();
+                                let env2 = env.clone();
+                                let k_set = ContFn::new(move |v| {
+                                    env_set_existing(&env2, &name2, v);
+                                    k.call(Value::Nil)
+                                });
+                                return eval_cps(&elems[2], env, k_set);
+                            }
+                        }
+                        // Fall through to eager eval
+                        let v = eval(expr, env)?;
+                        let v = force(v)?;
+                        return k.call(v);
+                    }
+                    "let" => {
+                        // (let ...) — CPS body evaluation for captured continuations
+                        return eval_cps_let(&elems[1..], env, pos, k);
+                    }
+                    "begin" => {
+                        // (begin e1 e2 ...) — CPS body
+                        if elems[1..].is_empty() {
+                            return k.call(Value::Boolean(false));
+                        }
+                        return eval_body_cps(&elems[1..], env, k);
+                    }
+                    "letrec" => {
+                        return eval_cps_letrec(&elems[1..], env, pos, k, false);
+                    }
+                    "letrec*" => {
+                        return eval_cps_letrec(&elems[1..], env, pos, k, true);
+                    }
+                    "let*" => {
+                        return eval_cps_let_star(&elems[1..], env, pos, k);
+                    }
+                    "if" => {
+                        // (if cond then [else]) — evaluate condition eagerly, then CPS branch
+                        if elems.len() < 3 || elems.len() > 4 {
+                            return Err(EvalError::Arity(format!("if: bad syntax at {}", pos)));
+                        }
+                        let cond_val = force(eval(&elems[1], env)?)?;
+                        let branch = if !matches!(cond_val, Value::Boolean(false)) {
+                            elems[2].clone()
+                        } else if elems.len() == 4 {
+                            elems[3].clone()
+                        } else {
+                            return k.call(Value::Boolean(false));
+                        };
+                        return eval_cps(&branch, env, k);
+                    }
+                    // Other recognized special forms that produce values without calling
+                    // user lambdas: evaluate eagerly and pass result to k.
+                    // ContinuationEscape propagates via ? if any nested call invokes a continuation.
+                    "lambda" | "case-lambda" | "quote" | "define-syntax"
+                    | "define-record-type" | "string-set!" => {
+                        let v = eval(expr, env)?;
+                        let v = force(v)?;
+                        return k.call(v);
+                    }
+                    // cond/and/or/when/unless/case/do may call user functions — handle via CPS.
+                    // Desugar them: use eager eval to get the value but note that if any
+                    // continuation is invoked inside, ContinuationEscape propagates via ? correctly.
+                    "cond" | "and" | "or" | "when" | "unless" | "case" | "do" => {
+                        let v = eval(expr, env)?;
+                        let v = force(v)?;
+                        return k.call(v);
+                    }
+                    _ => {
+                        // Check if this is a macro
+                        if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
+                            // Expand macro and re-evaluate via CPS
+                            let expanded = eval_macro(&literals, &rules, &def_env, elems, env, pos)?;
+                            return k.call(force(expanded)?);
+                        }
+                        // Otherwise: user function call or builtin — fall through to general application
+                    }
+                }
+            }
+
+            // General function application: evaluate function expression via CPS,
+            // then evaluate all args via CPS (so lambda bodies are always CPS-evaluated),
+            // then apply via apply_cps_value.
+            let func_expr = elems[0].clone();
+            let arg_exprs = elems[1..].to_vec();
+            let env2 = env.clone();
+            let k_func = ContFn::new(move |func_val| {
+                eval_args_cps(func_val, &arg_exprs, &env2, pos, 0, Vec::new(), k.clone())
+            });
+            eval_cps(&func_expr, env, k_func)
+        }
+        _ => {
+            // Atoms and other non-list expressions: evaluate eagerly
+            let v = eval(expr, env)?;
+            let v = force(v)?;
+            k.call(v)
+        }
+    }
+}
+
+/// CPS variant of let evaluation.
+fn eval_cps_let(args: &[Expr], env: &Env, p: Pos, k: ContFn) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("let requires bindings and body at {}", p)));
+    }
+    // Named let: (let name ((var init) ...) body ...)
+    if let Expr::Symbol(_name, _) = &args[0] {
+        // Use the existing eval_let for named let (it creates a loop lambda)
+        // and wrap result with k
+        let v = eval_let(args, env, p)?;
+        let v = force(v)?;
+        return k.call(v);
+    }
+    // Regular let
+    let bindings_expr = match &args[0] {
+        Expr::List(b, _) => b,
+        _ => return Err(EvalError::Type(format!("let: expected bindings list at {}", p))),
+    };
+    let local_env = new_env(Some(env.clone()));
+    for b in bindings_expr {
+        match b {
+            Expr::List(pair, _) if pair.len() == 2 => {
+                let name = match &pair[0] {
+                    Expr::Symbol(s, _) => s.clone(),
+                    _ => return Err(EvalError::Type(format!("let: expected symbol in binding at {}", p))),
+                };
+                let val = eval(&pair[1], env)?;
+                let val = force(val)?;
+                env_set(&local_env, name, val);
+            }
+            _ => return Err(EvalError::Type(format!("let: invalid binding at {}", p))),
+        }
+    }
+    let body = &args[1..];
+    if body.is_empty() {
+        return k.call(Value::Boolean(false));
+    }
+    eval_body_cps(body, &local_env, k)
+}
+
+/// CPS variant of letrec/letrec* evaluation.
+fn eval_cps_letrec(args: &[Expr], env: &Env, p: Pos, k: ContFn, star: bool) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("letrec requires bindings and body at {}", p)));
+    }
+    let bindings_expr = match &args[0] {
+        Expr::List(b, _) => b,
+        _ => return Err(EvalError::Type(format!("letrec: expected bindings list at {}", p))),
+    };
+    let local_env = new_env(Some(env.clone()));
+    if !star {
+        // Pre-bind all names to #f
+        let mut names = Vec::new();
+        let mut init_exprs = Vec::new();
+        for b in bindings_expr {
+            match b {
+                Expr::List(pair, _) if pair.len() == 2 => {
+                    let name = match &pair[0] {
+                        Expr::Symbol(s, _) => s.clone(),
+                        _ => return Err(EvalError::Type(format!("letrec: expected symbol at {}", p))),
+                    };
+                    env_set(&local_env, name.clone(), Value::Boolean(false));
+                    names.push(name);
+                    init_exprs.push(pair[1].clone());
+                }
+                _ => return Err(EvalError::Type(format!("letrec: invalid binding at {}", p))),
+            }
+        }
+        for (name, init) in names.iter().zip(init_exprs.iter()) {
+            let val = force(eval(init, &local_env)?)?;
+            env_set(&local_env, name.clone(), val);
+        }
+    } else {
+        for b in bindings_expr {
+            match b {
+                Expr::List(pair, _) if pair.len() == 2 => {
+                    let name = match &pair[0] {
+                        Expr::Symbol(s, _) => s.clone(),
+                        _ => return Err(EvalError::Type(format!("letrec*: expected symbol at {}", p))),
+                    };
+                    let val = force(eval(&pair[1], &local_env)?)?;
+                    env_set(&local_env, name, val);
+                }
+                _ => return Err(EvalError::Type(format!("letrec*: invalid binding at {}", p))),
+            }
+        }
+    }
+    let body = &args[1..];
+    if body.is_empty() {
+        return k.call(Value::Boolean(false));
+    }
+    eval_body_cps(body, &local_env, k)
+}
+
+/// CPS variant of let* evaluation.
+fn eval_cps_let_star(args: &[Expr], env: &Env, p: Pos, k: ContFn) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("let* requires bindings and body at {}", p)));
+    }
+    let bindings_expr = match &args[0] {
+        Expr::List(b, _) => b,
+        _ => return Err(EvalError::Type(format!("let*: expected bindings list at {}", p))),
+    };
+    let local_env = new_env(Some(env.clone()));
+    for b in bindings_expr {
+        match b {
+            Expr::List(pair, _) if pair.len() == 2 => {
+                let name = match &pair[0] {
+                    Expr::Symbol(s, _) => s.clone(),
+                    _ => return Err(EvalError::Type(format!("let*: expected symbol at {}", p))),
+                };
+                let val = force(eval(&pair[1], &local_env)?)?;
+                env_set(&local_env, name, val);
+            }
+            _ => return Err(EvalError::Type(format!("let*: invalid binding at {}", p))),
+        }
+    }
+    let body = &args[1..];
+    if body.is_empty() {
+        return k.call(Value::Boolean(false));
+    }
+    eval_body_cps(body, &local_env, k)
+}
+
+/// Evaluate argument expressions one by one using CPS, accumulating results.
+/// When all args are evaluated, apply func to them and call k.
+fn eval_args_cps(
+    func_val: Value,
+    arg_exprs: &[Expr],
+    env: &Env,
+    pos: Pos,
+    idx: usize,
+    evaluated: Vec<Value>,
+    k: ContFn,
+) -> Result<Value, EvalError> {
+    if idx >= arg_exprs.len() {
+        // All args evaluated; apply function
+        return apply_cps_value(func_val, evaluated, pos, k);
+    }
+
+    // Always evaluate args via CPS so lambda bodies are always CPS-evaluated
+    let func_val2 = func_val;
+    let remaining: Vec<Expr> = arg_exprs[idx + 1..].to_vec();
+    let env2 = env.clone();
+    let arg_expr = arg_exprs[idx].clone();
+    let k_arg = ContFn::new(move |v| {
+        let mut evaled = evaluated.clone();
+        evaled.push(v);
+        eval_args_cps(func_val2.clone(), &remaining, &env2, pos, 0, evaled, k.clone())
+    });
+    eval_cps(&arg_expr, env, k_arg)
+}
+
+/// Apply a captured continuation (call/cc handler).
+fn apply_cps_callcc(f: Value, pos: Pos, outer_k: ContFn) -> Result<Value, EvalError> {
+    // Check if we're replaying (an override is waiting for the next call/cc)
+    if let Some(v) = CC_OVERRIDE_STACK.with(|s| {
+        if !s.borrow().is_empty() { Some(s.borrow_mut().pop().unwrap()) } else { None }
+    }) {
+        // Replay: return the override value directly via outer_k
+        return outer_k.call(v);
+    }
+
+    let id = next_cc_id();
+
+    // Build the restart function for reentrant invocations.
+    // Take the current BODY_CTX (if available) to build a proper restart.
+    let restart_fn: ContFn = BODY_CTX.with(|ctx| {
+        if let Some(rc) = ctx.borrow().as_ref() {
+            // Clone the restart context
+            let r_exprs = rc.body_exprs.clone();
+            let r_idx = rc.body_idx;
+            let r_env = rc.body_env.clone();
+            let r_outer_k = rc.outer_k.clone();
+            ContFn::new(move |v| {
+                // Push override so the replayed call/cc returns v
+                CC_OVERRIDE_STACK.with(|s| s.borrow_mut().push(v));
+                // Re-evaluate the body from the start position
+                eval_body_cps_from(&r_exprs, r_idx, &r_env, r_outer_k.clone())
+            })
+        } else {
+            // No body context: fall back to outer_k (for escape-only continuations)
+            outer_k.clone()
+        }
+    });
+
+    // Build the continuation value
+    let restart_fn2 = restart_fn.clone();
+    let cont_val = Value::Continuation {
+        id,
+        func: ContFn::new(move |v| {
+            let is_active = ACTIVE_CC.with(|ac| ac.borrow().contains(&id));
+            if is_active {
+                Err(EvalError::ContinuationEscape(id, Box::new(v)))
+            } else {
+                // Reentrant: use restart function
+                restart_fn2.call(v)
+            }
+        }),
+    };
+
+    // Register this call/cc as active
+    ACTIVE_CC.with(|ac| ac.borrow_mut().push(id));
+
+    // Apply f to cont_val, using outer_k as the continuation of the whole call/cc
+    let result = apply_cps_value(f, vec![cont_val], pos, outer_k.clone());
+
+    // Remove from active
+    ACTIVE_CC.with(|ac| {
+        let mut v = ac.borrow_mut();
+        if let Some(i) = v.iter().rposition(|x| *x == id) {
+            v.remove(i);
+        }
+    });
+
+    match result {
+        Ok(v) => Ok(v),
+        Err(EvalError::ContinuationEscape(eid, val)) if eid == id => {
+            // Escape: the continuation was called within dynamic extent
+            outer_k.call(*val)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// CPS apply: apply a value as a function to args, then call k.
+fn apply_cps_value(func: Value, args: Vec<Value>, pos: Pos, k: ContFn) -> Result<Value, EvalError> {
+    match &func {
+        Value::Symbol(op) if op == "call/cc" || op == "call-with-current-continuation" => {
+            // call/cc called as a value (e.g., ((lambda (cc) ...) call/cc))
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "call/cc expects 1 argument at {}", pos
+                )));
+            }
+            apply_cps_callcc(args.into_iter().next().unwrap(), pos, k)
+        }
+        Value::Lambda { params, rest_param, body, env } => {
+            // Apply lambda with CPS body evaluation
+            let local_env = new_env(Some(env.clone()));
+            if let Some(ref rest) = rest_param {
+                if args.len() < params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected at least {} arguments, got {} at {}",
+                        params.len(), args.len(), pos
+                    )));
+                }
+                for (p, a) in params.iter().zip(args.iter()) {
+                    env_set(&local_env, p.clone(), a.clone());
+                }
+                let rest_list = vec_to_list(args[params.len()..].to_vec());
+                env_set(&local_env, rest.clone(), rest_list);
+            } else {
+                if args.len() != params.len() {
+                    return Err(EvalError::Arity(format!(
+                        "expected {} arguments, got {} at {}",
+                        params.len(), args.len(), pos
+                    )));
+                }
+                for (p, a) in params.iter().zip(args.iter()) {
+                    env_set(&local_env, p.clone(), a.clone());
+                }
+            }
+            if body.is_empty() {
+                return k.call(Value::Boolean(false));
+            }
+            eval_body_cps(body, &local_env, k)
+        }
+        Value::CaseLambda { clauses, env } => {
+            for (params, rest_param, body) in clauses {
+                let matches = if rest_param.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let local_env = new_env(Some(env.clone()));
+                    for (p, a) in params.iter().zip(args.iter()) {
+                        env_set(&local_env, p.clone(), a.clone());
+                    }
+                    if let Some(ref rest) = rest_param {
+                        let rest_list = vec_to_list(args[params.len()..].to_vec());
+                        env_set(&local_env, rest.clone(), rest_list);
+                    }
+                    if body.is_empty() {
+                        return k.call(Value::Boolean(false));
+                    }
+                    return eval_body_cps(body, &local_env, k);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "case-lambda: no matching clause for {} arguments at {}",
+                args.len(), pos
+            )))
+        }
+        Value::Continuation { id, func } => {
+            // Already handled in apply_value; duplicate logic here for CPS path
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "continuation expects 1 argument, got {} at {}", args.len(), pos
+                )));
+            }
+            let val = args.into_iter().next().unwrap();
+            let is_active = ACTIVE_CC.with(|ac| ac.borrow().contains(id));
+            if is_active {
+                Err(EvalError::ContinuationEscape(*id, Box::new(val)))
+            } else {
+                func.call(val)
+            }
+        }
+        _ => {
+            // For all other callable values, use the existing apply_value mechanism
+            // and wrap the result with k
+            let result = force(apply_value(&func, &args, pos)?)?;
+            k.call(result)
+        }
+    }
+}
+
+// ── End CPS evaluator ───────────────────────────────────────────────────────
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
@@ -3242,6 +3846,12 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         return Err(EvalError::Parse("empty input".into()));
     }
     let env = default_env();
+    // Check if any expression contains call/cc; if so, use the CPS evaluator.
+    if exprs.iter().any(contains_callcc) {
+        let k = ContFn::new(|v| Ok(v));
+        let result = eval_body_cps(&exprs, &env, k)?;
+        return Ok(result.to_string());
+    }
     let mut result = Value::Boolean(false);
     for expr in &exprs {
         result = eval(expr, &env)?;
@@ -3259,10 +3869,17 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         return Err(EvalError::Parse("empty input".into()));
     }
     let env = default_env();
-    let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &env)?;
-    }
+    // Check if any expression contains call/cc; if so, use the CPS evaluator.
+    let result = if exprs.iter().any(contains_callcc) {
+        let k = ContFn::new(|v| Ok(v));
+        eval_body_cps(&exprs, &env, k)?
+    } else {
+        let mut result = Value::Boolean(false);
+        for expr in &exprs {
+            result = eval(expr, &env)?;
+        }
+        result
+    };
     let output = OUTPUT.with(|out| out.borrow().clone());
     Ok((result.to_string(), output))
 }
