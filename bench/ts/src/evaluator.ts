@@ -430,6 +430,35 @@ function applyProc(proc: SchemeVal, args: SchemeVal[], pos?: Pos): SchemeVal {
   throw errAt(`not a procedure: ${display(proc)}`, pos);
 }
 
+function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag !== b.tag) return false;
+  switch (a.tag) {
+    case 'number': return a.value === (b as typeof a).value;
+    case 'boolean': return a.value === (b as typeof a).value;
+    case 'string': return a === b; // reference equality for strings in eq?
+    case 'symbol': return a.value === (b as typeof a).value;
+    case 'char': return a.value === (b as typeof a).value;
+    case 'nil': return true;
+    case 'pair': return a === b;
+    default: return a === b;
+  }
+}
+
+function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
+  if (a.tag !== b.tag) return false;
+  switch (a.tag) {
+    case 'number': return a.value === (b as typeof a).value;
+    case 'boolean': return a.value === (b as typeof a).value;
+    case 'string': return a.value === (b as typeof a).value;
+    case 'symbol': return a.value === (b as typeof a).value;
+    case 'char': return a.value === (b as typeof a).value;
+    case 'nil': return true;
+    case 'pair':
+      return b.tag === 'pair' && schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    default: return a === b;
+  }
+}
+
 function requireNumbers(name: string, args: SchemeVal[], pos?: Pos): number[] {
   return args.map(a => {
     if (a.tag !== 'number') throw errAt(`${name}: expected number`, pos);
@@ -448,6 +477,14 @@ const BUILTINS = new Set([
   'string-ref',
   'string-copy', 'string-set!',
   'apply',
+  'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
+  'zero?', 'positive?', 'negative?', 'odd?', 'even?',
+  'list-ref', 'list-tail', 'list?', 'assoc', 'map',
+  'eq?', 'equal?',
+  'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase',
+  'char=?', 'char<?',
+  'string=?', 'string<?', 'string-ci=?',
+  'string-upcase', 'string-downcase',
 ]);
 
 function isBuiltin(name: string): boolean {
@@ -644,6 +681,197 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       const prefixArgs = args.slice(1, args.length - 1);
       const allArgs = prefixArgs.concat(tailList ?? []);
       return applyProc(proc, allArgs, pos);
+    }
+    case 'abs': {
+      if (args.length !== 1) throw errAt('abs: expected 1 argument', pos);
+      const nums = requireNumbers('abs', args, pos);
+      return { tag: 'number', value: Math.abs(nums[0]) };
+    }
+    case 'modulo': {
+      if (args.length !== 2) throw errAt('modulo: expected 2 arguments', pos);
+      const nums = requireNumbers('modulo', args, pos);
+      if (nums[1] === 0) throw errAt('modulo: division by zero', pos);
+      const r = nums[0] % nums[1];
+      // modulo takes the sign of the divisor
+      return { tag: 'number', value: (r !== 0 && Math.sign(r) !== Math.sign(nums[1])) ? r + nums[1] : r };
+    }
+    case 'remainder': {
+      if (args.length !== 2) throw errAt('remainder: expected 2 arguments', pos);
+      const nums = requireNumbers('remainder', args, pos);
+      if (nums[1] === 0) throw errAt('remainder: division by zero', pos);
+      // remainder takes the sign of the dividend (JS % does this)
+      return { tag: 'number', value: nums[0] % nums[1] };
+    }
+    case 'quotient': {
+      if (args.length !== 2) throw errAt('quotient: expected 2 arguments', pos);
+      const nums = requireNumbers('quotient', args, pos);
+      if (nums[1] === 0) throw errAt('quotient: division by zero', pos);
+      return { tag: 'number', value: Math.trunc(nums[0] / nums[1]) };
+    }
+    case 'min': {
+      if (args.length === 0) throw errAt('min: expected at least 1 argument', pos);
+      const nums = requireNumbers('min', args, pos);
+      return { tag: 'number', value: Math.min(...nums) };
+    }
+    case 'max': {
+      if (args.length === 0) throw errAt('max: expected at least 1 argument', pos);
+      const nums = requireNumbers('max', args, pos);
+      return { tag: 'number', value: Math.max(...nums) };
+    }
+    case 'expt': {
+      if (args.length !== 2) throw errAt('expt: expected 2 arguments', pos);
+      const nums = requireNumbers('expt', args, pos);
+      return { tag: 'number', value: Math.pow(nums[0], nums[1]) };
+    }
+    case 'zero?': {
+      if (args.length !== 1) throw errAt('zero?: expected 1 argument', pos);
+      if (args[0].tag !== 'number') throw errAt('zero?: expected number', pos);
+      return args[0].value === 0 ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'positive?': {
+      if (args.length !== 1) throw errAt('positive?: expected 1 argument', pos);
+      if (args[0].tag !== 'number') throw errAt('positive?: expected number', pos);
+      return args[0].value > 0 ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'negative?': {
+      if (args.length !== 1) throw errAt('negative?: expected 1 argument', pos);
+      if (args[0].tag !== 'number') throw errAt('negative?: expected number', pos);
+      return args[0].value < 0 ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'odd?': {
+      if (args.length !== 1) throw errAt('odd?: expected 1 argument', pos);
+      if (args[0].tag !== 'number') throw errAt('odd?: expected number', pos);
+      return Math.abs(args[0].value) % 2 === 1 ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'even?': {
+      if (args.length !== 1) throw errAt('even?: expected 1 argument', pos);
+      if (args[0].tag !== 'number') throw errAt('even?: expected number', pos);
+      return args[0].value % 2 === 0 ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'list-ref': {
+      if (args.length !== 2) throw errAt('list-ref: expected 2 arguments', pos);
+      if (args[1].tag !== 'number') throw errAt('list-ref: expected number index', pos);
+      let cur = args[0];
+      let idx = args[1].value;
+      while (idx > 0 && cur.tag === 'pair') {
+        cur = cur.cdr;
+        idx--;
+      }
+      if (cur.tag !== 'pair') throw errAt('list-ref: index out of range', pos);
+      return cur.car;
+    }
+    case 'list-tail': {
+      if (args.length !== 2) throw errAt('list-tail: expected 2 arguments', pos);
+      if (args[1].tag !== 'number') throw errAt('list-tail: expected number index', pos);
+      let cur = args[0];
+      let idx = args[1].value;
+      while (idx > 0) {
+        if (cur.tag !== 'pair') throw errAt('list-tail: index out of range', pos);
+        cur = cur.cdr;
+        idx--;
+      }
+      return cur;
+    }
+    case 'list?': {
+      let cur = args[0];
+      while (cur.tag === 'pair') {
+        cur = cur.cdr;
+      }
+      return cur.tag === 'nil' ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'assoc': {
+      if (args.length !== 2) throw errAt('assoc: expected 2 arguments', pos);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        const entry = cur.car;
+        if (entry.tag === 'pair' && schemeEqual(args[0], entry.car)) {
+          return entry;
+        }
+        cur = cur.cdr;
+      }
+      return SCM_FALSE;
+    }
+    case 'map': {
+      if (args.length < 2) throw errAt('map: expected at least 2 arguments', pos);
+      const proc = args[0];
+      const lists = args.slice(1).map(a => {
+        const arr = pairToArray(a);
+        if (arr === null) throw errAt('map: expected proper list', pos);
+        return arr;
+      });
+      const len = lists[0].length;
+      for (const l of lists) {
+        if (l.length !== len) throw errAt('map: lists must have equal length', pos);
+      }
+      const results: SchemeVal[] = [];
+      for (let i = 0; i < len; i++) {
+        const mapArgs = lists.map(l => l[i]);
+        results.push(applyProc(proc, mapArgs, pos));
+      }
+      return arrayToList(results);
+    }
+    case 'eq?': {
+      if (args.length !== 2) throw errAt('eq?: expected 2 arguments', pos);
+      return schemeEq(args[0], args[1]) ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'equal?': {
+      if (args.length !== 2) throw errAt('equal?: expected 2 arguments', pos);
+      return schemeEqual(args[0], args[1]) ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'char-alphabetic?': {
+      if (args.length !== 1 || args[0].tag !== 'char')
+        throw errAt('char-alphabetic?: expected char', pos);
+      return /[a-zA-Z]/.test(args[0].value) ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'char-numeric?': {
+      if (args.length !== 1 || args[0].tag !== 'char')
+        throw errAt('char-numeric?: expected char', pos);
+      return /[0-9]/.test(args[0].value) ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'char-upcase': {
+      if (args.length !== 1 || args[0].tag !== 'char')
+        throw errAt('char-upcase: expected char', pos);
+      return { tag: 'char', value: args[0].value.toUpperCase() };
+    }
+    case 'char-downcase': {
+      if (args.length !== 1 || args[0].tag !== 'char')
+        throw errAt('char-downcase: expected char', pos);
+      return { tag: 'char', value: args[0].value.toLowerCase() };
+    }
+    case 'char=?': {
+      if (args.length !== 2 || args[0].tag !== 'char' || args[1].tag !== 'char')
+        throw errAt('char=?: expected 2 chars', pos);
+      return args[0].value === args[1].value ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'char<?': {
+      if (args.length !== 2 || args[0].tag !== 'char' || args[1].tag !== 'char')
+        throw errAt('char<?: expected 2 chars', pos);
+      return args[0].value < args[1].value ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'string=?': {
+      if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+        throw errAt('string=?: expected 2 strings', pos);
+      return args[0].value === args[1].value ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'string<?': {
+      if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+        throw errAt('string<?: expected 2 strings', pos);
+      return args[0].value < args[1].value ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'string-ci=?': {
+      if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+        throw errAt('string-ci=?: expected 2 strings', pos);
+      return args[0].value.toLowerCase() === args[1].value.toLowerCase() ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'string-upcase': {
+      if (args.length !== 1 || args[0].tag !== 'string')
+        throw errAt('string-upcase: expected string', pos);
+      return { tag: 'string', value: args[0].value.toUpperCase() };
+    }
+    case 'string-downcase': {
+      if (args.length !== 1 || args[0].tag !== 'string')
+        throw errAt('string-downcase: expected string', pos);
+      return { tag: 'string', value: args[0].value.toLowerCase() };
     }
     default:
       throw errAt(`unbound variable: ${name}`, pos);
