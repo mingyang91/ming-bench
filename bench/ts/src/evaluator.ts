@@ -623,6 +623,58 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return absNumber(expectNumber(args[0]));
   }));
 
+  env.define('gcd', builtin('gcd', (args) => {
+    if (args.length === 0) {
+      return makeExactNumber(0);
+    }
+
+    const numbers = args.map(expectNumber);
+    let result = 0;
+    for (let index = 0; index < numbers.length; index += 1) {
+      result = gcd(result, expectIntegerNumber(numbers[index], args[index].expr));
+    }
+
+    return numbers.every((value) => value.exact)
+      ? makeExactNumber(result)
+      : makeInexactNumber(result);
+  }));
+
+  env.define('lcm', builtin('lcm', (args) => {
+    if (args.length === 0) {
+      return makeExactNumber(1);
+    }
+
+    const numbers = args.map(expectNumber);
+    let result = 1;
+    for (let index = 0; index < numbers.length; index += 1) {
+      result = lcm(result, expectIntegerNumber(numbers[index], args[index].expr));
+    }
+
+    return numbers.every((value) => value.exact)
+      ? makeExactNumber(result)
+      : makeInexactNumber(result);
+  }));
+
+  env.define('truncate', builtin('truncate', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: truncate expects exactly 1 argument`);
+    }
+
+    const value = expectNumber(args[0]);
+    const truncated = Math.trunc(numberToJs(value));
+    return value.exact ? makeExactNumber(truncated) : makeInexactNumber(truncated);
+  }));
+
+  env.define('round', builtin('round', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: round expects exactly 1 argument`);
+    }
+
+    const value = expectNumber(args[0]);
+    const rounded = Math.round(numberToJs(value));
+    return value.exact ? makeExactNumber(rounded) : makeInexactNumber(rounded);
+  }));
+
   env.define('quotient', builtin('quotient', (args, loc) => {
     if (args.length !== 2) {
       throw new EvalError(`${loc.line}:${loc.col}: quotient expects exactly 2 arguments`);
@@ -822,6 +874,37 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return expectPairArg(args[0]).cdr;
   }));
 
+  env.define('cddr', builtin('cddr', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: cddr expects exactly 1 argument`);
+    }
+
+    const tail = expectPairArg(args[0]).cdr;
+    if (!isPair(tail)) {
+      throw new EvalError(`${args[0].expr.line}:${args[0].expr.col}: expected pair`);
+    }
+
+    return tail.cdr;
+  }));
+
+  env.define('set-car!', builtin('set-car!', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: set-car! expects exactly 2 arguments`);
+    }
+
+    expectPairArg(args[0]).car = args[1].value;
+    return VOID_VALUE;
+  }));
+
+  env.define('set-cdr!', builtin('set-cdr!', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: set-cdr! expects exactly 2 arguments`);
+    }
+
+    expectPairArg(args[0]).cdr = args[1].value;
+    return VOID_VALUE;
+  }));
+
   env.define('null?', builtin('null?', (args, loc) => {
     if (args.length !== 1) {
       throw new EvalError(`${loc.line}:${loc.col}: null? expects exactly 1 argument`);
@@ -901,6 +984,14 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return result;
   }));
 
+  env.define('reverse', builtin('reverse', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: reverse expects exactly 1 argument`);
+    }
+
+    return makeList(expectProperList(args[0].value, args[0].expr).slice().reverse());
+  }));
+
   env.define('map', builtin('map', (args, loc) => {
     if (args.length < 2) {
       throw new EvalError(`${loc.line}:${loc.col}: map expects a procedure and at least 1 list`);
@@ -930,6 +1021,36 @@ function createGlobalEnv(runtime: Runtime): Environment {
     }
 
     return makeList(results);
+  }));
+
+  env.define('for-each', builtin('for-each', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: for-each expects a procedure and at least 1 list`);
+    }
+
+    const procedure = args[0].value;
+    const listArgs = args.slice(1);
+    const lists = listArgs.map((arg) => expectProperList(arg.value, arg.expr));
+    const expectedLength = lists[0].length;
+
+    for (let index = 1; index < lists.length; index += 1) {
+      if (lists[index].length !== expectedLength) {
+        throw new EvalError(`${listArgs[index].expr.line}:${listArgs[index].expr.col}: for-each lists must have the same length`);
+      }
+    }
+
+    for (let index = 0; index < expectedLength; index += 1) {
+      const appliedArgs = listArgs.map((arg, listIndex) => ({
+        expr: arg.expr,
+        value: lists[listIndex][index],
+      }));
+      resolveEvalOutcome(
+        applyProcedure(procedure, appliedArgs, args[0].expr, runtime),
+        runtime,
+      );
+    }
+
+    return VOID_VALUE;
   }));
 
   env.define('eq?', builtin('eq?', (args, loc) => {
@@ -970,6 +1091,53 @@ function createGlobalEnv(runtime: Runtime): Environment {
 
       if (isEqual(args[0].value, entry.car)) {
         return entry;
+      }
+
+      current = current.cdr;
+    }
+
+    if (!isEmptyList(current)) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: expected proper list`);
+    }
+
+    return false;
+  }));
+
+  env.define('assv', builtin('assv', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: assv expects exactly 2 arguments`);
+    }
+
+    let current = args[1].value;
+    while (isPair(current)) {
+      const entry = current.car;
+      if (!isPair(entry)) {
+        throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: assv expects an association list`);
+      }
+
+      if (isEqv(args[0].value, entry.car)) {
+        return entry;
+      }
+
+      current = current.cdr;
+    }
+
+    if (!isEmptyList(current)) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: expected proper list`);
+    }
+
+    return false;
+  }));
+
+  env.define('member', builtin('member', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: member expects exactly 2 arguments`);
+    }
+
+    let current = args[1].value;
+    while (isPair(current)) {
+      if (isEqual(args[0].value, current.car)) {
+        return current;
       }
 
       current = current.cdr;
@@ -1132,6 +1300,24 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return { kind: 'char', value: chars[index] };
   }));
 
+  env.define('string', builtin('string', (args) => (
+    makeString(args.map((arg) => expectCharArg(arg).value).join(''))
+  )));
+
+  env.define('make-string', builtin('make-string', (args, loc) => {
+    if (args.length !== 1 && args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: make-string expects 1 or 2 arguments`);
+    }
+
+    const length = expectIndexArg(args[0]);
+    if (length < 0) {
+      throw new EvalError(`${args[0].expr.line}:${args[0].expr.col}: make-string length out of bounds`);
+    }
+
+    const fill = args[1] === undefined ? '\0' : expectCharArg(args[1]).value;
+    return makeString(fill.repeat(length));
+  }));
+
   env.define('string->list', builtin('string->list', (args, loc) => {
     if (args.length !== 1) {
       throw new EvalError(`${loc.line}:${loc.col}: string->list expects exactly 1 argument`);
@@ -1231,6 +1417,48 @@ function createGlobalEnv(runtime: Runtime): Environment {
 
     for (let index = 0; index < args.length - 1; index += 1) {
       if (!(expectStringArg(args[index]) < expectStringArg(args[index + 1]))) {
+        return false;
+      }
+    }
+
+    return true;
+  }));
+
+  env.define('string>?', builtin('string>?', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: string>? expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (!(expectStringArg(args[index]) > expectStringArg(args[index + 1]))) {
+        return false;
+      }
+    }
+
+    return true;
+  }));
+
+  env.define('string<=?', builtin('string<=?', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: string<=? expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (!(expectStringArg(args[index]) <= expectStringArg(args[index + 1]))) {
+        return false;
+      }
+    }
+
+    return true;
+  }));
+
+  env.define('string>=?', builtin('string>=?', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: string>=? expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (!(expectStringArg(args[index]) >= expectStringArg(args[index + 1]))) {
         return false;
       }
     }
@@ -1497,6 +1725,8 @@ function evaluateList(expr: ListExpr, env: Environment, runtime: Runtime): EvalO
         return evalCond(args, head, env, runtime);
       case 'let':
         return evalLet(args, head, env, runtime);
+      case 'let*':
+        return evalLetStar(args, head, env, runtime);
       case 'letrec':
         return evalLetrec(args, head, env, runtime, false);
       case 'letrec*':
@@ -1837,6 +2067,22 @@ function evalLet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runt
   }
 
   return makeSequenceStep(body, letEnv);
+}
+
+function evalLetStar(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): EvalOutcome {
+  if (args.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: let* expects bindings and a body`);
+  }
+
+  const bindings = parseLetBindings(args[0], head);
+  const body = args.slice(1);
+  const letStarEnv = new Environment(env);
+
+  for (const binding of bindings) {
+    letStarEnv.define(symbolLookupName(binding.name), evaluate(binding.valueExpr, letStarEnv, runtime));
+  }
+
+  return makeSequenceStep(body, letStarEnv);
 }
 
 function evalLetrec(
@@ -2624,13 +2870,14 @@ function hygienizeList(
   }
 
   if (
-    (headName === 'let' || headName === 'letrec' || headName === 'letrec*')
+    (headName === 'let' || headName === 'let*' || headName === 'letrec' || headName === 'letrec*')
     && expr.elements.length >= 3
   ) {
     if (expr.elements[1].type === 'list') {
       const bodyScope = new Map(scope);
       const bindings: Expr[] = [];
       const recursiveBindings = headName === 'letrec' || headName === 'letrec*';
+      const sequentialBindings = headName === 'let*';
 
       if (recursiveBindings) {
         for (const binding of expr.elements[1].elements) {
@@ -2702,11 +2949,12 @@ function hygienizeList(
           };
         }
 
+        const valueScope = sequentialBindings ? new Map(bodyScope) : scope;
         bindings.push({
           type: 'list',
           elements: [
             hygienizeBindingIdentifier(binding.elements[0], bodyScope, runtime),
-            hygienizeExpr(binding.elements[1], scope, definitionEnv, runtime),
+            hygienizeExpr(binding.elements[1], valueScope, definitionEnv, runtime),
           ],
           line: binding.line,
           col: binding.col,
@@ -2896,6 +3144,7 @@ function isSpecialFormName(name: string): boolean {
     'begin',
     'cond',
     'let',
+    'let*',
     'letrec',
     'letrec*',
     'case',
@@ -2990,9 +3239,15 @@ function expectVectorArg(arg: EvaluatedArg): VectorValue {
 
 function expectProperList(value: Value, loc: SourceLoc): Value[] {
   const elements: Value[] = [];
+  const seen = new Set<PairValue>();
   let current = value;
 
   while (isPair(current)) {
+    if (seen.has(current)) {
+      throw new EvalError(`${loc.line}:${loc.col}: expected proper list`);
+    }
+
+    seen.add(current);
     elements.push(current.car);
     current = current.cdr;
   }
@@ -3114,13 +3369,31 @@ function isEqual(left: Value, right: Value): boolean {
 }
 
 function isProperList(value: Value): boolean {
-  let current = value;
+  let slow: Value = value;
+  let fast: Value = value;
 
-  while (isPair(current)) {
-    current = current.cdr;
+  while (isPair(fast)) {
+    fast = fast.cdr;
+    if (isEmptyList(fast)) {
+      return true;
+    }
+
+    if (!isPair(fast)) {
+      return false;
+    }
+
+    fast = fast.cdr;
+    if (!isPair(slow)) {
+      return false;
+    }
+
+    slow = slow.cdr;
+    if (fast === slow) {
+      return false;
+    }
   }
 
-  return isEmptyList(current);
+  return isEmptyList(fast);
 }
 
 function isTruthy(value: Value): boolean {
@@ -3411,6 +3684,14 @@ function gcd(left: number, right: number): number {
   }
 
   return a === 0 ? 1 : a;
+}
+
+function lcm(left: number, right: number): number {
+  if (left === 0 || right === 0) {
+    return 0;
+  }
+
+  return Math.abs((left / gcd(left, right)) * right);
 }
 
 function isIntegerNumberValue(value: NumberValue): boolean {
