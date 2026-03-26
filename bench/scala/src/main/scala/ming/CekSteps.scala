@@ -87,19 +87,7 @@ object CekSteps:
         case (nextName, nextExpr) :: rest =>
           CekState.Eval(nextExpr, letEnv, Kont.LetStarBind(nextName, rest, letEnv, body, next))
 
-    case Kont.NamedLetArgs(params, doneVals, remainingExprs, initEnv, loopEnv, body, next) =>
-      val newDone = doneVals :+ v
-      remainingExprs match
-        case Nil =>
-          val callEnv = loopEnv.child()
-          params.zip(newDone).foreach((p, a) => callEnv.define(p, a))
-          bodyToCek(body, callEnv, next)
-        case nextExpr :: rest =>
-          CekState.Eval(
-            nextExpr,
-            initEnv,
-            Kont.NamedLetArgs(params, newDone, rest, initEnv, loopEnv, body, next)
-          )
+    case k: Kont.NamedLetArgs => stepNamedLetArgs(v, k)
 
     case Kont.CondTest(body, remaining, env, next) =>
       if isTruthy(v) then
@@ -122,6 +110,12 @@ object CekSteps:
 
     case Kont.RaiseReturn(_) =>
       throw EvalError("handler returned from raise")
+
+    case Kont.CallWithValues(consumer, env, pos, next) =>
+      val vals = v match
+        case Value.VValues(vs) => vs;
+        case _                 => List(v)
+      Evaluator.cekApply(consumer, vals, pos, env, next)
 
     case k: Kont.AppHead => stepAppKont(v, k)
     case k: Kont.AppArg  => stepAppKont(v, k)
@@ -175,6 +169,21 @@ object CekSteps:
           CekState.Eval(nextExpr, env, Kont.AppArg(func, newDone, rest, env, pos, next))
 
     case _ => throw EvalError("unreachable: stepAppKont")
+
+  // ── Named-let argument collection ────────────────────────────────
+  private def stepNamedLetArgs(v: Value, k: Kont.NamedLetArgs): CekState =
+    val newDone = k.doneVals :+ v
+    k.remainingExprs match
+      case Nil =>
+        val callEnv = k.loopEnv.child()
+        k.params.zip(newDone).foreach((p, a) => callEnv.define(p, a))
+        bodyToCek(k.body, callEnv, k.next)
+      case nextExpr :: rest =>
+        CekState.Eval(
+          nextExpr,
+          k.initEnv,
+          Kont.NamedLetArgs(k.params, newDone, rest, k.initEnv, k.loopEnv, k.body, k.next)
+        )
 
   // ── Special form step helpers ──────────────────────────────────────
 

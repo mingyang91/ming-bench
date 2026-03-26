@@ -182,6 +182,17 @@ object Evaluator:
       val afterIn   = Kont.DynWindAfterIn(bodyThunk, entry, env, pos, k)
       cekApply(inThunk, Nil, pos, env, afterIn)
 
+    case Value.VBuiltin("values") =>
+      args match
+        case single :: Nil => CekState.ApplyK(single, k)
+        case _             => CekState.ApplyK(Value.VValues(args), k)
+
+    case Value.VBuiltin("call-with-values") =>
+      if args.length != 2 then throw errAt(pos, "call-with-values requires 2 arguments")
+      val producer = args(0)
+      val consumer = args(1)
+      cekApply(producer, Nil, pos, env, Kont.CallWithValues(consumer, env, pos, k))
+
     case Value.VBuiltin("apply") =>
       if args.length < 2 then throw errAt(pos, "apply requires at least 2 arguments")
       val innerFunc = args.head

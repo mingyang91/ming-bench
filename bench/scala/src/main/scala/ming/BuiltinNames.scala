@@ -114,5 +114,7 @@ object BuiltinNames:
     "call-with-current-continuation",
     "dynamic-wind",
     "raise",
-    "with-exception-handler"
+    "with-exception-handler",
+    "values",
+    "call-with-values"
   )

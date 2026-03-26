@@ -78,6 +78,7 @@ enum Kont:
   case PopHandler(next: Kont)
   case GuardTest(variable: String, clauses: List[Expr], env: Env, next: Kont)
   case RaiseReturn(next: Kont)
+  case CallWithValues(consumer: Value, env: Env, pos: Pos, next: Kont)
 
 /** Exception for continuation invocation from non-CEK code paths (builtins). */
 class ContinuationInvoke(val value: Value, val kont: Kont) extends RuntimeException(null, null, true, false)

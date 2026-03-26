@@ -35,6 +35,7 @@ object Display:
     case Value.VVector(elems) =>
       "#(" + elems.map(e => displaySafe(e, seen)).mkString(" ") + ")"
     case Value.VRecord(typeName, _) => s"#<record:$typeName>"
+    case Value.VValues(_)           => ""
     case Value.VVoid                => ""
 
   private def displayPairChain(
