@@ -101,7 +101,7 @@ private[ming] object BindingForms:
             break(Evaluator.evalBody(body, env))
           case SList(SList(datums, _) :: body, _) =>
             val matched = datums.exists { d =>
-              val dv = Evaluator.exprToVal(d)
+              val dv = EvalHelpers.exprToVal(d)
               ListBuiltins.schemeEqv(key, dv)
             }
             if matched then

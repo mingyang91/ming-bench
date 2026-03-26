@@ -8,6 +8,7 @@ object Evaluator:
     val tokens = Tokenizer.tokenize(input)
     val exprs  = Parser.parseAll(tokens)
     if exprs.isEmpty then throw new EvalError("empty input")
+    windStack = Nil
     val env = makeGlobalEnv()
     evalSequence(exprs, env).display
 
@@ -15,6 +16,7 @@ object Evaluator:
     val tokens = Tokenizer.tokenize(input)
     val exprs  = Parser.parseAll(tokens)
     if exprs.isEmpty then throw new EvalError("empty input")
+    windStack = Nil
     val output = new StringBuilder
     val env    = makeGlobalEnv(output)
     val result = evalSequence(exprs, env)
@@ -25,6 +27,7 @@ object Evaluator:
     Builtins.install(env, output)
     env.set("call/cc", SchemeCallCC)
     env.set("call-with-current-continuation", SchemeCallCC)
+    env.set("dynamic-wind", SchemeDynamicWind)
     env
 
   private[ming] def isFalsy(v: SchemeVal): Boolean = v match
@@ -49,7 +52,8 @@ object Evaluator:
     else if exprs.size == 1 then run(SEval(exprs.head, env, HaltK))
     else run(SEval(exprs.head, env, SeqK(exprs.tail, env, HaltK)))
 
-  private var lastPos: Pos = Pos.zero
+  private var lastPos: Pos                            = Pos.zero
+  private var windStack: List[(SchemeVal, SchemeVal)] = Nil
 
   private def run(initial: MState): SchemeVal =
     var state = initial
@@ -175,7 +179,7 @@ object Evaluator:
       else SEval(remaining.head, env, OrK(remaining.tail, env, k2))
 
     case CallCCK(k2) =>
-      val cont = new SchemeContinuation(k2)
+      val cont = new SchemeContinuation(k2, windStack)
       applyFunction(value, List(cont), k2)
 
     case CondTestK(body, remaining, env, k2) =>
@@ -202,6 +206,25 @@ object Evaluator:
       if shouldRun then evalBodyCEK(body, env, k2)
       else SApply(SchemeVoid, k2)
 
+    case DynWindAfterInK(inThunk, bodyThunk, outThunk, k2) =>
+      val entry = (inThunk, outThunk)
+      windStack = entry :: windStack
+      applyFunction(bodyThunk, Nil, DynWindAfterBodyK(outThunk, k2))
+
+    case DynWindAfterBodyK(outThunk, k2) =>
+      windStack = windStack.tail
+      applyFunction(outThunk, Nil, DynWindAfterOutK(value, k2))
+
+    case DynWindAfterOutK(bodyVal, k2) =>
+      SApply(bodyVal, k2)
+
+    case WindContK(actions, savedVal, targetK) =>
+      processWindActions(actions, savedVal, targetK)
+
+    case WindPushK(entry, actions, savedVal, targetK) =>
+      windStack = entry :: windStack
+      processWindActions(actions, savedVal, targetK)
+
   private[ming] def applyFunction(op: SchemeVal, args: List[SchemeVal], k: Kont): MState =
     op match
       case SchemeBuiltin("apply", _) =>
@@ -217,7 +240,7 @@ object Evaluator:
         SApply(fn(args), k)
 
       case SchemeLambda(params, restParam, body, closureEnv) =>
-        val localEnv = bindArgs(params, restParam, args, closureEnv)
+        val localEnv = EvalHelpers.bindArgs(params, restParam, args, closureEnv)
         evalBodyCEK(body, localEnv, k)
 
       case SchemeCaseLambda(clauses) =>
@@ -232,47 +255,44 @@ object Evaluator:
 
       case SchemeCallCC =>
         if args.size != 1 then throw new EvalError("call/cc: expected 1 argument")
-        val cont = new SchemeContinuation(k)
+        val cont = new SchemeContinuation(k, windStack)
         applyFunction(args.head, List(cont), k)
+
+      case SchemeDynamicWind =>
+        if args.size != 3 then throw new EvalError("dynamic-wind: expected 3 arguments")
+        val List(inThunk, bodyThunk, outThunk) = args
+        applyFunction(inThunk, Nil, DynWindAfterInK(inThunk, bodyThunk, outThunk, k))
 
       case cont: SchemeContinuation =>
         if args.size != 1 then throw new EvalError("continuation: expected 1 argument")
         cont.savedK match
-          case k2: Kont => SApply(args.head, k2)
-          case _        => throw new EvalError("invalid continuation")
+          case targetK: Kont =>
+            val targetWind = cont.savedWind
+            val v          = args.head
+            val common     = EvalHelpers.commonWindTail(windStack, targetWind)
+            val toUnwind   = windStack.take(windStack.length - common.length)
+            val toRewind   = targetWind.take(targetWind.length - common.length).reverse
+            val actions: List[WindAction] =
+              toUnwind.map(e => DoUnwind(e._2)) ++ toRewind.map(e => DoRewind(e._1, e))
+            processWindActions(actions, v, targetK)
+          case _ => throw new EvalError("invalid continuation")
 
       case _ => throw new EvalError(s"not a procedure: ${op.display}")
-
-  private def bindArgs(
-    params: List[String],
-    restParam: Option[String],
-    args: List[SchemeVal],
-    closureEnv: Env
-  ): Env =
-    restParam match
-      case None =>
-        if params.size != args.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
-        new Env(mutable.Map.from(params.zip(args)), Some(closureEnv))
-      case Some(rest) =>
-        if args.size < params.size then
-          throw new EvalError(s"expected at least ${params.size} arguments, got ${args.size}")
-        val (required, extra) = args.splitAt(params.size)
-        val bindings          = mutable.Map.from(params.zip(required))
-        bindings(rest) = SchemeListOps.makeList(extra)
-        new Env(bindings, Some(closureEnv))
 
   private[ming] def evalBodyCEK(exprs: List[Expr], env: Env, k: Kont): MState =
     if exprs.isEmpty then SApply(SchemeVoid, k)
     else if exprs.size == 1 then SEval(exprs.head, env, k)
     else SEval(exprs.head, env, SeqK(exprs.tail, env, k))
 
-  private[ming] def exprToVal(expr: Expr): SchemeVal =
-    expr match
-      case IntLit(v, _)         => SchemeInt(v)
-      case FloatLit(v, _)       => SchemeFloat(v)
-      case RationalLit(n, d, _) => SchemeRational(n, d)
-      case BoolLit(v, _)        => SchemeBool(v)
-      case StringLit(v, _)      => SchemeString(v)
-      case CharLit(v, _)        => SchemeChar(v)
-      case Symbol(name, _)      => SchemeSymbol(name)
-      case SList(elems, _)      => SchemeListOps.makeList(elems.map(exprToVal))
+  private def processWindActions(
+    actions: List[WindAction],
+    savedVal: SchemeVal,
+    targetK: Kont
+  ): MState =
+    actions match
+      case Nil => SApply(savedVal, targetK)
+      case DoUnwind(outThunk) :: rest =>
+        windStack = windStack.tail
+        applyFunction(outThunk, Nil, WindContK(rest, savedVal, targetK))
+      case DoRewind(inThunk, entry) :: rest =>
+        applyFunction(inThunk, Nil, WindPushK(entry, rest, savedVal, targetK))

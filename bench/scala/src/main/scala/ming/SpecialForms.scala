@@ -67,7 +67,7 @@ private[ming] object SpecialForms:
         case SList(Symbol("else", _) :: body, _) =>
           Evaluator.evalBodyCEK(body, env, k)
         case SList(SList(datums, _) :: body, _) =>
-          val matched = datums.exists(d => ListBuiltins.schemeEqv(key, Evaluator.exprToVal(d)))
+          val matched = datums.exists(d => ListBuiltins.schemeEqv(key, EvalHelpers.exprToVal(d)))
           if matched then
             if body.isEmpty then SApply(SchemeVoid, k)
             else Evaluator.evalBodyCEK(body, env, k)
@@ -204,7 +204,7 @@ private[ming] object SpecialForms:
 
   def evalQuote(args: List[Expr]): SchemeVal =
     if args.size != 1 then throw new EvalError("quote: expected 1 argument")
-    Evaluator.exprToVal(args.head)
+    EvalHelpers.exprToVal(args.head)
 
   def evalDefineSyntax(args: List[Expr], env: Env): Unit =
     args match

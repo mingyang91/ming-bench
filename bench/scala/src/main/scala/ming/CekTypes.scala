@@ -32,6 +32,30 @@ private[ming] case class LetrecBindK(
 ) extends Kont
 private[ming] case class TestBodyK(body: List[Expr], invert: Boolean, env: Env, k: Kont) extends Kont
 
+// dynamic-wind frames
+private[ming] case class DynWindAfterInK(inThunk: SchemeVal, bodyThunk: SchemeVal, outThunk: SchemeVal, k: Kont)
+    extends Kont
+private[ming] case class DynWindAfterBodyK(outThunk: SchemeVal, k: Kont) extends Kont
+private[ming] case class DynWindAfterOutK(bodyVal: SchemeVal, k: Kont)   extends Kont
+
+// wind transition frames (for continuation invocation across dynamic-wind boundaries)
+sealed private[ming] trait WindAction
+private[ming] case class DoUnwind(outThunk: SchemeVal)                               extends WindAction
+private[ming] case class DoRewind(inThunk: SchemeVal, entry: (SchemeVal, SchemeVal)) extends WindAction
+
+private[ming] case class WindContK(
+  actions: List[WindAction],
+  savedVal: SchemeVal,
+  targetK: Kont
+) extends Kont
+
+private[ming] case class WindPushK(
+  entry: (SchemeVal, SchemeVal),
+  actions: List[WindAction],
+  savedVal: SchemeVal,
+  targetK: Kont
+) extends Kont
+
 // ── CEK Machine State ──────────────────────────────────────────
 
 sealed private[ming] trait MState
