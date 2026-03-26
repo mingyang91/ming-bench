@@ -6,15 +6,17 @@ mod macros;
 mod model;
 mod number;
 mod parser;
+mod records;
 
 use builtins::{apply_builtin, eqv_values};
 pub use error::EvalError;
 use macros::{env_with_expansion_aliases, expand_macro_call, parse_syntax_rules};
 use model::{
-    Builtin, Env, EnvRef, Expr, Params, Procedure, ProcedureClause, ProcedureKind, RecordInstance,
-    RecordProcedure, RecordProcedureKind, RecordType, SchemeString, Value,
+    Builtin, Env, EnvRef, Expr, Params, Procedure, ProcedureClause, ProcedureKind, SchemeString,
+    Value,
 };
 use parser::Parser;
+use records::{apply_record_procedure, eval_define_record_type};
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -155,6 +157,447 @@ fn eval_sequence(exprs: &[Expr], env: &EnvRef, output: &mut String) -> Result<Va
     Ok(result)
 }
 
+enum TailAction {
+    Return(Value),
+    Continue { expr: Expr, env: EnvRef },
+}
+
+fn tail_sequence(exprs: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+    let Some((last, prefix)) = exprs.split_last() else {
+        return Ok(TailAction::Return(Value::Void));
+    };
+
+    for expr in prefix {
+        eval(expr, env, output)?;
+    }
+
+    Ok(TailAction::Continue {
+        expr: last.clone(),
+        env: env.clone(),
+    })
+}
+
+fn eval_tail(expr: Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    let mut current_expr = expr;
+    let mut current_env = env;
+
+    loop {
+        let pos = current_expr.pos();
+
+        match current_expr {
+            Expr::Number(value, _) => return Ok(Value::Number(value)),
+            Expr::Boolean(value, _) => return Ok(Value::Boolean(value)),
+            Expr::String(value, _) => {
+                return Ok(Value::String(SchemeString::literal(&value)));
+            }
+            Expr::Char(value, _) => return Ok(Value::Char(value)),
+            Expr::Symbol(name, _) => {
+                return current_env
+                    .lookup(&name)
+                    .ok_or(EvalError::UnboundVariable { name })
+                    .map_err(|error| error.with_position(pos));
+            }
+            Expr::List(items, _) => {
+                match eval_tail_list(items, &current_env, output)
+                    .map_err(|error| error.with_position(pos))?
+                {
+                    TailAction::Return(value) => return Ok(value),
+                    TailAction::Continue { expr, env } => {
+                        current_expr = expr;
+                        current_env = env;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn eval_tail_list(
+    items: Vec<Expr>,
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
+    let Some((head, tail)) = items.split_first() else {
+        return Err(EvalError::Syntax {
+            message: "cannot evaluate empty list".into(),
+        });
+    };
+
+    if let Expr::Symbol(name, _) = head {
+        match name.as_str() {
+            "define" => return eval_define(tail, env, output).map(TailAction::Return),
+            "define-syntax" => return eval_define_syntax(tail, env).map(TailAction::Return),
+            "define-record-type" => {
+                return eval_define_record_type(tail, env).map(TailAction::Return);
+            }
+            "set!" => return eval_set(tail, env, output).map(TailAction::Return),
+            "if" => return eval_tail_if(tail, env, output),
+            "quote" => return eval_quote(tail).map(TailAction::Return),
+            "lambda" => return build_lambda(tail, env, None).map(TailAction::Return),
+            "case-lambda" => return build_case_lambda(tail, env, None).map(TailAction::Return),
+            "and" => return eval_tail_and(tail, env, output),
+            "or" => return eval_tail_or(tail, env, output),
+            "begin" => return eval_tail_begin(tail, env, output),
+            "cond" => return eval_tail_cond(tail, env, output),
+            "let" => return eval_tail_let(tail, env, output),
+            "letrec" => return eval_tail_letrec(tail, env, output, false),
+            "letrec*" => return eval_tail_letrec(tail, env, output, true),
+            "case" => return eval_tail_case(tail, env, output),
+            "do" => return eval_tail_do(tail, env, output),
+            _ => {}
+        }
+
+        if let Some(transformer) = env.lookup_macro(name) {
+            let expansion = expand_macro_call(&items, &transformer)?;
+            let expanded_env = env_with_expansion_aliases(env, &expansion);
+            return Ok(TailAction::Continue {
+                expr: expansion.expr,
+                env: expanded_env,
+            });
+        }
+    }
+
+    let callable = eval(head, env, output)?;
+    let args = eval_args(tail, env, output)?;
+    apply_tail(callable, &args, output)
+}
+
+fn eval_tail_if(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+    match args {
+        [condition, then_branch] => {
+            if eval(condition, env, output)?.is_truthy() {
+                Ok(TailAction::Continue {
+                    expr: then_branch.clone(),
+                    env: env.clone(),
+                })
+            } else {
+                Ok(TailAction::Return(Value::Void))
+            }
+        }
+        [condition, then_branch, else_branch] => {
+            let branch = if eval(condition, env, output)?.is_truthy() {
+                then_branch
+            } else {
+                else_branch
+            };
+            Ok(TailAction::Continue {
+                expr: branch.clone(),
+                env: env.clone(),
+            })
+        }
+        _ => Err(wrong_arg_count("if", "2 or 3", args.len())),
+    }
+}
+
+fn eval_tail_and(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(TailAction::Return(Value::Boolean(true)));
+    };
+
+    for expr in prefix {
+        let value = eval(expr, env, output)?;
+        if !value.is_truthy() {
+            return Ok(TailAction::Return(value));
+        }
+    }
+
+    Ok(TailAction::Continue {
+        expr: last.clone(),
+        env: env.clone(),
+    })
+}
+
+fn eval_tail_or(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(TailAction::Return(Value::Boolean(false)));
+    };
+
+    for expr in prefix {
+        let value = eval(expr, env, output)?;
+        if value.is_truthy() {
+            return Ok(TailAction::Return(value));
+        }
+    }
+
+    Ok(TailAction::Continue {
+        expr: last.clone(),
+        env: env.clone(),
+    })
+}
+
+fn eval_tail_begin(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
+    tail_sequence(args, env, output)
+}
+
+fn eval_tail_cond(
+    clauses: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items, _) = clause else {
+            return Err(EvalError::Syntax {
+                message: "cond: expected clause".into(),
+            });
+        };
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::Syntax {
+                message: "cond: expected clause".into(),
+            });
+        };
+
+        if matches!(test, Expr::Symbol(name, _) if name == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::Syntax {
+                    message: "cond: else must be last".into(),
+                });
+            }
+            return tail_sequence(body, env, output);
+        }
+
+        let value = eval(test, env, output)?;
+        if value.is_truthy() {
+            return if body.is_empty() {
+                Ok(TailAction::Return(value))
+            } else {
+                tail_sequence(body, env, output)
+            };
+        }
+    }
+
+    Ok(TailAction::Return(Value::Void))
+}
+
+fn eval_tail_let(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+    match args {
+        [Expr::Symbol(name, _), bindings, body @ ..] => {
+            eval_tail_named_let(name, bindings, body, env, output)
+        }
+        [bindings, body @ ..] => eval_tail_plain_let(bindings, body, env, output),
+        _ => Err(EvalError::Syntax {
+            message: "let: invalid syntax".into(),
+        }),
+    }
+}
+
+fn eval_tail_plain_let(
+    bindings_expr: &Expr,
+    body: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "let: expected body".into(),
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let mut values = Vec::with_capacity(bindings.len());
+    for (_, value_expr) in &bindings {
+        values.push(eval(value_expr, env, output)?);
+    }
+
+    let let_env = Env::new(Some(env.clone()));
+    for ((name, _), value) in bindings.into_iter().zip(values) {
+        let_env.define(name, value);
+    }
+
+    tail_sequence(body, &let_env, output)
+}
+
+fn eval_tail_named_let(
+    name: &str,
+    bindings_expr: &Expr,
+    body: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "let: expected body".into(),
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let mut args = Vec::with_capacity(bindings.len());
+    for (_, value_expr) in &bindings {
+        args.push(eval(value_expr, env, output)?);
+    }
+    let params = bindings.iter().map(|(param, _)| param.clone()).collect();
+
+    let let_env = Env::new(Some(env.clone()));
+    let procedure = new_procedure(Some(name.into()), Params::fixed(params), body, &let_env);
+    let_env.define(name.into(), procedure.clone());
+    apply_tail(procedure, &args, output)
+}
+
+fn eval_tail_letrec(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+    sequential: bool,
+) -> Result<TailAction, EvalError> {
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::Syntax {
+            message: "letrec: invalid syntax".into(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "letrec: expected body".into(),
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let letrec_env = Env::new(Some(env.clone()));
+
+    if sequential {
+        for (name, value_expr) in bindings {
+            letrec_env.define(name.clone(), Value::Void);
+            let value = eval_letrec_initializer(&name, &value_expr, &letrec_env, output)?;
+            let updated = letrec_env.set(&name, value);
+            debug_assert!(updated, "letrec* binding defined before initialization");
+        }
+    } else {
+        for (name, _) in &bindings {
+            letrec_env.define(name.clone(), Value::Void);
+        }
+
+        let mut values = Vec::with_capacity(bindings.len());
+        for (name, value_expr) in &bindings {
+            values.push(eval_letrec_initializer(
+                name,
+                value_expr,
+                &letrec_env,
+                output,
+            )?);
+        }
+
+        for ((name, _), value) in bindings.into_iter().zip(values) {
+            let updated = letrec_env.set(&name, value);
+            debug_assert!(updated, "letrec binding defined before initialization");
+        }
+    }
+
+    tail_sequence(body, &letrec_env, output)
+}
+
+fn eval_tail_case(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
+    let [key_expr, clauses @ ..] = args else {
+        return Err(EvalError::Syntax {
+            message: "case: invalid syntax".into(),
+        });
+    };
+
+    let key = eval(key_expr, env, output)?;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items, _) = clause else {
+            return Err(EvalError::Syntax {
+                message: "case: expected clause".into(),
+            });
+        };
+        let Some((datum_expr, body)) = items.split_first() else {
+            return Err(EvalError::Syntax {
+                message: "case: expected clause".into(),
+            });
+        };
+
+        if matches!(datum_expr, Expr::Symbol(name, _) if name == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::Syntax {
+                    message: "case: else must be last".into(),
+                });
+            }
+            return if body.is_empty() {
+                Ok(TailAction::Return(Value::Void))
+            } else {
+                tail_sequence(body, env, output)
+            };
+        }
+
+        let Expr::List(datums, _) = datum_expr else {
+            return Err(EvalError::Syntax {
+                message: "case: expected datum list".into(),
+            });
+        };
+
+        if datums
+            .iter()
+            .map(quote_expr)
+            .any(|datum| eqv_values(&key, &datum))
+        {
+            return if body.is_empty() {
+                Ok(TailAction::Return(Value::Void))
+            } else {
+                tail_sequence(body, env, output)
+            };
+        }
+    }
+
+    Ok(TailAction::Return(Value::Void))
+}
+
+fn eval_tail_do(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+    let [bindings_expr, test_clause_expr, body @ ..] = args else {
+        return Err(EvalError::Syntax {
+            message: "do: invalid syntax".into(),
+        });
+    };
+
+    let bindings = parse_do_bindings(bindings_expr)?;
+    let (test_expr, result_exprs) = parse_do_test_clause(test_clause_expr)?;
+
+    let loop_env = Env::new(Some(env.clone()));
+    let mut initial_values = Vec::with_capacity(bindings.len());
+    for binding in &bindings {
+        initial_values.push(eval(&binding.init, env, output)?);
+    }
+    for (binding, value) in bindings.iter().zip(initial_values) {
+        loop_env.define(binding.name.clone(), value);
+    }
+
+    loop {
+        if eval(&test_expr, &loop_env, output)?.is_truthy() {
+            return tail_sequence(&result_exprs, &loop_env, output);
+        }
+
+        if !body.is_empty() {
+            eval_sequence(body, &loop_env, output)?;
+        }
+
+        let mut next_values = Vec::with_capacity(bindings.len());
+        for binding in &bindings {
+            let value = match &binding.step {
+                Some(step) => eval(step, &loop_env, output)?,
+                None => loop_env
+                    .lookup(&binding.name)
+                    .expect("do binding is always present"),
+            };
+            next_values.push(value);
+        }
+
+        for (binding, value) in bindings.iter().zip(next_values) {
+            let updated = loop_env.set(&binding.name, value);
+            debug_assert!(updated, "do binding defined before loop step");
+        }
+    }
+}
+
 fn eval(expr: &Expr, env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
     let pos = expr.pos();
 
@@ -260,123 +703,6 @@ fn eval_define_syntax(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             message: "define-syntax: expected transformer name".into(),
         }),
         _ => Err(wrong_arg_count("define-syntax", "2", args.len())),
-    }
-}
-
-fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] = args else {
-        return Err(EvalError::Syntax {
-            message: "define-record-type: invalid syntax".into(),
-        });
-    };
-
-    let type_name = match type_name_expr {
-        Expr::Symbol(name, _) => name.clone(),
-        _ => {
-            return Err(EvalError::Syntax {
-                message: "define-record-type: expected type name".into(),
-            });
-        }
-    };
-
-    let (constructor_name, constructor_arity) = parse_record_constructor(constructor_expr)?;
-    let predicate_name = match predicate_expr {
-        Expr::Symbol(name, _) => name.clone(),
-        _ => {
-            return Err(EvalError::Syntax {
-                message: "define-record-type: expected predicate name".into(),
-            });
-        }
-    };
-
-    let accessor_names = field_exprs
-        .iter()
-        .map(parse_record_field)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if constructor_arity != accessor_names.len() {
-        return Err(EvalError::Syntax {
-            message: "define-record-type: constructor and field count must match".into(),
-        });
-    }
-
-    let record_type = Rc::new(RecordType {
-        name: type_name,
-        field_count: accessor_names.len(),
-    });
-
-    env.define(
-        constructor_name.clone(),
-        Value::RecordProcedure(Rc::new(RecordProcedure {
-            name: constructor_name,
-            kind: RecordProcedureKind::Constructor {
-                record_type: record_type.clone(),
-            },
-        })),
-    );
-
-    env.define(
-        predicate_name.clone(),
-        Value::RecordProcedure(Rc::new(RecordProcedure {
-            name: predicate_name,
-            kind: RecordProcedureKind::Predicate {
-                record_type: record_type.clone(),
-            },
-        })),
-    );
-
-    for (field_index, accessor_name) in accessor_names.into_iter().enumerate() {
-        env.define(
-            accessor_name.clone(),
-            Value::RecordProcedure(Rc::new(RecordProcedure {
-                name: accessor_name,
-                kind: RecordProcedureKind::Accessor {
-                    record_type: record_type.clone(),
-                    field_index,
-                },
-            })),
-        );
-    }
-
-    Ok(Value::Void)
-}
-
-fn parse_record_constructor(expr: &Expr) -> Result<(String, usize), EvalError> {
-    let Expr::List(items, _) = expr else {
-        return Err(EvalError::Syntax {
-            message: "define-record-type: expected constructor spec".into(),
-        });
-    };
-
-    let Some((Expr::Symbol(name, _), params)) = items.split_first() else {
-        return Err(EvalError::Syntax {
-            message: "define-record-type: expected constructor name".into(),
-        });
-    };
-
-    for param in params {
-        if !matches!(param, Expr::Symbol(_, _)) {
-            return Err(EvalError::Syntax {
-                message: "define-record-type: expected constructor field name".into(),
-            });
-        }
-    }
-
-    Ok((name.clone(), params.len()))
-}
-
-fn parse_record_field(expr: &Expr) -> Result<String, EvalError> {
-    let Expr::List(items, _) = expr else {
-        return Err(EvalError::Syntax {
-            message: "define-record-type: expected field spec".into(),
-        });
-    };
-
-    match items.as_slice() {
-        [Expr::Symbol(_, _), Expr::Symbol(accessor, _)] => Ok(accessor.clone()),
-        _ => Err(EvalError::Syntax {
-            message: "define-record-type: expected (field accessor)".into(),
-        }),
     }
 }
 
@@ -1007,11 +1333,35 @@ fn apply(callable: Value, args: &[Value], output: &mut String) -> Result<Value, 
     }
 }
 
+fn apply_tail(callable: Value, args: &[Value], output: &mut String) -> Result<TailAction, EvalError> {
+    match callable {
+        Value::Builtin(builtin) => apply_builtin(builtin, args, output).map(TailAction::Return),
+        Value::Procedure(procedure) => prepare_tail_procedure(&procedure, args, output),
+        Value::RecordProcedure(procedure) => {
+            apply_record_procedure(&procedure, args).map(TailAction::Return)
+        }
+        value => Err(EvalError::NotAProcedure {
+            got: value.type_name().into(),
+        }),
+    }
+}
+
 fn apply_procedure(
     procedure: &Procedure,
     args: &[Value],
     output: &mut String,
 ) -> Result<Value, EvalError> {
+    match prepare_tail_procedure(procedure, args, output)? {
+        TailAction::Return(value) => Ok(value),
+        TailAction::Continue { expr, env } => eval_tail(expr, env, output),
+    }
+}
+
+fn prepare_tail_procedure(
+    procedure: &Procedure,
+    args: &[Value],
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
     let Some(clause) = procedure
         .clauses
         .iter()
@@ -1036,50 +1386,10 @@ fn apply_procedure(
         );
     }
 
-    eval_sequence(&clause.body, &call_env, output)
+    tail_sequence(&clause.body, &call_env, output)
 }
 
-fn apply_record_procedure(procedure: &RecordProcedure, args: &[Value]) -> Result<Value, EvalError> {
-    match &procedure.kind {
-        RecordProcedureKind::Constructor { record_type } => {
-            if args.len() != record_type.field_count {
-                return Err(wrong_arg_count(
-                    &procedure.name,
-                    &record_type.field_count.to_string(),
-                    args.len(),
-                ));
-            }
-
-            Ok(Value::Record(Rc::new(RecordInstance {
-                record_type: record_type.clone(),
-                fields: args.to_vec(),
-            })))
-        }
-        RecordProcedureKind::Predicate { record_type } => match args {
-            [Value::Record(record)] => {
-                Ok(Value::Boolean(Rc::ptr_eq(&record.record_type, record_type)))
-            }
-            [_] => Ok(Value::Boolean(false)),
-            _ => Err(wrong_arg_count(&procedure.name, "1", args.len())),
-        },
-        RecordProcedureKind::Accessor {
-            record_type,
-            field_index,
-        } => match args {
-            [Value::Record(record)] if Rc::ptr_eq(&record.record_type, record_type) => {
-                Ok(record.fields[*field_index].clone())
-            }
-            [value] => Err(EvalError::TypeMismatch {
-                name: procedure.name.clone(),
-                expected: format!("{} record", record_type.name),
-                got: value.type_name().into(),
-            }),
-            _ => Err(wrong_arg_count(&procedure.name, "1", args.len())),
-        },
-    }
-}
-
-fn wrong_arg_count(name: &str, expected: &str, got: usize) -> EvalError {
+pub(super) fn wrong_arg_count(name: &str, expected: &str, got: usize) -> EvalError {
     EvalError::WrongArgCount {
         name: name.into(),
         expected: expected.into(),
