@@ -846,7 +846,7 @@ struct ParameterSpec {
 
 struct Closure {
     params: ParameterSpec,
-    body: Vec<Expr>,
+    body: Rc<[Expr]>,
     env: EnvRef,
 }
 
@@ -1277,60 +1277,263 @@ fn eval_program(expressions: &[Expr], output: Rc<RefCell<String>>) -> Result<Val
     eval_sequence(expressions, &env)
 }
 
-fn eval_sequence(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let mut last_value = Value::Void;
+enum TailTarget<'a> {
+    Expr(&'a Expr),
+    Sequence(&'a [Expr]),
+    OwnedExpr(Expr),
+    OwnedSequence(Rc<[Expr]>),
+}
 
-    for expression in expressions {
-        last_value = eval_expr(expression, env)?;
+enum TailControl<'a> {
+    Return(Value),
+    Continue { target: TailTarget<'a>, env: EnvRef },
+}
+
+fn borrowed_expr_target<'a>(expr: &'a Expr) -> TailTarget<'a> {
+    TailTarget::Expr(expr)
+}
+
+fn borrowed_sequence_target<'a>(expressions: &'a [Expr]) -> TailTarget<'a> {
+    TailTarget::Sequence(expressions)
+}
+
+fn owned_expr_target<'a>(expr: &'a Expr) -> TailTarget<'a> {
+    TailTarget::OwnedExpr(expr.clone())
+}
+
+fn owned_sequence_target<'a>(expressions: &'a [Expr]) -> TailTarget<'a> {
+    TailTarget::OwnedSequence(Rc::from(expressions.to_vec()))
+}
+
+fn into_owned_target(target: TailTarget<'_>) -> TailTarget<'static> {
+    match target {
+        TailTarget::Expr(expr) => TailTarget::OwnedExpr(expr.clone()),
+        TailTarget::Sequence(expressions) => TailTarget::OwnedSequence(Rc::from(expressions.to_vec())),
+        TailTarget::OwnedExpr(expr) => TailTarget::OwnedExpr(expr),
+        TailTarget::OwnedSequence(expressions) => TailTarget::OwnedSequence(expressions),
     }
+}
 
-    Ok(last_value)
+fn into_owned_control(control: TailControl<'_>) -> TailControl<'static> {
+    match control {
+        TailControl::Return(value) => TailControl::Return(value),
+        TailControl::Continue { target, env } => TailControl::Continue {
+            target: into_owned_target(target),
+            env,
+        },
+    }
+}
+
+fn eval_sequence(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    eval_tail_target(TailTarget::Sequence(expressions), env)
 }
 
 fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
+    eval_tail_target(TailTarget::Expr(expr), env)
+}
+
+fn eval_tail_target<'a>(mut target: TailTarget<'a>, env: &EnvRef) -> Result<Value, EvalError> {
+    let mut env = env.clone();
+
+    loop {
+        let control = match target {
+            TailTarget::Expr(expr) => eval_expr_control(
+                expr,
+                &env,
+                borrowed_expr_target,
+                borrowed_sequence_target,
+            )?,
+            TailTarget::Sequence(expressions) => {
+                eval_sequence_control(expressions, &env, borrowed_expr_target)?
+            }
+            TailTarget::OwnedExpr(expr) => into_owned_control(eval_expr_control(
+                &expr,
+                &env,
+                owned_expr_target,
+                owned_sequence_target,
+            )?),
+            TailTarget::OwnedSequence(expressions) => {
+                eval_owned_sequence_control(expressions, &env)?
+            }
+        };
+
+        match control {
+            TailControl::Return(value) => return Ok(value),
+            TailControl::Continue {
+                target: next_target,
+                env: next_env,
+            } => {
+                target = next_target;
+                env = next_env;
+            }
+        }
+    }
+}
+
+fn eval_sequence_control<'a, F>(
+    expressions: &'a [Expr],
+    env: &EnvRef,
+    make_expr_target: F,
+) -> Result<TailControl<'a>, EvalError>
+where
+    F: Fn(&'a Expr) -> TailTarget<'a>,
+{
+    let Some((last, initial)) = expressions.split_last() else {
+        return Ok(TailControl::Return(Value::Void));
+    };
+
+    for expression in initial {
+        eval_expr(expression, env)?;
+    }
+
+    Ok(TailControl::Continue {
+        target: make_expr_target(last),
+        env: env.clone(),
+    })
+}
+
+fn eval_owned_sequence_control(
+    expressions: Rc<[Expr]>,
+    env: &EnvRef,
+) -> Result<TailControl<'static>, EvalError> {
+    let slice = expressions.as_ref();
+    let Some((last, initial)) = slice.split_last() else {
+        return Ok(TailControl::Return(Value::Void));
+    };
+
+    for expression in initial {
+        eval_expr(expression, env)?;
+    }
+
+    Ok(TailControl::Continue {
+        target: TailTarget::OwnedExpr(last.clone()),
+        env: env.clone(),
+    })
+}
+
+fn eval_expr_control<'a, FExpr, FSeq>(
+    expr: &'a Expr,
+    env: &EnvRef,
+    make_expr_target: FExpr,
+    make_sequence_target: FSeq,
+) -> Result<TailControl<'a>, EvalError>
+where
+    FExpr: Copy + Fn(&'a Expr) -> TailTarget<'a>,
+    FSeq: Copy + Fn(&'a [Expr]) -> TailTarget<'a>,
+{
     match &expr.kind {
-        ExprKind::Number(value) => Ok(Value::Number(*value)),
-        ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
-        ExprKind::String(value) => Ok(Value::String(SchemeString::immutable(value.clone()))),
-        ExprKind::Char(value) => Ok(Value::Char(*value)),
+        ExprKind::Number(value) => Ok(TailControl::Return(Value::Number(*value))),
+        ExprKind::Boolean(value) => Ok(TailControl::Return(Value::Boolean(*value))),
+        ExprKind::String(value) => Ok(TailControl::Return(Value::String(
+            SchemeString::immutable(value.clone()),
+        ))),
+        ExprKind::Char(value) => Ok(TailControl::Return(Value::Char(*value))),
         ExprKind::Symbol(name) => match env.lookup(name) {
             Some(Value::Uninitialized(_)) => {
                 Err(EvalError::UninitializedBinding { name: name.clone() }
                     .with_offset(expr.pos.offset))
             }
-            Some(value) => Ok(value),
+            Some(value) => Ok(TailControl::Return(value)),
             None => {
                 Err(EvalError::UnboundVariable { name: name.clone() }.with_offset(expr.pos.offset))
             }
         },
-        ExprKind::List(items) => eval_application(expr.pos, items, env),
+        ExprKind::List(items) => eval_list_control(
+            expr.pos,
+            items,
+            env,
+            make_expr_target,
+            make_sequence_target,
+        ),
     }
 }
 
 fn eval_application(list_pos: SourcePos, items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    eval_tail_target(
+        TailTarget::OwnedExpr(Expr::new(ExprKind::List(items.to_vec()), list_pos)),
+        env,
+    )
+}
+
+fn eval_list_control<'a, FExpr, FSeq>(
+    list_pos: SourcePos,
+    items: &'a [Expr],
+    env: &EnvRef,
+    make_expr_target: FExpr,
+    make_sequence_target: FSeq,
+) -> Result<TailControl<'a>, EvalError>
+where
+    FExpr: Copy + Fn(&'a Expr) -> TailTarget<'a>,
+    FSeq: Copy + Fn(&'a [Expr]) -> TailTarget<'a>,
+{
     let (operator, arguments) = items
         .split_first()
         .ok_or_else(|| EvalError::EmptyList.with_offset(list_pos.offset))?;
 
     if let ExprKind::Symbol(name) = &operator.kind {
         match name.as_str() {
-            "define" => return eval_define(operator.pos, arguments, env),
-            "define-record-type" => return eval_define_record_type(operator.pos, arguments, env),
-            "define-syntax" => return eval_define_syntax(operator.pos, arguments, env),
-            "set!" => return eval_set(operator.pos, arguments, env),
-            "if" => return eval_if(operator.pos, arguments, env),
-            "quote" => return eval_quote(operator.pos, arguments),
-            "lambda" => return eval_lambda(operator.pos, arguments, env),
-            "case-lambda" => return eval_case_lambda(arguments, env),
-            "and" => return eval_and(arguments, env),
-            "or" => return eval_or(arguments, env),
-            "begin" => return eval_begin(arguments, env),
-            "let" => return eval_let(operator.pos, arguments, env),
-            "letrec" => return eval_letrec(operator.pos, arguments, env, false),
-            "letrec*" => return eval_letrec(operator.pos, arguments, env, true),
-            "cond" => return eval_cond(arguments, env),
-            "case" => return eval_case(operator.pos, arguments, env),
-            "do" => return eval_do(operator.pos, arguments, env),
+            "define" => {
+                return Ok(TailControl::Return(eval_define(
+                    operator.pos,
+                    arguments,
+                    env,
+                )?))
+            }
+            "define-record-type" => {
+                return Ok(TailControl::Return(eval_define_record_type(
+                    operator.pos,
+                    arguments,
+                    env,
+                )?))
+            }
+            "define-syntax" => {
+                return Ok(TailControl::Return(eval_define_syntax(
+                    operator.pos,
+                    arguments,
+                    env,
+                )?))
+            }
+            "set!" => return Ok(TailControl::Return(eval_set(operator.pos, arguments, env)?)),
+            "if" => return eval_if_control(operator.pos, arguments, env, make_expr_target),
+            "quote" => return Ok(TailControl::Return(eval_quote(operator.pos, arguments)?)),
+            "lambda" => {
+                return Ok(TailControl::Return(eval_lambda(operator.pos, arguments, env)?))
+            }
+            "case-lambda" => return Ok(TailControl::Return(eval_case_lambda(arguments, env)?)),
+            "and" => return eval_and_control(arguments, env, make_expr_target),
+            "or" => return eval_or_control(arguments, env, make_expr_target),
+            "begin" => {
+                return Ok(TailControl::Continue {
+                    target: make_sequence_target(arguments),
+                    env: env.clone(),
+                })
+            }
+            "let" => return eval_let_control(operator.pos, arguments, env, make_sequence_target),
+            "letrec" => {
+                return Ok(TailControl::Return(eval_letrec(
+                    operator.pos,
+                    arguments,
+                    env,
+                    false,
+                )?))
+            }
+            "letrec*" => {
+                return Ok(TailControl::Return(eval_letrec(
+                    operator.pos,
+                    arguments,
+                    env,
+                    true,
+                )?))
+            }
+            "cond" => return eval_cond_control(arguments, env, make_sequence_target),
+            "case" => {
+                return Ok(TailControl::Return(eval_case(
+                    operator.pos,
+                    arguments,
+                    env,
+                )?))
+            }
+            "do" => return Ok(TailControl::Return(eval_do(operator.pos, arguments, env)?)),
             _ => {}
         }
 
@@ -1343,12 +1546,306 @@ fn eval_application(list_pos: SourcePos, items: &[Expr], env: &EnvRef) -> Result
                 macro_env.define(alias, value);
             }
 
-            return eval_expr(&expansion.expr, &macro_env);
+            return Ok(TailControl::Continue {
+                target: TailTarget::OwnedExpr(expansion.expr),
+                env: macro_env,
+            });
         }
     }
 
     let procedure = eval_expr(operator, env)?;
-    apply_value(procedure, arguments, env, operator.pos)
+    eval_tail_application(procedure, arguments, env, operator.pos)
+}
+
+fn eval_tail_application<'a>(
+    value: Value,
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<TailControl<'a>, EvalError> {
+    match value {
+        Value::Builtin(builtin) => Ok(TailControl::Return(eval_builtin(
+            builtin, arguments, env, call_pos,
+        )?)),
+        Value::NativeProcedure(procedure) => Ok(TailControl::Return(apply_native_procedure(
+            &procedure, arguments, env, call_pos,
+        )?)),
+        Value::Procedure(closure) => {
+            let argument_values = eval_args(arguments, env)?;
+            let call_env = create_closure_call_env(closure.as_ref(), argument_values, call_pos)?;
+            Ok(TailControl::Continue {
+                target: TailTarget::OwnedSequence(closure.body.clone()),
+                env: call_env,
+            })
+        }
+        Value::CaseProcedure(closure) => {
+            let argument_values = eval_args(arguments, env)?;
+            let clause =
+                select_case_lambda_clause(closure.as_ref(), argument_values.len(), call_pos)?;
+            let call_env = create_closure_call_env(clause.as_ref(), argument_values, call_pos)?;
+            Ok(TailControl::Continue {
+                target: TailTarget::OwnedSequence(clause.body.clone()),
+                env: call_env,
+            })
+        }
+        other => Err(EvalError::NotAProcedure {
+            found: other.kind().into(),
+        }
+        .with_offset(call_pos.offset)),
+    }
+}
+
+fn eval_if_control<'a, F>(
+    pos: SourcePos,
+    arguments: &'a [Expr],
+    env: &EnvRef,
+    make_expr_target: F,
+) -> Result<TailControl<'a>, EvalError>
+where
+    F: Copy + Fn(&'a Expr) -> TailTarget<'a>,
+{
+    match arguments {
+        [condition, consequent] => {
+            if eval_expr(condition, env)?.is_truthy() {
+                Ok(TailControl::Continue {
+                    target: make_expr_target(consequent),
+                    env: env.clone(),
+                })
+            } else {
+                Ok(TailControl::Return(Value::Boolean(false)))
+            }
+        }
+        [condition, consequent, alternate] => {
+            let next = if eval_expr(condition, env)?.is_truthy() {
+                consequent
+            } else {
+                alternate
+            };
+
+            Ok(TailControl::Continue {
+                target: make_expr_target(next),
+                env: env.clone(),
+            })
+        }
+        _ => Err(EvalError::WrongArgCount {
+            name: "if".into(),
+            expected: "2 or 3".into(),
+            got: arguments.len(),
+        }
+        .with_offset(pos.offset)),
+    }
+}
+
+fn eval_and_control<'a, F>(
+    arguments: &'a [Expr],
+    env: &EnvRef,
+    make_expr_target: F,
+) -> Result<TailControl<'a>, EvalError>
+where
+    F: Copy + Fn(&'a Expr) -> TailTarget<'a>,
+{
+    let Some((last, initial)) = arguments.split_last() else {
+        return Ok(TailControl::Return(Value::Boolean(true)));
+    };
+
+    for argument in initial {
+        let value = eval_expr(argument, env)?;
+        if !value.is_truthy() {
+            return Ok(TailControl::Return(value));
+        }
+    }
+
+    Ok(TailControl::Continue {
+        target: make_expr_target(last),
+        env: env.clone(),
+    })
+}
+
+fn eval_or_control<'a, F>(
+    arguments: &'a [Expr],
+    env: &EnvRef,
+    make_expr_target: F,
+) -> Result<TailControl<'a>, EvalError>
+where
+    F: Copy + Fn(&'a Expr) -> TailTarget<'a>,
+{
+    let Some((last, initial)) = arguments.split_last() else {
+        return Ok(TailControl::Return(Value::Boolean(false)));
+    };
+
+    for argument in initial {
+        let value = eval_expr(argument, env)?;
+        if value.is_truthy() {
+            return Ok(TailControl::Return(value));
+        }
+    }
+
+    Ok(TailControl::Continue {
+        target: make_expr_target(last),
+        env: env.clone(),
+    })
+}
+
+fn eval_let_control<'a, F>(
+    pos: SourcePos,
+    arguments: &'a [Expr],
+    env: &EnvRef,
+    make_sequence_target: F,
+) -> Result<TailControl<'a>, EvalError>
+where
+    F: Copy + Fn(&'a [Expr]) -> TailTarget<'a>,
+{
+    let Some((first, rest)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(pos.offset));
+    };
+
+    match &first.kind {
+        ExprKind::Symbol(name) => eval_named_let_control(name, rest, env, pos),
+        _ => eval_plain_let_control(first, rest, env, make_sequence_target),
+    }
+}
+
+fn eval_plain_let_control<'a, F>(
+    bindings_expr: &'a Expr,
+    body: &'a [Expr],
+    env: &EnvRef,
+    make_sequence_target: F,
+) -> Result<TailControl<'a>, EvalError>
+where
+    F: Copy + Fn(&'a [Expr]) -> TailTarget<'a>,
+{
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(bindings_expr.pos.offset));
+    }
+
+    let bindings = parse_bindings(bindings_expr, "let")?;
+    let values = eval_binding_values(&bindings, env)?;
+    let let_env = Env::child(env);
+
+    for ((name, _), value) in bindings.into_iter().zip(values) {
+        let_env.define(name, value);
+    }
+
+    Ok(TailControl::Continue {
+        target: make_sequence_target(body),
+        env: let_env,
+    })
+}
+
+fn eval_named_let_control(
+    name: &str,
+    arguments: &[Expr],
+    env: &EnvRef,
+    pos: SourcePos,
+) -> Result<TailControl<'static>, EvalError> {
+    let Some((bindings_expr, body)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 3".into(),
+            got: 1,
+        }
+        .with_offset(pos.offset));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 3".into(),
+            got: 2,
+        }
+        .with_offset(pos.offset));
+    }
+
+    let bindings = parse_bindings(bindings_expr, "let")?;
+    let named_env = Env::child(env);
+    let params = bindings
+        .iter()
+        .map(|(binding, _)| binding.clone())
+        .collect();
+    let closure = Rc::new(Closure {
+        params: ParameterSpec {
+            required: params,
+            rest: None,
+        },
+        body: Rc::from(body.to_vec()),
+        env: named_env.clone(),
+    });
+
+    named_env.define(name.into(), Value::Procedure(closure.clone()));
+
+    let values = eval_binding_values(&bindings, &named_env)?;
+    let call_env = create_closure_call_env(closure.as_ref(), values, pos)?;
+    Ok(TailControl::Continue {
+        target: TailTarget::OwnedSequence(closure.body.clone()),
+        env: call_env,
+    })
+}
+
+fn eval_cond_control<'a, F>(
+    arguments: &'a [Expr],
+    env: &EnvRef,
+    make_sequence_target: F,
+) -> Result<TailControl<'a>, EvalError>
+where
+    F: Copy + Fn(&'a [Expr]) -> TailTarget<'a>,
+{
+    for (index, clause) in arguments.iter().enumerate() {
+        let ExprKind::List(items) = &clause.kind else {
+            return Err(EvalError::InvalidSyntax {
+                message: "cond: clauses must be lists".into(),
+            }
+            .with_offset(clause.pos.offset));
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::InvalidSyntax {
+                message: "cond: clauses cannot be empty".into(),
+            }
+            .with_offset(clause.pos.offset));
+        };
+
+        if matches!(&test.kind, ExprKind::Symbol(name) if name == "else") {
+            if index + 1 != arguments.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "cond: else clause must be last".into(),
+                }
+                .with_offset(test.pos.offset));
+            }
+
+            return if body.is_empty() {
+                Ok(TailControl::Return(Value::Void))
+            } else {
+                Ok(TailControl::Continue {
+                    target: make_sequence_target(body),
+                    env: env.clone(),
+                })
+            };
+        }
+
+        let value = eval_expr(test, env)?;
+        if value.is_truthy() {
+            return if body.is_empty() {
+                Ok(TailControl::Return(value))
+            } else {
+                Ok(TailControl::Continue {
+                    target: make_sequence_target(body),
+                    env: env.clone(),
+                })
+            };
+        }
+    }
+
+    Ok(TailControl::Return(Value::Void))
 }
 
 fn apply_value(
@@ -1687,6 +2184,25 @@ fn apply_closure_values(
     argument_values: Vec<Value>,
     call_pos: SourcePos,
 ) -> Result<Value, EvalError> {
+    let call_env = create_closure_call_env(closure.as_ref(), argument_values, call_pos)?;
+    eval_sequence(closure.body.as_ref(), &call_env)
+}
+
+fn apply_case_closure_values(
+    closure: Rc<CaseClosure>,
+    argument_values: Vec<Value>,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let clause = select_case_lambda_clause(closure.as_ref(), argument_values.len(), call_pos)?;
+    let call_env = create_closure_call_env(clause.as_ref(), argument_values, call_pos)?;
+    eval_sequence(clause.body.as_ref(), &call_env)
+}
+
+fn create_closure_call_env(
+    closure: &Closure,
+    argument_values: Vec<Value>,
+    call_pos: SourcePos,
+) -> Result<EnvRef, EvalError> {
     let required = closure.params.required.len();
     let has_rest = closure.params.rest.is_some();
 
@@ -1719,29 +2235,27 @@ fn apply_closure_values(
         call_env.define(rest_param.clone(), Value::List(argument_values.collect()));
     }
 
-    eval_sequence(&closure.body, &call_env)
+    Ok(call_env)
 }
 
-fn apply_case_closure_values(
-    closure: Rc<CaseClosure>,
-    argument_values: Vec<Value>,
+fn select_case_lambda_clause(
+    closure: &CaseClosure,
+    argument_count: usize,
     call_pos: SourcePos,
-) -> Result<Value, EvalError> {
-    let argument_count = argument_values.len();
-    let Some(clause) = closure
+) -> Result<Rc<Closure>, EvalError> {
+    closure
         .clauses
         .iter()
         .find(|clause| parameter_spec_accepts(&clause.params, argument_count))
-    else {
-        return Err(EvalError::WrongArgCount {
-            name: "procedure".into(),
-            expected: format_case_lambda_arity(&closure),
-            got: argument_count,
-        }
-        .with_offset(call_pos.offset));
-    };
-
-    apply_closure_values(clause.clone(), argument_values, call_pos)
+        .cloned()
+        .ok_or_else(|| {
+            EvalError::WrongArgCount {
+                name: "procedure".into(),
+                expected: format_case_lambda_arity(closure),
+                got: argument_count,
+            }
+            .with_offset(call_pos.offset)
+        })
 }
 
 fn eval_args(arguments: &[Expr], env: &EnvRef) -> Result<Vec<Value>, EvalError> {
@@ -1793,7 +2307,7 @@ fn eval_define(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value
 
             let closure = Value::Procedure(Rc::new(Closure {
                 params: parse_params(params)?,
-                body: arguments[1..].to_vec(),
+                body: Rc::from(arguments[1..].to_vec()),
                 env: env.clone(),
             }));
 
@@ -2813,7 +3327,7 @@ fn eval_lambda(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value
 
     Ok(Value::Procedure(Rc::new(Closure {
         params: parse_param_list(param_list)?,
-        body: body.to_vec(),
+        body: Rc::from(body.to_vec()),
         env: env.clone(),
     })))
 }
@@ -2845,7 +3359,7 @@ fn eval_case_lambda(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError
 
         clauses.push(Rc::new(Closure {
             params: parse_param_list(params_expr)?,
-            body: body.to_vec(),
+            body: Rc::from(body.to_vec()),
             env: env.clone(),
         }));
     }
@@ -2929,7 +3443,7 @@ fn eval_named_let(
             required: params,
             rest: None,
         },
-        body: body.to_vec(),
+        body: Rc::from(body.to_vec()),
         env: named_env.clone(),
     });
 
