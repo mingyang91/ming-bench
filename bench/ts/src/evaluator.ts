@@ -86,6 +86,18 @@ interface VoidValue {
   kind: 'void';
 }
 
+interface RecordTypeDescriptor {
+  name: string;
+  fieldCount: number;
+  fieldIndices: Map<string, number>;
+}
+
+interface RecordValue {
+  kind: 'record';
+  recordType: RecordTypeDescriptor;
+  fields: Value[];
+}
+
 interface BindingCell {
   value: Value;
 }
@@ -98,6 +110,11 @@ interface EvaluatedArg {
 interface LetBinding {
   name: SymbolExpr;
   valueExpr: Expr;
+}
+
+interface RecordFieldSpec {
+  fieldName: SymbolExpr;
+  accessorName: SymbolExpr;
 }
 
 interface ParsedParameters {
@@ -145,6 +162,7 @@ type Value =
   | SchemeChar
   | EmptyListValue
   | PairValue
+  | RecordValue
   | VoidValue
   | ProcedureValue;
 
@@ -1267,6 +1285,8 @@ function evaluateList(expr: ListExpr, env: Environment, runtime: Runtime): Value
     }
 
     switch (head.value) {
+      case 'define-record-type':
+        return evalDefineRecordType(args, head, env);
       case 'define':
         return evalDefine(args, head, env, runtime);
       case 'set!':
@@ -1311,6 +1331,111 @@ function evalDefineSyntax(
   }
 
   runtime.defineSyntaxRule(nameExpr.value, parseMacroTransformer(args[1], env));
+  return VOID_VALUE;
+}
+
+function evalDefineRecordType(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  if (args.length < 3) {
+    throw new EvalError(
+      `${head.line}:${head.col}: define-record-type expects a type, constructor, predicate, and fields`,
+    );
+  }
+
+  const typeName = expectSymbolExpr(args[0], 'record type name must be a symbol');
+  const constructorExpr = args[1];
+  if (constructorExpr.type !== 'list' || constructorExpr.elements.length === 0) {
+    throw new EvalError(`${head.line}:${head.col}: record constructor spec must be a non-empty list`);
+  }
+
+  const constructorName = expectBindableSymbol(
+    constructorExpr.elements[0],
+    'record constructor name must be a symbol',
+  );
+  const constructorFields = constructorExpr.elements.slice(1).map((fieldExpr) => (
+    expectSymbolExpr(fieldExpr, 'record constructor fields must be symbols')
+  ));
+  const predicateName = expectBindableSymbol(
+    args[2],
+    'record predicate name must be a symbol',
+  );
+  const fieldSpecs = args.slice(3).map((fieldExpr) => parseRecordFieldSpec(fieldExpr, head));
+
+  if (constructorFields.length !== fieldSpecs.length) {
+    throw new EvalError(
+      `${head.line}:${head.col}: define-record-type constructor and field specs must match`,
+    );
+  }
+
+  const fieldIndices = new Map<string, number>();
+  for (let index = 0; index < constructorFields.length; index += 1) {
+    const fieldName = constructorFields[index];
+    if (fieldIndices.has(fieldName.value)) {
+      throw new EvalError(`${fieldName.line}:${fieldName.col}: duplicate record field ${fieldName.value}`);
+    }
+
+    fieldIndices.set(fieldName.value, index);
+  }
+
+  const seenFields = new Set<string>();
+  for (const fieldSpec of fieldSpecs) {
+    if (seenFields.has(fieldSpec.fieldName.value)) {
+      throw new EvalError(
+        `${fieldSpec.fieldName.line}:${fieldSpec.fieldName.col}: duplicate record field ${fieldSpec.fieldName.value}`,
+      );
+    }
+
+    if (!fieldIndices.has(fieldSpec.fieldName.value)) {
+      throw new EvalError(
+        `${fieldSpec.fieldName.line}:${fieldSpec.fieldName.col}: unknown record field ${fieldSpec.fieldName.value}`,
+      );
+    }
+
+    seenFields.add(fieldSpec.fieldName.value);
+  }
+
+  const recordType: RecordTypeDescriptor = {
+    name: typeName.value,
+    fieldCount: constructorFields.length,
+    fieldIndices,
+  };
+
+  env.define(symbolLookupName(constructorName), builtin(constructorName.value, (callArgs, loc) => {
+    if (callArgs.length !== recordType.fieldCount) {
+      throw new EvalError(
+        `${loc.line}:${loc.col}: ${constructorName.value} expects exactly ${recordType.fieldCount} arguments`,
+      );
+    }
+
+    return {
+      kind: 'record',
+      recordType,
+      fields: callArgs.map((arg) => arg.value),
+    };
+  }));
+
+  env.define(symbolLookupName(predicateName), predicateBuiltin(predicateName.value, (value) => (
+    isRecordValue(value) && value.recordType === recordType
+  )));
+
+  for (const fieldSpec of fieldSpecs) {
+    const fieldIndex = recordType.fieldIndices.get(fieldSpec.fieldName.value);
+    if (fieldIndex === undefined) {
+      throw new EvalError(
+        `${fieldSpec.fieldName.line}:${fieldSpec.fieldName.col}: unknown record field ${fieldSpec.fieldName.value}`,
+      );
+    }
+
+    env.define(symbolLookupName(fieldSpec.accessorName), builtin(fieldSpec.accessorName.value, (callArgs, loc) => {
+      if (callArgs.length !== 1) {
+        throw new EvalError(
+          `${loc.line}:${loc.col}: ${fieldSpec.accessorName.value} expects exactly 1 argument`,
+        );
+      }
+
+      return expectRecordOfType(callArgs[0], recordType).fields[fieldIndex];
+    }));
+  }
+
   return VOID_VALUE;
 }
 
@@ -1597,6 +1722,20 @@ function parseLetBindings(expr: Expr, head: SymbolExpr): LetBinding[] {
 
     return { name: nameExpr, valueExpr };
   });
+}
+
+function parseRecordFieldSpec(expr: Expr, head: SymbolExpr): RecordFieldSpec {
+  if (expr.type !== 'list' || expr.elements.length !== 2) {
+    throw new EvalError(`${head.line}:${head.col}: define-record-type field specs must be pairs`);
+  }
+
+  return {
+    fieldName: expectSymbolExpr(expr.elements[0], 'record field name must be a symbol'),
+    accessorName: expectBindableSymbol(
+      expr.elements[1],
+      'record accessor name must be a symbol',
+    ),
+  };
 }
 
 function evaluateSequence(exprs: Expr[], env: Environment, runtime: Runtime): Value {
@@ -2229,6 +2368,7 @@ function cloneExpr(expr: Expr): Expr {
 
 function isSpecialFormName(name: string): boolean {
   return [
+    'define-record-type',
     'define',
     'define-syntax',
     'set!',
@@ -2241,6 +2381,22 @@ function isSpecialFormName(name: string): boolean {
     'cond',
     'let',
   ].includes(name);
+}
+
+function expectSymbolExpr(expr: Expr, message: string): SymbolExpr {
+  if (expr.type !== 'symbol') {
+    throw new EvalError(`${expr.line}:${expr.col}: ${message}`);
+  }
+
+  return expr;
+}
+
+function expectBindableSymbol(expr: Expr, message: string): SymbolExpr {
+  if (expr.type !== 'symbol' || expr.capturedCell !== undefined) {
+    throw new EvalError(`${expr.line}:${expr.col}: ${message}`);
+  }
+
+  return expr;
 }
 
 function expectNumber(arg: EvaluatedArg): NumberValue {
@@ -2320,6 +2476,14 @@ function expectProperList(value: Value, loc: SourceLoc): Value[] {
   return elements;
 }
 
+function expectRecordOfType(arg: EvaluatedArg, recordType: RecordTypeDescriptor): RecordValue {
+  if (!isRecordValue(arg.value) || arg.value.recordType !== recordType) {
+    throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected ${recordType.name} record`);
+  }
+
+  return arg.value;
+}
+
 function isEq(left: Value, right: Value): boolean {
   if (isNumberValue(left)) {
     return isNumberValue(right) && numbersEqual(left, right);
@@ -2354,6 +2518,10 @@ function isEq(left: Value, right: Value): boolean {
   }
 
   if (isProcedure(left) && isProcedure(right)) {
+    return left === right;
+  }
+
+  if (isRecordValue(left) && isRecordValue(right)) {
     return left === right;
   }
 
@@ -2397,6 +2565,10 @@ function isEqual(left: Value, right: Value): boolean {
     return left === right;
   }
 
+  if (isRecordValue(left) && isRecordValue(right)) {
+    return left === right;
+  }
+
   return left.kind === 'void' && right.kind === 'void';
 }
 
@@ -2432,6 +2604,10 @@ function isBuiltinProcedure(value: ProcedureValue): value is BuiltinProcedure {
 
 function isPair(value: Value): value is PairValue {
   return typeof value === 'object' && value !== null && value.kind === 'pair';
+}
+
+function isRecordValue(value: Value): value is RecordValue {
+  return typeof value === 'object' && value !== null && value.kind === 'record';
 }
 
 function isEmptyList(value: Value): value is EmptyListValue {
@@ -2482,6 +2658,8 @@ function formatValue(value: Value): string {
       return '()';
     case 'pair':
       return formatPair(value);
+    case 'record':
+      return `#<record ${value.recordType.name}>`;
     case 'void':
       return '#<void>';
     case 'procedure':
@@ -2505,6 +2683,8 @@ function formatDisplayValue(value: Value): string {
       return '()';
     case 'pair':
       return formatDisplayPair(value);
+    case 'record':
+      return `#<record ${value.recordType.name}>`;
     case 'void':
       return '#<void>';
     case 'procedure':

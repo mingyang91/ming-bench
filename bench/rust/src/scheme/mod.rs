@@ -122,9 +122,43 @@ struct ClosureProcedure {
 }
 
 #[derive(Clone)]
+struct RecordType {
+    name: String,
+    field_count: usize,
+    type_id: u64,
+}
+
+struct RecordValue {
+    type_info: Rc<RecordType>,
+    fields: RefCell<Vec<Value>>,
+}
+
+#[derive(Clone)]
+struct NativeProcedure {
+    name: String,
+    kind: NativeProcedureKind,
+}
+
+#[derive(Clone)]
+enum NativeProcedureKind {
+    Map,
+    RecordConstructor(Rc<RecordType>),
+    RecordPredicate(Rc<RecordType>),
+    RecordAccessor {
+        type_info: Rc<RecordType>,
+        field_index: usize,
+    },
+    RecordMutator {
+        type_info: Rc<RecordType>,
+        field_index: usize,
+    },
+}
+
+#[derive(Clone)]
 enum ProcedureValue {
     Builtin(BuiltinProcedure),
     Closure(Rc<ClosureProcedure>),
+    Native(Rc<NativeProcedure>),
 }
 
 #[derive(Clone)]
@@ -137,6 +171,7 @@ enum Value {
     Pair(Rc<PairValue>),
     Void,
     Procedure(ProcedureValue),
+    Record(Rc<RecordValue>),
 }
 
 type BindingCell = Rc<RefCell<Value>>;
@@ -178,10 +213,14 @@ impl EvalState {
         }
     }
 
-    fn fresh_identifier(&mut self, name: &str) -> Identifier {
+    fn fresh_unique_id(&mut self) -> u64 {
         let unique = self.next_unique;
         self.next_unique += 1;
-        Identifier::fresh(name.to_string(), unique)
+        unique
+    }
+
+    fn fresh_identifier(&mut self, name: &str) -> Identifier {
+        Identifier::fresh(name.to_string(), self.fresh_unique_id())
     }
 }
 
@@ -232,7 +271,11 @@ impl Environment {
         self.inner.bindings.borrow_mut().insert(name, cell);
     }
 
-    fn lookup_identifier(&self, identifier: &Identifier, loc: SourceLoc) -> Result<Value, EvalError> {
+    fn lookup_identifier(
+        &self,
+        identifier: &Identifier,
+        loc: SourceLoc,
+    ) -> Result<Value, EvalError> {
         if let Some(cell) = &identifier.captured {
             return Ok(cell.borrow().clone());
         }
@@ -253,7 +296,10 @@ impl Environment {
             return Some(cell.clone());
         }
 
-        self.inner.parent.as_ref().and_then(|parent| parent.lookup_cell(name))
+        self.inner
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.lookup_cell(name))
     }
 
     fn lookup_plain_cell(&self, name: &str) -> Option<BindingCell> {
@@ -556,6 +602,7 @@ fn create_global_env() -> Environment {
     env.define("list", builtin("list", builtin_list));
     env.define("length", builtin("length", builtin_length));
     env.define("append", builtin("append", builtin_append));
+    env.define("map", native("map", NativeProcedureKind::Map));
 
     env.define("string?", builtin("string?", builtin_string_pred));
     env.define("number?", builtin("number?", builtin_number_pred));
@@ -570,6 +617,13 @@ fn builtin(name: &'static str, call: BuiltinFn) -> Value {
     Value::Procedure(ProcedureValue::Builtin(BuiltinProcedure { name, call }))
 }
 
+fn native(name: impl Into<String>, kind: NativeProcedureKind) -> Value {
+    Value::Procedure(ProcedureValue::Native(Rc::new(NativeProcedure {
+        name: name.into(),
+        kind,
+    })))
+}
+
 fn evaluate(expr: &Expr, env: &Environment, state: &mut EvalState) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Number(value) => Ok(Value::Number(*value)),
@@ -580,7 +634,11 @@ fn evaluate(expr: &Expr, env: &Environment, state: &mut EvalState) -> Result<Val
     }
 }
 
-fn evaluate_list(expr: &Expr, env: &Environment, state: &mut EvalState) -> Result<Value, EvalError> {
+fn evaluate_list(
+    expr: &Expr,
+    env: &Environment,
+    state: &mut EvalState,
+) -> Result<Value, EvalError> {
     let elements = expr_list(expr).expect("list expression expected");
 
     if elements.is_empty() {
@@ -602,6 +660,7 @@ fn evaluate_list(expr: &Expr, env: &Environment, state: &mut EvalState) -> Resul
 
         match symbol {
             "define" => return eval_define(args, head, env, state),
+            "define-record-type" => return eval_define_record_type(args, head, env, state),
             "set!" => return eval_set(args, head, env, state),
             "if" => return eval_if(args, head, env, state),
             "quote" => return eval_quote(args, head),
@@ -636,7 +695,10 @@ fn eval_define_syntax(
     state: &mut EvalState,
 ) -> Result<Value, EvalError> {
     if args.len() != 2 {
-        return Err(err_at(head.loc, "define-syntax expects exactly 2 arguments"));
+        return Err(err_at(
+            head.loc,
+            "define-syntax expects exactly 2 arguments",
+        ));
     }
 
     let name_expr = &args[0];
@@ -696,6 +758,140 @@ fn eval_define(
     })));
 
     env.define_identifier(name, procedure);
+    Ok(Value::Void)
+}
+
+fn eval_define_record_type(
+    args: &[Expr],
+    head: &Expr,
+    env: &Environment,
+    state: &mut EvalState,
+) -> Result<Value, EvalError> {
+    if args.len() < 3 {
+        return Err(err_at(
+            head.loc,
+            "define-record-type expects a type name, constructor, predicate, and fields",
+        ));
+    }
+
+    let Some(type_name) = expr_symbol_name(&args[0]) else {
+        return Err(err_at(args[0].loc, "record type name must be a symbol"));
+    };
+
+    let constructor_expr = &args[1];
+    let Some(constructor_parts) = expr_list(constructor_expr) else {
+        return Err(err_at(
+            constructor_expr.loc,
+            "record constructor must be a list",
+        ));
+    };
+
+    if constructor_parts.is_empty() {
+        return Err(err_at(
+            constructor_expr.loc,
+            "record constructor must be a non-empty list",
+        ));
+    }
+
+    let constructor_name = expect_bindable_identifier(
+        &constructor_parts[0],
+        "record constructor name must be a symbol",
+    )?;
+    let constructor_fields = constructor_parts[1..]
+        .iter()
+        .map(|expr| {
+            expect_bindable_identifier(expr, "record constructor field name must be a symbol")
+        })
+        .collect::<Result<Vec<_>, EvalError>>()?;
+
+    let predicate_name =
+        expect_bindable_identifier(&args[2], "record predicate name must be a symbol")?;
+
+    let mut accessors = Vec::new();
+    let mut mutators = Vec::new();
+
+    for field_expr in &args[3..] {
+        let Some(field_parts) = expr_list(field_expr) else {
+            return Err(err_at(field_expr.loc, "record field must be a list"));
+        };
+
+        if !(2..=3).contains(&field_parts.len()) {
+            return Err(err_at(
+                field_expr.loc,
+                "record field must contain a name, accessor, and optional mutator",
+            ));
+        }
+
+        expect_bindable_identifier(&field_parts[0], "record field name must be a symbol")?;
+        accessors.push(expect_bindable_identifier(
+            &field_parts[1],
+            "record accessor name must be a symbol",
+        )?);
+
+        if field_parts.len() == 3 {
+            mutators.push(Some(expect_bindable_identifier(
+                &field_parts[2],
+                "record mutator name must be a symbol",
+            )?));
+        } else {
+            mutators.push(None);
+        }
+    }
+
+    if constructor_fields.len() != accessors.len() {
+        return Err(err_at(
+            head.loc,
+            "record constructor and field definitions must have the same arity",
+        ));
+    }
+
+    let type_info = Rc::new(RecordType {
+        name: type_name.to_string(),
+        field_count: accessors.len(),
+        type_id: state.fresh_unique_id(),
+    });
+
+    env.define_identifier(
+        &constructor_name,
+        native(
+            constructor_name.display_name().to_string(),
+            NativeProcedureKind::RecordConstructor(type_info.clone()),
+        ),
+    );
+    env.define_identifier(
+        &predicate_name,
+        native(
+            predicate_name.display_name().to_string(),
+            NativeProcedureKind::RecordPredicate(type_info.clone()),
+        ),
+    );
+
+    for (field_index, accessor_name) in accessors.iter().enumerate() {
+        env.define_identifier(
+            accessor_name,
+            native(
+                accessor_name.display_name().to_string(),
+                NativeProcedureKind::RecordAccessor {
+                    type_info: type_info.clone(),
+                    field_index,
+                },
+            ),
+        );
+
+        if let Some(mutator_name) = &mutators[field_index] {
+            env.define_identifier(
+                mutator_name,
+                native(
+                    mutator_name.display_name().to_string(),
+                    NativeProcedureKind::RecordMutator {
+                        type_info: type_info.clone(),
+                        field_index,
+                    },
+                ),
+            );
+        }
+    }
+
     Ok(Value::Void)
 }
 
@@ -920,6 +1116,7 @@ fn apply_procedure(
 
     match procedure {
         ProcedureValue::Builtin(procedure) => (procedure.call)(args, loc),
+        ProcedureValue::Native(procedure) => apply_native_procedure(&procedure, args, loc, state),
         ProcedureValue::Closure(procedure) => {
             if args.len() != procedure.params.len() {
                 return Err(err_at(
@@ -938,6 +1135,116 @@ fn apply_procedure(
             }
 
             evaluate_sequence(&procedure.body, &call_env, state)
+        }
+    }
+}
+
+fn apply_native_procedure(
+    procedure: &NativeProcedure,
+    args: &[EvaluatedArg],
+    loc: SourceLoc,
+    state: &mut EvalState,
+) -> Result<Value, EvalError> {
+    match &procedure.kind {
+        NativeProcedureKind::Map => {
+            if args.len() < 2 {
+                return Err(err_at(loc, "map expects a procedure and at least 1 list"));
+            }
+
+            let operator = args[0].value.clone();
+            let list_args = &args[1..];
+            let lists = list_args
+                .iter()
+                .map(|arg| expect_proper_list(&arg.value, arg.expr.loc))
+                .collect::<Result<Vec<_>, EvalError>>()?;
+
+            let expected_len = lists[0].len();
+            for (index, list) in lists.iter().enumerate().skip(1) {
+                if list.len() != expected_len {
+                    return Err(err_at(
+                        list_args[index].expr.loc,
+                        "map lists must have the same length",
+                    ));
+                }
+            }
+
+            let mut results = Vec::with_capacity(expected_len);
+            for item_index in 0..expected_len {
+                let applied_args = list_args
+                    .iter()
+                    .enumerate()
+                    .map(|(list_index, arg)| EvaluatedArg {
+                        expr: arg.expr.clone(),
+                        value: lists[list_index][item_index].clone(),
+                    })
+                    .collect::<Vec<_>>();
+
+                results.push(apply_procedure(
+                    operator.clone(),
+                    &applied_args,
+                    args[0].expr.loc,
+                    state,
+                )?);
+            }
+
+            Ok(make_list(results))
+        }
+        NativeProcedureKind::RecordConstructor(type_info) => {
+            expect_exact_args(&procedure.name, args, loc, type_info.field_count)?;
+            Ok(Value::Record(Rc::new(RecordValue {
+                type_info: type_info.clone(),
+                fields: RefCell::new(args.iter().map(|arg| arg.value.clone()).collect()),
+            })))
+        }
+        NativeProcedureKind::RecordPredicate(type_info) => {
+            expect_exact_args(&procedure.name, args, loc, 1)?;
+            Ok(Value::Boolean(matches!(
+                &args[0].value,
+                Value::Record(record) if record.type_info.type_id == type_info.type_id
+            )))
+        }
+        NativeProcedureKind::RecordAccessor {
+            type_info,
+            field_index,
+        } => {
+            expect_exact_args(&procedure.name, args, loc, 1)?;
+            let Value::Record(record) = &args[0].value else {
+                return Err(err_at(
+                    args[0].expr.loc,
+                    format!("expected {}", type_info.name),
+                ));
+            };
+
+            if record.type_info.type_id != type_info.type_id {
+                return Err(err_at(
+                    args[0].expr.loc,
+                    format!("expected {}", type_info.name),
+                ));
+            }
+
+            Ok(record.fields.borrow()[*field_index].clone())
+        }
+        NativeProcedureKind::RecordMutator {
+            type_info,
+            field_index,
+        } => {
+            expect_exact_args(&procedure.name, args, loc, 2)?;
+            let Value::Record(record) = &args[0].value else {
+                return Err(err_at(
+                    args[0].expr.loc,
+                    format!("expected {}", type_info.name),
+                ));
+            };
+
+            if record.type_info.type_id != type_info.type_id {
+                return Err(err_at(
+                    args[0].expr.loc,
+                    format!("expected {}", type_info.name),
+                ));
+            }
+
+            record.fields.borrow_mut()[*field_index] = args[1].value.clone();
+            Ok(Value::Void)
         }
     }
 }
@@ -1017,15 +1324,24 @@ fn parse_macro_transformer(
     definition_env: &Environment,
 ) -> Result<MacroTransformer, EvalError> {
     let Some(elements) = expr_list(expr) else {
-        return Err(err_at(expr.loc, "define-syntax expects a syntax-rules form"));
+        return Err(err_at(
+            expr.loc,
+            "define-syntax expects a syntax-rules form",
+        ));
     };
 
     if elements.len() < 2 || !matches!(expr_plain_symbol(&elements[0]), Some("syntax-rules")) {
-        return Err(err_at(expr.loc, "define-syntax expects a syntax-rules form"));
+        return Err(err_at(
+            expr.loc,
+            "define-syntax expects a syntax-rules form",
+        ));
     }
 
     let Some(literal_exprs) = expr_list(&elements[1]) else {
-        return Err(err_at(elements[1].loc, "syntax-rules literals must be a list"));
+        return Err(err_at(
+            elements[1].loc,
+            "syntax-rules literals must be a list",
+        ));
     };
 
     let literals = literal_exprs
@@ -1101,7 +1417,12 @@ fn match_macro_rule(
     }
 
     let mut bindings = MacroBindings::default();
-    if match_pattern_list(&pattern_items[1..], &invocation_items[1..], literals, &mut bindings) {
+    if match_pattern_list(
+        &pattern_items[1..],
+        &invocation_items[1..],
+        literals,
+        &mut bindings,
+    ) {
         Some(bindings)
     } else {
         None
@@ -1326,7 +1647,12 @@ fn expand_template(
 fn template_repeat_count(template: &Expr, bindings: &MacroBindings) -> Result<usize, EvalError> {
     let mut count = None;
     collect_template_repeat_count(template, bindings, &mut count)?;
-    count.ok_or_else(|| err_at(template.loc, "ellipsis template must reference a repeated pattern"))
+    count.ok_or_else(|| {
+        err_at(
+            template.loc,
+            "ellipsis template must reference a repeated pattern",
+        )
+    })
 }
 
 fn collect_template_repeat_count(
@@ -1336,7 +1662,8 @@ fn collect_template_repeat_count(
 ) -> Result<(), EvalError> {
     match &template.kind {
         ExprKind::Symbol(identifier) => {
-            if let Some(MacroBinding::Repeated(values)) = bindings.values.get(identifier.display_name())
+            if let Some(MacroBinding::Repeated(values)) =
+                bindings.values.get(identifier.display_name())
             {
                 match count {
                     Some(existing) if *existing != values.len() => {
@@ -1373,7 +1700,9 @@ fn hygienize_expr(
             kind: ExprKind::Symbol(hygienize_symbol(identifier, scope, definition_env, state)),
             loc: expr.loc,
         },
-        ExprKind::List(elements) => hygienize_list(expr.loc, elements, scope, definition_env, state),
+        ExprKind::List(elements) => {
+            hygienize_list(expr.loc, elements, scope, definition_env, state)
+        }
     }
 }
 
@@ -1394,7 +1723,10 @@ fn hygienize_list(
     let head_name = expr_symbol_name(&elements[0]);
     if matches!(head_name, Some("quote")) && elements.len() == 2 {
         return Expr {
-            kind: ExprKind::List(vec![plain_symbol_expr("quote", elements[0].loc), elements[1].clone()]),
+            kind: ExprKind::List(vec![
+                plain_symbol_expr("quote", elements[0].loc),
+                elements[1].clone(),
+            ]),
             loc,
         };
     }
@@ -1555,6 +1887,18 @@ fn expect_parameter_identifier(expr: &Expr) -> Result<Identifier, EvalError> {
 
     if identifier.captured.is_some() {
         return Err(err_at(expr.loc, "parameter must be a symbol"));
+    }
+
+    Ok(identifier.clone())
+}
+
+fn expect_bindable_identifier(expr: &Expr, message: &str) -> Result<Identifier, EvalError> {
+    let Some(identifier) = expr_identifier(expr) else {
+        return Err(err_at(expr.loc, message));
+    };
+
+    if identifier.captured.is_some() {
+        return Err(err_at(expr.loc, message));
     }
 
     Ok(identifier.clone())
@@ -1835,6 +2179,7 @@ fn is_special_form_name(name: &str) -> bool {
         name,
         "define"
             | "define-syntax"
+            | "define-record-type"
             | "syntax-rules"
             | "set!"
             | "if"
@@ -1872,6 +2217,7 @@ fn format_value(value: &Value) -> String {
         Value::Pair(value) => format_pair(value),
         Value::Void => "#<void>".to_string(),
         Value::Procedure(_) => "#<procedure>".to_string(),
+        Value::Record(_) => "#<record>".to_string(),
     }
 }
 
