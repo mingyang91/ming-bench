@@ -1,9 +1,11 @@
 package ming;
 
-import java.math.BigDecimal;
-import java.math.BigInteger;
+import static ming.ValueSupport.*;
+
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Predicate;
 
@@ -200,6 +202,7 @@ public class Evaluator {
 
             return switch (operatorName) {
                 case "define" -> evalDefine(arguments, env);
+                case "define-record-type" -> evalDefineRecordType(arguments, env);
                 case "set!" -> evalSet(arguments, env);
                 case "if" -> evalIf(arguments, env);
                 case "quote" -> evalQuote(arguments);
@@ -250,6 +253,131 @@ public class Evaluator {
         }
 
         throw new EvalError("define target must be a symbol or parameter list");
+    }
+
+    private Value evalDefineRecordType(List<Expr> arguments, Env env) throws EvalError {
+        requireMinArgs("define-record-type", arguments, 3);
+
+        Expr typeExpr = arguments.get(0);
+        if (!(typeExpr instanceof SymbolExpr typeSymbol)) {
+            throw new EvalError("define-record-type type name must be a symbol");
+        }
+
+        Expr constructorExpr = arguments.get(1);
+        if (!(constructorExpr instanceof ListExpr constructorList)
+                || constructorList.elements().isEmpty()) {
+            throw new EvalError("define-record-type constructor spec must be a list");
+        }
+
+        Expr constructorNameExpr = constructorList.elements().get(0);
+        if (!(constructorNameExpr instanceof SymbolExpr constructorNameSymbol)) {
+            throw new EvalError("define-record-type constructor name must be a symbol");
+        }
+
+        Expr predicateExpr = arguments.get(2);
+        if (!(predicateExpr instanceof SymbolExpr predicateSymbol)) {
+            throw new EvalError("define-record-type predicate name must be a symbol");
+        }
+
+        List<RecordFieldSpec> fieldSpecs = new ArrayList<>();
+        Map<String, Integer> fieldIndexes = new HashMap<>();
+        for (int index = 3; index < arguments.size(); index++) {
+            Expr fieldExpr = arguments.get(index);
+            if (!(fieldExpr instanceof ListExpr fieldList) || fieldList.elements().size() != 2) {
+                throw new EvalError("define-record-type field spec must contain a field and accessor");
+            }
+
+            Expr fieldNameExpr = fieldList.elements().get(0);
+            if (!(fieldNameExpr instanceof SymbolExpr fieldNameSymbol)) {
+                throw new EvalError("define-record-type field name must be a symbol");
+            }
+
+            Expr accessorExpr = fieldList.elements().get(1);
+            if (!(accessorExpr instanceof SymbolExpr accessorSymbol)) {
+                throw new EvalError("define-record-type accessor name must be a symbol");
+            }
+
+            String fieldName = fieldNameSymbol.name();
+            if (fieldIndexes.containsKey(fieldName)) {
+                throw new EvalError("define-record-type field names must be unique");
+            }
+
+            fieldIndexes.put(fieldName, fieldSpecs.size());
+            fieldSpecs.add(new RecordFieldSpec(fieldName, accessorSymbol.name()));
+        }
+
+        List<Expr> constructorFields = constructorList.elements().subList(1,
+                constructorList.elements().size());
+        if (constructorFields.size() != fieldSpecs.size()) {
+            throw new EvalError("define-record-type constructor field count must match field specs");
+        }
+
+        int[] constructorOrder = new int[constructorFields.size()];
+        boolean[] assignedFields = new boolean[fieldSpecs.size()];
+        for (int index = 0; index < constructorFields.size(); index++) {
+            Expr fieldExpr = constructorFields.get(index);
+            if (!(fieldExpr instanceof SymbolExpr fieldSymbol)) {
+                throw new EvalError("define-record-type constructor fields must be symbols");
+            }
+
+            Integer fieldIndex = fieldIndexes.get(fieldSymbol.name());
+            if (fieldIndex == null) {
+                throw new EvalError("define-record-type constructor references an unknown field");
+            }
+            if (assignedFields[fieldIndex]) {
+                throw new EvalError("define-record-type constructor fields must be unique");
+            }
+
+            constructorOrder[index] = fieldIndex;
+            assignedFields[fieldIndex] = true;
+        }
+
+        RecordTypeValue type = new RecordTypeValue(typeSymbol.name());
+        env.define(constructorNameSymbol.name(),
+                new BuiltinValue(constructorNameSymbol.name(),
+                        values -> constructRecord(type, constructorOrder, values,
+                                constructorNameSymbol.name())));
+        env.define(predicateSymbol.name(),
+                new BuiltinValue(predicateSymbol.name(),
+                        values -> recordPredicate(type, values, predicateSymbol.name())));
+        for (int index = 0; index < fieldSpecs.size(); index++) {
+            RecordFieldSpec fieldSpec = fieldSpecs.get(index);
+            int fieldIndex = index;
+            env.define(fieldSpec.accessorName(),
+                    new BuiltinValue(fieldSpec.accessorName(),
+                            values -> recordAccessor(type, fieldIndex, values,
+                                    fieldSpec.accessorName())));
+        }
+        return VOID;
+    }
+
+    private Value constructRecord(RecordTypeValue type, int[] constructorOrder,
+            List<Value> arguments, String constructorName) throws EvalError {
+        requireExactArgs(constructorName, arguments, constructorOrder.length);
+
+        Value[] fields = new Value[constructorOrder.length];
+        for (int index = 0; index < constructorOrder.length; index++) {
+            fields[constructorOrder[index]] = arguments.get(index);
+        }
+        return new RecordInstanceValue(type, List.of(fields));
+    }
+
+    private Value recordPredicate(RecordTypeValue type, List<Value> arguments, String name)
+            throws EvalError {
+        requireExactArgs(name, arguments, 1);
+        return boolValue(arguments.get(0) instanceof RecordInstanceValue recordInstance
+                && recordInstance.type() == type);
+    }
+
+    private Value recordAccessor(RecordTypeValue type, int fieldIndex, List<Value> arguments,
+            String accessorName) throws EvalError {
+        requireExactArgs(accessorName, arguments, 1);
+        Value value = arguments.get(0);
+        if (!(value instanceof RecordInstanceValue recordInstance)
+                || recordInstance.type() != type) {
+            throw new EvalError(accessorName + " expects a " + type.name() + " record");
+        }
+        return recordInstance.field(fieldIndex);
     }
 
     private Value evalSet(List<Expr> arguments, Env env) throws EvalError {
@@ -1138,7 +1266,7 @@ public class Evaluator {
         return boolValue(predicate.test(arguments.get(0)));
     }
 
-    private void requireMinArgs(String name, List<Value> arguments, int min)
+    private void requireMinArgs(String name, List<?> arguments, int min)
             throws EvalError {
         if (arguments.size() < min) {
             throw new EvalError(name + " expected at least "
@@ -1152,49 +1280,6 @@ public class Evaluator {
             throw new EvalError(name + " expected exactly "
                     + exact + " argument(s)");
         }
-    }
-
-    private long requireInt(Value value, String operator) throws EvalError {
-        if (value instanceof IntValue intValue) {
-            return intValue.value();
-        }
-        throw new EvalError(operator + " expects numeric arguments");
-    }
-
-    private Value requireNumericValue(Value value, String operator) throws EvalError {
-        if (isNumber(value)) {
-            return value;
-        }
-        throw new EvalError(operator + " expects numeric arguments");
-    }
-
-    private double requireNumberAsDouble(Value value, String operator) throws EvalError {
-        return switch (requireNumericValue(value, operator)) {
-            case IntValue intValue -> (double) intValue.value();
-            case RationalValue rationalValue ->
-                    (double) rationalValue.numerator() / (double) rationalValue.denominator();
-            case InexactValue inexactValue -> inexactValue.value();
-            default -> throw new IllegalStateException("non-numeric value");
-        };
-    }
-
-    private ExactRational requireExactRational(Value value, String operator) throws EvalError {
-        return switch (value) {
-            case IntValue intValue -> new ExactRational(intValue.value(), 1L);
-            case RationalValue rationalValue ->
-                    new ExactRational(rationalValue.numerator(), rationalValue.denominator());
-            case InexactValue ignored -> throw new EvalError(operator + " expects numeric arguments");
-            default -> throw new EvalError(operator + " expects numeric arguments");
-        };
-    }
-
-    private ExactRational requireRationalParts(Value value, String operator) throws EvalError {
-        return switch (value) {
-            case IntValue intValue -> new ExactRational(intValue.value(), 1L);
-            case RationalValue rationalValue ->
-                    new ExactRational(rationalValue.numerator(), rationalValue.denominator());
-            default -> throw new EvalError(operator + " expects an exact rational");
-        };
     }
 
     private String requireString(Value value, String operator) throws EvalError {
@@ -1258,80 +1343,6 @@ public class Evaluator {
         return current instanceof EmptyListValue;
     }
 
-    private boolean isNumber(Value value) {
-        return value instanceof IntValue
-                || value instanceof RationalValue
-                || value instanceof InexactValue;
-    }
-
-    private boolean isExactNumber(Value value) {
-        return value instanceof IntValue || value instanceof RationalValue;
-    }
-
-    private boolean isInteger(Value value) {
-        if (value instanceof IntValue) {
-            return true;
-        }
-        if (value instanceof RationalValue rationalValue) {
-            return rationalValue.denominator() == 1L;
-        }
-        if (value instanceof InexactValue inexactValue) {
-            return Double.isFinite(inexactValue.value())
-                    && Math.rint(inexactValue.value()) == inexactValue.value();
-        }
-        return false;
-    }
-
-    private boolean containsInexact(List<Value> values) {
-        for (Value value : values) {
-            if (value instanceof InexactValue) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean eqValues(Value left, Value right) {
-        if (left == right) {
-            return true;
-        }
-        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
-            return leftInt.value() == rightInt.value();
-        }
-        if (left instanceof RationalValue leftRational
-                && right instanceof RationalValue rightRational) {
-            return leftRational.numerator() == rightRational.numerator()
-                    && leftRational.denominator() == rightRational.denominator();
-        }
-        if (left instanceof InexactValue leftInexact && right instanceof InexactValue rightInexact) {
-            return Double.compare(leftInexact.value(), rightInexact.value()) == 0;
-        }
-        if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
-            return leftBool.value() == rightBool.value();
-        }
-        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
-            return leftChar.value() == rightChar.value();
-        }
-        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
-            return leftSymbol.name().equals(rightSymbol.name());
-        }
-        return left instanceof EmptyListValue && right instanceof EmptyListValue;
-    }
-
-    private boolean equalValues(Value left, Value right) {
-        if (eqValues(left, right)) {
-            return true;
-        }
-        if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
-            return leftString.text().equals(rightString.text());
-        }
-        if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
-            return equalValues(leftPair.car(), rightPair.car())
-                    && equalValues(leftPair.cdr(), rightPair.cdr());
-        }
-        return false;
-    }
-
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
     }
@@ -1340,110 +1351,12 @@ public class Evaluator {
         return value ? TRUE : FALSE;
     }
 
-    private int numberSign(Value value, String operator) throws EvalError {
-        if (value instanceof InexactValue inexactValue) {
-            return Double.compare(inexactValue.value(), 0.0);
-        }
-        return Long.compare(requireExactRational(value, operator).numerator(), 0L);
-    }
-
-    private Value exactValue(ExactRational rational) {
-        return exactValue(rational.numerator(), rational.denominator());
-    }
-
-    private Value exactValue(long numerator, long denominator) {
-        ExactRational normalized = normalizeExactRational(numerator, denominator);
-        if (normalized.denominator() == 1L) {
-            return new IntValue(normalized.numerator());
-        }
-        return new RationalValue(normalized.numerator(), normalized.denominator());
-    }
-
-    private ExactRational normalizeExactRational(long numerator, long denominator) {
-        if (denominator == 0L) {
-            throw new IllegalArgumentException("exact rationals cannot have zero denominator");
-        }
-        if (denominator < 0L) {
-            numerator = -numerator;
-            denominator = -denominator;
-        }
-
-        long divisor = gcd(numerator, denominator);
-        return new ExactRational(numerator / divisor, denominator / divisor);
-    }
-
-    private ExactRational addExact(ExactRational left, ExactRational right) {
-        return normalizeExactRational(
-                left.numerator() * right.denominator() + right.numerator() * left.denominator(),
-                left.denominator() * right.denominator());
-    }
-
-    private ExactRational subtractExact(ExactRational left, ExactRational right) {
-        return normalizeExactRational(
-                left.numerator() * right.denominator() - right.numerator() * left.denominator(),
-                left.denominator() * right.denominator());
-    }
-
-    private ExactRational multiplyExact(ExactRational left, ExactRational right) {
-        return normalizeExactRational(
-                left.numerator() * right.numerator(),
-                left.denominator() * right.denominator());
-    }
-
-    private ExactRational divideExact(ExactRational left, ExactRational right) {
-        return normalizeExactRational(
-                left.numerator() * right.denominator(),
-                left.denominator() * right.numerator());
-    }
-
-    private int compareExact(ExactRational left, ExactRational right) {
-        return Long.compare(
-                left.numerator() * right.denominator(),
-                right.numerator() * left.denominator());
-    }
-
-    private long gcd(long left, long right) {
-        long a = Math.abs(left);
-        long b = Math.abs(right);
-        if (a == 0L) {
-            return b == 0L ? 1L : b;
-        }
-        while (b != 0L) {
-            long next = a % b;
-            a = b;
-            b = next;
-        }
-        return a;
-    }
-
-    private Value inexactToExactValue(double value) throws EvalError {
-        if (!Double.isFinite(value)) {
-            throw new EvalError("inexact->exact expects a finite inexact number");
-        }
-
-        BigDecimal decimal = BigDecimal.valueOf(value);
-        BigInteger numerator = decimal.unscaledValue();
-        BigInteger denominator = BigInteger.ONE;
-        if (decimal.scale() >= 0) {
-            denominator = BigInteger.TEN.pow(decimal.scale());
-        } else {
-            numerator = numerator.multiply(BigInteger.TEN.pow(-decimal.scale()));
-        }
-
-        try {
-            return exactValue(numerator.longValueExact(), denominator.longValueExact());
-        } catch (ArithmeticException error) {
-            throw new EvalError("inexact->exact overflow");
-        }
-    }
-
     private void appendOutput(String value) {
         if (outputBuffer != null) {
             outputBuffer.append(value);
         }
     }
 
-    private StringValue immutableString(String value) {
-        return new StringValue(new StringBuilder(value), false);
+    private record RecordFieldSpec(String name, String accessorName) {
     }
 }

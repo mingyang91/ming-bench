@@ -29,6 +29,9 @@ final class ValueRenderer {
             case PairValue pairValue -> renderPair(pairValue, displayMode);
             case BuiltinValue ignored -> "#<procedure>";
             case ClosureValue ignored -> "#<procedure>";
+            case RecordTypeValue recordTypeValue -> "#<record-type " + recordTypeValue.name() + ">";
+            case RecordInstanceValue recordInstanceValue ->
+                    "#<record " + recordInstanceValue.type().name() + ">";
             case VoidValue ignored -> "#<void>";
             case UninitializedValue ignored -> "#<uninitialized>";
         };

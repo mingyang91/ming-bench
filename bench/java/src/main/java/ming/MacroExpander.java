@@ -478,7 +478,8 @@ final class MacroExpander {
     private boolean isSyntaxKeyword(String name) {
         return switch (name) {
             case "define", "define-syntax", "set!", "if", "quote", "lambda",
-                    "and", "or", "begin", "let", "cond", "syntax-rules", "else" -> true;
+                    "and", "or", "begin", "let", "cond", "define-record-type",
+                    "syntax-rules", "else" -> true;
             default -> false;
         };
     }

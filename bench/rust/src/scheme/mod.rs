@@ -80,6 +80,7 @@ impl Evaluator {
         if let ExprKind::Symbol(name) = &operator_expr.kind {
             return match name.as_str() {
                 "define" => self.eval_define(arguments, env),
+                "define-record-type" => self.eval_define_record_type(arguments, env),
                 "if" => self.eval_if(arguments, env),
                 "quote" => self.eval_quote(arguments),
                 "lambda" => self.eval_lambda(arguments, env),
@@ -172,6 +173,79 @@ impl Evaluator {
             body: arguments[1..].to_vec(),
             env,
         })))
+    }
+
+    fn eval_define_record_type(
+        &self,
+        arguments: &[Expr],
+        env: Rc<Env>,
+    ) -> Result<Value, EvalError> {
+        if arguments.len() < 3 {
+            return Err(EvalError::message(
+                "define-record-type expects a name, constructor, predicate, and fields",
+            ));
+        }
+
+        let type_name = parse_symbol_name(
+            &arguments[0],
+            "define-record-type name must be a symbol",
+        )?;
+
+        let constructor = parse_record_constructor(&arguments[1])?;
+        let predicate_name = parse_symbol_name(
+            &arguments[2],
+            "define-record-type predicate must be a symbol",
+        )?;
+        let fields = parse_record_fields(&arguments[3..])?;
+
+        if constructor.field_names.len() != fields.len() {
+            return Err(EvalError::message(
+                "define-record-type constructor arity must match field count",
+            ));
+        }
+
+        for (constructor_field, field) in constructor.field_names.iter().zip(fields.iter()) {
+            if constructor_field != &field.name {
+                return Err(EvalError::message(
+                    "define-record-type constructor fields must match accessor fields",
+                ));
+            }
+        }
+
+        let record_type = Rc::new(RecordType {
+            name: type_name,
+            field_count: fields.len(),
+        });
+
+        env.define(
+            constructor.name,
+            Value::RecordProcedure(RecordProcedure::Constructor(record_type.clone())),
+        );
+        env.define(
+            predicate_name,
+            Value::RecordProcedure(RecordProcedure::Predicate(record_type.clone())),
+        );
+
+        for (field_index, field) in fields.iter().enumerate() {
+            env.define(
+                field.accessor.clone(),
+                Value::RecordProcedure(RecordProcedure::Accessor {
+                    record_type: record_type.clone(),
+                    field_index,
+                }),
+            );
+            if let Some(mutator) = &field.mutator {
+                env.define(
+                    mutator.clone(),
+                    Value::RecordProcedure(RecordProcedure::Mutator {
+                        record_type: record_type.clone(),
+                        field_index,
+                    }),
+                );
+            }
+        }
+
+        Ok(Value::Void)
     }
 
     fn eval_all(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Vec<Value>, EvalError> {
@@ -306,6 +380,7 @@ impl Evaluator {
         match operator {
             Value::Builtin(builtin) => (builtin.implementation)(self, &arguments),
             Value::Closure(closure) => self.apply_closure(&closure, arguments),
+            Value::RecordProcedure(procedure) => self.apply_record_procedure(procedure, arguments),
             _ => Err(EvalError::message("attempted to call a non-procedure")),
         }
     }
@@ -338,6 +413,65 @@ impl Evaluator {
             );
         }
         self.eval_sequence(&closure.body, call_env)
+    }
+
+    fn apply_record_procedure(
+        &self,
+        procedure: RecordProcedure,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        match procedure {
+            RecordProcedure::Constructor(record_type) => {
+                require_exact_args(
+                    "record constructor",
+                    arguments.len(),
+                    record_type.field_count,
+                )?;
+                Ok(Value::Record(Rc::new(RecordValue {
+                    record_type,
+                    fields: arguments
+                        .into_iter()
+                        .map(|value| Rc::new(RefCell::new(value)))
+                        .collect(),
+                })))
+            }
+            RecordProcedure::Predicate(record_type) => {
+                require_exact_args("record predicate", arguments.len(), 1)?;
+                let result = match &arguments[0] {
+                    Value::Record(record) => Rc::ptr_eq(&record.record_type, &record_type),
+                    _ => false,
+                };
+                Ok(Value::Bool(result))
+            }
+            RecordProcedure::Accessor {
+                record_type,
+                field_index,
+            } => {
+                require_exact_args("record accessor", arguments.len(), 1)?;
+                Ok(require_record_field(
+                    &arguments[0],
+                    &record_type,
+                    field_index,
+                    "record accessor",
+                )?
+                .borrow()
+                .clone())
+            }
+            RecordProcedure::Mutator {
+                record_type,
+                field_index,
+            } => {
+                require_exact_args("record mutator", arguments.len(), 2)?;
+                let field = require_record_field(
+                    &arguments[0],
+                    &record_type,
+                    field_index,
+                    "record mutator",
+                )?;
+                *field.borrow_mut() = arguments[1].clone();
+                Ok(Value::Void)
+            }
+        }
     }
 
     fn eval_sequence(&self, expressions: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
@@ -385,6 +519,7 @@ fn create_global_env() -> Rc<Env> {
     env.define_builtin("pair?", |_, arguments| builtin_is_pair(arguments));
     env.define_builtin("symbol?", |_, arguments| builtin_is_symbol(arguments));
     env.define_builtin("apply", builtin_apply);
+    env.define_builtin("map", builtin_map);
     env
 }
 
@@ -430,6 +565,89 @@ fn parse_bindings(binding_expr: &Expr) -> Result<Vec<BindingSpec>, EvalError> {
         });
     }
     Ok(bindings)
+}
+
+fn parse_symbol_name(expr: &Expr, error_message: &str) -> Result<String, EvalError> {
+    match &expr.kind {
+        ExprKind::Symbol(name) => Ok(name.clone()),
+        _ => Err(EvalError::message(error_message)),
+    }
+}
+
+fn parse_record_constructor(expr: &Expr) -> Result<RecordConstructorSpec, EvalError> {
+    let ExprKind::List(elements) = &expr.kind else {
+        return Err(EvalError::message(
+            "define-record-type constructor must be a list",
+        ));
+    };
+
+    if elements.is_empty() {
+        return Err(EvalError::message(
+            "define-record-type constructor must not be empty",
+        ));
+    }
+
+    let name = parse_symbol_name(
+        &elements[0],
+        "define-record-type constructor name must be a symbol",
+    )?;
+    let mut field_names = Vec::with_capacity(elements.len().saturating_sub(1));
+    for field in &elements[1..] {
+        field_names.push(parse_symbol_name(
+            field,
+            "define-record-type constructor field must be a symbol",
+        )?);
+    }
+
+    Ok(RecordConstructorSpec { name, field_names })
+}
+
+fn parse_record_fields(field_exprs: &[Expr]) -> Result<Vec<RecordFieldSpec>, EvalError> {
+    if field_exprs.is_empty() {
+        return Err(EvalError::message(
+            "define-record-type requires at least one field",
+        ));
+    }
+
+    let mut fields = Vec::with_capacity(field_exprs.len());
+    for field_expr in field_exprs {
+        let ExprKind::List(elements) = &field_expr.kind else {
+            return Err(EvalError::message(
+                "define-record-type field specification must be a list",
+            ));
+        };
+
+        if elements.len() != 2 && elements.len() != 3 {
+            return Err(EvalError::message(
+                "define-record-type field specification must have 2 or 3 elements",
+            ));
+        }
+
+        let name = parse_symbol_name(
+            &elements[0],
+            "define-record-type field name must be a symbol",
+        )?;
+        let accessor = parse_symbol_name(
+            &elements[1],
+            "define-record-type accessor name must be a symbol",
+        )?;
+        let mutator = if elements.len() == 3 {
+            Some(parse_symbol_name(
+                &elements[2],
+                "define-record-type mutator name must be a symbol",
+            )?)
+        } else {
+            None
+        };
+
+        fields.push(RecordFieldSpec {
+            name,
+            accessor,
+            mutator,
+        });
+    }
+
+    Ok(fields)
 }
 
 fn parse_parameter_names(parameter_expr: &Expr) -> Result<ParameterSpec, EvalError> {
@@ -610,6 +828,25 @@ fn require_pair<'a>(value: &'a Value, operator: &str) -> Result<&'a PairValue, E
     }
 }
 
+fn require_record_field(
+    value: &Value,
+    expected_type: &Rc<RecordType>,
+    field_index: usize,
+    operator: &str,
+) -> Result<Cell, EvalError> {
+    match value {
+        Value::Record(record) if Rc::ptr_eq(&record.record_type, expected_type) => record
+            .fields
+            .get(field_index)
+            .cloned()
+            .ok_or_else(|| EvalError::message(format!("{operator} field out of range"))),
+        Value::Record(_) => Err(EvalError::message(format!(
+            "{operator} expects a record of the correct type"
+        ))),
+        _ => Err(EvalError::message(format!("{operator} expects a record"))),
+    }
+}
+
 fn require_proper_list(value: &Value, operator: &str) -> Result<Vec<Value>, EvalError> {
     let mut elements = Vec::new();
     let mut current = value.clone();
@@ -645,7 +882,10 @@ fn render(value: &Value) -> String {
         Value::Symbol(name) => name.clone(),
         Value::EmptyList => "()".to_string(),
         Value::Pair(pair) => render_pair(pair.as_ref()),
-        Value::Builtin(_) | Value::Closure(_) => "#<procedure>".to_string(),
+        Value::Record(record) => format!("#<record {}>", record.record_type.name),
+        Value::Builtin(_) | Value::Closure(_) | Value::RecordProcedure(_) => {
+            "#<procedure>".to_string()
+        }
         Value::Void => "#<void>".to_string(),
         Value::Uninitialized => "#<uninitialized>".to_string(),
     }
@@ -1011,6 +1251,29 @@ fn builtin_apply(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, Ev
     evaluator.apply_procedure(operator, applied_arguments)
 }
 
+fn builtin_map(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
+    require_min_args("map", arguments.len(), 2)?;
+
+    let operator = arguments[0].clone();
+    let lists = arguments[1..]
+        .iter()
+        .map(|value| require_proper_list(value, "map"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let result_len = lists.iter().map(Vec::len).min().unwrap_or(0);
+    let mut results = Vec::with_capacity(result_len);
+
+    for index in 0..result_len {
+        let call_arguments = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        results.push(evaluator.apply_procedure(operator.clone(), call_arguments)?);
+    }
+
+    Ok(list_value(results))
+}
+
 fn builtin_is_string(arguments: &[Value]) -> Result<Value, EvalError> {
     type_predicate("string?", arguments, |value| {
         matches!(value, Value::String(_))
@@ -1081,8 +1344,10 @@ enum Value {
     Symbol(String),
     EmptyList,
     Pair(Rc<PairValue>),
+    Record(Rc<RecordValue>),
     Builtin(Builtin),
     Closure(Rc<ClosureValue>),
+    RecordProcedure(RecordProcedure),
     Void,
     Uninitialized,
 }
@@ -1093,10 +1358,30 @@ struct PairValue {
     cdr: Value,
 }
 
+#[derive(Clone)]
+struct RecordValue {
+    record_type: Rc<RecordType>,
+    fields: Vec<Cell>,
+}
+
 #[derive(Clone, Copy)]
 struct Builtin {
     name: &'static str,
     implementation: BuiltinFn,
+}
+
+#[derive(Clone)]
+enum RecordProcedure {
+    Constructor(Rc<RecordType>),
+    Predicate(Rc<RecordType>),
+    Accessor {
+        record_type: Rc<RecordType>,
+        field_index: usize,
+    },
+    Mutator {
+        record_type: Rc<RecordType>,
+        field_index: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -1116,6 +1401,22 @@ struct BindingSpec {
 struct ParameterSpec {
     required: Vec<String>,
     rest: Option<String>,
+}
+
+struct RecordType {
+    name: String,
+    field_count: usize,
+}
+
+struct RecordConstructorSpec {
+    name: String,
+    field_names: Vec<String>,
+}
+
+struct RecordFieldSpec {
+    name: String,
+    accessor: String,
+    mutator: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
