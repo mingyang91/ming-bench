@@ -177,7 +177,12 @@ type MacroEvalContext = {
 type EvalContext = {
   output: string[];
   immutableStrings: boolean;
+  stepBudget?: StepBudget;
   macroContext?: MacroEvalContext;
+};
+
+type StepBudget = {
+  remaining: number;
 };
 
 type CallCcState = {
@@ -620,6 +625,10 @@ export function evalStr(input: string): string {
   return formatValue(expectSingleValue(evaluateProgram(input).result));
 }
 
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  return formatValue(expectSingleValue(evaluateProgram(input, maxSteps).result));
+}
+
 /**
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
@@ -632,7 +641,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   };
 }
 
-function evaluateProgram(input: string): { result: RuntimeValue; output: string } {
+function evaluateProgram(input: string, maxSteps?: number): { result: RuntimeValue; output: string } {
   const expressions = parseProgram(input);
 
   if (expressions.length === 0) {
@@ -643,6 +652,7 @@ function evaluateProgram(input: string): { result: RuntimeValue; output: string 
   const context: EvalContext = {
     output: [],
     immutableStrings: currentBenchLevel() >= 15,
+    stepBudget: createStepBudget(maxSteps),
   };
   const result = evaluateSequence(expressions, env, context);
 
@@ -1000,6 +1010,31 @@ function evaluateExprSingle(expr: Expr, env: Environment, context: EvalContext):
   return expectSingleValue(evaluateExpr(expr, env, context), expr.pos);
 }
 
+function createStepBudget(maxSteps?: number): StepBudget | undefined {
+  if (maxSteps === undefined) {
+    return undefined;
+  }
+
+  if (!Number.isInteger(maxSteps) || maxSteps < 0) {
+    throw new EvalError('max steps must be a non-negative integer');
+  }
+
+  return { remaining: maxSteps };
+}
+
+function consumeStep(context: EvalContext, pos: SourcePos): void {
+  const stepBudget = context.stepBudget;
+  if (stepBudget === undefined) {
+    return;
+  }
+
+  if (stepBudget.remaining <= 0) {
+    throw new EvalError('step limit exceeded', pos);
+  }
+
+  stepBudget.remaining -= 1;
+}
+
 function runEvaluation(initialAction: EvalAction, context: EvalContext): RuntimeValue {
   let action = initialAction;
   const stack = createContinuationStack();
@@ -1028,6 +1063,7 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
           break;
         case 'expr':
           errorPos = action.expr.pos;
+          consumeStep(context, action.expr.pos);
           action = evaluateExprAction(action.expr, action.env, context, stack, winds, handlerState);
           break;
         case 'sequence':
@@ -2597,6 +2633,7 @@ function expandProcedureMacroInvocation(
     {
       output: [],
       immutableStrings: context.immutableStrings,
+      stepBudget: context.stepBudget,
       macroContext: {
         name: macroRules.name,
         definitionEnv: macroRules.env,
