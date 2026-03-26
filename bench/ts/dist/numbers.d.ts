@@ -1,0 +1,37 @@
+export type ExactNumber = {
+    exact: true;
+    numerator: bigint;
+    denominator: bigint;
+};
+export type InexactNumber = {
+    exact: false;
+    value: number;
+};
+export type SchemeNumber = ExactNumber | InexactNumber;
+export declare function parseNumberLiteral(text: string): SchemeNumber | undefined;
+export declare function parseNumberStringValue(text: string): SchemeNumber | undefined;
+export declare function makeExactInteger(value: bigint | number): SchemeNumber;
+export declare function makeExactRational(numerator: bigint, denominator: bigint): SchemeNumber;
+export declare function makeInexact(value: number): SchemeNumber;
+export declare function isExactNumber(value: SchemeNumber): value is ExactNumber;
+export declare function isInexactNumber(value: SchemeNumber): value is InexactNumber;
+export declare function isIntegerNumber(value: SchemeNumber): boolean;
+export declare function isRationalNumber(value: SchemeNumber): boolean;
+export declare function addNumbers(values: SchemeNumber[]): SchemeNumber;
+export declare function subtractNumbers(values: SchemeNumber[]): SchemeNumber;
+export declare function multiplyNumbers(values: SchemeNumber[]): SchemeNumber;
+export declare function divideNumbers(values: SchemeNumber[]): SchemeNumber;
+export declare function absNumber(value: SchemeNumber): SchemeNumber;
+export declare function integerDivision(left: SchemeNumber, right: SchemeNumber, operation: 'modulo' | 'remainder' | 'quotient'): SchemeNumber;
+export declare function minNumbers(values: SchemeNumber[]): SchemeNumber;
+export declare function maxNumbers(values: SchemeNumber[]): SchemeNumber;
+export declare function exptNumber(base: SchemeNumber, exponent: SchemeNumber): SchemeNumber;
+export declare function compareNumbers(left: SchemeNumber, right: SchemeNumber): -1 | 0 | 1;
+export declare function equalNumbers(left: SchemeNumber, right: SchemeNumber): boolean;
+export declare function sameNumericSyntax(left: SchemeNumber, right: SchemeNumber): boolean;
+export declare function numberToJsNumber(value: SchemeNumber): number;
+export declare function exactToInexact(value: SchemeNumber): SchemeNumber;
+export declare function inexactToExact(value: SchemeNumber): SchemeNumber;
+export declare function numeratorValue(value: SchemeNumber): SchemeNumber;
+export declare function denominatorValue(value: SchemeNumber): SchemeNumber;
+export declare function formatNumber(value: SchemeNumber): string;

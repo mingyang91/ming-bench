@@ -1,8 +1,34 @@
 import { EvalError, type SourcePos } from './evalError.js';
+import {
+  absNumber,
+  addNumbers,
+  compareNumbers,
+  denominatorValue,
+  divideNumbers,
+  equalNumbers,
+  exactToInexact,
+  exptNumber,
+  formatNumber as formatSchemeNumber,
+  inexactToExact,
+  integerDivision,
+  isIntegerNumber,
+  isRationalNumber,
+  makeExactInteger,
+  maxNumbers,
+  minNumbers,
+  multiplyNumbers,
+  numeratorValue,
+  numberToJsNumber,
+  parseNumberLiteral,
+  parseNumberStringValue,
+  sameNumericSyntax,
+  subtractNumbers,
+  type SchemeNumber,
+} from './numbers.js';
 
 type ExprBase = { pos: SourcePos };
 
-type NumberExpr = ExprBase & { kind: 'number'; value: number };
+type NumberExpr = ExprBase & { kind: 'number'; value: SchemeNumber };
 type BooleanExpr = ExprBase & { kind: 'boolean'; value: boolean };
 type StringExpr = ExprBase & { kind: 'string'; value: string };
 type CharExpr = ExprBase & { kind: 'char'; value: string };
@@ -94,6 +120,10 @@ const BUILTIN_NAMES = [
   'map',
   'string?',
   'number?',
+  'exact?',
+  'inexact?',
+  'integer?',
+  'rational?',
   'boolean?',
   'pair?',
   'symbol?',
@@ -107,6 +137,10 @@ const BUILTIN_NAMES = [
   'substring',
   'string->number',
   'number->string',
+  'exact->inexact',
+  'inexact->exact',
+  'numerator',
+  'denominator',
   'symbol->string',
   'string->symbol',
   'string-ref',
@@ -455,8 +489,9 @@ function parseAtom(token: Extract<Token, { kind: 'atom' }>): Expr {
     return { kind: 'char', value: parseCharLiteral(token), pos: token.pos };
   }
 
-  if (/^[+-]?\d+$/.test(token.value)) {
-    return { kind: 'number', value: Number.parseInt(token.value, 10), pos: token.pos };
+  const number = parseNumberLiteral(token.value);
+  if (number !== undefined) {
+    return { kind: 'number', value: number, pos: token.pos };
   }
 
   return { kind: 'symbol', name: token.value, pos: token.pos };
@@ -913,7 +948,7 @@ function matchPatternExpr(
 ): boolean {
   switch (pattern.kind) {
     case 'number':
-      return expr.kind === 'number' && expr.value === pattern.value;
+      return expr.kind === 'number' && sameNumericSyntax(expr.value, pattern.value);
     case 'boolean':
       return expr.kind === 'boolean' && expr.value === pattern.value;
     case 'string':
@@ -1605,7 +1640,7 @@ function equalExprSyntax(left: Expr, right: Expr): boolean {
 
   switch (left.kind) {
     case 'number':
-      return left.value === (right as NumberExpr).value;
+      return sameNumericSyntax(left.value, (right as NumberExpr).value);
     case 'boolean':
       return left.value === (right as BooleanExpr).value;
     case 'string':
@@ -1848,13 +1883,11 @@ function evaluateSequence(exprs: Expr[], env: Environment, context: EvalContext)
 function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalContext): RuntimeValue {
   switch (name) {
     case '+':
-      return makeNumber(args.map((arg) => expectNumber(arg, '+')).reduce((sum, value) => sum + value, 0));
+      return makeNumber(addNumbers(args.map((arg) => expectNumber(arg, '+'))));
     case '-':
       return applySubtraction(args);
     case '*':
-      return makeNumber(
-        args.map((arg) => expectNumber(arg, '*')).reduce((product, value) => product * value, 1),
-      );
+      return makeNumber(multiplyNumbers(args.map((arg) => expectNumber(arg, '*'))));
     case '/':
       return applyDivision(args);
     case 'abs':
@@ -1866,29 +1899,40 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
     case 'quotient':
       return applyIntegerDivision(args, 'quotient', 'quotient');
     case 'min':
-      return applyMinMax(args, 'min', Math.min);
+      return applyMinMax(args, 'min');
     case 'max':
-      return applyMinMax(args, 'max', Math.max);
+      return applyMinMax(args, 'max');
     case 'expt':
       return applyExpt(args);
     case '<':
-      return applyComparison(args, '<', (left, right) => left < right);
+      return applyComparison(args, '<', (comparison) => comparison < 0);
     case '>':
-      return applyComparison(args, '>', (left, right) => left > right);
+      return applyComparison(args, '>', (comparison) => comparison > 0);
     case '=':
-      return applyComparison(args, '=', (left, right) => left === right);
+      return applyComparison(args, '=', (comparison) => comparison === 0);
     case '<=':
-      return applyComparison(args, '<=', (left, right) => left <= right);
+      return applyComparison(args, '<=', (comparison) => comparison <= 0);
     case 'zero?':
-      return applyNumericPredicate(args, 'zero?', (value) => value === 0);
+      return applyNumericPredicate(args, 'zero?', (value) => compareNumbers(value, makeExactInteger(0)) === 0);
     case 'positive?':
-      return applyNumericPredicate(args, 'positive?', (value) => value > 0);
+      return applyNumericPredicate(args, 'positive?', (value) => compareNumbers(value, makeExactInteger(0)) > 0);
     case 'negative?':
-      return applyNumericPredicate(args, 'negative?', (value) => value < 0);
+      return applyNumericPredicate(args, 'negative?', (value) => compareNumbers(value, makeExactInteger(0)) < 0);
     case 'odd?':
-      return applyIntegerPredicate(args, 'odd?', (value) => Math.abs(value % 2) === 1);
+      return applyIntegerPredicate(
+        args,
+        'odd?',
+        (value) =>
+          value.exact
+            ? value.numerator % 2n !== 0n
+            : Math.abs(numberToJsNumber(value) % 2) === 1,
+      );
     case 'even?':
-      return applyIntegerPredicate(args, 'even?', (value) => value % 2 === 0);
+      return applyIntegerPredicate(
+        args,
+        'even?',
+        (value) => (value.exact ? value.numerator % 2n === 0n : numberToJsNumber(value) % 2 === 0),
+      );
     case 'not':
       if (args.length !== 1) {
         throw new EvalError('not expects exactly 1 argument');
@@ -1937,6 +1981,14 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return applyTypePredicate(args, 'string?', (value) => value.kind === 'string');
     case 'number?':
       return applyTypePredicate(args, 'number?', (value) => value.kind === 'number');
+    case 'exact?':
+      return applyTypePredicate(args, 'exact?', (value) => value.kind === 'number' && value.value.exact);
+    case 'inexact?':
+      return applyTypePredicate(args, 'inexact?', (value) => value.kind === 'number' && !value.value.exact);
+    case 'integer?':
+      return applyTypePredicate(args, 'integer?', (value) => value.kind === 'number' && isIntegerNumber(value.value));
+    case 'rational?':
+      return applyTypePredicate(args, 'rational?', (value) => value.kind === 'number' && isRationalNumber(value.value));
     case 'boolean?':
       return applyTypePredicate(args, 'boolean?', (value) => value.kind === 'boolean');
     case 'pair?':
@@ -1989,7 +2041,27 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       if (args.length !== 1) {
         throw new EvalError('number->string expects exactly 1 argument');
       }
-      return makeString(formatNumber(expectNumber(args[0], 'number->string')));
+      return makeString(formatSchemeNumber(expectNumber(args[0], 'number->string')));
+    case 'exact->inexact':
+      if (args.length !== 1) {
+        throw new EvalError('exact->inexact expects exactly 1 argument');
+      }
+      return makeNumber(exactToInexact(expectNumber(args[0], 'exact->inexact')));
+    case 'inexact->exact':
+      if (args.length !== 1) {
+        throw new EvalError('inexact->exact expects exactly 1 argument');
+      }
+      return makeNumber(inexactToExact(expectNumber(args[0], 'inexact->exact')));
+    case 'numerator':
+      if (args.length !== 1) {
+        throw new EvalError('numerator expects exactly 1 argument');
+      }
+      return makeNumber(numeratorValue(expectNumber(args[0], 'numerator')));
+    case 'denominator':
+      if (args.length !== 1) {
+        throw new EvalError('denominator expects exactly 1 argument');
+      }
+      return makeNumber(denominatorValue(expectNumber(args[0], 'denominator')));
     case 'symbol->string':
       if (args.length !== 1) {
         throw new EvalError('symbol->string expects exactly 1 argument');
@@ -2059,7 +2131,7 @@ function applyAbs(args: RuntimeValue[]): RuntimeValue {
     throw new EvalError('abs expects exactly 1 argument');
   }
 
-  return makeNumber(Math.abs(expectNumber(args[0], 'abs')));
+  return makeNumber(absNumber(expectNumber(args[0], 'abs')));
 }
 
 function applyIntegerDivision(
@@ -2071,37 +2143,16 @@ function applyIntegerDivision(
     throw new EvalError(`${name} expects exactly 2 arguments`);
   }
 
-  const dividend = expectInteger(args[0], name);
-  const divisor = expectInteger(args[1], name);
-  if (divisor === 0) {
-    throw new EvalError('division by zero');
-  }
-
-  switch (operation) {
-    case 'quotient':
-      return makeNumber(Math.trunc(dividend / divisor));
-    case 'remainder':
-      return makeNumber(dividend % divisor);
-    case 'modulo': {
-      let result = dividend % divisor;
-      if (result !== 0 && Math.sign(result) !== Math.sign(divisor)) {
-        result += divisor;
-      }
-      return makeNumber(result);
-    }
-  }
+  return makeNumber(integerDivision(expectInteger(args[0], name), expectInteger(args[1], name), operation));
 }
 
-function applyMinMax(
-  args: RuntimeValue[],
-  name: 'min' | 'max',
-  operator: (...values: number[]) => number,
-): RuntimeValue {
+function applyMinMax(args: RuntimeValue[], name: 'min' | 'max'): RuntimeValue {
   if (args.length === 0) {
     throw new EvalError(`${name} expects at least 1 argument`);
   }
 
-  return makeNumber(operator(...args.map((arg) => expectNumber(arg, name))));
+  const numbers = args.map((arg) => expectNumber(arg, name));
+  return makeNumber(name === 'min' ? minNumbers(numbers) : maxNumbers(numbers));
 }
 
 function applyExpt(args: RuntimeValue[]): RuntimeValue {
@@ -2111,13 +2162,13 @@ function applyExpt(args: RuntimeValue[]): RuntimeValue {
 
   const base = expectNumber(args[0], 'expt');
   const exponent = expectInteger(args[1], 'expt');
-  return makeNumber(base ** exponent);
+  return makeNumber(exptNumber(base, exponent));
 }
 
 function applyNumericPredicate(
   args: RuntimeValue[],
   name: string,
-  predicate: (value: number) => boolean,
+  predicate: (value: SchemeNumber) => boolean,
 ): RuntimeValue {
   if (args.length !== 1) {
     throw new EvalError(`${name} expects exactly 1 argument`);
@@ -2129,7 +2180,7 @@ function applyNumericPredicate(
 function applyIntegerPredicate(
   args: RuntimeValue[],
   name: string,
-  predicate: (value: number) => boolean,
+  predicate: (value: SchemeNumber) => boolean,
 ): RuntimeValue {
   if (args.length !== 1) {
     throw new EvalError(`${name} expects exactly 1 argument`);
@@ -2143,13 +2194,7 @@ function applySubtraction(args: RuntimeValue[]): RuntimeValue {
     throw new EvalError('- expects at least 1 argument');
   }
 
-  const numbers = args.map((arg) => expectNumber(arg, '-'));
-  if (numbers.length === 1) {
-    return makeNumber(-numbers[0]);
-  }
-
-  const [first, ...rest] = numbers;
-  return makeNumber(rest.reduce((result, value) => result - value, first));
+  return makeNumber(subtractNumbers(args.map((arg) => expectNumber(arg, '-'))));
 }
 
 function applyDivision(args: RuntimeValue[]): RuntimeValue {
@@ -2157,31 +2202,13 @@ function applyDivision(args: RuntimeValue[]): RuntimeValue {
     throw new EvalError('/ expects at least 1 argument');
   }
 
-  const numbers = args.map((arg) => expectNumber(arg, '/'));
-  if (numbers.length === 1) {
-    if (numbers[0] === 0) {
-      throw new EvalError('division by zero');
-    }
-    return makeNumber(1 / numbers[0]);
-  }
-
-  const [first, ...rest] = numbers;
-  let result = first;
-
-  for (const value of rest) {
-    if (value === 0) {
-      throw new EvalError('division by zero');
-    }
-    result /= value;
-  }
-
-  return makeNumber(result);
+  return makeNumber(divideNumbers(args.map((arg) => expectNumber(arg, '/'))));
 }
 
 function applyComparison(
   args: RuntimeValue[],
   name: string,
-  predicate: (left: number, right: number) => boolean,
+  predicate: (comparison: -1 | 0 | 1) => boolean,
 ): RuntimeValue {
   if (args.length < 2) {
     throw new EvalError(`${name} expects at least 2 arguments`);
@@ -2189,7 +2216,7 @@ function applyComparison(
 
   const numbers = args.map((arg) => expectNumber(arg, name));
   for (let index = 0; index < numbers.length - 1; index += 1) {
-    if (!predicate(numbers[index], numbers[index + 1])) {
+    if (!predicate(compareNumbers(numbers[index], numbers[index + 1]))) {
       return makeBoolean(false);
     }
   }
@@ -2402,16 +2429,16 @@ function applyCharComparison(
   return makeBoolean(true);
 }
 
-function expectNumber(value: RuntimeValue, procedure: string): number {
+function expectNumber(value: RuntimeValue, procedure: string): SchemeNumber {
   if (value.kind !== 'number') {
     throw new EvalError(`${procedure} expects numeric arguments`);
   }
   return value.value;
 }
 
-function expectInteger(value: RuntimeValue, procedure: string): number {
+function expectInteger(value: RuntimeValue, procedure: string): SchemeNumber {
   const numericValue = expectNumber(value, procedure);
-  if (!Number.isInteger(numericValue)) {
+  if (!isIntegerNumber(numericValue)) {
     throw new EvalError(`${procedure} expects integer arguments`);
   }
 
@@ -2441,10 +2468,16 @@ function expectSymbol(value: RuntimeValue, procedure: string): SymbolValue {
 
 function expectIndex(value: RuntimeValue, procedure: string): number {
   const numericValue = expectNumber(value, procedure);
-  if (!Number.isInteger(numericValue) || numericValue < 0) {
+  if (!isIntegerNumber(numericValue) || compareNumbers(numericValue, makeExactInteger(0)) < 0) {
     throw new EvalError(`${procedure} expects a non-negative integer index`);
   }
-  return numericValue;
+
+  const index = numberToJsNumber(numericValue);
+  if (!Number.isSafeInteger(index)) {
+    throw new EvalError(`${procedure} index is too large`);
+  }
+
+  return index;
 }
 
 function expectPair(value: RuntimeValue, procedure: string): PairValue {
@@ -2550,7 +2583,7 @@ function isProperList(value: RuntimeValue): boolean {
 
 function eqValues(left: RuntimeValue, right: RuntimeValue): boolean {
   if (left.kind === 'number' && right.kind === 'number') {
-    return left.value === right.value;
+    return equalNumbers(left.value, right.value);
   }
 
   if (left.kind === 'boolean' && right.kind === 'boolean') {
@@ -2627,11 +2660,11 @@ function isTruthy(value: RuntimeValue): boolean {
   return value.kind !== 'boolean' || value.value;
 }
 
-function makeNumber(value: number): NumberExpr {
+function makeNumber(value: SchemeNumber | number): NumberExpr {
   return {
     kind: 'number',
     pos: DEFAULT_SOURCE_POS,
-    value: Object.is(value, -0) ? 0 : value,
+    value: typeof value === 'number' ? makeExactInteger(value) : value,
   };
 }
 
@@ -2673,7 +2706,7 @@ function formatDisplayValue(value: RuntimeValue): string {
 function formatValueWithMode(value: RuntimeValue, mode: 'write' | 'display'): string {
   switch (value.kind) {
     case 'number':
-      return formatNumber(value.value);
+      return formatSchemeNumber(value.value);
     case 'boolean':
       return value.value ? '#t' : '#f';
     case 'string':
@@ -2692,18 +2725,6 @@ function formatValueWithMode(value: RuntimeValue, mode: 'write' | 'display'): st
     case 'void':
       return '';
   }
-}
-
-function formatNumber(value: number): string {
-  if (Object.is(value, -0)) {
-    return '0';
-  }
-
-  if (Number.isInteger(value)) {
-    return value.toString(10);
-  }
-
-  return String(value);
 }
 
 function escapeString(value: string): string {
@@ -2764,9 +2785,9 @@ function charCodePoint(value: string): number {
 }
 
 function parseNumberString(value: string): RuntimeValue {
-  const trimmed = value.trim();
-  if (/^[+-]?(?:\d+|\d+\.\d+|\.\d+)$/.test(trimmed)) {
-    return makeNumber(Number(trimmed));
+  const parsed = parseNumberStringValue(value);
+  if (parsed !== undefined) {
+    return makeNumber(parsed);
   }
 
   return makeBoolean(false);
