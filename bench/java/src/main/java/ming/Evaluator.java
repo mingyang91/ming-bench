@@ -135,6 +135,9 @@ public class Evaluator {
             if ("let".equals(name)) {
                 return evalLetTail(elements, environment);
             }
+            if ("let*".equals(name)) {
+                return evalLetStarTail(elements, environment);
+            }
             if ("letrec".equals(name)) {
                 return evalLetrecTail(elements, environment, false);
             }
@@ -222,6 +225,9 @@ public class Evaluator {
             }
             if ("let".equals(name)) {
                 return evalLet(elements, environment);
+            }
+            if ("let*".equals(name)) {
+                return evalLetStar(elements, environment);
             }
             if ("letrec".equals(name)) {
                 return evalLetrec(elements, environment, false);
@@ -441,17 +447,24 @@ public class Evaluator {
         builtins.put("cons", new BuiltinProcedure("cons", Evaluator::applyCons));
         builtins.put("car", new BuiltinProcedure("car", Evaluator::applyCar));
         builtins.put("cdr", new BuiltinProcedure("cdr", Evaluator::applyCdr));
+        builtins.put("cddr", new BuiltinProcedure("cddr", Evaluator::applyCddr));
+        builtins.put("set-car!", new BuiltinProcedure("set-car!", Evaluator::applySetCar));
+        builtins.put("set-cdr!", new BuiltinProcedure("set-cdr!", Evaluator::applySetCdr));
         builtins.put("null?", new BuiltinProcedure("null?", args -> applyPredicate(args, "null?",
                 value -> value instanceof EmptyListValue)));
         builtins.put("list", new BuiltinProcedure("list", Evaluator::applyList));
         builtins.put("length", new BuiltinProcedure("length", Evaluator::applyLength));
         builtins.put("append", new BuiltinProcedure("append", Evaluator::applyAppend));
+        builtins.put("reverse", new BuiltinProcedure("reverse", Evaluator::applyReverse));
         builtins.put("display", new BuiltinProcedure("display", this::applyDisplay));
         builtins.put("write", new BuiltinProcedure("write", this::applyWrite));
         builtins.put("newline", new BuiltinProcedure("newline", this::applyNewline));
         builtins.put("apply", new BuiltinProcedure("apply", this::applyApply));
         builtins.put("map", new BuiltinProcedure("map", this::applyMap));
+        builtins.put("for-each", new BuiltinProcedure("for-each", this::applyForEach));
         builtins.put("string-append", new BuiltinProcedure("string-append", Evaluator::applyStringAppend));
+        builtins.put("make-string", new BuiltinProcedure("make-string", Evaluator::applyMakeString));
+        builtins.put("string", new BuiltinProcedure("string", Evaluator::applyString));
         builtins.put("string-length", new BuiltinProcedure("string-length", Evaluator::applyStringLength));
         builtins.put("substring", new BuiltinProcedure("substring", Evaluator::applySubstring));
         builtins.put("string->number", new BuiltinProcedure("string->number", Evaluator::applyStringToNumber));
@@ -465,6 +478,12 @@ public class Evaluator {
         builtins.put("list->string", new BuiltinProcedure("list->string", Evaluator::applyListToString));
         builtins.put("string=?", new BuiltinProcedure("string=?", Evaluator::applyStringEqual));
         builtins.put("string<?", new BuiltinProcedure("string<?", Evaluator::applyStringLess));
+        builtins.put("string>?", new BuiltinProcedure("string>?",
+                args -> compareStrings(args, "string>?", (left, right) -> left.compareTo(right) > 0)));
+        builtins.put("string<=?", new BuiltinProcedure("string<=?",
+                args -> compareStrings(args, "string<=?", (left, right) -> left.compareTo(right) <= 0)));
+        builtins.put("string>=?", new BuiltinProcedure("string>=?",
+                args -> compareStrings(args, "string>=?", (left, right) -> left.compareTo(right) >= 0)));
         builtins.put("string-ci=?", new BuiltinProcedure("string-ci=?", Evaluator::applyStringCiEqual));
         builtins.put("string-upcase", new BuiltinProcedure("string-upcase", Evaluator::applyStringUpcase));
         builtins.put("string-downcase", new BuiltinProcedure("string-downcase", Evaluator::applyStringDowncase));
@@ -509,12 +528,16 @@ public class Evaluator {
         builtins.put("char<?", new BuiltinProcedure("char<?", args -> compareChars(args, "char<?",
                 (left, right) -> left < right)));
         builtins.put("abs", new BuiltinProcedure("abs", Evaluator::applyAbs));
+        builtins.put("gcd", new BuiltinProcedure("gcd", Evaluator::applyGcd));
+        builtins.put("lcm", new BuiltinProcedure("lcm", Evaluator::applyLcm));
         builtins.put("modulo", new BuiltinProcedure("modulo", Evaluator::applyModulo));
         builtins.put("remainder", new BuiltinProcedure("remainder", Evaluator::applyRemainder));
         builtins.put("quotient", new BuiltinProcedure("quotient", Evaluator::applyQuotient));
         builtins.put("min", new BuiltinProcedure("min", Evaluator::applyMin));
         builtins.put("max", new BuiltinProcedure("max", Evaluator::applyMax));
         builtins.put("expt", new BuiltinProcedure("expt", Evaluator::applyExpt));
+        builtins.put("truncate", new BuiltinProcedure("truncate", Evaluator::applyTruncate));
+        builtins.put("round", new BuiltinProcedure("round", Evaluator::applyRound));
         builtins.put("zero?", new BuiltinProcedure("zero?", args -> applyNumericPredicate(args, "zero?",
                 value -> value == 0L)));
         builtins.put("positive?", new BuiltinProcedure("positive?", args -> applyNumericPredicate(args, "positive?",
@@ -529,9 +552,12 @@ public class Evaluator {
         builtins.put("list-tail", new BuiltinProcedure("list-tail", Evaluator::applyListTail));
         builtins.put("list?", new BuiltinProcedure("list?", Evaluator::applyListPredicate));
         builtins.put("assoc", new BuiltinProcedure("assoc", Evaluator::applyAssoc));
+        builtins.put("assv", new BuiltinProcedure("assv", Evaluator::applyAssv));
+        builtins.put("member", new BuiltinProcedure("member", Evaluator::applyMember));
         builtins.put("eq?", new BuiltinProcedure("eq?", Evaluator::applyEq));
         builtins.put("eqv?", new BuiltinProcedure("eqv?", Evaluator::applyEqv));
         builtins.put("equal?", new BuiltinProcedure("equal?", Evaluator::applyEqual));
+        builtins.put("error", new BuiltinProcedure("error", Evaluator::applyError));
         builtins.put("vector", new BuiltinProcedure("vector", Evaluator::applyVector));
         builtins.put("make-vector", new BuiltinProcedure("make-vector", Evaluator::applyMakeVector));
         builtins.put("vector-ref", new BuiltinProcedure("vector-ref", Evaluator::applyVectorRef));
@@ -654,6 +680,27 @@ public class Evaluator {
             letEnvironment.define(bindings.get(index).name(), values.get(index));
         }
         return evalSequence(body, letEnvironment);
+    }
+
+    private SchemeValue evalLetStar(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("let*: expected bindings and body");
+        }
+        if (!(elements.get(1) instanceof ListExpression bindingsExpression)) {
+            throw new EvalError("let*: expected bindings");
+        }
+
+        List<SchemeExpression> body = elements.subList(2, elements.size());
+        if (body.isEmpty()) {
+            throw new EvalError("let*: expected body");
+        }
+
+        List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let*");
+        Environment letStarEnvironment = new Environment(environment);
+        for (Binding binding : bindings) {
+            letStarEnvironment.define(binding.name(), evalNonTail(binding.valueExpression(), letStarEnvironment));
+        }
+        return evalSequence(body, letStarEnvironment);
     }
 
     private SchemeValue evalLetrec(List<SchemeExpression> elements, Environment environment, boolean sequential)
@@ -1027,6 +1074,27 @@ public class Evaluator {
             letEnvironment.define(bindings.get(index).name(), values.get(index));
         }
         return tailSequence(body, letEnvironment, VoidValue.INSTANCE);
+    }
+
+    private TailStep evalLetStarTail(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("let*: expected bindings and body");
+        }
+        if (!(elements.get(1) instanceof ListExpression bindingsExpression)) {
+            throw new EvalError("let*: expected bindings");
+        }
+
+        List<SchemeExpression> body = elements.subList(2, elements.size());
+        if (body.isEmpty()) {
+            throw new EvalError("let*: expected body");
+        }
+
+        List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let*");
+        Environment letStarEnvironment = new Environment(environment);
+        for (Binding binding : bindings) {
+            letStarEnvironment.define(binding.name(), evalNonTail(binding.valueExpression(), letStarEnvironment));
+        }
+        return tailSequence(body, letStarEnvironment, VoidValue.INSTANCE);
     }
 
     private TailStep evalLetrecTail(List<SchemeExpression> elements, Environment environment, boolean sequential)
@@ -1438,6 +1506,23 @@ public class Evaluator {
         return requirePair(arguments.getFirst(), "cdr").cdr();
     }
 
+    private static SchemeValue applyCddr(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "cddr");
+        return requirePair(requirePair(arguments.getFirst(), "cddr").cdr(), "cddr").cdr();
+    }
+
+    private static SchemeValue applySetCar(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "set-car!");
+        requirePair(arguments.get(0), "set-car!").setCar(arguments.get(1));
+        return VoidValue.INSTANCE;
+    }
+
+    private static SchemeValue applySetCdr(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "set-cdr!");
+        requirePair(arguments.get(0), "set-cdr!").setCdr(arguments.get(1));
+        return VoidValue.INSTANCE;
+    }
+
     private static SchemeValue applyList(List<SchemeValue> arguments) {
         return buildList(arguments);
     }
@@ -1462,6 +1547,15 @@ public class Evaluator {
 
         if (arguments.size() == 1) {
             requireProperList(arguments.getFirst(), "append");
+        }
+        return result;
+    }
+
+    private static SchemeValue applyReverse(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "reverse");
+        SchemeValue result = EmptyListValue.INSTANCE;
+        for (SchemeValue element : requireProperList(arguments.getFirst(), "reverse")) {
+            result = new PairValue(element, result);
         }
         return result;
     }
@@ -1526,10 +1620,60 @@ public class Evaluator {
         return buildList(results);
     }
 
+    private SchemeValue applyForEach(List<SchemeValue> arguments) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("for-each: expected at least 2 arguments");
+        }
+
+        SchemeValue procedure = arguments.getFirst();
+        List<List<SchemeValue>> lists = new ArrayList<>(arguments.size() - 1);
+        for (int index = 1; index < arguments.size(); index++) {
+            lists.add(requireProperList(arguments.get(index), "for-each"));
+        }
+
+        int length = lists.getFirst().size();
+        for (int index = 1; index < lists.size(); index++) {
+            if (lists.get(index).size() != length) {
+                throw new EvalError("for-each: expected lists of equal length");
+            }
+        }
+
+        for (int index = 0; index < length; index++) {
+            List<SchemeValue> callArguments = new ArrayList<>(lists.size());
+            for (List<SchemeValue> list : lists) {
+                callArguments.add(list.get(index));
+            }
+            applyProcedure(procedure, callArguments);
+        }
+        return VoidValue.INSTANCE;
+    }
+
     private static SchemeValue applyStringAppend(List<SchemeValue> arguments) throws EvalError {
         StringBuilder builder = new StringBuilder();
         for (SchemeValue argument : arguments) {
             builder.append(requireString(argument, "string-append"));
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private static SchemeValue applyMakeString(List<SchemeValue> arguments) throws EvalError {
+        if (arguments.size() != 1 && arguments.size() != 2) {
+            throw new EvalError("make-string: expected 1 or 2 arguments");
+        }
+
+        long length = requireIndex(arguments.getFirst(), "make-string");
+        if (length > Integer.MAX_VALUE) {
+            throw new EvalError("make-string: length too large");
+        }
+
+        char fill = arguments.size() == 2 ? requireChar(arguments.get(1), "make-string") : ' ';
+        return new StringValue(String.valueOf(fill).repeat((int) length));
+    }
+
+    private static SchemeValue applyString(List<SchemeValue> arguments) throws EvalError {
+        StringBuilder builder = new StringBuilder(arguments.size());
+        for (SchemeValue argument : arguments) {
+            builder.append(requireChar(argument, "string"));
         }
         return new StringValue(builder.toString());
     }
@@ -1678,6 +1822,27 @@ public class Evaluator {
         return Numbers.abs(arguments.getFirst(), "abs");
     }
 
+    private static SchemeValue applyGcd(List<SchemeValue> arguments) throws EvalError {
+        long result = 0L;
+        for (SchemeValue argument : arguments) {
+            result = gcd(result, requireInteger(argument, "gcd"));
+        }
+        return new IntValue(Math.abs(result));
+    }
+
+    private static SchemeValue applyLcm(List<SchemeValue> arguments) throws EvalError {
+        long result = 1L;
+        for (SchemeValue argument : arguments) {
+            long value = requireInteger(argument, "lcm");
+            if (result == 0L || value == 0L) {
+                result = 0L;
+                continue;
+            }
+            result = Math.abs((result / gcd(result, value)) * value);
+        }
+        return new IntValue(result);
+    }
+
     private static SchemeValue applyExactToInexact(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 1, "exact->inexact");
         return Numbers.exactToInexact(arguments.getFirst(), "exact->inexact");
@@ -1780,6 +1945,23 @@ public class Evaluator {
         return new IntValue(result);
     }
 
+    private static SchemeValue applyTruncate(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "truncate");
+        return new IntValue(truncateToLong(arguments.getFirst(), "truncate"));
+    }
+
+    private static SchemeValue applyRound(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "round");
+        NumericValue numeric = Numbers.requireNumeric(arguments.getFirst(), "round");
+        if (numeric instanceof IntValue intValue) {
+            return intValue;
+        }
+        if (numeric instanceof RationalValue rationalValue) {
+            return new IntValue(Math.round((double) rationalValue.numerator() / (double) rationalValue.denominator()));
+        }
+        return new IntValue(Math.round(numeric.doubleValue()));
+    }
+
     private static SchemeValue applyListRef(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 2, "list-ref");
         SchemeValue tail = nthTail(arguments.getFirst(), requireIndex(arguments.get(1), "list-ref"), "list-ref");
@@ -1817,6 +1999,48 @@ public class Evaluator {
         throw new EvalError("assoc: expected list");
     }
 
+    private static SchemeValue applyAssv(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "assv");
+        SchemeValue key = arguments.get(0);
+        SchemeValue current = arguments.get(1);
+        Set<PairValue> seen = new HashSet<>();
+        while (current instanceof PairValue pair) {
+            if (!seen.add(pair)) {
+                throw new EvalError("assv: expected list");
+            }
+            SchemeValue candidate = pair.car();
+            PairValue association = requirePair(candidate, "assv");
+            if (eqvValues(key, association.car())) {
+                return candidate;
+            }
+            current = pair.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return BoolValue.FALSE;
+        }
+        throw new EvalError("assv: expected list");
+    }
+
+    private static SchemeValue applyMember(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "member");
+        SchemeValue key = arguments.get(0);
+        SchemeValue current = arguments.get(1);
+        Set<PairValue> seen = new HashSet<>();
+        while (current instanceof PairValue pair) {
+            if (!seen.add(pair)) {
+                throw new EvalError("member: expected list");
+            }
+            if (equalValues(key, pair.car())) {
+                return current;
+            }
+            current = pair.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return BoolValue.FALSE;
+        }
+        throw new EvalError("member: expected list");
+    }
+
     private static SchemeValue applyEq(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 2, "eq?");
         return SchemeValue.booleanValue(eqValues(arguments.get(0), arguments.get(1)));
@@ -1830,6 +2054,22 @@ public class Evaluator {
     private static SchemeValue applyEqual(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 2, "equal?");
         return SchemeValue.booleanValue(equalValues(arguments.get(0), arguments.get(1)));
+    }
+
+    private static SchemeValue applyError(List<SchemeValue> arguments) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw new EvalError("error");
+        }
+
+        StringBuilder builder = new StringBuilder();
+        builder.append(arguments.getFirst() instanceof StringValue
+                ? arguments.getFirst().display()
+                : arguments.getFirst().render());
+        for (int index = 1; index < arguments.size(); index++) {
+            builder.append(' ');
+            builder.append(arguments.get(index).render());
+        }
+        throw new EvalError(builder.toString());
     }
 
     private static SchemeValue applyVector(List<SchemeValue> arguments) {
@@ -2067,7 +2307,11 @@ public class Evaluator {
     private static List<SchemeValue> requireProperList(SchemeValue value, String procedure) throws EvalError {
         List<SchemeValue> elements = new ArrayList<>();
         SchemeValue current = value;
+        Set<PairValue> seen = new HashSet<>();
         while (current instanceof PairValue pair) {
+            if (!seen.add(pair)) {
+                throw new EvalError(procedure + ": expected list");
+            }
             elements.add(pair.car());
             current = pair.cdr();
         }
@@ -2150,6 +2394,15 @@ public class Evaluator {
     }
 
     private static boolean equalValues(SchemeValue left, SchemeValue right) {
+        return equalValues(left, right, new HashSet<>(), new HashSet<>());
+    }
+
+    private static boolean equalValues(
+            SchemeValue left,
+            SchemeValue right,
+            Set<PairComparison> seenPairs,
+            Set<VectorComparison> seenVectors
+    ) {
         if (eqvValues(left, right)) {
             return true;
         }
@@ -2157,19 +2410,25 @@ public class Evaluator {
             return leftString.value().equals(rightString.value());
         }
         if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
+            if (!seenVectors.add(new VectorComparison(leftVector, rightVector))) {
+                return true;
+            }
             if (leftVector.length() != rightVector.length()) {
                 return false;
             }
             for (int index = 0; index < leftVector.length(); index++) {
-                if (!equalValues(leftVector.ref(index), rightVector.ref(index))) {
+                if (!equalValues(leftVector.ref(index), rightVector.ref(index), seenPairs, seenVectors)) {
                     return false;
                 }
             }
             return true;
         }
         if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
-            return equalValues(leftPair.car(), rightPair.car())
-                    && equalValues(leftPair.cdr(), rightPair.cdr());
+            if (!seenPairs.add(new PairComparison(leftPair, rightPair))) {
+                return true;
+            }
+            return equalValues(leftPair.car(), rightPair.car(), seenPairs, seenVectors)
+                    && equalValues(leftPair.cdr(), rightPair.cdr(), seenPairs, seenVectors);
         }
         return false;
     }
@@ -2198,6 +2457,33 @@ public class Evaluator {
 
     private static boolean isProcedureValue(SchemeValue value) {
         return value instanceof ProcedureValue;
+    }
+
+    private static long gcd(long left, long right) {
+        long a = Math.abs(left);
+        long b = Math.abs(right);
+        while (b != 0L) {
+            long remainder = a % b;
+            a = b;
+            b = remainder;
+        }
+        return a;
+    }
+
+    private static long truncateToLong(SchemeValue value, String procedure) throws EvalError {
+        if (value instanceof IntValue intValue) {
+            return intValue.value();
+        }
+        if (value instanceof RationalValue rationalValue) {
+            return rationalValue.numerator() / rationalValue.denominator();
+        }
+
+        NumericValue numeric = Numbers.requireNumeric(value, procedure);
+        double raw = numeric.doubleValue();
+        if (Double.isNaN(raw) || Double.isInfinite(raw)) {
+            throw new EvalError(procedure + ": expected finite number");
+        }
+        return (long) (raw < 0.0 ? Math.ceil(raw) : Math.floor(raw));
     }
 
     private static boolean matchesArity(int requiredCount, String restParameter, int actualCount) {
@@ -2237,6 +2523,12 @@ public class Evaluator {
     }
 
     private record RecordAccessorSpec(String fieldName, String accessorName) {
+    }
+
+    private record PairComparison(PairValue left, PairValue right) {
+    }
+
+    private record VectorComparison(VectorValue left, VectorValue right) {
     }
 
     @FunctionalInterface

@@ -1,7 +1,9 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 interface SchemeValue {
     String render();
@@ -158,7 +160,31 @@ final class EmptyListValue implements SchemeValue {
     }
 }
 
-record PairValue(SchemeValue car, SchemeValue cdr) implements SchemeValue {
+final class PairValue implements SchemeValue {
+    private SchemeValue car;
+    private SchemeValue cdr;
+
+    PairValue(SchemeValue car, SchemeValue cdr) {
+        this.car = car;
+        this.cdr = cdr;
+    }
+
+    SchemeValue car() {
+        return car;
+    }
+
+    SchemeValue cdr() {
+        return cdr;
+    }
+
+    void setCar(SchemeValue car) {
+        this.car = car;
+    }
+
+    void setCdr(SchemeValue cdr) {
+        this.cdr = cdr;
+    }
+
     @Override
     public String render() {
         return format(false);
@@ -171,36 +197,53 @@ record PairValue(SchemeValue car, SchemeValue cdr) implements SchemeValue {
 
     private String format(boolean useDisplay) {
         StringBuilder builder = new StringBuilder();
-        builder.append('(');
-        appendContents(builder, this, useDisplay);
-        builder.append(')');
+        appendPair(builder, this, useDisplay, new HashSet<>());
         return builder.toString();
     }
 
-    private static void appendContents(StringBuilder builder, SchemeValue value, boolean useDisplay) {
-        SchemeValue current = value;
-        boolean first = true;
-
-        while (current instanceof PairValue pair) {
-            if (!first) {
-                builder.append(' ');
-            }
-            builder.append(renderValue(pair.car(), useDisplay));
-            current = pair.cdr();
-            first = false;
+    private static void appendPair(StringBuilder builder, PairValue pair, boolean useDisplay, Set<PairValue> active) {
+        if (!active.add(pair)) {
+            builder.append("#<cycle>");
+            return;
         }
-
-        if (!(current instanceof EmptyListValue)) {
-            builder.append(" . ");
-            builder.append(renderValue(current, useDisplay));
-        }
+        builder.append('(');
+        appendContents(builder, pair, useDisplay, active);
+        builder.append(')');
+        active.remove(pair);
     }
 
-    private static String renderValue(SchemeValue value, boolean useDisplay) {
-        if (useDisplay) {
-            return value.display();
+    private static void appendContents(StringBuilder builder, PairValue pair, boolean useDisplay, Set<PairValue> active) {
+        appendValue(builder, pair.car, useDisplay, active);
+        SchemeValue tail = pair.cdr;
+        if (tail instanceof EmptyListValue) {
+            return;
         }
-        return value.render();
+
+        if (tail instanceof PairValue nextPair) {
+            if (!active.add(nextPair)) {
+                builder.append(" . #<cycle>");
+                return;
+            }
+            builder.append(' ');
+            appendContents(builder, nextPair, useDisplay, active);
+            active.remove(nextPair);
+            return;
+        }
+
+        builder.append(" . ");
+        appendValue(builder, tail, useDisplay, active);
+    }
+
+    private static void appendValue(StringBuilder builder, SchemeValue value, boolean useDisplay, Set<PairValue> active) {
+        if (value instanceof PairValue pair) {
+            appendPair(builder, pair, useDisplay, active);
+            return;
+        }
+        if (useDisplay) {
+            builder.append(value.display());
+            return;
+        }
+        builder.append(value.render());
     }
 }
 
