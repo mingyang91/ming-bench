@@ -3,6 +3,7 @@ package ming;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -64,6 +65,16 @@ public class Evaluator {
         env.define("-", builtin("-", args -> new IntValue(subtract(args))));
         env.define("*", builtin("*", args -> new IntValue(multiply(args))));
         env.define("/", builtin("/", args -> new IntValue(divide(args))));
+        env.define("abs", builtin("abs", args -> {
+            requireArity("abs", args.size(), 1);
+            return new IntValue(Math.abs(expectInt(args.getFirst())));
+        }));
+        env.define("quotient", builtin("quotient", args -> new IntValue(quotient(args))));
+        env.define("remainder", builtin("remainder", args -> new IntValue(remainder(args))));
+        env.define("modulo", builtin("modulo", args -> new IntValue(modulo(args))));
+        env.define("min", builtin("min", args -> new IntValue(min(args))));
+        env.define("max", builtin("max", args -> new IntValue(max(args))));
+        env.define("expt", builtin("expt", args -> new IntValue(expt(args))));
         env.define("<", builtin("<",
                 args -> BoolValue.of(compareIncreasing(args, Comparison.STRICTLY_LESS))));
         env.define(">", builtin(">",
@@ -92,13 +103,49 @@ public class Evaluator {
             requireArity("null?", args.size(), 1);
             return BoolValue.of(args.getFirst() instanceof EmptyListValue);
         }));
+        env.define("zero?", builtin("zero?", args -> {
+            requireArity("zero?", args.size(), 1);
+            return BoolValue.of(expectInt(args.getFirst()) == 0);
+        }));
+        env.define("positive?", builtin("positive?", args -> {
+            requireArity("positive?", args.size(), 1);
+            return BoolValue.of(expectInt(args.getFirst()) > 0);
+        }));
+        env.define("negative?", builtin("negative?", args -> {
+            requireArity("negative?", args.size(), 1);
+            return BoolValue.of(expectInt(args.getFirst()) < 0);
+        }));
+        env.define("odd?", builtin("odd?", args -> {
+            requireArity("odd?", args.size(), 1);
+            return BoolValue.of(expectInt(args.getFirst()) % 2 != 0);
+        }));
+        env.define("even?", builtin("even?", args -> {
+            requireArity("even?", args.size(), 1);
+            return BoolValue.of(expectInt(args.getFirst()) % 2 == 0);
+        }));
         env.define("list", builtin("list", this::makeList));
         env.define("length", builtin("length", args -> {
             requireArity("length", args.size(), 1);
             return new IntValue(lengthOfList(args.getFirst()));
         }));
+        env.define("list-ref", builtin("list-ref", this::listRef));
+        env.define("list-tail", builtin("list-tail", this::listTailBuiltin));
+        env.define("list?", builtin("list?", args -> {
+            requireArity("list?", args.size(), 1);
+            return BoolValue.of(isProperList(args.getFirst()));
+        }));
         env.define("append", builtin("append", this::appendLists));
         env.define("apply", builtin("apply", this::applyBuiltin));
+        env.define("map", builtin("map", this::mapBuiltin));
+        env.define("eq?", builtin("eq?", args -> {
+            requireArity("eq?", args.size(), 2);
+            return BoolValue.of(isEq(args.get(0), args.get(1)));
+        }));
+        env.define("equal?", builtin("equal?", args -> {
+            requireArity("equal?", args.size(), 2);
+            return BoolValue.of(isEqual(args.get(0), args.get(1)));
+        }));
+        env.define("assoc", builtin("assoc", this::assocBuiltin));
         env.define("string?", builtin("string?",
                 args -> typePredicate("string?", args, value -> value instanceof StringValue)));
         env.define("number?", builtin("number?",
@@ -174,6 +221,31 @@ public class Evaluator {
             requireArity("string-copy", args.size(), 1);
             return expectStringValue(args.getFirst()).copy(true);
         }));
+        env.define("string=?", builtin("string=?",
+                args -> BoolValue.of(compareStrings(args, "string=?", StringComparison.EQUAL))));
+        env.define("string<?", builtin("string<?",
+                args -> BoolValue.of(compareStrings(args, "string<?", StringComparison.LESS))));
+        env.define("string-ci=?", builtin("string-ci=?", args -> {
+            requireAtLeast("string-ci=?", args.size(), 2);
+
+            String previous = expectString(args.getFirst());
+            for (int index = 1; index < args.size(); index++) {
+                String current = expectString(args.get(index));
+                if (!previous.equalsIgnoreCase(current)) {
+                    return BoolValue.FALSE;
+                }
+                previous = current;
+            }
+            return BoolValue.TRUE;
+        }));
+        env.define("string-upcase", builtin("string-upcase", args -> {
+            requireArity("string-upcase", args.size(), 1);
+            return new StringValue(expectString(args.getFirst()).toUpperCase(Locale.ROOT));
+        }));
+        env.define("string-downcase", builtin("string-downcase", args -> {
+            requireArity("string-downcase", args.size(), 1);
+            return new StringValue(expectString(args.getFirst()).toLowerCase(Locale.ROOT));
+        }));
         env.define("string-set!", builtin("string-set!", args -> {
             requireArity("string-set!", args.size(), 3);
             StringValue value = expectStringValue(args.get(0));
@@ -186,6 +258,26 @@ public class Evaluator {
         }));
         env.define("char?", builtin("char?",
                 args -> typePredicate("char?", args, value -> value instanceof CharValue)));
+        env.define("char-alphabetic?", builtin("char-alphabetic?", args -> {
+            requireArity("char-alphabetic?", args.size(), 1);
+            return BoolValue.of(Character.isLetter(expectChar(args.getFirst())));
+        }));
+        env.define("char-numeric?", builtin("char-numeric?", args -> {
+            requireArity("char-numeric?", args.size(), 1);
+            return BoolValue.of(Character.isDigit(expectChar(args.getFirst())));
+        }));
+        env.define("char-upcase", builtin("char-upcase", args -> {
+            requireArity("char-upcase", args.size(), 1);
+            return new CharValue(Character.toUpperCase(expectChar(args.getFirst())));
+        }));
+        env.define("char-downcase", builtin("char-downcase", args -> {
+            requireArity("char-downcase", args.size(), 1);
+            return new CharValue(Character.toLowerCase(expectChar(args.getFirst())));
+        }));
+        env.define("char=?", builtin("char=?",
+                args -> BoolValue.of(compareChars(args, "char=?", CharComparison.EQUAL))));
+        env.define("char<?", builtin("char<?",
+                args -> BoolValue.of(compareChars(args, "char<?", CharComparison.LESS))));
 
         return env;
     }
@@ -596,6 +688,75 @@ public class Evaluator {
         return result;
     }
 
+    private int quotient(List<Value> args) throws EvalError {
+        requireArity("quotient", args.size(), 2);
+
+        int dividend = expectInt(args.get(0));
+        int divisor = expectInt(args.get(1));
+        if (divisor == 0) {
+            throw new EvalError("division by zero");
+        }
+        return dividend / divisor;
+    }
+
+    private int remainder(List<Value> args) throws EvalError {
+        requireArity("remainder", args.size(), 2);
+
+        int dividend = expectInt(args.get(0));
+        int divisor = expectInt(args.get(1));
+        if (divisor == 0) {
+            throw new EvalError("division by zero");
+        }
+        return dividend % divisor;
+    }
+
+    private int modulo(List<Value> args) throws EvalError {
+        requireArity("modulo", args.size(), 2);
+
+        int dividend = expectInt(args.get(0));
+        int divisor = expectInt(args.get(1));
+        if (divisor == 0) {
+            throw new EvalError("division by zero");
+        }
+        return Math.floorMod(dividend, divisor);
+    }
+
+    private int min(List<Value> args) throws EvalError {
+        requireAtLeast("min", args.size(), 1);
+
+        int result = expectInt(args.getFirst());
+        for (int index = 1; index < args.size(); index++) {
+            result = Math.min(result, expectInt(args.get(index)));
+        }
+        return result;
+    }
+
+    private int max(List<Value> args) throws EvalError {
+        requireAtLeast("max", args.size(), 1);
+
+        int result = expectInt(args.getFirst());
+        for (int index = 1; index < args.size(); index++) {
+            result = Math.max(result, expectInt(args.get(index)));
+        }
+        return result;
+    }
+
+    private int expt(List<Value> args) throws EvalError {
+        requireArity("expt", args.size(), 2);
+
+        int base = expectInt(args.get(0));
+        int exponent = expectInt(args.get(1));
+        if (exponent < 0) {
+            throw new EvalError("expt exponent must be non-negative");
+        }
+
+        int result = 1;
+        for (int index = 0; index < exponent; index++) {
+            result *= base;
+        }
+        return result;
+    }
+
     private boolean compareIncreasing(List<Value> args, Comparison comparison)
             throws EvalError {
         requireAtLeast(comparison.symbol, args.size(), 2);
@@ -684,6 +845,51 @@ public class Evaluator {
         throw new EvalError("expected list");
     }
 
+    private Value listRef(List<Value> args) throws EvalError {
+        requireArity("list-ref", args.size(), 2);
+
+        int index = expectIndex(args.get(1), "list-ref");
+        Value current = args.getFirst();
+        for (int remaining = index; remaining >= 0; remaining--) {
+            if (!(current instanceof PairValue pairValue)) {
+                throw new EvalError("list-ref index out of range");
+            }
+            if (remaining == 0) {
+                return pairValue.car();
+            }
+            current = pairValue.cdr();
+        }
+
+        throw new EvalError("list-ref index out of range");
+    }
+
+    private Value listTailBuiltin(List<Value> args) throws EvalError {
+        requireArity("list-tail", args.size(), 2);
+        return listTail(args.getFirst(), expectIndex(args.get(1), "list-tail"));
+    }
+
+    private Value listTail(Value value, int index) throws EvalError {
+        Value current = value;
+        for (int remaining = index; remaining > 0; remaining--) {
+            if (!(current instanceof PairValue pairValue)) {
+                throw new EvalError("list-tail index out of range");
+            }
+            current = pairValue.cdr();
+        }
+        if (current instanceof PairValue || current instanceof EmptyListValue) {
+            return current;
+        }
+        throw new EvalError("list-tail index out of range");
+    }
+
+    private boolean isProperList(Value value) {
+        Value current = value;
+        while (current instanceof PairValue pairValue) {
+            current = pairValue.cdr();
+        }
+        return current instanceof EmptyListValue;
+    }
+
     private Value appendLists(List<Value> args) throws EvalError {
         if (args.isEmpty()) {
             return EmptyListValue.INSTANCE;
@@ -711,12 +917,134 @@ public class Evaluator {
         return applyProcedure(args.getFirst(), expandedArgs);
     }
 
+    private Value mapBuiltin(List<Value> args) throws EvalError {
+        requireAtLeast("map", args.size(), 2);
+
+        Value procedure = args.getFirst();
+        List<List<Value>> listArguments = new ArrayList<>(args.size() - 1);
+        Integer expectedLength = null;
+
+        for (int index = 1; index < args.size(); index++) {
+            List<Value> elements = listElements(args.get(index));
+            if (expectedLength == null) {
+                expectedLength = elements.size();
+            } else if (elements.size() != expectedLength) {
+                throw new EvalError("map lists must have the same length");
+            }
+            listArguments.add(elements);
+        }
+
+        List<Value> results = new ArrayList<>(expectedLength == null ? 0 : expectedLength);
+        for (int elementIndex = 0; elementIndex < expectedLength; elementIndex++) {
+            List<Value> invocationArgs = new ArrayList<>(listArguments.size());
+            for (List<Value> listArgument : listArguments) {
+                invocationArgs.add(listArgument.get(elementIndex));
+            }
+            results.add(applyProcedure(procedure, invocationArgs));
+        }
+        return makeList(results);
+    }
+
+    private Value assocBuiltin(List<Value> args) throws EvalError {
+        requireArity("assoc", args.size(), 2);
+
+        Value key = args.get(0);
+        Value current = args.get(1);
+        while (current instanceof PairValue pairValue) {
+            Value entry = pairValue.car();
+            PairValue association = expectPair(entry);
+            if (isEqual(key, association.car())) {
+                return entry;
+            }
+            current = pairValue.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return BoolValue.FALSE;
+        }
+        throw new EvalError("expected list");
+    }
+
     private String stringAppend(List<Value> args) throws EvalError {
         StringBuilder builder = new StringBuilder();
         for (Value arg : args) {
             builder.append(expectString(arg));
         }
         return builder.toString();
+    }
+
+    private boolean compareChars(List<Value> args, String name, CharComparison comparison)
+            throws EvalError {
+        requireAtLeast(name, args.size(), 2);
+
+        char previous = expectChar(args.getFirst());
+        for (int index = 1; index < args.size(); index++) {
+            char current = expectChar(args.get(index));
+            if (!comparison.matches(previous, current)) {
+                return false;
+            }
+            previous = current;
+        }
+        return true;
+    }
+
+    private boolean compareStrings(List<Value> args, String name, StringComparison comparison)
+            throws EvalError {
+        requireAtLeast(name, args.size(), 2);
+
+        String previous = expectString(args.getFirst());
+        for (int index = 1; index < args.size(); index++) {
+            String current = expectString(args.get(index));
+            if (!comparison.matches(previous, current)) {
+                return false;
+            }
+            previous = current;
+        }
+        return true;
+    }
+
+    private boolean isEq(Value left, Value right) {
+        if (left == right) {
+            return true;
+        }
+        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
+            return leftInt.value() == rightInt.value();
+        }
+        if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
+            return leftBool.value() == rightBool.value();
+        }
+        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
+            return leftChar.value() == rightChar.value();
+        }
+        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
+            return leftSymbol.name().equals(rightSymbol.name());
+        }
+        return false;
+    }
+
+    private boolean isEqual(Value left, Value right) {
+        if (left == right) {
+            return true;
+        }
+        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
+            return leftInt.value() == rightInt.value();
+        }
+        if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
+            return leftBool.value() == rightBool.value();
+        }
+        if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
+            return leftString.value().equals(rightString.value());
+        }
+        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
+            return leftChar.value() == rightChar.value();
+        }
+        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
+            return leftSymbol.name().equals(rightSymbol.name());
+        }
+        if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
+            return isEqual(leftPair.car(), rightPair.car())
+                    && isEqual(leftPair.cdr(), rightPair.cdr());
+        }
+        return false;
     }
 
     private Value makeList(List<Value> args) {
@@ -755,41 +1083,6 @@ public class Evaluator {
 
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
-    }
-
-    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr,
-            SymbolExpr, ListExpr {
-        SourcePos position();
-    }
-
-    private record IntExpr(int value, SourcePos position) implements Expr {
-    }
-
-    private record BoolExpr(boolean value, SourcePos position) implements Expr {
-    }
-
-    private record StringExpr(String value, SourcePos position) implements Expr {
-    }
-
-    private record CharExpr(char value, SourcePos position) implements Expr {
-    }
-
-    private record SymbolExpr(String name, SourcePos position) implements Expr {
-    }
-
-    private record ListExpr(List<Expr> elements, SourcePos position) implements Expr {
-    }
-
-    private record LetBinding(String name, Expr valueExpr) {
-    }
-
-    private record ParameterSpec(List<String> requiredParameters, String restParameter) {
-        private ParameterSpec {
-            requiredParameters = List.copyOf(requiredParameters);
-        }
-    }
-
-    private record SourcePos(int line, int column) {
     }
 
     private interface Value {
@@ -1067,6 +1360,40 @@ public class Evaluator {
         abstract boolean matches(int left, int right);
     }
 
+    private enum CharComparison {
+        EQUAL {
+            @Override
+            boolean matches(char left, char right) {
+                return left == right;
+            }
+        },
+        LESS {
+            @Override
+            boolean matches(char left, char right) {
+                return left < right;
+            }
+        };
+
+        abstract boolean matches(char left, char right);
+    }
+
+    private enum StringComparison {
+        EQUAL {
+            @Override
+            boolean matches(String left, String right) {
+                return left.equals(right);
+            }
+        },
+        LESS {
+            @Override
+            boolean matches(String left, String right) {
+                return left.compareTo(right) < 0;
+            }
+        };
+
+        abstract boolean matches(String left, String right);
+    }
+
     private static void appendListContents(StringBuilder builder, Value value) {
         Value current = value;
         boolean first = true;
@@ -1104,203 +1431,4 @@ public class Evaluator {
         return builder.toString();
     }
 
-    private static final class Parser {
-        private final String input;
-        private int index;
-        private int line = 1;
-        private int column = 1;
-
-        private Parser(String input) {
-            this.input = input;
-        }
-
-        private boolean hasMore() {
-            skipWhitespace();
-            return index < input.length();
-        }
-
-        private Expr parseExpr() throws EvalError {
-            skipWhitespace();
-            if (index >= input.length()) {
-                throw errorAtCurrent("unexpected end of input");
-            }
-
-            SourcePos position = currentPosition();
-            char ch = input.charAt(index);
-            return switch (ch) {
-                case '(' -> parseList(position);
-                case '\'' -> parseQuoted(position);
-                case '"' -> parseString(position);
-                case ')' -> throw errorAt(position, "unexpected ')'");
-                default -> {
-                    if (ch == '#' && index + 1 < input.length() && input.charAt(index + 1) == '\\') {
-                        yield parseCharLiteral(position);
-                    }
-                    yield parseAtom(position);
-                }
-            };
-        }
-
-        private Expr parseQuoted(SourcePos position) throws EvalError {
-            advance();
-            return new ListExpr(List.of(new SymbolExpr("quote", position), parseExpr()), position);
-        }
-
-        private Expr parseList(SourcePos position) throws EvalError {
-            advance();
-            List<Expr> elements = new ArrayList<>();
-
-            while (true) {
-                skipWhitespace();
-                if (index >= input.length()) {
-                    throw errorAt(position, "unterminated list");
-                }
-                if (input.charAt(index) == ')') {
-                    advance();
-                    return new ListExpr(elements, position);
-                }
-                elements.add(parseExpr());
-            }
-        }
-
-        private Expr parseString(SourcePos position) throws EvalError {
-            advance();
-            StringBuilder builder = new StringBuilder();
-
-            while (index < input.length()) {
-                char ch = readChar();
-                if (ch == '"') {
-                    return new StringExpr(builder.toString(), position);
-                }
-                if (ch == '\\') {
-                    builder.append(parseEscape(position));
-                    continue;
-                }
-                builder.append(ch);
-            }
-
-            throw errorAt(position, "unterminated string");
-        }
-
-        private Expr parseCharLiteral(SourcePos position) throws EvalError {
-            advance();
-            advance();
-
-            if (index >= input.length()) {
-                throw errorAt(position, "invalid character literal");
-            }
-
-            char next = input.charAt(index);
-            if (isTokenDelimiter(next)) {
-                advance();
-                return new CharExpr(next, position);
-            }
-
-            int start = index;
-            while (index < input.length() && !isTokenDelimiter(input.charAt(index))) {
-                advance();
-            }
-
-            String literal = input.substring(start, index);
-            return switch (literal) {
-                case "space" -> new CharExpr(' ', position);
-                case "newline" -> new CharExpr('\n', position);
-                default -> {
-                    if (literal.length() == 1) {
-                        yield new CharExpr(literal.charAt(0), position);
-                    }
-                    throw errorAt(position, "invalid character literal");
-                }
-            };
-        }
-
-        private char parseEscape(SourcePos position) throws EvalError {
-            if (index >= input.length()) {
-                throw errorAt(position, "unterminated string escape");
-            }
-
-            char ch = readChar();
-            return switch (ch) {
-                case '\\' -> '\\';
-                case '"' -> '"';
-                case 'n' -> '\n';
-                case 't' -> '\t';
-                case 'r' -> '\r';
-                default -> ch;
-            };
-        }
-
-        private Expr parseAtom(SourcePos position) {
-            int start = index;
-            while (index < input.length()) {
-                char ch = input.charAt(index);
-                if (isTokenDelimiter(ch)) {
-                    break;
-                }
-                advance();
-            }
-
-            String token = input.substring(start, index);
-            if (token.equals("#t")) {
-                return new BoolExpr(true, position);
-            }
-            if (token.equals("#f")) {
-                return new BoolExpr(false, position);
-            }
-            if (token.matches("[+-]?\\d+")) {
-                return new IntExpr(Integer.parseInt(token), position);
-            }
-            return new SymbolExpr(token, position);
-        }
-
-        private boolean isTokenDelimiter(char ch) {
-            return Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';';
-        }
-
-        private void skipWhitespace() {
-            while (index < input.length()) {
-                char ch = input.charAt(index);
-                if (Character.isWhitespace(ch)) {
-                    advance();
-                    continue;
-                }
-                if (ch == ';') {
-                    advance();
-                    while (index < input.length() && input.charAt(index) != '\n') {
-                        advance();
-                    }
-                    continue;
-                }
-                break;
-            }
-        }
-
-        private SourcePos currentPosition() {
-            return new SourcePos(line, column);
-        }
-
-        private EvalError errorAtCurrent(String message) {
-            return errorAt(currentPosition(), message);
-        }
-
-        private EvalError errorAt(SourcePos position, String message) {
-            return new EvalError(message, position.line(), position.column());
-        }
-
-        private char readChar() {
-            char ch = input.charAt(index);
-            advance();
-            return ch;
-        }
-
-        private void advance() {
-            char ch = input.charAt(index++);
-            if (ch == '\n') {
-                line++;
-                column = 1;
-                return;
-            }
-            column++;
-        }
-    }
 }
