@@ -83,6 +83,18 @@ enum Builtin {
     Equal,
     LessEqual,
     Not,
+    Cons,
+    Car,
+    Cdr,
+    NullPred,
+    List,
+    Length,
+    Append,
+    StringPred,
+    NumberPred,
+    BooleanPred,
+    PairPred,
+    SymbolPred,
 }
 
 impl Builtin {
@@ -97,6 +109,18 @@ impl Builtin {
             Self::Equal => "=",
             Self::LessEqual => "<=",
             Self::Not => "not",
+            Self::Cons => "cons",
+            Self::Car => "car",
+            Self::Cdr => "cdr",
+            Self::NullPred => "null?",
+            Self::List => "list",
+            Self::Length => "length",
+            Self::Append => "append",
+            Self::StringPred => "string?",
+            Self::NumberPred => "number?",
+            Self::BooleanPred => "boolean?",
+            Self::PairPred => "pair?",
+            Self::SymbolPred => "symbol?",
         }
     }
 }
@@ -131,6 +155,18 @@ impl Env {
             ("=", Builtin::Equal),
             ("<=", Builtin::LessEqual),
             ("not", Builtin::Not),
+            ("cons", Builtin::Cons),
+            ("car", Builtin::Car),
+            ("cdr", Builtin::Cdr),
+            ("null?", Builtin::NullPred),
+            ("list", Builtin::List),
+            ("length", Builtin::Length),
+            ("append", Builtin::Append),
+            ("string?", Builtin::StringPred),
+            ("number?", Builtin::NumberPred),
+            ("boolean?", Builtin::BooleanPred),
+            ("pair?", Builtin::PairPred),
+            ("symbol?", Builtin::SymbolPred),
         ] {
             env.define(name.into(), Value::Builtin(builtin));
         }
@@ -189,11 +225,20 @@ impl<'a> Parser<'a> {
 
         match self.peek_char() {
             Some('(') => self.parse_list(),
+            Some('\'') => self.parse_quote(),
             Some(')') => Err(EvalError::UnexpectedCloseParen),
             Some('"') => self.parse_string().map(Expr::String),
             Some(_) => self.parse_atom(),
             None => Err(EvalError::UnexpectedEof),
         }
+    }
+
+    fn parse_quote(&mut self) -> Result<Expr, EvalError> {
+        self.next_char();
+        Ok(Expr::List(vec![
+            Expr::Symbol("quote".into()),
+            self.parse_expr()?,
+        ]))
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
@@ -335,6 +380,9 @@ fn eval_application(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             "lambda" => return eval_lambda(arguments, env),
             "and" => return eval_and(arguments, env),
             "or" => return eval_or(arguments, env),
+            "begin" => return eval_begin(arguments, env),
+            "let" => return eval_let(arguments, env),
+            "cond" => return eval_cond(arguments, env),
             _ => {}
         }
     }
@@ -370,6 +418,31 @@ fn eval_builtin(builtin: Builtin, arguments: &[Expr], env: &EnvRef) -> Result<Va
             eval_compare(builtin.name(), arguments, env, |left, right| left <= right)
         }
         Builtin::Not => eval_not(arguments, env),
+        Builtin::Cons => eval_cons(arguments, env),
+        Builtin::Car => eval_car(arguments, env),
+        Builtin::Cdr => eval_cdr(arguments, env),
+        Builtin::NullPred => eval_null_pred(arguments, env),
+        Builtin::List => eval_list_builtin(arguments, env),
+        Builtin::Length => eval_length(arguments, env),
+        Builtin::Append => eval_append(arguments, env),
+        Builtin::StringPred => eval_type_predicate(arguments, env, "string?", |value| {
+            matches!(value, Value::String(_))
+        }),
+        Builtin::NumberPred => eval_type_predicate(arguments, env, "number?", |value| {
+            matches!(value, Value::Integer(_))
+        }),
+        Builtin::BooleanPred => eval_type_predicate(arguments, env, "boolean?", |value| {
+            matches!(value, Value::Boolean(_))
+        }),
+        Builtin::PairPred => eval_type_predicate(
+            arguments,
+            env,
+            "pair?",
+            |value| matches!(value, Value::List(items) if !items.is_empty()),
+        ),
+        Builtin::SymbolPred => eval_type_predicate(arguments, env, "symbol?", |value| {
+            matches!(value, Value::Symbol(_))
+        }),
     }
 }
 
@@ -378,15 +451,22 @@ fn apply_closure(
     arguments: &[Expr],
     env: &EnvRef,
 ) -> Result<Value, EvalError> {
-    if arguments.len() != closure.params.len() {
+    let argument_values = eval_args(arguments, env)?;
+    apply_closure_values(closure, argument_values)
+}
+
+fn apply_closure_values(
+    closure: Rc<Closure>,
+    argument_values: Vec<Value>,
+) -> Result<Value, EvalError> {
+    if argument_values.len() != closure.params.len() {
         return Err(EvalError::WrongArgCount {
             name: "procedure".into(),
             expected: format!("exactly {}", closure.params.len()),
-            got: arguments.len(),
+            got: argument_values.len(),
         });
     }
 
-    let argument_values = eval_args(arguments, env)?;
     let call_env = Env::child(&closure.env);
 
     for (param, value) in closure.params.iter().cloned().zip(argument_values) {
@@ -515,6 +595,151 @@ fn eval_lambda(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     })))
 }
 
+fn eval_begin(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    eval_sequence(arguments, env)
+}
+
+fn eval_let(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let Some((first, rest)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        });
+    };
+
+    match first {
+        Expr::Symbol(name) => eval_named_let(name, rest, env),
+        _ => eval_plain_let(first, rest, env),
+    }
+}
+
+fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        });
+    }
+
+    let bindings = parse_bindings(bindings_expr, "let")?;
+    let values = eval_binding_values(&bindings, env)?;
+    let let_env = Env::child(env);
+
+    for ((name, _), value) in bindings.into_iter().zip(values) {
+        let_env.define(name, value);
+    }
+
+    eval_sequence(body, &let_env)
+}
+
+fn eval_named_let(name: &str, arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let Some((bindings_expr, body)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 3".into(),
+            got: 1,
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 3".into(),
+            got: 2,
+        });
+    }
+
+    let bindings = parse_bindings(bindings_expr, "let")?;
+    let named_env = Env::child(env);
+    let params = bindings
+        .iter()
+        .map(|(binding, _)| binding.clone())
+        .collect();
+    let closure = Rc::new(Closure {
+        params,
+        body: body.to_vec(),
+        env: named_env.clone(),
+    });
+
+    named_env.define(name.into(), Value::Procedure(closure.clone()));
+
+    let values = eval_binding_values(&bindings, &named_env)?;
+    apply_closure_values(closure, values)
+}
+
+fn parse_bindings(bindings_expr: &Expr, form_name: &str) -> Result<Vec<(String, Expr)>, EvalError> {
+    let Expr::List(bindings) = bindings_expr else {
+        return Err(EvalError::InvalidSyntax {
+            message: format!("{form_name}: expected binding list"),
+        });
+    };
+
+    bindings
+        .iter()
+        .map(|binding| match binding {
+            Expr::List(parts) if parts.len() == 2 => match &parts[0] {
+                Expr::Symbol(name) => Ok((name.clone(), parts[1].clone())),
+                _ => Err(EvalError::InvalidSyntax {
+                    message: format!("{form_name}: binding name must be a symbol"),
+                }),
+            },
+            _ => Err(EvalError::InvalidSyntax {
+                message: format!("{form_name}: each binding must have exactly 2 elements"),
+            }),
+        })
+        .collect()
+}
+
+fn eval_binding_values(bindings: &[(String, Expr)], env: &EnvRef) -> Result<Vec<Value>, EvalError> {
+    bindings
+        .iter()
+        .map(|(_, expression)| eval_expr(expression, env))
+        .collect()
+}
+
+fn eval_cond(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    for (index, clause) in arguments.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::InvalidSyntax {
+                message: "cond: clauses must be lists".into(),
+            });
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::InvalidSyntax {
+                message: "cond: clauses cannot be empty".into(),
+            });
+        };
+
+        if matches!(test, Expr::Symbol(name) if name == "else") {
+            if index + 1 != arguments.len() {
+                return Err(EvalError::InvalidSyntax {
+                    message: "cond: else clause must be last".into(),
+                });
+            }
+
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(body, env)
+            };
+        }
+
+        let value = eval_expr(test, env)?;
+        if value.is_truthy() {
+            return if body.is_empty() {
+                Ok(value)
+            } else {
+                eval_sequence(body, env)
+            };
+        }
+    }
+
+    Ok(Value::Void)
+}
+
 fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
     let Expr::List(params) = expr else {
         return Err(EvalError::InvalidSyntax {
@@ -619,6 +844,147 @@ fn eval_not(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 
     let value = eval_expr(&arguments[0], env)?;
     Ok(Value::Boolean(!value.is_truthy()))
+}
+
+fn eval_cons(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let [head_expr, tail_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "cons".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        });
+    };
+
+    let head = eval_expr(head_expr, env)?;
+    let tail = eval_expr(tail_expr, env)?;
+
+    match tail {
+        Value::List(mut items) => {
+            items.insert(0, head);
+            Ok(Value::List(items))
+        }
+        other => Err(EvalError::TypeMismatch {
+            expected: "list".into(),
+            found: other.kind().into(),
+        }),
+    }
+}
+
+fn eval_car(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let [list_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "car".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        });
+    };
+
+    match eval_expr(list_expr, env)? {
+        Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
+        Value::List(_) => Err(EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: "list".into(),
+        }),
+        other => Err(EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: other.kind().into(),
+        }),
+    }
+}
+
+fn eval_cdr(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let [list_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "cdr".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        });
+    };
+
+    match eval_expr(list_expr, env)? {
+        Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
+        Value::List(_) => Err(EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: "list".into(),
+        }),
+        other => Err(EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: other.kind().into(),
+        }),
+    }
+}
+
+fn eval_null_pred(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let [list_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "null?".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        });
+    };
+
+    let value = eval_expr(list_expr, env)?;
+    Ok(Value::Boolean(
+        matches!(value, Value::List(items) if items.is_empty()),
+    ))
+}
+
+fn eval_list_builtin(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    Ok(Value::List(eval_args(arguments, env)?))
+}
+
+fn eval_length(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let [list_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "length".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        });
+    };
+
+    match eval_expr(list_expr, env)? {
+        Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+        other => Err(EvalError::TypeMismatch {
+            expected: "list".into(),
+            found: other.kind().into(),
+        }),
+    }
+}
+
+fn eval_append(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let mut items = Vec::new();
+
+    for value in eval_args(arguments, env)? {
+        match value {
+            Value::List(mut list_items) => items.append(&mut list_items),
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "list".into(),
+                    found: other.kind().into(),
+                });
+            }
+        }
+    }
+
+    Ok(Value::List(items))
+}
+
+fn eval_type_predicate(
+    arguments: &[Expr],
+    env: &EnvRef,
+    name: &str,
+    predicate: impl Fn(&Value) -> bool,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        });
+    };
+
+    let value = eval_expr(expr, env)?;
+    Ok(Value::Boolean(predicate(&value)))
 }
 
 fn eval_and(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
