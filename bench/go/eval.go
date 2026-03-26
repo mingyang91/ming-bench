@@ -62,6 +62,14 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalAnd(expr, env)
 		case "or":
 			return evalOr(expr, env)
+		case "define":
+			return evalDefine(expr, env)
+		case "if":
+			return evalIf(expr, env)
+		case "quote":
+			return evalQuote(expr)
+		case "lambda":
+			return evalLambda(expr, env)
 		}
 	}
 
@@ -87,6 +95,26 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 		if fn, ok := builtinRegistry[name]; ok {
 			return fn(args, expr)
 		}
+	}
+
+	// Dispatch lambda calls
+	if op.Type == TypeLambda {
+		if len(args) != len(op.Params) {
+			return nil, fmt.Errorf("%d:%d: wrong number of arguments: expected %d, got %d", expr.Line, expr.Col, len(op.Params), len(args))
+		}
+		callEnv := NewEnv(op.ClosureEnv)
+		for i, param := range op.Params {
+			callEnv.Set(param, args[i])
+		}
+		var result *Value
+		for _, bodyExpr := range op.Body {
+			var err error
+			result, err = Eval(bodyExpr, callEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
 	}
 
 	return nil, fmt.Errorf("%d:%d: not a procedure", head.Line, head.Col)
@@ -270,4 +298,112 @@ func builtinNot(args []*Value, expr *Expr) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: not: expected 1 argument", expr.Line, expr.Col)
 	}
 	return BoolValue(!args[0].IsTruthy()), nil
+}
+
+func evalDefine(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, fmt.Errorf("%d:%d: define: too few arguments", expr.Line, expr.Col)
+	}
+	target := expr.List[1]
+	if target.Type == ExprSymbol {
+		// (define x val)
+		val, err := Eval(expr.List[2], env)
+		if err != nil {
+			return nil, err
+		}
+		env.Set(target.StrVal, val)
+		return Void, nil
+	}
+	if target.Type == ExprList && len(target.List) >= 1 && target.List[0].Type == ExprSymbol {
+		// (define (f params...) body...)
+		name := target.List[0].StrVal
+		params := make([]string, 0, len(target.List)-1)
+		for _, p := range target.List[1:] {
+			if p.Type != ExprSymbol {
+				return nil, fmt.Errorf("%d:%d: define: parameter must be a symbol", p.Line, p.Col)
+			}
+			params = append(params, p.StrVal)
+		}
+		lambda := &Value{
+			Type:       TypeLambda,
+			Params:     params,
+			Body:       expr.List[2:],
+			ClosureEnv: env,
+		}
+		env.Set(name, lambda)
+		return Void, nil
+	}
+	return nil, fmt.Errorf("%d:%d: define: bad syntax", expr.Line, expr.Col)
+}
+
+func evalIf(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 || len(expr.List) > 4 {
+		return nil, fmt.Errorf("%d:%d: if: expected 2 or 3 arguments", expr.Line, expr.Col)
+	}
+	cond, err := Eval(expr.List[1], env)
+	if err != nil {
+		return nil, err
+	}
+	if cond.IsTruthy() {
+		return Eval(expr.List[2], env)
+	}
+	if len(expr.List) == 4 {
+		return Eval(expr.List[3], env)
+	}
+	return Void, nil
+}
+
+func evalQuote(expr *Expr) (*Value, error) {
+	if len(expr.List) != 2 {
+		return nil, fmt.Errorf("%d:%d: quote: expected 1 argument", expr.Line, expr.Col)
+	}
+	return exprToValue(expr.List[1]), nil
+}
+
+func exprToValue(expr *Expr) *Value {
+	switch expr.Type {
+	case ExprInt:
+		return IntValue(expr.IntVal)
+	case ExprBool:
+		return BoolValue(expr.BoolVal)
+	case ExprString:
+		return StringValue(expr.StrVal)
+	case ExprSymbol:
+		return SymbolValue(expr.StrVal)
+	case ExprList:
+		if len(expr.List) == 0 {
+			return Nil
+		}
+		// Build a proper list from the elements
+		result := Nil
+		for i := len(expr.List) - 1; i >= 0; i-- {
+			result = &Value{Type: TypePair, Car: exprToValue(expr.List[i]), Cdr: result}
+		}
+		return result
+	default:
+		return Void
+	}
+}
+
+func evalLambda(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, fmt.Errorf("%d:%d: lambda: too few arguments", expr.Line, expr.Col)
+	}
+	paramList := expr.List[1]
+	if paramList.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: lambda: parameters must be a list", paramList.Line, paramList.Col)
+	}
+	params := make([]string, 0, len(paramList.List))
+	for _, p := range paramList.List {
+		if p.Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: lambda: parameter must be a symbol", p.Line, p.Col)
+		}
+		params = append(params, p.StrVal)
+	}
+	return &Value{
+		Type:       TypeLambda,
+		Params:     params,
+		Body:       expr.List[2:],
+		ClosureEnv: env,
+	}, nil
 }
