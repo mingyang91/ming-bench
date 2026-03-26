@@ -7,6 +7,7 @@ type runtimeState struct {
 	exceptionHandler *exceptionHandlerFrame
 	stepLimitEnabled bool
 	remainingSteps   int
+	macroKeyCounter  int
 }
 
 type dynamicWindFrame struct {

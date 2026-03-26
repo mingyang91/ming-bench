@@ -2,8 +2,6 @@ package ming
 
 import "fmt"
 
-var macroKeyCounter int
-
 type syntaxMacro struct {
 	name      string
 	literals  map[string]struct{}
@@ -462,7 +460,7 @@ func (m *syntaxMacro) instantiateBinderSymbol(rule syntaxRule, template symbolEx
 		return symbol, "", nil
 	}
 
-	template.key = nextMacroGeneratedKey("bind", template.name)
+	template.key = m.nextGeneratedKey("bind", template.name)
 	return template, template.key, nil
 }
 
@@ -477,7 +475,7 @@ func (m *syntaxMacro) captureIdentifier(name string) string {
 		return ""
 	}
 
-	aliasKey := nextMacroGeneratedKey("capture", name)
+	aliasKey := m.nextGeneratedKey("capture", name)
 	if hasValueBinding {
 		m.defEnv.defineAlias(aliasKey, cell)
 	}
@@ -578,7 +576,10 @@ func isCoreSyntaxName(name string) bool {
 	}
 }
 
-func nextMacroGeneratedKey(kind string, name string) string {
-	macroKeyCounter++
-	return fmt.Sprintf("__%s_%d_%s", kind, macroKeyCounter, name)
+func (m *syntaxMacro) nextGeneratedKey(kind string, name string) string {
+	if m.defEnv == nil || m.defEnv.runtime == nil {
+		return fmt.Sprintf("__%s_0_%s", kind, name)
+	}
+	m.defEnv.runtime.macroKeyCounter++
+	return fmt.Sprintf("__%s_%d_%s", kind, m.defEnv.runtime.macroKeyCounter, name)
 }

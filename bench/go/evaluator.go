@@ -33,7 +33,7 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	if err != nil {
 		return "", output, ensureSourcePos(err)
 	}
-	return formatValue(value), output, nil
+	return formatEvalStrWithOutputResult(value), output, nil
 }
 
 // EvalStrWithLimit evaluates Scheme expressions with a fixed eval-dispatch budget.
@@ -2509,6 +2509,17 @@ func formatValue(value any) string {
 		vectors: map[*vectorValue]bool{},
 	}
 	return formatValueWithState(value, state)
+}
+
+func formatEvalStrWithOutputResult(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case *mutableString:
+		return string(v.runes)
+	default:
+		return formatValue(value)
+	}
 }
 
 func formatValueWithState(value any, state *formatState) string {
