@@ -11,6 +11,45 @@ import java.nio.file.Path;
 
 public class TestRunner {
 
+    /**
+     * Run a surprise-level test class by invoking each testXxx method directly
+     * (skipping main() which calls System.exit). Reads the static passed/failed counters.
+     */
+    private static int runSurpriseLevel(String className) {
+        try {
+            Class<?> cls = Class.forName(className);
+
+            // Reset counters
+            var passedField = cls.getDeclaredField("passed");
+            var failedField = cls.getDeclaredField("failed");
+            passedField.setInt(null, 0);
+            failedField.setInt(null, 0);
+
+            // Invoke all static test methods (those starting with "test")
+            for (var method : cls.getDeclaredMethods()) {
+                if (method.getName().startsWith("test") && java.lang.reflect.Modifier.isStatic(method.getModifiers())) {
+                    method.setAccessible(true);
+                    try {
+                        method.invoke(null);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        System.out.println("FAIL " + method.getName() + ": " + e.getCause());
+                        failedField.setInt(null, failedField.getInt(null) + 1);
+                    }
+                }
+            }
+
+            int p = passedField.getInt(null);
+            int f = failedField.getInt(null);
+            System.out.println(p + " passed, " + f + " failed out of " + (p + f) + " tests");
+            return f;
+        } catch (ClassNotFoundException ignored) {
+            return 0; // test class not present — skip
+        } catch (Exception e) {
+            System.out.println("FAIL " + className + ": " + e);
+            return 1;
+        }
+    }
+
     public static void main(String[] args) {
         if (args.length < 1) {
             System.err.println("Usage: java ming.TestRunner <level|all>");
@@ -146,19 +185,13 @@ public class TestRunner {
 
         System.out.println(passed + " passed, " + failed + " failed out of " + total + " tests");
 
-        // Delegate to standalone surprise-level tests if applicable
+        // Delegate to standalone surprise-level tests, calling methods directly
+        // to avoid System.exit() in their main() killing the JVM prematurely.
         if (benchLevel == 0 || benchLevel >= 27) {
-            try {
-                Class.forName("ming.L27Tests").getMethod("main", String[].class)
-                    .invoke(null, (Object) new String[0]);
-                // L27Tests calls System.exit — if we reach here, it passed (exit 0 was suppressed)
-            } catch (ClassNotFoundException ignored) {
-                // L27Tests not present — skip
-            } catch (Exception e) {
-                // If L27Tests.main called System.exit(1), it would throw SecurityException or
-                // the JVM would exit. If we get here via InvocationTargetException, tests failed.
-                System.exit(1);
-            }
+            failed += runSurpriseLevel("ming.L27Tests");
+        }
+        if (benchLevel == 0 || benchLevel >= 28) {
+            failed += runSurpriseLevel("ming.L28Tests");
         }
 
         System.exit(failed > 0 ? 1 : 0);

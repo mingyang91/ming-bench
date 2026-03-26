@@ -253,10 +253,12 @@ public class Evaluator {
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
         outputBuffer = new StringBuilder();
+        stepLimit = 0;
+        stepCount = 0;
         List<Object> exprs = parse(input);
         Env env = makeGlobalEnv();
         Object result = evalTopLevel(exprs, env);
-        return new EvalResult(schemeToString(result), outputBuffer.toString());
+        return new EvalResult(displayValue(result), outputBuffer.toString());
     }
 
     private Object evalTopLevel(List<Object> exprs, Env env) throws EvalError {
