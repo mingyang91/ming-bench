@@ -3,11 +3,11 @@ package ming
 import "fmt"
 
 type macroExpr struct {
-	name     string
+	name        string
 	transformer expr
-	literals map[string]struct{}
-	rules    []macroRule
-	defEnv   *env
+	literals    map[string]struct{}
+	rules       []macroRule
+	defEnv      *env
 }
 
 type macroRule struct {
@@ -853,6 +853,12 @@ func cloneSyntax(value expr) expr {
 			car: cloneSyntax(form.car),
 			cdr: cloneSyntax(form.cdr),
 		}
+	case *vectorExpr:
+		items := make([]expr, len(form.items))
+		for i, item := range form.items {
+			items[i] = cloneSyntax(item)
+		}
+		return &vectorExpr{items: items}
 	case *stringExpr:
 		return form.copy(form.mutable)
 	default:

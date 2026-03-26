@@ -63,7 +63,11 @@ const (
 	tokenLParen tokenKind = iota
 	tokenRParen
 	tokenQuote
+	tokenQuasiquote
+	tokenUnquote
+	tokenUnquoteSplicing
 	tokenSyntaxQuote
+	tokenVectorStart
 	tokenAtom
 	tokenString
 )
@@ -407,11 +411,29 @@ func tokenize(input string) ([]token, error) {
 			tokens = append(tokens, token{kind: tokenQuote, text: "'", pos: start})
 			input = input[size:]
 			pos = pos.advance(r)
+		case r == '`':
+			tokens = append(tokens, token{kind: tokenQuasiquote, text: "`", pos: start})
+			input = input[size:]
+			pos = pos.advance(r)
+		case r == ',' && strings.HasPrefix(input, ",@"):
+			tokens = append(tokens, token{kind: tokenUnquoteSplicing, text: ",@", pos: start})
+			input = input[2:]
+			pos = pos.advance(',')
+			pos = pos.advance('@')
+		case r == ',':
+			tokens = append(tokens, token{kind: tokenUnquote, text: ",", pos: start})
+			input = input[size:]
+			pos = pos.advance(r)
 		case r == '#' && strings.HasPrefix(input, "#'"):
 			tokens = append(tokens, token{kind: tokenSyntaxQuote, text: "#'", pos: start})
 			input = input[2:]
 			pos = pos.advance('#')
 			pos = pos.advance('\'')
+		case r == '#' && strings.HasPrefix(input, "#("):
+			tokens = append(tokens, token{kind: tokenVectorStart, text: "#(", pos: start})
+			input = input[2:]
+			pos = pos.advance('#')
+			pos = pos.advance('(')
 		case r == '"':
 			text, rest, nextPos, err := scanString(input[size:], pos.advance(r), start)
 			if err != nil {
@@ -482,7 +504,14 @@ func scanString(input string, pos sourcePos, start sourcePos) (string, string, s
 
 func scanAtom(input string, pos sourcePos) (string, string, sourcePos) {
 	for i, r := range input {
-		if unicode.IsSpace(r) || r == '(' || r == ')' || r == '\'' || r == ';' || (r == '#' && strings.HasPrefix(input[i:], "#'")) {
+		if unicode.IsSpace(r) ||
+			r == '(' ||
+			r == ')' ||
+			r == '\'' ||
+			r == '`' ||
+			r == ',' ||
+			r == ';' ||
+			(r == '#' && (strings.HasPrefix(input[i:], "#'") || strings.HasPrefix(input[i:], "#("))) {
 			return input[:i], input[i:], pos
 		}
 		pos = pos.advance(r)
@@ -527,6 +556,22 @@ func (p *parser) parseExpr() (expr, error) {
 			}
 			items = append(items, item)
 		}
+	case tokenVectorStart:
+		var items []expr
+		for {
+			if p.pos >= len(p.tokens) {
+				return nil, errorAt(tok.pos, "unterminated vector")
+			}
+			if p.tokens[p.pos].kind == tokenRParen {
+				p.pos++
+				return &vectorExpr{items: items}, nil
+			}
+			item, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, item)
+		}
 	case tokenRParen:
 		return nil, errorAt(tok.pos, "unexpected ')'")
 	case tokenQuote:
@@ -537,6 +582,42 @@ func (p *parser) parseExpr() (expr, error) {
 		return listExpr{
 			items: []expr{
 				symbolExpr{name: "quote", pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
+	case tokenQuasiquote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, attachPos(err, tok.pos)
+		}
+		return listExpr{
+			items: []expr{
+				symbolExpr{name: "quasiquote", pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
+	case tokenUnquote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, attachPos(err, tok.pos)
+		}
+		return listExpr{
+			items: []expr{
+				symbolExpr{name: "unquote", pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
+	case tokenUnquoteSplicing:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, attachPos(err, tok.pos)
+		}
+		return listExpr{
+			items: []expr{
+				symbolExpr{name: "unquote-splicing", pos: tok.pos},
 				quoted,
 			},
 			pos: tok.pos,
@@ -718,6 +799,9 @@ func evalListStep(environment *env, items listExpr) (evalStep, error) {
 		case "quote":
 			value, err := evalQuote(items.items[1:])
 			return doneStep(value), attachPos(err, operator.pos)
+		case "quasiquote":
+			value, err := evalQuasiquote(environment, items.items[1:])
+			return doneStep(value), attachPos(err, operator.pos)
 		case "syntax":
 			value, err := evalSyntax(environment, items.items[1:])
 			return doneStep(value), attachPos(err, operator.pos)
@@ -874,6 +958,13 @@ func evalCond(environment *env, forms []expr) (evalStep, error) {
 		if !isTruthy(testValue) {
 			continue
 		}
+		if isCondArrowClause(clause) {
+			recipient, err := evalSingleExpr(environment, clause.items[2], "cond")
+			if err != nil {
+				return evalStep{}, err
+			}
+			return applyCallableStep(recipient, []expr{testValue})
+		}
 		if len(clause.items) == 1 {
 			return doneStep(testValue), nil
 		}
@@ -881,6 +972,14 @@ func evalCond(environment *env, forms []expr) (evalStep, error) {
 	}
 
 	return doneStep(voidExpr{}), nil
+}
+
+func isCondArrowClause(clause listExpr) bool {
+	if len(clause.items) != 3 {
+		return false
+	}
+	symbol, ok := clause.items[1].(symbolExpr)
+	return ok && symbol.name == "=>"
 }
 
 func evalQuote(forms []expr) (expr, error) {
@@ -1390,15 +1489,21 @@ func builtinAbs(args []expr) (expr, error) {
 }
 
 func builtinAppend(args []expr) (expr, error) {
-	result := make([]expr, 0)
-	for _, arg := range args {
-		items, ok := listElements(arg)
-		if !ok {
-			return nil, &EvalError{Message: "append expects list arguments"}
-		}
-		result = append(result, items...)
+	if len(args) == 0 {
+		return listExpr{}, nil
 	}
-	return properListFromSlice(result), nil
+
+	result := args[len(args)-1]
+	for i := len(args) - 2; i >= 0; i-- {
+		items, ok := listElements(args[i])
+		if !ok {
+			return nil, &EvalError{Message: "append expects list arguments before the final tail"}
+		}
+		for j := len(items) - 1; j >= 0; j-- {
+			result = &pairExpr{car: items[j], cdr: result}
+		}
+	}
+	return result, nil
 }
 
 func builtinApply(args []expr) (expr, error) {

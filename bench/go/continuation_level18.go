@@ -494,6 +494,13 @@ func (m *level18Machine) stepList(items listExpr) error {
 			}
 			m.returnValue(quoteDatum(items.items[1]), m.cont)
 			return nil
+		case "quasiquote":
+			value, err := evalQuasiquote(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.returnValue(value, m.cont)
+			return nil
 		case "syntax":
 			value, err := evalSyntax(environment, items.items[1:])
 			if err != nil {
@@ -982,6 +989,36 @@ func level18ExpandCond(pos sourcePos, clauses []expr) (expr, error) {
 				return nil, &EvalError{Message: "cond else clause must be last"}
 			}
 			result = level18SequenceForm(clause.pos, clause.items[1:])
+			continue
+		}
+
+		if isCondArrowClause(clause) {
+			tmp := symbolExpr{name: freshMacroName("%cond_value"), pos: clause.pos}
+			result = listExpr{
+				pos: clause.pos,
+				items: []expr{
+					listExpr{
+						pos: clause.pos,
+						items: []expr{
+							symbolExpr{name: "lambda", pos: clause.pos},
+							listExpr{items: []expr{tmp}, pos: clause.pos},
+							listExpr{
+								pos: clause.pos,
+								items: []expr{
+									symbolExpr{name: "if", pos: clause.pos},
+									tmp,
+									listExpr{
+										pos:   clause.pos,
+										items: []expr{clause.items[2], tmp},
+									},
+									result,
+								},
+							},
+						},
+					},
+					clause.items[0],
+				},
+			}
 			continue
 		}
 

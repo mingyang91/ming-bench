@@ -42,11 +42,7 @@ func properListFromSlice(items []expr) expr {
 func quoteDatum(form expr) expr {
 	switch v := form.(type) {
 	case listExpr:
-		items := make([]expr, len(v.items))
-		for i, item := range v.items {
-			items[i] = quoteDatum(item)
-		}
-		return properListFromSlice(items)
+		return quoteListDatum(v.items)
 	case *pairExpr:
 		return &pairExpr{
 			car: quoteDatum(v.car),
@@ -61,6 +57,34 @@ func quoteDatum(form expr) expr {
 	default:
 		return form
 	}
+}
+
+func quoteListDatum(items []expr) expr {
+	dotIndex := -1
+	for i, item := range items {
+		symbol, ok := item.(symbolExpr)
+		if ok && symbol.name == "." {
+			dotIndex = i
+			break
+		}
+	}
+
+	if dotIndex == -1 || dotIndex != len(items)-2 {
+		quoted := make([]expr, len(items))
+		for i, item := range items {
+			quoted[i] = quoteDatum(item)
+		}
+		return properListFromSlice(quoted)
+	}
+
+	tail := quoteDatum(items[len(items)-1])
+	for i := dotIndex - 1; i >= 0; i-- {
+		tail = &pairExpr{
+			car: quoteDatum(items[i]),
+			cdr: tail,
+		}
+	}
+	return tail
 }
 
 func carValue(value expr) (expr, bool) {
