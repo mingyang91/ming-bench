@@ -15,6 +15,25 @@ type boolExpr bool
 type stringExpr string
 type symbolExpr string
 type listExpr []expr
+type voidExpr struct{}
+
+type builtinFunc func([]expr) (expr, error)
+
+type builtinProc struct {
+	name string
+	fn   builtinFunc
+}
+
+type closureExpr struct {
+	params []string
+	body   []expr
+	env    *env
+}
+
+type env struct {
+	parent   *env
+	bindings map[string]expr
+}
 
 type tokenKind int
 
@@ -50,15 +69,42 @@ func evalProgram(input string) (string, error) {
 		return "", &EvalError{Message: "empty program"}
 	}
 
-	var result expr
-	for _, form := range program {
-		result, err = evalExpr(form)
-		if err != nil {
-			return "", err
-		}
+	environment := newGlobalEnv()
+	result, err := evalSequence(environment, program)
+	if err != nil {
+		return "", err
 	}
 
 	return renderExpr(result), nil
+}
+
+func newGlobalEnv() *env {
+	root := &env{bindings: map[string]expr{}}
+
+	root.define("+", builtinProc{name: "+", fn: builtinAdd})
+	root.define("-", builtinProc{name: "-", fn: builtinSub})
+	root.define("*", builtinProc{name: "*", fn: builtinMul})
+	root.define("/", builtinProc{name: "/", fn: builtinDiv})
+	root.define("<", builtinProc{name: "<", fn: comparisonBuiltin("<", func(a, b int) bool { return a < b })})
+	root.define(">", builtinProc{name: ">", fn: comparisonBuiltin(">", func(a, b int) bool { return a > b })})
+	root.define("=", builtinProc{name: "=", fn: comparisonBuiltin("=", func(a, b int) bool { return a == b })})
+	root.define("<=", builtinProc{name: "<=", fn: comparisonBuiltin("<=", func(a, b int) bool { return a <= b })})
+	root.define("not", builtinProc{name: "not", fn: builtinNot})
+
+	return root
+}
+
+func (e *env) define(name string, value expr) {
+	e.bindings[name] = value
+}
+
+func (e *env) lookup(name string) (expr, bool) {
+	for current := e; current != nil; current = current.parent {
+		if value, ok := current.bindings[name]; ok {
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func tokenize(input string) ([]token, error) {
@@ -211,68 +257,192 @@ func parseAtom(text string) expr {
 	return symbolExpr(text)
 }
 
-func evalExpr(form expr) (expr, error) {
+func evalSequence(environment *env, forms []expr) (expr, error) {
+	result := expr(voidExpr{})
+	for _, form := range forms {
+		value, err := evalExpr(environment, form)
+		if err != nil {
+			return nil, err
+		}
+		result = value
+	}
+	return result, nil
+}
+
+func evalExpr(environment *env, form expr) (expr, error) {
 	switch v := form.(type) {
 	case intExpr, boolExpr, stringExpr:
 		return v, nil
 	case symbolExpr:
-		return nil, &EvalError{Message: fmt.Sprintf("unbound symbol: %s", string(v))}
+		value, ok := environment.lookup(string(v))
+		if !ok {
+			return nil, &EvalError{Message: fmt.Sprintf("unbound symbol: %s", string(v))}
+		}
+		return value, nil
 	case listExpr:
-		return evalList(v)
+		return evalList(environment, v)
 	default:
 		return nil, &EvalError{Message: "unsupported expression"}
 	}
 }
 
-func evalList(items listExpr) (expr, error) {
+func evalList(environment *env, items listExpr) (expr, error) {
 	if len(items) == 0 {
 		return nil, &EvalError{Message: "cannot evaluate empty list"}
 	}
 
-	operator, ok := items[0].(symbolExpr)
-	if !ok {
-		return nil, &EvalError{Message: "first list element is not a procedure"}
+	if operator, ok := items[0].(symbolExpr); ok {
+		switch string(operator) {
+		case "define":
+			return evalDefine(environment, items[1:])
+		case "if":
+			return evalIf(environment, items[1:])
+		case "quote":
+			return evalQuote(items[1:])
+		case "lambda":
+			return evalLambda(environment, items[1:])
+		case "and":
+			return evalAnd(environment, items[1:])
+		case "or":
+			return evalOr(environment, items[1:])
+		}
 	}
 
-	switch string(operator) {
-	case "and":
-		return evalAnd(items[1:])
-	case "or":
-		return evalOr(items[1:])
-	case "not":
-		args, err := evalArgs(items[1:])
+	operatorValue, err := evalExpr(environment, items[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return applyProcedure(environment, operatorValue, items[1:])
+}
+
+func evalDefine(environment *env, forms []expr) (expr, error) {
+	if len(forms) < 2 {
+		return nil, &EvalError{Message: "define expects a name and value"}
+	}
+
+	switch target := forms[0].(type) {
+	case symbolExpr:
+		if len(forms) != 2 {
+			return nil, &EvalError{Message: "define expects exactly 2 arguments"}
+		}
+		value, err := evalExpr(environment, forms[1])
 		if err != nil {
 			return nil, err
 		}
-		if len(args) != 1 {
-			return nil, &EvalError{Message: "not expects exactly 1 argument"}
+		environment.define(string(target), value)
+		return voidExpr{}, nil
+	case listExpr:
+		if len(target) == 0 {
+			return nil, &EvalError{Message: "define function name cannot be empty"}
 		}
-		return boolExpr(!isTruthy(args[0])), nil
-	case "+":
-		return evalAdd(items[1:])
-	case "-":
-		return evalSub(items[1:])
-	case "*":
-		return evalMul(items[1:])
-	case "/":
-		return evalDiv(items[1:])
-	case "<":
-		return evalComparison(items[1:], func(a, b int) bool { return a < b }, "<")
-	case ">":
-		return evalComparison(items[1:], func(a, b int) bool { return a > b }, ">")
-	case "=":
-		return evalComparison(items[1:], func(a, b int) bool { return a == b }, "=")
-	case "<=":
-		return evalComparison(items[1:], func(a, b int) bool { return a <= b }, "<=")
+		name, ok := target[0].(symbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "define function name must be a symbol"}
+		}
+		params, err := parseParamList(target[1:])
+		if err != nil {
+			return nil, err
+		}
+		closure := closureExpr{
+			params: params,
+			body:   append([]expr(nil), forms[1:]...),
+			env:    environment,
+		}
+		environment.define(string(name), closure)
+		return voidExpr{}, nil
 	default:
-		return nil, &EvalError{Message: fmt.Sprintf("unknown procedure: %s", string(operator))}
+		return nil, &EvalError{Message: "define target must be a symbol or parameter list"}
 	}
 }
 
-func evalArgs(forms []expr) ([]expr, error) {
+func evalIf(environment *env, forms []expr) (expr, error) {
+	if len(forms) != 3 {
+		return nil, &EvalError{Message: "if expects exactly 3 arguments"}
+	}
+
+	condition, err := evalExpr(environment, forms[0])
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(condition) {
+		return evalExpr(environment, forms[1])
+	}
+	return evalExpr(environment, forms[2])
+}
+
+func evalQuote(forms []expr) (expr, error) {
+	if len(forms) != 1 {
+		return nil, &EvalError{Message: "quote expects exactly 1 argument"}
+	}
+	return forms[0], nil
+}
+
+func evalLambda(environment *env, forms []expr) (expr, error) {
+	if len(forms) < 2 {
+		return nil, &EvalError{Message: "lambda expects parameters and a body"}
+	}
+
+	paramList, ok := forms[0].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "lambda parameters must be a list"}
+	}
+
+	params, err := parseParamList(paramList)
+	if err != nil {
+		return nil, err
+	}
+
+	return closureExpr{
+		params: params,
+		body:   append([]expr(nil), forms[1:]...),
+		env:    environment,
+	}, nil
+}
+
+func parseParamList(items []expr) ([]string, error) {
+	params := make([]string, 0, len(items))
+	for _, item := range items {
+		symbol, ok := item.(symbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "parameter name must be a symbol"}
+		}
+		params = append(params, string(symbol))
+	}
+	return params, nil
+}
+
+func applyProcedure(environment *env, proc expr, argForms []expr) (expr, error) {
+	args, err := evalArgs(environment, argForms)
+	if err != nil {
+		return nil, err
+	}
+
+	switch callable := proc.(type) {
+	case builtinProc:
+		return callable.fn(args)
+	case closureExpr:
+		if len(args) != len(callable.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
+		}
+
+		callEnv := &env{
+			parent:   callable.env,
+			bindings: map[string]expr{},
+		}
+		for i, name := range callable.params {
+			callEnv.define(name, args[i])
+		}
+		return evalSequence(callEnv, callable.body)
+	default:
+		return nil, &EvalError{Message: "first list element is not a procedure"}
+	}
+}
+
+func evalArgs(environment *env, forms []expr) ([]expr, error) {
 	args := make([]expr, 0, len(forms))
 	for _, form := range forms {
-		value, err := evalExpr(form)
+		value, err := evalExpr(environment, form)
 		if err != nil {
 			return nil, err
 		}
@@ -281,10 +451,10 @@ func evalArgs(forms []expr) ([]expr, error) {
 	return args, nil
 }
 
-func evalAnd(forms []expr) (expr, error) {
+func evalAnd(environment *env, forms []expr) (expr, error) {
 	result := expr(boolExpr(true))
 	for _, form := range forms {
-		value, err := evalExpr(form)
+		value, err := evalExpr(environment, form)
 		if err != nil {
 			return nil, err
 		}
@@ -296,9 +466,9 @@ func evalAnd(forms []expr) (expr, error) {
 	return result, nil
 }
 
-func evalOr(forms []expr) (expr, error) {
+func evalOr(environment *env, forms []expr) (expr, error) {
 	for _, form := range forms {
-		value, err := evalExpr(form)
+		value, err := evalExpr(environment, form)
 		if err != nil {
 			return nil, err
 		}
@@ -309,69 +479,69 @@ func evalOr(forms []expr) (expr, error) {
 	return boolExpr(false), nil
 }
 
-func evalAdd(forms []expr) (expr, error) {
-	args, err := evalNumericArgs(forms)
+func builtinAdd(args []expr) (expr, error) {
+	numbers, err := numericArgs(args)
 	if err != nil {
 		return nil, err
 	}
 
 	total := 0
-	for _, n := range args {
+	for _, n := range numbers {
 		total += n
 	}
 	return intExpr(total), nil
 }
 
-func evalSub(forms []expr) (expr, error) {
-	args, err := evalNumericArgs(forms)
+func builtinSub(args []expr) (expr, error) {
+	numbers, err := numericArgs(args)
 	if err != nil {
 		return nil, err
 	}
-	if len(args) == 0 {
+	if len(numbers) == 0 {
 		return nil, &EvalError{Message: "- expects at least 1 argument"}
 	}
-	if len(args) == 1 {
-		return intExpr(-args[0]), nil
+	if len(numbers) == 1 {
+		return intExpr(-numbers[0]), nil
 	}
 
-	result := args[0]
-	for _, n := range args[1:] {
+	result := numbers[0]
+	for _, n := range numbers[1:] {
 		result -= n
 	}
 	return intExpr(result), nil
 }
 
-func evalMul(forms []expr) (expr, error) {
-	args, err := evalNumericArgs(forms)
+func builtinMul(args []expr) (expr, error) {
+	numbers, err := numericArgs(args)
 	if err != nil {
 		return nil, err
 	}
 
 	result := 1
-	for _, n := range args {
+	for _, n := range numbers {
 		result *= n
 	}
 	return intExpr(result), nil
 }
 
-func evalDiv(forms []expr) (expr, error) {
-	args, err := evalNumericArgs(forms)
+func builtinDiv(args []expr) (expr, error) {
+	numbers, err := numericArgs(args)
 	if err != nil {
 		return nil, err
 	}
-	if len(args) == 0 {
+	if len(numbers) == 0 {
 		return nil, &EvalError{Message: "/ expects at least 1 argument"}
 	}
 
-	result := args[0]
-	if len(args) == 1 {
+	result := numbers[0]
+	if len(numbers) == 1 {
 		if result == 0 {
 			return nil, &EvalError{Message: "division by zero"}
 		}
 		return intExpr(1 / result), nil
 	}
 
-	for _, n := range args[1:] {
+	for _, n := range numbers[1:] {
 		if n == 0 {
 			return nil, &EvalError{Message: "division by zero"}
 		}
@@ -380,29 +550,33 @@ func evalDiv(forms []expr) (expr, error) {
 	return intExpr(result), nil
 }
 
-func evalComparison(forms []expr, cmp func(int, int) bool, name string) (expr, error) {
-	args, err := evalNumericArgs(forms)
-	if err != nil {
-		return nil, err
+func builtinNot(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "not expects exactly 1 argument"}
 	}
-	if len(args) < 2 {
-		return nil, &EvalError{Message: fmt.Sprintf("%s expects at least 2 arguments", name)}
-	}
-
-	for i := 0; i < len(args)-1; i++ {
-		if !cmp(args[i], args[i+1]) {
-			return boolExpr(false), nil
-		}
-	}
-	return boolExpr(true), nil
+	return boolExpr(!isTruthy(args[0])), nil
 }
 
-func evalNumericArgs(forms []expr) ([]int, error) {
-	values, err := evalArgs(forms)
-	if err != nil {
-		return nil, err
-	}
+func comparisonBuiltin(name string, cmp func(int, int) bool) builtinFunc {
+	return func(args []expr) (expr, error) {
+		numbers, err := numericArgs(args)
+		if err != nil {
+			return nil, err
+		}
+		if len(numbers) < 2 {
+			return nil, &EvalError{Message: fmt.Sprintf("%s expects at least 2 arguments", name)}
+		}
 
+		for i := 0; i < len(numbers)-1; i++ {
+			if !cmp(numbers[i], numbers[i+1]) {
+				return boolExpr(false), nil
+			}
+		}
+		return boolExpr(true), nil
+	}
+}
+
+func numericArgs(values []expr) ([]int, error) {
 	args := make([]int, 0, len(values))
 	for _, value := range values {
 		number, ok := value.(intExpr)
@@ -438,6 +612,12 @@ func renderExpr(value expr) string {
 			parts = append(parts, renderExpr(item))
 		}
 		return "(" + strings.Join(parts, " ") + ")"
+	case voidExpr:
+		return ""
+	case builtinProc:
+		return "#<procedure:" + v.name + ">"
+	case closureExpr:
+		return "#<procedure>"
 	default:
 		return ""
 	}
