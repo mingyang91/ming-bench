@@ -11,7 +11,7 @@ import (
 func EvalStr(input string) (string, error) {
 	result, _, err := evalStrInternal(input)
 	if err != nil {
-		return "", err
+		return "", ensureSourcePos(err)
 	}
 	return formatValue(result), nil
 }
@@ -21,21 +21,29 @@ func EvalStr(input string) (string, error) {
 func EvalStrWithOutput(input string) (result string, output string, err error) {
 	value, output, err := evalStrInternal(input)
 	if err != nil {
-		return "", output, err
+		return "", output, ensureSourcePos(err)
 	}
 	return formatValue(value), output, nil
 }
 
 type stringExpr struct {
 	value string
+	pos   sourcePos
 }
 
 type symbolExpr struct {
 	name string
+	pos  sourcePos
 }
 
 type listExpr struct {
 	elements []any
+	pos      sourcePos
+}
+
+type sourcePos struct {
+	line int
+	col  int
 }
 
 type pairValue struct {
@@ -161,7 +169,7 @@ func evalStrInternal(input string) (any, string, error) {
 		return nil, "", err
 	}
 	if len(exprs) == 0 {
-		return nil, "", &EvalError{Message: "empty input"}
+		return nil, "", sourcePos{line: 1, col: 1}.errorf("empty input")
 	}
 
 	scope := newGlobalEnv()
@@ -195,7 +203,7 @@ func (p *parser) parseProgram() ([]any, error) {
 func (p *parser) parseExpr() (any, error) {
 	p.skipIgnorable()
 	if p.atEnd() {
-		return nil, &EvalError{Message: "unexpected end of input"}
+		return nil, p.currentPos().errorf("unexpected end of input")
 	}
 
 	switch p.peek() {
@@ -211,6 +219,7 @@ func (p *parser) parseExpr() (any, error) {
 }
 
 func (p *parser) parseQuoteShorthand() (any, error) {
+	start := p.pos
 	p.pos++
 
 	expr, err := p.parseExpr()
@@ -218,26 +227,29 @@ func (p *parser) parseQuoteShorthand() (any, error) {
 		return nil, err
 	}
 
+	pos := p.posAt(start)
 	return listExpr{
 		elements: []any{
-			symbolExpr{name: "quote"},
+			symbolExpr{name: "quote", pos: pos},
 			expr,
 		},
+		pos: pos,
 	}, nil
 }
 
 func (p *parser) parseList() (any, error) {
+	start := p.pos
 	p.pos++
 
 	var elements []any
 	for {
 		p.skipIgnorable()
 		if p.atEnd() {
-			return nil, &EvalError{Message: "unterminated list"}
+			return nil, p.posAt(start).errorf("unterminated list")
 		}
 		if p.peek() == ')' {
 			p.pos++
-			return listExpr{elements: elements}, nil
+			return listExpr{elements: elements, pos: p.posAt(start)}, nil
 		}
 
 		expr, err := p.parseExpr()
@@ -249,6 +261,7 @@ func (p *parser) parseList() (any, error) {
 }
 
 func (p *parser) parseString() (any, error) {
+	start := p.pos
 	p.pos++
 
 	var b strings.Builder
@@ -258,10 +271,10 @@ func (p *parser) parseString() (any, error) {
 
 		switch ch {
 		case '"':
-			return stringExpr{value: b.String()}, nil
+			return stringExpr{value: b.String(), pos: p.posAt(start)}, nil
 		case '\\':
 			if p.atEnd() {
-				return nil, &EvalError{Message: "unterminated string"}
+				return nil, p.posAt(start).errorf("unterminated string")
 			}
 
 			escaped := p.peek()
@@ -283,7 +296,7 @@ func (p *parser) parseString() (any, error) {
 		}
 	}
 
-	return nil, &EvalError{Message: "unterminated string"}
+	return nil, p.posAt(start).errorf("unterminated string")
 }
 
 func (p *parser) parseAtom() (any, error) {
@@ -298,7 +311,7 @@ func (p *parser) parseAtom() (any, error) {
 
 	token := p.input[start:p.pos]
 	if token == "" {
-		return nil, &EvalError{Message: "unexpected token"}
+		return nil, p.posAt(start).errorf("unexpected token")
 	}
 
 	switch token {
@@ -312,7 +325,7 @@ func (p *parser) parseAtom() (any, error) {
 		return n, nil
 	}
 
-	return symbolExpr{name: token}, nil
+	return symbolExpr{name: token, pos: p.posAt(start)}, nil
 }
 
 func (p *parser) skipIgnorable() {
@@ -339,6 +352,63 @@ func (p *parser) peek() byte {
 	return p.input[p.pos]
 }
 
+func (p *parser) currentPos() sourcePos {
+	return p.posAt(p.pos)
+}
+
+func (p *parser) posAt(offset int) sourcePos {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(p.input) {
+		offset = len(p.input)
+	}
+
+	line := 1
+	col := 1
+	for i := 0; i < offset; i++ {
+		if p.input[i] == '\n' {
+			line++
+			col = 1
+			continue
+		}
+		col++
+	}
+
+	return sourcePos{line: line, col: col}
+}
+
+func (pos sourcePos) errorf(format string, args ...any) *EvalError {
+	return &EvalError{
+		Message: fmt.Sprintf(format, args...),
+		Line:    pos.line,
+		Col:     pos.col,
+	}
+}
+
+func ensureSourcePos(err error) error {
+	return attachSourcePos(err, sourcePos{line: 1, col: 1})
+}
+
+func attachSourcePos(err error, pos sourcePos) error {
+	if err == nil {
+		return nil
+	}
+
+	evalErr, ok := err.(*EvalError)
+	if !ok {
+		return pos.errorf("%s", err.Error())
+	}
+	if evalErr.Line > 0 && evalErr.Col > 0 {
+		return err
+	}
+	return &EvalError{
+		Message: evalErr.Message,
+		Line:    pos.line,
+		Col:     pos.col,
+	}
+}
+
 func isDelimiter(ch byte) bool {
 	switch ch {
 	case ' ', '\t', '\n', '\r', '(', ')', ';':
@@ -359,11 +429,15 @@ func eval(scope *env, expr any) (any, error) {
 	case symbolExpr:
 		value, ok := scope.lookup(node.name)
 		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", node.name)}
+			return nil, node.pos.errorf("unbound variable: %s", node.name)
 		}
 		return value, nil
 	case listExpr:
-		return evalList(scope, node)
+		value, err := evalList(scope, node)
+		if err != nil {
+			return nil, attachSourcePos(err, node.pos)
+		}
+		return value, nil
 	case string:
 		return node, nil
 	case builtinProc:
