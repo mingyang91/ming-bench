@@ -111,8 +111,20 @@ object CekSteps:
     case k: Kont.DynWindAfterBody  => stepDynWind(v, k)
     case k: Kont.DynWindAfterOut   => stepDynWind(v, k)
     case k: Kont.DynWindTransition => stepDynWind(v, k)
-    case k: Kont.AppHead           => stepAppKont(v, k)
-    case k: Kont.AppArg            => stepAppKont(v, k)
+    case Kont.PopHandler(next) =>
+      Evaluator.exceptionHandlers = Evaluator.exceptionHandlers.tail
+      CekState.ApplyK(v, next)
+
+    case Kont.GuardTest(variable, clauses, env, next) =>
+      val guardEnv = env.child()
+      guardEnv.define(variable, v)
+      stepCond(clauses, guardEnv, next)
+
+    case Kont.RaiseReturn(_) =>
+      throw EvalError("handler returned from raise")
+
+    case k: Kont.AppHead => stepAppKont(v, k)
+    case k: Kont.AppArg  => stepAppKont(v, k)
 
   // ── Dynamic-wind continuation helpers ─────────────────────────────
   private def stepDynWind(v: Value, k: Kont): CekState = k match

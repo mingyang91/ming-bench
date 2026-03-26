@@ -9,6 +9,9 @@ object Evaluator:
   // ── Dynamic-wind stack ────────────────────────────────────────────────
   private[ming] var windStack: List[WindEntry] = Nil
 
+  // ── Exception handler stack ─────────────────────────────────────────
+  private[ming] var exceptionHandlers: List[ExceptionHandler] = Nil
+
   private[ming] def commonTail(a: List[WindEntry], b: List[WindEntry]): List[WindEntry] =
     val aLen                = a.length
     val bLen                = b.length
@@ -20,6 +23,29 @@ object Evaluator:
       aa = aa.tail
       bb = bb.tail
     aa
+
+  // ── Exception handling ──────────────────────────────────────────────
+  private def handleRaise(exnValue: Value): CekState =
+    if exceptionHandlers.isEmpty then throw EvalError(s"unhandled exception: ${display(exnValue)}")
+    val handler = exceptionHandlers.head
+    exceptionHandlers = exceptionHandlers.tail
+    handler match
+      case ExceptionHandler.Guard(variable, clauses, env, guardK, savedWindStack) =>
+        val guardTestK = Kont.GuardTest(variable, clauses, env, guardK)
+        val common     = commonTail(windStack, savedWindStack)
+        val toUnwind   = windStack.take(windStack.length - common.length)
+        val toRewind   = savedWindStack.take(savedWindStack.length - common.length).reverse
+        val ops        = toUnwind.map(e => (false, e)) ++ toRewind.map(e => (true, e))
+        if ops.isEmpty then CekState.ApplyK(exnValue, guardTestK)
+        else
+          val dummyPos = Pos(0, 0)
+          CekState.ApplyK(
+            Value.VVoid,
+            Kont.DynWindTransition(ops, exnValue, guardTestK, env, dummyPos)
+          )
+      case ExceptionHandler.Proc(handlerProc, env, _) =>
+        val dummyPos = Pos(0, 0)
+        cekApply(handlerProc, List(exnValue), dummyPos, env, Kont.RaiseReturn(Kont.Halt))
 
   // ── Environment ──────────────────────────────────────────────────────
   private def defaultEnv(
@@ -43,6 +69,8 @@ object Evaluator:
         catch
           case ci: ContinuationInvoke =>
             CekState.ApplyK(ci.value, ci.kont)
+          case sr: SchemeRaise =>
+            handleRaise(sr.value)
     throw EvalError("unreachable")
 
   // ── Eval step ──────────────────────────────────────────────────────
@@ -112,6 +140,10 @@ object Evaluator:
       case Expr.SList(Expr.Symbol("do", _) :: rest, p) =>
         CekState.ApplyK(EvalCompound.evalDo(rest, env, p, evalExpr, evalBody, posOf), k)
 
+      case Expr.SList(Expr.Symbol("guard", _) :: Expr.SList(Expr.Symbol(variable, _) :: clauses, _) :: body, _) =>
+        exceptionHandlers = ExceptionHandler.Guard(variable, clauses, env, k, windStack) :: exceptionHandlers
+        bodyToCek(body, env, Kont.PopHandler(k))
+
       // ── Application ────────────────────────────────────────────────
       case Expr.SList(head :: args, p) =>
         CekSteps.stepApp(head, args, env, p, k)
@@ -129,6 +161,17 @@ object Evaluator:
       val proc    = args.head
       val contVal = Value.VContinuation(k, windStack)
       cekApply(proc, List(contVal), pos, env, k)
+
+    case Value.VBuiltin("raise") =>
+      if args.length != 1 then throw errAt(pos, "raise requires 1 argument")
+      throw new SchemeRaise(args.head)
+
+    case Value.VBuiltin("with-exception-handler") =>
+      if args.length != 2 then throw errAt(pos, "with-exception-handler requires 2 arguments")
+      val handler = args(0)
+      val thunk   = args(1)
+      exceptionHandlers = ExceptionHandler.Proc(handler, env, windStack) :: exceptionHandlers
+      cekApply(thunk, Nil, pos, env, Kont.PopHandler(k))
 
     case Value.VBuiltin("dynamic-wind") =>
       if args.length != 3 then throw errAt(pos, "dynamic-wind requires 3 arguments")
@@ -195,58 +238,18 @@ object Evaluator:
   private def evalExpr(expr: Expr, env: Env): Value =
     runCek(CekState.Eval(expr, env, Kont.Halt))
 
+  private[ming] def runCekInternal(state: CekState): Value = runCek(state)
+
   private def evalBody(body: List[Expr], env: Env): Value =
     if body.isEmpty then Value.VVoid
     else runCek(bodyToCek(body, env, Kont.Halt))
-
-  /** Apply a function to args (non-CEK path, used by builtins like map/for-each). */
-  private[ming] def applyFunc(
-    func: Value,
-    args: List[Value],
-    pos: Pos,
-    env: Env
-  ): Value = func match
-    case Value.VBuiltin("call/cc") | Value.VBuiltin("call-with-current-continuation") =>
-      if args.length != 1 then throw errAt(pos, "call/cc requires 1 argument")
-      val proc    = args.head
-      val contVal = Value.VContinuation(Kont.Halt, windStack)
-      applyFunc(proc, List(contVal), pos, env)
-    case Value.VBuiltin("apply") =>
-      if args.length < 2 then throw errAt(pos, "apply requires at least 2 arguments")
-      val innerFunc = args.head
-      val lastArg = args.last match
-        case Value.VList(elems) => elems
-        case Value.VPair(_)     => pairToScalaList(args.last, pos)
-        case _                  => throw errAt(pos, "apply: last argument must be a list")
-      val prefixArgs = args.slice(1, args.length - 1)
-      applyFunc(innerFunc, prefixArgs ++ lastArg, pos, env)
-    case Value.VBuiltin(name) => Builtins(name, args, pos, env)
-    case Value.VLambda(params, restParam, body, closure) =>
-      val callEnv = closure.child()
-      EvalTail.bindArgs(params, restParam, args, callEnv, pos)
-      evalBody(body, callEnv)
-    case Value.VCaseLambda(clauses) =>
-      val matched = clauses.find { case (params, restParam, _, _) =>
-        restParam match
-          case None    => args.length == params.length
-          case Some(_) => args.length >= params.length
-      }
-      matched match
-        case Some((params, restParam, body, closure)) =>
-          val callEnv = closure.child()
-          EvalTail.bindArgs(params, restParam, args, callEnv, pos)
-          evalBody(body, callEnv)
-        case None => throw errAt(pos, "wrong number of arguments")
-    case Value.VContinuation(savedK, _) =>
-      if args.length != 1 then throw errAt(pos, "continuation requires 1 argument")
-      throw new ContinuationInvoke(args.head, savedK)
-    case _ => throw errAt(pos, "not a procedure")
 
   // ── Public API ───────────────────────────────────────────────────────
   def evalStr(input: String): String =
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw EvalError("no expressions")
     windStack = Nil
+    exceptionHandlers = Nil
     val env = defaultEnv()
     display(runCek(bodyToCek(exprs, env, Kont.Halt)))
 
@@ -254,6 +257,7 @@ object Evaluator:
     val exprs = Parser.parseAll(input)
     if exprs.isEmpty then throw EvalError("no expressions")
     windStack = Nil
+    exceptionHandlers = Nil
     val output = new StringBuilder
     val env    = defaultEnv(output)
     val result = display(runCek(bodyToCek(exprs, env, Kont.Halt)))

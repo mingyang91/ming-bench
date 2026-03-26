@@ -76,7 +76,7 @@ private[ming] object ListUtilBuiltins:
       val len   = lists.head.length
       val result = (0 until len).toList.map { i =>
         val mapArgs = lists.map(_(i))
-        Evaluator.applyFunc(func, mapArgs, pos, env)
+        ApplyFunc(func, mapArgs, pos, env)
       }
       schemeList(result)
     case "for-each" =>
@@ -86,7 +86,7 @@ private[ming] object ListUtilBuiltins:
       val len   = lists.head.length
       (0 until len).foreach { i =>
         val fArgs = lists.map(_(i))
-        Evaluator.applyFunc(func, fArgs, pos, env)
+        ApplyFunc(func, fArgs, pos, env)
       }
       Value.VVoid
     case "equal?" =>

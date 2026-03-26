@@ -74,5 +74,18 @@ enum Kont:
     pos: Pos
   )
 
+  // Exception handling
+  case PopHandler(next: Kont)
+  case GuardTest(variable: String, clauses: List[Expr], env: Env, next: Kont)
+  case RaiseReturn(next: Kont)
+
 /** Exception for continuation invocation from non-CEK code paths (builtins). */
 class ContinuationInvoke(val value: Value, val kont: Kont) extends RuntimeException(null, null, true, false)
+
+/** Exception for Scheme raise — caught by the CEK loop to dispatch to exception handlers. */
+class SchemeRaise(val value: Value) extends RuntimeException(null, null, true, false)
+
+/** Exception handler installed by guard or with-exception-handler. */
+enum ExceptionHandler:
+  case Guard(variable: String, clauses: List[Expr], env: Env, kont: Kont, savedWindStack: List[WindEntry])
+  case Proc(handler: Value, env: Env, savedWindStack: List[WindEntry])

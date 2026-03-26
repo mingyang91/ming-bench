@@ -58,7 +58,7 @@ object Builtins:
       StringCharBuiltins.applyStringCompare(name, args, pos)
     case s if s.startsWith("__record-") => Records.applyRecordOp(s, args, pos)
     case "call/cc" | "call-with-current-continuation" =>
-      Evaluator.applyFunc(Value.VBuiltin(name), args, pos, env)
+      ApplyFunc(Value.VBuiltin(name), args, pos, env)
     case _ => throw errAt(pos, s"unknown builtin: $name")
 
   private def applyListOps(
@@ -219,4 +219,4 @@ object Builtins:
         throw errAt(pos, "apply: last argument must be a list")
     val prefixArgs = args.slice(1, args.length - 1)
     val allArgs    = prefixArgs ++ lastArg
-    Evaluator.applyFunc(func, allArgs, pos, env)
+    ApplyFunc(func, allArgs, pos, env)

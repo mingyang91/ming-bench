@@ -112,5 +112,7 @@ object BuiltinNames:
     "assv",
     "call/cc",
     "call-with-current-continuation",
-    "dynamic-wind"
+    "dynamic-wind",
+    "raise",
+    "with-exception-handler"
   )
