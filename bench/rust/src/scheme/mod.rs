@@ -65,11 +65,18 @@ struct RecordValue {
 }
 
 type PairRef = Rc<RefCell<PairCell>>;
+type DynamicWindRef = Rc<DynamicWind>;
 
 #[derive(Debug, Clone)]
 struct PairCell {
     car: Value,
     cdr: Value,
+}
+
+#[derive(Debug)]
+struct DynamicWind {
+    in_thunk: Value,
+    out_thunk: Value,
 }
 
 impl SchemeString {
@@ -180,6 +187,7 @@ enum Procedure {
     Continuation {
         frames: Vec<ContinuationFrame>,
         position: Option<Position>,
+        winds: Vec<DynamicWindRef>,
     },
     RecordConstructor {
         name: String,
@@ -365,12 +373,23 @@ enum ContinuationFrame {
         lists: Vec<Vec<Value>>,
         index: usize,
     },
+    DynamicWindAfterIn {
+        wind: DynamicWindRef,
+        body_thunk: Value,
+    },
+    DynamicWindAfterBody {
+        wind: DynamicWindRef,
+    },
+    DynamicWindAfterOut {
+        result: Value,
+    },
 }
 
 #[derive(Debug)]
 struct EvalContext {
     output: String,
     frames: Rc<RefCell<Vec<ContinuationFrame>>>,
+    dynamic_winds: Rc<RefCell<Vec<DynamicWindRef>>>,
     position: Rc<RefCell<Option<Position>>>,
 }
 
@@ -378,6 +397,7 @@ struct EvalContext {
 struct ContinuationJump {
     value: Value,
     frames: Vec<ContinuationFrame>,
+    winds: Vec<DynamicWindRef>,
     position: Option<Position>,
 }
 
@@ -393,6 +413,7 @@ impl Default for EvalContext {
         Self {
             output: String::new(),
             frames: Rc::new(RefCell::new(Vec::new())),
+            dynamic_winds: Rc::new(RefCell::new(Vec::new())),
             position: Rc::new(RefCell::new(None)),
         }
     }
@@ -412,6 +433,7 @@ enum EvalAction {
     Resume {
         value: Value,
         frames: Vec<ContinuationFrame>,
+        winds: Vec<DynamicWindRef>,
         position: Option<Position>,
     },
 }
@@ -474,15 +496,64 @@ fn current_position(context: &EvalContext) -> Option<Position> {
     *context.position.borrow()
 }
 
+fn push_dynamic_wind(wind: DynamicWindRef, context: &EvalContext) {
+    context.dynamic_winds.borrow_mut().push(wind);
+}
+
+fn pop_dynamic_wind(expected: &DynamicWindRef, context: &EvalContext) {
+    let popped = context.dynamic_winds.borrow_mut().pop();
+    debug_assert!(
+        popped.as_ref().is_some_and(|wind| Rc::ptr_eq(wind, expected)),
+        "dynamic-wind stack must unwind in LIFO order",
+    );
+}
+
+fn dynamic_wind_prefix_len(current: &[DynamicWindRef], target: &[DynamicWindRef]) -> usize {
+    current
+        .iter()
+        .zip(target)
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count()
+}
+
+fn transition_dynamic_winds(
+    target: &[DynamicWindRef],
+    context: &mut EvalContext,
+) -> Result<(), EvalError> {
+    loop {
+        let current = context.dynamic_winds.borrow().clone();
+        let shared = dynamic_wind_prefix_len(&current, target);
+
+        if shared == current.len() && shared == target.len() {
+            return Ok(());
+        }
+
+        if current.len() > shared {
+            let wind = current
+                .last()
+                .expect("current dynamic-wind stack is non-empty when unwinding")
+                .clone();
+            pop_dynamic_wind(&wind, context);
+            apply_procedure(wind.out_thunk.clone(), Vec::new(), context)?;
+        } else {
+            let wind = target[shared].clone();
+            apply_procedure(wind.in_thunk.clone(), Vec::new(), context)?;
+            push_dynamic_wind(wind, context);
+        }
+    }
+}
+
 fn signal_continuation(
     value: Value,
     frames: Vec<ContinuationFrame>,
+    winds: Vec<DynamicWindRef>,
     position: Option<Position>,
 ) -> ! {
     CONTINUATION_JUMP.with(|slot| {
         *slot.borrow_mut() = Some(ContinuationJump {
             value,
             frames,
+            winds,
             position,
         });
     });
@@ -561,9 +632,55 @@ impl Procedure {
                     let continuation = Value::Procedure(Rc::new(Procedure::Continuation {
                         frames: context.frames.borrow().clone(),
                         position: current_position(context),
+                        winds: context.dynamic_winds.borrow().clone(),
                     }));
 
                     Ok(EvalStep::Apply(args[0].clone(), vec![continuation]))
+                } else if *name == "dynamic-wind" {
+                    if args.len() != 3 {
+                        return Err(EvalError::WrongArgCount {
+                            name,
+                            expected: "exactly 3 arguments",
+                            got: args.len(),
+                        });
+                    }
+
+                    let wind = Rc::new(DynamicWind {
+                        in_thunk: args[0].clone(),
+                        out_thunk: args[2].clone(),
+                    });
+
+                    apply_procedure_with_frame(
+                        args[0].clone(),
+                        Vec::new(),
+                        ContinuationFrame::DynamicWindAfterIn {
+                            wind: wind.clone(),
+                            body_thunk: args[1].clone(),
+                        },
+                        context,
+                    )?;
+
+                    push_dynamic_wind(wind.clone(), context);
+
+                    let result = apply_procedure_with_frame(
+                        args[1].clone(),
+                        Vec::new(),
+                        ContinuationFrame::DynamicWindAfterBody { wind: wind.clone() },
+                        context,
+                    )?;
+
+                    pop_dynamic_wind(&wind, context);
+
+                    apply_procedure_with_frame(
+                        wind.out_thunk.clone(),
+                        Vec::new(),
+                        ContinuationFrame::DynamicWindAfterOut {
+                            result: result.clone(),
+                        },
+                        context,
+                    )?;
+
+                    Ok(EvalStep::Value(result))
                 } else if *name == "apply" {
                     if args.len() < 2 {
                         return Err(EvalError::WrongArgCount {
@@ -584,7 +701,11 @@ impl Procedure {
                     Ok(EvalStep::Value(apply_builtin(name, &args, context)?))
                 }
             }
-            Self::Continuation { frames, position } => {
+            Self::Continuation {
+                frames,
+                position,
+                winds,
+            } => {
                 if args.len() != 1 {
                     return Err(EvalError::WrongArgCountDynamic {
                         name: "continuation".into(),
@@ -593,7 +714,7 @@ impl Procedure {
                     });
                 }
 
-                signal_continuation(args[0].clone(), frames.clone(), *position);
+                signal_continuation(args[0].clone(), frames.clone(), winds.clone(), *position);
             }
             Self::RecordConstructor {
                 name,
@@ -1030,9 +1151,11 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
             EvalAction::Resume {
                 value,
                 frames,
+                winds,
                 position,
             } => {
                 let _position_guard = push_position(context, position);
+                transition_dynamic_winds(&winds, context)?;
                 resume_continuation_frames(value, frames, context)
             }
         }));
@@ -1045,6 +1168,7 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
                     action = EvalAction::Resume {
                         value: jump.value,
                         frames: jump.frames,
+                        winds: jump.winds,
                         position: jump.position,
                     };
                 } else {
@@ -1268,6 +1392,38 @@ fn resume_continuation_frames(
                 lists,
                 index,
             } => apply_for_each_from_index(procedure, &lists, index, context)?,
+            ContinuationFrame::DynamicWindAfterIn { wind, body_thunk } => {
+                push_dynamic_wind(wind.clone(), context);
+                let result = apply_procedure_with_frame(
+                    body_thunk,
+                    Vec::new(),
+                    ContinuationFrame::DynamicWindAfterBody { wind: wind.clone() },
+                    context,
+                )?;
+                pop_dynamic_wind(&wind, context);
+                apply_procedure_with_frame(
+                    wind.out_thunk.clone(),
+                    Vec::new(),
+                    ContinuationFrame::DynamicWindAfterOut {
+                        result: result.clone(),
+                    },
+                    context,
+                )?;
+                result
+            }
+            ContinuationFrame::DynamicWindAfterBody { wind } => {
+                pop_dynamic_wind(&wind, context);
+                apply_procedure_with_frame(
+                    wind.out_thunk.clone(),
+                    Vec::new(),
+                    ContinuationFrame::DynamicWindAfterOut {
+                        result: value.clone(),
+                    },
+                    context,
+                )?;
+                value
+            }
+            ContinuationFrame::DynamicWindAfterOut { result } => result,
         };
     }
 
@@ -2946,6 +3102,7 @@ fn root_env() -> EnvRef {
         "cons",
         "display",
         "denominator",
+        "dynamic-wind",
         "eq?",
         "eqv?",
         "error",
