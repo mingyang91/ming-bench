@@ -66,18 +66,40 @@ public class Evaluator {
         env.define("-", new BuiltinValue("-", this::subtract));
         env.define("*", new BuiltinValue("*", this::multiply));
         env.define("/", new BuiltinValue("/", this::divide));
+        env.define("abs", new BuiltinValue("abs", this::abs));
+        env.define("modulo", new BuiltinValue("modulo", this::modulo));
+        env.define("remainder", new BuiltinValue("remainder", this::remainder));
+        env.define("quotient", new BuiltinValue("quotient", this::quotient));
+        env.define("min", new BuiltinValue("min", arguments -> extremum(arguments, "min")));
+        env.define("max", new BuiltinValue("max", arguments -> extremum(arguments, "max")));
+        env.define("expt", new BuiltinValue("expt", this::expt));
         env.define("<", new BuiltinValue("<", arguments -> compare(arguments, "<")));
         env.define(">", new BuiltinValue(">", arguments -> compare(arguments, ">")));
         env.define("=", new BuiltinValue("=", arguments -> compare(arguments, "=")));
         env.define("<=", new BuiltinValue("<=", arguments -> compare(arguments, "<=")));
         env.define("not", new BuiltinValue("not", this::not));
+        env.define("zero?", new BuiltinValue("zero?",
+                arguments -> numericPredicate("zero?", arguments, value -> value == 0L)));
+        env.define("positive?", new BuiltinValue("positive?",
+                arguments -> numericPredicate("positive?", arguments, value -> value > 0L)));
+        env.define("negative?", new BuiltinValue("negative?",
+                arguments -> numericPredicate("negative?", arguments, value -> value < 0L)));
+        env.define("odd?", new BuiltinValue("odd?",
+                arguments -> numericPredicate("odd?", arguments, value -> value % 2L != 0L)));
+        env.define("even?", new BuiltinValue("even?",
+                arguments -> numericPredicate("even?", arguments, value -> value % 2L == 0L)));
         env.define("cons", new BuiltinValue("cons", this::cons));
         env.define("car", new BuiltinValue("car", this::car));
         env.define("cdr", new BuiltinValue("cdr", this::cdr));
         env.define("null?", new BuiltinValue("null?", arguments ->
                 typePredicate("null?", arguments, value -> value instanceof EmptyListValue)));
         env.define("list", new BuiltinValue("list", this::list));
+        env.define("map", new BuiltinValue("map", this::map));
         env.define("length", new BuiltinValue("length", this::length));
+        env.define("list-ref", new BuiltinValue("list-ref", this::listRef));
+        env.define("list-tail", new BuiltinValue("list-tail", this::listTail));
+        env.define("list?", new BuiltinValue("list?", this::listPredicate));
+        env.define("assoc", new BuiltinValue("assoc", this::assoc));
         env.define("append", new BuiltinValue("append", this::append));
         env.define("apply", new BuiltinValue("apply", this::apply));
         env.define("string?", new BuiltinValue("string?", arguments ->
@@ -90,6 +112,8 @@ public class Evaluator {
                 typePredicate("pair?", arguments, value -> value instanceof PairValue)));
         env.define("symbol?", new BuiltinValue("symbol?", arguments ->
                 typePredicate("symbol?", arguments, value -> value instanceof SymbolValue)));
+        env.define("eq?", new BuiltinValue("eq?", this::eq));
+        env.define("equal?", new BuiltinValue("equal?", this::equal));
         env.define("display", new BuiltinValue("display", this::display));
         env.define("write", new BuiltinValue("write", this::write));
         env.define("newline", new BuiltinValue("newline", this::newline));
@@ -103,8 +127,25 @@ public class Evaluator {
         env.define("string-ref", new BuiltinValue("string-ref", this::stringRef));
         env.define("string-set!", new BuiltinValue("string-set!", this::stringSet));
         env.define("string-copy", new BuiltinValue("string-copy", this::stringCopy));
+        env.define("string=?", new BuiltinValue("string=?",
+                arguments -> compareStrings(arguments, "string=?")));
+        env.define("string<?", new BuiltinValue("string<?",
+                arguments -> compareStrings(arguments, "string<?")));
+        env.define("string-ci=?", new BuiltinValue("string-ci=?",
+                arguments -> compareStrings(arguments, "string-ci=?")));
+        env.define("string-upcase", new BuiltinValue("string-upcase", this::stringUpcase));
+        env.define("string-downcase", new BuiltinValue("string-downcase", this::stringDowncase));
         env.define("char?", new BuiltinValue("char?", arguments ->
                 typePredicate("char?", arguments, value -> value instanceof CharValue)));
+        env.define("char-alphabetic?", new BuiltinValue("char-alphabetic?",
+                this::charAlphabetic));
+        env.define("char-numeric?", new BuiltinValue("char-numeric?", this::charNumeric));
+        env.define("char-upcase", new BuiltinValue("char-upcase", this::charUpcase));
+        env.define("char-downcase", new BuiltinValue("char-downcase", this::charDowncase));
+        env.define("char=?", new BuiltinValue("char=?",
+                arguments -> compareChars(arguments, "char=?")));
+        env.define("char<?", new BuiltinValue("char<?",
+                arguments -> compareChars(arguments, "char<?")));
         return env;
     }
 
@@ -496,6 +537,11 @@ public class Evaluator {
         return new IntValue(total);
     }
 
+    private Value abs(List<Value> arguments) throws EvalError {
+        requireExactArgs("abs", arguments, 1);
+        return new IntValue(Math.abs(requireInt(arguments.get(0), "abs")));
+    }
+
     private Value subtract(List<Value> arguments) throws EvalError {
         requireMinArgs("-", arguments, 1);
         long result = requireInt(arguments.get(0), "-");
@@ -515,6 +561,33 @@ public class Evaluator {
             total *= requireInt(argument, "*");
         }
         return new IntValue(total);
+    }
+
+    private Value map(List<Value> arguments) throws EvalError {
+        requireMinArgs("map", arguments, 2);
+
+        Value procedure = arguments.get(0);
+        List<List<Value>> lists = new ArrayList<>(arguments.size() - 1);
+        int expectedLength = -1;
+        for (int index = 1; index < arguments.size(); index++) {
+            List<Value> list = requireProperList(arguments.get(index), "map");
+            if (expectedLength == -1) {
+                expectedLength = list.size();
+            } else if (list.size() != expectedLength) {
+                throw new EvalError("map expects lists of equal length");
+            }
+            lists.add(list);
+        }
+
+        List<Value> results = new ArrayList<>(expectedLength);
+        for (int item = 0; item < expectedLength; item++) {
+            List<Value> callArguments = new ArrayList<>(lists.size());
+            for (List<Value> list : lists) {
+                callArguments.add(list.get(item));
+            }
+            results.add(applyProcedure(procedure, callArguments));
+        }
+        return listValue(results);
     }
 
     private Value cons(List<Value> arguments) throws EvalError {
@@ -616,9 +689,77 @@ public class Evaluator {
         return requireStringValue(arguments.get(0), "string-copy").copy(true);
     }
 
+    private Value stringUpcase(List<Value> arguments) throws EvalError {
+        requireExactArgs("string-upcase", arguments, 1);
+        return immutableString(requireString(arguments.get(0), "string-upcase").toUpperCase());
+    }
+
+    private Value stringDowncase(List<Value> arguments) throws EvalError {
+        requireExactArgs("string-downcase", arguments, 1);
+        return immutableString(requireString(arguments.get(0), "string-downcase").toLowerCase());
+    }
+
     private Value length(List<Value> arguments) throws EvalError {
         requireExactArgs("length", arguments, 1);
         return new IntValue(requireProperList(arguments.get(0), "length").size());
+    }
+
+    private Value listRef(List<Value> arguments) throws EvalError {
+        requireExactArgs("list-ref", arguments, 2);
+        List<Value> elements = requireProperList(arguments.get(0), "list-ref");
+        int index = requireIndex(arguments.get(1), "list-ref");
+        if (index >= elements.size()) {
+            throw new EvalError("list-ref index out of bounds");
+        }
+        return elements.get(index);
+    }
+
+    private Value listTail(List<Value> arguments) throws EvalError {
+        requireExactArgs("list-tail", arguments, 2);
+        int index = requireIndex(arguments.get(1), "list-tail");
+
+        Value current = arguments.get(0);
+        for (int i = 0; i < index; i++) {
+            if (current instanceof PairValue pairValue) {
+                current = pairValue.cdr();
+            } else if (current instanceof EmptyListValue) {
+                throw new EvalError("list-tail index out of bounds");
+            } else {
+                throw new EvalError("list-tail expects a proper list");
+            }
+        }
+
+        if (!isProperListValue(current)) {
+            throw new EvalError("list-tail expects a proper list");
+        }
+        return current;
+    }
+
+    private Value listPredicate(List<Value> arguments) throws EvalError {
+        requireExactArgs("list?", arguments, 1);
+        return boolValue(isProperListValue(arguments.get(0)));
+    }
+
+    private Value assoc(List<Value> arguments) throws EvalError {
+        requireExactArgs("assoc", arguments, 2);
+
+        Value key = arguments.get(0);
+        Value current = arguments.get(1);
+        while (current instanceof PairValue pairValue) {
+            Value entry = pairValue.car();
+            if (!(entry instanceof PairValue entryPair)) {
+                throw new EvalError("assoc expects an association list");
+            }
+            if (equalValues(key, entryPair.car())) {
+                return entry;
+            }
+            current = pairValue.cdr();
+        }
+
+        if (!(current instanceof EmptyListValue)) {
+            throw new EvalError("assoc expects a proper list");
+        }
+        return FALSE;
     }
 
     private Value append(List<Value> arguments) throws EvalError {
@@ -661,12 +802,117 @@ public class Evaluator {
         return new IntValue(result);
     }
 
+    private Value modulo(List<Value> arguments) throws EvalError {
+        requireExactArgs("modulo", arguments, 2);
+        long dividend = requireInt(arguments.get(0), "modulo");
+        long divisor = requireInt(arguments.get(1), "modulo");
+        if (divisor == 0L) {
+            throw new EvalError("division by zero");
+        }
+
+        long result = dividend % divisor;
+        if (result != 0L && ((result > 0L) != (divisor > 0L))) {
+            result += divisor;
+        }
+        return new IntValue(result);
+    }
+
+    private Value remainder(List<Value> arguments) throws EvalError {
+        requireExactArgs("remainder", arguments, 2);
+        long dividend = requireInt(arguments.get(0), "remainder");
+        long divisor = requireInt(arguments.get(1), "remainder");
+        if (divisor == 0L) {
+            throw new EvalError("division by zero");
+        }
+        return new IntValue(dividend % divisor);
+    }
+
+    private Value quotient(List<Value> arguments) throws EvalError {
+        requireExactArgs("quotient", arguments, 2);
+        long dividend = requireInt(arguments.get(0), "quotient");
+        long divisor = requireInt(arguments.get(1), "quotient");
+        if (divisor == 0L) {
+            throw new EvalError("division by zero");
+        }
+        return new IntValue(dividend / divisor);
+    }
+
+    private Value extremum(List<Value> arguments, String name) throws EvalError {
+        requireMinArgs(name, arguments, 1);
+        long result = requireInt(arguments.get(0), name);
+        for (int index = 1; index < arguments.size(); index++) {
+            long candidate = requireInt(arguments.get(index), name);
+            if ("min".equals(name)) {
+                result = Math.min(result, candidate);
+            } else {
+                result = Math.max(result, candidate);
+            }
+        }
+        return new IntValue(result);
+    }
+
+    private Value expt(List<Value> arguments) throws EvalError {
+        requireExactArgs("expt", arguments, 2);
+        long base = requireInt(arguments.get(0), "expt");
+        long exponent = requireInt(arguments.get(1), "expt");
+        if (exponent < 0L) {
+            throw new EvalError("expt expects a non-negative exponent");
+        }
+
+        long result = 1L;
+        long factor = base;
+        long remaining = exponent;
+        while (remaining > 0L) {
+            if ((remaining & 1L) != 0L) {
+                result *= factor;
+            }
+            remaining >>= 1;
+            if (remaining > 0L) {
+                factor *= factor;
+            }
+        }
+        return new IntValue(result);
+    }
+
     private Value compare(List<Value> arguments, String operator) throws EvalError {
         requireMinArgs(operator, arguments, 2);
         for (int index = 0; index < arguments.size() - 1; index++) {
             long left = requireInt(arguments.get(index), operator);
             long right = requireInt(arguments.get(index + 1), operator);
             if (!comparePair(left, right, operator)) {
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }
+
+    private Value compareChars(List<Value> arguments, String operator) throws EvalError {
+        requireMinArgs(operator, arguments, 2);
+        for (int index = 0; index < arguments.size() - 1; index++) {
+            char left = requireChar(arguments.get(index), operator);
+            char right = requireChar(arguments.get(index + 1), operator);
+            if ("char=?".equals(operator) && left != right) {
+                return FALSE;
+            }
+            if ("char<?".equals(operator) && left >= right) {
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }
+
+    private Value compareStrings(List<Value> arguments, String operator) throws EvalError {
+        requireMinArgs(operator, arguments, 2);
+        for (int index = 0; index < arguments.size() - 1; index++) {
+            String left = requireString(arguments.get(index), operator);
+            String right = requireString(arguments.get(index + 1), operator);
+            boolean matches = switch (operator) {
+                case "string=?" -> left.equals(right);
+                case "string<?" -> left.compareTo(right) < 0;
+                case "string-ci=?" -> left.equalsIgnoreCase(right);
+                default -> throw new EvalError("unknown string comparison operator: " + operator);
+            };
+            if (!matches) {
                 return FALSE;
             }
         }
@@ -687,6 +933,42 @@ public class Evaluator {
     private Value not(List<Value> arguments) throws EvalError {
         requireExactArgs("not", arguments, 1);
         return boolValue(!isTruthy(arguments.get(0)));
+    }
+
+    private Value numericPredicate(String name, List<Value> arguments,
+            java.util.function.LongPredicate predicate) throws EvalError {
+        requireExactArgs(name, arguments, 1);
+        return boolValue(predicate.test(requireInt(arguments.get(0), name)));
+    }
+
+    private Value charAlphabetic(List<Value> arguments) throws EvalError {
+        requireExactArgs("char-alphabetic?", arguments, 1);
+        return boolValue(Character.isLetter(requireChar(arguments.get(0), "char-alphabetic?")));
+    }
+
+    private Value charNumeric(List<Value> arguments) throws EvalError {
+        requireExactArgs("char-numeric?", arguments, 1);
+        return boolValue(Character.isDigit(requireChar(arguments.get(0), "char-numeric?")));
+    }
+
+    private Value charUpcase(List<Value> arguments) throws EvalError {
+        requireExactArgs("char-upcase", arguments, 1);
+        return new CharValue(Character.toUpperCase(requireChar(arguments.get(0), "char-upcase")));
+    }
+
+    private Value charDowncase(List<Value> arguments) throws EvalError {
+        requireExactArgs("char-downcase", arguments, 1);
+        return new CharValue(Character.toLowerCase(requireChar(arguments.get(0), "char-downcase")));
+    }
+
+    private Value eq(List<Value> arguments) throws EvalError {
+        requireExactArgs("eq?", arguments, 2);
+        return boolValue(eqValues(arguments.get(0), arguments.get(1)));
+    }
+
+    private Value equal(List<Value> arguments) throws EvalError {
+        requireExactArgs("equal?", arguments, 2);
+        return boolValue(equalValues(arguments.get(0), arguments.get(1)));
     }
 
     private Value typePredicate(String name, List<Value> arguments, Predicate<Value> predicate)
@@ -769,6 +1051,47 @@ public class Evaluator {
             throw new EvalError(operator + " expects a proper list");
         }
         return elements;
+    }
+
+    private boolean isProperListValue(Value value) {
+        Value current = value;
+        while (current instanceof PairValue pairValue) {
+            current = pairValue.cdr();
+        }
+        return current instanceof EmptyListValue;
+    }
+
+    private boolean eqValues(Value left, Value right) {
+        if (left == right) {
+            return true;
+        }
+        if (left instanceof IntValue leftInt && right instanceof IntValue rightInt) {
+            return leftInt.value() == rightInt.value();
+        }
+        if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
+            return leftBool.value() == rightBool.value();
+        }
+        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
+            return leftChar.value() == rightChar.value();
+        }
+        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
+            return leftSymbol.name().equals(rightSymbol.name());
+        }
+        return left instanceof EmptyListValue && right instanceof EmptyListValue;
+    }
+
+    private boolean equalValues(Value left, Value right) {
+        if (eqValues(left, right)) {
+            return true;
+        }
+        if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
+            return leftString.text().equals(rightString.text());
+        }
+        if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
+            return equalValues(leftPair.car(), rightPair.car())
+                    && equalValues(leftPair.cdr(), rightPair.cdr());
+        }
+        return false;
     }
 
     private boolean isTruthy(Value value) {
@@ -866,34 +1189,9 @@ public class Evaluator {
         return new StringValue(new StringBuilder(value), false);
     }
 
-    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, SymbolExpr,
-            CharExpr, ListExpr {
-        int line();
-
-        int column();
-    }
-
     private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
             CharValue, EmptyListValue, PairValue, BuiltinValue, ClosureValue, VoidValue,
             UninitializedValue {
-    }
-
-    private record IntExpr(long value, int line, int column) implements Expr {
-    }
-
-    private record BoolExpr(boolean value, int line, int column) implements Expr {
-    }
-
-    private record CharExpr(char value, int line, int column) implements Expr {
-    }
-
-    private record StringExpr(String value, int line, int column) implements Expr {
-    }
-
-    private record SymbolExpr(String name, int line, int column) implements Expr {
-    }
-
-    private record ListExpr(List<Expr> elements, int line, int column) implements Expr {
     }
 
     private record IntValue(long value) implements Value {
@@ -1010,231 +1308,6 @@ public class Evaluator {
                 return parent.lookupCell(name);
             }
             return null;
-        }
-    }
-
-    private static final class Parser {
-        private final String input;
-        private int index;
-        private int line = 1;
-        private int column = 1;
-
-        private Parser(String input) {
-            this.input = input;
-        }
-
-        private List<Expr> parseProgram() throws EvalError {
-            List<Expr> expressions = new ArrayList<>();
-            skipTrivia();
-            while (!isAtEnd()) {
-                expressions.add(parseExpression());
-                skipTrivia();
-            }
-            return expressions;
-        }
-
-        private Expr parseExpression() throws EvalError {
-            skipTrivia();
-            if (isAtEnd()) {
-                throw error("unexpected end of input");
-            }
-
-            int startLine = line;
-            int startColumn = column;
-            char current = currentChar();
-            if (current == '(') {
-                return parseList(startLine, startColumn);
-            }
-            if (current == '\'') {
-                advance();
-                Expr quoted = parseExpression();
-                return new ListExpr(
-                        List.of(new SymbolExpr("quote", startLine, startColumn), quoted),
-                        startLine,
-                        startColumn);
-            }
-            if (current == '"') {
-                return parseString(startLine, startColumn);
-            }
-            if (current == ')') {
-                throw error("unexpected ')'");
-            }
-            return parseAtom(startLine, startColumn);
-        }
-
-        private Expr parseList(int startLine, int startColumn) throws EvalError {
-            consume('(');
-            List<Expr> elements = new ArrayList<>();
-            skipTrivia();
-            while (!isAtEnd() && currentChar() != ')') {
-                elements.add(parseExpression());
-                skipTrivia();
-            }
-
-            if (isAtEnd()) {
-                throw error("unterminated list");
-            }
-
-            consume(')');
-            return new ListExpr(List.copyOf(elements), startLine, startColumn);
-        }
-
-        private Expr parseString(int startLine, int startColumn) throws EvalError {
-            consume('"');
-            StringBuilder builder = new StringBuilder();
-            while (!isAtEnd()) {
-                char current = advance();
-                if (current == '"') {
-                    return new StringExpr(builder.toString(), startLine, startColumn);
-                }
-                if (current == '\\') {
-                    if (isAtEnd()) {
-                        throw error("unterminated string escape");
-                    }
-                    builder.append(unescape(advance()));
-                    continue;
-                }
-                builder.append(current);
-            }
-            throw error("unterminated string literal");
-        }
-
-        private char unescape(char escaped) {
-            return switch (escaped) {
-                case 'n' -> '\n';
-                case 'r' -> '\r';
-                case 't' -> '\t';
-                case '"' -> '"';
-                case '\\' -> '\\';
-                default -> escaped;
-            };
-        }
-
-        private Expr parseAtom(int startLine, int startColumn) throws EvalError {
-            int start = index;
-            while (!isAtEnd() && !isDelimiter(currentChar())) {
-                advance();
-            }
-            String token = input.substring(start, index);
-            return parseAtomToken(token, startLine, startColumn);
-        }
-
-        private Expr parseAtomToken(String token, int startLine, int startColumn)
-                throws EvalError {
-            return switch (token) {
-                case "#t" -> new BoolExpr(true, startLine, startColumn);
-                case "#f" -> new BoolExpr(false, startLine, startColumn);
-                default -> parseCharNumberOrSymbol(token, startLine, startColumn);
-            };
-        }
-
-        private Expr parseCharNumberOrSymbol(String token, int startLine, int startColumn)
-                throws EvalError {
-            if (token.startsWith("#\\")) {
-                return parseCharToken(token, startLine, startColumn);
-            }
-            return parseNumberOrSymbol(token, startLine, startColumn);
-        }
-
-        private Expr parseCharToken(String token, int startLine, int startColumn)
-                throws EvalError {
-            String value = token.substring(2);
-            return switch (value) {
-                case "space" -> new CharExpr(' ', startLine, startColumn);
-                case "newline" -> new CharExpr('\n', startLine, startColumn);
-                default -> {
-                    if (value.length() == 1) {
-                        yield new CharExpr(value.charAt(0), startLine, startColumn);
-                    }
-                    throw new EvalError("invalid character literal", startLine, startColumn);
-                }
-            };
-        }
-
-        private Expr parseNumberOrSymbol(String token, int startLine, int startColumn) {
-            if (isIntegerToken(token)) {
-                return new IntExpr(Long.parseLong(token), startLine, startColumn);
-            }
-            return new SymbolExpr(token, startLine, startColumn);
-        }
-
-        private boolean isIntegerToken(String token) {
-            if (token.isEmpty()) {
-                return false;
-            }
-
-            int start = 0;
-            char first = token.charAt(0);
-            if (first == '+' || first == '-') {
-                if (token.length() == 1) {
-                    return false;
-                }
-                start = 1;
-            }
-
-            for (int i = start; i < token.length(); i++) {
-                if (!Character.isDigit(token.charAt(i))) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private void skipTrivia() {
-            while (!isAtEnd()) {
-                char current = currentChar();
-                if (Character.isWhitespace(current)) {
-                    advance();
-                    continue;
-                }
-                if (current == ';') {
-                    skipComment();
-                    continue;
-                }
-                return;
-            }
-        }
-
-        private void skipComment() {
-            while (!isAtEnd() && currentChar() != '\n') {
-                advance();
-            }
-        }
-
-        private boolean isDelimiter(char ch) {
-            return Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';'
-                    || ch == '\'';
-        }
-
-        private void consume(char expected) throws EvalError {
-            if (isAtEnd() || currentChar() != expected) {
-                throw error("expected '" + expected + "'");
-            }
-            advance();
-        }
-
-        private char currentChar() {
-            return input.charAt(index);
-        }
-
-        private boolean isAtEnd() {
-            return index >= input.length();
-        }
-
-        private char advance() {
-            char current = input.charAt(index);
-            index++;
-            if (current == '\n') {
-                line++;
-                column = 1;
-            } else {
-                column++;
-            }
-            return current;
-        }
-
-        private EvalError error(String message) {
-            return new EvalError(message, line, column);
         }
     }
 }
