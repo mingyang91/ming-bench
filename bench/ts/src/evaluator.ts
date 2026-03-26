@@ -122,18 +122,26 @@ interface ParsedParameters {
   restParam?: SymbolExpr;
 }
 
+interface ProcedureClause extends ParsedParameters {
+  body: Expr[];
+}
+
 interface BuiltinProcedure {
   kind: 'procedure';
   name: string;
   call(args: EvaluatedArg[], loc: SourceLoc): Value;
 }
 
-interface ClosureProcedure {
+interface ClosureProcedure extends ProcedureClause {
   kind: 'procedure';
   name?: string;
-  params: SymbolExpr[];
-  restParam?: SymbolExpr;
-  body: Expr[];
+  env: Environment;
+}
+
+interface CaseLambdaProcedure {
+  kind: 'procedure';
+  name?: string;
+  clauses: ProcedureClause[];
   env: Environment;
 }
 
@@ -152,7 +160,7 @@ type MacroBinding =
   | { kind: 'single'; expr: Expr }
   | { kind: 'repeated'; exprs: Expr[] };
 
-type ProcedureValue = BuiltinProcedure | ClosureProcedure;
+type ProcedureValue = BuiltinProcedure | ClosureProcedure | CaseLambdaProcedure;
 
 type Value =
   | NumberValue
@@ -961,6 +969,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
   env.define('list?', predicateBuiltin('list?', isProperList));
   env.define('symbol?', predicateBuiltin('symbol?', isSchemeSymbolValue));
   env.define('char?', predicateBuiltin('char?', isSchemeCharValue));
+  env.define('procedure?', predicateBuiltin('procedure?', isProcedure));
   env.define('char-alphabetic?', predicateBuiltin('char-alphabetic?', (value) => (
     isSchemeCharValue(value) && isAlphabeticChar(value.value)
   )));
@@ -1297,6 +1306,8 @@ function evaluateList(expr: ListExpr, env: Environment, runtime: Runtime): Value
         return evalQuote(args, head);
       case 'lambda':
         return evalLambda(args, head, env);
+      case 'case-lambda':
+        return evalCaseLambda(args, head, env);
       case 'and':
         return evalAnd(args, env, runtime);
       case 'or':
@@ -1534,6 +1545,18 @@ function evalLambda(args: Expr[], head: SymbolExpr, env: Environment): Value {
   };
 }
 
+function evalCaseLambda(args: Expr[], head: SymbolExpr, env: Environment): Value {
+  if (args.length === 0) {
+    throw new EvalError(`${head.line}:${head.col}: case-lambda expects at least 1 clause`);
+  }
+
+  return {
+    kind: 'procedure',
+    clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr, head)),
+    env,
+  };
+}
+
 function evalAnd(args: Expr[], env: Environment, runtime: Runtime): Value {
   let result: Value = true;
 
@@ -1658,31 +1681,30 @@ function applyProcedure(
     return operator.call(args, loc);
   }
 
-  if (operator.restParam === undefined && args.length !== operator.params.length) {
-    throw new EvalError(
-      `${loc.line}:${loc.col}: ${procedureDisplayName(operator)} expects exactly ${operator.params.length} arguments`,
-    );
+  if (isCaseLambdaProcedure(operator)) {
+    const clause = findMatchingCaseLambdaClause(operator, args.length);
+    if (clause === undefined) {
+      throw new EvalError(
+        `${loc.line}:${loc.col}: ${procedureDisplayName(operator)} has no matching clause for ${args.length} arguments`,
+      );
+    }
+
+    return applyProcedureClause(operator.env, clause, args, runtime);
   }
 
-  if (operator.restParam !== undefined && args.length < operator.params.length) {
+  if (!procedureClauseMatchesArity(operator, args.length)) {
+    if (operator.restParam === undefined) {
+      throw new EvalError(
+        `${loc.line}:${loc.col}: ${procedureDisplayName(operator)} expects exactly ${operator.params.length} arguments`,
+      );
+    }
+
     throw new EvalError(
       `${loc.line}:${loc.col}: ${procedureDisplayName(operator)} expects at least ${operator.params.length} arguments`,
     );
   }
 
-  const callEnv = new Environment(operator.env);
-  for (let index = 0; index < operator.params.length; index += 1) {
-    callEnv.define(symbolLookupName(operator.params[index]), args[index].value);
-  }
-
-  if (operator.restParam !== undefined) {
-    callEnv.define(
-      symbolLookupName(operator.restParam),
-      makeList(args.slice(operator.params.length).map((arg) => arg.value)),
-    );
-  }
-
-  return evaluateSequence(operator.body, callEnv, runtime);
+  return applyProcedureClause(operator.env, operator, args, runtime);
 }
 
 function quoteExpr(expr: Expr): Value {
@@ -1735,6 +1757,22 @@ function parseRecordFieldSpec(expr: Expr, head: SymbolExpr): RecordFieldSpec {
       expr.elements[1],
       'record accessor name must be a symbol',
     ),
+  };
+}
+
+function parseCaseLambdaClause(expr: Expr, head: SymbolExpr): ProcedureClause {
+  if (expr.type !== 'list' || expr.elements.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: case-lambda clauses must be non-empty lists`);
+  }
+
+  const [paramsExpr, ...body] = expr.elements;
+  if (paramsExpr.type !== 'list') {
+    throw new EvalError(`${paramsExpr.line}:${paramsExpr.col}: case-lambda parameters must be a list`);
+  }
+
+  return {
+    ...parseProcedureParameters(paramsExpr.elements),
+    body,
   };
 }
 
@@ -2170,6 +2208,47 @@ function hygienizeList(
     };
   }
 
+  if (headName === 'case-lambda' && expr.elements.length >= 2) {
+    const clauses: Expr[] = expr.elements.slice(1).map((clause): Expr => {
+      if (clause.type !== 'list' || clause.elements.length < 2 || clause.elements[0].type !== 'list') {
+        return hygienizeExpr(clause, scope, definitionEnv, runtime);
+      }
+
+      const bodyScope = new Map(scope);
+      const params = clause.elements[0].elements.map((param) => {
+        if (exprSymbolName(param) === '.') {
+          return plainSymbolExpr('.', param);
+        }
+
+        return hygienizeBindingIdentifier(param, bodyScope, runtime);
+      });
+
+      return {
+        type: 'list',
+        elements: [
+          {
+            type: 'list',
+            elements: params,
+            line: clause.elements[0].line,
+            col: clause.elements[0].col,
+          },
+          ...clause.elements.slice(1).map((element) => (
+            hygienizeExpr(element, bodyScope, definitionEnv, runtime)
+          )),
+        ],
+        line: clause.line,
+        col: clause.col,
+      };
+    });
+
+    return {
+      type: 'list',
+      elements: [plainSymbolExpr('case-lambda', expr.elements[0]), ...clauses],
+      line: expr.line,
+      col: expr.col,
+    };
+  }
+
   if (headName === 'let' && expr.elements.length >= 3) {
     if (expr.elements[1].type === 'list') {
       const bodyScope = new Map(scope);
@@ -2375,6 +2454,7 @@ function isSpecialFormName(name: string): boolean {
     'if',
     'quote',
     'lambda',
+    'case-lambda',
     'and',
     'or',
     'begin',
@@ -2602,6 +2682,10 @@ function isBuiltinProcedure(value: ProcedureValue): value is BuiltinProcedure {
   return 'call' in value;
 }
 
+function isCaseLambdaProcedure(value: ProcedureValue): value is CaseLambdaProcedure {
+  return 'clauses' in value;
+}
+
 function isPair(value: Value): value is PairValue {
   return typeof value === 'object' && value !== null && value.kind === 'pair';
 }
@@ -2626,8 +2710,46 @@ function isSchemeCharValue(value: Value): value is SchemeChar {
   return typeof value === 'object' && value !== null && value.kind === 'char';
 }
 
-function procedureDisplayName(proc: ClosureProcedure): string {
-  return proc.name ?? 'lambda';
+function procedureDisplayName(proc: ClosureProcedure | CaseLambdaProcedure): string {
+  if (proc.name !== undefined) {
+    return proc.name;
+  }
+
+  return isCaseLambdaProcedure(proc) ? 'case-lambda' : 'lambda';
+}
+
+function procedureClauseMatchesArity(clause: ParsedParameters, argCount: number): boolean {
+  return clause.restParam === undefined
+    ? argCount === clause.params.length
+    : argCount >= clause.params.length;
+}
+
+function findMatchingCaseLambdaClause(
+  proc: CaseLambdaProcedure,
+  argCount: number,
+): ProcedureClause | undefined {
+  return proc.clauses.find((clause) => procedureClauseMatchesArity(clause, argCount));
+}
+
+function applyProcedureClause(
+  env: Environment,
+  clause: ProcedureClause,
+  args: EvaluatedArg[],
+  runtime: Runtime,
+): Value {
+  const callEnv = new Environment(env);
+  for (let index = 0; index < clause.params.length; index += 1) {
+    callEnv.define(symbolLookupName(clause.params[index]), args[index].value);
+  }
+
+  if (clause.restParam !== undefined) {
+    callEnv.define(
+      symbolLookupName(clause.restParam),
+      makeList(args.slice(clause.params.length).map((arg) => arg.value)),
+    );
+  }
+
+  return evaluateSequence(clause.body, callEnv, runtime);
 }
 
 function makeString(value: string, mutable = true): SchemeString {
