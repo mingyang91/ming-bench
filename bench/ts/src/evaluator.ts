@@ -74,6 +74,18 @@ class Env {
   set(name: string, val: SchemeVal): void {
     this.bindings.set(name, val);
   }
+
+  setExisting(name: string, val: SchemeVal): void {
+    if (this.bindings.has(name)) {
+      this.bindings.set(name, val);
+      return;
+    }
+    if (this.parent) {
+      this.parent.setExisting(name, val);
+      return;
+    }
+    throw new EvalError(`set!: unbound variable: ${name}`);
+  }
 }
 
 // ── Tokenizer ──────────────────────────────────────────────────────────
@@ -269,6 +281,14 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
               result = evalExpr(elems[i], env);
             }
             return result;
+          }
+          case 'set!': {
+            if (elems.length !== 3) throw errAt('set!: bad syntax', expr.pos);
+            const target = elems[1];
+            if (target.tag !== 'symbol') throw errAt('set!: expected symbol', expr.pos);
+            const val = evalExpr(elems[2], env);
+            env.setExisting(target.value, val);
+            return SCM_FALSE;
           }
           case 'cond': {
             for (let i = 1; i < elems.length; i++) {
