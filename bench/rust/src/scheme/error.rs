@@ -31,6 +31,12 @@ pub enum EvalError {
     #[error("attempted to call a non-procedure")]
     NotAProcedure,
 
+    #[error("invalid {name} form: {message}")]
+    InvalidForm {
+        name: &'static str,
+        message: &'static str,
+    },
+
     #[error("{name} expected {expected}, got {got}")]
     WrongArgCount {
         name: &'static str,
