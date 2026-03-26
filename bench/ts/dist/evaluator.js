@@ -71,7 +71,7 @@ function createBuiltins(context) {
             'string?',
             builtin('string?', (args, pos) => {
                 expectArity('string?', args, 1, pos);
-                return typeof args[0] === 'string';
+                return isStringValue(args[0]);
             }),
         ],
         [
@@ -128,33 +128,33 @@ function createBuiltins(context) {
         ],
         [
             'string-append',
-            builtin('string-append', (args, pos) => args.map((arg) => expectString(arg, 'string-append', pos)).join('')),
+            builtin('string-append', (args, pos) => makeString(args.map((arg) => expectStringContent(arg, 'string-append', pos)).join(''))),
         ],
         [
             'string-length',
             builtin('string-length', (args, pos) => {
                 expectArity('string-length', args, 1, pos);
-                return stringToChars(expectString(args[0], 'string-length', pos)).length;
+                return expectStringValue(args[0], 'string-length', pos).chars.length;
             }),
         ],
         [
             'substring',
             builtin('substring', (args, pos) => {
                 expectArity('substring', args, 3, pos);
-                const chars = stringToChars(expectString(args[0], 'substring', pos));
+                const chars = expectStringValue(args[0], 'substring', pos).chars;
                 const start = expectIndex(args[1], 'substring', pos);
                 const end = expectIndex(args[2], 'substring', pos);
                 if (start > end || end > chars.length) {
                     throw new EvalError('substring index out of bounds', pos);
                 }
-                return chars.slice(start, end).join('');
+                return makeString(chars.slice(start, end));
             }),
         ],
         [
             'string->number',
             builtin('string->number', (args, pos) => {
                 expectArity('string->number', args, 1, pos);
-                const value = expectString(args[0], 'string->number', pos);
+                const value = expectStringContent(args[0], 'string->number', pos);
                 return /^[+-]?\d+$/.test(value) ? Number(value) : false;
             }),
         ],
@@ -162,33 +162,57 @@ function createBuiltins(context) {
             'number->string',
             builtin('number->string', (args, pos) => {
                 expectArity('number->string', args, 1, pos);
-                return String(normalizeNumber(expectNumber(args[0], 'number->string', pos)));
+                return makeString(String(normalizeNumber(expectNumber(args[0], 'number->string', pos))));
             }),
         ],
         [
             'symbol->string',
             builtin('symbol->string', (args, pos) => {
                 expectArity('symbol->string', args, 1, pos);
-                return expectSymbolValue(args[0], 'symbol->string', pos).name;
+                return makeString(expectSymbolValue(args[0], 'symbol->string', pos).name);
             }),
         ],
         [
             'string->symbol',
             builtin('string->symbol', (args, pos) => {
                 expectArity('string->symbol', args, 1, pos);
-                return { kind: 'symbol', name: expectString(args[0], 'string->symbol', pos) };
+                return {
+                    kind: 'symbol',
+                    name: expectStringContent(args[0], 'string->symbol', pos),
+                };
             }),
         ],
         [
             'string-ref',
             builtin('string-ref', (args, pos) => {
                 expectArity('string-ref', args, 2, pos);
-                const chars = stringToChars(expectString(args[0], 'string-ref', pos));
+                const chars = expectStringValue(args[0], 'string-ref', pos).chars;
                 const index = expectIndex(args[1], 'string-ref', pos);
                 if (index >= chars.length) {
                     throw new EvalError('string-ref index out of bounds', pos);
                 }
                 return { kind: 'char', value: chars[index] };
+            }),
+        ],
+        [
+            'string-copy',
+            builtin('string-copy', (args, pos) => {
+                expectArity('string-copy', args, 1, pos);
+                return makeString(expectStringValue(args[0], 'string-copy', pos).chars, true);
+            }),
+        ],
+        [
+            'string-set!',
+            builtin('string-set!', (args, pos) => {
+                expectArity('string-set!', args, 3, pos);
+                const target = expectMutableString(args[0], 'string-set!', pos);
+                const index = expectIndex(args[1], 'string-set!', pos);
+                const char = expectChar(args[2], 'string-set!', pos);
+                if (index >= target.chars.length) {
+                    throw new EvalError('string-set! index out of bounds', pos);
+                }
+                target.chars[index] = char.value;
+                return VOID;
             }),
         ],
         [
@@ -254,8 +278,11 @@ function evaluate(expression, env) {
         switch (expression.kind) {
             case 'number':
             case 'boolean':
-            case 'string':
                 return expression.value;
+            case 'string':
+                return makeString(expression.value);
+            case 'char':
+                return { kind: 'char', value: expression.value };
             case 'symbol':
                 return env.lookup(expression.name, expression.pos);
             case 'list':
@@ -460,8 +487,11 @@ function quoteExpr(expression) {
     switch (expression.kind) {
         case 'number':
         case 'boolean':
-        case 'string':
             return expression.value;
+        case 'string':
+            return makeString(expression.value);
+        case 'char':
+            return { kind: 'char', value: expression.value };
         case 'symbol':
             return { kind: 'symbol', name: expression.name };
         case 'list':
@@ -548,6 +578,9 @@ function tokenize(input) {
         else if (rawToken === '#f') {
             tokens.push({ kind: 'boolean', value: false, pos });
         }
+        else if (rawToken.startsWith('#\\')) {
+            tokens.push({ kind: 'char', value: parseCharLiteral(rawToken, pos), pos });
+        }
         else if (/^[+-]?\d+$/.test(rawToken)) {
             tokens.push({ kind: 'number', value: Number(rawToken), pos });
         }
@@ -615,6 +648,8 @@ class Parser {
                 return { kind: 'boolean', value: token.value, pos: token.pos };
             case 'string':
                 return { kind: 'string', value: token.value, pos: token.pos };
+            case 'char':
+                return { kind: 'char', value: token.value, pos: token.pos };
             case 'symbol':
                 return { kind: 'symbol', name: token.value, pos: token.pos };
             case 'quote':
@@ -677,6 +712,9 @@ function isClosure(value) {
 function isSymbolValue(value) {
     return typeof value === 'object' && value !== null && value.kind === 'symbol';
 }
+function isStringValue(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'string';
+}
 function isPair(value) {
     return typeof value === 'object' && value !== null && value.kind === 'pair';
 }
@@ -702,15 +740,31 @@ function expectNumber(value, name, pos) {
     }
     return value;
 }
-function expectString(value, name, pos) {
-    if (typeof value !== 'string') {
+function expectStringValue(value, name, pos) {
+    if (!isStringValue(value)) {
         throw new EvalError(`${name} expected a string`, pos);
     }
     return value;
 }
+function expectStringContent(value, name, pos) {
+    return expectStringValue(value, name, pos).chars.join('');
+}
+function expectMutableString(value, name, pos) {
+    const stringValue = expectStringValue(value, name, pos);
+    if (!stringValue.mutable) {
+        throw new EvalError(`${name} expected a mutable string`, pos);
+    }
+    return stringValue;
+}
 function expectPair(value, name, pos) {
     if (!isPair(value)) {
         throw new EvalError(`${name} expected a pair`, pos);
+    }
+    return value;
+}
+function expectChar(value, name, pos) {
+    if (!isChar(value)) {
+        throw new EvalError(`${name} expected a character`, pos);
     }
     return value;
 }
@@ -833,6 +887,26 @@ function isWhitespace(value) {
 function stringToChars(value) {
     return Array.from(value);
 }
+function makeString(value, mutable = true) {
+    return {
+        kind: 'string',
+        chars: typeof value === 'string' ? stringToChars(value) : [...value],
+        mutable,
+    };
+}
+function parseCharLiteral(rawToken, pos) {
+    const literal = rawToken.slice(2);
+    if (literal === 'space') {
+        return ' ';
+    }
+    if (literal === 'newline') {
+        return '\n';
+    }
+    if (stringToChars(literal).length === 1) {
+        return literal;
+    }
+    throw new EvalError('invalid character literal', pos);
+}
 function formatValue(value) {
     if (typeof value === 'number') {
         return String(normalizeNumber(value));
@@ -840,8 +914,8 @@ function formatValue(value) {
     if (typeof value === 'boolean') {
         return value ? '#t' : '#f';
     }
-    if (typeof value === 'string') {
-        return JSON.stringify(value);
+    if (isStringValue(value)) {
+        return JSON.stringify(value.chars.join(''));
     }
     if (isChar(value)) {
         return formatCharLiteral(value.value);
@@ -867,8 +941,8 @@ function formatValue(value) {
     throw new EvalError('cannot format value');
 }
 function formatDisplayValue(value) {
-    if (typeof value === 'string') {
-        return value;
+    if (isStringValue(value)) {
+        return value.chars.join('');
     }
     if (isChar(value)) {
         return value.value;
