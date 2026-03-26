@@ -1,6 +1,6 @@
 package ming
 
-import SchemeTypes.{asNum, display, displayStr, errAt, isTruthy, valuesEqual, Env, Pos, Value}
+import SchemeTypes.{display, displayStr, errAt, isNumeric, isTruthy, valuesEqual, Env, Pos, Value}
 
 object Builtins:
 
@@ -11,17 +11,19 @@ object Builtins:
     env: Env
   ): Value = name match
     case "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" =>
-      applyArithmetic(name, args, pos)
+      ArithmeticBuiltins.applyArithmetic(name, args, pos)
     case "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" =>
-      applyNumericUtils(name, args, pos)
+      ArithmeticBuiltins.applyNumericUtils(name, args, pos)
     case "zero?" | "positive?" | "negative?" | "odd?" | "even?" =>
-      applyNumericPredicates(name, args, pos)
+      ArithmeticBuiltins.applyNumericPredicates(name, args, pos)
     case "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append" =>
       applyListOps(name, args, pos)
     case "list-ref" | "list-tail" | "list?" | "assoc" | "map" | "equal?" | "eq?" =>
       applyListUtils(name, args, pos, env)
-    case "number?" | "string?" | "boolean?" | "pair?" | "symbol?" | "char?" =>
+    case "number?" | "string?" | "boolean?" | "pair?" | "symbol?" | "char?" | "integer?" | "rational?" =>
       applyTypeCheck(name, args, pos)
+    case "exact?" | "inexact?" | "exact->inexact" | "inexact->exact" | "numerator" | "denominator" =>
+      ArithmeticBuiltins.applyExactOps(name, args, pos)
     case "display" | "write" | "newline" =>
       applyIO(name, args, pos, env)
     case "apply" =>
@@ -34,41 +36,6 @@ object Builtins:
     case "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
       StringCharBuiltins.applyStringCompare(name, args, pos)
     case _ => throw errAt(pos, s"unknown builtin: $name")
-
-  private def applyArithmetic(
-    name: String,
-    args: List[Value],
-    pos: Pos
-  ): Value = name match
-    case "+" => Value.VNum(args.map(v => asNum(v, pos)).sum)
-    case "*" => Value.VNum(args.map(v => asNum(v, pos)).product)
-    case "-" =>
-      if args.isEmpty then throw errAt(pos, "- requires at least 1 argument")
-      else if args.length == 1 then Value.VNum(-asNum(args.head, pos))
-      else Value.VNum(args.map(v => asNum(v, pos)).reduceLeft(_ - _))
-    case "/" =>
-      if args.isEmpty then throw errAt(pos, "/ requires at least 1 argument")
-      else if args.length == 1 then Value.VNum(1 / asNum(args.head, pos))
-      else
-        val nums = args.map(v => asNum(v, pos))
-        if nums.tail.contains(0L) then throw errAt(pos, "division by zero")
-        Value.VNum(nums.reduceLeft(_ / _))
-    case "<" =>
-      val nums = args.map(v => asNum(v, pos))
-      Value.VBool(nums.zip(nums.tail).forall((a, b) => a < b))
-    case ">" =>
-      val nums = args.map(v => asNum(v, pos))
-      Value.VBool(nums.zip(nums.tail).forall((a, b) => a > b))
-    case "=" =>
-      val nums = args.map(v => asNum(v, pos))
-      Value.VBool(nums.zip(nums.tail).forall((a, b) => a == b))
-    case "<=" =>
-      val nums = args.map(v => asNum(v, pos))
-      Value.VBool(nums.zip(nums.tail).forall((a, b) => a <= b))
-    case ">=" =>
-      val nums = args.map(v => asNum(v, pos))
-      Value.VBool(nums.zip(nums.tail).forall((a, b) => a >= b))
-    case _ => throw errAt(pos, s"unknown arithmetic op: $name")
 
   private def applyListOps(
     name: String,
@@ -127,8 +94,15 @@ object Builtins:
     if args.length != 1 then throw errAt(pos, s"$name requires 1 argument")
     val arg = args.head
     val result = (name, arg) match
-      case ("number?", _: Value.VNum)      => true
-      case ("number?", _)                  => false
+      case ("number?", v)                      => isNumeric(v)
+      case ("integer?", Value.VNum(_))         => true
+      case ("integer?", Value.VRational(_, _)) => false
+      case ("integer?", Value.VFloat(d))       => d == d.toLong.toDouble && !d.isInfinite
+      case ("integer?", _)                     => false
+      case ("rational?", v) =>
+        v match
+          case _: Value.VNum | _: Value.VRational => true
+          case _                                  => false
       case ("string?", _: Value.VStr)      => true
       case ("string?", _)                  => false
       case ("boolean?", _: Value.VBool)    => true
@@ -162,56 +136,6 @@ object Builtins:
       env.output.append("\n")
       Value.VVoid
     case _ => throw errAt(pos, s"unknown IO op: $name")
-
-  private def applyNumericUtils(
-    name: String,
-    args: List[Value],
-    pos: Pos
-  ): Value = name match
-    case "abs" =>
-      if args.length != 1 then throw errAt(pos, "abs requires 1 argument")
-      Value.VNum(math.abs(asNum(args.head, pos)))
-    case "modulo" =>
-      if args.length != 2 then throw errAt(pos, "modulo requires 2 arguments")
-      val a = asNum(args(0), pos)
-      val b = asNum(args(1), pos)
-      Value.VNum(java.lang.Math.floorMod(a, b))
-    case "remainder" =>
-      if args.length != 2 then throw errAt(pos, "remainder requires 2 arguments")
-      Value.VNum(asNum(args(0), pos) % asNum(args(1), pos))
-    case "quotient" =>
-      if args.length != 2 then throw errAt(pos, "quotient requires 2 arguments")
-      val a = asNum(args(0), pos)
-      val b = asNum(args(1), pos)
-      Value.VNum((a.toDouble / b.toDouble).toLong)
-    case "min" =>
-      if args.isEmpty then throw errAt(pos, "min requires at least 1 argument")
-      Value.VNum(args.map(v => asNum(v, pos)).min)
-    case "max" =>
-      if args.isEmpty then throw errAt(pos, "max requires at least 1 argument")
-      Value.VNum(args.map(v => asNum(v, pos)).max)
-    case "expt" =>
-      if args.length != 2 then throw errAt(pos, "expt requires 2 arguments")
-      val base = asNum(args(0), pos)
-      val exp  = asNum(args(1), pos)
-      Value.VNum(math.pow(base.toDouble, exp.toDouble).toLong)
-    case _ => throw errAt(pos, s"unknown numeric op: $name")
-
-  private def applyNumericPredicates(
-    name: String,
-    args: List[Value],
-    pos: Pos
-  ): Value =
-    if args.length != 1 then throw errAt(pos, s"$name requires 1 argument")
-    val n = asNum(args.head, pos)
-    val result = name match
-      case "zero?"     => n == 0
-      case "positive?" => n > 0
-      case "negative?" => n < 0
-      case "odd?"      => n % 2 != 0
-      case "even?"     => n % 2 == 0
-      case _           => throw errAt(pos, s"unknown predicate: $name")
-    Value.VBool(result)
 
   private def applyListUtils(
     name: String,

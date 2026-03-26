@@ -7,6 +7,8 @@ object Evaluator:
   // ── Position helpers ────────────────────────────────────────────────
   private def posOf(expr: Expr): Pos = expr match
     case Expr.Num(_, p)    => p
+    case Expr.Flt(_, p)    => p
+    case Expr.Rat(_, _, p) => p
     case Expr.Bool(_, p)   => p
     case Expr.Str(_, p)    => p
     case Expr.Chr(_, p)    => p
@@ -25,6 +27,8 @@ object Evaluator:
   // ── Eval ─────────────────────────────────────────────────────────────
   private def eval(expr: Expr, env: Env): Value = expr match
     case Expr.Num(n, _)       => Value.VNum(n)
+    case Expr.Flt(d, _)       => Value.VFloat(d)
+    case Expr.Rat(n, d, _)    => Value.VRational(n, d)
     case Expr.Bool(b, _)      => Value.VBool(b)
     case Expr.Str(s, _)       => Value.VStr(s.toCharArray)
     case Expr.Chr(c, _)       => Value.VChar(c)
@@ -95,6 +99,8 @@ object Evaluator:
 
   private def quoteToValue(expr: Expr): Value = expr match
     case Expr.Num(n, _)       => Value.VNum(n)
+    case Expr.Flt(d, _)       => Value.VFloat(d)
+    case Expr.Rat(n, d, _)    => Value.VRational(n, d)
     case Expr.Bool(b, _)      => Value.VBool(b)
     case Expr.Str(s, _)       => Value.VStr(s.toCharArray)
     case Expr.Chr(c, _)       => Value.VChar(c)

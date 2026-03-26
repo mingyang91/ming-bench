@@ -5,6 +5,8 @@ object SchemeTypes:
   // ── Values ───────────────────────────────────────────────────────────
   enum Value:
     case VNum(n: Long)
+    case VFloat(d: Double)
+    case VRational(num: Long, den: Long)
     case VBool(b: Boolean)
     case VStr(chars: Array[Char])
     case VChar(c: Char)
@@ -30,11 +32,13 @@ object SchemeTypes:
   type Pos = ming.Pos
 
   def display(v: Value): String = v match
-    case Value.VNum(n)      => n.toString
-    case Value.VBool(true)  => "#t"
-    case Value.VBool(false) => "#f"
-    case Value.VStr(chars)  => s"\"${new String(chars)}\""
-    case Value.VChar(c)     => displayChar(c)
+    case Value.VNum(n)         => n.toString
+    case Value.VFloat(d)       => displayFloat(d)
+    case Value.VRational(n, d) => s"$n/$d"
+    case Value.VBool(true)     => "#t"
+    case Value.VBool(false)    => "#f"
+    case Value.VStr(chars)     => s"\"${new String(chars)}\""
+    case Value.VChar(c)        => displayChar(c)
     case Value.VList(elems) =>
       "(" + elems.map(display).mkString(" ") + ")"
     case Value.VDottedList(elems, last) =>
@@ -44,6 +48,10 @@ object SchemeTypes:
     case Value.VLambda(_, _, _, _) => "#<procedure>"
     case Value.VMacro(_, _, _)     => "#<macro>"
     case Value.VVoid               => ""
+
+  private def displayFloat(d: Double): String =
+    if d == d.toLong.toDouble && !d.isInfinite then s"${d.toLong}.0"
+    else d.toString
 
   private def displayChar(c: Char): String = c match
     case ' '  => "#\\space"
@@ -101,15 +109,52 @@ object SchemeTypes:
     case _                  => true
 
   def asNum(v: Value, pos: Pos): Long = v match
-    case Value.VNum(n) => n
-    case _             => throw errAt(pos, "expected number")
+    case Value.VNum(n)         => n
+    case Value.VRational(n, d) => n / d
+    case Value.VFloat(d)       => d.toLong
+    case _                     => throw errAt(pos, "expected number")
+
+  def toDouble(v: Value, pos: Pos): Double = v match
+    case Value.VNum(n)         => n.toDouble
+    case Value.VFloat(d)       => d
+    case Value.VRational(n, d) => n.toDouble / d.toDouble
+    case _                     => throw errAt(pos, "expected number")
+
+  def isNumeric(v: Value): Boolean = v match
+    case _: Value.VNum | _: Value.VFloat | _: Value.VRational => true
+    case _                                                    => false
+
+  def gcd(a: Long, b: Long): Long =
+    if b == 0 then math.abs(a) else gcd(b, a % b)
+
+  def makeRational(n: Long, d: Long): Value =
+    if d == 0 then throw EvalError("division by zero")
+    val g    = gcd(math.abs(n), math.abs(d))
+    val sign = if d < 0 then -1L else 1L
+    val rn   = sign * n / g
+    val rd   = sign * d / g
+    if rd == 1L then Value.VNum(rn) else Value.VRational(rn, rd)
+
+  def numericEqual(a: Value, b: Value, pos: Pos): Boolean =
+    (a, b) match
+      case (Value.VNum(x), Value.VNum(y))                     => x == y
+      case (Value.VFloat(x), Value.VFloat(y))                 => x == y
+      case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
+      case _                                                  => toDouble(a, pos) == toDouble(b, pos)
+
+  def numericCompare(a: Value, b: Value, pos: Pos): Int =
+    (a, b) match
+      case (Value.VNum(x), Value.VNum(y)) => x.compareTo(y)
+      case _                              => toDouble(a, pos).compareTo(toDouble(b, pos))
 
   def valuesEqual(a: Value, b: Value): Boolean = (a, b) match
-    case (Value.VNum(x), Value.VNum(y))       => x == y
-    case (Value.VBool(x), Value.VBool(y))     => x == y
-    case (Value.VStr(x), Value.VStr(y))       => java.util.Arrays.equals(x, y)
-    case (Value.VChar(x), Value.VChar(y))     => x == y
-    case (Value.VSymbol(x), Value.VSymbol(y)) => x == y
+    case (Value.VNum(x), Value.VNum(y))                     => x == y
+    case (Value.VFloat(x), Value.VFloat(y))                 => x == y
+    case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
+    case (Value.VBool(x), Value.VBool(y))                   => x == y
+    case (Value.VStr(x), Value.VStr(y))                     => java.util.Arrays.equals(x, y)
+    case (Value.VChar(x), Value.VChar(y))                   => x == y
+    case (Value.VSymbol(x), Value.VSymbol(y))               => x == y
     case (Value.VList(xs), Value.VList(ys)) =>
       xs.length == ys.length && xs
         .zip(ys)
@@ -188,5 +233,13 @@ object SchemeTypes:
     "string<?",
     "string-ci=?",
     "string-upcase",
-    "string-downcase"
+    "string-downcase",
+    "exact?",
+    "inexact?",
+    "exact->inexact",
+    "inexact->exact",
+    "numerator",
+    "denominator",
+    "rational?",
+    "integer?"
   )

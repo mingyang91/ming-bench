@@ -5,6 +5,8 @@ private[ming] case class Pos(line: Int, col: Int):
 
 private[ming] enum Expr:
   case Num(value: Long, pos: Pos = Pos(0, 0))
+  case Flt(value: Double, pos: Pos = Pos(0, 0))
+  case Rat(num: Long, den: Long, pos: Pos = Pos(0, 0))
   case Bool(value: Boolean, pos: Pos = Pos(0, 0))
   case Str(value: String, pos: Pos = Pos(0, 0))
   case Chr(value: Char, pos: Pos = Pos(0, 0))
@@ -92,7 +94,32 @@ private[ming] object Parser:
     else
       token.toLongOption match
         case Some(n) => Expr.Num(n, pos)
-        case None    => Expr.Symbol(token, pos)
+        case None =>
+          tryParseRationalOrFloat(token, pos)
+
+  private def tryParseRationalOrFloat(token: String, pos: Pos): Expr =
+    val slashIdx = token.indexOf('/')
+    if slashIdx > 0 && slashIdx < token.length - 1 then tryParseRational(token, slashIdx, pos)
+    else
+      token.toDoubleOption match
+        case Some(d) if token.contains('.') => Expr.Flt(d, pos)
+        case _                              => Expr.Symbol(token, pos)
+
+  private def tryParseRational(token: String, slashIdx: Int, pos: Pos): Expr =
+    val numPart = token.substring(0, slashIdx)
+    val denPart = token.substring(slashIdx + 1)
+    (numPart.toLongOption, denPart.toLongOption) match
+      case (Some(n), Some(d)) if d != 0 =>
+        val g    = gcd(math.abs(n), math.abs(d))
+        val sign = if d < 0 then -1L else 1L
+        val rn   = sign * n / g
+        val rd   = sign * d / g
+        if rd == 1L then Expr.Num(rn, pos)
+        else Expr.Rat(rn, rd, pos)
+      case _ => Expr.Symbol(token, pos)
+
+  private def gcd(a: Long, b: Long): Long =
+    if b == 0 then a else gcd(b, a % b)
 
   private def parseCharLiteral(name: String, pos: Pos): Expr =
     val c = name match
