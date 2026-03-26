@@ -54,11 +54,11 @@ object ProcApply:
         applyFunction(inThunk, Nil, DynWindAfterInK(inThunk, bodyThunk, outThunk, k))
 
       case cont: SchemeContinuation =>
-        if args.size != 1 then throw new EvalError("continuation: expected 1 argument")
+        if args.isEmpty then throw new EvalError("continuation: expected at least 1 argument")
         cont.savedK match
           case targetK: Kont =>
             val targetWind = cont.savedWind
-            val v          = args.head
+            val v          = if args.size == 1 then args.head else SchemeValues(args)
             val common     = EvalHelpers.commonWindTail(Evaluator.windStack, targetWind)
             val toUnwind   = Evaluator.windStack.take(Evaluator.windStack.length - common.length)
             val toRewind   = targetWind.take(targetWind.length - common.length).reverse
