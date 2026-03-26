@@ -59,6 +59,7 @@ public class Evaluator {
         globalEnv.define("call/cc", new BuiltinProcedure("call/cc"));
         globalEnv.define("call-with-current-continuation", new BuiltinProcedure("call/cc"));
         globalEnv.define("raise", new BuiltinProcedure("raise"));
+        globalEnv.define("error", new BuiltinProcedure("error"));
         globalEnv.define("with-exception-handler", new BuiltinProcedure("with-exception-handler"));
         globalEnv.define("values", new BuiltinProcedure("values"));
         globalEnv.define("call-with-values", new BuiltinProcedure("call-with-values"));
@@ -286,7 +287,32 @@ public class Evaluator {
     }
 
     // Convert a parsed Java List to a Scheme list (SchemePair chain ending in NIL)
+    // Handles dotted-pair syntax: (a b . c) becomes (a . (b . c))
     private Object javaListToSchemeList(List<?> javaList) {
+        // Check for dotted pair: if second-to-last element is "."
+        int dotIdx = -1;
+        for (int i = 0; i < javaList.size(); i++) {
+            Object elem = unwrap(javaList.get(i));
+            if (elem instanceof SchemeSymbol s && s.name().equals(".")) {
+                dotIdx = i;
+                break;
+            }
+        }
+        if (dotIdx >= 0 && dotIdx == javaList.size() - 2) {
+            // Dotted pair: elements before dot form proper list, last element is cdr
+            Object tail = unwrap(javaList.get(dotIdx + 1));
+            if (tail instanceof List<?> subList) {
+                tail = javaListToSchemeList(subList);
+            }
+            for (int i = dotIdx - 1; i >= 0; i--) {
+                Object elem = unwrap(javaList.get(i));
+                if (elem instanceof List<?> subList) {
+                    elem = javaListToSchemeList(subList);
+                }
+                tail = new SchemePair(elem, tail);
+            }
+            return tail;
+        }
         Object result = SchemeNil.INSTANCE;
         for (int i = javaList.size() - 1; i >= 0; i--) {
             Object elem = unwrap(javaList.get(i));
@@ -296,6 +322,102 @@ public class Evaluator {
             result = new SchemePair(elem, result);
         }
         return result;
+    }
+
+    // Expand quasiquote template: evaluate unquote/unquote-splicing, quote everything else
+    @SuppressWarnings("unchecked")
+    private Object expandQuasiquote(Object template, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
+        template = unwrap(template);
+        if (template instanceof List<?> rawList) {
+            List<Object> list = (List<Object>) rawList;
+            if (list.isEmpty()) return SchemeNil.INSTANCE;
+            Object first = unwrap(list.get(0));
+            if (first instanceof SchemeSymbol s) {
+                if (s.name().equals("unquote") && list.size() == 2) {
+                    return eval(list.get(1), env);
+                }
+                if (s.name().equals("unquote-splicing")) {
+                    throw new EvalError("unquote-splicing: not in list context");
+                }
+            }
+            // Check for dotted pair syntax: (a b . c)
+            int dotIdx = -1;
+            for (int i = 0; i < list.size(); i++) {
+                Object elem = unwrap(list.get(i));
+                if (elem instanceof SchemeSymbol ds && ds.name().equals(".")) {
+                    dotIdx = i;
+                    break;
+                }
+            }
+            if (dotIdx >= 0 && dotIdx == list.size() - 2) {
+                // Dotted quasiquote: process elements before dot, then tail
+                Object tail = expandQuasiquote(unwrap(list.get(dotIdx + 1)), env);
+                for (int i = dotIdx - 1; i >= 0; i--) {
+                    Object elem = unwrap(list.get(i));
+                    if (elem instanceof List<?> el) {
+                        List<Object> elList = (List<Object>) el;
+                        Object elFirst = elList.isEmpty() ? null : unwrap(elList.get(0));
+                        if (elFirst instanceof SchemeSymbol us && us.name().equals("unquote-splicing") && elList.size() == 2) {
+                            Object spliced = eval(elList.get(1), env);
+                            // Append spliced list to tail
+                            List<Object> splicedElems = new ArrayList<>();
+                            Object cur = spliced;
+                            while (cur instanceof SchemePair p) { splicedElems.add(p.car); cur = p.cdr; }
+                            for (int j = splicedElems.size() - 1; j >= 0; j--) {
+                                tail = new SchemePair(splicedElems.get(j), tail);
+                            }
+                            continue;
+                        }
+                    }
+                    tail = new SchemePair(expandQuasiquote(list.get(i), env), tail);
+                }
+                return tail;
+            }
+            // Regular list: process each element, handling splicing
+            Object result = SchemeNil.INSTANCE;
+            // Build in reverse
+            List<Object> expanded = new ArrayList<>();
+            for (int i = 0; i < list.size(); i++) {
+                Object elem = unwrap(list.get(i));
+                if (elem instanceof List<?> el) {
+                    List<Object> elList = (List<Object>) el;
+                    Object elFirst = elList.isEmpty() ? null : unwrap(elList.get(0));
+                    if (elFirst instanceof SchemeSymbol us && us.name().equals("unquote-splicing") && elList.size() == 2) {
+                        Object spliced = eval(elList.get(1), env);
+                        Object cur = spliced;
+                        while (cur instanceof SchemePair p) { expanded.add(p.car); cur = p.cdr; }
+                        continue;
+                    }
+                }
+                expanded.add(expandQuasiquote(list.get(i), env));
+            }
+            for (int i = expanded.size() - 1; i >= 0; i--) {
+                result = new SchemePair(expanded.get(i), result);
+            }
+            return result;
+        }
+        // Non-list: just quote it (atoms stay as-is)
+        if (template instanceof SchemeSymbol || template instanceof Long || template instanceof Double
+                || template instanceof Boolean || template instanceof SchemeChar
+                || template instanceof SchemeString || template instanceof SchemeNil
+                || template instanceof String || template instanceof SchemeRational) {
+            if (template instanceof List<?> ql) {
+                return javaListToSchemeList(ql);
+            }
+            return template;
+        }
+        // SchemePair in quasiquote context (shouldn't normally happen from parser, but handle it)
+        if (template instanceof SchemePair p) {
+            Object car = unwrap(p.car);
+            if (car instanceof SchemeSymbol s && s.name().equals("unquote")) {
+                return eval(p.cdr instanceof SchemePair cdrP ? cdrP.car : p.cdr, env);
+            }
+            // Check car for unquote-splicing
+            Object expandedCar = expandQuasiquote(p.car, env);
+            Object expandedCdr = expandQuasiquote(p.cdr, env);
+            return new SchemePair(expandedCar, expandedCdr);
+        }
+        return template;
     }
 
     // eval() is the public trampoline entry point
@@ -352,6 +474,10 @@ public class Evaluator {
                             return javaListToSchemeList(ql);
                         }
                         return quoted;
+                    }
+                    case "quasiquote" -> {
+                        if (args.size() != 1) throw new EvalError("quasiquote: expected 1 argument");
+                        return expandQuasiquote(unwrap(args.get(0)), env);
                     }
                     case "if" -> {
                         if (args.size() < 2 || args.size() > 3)
@@ -810,6 +936,14 @@ public class Evaluator {
             Object testVal = eval(test, env);
             if (!testVal.equals(Boolean.FALSE)) {
                 if (cl.size() == 1) return testVal;
+                // Handle (cond (test => proc)) syntax
+                if (cl.size() == 3) {
+                    Object arrow = unwrap(cl.get(1));
+                    if (arrow instanceof SchemeSymbol sa && sa.name().equals("=>")) {
+                        Object proc = eval(cl.get(2), env);
+                        return apply(proc, List.of(testVal));
+                    }
+                }
                 for (int i = 1; i < cl.size() - 1; i++) {
                     eval(cl.get(i), env);
                 }
@@ -1139,6 +1273,15 @@ public class Evaluator {
                 if (args.size() != 1) throw new EvalError("raise: expected 1 argument");
                 throw new SchemeRaiseException(args.get(0));
             }
+            case "error" -> {
+                if (args.isEmpty()) throw new EvalError("error: expected at least 1 argument");
+                StringBuilder sb = new StringBuilder();
+                sb.append(schemeToString(args.get(0)));
+                for (int i = 1; i < args.size(); i++) {
+                    sb.append(" ").append(schemeToString(args.get(i)));
+                }
+                throw new EvalError(sb.toString());
+            }
             case "with-exception-handler" -> {
                 if (args.size() != 2) throw new EvalError("with-exception-handler: expected 2 arguments");
                 yield evalWithExceptionHandler(args.get(0), args.get(1));
@@ -1223,40 +1366,11 @@ public class Evaluator {
                 if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) yield ca.value() == cb.value();
                 yield a == b || a.equals(b);
             }
-            case "eqv?" -> schemeEqv(args.get(0), args.get(1));
-            case "equal?" -> schemeEqual(args.get(0), args.get(1));
-            case "vector" -> new SchemeVector(args.toArray());
-            case "make-vector" -> {
-                int size = (int) requireLong(args.get(0));
-                Object fill = args.size() > 1 ? args.get(1) : 0L;
-                yield new SchemeVector(size, fill);
-            }
-            case "vector-ref" -> {
-                if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-ref: not a vector");
-                yield v.ref((int) requireLong(args.get(1)));
-            }
-            case "vector-set!" -> {
-                if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-set!: not a vector");
-                v.set((int) requireLong(args.get(1)), args.get(2));
-                yield VOID;
-            }
-            case "vector-length" -> {
-                if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector-length: not a vector");
-                yield (long) v.length();
-            }
-            case "vector?" -> args.get(0) instanceof SchemeVector;
-            case "vector->list" -> {
-                if (!(args.get(0) instanceof SchemeVector v)) throw new EvalError("vector->list: not a vector");
-                Object result = SchemeNil.INSTANCE;
-                for (int i = v.length() - 1; i >= 0; i--) result = new SchemePair(v.elements[i], result);
-                yield result;
-            }
-            case "list->vector" -> {
-                List<Object> elems = new ArrayList<>();
-                Object cur = args.get(0);
-                while (cur instanceof SchemePair p) { elems.add(p.car); cur = p.cdr; }
-                yield new SchemeVector(elems.toArray());
-            }
+            case "eqv?" -> SchemeEquality.schemeEqv(args.get(0), args.get(1));
+            case "equal?" -> SchemeEquality.schemeEqual(args.get(0), args.get(1));
+            case "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
+                 "vector?", "vector->list", "list->vector" ->
+                VectorBuiltins.apply(name, args);
             default -> {
                 if (name.startsWith("record-ctor:")) {
                     String recType = name.substring("record-ctor:".length());
@@ -1354,43 +1468,11 @@ public class Evaluator {
     }
 
     static boolean schemeEqv(Object a, Object b) {
-        if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
-        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
-        if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
-        if (ArithmeticOps.isNumber(a) && ArithmeticOps.isNumber(b)) {
-            try { return ArithmeticOps.toDouble(a) == ArithmeticOps.toDouble(b); } catch (EvalError e) { return false; }
-        }
-        return a == b;
+        return SchemeEquality.schemeEqv(a, b);
     }
 
     static boolean schemeEqual(Object a, Object b) {
-        return schemeEqualRec(a, b, 0);
-    }
-
-    static boolean schemeEqualRec(Object a, Object b, int depth) {
-        if (a == b) return true;
-        if (depth > 100000) return false; // prevent infinite recursion on cycles
-        if (a instanceof SchemePair pa && b instanceof SchemePair pb) {
-            return schemeEqualRec(pa.car, pb.car, depth + 1) && schemeEqualRec(pa.cdr, pb.cdr, depth + 1);
-        }
-        if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
-            if (va.length() != vb.length()) return false;
-            for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqualRec(va.elements[i], vb.elements[i], depth + 1)) return false;
-            }
-            return true;
-        }
-        if (a instanceof SchemeNil && b instanceof SchemeNil) return true;
-        if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
-        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
-        if (ArithmeticOps.isNumber(a) && ArithmeticOps.isNumber(b)) {
-            try { return ArithmeticOps.toDouble(a) == ArithmeticOps.toDouble(b); } catch (EvalError e) { return false; }
-        }
-        if ((a instanceof String || a instanceof SchemeString) && (b instanceof String || b instanceof SchemeString)) {
-            try { return requireString(a).equals(requireString(b)); } catch (EvalError e) { return false; }
-        }
-        if (a == null || b == null) return a == b;
-        return a.equals(b);
+        return SchemeEquality.schemeEqual(a, b);
     }
 
     private void requireArgCount(String name, List<?> args, int expected) throws EvalError {

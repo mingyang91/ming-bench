@@ -52,6 +52,20 @@ class SchemeReader {
                 tokens.add(new Token("'", line, col));
                 i++;
                 col++;
+            } else if (c == '`') {
+                tokens.add(new Token("`", line, col));
+                i++;
+                col++;
+            } else if (c == ',') {
+                if (i + 1 < len && input.charAt(i + 1) == '@') {
+                    tokens.add(new Token(",@", line, col));
+                    i += 2;
+                    col += 2;
+                } else {
+                    tokens.add(new Token(",", line, col));
+                    i++;
+                    col++;
+                }
             } else if (c == '(') {
                 tokens.add(new Token("(", line, col));
                 i++;
@@ -182,6 +196,30 @@ class SchemeReader {
             quoteExpr.add(new SchemeSymbol("quote"));
             quoteExpr.add(quoted);
             return new Located(quoteExpr, token.line(), token.col());
+        }
+
+        if (token.value().equals("`")) {
+            Object body = parse(tokens, pos);
+            List<Object> expr = new ArrayList<>();
+            expr.add(new SchemeSymbol("quasiquote"));
+            expr.add(body);
+            return new Located(expr, token.line(), token.col());
+        }
+
+        if (token.value().equals(",")) {
+            Object body = parse(tokens, pos);
+            List<Object> expr = new ArrayList<>();
+            expr.add(new SchemeSymbol("unquote"));
+            expr.add(body);
+            return new Located(expr, token.line(), token.col());
+        }
+
+        if (token.value().equals(",@")) {
+            Object body = parse(tokens, pos);
+            List<Object> expr = new ArrayList<>();
+            expr.add(new SchemeSymbol("unquote-splicing"));
+            expr.add(body);
+            return new Located(expr, token.line(), token.col());
         }
 
         if (token.value().equals("#'")) {
