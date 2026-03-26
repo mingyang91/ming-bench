@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
 
 type Output = Rc<RefCell<String>>;
+type RcExprs = Rc<Vec<Expr>>;
 
 static NEXT_CONT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_WIND_ID: AtomicU64 = AtomicU64::new(1);
@@ -22,18 +23,18 @@ struct WindEntry {
 #[derive(Clone)]
 struct ContinuationData {
     callcc_span: (usize, usize), // (line, col) of the call/cc expression
-    remaining_exprs: Vec<Expr>,
+    remaining_exprs: RcExprs,
     env: Env,
     out: Output,
     wind_stack: Vec<WindEntry>,
-    top_level_context: Option<(Vec<Expr>, usize, Env, Output)>,
+    top_level_context: Option<(RcExprs, usize, Env, Output)>,
 }
 
 thread_local! {
     static CONTINUATION_REGISTRY: RefCell<HashMap<u64, ContinuationData>> = RefCell::new(HashMap::new());
     static CALLCC_RESUME: RefCell<Option<((usize, usize), Value)>> = RefCell::new(None);
-    static TOP_LEVEL_CONTEXT: RefCell<Option<(Vec<Expr>, usize, Env, Output)>> = RefCell::new(None);
-    static BODY_CONTEXT: RefCell<Option<(Vec<Expr>, usize, Env, Output)>> = RefCell::new(None);
+    static TOP_LEVEL_CONTEXT: RefCell<Option<(RcExprs, usize, Env, Output)>> = RefCell::new(None);
+    static BODY_CONTEXT: RefCell<Option<(RcExprs, usize, Env, Output)>> = RefCell::new(None);
     static CONT_RETURN_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
     static RAISED_VALUE: RefCell<Option<Value>> = RefCell::new(None);
@@ -54,7 +55,7 @@ enum Value {
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
-        body: Vec<Expr>,
+        body: RcExprs,
         env: Env,
     },
     Builtin(String),
@@ -69,8 +70,9 @@ enum Value {
     RecordConstructor { type_id: u64, n_fields: usize },
     RecordPredicate { type_id: u64 },
     RecordAccessor { type_id: u64, index: usize },
-    CaseLambda { clauses: Vec<(Vec<String>, Option<String>, Vec<Expr>, Env)> },
+    CaseLambda { clauses: Vec<(Vec<String>, Option<String>, RcExprs, Env)> },
     Continuation(u64),
+    Values(Vec<Value>),
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -234,6 +236,10 @@ impl Value {
             Value::Macro { .. } => "#<macro>".into(),
             Value::Record { .. } => "#<record>".into(),
             Value::RecordConstructor { .. } | Value::RecordPredicate { .. } | Value::RecordAccessor { .. } => "#<procedure>".into(),
+            Value::Values(vals) => {
+                let parts: Vec<String> = vals.iter().map(|v| v.fmt_val(write_mode, seen)).collect();
+                parts.join("\n")
+            }
         }
     }
 
@@ -344,6 +350,9 @@ fn global_env() -> Env {
     // exceptions
     env_set(&env, "raise".to_string(), Value::Builtin("raise".to_string()));
     env_set(&env, "with-exception-handler".to_string(), Value::Builtin("with-exception-handler".to_string()));
+    // values
+    env_set(&env, "values".to_string(), Value::Builtin("values".to_string()));
+    env_set(&env, "call-with-values".to_string(), Value::Builtin("call-with-values".to_string()));
     env
 }
 
@@ -777,11 +786,10 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             }
                             let local = new_env(Some(cur_env.clone()));
                             if let Some(loop_name) = name {
-                                let body_vec = body.to_vec();
                                 let lambda = Value::Lambda {
                                     params: param_names.clone(),
                                     rest_param: None,
-                                    body: body_vec,
+                                    body: Rc::new(body.to_vec()),
                                     env: local.clone(),
                                 };
                                 env_set(&local, loop_name, lambda);
@@ -794,7 +802,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                             }
                             {
                                 let old_body_ctx = BODY_CONTEXT.with(|c| c.borrow().clone());
-                                let body_vec: Vec<Expr> = body.to_vec();
+                                let body_vec: RcExprs = Rc::new(body.to_vec());
                                 for (bi, e) in body[..body.len() - 1].iter().enumerate() {
                                     BODY_CONTEXT.with(|c| {
                                         *c.borrow_mut() = Some((body_vec.clone(), bi, local.clone(), out.clone()));
@@ -1043,7 +1051,7 @@ fn eval_callcc(proc: Value, span: Span, out: &Output) -> Result<Value, EvalError
     if let Some((exprs, idx, env, out_ref)) = ctx {
         let data = ContinuationData {
             callcc_span: callcc_key,
-            remaining_exprs: exprs[idx..].to_vec(),
+            remaining_exprs: Rc::new(exprs[idx..].to_vec()),
             env,
             out: out_ref,
             wind_stack,
@@ -1169,7 +1177,7 @@ fn eval_define(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Val
                 _ => return Err(err_at(span, "define: expected symbol")),
             };
             let (params, rest_param) = parse_params(&sig[1..], span, "define")?;
-            let body = args[1..].to_vec();
+            let body: RcExprs = Rc::new(args[1..].to_vec());
             let lambda = Value::Lambda { params, rest_param, body, env: env.clone() };
             env_set(env, name, lambda);
             Ok(Value::Void)
@@ -1243,7 +1251,7 @@ fn eval_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalError>
         }
         _ => return Err(err_at(span, "lambda: expected parameter list")),
     };
-    let body = args[1..].to_vec();
+    let body: RcExprs = Rc::new(args[1..].to_vec());
     Ok(Value::Lambda { params, rest_param, body, env: env.clone() })
 }
 
@@ -1260,7 +1268,7 @@ fn eval_case_lambda(args: &[Expr], env: &Env, span: Span) -> Result<Value, EvalE
                     ExprKind::Symbol(s) => (Vec::new(), Some(s.clone())),
                     _ => return Err(err_at(span, "case-lambda: expected parameter list")),
                 };
-                let body = items[1..].to_vec();
+                let body: RcExprs = Rc::new(items[1..].to_vec());
                 clauses.push((params, rest_param, body, env.clone()));
             }
             _ => return Err(err_at(span, "case-lambda: expected clause")),
@@ -1852,7 +1860,7 @@ fn apply_func(func: &Value, args: &[Value], span: Span, out: &Output) -> Result<
                 env_set(&local, rp.clone(), rest);
             }
             let mut result = Value::Void;
-            let body_vec: Vec<Expr> = body.clone();
+            let body_vec: RcExprs = body.clone();
             let _old_body_ctx = BODY_CONTEXT.with(|c| c.borrow().clone());
             for (bi, expr) in body.iter().enumerate() {
                 BODY_CONTEXT.with(|c| {
@@ -1883,7 +1891,7 @@ fn apply_func(func: &Value, args: &[Value], span: Span, out: &Output) -> Result<
                         env_set(&local, rp.clone(), rest);
                     }
                     let mut result = Value::Void;
-                    let body_vec: Vec<Expr> = body.clone();
+                    let body_vec: RcExprs = body.clone();
                     let old_body_ctx = BODY_CONTEXT.with(|c| c.borrow().clone());
                     for (bi, expr) in body.iter().enumerate() {
                         BODY_CONTEXT.with(|c| {
@@ -2010,6 +2018,24 @@ fn apply_builtin(name: &str, args: &[Value], span: Span, out: &Output) -> Result
             let result = apply_func(&thunk, &[], span, out);
             EXCEPTION_HANDLERS.with(|eh| eh.borrow_mut().pop());
             return result;
+        }
+        "values" => {
+            if args.len() == 1 {
+                return Ok(args[0].clone());
+            }
+            return Ok(Value::Values(args.to_vec()));
+        }
+        "call-with-values" => {
+            if args.len() != 2 {
+                return Err(err_at(span, "call-with-values: expected 2 arguments"));
+            }
+            let producer = &args[0];
+            let consumer = &args[1];
+            let produced = apply_func(producer, &[], span, out)?;
+            match produced {
+                Value::Values(vals) => return apply_func(consumer, &vals, span, out),
+                single => return apply_func(consumer, &[single], span, out),
+            }
         }
         "dynamic-wind" => {
             if args.len() != 3 {
@@ -3222,7 +3248,7 @@ fn builtin_cmp(args: &[Value], cmp: fn(f64, f64) -> bool, span: Span) -> Result<
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 fn eval_top_level(exprs: &[Expr], env: &Env, out: &Output) -> Result<Value, EvalError> {
-    let mut cur_exprs = exprs.to_vec();
+    let mut cur_exprs: RcExprs = Rc::new(exprs.to_vec());
     let mut cur_env = env.clone();
     let mut cur_out = out.clone();
 
@@ -3272,7 +3298,7 @@ fn eval_top_level(exprs: &[Expr], env: &Env, out: &Output) -> Result<Value, Eval
                                 *cr.borrow_mut() = Some((data.callcc_span, val));
                             });
                             let mut body_last = Value::Void;
-                            for bexpr in &data.remaining_exprs {
+                            for bexpr in data.remaining_exprs.iter() {
                                 body_last = eval(bexpr, &data.env, &data.out)?;
                             }
 
@@ -3286,7 +3312,7 @@ fn eval_top_level(exprs: &[Expr], env: &Env, out: &Output) -> Result<Value, Eval
                             // Continue with top-level context if available
                             if let Some((tl_exprs, tl_idx, tl_env, tl_out)) = &data.top_level_context {
                                 if tl_idx + 1 < tl_exprs.len() {
-                                    cur_exprs = tl_exprs[tl_idx + 1..].to_vec();
+                                    cur_exprs = Rc::new(tl_exprs[tl_idx + 1..].to_vec());
                                     cur_env = tl_env.clone();
                                     cur_out = tl_out.clone();
                                     jumped = true;
