@@ -101,6 +101,12 @@ public class Evaluator {
             if (parent != null) return parent.lookup(name);
             throw new EvalError("unbound variable: " + name);
         }
+
+        void set(String name, Object value) throws EvalError {
+            if (bindings.containsKey(name)) { bindings.put(name, value); return; }
+            if (parent != null) { parent.set(name, value); return; }
+            throw new EvalError("set!: unbound variable: " + name);
+        }
     }
 
     // ---- Procedure types ----
@@ -371,6 +377,18 @@ public class Evaluator {
                             result2 = eval(list.get(i), letEnv);
                         }
                         return result2;
+                    }
+                    case "set!" -> {
+                        if (list.size() != 3) throw posError("set!: bad syntax");
+                        Object varName = unwrap(list.get(1));
+                        if (!(varName instanceof String name)) throw posError("set!: expected symbol");
+                        Object val = eval(list.get(2), env);
+                        try {
+                            env.set(name, val);
+                        } catch (EvalError e) {
+                            throw posError("set!: unbound variable: " + name);
+                        }
+                        return null;
                     }
                     case "cond" -> {
                         for (int i = 1; i < list.size(); i++) {
