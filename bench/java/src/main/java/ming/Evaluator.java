@@ -2,7 +2,6 @@ package ming;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -242,6 +241,9 @@ public class Evaluator {
 
     final List<WindFrame> windStack = new ArrayList<>();
 
+    // ---- Exception handling ----
+    final List<Object> exceptionHandlers = new ArrayList<>();
+
     // ---- Continuation / trampoline types ----
     static final class SchemeCont {
         final Cont k;
@@ -290,7 +292,9 @@ public class Evaluator {
     }
 
     private long gensymCounter = 0;
-    private String gensym(String base) { return base + "__g" + (gensymCounter++); }
+    String gensym(String base) { return base + "__g" + (gensymCounter++); }
+
+    private final MacroExpander macroExpander = new MacroExpander(this);
 
     // ---- Token ----
     private static final class Token {
@@ -597,7 +601,7 @@ public class Evaluator {
                     case "define-syntax": {
                         if (list.size() != 3) throw posError("define-syntax: bad syntax");
                         String name = (String) unwrap(list.get(1));
-                        SyntaxRules transformer = evalSyntaxRules(list.get(2), env);
+                        SyntaxRules transformer = macroExpander.evalSyntaxRules(list.get(2), env);
                         env.define(name, transformer);
                         return new BounceApplyK(k, null);
                     }
@@ -626,12 +630,70 @@ public class Evaluator {
                                     });
                                 })));
                     }
+                    case "raise": {
+                        // raise can be locally shadowed (it's a procedure, not true syntax)
+                        boolean raiseLocal = false;
+                        try { env.lookup("raise"); raiseLocal = true; } catch (EvalError ignored) {}
+                        if (raiseLocal) break;
+                        if (list.size() != 2) throw posError("raise: expected 1 argument");
+                        return new BounceStep(list.get(1), env, raisedVal -> {
+                            if (exceptionHandlers.isEmpty()) {
+                                throw new EvalError("unhandled exception: " + schemeToString(raisedVal));
+                            }
+                            Object handler = exceptionHandlers.remove(exceptionHandlers.size() - 1);
+                            return applyProc(handler, List.of(raisedVal), retVal -> {
+                                throw new EvalError("raise: exception handler returned");
+                            });
+                        });
+                    }
+                    case "with-exception-handler": {
+                        // can be locally shadowed
+                        boolean wehLocal = false;
+                        try { env.lookup("with-exception-handler"); wehLocal = true; } catch (EvalError ignored) {}
+                        if (wehLocal) break;
+                        if (list.size() != 3) throw posError("with-exception-handler: expected 2 arguments");
+                        Env wehEnv = env;
+                        return new BounceStep(list.get(1), env, handlerProc ->
+                            new BounceStep(list.get(2), wehEnv, thunk -> {
+                                exceptionHandlers.add(handlerProc);
+                                return applyProc(thunk, List.of(), bodyVal -> {
+                                    exceptionHandlers.remove(exceptionHandlers.size() - 1);
+                                    return new BounceApplyK(k, bodyVal);
+                                });
+                            })
+                        );
+                    }
+                    case "guard": {
+                        // (guard (var clause ...) body ...)
+                        List<?> spec = (List<?>) unwrap(list.get(1));
+                        String guardVar = (String) unwrap(spec.get(0));
+                        List<Object> guardClauses = new ArrayList<>();
+                        for (int i = 1; i < spec.size(); i++) guardClauses.add(spec.get(i));
+                        List<Object> guardBody = new ArrayList<>();
+                        for (int i = 2; i < list.size(); i++) guardBody.add(list.get(i));
+                        Env guardEnv = env;
+                        Cont guardK = k;
+
+                        // Create escape continuation that tests clauses after wind transition
+                        Cont clauseTestK = exnVal -> {
+                            Env clauseEnv = new Env(guardEnv);
+                            clauseEnv.define(guardVar, exnVal);
+                            return evalGuardClauses(guardClauses, exnVal, clauseEnv, guardK);
+                        };
+                        SchemeCont guardHandler = new SchemeCont(clauseTestK, new ArrayList<>(windStack));
+
+                        exceptionHandlers.add(guardHandler);
+                        return evalBody(guardBody, env, bodyVal -> {
+                            exceptionHandlers.remove(exceptionHandlers.size() - 1);
+                            return new BounceApplyK(guardK, bodyVal);
+                        });
+                    }
                 }
                 // Check for macros
                 try {
                     Object maybeMacro = env.lookup(op);
                     if (maybeMacro instanceof SyntaxRules sr) {
-                        return new BounceStep(expandMacro(sr, (List<Object>) list), env, k);
+                        return new BounceStep(macroExpander.expandMacro(sr, (List<Object>) list), env, k);
                     }
                 } catch (EvalError ignored) {}
             }
@@ -640,7 +702,7 @@ public class Evaluator {
             if (rawHead instanceof ResolvedRef ref) {
                 Object resolved = ref.env.lookup(ref.name);
                 if (resolved instanceof SyntaxRules sr) {
-                    return new BounceStep(expandMacro(sr, (List<Object>) list), env, k);
+                    return new BounceStep(macroExpander.expandMacro(sr, (List<Object>) list), env, k);
                 }
                 return evalArgsAndApply(resolved, list, 1, env, k);
             }
@@ -669,6 +731,41 @@ public class Evaluator {
             if (nextIdx == exprs.size() - 1) return new BounceStep(exprs.get(nextIdx), env, k);
             return new BounceStep(exprs.get(nextIdx), env, makeSeqCont(exprs, nextIdx + 1, env, k));
         };
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalGuardClauses(List<Object> clauses, Object exnVal, Env env, Cont k) throws EvalError {
+        return evalGuardClause(clauses, 0, exnVal, env, k);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalGuardClause(List<Object> clauses, int idx, Object exnVal, Env env, Cont k) throws EvalError {
+        if (idx >= clauses.size()) {
+            // No clause matched - re-raise
+            if (exceptionHandlers.isEmpty()) {
+                throw new EvalError("unhandled exception: " + schemeToString(exnVal));
+            }
+            Object handler = exceptionHandlers.remove(exceptionHandlers.size() - 1);
+            return applyProc(handler, List.of(exnVal), retVal -> {
+                throw new EvalError("raise: exception handler returned");
+            });
+        }
+        List<?> clause = (List<?>) unwrap(clauses.get(idx));
+        Object testExpr = unwrap(clause.get(0));
+        if ("else".equals(testExpr)) {
+            List<Object> body = new ArrayList<>();
+            for (int i = 1; i < clause.size(); i++) body.add(clause.get(i));
+            return evalBody(body, env, k);
+        }
+        return new BounceStep(clause.get(0), env, testVal -> {
+            if (!isFalse(testVal)) {
+                if (clause.size() == 1) return new BounceApplyK(k, testVal);
+                List<Object> body = new ArrayList<>();
+                for (int i = 1; i < clause.size(); i++) body.add(clause.get(i));
+                return evalBody(body, env, k);
+            }
+            return evalGuardClause(clauses, idx + 1, exnVal, env, k);
+        });
     }
 
     private Object evalAnd(List<?> form, int idx, Env env, Cont k) throws EvalError {
@@ -1267,148 +1364,4 @@ public class Evaluator {
         return val.toString();
     }
 
-    // ---- Macro support ----
-
-    private static boolean isKeyword(String sym) {
-        return switch (sym) {
-            case "if", "define", "lambda", "quote", "set!", "begin", "cond",
-                 "let", "let*", "and", "or", "define-syntax", "syntax-rules",
-                 "define-record-type", "case-lambda",
-                 "letrec", "letrec*", "case", "do", "dynamic-wind" -> true;
-            default -> false;
-        };
-    }
-
-    @SuppressWarnings("unchecked")
-    private SyntaxRules evalSyntaxRules(Object expr, Env env) throws EvalError {
-        List<?> form = (List<?>) unwrap(expr);
-        if (form.isEmpty() || !"syntax-rules".equals(unwrap(form.get(0))))
-            throw posError("expected syntax-rules");
-        List<?> literalsRaw = (List<?>) unwrap(form.get(1));
-        List<String> literals = new ArrayList<>();
-        for (Object lit : literalsRaw) literals.add((String) unwrap(lit));
-        List<Object[]> rules = new ArrayList<>();
-        for (int i = 2; i < form.size(); i++) {
-            List<?> rule = (List<?>) unwrap(form.get(i));
-            rules.add(new Object[]{rule.get(0), rule.get(1)});
-        }
-        return new SyntaxRules(literals, rules, env);
-    }
-
-    @SuppressWarnings("unchecked")
-    private Object expandMacro(SyntaxRules sr, List<?> form) throws EvalError {
-        Set<String> literalSet = new HashSet<>(sr.literals);
-        for (Object[] rule : sr.rules) {
-            List<?> pattern = (List<?>) unwrap(rule[0]);
-            Object template = rule[1];
-            Set<String> ellipsisVars = new HashSet<>();
-            Map<String, Object> bindings = matchPattern(pattern, form, literalSet, ellipsisVars);
-            if (bindings != null) {
-                Set<String> patternVars = new HashSet<>(bindings.keySet());
-                Map<String, String> gensymMap = new HashMap<>();
-                return expandTemplate(template, bindings, patternVars, ellipsisVars, sr, gensymMap);
-            }
-        }
-        throw posError("no matching syntax-rules pattern");
-    }
-
-    private Map<String, Object> matchPattern(List<?> pattern, List<?> form,
-                                              Set<String> literals, Set<String> ellipsisVars) {
-        Map<String, Object> bindings = new HashMap<>();
-        int pi = 1, fi = 1;
-        int patLen = pattern.size(), formLen = form.size();
-        while (pi < patLen) {
-            Object rawPat = unwrap(pattern.get(pi));
-            boolean hasEllipsis = (pi + 1 < patLen && "...".equals(unwrap(pattern.get(pi + 1))));
-            if (hasEllipsis) {
-                if (!(rawPat instanceof String varName)) return null;
-                int remaining = 0;
-                for (int k = pi + 2; k < patLen; k++) {
-                    if (!"...".equals(unwrap(pattern.get(k)))) remaining++;
-                }
-                int endFi = formLen - remaining;
-                List<Object> matched = new ArrayList<>();
-                while (fi < endFi) { matched.add(form.get(fi)); fi++; }
-                ellipsisVars.add(varName);
-                bindings.put(varName, matched);
-                pi += 2;
-            } else if (rawPat instanceof String sym) {
-                if (literals.contains(sym)) {
-                    if (fi >= formLen) return null;
-                    if (!sym.equals(unwrap(form.get(fi)))) return null;
-                    fi++;
-                } else {
-                    if (fi >= formLen) return null;
-                    bindings.put(sym, form.get(fi));
-                    fi++;
-                }
-                pi++;
-            } else {
-                if (fi >= formLen) return null;
-                fi++; pi++;
-            }
-        }
-        return (fi == formLen) ? bindings : null;
-    }
-
-    @SuppressWarnings("unchecked")
-    private Object expandTemplate(Object template, Map<String, Object> bindings,
-                                   Set<String> patternVars, Set<String> ellipsisVars,
-                                   SyntaxRules sr, Map<String, String> gensymMap) throws EvalError {
-        Object raw = unwrap(template);
-        if (raw instanceof String sym) {
-            if (patternVars.contains(sym) && !ellipsisVars.contains(sym)) return bindings.get(sym);
-            if (ellipsisVars.contains(sym)) return bindings.get(sym);
-            if (isKeyword(sym) || sym.equals("...")) return sym;
-            try {
-                sr.defEnv.lookup(sym);
-                return new ResolvedRef(sym, sr.defEnv);
-            } catch (EvalError e) {
-                return gensymMap.computeIfAbsent(sym, k -> gensym(k));
-            }
-        }
-        if (raw instanceof Boolean || raw instanceof Long ||
-            raw instanceof SchemeString || raw instanceof SchemeChar) return raw;
-        if (raw instanceof List<?> tmplList) {
-            List<Object> result = new ArrayList<>();
-            for (int i = 0; i < tmplList.size(); i++) {
-                boolean hasEllipsis = (i + 1 < tmplList.size() && "...".equals(unwrap(tmplList.get(i + 1))));
-                if (hasEllipsis) {
-                    Set<String> usedEllipsis = findEllipsisVarsInTemplate(tmplList.get(i), ellipsisVars);
-                    if (!usedEllipsis.isEmpty()) {
-                        String anyVar = usedEllipsis.iterator().next();
-                        List<Object> varList = (List<Object>) bindings.get(anyVar);
-                        for (int j = 0; j < varList.size(); j++) {
-                            Map<String, Object> iterBindings = new HashMap<>(bindings);
-                            for (String ev : usedEllipsis) {
-                                List<Object> evList = (List<Object>) bindings.get(ev);
-                                iterBindings.put(ev, evList.get(j));
-                            }
-                            Set<String> adjustedEllipsis = new HashSet<>(ellipsisVars);
-                            adjustedEllipsis.removeAll(usedEllipsis);
-                            result.add(expandTemplate(tmplList.get(i), iterBindings, patternVars,
-                                                       adjustedEllipsis, sr, gensymMap));
-                        }
-                    }
-                    i++;
-                } else {
-                    result.add(expandTemplate(tmplList.get(i), bindings, patternVars,
-                                               ellipsisVars, sr, gensymMap));
-                }
-            }
-            return new Located(result, 0, 0);
-        }
-        return raw;
-    }
-
-    private Set<String> findEllipsisVarsInTemplate(Object template, Set<String> ellipsisVars) {
-        Object raw = unwrap(template);
-        Set<String> found = new HashSet<>();
-        if (raw instanceof String sym && ellipsisVars.contains(sym)) {
-            found.add(sym);
-        } else if (raw instanceof List<?> list) {
-            for (Object elem : list) found.addAll(findEllipsisVarsInTemplate(elem, ellipsisVars));
-        }
-        return found;
-    }
 }
