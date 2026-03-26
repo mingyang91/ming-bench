@@ -54,21 +54,25 @@ public class Evaluator {
         for (String name : BUILTIN_NAMES) {
             globalEnv.define(name, new BuiltinProcedure(name));
         }
+        globalEnv.define("call/cc", new BuiltinProcedure("call/cc"));
+        globalEnv.define("call-with-current-continuation", new BuiltinProcedure("call/cc"));
     }
 
     private final SchemeReader reader = new SchemeReader();
 
+    // Top-level expression list and current index, used for continuation capture
+    private List<Object> topLevelExprs;
+    private int topLevelIndex;
+
     public String evalStr(String input) throws EvalError {
         var tokens = reader.tokenize(input);
         int[] pos = {0};
-        Object lastResult = null;
+        List<Object> exprs = new ArrayList<>();
         while (pos[0] < tokens.size()) {
-            Object expr = reader.parse(tokens, pos);
-            lastResult = eval(expr, globalEnv);
+            exprs.add(reader.parse(tokens, pos));
         }
-        if (lastResult == null) {
-            throw new EvalError("no expression");
-        }
+        if (exprs.isEmpty()) throw new EvalError("no expression");
+        Object lastResult = evalTopLevel(exprs, globalEnv);
         return schemeToString(lastResult);
     }
 
@@ -77,19 +81,94 @@ public class Evaluator {
         try {
             var tokens = reader.tokenize(input);
             int[] pos = {0};
-            Object lastResult = null;
+            List<Object> exprs = new ArrayList<>();
             while (pos[0] < tokens.size()) {
-                Object expr = reader.parse(tokens, pos);
-                lastResult = eval(expr, globalEnv);
+                exprs.add(reader.parse(tokens, pos));
             }
-            if (lastResult == null) {
-                throw new EvalError("no expression");
-            }
+            if (exprs.isEmpty()) throw new EvalError("no expression");
+            Object lastResult = evalTopLevel(exprs, globalEnv);
             return new EvalResult(schemeToString(lastResult), outputBuffer.toString());
         } finally {
             outputBuffer = null;
         }
     }
+
+    // Pending continuation re-entry
+    private ContinuationException pendingContinuation = null;
+
+    private Object evalTopLevel(List<Object> exprs, Environment env) throws EvalError {
+        topLevelExprs = exprs;
+        Object lastResult = null;
+        topLevelIndex = 0;
+        while (true) {
+            try {
+                // Check if there's a pending continuation to replay
+                if (pendingContinuation != null) {
+                    ContinuationException ce = pendingContinuation;
+                    pendingContinuation = null;
+                    SchemeContinuation cont = continuationRegistry.get(ce.continuationId);
+                    if (cont == null) throw new EvalError("invalid continuation");
+                    activeContinuationValue = ce.value;
+                    activeContinuationId = ce.continuationId;
+                    // Determine replay strategy:
+                    // If continuation was thrown from within the same top-level expr
+                    // that captured it (same index), use body-level replay.
+                    // Otherwise, use top-level replay (re-eval the capturing expr).
+                    boolean sameExpr = (throwTopLevelIndex == cont.captureTopLevelIndex)
+                        && cont.bodyExprs != null;
+                    if (sameExpr) {
+                        // Body-level replay (reentrant continuation)
+                        List<Object> replayBody = cont.bodyExprs.subList(cont.bodyIndex, cont.bodyExprs.size());
+                        currentBodyExprs = new ArrayList<>(replayBody);
+                        currentBodyEnv = cont.bodyEnv;
+                        Object bodyResult = null;
+                        for (int bi = 0; bi < replayBody.size(); bi++) {
+                            currentBodyIndex = bi;
+                            bodyResult = eval(replayBody.get(bi), cont.bodyEnv);
+                        }
+                        exprs = cont.remainingTopLevel;
+                        topLevelExprs = exprs;
+                        topLevelIndex = 0;
+                        lastResult = bodyResult;
+                    } else {
+                        // Top-level replay (saved continuation invoked from outside)
+                        List<Object> replay = new ArrayList<>();
+                        if (cont.topLevelExpr != null) {
+                            replay.add(cont.topLevelExpr);
+                        }
+                        replay.addAll(cont.remainingTopLevel);
+                        exprs = replay;
+                        topLevelExprs = exprs;
+                        topLevelIndex = 0;
+                        lastResult = null;
+                    }
+                }
+                // Normal evaluation loop
+                while (topLevelIndex < exprs.size()) {
+                    int idx = topLevelIndex;
+                    lastResult = eval(exprs.get(idx), env);
+                    topLevelIndex = idx + 1;
+                }
+                return lastResult;
+            } catch (ContinuationException ce) {
+                throwTopLevelIndex = topLevelIndex;
+                pendingContinuation = ce;
+            }
+        }
+    }
+
+    private int throwTopLevelIndex = -1;
+
+    // Registry of all continuations by ID
+    private final Map<Long, SchemeContinuation> continuationRegistry = new HashMap<>();
+    // When replaying a continuation, these are set so call/cc knows to return the value
+    private Long activeContinuationId = null;
+    private Object activeContinuationValue = null;
+
+    // Current body context tracking (for continuation capture)
+    private List<Object> currentBodyExprs = null;
+    private int currentBodyIndex = 0;
+    private Environment currentBodyEnv = null;
 
     // --- Evaluator ---
 
@@ -108,7 +187,7 @@ public class Evaluator {
     }
 
     // Resolve a TailCall chain (trampoline)
-    private Object trampoline(Object result) throws EvalError {
+    private Object trampoline(Object result) throws EvalError, ContinuationException {
         while (result instanceof TailCall tc) {
             result = evalStep(tc.expr, tc.env);
         }
@@ -116,7 +195,7 @@ public class Evaluator {
     }
 
     // Apply that fully resolves (for non-tail contexts like map, builtin apply)
-    private Object applyResolved(Object proc, List<Object> args) throws EvalError {
+    private Object applyResolved(Object proc, List<Object> args) throws EvalError, ContinuationException {
         return trampoline(apply(proc, args));
     }
 
@@ -135,13 +214,13 @@ public class Evaluator {
 
     // eval() is the public trampoline entry point
     @SuppressWarnings("unchecked")
-    private Object eval(Object expr, Environment env) throws EvalError {
+    private Object eval(Object expr, Environment env) throws EvalError, ContinuationException {
         return trampoline(evalStep(expr, env));
     }
 
     // evalStep does one step of evaluation; returns TailCall for tail positions
     @SuppressWarnings("unchecked")
-    private Object evalStep(Object expr, Environment env) throws EvalError {
+    private Object evalStep(Object expr, Environment env) throws EvalError, ContinuationException {
         // Unwrap Located and add position to any errors
         if (expr instanceof SchemeReader.Located loc) {
             try {
@@ -227,13 +306,27 @@ public class Evaluator {
                         return new SchemeCaseLambda(clauses);
                     }
                     case "begin" -> {
-                        for (int i = 0; i < args.size() - 1; i++) {
-                            eval(args.get(i), env);
+                        // Save and set body context for continuation capture
+                        List<Object> prevBody = currentBodyExprs;
+                        int prevIdx = currentBodyIndex;
+                        Environment prevEnv = currentBodyEnv;
+                        currentBodyExprs = args;
+                        currentBodyEnv = env;
+                        try {
+                            for (int i = 0; i < args.size() - 1; i++) {
+                                currentBodyIndex = i;
+                                eval(args.get(i), env);
+                            }
+                            if (!args.isEmpty()) {
+                                currentBodyIndex = args.size() - 1;
+                                return new TailCall(args.get(args.size() - 1), env);
+                            }
+                            return VOID;
+                        } finally {
+                            currentBodyExprs = prevBody;
+                            currentBodyIndex = prevIdx;
+                            currentBodyEnv = prevEnv;
                         }
-                        if (!args.isEmpty()) {
-                            return new TailCall(args.get(args.size() - 1), env);
-                        }
-                        return VOID;
                     }
                     case "let" -> {
                         return evalLet(args, env);
@@ -310,6 +403,9 @@ public class Evaluator {
                     case "define-record-type" -> {
                         return evalDefineRecordType(args, env);
                     }
+                    case "call/cc", "call-with-current-continuation" -> {
+                        return evalCallCC(args, env);
+                    }
                     case "define-syntax" -> {
                         if (args.size() != 2) throw new EvalError("define-syntax: bad syntax");
                         String macroName = ((SchemeSymbol) unwrap(args.get(0))).name();
@@ -357,7 +453,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalLet(List<Object> args, Environment env) throws EvalError {
+    private Object evalLet(List<Object> args, Environment env) throws EvalError, ContinuationException {
         if (args.size() < 2) throw new EvalError("let: bad syntax");
         Object first2 = unwrap(args.get(0));
         if (first2 instanceof SchemeSymbol loopName) {
@@ -385,18 +481,32 @@ public class Evaluator {
             Object val = eval(b.get(1), env);
             letEnv.define(varName, val);
         }
-        // Eval all but last body expression, return TailCall for last
-        for (int i = 1; i < args.size() - 1; i++) {
-            eval(args.get(i), letEnv);
+        // Track body context for continuation capture
+        List<Object> bodyExprs = args.subList(1, args.size());
+        List<Object> prevBody = currentBodyExprs;
+        int prevIdx = currentBodyIndex;
+        Environment prevEnv = currentBodyEnv;
+        currentBodyExprs = bodyExprs;
+        currentBodyEnv = letEnv;
+        try {
+            for (int i = 0; i < bodyExprs.size() - 1; i++) {
+                currentBodyIndex = i;
+                eval(bodyExprs.get(i), letEnv);
+            }
+            if (!bodyExprs.isEmpty()) {
+                currentBodyIndex = bodyExprs.size() - 1;
+                return new TailCall(bodyExprs.get(bodyExprs.size() - 1), letEnv);
+            }
+            return VOID;
+        } finally {
+            currentBodyExprs = prevBody;
+            currentBodyIndex = prevIdx;
+            currentBodyEnv = prevEnv;
         }
-        if (args.size() > 1) {
-            return new TailCall(args.get(args.size() - 1), letEnv);
-        }
-        return VOID;
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalLetStar(List<Object> args, Environment env) throws EvalError {
+    private Object evalLetStar(List<Object> args, Environment env) throws EvalError, ContinuationException {
         if (args.size() < 2) throw new EvalError("let*: bad syntax");
         List<?> bindings = (List<?>) unwrap(args.get(0));
         Environment letEnv = new Environment(env);
@@ -416,7 +526,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalLetrec(List<Object> args, Environment env) throws EvalError {
+    private Object evalLetrec(List<Object> args, Environment env) throws EvalError, ContinuationException {
         if (args.size() < 2) throw new EvalError("letrec: bad syntax");
         List<?> bindings = (List<?>) unwrap(args.get(0));
         Environment letEnv = new Environment(env);
@@ -446,7 +556,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalLetrecStar(List<Object> args, Environment env) throws EvalError {
+    private Object evalLetrecStar(List<Object> args, Environment env) throws EvalError, ContinuationException {
         if (args.size() < 2) throw new EvalError("letrec*: bad syntax");
         List<?> bindings = (List<?>) unwrap(args.get(0));
         Environment letEnv = new Environment(env);
@@ -470,7 +580,7 @@ public class Evaluator {
         return VOID;
     }
 
-    private Object evalCase(List<Object> args, Environment env) throws EvalError {
+    private Object evalCase(List<Object> args, Environment env) throws EvalError, ContinuationException {
         if (args.isEmpty()) throw new EvalError("case: bad syntax");
         Object key = eval(args.get(0), env);
         for (int i = 1; i < args.size(); i++) {
@@ -503,7 +613,7 @@ public class Evaluator {
         return VOID;
     }
 
-    private Object evalDo(List<Object> args, Environment env) throws EvalError {
+    private Object evalDo(List<Object> args, Environment env) throws EvalError, ContinuationException {
         if (args.size() < 2) throw new EvalError("do: bad syntax");
         List<?> varSpecs = (List<?>) unwrap(args.get(0));
         List<?> testClause = (List<?>) unwrap(args.get(1));
@@ -547,7 +657,7 @@ public class Evaluator {
         }
     }
 
-    private Object evalCond(List<Object> args, Environment env) throws EvalError {
+    private Object evalCond(List<Object> args, Environment env) throws EvalError, ContinuationException {
         for (Object clause : args) {
             List<?> cl = (List<?>) unwrap(clause);
             if (cl.isEmpty()) throw new EvalError("cond: empty clause");
@@ -575,7 +685,7 @@ public class Evaluator {
     }
 
     @SuppressWarnings("unchecked")
-    private Object evalDefine(List<Object> args, Environment env) throws EvalError {
+    private Object evalDefine(List<Object> args, Environment env) throws EvalError, ContinuationException {
         if (args.size() < 2) throw new EvalError("define: bad syntax");
         Object target = unwrap(args.get(0));
         if (target instanceof SchemeSymbol s) {
@@ -605,7 +715,7 @@ public class Evaluator {
         throw new EvalError("define: bad syntax");
     }
 
-    private Object evalDefineRecordType(List<Object> args, Environment env) throws EvalError {
+    private Object evalDefineRecordType(List<Object> args, Environment env) throws EvalError, ContinuationException {
         if (args.size() < 3) throw new EvalError("define-record-type: bad syntax");
         String typeName = ((SchemeSymbol) unwrap(args.get(0))).name();
         List<?> ctorSpec = (List<?>) unwrap(args.get(1));
@@ -628,6 +738,49 @@ public class Evaluator {
             env.define(accessorNames.get(i), new BuiltinProcedure("record-acc:" + typeName + ":" + fieldNames.get(i)));
         }
         return VOID;
+    }
+
+    private Object evalCallCC(List<Object> args, Environment env) throws EvalError, ContinuationException {
+        if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
+        Object proc = eval(args.get(0), env);
+        return doCallCC(proc);
+    }
+
+    private Object doCallCC(Object proc) throws EvalError, ContinuationException {
+        // Check if we're replaying a continuation
+        if (activeContinuationId != null) {
+            Object val = activeContinuationValue;
+            activeContinuationId = null;
+            activeContinuationValue = null;
+            return val;
+        }
+        // Capture body context for replay
+        List<Object> bodyExprs = currentBodyExprs;
+        int bodyIdx = currentBodyIndex;
+        Environment bodyEnv = currentBodyEnv;
+        // Capture remaining top-level expressions
+        List<Object> remainingTopLevel = new ArrayList<>();
+        if (topLevelExprs != null) {
+            for (int ri = topLevelIndex + 1; ri < topLevelExprs.size(); ri++) {
+                remainingTopLevel.add(topLevelExprs.get(ri));
+            }
+        }
+        Object topLevelExpr = (topLevelExprs != null && topLevelIndex < topLevelExprs.size())
+            ? topLevelExprs.get(topLevelIndex) : null;
+        SchemeContinuation cont = new SchemeContinuation(bodyExprs, bodyIdx, bodyEnv,
+            topLevelIndex, topLevelExpr, remainingTopLevel, globalEnv, this);
+        continuationRegistry.put(cont.id, cont);
+        // Call the procedure with the continuation
+        List<Object> contArgs = new ArrayList<>();
+        contArgs.add(cont);
+        try {
+            return applyResolved(proc, contArgs);
+        } catch (ContinuationException ce) {
+            if (ce.continuationId == cont.id) {
+                return ce.value;
+            }
+            throw ce;
+        }
     }
 
     private Object wrapBodyInBegin(List<Object> args, int bodyStart) {
@@ -661,7 +814,11 @@ public class Evaluator {
     }
 
     // apply returns TailCall for lambda bodies (for TCO)
-    private Object apply(Object proc, List<Object> args) throws EvalError {
+    private Object apply(Object proc, List<Object> args) throws EvalError, ContinuationException {
+        if (proc instanceof SchemeContinuation cont) {
+            if (args.size() != 1) throw new EvalError("continuation: expected 1 argument");
+            throw new ContinuationException(cont.id, args.get(0));
+        }
         if (proc instanceof SchemeCaseLambda cl) {
             for (SchemeLambda clause : cl.clauses) {
                 if (clause.restParam != null) {
@@ -705,66 +862,22 @@ public class Evaluator {
         throw new EvalError("not a procedure");
     }
 
-    private static boolean isNumber(Object o) {
-        return o instanceof Long || o instanceof Double || o instanceof SchemeRational;
-    }
 
-    private static double toDouble(Object o) throws EvalError {
-        if (o instanceof Long l) return l.doubleValue();
-        if (o instanceof Double d) return d;
-        if (o instanceof SchemeRational r) return r.toDouble();
-        throw new EvalError("expected number, got: " + schemeToString(o));
-    }
-
-    private static boolean hasInexact(List<Object> args) {
-        for (Object a : args) if (a instanceof Double) return true;
-        return false;
-    }
-
-    private static long[] toRational(Object a) throws EvalError {
-        if (a instanceof Long l) return new long[]{l, 1};
-        if (a instanceof SchemeRational r) return new long[]{r.numerator, r.denominator};
-        throw new EvalError("expected number, got: " + schemeToString(a));
-    }
-
-    private static Object exactAdd(Object a, Object b) throws EvalError {
-        long[] ra = toRational(a), rb = toRational(b);
-        return SchemeRational.make(ra[0] * rb[1] + rb[0] * ra[1], ra[1] * rb[1]);
-    }
-
-    private static Object exactSub(Object a, Object b) throws EvalError {
-        long[] ra = toRational(a), rb = toRational(b);
-        return SchemeRational.make(ra[0] * rb[1] - rb[0] * ra[1], ra[1] * rb[1]);
-    }
-
-    private static Object exactMul(Object a, Object b) throws EvalError {
-        long[] ra = toRational(a), rb = toRational(b);
-        return SchemeRational.make(ra[0] * rb[0], ra[1] * rb[1]);
-    }
-
-    private static Object exactDiv(Object a, Object b) throws EvalError {
-        long[] ra = toRational(a), rb = toRational(b);
-        if (rb[0] == 0) throw new EvalError("division by zero");
-        return SchemeRational.make(ra[0] * rb[1], ra[1] * rb[0]);
-    }
-
-    private static Object exactNeg(Object a) throws EvalError {
-        if (a instanceof Long l) return -l;
-        if (a instanceof SchemeRational r) return SchemeRational.make(-r.numerator, r.denominator);
-        throw new EvalError("expected number, got: " + schemeToString(a));
-    }
-
-    private Object applyBuiltin(String name, List<Object> args) throws EvalError {
+    private Object applyBuiltin(String name, List<Object> args) throws EvalError, ContinuationException {
         return switch (name) {
+            case "call/cc" -> {
+                if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
+                yield doCallCC(args.get(0));
+            }
             case "+", "-", "*", "/", "abs", "modulo", "remainder", "quotient",
                  "min", "max", "expt", "zero?", "positive?", "negative?", "odd?", "even?",
                  "gcd", "lcm", "truncate", "round" ->
-                applyArithmeticBuiltin(name, args);
-            case "<" -> toDouble(args.get(0)) < toDouble(args.get(1));
-            case ">" -> toDouble(args.get(0)) > toDouble(args.get(1));
-            case "=" -> toDouble(args.get(0)) == toDouble(args.get(1));
-            case "<=" -> toDouble(args.get(0)) <= toDouble(args.get(1));
-            case ">=" -> toDouble(args.get(0)) >= toDouble(args.get(1));
+                ArithmeticOps.apply(name, args);
+            case "<" -> ArithmeticOps.toDouble(args.get(0)) < ArithmeticOps.toDouble(args.get(1));
+            case ">" -> ArithmeticOps.toDouble(args.get(0)) > ArithmeticOps.toDouble(args.get(1));
+            case "=" -> ArithmeticOps.toDouble(args.get(0)) == ArithmeticOps.toDouble(args.get(1));
+            case "<=" -> ArithmeticOps.toDouble(args.get(0)) <= ArithmeticOps.toDouble(args.get(1));
+            case ">=" -> ArithmeticOps.toDouble(args.get(0)) >= ArithmeticOps.toDouble(args.get(1));
             case "not" -> args.get(0).equals(Boolean.FALSE);
             case "cons", "car", "cdr", "null?", "list", "length", "append",
                  "list-ref", "list-tail", "list?", "assoc", "map",
@@ -869,123 +982,6 @@ public class Evaluator {
         };
     }
 
-    private Object applyArithmeticBuiltin(String name, List<Object> args) throws EvalError {
-        return switch (name) {
-            case "+" -> {
-                if (hasInexact(args)) {
-                    double result = 0;
-                    for (Object arg : args) result += toDouble(arg);
-                    yield result;
-                }
-                Object result = 0L;
-                for (Object arg : args) result = exactAdd(result, arg);
-                yield result;
-            }
-            case "-" -> {
-                if (args.isEmpty()) throw new EvalError("- requires at least one argument");
-                if (hasInexact(args)) {
-                    if (args.size() == 1) yield -toDouble(args.get(0));
-                    double result = toDouble(args.get(0));
-                    for (int i = 1; i < args.size(); i++) result -= toDouble(args.get(i));
-                    yield result;
-                }
-                if (args.size() == 1) yield exactNeg(args.get(0));
-                Object result = args.get(0);
-                for (int i = 1; i < args.size(); i++) result = exactSub(result, args.get(i));
-                yield result;
-            }
-            case "*" -> {
-                if (hasInexact(args)) {
-                    double result = 1;
-                    for (Object arg : args) result *= toDouble(arg);
-                    yield result;
-                }
-                Object result = 1L;
-                for (Object arg : args) result = exactMul(result, arg);
-                yield result;
-            }
-            case "/" -> {
-                if (args.isEmpty()) throw new EvalError("/ requires at least one argument");
-                if (hasInexact(args)) {
-                    double result = toDouble(args.get(0));
-                    if (args.size() == 1) yield 1.0 / result;
-                    for (int i = 1; i < args.size(); i++) {
-                        double d = toDouble(args.get(i));
-                        if (d == 0) throw new EvalError("division by zero");
-                        result /= d;
-                    }
-                    yield result;
-                }
-                Object result = args.get(0);
-                if (args.size() == 1) yield exactDiv(1L, result);
-                for (int i = 1; i < args.size(); i++) result = exactDiv(result, args.get(i));
-                yield result;
-            }
-            case "abs" -> Math.abs(requireLong(args.get(0)));
-            case "modulo" -> Math.floorMod(requireLong(args.get(0)), requireLong(args.get(1)));
-            case "remainder" -> requireLong(args.get(0)) % requireLong(args.get(1));
-            case "quotient" -> requireLong(args.get(0)) / requireLong(args.get(1));
-            case "min" -> {
-                if (args.isEmpty()) throw new EvalError("min: expected at least 1 argument");
-                long result = requireLong(args.get(0));
-                for (int i = 1; i < args.size(); i++) result = Math.min(result, requireLong(args.get(i)));
-                yield result;
-            }
-            case "max" -> {
-                if (args.isEmpty()) throw new EvalError("max: expected at least 1 argument");
-                long result = requireLong(args.get(0));
-                for (int i = 1; i < args.size(); i++) result = Math.max(result, requireLong(args.get(i)));
-                yield result;
-            }
-            case "expt" -> {
-                long base = requireLong(args.get(0)), exp = requireLong(args.get(1));
-                long result = 1;
-                for (long i = 0; i < exp; i++) result *= base;
-                yield result;
-            }
-            case "zero?" -> requireLong(args.get(0)) == 0;
-            case "positive?" -> requireLong(args.get(0)) > 0;
-            case "negative?" -> requireLong(args.get(0)) < 0;
-            case "odd?" -> Math.abs(requireLong(args.get(0))) % 2 == 1;
-            case "even?" -> requireLong(args.get(0)) % 2 == 0;
-            case "gcd" -> {
-                if (args.isEmpty()) yield 0L;
-                long result = Math.abs(requireLong(args.get(0)));
-                for (int i = 1; i < args.size(); i++) {
-                    long b = Math.abs(requireLong(args.get(i)));
-                    while (b != 0) { long t = b; b = result % b; result = t; }
-                }
-                yield result;
-            }
-            case "lcm" -> {
-                if (args.isEmpty()) yield 1L;
-                long result = Math.abs(requireLong(args.get(0)));
-                for (int i = 1; i < args.size(); i++) {
-                    long b = Math.abs(requireLong(args.get(i)));
-                    if (result == 0 && b == 0) { result = 0; continue; }
-                    long g = result; long t = b;
-                    while (t != 0) { long tmp = t; t = g % t; g = tmp; }
-                    result = result / g * b;
-                }
-                yield result;
-            }
-            case "truncate" -> {
-                Object v = args.get(0);
-                if (v instanceof Long) yield v;
-                if (v instanceof Double d) { long r = (long) d.doubleValue(); yield r; }
-                if (v instanceof SchemeRational r) { long res = r.numerator / r.denominator; yield res; }
-                throw new EvalError("truncate: not a number");
-            }
-            case "round" -> {
-                Object v = args.get(0);
-                if (v instanceof Long) yield v;
-                if (v instanceof Double d) { long r = Math.round(d); yield r; }
-                if (v instanceof SchemeRational r) { long res = (r.numerator + r.denominator / 2) / r.denominator; yield res; }
-                throw new EvalError("round: not a number");
-            }
-            default -> throw new EvalError("unknown arithmetic procedure: " + name);
-        };
-    }
 
     private Object applyCxr(String name, Object val) throws EvalError {
         // Process cxr name from right to left (inner to outer): c[ad]+r
@@ -997,7 +993,7 @@ public class Evaluator {
         return val;
     }
 
-    private Object applyListBuiltin(String name, List<Object> args) throws EvalError {
+    private Object applyListBuiltin(String name, List<Object> args) throws EvalError, ContinuationException {
         return switch (name) {
             case "cons" -> new SchemePair(args.get(0), args.get(1));
             case "car" -> {
@@ -1209,7 +1205,7 @@ public class Evaluator {
 
     private Object applyNumericTypeBuiltin(String name, List<Object> args) throws EvalError {
         return switch (name) {
-            case "number?" -> isNumber(args.get(0));
+            case "number?" -> ArithmeticOps.isNumber(args.get(0));
             case "integer?" -> {
                 Object v = args.get(0);
                 if (v instanceof Long) yield true;
@@ -1219,7 +1215,7 @@ public class Evaluator {
             case "rational?" -> args.get(0) instanceof Long || args.get(0) instanceof SchemeRational;
             case "exact?" -> args.get(0) instanceof Long || args.get(0) instanceof SchemeRational;
             case "inexact?" -> args.get(0) instanceof Double;
-            case "exact->inexact" -> toDouble(args.get(0));
+            case "exact->inexact" -> ArithmeticOps.toDouble(args.get(0));
             case "inexact->exact" -> {
                 Object v = args.get(0);
                 if (v instanceof Long || v instanceof SchemeRational) yield v;
@@ -1258,7 +1254,7 @@ public class Evaluator {
             case "pair?" -> args.get(0) instanceof SchemePair;
             case "symbol?" -> args.get(0) instanceof SchemeSymbol;
             case "char?" -> args.get(0) instanceof SchemeChar;
-            case "procedure?" -> args.get(0) instanceof SchemeLambda || args.get(0) instanceof SchemeCaseLambda || args.get(0) instanceof BuiltinProcedure;
+            case "procedure?" -> args.get(0) instanceof SchemeLambda || args.get(0) instanceof SchemeCaseLambda || args.get(0) instanceof BuiltinProcedure || args.get(0) instanceof SchemeContinuation;
             default -> false;
         };
     }
@@ -1394,7 +1390,7 @@ public class Evaluator {
         };
     }
 
-    private Object evalBuiltin(String name, List<Object> args, Environment env) throws EvalError {
+    private Object evalBuiltin(String name, List<Object> args, Environment env) throws EvalError, ContinuationException {
         List<Object> evaluated = new ArrayList<>();
         for (Object arg : args) {
             evaluated.add(eval(arg, env));
@@ -1439,8 +1435,8 @@ public class Evaluator {
         if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
         if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
-        if (isNumber(a) && isNumber(b)) {
-            try { return toDouble(a) == toDouble(b); } catch (EvalError e) { return false; }
+        if (ArithmeticOps.isNumber(a) && ArithmeticOps.isNumber(b)) {
+            try { return ArithmeticOps.toDouble(a) == ArithmeticOps.toDouble(b); } catch (EvalError e) { return false; }
         }
         return a == b;
     }
@@ -1465,8 +1461,8 @@ public class Evaluator {
         if (a instanceof SchemeNil && b instanceof SchemeNil) return true;
         if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
-        if (isNumber(a) && isNumber(b)) {
-            try { return toDouble(a) == toDouble(b); } catch (EvalError e) { return false; }
+        if (ArithmeticOps.isNumber(a) && ArithmeticOps.isNumber(b)) {
+            try { return ArithmeticOps.toDouble(a) == ArithmeticOps.toDouble(b); } catch (EvalError e) { return false; }
         }
         if ((a instanceof String || a instanceof SchemeString) && (b instanceof String || b instanceof SchemeString)) {
             try { return requireString(a).equals(requireString(b)); } catch (EvalError e) { return false; }
