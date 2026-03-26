@@ -153,6 +153,9 @@ class Reader {
         if (/^-?\d+$/.test(token)) {
             return { type: 'number', value: Number(token), ...loc };
         }
+        if (token.startsWith('#\\')) {
+            return { type: 'char', value: parseCharLiteral(token, loc), ...loc };
+        }
         return { type: 'symbol', value: token, ...loc };
     }
     skipWhitespaceAndComments() {
@@ -351,7 +354,8 @@ function createGlobalEnv(runtime) {
     }));
     env.define('string-append', builtin('string-append', (args) => ({
         kind: 'string',
-        value: args.map(expectString).join(''),
+        chars: Array.from(args.map(expectString).join('')),
+        mutable: true,
     })));
     env.define('string-length', builtin('string-length', (args, loc) => {
         if (args.length !== 1) {
@@ -370,10 +374,7 @@ function createGlobalEnv(runtime) {
         if (start < 0 || end < start || end > chars.length) {
             throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: substring indices out of bounds`);
         }
-        return {
-            kind: 'string',
-            value: chars.slice(start, end).join(''),
-        };
+        return makeString(chars.slice(start, end).join(''));
     }));
     env.define('string->number', builtin('string->number', (args, loc) => {
         if (args.length !== 1) {
@@ -385,19 +386,13 @@ function createGlobalEnv(runtime) {
         if (args.length !== 1) {
             throw new EvalError(`${loc.line}:${loc.col}: number->string expects exactly 1 argument`);
         }
-        return {
-            kind: 'string',
-            value: formatNumber(expectNumber(args[0])),
-        };
+        return makeString(formatNumber(expectNumber(args[0])));
     }));
     env.define('symbol->string', builtin('symbol->string', (args, loc) => {
         if (args.length !== 1) {
             throw new EvalError(`${loc.line}:${loc.col}: symbol->string expects exactly 1 argument`);
         }
-        return {
-            kind: 'string',
-            value: expectSymbolArg(args[0]).value,
-        };
+        return makeString(expectSymbolArg(args[0]).value);
     }));
     env.define('string->symbol', builtin('string->symbol', (args, loc) => {
         if (args.length !== 1) {
@@ -418,6 +413,28 @@ function createGlobalEnv(runtime) {
             throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: string-ref index out of bounds`);
         }
         return { kind: 'char', value: chars[index] };
+    }));
+    env.define('string-copy', builtin('string-copy', (args, loc) => {
+        if (args.length !== 1) {
+            throw new EvalError(`${loc.line}:${loc.col}: string-copy expects exactly 1 argument`);
+        }
+        const value = expectStringValue(args[0]);
+        return { kind: 'string', chars: [...value.chars], mutable: true };
+    }));
+    env.define('string-set!', builtin('string-set!', (args, loc) => {
+        if (args.length !== 3) {
+            throw new EvalError(`${loc.line}:${loc.col}: string-set! expects exactly 3 arguments`);
+        }
+        const value = expectStringValue(args[0]);
+        const index = expectIndexArg(args[1]);
+        if (!value.mutable) {
+            throw new EvalError(`${args[0].expr.line}:${args[0].expr.col}: immutable string`);
+        }
+        if (index < 0 || index >= value.chars.length) {
+            throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: string-set! index out of bounds`);
+        }
+        value.chars[index] = expectCharArg(args[2]).value;
+        return VOID_VALUE;
     }));
     return env;
 }
@@ -453,7 +470,9 @@ function evaluate(expr, env) {
         case 'boolean':
             return expr.value;
         case 'string':
-            return { kind: 'string', value: expr.value };
+            return makeString(expr.value);
+        case 'char':
+            return { kind: 'char', value: expr.value };
         case 'symbol':
             return env.lookup(expr.value, expr);
         case 'list':
@@ -661,7 +680,9 @@ function quoteExpr(expr) {
         case 'boolean':
             return expr.value;
         case 'string':
-            return { kind: 'string', value: expr.value };
+            return makeString(expr.value);
+        case 'char':
+            return { kind: 'char', value: expr.value };
         case 'symbol':
             return { kind: 'symbol', value: expr.value };
         case 'list':
@@ -719,13 +740,16 @@ function expectPairArg(arg) {
     return arg.value;
 }
 function expectString(arg) {
-    if (!isSchemeStringValue(arg.value)) {
-        throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected string`);
-    }
-    return arg.value.value;
+    return schemeStringText(expectStringValue(arg));
 }
 function expectStringArg(arg) {
     return expectString(arg);
+}
+function expectStringValue(arg) {
+    if (!isSchemeStringValue(arg.value)) {
+        throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected string`);
+    }
+    return arg.value;
 }
 function expectSymbolArg(arg) {
     if (!isSchemeSymbolValue(arg.value)) {
@@ -739,6 +763,12 @@ function expectIndexArg(arg) {
         throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected integer`);
     }
     return value;
+}
+function expectCharArg(arg) {
+    if (!isSchemeCharValue(arg.value)) {
+        throw new EvalError(`${arg.expr.line}:${arg.expr.col}: expected char`);
+    }
+    return arg.value;
 }
 function expectProperList(value, loc) {
     const elements = [];
@@ -779,6 +809,12 @@ function isSchemeCharValue(value) {
 function procedureDisplayName(proc) {
     return proc.name ?? 'lambda';
 }
+function makeString(value, mutable = true) {
+    return { kind: 'string', chars: Array.from(value), mutable };
+}
+function schemeStringText(value) {
+    return value.chars.join('');
+}
 function formatValue(value) {
     if (typeof value === 'number') {
         return formatNumber(value);
@@ -788,7 +824,7 @@ function formatValue(value) {
     }
     switch (value.kind) {
         case 'string':
-            return `"${escapeString(value.value)}"`;
+            return `"${escapeString(schemeStringText(value))}"`;
         case 'symbol':
             return value.value;
         case 'char':
@@ -809,7 +845,7 @@ function formatDisplayValue(value) {
     }
     switch (value.kind) {
         case 'string':
-            return value.value;
+            return schemeStringText(value);
         case 'symbol':
             return value.value;
         case 'char':
@@ -869,6 +905,19 @@ function escapeString(value) {
 }
 function stringChars(value) {
     return Array.from(value);
+}
+function parseCharLiteral(token, loc) {
+    const body = token.slice(2);
+    if (body.length === 1) {
+        return body;
+    }
+    if (body === 'space') {
+        return ' ';
+    }
+    if (body === 'newline') {
+        return '\n';
+    }
+    throw new EvalError(`${loc.line}:${loc.col}: invalid character literal`);
 }
 function parseStringNumber(value) {
     if (!/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(value)) {
