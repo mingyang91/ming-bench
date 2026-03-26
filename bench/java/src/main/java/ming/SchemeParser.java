@@ -6,6 +6,8 @@ import java.util.List;
 final class SchemeParser {
     private final String input;
     private int index;
+    private int line = 1;
+    private int column = 1;
 
     SchemeParser(String input) {
         this.input = input;
@@ -24,61 +26,65 @@ final class SchemeParser {
     private SchemeExpression parseExpression() throws EvalError {
         skipIgnorable();
         if (isAtEnd()) {
-            throw new EvalError("unexpected end of input");
+            throw new EvalError(currentPosition(), "unexpected end of input");
         }
 
-        char current = input.charAt(index);
+        SourcePosition position = currentPosition();
+        char current = currentChar();
         if (current == '(') {
-            return parseList();
+            return parseList(position);
         }
         if (current == ')') {
-            throw new EvalError("unexpected ')'");
+            throw new EvalError(position, "unexpected ')'");
         }
         if (current == '"') {
-            return new LiteralExpression(new StringValue(parseStringLiteral()));
+            return new LiteralExpression(new StringValue(parseStringLiteral(position)), position);
         }
         if (current == '\'') {
-            index++;
-            return new ListExpression(List.of(new SymbolExpression("quote"), parseExpression()));
+            advance();
+            return new ListExpression(
+                    List.of(new SymbolExpression("quote", position), parseExpression()),
+                    position
+            );
         }
 
         String token = readToken();
         if ("#t".equals(token)) {
-            return new LiteralExpression(BoolValue.TRUE);
+            return new LiteralExpression(BoolValue.TRUE, position);
         }
         if ("#f".equals(token)) {
-            return new LiteralExpression(BoolValue.FALSE);
+            return new LiteralExpression(BoolValue.FALSE, position);
         }
         if (isIntegerToken(token)) {
-            return new LiteralExpression(new IntValue(parseInteger(token)));
+            return new LiteralExpression(new IntValue(parseInteger(token, position)), position);
         }
-        return new SymbolExpression(token);
+        return new SymbolExpression(token, position);
     }
 
-    private ListExpression parseList() throws EvalError {
-        index++;
+    private ListExpression parseList(SourcePosition startPosition) throws EvalError {
+        advance();
         List<SchemeExpression> elements = new ArrayList<>();
         skipIgnorable();
 
-        while (!isAtEnd() && input.charAt(index) != ')') {
+        while (!isAtEnd() && currentChar() != ')') {
             elements.add(parseExpression());
             skipIgnorable();
         }
 
         if (isAtEnd()) {
-            throw new EvalError("unterminated list");
+            throw new EvalError(startPosition, "unterminated list");
         }
 
-        index++;
-        return new ListExpression(List.copyOf(elements));
+        advance();
+        return new ListExpression(List.copyOf(elements), startPosition);
     }
 
-    private String parseStringLiteral() throws EvalError {
-        index++;
+    private String parseStringLiteral(SourcePosition startPosition) throws EvalError {
+        advance();
         StringBuilder builder = new StringBuilder();
 
         while (!isAtEnd()) {
-            char current = input.charAt(index++);
+            char current = advance();
             if (current == '"') {
                 return builder.toString();
             }
@@ -89,15 +95,15 @@ final class SchemeParser {
             }
         }
 
-        throw new EvalError("unterminated string");
+        throw new EvalError(startPosition, "unterminated string");
     }
 
     private char parseEscape() throws EvalError {
         if (isAtEnd()) {
-            throw new EvalError("unterminated string escape");
+            throw new EvalError(currentPosition(), "unterminated string escape");
         }
 
-        char escaped = input.charAt(index++);
+        char escaped = advance();
         return switch (escaped) {
             case 'n' -> '\n';
             case 'r' -> '\r';
@@ -110,9 +116,9 @@ final class SchemeParser {
 
     private void skipIgnorable() {
         while (!isAtEnd()) {
-            char current = input.charAt(index);
+            char current = currentChar();
             if (Character.isWhitespace(current)) {
-                index++;
+                advance();
                 continue;
             }
             if (current == ';') {
@@ -124,18 +130,18 @@ final class SchemeParser {
     }
 
     private void skipComment() {
-        while (!isAtEnd() && input.charAt(index) != '\n') {
-            index++;
+        while (!isAtEnd() && currentChar() != '\n') {
+            advance();
         }
         if (!isAtEnd()) {
-            index++;
+            advance();
         }
     }
 
     private String readToken() {
         int start = index;
-        while (!isAtEnd() && !isDelimiter(input.charAt(index))) {
-            index++;
+        while (!isAtEnd() && !isDelimiter(currentChar())) {
+            advance();
         }
         return input.substring(start, index);
     }
@@ -149,6 +155,25 @@ final class SchemeParser {
 
     private boolean isAtEnd() {
         return index >= input.length();
+    }
+
+    private char currentChar() {
+        return input.charAt(index);
+    }
+
+    private SourcePosition currentPosition() {
+        return new SourcePosition(line, column);
+    }
+
+    private char advance() {
+        char current = input.charAt(index++);
+        if (current == '\n') {
+            line++;
+            column = 1;
+        } else {
+            column++;
+        }
+        return current;
     }
 
     private boolean isIntegerToken(String token) {
@@ -173,11 +198,11 @@ final class SchemeParser {
         return true;
     }
 
-    private long parseInteger(String token) throws EvalError {
+    private long parseInteger(String token, SourcePosition position) throws EvalError {
         try {
             return Long.parseLong(token);
         } catch (NumberFormatException error) {
-            throw new EvalError("invalid integer: " + token);
+            throw new EvalError(position, "invalid integer: " + token);
         }
     }
 }

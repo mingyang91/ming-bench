@@ -41,15 +41,19 @@ public class Evaluator {
     }
 
     private SchemeValue eval(SchemeExpression expression, Environment environment) throws EvalError {
-        if (expression instanceof LiteralExpression literal) {
-            return literal.value();
-        }
+        try {
+            if (expression instanceof LiteralExpression literal) {
+                return literal.value();
+            }
 
-        if (expression instanceof SymbolExpression symbol) {
-            return environment.lookup(symbol.name());
-        }
+            if (expression instanceof SymbolExpression symbol) {
+                return environment.lookup(symbol.name());
+            }
 
-        return evalList((ListExpression) expression, environment);
+            return evalList((ListExpression) expression, environment);
+        } catch (EvalError error) {
+            throw error.withPosition(expression.position());
+        }
     }
 
     private SchemeValue evalList(ListExpression expression, Environment environment) throws EvalError {
