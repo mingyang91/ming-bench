@@ -7,15 +7,13 @@ import scala.jdk.CollectionConverters.*
 
 /** Standalone test runner — no test framework needed.
   *
-  * Reads tests.json + fixtures, calls evalStr/evalStrWithOutput, compares
-  * results. Exit 0 = all pass, exit 1 = failures found.
+  * Reads tests.json + fixtures, calls evalStr/evalStrWithOutput, compares results. Exit 0 = all pass, exit 1 = failures
+  * found.
   *
-  * Usage: java -jar test.jar 01       # run level 1
-  *        java -jar test.jar all      # run all levels
+  * Usage: java -jar test.jar 01 # run level 1 java -jar test.jar all # run all levels
   *
-  * Env vars:
-  *   TESTS_JSON  — path to tests.json   (default ../tests.json)
-  *   FIXTURES_DIR — path to fixtures dir (default ../fixtures)
+  * Env vars: TESTS_JSON — path to tests.json (default ../tests.json) FIXTURES_DIR — path to fixtures dir (default
+  * ../fixtures)
   */
 object TestRunner:
 
@@ -40,11 +38,11 @@ object TestRunner:
 
     val results: List[TestResult] =
       testCases.iterator().asScala.toList.flatMap { elem =>
-        val tc = elem.getAsJsonObject
-        val name = tc.get("name").getAsString
-        val level = tc.get("level").getAsInt
+        val tc      = elem.getAsJsonObject
+        val name    = tc.get("name").getAsString
+        val level   = tc.get("level").getAsInt
         val fixture = tc.get("fixture").getAsString
-        val kind = tc.get("kind").getAsString
+        val kind    = tc.get("kind").getAsString
 
         val skip =
           (benchLevel > 0 && level > benchLevel) ||
@@ -64,22 +62,22 @@ object TestRunner:
 
     val passed = results.count(_.passed)
     val failed = results.count(!_.passed)
-    val total = results.size
+    val total  = results.size
     println(s"$passed passed, $failed failed out of $total tests")
 
     if failed > 0 then System.exit(1)
 
   private def runTest(
-      name: String,
-      kind: String,
-      input: String,
-      tc: JsonObject,
+    name: String,
+    kind: String,
+    input: String,
+    tc: JsonObject
   ): TestResult =
     try
       kind match
         case "eval_str_ok" =>
           val expected = tc.get("expected").getAsString
-          val result = Evaluator.evalStr(input)
+          val result   = Evaluator.evalStr(input)
           if result == expected then TestResult(name, passed = true, "")
           else TestResult(name, passed = false, s"expected $expected got $result")
 
@@ -95,18 +93,17 @@ object TestRunner:
             TestResult(name, passed = false, s"expected EvalError but got $result")
           catch
             case e: EvalError =>
-              if e.getMessage.matches(".*\\d+:\\d+.*") then
-                TestResult(name, passed = true, "")
+              if e.getMessage.matches(".*\\d+:\\d+.*") then TestResult(name, passed = true, "")
               else
                 TestResult(
                   name,
                   passed = false,
-                  s"error message should contain line:col position, got: ${e.getMessage}",
+                  s"error message should contain line:col position, got: ${e.getMessage}"
                 )
 
         case "eval_str_with_output" =>
           val expectedOutput = tc.get("expected_output").getAsString
-          val (_, output) = Evaluator.evalStrWithOutput(input)
+          val (_, output)    = Evaluator.evalStrWithOutput(input)
           if output == expectedOutput then TestResult(name, passed = true, "")
           else TestResult(name, passed = false, s"expected output $expectedOutput got $output")
 
