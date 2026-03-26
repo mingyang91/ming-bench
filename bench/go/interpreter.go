@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 	"unicode"
@@ -195,7 +196,12 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("eq?", builtinProc{name: "eq?", fn: builtinEq})
 	root.define("equal?", builtinProc{name: "equal?", fn: builtinEqual})
 	root.define("even?", builtinProc{name: "even?", fn: builtinEven})
+	root.define("exact?", builtinProc{name: "exact?", fn: builtinExact})
+	root.define("exact->inexact", builtinProc{name: "exact->inexact", fn: builtinExactToInexact})
 	root.define("expt", builtinProc{name: "expt", fn: builtinExpt})
+	root.define("inexact?", builtinProc{name: "inexact?", fn: builtinInexact})
+	root.define("inexact->exact", builtinProc{name: "inexact->exact", fn: builtinInexactToExact})
+	root.define("integer?", builtinProc{name: "integer?", fn: builtinInteger})
 	root.define("length", builtinProc{name: "length", fn: builtinLength})
 	root.define("list", builtinProc{name: "list", fn: builtinList})
 	root.define("list?", builtinProc{name: "list?", fn: builtinListPred})
@@ -214,9 +220,9 @@ func newGlobalEnv(rt *runtime) *env {
 		return ok
 	})})
 	root.define("number?", builtinProc{name: "number?", fn: typePredicate(func(value expr) bool {
-		_, ok := value.(intExpr)
-		return ok
+		return isNumber(value)
 	})})
+	root.define("numerator", builtinProc{name: "numerator", fn: builtinNumerator})
 	root.define("pair?", builtinProc{name: "pair?", fn: typePredicate(func(value expr) bool {
 		list, ok := value.(listExpr)
 		if ok {
@@ -227,7 +233,9 @@ func newGlobalEnv(rt *runtime) *env {
 	})})
 	root.define("positive?", builtinProc{name: "positive?", fn: builtinPositive})
 	root.define("quotient", builtinProc{name: "quotient", fn: builtinQuotient})
+	root.define("rational?", builtinProc{name: "rational?", fn: builtinRational})
 	root.define("remainder", builtinProc{name: "remainder", fn: builtinRemainder})
+	root.define("denominator", builtinProc{name: "denominator", fn: builtinDenominator})
 	root.define("number->string", builtinProc{name: "number->string", fn: builtinNumberToString})
 	root.define("string?", builtinProc{name: "string?", fn: typePredicate(func(value expr) bool {
 		_, ok := asString(value)
@@ -463,8 +471,8 @@ func parseAtom(tok token) expr {
 		return charExpr(value)
 	}
 
-	if n, err := strconv.Atoi(tok.text); err == nil {
-		return intExpr(n)
+	if value, ok := parseNumberLiteral(tok.text); ok {
+		return value
 	}
 
 	return symbolExpr{name: tok.text, pos: tok.pos}
@@ -504,7 +512,7 @@ func evalSequence(environment *env, forms []expr) (expr, error) {
 
 func evalExpr(environment *env, form expr) (expr, error) {
 	switch v := form.(type) {
-	case intExpr, boolExpr, charExpr, *stringExpr:
+	case intExpr, rationalExpr, inexactExpr, boolExpr, charExpr, *stringExpr:
 		return v, nil
 	case symbolExpr:
 		lookupEnv := environment
@@ -938,11 +946,19 @@ func builtinAdd(args []expr) (expr, error) {
 		return nil, err
 	}
 
-	total := 0
-	for _, n := range numbers {
-		total += n
+	if numbersContainInexact(numbers) {
+		total := 0.0
+		for _, n := range numbers {
+			total += numberToFloat(n)
+		}
+		return newInexactExpr(total), nil
 	}
-	return intExpr(total), nil
+
+	total := new(big.Rat)
+	for _, n := range numbers {
+		total.Add(total, n.exact)
+	}
+	return exprFromRat(total), nil
 }
 
 func builtinSub(args []expr) (expr, error) {
@@ -953,15 +969,30 @@ func builtinSub(args []expr) (expr, error) {
 	if len(numbers) == 0 {
 		return nil, &EvalError{Message: "- expects at least 1 argument"}
 	}
-	if len(numbers) == 1 {
-		return intExpr(-numbers[0]), nil
+
+	if numbersContainInexact(numbers) {
+		result := numberToFloat(numbers[0])
+		if len(numbers) == 1 {
+			return newInexactExpr(-result), nil
+		}
+
+		for _, n := range numbers[1:] {
+			result -= numberToFloat(n)
+		}
+		return newInexactExpr(result), nil
 	}
 
-	result := numbers[0]
-	for _, n := range numbers[1:] {
-		result -= n
+	if len(numbers) == 1 {
+		result := copyRat(numbers[0].exact)
+		result.Neg(result)
+		return exprFromRat(result), nil
 	}
-	return intExpr(result), nil
+
+	result := copyRat(numbers[0].exact)
+	for _, n := range numbers[1:] {
+		result.Sub(result, n.exact)
+	}
+	return exprFromRat(result), nil
 }
 
 func builtinMul(args []expr) (expr, error) {
@@ -970,11 +1001,19 @@ func builtinMul(args []expr) (expr, error) {
 		return nil, err
 	}
 
-	result := 1
-	for _, n := range numbers {
-		result *= n
+	if numbersContainInexact(numbers) {
+		result := 1.0
+		for _, n := range numbers {
+			result *= numberToFloat(n)
+		}
+		return newInexactExpr(result), nil
 	}
-	return intExpr(result), nil
+
+	result := big.NewRat(1, 1)
+	for _, n := range numbers {
+		result.Mul(result, n.exact)
+	}
+	return exprFromRat(result), nil
 }
 
 func builtinDiv(args []expr) (expr, error) {
@@ -986,21 +1025,42 @@ func builtinDiv(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "/ expects at least 1 argument"}
 	}
 
-	result := numbers[0]
-	if len(numbers) == 1 {
-		if result == 0 {
-			return nil, &EvalError{Message: "division by zero"}
+	if numbersContainInexact(numbers) {
+		result := numberToFloat(numbers[0])
+		if len(numbers) == 1 {
+			if result == 0 {
+				return nil, &EvalError{Message: "division by zero"}
+			}
+			return newInexactExpr(1 / result), nil
 		}
-		return intExpr(1 / result), nil
+
+		for _, n := range numbers[1:] {
+			divisor := numberToFloat(n)
+			if divisor == 0 {
+				return nil, &EvalError{Message: "division by zero"}
+			}
+			result /= divisor
+		}
+		return newInexactExpr(result), nil
 	}
 
-	for _, n := range numbers[1:] {
-		if n == 0 {
+	if len(numbers) == 1 {
+		if numberIsZero(numbers[0]) {
 			return nil, &EvalError{Message: "division by zero"}
 		}
-		result /= n
+		result := big.NewRat(1, 1)
+		result.Quo(result, numbers[0].exact)
+		return exprFromRat(result), nil
 	}
-	return intExpr(result), nil
+
+	result := copyRat(numbers[0].exact)
+	for _, n := range numbers[1:] {
+		if numberIsZero(n) {
+			return nil, &EvalError{Message: "division by zero"}
+		}
+		result.Quo(result, n.exact)
+	}
+	return exprFromRat(result), nil
 }
 
 func builtinNot(args []expr) (expr, error) {
@@ -1011,18 +1071,24 @@ func builtinNot(args []expr) (expr, error) {
 }
 
 func builtinAbs(args []expr) (expr, error) {
-	if len(args) != 1 {
-		return nil, &EvalError{Message: "abs expects exactly 1 argument"}
+	number, err := unaryNumberArg(args, "abs")
+	if err != nil {
+		return nil, err
 	}
 
-	n, ok := args[0].(intExpr)
-	if !ok {
-		return nil, &EvalError{Message: "abs expects a number"}
+	if number.isInexact {
+		value := numberToFloat(number)
+		if value < 0 {
+			value = -value
+		}
+		return newInexactExpr(value), nil
 	}
-	if n < 0 {
-		return intExpr(-n), nil
+
+	result := copyRat(number.exact)
+	if result.Sign() < 0 {
+		result.Neg(result)
 	}
-	return n, nil
+	return exprFromRat(result), nil
 }
 
 func builtinAppend(args []expr) (expr, error) {
@@ -1222,13 +1288,17 @@ func builtinMax(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "max expects at least 1 argument"}
 	}
 
+	inexact := numbersContainInexact(numbers)
 	result := numbers[0]
 	for _, n := range numbers[1:] {
-		if n > result {
+		if compareNumbers(n, result) > 0 {
 			result = n
 		}
 	}
-	return intExpr(result), nil
+	if inexact {
+		return newInexactExpr(numberToFloat(result)), nil
+	}
+	return exprFromRat(result.exact), nil
 }
 
 func builtinMin(args []expr) (expr, error) {
@@ -1240,17 +1310,21 @@ func builtinMin(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "min expects at least 1 argument"}
 	}
 
+	inexact := numbersContainInexact(numbers)
 	result := numbers[0]
 	for _, n := range numbers[1:] {
-		if n < result {
+		if compareNumbers(n, result) < 0 {
 			result = n
 		}
 	}
-	return intExpr(result), nil
+	if inexact {
+		return newInexactExpr(numberToFloat(result)), nil
+	}
+	return exprFromRat(result.exact), nil
 }
 
 func builtinModulo(args []expr) (expr, error) {
-	a, b, err := numericPair(args, "modulo")
+	a, b, err := exactIntegerPair(args, "modulo")
 	if err != nil {
 		return nil, err
 	}
@@ -1305,7 +1379,7 @@ func makeNewlineBuiltin(rt *runtime) builtinFunc {
 }
 
 func builtinOdd(args []expr) (expr, error) {
-	n, err := unaryNumberPredicateArg(args, "odd?")
+	n, err := unaryExactIntegerArg(args, "odd?")
 	if err != nil {
 		return nil, err
 	}
@@ -1313,7 +1387,7 @@ func builtinOdd(args []expr) (expr, error) {
 }
 
 func builtinEven(args []expr) (expr, error) {
-	n, err := unaryNumberPredicateArg(args, "even?")
+	n, err := unaryExactIntegerArg(args, "even?")
 	if err != nil {
 		return nil, err
 	}
@@ -1321,31 +1395,31 @@ func builtinEven(args []expr) (expr, error) {
 }
 
 func builtinPositive(args []expr) (expr, error) {
-	n, err := unaryNumberPredicateArg(args, "positive?")
+	n, err := unaryNumberArg(args, "positive?")
 	if err != nil {
 		return nil, err
 	}
-	return boolExpr(n > 0), nil
+	return boolExpr(numberSign(n) > 0), nil
 }
 
 func builtinNegative(args []expr) (expr, error) {
-	n, err := unaryNumberPredicateArg(args, "negative?")
+	n, err := unaryNumberArg(args, "negative?")
 	if err != nil {
 		return nil, err
 	}
-	return boolExpr(n < 0), nil
+	return boolExpr(numberSign(n) < 0), nil
 }
 
 func builtinZero(args []expr) (expr, error) {
-	n, err := unaryNumberPredicateArg(args, "zero?")
+	n, err := unaryNumberArg(args, "zero?")
 	if err != nil {
 		return nil, err
 	}
-	return boolExpr(n == 0), nil
+	return boolExpr(numberIsZero(n)), nil
 }
 
 func builtinQuotient(args []expr) (expr, error) {
-	a, b, err := numericPair(args, "quotient")
+	a, b, err := exactIntegerPair(args, "quotient")
 	if err != nil {
 		return nil, err
 	}
@@ -1356,7 +1430,7 @@ func builtinQuotient(args []expr) (expr, error) {
 }
 
 func builtinRemainder(args []expr) (expr, error) {
-	a, b, err := numericPair(args, "remainder")
+	a, b, err := exactIntegerPair(args, "remainder")
 	if err != nil {
 		return nil, err
 	}
@@ -1367,7 +1441,7 @@ func builtinRemainder(args []expr) (expr, error) {
 }
 
 func builtinExpt(args []expr) (expr, error) {
-	base, exponent, err := numericPair(args, "expt")
+	base, exponent, err := exactIntegerPair(args, "expt")
 	if err != nil {
 		return nil, err
 	}
@@ -1476,11 +1550,11 @@ func builtinStringToNumber(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "string->number expects a string"}
 	}
 
-	n, err := strconv.Atoi(text.text())
-	if err != nil {
+	value, ok := parseNumberLiteral(text.text())
+	if !ok {
 		return boolExpr(false), nil
 	}
-	return intExpr(n), nil
+	return value, nil
 }
 
 func builtinNumberToString(args []expr) (expr, error) {
@@ -1488,11 +1562,11 @@ func builtinNumberToString(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "number->string expects exactly 1 argument"}
 	}
 
-	n, ok := args[0].(intExpr)
+	text, ok := renderNumber(args[0])
 	if !ok {
 		return nil, &EvalError{Message: "number->string expects a number"}
 	}
-	return newStringExpr(strconv.Itoa(int(n)), false), nil
+	return newStringExpr(text, false), nil
 }
 
 func builtinSymbolToString(args []expr) (expr, error) {
@@ -1674,7 +1748,8 @@ func comparisonBuiltin(name string, cmp func(int, int) bool) builtinFunc {
 		}
 
 		for i := 0; i < len(numbers)-1; i++ {
-			if !cmp(numbers[i], numbers[i+1]) {
+			order := compareNumbers(numbers[i], numbers[i+1])
+			if !cmp(order, 0) {
 				return boolExpr(false), nil
 			}
 		}
@@ -1739,41 +1814,6 @@ func typePredicate(test func(expr) bool) builtinFunc {
 	}
 }
 
-func numericArgs(values []expr) ([]int, error) {
-	args := make([]int, 0, len(values))
-	for _, value := range values {
-		number, ok := value.(intExpr)
-		if !ok {
-			return nil, &EvalError{Message: "expected number"}
-		}
-		args = append(args, int(number))
-	}
-	return args, nil
-}
-
-func numericPair(args []expr, name string) (int, int, error) {
-	numbers, err := numericArgs(args)
-	if err != nil {
-		return 0, 0, err
-	}
-	if len(numbers) != 2 {
-		return 0, 0, &EvalError{Message: fmt.Sprintf("%s expects exactly 2 arguments", name)}
-	}
-	return numbers[0], numbers[1], nil
-}
-
-func unaryNumberPredicateArg(args []expr, name string) (int, error) {
-	if len(args) != 1 {
-		return 0, &EvalError{Message: fmt.Sprintf("%s expects exactly 1 argument", name)}
-	}
-
-	number, ok := args[0].(intExpr)
-	if !ok {
-		return 0, &EvalError{Message: fmt.Sprintf("%s expects a number", name)}
-	}
-	return int(number), nil
-}
-
 func unaryCharArg(args []expr, name string) (rune, error) {
 	if len(args) != 1 {
 		return 0, &EvalError{Message: fmt.Sprintf("%s expects exactly 1 argument", name)}
@@ -1787,6 +1827,10 @@ func unaryCharArg(args []expr, name string) (rune, error) {
 }
 
 func eqExpr(a, b expr) bool {
+	if equal, ok := numericEqualExpr(a, b); ok {
+		return equal
+	}
+
 	switch left := a.(type) {
 	case intExpr:
 		right, ok := b.(intExpr)
@@ -1823,6 +1867,10 @@ func eqExpr(a, b expr) bool {
 }
 
 func equalExpr(a, b expr) bool {
+	if equal, ok := numericEqualExpr(a, b); ok {
+		return equal
+	}
+
 	switch left := a.(type) {
 	case intExpr:
 		right, ok := b.(intExpr)
@@ -1870,9 +1918,11 @@ func isTruthy(value expr) bool {
 }
 
 func renderExpr(value expr) string {
+	if text, ok := renderNumber(value); ok {
+		return text
+	}
+
 	switch v := value.(type) {
-	case intExpr:
-		return strconv.Itoa(int(v))
 	case boolExpr:
 		if bool(v) {
 			return "#t"
