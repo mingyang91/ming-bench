@@ -129,6 +129,28 @@ public class Evaluator {
                         tokens.add(new Token("#f", line, startCol));
                         i += 2;
                         col += 2;
+                    } else if (next == '\\') {
+                        // Character literal: #\x or #\space, #\newline, etc.
+                        if (i + 2 < len) {
+                            // Try to read a named character or single char
+                            int charStart = i + 2;
+                            int charEnd = charStart;
+                            while (charEnd < len && !Character.isWhitespace(input.charAt(charEnd))
+                                    && input.charAt(charEnd) != ')' && input.charAt(charEnd) != '('
+                                    && input.charAt(charEnd) != '"' && input.charAt(charEnd) != ';') {
+                                charEnd++;
+                            }
+                            String charName = input.substring(charStart, charEnd);
+                            String tok = "#\\" + charName;
+                            tokens.add(new Token(tok, line, startCol));
+                            int tokLen = tok.length();
+                            i += tokLen;
+                            col += tokLen;
+                        } else {
+                            tokens.add(new Token("#\\", line, startCol));
+                            i += 2;
+                            col += 2;
+                        }
                     } else {
                         String sym = readSymbol(input, i);
                         tokens.add(new Token(sym, line, startCol));
@@ -205,6 +227,14 @@ public class Evaluator {
         if (token.equals("#f")) {
             return Boolean.FALSE;
         }
+        if (token.startsWith("#\\")) {
+            String charName = token.substring(2);
+            if (charName.equals("space")) return new SchemeChar(' ');
+            if (charName.equals("newline")) return new SchemeChar('\n');
+            if (charName.equals("tab")) return new SchemeChar('\t');
+            if (charName.length() == 1) return new SchemeChar(charName.charAt(0));
+            return new SchemeChar(charName.charAt(0)); // fallback
+        }
         if (token.startsWith("\"") && token.endsWith("\"")) {
             return token; // keep as quoted string
         }
@@ -248,11 +278,14 @@ public class Evaluator {
             }
         }
 
-        if (expr instanceof Long || expr instanceof Boolean) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String s) {
             return s;
+        }
+        if (expr instanceof SchemeString ss) {
+            return ss;
         }
         if (expr instanceof SchemeSymbol sym) {
             return env.lookup(sym.name());
@@ -439,7 +472,8 @@ public class Evaluator {
                          "display", "write", "newline",
                          "string-append", "string-length", "substring", "string-ref",
                          "string->number", "number->string",
-                         "symbol->string", "string->symbol" -> {
+                         "symbol->string", "string->symbol",
+                         "string-copy", "string-set!" -> {
                         return evalBuiltin(name, args, env);
                     }
                     default -> {
@@ -615,7 +649,8 @@ public class Evaluator {
             }
             case "string?" -> {
                 requireArgCount(name, args, 1);
-                return eval(args.get(0), env) instanceof String;
+                Object sv = eval(args.get(0), env);
+                return sv instanceof String || sv instanceof SchemeString;
             }
             case "boolean?" -> {
                 requireArgCount(name, args, 1);
@@ -708,6 +743,23 @@ public class Evaluator {
                 String s = requireString(eval(args.get(0), env));
                 return new SchemeSymbol(s);
             }
+            case "string-copy" -> {
+                requireArgCount(name, args, 1);
+                String s = requireString(eval(args.get(0), env));
+                return new SchemeString(s);
+            }
+            case "string-set!" -> {
+                requireArgCount(name, args, 3);
+                Object target = eval(args.get(0), env);
+                int idx = (int) requireLong(eval(args.get(1), env));
+                Object charVal = eval(args.get(2), env);
+                if (!(charVal instanceof SchemeChar ch))
+                    throw new EvalError("string-set!: expected char");
+                if (!(target instanceof SchemeString ss))
+                    throw new EvalError("string-set!: string is immutable");
+                ss.setCharAt(idx, ch.value());
+                return VOID;
+            }
             default -> throw new EvalError("unknown procedure: " + name);
         }
     }
@@ -724,6 +776,9 @@ public class Evaluator {
             }
             return s;
         }
+        if (val instanceof SchemeString ss) {
+            return ss.value();
+        }
         throw new EvalError("expected string, got: " + schemeToString(val));
     }
 
@@ -734,6 +789,9 @@ public class Evaluator {
                 return s.substring(1, s.length() - 1);
             }
             return s;
+        }
+        if (val instanceof SchemeString ss) {
+            return ss.value();
         }
         return schemeToString(val);
     }
@@ -749,6 +807,7 @@ public class Evaluator {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof String s) return s;
+        if (val instanceof SchemeString ss) return ss.toString();
         if (val instanceof SchemeSymbol sym) return sym.name();
         if (val instanceof SchemeChar ch) return "#\\" + ch.value();
         if (val instanceof SchemeNil) return "()";
