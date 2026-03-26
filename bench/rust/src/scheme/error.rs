@@ -16,6 +16,10 @@ pub enum EvalError {
     #[error("continuation escape")]
     #[allow(private_interfaces)]
     ContinuationEscape(usize, Box<crate::scheme::Value>),
+    /// A Scheme-level exception raised via `raise`.
+    #[error("raised exception")]
+    #[allow(private_interfaces)]
+    RaisedValue(Box<crate::scheme::Value>),
 }
 
 impl PartialEq for EvalError {
@@ -27,6 +31,7 @@ impl PartialEq for EvalError {
             (EvalError::Arity(a), EvalError::Arity(b)) => a == b,
             (EvalError::DivisionByZero(a), EvalError::DivisionByZero(b)) => a == b,
             (EvalError::ContinuationEscape(a, _), EvalError::ContinuationEscape(b, _)) => a == b,
+            (EvalError::RaisedValue(_), EvalError::RaisedValue(_)) => true,
             _ => false,
         }
     }

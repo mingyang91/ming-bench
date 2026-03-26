@@ -788,6 +788,7 @@ fn is_builtin(name: &str) -> bool {
             | "make-string" | "string" | "string>?" | "string<=?" | "string>=?"
             | "call/cc" | "call-with-current-continuation"
             | "dynamic-wind"
+            | "raise" | "with-exception-handler"
     )
 }
 
@@ -859,6 +860,7 @@ fn eval_step(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "let*" => return eval_let_star(&elems[1..], env, p),
                     "when" => return eval_when(&elems[1..], env, p),
                     "dynamic-wind" => return eval_dynamic_wind(&elems[1..], env, p),
+                    "guard" => return eval_guard(&elems[1..], env, p),
                     _ => {
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
                             return eval_macro(&literals, &rules, &def_env, elems, env, p);
@@ -902,6 +904,81 @@ fn eval_dynamic_wind(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalErro
     force(apply_value(&out_thunk, &[], p)?)?;
 
     body_result
+}
+
+/// (guard (var clause ...) body ...)
+/// Evaluate body. If it raises, bind var to the raised value and evaluate clauses like cond.
+fn eval_guard(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("guard requires at least 2 arguments at {}", p)));
+    }
+    // First arg is (var clause1 clause2 ...)
+    let header = match &args[0] {
+        Expr::List(elems, _) if elems.len() >= 2 => elems,
+        _ => return Err(EvalError::Type(format!("guard: bad syntax at {}", p))),
+    };
+    let var_name = match &header[0] {
+        Expr::Symbol(s, _) => s.clone(),
+        _ => return Err(EvalError::Type(format!("guard: expected variable name at {}", p))),
+    };
+    let clauses = &header[1..];
+    let body = &args[1..];
+
+    // Evaluate body
+    let body_result = (|| -> Result<Value, EvalError> {
+        let mut result = Value::Boolean(false);
+        for expr in body {
+            result = eval(expr, env)?;
+        }
+        Ok(result)
+    })();
+
+    match body_result {
+        Ok(v) => Ok(v),
+        Err(EvalError::RaisedValue(val)) => {
+            // Bind var to raised value, evaluate clauses
+            let guard_env = new_env(Some(env.clone()));
+            env_set(&guard_env, var_name, *val.clone());
+            eval_guard_clauses(clauses, &guard_env, *val)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn eval_guard_clauses(clauses: &[Expr], env: &Env, raised_val: Value) -> Result<Value, EvalError> {
+    for clause in clauses {
+        match clause {
+            Expr::List(parts, _) if !parts.is_empty() => {
+                // Check for else clause
+                if let Expr::Symbol(s, _) = &parts[0] {
+                    if s == "else" {
+                        // Evaluate the else body
+                        let mut result = Value::Boolean(false);
+                        for expr in &parts[1..] {
+                            result = eval(expr, env)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                // Evaluate the test
+                let test_val = eval(&parts[0], env)?;
+                if !matches!(test_val, Value::Boolean(false)) {
+                    // Test passed, evaluate body (or return test value if no body)
+                    if parts.len() == 1 {
+                        return Ok(test_val);
+                    }
+                    let mut result = Value::Boolean(false);
+                    for expr in &parts[1..] {
+                        result = eval(expr, env)?;
+                    }
+                    return Ok(result);
+                }
+            }
+            _ => {}
+        }
+    }
+    // No clause matched, re-raise
+    Err(EvalError::RaisedValue(Box::new(raised_val)))
 }
 
 fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
@@ -3296,6 +3373,22 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             let msg = format!("{}", args[0]);
             Err(EvalError::Type(format!("error: {}", msg)))
         }
+        "raise" => {
+            ensure_args("raise", args, 1, p)?;
+            Err(EvalError::RaisedValue(Box::new(args[0].clone())))
+        }
+        "with-exception-handler" => {
+            ensure_args("with-exception-handler", args, 2, p)?;
+            let handler = args[0].clone();
+            let thunk = args[1].clone();
+            match force(apply_value(&thunk, &[], p)?) {
+                Ok(v) => Ok(v),
+                Err(EvalError::RaisedValue(val)) => {
+                    force(apply_value(&handler, &[*val], p)?)
+                }
+                Err(e) => Err(e),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", op, p))),
     }
 }
@@ -3569,6 +3662,11 @@ fn eval_cps(expr: &Expr, env: &Env, k: ContFn) -> Result<Value, EvalError> {
                     "lambda" | "case-lambda" | "quote" | "define-syntax"
                     | "define-record-type" | "string-set!" => {
                         let v = eval(expr, env)?;
+                        let v = force(v)?;
+                        return k.call(v);
+                    }
+                    "guard" => {
+                        let v = eval_guard(&elems[1..], env, pos)?;
                         let v = force(v)?;
                         return k.call(v);
                     }
