@@ -9,6 +9,6 @@ pub enum EvalError {
     Type(String),
     #[error("arity error: {0}")]
     Arity(String),
-    #[error("division by zero")]
-    DivisionByZero,
+    #[error("division by zero at {0}")]
+    DivisionByZero(String),
 }
