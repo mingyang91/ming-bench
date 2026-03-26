@@ -27,6 +27,9 @@ pub enum EvalError {
     #[error("invalid boolean literal: {literal}")]
     InvalidBoolean { literal: String },
 
+    #[error("invalid character literal: {literal}")]
+    InvalidCharacter { literal: String },
+
     #[error("unterminated string literal")]
     UnterminatedString,
 
@@ -64,6 +67,12 @@ pub enum EvalError {
         found: &'static str,
     },
 
+    #[error("{name} expected a character, got {found}")]
+    ExpectedCharacter {
+        name: &'static str,
+        found: &'static str,
+    },
+
     #[error("{name} expected a symbol, got {found}")]
     ExpectedSymbol {
         name: &'static str,
@@ -91,6 +100,9 @@ pub enum EvalError {
         start: i64,
         end: i64,
     },
+
+    #[error("{name} cannot mutate an immutable string")]
+    ImmutableString { name: &'static str },
 
     #[error("division by zero")]
     DivisionByZero,

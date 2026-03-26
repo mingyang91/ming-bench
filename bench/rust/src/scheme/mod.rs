@@ -8,6 +8,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 enum Expr {
     Integer(i64),
     Boolean(bool),
+    Char(char),
     String(String),
     Symbol(String),
     List(Vec<Expr>),
@@ -26,10 +27,69 @@ struct PositionedExpr {
 }
 
 #[derive(Debug, Clone)]
+struct SchemeString {
+    inner: Rc<SchemeStringInner>,
+}
+
+#[derive(Debug)]
+struct SchemeStringInner {
+    chars: RefCell<Vec<char>>,
+    mutable: bool,
+}
+
+impl SchemeString {
+    fn new_immutable(value: impl AsRef<str>) -> Self {
+        Self::from_chars(value.as_ref().chars().collect(), false)
+    }
+
+    fn new_mutable(value: impl AsRef<str>) -> Self {
+        Self::from_chars(value.as_ref().chars().collect(), true)
+    }
+
+    fn from_chars(chars: Vec<char>, mutable: bool) -> Self {
+        Self {
+            inner: Rc::new(SchemeStringInner {
+                chars: RefCell::new(chars),
+                mutable,
+            }),
+        }
+    }
+
+    fn copy_mutable(&self) -> Self {
+        Self::from_chars(self.chars(), true)
+    }
+
+    fn chars(&self) -> Vec<char> {
+        self.inner.chars.borrow().clone()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.chars.borrow().len()
+    }
+
+    fn get(&self, index: usize) -> char {
+        self.inner.chars.borrow()[index]
+    }
+
+    fn set(&self, index: usize, value: char, name: &'static str) -> Result<(), EvalError> {
+        if !self.inner.mutable {
+            return Err(EvalError::ImmutableString { name });
+        }
+
+        self.inner.chars.borrow_mut()[index] = value;
+        Ok(())
+    }
+
+    fn to_plain_string(&self) -> String {
+        self.inner.chars.borrow().iter().collect()
+    }
+}
+
+#[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
-    String(String),
+    String(SchemeString),
     Symbol(String),
     Char(char),
     List(Vec<Value>),
@@ -132,6 +192,7 @@ impl Value {
             Self::Boolean(false) => "#f".into(),
             Self::String(value) => {
                 let escaped = value
+                    .to_plain_string()
                     .chars()
                     .flat_map(|ch| match ch {
                         '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
@@ -161,7 +222,7 @@ impl Value {
 
     fn display_render(&self) -> String {
         match self {
-            Self::String(value) => value.clone(),
+            Self::String(value) => value.to_plain_string(),
             Self::Char(value) => value.to_string(),
             Self::List(items) => {
                 let rendered = items
@@ -218,7 +279,7 @@ impl<'a> Parser<'a> {
             '(' => self.parse_list(),
             '\'' => self.parse_quote_shorthand(),
             '"' => self.parse_string(),
-            '#' => self.parse_boolean(),
+            '#' => self.parse_hash_literal(),
             ')' => Err(self.error(EvalError::UnexpectedToken { token: ")".into() })),
             '-' if self
                 .peek_second_char()
@@ -281,15 +342,53 @@ impl<'a> Parser<'a> {
         Err(self.error(EvalError::UnterminatedString))
     }
 
-    fn parse_boolean(&mut self) -> Result<Expr, EvalError> {
+    fn parse_hash_literal(&mut self) -> Result<Expr, EvalError> {
         self.expect_char('#')?;
         match self.bump_char() {
             Some('t') => Ok(Expr::Boolean(true)),
             Some('f') => Ok(Expr::Boolean(false)),
+            Some('\\') => self.parse_character_literal(),
             Some(other) => Err(self.error(EvalError::InvalidBoolean {
                 literal: format!("#{other}"),
             })),
             None => Err(self.error(EvalError::UnexpectedEof)),
+        }
+    }
+
+    fn parse_character_literal(&mut self) -> Result<Expr, EvalError> {
+        let Some(first) = self.peek_char() else {
+            return Err(self.error(EvalError::InvalidCharacter {
+                literal: "#\\".into(),
+            }));
+        };
+
+        if first.is_whitespace() {
+            return Err(self.error(EvalError::InvalidCharacter {
+                literal: "#\\".into(),
+            }));
+        }
+
+        if first.is_ascii_alphabetic() {
+            let start = self.offset;
+            while self.peek_char().is_some_and(|ch| !is_token_delimiter(ch)) {
+                self.bump_char();
+            }
+
+            let literal = &self.input[start..self.offset];
+            let value = match literal {
+                "space" => ' ',
+                "newline" => '\n',
+                _ if literal.chars().count() == 1 => literal.chars().next().unwrap(),
+                _ => {
+                    return Err(self.error(EvalError::InvalidCharacter {
+                        literal: format!("#\\{literal}"),
+                    }));
+                }
+            };
+
+            Ok(Expr::Char(value))
+        } else {
+            Ok(Expr::Char(self.bump_char().unwrap()))
         }
     }
 
@@ -322,9 +421,7 @@ impl<'a> Parser<'a> {
     fn parse_symbol(&mut self) -> Result<Expr, EvalError> {
         let start = self.offset;
 
-        while self.peek_char().is_some_and(|ch| {
-            !ch.is_whitespace() && ch != '(' && ch != ')' && ch != ';' && ch != '\''
-        }) {
+        while self.peek_char().is_some_and(|ch| !is_token_delimiter(ch)) {
             self.bump_char();
         }
 
@@ -415,7 +512,8 @@ fn eval_expr_in_env(
     match expr {
         Expr::Integer(value) => Ok(Value::Integer(*value)),
         Expr::Boolean(value) => Ok(Value::Boolean(*value)),
-        Expr::String(value) => Ok(Value::String(value.clone())),
+        Expr::Char(value) => Ok(Value::Char(*value)),
+        Expr::String(value) => Ok(Value::String(SchemeString::new_immutable(value))),
         Expr::Symbol(name) => env
             .get(name)
             .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
@@ -787,7 +885,8 @@ fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Integer(value) => Value::Integer(*value),
         Expr::Boolean(value) => Value::Boolean(*value),
-        Expr::String(value) => Value::String(value.clone()),
+        Expr::Char(value) => Value::Char(*value),
+        Expr::String(value) => Value::String(SchemeString::new_immutable(value)),
         Expr::Symbol(value) => Value::Symbol(value.clone()),
         Expr::List(items) => Value::List(items.iter().map(quote_expr).collect()),
     }
@@ -831,8 +930,10 @@ fn root_env() -> EnvRef {
         "string->number",
         "string->symbol",
         "string-append",
+        "string-copy",
         "string-length",
         "string-ref",
+        "string-set!",
         "string?",
         "substring",
         "symbol?",
@@ -1012,7 +1113,7 @@ fn apply_builtin(
         }
         "number->string" => {
             let number = expect_number_arg("number->string", args)?;
-            Ok(Value::String(number.to_string()))
+            Ok(Value::String(SchemeString::new_mutable(number.to_string())))
         }
         "null?" => predicate_builtin(
             "null?",
@@ -1027,25 +1128,29 @@ fn apply_builtin(
         ),
         "string->number" => {
             let value = expect_string_arg("string->number", args)?;
-            match value.parse::<i64>() {
+            match value.to_plain_string().parse::<i64>() {
                 Ok(number) => Ok(Value::Integer(number)),
                 Err(_) => Ok(Value::Boolean(false)),
             }
         }
         "string->symbol" => {
             let value = expect_string_arg("string->symbol", args)?;
-            Ok(Value::Symbol(value.to_owned()))
+            Ok(Value::Symbol(value.to_plain_string()))
         }
         "string-append" => {
             let mut result = String::new();
             for arg in args {
-                result.push_str(expect_string("string-append", arg)?);
+                result.push_str(&expect_string("string-append", arg)?.to_plain_string());
             }
-            Ok(Value::String(result))
+            Ok(Value::String(SchemeString::new_mutable(result)))
+        }
+        "string-copy" => {
+            let value = expect_string_arg("string-copy", args)?;
+            Ok(Value::String(value.copy_mutable()))
         }
         "string-length" => {
             let value = expect_string_arg("string-length", args)?;
-            Ok(Value::Integer(value.chars().count() as i64))
+            Ok(Value::Integer(value.len() as i64))
         }
         "string-ref" => {
             if args.len() != 2 {
@@ -1056,11 +1161,24 @@ fn apply_builtin(
                 });
             }
 
-            let chars = expect_string("string-ref", &args[0])?
-                .chars()
-                .collect::<Vec<_>>();
-            let index = expect_index("string-ref", &args[1], chars.len())?;
-            Ok(Value::Char(chars[index]))
+            let string = expect_string("string-ref", &args[0])?;
+            let index = expect_index("string-ref", &args[1], string.len())?;
+            Ok(Value::Char(string.get(index)))
+        }
+        "string-set!" => {
+            if args.len() != 3 {
+                return Err(EvalError::WrongArgCount {
+                    name: "string-set!",
+                    expected: "exactly 3 arguments",
+                    got: args.len(),
+                });
+            }
+
+            let string = expect_string("string-set!", &args[0])?;
+            let index = expect_index("string-set!", &args[1], string.len())?;
+            let value = expect_char("string-set!", &args[2])?;
+            string.set(index, value, "string-set!")?;
+            Ok(Value::Void)
         }
         "string?" => predicate_builtin("string?", args, |value| matches!(value, Value::String(_))),
         "substring" => {
@@ -1072,9 +1190,7 @@ fn apply_builtin(
                 });
             }
 
-            let chars = expect_string("substring", &args[0])?
-                .chars()
-                .collect::<Vec<_>>();
+            let chars = expect_string("substring", &args[0])?.chars();
             let start = expect_index_inclusive_end("substring", &args[1], chars.len())?;
             let end = expect_index_inclusive_end("substring", &args[2], chars.len())?;
 
@@ -1086,12 +1202,14 @@ fn apply_builtin(
                 });
             }
 
-            Ok(Value::String(chars[start..end].iter().collect()))
+            Ok(Value::String(SchemeString::new_mutable(
+                chars[start..end].iter().collect::<String>(),
+            )))
         }
         "symbol?" => predicate_builtin("symbol?", args, |value| matches!(value, Value::Symbol(_))),
         "symbol->string" => {
             let value = expect_symbol_arg("symbol->string", args)?;
-            Ok(Value::String(value.to_owned()))
+            Ok(Value::String(SchemeString::new_mutable(value)))
         }
         "write" => {
             if args.len() != 1 {
@@ -1160,9 +1278,9 @@ fn expect_number_arg(name: &'static str, args: &[Value]) -> Result<i64, EvalErro
     }
 }
 
-fn expect_string<'a>(name: &'static str, value: &'a Value) -> Result<&'a str, EvalError> {
+fn expect_string(name: &'static str, value: &Value) -> Result<SchemeString, EvalError> {
     match value {
-        Value::String(string) => Ok(string),
+        Value::String(string) => Ok(string.clone()),
         other => Err(EvalError::ExpectedString {
             name,
             found: other.type_name(),
@@ -1170,7 +1288,7 @@ fn expect_string<'a>(name: &'static str, value: &'a Value) -> Result<&'a str, Ev
     }
 }
 
-fn expect_string_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a str, EvalError> {
+fn expect_string_arg(name: &'static str, args: &[Value]) -> Result<SchemeString, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name,
@@ -1180,6 +1298,16 @@ fn expect_string_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a st
     }
 
     expect_string(name, &args[0])
+}
+
+fn expect_char(name: &'static str, value: &Value) -> Result<char, EvalError> {
+    match value {
+        Value::Char(ch) => Ok(*ch),
+        other => Err(EvalError::ExpectedCharacter {
+            name,
+            found: other.type_name(),
+        }),
+    }
 }
 
 fn expect_symbol_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a str, EvalError> {
@@ -1324,6 +1452,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let (value, output) = eval_program(input)?;
     Ok((value.render(), output))
+}
+
+fn is_token_delimiter(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '(' | ')' | ';' | '\'' | '"')
 }
 
 #[cfg(test)]
