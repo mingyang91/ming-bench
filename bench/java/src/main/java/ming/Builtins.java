@@ -21,7 +21,8 @@ final class Builtins {
         return switch (name) {
             // Arithmetic
             case "+", "-", "*", "/", "abs", "modulo", "remainder", "quotient",
-                 "min", "max", "expt" -> applyArithmetic(name, args);
+                 "min", "max", "expt", "gcd", "lcm", "truncate", "round" ->
+                applyArithmetic(name, args);
 
             // Numeric predicates
             case "zero?", "positive?", "negative?", "odd?", "even?" ->
@@ -36,7 +37,16 @@ final class Builtins {
 
             // Pair / List
             case "cons", "car", "cdr", "null?", "list", "length", "append",
-                 "list-ref", "list-tail", "list?", "assoc", "pair?" ->
+                 "list-ref", "list-tail", "list?", "assoc", "pair?",
+                 "set-car!", "set-cdr!",
+                 "caar", "cadr", "cdar", "cddr",
+                 "caaar", "caadr", "cadar", "caddr",
+                 "cdaar", "cdadr", "cddar", "cdddr",
+                 "caaaar", "caaadr", "caadar", "caaddr",
+                 "cadaar", "cadadr", "caddar", "cadddr",
+                 "cdaaar", "cdaadr", "cdadar", "cdaddr",
+                 "cddaar", "cddadr", "cdddar", "cddddr",
+                 "assq", "assv", "memq", "memv", "member", "reverse" ->
                 applyList(name, args);
 
             // Type predicates
@@ -51,8 +61,10 @@ final class Builtins {
                  "string->number", "number->string", "symbol->string", "string->symbol",
                  "string-ref", "string-copy", "string-set!",
                  "string->list", "list->string",
-                 "string=?", "string<?", "string-ci=?",
-                 "string-upcase", "string-downcase" ->
+                 "string=?", "string<?", "string>?", "string<=?", "string>=?",
+                 "string-ci=?",
+                 "string-upcase", "string-downcase",
+                 "make-string", "string" ->
                 applyString(name, args);
 
             // Char operations
@@ -224,6 +236,39 @@ final class Builtins {
                 for (long i = 0; i < exp; i++) result *= base;
                 yield result;
             }
+            case "gcd" -> {
+                if (args.isEmpty()) yield 0L;
+                for (Object a : args) requireNumber(a, "gcd");
+                long result = Math.abs(requireLong(args.get(0), "gcd"));
+                for (int i = 1; i < args.size(); i++) {
+                    result = Evaluator.gcd(result, Math.abs(requireLong(args.get(i), "gcd")));
+                }
+                yield result;
+            }
+            case "lcm" -> {
+                if (args.isEmpty()) yield 1L;
+                for (Object a : args) requireNumber(a, "lcm");
+                long result = Math.abs(requireLong(args.get(0), "lcm"));
+                for (int i = 1; i < args.size(); i++) {
+                    long b = Math.abs(requireLong(args.get(i), "lcm"));
+                    if (result == 0 || b == 0) { result = 0; } else {
+                        result = result / Evaluator.gcd(result, b) * b;
+                    }
+                }
+                yield result;
+            }
+            case "truncate" -> {
+                requireArgCount(args, 1, "truncate");
+                requireNumber(args.get(0), "truncate");
+                if (args.get(0) instanceof Long) yield args.get(0);
+                yield (long) toDouble(args.get(0));
+            }
+            case "round" -> {
+                requireArgCount(args, 1, "round");
+                requireNumber(args.get(0), "round");
+                if (args.get(0) instanceof Long) yield args.get(0);
+                yield Math.round(toDouble(args.get(0)));
+            }
             default -> throw evaluator.posError("unknown arithmetic op: " + name);
         };
     }
@@ -340,9 +385,16 @@ final class Builtins {
             }
             case "list?" -> {
                 requireArgCount(args, 1, "list?");
-                Object cur = args.get(0);
-                while (cur instanceof Evaluator.Pair p) cur = p.cdr;
-                yield cur == NIL;
+                // Tortoise-and-hare cycle detection
+                Object slow = args.get(0), fast = args.get(0);
+                while (fast instanceof Evaluator.Pair fp) {
+                    fast = fp.cdr;
+                    if (!(fast instanceof Evaluator.Pair fp2)) break;
+                    fast = fp2.cdr;
+                    slow = ((Evaluator.Pair) slow).cdr;
+                    if (slow == fast) yield false; // cycle detected
+                }
+                yield !(fast instanceof Evaluator.Pair) && (fast == NIL);
             }
             case "assoc" -> {
                 requireArgCount(args, 2, "assoc");
@@ -351,6 +403,108 @@ final class Builtins {
                 while (alist instanceof Evaluator.Pair p) {
                     if (p.car instanceof Evaluator.Pair entry && evaluator.schemeEqual(key, entry.car)) yield entry;
                     alist = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "set-car!" -> {
+                requireArgCount(args, 2, "set-car!");
+                if (!(args.get(0) instanceof Evaluator.Pair p)) throw evaluator.posError("set-car!: expected pair");
+                p.car = args.get(1);
+                yield (Object) null;
+            }
+            case "set-cdr!" -> {
+                requireArgCount(args, 2, "set-cdr!");
+                if (!(args.get(0) instanceof Evaluator.Pair p)) throw evaluator.posError("set-cdr!: expected pair");
+                p.cdr = args.get(1);
+                yield (Object) null;
+            }
+            case "caar", "cadr", "cdar", "cddr",
+                 "caaar", "caadr", "cadar", "caddr",
+                 "cdaar", "cdadr", "cddar", "cdddr",
+                 "caaaar", "caaadr", "caadar", "caaddr",
+                 "cadaar", "cadadr", "caddar", "cadddr",
+                 "cdaaar", "cdaadr", "cdadar", "cdaddr",
+                 "cddaar", "cddadr", "cdddar", "cddddr" -> {
+                requireArgCount(args, 1, name);
+                Object val = args.get(0);
+                // Process letters between c and r from right to left
+                String ops = name.substring(1, name.length() - 1); // strip c and r
+                for (int i = ops.length() - 1; i >= 0; i--) {
+                    if (!(val instanceof Evaluator.Pair p)) throw evaluator.posError(name + ": expected pair");
+                    val = (ops.charAt(i) == 'a') ? p.car : p.cdr;
+                }
+                yield val;
+            }
+            case "assq" -> {
+                requireArgCount(args, 2, "assq");
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Evaluator.Pair p) {
+                    if (p.car instanceof Evaluator.Pair entry) {
+                        // eq? comparison
+                        if (entry.car == key || (entry.car instanceof Long && entry.car.equals(key))
+                            || (entry.car instanceof Boolean && entry.car.equals(key))
+                            || (entry.car instanceof String && entry.car.equals(key))) {
+                            yield entry;
+                        }
+                    }
+                    alist = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "reverse" -> {
+                requireArgCount(args, 1, "reverse");
+                Object cur = args.get(0);
+                Object result = NIL;
+                while (cur instanceof Evaluator.Pair p) {
+                    result = new Evaluator.Pair(p.car, result);
+                    cur = p.cdr;
+                }
+                yield result;
+            }
+            case "assv" -> {
+                requireArgCount(args, 2, "assv");
+                Object key = args.get(0);
+                Object alist = args.get(1);
+                while (alist instanceof Evaluator.Pair p) {
+                    if (p.car instanceof Evaluator.Pair entry && evaluator.schemeEqv(key, entry.car)) {
+                        yield entry;
+                    }
+                    alist = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "memv" -> {
+                requireArgCount(args, 2, "memv");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Evaluator.Pair p) {
+                    if (evaluator.schemeEqv(key, p.car)) yield lst;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "member" -> {
+                requireArgCount(args, 2, "member");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Evaluator.Pair p) {
+                    if (evaluator.schemeEqual(key, p.car)) yield lst;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "memq" -> {
+                requireArgCount(args, 2, "memq");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Evaluator.Pair p) {
+                    if (p.car == key || (p.car instanceof Long && p.car.equals(key))
+                        || (p.car instanceof Boolean && p.car.equals(key))
+                        || (p.car instanceof String && p.car.equals(key))) {
+                        yield lst;
+                    }
+                    lst = p.cdr;
                 }
                 yield Boolean.FALSE;
             }
@@ -495,6 +649,40 @@ final class Builtins {
                 requireArgCount(args, 1, "string-downcase");
                 if (!(args.get(0) instanceof Evaluator.SchemeString s)) throw evaluator.posError("string-downcase: expected string");
                 yield new Evaluator.SchemeString(s.value.toLowerCase());
+            }
+            case "string>?" -> {
+                requireArgCount(args, 2, "string>?");
+                if (!(args.get(0) instanceof Evaluator.SchemeString a)) throw evaluator.posError("string>?: expected string");
+                if (!(args.get(1) instanceof Evaluator.SchemeString b)) throw evaluator.posError("string>?: expected string");
+                yield a.value.compareTo(b.value) > 0;
+            }
+            case "string<=?" -> {
+                requireArgCount(args, 2, "string<=?");
+                if (!(args.get(0) instanceof Evaluator.SchemeString a)) throw evaluator.posError("string<=?: expected string");
+                if (!(args.get(1) instanceof Evaluator.SchemeString b)) throw evaluator.posError("string<=?: expected string");
+                yield a.value.compareTo(b.value) <= 0;
+            }
+            case "string>=?" -> {
+                requireArgCount(args, 2, "string>=?");
+                if (!(args.get(0) instanceof Evaluator.SchemeString a)) throw evaluator.posError("string>=?: expected string");
+                if (!(args.get(1) instanceof Evaluator.SchemeString b)) throw evaluator.posError("string>=?: expected string");
+                yield a.value.compareTo(b.value) >= 0;
+            }
+            case "make-string" -> {
+                if (args.size() < 1 || args.size() > 2) throw evaluator.posError("make-string: expected 1 or 2 arguments");
+                int len = (int) requireLong(args.get(0), "make-string");
+                char fill = args.size() == 2 && args.get(1) instanceof Evaluator.SchemeChar c ? c.value : ' ';
+                char[] chars = new char[len];
+                java.util.Arrays.fill(chars, fill);
+                yield new Evaluator.SchemeString(new String(chars), true);
+            }
+            case "string" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object a : args) {
+                    if (!(a instanceof Evaluator.SchemeChar c)) throw evaluator.posError("string: expected char");
+                    sb.append(c.value);
+                }
+                yield new Evaluator.SchemeString(sb.toString());
             }
             default -> throw evaluator.posError("unknown string op: " + name);
         };

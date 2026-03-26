@@ -45,6 +45,18 @@ public class Evaluator {
                 "string-upcase", "string-downcase",
                 "exact?", "inexact?", "exact->inexact", "inexact->exact",
                 "numerator", "denominator", "integer?", "rational?",
+                "set-car!", "set-cdr!",
+                "caar", "cadr", "cdar", "cddr",
+                "caaar", "caadr", "cadar", "caddr",
+                "cdaar", "cdadr", "cddar", "cdddr",
+                "caaaar", "caaadr", "caadar", "caaddr",
+                "cadaar", "cadadr", "caddar", "cadddr",
+                "cdaaar", "cdaadr", "cdadar", "cdaddr",
+                "cddaar", "cddadr", "cdddar", "cddddr",
+                "assq", "assv", "memq", "memv", "member", "reverse",
+                "gcd", "lcm", "truncate", "round",
+                "make-string", "string",
+                "string>?", "string<=?", "string>=?",
                 "procedure?"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
@@ -543,6 +555,23 @@ public class Evaluator {
                         }
                         return null;
                     }
+                    case "let*" -> {
+                        if (list.size() < 3) throw posError("let*: bad syntax");
+                        List<?> bindings = (List<?>) unwrap(list.get(1));
+                        Env letEnv = new Env(env);
+                        for (Object b : bindings) {
+                            List<?> binding = (List<?>) unwrap(b);
+                            String bname = (String) unwrap(binding.get(0));
+                            Object bval = eval(binding.get(1), letEnv);
+                            letEnv.define(bname, bval);
+                        }
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letEnv);
+                        }
+                        expr = list.get(list.size() - 1);
+                        env = letEnv;
+                        continue;
+                    }
                     case "letrec" -> {
                         if (list.size() < 3) throw posError("letrec: bad syntax");
                         List<?> bindings = (List<?>) unwrap(list.get(1));
@@ -980,6 +1009,10 @@ public class Evaluator {
     }
 
     boolean schemeEqual(Object a, Object b) {
+        return schemeEqualImpl(a, b, new java.util.IdentityHashMap<>());
+    }
+
+    private boolean schemeEqualImpl(Object a, Object b, java.util.IdentityHashMap<Object, Set<Object>> seen) {
         if (a == b) return true;
         if (isNumber(a) && isNumber(b)) return numToDouble(a) == numToDouble(b);
         if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
@@ -988,12 +1021,20 @@ public class Evaluator {
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value == cb.value;
         if (a == NIL && b == NIL) return true;
         if (a instanceof Pair pa && b instanceof Pair pb) {
-            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+            Set<Object> aSet = seen.get(a);
+            if (aSet != null && aSet.contains(b)) return true; // already comparing these
+            if (aSet == null) { aSet = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()); seen.put(a, aSet); }
+            aSet.add(b);
+            return schemeEqualImpl(pa.car, pb.car, seen) && schemeEqualImpl(pa.cdr, pb.cdr, seen);
         }
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.data.length != vb.data.length) return false;
+            Set<Object> aSet = seen.get(a);
+            if (aSet != null && aSet.contains(b)) return true;
+            if (aSet == null) { aSet = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()); seen.put(a, aSet); }
+            aSet.add(b);
             for (int i = 0; i < va.data.length; i++) {
-                if (!schemeEqual(va.data[i], vb.data[i])) return false;
+                if (!schemeEqualImpl(va.data[i], vb.data[i], seen)) return false;
             }
             return true;
         }
@@ -1026,11 +1067,15 @@ public class Evaluator {
     String displayString(Object val) {
         if (val instanceof SchemeString s) return s.value;
         if (val instanceof SchemeChar c) return String.valueOf(c.value);
-        return schemeToString(val);
+        return schemeToStringImpl(val, new java.util.IdentityHashMap<>());
     }
 
     @SuppressWarnings("unchecked")
     String schemeToString(Object val) {
+        return schemeToStringImpl(val, new java.util.IdentityHashMap<>());
+    }
+
+    private String schemeToStringImpl(Object val, java.util.IdentityHashMap<Object, Boolean> seen) {
         if (val == null) return ""; // void
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
@@ -1048,26 +1093,35 @@ public class Evaluator {
         }
         if (val instanceof String s) return s;
         if (val instanceof SchemeVector v) {
+            if (seen.containsKey(v)) return "#<cycle>";
+            seen.put(v, Boolean.TRUE);
             StringBuilder sb = new StringBuilder("#(");
             for (int i = 0; i < v.data.length; i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(v.data[i]));
+                sb.append(schemeToStringImpl(v.data[i], seen));
             }
             sb.append(")");
+            seen.remove(v);
             return sb.toString();
         }
         if (val instanceof Pair) {
+            if (seen.containsKey(val)) return "#<cycle>";
+            seen.put(val, Boolean.TRUE);
             StringBuilder sb = new StringBuilder("(");
             Object cur = val;
             boolean first = true;
             while (cur instanceof Pair p) {
+                if (!first) {
+                    if (seen.containsKey(cur)) { sb.append(" . #<cycle>"); break; }
+                    seen.put(cur, Boolean.TRUE);
+                }
                 if (!first) sb.append(" ");
                 first = false;
-                sb.append(schemeToString(p.car));
+                sb.append(schemeToStringImpl(p.car, seen));
                 cur = p.cdr;
             }
-            if (cur != NIL) {
-                sb.append(" . ").append(schemeToString(cur));
+            if (cur != NIL && !(cur instanceof Pair)) {
+                sb.append(" . ").append(schemeToStringImpl(cur, seen));
             }
             sb.append(")");
             return sb.toString();
@@ -1076,7 +1130,7 @@ public class Evaluator {
             StringBuilder sb = new StringBuilder("(");
             for (int i = 0; i < list.size(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(list.get(i)));
+                sb.append(schemeToStringImpl(list.get(i), seen));
             }
             sb.append(")");
             return sb.toString();
@@ -1089,7 +1143,7 @@ public class Evaluator {
     private static boolean isKeyword(String sym) {
         return switch (sym) {
             case "if", "define", "lambda", "quote", "set!", "begin", "cond",
-                 "let", "and", "or", "define-syntax", "syntax-rules",
+                 "let", "let*", "and", "or", "define-syntax", "syntax-rules",
                  "define-record-type", "case-lambda",
                  "letrec", "letrec*", "case", "do" -> true;
             default -> false;
