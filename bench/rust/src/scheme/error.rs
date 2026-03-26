@@ -59,6 +59,8 @@ pub enum EvalError {
         end: usize,
         len: usize,
     },
+    #[error("circular list")]
+    CyclicList,
 }
 
 impl EvalError {
