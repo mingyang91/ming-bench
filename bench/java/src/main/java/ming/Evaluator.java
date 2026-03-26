@@ -63,6 +63,51 @@ public class Evaluator {
         TailCall(Object expr, Env env) { this.expr = expr; this.env = env; }
     }
 
+    // --- Continuations (call/cc) ---
+
+    static final Object CALLCC_SENTINEL = new Object() {
+        @Override public String toString() { return "#<procedure:call/cc>"; }
+    };
+
+    private static class ContinuationInvoked extends RuntimeException {
+        final Object value;
+        final SchemeContinuation continuation;
+        ContinuationInvoked(Object value, SchemeContinuation cont) {
+            super(null, null, true, false);
+            this.value = value;
+            this.continuation = cont;
+        }
+    }
+
+    private static class SchemeContinuation {
+        final List<Object> bodyExprs;
+        final Env bodyEnv;
+        final boolean useInnerBody;
+        final int topIdx;
+        final List<Object> topExprs;
+        final Env topEnv;
+
+        SchemeContinuation(List<Object> bodyExprs, Env bodyEnv, boolean useInnerBody,
+                           int topIdx, List<Object> topExprs, Env topEnv) {
+            this.bodyExprs = bodyExprs;
+            this.bodyEnv = bodyEnv;
+            this.useInnerBody = useInnerBody;
+            this.topIdx = topIdx;
+            this.topExprs = topExprs;
+            this.topEnv = topEnv;
+        }
+    }
+
+    // Continuation context tracking
+    private Object pendingCCValue;
+    private boolean hasPendingCC;
+    private List<Object> ccBodyExprs;
+    private Env ccBodyEnv;
+    private boolean ccInLetBody;
+    private List<Object> ccTopExprs;
+    private int ccTopIdx;
+    private Env ccTopEnv;
+
     // --- CaseLambda ---
 
     private static class CaseLambda {
@@ -149,10 +194,7 @@ public class Evaluator {
     public String evalStr(String input) throws EvalError {
         List<Object> exprs = parse(input);
         Env env = makeGlobalEnv();
-        Object result = null;
-        for (Object expr : exprs) {
-            result = eval(expr, env);
-        }
+        Object result = evalTopLevel(exprs, env);
         return schemeToString(result);
     }
 
@@ -160,11 +202,102 @@ public class Evaluator {
         outputBuffer = new StringBuilder();
         List<Object> exprs = parse(input);
         Env env = makeGlobalEnv();
-        Object result = null;
-        for (Object expr : exprs) {
-            result = eval(expr, env);
-        }
+        Object result = evalTopLevel(exprs, env);
         return new EvalResult(schemeToString(result), outputBuffer.toString());
+    }
+
+    private Object evalTopLevel(List<Object> exprs, Env env) throws EvalError {
+        ccTopExprs = exprs;
+        ccTopEnv = env;
+        ccInLetBody = false;
+        ccBodyExprs = null;
+        ccBodyEnv = null;
+        hasPendingCC = false;
+
+        Object result = null;
+        int startIdx = 0;
+        List<Object> replayBodyExprs = null;
+        Env replayBodyEnv = null;
+        int replayTopIdx = -1;
+
+        while (true) {
+            try {
+                if (replayBodyExprs != null) {
+                    List<Object> bExprs = replayBodyExprs;
+                    Env bEnv = replayBodyEnv;
+                    int tIdx = replayTopIdx;
+                    replayBodyExprs = null;
+                    ccInLetBody = true;
+                    for (int j = 0; j < bExprs.size(); j++) {
+                        ccBodyExprs = new ArrayList<>(bExprs.subList(j, bExprs.size()));
+                        ccBodyEnv = bEnv;
+                        ccTopIdx = tIdx;
+                        result = eval(bExprs.get(j), bEnv);
+                    }
+                    for (int i = tIdx + 1; i < exprs.size(); i++) {
+                        ccTopIdx = i;
+                        ccBodyExprs = new ArrayList<>(exprs.subList(i, exprs.size()));
+                        ccBodyEnv = env;
+                        ccInLetBody = false;
+                        result = eval(exprs.get(i), env);
+                    }
+                } else {
+                    for (int i = startIdx; i < exprs.size(); i++) {
+                        ccTopIdx = i;
+                        ccBodyExprs = new ArrayList<>(exprs.subList(i, exprs.size()));
+                        ccBodyEnv = env;
+                        ccInLetBody = false;
+                        result = eval(exprs.get(i), env);
+                    }
+                }
+                return result;
+            } catch (ContinuationInvoked ci) {
+                SchemeContinuation cont = ci.continuation;
+                hasPendingCC = true;
+                pendingCCValue = ci.value;
+                if (cont.useInnerBody) {
+                    replayBodyExprs = cont.bodyExprs;
+                    replayBodyEnv = cont.bodyEnv;
+                    replayTopIdx = cont.topIdx;
+                    startIdx = 0;
+                } else {
+                    startIdx = cont.topIdx;
+                    replayBodyExprs = null;
+                }
+            }
+        }
+    }
+
+    private Object doCallCC(Object userLambda) throws EvalError {
+        if (hasPendingCC) {
+            hasPendingCC = false;
+            Object val = pendingCCValue;
+            pendingCCValue = null;
+            return val;
+        }
+
+        SchemeContinuation cont = new SchemeContinuation(
+            ccBodyExprs != null ? new ArrayList<>(ccBodyExprs) : null,
+            ccBodyEnv,
+            ccInLetBody && ccBodyExprs != null,
+            ccTopIdx,
+            ccTopExprs,
+            ccTopEnv
+        );
+
+        BuiltinProc kProc = new BuiltinProc("continuation", kArgs -> {
+            if (kArgs.size() != 1) throw new EvalError("continuation: expected 1 argument");
+            throw new ContinuationInvoked(kArgs.get(0), cont);
+        });
+
+        try {
+            return apply(userLambda, List.of(kProc));
+        } catch (ContinuationInvoked ci) {
+            if (ci.continuation == cont) {
+                return ci.value;
+            }
+            throw ci;
+        }
     }
 
     private Env makeGlobalEnv() {
@@ -436,6 +569,10 @@ public class Evaluator {
                 for (int i = 1; i < list.elems.size(); i++) {
                     args.add(eval(list.elems.get(i), env));
                 }
+                if (proc == CALLCC_SENTINEL) {
+                    if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
+                    return doCallCC(args.get(0));
+                }
                 if (proc instanceof Lambda lam) {
                     return tailApplyLambda(lam, args);
                 }
@@ -478,9 +615,14 @@ public class Evaluator {
 
     private Object tailApplyLambda(Lambda lam, List<Object> args) throws EvalError {
         Env callEnv = bindLambdaArgs(lam, args);
+        ccInLetBody = false;
         for (int i = 0; i < lam.body.size() - 1; i++) {
+            ccBodyExprs = new ArrayList<>(lam.body.subList(i, lam.body.size()));
+            ccBodyEnv = callEnv;
             eval(lam.body.get(i), callEnv);
         }
+        ccBodyExprs = new ArrayList<>(lam.body.subList(lam.body.size() - 1, lam.body.size()));
+        ccBodyEnv = callEnv;
         return new TailCall(lam.body.get(lam.body.size() - 1), callEnv);
     }
 
@@ -644,6 +786,7 @@ public class Evaluator {
             for (int i = 0; i < paramNames.size(); i++) {
                 letEnv.define(paramNames.get(i), eval(initExprs.get(i), env));
             }
+            ccInLetBody = true;
             return tailBody(body, letEnv);
         }
     }
@@ -733,6 +876,7 @@ public class Evaluator {
             Object val = eval(initExprs.get(i), letEnv);
             letEnv.define(names.get(i), val);
         }
+        ccInLetBody = true;
         return tailBody(elems.subList(2, elems.size()), letEnv);
     }
 
@@ -747,6 +891,7 @@ public class Evaluator {
             Object val = eval(binding.elems.get(1), letEnv);
             letEnv.define(name, val);
         }
+        ccInLetBody = true;
         return tailBody(elems.subList(2, elems.size()), letEnv);
     }
 
@@ -761,6 +906,7 @@ public class Evaluator {
             Object val = eval(binding.elems.get(1), letEnv);
             letEnv.define(name, val);
         }
+        ccInLetBody = true;
         return tailBody(elems.subList(2, elems.size()), letEnv);
     }
 
@@ -829,8 +975,12 @@ public class Evaluator {
 
     private Object tailBody(List<Object> body, Env env) throws EvalError {
         for (int i = 0; i < body.size() - 1; i++) {
+            ccBodyExprs = new ArrayList<>(body.subList(i, body.size()));
+            ccBodyEnv = env;
             eval(body.get(i), env);
         }
+        ccBodyExprs = new ArrayList<>(body.subList(body.size() - 1, body.size()));
+        ccBodyEnv = env;
         return new TailCall(body.get(body.size() - 1), env);
     }
 
@@ -845,6 +995,10 @@ public class Evaluator {
     }
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
+        if (proc == CALLCC_SENTINEL) {
+            if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
+            return doCallCC(args.get(0));
+        }
         if (proc instanceof Lambda lam) {
             if (lam.restParam != null) {
                 if (args.size() < lam.params.size()) {
@@ -1280,8 +1434,12 @@ public class Evaluator {
         env.define("procedure?", new BuiltinProc("procedure?", args -> {
             requireArgCount("procedure?", args, 1);
             Object v = args.get(0);
-            return v instanceof Lambda || v instanceof CaseLambda || v instanceof BuiltinProc;
+            return v instanceof Lambda || v instanceof CaseLambda || v instanceof BuiltinProc || v == CALLCC_SENTINEL;
         }));
+
+        // L18: call/cc
+        env.define("call/cc", CALLCC_SENTINEL);
+        env.define("call-with-current-continuation", CALLCC_SENTINEL);
 
         // L08: apply
         env.define("apply", new BuiltinProc("apply", args -> {
@@ -2165,6 +2323,7 @@ public class Evaluator {
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
+        if (val == CALLCC_SENTINEL) return "#<procedure>";
         if (val instanceof SchemeVector v) {
             if (!seen.add(v)) return "#(...)";
             StringBuilder sb = new StringBuilder("#(");
