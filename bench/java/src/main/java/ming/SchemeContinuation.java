@@ -7,10 +7,8 @@ import java.util.List;
  */
 public class SchemeContinuation {
     final long id;
-    // Body context at the point of capture (null if at top level or no body)
-    final List<Object> bodyExprs;
-    final int bodyIndex;
-    final Environment bodyEnv;
+    // Full body frame stack at the point of capture (outermost to innermost)
+    final List<Evaluator.BodyFrame> frameStack;
     // The top-level expression index at capture time
     final int captureTopLevelIndex;
     // The top-level expression that contained this call/cc
@@ -21,14 +19,12 @@ public class SchemeContinuation {
     final Evaluator evaluator;
     private static long nextId = 0;
 
-    SchemeContinuation(List<Object> bodyExprs, int bodyIndex, Environment bodyEnv,
+    SchemeContinuation(List<Evaluator.BodyFrame> frameStack,
                        int captureTopLevelIndex, Object topLevelExpr,
                        List<Object> remainingTopLevel, Environment topLevelEnv,
                        Evaluator evaluator) {
         this.id = nextId++;
-        this.bodyExprs = bodyExprs;
-        this.bodyIndex = bodyIndex;
-        this.bodyEnv = bodyEnv;
+        this.frameStack = frameStack;
         this.captureTopLevelIndex = captureTopLevelIndex;
         this.topLevelExpr = topLevelExpr;
         this.remainingTopLevel = remainingTopLevel;

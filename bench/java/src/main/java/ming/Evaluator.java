@@ -2,6 +2,7 @@ package ming;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -113,30 +114,59 @@ public class Evaluator {
                     pendingContinuation = null;
                     SchemeContinuation cont = continuationRegistry.get(ce.continuationId);
                     if (cont == null) throw new EvalError("invalid continuation");
-                    activeContinuationValue = ce.value;
-                    activeContinuationId = ce.continuationId;
-                    // Determine replay strategy:
-                    // If continuation was thrown from within the same top-level expr
-                    // that captured it (same index), use body-level replay.
-                    // Otherwise, use top-level replay (re-eval the capturing expr).
+                    // Clean up any leftover frame stack state
+                    bodyFrameStack.clear();
+
                     boolean sameExpr = (throwTopLevelIndex == cont.captureTopLevelIndex)
-                        && cont.bodyExprs != null;
+                        && cont.frameStack != null && !cont.frameStack.isEmpty()
+                        && cont.frameStack.get(cont.frameStack.size() - 1).exprs != null;
                     if (sameExpr) {
-                        // Body-level replay (reentrant continuation)
-                        List<Object> replayBody = cont.bodyExprs.subList(cont.bodyIndex, cont.bodyExprs.size());
-                        currentBodyExprs = new ArrayList<>(replayBody);
-                        currentBodyEnv = cont.bodyEnv;
-                        Object bodyResult = null;
-                        for (int bi = 0; bi < replayBody.size(); bi++) {
-                            currentBodyIndex = bi;
-                            bodyResult = eval(replayBody.get(bi), cont.bodyEnv);
+                        // Frame-stack replay: process from innermost to outermost
+                        List<BodyFrame> frames = cont.frameStack;
+
+                        // Set up bodyFrameStack with all frames except innermost
+                        for (int fi = 0; fi < frames.size() - 1; fi++) {
+                            BodyFrame f = frames.get(fi);
+                            bodyFrameStack.add(new BodyFrame(f.exprs, f.index, f.env));
                         }
+
+                        // Set activeContinuationId for the target call/cc
+                        activeContinuationId = ce.continuationId;
+                        activeContinuationValue = ce.value;
+
+                        // Process innermost frame (contains the target call/cc)
+                        BodyFrame innermost = frames.get(frames.size() - 1);
+                        currentBodyExprs = innermost.exprs;
+                        currentBodyEnv = innermost.env;
+                        Object bodyResult = null;
+                        for (int bi = innermost.index; bi < innermost.exprs.size(); bi++) {
+                            currentBodyIndex = bi;
+                            bodyResult = eval(innermost.exprs.get(bi), innermost.env);
+                        }
+
+                        // Process outer frames from innermost to outermost
+                        for (int fi = frames.size() - 2; fi >= 0; fi--) {
+                            if (!bodyFrameStack.isEmpty()) {
+                                bodyFrameStack.remove(bodyFrameStack.size() - 1);
+                            }
+                            BodyFrame frame = frames.get(fi);
+                            if (frame.exprs == null) continue;
+                            currentBodyExprs = frame.exprs;
+                            currentBodyEnv = frame.env;
+                            for (int bi = frame.index + 1; bi < frame.exprs.size(); bi++) {
+                                currentBodyIndex = bi;
+                                bodyResult = eval(frame.exprs.get(bi), frame.env);
+                            }
+                        }
+
                         exprs = cont.remainingTopLevel;
                         topLevelExprs = exprs;
                         topLevelIndex = 0;
                         lastResult = bodyResult;
                     } else {
                         // Top-level replay (saved continuation invoked from outside)
+                        activeContinuationValue = ce.value;
+                        activeContinuationId = ce.continuationId;
                         List<Object> replay = new ArrayList<>();
                         if (cont.topLevelExpr != null) {
                             replay.add(cont.topLevelExpr);
@@ -156,6 +186,7 @@ public class Evaluator {
                 }
                 return lastResult;
             } catch (ContinuationException ce) {
+                bodyFrameStack.clear();
                 throwTopLevelIndex = topLevelIndex;
                 pendingContinuation = ce;
             } catch (SchemeRaiseException re) {
@@ -171,11 +202,27 @@ public class Evaluator {
     // When replaying a continuation, these are set so call/cc knows to return the value
     private Long activeContinuationId = null;
     private Object activeContinuationValue = null;
+    // Track which call/cc sites are currently active (within their dynamic extent)
+    private final java.util.Set<Long> activeContinuationSites = new java.util.HashSet<>();
 
     // Current body context tracking (for continuation capture)
     private List<Object> currentBodyExprs = null;
     private int currentBodyIndex = 0;
     private Environment currentBodyEnv = null;
+
+    // Body frame stack: outer body contexts saved when entering nested body forms
+    static final class BodyFrame {
+        List<Object> exprs;
+        int index;
+        Environment env;
+        BodyFrame(List<Object> exprs, int index, Environment env) {
+            this.exprs = exprs; this.index = index; this.env = env;
+        }
+    }
+    private final List<BodyFrame> bodyFrameStack = new ArrayList<>();
+
+    // Macro expansion cache (by list identity) to avoid re-expanding in tight loops
+    private final Map<Object, Object> macroExpansionCache = new IdentityHashMap<>();
 
     // dynamic-wind stack: each entry is {inThunk, outThunk}
     private final List<Object[]> windStack = new ArrayList<>();
@@ -192,18 +239,45 @@ public class Evaluator {
     private static final class TailCall {
         Object expr;
         Environment env;
+        boolean hasBodyFrame; // true if a body form left a frame on bodyFrameStack
         TailCall(Object expr, Environment env) {
             this.expr = expr;
             this.env = env;
+        }
+        TailCall(Object expr, Environment env, boolean hasBodyFrame) {
+            this.expr = expr;
+            this.env = env;
+            this.hasBodyFrame = hasBodyFrame;
         }
     }
 
     // Resolve a TailCall chain (trampoline)
     private Object trampoline(Object result) throws EvalError, ContinuationException, SchemeRaiseException {
-        while (result instanceof TailCall tc) {
-            result = evalStep(tc.expr, tc.env);
+        int framesToPop = 0;
+        try {
+            while (result instanceof TailCall tc) {
+                if (tc.hasBodyFrame) framesToPop++;
+                result = evalStep(tc.expr, tc.env);
+                // If continuing the chain, pop frames for TCO (don't restore currentBodyExprs
+                // yet — body context should persist through the tail-call chain)
+                if (result instanceof TailCall) {
+                    while (framesToPop > 0 && !bodyFrameStack.isEmpty()) {
+                        bodyFrameStack.remove(bodyFrameStack.size() - 1);
+                        framesToPop--;
+                    }
+                }
+            }
+            return result;
+        } finally {
+            // Restore currentBodyExprs when trampoline exits
+            while (framesToPop > 0 && !bodyFrameStack.isEmpty()) {
+                BodyFrame popped = bodyFrameStack.remove(bodyFrameStack.size() - 1);
+                currentBodyExprs = popped.exprs;
+                currentBodyIndex = popped.index;
+                currentBodyEnv = popped.env;
+                framesToPop--;
+            }
         }
-        return result;
     }
 
     // Apply that fully resolves (for non-tail contexts like map, builtin apply)
@@ -318,12 +392,11 @@ public class Evaluator {
                         return new SchemeCaseLambda(clauses);
                     }
                     case "begin" -> {
-                        // Save and set body context for continuation capture
-                        List<Object> prevBody = currentBodyExprs;
-                        int prevIdx = currentBodyIndex;
-                        Environment prevEnv = currentBodyEnv;
+                        // Push body frame for continuation capture
+                        bodyFrameStack.add(new BodyFrame(currentBodyExprs, currentBodyIndex, currentBodyEnv));
                         currentBodyExprs = args;
                         currentBodyEnv = env;
+                        boolean tailReturn = false;
                         try {
                             for (int i = 0; i < args.size() - 1; i++) {
                                 currentBodyIndex = i;
@@ -331,13 +404,17 @@ public class Evaluator {
                             }
                             if (!args.isEmpty()) {
                                 currentBodyIndex = args.size() - 1;
-                                return new TailCall(args.get(args.size() - 1), env);
+                                tailReturn = true;
+                                return new TailCall(args.get(args.size() - 1), env, true);
                             }
                             return VOID;
                         } finally {
-                            currentBodyExprs = prevBody;
-                            currentBodyIndex = prevIdx;
-                            currentBodyEnv = prevEnv;
+                            if (!tailReturn) {
+                                BodyFrame prev = bodyFrameStack.remove(bodyFrameStack.size() - 1);
+                                currentBodyExprs = prev.exprs;
+                                currentBodyIndex = prev.index;
+                                currentBodyEnv = prev.env;
+                            }
                         }
                     }
                     case "let" -> {
@@ -468,9 +545,12 @@ public class Evaluator {
                         try {
                             Object val = env.lookup(name);
                             if (val instanceof SyntaxRules sr) {
+                                Object cached = macroExpansionCache.get(list);
+                                if (cached != null) return new TailCall(cached, env);
                                 @SuppressWarnings("unchecked")
                                 List<Object> deepForm = (List<Object>) deepUnwrap(list);
                                 Object expanded = sr.expand(deepForm, env);
+                                macroExpansionCache.put(list, expanded);
                                 return new TailCall(expanded, env);
                             }
                             if (val instanceof SyntaxCaseHandler.MacroTransformer mt) {
@@ -533,13 +613,12 @@ public class Evaluator {
             Object val = eval(b.get(1), env);
             letEnv.define(varName, val);
         }
-        // Track body context for continuation capture
+        // Track body context for continuation capture via frame stack
         List<Object> bodyExprs = args.subList(1, args.size());
-        List<Object> prevBody = currentBodyExprs;
-        int prevIdx = currentBodyIndex;
-        Environment prevEnv = currentBodyEnv;
+        bodyFrameStack.add(new BodyFrame(currentBodyExprs, currentBodyIndex, currentBodyEnv));
         currentBodyExprs = bodyExprs;
         currentBodyEnv = letEnv;
+        boolean tailReturn = false;
         try {
             for (int i = 0; i < bodyExprs.size() - 1; i++) {
                 currentBodyIndex = i;
@@ -547,13 +626,17 @@ public class Evaluator {
             }
             if (!bodyExprs.isEmpty()) {
                 currentBodyIndex = bodyExprs.size() - 1;
-                return new TailCall(bodyExprs.get(bodyExprs.size() - 1), letEnv);
+                tailReturn = true;
+                return new TailCall(bodyExprs.get(bodyExprs.size() - 1), letEnv, true);
             }
             return VOID;
         } finally {
-            currentBodyExprs = prevBody;
-            currentBodyIndex = prevIdx;
-            currentBodyEnv = prevEnv;
+            if (!tailReturn) {
+                BodyFrame prev = bodyFrameStack.remove(bodyFrameStack.size() - 1);
+                currentBodyExprs = prev.exprs;
+                currentBodyIndex = prev.index;
+                currentBodyEnv = prev.env;
+            }
         }
     }
 
@@ -806,10 +889,12 @@ public class Evaluator {
             activeContinuationValue = null;
             return val;
         }
-        // Capture body context for replay
-        List<Object> bodyExprs = currentBodyExprs;
-        int bodyIdx = currentBodyIndex;
-        Environment bodyEnv = currentBodyEnv;
+        // Capture full body frame stack (outer frames + current)
+        List<BodyFrame> capturedStack = new ArrayList<>(bodyFrameStack.size() + 1);
+        for (BodyFrame f : bodyFrameStack) {
+            capturedStack.add(new BodyFrame(f.exprs, f.index, f.env));
+        }
+        capturedStack.add(new BodyFrame(currentBodyExprs, currentBodyIndex, currentBodyEnv));
         // Capture remaining top-level expressions
         List<Object> remainingTopLevel = new ArrayList<>();
         if (topLevelExprs != null) {
@@ -819,12 +904,13 @@ public class Evaluator {
         }
         Object topLevelExpr = (topLevelExprs != null && topLevelIndex < topLevelExprs.size())
             ? topLevelExprs.get(topLevelIndex) : null;
-        SchemeContinuation cont = new SchemeContinuation(bodyExprs, bodyIdx, bodyEnv,
+        SchemeContinuation cont = new SchemeContinuation(capturedStack,
             topLevelIndex, topLevelExpr, remainingTopLevel, globalEnv, this);
         continuationRegistry.put(cont.id, cont);
-        // Call the procedure with the continuation
+        // Call the procedure with the continuation, tracking active site
         List<Object> contArgs = new ArrayList<>();
         contArgs.add(cont);
+        activeContinuationSites.add(cont.id);
         try {
             return applyResolved(proc, contArgs);
         } catch (ContinuationException ce) {
@@ -832,6 +918,8 @@ public class Evaluator {
                 return ce.value;
             }
             throw ce;
+        } finally {
+            activeContinuationSites.remove(cont.id);
         }
     }
 
@@ -955,7 +1043,32 @@ public class Evaluator {
     private Object apply(Object proc, List<Object> args) throws EvalError, ContinuationException, SchemeRaiseException {
         if (proc instanceof SchemeContinuation cont) {
             if (args.size() != 1) throw new EvalError("continuation: expected 1 argument");
-            throw new ContinuationException(cont.id, args.get(0));
+            // Within dynamic extent: escape (caught by doCallCC's try/catch)
+            if (activeContinuationSites.contains(cont.id)) {
+                throw new ContinuationException(cont.id, args.get(0));
+            }
+            // Different top-level expression: throw for top-level replay
+            if (topLevelIndex != cont.captureTopLevelIndex) {
+                throw new ContinuationException(cont.id, args.get(0));
+            }
+            // Same top-level: check if we're in the same body context as the call/cc
+            if (cont.frameStack != null && !cont.frameStack.isEmpty()) {
+                BodyFrame innermost = cont.frameStack.get(cont.frameStack.size() - 1);
+                if (innermost.exprs != null) {
+                    // Check current body context
+                    if (innermost.exprs == currentBodyExprs) {
+                        throw new ContinuationException(cont.id, args.get(0));
+                    }
+                    // Check outer frames on the stack
+                    for (BodyFrame frame : bodyFrameStack) {
+                        if (frame.exprs != null && frame.exprs == innermost.exprs) {
+                            throw new ContinuationException(cont.id, args.get(0));
+                        }
+                    }
+                }
+            }
+            // Same top-level, different body context: return value directly (no replay)
+            return args.get(0);
         }
         if (proc instanceof SchemeCaseLambda cl) {
             for (SchemeLambda clause : cl.clauses) {
@@ -1158,224 +1271,8 @@ public class Evaluator {
     }
 
 
-    private Object applyCxr(String name, Object val) throws EvalError {
-        // Process cxr name from right to left (inner to outer): c[ad]+r
-        // e.g., cadr = car(cdr(x)), so process 'd' then 'a'
-        for (int i = name.length() - 2; i >= 1; i--) {
-            if (!(val instanceof SchemePair p)) throw new EvalError(name + ": not a pair");
-            val = name.charAt(i) == 'a' ? p.car : p.cdr;
-        }
-        return val;
-    }
-
     private Object applyListBuiltin(String name, List<Object> args) throws EvalError, ContinuationException, SchemeRaiseException {
-        return switch (name) {
-            case "cons" -> new SchemePair(args.get(0), args.get(1));
-            case "car" -> {
-                if (args.get(0) instanceof SchemePair p) yield p.car;
-                throw new EvalError("car: not a pair");
-            }
-            case "cdr" -> {
-                if (args.get(0) instanceof SchemePair p) yield p.cdr;
-                throw new EvalError("cdr: not a pair");
-            }
-            case "null?" -> args.get(0) instanceof SchemeNil;
-            case "list" -> {
-                Object result = SchemeNil.INSTANCE;
-                for (int i = args.size() - 1; i >= 0; i--) result = new SchemePair(args.get(i), result);
-                yield result;
-            }
-            case "length" -> {
-                Object val = args.get(0);
-                Object slow = val, fast = val;
-                long len = 0;
-                while (val instanceof SchemePair p) {
-                    len++;
-                    val = p.cdr;
-                    // Cycle detection with tortoise-and-hare
-                    if (len % 2 == 0 && slow instanceof SchemePair sp) slow = sp.cdr;
-                    if (val == slow && len > 0 && val instanceof SchemePair) throw new EvalError("length: not a proper list");
-                }
-                if (!(val instanceof SchemeNil)) throw new EvalError("length: not a proper list");
-                yield len;
-            }
-            case "append" -> {
-                Object result = SchemeNil.INSTANCE;
-                for (int i = args.size() - 1; i >= 0; i--) {
-                    Object lst = args.get(i);
-                    if (lst instanceof SchemeNil) continue;
-                    if (i == args.size() - 1) {
-                        result = lst;
-                    } else {
-                        List<Object> elems = new ArrayList<>();
-                        Object cur = lst;
-                        while (cur instanceof SchemePair p) { elems.add(p.car); cur = p.cdr; }
-                        for (int j = elems.size() - 1; j >= 0; j--) result = new SchemePair(elems.get(j), result);
-                    }
-                }
-                yield result;
-            }
-            case "list-ref" -> {
-                Object lst = args.get(0);
-                int idx = (int) requireLong(args.get(1));
-                for (int i = 0; i < idx; i++) {
-                    if (!(lst instanceof SchemePair p)) throw new EvalError("list-ref: index out of range");
-                    lst = p.cdr;
-                }
-                if (!(lst instanceof SchemePair p)) throw new EvalError("list-ref: index out of range");
-                yield p.car;
-            }
-            case "list-tail" -> {
-                Object lst = args.get(0);
-                int idx = (int) requireLong(args.get(1));
-                for (int i = 0; i < idx; i++) {
-                    if (!(lst instanceof SchemePair p)) throw new EvalError("list-tail: index out of range");
-                    lst = p.cdr;
-                }
-                yield lst;
-            }
-            case "list?" -> {
-                // Tortoise-and-hare cycle detection
-                Object slow = args.get(0);
-                Object fast = args.get(0);
-                while (fast instanceof SchemePair fp) {
-                    fast = fp.cdr;
-                    if (fast instanceof SchemeNil) { yield true; }
-                    if (!(fast instanceof SchemePair fp2)) { yield false; }
-                    fast = ((SchemePair) fast).cdr;
-                    slow = ((SchemePair) slow).cdr;
-                    if (slow == fast) { yield false; } // cycle detected
-                }
-                yield fast instanceof SchemeNil;
-            }
-            case "assoc" -> {
-                Object key = args.get(0);
-                Object lst = args.get(1);
-                while (lst instanceof SchemePair p) {
-                    if (p.car instanceof SchemePair entry) {
-                        if (schemeEqual(key, entry.car)) yield entry;
-                    }
-                    lst = p.cdr;
-                }
-                yield Boolean.FALSE;
-            }
-            case "map" -> {
-                if (args.size() < 2) throw new EvalError("map: expected at least 2 arguments");
-                Object proc = args.get(0);
-                List<List<Object>> lists = new ArrayList<>();
-                for (int i = 1; i < args.size(); i++) {
-                    List<Object> elems = new ArrayList<>();
-                    Object cur = args.get(i);
-                    while (cur instanceof SchemePair p) { elems.add(p.car); cur = p.cdr; }
-                    lists.add(elems);
-                }
-                int len = lists.get(0).size();
-                List<Object> results = new ArrayList<>();
-                for (int i = 0; i < len; i++) {
-                    List<Object> callArgs = new ArrayList<>();
-                    for (List<Object> l : lists) callArgs.add(l.get(i));
-                    results.add(applyResolved(proc, callArgs));
-                }
-                Object result = SchemeNil.INSTANCE;
-                for (int i = results.size() - 1; i >= 0; i--) result = new SchemePair(results.get(i), result);
-                yield result;
-            }
-            case "set-car!" -> {
-                if (!(args.get(0) instanceof SchemePair p)) throw new EvalError("set-car!: not a pair");
-                p.car = args.get(1);
-                yield VOID;
-            }
-            case "set-cdr!" -> {
-                if (!(args.get(0) instanceof SchemePair p)) throw new EvalError("set-cdr!: not a pair");
-                p.cdr = args.get(1);
-                yield VOID;
-            }
-            case "for-each" -> {
-                if (args.size() < 2) throw new EvalError("for-each: expected at least 2 arguments");
-                Object proc = args.get(0);
-                List<List<Object>> lists = new ArrayList<>();
-                for (int i = 1; i < args.size(); i++) {
-                    List<Object> elems = new ArrayList<>();
-                    Object cur = args.get(i);
-                    while (cur instanceof SchemePair p) { elems.add(p.car); cur = p.cdr; }
-                    lists.add(elems);
-                }
-                int len = lists.get(0).size();
-                for (int i = 0; i < len; i++) {
-                    List<Object> callArgs = new ArrayList<>();
-                    for (List<Object> l : lists) callArgs.add(l.get(i));
-                    applyResolved(proc, callArgs);
-                }
-                yield VOID;
-            }
-            case "caar", "cadr", "cdar", "cddr", "caddr", "cadar", "caddar",
-                 "caaar", "caadr", "cdaar", "cdadr", "cddar", "cdddr",
-                 "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
-                 "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr" -> {
-                yield applyCxr(name, args.get(0));
-            }
-            case "reverse" -> {
-                Object lst = args.get(0);
-                Object result = SchemeNil.INSTANCE;
-                while (lst instanceof SchemePair p) {
-                    result = new SchemePair(p.car, result);
-                    lst = p.cdr;
-                }
-                yield result;
-            }
-            case "memq" -> {
-                Object key = args.get(0);
-                Object lst = args.get(1);
-                while (lst instanceof SchemePair p) {
-                    if (schemeEqv(key, p.car)) yield lst;
-                    lst = p.cdr;
-                }
-                yield Boolean.FALSE;
-            }
-            case "memv" -> {
-                Object key = args.get(0);
-                Object lst = args.get(1);
-                while (lst instanceof SchemePair p) {
-                    if (schemeEqv(key, p.car)) yield lst;
-                    lst = p.cdr;
-                }
-                yield Boolean.FALSE;
-            }
-            case "member" -> {
-                Object key = args.get(0);
-                Object lst = args.get(1);
-                while (lst instanceof SchemePair p) {
-                    if (schemeEqual(key, p.car)) yield lst;
-                    lst = p.cdr;
-                }
-                yield Boolean.FALSE;
-            }
-            case "assq" -> {
-                Object key = args.get(0);
-                Object lst = args.get(1);
-                while (lst instanceof SchemePair p) {
-                    if (p.car instanceof SchemePair entry) {
-                        Object k = entry.car;
-                        if (k == key || k.equals(key) ||
-                            (k instanceof SchemeSymbol sk && key instanceof SchemeSymbol sy && sk.name().equals(sy.name()))) {
-                            yield entry;
-                        }
-                    }
-                    lst = p.cdr;
-                }
-                yield Boolean.FALSE;
-            }
-            case "assv" -> {
-                Object key = args.get(0);
-                Object lst = args.get(1);
-                while (lst instanceof SchemePair p) {
-                    if (p.car instanceof SchemePair entry && schemeEqv(key, entry.car)) yield entry;
-                    lst = p.cdr;
-                }
-                yield Boolean.FALSE;
-            }
-            default -> throw new EvalError("unknown list procedure: " + name);
-        };
+        return ListBuiltins.apply(name, args, this::applyResolved);
     }
 
     private Object applyTypePredicateBuiltin(String name, List<Object> args) {
@@ -1408,13 +1305,13 @@ public class Evaluator {
         return applyBuiltin(name, evaluated);
     }
 
-    private long requireLong(Object val) throws EvalError {
+    static long requireLong(Object val) throws EvalError {
         if (val instanceof Long l) return l;
         if (val instanceof Double d) return d.longValue();
         throw new EvalError("expected integer, got: " + schemeToString(val));
     }
 
-    private String requireString(Object val) throws EvalError {
+    static String requireString(Object val) throws EvalError {
         if (val instanceof String s) {
             if (s.startsWith("\"") && s.endsWith("\"")) {
                 return s.substring(1, s.length() - 1);
@@ -1441,7 +1338,7 @@ public class Evaluator {
         return schemeToString(val);
     }
 
-    private boolean schemeEqv(Object a, Object b) {
+    static boolean schemeEqv(Object a, Object b) {
         if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name().equals(sb.name());
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
         if (a instanceof Boolean ba && b instanceof Boolean bb) return ba.equals(bb);
@@ -1451,11 +1348,11 @@ public class Evaluator {
         return a == b;
     }
 
-    private boolean schemeEqual(Object a, Object b) {
+    static boolean schemeEqual(Object a, Object b) {
         return schemeEqualRec(a, b, 0);
     }
 
-    private boolean schemeEqualRec(Object a, Object b, int depth) {
+    static boolean schemeEqualRec(Object a, Object b, int depth) {
         if (a == b) return true;
         if (depth > 100000) return false; // prevent infinite recursion on cycles
         if (a instanceof SchemePair pa && b instanceof SchemePair pb) {
