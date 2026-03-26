@@ -25,7 +25,8 @@ public class Evaluator {
                 "string-append", "string-length", "substring",
                 "string->number", "number->string",
                 "symbol->string", "string->symbol",
-                "string-ref", "char?"}) {
+                "string-ref", "char?",
+                "string-copy", "string-set!"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
     }
@@ -59,7 +60,7 @@ public class Evaluator {
     };
 
     static final class SchemeString {
-        final String value;
+        String value;
         SchemeString(String value) { this.value = value; }
     }
 
@@ -223,6 +224,14 @@ public class Evaluator {
     private Object parseAtom(String token) {
         if (token.equals("#t")) return Boolean.TRUE;
         if (token.equals("#f")) return Boolean.FALSE;
+        if (token.startsWith("#\\")) {
+            String charName = token.substring(2);
+            if (charName.equals("space")) return new SchemeChar(' ');
+            if (charName.equals("newline")) return new SchemeChar('\n');
+            if (charName.equals("tab")) return new SchemeChar('\t');
+            if (charName.length() == 1) return new SchemeChar(charName.charAt(0));
+            throw new RuntimeException("unknown character literal: " + token);
+        }
         if (token.startsWith("\"") && token.endsWith("\"")) {
             String s = token.substring(1, token.length() - 1);
             s = s.replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\").replace("\\\"", "\"");
@@ -249,7 +258,7 @@ public class Evaluator {
             expr = loc.datum;
         }
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String sym) {
@@ -654,6 +663,21 @@ public class Evaluator {
             case "char?" -> {
                 requireArgCount(args, 1, "char?");
                 yield args.get(0) instanceof SchemeChar;
+            }
+            case "string-copy" -> {
+                requireArgCount(args, 1, "string-copy");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-copy: expected string");
+                yield new SchemeString(s.value);
+            }
+            case "string-set!" -> {
+                requireArgCount(args, 3, "string-set!");
+                if (!(args.get(0) instanceof SchemeString s)) throw posError("string-set!: expected string");
+                int idx = (int) requireLong(args.get(1), "string-set!");
+                if (!(args.get(2) instanceof SchemeChar c)) throw posError("string-set!: expected char");
+                char[] chars = s.value.toCharArray();
+                chars[idx] = c.value;
+                s.value = new String(chars);
+                yield null; // void
             }
             default -> throw posError("unbound variable: " + name);
         };
