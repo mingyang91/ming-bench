@@ -1658,7 +1658,7 @@ pub(super) fn apply_builtin_by_name(
             Ok(Value::Boolean(matches!(&args[0],
                 Value::Lambda { .. } | Value::CaseLambda { .. }
                 | Value::RecordConstructor { .. } | Value::RecordPredicate { .. }
-                | Value::RecordAccessor { .. }
+                | Value::RecordAccessor { .. } | Value::Continuation(_)
             )))
         }
         "display" => {
