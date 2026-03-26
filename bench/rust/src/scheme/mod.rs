@@ -32,6 +32,7 @@ impl Expr {
 
 type EnvRef = Rc<RefCell<Environment>>;
 type OutputRef = Rc<RefCell<String>>;
+type BindingRef = Rc<RefCell<Value>>;
 
 #[derive(Clone)]
 enum Value {
@@ -100,7 +101,7 @@ enum BuiltinKind {
 
 struct Environment {
     parent: Option<EnvRef>,
-    bindings: HashMap<String, Value>,
+    bindings: HashMap<String, BindingRef>,
 }
 
 impl Value {
@@ -530,11 +531,13 @@ fn render_char(value: char) -> String {
 }
 
 fn env_define(env: &EnvRef, name: String, value: Value) {
-    env.borrow_mut().bindings.insert(name, value);
+    env.borrow_mut()
+        .bindings
+        .insert(name, Rc::new(RefCell::new(value)));
 }
 
-fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
-    let (value, parent) = {
+fn env_lookup_binding(env: &EnvRef, name: &str) -> Option<BindingRef> {
+    let (binding, parent) = {
         let borrowed = env.borrow();
         (
             borrowed.bindings.get(name).cloned(),
@@ -542,7 +545,30 @@ fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
         )
     };
 
-    value.or_else(|| parent.and_then(|parent| env_lookup(&parent, name)))
+    binding.or_else(|| parent.and_then(|parent| env_lookup_binding(&parent, name)))
+}
+
+fn env_lookup(env: &EnvRef, name: &str) -> Option<Value> {
+    env_lookup_binding(env, name).map(|binding| binding.borrow().clone())
+}
+
+fn env_set(env: &EnvRef, name: &str, value: Value) -> bool {
+    let (binding, parent) = {
+        let borrowed = env.borrow();
+        (
+            borrowed.bindings.get(name).cloned(),
+            borrowed.parent.clone(),
+        )
+    };
+
+    if let Some(binding) = binding {
+        *binding.borrow_mut() = value;
+        true
+    } else if let Some(parent) = parent {
+        env_set(&parent, name, value)
+    } else {
+        false
+    }
 }
 
 fn eval_program(exprs: &[Expr], output: OutputRef) -> Result<Value, EvalError> {
@@ -603,6 +629,9 @@ fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             "lambda" => {
                 return eval_lambda(&items[1..], env)
                     .map_err(|err| err.with_position(head_position))
+            }
+            "set!" => {
+                return eval_set(&items[1..], env).map_err(|err| err.with_position(head_position))
             }
             "and" => {
                 return eval_and(&items[1..], env).map_err(|err| err.with_position(head_position))
@@ -745,6 +774,27 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         body: body.to_vec(),
         env: Rc::clone(env),
     })))
+}
+
+fn eval_set(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    match args {
+        [Expr::Symbol(name, position), value_expr] => {
+            let value = eval_expr(value_expr, env)?;
+            if env_set(env, name, value) {
+                Ok(Value::Void)
+            } else {
+                Err(EvalError::UnboundVariable { name: name.clone() }.with_position(*position))
+            }
+        }
+        [_, _] => Err(EvalError::SyntaxError {
+            message: "set! target must be a symbol".into(),
+        }),
+        _ => Err(EvalError::WrongArgCount {
+            name: "set!".into(),
+            expected: "exactly 2 arguments".into(),
+            got: args.len(),
+        }),
+    }
 }
 
 fn parse_param_list(params_expr: &Expr) -> Result<Vec<String>, EvalError> {
