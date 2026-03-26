@@ -6,6 +6,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn gensym(base: &str) -> String {
+    let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}##{}", base, n)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Pos {
@@ -33,6 +41,11 @@ enum Value {
         rest_param: Option<String>,
         body: Vec<Expr>,
         env: Env,
+    },
+    Macro {
+        literals: Vec<String>,
+        rules: Vec<(Expr, Expr)>,
+        def_env: Env,
     },
 }
 
@@ -142,6 +155,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
+            Value::Macro { .. } => write!(f, "#<macro>"),
         }
     }
 }
@@ -462,7 +476,12 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "cond" => return eval_cond(&elems[1..], env),
                     "string-set!" => return eval_string_set(&elems[1..], env, p),
                     "set!" => return eval_set(&elems[1..], env, p),
-                    _ => {}
+                    "define-syntax" => return eval_define_syntax(&elems[1..], env, p),
+                    _ => {
+                        if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
+                            return eval_macro(&literals, &rules, &def_env, elems, env, p);
+                        }
+                    }
                 }
             }
             // Function call
@@ -911,6 +930,335 @@ fn eval_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     let val = eval(&args[1], env)?;
     env_set_existing(env, &name, val);
     Ok(Value::Nil)
+}
+
+// --- Macros (syntax-rules) ---
+
+fn is_special_form(name: &str) -> bool {
+    matches!(
+        name,
+        "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "begin"
+            | "cond" | "string-set!" | "set!" | "define-syntax"
+    )
+}
+
+fn eval_define_syntax(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity(format!(
+            "define-syntax requires 2 arguments at {}", p
+        )));
+    }
+    let name = match &args[0] {
+        Expr::Symbol(s, _) => s.clone(),
+        _ => return Err(EvalError::Type(format!(
+            "define-syntax: expected symbol at {}", p
+        ))),
+    };
+    let sr = match &args[1] {
+        Expr::List(elems, _) => elems,
+        _ => return Err(EvalError::Type(format!(
+            "define-syntax: expected syntax-rules at {}", p
+        ))),
+    };
+    if sr.len() < 2 {
+        return Err(EvalError::Parse(format!(
+            "define-syntax: invalid syntax-rules at {}", p
+        )));
+    }
+    match &sr[0] {
+        Expr::Symbol(s, _) if s == "syntax-rules" => {}
+        _ => return Err(EvalError::Type(format!(
+            "define-syntax: expected syntax-rules at {}", p
+        ))),
+    }
+    let literals = match &sr[1] {
+        Expr::List(lits, _) => lits
+            .iter()
+            .map(|l| match l {
+                Expr::Symbol(s, _) => Ok(s.clone()),
+                _ => Err(EvalError::Type(format!(
+                    "define-syntax: expected symbol in literals at {}", p
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(EvalError::Type(format!(
+            "define-syntax: expected literals list at {}", p
+        ))),
+    };
+    let mut rules = Vec::new();
+    for rule in &sr[2..] {
+        match rule {
+            Expr::List(parts, _) if parts.len() == 2 => {
+                rules.push((parts[0].clone(), parts[1].clone()));
+            }
+            _ => return Err(EvalError::Type(format!(
+                "define-syntax: invalid rule at {}", p
+            ))),
+        }
+    }
+    let mac = Value::Macro {
+        literals,
+        rules,
+        def_env: env.clone(),
+    };
+    env_set(env, name.clone(), mac);
+    Ok(Value::Symbol(name))
+}
+
+#[derive(Debug, Clone)]
+enum PatBinding {
+    Single(Expr),
+    List(Vec<Expr>),
+}
+
+fn match_one(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &[String],
+    bindings: &mut HashMap<String, PatBinding>,
+) -> bool {
+    match pattern {
+        Expr::Symbol(name, _) if name == "_" => true,
+        Expr::Symbol(name, _) if name == "..." => false,
+        Expr::Symbol(name, _) if literals.contains(name) => {
+            matches!(input, Expr::Symbol(s, _) if s == name)
+        }
+        Expr::Symbol(name, _) => {
+            bindings.insert(name.clone(), PatBinding::Single(input.clone()));
+            true
+        }
+        Expr::List(pelems, _) => match input {
+            Expr::List(ielems, _) => match_list(pelems, ielems, literals, bindings),
+            _ => false,
+        },
+        Expr::Integer(n, _) => matches!(input, Expr::Integer(m, _) if m == n),
+        Expr::Boolean(b, _) => matches!(input, Expr::Boolean(c, _) if c == b),
+        Expr::Str(s, _) => matches!(input, Expr::Str(t, _) if t == s),
+        Expr::Char(c, _) => matches!(input, Expr::Char(d, _) if d == c),
+    }
+}
+
+fn match_list(
+    pattern: &[Expr],
+    input: &[Expr],
+    literals: &[String],
+    bindings: &mut HashMap<String, PatBinding>,
+) -> bool {
+    let mut pi = 0;
+    let mut ii = 0;
+    while pi < pattern.len() {
+        // Check if current element is followed by ...
+        if pi + 1 < pattern.len() {
+            if let Expr::Symbol(s, _) = &pattern[pi + 1] {
+                if s == "..." {
+                    let sub_pattern = &pattern[pi];
+                    let var_names = collect_pattern_vars(sub_pattern, literals);
+                    let remaining_pat = pattern.len() - pi - 2;
+                    let max_match = if input.len() >= ii + remaining_pat {
+                        input.len() - ii - remaining_pat
+                    } else {
+                        return false;
+                    };
+                    let mut list_bindings: HashMap<String, Vec<Expr>> = HashMap::new();
+                    for v in &var_names {
+                        list_bindings.insert(v.clone(), Vec::new());
+                    }
+                    for j in 0..max_match {
+                        let mut sub_bindings = HashMap::new();
+                        if !match_one(sub_pattern, &input[ii + j], literals, &mut sub_bindings) {
+                            return false;
+                        }
+                        for v in &var_names {
+                            if let Some(PatBinding::Single(e)) = sub_bindings.get(v) {
+                                list_bindings.get_mut(v).unwrap().push(e.clone());
+                            }
+                        }
+                    }
+                    for (v, exprs) in list_bindings {
+                        bindings.insert(v, PatBinding::List(exprs));
+                    }
+                    ii += max_match;
+                    pi += 2;
+                    continue;
+                }
+            }
+        }
+        if ii >= input.len() {
+            return false;
+        }
+        if !match_one(&pattern[pi], &input[ii], literals, bindings) {
+            return false;
+        }
+        pi += 1;
+        ii += 1;
+    }
+    pi == pattern.len() && ii == input.len()
+}
+
+fn collect_pattern_vars(pattern: &Expr, literals: &[String]) -> Vec<String> {
+    let mut vars = Vec::new();
+    collect_pvars_inner(pattern, literals, &mut vars);
+    vars
+}
+
+fn collect_pvars_inner(pattern: &Expr, literals: &[String], vars: &mut Vec<String>) {
+    match pattern {
+        Expr::Symbol(name, _)
+            if name != "..." && name != "_" && !literals.contains(name) =>
+        {
+            vars.push(name.clone());
+        }
+        Expr::List(elems, _) => {
+            for e in elems {
+                collect_pvars_inner(e, literals, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expand_template(
+    template: &Expr,
+    bindings: &HashMap<String, PatBinding>,
+    gensym_map: &HashMap<String, String>,
+) -> Expr {
+    match template {
+        Expr::Symbol(name, pos) => {
+            if let Some(binding) = bindings.get(name) {
+                match binding {
+                    PatBinding::Single(e) => e.clone(),
+                    PatBinding::List(_) => template.clone(),
+                }
+            } else if let Some(gname) = gensym_map.get(name) {
+                Expr::Symbol(gname.clone(), *pos)
+            } else {
+                template.clone()
+            }
+        }
+        Expr::List(elems, pos) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len() {
+                    if let Expr::Symbol(s, _) = &elems[i + 1] {
+                        if s == "..." {
+                            let sub = &elems[i];
+                            let evars = find_ellipsis_vars(sub, bindings);
+                            if let Some(first_var) = evars.first() {
+                                if let Some(PatBinding::List(items)) = bindings.get(first_var) {
+                                    let count = items.len();
+                                    for j in 0..count {
+                                        let mut sub_bindings = bindings.clone();
+                                        for v in &evars {
+                                            if let Some(PatBinding::List(vitems)) = bindings.get(v)
+                                            {
+                                                sub_bindings.insert(
+                                                    v.clone(),
+                                                    PatBinding::Single(vitems[j].clone()),
+                                                );
+                                            }
+                                        }
+                                        result.push(expand_template(sub, &sub_bindings, gensym_map));
+                                    }
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                result.push(expand_template(&elems[i], bindings, gensym_map));
+                i += 1;
+            }
+            Expr::List(result, *pos)
+        }
+        _ => template.clone(),
+    }
+}
+
+fn find_ellipsis_vars(template: &Expr, bindings: &HashMap<String, PatBinding>) -> Vec<String> {
+    let mut vars = Vec::new();
+    find_evars_inner(template, bindings, &mut vars);
+    vars
+}
+
+fn find_evars_inner(
+    template: &Expr,
+    bindings: &HashMap<String, PatBinding>,
+    vars: &mut Vec<String>,
+) {
+    match template {
+        Expr::Symbol(name, _) => {
+            if matches!(bindings.get(name), Some(PatBinding::List(_))) && !vars.contains(name) {
+                vars.push(name.clone());
+            }
+        }
+        Expr::List(elems, _) => {
+            for e in elems {
+                find_evars_inner(e, bindings, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_template_symbols(
+    template: &Expr,
+    pat_vars: &[String],
+    gensym_map: &mut HashMap<String, String>,
+) {
+    match template {
+        Expr::Symbol(name, _) => {
+            if !pat_vars.contains(name)
+                && !is_special_form(name)
+                && !is_builtin(name)
+                && name != "..."
+                && !gensym_map.contains_key(name)
+            {
+                gensym_map.insert(name.clone(), gensym(name));
+            }
+        }
+        Expr::List(elems, _) => {
+            for e in elems {
+                collect_template_symbols(e, pat_vars, gensym_map);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn eval_macro(
+    literals: &[String],
+    rules: &[(Expr, Expr)],
+    def_env: &Env,
+    input: &[Expr],
+    env: &Env,
+    p: Pos,
+) -> Result<Value, EvalError> {
+    for (pattern, template) in rules {
+        let mut bindings = HashMap::new();
+        if let Expr::List(pat_elems, _) = pattern {
+            if match_list(&pat_elems[1..], &input[1..], literals, &mut bindings) {
+                let pat_vars: Vec<String> = bindings.keys().cloned().collect();
+                let mut gensym_map = HashMap::new();
+                collect_template_symbols(template, &pat_vars, &mut gensym_map);
+
+                let expanded = expand_template(template, &bindings, &gensym_map);
+
+                let wrapper_env = new_env(Some(env.clone()));
+                for (orig, gsym) in &gensym_map {
+                    if let Some(val) = env_get(def_env, orig) {
+                        env_set(&wrapper_env, gsym.clone(), val);
+                    }
+                }
+
+                return eval(&expanded, &wrapper_env);
+            }
+        }
+    }
+    Err(EvalError::Type(format!(
+        "no matching macro pattern at {}", p
+    )))
 }
 
 fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
