@@ -33,6 +33,7 @@ type stringExpr struct {
 
 type symbolExpr struct {
 	name string
+	key  string
 	pos  sourcePos
 }
 
@@ -66,9 +67,14 @@ type parser struct {
 	pos   int
 }
 
+type bindingCell struct {
+	value any
+}
+
 type env struct {
 	parent   *env
-	bindings map[string]any
+	bindings map[string]*bindingCell
+	macros   map[string]*syntaxMacro
 }
 
 type builtinFunc func(args []any) (any, error)
@@ -79,8 +85,8 @@ type builtinProc struct {
 }
 
 type closure struct {
-	params     []string
-	restParam  string
+	params     []symbolExpr
+	restParam  symbolExpr
 	hasRest    bool
 	body       []any
 	env        *env
@@ -89,31 +95,103 @@ type closure struct {
 func newEnv(parent *env) *env {
 	return &env{
 		parent:   parent,
-		bindings: map[string]any{},
+		bindings: map[string]*bindingCell{},
+		macros:   map[string]*syntaxMacro{},
 	}
 }
 
+func (s symbolExpr) bindingKey() string {
+	if s.key != "" {
+		return s.key
+	}
+	return s.name
+}
+
 func (e *env) define(name string, value any) {
-	e.bindings[name] = value
+	e.defineKey(name, value)
+}
+
+func (e *env) defineKey(key string, value any) {
+	if cell, ok := e.bindings[key]; ok {
+		cell.value = value
+		return
+	}
+	e.bindings[key] = &bindingCell{value: value}
+}
+
+func (e *env) defineSymbol(symbol symbolExpr, value any) {
+	e.defineKey(symbol.bindingKey(), value)
+}
+
+func (e *env) defineAlias(key string, cell *bindingCell) {
+	e.bindings[key] = cell
 }
 
 func (e *env) lookup(name string) (any, bool) {
+	return e.lookupByKey(name)
+}
+
+func (e *env) lookupByKey(key string) (any, bool) {
+	cell, ok := e.lookupCellByKey(key)
+	if !ok {
+		return nil, false
+	}
+	return cell.value, true
+}
+
+func (e *env) lookupSymbol(symbol symbolExpr) (any, bool) {
+	return e.lookupByKey(symbol.bindingKey())
+}
+
+func (e *env) lookupCellByKey(key string) (*bindingCell, bool) {
 	for scope := e; scope != nil; scope = scope.parent {
-		if value, ok := scope.bindings[name]; ok {
-			return value, true
+		if cell, ok := scope.bindings[key]; ok {
+			return cell, true
 		}
 	}
 	return nil, false
 }
 
 func (e *env) set(name string, value any) bool {
+	return e.setByKey(name, value)
+}
+
+func (e *env) setByKey(key string, value any) bool {
+	cell, ok := e.lookupCellByKey(key)
+	if !ok {
+		return false
+	}
+	cell.value = value
+	return true
+}
+
+func (e *env) setSymbol(symbol symbolExpr, value any) bool {
+	return e.setByKey(symbol.bindingKey(), value)
+}
+
+func (e *env) defineMacro(name string, macro *syntaxMacro) {
+	e.defineMacroKey(name, macro)
+}
+
+func (e *env) defineMacroKey(key string, macro *syntaxMacro) {
+	e.macros[key] = macro
+}
+
+func (e *env) lookupMacro(name string) (*syntaxMacro, bool) {
+	return e.lookupMacroByKey(name)
+}
+
+func (e *env) lookupMacroByKey(key string) (*syntaxMacro, bool) {
 	for scope := e; scope != nil; scope = scope.parent {
-		if _, ok := scope.bindings[name]; ok {
-			scope.bindings[name] = value
-			return true
+		if macro, ok := scope.macros[key]; ok {
+			return macro, true
 		}
 	}
-	return false
+	return nil, false
+}
+
+func (e *env) lookupMacroSymbol(symbol symbolExpr) (*syntaxMacro, bool) {
+	return e.lookupMacroByKey(symbol.bindingKey())
 }
 
 func newGlobalEnv(output *strings.Builder) *env {
@@ -520,7 +598,7 @@ func eval(scope *env, expr any) (any, error) {
 	case charValue:
 		return node, nil
 	case symbolExpr:
-		value, ok := scope.lookup(node.name)
+		value, ok := scope.lookupSymbol(node)
 		if !ok {
 			return nil, node.pos.errorf("unbound variable: %s", node.name)
 		}
@@ -560,6 +638,8 @@ func evalList(scope *env, expr listExpr) (any, error) {
 		switch head.name {
 		case "define":
 			return evalDefine(scope, args)
+		case "define-syntax":
+			return evalDefineSyntax(scope, args)
 		case "set!":
 			return evalSet(scope, args)
 		case "if":
@@ -578,6 +658,14 @@ func evalList(scope *env, expr listExpr) (any, error) {
 			return evalLet(scope, args)
 		case "cond":
 			return evalCond(scope, args)
+		}
+
+		if macro, ok := scope.lookupMacroSymbol(head); ok {
+			expanded, err := macro.expand(expr)
+			if err != nil {
+				return nil, err
+			}
+			return eval(scope, expanded)
 		}
 	}
 
@@ -613,7 +701,7 @@ func evalDefine(scope *env, args []any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		scope.define(target.name, value)
+		scope.defineSymbol(target, value)
 		return voidValue{}, nil
 	case listExpr:
 		if len(target.elements) == 0 {
@@ -637,11 +725,30 @@ func evalDefine(scope *env, args []any) (any, error) {
 			body:      args[1:],
 			env:       scope,
 		}
-		scope.define(name.name, proc)
+		scope.defineSymbol(name, proc)
 		return voidValue{}, nil
 	default:
 		return nil, &EvalError{Message: "define requires a symbol or function signature"}
 	}
+}
+
+func evalDefineSyntax(scope *env, args []any) (any, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "define-syntax expects exactly 2 arguments"}
+	}
+
+	name, ok := args[0].(symbolExpr)
+	if !ok {
+		return nil, &EvalError{Message: "define-syntax requires a symbol"}
+	}
+
+	macro, err := parseSyntaxRules(name, args[1], scope)
+	if err != nil {
+		return nil, err
+	}
+
+	scope.defineMacroKey(name.bindingKey(), macro)
+	return voidValue{}, nil
 }
 
 func evalSet(scope *env, args []any) (any, error) {
@@ -659,7 +766,7 @@ func evalSet(scope *env, args []any) (any, error) {
 		return nil, err
 	}
 
-	if !scope.set(target.name, value) {
+	if !scope.setSymbol(target, value) {
 		return nil, target.pos.errorf("unbound variable: %s", target.name)
 	}
 
@@ -768,7 +875,7 @@ func evalLet(scope *env, args []any) (any, error) {
 			body:   args[2:],
 			env:    letScope,
 		}
-		letScope.define(name.name, proc)
+		letScope.defineSymbol(name, proc)
 		return applyProcedure(proc, values)
 	}
 
@@ -784,7 +891,7 @@ func evalLet(scope *env, args []any) (any, error) {
 
 	letScope := newEnv(scope)
 	for i, param := range params {
-		letScope.define(param, values[i])
+		letScope.defineSymbol(param, values[i])
 	}
 
 	return evalSequence(letScope, args[1:])
@@ -823,8 +930,8 @@ func evalCond(scope *env, args []any) (any, error) {
 	return voidValue{}, nil
 }
 
-func evalBindings(scope *env, bindings []any) ([]string, []any, error) {
-	names := make([]string, 0, len(bindings))
+func evalBindings(scope *env, bindings []any) ([]symbolExpr, []any, error) {
+	names := make([]symbolExpr, 0, len(bindings))
 	values := make([]any, 0, len(bindings))
 	for _, bindingExpr := range bindings {
 		binding, ok := bindingExpr.(listExpr)
@@ -842,49 +949,49 @@ func evalBindings(scope *env, bindings []any) ([]string, []any, error) {
 			return nil, nil, err
 		}
 
-		names = append(names, name.name)
+		names = append(names, name)
 		values = append(values, value)
 	}
 	return names, values, nil
 }
 
-func parseFormals(formals any) ([]string, string, bool, error) {
+func parseFormals(formals any) ([]symbolExpr, symbolExpr, bool, error) {
 	switch formals := formals.(type) {
 	case symbolExpr:
-		return nil, formals.name, true, nil
+		return nil, formals, true, nil
 	case listExpr:
 		return parseParamList(formals.elements)
 	default:
-		return nil, "", false, &EvalError{Message: "lambda parameters must be a list or symbol"}
+		return nil, symbolExpr{}, false, &EvalError{Message: "lambda parameters must be a list or symbol"}
 	}
 }
 
-func parseParamList(params []any) ([]string, string, bool, error) {
-	names := make([]string, 0, len(params))
+func parseParamList(params []any) ([]symbolExpr, symbolExpr, bool, error) {
+	names := make([]symbolExpr, 0, len(params))
 	for i := 0; i < len(params); i++ {
 		name, ok := params[i].(symbolExpr)
 		if !ok {
-			return nil, "", false, &EvalError{Message: "parameter names must be symbols"}
+			return nil, symbolExpr{}, false, &EvalError{Message: "parameter names must be symbols"}
 		}
 
 		if name.name == "." {
 			if i == len(params)-1 {
-				return nil, "", false, &EvalError{Message: "dot must be followed by a rest parameter"}
+				return nil, symbolExpr{}, false, &EvalError{Message: "dot must be followed by a rest parameter"}
 			}
 
 			rest, ok := params[i+1].(symbolExpr)
 			if !ok || rest.name == "." {
-				return nil, "", false, &EvalError{Message: "rest parameter name must be a symbol"}
+				return nil, symbolExpr{}, false, &EvalError{Message: "rest parameter name must be a symbol"}
 			}
 			if i+2 != len(params) {
-				return nil, "", false, &EvalError{Message: "dot must appear before the final parameter"}
+				return nil, symbolExpr{}, false, &EvalError{Message: "dot must appear before the final parameter"}
 			}
-			return names, rest.name, true, nil
+			return names, rest, true, nil
 		}
 
-		names = append(names, name.name)
+		names = append(names, name)
 	}
-	return names, "", false, nil
+	return names, symbolExpr{}, false, nil
 }
 
 func applyProcedure(proc any, args []any) (any, error) {
@@ -901,10 +1008,10 @@ func applyProcedure(proc any, args []any) (any, error) {
 
 		callScope := newEnv(callable.env)
 		for i, param := range callable.params {
-			callScope.define(param, args[i])
+			callScope.defineSymbol(param, args[i])
 		}
 		if callable.hasRest {
-			callScope.define(callable.restParam, makeListValue(args[len(callable.params):]))
+			callScope.defineSymbol(callable.restParam, makeListValue(args[len(callable.params):]))
 		}
 
 		return evalSequence(callScope, callable.body)
