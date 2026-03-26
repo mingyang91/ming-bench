@@ -63,6 +63,9 @@ impl Evaluator {
             ExprKind::Bool(value) => Ok(Value::Bool(*value)),
             ExprKind::String(value) => Ok(Value::String(value.clone())),
             ExprKind::Symbol(name) => env.lookup(name),
+            ExprKind::Vector(elements) => {
+                Ok(vector_value(elements.iter().map(quote_to_value).collect()))
+            }
             ExprKind::List(elements) => self.eval_list(elements, env),
         };
 
@@ -81,6 +84,7 @@ impl Evaluator {
             return match name.as_str() {
                 "define" => self.eval_define(arguments, env),
                 "define-record-type" => self.eval_define_record_type(arguments, env),
+                "set!" => self.eval_set(arguments, env),
                 "if" => self.eval_if(arguments, env),
                 "quote" => self.eval_quote(arguments),
                 "lambda" => self.eval_lambda(arguments, env),
@@ -88,7 +92,11 @@ impl Evaluator {
                 "or" => self.eval_or(arguments, env),
                 "begin" => self.eval_begin(arguments, env),
                 "let" => self.eval_let(arguments, env),
+                "letrec" => self.eval_letrec(arguments, env, false),
+                "letrec*" => self.eval_letrec(arguments, env, true),
                 "cond" => self.eval_cond(arguments, env),
+                "case" => self.eval_case(arguments, env),
+                "do" => self.eval_do(arguments, env),
                 _ => {
                     let operator = self.eval(operator_expr, env.clone())?;
                     let values = self.eval_all(arguments, env)?;
@@ -148,13 +156,29 @@ impl Evaluator {
         }
     }
 
+    fn eval_set(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        require_exact_args("set!", arguments.len(), 2)?;
+
+        let ExprKind::Symbol(name) = &arguments[0].kind else {
+            return Err(EvalError::message("set! target must be a symbol"));
+        };
+
+        let value = self.eval(&arguments[1], env.clone())?;
+        env.set(name, value)?;
+        Ok(Value::Void)
+    }
+
     fn eval_if(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
-        require_exact_args("if", arguments.len(), 3)?;
+        if arguments.len() != 2 && arguments.len() != 3 {
+            return Err(EvalError::message("if expected 2 or 3 argument(s)"));
+        }
         let condition = self.eval(&arguments[0], env.clone())?;
         if is_truthy(&condition) {
             self.eval(&arguments[1], env)
-        } else {
+        } else if arguments.len() == 3 {
             self.eval(&arguments[2], env)
+        } else {
+            Ok(Value::Void)
         }
     }
 
@@ -186,10 +210,8 @@ impl Evaluator {
             ));
         }
 
-        let type_name = parse_symbol_name(
-            &arguments[0],
-            "define-record-type name must be a symbol",
-        )?;
+        let type_name =
+            parse_symbol_name(&arguments[0], "define-record-type name must be a symbol")?;
 
         let constructor = parse_record_constructor(&arguments[1])?;
         let predicate_name = parse_symbol_name(
@@ -306,6 +328,45 @@ impl Evaluator {
         self.eval_sequence(&arguments[1..], let_env)
     }
 
+    fn eval_letrec(
+        &self,
+        arguments: &[Expr],
+        env: Rc<Env>,
+        sequential: bool,
+    ) -> Result<Value, EvalError> {
+        let form_name = if sequential { "letrec*" } else { "letrec" };
+        if arguments.len() < 2 {
+            return Err(EvalError::message(format!(
+                "{form_name} requires bindings and a body"
+            )));
+        }
+
+        let bindings = parse_bindings(&arguments[0])?;
+        let letrec_env = Env::new(Some(env));
+        let mut cells = Vec::with_capacity(bindings.len());
+
+        for binding in &bindings {
+            cells.push(letrec_env.define_placeholder(binding.name.clone()));
+        }
+
+        if sequential {
+            for (binding, cell) in bindings.iter().zip(cells.iter()) {
+                let value = self.eval(&binding.init_expr, letrec_env.clone())?;
+                *cell.borrow_mut() = value;
+            }
+        } else {
+            let mut values = Vec::with_capacity(bindings.len());
+            for binding in &bindings {
+                values.push(self.eval(&binding.init_expr, letrec_env.clone())?);
+            }
+            for (cell, value) in cells.into_iter().zip(values) {
+                *cell.borrow_mut() = value;
+            }
+        }
+
+        self.eval_sequence(&arguments[1..], letrec_env)
+    }
+
     fn eval_named_let(
         &self,
         name: &str,
@@ -374,6 +435,107 @@ impl Evaluator {
         }
 
         Ok(Value::Void)
+    }
+
+    fn eval_case(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        if arguments.len() < 2 {
+            return Err(EvalError::message(
+                "case requires a key and at least one clause",
+            ));
+        }
+
+        let key = self.eval(&arguments[0], env.clone())?;
+        for (index, clause_expr) in arguments[1..].iter().enumerate() {
+            let ExprKind::List(elements) = &clause_expr.kind else {
+                return Err(EvalError::message("case clause must be a non-empty list"));
+            };
+            if elements.is_empty() {
+                return Err(EvalError::message("case clause must be a non-empty list"));
+            }
+
+            if let ExprKind::Symbol(name) = &elements[0].kind {
+                if name == "else" {
+                    if index != arguments.len() - 2 {
+                        return Err(EvalError::message("case else clause must be last"));
+                    }
+                    if elements.len() == 1 {
+                        return Ok(Value::Bool(true));
+                    }
+                    return self.eval_sequence(&elements[1..], env);
+                }
+            }
+
+            let ExprKind::List(datums) = &elements[0].kind else {
+                return Err(EvalError::message("case clause datums must be a list"));
+            };
+
+            if datums
+                .iter()
+                .any(|datum| eqv_values(&key, &quote_to_value(datum)))
+            {
+                if elements.len() == 1 {
+                    return Ok(Value::Void);
+                }
+                return self.eval_sequence(&elements[1..], env);
+            }
+        }
+
+        Ok(Value::Void)
+    }
+
+    fn eval_do(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        if arguments.len() < 2 {
+            return Err(EvalError::message(
+                "do requires bindings and a termination clause",
+            ));
+        }
+
+        let bindings = parse_do_bindings(&arguments[0])?;
+        let ExprKind::List(termination_clause) = &arguments[1].kind else {
+            return Err(EvalError::message(
+                "do termination clause must be a non-empty list",
+            ));
+        };
+        if termination_clause.is_empty() {
+            return Err(EvalError::message(
+                "do termination clause must be a non-empty list",
+            ));
+        }
+
+        let loop_env = Env::new(Some(env.clone()));
+        let mut initial_values = Vec::with_capacity(bindings.len());
+        for binding in &bindings {
+            initial_values.push(self.eval(&binding.init_expr, env.clone())?);
+        }
+        for (binding, value) in bindings.iter().zip(initial_values) {
+            loop_env.define(binding.name.clone(), value);
+        }
+
+        let body = &arguments[2..];
+        loop {
+            let test_result = self.eval(&termination_clause[0], loop_env.clone())?;
+            if is_truthy(&test_result) {
+                if termination_clause.len() == 1 {
+                    return Ok(Value::Void);
+                }
+                return self.eval_sequence(&termination_clause[1..], loop_env);
+            }
+
+            self.eval_sequence(body, loop_env.clone())?;
+
+            let mut next_values = Vec::with_capacity(bindings.len());
+            for binding in &bindings {
+                let next_value = match &binding.step_expr {
+                    Some(step_expr) => self.eval(step_expr, loop_env.clone())?,
+                    None => loop_env.lookup(&binding.name)?,
+                };
+                next_values.push(next_value);
+            }
+
+            for (binding, value) in bindings.iter().zip(next_values) {
+                loop_env.set(&binding.name, value)?;
+            }
+        }
     }
 
     fn apply_procedure(&self, operator: Value, arguments: Vec<Value>) -> Result<Value, EvalError> {
@@ -489,11 +651,17 @@ fn create_global_env() -> Rc<Env> {
     env.define_builtin("-", |_, arguments| builtin_subtract(arguments));
     env.define_builtin("*", |_, arguments| builtin_multiply(arguments));
     env.define_builtin("/", |_, arguments| builtin_divide(arguments));
+    env.define_builtin("zero?", |_, arguments| builtin_is_zero(arguments));
+    env.define_builtin("remainder", |_, arguments| builtin_remainder(arguments));
+    env.define_builtin("quotient", |_, arguments| builtin_quotient(arguments));
     env.define_builtin("<", |_, arguments| builtin_less_than(arguments));
     env.define_builtin(">", |_, arguments| builtin_greater_than(arguments));
     env.define_builtin("=", |_, arguments| builtin_equal(arguments));
     env.define_builtin("<=", |_, arguments| builtin_less_equal(arguments));
     env.define_builtin("not", |_, arguments| builtin_not(arguments));
+    env.define_builtin("eq?", |_, arguments| builtin_eq(arguments));
+    env.define_builtin("eqv?", |_, arguments| builtin_eqv(arguments));
+    env.define_builtin("equal?", |_, arguments| builtin_equal_value(arguments));
     env.define_builtin("exact?", |_, arguments| builtin_is_exact(arguments));
     env.define_builtin("inexact?", |_, arguments| builtin_is_inexact(arguments));
     env.define_builtin("integer?", |_, arguments| builtin_is_integer(arguments));
@@ -518,6 +686,20 @@ fn create_global_env() -> Rc<Env> {
     env.define_builtin("boolean?", |_, arguments| builtin_is_boolean(arguments));
     env.define_builtin("pair?", |_, arguments| builtin_is_pair(arguments));
     env.define_builtin("symbol?", |_, arguments| builtin_is_symbol(arguments));
+    env.define_builtin("vector", |_, arguments| builtin_vector(arguments));
+    env.define_builtin("make-vector", |_, arguments| builtin_make_vector(arguments));
+    env.define_builtin("vector-ref", |_, arguments| builtin_vector_ref(arguments));
+    env.define_builtin("vector-set!", |_, arguments| builtin_vector_set(arguments));
+    env.define_builtin("vector-length", |_, arguments| {
+        builtin_vector_length(arguments)
+    });
+    env.define_builtin("vector?", |_, arguments| builtin_is_vector(arguments));
+    env.define_builtin("vector->list", |_, arguments| {
+        builtin_vector_to_list(arguments)
+    });
+    env.define_builtin("list->vector", |_, arguments| {
+        builtin_list_to_vector(arguments)
+    });
     env.define_builtin("apply", builtin_apply);
     env.define_builtin("map", builtin_map);
     env
@@ -562,6 +744,34 @@ fn parse_bindings(binding_expr: &Expr) -> Result<Vec<BindingSpec>, EvalError> {
         bindings.push(BindingSpec {
             name: name.clone(),
             init_expr: entry[1].clone(),
+        });
+    }
+    Ok(bindings)
+}
+
+fn parse_do_bindings(binding_expr: &Expr) -> Result<Vec<DoBindingSpec>, EvalError> {
+    let ExprKind::List(binding_list) = &binding_expr.kind else {
+        return Err(EvalError::message("do bindings must be a list"));
+    };
+
+    let mut bindings = Vec::with_capacity(binding_list.len());
+    for entry_expr in binding_list {
+        let ExprKind::List(entry) = &entry_expr.kind else {
+            return Err(EvalError::message("do binding must have 2 or 3 elements"));
+        };
+
+        if entry.len() != 2 && entry.len() != 3 {
+            return Err(EvalError::message("do binding must have 2 or 3 elements"));
+        }
+
+        let ExprKind::Symbol(name) = &entry[0].kind else {
+            return Err(EvalError::message("do binding name must be a symbol"));
+        };
+
+        bindings.push(DoBindingSpec {
+            name: name.clone(),
+            init_expr: entry[1].clone(),
+            step_expr: entry.get(2).cloned(),
         });
     }
     Ok(bindings)
@@ -714,6 +924,7 @@ fn quote_to_value(expr: &Expr) -> Value {
         ExprKind::Bool(value) => Value::Bool(*value),
         ExprKind::String(value) => Value::String(value.clone()),
         ExprKind::Symbol(name) => Value::Symbol(name.clone()),
+        ExprKind::Vector(elements) => vector_value(elements.iter().map(quote_to_value).collect()),
         ExprKind::List(elements) => list_value(elements.iter().map(quote_to_value).collect()),
     }
 }
@@ -727,6 +938,12 @@ fn list_value(values: Vec<Value>) -> Value {
         }));
     }
     result
+}
+
+fn vector_value(values: Vec<Value>) -> Value {
+    Value::Vector(Rc::new(VectorValue {
+        elements: RefCell::new(values),
+    }))
 }
 
 fn exact_value(number: ExactNumber) -> Value {
@@ -828,6 +1045,19 @@ fn require_pair<'a>(value: &'a Value, operator: &str) -> Result<&'a PairValue, E
     }
 }
 
+fn require_vector<'a>(value: &'a Value, operator: &str) -> Result<&'a Rc<VectorValue>, EvalError> {
+    match value {
+        Value::Vector(vector) => Ok(vector),
+        _ => Err(EvalError::message(format!("{operator} expects a vector"))),
+    }
+}
+
+fn require_index(value: &Value, operator: &str) -> Result<usize, EvalError> {
+    let index = require_int(value, operator)?;
+    usize::try_from(index)
+        .map_err(|_| EvalError::message(format!("{operator} expects a valid index")))
+}
+
 fn require_record_field(
     value: &Value,
     expected_type: &Rc<RecordType>,
@@ -871,6 +1101,130 @@ fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Bool(false))
 }
 
+fn eqv_values(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Rational(left), Value::Rational(right)) => left == right,
+        (Value::Inexact(left), Value::Inexact(right)) => left == right,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::Builtin(left), Value::Builtin(right)) => left.name == right.name,
+        (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
+        (Value::RecordProcedure(left), Value::RecordProcedure(right)) => {
+            record_procedure_eqv(left, right)
+        }
+        (Value::Void, Value::Void) => true,
+        (Value::Uninitialized, Value::Uninitialized) => true,
+        _ => false,
+    }
+}
+
+fn record_procedure_eqv(left: &RecordProcedure, right: &RecordProcedure) -> bool {
+    match (left, right) {
+        (RecordProcedure::Constructor(left), RecordProcedure::Constructor(right)) => {
+            Rc::ptr_eq(left, right)
+        }
+        (RecordProcedure::Predicate(left), RecordProcedure::Predicate(right)) => {
+            Rc::ptr_eq(left, right)
+        }
+        (
+            RecordProcedure::Accessor {
+                record_type: left_type,
+                field_index: left_index,
+            },
+            RecordProcedure::Accessor {
+                record_type: right_type,
+                field_index: right_index,
+            },
+        ) => left_index == right_index && Rc::ptr_eq(left_type, right_type),
+        (
+            RecordProcedure::Mutator {
+                record_type: left_type,
+                field_index: left_index,
+            },
+            RecordProcedure::Mutator {
+                record_type: right_type,
+                field_index: right_index,
+            },
+        ) => left_index == right_index && Rc::ptr_eq(left_type, right_type),
+        _ => false,
+    }
+}
+
+fn equal_values(left: &Value, right: &Value) -> bool {
+    let mut visited = Vec::new();
+    equal_values_inner(left, right, &mut visited)
+}
+
+fn equal_values_inner(left: &Value, right: &Value, visited: &mut Vec<(usize, usize)>) -> bool {
+    if numeric_values_equal(left, right) || eqv_values(left, right) {
+        return true;
+    }
+
+    match (left, right) {
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Pair(left), Value::Pair(right)) => {
+            let key = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if visited.contains(&key) {
+                return true;
+            }
+            visited.push(key);
+
+            equal_values_inner(&left.car, &right.car, visited)
+                && equal_values_inner(&left.cdr, &right.cdr, visited)
+        }
+        (Value::Vector(left), Value::Vector(right)) => {
+            let key = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if visited.contains(&key) {
+                return true;
+            }
+            visited.push(key);
+
+            let left = left.elements.borrow();
+            let right = right.elements.borrow();
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| equal_values_inner(left, right, visited))
+        }
+        _ => false,
+    }
+}
+
+fn numeric_values_equal(left: &Value, right: &Value) -> bool {
+    if !is_number(left) || !is_number(right) {
+        return false;
+    }
+
+    if matches!(left, Value::Inexact(_)) || matches!(right, Value::Inexact(_)) {
+        return numeric_value_as_f64(left) == numeric_value_as_f64(right);
+    }
+
+    exact_number_value(left).compare(exact_number_value(right)) == Ordering::Equal
+}
+
+fn numeric_value_as_f64(value: &Value) -> f64 {
+    match value {
+        Value::Int(number) => *number as f64,
+        Value::Rational(number) => number.as_f64(),
+        Value::Inexact(number) => *number,
+        _ => unreachable!("validated numeric value"),
+    }
+}
+
+fn exact_number_value(value: &Value) -> ExactNumber {
+    match value {
+        Value::Int(number) => ExactNumber::integer(*number),
+        Value::Rational(number) => *number,
+        _ => unreachable!("validated exact numeric value"),
+    }
+}
+
 fn render(value: &Value) -> String {
     match value {
         Value::Int(number) => number.to_string(),
@@ -882,6 +1236,7 @@ fn render(value: &Value) -> String {
         Value::Symbol(name) => name.clone(),
         Value::EmptyList => "()".to_string(),
         Value::Pair(pair) => render_pair(pair.as_ref()),
+        Value::Vector(vector) => render_vector(vector.as_ref()),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Builtin(_) | Value::Closure(_) | Value::RecordProcedure(_) => {
             "#<procedure>".to_string()
@@ -956,6 +1311,19 @@ fn render_pair(pair: &PairValue) -> String {
             }
         }
     }
+}
+
+fn render_vector(vector: &VectorValue) -> String {
+    let elements = vector.elements.borrow();
+    let mut result = String::from("#(");
+    for (index, element) in elements.iter().enumerate() {
+        if index > 0 {
+            result.push(' ');
+        }
+        result.push_str(&render(element));
+    }
+    result.push(')');
+    result
 }
 
 fn quote_string(value: &str) -> String {
@@ -1087,6 +1455,37 @@ fn builtin_less_equal(arguments: &[Value]) -> Result<Value, EvalError> {
     compare(arguments, "<=")
 }
 
+fn builtin_is_zero(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("zero?", arguments.len(), 1)?;
+    let result = match require_number(&arguments[0], "zero?")? {
+        Value::Int(number) => *number == 0,
+        Value::Rational(number) => number.numerator == 0,
+        Value::Inexact(number) => *number == 0.0,
+        _ => unreachable!("validated numeric value"),
+    };
+    Ok(Value::Bool(result))
+}
+
+fn builtin_remainder(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("remainder", arguments.len(), 2)?;
+    let dividend = require_int(&arguments[0], "remainder")?;
+    let divisor = require_int(&arguments[1], "remainder")?;
+    if divisor == 0 {
+        return Err(EvalError::message("division by zero"));
+    }
+    Ok(Value::Int(dividend % divisor))
+}
+
+fn builtin_quotient(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("quotient", arguments.len(), 2)?;
+    let dividend = require_int(&arguments[0], "quotient")?;
+    let divisor = require_int(&arguments[1], "quotient")?;
+    if divisor == 0 {
+        return Err(EvalError::message("division by zero"));
+    }
+    Ok(Value::Int(dividend / divisor))
+}
+
 fn compare(arguments: &[Value], operator: &str) -> Result<Value, EvalError> {
     require_min_args(operator, arguments.len(), 2)?;
     for pair in arguments.windows(2) {
@@ -1121,6 +1520,21 @@ fn compare(arguments: &[Value], operator: &str) -> Result<Value, EvalError> {
 fn builtin_not(arguments: &[Value]) -> Result<Value, EvalError> {
     require_exact_args("not", arguments.len(), 1)?;
     Ok(Value::Bool(!is_truthy(&arguments[0])))
+}
+
+fn builtin_eq(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("eq?", arguments.len(), 2)?;
+    Ok(Value::Bool(eqv_values(&arguments[0], &arguments[1])))
+}
+
+fn builtin_eqv(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("eqv?", arguments.len(), 2)?;
+    Ok(Value::Bool(eqv_values(&arguments[0], &arguments[1])))
+}
+
+fn builtin_equal_value(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("equal?", arguments.len(), 2)?;
+    Ok(Value::Bool(equal_values(&arguments[0], &arguments[1])))
 }
 
 fn builtin_is_exact(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -1300,6 +1714,72 @@ fn builtin_is_symbol(arguments: &[Value]) -> Result<Value, EvalError> {
     })
 }
 
+fn builtin_vector(arguments: &[Value]) -> Result<Value, EvalError> {
+    Ok(vector_value(arguments.to_vec()))
+}
+
+fn builtin_make_vector(arguments: &[Value]) -> Result<Value, EvalError> {
+    if arguments.len() != 1 && arguments.len() != 2 {
+        return Err(EvalError::message(
+            "make-vector expected 1 or 2 argument(s)",
+        ));
+    }
+
+    let length = require_index(&arguments[0], "make-vector")?;
+    let fill = arguments.get(1).cloned().unwrap_or(Value::Void);
+    Ok(vector_value(vec![fill; length]))
+}
+
+fn builtin_vector_ref(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("vector-ref", arguments.len(), 2)?;
+    let vector = require_vector(&arguments[0], "vector-ref")?;
+    let index = require_index(&arguments[1], "vector-ref")?;
+    vector
+        .elements
+        .borrow()
+        .get(index)
+        .cloned()
+        .ok_or_else(|| EvalError::message("vector-ref index out of bounds"))
+}
+
+fn builtin_vector_set(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("vector-set!", arguments.len(), 3)?;
+    let vector = require_vector(&arguments[0], "vector-set!")?;
+    let index = require_index(&arguments[1], "vector-set!")?;
+    let mut elements = vector.elements.borrow_mut();
+    let Some(slot) = elements.get_mut(index) else {
+        return Err(EvalError::message("vector-set! index out of bounds"));
+    };
+    *slot = arguments[2].clone();
+    Ok(Value::Void)
+}
+
+fn builtin_vector_length(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("vector-length", arguments.len(), 1)?;
+    let vector = require_vector(&arguments[0], "vector-length")?;
+    Ok(Value::Int(vector.elements.borrow().len() as i64))
+}
+
+fn builtin_is_vector(arguments: &[Value]) -> Result<Value, EvalError> {
+    type_predicate("vector?", arguments, |value| {
+        matches!(value, Value::Vector(_))
+    })
+}
+
+fn builtin_vector_to_list(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("vector->list", arguments.len(), 1)?;
+    let vector = require_vector(&arguments[0], "vector->list")?;
+    Ok(list_value(vector.elements.borrow().clone()))
+}
+
+fn builtin_list_to_vector(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("list->vector", arguments.len(), 1)?;
+    Ok(vector_value(require_proper_list(
+        &arguments[0],
+        "list->vector",
+    )?))
+}
+
 fn type_predicate<F>(name: &str, arguments: &[Value], predicate: F) -> Result<Value, EvalError>
 where
     F: Fn(&Value) -> bool,
@@ -1325,6 +1805,7 @@ enum ExprKind {
     Bool(bool),
     String(String),
     Symbol(String),
+    Vector(Vec<Expr>),
     List(Vec<Expr>),
 }
 
@@ -1344,6 +1825,7 @@ enum Value {
     Symbol(String),
     EmptyList,
     Pair(Rc<PairValue>),
+    Vector(Rc<VectorValue>),
     Record(Rc<RecordValue>),
     Builtin(Builtin),
     Closure(Rc<ClosureValue>),
@@ -1362,6 +1844,10 @@ struct PairValue {
 struct RecordValue {
     record_type: Rc<RecordType>,
     fields: Vec<Cell>,
+}
+
+struct VectorValue {
+    elements: RefCell<Vec<Value>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1395,6 +1881,13 @@ struct ClosureValue {
 struct BindingSpec {
     name: String,
     init_expr: Expr,
+}
+
+#[derive(Clone)]
+struct DoBindingSpec {
+    name: String,
+    init_expr: Expr,
+    step_expr: Option<Expr>,
 }
 
 #[derive(Clone)]
@@ -1547,6 +2040,19 @@ impl Env {
         Ok(value)
     }
 
+    fn set(&self, name: &str, value: Value) -> Result<(), EvalError> {
+        let Some(cell) = self.lookup_cell(name) else {
+            return Err(EvalError::message(format!("unbound variable: {name}")));
+        };
+
+        if matches!(*cell.borrow(), Value::Uninitialized) {
+            return Err(EvalError::message(format!("unbound variable: {name}")));
+        }
+
+        *cell.borrow_mut() = value;
+        Ok(())
+    }
+
     fn lookup_cell(&self, name: &str) -> Option<Cell> {
         if let Some(cell) = self.bindings.borrow().get(name).cloned() {
             return Some(cell);
@@ -1607,6 +2113,7 @@ impl<'input> Parser<'input> {
                     position,
                 })
             }
+            '#' if self.peek_char() == Some('(') => self.parse_vector(),
             '"' => self.parse_string(),
             ')' => Err(self.error("unexpected ')'")),
             _ => self.parse_atom(),
@@ -1630,6 +2137,29 @@ impl<'input> Parser<'input> {
         self.consume(')')?;
         Ok(Expr {
             kind: ExprKind::List(elements),
+            position,
+        })
+    }
+
+    fn parse_vector(&mut self) -> Result<Expr, EvalError> {
+        let position = self.current_loc();
+        self.consume('#')?;
+        self.consume('(')?;
+
+        let mut elements = Vec::new();
+        self.skip_trivia();
+        while !self.is_at_end() && self.current_char() != Some(')') {
+            elements.push(self.parse_expression()?);
+            self.skip_trivia();
+        }
+
+        if self.is_at_end() {
+            return Err(self.error("unterminated vector"));
+        }
+
+        self.consume(')')?;
+        Ok(Expr {
+            kind: ExprKind::Vector(elements),
             position,
         })
     }
@@ -1758,6 +2288,12 @@ impl<'input> Parser<'input> {
 
     fn current_char(&self) -> Option<char> {
         self.input[self.index..].chars().next()
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        let mut chars = self.input[self.index..].chars();
+        chars.next()?;
+        chars.next()
     }
 
     fn is_at_end(&self) -> bool {

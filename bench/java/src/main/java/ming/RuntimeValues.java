@@ -1,11 +1,12 @@
 package ming;
 
+import java.util.ArrayList;
 import java.util.List;
 
 sealed interface Value permits IntValue, RationalValue, InexactValue, BoolValue,
-        StringValue, SymbolValue, CharValue, EmptyListValue, PairValue, BuiltinValue,
-        ClosureValue, CaseLambdaValue, RecordTypeValue, RecordInstanceValue, VoidValue,
-        UninitializedValue {
+        StringValue, SymbolValue, CharValue, EmptyListValue, PairValue, VectorValue,
+        BuiltinValue, ClosureValue, CaseLambdaValue, RecordTypeValue, RecordInstanceValue,
+        VoidValue, UninitializedValue {
 }
 
 record IntValue(long value) implements Value {
@@ -52,6 +53,30 @@ record EmptyListValue() implements Value {
 }
 
 record PairValue(Value car, Value cdr) implements Value {
+}
+
+final class VectorValue implements Value {
+    private final List<Value> elements;
+
+    VectorValue(List<Value> elements) {
+        this.elements = new ArrayList<>(elements);
+    }
+
+    int length() {
+        return elements.size();
+    }
+
+    Value ref(int index) {
+        return elements.get(index);
+    }
+
+    void set(int index, Value value) {
+        elements.set(index, value);
+    }
+
+    List<Value> elements() {
+        return elements;
+    }
 }
 
 record BuiltinValue(String name, BuiltinFunction implementation) implements Value {

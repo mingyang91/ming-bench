@@ -122,8 +122,22 @@ final class ValueSupport {
             case PairValue leftPair -> right instanceof PairValue rightPair
                     && equalValues(leftPair.car(), rightPair.car())
                     && equalValues(leftPair.cdr(), rightPair.cdr());
+            case VectorValue leftVector -> right instanceof VectorValue rightVector
+                    && vectorsEqual(leftVector, rightVector);
             default -> false;
         };
+    }
+
+    private static boolean vectorsEqual(VectorValue left, VectorValue right) {
+        if (left.length() != right.length()) {
+            return false;
+        }
+        for (int index = 0; index < left.length(); index++) {
+            if (!equalValues(left.ref(index), right.ref(index))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     static int numberSign(Value value, String operator) throws EvalError {

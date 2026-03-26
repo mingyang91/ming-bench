@@ -27,6 +27,7 @@ final class ValueRenderer {
                     ? Character.toString(charValue.value())
                     : renderChar(charValue.value());
             case PairValue pairValue -> renderPair(pairValue, displayMode);
+            case VectorValue vectorValue -> renderVector(vectorValue, displayMode);
             case BuiltinValue ignored -> "#<procedure>";
             case ClosureValue ignored -> "#<procedure>";
             case CaseLambdaValue ignored -> "#<procedure>";
@@ -58,6 +59,19 @@ final class ValueRenderer {
             builder.append(renderValue(current, displayMode));
         }
 
+        builder.append(')');
+        return builder.toString();
+    }
+
+    private static String renderVector(VectorValue vectorValue, boolean displayMode) {
+        StringBuilder builder = new StringBuilder();
+        builder.append("#(");
+        for (int index = 0; index < vectorValue.length(); index++) {
+            if (index > 0) {
+                builder.append(' ');
+            }
+            builder.append(renderValue(vectorValue.ref(index), displayMode));
+        }
         builder.append(')');
         return builder.toString();
     }
