@@ -240,13 +240,6 @@ impl SchemeString {
         Self::from_owned(value, true)
     }
 
-    pub(super) fn copy(&self) -> Self {
-        Self {
-            chars: Rc::new(RefCell::new(self.chars.borrow().clone())),
-            mutable: false,
-        }
-    }
-
     pub(super) fn mutable_copy(&self) -> Self {
         Self {
             chars: Rc::new(RefCell::new(self.chars.borrow().clone())),
