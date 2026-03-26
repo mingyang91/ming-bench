@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Env represents a Scheme environment (scope).
@@ -145,6 +146,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return builtinNewline(args, expr, env)
 		case "apply":
 			return builtinApply(args, expr, env)
+		case "map":
+			return builtinMap(args, expr, env)
 		}
 		if fn, ok := builtinRegistry[name]; ok {
 			return fn(args, expr)
@@ -263,6 +266,37 @@ func MakeDefaultEnv() *Env {
 		"char?":           builtinCharQ,
 		"string-copy":     builtinStringCopy,
 		"string-set!":     builtinStringSet,
+		// L09 builtins
+		"abs":               builtinAbs,
+		"modulo":            builtinModulo,
+		"remainder":         builtinRemainder,
+		"quotient":          builtinQuotient,
+		"min":               builtinMin,
+		"max":               builtinMax,
+		"expt":              builtinExpt,
+		"zero?":             builtinZeroQ,
+		"positive?":         builtinPositiveQ,
+		"negative?":         builtinNegativeQ,
+		"odd?":              builtinOddQ,
+		"even?":             builtinEvenQ,
+		"list-ref":          builtinListRef,
+		"list-tail":         builtinListTail,
+		"list?":             builtinListQ,
+		"assoc":             builtinAssoc,
+		"map":               nil, // special-cased
+		"eq?":               builtinEqQ,
+		"equal?":            builtinEqualQ,
+		"char-alphabetic?":  builtinCharAlphabeticQ,
+		"char-numeric?":     builtinCharNumericQ,
+		"char-upcase":       builtinCharUpcase,
+		"char-downcase":     builtinCharDowncase,
+		"char=?":            builtinCharEqQ,
+		"char<?":            builtinCharLtQ,
+		"string=?":          builtinStringEqQ,
+		"string<?":          builtinStringLtQ,
+		"string-ci=?":       builtinStringCiEqQ,
+		"string-upcase":     builtinStringUpcase,
+		"string-downcase":   builtinStringDowncase,
 		// I/O builtins (dispatch is special-cased in evalList, but need env registration)
 		"display": nil,
 		"write":   nil,
@@ -788,6 +822,8 @@ func builtinApply(args []*Value, expr *Expr, env *Env) (*Value, error) {
 			return builtinNewline(callArgs, expr, env)
 		case "apply":
 			return builtinApply(callArgs, expr, env)
+		case "map":
+			return builtinMap(callArgs, expr, env)
 		}
 		if bfn, ok := builtinRegistry[name]; ok {
 			return bfn(callArgs, expr)
@@ -901,6 +937,404 @@ func builtinStringSet(args []*Value, expr *Expr) (*Value, error) {
 	}
 	s.Runes[idx] = rune(args[2].IntVal)
 	return Void, nil
+}
+
+// L09 builtins
+
+func builtinAbs(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: abs: expected 1 number argument", expr.Line, expr.Col)
+	}
+	n := args[0].IntVal
+	if n < 0 {
+		n = -n
+	}
+	return IntValue(n), nil
+}
+
+func builtinModulo(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: modulo: expected 2 arguments", expr.Line, expr.Col)
+	}
+	if err := requireInts(args, expr, "modulo"); err != nil {
+		return nil, err
+	}
+	if args[1].IntVal == 0 {
+		return nil, fmt.Errorf("%d:%d: modulo: division by zero", expr.Line, expr.Col)
+	}
+	a, b := args[0].IntVal, args[1].IntVal
+	r := a % b
+	// modulo takes the sign of the divisor
+	if r != 0 && (r > 0) != (b > 0) {
+		r += b
+	}
+	return IntValue(r), nil
+}
+
+func builtinRemainder(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: remainder: expected 2 arguments", expr.Line, expr.Col)
+	}
+	if err := requireInts(args, expr, "remainder"); err != nil {
+		return nil, err
+	}
+	if args[1].IntVal == 0 {
+		return nil, fmt.Errorf("%d:%d: remainder: division by zero", expr.Line, expr.Col)
+	}
+	// Go's % already takes the sign of the dividend
+	return IntValue(args[0].IntVal % args[1].IntVal), nil
+}
+
+func builtinQuotient(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: quotient: expected 2 arguments", expr.Line, expr.Col)
+	}
+	if err := requireInts(args, expr, "quotient"); err != nil {
+		return nil, err
+	}
+	if args[1].IntVal == 0 {
+		return nil, fmt.Errorf("%d:%d: quotient: division by zero", expr.Line, expr.Col)
+	}
+	// Go's / truncates toward zero, which is what quotient does
+	return IntValue(args[0].IntVal / args[1].IntVal), nil
+}
+
+func builtinMin(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("%d:%d: min: expected at least 1 argument", expr.Line, expr.Col)
+	}
+	if err := requireInts(args, expr, "min"); err != nil {
+		return nil, err
+	}
+	m := args[0].IntVal
+	for _, a := range args[1:] {
+		if a.IntVal < m {
+			m = a.IntVal
+		}
+	}
+	return IntValue(m), nil
+}
+
+func builtinMax(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("%d:%d: max: expected at least 1 argument", expr.Line, expr.Col)
+	}
+	if err := requireInts(args, expr, "max"); err != nil {
+		return nil, err
+	}
+	m := args[0].IntVal
+	for _, a := range args[1:] {
+		if a.IntVal > m {
+			m = a.IntVal
+		}
+	}
+	return IntValue(m), nil
+}
+
+func builtinExpt(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: expt: expected 2 arguments", expr.Line, expr.Col)
+	}
+	if err := requireInts(args, expr, "expt"); err != nil {
+		return nil, err
+	}
+	base, exp := args[0].IntVal, args[1].IntVal
+	result := int64(1)
+	for i := int64(0); i < exp; i++ {
+		result *= base
+	}
+	return IntValue(result), nil
+}
+
+func builtinZeroQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: zero?: expected 1 number argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].IntVal == 0), nil
+}
+
+func builtinPositiveQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: positive?: expected 1 number argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].IntVal > 0), nil
+}
+
+func builtinNegativeQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: negative?: expected 1 number argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].IntVal < 0), nil
+}
+
+func builtinOddQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: odd?: expected 1 number argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].IntVal%2 != 0), nil
+}
+
+func builtinEvenQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: even?: expected 1 number argument", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].IntVal%2 == 0), nil
+}
+
+func builtinListRef(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[1].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: list-ref: expected list and int", expr.Line, expr.Col)
+	}
+	idx := int(args[1].IntVal)
+	v := args[0]
+	for i := 0; i < idx; i++ {
+		if v.Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: list-ref: index out of range", expr.Line, expr.Col)
+		}
+		v = v.Cdr
+	}
+	if v.Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: list-ref: index out of range", expr.Line, expr.Col)
+	}
+	return v.Car, nil
+}
+
+func builtinListTail(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[1].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: list-tail: expected list and int", expr.Line, expr.Col)
+	}
+	idx := int(args[1].IntVal)
+	v := args[0]
+	for i := 0; i < idx; i++ {
+		if v.Type != TypePair {
+			return nil, fmt.Errorf("%d:%d: list-tail: index out of range", expr.Line, expr.Col)
+		}
+		v = v.Cdr
+	}
+	return v, nil
+}
+
+func builtinListQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: list?: expected 1 argument", expr.Line, expr.Col)
+	}
+	v := args[0]
+	for v.Type == TypePair {
+		v = v.Cdr
+	}
+	return BoolValue(v.Type == TypeNil), nil
+}
+
+func valuesEqual(a, b *Value) bool {
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeInt:
+		return a.IntVal == b.IntVal
+	case TypeBool:
+		return a.BoolVal == b.BoolVal
+	case TypeString:
+		return a.StrContent() == b.StrContent()
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeChar:
+		return a.IntVal == b.IntVal
+	case TypeNil:
+		return true
+	case TypePair:
+		return valuesEqual(a.Car, b.Car) && valuesEqual(a.Cdr, b.Cdr)
+	default:
+		return a == b
+	}
+}
+
+func builtinAssoc(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: assoc: expected 2 arguments", expr.Line, expr.Col)
+	}
+	key := args[0]
+	lst := args[1]
+	for lst.Type == TypePair {
+		if lst.Car.Type == TypePair && valuesEqual(lst.Car.Car, key) {
+			return lst.Car, nil
+		}
+		lst = lst.Cdr
+	}
+	return BoolValue(false), nil
+}
+
+func builtinMap(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("%d:%d: map: expected at least 2 arguments", expr.Line, expr.Col)
+	}
+	fn := args[0]
+	lists := args[1:]
+
+	var result []*Value
+	for {
+		// Check if any list is exhausted
+		allPair := true
+		for _, l := range lists {
+			if l.Type != TypePair {
+				allPair = false
+				break
+			}
+		}
+		if !allPair {
+			break
+		}
+		// Collect cars
+		callArgs := make([]*Value, len(lists))
+		for i, l := range lists {
+			callArgs[i] = l.Car
+		}
+		// Call function
+		var val *Value
+		var err error
+		if fn.Type == TypeLambda {
+			val, err = callLambda(fn, callArgs, expr)
+		} else if fn.Type == TypeSymbol && len(fn.StrVal) > 10 && fn.StrVal[:10] == "__builtin:" {
+			name := fn.StrVal[10:]
+			if bfn, ok := builtinRegistry[name]; ok && bfn != nil {
+				val, err = bfn(callArgs, expr)
+			} else {
+				// Try special-cased builtins
+				switch name {
+				case "display":
+					val, err = builtinDisplay(callArgs, expr, env)
+				case "write":
+					val, err = builtinWrite(callArgs, expr, env)
+				default:
+					return nil, fmt.Errorf("%d:%d: map: not a procedure", expr.Line, expr.Col)
+				}
+			}
+		} else {
+			return nil, fmt.Errorf("%d:%d: map: first argument is not a procedure", expr.Line, expr.Col)
+		}
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, val)
+		// Advance all lists
+		for i := range lists {
+			lists[i] = lists[i].Cdr
+		}
+	}
+	// Build result list
+	out := Nil
+	for i := len(result) - 1; i >= 0; i-- {
+		out = &Value{Type: TypePair, Car: result[i], Cdr: out}
+	}
+	return out, nil
+}
+
+func builtinEqQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: eq?: expected 2 arguments", expr.Line, expr.Col)
+	}
+	a, b := args[0], args[1]
+	if a.Type != b.Type {
+		return BoolValue(false), nil
+	}
+	switch a.Type {
+	case TypeSymbol:
+		return BoolValue(a.StrVal == b.StrVal), nil
+	case TypeBool:
+		return BoolValue(a.BoolVal == b.BoolVal), nil
+	case TypeInt:
+		return BoolValue(a.IntVal == b.IntVal), nil
+	case TypeChar:
+		return BoolValue(a.IntVal == b.IntVal), nil
+	case TypeNil:
+		return BoolValue(true), nil
+	default:
+		return BoolValue(a == b), nil
+	}
+}
+
+func builtinEqualQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: equal?: expected 2 arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(valuesEqual(args[0], args[1])), nil
+}
+
+func builtinCharAlphabeticQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeChar {
+		return nil, fmt.Errorf("%d:%d: char-alphabetic?: expected 1 char argument", expr.Line, expr.Col)
+	}
+	return BoolValue(unicode.IsLetter(rune(args[0].IntVal))), nil
+}
+
+func builtinCharNumericQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeChar {
+		return nil, fmt.Errorf("%d:%d: char-numeric?: expected 1 char argument", expr.Line, expr.Col)
+	}
+	return BoolValue(unicode.IsDigit(rune(args[0].IntVal))), nil
+}
+
+func builtinCharUpcase(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeChar {
+		return nil, fmt.Errorf("%d:%d: char-upcase: expected 1 char argument", expr.Line, expr.Col)
+	}
+	return CharValue(unicode.ToUpper(rune(args[0].IntVal))), nil
+}
+
+func builtinCharDowncase(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeChar {
+		return nil, fmt.Errorf("%d:%d: char-downcase: expected 1 char argument", expr.Line, expr.Col)
+	}
+	return CharValue(unicode.ToLower(rune(args[0].IntVal))), nil
+}
+
+func builtinCharEqQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeChar || args[1].Type != TypeChar {
+		return nil, fmt.Errorf("%d:%d: char=?: expected 2 char arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].IntVal == args[1].IntVal), nil
+}
+
+func builtinCharLtQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeChar || args[1].Type != TypeChar {
+		return nil, fmt.Errorf("%d:%d: char<?: expected 2 char arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].IntVal < args[1].IntVal), nil
+}
+
+func builtinStringEqQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string=?: expected 2 string arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].StrContent() == args[1].StrContent()), nil
+}
+
+func builtinStringLtQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string<?: expected 2 string arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].StrContent() < args[1].StrContent()), nil
+}
+
+func builtinStringCiEqQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string-ci=?: expected 2 string arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(strings.EqualFold(args[0].StrContent(), args[1].StrContent())), nil
+}
+
+func builtinStringUpcase(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string-upcase: expected 1 string argument", expr.Line, expr.Col)
+	}
+	return StringValue(strings.ToUpper(args[0].StrContent())), nil
+}
+
+func builtinStringDowncase(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string-downcase: expected 1 string argument", expr.Line, expr.Col)
+	}
+	return StringValue(strings.ToLower(args[0].StrContent())), nil
 }
 
 func evalSetBang(expr *Expr, env *Env) (*Value, error) {
