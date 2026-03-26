@@ -17,7 +17,13 @@ type SymbolValue = { kind: 'symbol'; name: string };
 type NilValue = { kind: 'nil' };
 type PairValue = { kind: 'pair'; car: RuntimeValue; cdr: RuntimeValue };
 type BuiltinProcedure = { kind: 'builtin'; name: BuiltinName };
-type ClosureProcedure = { kind: 'closure'; params: string[]; body: Expr[]; env: Environment };
+type ClosureProcedure = {
+  kind: 'closure';
+  params: string[];
+  restParam?: string;
+  body: Expr[];
+  env: Environment;
+};
 type VoidValue = { kind: 'void' };
 
 type RuntimeValue =
@@ -78,6 +84,7 @@ const BUILTIN_NAMES = [
   'string-copy',
   'string-set!',
   'char?',
+  'apply',
 ] as const;
 type BuiltinName = (typeof BUILTIN_NAMES)[number];
 
@@ -495,7 +502,8 @@ function evaluateDefine(argExprs: Expr[], env: Environment, context: EvalContext
     const params = readParameterList(paramExprs);
     const procedure: ClosureProcedure = {
       kind: 'closure',
-      params,
+      params: params.fixedParams,
+      restParam: params.restParam,
       body,
       env,
     };
@@ -563,30 +571,51 @@ function evaluateLambda(argExprs: Expr[], env: Environment): RuntimeValue {
   }
 
   const [paramsExpr, ...body] = argExprs;
-  if (paramsExpr.kind !== 'list') {
-    throw new EvalError('lambda parameters must be a list');
+  const params =
+    paramsExpr.kind === 'symbol'
+      ? { fixedParams: [], restParam: paramsExpr.name }
+      : paramsExpr.kind === 'list'
+        ? readParameterList(paramsExpr.elements)
+        : undefined;
+
+  if (params === undefined) {
+    throw new EvalError('lambda parameters must be a list or symbol');
   }
 
   return {
     kind: 'closure',
-    params: readParameterList(paramsExpr.elements),
+    params: params.fixedParams,
+    restParam: params.restParam,
     body,
     env,
   };
 }
 
-function readParameterList(exprs: Expr[]): string[] {
-  const params: string[] = [];
+function readParameterList(exprs: Expr[]): { fixedParams: string[]; restParam?: string } {
+  const fixedParams: string[] = [];
 
-  for (const expr of exprs) {
+  for (let index = 0; index < exprs.length; index += 1) {
+    const expr = exprs[index];
     if (expr.kind !== 'symbol') {
       throw new EvalError('parameter list must contain only symbols');
     }
 
-    params.push(expr.name);
+    if (expr.name === '.') {
+      const restExpr = exprs[index + 1];
+      if (restExpr === undefined || restExpr.kind !== 'symbol' || index + 2 !== exprs.length) {
+        throw new EvalError('invalid dotted parameter list');
+      }
+
+      return {
+        fixedParams,
+        restParam: restExpr.name,
+      };
+    }
+
+    fixedParams.push(expr.name);
   }
 
-  return params;
+  return { fixedParams };
 }
 
 function evaluateAnd(argExprs: Expr[], env: Environment, context: EvalContext): RuntimeValue {
@@ -742,14 +771,22 @@ function applyClosure(
   args: RuntimeValue[],
   context: EvalContext,
 ): RuntimeValue {
-  if (args.length !== procedure.params.length) {
+  if (procedure.restParam === undefined && args.length !== procedure.params.length) {
     throw new EvalError(`expected ${procedure.params.length} arguments, got ${args.length}`);
+  }
+
+  if (procedure.restParam !== undefined && args.length < procedure.params.length) {
+    throw new EvalError(`expected at least ${procedure.params.length} arguments, got ${args.length}`);
   }
 
   const callEnv = new Environment(procedure.env);
 
   for (let index = 0; index < procedure.params.length; index += 1) {
     callEnv.define(procedure.params[index], args[index]);
+  }
+
+  if (procedure.restParam !== undefined) {
+    callEnv.define(procedure.restParam, buildList(args.slice(procedure.params.length)));
   }
 
   return evaluateSequence(procedure.body, callEnv, context);
@@ -887,7 +924,20 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       return applyStringSet(args);
     case 'char?':
       return applyTypePredicate(args, 'char?', (value) => value.kind === 'char');
+    case 'apply':
+      return applyApply(args, context);
   }
+}
+
+function applyApply(args: RuntimeValue[], context: EvalContext): RuntimeValue {
+  if (args.length < 2) {
+    throw new EvalError('apply expects at least 2 arguments');
+  }
+
+  const procedure = args[0];
+  const prefixArgs = args.slice(1, -1);
+  const tailArgs = listToArray(args[args.length - 1], 'apply');
+  return applyProcedure(procedure, [...prefixArgs, ...tailArgs], context);
 }
 
 function applySubtraction(args: RuntimeValue[]): RuntimeValue {

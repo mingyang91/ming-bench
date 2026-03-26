@@ -35,6 +35,7 @@ const BUILTIN_NAMES = [
     'string-copy',
     'string-set!',
     'char?',
+    'apply',
 ];
 const NIL_VALUE = { kind: 'nil' };
 const VOID_VALUE = { kind: 'void' };
@@ -377,7 +378,8 @@ function evaluateDefine(argExprs, env, context) {
         const params = readParameterList(paramExprs);
         const procedure = {
             kind: 'closure',
-            params,
+            params: params.fixedParams,
+            restParam: params.restParam,
             body,
             env,
         };
@@ -433,25 +435,42 @@ function evaluateLambda(argExprs, env) {
         throw new EvalError('lambda expects parameters and a body');
     }
     const [paramsExpr, ...body] = argExprs;
-    if (paramsExpr.kind !== 'list') {
-        throw new EvalError('lambda parameters must be a list');
+    const params = paramsExpr.kind === 'symbol'
+        ? { fixedParams: [], restParam: paramsExpr.name }
+        : paramsExpr.kind === 'list'
+            ? readParameterList(paramsExpr.elements)
+            : undefined;
+    if (params === undefined) {
+        throw new EvalError('lambda parameters must be a list or symbol');
     }
     return {
         kind: 'closure',
-        params: readParameterList(paramsExpr.elements),
+        params: params.fixedParams,
+        restParam: params.restParam,
         body,
         env,
     };
 }
 function readParameterList(exprs) {
-    const params = [];
-    for (const expr of exprs) {
+    const fixedParams = [];
+    for (let index = 0; index < exprs.length; index += 1) {
+        const expr = exprs[index];
         if (expr.kind !== 'symbol') {
             throw new EvalError('parameter list must contain only symbols');
         }
-        params.push(expr.name);
+        if (expr.name === '.') {
+            const restExpr = exprs[index + 1];
+            if (restExpr === undefined || restExpr.kind !== 'symbol' || index + 2 !== exprs.length) {
+                throw new EvalError('invalid dotted parameter list');
+            }
+            return {
+                fixedParams,
+                restParam: restExpr.name,
+            };
+        }
+        fixedParams.push(expr.name);
     }
-    return params;
+    return { fixedParams };
 }
 function evaluateAnd(argExprs, env, context) {
     let lastValue = makeBoolean(true);
@@ -571,12 +590,18 @@ function applyProcedure(procedure, args, context) {
     }
 }
 function applyClosure(procedure, args, context) {
-    if (args.length !== procedure.params.length) {
+    if (procedure.restParam === undefined && args.length !== procedure.params.length) {
         throw new EvalError(`expected ${procedure.params.length} arguments, got ${args.length}`);
+    }
+    if (procedure.restParam !== undefined && args.length < procedure.params.length) {
+        throw new EvalError(`expected at least ${procedure.params.length} arguments, got ${args.length}`);
     }
     const callEnv = new Environment(procedure.env);
     for (let index = 0; index < procedure.params.length; index += 1) {
         callEnv.define(procedure.params[index], args[index]);
+    }
+    if (procedure.restParam !== undefined) {
+        callEnv.define(procedure.restParam, buildList(args.slice(procedure.params.length)));
     }
     return evaluateSequence(procedure.body, callEnv, context);
 }
@@ -707,7 +732,18 @@ function applyBuiltin(name, args, context) {
             return applyStringSet(args);
         case 'char?':
             return applyTypePredicate(args, 'char?', (value) => value.kind === 'char');
+        case 'apply':
+            return applyApply(args, context);
     }
+}
+function applyApply(args, context) {
+    if (args.length < 2) {
+        throw new EvalError('apply expects at least 2 arguments');
+    }
+    const procedure = args[0];
+    const prefixArgs = args.slice(1, -1);
+    const tailArgs = listToArray(args[args.length - 1], 'apply');
+    return applyProcedure(procedure, [...prefixArgs, ...tailArgs], context);
 }
 function applySubtraction(args) {
     if (args.length === 0) {
