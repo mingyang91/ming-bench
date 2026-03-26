@@ -25,7 +25,7 @@ final class Environment {
         bindings.put(name, new ValueCell(UninitializedValue.INSTANCE));
     }
 
-    void defineMacro(String name, SyntaxRulesMacro macro) {
+    void defineMacro(String name, MacroTransformer macro) {
         MacroCell cell = macros.get(name);
         if (cell != null) {
             cell.set(macro);
@@ -67,7 +67,7 @@ final class Environment {
         throw new EvalError("unbound variable: " + name);
     }
 
-    SyntaxRulesMacro lookupMacro(String name) {
+    MacroTransformer lookupMacro(String name) {
         MacroCell cell = findMacroCell(name);
         if (cell == null) {
             return null;
@@ -112,17 +112,17 @@ final class Environment {
     }
 
     private static final class MacroCell {
-        private SyntaxRulesMacro macro;
+        private MacroTransformer macro;
 
-        private MacroCell(SyntaxRulesMacro macro) {
+        private MacroCell(MacroTransformer macro) {
             this.macro = macro;
         }
 
-        private SyntaxRulesMacro get() {
+        private MacroTransformer get() {
             return macro;
         }
 
-        private void set(SyntaxRulesMacro macro) {
+        private void set(MacroTransformer macro) {
             this.macro = macro;
         }
     }

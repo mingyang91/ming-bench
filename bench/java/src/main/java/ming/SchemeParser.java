@@ -47,6 +47,14 @@ final class SchemeParser {
                     position
             );
         }
+        if (current == '#' && peekChar('\'', 1)) {
+            advance();
+            advance();
+            return new ListExpression(
+                    List.of(new SymbolExpression("syntax", position), parseExpression()),
+                    position
+            );
+        }
 
         String token = readToken();
         if ("#t".equals(token)) {
@@ -163,6 +171,11 @@ final class SchemeParser {
 
     private char currentChar() {
         return input.charAt(index);
+    }
+
+    private boolean peekChar(char expected, int offset) {
+        int target = index + offset;
+        return target < input.length() && input.charAt(target) == expected;
     }
 
     private SourcePosition currentPosition() {

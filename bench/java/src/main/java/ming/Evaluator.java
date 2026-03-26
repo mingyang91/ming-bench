@@ -18,6 +18,8 @@ public class Evaluator {
     private StringBuilder outputBuffer;
     private ContinuationContext currentContinuation;
     private List<WindFrame> currentWinds = List.of();
+    private SyntaxTemplateContext currentSyntaxTemplateContext;
+    private List<SyntaxScope> currentSyntaxScopes = List.of();
 
     /**
      * Evaluate one or more Scheme expressions and return the string
@@ -247,6 +249,15 @@ public class Evaluator {
             if ("quote".equals(name)) {
                 return TailStep.done(evalQuote(elements));
             }
+            if ("syntax".equals(name)) {
+                return TailStep.done(evalSyntax(elements, environment));
+            }
+            if ("syntax-case".equals(name)) {
+                return TailStep.done(evalSyntaxCase(elements, environment));
+            }
+            if ("with-syntax".equals(name)) {
+                return TailStep.done(evalWithSyntax(elements, environment));
+            }
             if ("case".equals(name)) {
                 return evalCaseTail(elements, environment);
             }
@@ -263,9 +274,9 @@ public class Evaluator {
                 return TailStep.done(evalDo(elements, environment));
             }
 
-            SyntaxRulesMacro macro = environment.lookupMacro(name);
+            MacroTransformer macro = environment.lookupMacro(name);
             if (macro != null) {
-                return TailStep.next(macro.expand(expression), environment);
+                return TailStep.next(macro.expand(this, expression), environment);
             }
         }
 
@@ -323,6 +334,15 @@ public class Evaluator {
             if ("quote".equals(name)) {
                 return evalQuote(elements);
             }
+            if ("syntax".equals(name)) {
+                return evalSyntax(elements, environment);
+            }
+            if ("syntax-case".equals(name)) {
+                return evalSyntaxCase(elements, environment);
+            }
+            if ("with-syntax".equals(name)) {
+                return evalWithSyntax(elements, environment);
+            }
             if ("case".equals(name)) {
                 return evalCase(elements, environment);
             }
@@ -339,9 +359,9 @@ public class Evaluator {
                 return evalDo(elements, environment);
             }
 
-            SyntaxRulesMacro macro = environment.lookupMacro(name);
+            MacroTransformer macro = environment.lookupMacro(name);
             if (macro != null) {
-                return evalNonTail(macro.expand(expression), environment);
+                return evalNonTail(macro.expand(this, expression), environment);
             }
         }
 
@@ -570,7 +590,19 @@ public class Evaluator {
             throw new EvalError("define-syntax: expected macro name");
         }
 
-        environment.defineMacro(symbol.name(), parseSyntaxRules(symbol.name(), elements.get(2), environment));
+        SchemeExpression transformerExpression = elements.get(2);
+        MacroTransformer macro;
+        if (isSyntaxRulesTransformer(transformerExpression)) {
+            macro = parseSyntaxRules(symbol.name(), transformerExpression, environment);
+        } else {
+            SchemeValue transformerValue = evalNonTail(transformerExpression, environment);
+            if (!(transformerValue instanceof ProcedureValue procedureValue)) {
+                throw new EvalError("define-syntax: expected a transformer procedure");
+            }
+            macro = new ProcedureMacro(symbol.name(), procedureValue, environment);
+        }
+
+        environment.defineMacro(symbol.name(), macro);
         return VoidValue.INSTANCE;
     }
 
@@ -699,6 +731,8 @@ public class Evaluator {
         builtins.put("for-each", new BuiltinProcedure("for-each", this::applyForEach));
         builtins.put("values", new BuiltinProcedure("values", Evaluator::applyValues));
         builtins.put("call-with-values", new BuiltinProcedure("call-with-values", this::applyCallWithValues));
+        builtins.put("syntax->datum", new BuiltinProcedure("syntax->datum", this::applySyntaxToDatum));
+        builtins.put("datum->syntax", new BuiltinProcedure("datum->syntax", this::applyDatumToSyntax));
         BuiltinProcedure callWithCurrentContinuation = new BuiltinProcedure(
                 "call/cc",
                 this::applyCallWithCurrentContinuation
@@ -1154,6 +1188,154 @@ public class Evaluator {
         return new CaseLambdaProcedure(null, List.copyOf(clauses), environment);
     }
 
+    SchemeExpression expandProcedureMacro(
+            String macroName,
+            ProcedureValue transformer,
+            SyntaxTemplateContext templateContext,
+            ListExpression invocation
+    ) throws EvalError {
+        SyntaxTemplateContext previousTemplateContext = currentSyntaxTemplateContext;
+        List<SyntaxScope> previousSyntaxScopes = currentSyntaxScopes;
+        currentSyntaxTemplateContext = templateContext;
+        currentSyntaxScopes = List.of();
+        try {
+            SchemeValue expanded = requireSingleValue(
+                    applyProcedure(transformer, List.of(new SyntaxValue(invocation, UseSiteSyntaxContext.INSTANCE)))
+            );
+            if (!(expanded instanceof SyntaxValue syntaxValue)) {
+                throw new EvalError(invocation.position(), macroName + ": transformer must return syntax");
+            }
+            return syntaxValue.expression();
+        } finally {
+            currentSyntaxTemplateContext = previousTemplateContext;
+            currentSyntaxScopes = previousSyntaxScopes;
+        }
+    }
+
+    private SchemeValue evalSyntax(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() != 2) {
+            throw new EvalError("syntax: expected 1 argument");
+        }
+
+        SchemeExpression template = elements.get(1);
+        if (template instanceof SymbolExpression symbol) {
+            SyntaxMatcher.PatternBinding directBinding = lookupSyntaxBinding(symbol.name());
+            if (directBinding instanceof SyntaxMatcher.SinglePatternBinding singleBinding) {
+                return singleBinding.syntax();
+            }
+        }
+
+        SyntaxContext syntaxContext = currentSyntaxTemplateContext == null
+                ? UseSiteSyntaxContext.INSTANCE
+                : currentSyntaxTemplateContext;
+        SchemeExpression expanded = SyntaxMatcher.expandTemplate(
+                template,
+                currentSyntaxBindings(),
+                List.of(),
+                syntaxContext
+        );
+        return new SyntaxValue(expanded, syntaxContext);
+    }
+
+    private SchemeValue evalSyntaxCase(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 4) {
+            throw new EvalError("syntax-case: expected a target, literals, and at least one clause");
+        }
+
+        SyntaxValue target = requireSyntaxValue(evalNonTail(elements.get(1), environment), "syntax-case");
+        if (!(elements.get(2) instanceof ListExpression literalsExpression)) {
+            throw new EvalError("syntax-case: expected literal identifier list");
+        }
+        Set<String> literalIdentifiers = SyntaxMatcher.literalIdentifiers(literalsExpression);
+
+        for (int index = 3; index < elements.size(); index++) {
+            SchemeExpression clauseExpression = elements.get(index);
+            if (!(clauseExpression instanceof ListExpression clauseList)) {
+                throw new EvalError("syntax-case: expected clause");
+            }
+
+            List<SchemeExpression> clauseElements = clauseList.elements();
+            if (clauseElements.size() != 2 && clauseElements.size() != 3) {
+                throw new EvalError("syntax-case: expected clause pattern and result");
+            }
+
+            Map<String, SyntaxMatcher.PatternBinding> bindings = SyntaxMatcher.matchPattern(
+                    clauseElements.getFirst(),
+                    target,
+                    literalIdentifiers
+            );
+            if (bindings == null) {
+                continue;
+            }
+
+            Environment clauseEnvironment = extendWithSyntaxBindings(environment, bindings);
+            if (clauseElements.size() == 3) {
+                SchemeValue fender = withSyntaxScope(bindings, () -> evalNonTail(clauseElements.get(1), clauseEnvironment));
+                if (!isTruthy(fender)) {
+                    continue;
+                }
+                return withSyntaxScope(bindings, () -> evalNonTail(clauseElements.get(2), clauseEnvironment));
+            }
+
+            return withSyntaxScope(bindings, () -> evalNonTail(clauseElements.get(1), clauseEnvironment));
+        }
+
+        throw new EvalError("syntax-case: no matching clause");
+    }
+
+    private SchemeValue evalWithSyntax(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("with-syntax: expected bindings and body");
+        }
+        if (!(elements.get(1) instanceof ListExpression bindingsExpression)) {
+            throw new EvalError("with-syntax: expected binding list");
+        }
+
+        Map<String, SyntaxMatcher.PatternBinding> bindings = new HashMap<>();
+        for (SchemeExpression bindingExpression : bindingsExpression.elements()) {
+            if (!(bindingExpression instanceof ListExpression bindingList)) {
+                throw new EvalError("with-syntax: expected binding");
+            }
+            List<SchemeExpression> bindingElements = bindingList.elements();
+            if (bindingElements.size() != 2) {
+                throw new EvalError("with-syntax: expected pattern and expression");
+            }
+
+            SyntaxValue syntaxValue = requireSyntaxValue(
+                    evalNonTail(bindingElements.get(1), environment),
+                    "with-syntax"
+            );
+            Map<String, SyntaxMatcher.PatternBinding> bindingMatches = SyntaxMatcher.matchPattern(
+                    bindingElements.get(0),
+                    syntaxValue,
+                    Set.of()
+            );
+            if (bindingMatches == null) {
+                throw new EvalError("with-syntax: pattern did not match");
+            }
+
+            Map<String, SyntaxMatcher.PatternBinding> merged = SyntaxMatcher.mergeBindings(bindings, bindingMatches);
+            if (merged == null) {
+                throw new EvalError("with-syntax: duplicate pattern variable");
+            }
+            bindings = merged;
+        }
+
+        Environment bodyEnvironment = extendWithSyntaxBindings(environment, bindings);
+        Map<String, SyntaxMatcher.PatternBinding> scopeBindings = Map.copyOf(bindings);
+        return withSyntaxScope(scopeBindings, () -> evalSequence(elements.subList(2, elements.size()), bodyEnvironment));
+    }
+
+    private boolean isSyntaxRulesTransformer(SchemeExpression transformerExpression) {
+        if (!(transformerExpression instanceof ListExpression rulesExpression)) {
+            return false;
+        }
+        List<SchemeExpression> rulesElements = rulesExpression.elements();
+        return !rulesElements.isEmpty()
+                && rulesElements.getFirst() instanceof SymbolExpression symbol
+                && "syntax-rules".equals(symbol.name());
+    }
+
     private SyntaxRulesMacro parseSyntaxRules(
             String macroName,
             SchemeExpression transformerExpression,
@@ -1202,6 +1384,62 @@ public class Evaluator {
                 List.copyOf(rules),
                 environment
         );
+    }
+
+    private Environment extendWithSyntaxBindings(
+            Environment parent,
+            Map<String, SyntaxMatcher.PatternBinding> bindings
+    ) {
+        Environment environment = new Environment(parent);
+        for (Map.Entry<String, SyntaxMatcher.PatternBinding> entry : bindings.entrySet()) {
+            if (entry.getValue() instanceof SyntaxMatcher.SinglePatternBinding singleBinding) {
+                environment.define(entry.getKey(), singleBinding.syntax());
+            } else {
+                environment.define(entry.getKey(), new PatternBindingValue(entry.getValue()));
+            }
+        }
+        return environment;
+    }
+
+    private SchemeValue withSyntaxScope(
+            Map<String, SyntaxMatcher.PatternBinding> bindings,
+            RootComputation computation
+    ) throws EvalError {
+        List<SyntaxScope> previousSyntaxScopes = currentSyntaxScopes;
+        List<SyntaxScope> scopes = new ArrayList<>(previousSyntaxScopes.size() + 1);
+        scopes.addAll(previousSyntaxScopes);
+        scopes.add(new SyntaxScope(Map.copyOf(bindings)));
+        currentSyntaxScopes = List.copyOf(scopes);
+        try {
+            return computation.run();
+        } finally {
+            currentSyntaxScopes = previousSyntaxScopes;
+        }
+    }
+
+    private Map<String, SyntaxMatcher.PatternBinding> currentSyntaxBindings() {
+        if (currentSyntaxScopes.isEmpty()) {
+            return Map.of();
+        }
+
+        Map<String, SyntaxMatcher.PatternBinding> bindings = new HashMap<>();
+        for (int index = currentSyntaxScopes.size() - 1; index >= 0; index--) {
+            for (Map.Entry<String, SyntaxMatcher.PatternBinding> entry :
+                    currentSyntaxScopes.get(index).bindings().entrySet()) {
+                bindings.putIfAbsent(entry.getKey(), entry.getValue());
+            }
+        }
+        return Map.copyOf(bindings);
+    }
+
+    private SyntaxMatcher.PatternBinding lookupSyntaxBinding(String name) {
+        for (int index = currentSyntaxScopes.size() - 1; index >= 0; index--) {
+            SyntaxMatcher.PatternBinding binding = currentSyntaxScopes.get(index).bindings().get(name);
+            if (binding != null) {
+                return binding;
+            }
+        }
+        return null;
     }
 
     private SchemeValue evalSequenceToValue(
@@ -1789,6 +2027,55 @@ public class Evaluator {
         return result;
     }
 
+    private SchemeValue syntaxToDatum(SchemeValue value, String procedure) throws EvalError {
+        if (value instanceof SyntaxValue syntaxValue) {
+            return quote(syntaxValue.expression());
+        }
+        if (value instanceof PatternBindingValue bindingValue) {
+            return syntaxBindingToDatum(bindingValue.binding());
+        }
+        throw new EvalError(procedure + ": expected syntax object");
+    }
+
+    private SchemeValue syntaxBindingToDatum(SyntaxMatcher.PatternBinding binding) throws EvalError {
+        if (binding instanceof SyntaxMatcher.SinglePatternBinding singleBinding) {
+            return quote(singleBinding.syntax().expression());
+        }
+        if (binding instanceof SyntaxMatcher.RepeatedPatternBinding repeatedBinding) {
+            List<SchemeValue> items = new ArrayList<>(repeatedBinding.items().size());
+            for (SyntaxMatcher.PatternBinding item : repeatedBinding.items()) {
+                items.add(syntaxBindingToDatum(item));
+            }
+            return buildList(items);
+        }
+        throw new EvalError("syntax->datum: invalid syntax binding");
+    }
+
+    private SchemeExpression datumToExpression(SchemeValue value, String procedure) throws EvalError {
+        SourcePosition position = new SourcePosition(0, 0);
+
+        if (value instanceof NumericValue || value instanceof BoolValue
+                || value instanceof StringValue || value instanceof CharValue) {
+            return new LiteralExpression(value, position);
+        }
+        if (value instanceof SymbolValue symbolValue) {
+            return new SymbolExpression(symbolValue.name(), position);
+        }
+        if (value instanceof EmptyListValue) {
+            return new ListExpression(List.of(), position);
+        }
+        if (value instanceof PairValue) {
+            List<SchemeValue> elements = requireProperList(value, procedure);
+            List<SchemeExpression> expressions = new ArrayList<>(elements.size());
+            for (SchemeValue element : elements) {
+                expressions.add(datumToExpression(element, procedure));
+            }
+            return new ListExpression(List.copyOf(expressions), position);
+        }
+
+        throw new EvalError(procedure + ": expected datum");
+    }
+
     private static SchemeValue applyAdd(List<SchemeValue> arguments) throws EvalError {
         return Numbers.add(arguments, "+");
     }
@@ -1983,6 +2270,19 @@ public class Evaluator {
 
         SchemeValue produced = applyThunk(arguments.getFirst());
         return applyProcedure(arguments.get(1), unpackValues(produced));
+    }
+
+    private SchemeValue applySyntaxToDatum(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "syntax->datum");
+        return syntaxToDatum(arguments.getFirst(), "syntax->datum");
+    }
+
+    private SchemeValue applyDatumToSyntax(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "datum->syntax");
+
+        SyntaxValue context = requireSyntaxValue(arguments.get(0), "datum->syntax");
+        SchemeExpression datum = datumToExpression(arguments.get(1), "datum->syntax");
+        return new SyntaxValue(context.context().contextualize(datum), context.context());
     }
 
     private SchemeValue applyCallWithCurrentContinuation(List<SchemeValue> arguments) throws EvalError {
@@ -2689,6 +2989,13 @@ public class Evaluator {
         return Numbers.requireInteger(value, procedure);
     }
 
+    private static SyntaxValue requireSyntaxValue(SchemeValue value, String procedure) throws EvalError {
+        if (value instanceof SyntaxValue syntaxValue) {
+            return syntaxValue;
+        }
+        throw new EvalError(procedure + ": expected syntax object");
+    }
+
     private static String requireString(SchemeValue value, String procedure) throws EvalError {
         return requireStringValue(value, procedure).value();
     }
@@ -2956,6 +3263,9 @@ public class Evaluator {
     }
 
     private record DoBinding(String name, SchemeExpression initExpression, SchemeExpression stepExpression) {
+    }
+
+    private record SyntaxScope(Map<String, SyntaxMatcher.PatternBinding> bindings) {
     }
 
     private record TailStep(SchemeExpression nextExpression, Environment nextEnvironment, SchemeValue value) {

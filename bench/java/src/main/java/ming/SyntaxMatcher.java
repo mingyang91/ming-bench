@@ -7,109 +7,150 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-final class SyntaxRulesMacro implements MacroTransformer {
-    private static final Set<String> CORE_SYNTAX = SyntaxMatcher.CORE_SYNTAX;
-    private static long nextMacroId = 1L;
+final class SyntaxMatcher {
+    static final Set<String> CORE_SYNTAX = Set.of(
+            "and",
+            "begin",
+            "case",
+            "case-lambda",
+            "cond",
+            "define",
+            "define-record-type",
+            "define-syntax",
+            "do",
+            "else",
+            "guard",
+            "if",
+            "lambda",
+            "let",
+            "let*",
+            "letrec",
+            "letrec*",
+            "or",
+            "quote",
+            "set!",
+            "syntax",
+            "syntax-case",
+            "syntax-rules",
+            "with-syntax",
+            "."
+    );
 
-    private final long macroId;
-    private final String name;
-    private final Set<String> literalIdentifiers;
-    private final List<SyntaxRule> rules;
-    private final Environment definitionEnvironment;
-    private final Map<String, String> identifierAliases = new HashMap<>();
+    private SyntaxMatcher() {
+    }
 
-    SyntaxRulesMacro(
-            String name,
-            Set<String> literalIdentifiers,
-            List<SyntaxRule> rules,
-            Environment definitionEnvironment
+    static Map<String, PatternBinding> matchPattern(
+            SchemeExpression pattern,
+            SyntaxValue input,
+            Set<String> literalIdentifiers
     ) {
-        this.macroId = nextMacroId++;
-        this.name = name;
-        this.literalIdentifiers = literalIdentifiers;
-        this.rules = rules;
-        this.definitionEnvironment = definitionEnvironment;
-    }
-
-    @Override
-    public SchemeExpression expand(Evaluator evaluator, ListExpression invocation) throws EvalError {
-        for (SyntaxRule rule : rules) {
-            Map<String, PatternBinding> bindings = matchRule(rule.pattern(), invocation);
-            if (bindings != null) {
-                return expandTemplate(rule.template(), bindings, List.of());
-            }
-        }
-        throw new EvalError(invocation.position(), name + ": no matching syntax-rules pattern");
-    }
-
-    private Map<String, PatternBinding> matchRule(SchemeExpression pattern, ListExpression invocation) {
-        if (!(pattern instanceof ListExpression patternList)) {
-            return null;
-        }
-
-        List<SchemeExpression> patternElements = patternList.elements();
-        List<SchemeExpression> invocationElements = invocation.elements();
-        if (patternElements.isEmpty() || invocationElements.isEmpty()) {
-            return null;
-        }
-        return matchSequence(
-                patternElements.subList(1, patternElements.size()),
-                0,
-                invocationElements.subList(1, invocationElements.size()),
-                0
-        );
-    }
-
-    private Map<String, PatternBinding> matchPattern(SchemeExpression pattern, SchemeExpression input) {
         if (isQuotedForm(pattern)) {
-            if (expressionsEqual(pattern, input)) {
+            if (expressionsEqual(pattern, input.expression())) {
                 return Map.of();
             }
             return null;
         }
 
         if (pattern instanceof LiteralExpression) {
-            if (expressionsEqual(pattern, input)) {
+            if (expressionsEqual(pattern, input.expression())) {
                 return Map.of();
             }
             return null;
         }
 
         if (pattern instanceof SymbolExpression symbol) {
-            return matchSymbol(symbol, input);
+            return matchSymbol(symbol, input, literalIdentifiers);
         }
 
-        if (!(input instanceof ListExpression inputList)) {
+        if (!(input.expression() instanceof ListExpression inputList)) {
             return null;
         }
 
         List<SchemeExpression> patternElements = ((ListExpression) pattern).elements();
-        List<SchemeExpression> inputElements = inputList.elements();
-        return matchSequence(patternElements, 0, inputElements, 0);
+        List<SyntaxValue> inputElements = syntaxElements(inputList.elements(), input.context());
+        return matchSequence(patternElements, 0, inputElements, 0, literalIdentifiers);
     }
 
-    private Map<String, PatternBinding> matchSymbol(SymbolExpression pattern, SchemeExpression input) {
-        String symbolName = pattern.name();
-        if ("...".equals(symbolName)) {
-            return null;
-        }
-        if ("_".equals(symbolName)) {
-            return Map.of();
-        }
-        if (literalIdentifiers.contains(symbolName)) {
-            if (input instanceof SymbolExpression symbol && symbolName.equals(symbol.name())) {
-                return Map.of();
+    static Map<String, PatternBinding> mergeBindings(
+            Map<String, PatternBinding> left,
+            Map<String, PatternBinding> right
+    ) {
+        Map<String, PatternBinding> merged = new HashMap<>(left);
+        for (Map.Entry<String, PatternBinding> entry : right.entrySet()) {
+            PatternBinding existing = merged.get(entry.getKey());
+            if (existing != null && !bindingsEqual(existing, entry.getValue())) {
+                return null;
             }
-            return null;
+            merged.put(entry.getKey(), entry.getValue());
         }
-        return Map.of(symbolName, new SinglePatternBinding(input));
+        return merged;
     }
 
-    private Map<String, PatternBinding> matchSequence(
+    static SchemeExpression expandTemplate(
+            SchemeExpression template,
+            Map<String, PatternBinding> bindings,
+            List<Integer> repetitionPath,
+            SyntaxContext defaultContext
+    ) throws EvalError {
+        if (template instanceof LiteralExpression) {
+            return template;
+        }
+        if (template instanceof SymbolExpression symbol) {
+            return expandSymbol(symbol, bindings, repetitionPath, defaultContext);
+        }
+        if (isQuotedForm(template)) {
+            return template;
+        }
+
+        ListExpression list = (ListExpression) template;
+        return new ListExpression(
+                List.copyOf(expandTemplateSequence(list.elements(), bindings, repetitionPath, defaultContext)),
+                list.position()
+        );
+    }
+
+    static SchemeExpression contextualize(SchemeExpression expression, SyntaxContext context) {
+        if (context instanceof UseSiteSyntaxContext) {
+            return expression;
+        }
+        if (expression instanceof LiteralExpression) {
+            return expression;
+        }
+        if (expression instanceof SymbolExpression symbol) {
+            if ("...".equals(symbol.name()) || CORE_SYNTAX.contains(symbol.name())) {
+                return symbol;
+            }
+            return ((SyntaxTemplateContext) context).aliasSymbol(symbol);
+        }
+        if (isQuotedForm(expression)) {
+            return expression;
+        }
+
+        ListExpression list = (ListExpression) expression;
+        List<SchemeExpression> elements = new ArrayList<>(list.elements().size());
+        for (SchemeExpression element : list.elements()) {
+            elements.add(contextualize(element, context));
+        }
+        return new ListExpression(List.copyOf(elements), list.position());
+    }
+
+    static Set<String> literalIdentifiers(ListExpression literalsExpression) throws EvalError {
+        Set<String> literalIdentifiers = new HashSet<>();
+        for (SchemeExpression literal : literalsExpression.elements()) {
+            if (!(literal instanceof SymbolExpression literalSymbol)) {
+                throw new EvalError("syntax-case: expected literal identifier");
+            }
+            literalIdentifiers.add(literalSymbol.name());
+        }
+        return Set.copyOf(literalIdentifiers);
+    }
+
+    private static Map<String, PatternBinding> matchSequence(
             List<SchemeExpression> patterns,
             int patternIndex,
-            List<SchemeExpression> inputs,
-            int inputIndex
+            List<SyntaxValue> inputs,
+            int inputIndex,
+            Set<String> literalIdentifiers
     ) {
         if (patternIndex >= patterns.size()) {
             if (inputIndex == inputs.size()) {
@@ -120,14 +161,14 @@ final class SyntaxRulesMacro implements MacroTransformer {
 
         SchemeExpression pattern = patterns.get(patternIndex);
         if (patternIndex + 1 < patterns.size() && isEllipsis(patterns.get(patternIndex + 1))) {
-            Set<String> repeatedVariables = collectPatternVariables(pattern);
+            Set<String> repeatedVariables = collectPatternVariables(pattern, literalIdentifiers);
             int maxCount = inputs.size() - inputIndex;
             for (int count = 0; count <= maxCount; count++) {
                 List<Map<String, PatternBinding>> iterationMatches = new ArrayList<>(count);
                 boolean matched = true;
                 for (int offset = 0; offset < count; offset++) {
                     Map<String, PatternBinding> iterationMatch =
-                            matchPattern(pattern, inputs.get(inputIndex + offset));
+                            matchPattern(pattern, inputs.get(inputIndex + offset), literalIdentifiers);
                     if (iterationMatch == null) {
                         matched = false;
                         break;
@@ -145,7 +186,8 @@ final class SyntaxRulesMacro implements MacroTransformer {
                         patterns,
                         patternIndex + 2,
                         inputs,
-                        inputIndex + count
+                        inputIndex + count,
+                        literalIdentifiers
                 );
                 if (remainder == null) {
                     continue;
@@ -163,20 +205,42 @@ final class SyntaxRulesMacro implements MacroTransformer {
             return null;
         }
 
-        Map<String, PatternBinding> currentMatch = matchPattern(pattern, inputs.get(inputIndex));
+        Map<String, PatternBinding> currentMatch =
+                matchPattern(pattern, inputs.get(inputIndex), literalIdentifiers);
         if (currentMatch == null) {
             return null;
         }
 
         Map<String, PatternBinding> remainder =
-                matchSequence(patterns, patternIndex + 1, inputs, inputIndex + 1);
+                matchSequence(patterns, patternIndex + 1, inputs, inputIndex + 1, literalIdentifiers);
         if (remainder == null) {
             return null;
         }
         return mergeBindings(currentMatch, remainder);
     }
 
-    private Map<String, PatternBinding> aggregateRepeatedBindings(
+    private static Map<String, PatternBinding> matchSymbol(
+            SymbolExpression pattern,
+            SyntaxValue input,
+            Set<String> literalIdentifiers
+    ) {
+        String symbolName = pattern.name();
+        if ("...".equals(symbolName)) {
+            return null;
+        }
+        if ("_".equals(symbolName)) {
+            return Map.of();
+        }
+        if (literalIdentifiers.contains(symbolName)) {
+            if (input.expression() instanceof SymbolExpression symbol && symbolName.equals(symbol.name())) {
+                return Map.of();
+            }
+            return null;
+        }
+        return Map.of(symbolName, new SinglePatternBinding(input));
+    }
+
+    private static Map<String, PatternBinding> aggregateRepeatedBindings(
             Set<String> repeatedVariables,
             List<Map<String, PatternBinding>> iterationMatches
     ) {
@@ -191,28 +255,20 @@ final class SyntaxRulesMacro implements MacroTransformer {
         return bindings;
     }
 
-    private Map<String, PatternBinding> mergeBindings(
-            Map<String, PatternBinding> left,
-            Map<String, PatternBinding> right
+    private static Set<String> collectPatternVariables(
+            SchemeExpression pattern,
+            Set<String> literalIdentifiers
     ) {
-        Map<String, PatternBinding> merged = new HashMap<>(left);
-        for (Map.Entry<String, PatternBinding> entry : right.entrySet()) {
-            PatternBinding existing = merged.get(entry.getKey());
-            if (existing != null && !bindingsEqual(existing, entry.getValue())) {
-                return null;
-            }
-            merged.put(entry.getKey(), entry.getValue());
-        }
-        return merged;
-    }
-
-    private Set<String> collectPatternVariables(SchemeExpression pattern) {
         Set<String> variables = new HashSet<>();
-        collectPatternVariables(pattern, variables);
+        collectPatternVariables(pattern, literalIdentifiers, variables);
         return variables;
     }
 
-    private void collectPatternVariables(SchemeExpression pattern, Set<String> variables) {
+    private static void collectPatternVariables(
+            SchemeExpression pattern,
+            Set<String> literalIdentifiers,
+            Set<String> variables
+    ) {
         if (isQuotedForm(pattern) || pattern instanceof LiteralExpression) {
             return;
         }
@@ -226,37 +282,15 @@ final class SyntaxRulesMacro implements MacroTransformer {
         }
 
         for (SchemeExpression element : ((ListExpression) pattern).elements()) {
-            collectPatternVariables(element, variables);
+            collectPatternVariables(element, literalIdentifiers, variables);
         }
     }
 
-    private SchemeExpression expandTemplate(
-            SchemeExpression template,
-            Map<String, PatternBinding> bindings,
-            List<Integer> repetitionPath
-    ) throws EvalError {
-        if (template instanceof LiteralExpression) {
-            return template;
-        }
-        if (template instanceof SymbolExpression symbol) {
-            return expandSymbol(symbol, bindings, repetitionPath);
-        }
-
-        if (isQuotedForm(template)) {
-            return template;
-        }
-
-        ListExpression list = (ListExpression) template;
-        return new ListExpression(
-                List.copyOf(expandTemplateSequence(list.elements(), bindings, repetitionPath)),
-                list.position()
-        );
-    }
-
-    private List<SchemeExpression> expandTemplateSequence(
+    private static List<SchemeExpression> expandTemplateSequence(
             List<SchemeExpression> templates,
             Map<String, PatternBinding> bindings,
-            List<Integer> repetitionPath
+            List<Integer> repetitionPath,
+            SyntaxContext defaultContext
     ) throws EvalError {
         List<SchemeExpression> expanded = new ArrayList<>();
         for (int index = 0; index < templates.size(); index++) {
@@ -267,21 +301,23 @@ final class SyntaxRulesMacro implements MacroTransformer {
                     expanded.add(expandTemplate(
                             template,
                             bindings,
-                            appendIndex(repetitionPath, repeatIndex)
+                            appendIndex(repetitionPath, repeatIndex),
+                            defaultContext
                     ));
                 }
                 index++;
                 continue;
             }
-            expanded.add(expandTemplate(template, bindings, repetitionPath));
+            expanded.add(expandTemplate(template, bindings, repetitionPath, defaultContext));
         }
         return expanded;
     }
 
-    private SchemeExpression expandSymbol(
+    private static SchemeExpression expandSymbol(
             SymbolExpression symbol,
             Map<String, PatternBinding> bindings,
-            List<Integer> repetitionPath
+            List<Integer> repetitionPath,
+            SyntaxContext defaultContext
     ) throws EvalError {
         PatternBinding binding = bindings.get(symbol.name());
         if (binding != null) {
@@ -292,10 +328,13 @@ final class SyntaxRulesMacro implements MacroTransformer {
         if ("...".equals(symbolName) || CORE_SYNTAX.contains(symbolName)) {
             return symbol;
         }
-        return new SymbolExpression(aliasFor(symbolName), symbol.position());
+        if (defaultContext instanceof UseSiteSyntaxContext) {
+            return symbol;
+        }
+        return ((SyntaxTemplateContext) defaultContext).aliasSymbol(symbol);
     }
 
-    private int determineRepeatCount(
+    private static int determineRepeatCount(
             SchemeExpression template,
             Map<String, PatternBinding> bindings,
             List<Integer> repetitionPath
@@ -314,17 +353,17 @@ final class SyntaxRulesMacro implements MacroTransformer {
                 continue;
             }
             if (repeatCount != variableRepeatCount) {
-                throw new EvalError("syntax-rules: mismatched ellipsis lengths");
+                throw new EvalError("syntax-case: mismatched ellipsis lengths");
             }
         }
 
         if (repeatCount < 0) {
-            throw new EvalError("syntax-rules: ellipsis template has no repeated pattern variables");
+            throw new EvalError("syntax-case: ellipsis template has no repeated pattern variables");
         }
         return repeatCount;
     }
 
-    private void collectTemplateVariables(
+    private static void collectTemplateVariables(
             SchemeExpression template,
             Set<String> boundVariables,
             Set<String> variables
@@ -345,7 +384,7 @@ final class SyntaxRulesMacro implements MacroTransformer {
         }
     }
 
-    private int repeatCount(PatternBinding binding, List<Integer> repetitionPath) throws EvalError {
+    private static int repeatCount(PatternBinding binding, List<Integer> repetitionPath) throws EvalError {
         PatternBinding current = descend(binding, repetitionPath);
         if (current instanceof RepeatedPatternBinding repeated) {
             return repeated.items().size();
@@ -353,50 +392,42 @@ final class SyntaxRulesMacro implements MacroTransformer {
         return -1;
     }
 
-    private SchemeExpression resolveBinding(
+    private static SchemeExpression resolveBinding(
             PatternBinding binding,
             List<Integer> repetitionPath,
             String name
     ) throws EvalError {
         PatternBinding current = descend(binding, repetitionPath);
         if (current instanceof SinglePatternBinding single) {
-            return single.expression();
+            return single.syntax().expression();
         }
-        throw new EvalError("syntax-rules: pattern variable " + name + " used outside ellipsis");
+        throw new EvalError("syntax-case: pattern variable " + name + " used outside ellipsis");
     }
 
-    private PatternBinding descend(PatternBinding binding, List<Integer> repetitionPath) throws EvalError {
+    private static PatternBinding descend(PatternBinding binding, List<Integer> repetitionPath) throws EvalError {
         PatternBinding current = binding;
         for (Integer index : repetitionPath) {
             if (!(current instanceof RepeatedPatternBinding repeated)) {
-                throw new EvalError("syntax-rules: invalid ellipsis nesting");
+                throw new EvalError("syntax-case: invalid ellipsis nesting");
             }
             if (index < 0 || index >= repeated.items().size()) {
-                throw new EvalError("syntax-rules: ellipsis index out of bounds");
+                throw new EvalError("syntax-case: ellipsis index out of bounds");
             }
             current = repeated.items().get(index);
         }
         return current;
     }
 
-    private String aliasFor(String name) {
-        return identifierAliases.computeIfAbsent(name, key -> {
-            String alias = "__macro$" + macroId + "$" + key;
-            definitionEnvironment.defineAlias(alias, key);
-            return alias;
-        });
-    }
-
-    private List<Integer> appendIndex(List<Integer> repetitionPath, int index) {
+    private static List<Integer> appendIndex(List<Integer> repetitionPath, int index) {
         List<Integer> extendedPath = new ArrayList<>(repetitionPath.size() + 1);
         extendedPath.addAll(repetitionPath);
         extendedPath.add(index);
         return List.copyOf(extendedPath);
     }
 
-    private boolean bindingsEqual(PatternBinding left, PatternBinding right) {
+    private static boolean bindingsEqual(PatternBinding left, PatternBinding right) {
         if (left instanceof SinglePatternBinding leftSingle && right instanceof SinglePatternBinding rightSingle) {
-            return expressionsEqual(leftSingle.expression(), rightSingle.expression());
+            return expressionsEqual(leftSingle.syntax().expression(), rightSingle.syntax().expression());
         }
         if (left instanceof RepeatedPatternBinding leftRepeated
                 && right instanceof RepeatedPatternBinding rightRepeated) {
@@ -413,7 +444,7 @@ final class SyntaxRulesMacro implements MacroTransformer {
         return false;
     }
 
-    private boolean expressionsEqual(SchemeExpression left, SchemeExpression right) {
+    private static boolean expressionsEqual(SchemeExpression left, SchemeExpression right) {
         if (left instanceof LiteralExpression leftLiteral && right instanceof LiteralExpression rightLiteral) {
             return literalValuesEqual(leftLiteral.value(), rightLiteral.value());
         }
@@ -434,7 +465,7 @@ final class SyntaxRulesMacro implements MacroTransformer {
         return false;
     }
 
-    private boolean literalValuesEqual(SchemeValue left, SchemeValue right) {
+    private static boolean literalValuesEqual(SchemeValue left, SchemeValue right) {
         if (left == right) {
             return true;
         }
@@ -459,7 +490,7 @@ final class SyntaxRulesMacro implements MacroTransformer {
         return false;
     }
 
-    private boolean isQuotedForm(SchemeExpression expression) {
+    private static boolean isQuotedForm(SchemeExpression expression) {
         if (!(expression instanceof ListExpression list) || list.elements().size() != 2) {
             return false;
         }
@@ -467,19 +498,24 @@ final class SyntaxRulesMacro implements MacroTransformer {
                 && "quote".equals(symbol.name());
     }
 
-    private boolean isEllipsis(SchemeExpression expression) {
+    private static boolean isEllipsis(SchemeExpression expression) {
         return expression instanceof SymbolExpression symbol && "...".equals(symbol.name());
     }
 
-    record SyntaxRule(SchemeExpression pattern, SchemeExpression template) {
+    private static List<SyntaxValue> syntaxElements(List<SchemeExpression> expressions, SyntaxContext context) {
+        List<SyntaxValue> values = new ArrayList<>(expressions.size());
+        for (SchemeExpression expression : expressions) {
+            values.add(new SyntaxValue(expression, context));
+        }
+        return List.copyOf(values);
     }
 
-    private sealed interface PatternBinding permits SinglePatternBinding, RepeatedPatternBinding {
+    sealed interface PatternBinding permits SinglePatternBinding, RepeatedPatternBinding {
     }
 
-    private record SinglePatternBinding(SchemeExpression expression) implements PatternBinding {
+    record SinglePatternBinding(SyntaxValue syntax) implements PatternBinding {
     }
 
-    private record RepeatedPatternBinding(List<PatternBinding> items) implements PatternBinding {
+    record RepeatedPatternBinding(List<PatternBinding> items) implements PatternBinding {
     }
 }
