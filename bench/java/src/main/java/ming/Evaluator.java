@@ -98,6 +98,7 @@ public class Evaluator {
             return new IntValue(lengthOfList(args.getFirst()));
         }));
         env.define("append", builtin("append", this::appendLists));
+        env.define("apply", builtin("apply", this::applyBuiltin));
         env.define("string?", builtin("string?",
                 args -> typePredicate("string?", args, value -> value instanceof StringValue)));
         env.define("number?", builtin("number?",
@@ -274,11 +275,9 @@ public class Evaluator {
                 throw new EvalError("function name must be a symbol");
             }
 
-            List<String> parameterNames = parseParameterNames(
-                    signature.subList(1, signature.size()));
+            ParameterSpec parameters = parseParameterSpec(signature.subList(1, signature.size()));
             List<Expr> body = parseBody("define", argExprs.subList(1, argExprs.size()));
-            ProcedureValue procedure =
-                    new UserProcedure(nameExpr.name(), parameterNames, body, env);
+            ProcedureValue procedure = new UserProcedure(nameExpr.name(), parameters, body, env);
             env.define(nameExpr.name(), procedure);
             return VoidValue.INSTANCE;
         }
@@ -315,13 +314,10 @@ public class Evaluator {
         if (argExprs.size() < 2) {
             throw new EvalError("lambda requires parameters and a body");
         }
-        if (!(argExprs.getFirst() instanceof ListExpr paramsExpr)) {
-            throw new EvalError("lambda parameters must be a list");
-        }
 
-        List<String> parameterNames = parseParameterNames(paramsExpr.elements());
+        ParameterSpec parameters = parseLambdaParameterSpec(argExprs.getFirst());
         List<Expr> body = parseBody("lambda", argExprs.subList(1, argExprs.size()));
-        return new UserProcedure(null, parameterNames, body, env);
+        return new UserProcedure(null, parameters, body, env);
     }
 
     private Value evalBegin(List<Expr> argExprs, Environment env) throws EvalError {
@@ -375,7 +371,8 @@ public class Evaluator {
         }
 
         Environment letEnv = new Environment(env);
-        ProcedureValue procedure = new UserProcedure(name, parameterNames, body, letEnv);
+        ProcedureValue procedure = new UserProcedure(name,
+                new ParameterSpec(parameterNames, null), body, letEnv);
         letEnv.define(name, procedure);
         return procedure.apply(arguments);
     }
@@ -420,15 +417,46 @@ public class Evaluator {
         return evalSequence(body, env);
     }
 
-    private List<String> parseParameterNames(List<Expr> params) throws EvalError {
-        List<String> parameterNames = new ArrayList<>(params.size());
-        for (Expr param : params) {
+    private ParameterSpec parseLambdaParameterSpec(Expr paramsExpr) throws EvalError {
+        if (paramsExpr instanceof ListExpr paramsList) {
+            return parseParameterSpec(paramsList.elements());
+        }
+        if (paramsExpr instanceof SymbolExpr symbolExpr) {
+            if (symbolExpr.name().equals(".")) {
+                throw new EvalError("invalid parameter list");
+            }
+            return new ParameterSpec(List.of(), symbolExpr.name());
+        }
+        throw new EvalError("lambda parameters must be a list or symbol");
+    }
+
+    private ParameterSpec parseParameterSpec(List<Expr> params) throws EvalError {
+        List<String> requiredParameters = new ArrayList<>(params.size());
+        String restParameter = null;
+
+        for (int index = 0; index < params.size(); index++) {
+            Expr param = params.get(index);
+            if (param instanceof SymbolExpr symbolExpr && symbolExpr.name().equals(".")) {
+                if (restParameter != null || index != params.size() - 2) {
+                    throw new EvalError("invalid parameter list");
+                }
+
+                Expr restExpr = params.get(index + 1);
+                if (!(restExpr instanceof SymbolExpr restSymbol) || restSymbol.name().equals(".")) {
+                    throw new EvalError("rest parameter must be a symbol");
+                }
+                restParameter = restSymbol.name();
+                index++;
+                continue;
+            }
+
             if (!(param instanceof SymbolExpr symbolExpr)) {
                 throw new EvalError("parameter must be a symbol");
             }
-            parameterNames.add(symbolExpr.name());
+            requiredParameters.add(symbolExpr.name());
         }
-        return parameterNames;
+
+        return new ParameterSpec(requiredParameters, restParameter);
     }
 
     private List<LetBinding> parseBindings(List<Expr> bindingExprs) throws EvalError {
@@ -671,6 +699,18 @@ public class Evaluator {
         return result;
     }
 
+    private Value applyBuiltin(List<Value> args) throws EvalError {
+        requireAtLeast("apply", args.size(), 2);
+
+        List<Value> expandedArgs = new ArrayList<>();
+        for (int index = 1; index < args.size() - 1; index++) {
+            expandedArgs.add(args.get(index));
+        }
+        expandedArgs.addAll(listElements(args.get(args.size() - 1)));
+
+        return applyProcedure(args.getFirst(), expandedArgs);
+    }
+
     private String stringAppend(List<Value> args) throws EvalError {
         StringBuilder builder = new StringBuilder();
         for (Value arg : args) {
@@ -741,6 +781,12 @@ public class Evaluator {
     }
 
     private record LetBinding(String name, Expr valueExpr) {
+    }
+
+    private record ParameterSpec(List<String> requiredParameters, String restParameter) {
+        private ParameterSpec {
+            requiredParameters = List.copyOf(requiredParameters);
+        }
     }
 
     private record SourcePos(int line, int column) {
@@ -901,25 +947,34 @@ public class Evaluator {
 
     private final class UserProcedure extends ProcedureValue {
         private final String name;
-        private final List<String> parameterNames;
+        private final ParameterSpec parameters;
         private final List<Expr> body;
         private final Environment closureEnv;
 
-        private UserProcedure(String name, List<String> parameterNames,
+        private UserProcedure(String name, ParameterSpec parameters,
                               List<Expr> body, Environment closureEnv) {
             this.name = name;
-            this.parameterNames = List.copyOf(parameterNames);
+            this.parameters = parameters;
             this.body = List.copyOf(body);
             this.closureEnv = closureEnv;
         }
 
         @Override
         Value apply(List<Value> args) throws EvalError {
-            requireArity(displayName(), args.size(), parameterNames.size());
+            int requiredCount = parameters.requiredParameters().size();
+            if (parameters.restParameter() == null) {
+                requireArity(displayName(), args.size(), requiredCount);
+            } else if (args.size() < requiredCount) {
+                requireAtLeast(displayName(), args.size(), requiredCount);
+            }
 
             Environment callEnv = new Environment(closureEnv);
-            for (int index = 0; index < parameterNames.size(); index++) {
-                callEnv.define(parameterNames.get(index), args.get(index));
+            for (int index = 0; index < requiredCount; index++) {
+                callEnv.define(parameters.requiredParameters().get(index), args.get(index));
+            }
+            if (parameters.restParameter() != null) {
+                callEnv.define(parameters.restParameter(), makeList(args.subList(requiredCount,
+                        args.size())));
             }
             return evalSequence(body, callEnv);
         }
