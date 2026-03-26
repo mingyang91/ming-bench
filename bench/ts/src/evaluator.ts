@@ -4,6 +4,18 @@ import { EvalError } from './evalError.js';
 
 interface Pos { line: number; col: number }
 
+// CPS types
+type Cont = (val: SchemeVal) => Bounce;
+type Bounce = { tag: 'done'; value: SchemeVal } | { tag: 'bounce'; fn: () => Bounce };
+
+function done(v: SchemeVal): Bounce { return { tag: 'done', value: v }; }
+function bounce(fn: () => Bounce): Bounce { return { tag: 'bounce', fn }; }
+
+function trampoline(b: Bounce): SchemeVal {
+  while (b.tag === 'bounce') b = b.fn();
+  return b.value;
+}
+
 type SchemeVal =
   | { tag: 'number'; value: number; exact?: boolean; pos?: Pos }
   | { tag: 'rational'; num: number; den: number; pos?: Pos }
@@ -19,7 +31,8 @@ type SchemeVal =
   | { tag: 'macro'; rules: MacroRule[]; defEnv: Env; pos?: Pos }
   | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
   | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[]; pos?: Pos }
-  | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos };
+  | { tag: 'vector'; elements: SchemeVal[]; pos?: Pos }
+  | { tag: 'continuation'; k: Cont; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (after macro name)
@@ -290,8 +303,7 @@ function parse(tokens: Token[]): SchemeVal[] {
       const rn = parseInt(ratMatch[1], 10);
       const rd = parseInt(ratMatch[2], 10);
       const rv = makeRational(rn, rd);
-      if (rv.pos === undefined) rv.pos = tok.pos;
-      else rv.pos = tok.pos;
+      rv.pos = tok.pos;
       return rv;
     }
     const num = Number(tok.text);
@@ -309,7 +321,7 @@ function parse(tokens: Token[]): SchemeVal[] {
   return exprs;
 }
 
-// ── Evaluator ──────────────────────────────────────────────────────────
+// ── Evaluator helpers ──────────────────────────────────────────────────
 
 function parseParams(elements: SchemeVal[], pos?: Pos): { params: string[]; restParam?: string } {
   const params: string[] = [];
@@ -482,12 +494,31 @@ function expandMacro(
   throw errAt('no matching pattern in syntax-rules', pos);
 }
 
-function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
-  let expr: SchemeVal = initExpr;
-  let env: Env = initEnv;
+// ── CPS Evaluator ──────────────────────────────────────────────────────
 
-  // Trampoline loop for TCO: tail positions use `expr = ...; env = ...; continue;`
-  trampoline: while (true) {
+// Evaluate a sequence of expressions, passing the last result to k
+function evalBeginK(exprs: SchemeVal[], env: Env, k: Cont): Bounce {
+  if (exprs.length === 0) return k(SCM_FALSE);
+  function loop(i: number): Bounce {
+    if (i === exprs.length - 1) return bounce(() => evalK(exprs[i], env, k));
+    return evalK(exprs[i], env, (_) => loop(i + 1));
+  }
+  return loop(0);
+}
+
+// Evaluate a list of expressions right-to-left (Chez Scheme order),
+// returning the values array in left-to-right order
+function evalListK(exprs: SchemeVal[], env: Env, k: (vals: SchemeVal[]) => Bounce): Bounce {
+  function loop(i: number, acc: SchemeVal[]): Bounce {
+    if (i < 0) return k(acc);
+    return evalK(exprs[i], env, (val) => {
+      return loop(i - 1, [val, ...acc]);
+    });
+  }
+  return loop(exprs.length - 1, []);
+}
+
+function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
   switch (expr.tag) {
     case 'number':
     case 'rational':
@@ -497,9 +528,9 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
     case 'nil':
     case 'pair':
     case 'vector':
-      return expr;
+      return k(expr);
     case 'symbol':
-      try { return env.get(expr.value); }
+      try { return k(env.get(expr.value)); }
       catch (e) { throw errAt(`unbound variable: ${expr.value}`, expr.pos); }
     case 'list': {
       const elems = expr.elements;
@@ -511,23 +542,25 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
         switch (head.value) {
           case 'quote': {
             if (elems.length !== 2) throw errAt('quote: expected 1 argument', expr.pos);
-            return listToPairs(elems[1]);
+            return k(listToPairs(elems[1]));
           }
           case 'if': {
             if (elems.length < 3 || elems.length > 4)
               throw errAt('if: expected 2-3 arguments', expr.pos);
-            const cond = evalExpr(elems[1], env);
-            if (isTruthy(cond)) { expr = elems[2]; continue trampoline; }
-            if (elems.length === 4) { expr = elems[3]; continue trampoline; }
-            return SCM_FALSE;
+            return evalK(elems[1], env, (cond) => {
+              if (isTruthy(cond)) return bounce(() => evalK(elems[2], env, k));
+              if (elems.length === 4) return bounce(() => evalK(elems[3], env, k));
+              return k(SCM_FALSE);
+            });
           }
           case 'define': {
             if (elems.length < 3) throw errAt('define: bad syntax', expr.pos);
             const target = elems[1];
             if (target.tag === 'symbol') {
-              const val = evalExpr(elems[2], env);
-              env.set(target.value, val);
-              return val;
+              return evalK(elems[2], env, (val) => {
+                env.set(target.value, val);
+                return k(val);
+              });
             }
             if (target.tag === 'list' && target.elements.length > 0 && target.elements[0].tag === 'symbol') {
               const name = target.elements[0].value;
@@ -535,22 +568,21 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
               const body = elems.slice(2);
               const lambda: SchemeVal = { tag: 'lambda', params, restParam, body, env };
               env.set(name, lambda);
-              return lambda;
+              return k(lambda);
             }
             throw errAt('define: bad syntax', expr.pos);
           }
           case 'lambda': {
             if (elems.length < 3) throw errAt('lambda: bad syntax', expr.pos);
             const paramList = elems[1];
-            // (lambda args body) — single symbol captures all args
             if (paramList.tag === 'symbol') {
               const body = elems.slice(2);
-              return { tag: 'lambda', params: [], restParam: paramList.value, body, env };
+              return k({ tag: 'lambda', params: [], restParam: paramList.value, body, env });
             }
             if (paramList.tag !== 'list') throw errAt('lambda: params must be a list', expr.pos);
             const { params, restParam } = parseParams(paramList.elements, expr.pos);
             const body = elems.slice(2);
-            return { tag: 'lambda', params, restParam, body, env };
+            return k({ tag: 'lambda', params, restParam, body, env });
           }
           case 'case-lambda': {
             const clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[] = [];
@@ -570,66 +602,68 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
                 throw errAt('case-lambda: bad formals', expr.pos);
               }
             }
-            return { tag: 'case-lambda' as const, clauses, pos: expr.pos };
+            return k({ tag: 'case-lambda' as const, clauses, pos: expr.pos });
           }
           case 'and': {
-            if (elems.length === 1) return SCM_TRUE;
-            for (let i = 1; i < elems.length - 1; i++) {
-              const val = evalExpr(elems[i], env);
-              if (!isTruthy(val)) return val;
+            if (elems.length === 1) return k(SCM_TRUE);
+            function evalAnd(i: number): Bounce {
+              if (i === elems.length - 1) return bounce(() => evalK(elems[i], env, k));
+              return evalK(elems[i], env, (val) => {
+                if (!isTruthy(val)) return k(val);
+                return evalAnd(i + 1);
+              });
             }
-            expr = elems[elems.length - 1]; continue trampoline;
+            return evalAnd(1);
           }
           case 'or': {
-            if (elems.length === 1) return SCM_FALSE;
-            for (let i = 1; i < elems.length - 1; i++) {
-              const val = evalExpr(elems[i], env);
-              if (isTruthy(val)) return val;
+            if (elems.length === 1) return k(SCM_FALSE);
+            function evalOr(i: number): Bounce {
+              if (i === elems.length - 1) return bounce(() => evalK(elems[i], env, k));
+              return evalK(elems[i], env, (val) => {
+                if (isTruthy(val)) return k(val);
+                return evalOr(i + 1);
+              });
             }
-            expr = elems[elems.length - 1]; continue trampoline;
+            return evalOr(1);
           }
           case 'not': {
             if (elems.length !== 2) throw errAt('not: expected 1 argument', expr.pos);
-            const val = evalExpr(elems[1], env);
-            return isTruthy(val) ? SCM_FALSE : SCM_TRUE;
+            return evalK(elems[1], env, (val) =>
+              k(isTruthy(val) ? SCM_FALSE : SCM_TRUE)
+            );
           }
           case 'begin': {
-            if (elems.length === 1) return SCM_FALSE;
-            for (let i = 1; i < elems.length - 1; i++) {
-              evalExpr(elems[i], env);
-            }
-            expr = elems[elems.length - 1]; continue trampoline;
+            if (elems.length === 1) return k(SCM_FALSE);
+            return evalBeginK(elems.slice(1), env, k);
           }
           case 'set!': {
             if (elems.length !== 3) throw errAt('set!: bad syntax', expr.pos);
             const target = elems[1];
             if (target.tag !== 'symbol') throw errAt('set!: expected symbol', expr.pos);
-            const val = evalExpr(elems[2], env);
-            env.setExisting(target.value, val);
-            return SCM_FALSE;
+            return evalK(elems[2], env, (val) => {
+              env.setExisting(target.value, val);
+              return k(SCM_FALSE);
+            });
           }
           case 'cond': {
-            for (let i = 1; i < elems.length; i++) {
-              const clause = elems[i];
+            function tryCond(ci: number): Bounce {
+              if (ci >= elems.length) return k(SCM_FALSE);
+              const clause = elems[ci];
               if (clause.tag !== 'list' || clause.elements.length < 1)
                 throw errAt('cond: bad clause', expr.pos);
               const test = clause.elements[0];
               if (test.tag === 'symbol' && test.value === 'else') {
-                for (let j = 1; j < clause.elements.length - 1; j++) {
-                  evalExpr(clause.elements[j], env);
-                }
-                expr = clause.elements[clause.elements.length - 1]; continue trampoline;
+                return evalBeginK(clause.elements.slice(1), env, k);
               }
-              const testVal = evalExpr(test, env);
-              if (isTruthy(testVal)) {
-                if (clause.elements.length === 1) return testVal;
-                for (let j = 1; j < clause.elements.length - 1; j++) {
-                  evalExpr(clause.elements[j], env);
+              return evalK(test, env, (testVal) => {
+                if (isTruthy(testVal)) {
+                  if (clause.elements.length === 1) return k(testVal);
+                  return evalBeginK(clause.elements.slice(1), env, k);
                 }
-                expr = clause.elements[clause.elements.length - 1]; continue trampoline;
-              }
+                return tryCond(ci + 1);
+              });
             }
-            return SCM_FALSE;
+            return tryCond(1);
           }
           case 'let': {
             // Named let: (let name ((var init) ...) body...)
@@ -638,68 +672,71 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
               const bindingList = elems[2];
               if (bindingList.tag !== 'list') throw errAt('let: bad syntax', expr.pos);
               const paramNames: string[] = [];
-              const initVals: SchemeVal[] = [];
+              const initExprs: SchemeVal[] = [];
               for (const b of bindingList.elements) {
                 if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
                   throw errAt('let: bad binding', expr.pos);
                 paramNames.push(b.elements[0].value);
-                initVals.push(evalExpr(b.elements[1], env));
+                initExprs.push(b.elements[1]);
               }
               const body = elems.slice(3);
-              const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env };
-              // Create env where name is bound to the lambda (for recursion)
-              const callEnv = new Env(env);
-              callEnv.set(name, lambda);
-              // Also update the lambda's env to include itself
-              (lambda as any).env = callEnv;
-              for (let i = 0; i < paramNames.length; i++) {
-                callEnv.set(paramNames[i], initVals[i]);
-              }
-              for (let i = 0; i < body.length - 1; i++) {
-                evalExpr(body[i], callEnv);
-              }
-              expr = body[body.length - 1]; env = callEnv; continue trampoline;
+              // Evaluate inits left-to-right (named let semantics)
+              return evalListLeftK(initExprs, env, (initVals) => {
+                const lambda: SchemeVal = { tag: 'lambda', params: paramNames, body, env };
+                const callEnv = new Env(env);
+                callEnv.set(name, lambda);
+                (lambda as any).env = callEnv;
+                for (let i = 0; i < paramNames.length; i++) {
+                  callEnv.set(paramNames[i], initVals[i]);
+                }
+                return evalBeginK(body, callEnv, k);
+              });
             }
             // Regular let: (let ((var init) ...) body...)
             if (elems.length < 3) throw errAt('let: bad syntax', expr.pos);
             const bindings = elems[1];
             if (bindings.tag !== 'list') throw errAt('let: bad syntax', expr.pos);
-            const letEnv = new Env(env);
-            for (const b of bindings.elements) {
+            const bindExprs = bindings.elements.map(b => {
               if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
                 throw errAt('let: bad binding', expr.pos);
-              const val = evalExpr(b.elements[1], env);
-              letEnv.set(b.elements[0].value, val);
-            }
-            for (let i = 2; i < elems.length - 1; i++) {
-              evalExpr(elems[i], letEnv);
-            }
-            expr = elems[elems.length - 1]; env = letEnv; continue trampoline;
+              return b.elements[1];
+            });
+            const bindNames = bindings.elements.map(b => (b as any).elements[0].value as string);
+            return evalListLeftK(bindExprs, env, (vals) => {
+              const letEnv = new Env(env);
+              for (let i = 0; i < bindNames.length; i++) {
+                letEnv.set(bindNames[i], vals[i]);
+              }
+              return evalBeginK(elems.slice(2), letEnv, k);
+            });
           }
           case 'let*': {
             if (elems.length < 3) throw errAt('let*: bad syntax', expr.pos);
-            const bindings = elems[1];
-            if (bindings.tag !== 'list') throw errAt('let*: bad syntax', expr.pos);
-            let letStarEnv = new Env(env);
-            for (const b of bindings.elements) {
+            const bindingsLS = elems[1];
+            if (bindingsLS.tag !== 'list') throw errAt('let*: bad syntax', expr.pos);
+            const bindingsElems = bindingsLS.elements;
+            function bindLetStar(bi: number, curEnv: Env): Bounce {
+              if (bi >= bindingsElems.length) {
+                return evalBeginK(elems.slice(2), curEnv, k);
+              }
+              const b = bindingsElems[bi];
               if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
                 throw errAt('let*: bad binding', expr.pos);
-              const val = evalExpr(b.elements[1], letStarEnv);
-              const nextEnv = new Env(letStarEnv);
-              nextEnv.set(b.elements[0].value, val);
-              letStarEnv = nextEnv;
+              const bName = b.elements[0].value;
+              const bInit = b.elements[1];
+              return evalK(bInit, curEnv, (val) => {
+                const nextEnv = new Env(curEnv);
+                nextEnv.set(bName, val);
+                return bindLetStar(bi + 1, nextEnv);
+              });
             }
-            for (let i = 2; i < elems.length - 1; i++) {
-              evalExpr(elems[i], letStarEnv);
-            }
-            expr = elems[elems.length - 1]; env = letStarEnv; continue trampoline;
+            return bindLetStar(0, new Env(env));
           }
           case 'letrec': {
             if (elems.length < 3) throw errAt('letrec: bad syntax', expr.pos);
             const bindings = elems[1];
             if (bindings.tag !== 'list') throw errAt('letrec: bad syntax', expr.pos);
             const letrecEnv = new Env(env);
-            // First set all to undefined placeholder
             const names: string[] = [];
             for (const b of bindings.elements) {
               if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
@@ -707,121 +744,126 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
               names.push(b.elements[0].value);
               letrecEnv.set(b.elements[0].value, SCM_FALSE);
             }
-            // Then evaluate init expressions in the letrec env
-            for (let i = 0; i < bindings.elements.length; i++) {
-              const b = bindings.elements[i];
-              if (b.tag === 'list') {
-                const val = evalExpr(b.elements[1], letrecEnv);
-                letrecEnv.set(names[i], val);
+            const initExprs = bindings.elements.map(b => (b as any).elements[1] as SchemeVal);
+            return evalListLeftK(initExprs, letrecEnv, (vals) => {
+              for (let i = 0; i < names.length; i++) {
+                letrecEnv.set(names[i], vals[i]);
               }
-            }
-            for (let i = 2; i < elems.length - 1; i++) {
-              evalExpr(elems[i], letrecEnv);
-            }
-            expr = elems[elems.length - 1]; env = letrecEnv; continue trampoline;
+              return evalBeginK(elems.slice(2), letrecEnv, k);
+            });
           }
           case 'letrec*': {
             if (elems.length < 3) throw errAt('letrec*: bad syntax', expr.pos);
-            const bindings = elems[1];
-            if (bindings.tag !== 'list') throw errAt('letrec*: bad syntax', expr.pos);
+            const bindingsLRS = elems[1];
+            if (bindingsLRS.tag !== 'list') throw errAt('letrec*: bad syntax', expr.pos);
+            const lrsElems = bindingsLRS.elements;
             const letrecStarEnv = new Env(env);
-            for (const b of bindings.elements) {
+            function bindLetrecStar(bi: number): Bounce {
+              if (bi >= lrsElems.length) {
+                return evalBeginK(elems.slice(2), letrecStarEnv, k);
+              }
+              const b = lrsElems[bi];
               if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
                 throw errAt('letrec*: bad binding', expr.pos);
-              const val = evalExpr(b.elements[1], letrecStarEnv);
-              letrecStarEnv.set(b.elements[0].value, val);
+              const lrsName = b.elements[0].value;
+              const lrsInit = b.elements[1];
+              return evalK(lrsInit, letrecStarEnv, (val) => {
+                letrecStarEnv.set(lrsName, val);
+                return bindLetrecStar(bi + 1);
+              });
             }
-            for (let i = 2; i < elems.length - 1; i++) {
-              evalExpr(elems[i], letrecStarEnv);
-            }
-            expr = elems[elems.length - 1]; env = letrecStarEnv; continue trampoline;
+            return bindLetrecStar(0);
           }
           case 'case': {
             if (elems.length < 2) throw errAt('case: bad syntax', expr.pos);
-            const key = evalExpr(elems[1], env);
-            for (let i = 2; i < elems.length; i++) {
-              const clause = elems[i];
-              if (clause.tag !== 'list' || clause.elements.length < 2)
-                throw errAt('case: bad clause', expr.pos);
-              const datums = clause.elements[0];
-              if (datums.tag === 'symbol' && datums.value === 'else') {
-                for (let j = 1; j < clause.elements.length - 1; j++) {
-                  evalExpr(clause.elements[j], env);
+            return evalK(elems[1], env, (key) => {
+              function tryClause(ci: number): Bounce {
+                if (ci >= elems.length) return k(SCM_FALSE);
+                const clause = elems[ci];
+                if (clause.tag !== 'list' || clause.elements.length < 2)
+                  throw errAt('case: bad clause', expr.pos);
+                const datums = clause.elements[0];
+                if (datums.tag === 'symbol' && datums.value === 'else') {
+                  return evalBeginK(clause.elements.slice(1), env, k);
                 }
-                expr = clause.elements[clause.elements.length - 1]; continue trampoline;
-              }
-              if (datums.tag !== 'list') throw errAt('case: expected datum list', expr.pos);
-              for (const d of datums.elements) {
-                const datum = listToPairs(d);
-                if (schemeEqv(key, datum)) {
-                  for (let j = 1; j < clause.elements.length - 1; j++) {
-                    evalExpr(clause.elements[j], env);
+                if (datums.tag !== 'list') throw errAt('case: expected datum list', expr.pos);
+                for (const d of datums.elements) {
+                  const datum = listToPairs(d);
+                  if (schemeEqv(key, datum)) {
+                    return evalBeginK(clause.elements.slice(1), env, k);
                   }
-                  expr = clause.elements[clause.elements.length - 1]; continue trampoline;
                 }
+                return tryClause(ci + 1);
               }
-            }
-            return SCM_FALSE; // no match, no else => void (we use #f)
+              return tryClause(2);
+            });
           }
           case 'do': {
-            // (do ((var init step) ...) (test expr ...) body ...)
             if (elems.length < 3) throw errAt('do: bad syntax', expr.pos);
             const bindingList = elems[1];
             if (bindingList.tag !== 'list') throw errAt('do: bad syntax', expr.pos);
-            const testClause = elems[2];
-            if (testClause.tag !== 'list' || testClause.elements.length < 1)
+            const testClauseRaw = elems[2];
+            if (testClauseRaw.tag !== 'list' || testClauseRaw.elements.length < 1)
               throw errAt('do: bad test clause', expr.pos);
+            const testElems = testClauseRaw.elements;
 
             const doEnv = new Env(env);
             const varNames: string[] = [];
             const stepExprs: (SchemeVal | null)[] = [];
+            const initExprs: SchemeVal[] = [];
 
-            // Initialize variables
             for (const b of bindingList.elements) {
               if (b.tag !== 'list' || b.elements.length < 2 || b.elements[0].tag !== 'symbol')
                 throw errAt('do: bad variable spec', expr.pos);
-              const name = b.elements[0].value;
-              const init = evalExpr(b.elements[1], env);
-              varNames.push(name);
+              varNames.push(b.elements[0].value);
+              initExprs.push(b.elements[1]);
               stepExprs.push(b.elements.length >= 3 ? b.elements[2] : null);
-              doEnv.set(name, init);
             }
 
-            // Iteration loop
-            while (true) {
-              // Test
-              const testVal = evalExpr(testClause.elements[0], doEnv);
-              if (isTruthy(testVal)) {
-                // Evaluate result expressions
-                if (testClause.elements.length === 1) return testVal;
-                let result: SchemeVal = SCM_FALSE;
-                for (let j = 1; j < testClause.elements.length; j++) {
-                  result = evalExpr(testClause.elements[j], doEnv);
-                }
-                return result;
+            return evalListLeftK(initExprs, env, (initVals) => {
+              for (let i = 0; i < varNames.length; i++) {
+                doEnv.set(varNames[i], initVals[i]);
               }
-              // Execute body
-              for (let j = 3; j < elems.length; j++) {
-                evalExpr(elems[j], doEnv);
+              function doLoop(): Bounce {
+                return evalK(testElems[0], doEnv, (testVal) => {
+                  if (isTruthy(testVal)) {
+                    if (testElems.length === 1) return k(testVal);
+                    return evalBeginK(testElems.slice(1), doEnv, k);
+                  }
+                  const bodyExprs = elems.slice(3);
+                  function afterBody(): Bounce {
+                    // Parallel step
+                    const stepsToEval: { idx: number; stepExpr: SchemeVal }[] = [];
+                    for (let j = 0; j < varNames.length; j++) {
+                      if (stepExprs[j] !== null) stepsToEval.push({ idx: j, stepExpr: stepExprs[j]! });
+                    }
+                    if (stepsToEval.length === 0) return bounce(doLoop);
+                    const stepVals: (SchemeVal | null)[] = new Array(varNames.length).fill(null);
+                    function evalSteps(si: number): Bounce {
+                      if (si >= stepsToEval.length) {
+                        for (let j = 0; j < varNames.length; j++) {
+                          if (stepVals[j] !== null) doEnv.set(varNames[j], stepVals[j]!);
+                        }
+                        return bounce(doLoop);
+                      }
+                      const { idx, stepExpr } = stepsToEval[si];
+                      return evalK(stepExpr, doEnv, (val) => {
+                        stepVals[idx] = val;
+                        return evalSteps(si + 1);
+                      });
+                    }
+                    return evalSteps(0);
+                  }
+                  if (bodyExprs.length > 0) {
+                    return evalBeginK(bodyExprs, doEnv, (_) => afterBody());
+                  }
+                  return afterBody();
+                });
               }
-              // Parallel step: evaluate all step expressions before updating
-              const newVals: (SchemeVal | null)[] = [];
-              for (let j = 0; j < varNames.length; j++) {
-                if (stepExprs[j] !== null) {
-                  newVals.push(evalExpr(stepExprs[j]!, doEnv));
-                } else {
-                  newVals.push(null);
-                }
-              }
-              for (let j = 0; j < varNames.length; j++) {
-                if (newVals[j] !== null) {
-                  doEnv.set(varNames[j], newVals[j]!);
-                }
-              }
-            }
+              return doLoop();
+            });
           }
           case 'define-record-type': {
-            // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
             if (elems.length < 4) throw errAt('define-record-type: bad syntax', expr.pos);
             const rtName = elems[1];
             if (rtName.tag !== 'symbol') throw errAt('define-record-type: expected type name', expr.pos);
@@ -837,7 +879,6 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
             const predName = elems[3];
             if (predName.tag !== 'symbol') throw errAt('define-record-type: expected predicate name', expr.pos);
 
-            // Parse field accessors
             const accessors: { field: string; accessor: string }[] = [];
             for (let i = 4; i < elems.length; i++) {
               const fd = elems[i];
@@ -852,7 +893,6 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
 
             const typeId = Symbol(rtName.value);
 
-            // Constructor
             const ctorFieldsCopy = [...ctorFields];
             const ctorLambda: SchemeVal = {
               tag: 'lambda', params: ctorFieldsCopy, body: [], env: new Env(),
@@ -866,7 +906,6 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
             };
             env.set(ctorName.value, ctorLambda);
 
-            // Predicate
             const predLambda: SchemeVal = {
               tag: 'lambda', params: ['__x__'], body: [], env: new Env(),
             };
@@ -875,7 +914,6 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
             };
             env.set(predName.value, predLambda);
 
-            // Accessors
             for (const { field, accessor } of accessors) {
               const accLambda: SchemeVal = {
                 tag: 'lambda', params: ['__x__'], body: [], env: new Env(),
@@ -888,7 +926,7 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
               env.set(accessor, accLambda);
             }
 
-            return SCM_FALSE;
+            return k(SCM_FALSE);
           }
           case 'define-syntax': {
             if (elems.length !== 3) throw errAt('define-syntax: bad syntax', expr.pos);
@@ -917,157 +955,162 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
             }
             const macro: SchemeVal = { tag: 'macro', rules, defEnv: env };
             env.set(nameElem.value, macro);
-            return SCM_FALSE;
+            return k(SCM_FALSE);
           }
         }
         // Check for macro
         try {
           const resolved = env.get(head.value);
           if (resolved.tag === 'macro') {
-            // TCO: macro expansion result is in tail position
-            expr = expandMacro(resolved, elems, env, expr.pos);
-            continue trampoline;
+            const expanded = expandMacro(resolved, elems, env, expr.pos);
+            return bounce(() => evalK(expanded, env, k));
           }
         } catch (e) { /* not bound, fall through */ }
       }
 
-      // Function application
-      const args = elems.slice(1).map(a => evalExpr(a, env));
-
-      const proc = evalExpr(head, env);
-
-      if (proc.tag === 'lambda') {
-        // Inline lambda application for TCO
-        const nativeFn = (proc as any).nativeFn;
-        if (nativeFn) return nativeFn(...args);
-        if (proc.restParam) {
-          if (args.length < proc.params.length)
-            throw errAt(`expected at least ${proc.params.length} arguments, got ${args.length}`, expr.pos);
-        } else {
-          if (args.length !== proc.params.length)
-            throw errAt(`expected ${proc.params.length} arguments, got ${args.length}`, expr.pos);
-        }
-        const callEnv = new Env(proc.env);
-        for (let i = 0; i < proc.params.length; i++) {
-          callEnv.set(proc.params[i], args[i]);
-        }
-        if (proc.restParam) {
-          callEnv.set(proc.restParam, arrayToList(args.slice(proc.params.length)));
-        }
-        for (let i = 0; i < proc.body.length - 1; i++) {
-          evalExpr(proc.body[i], callEnv);
-        }
-        expr = proc.body[proc.body.length - 1]; env = callEnv; continue trampoline;
-      }
-
-      if (proc.tag === 'case-lambda') {
-        // Inline case-lambda application for TCO
-        let matched = false;
-        for (const clause of proc.clauses) {
-          if (clause.restParam) {
-            if (args.length >= clause.params.length) {
-              const callEnv = new Env(clause.env);
-              for (let i = 0; i < clause.params.length; i++) {
-                callEnv.set(clause.params[i], args[i]);
-              }
-              callEnv.set(clause.restParam, arrayToList(args.slice(clause.params.length)));
-              for (let i = 0; i < clause.body.length - 1; i++) {
-                evalExpr(clause.body[i], callEnv);
-              }
-              expr = clause.body[clause.body.length - 1]; env = callEnv; matched = true; break;
-            }
-          } else {
-            if (args.length === clause.params.length) {
-              const callEnv = new Env(clause.env);
-              for (let i = 0; i < clause.params.length; i++) {
-                callEnv.set(clause.params[i], args[i]);
-              }
-              for (let i = 0; i < clause.body.length - 1; i++) {
-                evalExpr(clause.body[i], callEnv);
-              }
-              expr = clause.body[clause.body.length - 1]; env = callEnv; matched = true; break;
-            }
-          }
-        }
-        if (matched) continue trampoline;
-        throw errAt(`case-lambda: no matching clause for ${args.length} arguments`, expr.pos);
-      }
-
-      if (proc.tag === 'builtin') {
-        return applyBuiltin(proc.name, args, expr.pos);
-      }
-
-      throw errAt(`not a procedure: ${display(proc)}`, expr.pos);
+      // Function application: evaluate args right-to-left, then head
+      return evalListK(elems.slice(1), env, (args) =>
+        evalK(head, env, (proc) =>
+          bounce(() => applyK(proc, args, k, expr.pos))
+        )
+      );
     }
     default:
       throw errAt(`cannot evaluate: ${display(expr)}`, expr.pos);
   }
-  } // end trampoline while
 }
 
-function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], pos?: Pos): SchemeVal {
-  // Native functions (record constructors, predicates, accessors)
-  const nativeFn = (proc as any).nativeFn;
-  if (nativeFn) return nativeFn(...args);
-  if (proc.restParam) {
-    if (args.length < proc.params.length)
-      throw errAt(`expected at least ${proc.params.length} arguments, got ${args.length}`, pos);
-  } else {
-    if (args.length !== proc.params.length)
-      throw errAt(`expected ${proc.params.length} arguments, got ${args.length}`, pos);
+// Evaluate list left-to-right (for let bindings, do inits)
+function evalListLeftK(exprs: SchemeVal[], env: Env, k: (vals: SchemeVal[]) => Bounce): Bounce {
+  function loop(i: number, acc: SchemeVal[]): Bounce {
+    if (i >= exprs.length) return k(acc);
+    return evalK(exprs[i], env, (val) => {
+      return loop(i + 1, [...acc, val]);
+    });
   }
-  const callEnv = new Env(proc.env);
-  for (let i = 0; i < proc.params.length; i++) {
-    callEnv.set(proc.params[i], args[i]);
-  }
-  if (proc.restParam) {
-    callEnv.set(proc.restParam, arrayToList(args.slice(proc.params.length)));
-  }
-  let result: SchemeVal = SCM_FALSE;
-  for (const bodyExpr of proc.body) {
-    result = evalExpr(bodyExpr, callEnv);
-  }
-  return result;
+  return loop(0, []);
 }
 
-function applyCaseLambda(proc: SchemeVal & { tag: 'case-lambda' }, args: SchemeVal[], pos?: Pos): SchemeVal {
-  for (const clause of proc.clauses) {
-    if (clause.restParam) {
-      if (args.length >= clause.params.length) {
-        const callEnv = new Env(clause.env);
-        for (let i = 0; i < clause.params.length; i++) {
-          callEnv.set(clause.params[i], args[i]);
-        }
-        callEnv.set(clause.restParam, arrayToList(args.slice(clause.params.length)));
-        let result: SchemeVal = SCM_FALSE;
-        for (const bodyExpr of clause.body) {
-          result = evalExpr(bodyExpr, callEnv);
-        }
-        return result;
-      }
+function applyK(proc: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce {
+  if (proc.tag === 'continuation') {
+    if (args.length !== 1) throw errAt('continuation: expected 1 argument', pos);
+    return bounce(() => proc.k(args[0]));
+  }
+
+  if (proc.tag === 'lambda') {
+    const nativeFn = (proc as any).nativeFn;
+    if (nativeFn) return k(nativeFn(...args));
+    if (proc.restParam) {
+      if (args.length < proc.params.length)
+        throw errAt(`expected at least ${proc.params.length} arguments, got ${args.length}`, pos);
     } else {
-      if (args.length === clause.params.length) {
-        const callEnv = new Env(clause.env);
-        for (let i = 0; i < clause.params.length; i++) {
-          callEnv.set(clause.params[i], args[i]);
+      if (args.length !== proc.params.length)
+        throw errAt(`expected ${proc.params.length} arguments, got ${args.length}`, pos);
+    }
+    const callEnv = new Env(proc.env);
+    for (let i = 0; i < proc.params.length; i++) {
+      callEnv.set(proc.params[i], args[i]);
+    }
+    if (proc.restParam) {
+      callEnv.set(proc.restParam, arrayToList(args.slice(proc.params.length)));
+    }
+    return evalBeginK(proc.body, callEnv, k);
+  }
+
+  if (proc.tag === 'case-lambda') {
+    for (const clause of proc.clauses) {
+      if (clause.restParam) {
+        if (args.length >= clause.params.length) {
+          const callEnv = new Env(clause.env);
+          for (let i = 0; i < clause.params.length; i++) {
+            callEnv.set(clause.params[i], args[i]);
+          }
+          callEnv.set(clause.restParam, arrayToList(args.slice(clause.params.length)));
+          return evalBeginK(clause.body, callEnv, k);
         }
-        let result: SchemeVal = SCM_FALSE;
-        for (const bodyExpr of clause.body) {
-          result = evalExpr(bodyExpr, callEnv);
+      } else {
+        if (args.length === clause.params.length) {
+          const callEnv = new Env(clause.env);
+          for (let i = 0; i < clause.params.length; i++) {
+            callEnv.set(clause.params[i], args[i]);
+          }
+          return evalBeginK(clause.body, callEnv, k);
         }
-        return result;
       }
     }
+    throw errAt(`case-lambda: no matching clause for ${args.length} arguments`, pos);
   }
-  throw errAt(`case-lambda: no matching clause for ${args.length} arguments`, pos);
-}
 
-function applyProc(proc: SchemeVal, args: SchemeVal[], pos?: Pos): SchemeVal {
-  if (proc.tag === 'lambda') return applyLambda(proc, args, pos);
-  if (proc.tag === 'case-lambda') return applyCaseLambda(proc, args, pos);
-  if (proc.tag === 'builtin') return applyBuiltin(proc.name, args, pos);
+  if (proc.tag === 'builtin') {
+    switch (proc.name) {
+      case 'call/cc':
+      case 'call-with-current-continuation': {
+        if (args.length !== 1) throw errAt('call/cc: expected 1 argument', pos);
+        const contVal: SchemeVal = { tag: 'continuation', k };
+        return bounce(() => applyK(args[0], [contVal], k, pos));
+      }
+      case 'apply': {
+        if (args.length < 2) throw errAt('apply: expected at least 2 arguments', pos);
+        const applyProc = args[0];
+        const lastArg = args[args.length - 1];
+        const tailList = pairToArray(lastArg);
+        if (tailList === null && lastArg.tag !== 'nil')
+          throw errAt('apply: last argument must be a proper list', pos);
+        const prefixArgs = args.slice(1, args.length - 1);
+        const allArgs = prefixArgs.concat(tailList ?? []);
+        return bounce(() => applyK(applyProc, allArgs, k, pos));
+      }
+      case 'map': {
+        if (args.length < 2) throw errAt('map: expected at least 2 arguments', pos);
+        const mapProc = args[0];
+        const lists = args.slice(1).map(a => {
+          const arr = pairToArray(a);
+          if (arr === null) throw errAt('map: expected proper list', pos);
+          return arr;
+        });
+        const len = lists[0].length;
+        for (const l of lists) {
+          if (l.length !== len) throw errAt('map: lists must have equal length', pos);
+        }
+        const results: SchemeVal[] = [];
+        function mapLoop(i: number): Bounce {
+          if (i >= len) return k(arrayToList(results));
+          const mapArgs = lists.map(l => l[i]);
+          return applyK(mapProc, mapArgs, (val) => {
+            results.push(val);
+            return bounce(() => mapLoop(i + 1));
+          }, pos);
+        }
+        return mapLoop(0);
+      }
+      case 'for-each': {
+        if (args.length < 2) throw errAt('for-each: expected at least 2 arguments', pos);
+        const feProc = args[0];
+        const lists = args.slice(1).map(a => {
+          const arr = pairToArray(a);
+          if (arr === null) throw errAt('for-each: expected proper list', pos);
+          return arr;
+        });
+        const len = lists[0].length;
+        for (const l of lists) {
+          if (l.length !== len) throw errAt('for-each: lists must have equal length', pos);
+        }
+        function feLoop(i: number): Bounce {
+          if (i >= len) return k(SCM_NIL);
+          const feArgs = lists.map(l => l[i]);
+          return applyK(feProc, feArgs, (_) => bounce(() => feLoop(i + 1)), pos);
+        }
+        return feLoop(0);
+      }
+      default:
+        return k(applyBuiltin(proc.name, args, pos));
+    }
+  }
+
   throw errAt(`not a procedure: ${display(proc)}`, pos);
 }
+
+// ── Equality ────────────────────────────────────────────────────────────
 
 function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
   if (isNumeric(a) && isNumeric(b)) return numericCompare(a, b) === 0;
@@ -1130,6 +1173,8 @@ function requireNumbers(name: string, args: SchemeVal[], pos?: Pos): number[] {
   });
 }
 
+// ── Builtins ────────────────────────────────────────────────────────────
+
 const BUILTINS = new Set([
   '+', '-', '*', '/', '<', '>', '=', '<=', '>=',
   'cons', 'car', 'cdr', 'null?', 'list', 'length', 'append',
@@ -1161,11 +1206,8 @@ const BUILTINS = new Set([
   'numerator', 'denominator', 'integer?', 'rational?',
   'gcd', 'lcm', 'truncate', 'round', 'floor', 'ceiling',
   'procedure?',
+  'call/cc', 'call-with-current-continuation',
 ]);
-
-function isBuiltin(name: string): boolean {
-  return BUILTINS.has(name);
-}
 
 function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
   switch (name) {
@@ -1288,7 +1330,8 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       return args[0].tag === 'char' ? SCM_TRUE : SCM_FALSE;
     case 'procedure?':
       if (args.length !== 1) throw errAt('procedure?: expected 1 argument', pos);
-      return (args[0].tag === 'lambda' || args[0].tag === 'builtin' || args[0].tag === 'case-lambda') ? SCM_TRUE : SCM_FALSE;
+      return (args[0].tag === 'lambda' || args[0].tag === 'builtin' ||
+              args[0].tag === 'case-lambda' || args[0].tag === 'continuation') ? SCM_TRUE : SCM_FALSE;
     case 'display': {
       if (args.length !== 1) throw errAt('display: expected 1 argument', pos);
       outputBuffer.push(displayFormat(args[0]));
@@ -1397,17 +1440,6 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
         throw errAt('integer->char: expected integer', pos);
       return { tag: 'char', value: String.fromCharCode(args[0].value) };
     }
-    case 'apply': {
-      if (args.length < 2) throw errAt('apply: expected at least 2 arguments', pos);
-      const proc = args[0];
-      const lastArg = args[args.length - 1];
-      const tailList = pairToArray(lastArg);
-      if (tailList === null && lastArg.tag !== 'nil')
-        throw errAt('apply: last argument must be a proper list', pos);
-      const prefixArgs = args.slice(1, args.length - 1);
-      const allArgs = prefixArgs.concat(tailList ?? []);
-      return applyProc(proc, allArgs, pos);
-    }
     case 'abs': {
       if (args.length !== 1) throw errAt('abs: expected 1 argument', pos);
       requireNumeric('abs', args, pos);
@@ -1508,7 +1540,6 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       return cur;
     }
     case 'list?': {
-      // Tortoise-and-hare cycle detection
       let slow = args[0];
       let fast = args[0];
       while (fast.tag === 'pair') {
@@ -1516,7 +1547,7 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
         fast = fast.cdr;
         if (fast.tag !== 'pair') break;
         fast = fast.cdr;
-        if (slow === fast) return SCM_FALSE; // cycle detected
+        if (slow === fast) return SCM_FALSE;
       }
       return fast.tag === 'nil' ? SCM_TRUE : SCM_FALSE;
     }
@@ -1531,25 +1562,6 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
         cur = cur.cdr;
       }
       return SCM_FALSE;
-    }
-    case 'map': {
-      if (args.length < 2) throw errAt('map: expected at least 2 arguments', pos);
-      const proc = args[0];
-      const lists = args.slice(1).map(a => {
-        const arr = pairToArray(a);
-        if (arr === null) throw errAt('map: expected proper list', pos);
-        return arr;
-      });
-      const len = lists[0].length;
-      for (const l of lists) {
-        if (l.length !== len) throw errAt('map: lists must have equal length', pos);
-      }
-      const results: SchemeVal[] = [];
-      for (let i = 0; i < len; i++) {
-        const mapArgs = lists.map(l => l[i]);
-        results.push(applyProc(proc, mapArgs, pos));
-      }
-      return arrayToList(results);
     }
     case 'eq?': {
       if (args.length !== 2) throw errAt('eq?: expected 2 arguments', pos);
@@ -1699,13 +1711,10 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       if (args.length !== 1) throw errAt('inexact->exact: expected 1 argument', pos);
       if (!isNumeric(args[0])) throw errAt('inexact->exact: expected number', pos);
       if (isExact(args[0])) return args[0];
-      // Convert float to rational: find closest fraction
       const v = toFloat(args[0]);
       if (Number.isInteger(v)) return { tag: 'number', value: v, exact: true };
-      // Use continued fraction approximation
       const sign = v < 0 ? -1 : 1;
       const av = Math.abs(v);
-      // Express as p/q by multiplying out the decimal
       const scale = Math.pow(10, 15);
       const p = Math.round(av * scale);
       const q = scale;
@@ -1728,7 +1737,7 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
     }
     case 'integer?': {
       if (args.length !== 1) throw errAt('integer?: expected 1 argument', pos);
-      if (args[0].tag === 'rational') return SCM_FALSE; // rationals that simplify to integers become numbers
+      if (args[0].tag === 'rational') return SCM_FALSE;
       if (args[0].tag === 'number') return Number.isInteger(args[0].value) ? SCM_TRUE : SCM_FALSE;
       return SCM_FALSE;
     }
@@ -1775,24 +1784,6 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       (args[0] as any).cdr = args[1];
       return SCM_NIL;
     }
-    case 'for-each': {
-      if (args.length < 2) throw errAt('for-each: expected at least 2 arguments', pos);
-      const proc = args[0];
-      const lists = args.slice(1).map(a => {
-        const arr = pairToArray(a);
-        if (arr === null) throw errAt('for-each: expected proper list', pos);
-        return arr;
-      });
-      const len = lists[0].length;
-      for (const l of lists) {
-        if (l.length !== len) throw errAt('for-each: lists must have equal length', pos);
-      }
-      for (let i = 0; i < len; i++) {
-        const feArgs = lists.map(l => l[i]);
-        applyProc(proc, feArgs, pos);
-      }
-      return SCM_NIL;
-    }
     case 'reverse': {
       if (args.length !== 1) throw errAt('reverse: expected 1 argument', pos);
       const items = pairToArray(args[0]);
@@ -1825,7 +1816,6 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       return { tag: 'string', value: ch.repeat(args[0].value) };
     }
     case 'string': {
-      // (string char ...) → string from chars
       for (const a of args) {
         if (a.tag !== 'char') throw errAt('string: expected char arguments', pos);
       }
@@ -1884,7 +1874,6 @@ function display(val: SchemeVal): string {
   switch (val.tag) {
     case 'number': {
       const s = String(val.value);
-      // Inexact numbers should show decimal point
       if (val.exact === false && Number.isInteger(val.value) && !s.includes('.')) return s + '.0';
       return s;
     }
@@ -1915,6 +1904,7 @@ function display(val: SchemeVal): string {
     case 'lambda': return '#<procedure>';
     case 'case-lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
+    case 'continuation': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'vector': return `#(${val.elements.map(display).join(' ')})`;
     case 'record': return `#<record ${val.typeName}>`;
@@ -1960,11 +1950,8 @@ export function evalStr(input: string): string {
   const exprs = parse(tokens);
   if (exprs.length === 0) throw new EvalError('no expressions');
   const env = makeGlobalEnv();
-  let result: SchemeVal | undefined;
-  for (const expr of exprs) {
-    result = evalExpr(expr, env);
-  }
-  return display(result!);
+  const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
+  return display(result);
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {
@@ -1973,9 +1960,6 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   if (exprs.length === 0) throw new EvalError('no expressions');
   outputBuffer = [];
   const env = makeGlobalEnv();
-  let result: SchemeVal | undefined;
-  for (const expr of exprs) {
-    result = evalExpr(expr, env);
-  }
-  return { result: display(result!), output: outputBuffer.join('') };
+  const result = trampoline(evalBeginK(exprs, env, (v) => done(v)));
+  return { result: display(result), output: outputBuffer.join('') };
 }
