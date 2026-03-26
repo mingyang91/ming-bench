@@ -118,7 +118,53 @@ function quoteDatum(val: SchemeVal): SchemeVal {
     if (val.value.length === 0) return NIL;
     return arrayToSchemeList(val.value.map(quoteDatum));
   }
+  if (val.tag === 'pair') {
+    return { tag: 'pair', car: quoteDatum(val.car), cdr: quoteDatum(val.cdr), pos: val.pos };
+  }
   return val;
+}
+
+// Expand quasiquote template into plain Scheme expressions
+function expandQQ(tmpl: SchemeVal, depth: number): SchemeVal {
+  function sym(s: string, p?: Pos): SchemeVal { return { tag: 'symbol', value: s, pos: p }; }
+  function lst(items: SchemeVal[], p?: Pos): SchemeVal { return { tag: 'list', value: items, pos: p }; }
+
+  function isTagged(v: SchemeVal, tag: string): boolean {
+    return v.tag === 'list' && v.value.length === 2 && v.value[0].tag === 'symbol' && v.value[0].value === tag;
+  }
+
+  if (isTagged(tmpl, 'unquote')) {
+    if (depth === 0) return tmpl.value[1];
+    return lst([sym('list'), lst([sym('quote'), sym('unquote')]), expandQQ(tmpl.value[1], depth - 1)]);
+  }
+  if (isTagged(tmpl, 'quasiquote')) {
+    return lst([sym('list'), lst([sym('quote'), sym('quasiquote')]), expandQQ(tmpl.value[1], depth + 1)]);
+  }
+  if (tmpl.tag === 'list') {
+    // Check for (unquote-splicing ...) at top level of this list
+    const parts: SchemeVal[] = [];
+    for (const el of tmpl.value) {
+      if (isTagged(el, 'unquote-splicing')) {
+        if (depth === 0) {
+          parts.push(el.value[1]);
+        } else {
+          parts.push(lst([sym('list'), lst([sym('list'), lst([sym('quote'), sym('unquote-splicing')]), expandQQ(el.value[1], depth - 1)])]));
+        }
+      } else {
+        parts.push(lst([sym('list'), expandQQ(el, depth)]));
+      }
+    }
+    if (parts.length === 0) return lst([sym('quote'), { tag: 'list', value: [] }]);
+    if (parts.length === 1) return parts[0];
+    return lst([sym('append'), ...parts]);
+  }
+  if (tmpl.tag === 'pair') {
+    // Dotted pair in quasiquote
+    return lst([sym('cons'), expandQQ(tmpl.car, depth), expandQQ(tmpl.cdr, depth)]);
+  }
+  // Atoms: self-quoting or need quote
+  if (tmpl.tag === 'symbol') return lst([sym('quote'), tmpl]);
+  return lst([sym('quote'), tmpl]);
 }
 
 // ── Rational helpers ──────────────────────────────────────────────
@@ -204,6 +250,18 @@ function tokenize(input: string): Token[] {
     if (ch === ';') { while (i < input.length && input[i] !== '\n') advance(); continue; }
     if (ch === '(' || ch === ')') { tokens.push({ text: ch, pos: curPos() }); advance(); continue; }
     if (ch === '\'') { tokens.push({ text: "'", pos: curPos() }); advance(); continue; }
+    if (ch === '`') { tokens.push({ text: "`", pos: curPos() }); advance(); continue; }
+    if (ch === ',') {
+      const p = curPos();
+      advance();
+      if (i < input.length && input[i] === '@') {
+        advance();
+        tokens.push({ text: ',@', pos: p });
+      } else {
+        tokens.push({ text: ',', pos: p });
+      }
+      continue;
+    }
     if (ch === '"') {
       const p = curPos();
       let s = '"';
@@ -257,6 +315,18 @@ function parse(tokens: Token[]): SchemeVal[] {
     if (tok.text === "'") {
       const datum = parseExpr();
       return { tag: 'list', value: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, datum], pos: tok.pos };
+    }
+    if (tok.text === '`') {
+      const datum = parseExpr();
+      return { tag: 'list', value: [{ tag: 'symbol', value: 'quasiquote', pos: tok.pos }, datum], pos: tok.pos };
+    }
+    if (tok.text === ',') {
+      const datum = parseExpr();
+      return { tag: 'list', value: [{ tag: 'symbol', value: 'unquote', pos: tok.pos }, datum], pos: tok.pos };
+    }
+    if (tok.text === ',@') {
+      const datum = parseExpr();
+      return { tag: 'list', value: [{ tag: 'symbol', value: 'unquote-splicing', pos: tok.pos }, datum], pos: tok.pos };
     }
     if (tok.text === "#'") {
       const datum = parseExpr();
@@ -378,7 +448,7 @@ function gensym(base: string): string {
 }
 
 const SPECIAL_FORMS = new Set([
-  'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'cond', 'and', 'or',
+  'quote', 'quasiquote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'cond', 'and', 'or',
   'define-syntax', 'syntax-rules', 'case-lambda',
   'letrec', 'letrec*', 'case', 'do',
   'syntax-case', 'syntax', 'with-syntax',
@@ -769,24 +839,39 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       return { tag: 'number', value: result };
     }
     case '<': {
-      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}<: need 2 arguments`);
-      return { tag: 'boolean', value: toFloat(args[0]) < toFloat(args[1]) };
+      if (args.length < 2) throw new EvalError(`${posStr(callPos)}<: need at least 2 arguments`);
+      for (let i = 0; i < args.length - 1; i++) {
+        if (!(toFloat(args[i]) < toFloat(args[i + 1]))) return { tag: 'boolean', value: false };
+      }
+      return { tag: 'boolean', value: true };
     }
     case '>': {
-      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}>: need 2 arguments`);
-      return { tag: 'boolean', value: toFloat(args[0]) > toFloat(args[1]) };
+      if (args.length < 2) throw new EvalError(`${posStr(callPos)}>: need at least 2 arguments`);
+      for (let i = 0; i < args.length - 1; i++) {
+        if (!(toFloat(args[i]) > toFloat(args[i + 1]))) return { tag: 'boolean', value: false };
+      }
+      return { tag: 'boolean', value: true };
     }
     case '=': {
-      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}=: need 2 arguments`);
-      return { tag: 'boolean', value: toFloat(args[0]) === toFloat(args[1]) };
+      if (args.length < 2) throw new EvalError(`${posStr(callPos)}=: need at least 2 arguments`);
+      for (let i = 0; i < args.length - 1; i++) {
+        if (toFloat(args[i]) !== toFloat(args[i + 1])) return { tag: 'boolean', value: false };
+      }
+      return { tag: 'boolean', value: true };
     }
     case '<=': {
-      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}<=: need 2 arguments`);
-      return { tag: 'boolean', value: toFloat(args[0]) <= toFloat(args[1]) };
+      if (args.length < 2) throw new EvalError(`${posStr(callPos)}<=: need at least 2 arguments`);
+      for (let i = 0; i < args.length - 1; i++) {
+        if (!(toFloat(args[i]) <= toFloat(args[i + 1]))) return { tag: 'boolean', value: false };
+      }
+      return { tag: 'boolean', value: true };
     }
     case '>=': {
-      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}>=: need 2 arguments`);
-      return { tag: 'boolean', value: toFloat(args[0]) >= toFloat(args[1]) };
+      if (args.length < 2) throw new EvalError(`${posStr(callPos)}>=: need at least 2 arguments`);
+      for (let i = 0; i < args.length - 1; i++) {
+        if (!(toFloat(args[i]) >= toFloat(args[i + 1]))) return { tag: 'boolean', value: false };
+      }
+      return { tag: 'boolean', value: true };
     }
     case 'cons': {
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}cons: need 2 arguments`);
@@ -2115,6 +2200,10 @@ function evaluate(startExpr: SchemeVal, startEnv: Env, startK: Kont = { tag: 'ha
         case 'quote': {
           if (elems.length !== 2) throw new EvalError(`${posStr(expr.pos)}quote: wrong number of arguments`);
           val = quoteDatum(elems[1]); isEval = false; continue;
+        }
+        case 'quasiquote': {
+          if (elems.length !== 2) throw new EvalError(`${posStr(expr.pos)}quasiquote: wrong number of arguments`);
+          expr = expandQQ(elems[1], 0); continue;
         }
         case 'if': {
           if (elems.length < 3 || elems.length > 4) throw new EvalError(`${posStr(expr.pos)}if: wrong number of arguments`);
