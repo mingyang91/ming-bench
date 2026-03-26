@@ -35,7 +35,8 @@ object Builtins:
       StringCharBuiltins.applyCharOps(name, args, pos)
     case "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
       StringCharBuiltins.applyStringCompare(name, args, pos)
-    case _ => throw errAt(pos, s"unknown builtin: $name")
+    case s if s.startsWith("__record-") => Records.applyRecordOp(s, args, pos)
+    case _                              => throw errAt(pos, s"unknown builtin: $name")
 
   private def applyListOps(
     name: String,

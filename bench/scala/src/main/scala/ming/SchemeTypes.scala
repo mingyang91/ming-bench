@@ -27,6 +27,11 @@ object SchemeTypes:
       rules: List[(Expr, Expr)],
       defEnv: Env
     )
+
+    case VRecord(
+      typeName: String,
+      fields: Map[String, Value]
+    )
     case VVoid
 
   type Pos = ming.Pos
@@ -43,11 +48,12 @@ object SchemeTypes:
       "(" + elems.map(display).mkString(" ") + ")"
     case Value.VDottedList(elems, last) =>
       "(" + elems.map(display).mkString(" ") + " . " + display(last) + ")"
-    case Value.VSymbol(n)          => n
-    case Value.VBuiltin(n)         => s"#<procedure $n>"
-    case Value.VLambda(_, _, _, _) => "#<procedure>"
-    case Value.VMacro(_, _, _)     => "#<macro>"
-    case Value.VVoid               => ""
+    case Value.VSymbol(n)           => n
+    case Value.VBuiltin(n)          => s"#<procedure $n>"
+    case Value.VLambda(_, _, _, _)  => "#<procedure>"
+    case Value.VMacro(_, _, _)      => "#<macro>"
+    case Value.VRecord(typeName, _) => s"#<record:$typeName>"
+    case Value.VVoid                => ""
 
   private def displayFloat(d: Double): String =
     if d == d.toLong.toDouble && !d.isInfinite then s"${d.toLong}.0"

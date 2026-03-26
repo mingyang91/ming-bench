@@ -57,6 +57,8 @@ object Evaluator:
       evalSet(rest, env, p)
     case Expr.SList(Expr.Symbol("define-syntax", _) :: rest, p) =>
       evalDefineSyntax(rest, env, p)
+    case Expr.SList(Expr.Symbol("define-record-type", _) :: rest, p) =>
+      evalDefineRecordType(rest, env, p)
     case Expr.SList(head :: args, p) =>
       val macroOpt = head match
         case Expr.Symbol(name, _) => env.lookupOpt(name).collect { case m: Value.VMacro => m }
@@ -271,6 +273,14 @@ object Evaluator:
         env.define(name, Value.VMacro(literals, parsedRules, env))
         Value.VVoid
       case _ => throw errAt(pos, "invalid define-syntax")
+
+  // ── Records ────────────────────────────────────────────────────────
+  private def evalDefineRecordType(
+    rest: List[Expr],
+    env: Env,
+    pos: Pos
+  ): Value =
+    Records.evalDefineRecordType(rest, env, pos)
 
   // ── Public API ───────────────────────────────────────────────────────
   def evalStr(input: String): String =
