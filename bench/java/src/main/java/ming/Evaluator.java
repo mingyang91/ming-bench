@@ -55,6 +55,30 @@ public class Evaluator {
         }
     }
 
+    // --- Syntax Rules Macro ---
+
+    private static class SyntaxRulesMacro {
+        final List<String> literals;
+        final List<Object[]> clauses; // each: [pattern (SchemeList), template]
+        final Env defEnv;
+
+        SyntaxRulesMacro(List<String> literals, List<Object[]> clauses, Env defEnv) {
+            this.literals = literals;
+            this.clauses = clauses;
+            this.defEnv = defEnv;
+        }
+    }
+
+    private int gensymCounter = 0;
+    private String gensym(String base) {
+        return base + "_$" + (gensymCounter++);
+    }
+
+    private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
+        "define", "if", "quote", "lambda", "and", "or", "set!", "begin", "let", "cond",
+        "define-syntax", "syntax-rules"
+    );
+
     // --- Pair (cons cell) ---
 
     static class SchemePair {
@@ -305,10 +329,18 @@ public class Evaluator {
                         case "begin" -> { return evalBegin(list.elems, env); }
                         case "let" -> { return evalLet(list.elems, env); }
                         case "cond" -> { return evalCond(list.elems, env); }
+                        case "define-syntax" -> { return evalDefineSyntax(list.elems, env); }
                     }
                 } catch (EvalError e) {
                     throw addPosition(e, list.line, list.col);
                 }
+                // Check for macro application
+                try {
+                    Object headVal = env.lookup(sym.name);
+                    if (headVal instanceof SyntaxRulesMacro macro) {
+                        return eval(expandMacro(macro, list, env), env);
+                    }
+                } catch (EvalError ignored) {}
             }
             // Function call
             try {
@@ -1016,6 +1048,187 @@ public class Evaluator {
             requireArgCount(">=", args, 2);
             return requireLong(args.get(0), ">=") >= requireLong(args.get(1), ">=");
         }));
+    }
+
+    // --- Macro support ---
+
+    private Object evalDefineSyntax(List<Object> elems, Env env) throws EvalError {
+        if (elems.size() != 3) throw new EvalError("define-syntax: bad syntax");
+        String macroName = ((SchemeSymbol) elems.get(1)).name;
+        Object transformer = elems.get(2);
+        if (!(transformer instanceof SchemeList srList)) throw new EvalError("define-syntax: expected syntax-rules");
+        if (srList.elems.isEmpty() || !(srList.elems.get(0) instanceof SchemeSymbol srSym)
+                || !srSym.name.equals("syntax-rules"))
+            throw new EvalError("define-syntax: expected syntax-rules");
+        List<String> literals = new ArrayList<>();
+        SchemeList litList = (SchemeList) srList.elems.get(1);
+        for (Object lit : litList.elems) {
+            literals.add(((SchemeSymbol) lit).name);
+        }
+        List<Object[]> clauses = new ArrayList<>();
+        for (int i = 2; i < srList.elems.size(); i++) {
+            SchemeList clause = (SchemeList) srList.elems.get(i);
+            clauses.add(new Object[]{clause.elems.get(0), clause.elems.get(1)});
+        }
+        env.define(macroName, new SyntaxRulesMacro(literals, clauses, env));
+        return null;
+    }
+
+    private Object expandMacro(SyntaxRulesMacro macro, SchemeList form, Env useEnv) throws EvalError {
+        for (Object[] clause : macro.clauses) {
+            SchemeList pattern = (SchemeList) clause[0];
+            Object template = clause[1];
+            java.util.Set<String> patVars = new java.util.HashSet<>();
+            collectPatternVars(pattern, macro.literals, patVars, true);
+            Map<String, Object> bindings = new HashMap<>();
+            Map<String, List<Object>> ellipsisBindings = new HashMap<>();
+            if (matchElems(pattern.elems, 1, form.elems, 1, macro.literals, bindings, ellipsisBindings)) {
+                Map<String, String> renames = new HashMap<>();
+                Object hygienic = renameTemplate(template, patVars, macro.literals, renames);
+                Object expanded = expandTemplate(hygienic, bindings, ellipsisBindings, form.line, form.col);
+                for (Map.Entry<String, String> entry : renames.entrySet()) {
+                    try {
+                        Object val = macro.defEnv.lookup(entry.getKey());
+                        useEnv.define(entry.getValue(), val);
+                    } catch (EvalError ignored) {}
+                }
+                return expanded;
+            }
+        }
+        throw new EvalError("syntax-rules: no matching pattern");
+    }
+
+    private void collectPatternVars(Object pattern, List<String> literals,
+                                     java.util.Set<String> patVars, boolean isTopLevel) {
+        if (pattern instanceof SchemeSymbol sym) {
+            if (!sym.name.equals("...") && !sym.name.equals("_") && !literals.contains(sym.name)) {
+                patVars.add(sym.name);
+            }
+        } else if (pattern instanceof SchemeList list) {
+            int start = isTopLevel ? 1 : 0;
+            for (int i = start; i < list.elems.size(); i++) {
+                Object elem = list.elems.get(i);
+                if (elem instanceof SchemeSymbol s && s.name.equals("...")) continue;
+                collectPatternVars(elem, literals, patVars, false);
+            }
+        }
+    }
+
+    private boolean matchElems(List<Object> pattern, int pStart, List<Object> input, int iStart,
+                                List<String> literals, Map<String, Object> bindings,
+                                Map<String, List<Object>> ellipsisBindings) {
+        int pi = pStart, ii = iStart;
+        while (pi < pattern.size()) {
+            Object pat = pattern.get(pi);
+            boolean hasEllipsis = (pi + 1 < pattern.size() &&
+                pattern.get(pi + 1) instanceof SchemeSymbol s && s.name.equals("..."));
+            if (hasEllipsis) {
+                int remainingPats = pattern.size() - pi - 2;
+                int available = input.size() - ii - remainingPats;
+                if (available < 0) return false;
+                if (pat instanceof SchemeSymbol sym && !literals.contains(sym.name) && !sym.name.equals("_")) {
+                    List<Object> matched = new ArrayList<>();
+                    for (int j = 0; j < available; j++) matched.add(input.get(ii + j));
+                    ellipsisBindings.put(sym.name, matched);
+                }
+                ii += available;
+                pi += 2;
+            } else {
+                if (ii >= input.size()) return false;
+                if (!matchOne(pat, input.get(ii), literals, bindings, ellipsisBindings)) return false;
+                pi++;
+                ii++;
+            }
+        }
+        return ii == input.size();
+    }
+
+    private boolean matchOne(Object pat, Object input, List<String> literals,
+                              Map<String, Object> bindings, Map<String, List<Object>> ellipsisBindings) {
+        if (pat instanceof SchemeSymbol sym) {
+            if (literals.contains(sym.name)) {
+                return input instanceof SchemeSymbol inSym && inSym.name.equals(sym.name);
+            }
+            if (sym.name.equals("_")) return true;
+            bindings.put(sym.name, input);
+            return true;
+        }
+        if (pat instanceof SchemeList patList) {
+            if (!(input instanceof SchemeList inList)) return false;
+            return matchElems(patList.elems, 0, inList.elems, 0, literals, bindings, ellipsisBindings);
+        }
+        if (pat instanceof Long && input instanceof Long) return pat.equals(input);
+        if (pat instanceof Boolean && input instanceof Boolean) return pat.equals(input);
+        return false;
+    }
+
+    private Object renameTemplate(Object template, java.util.Set<String> patVars,
+                                   List<String> literals, Map<String, String> renames) {
+        if (template instanceof SchemeSymbol sym) {
+            if (patVars.contains(sym.name) || sym.name.equals("...") ||
+                SPECIAL_FORMS.contains(sym.name) || literals.contains(sym.name)) {
+                return template;
+            }
+            String renamed = renames.computeIfAbsent(sym.name, k -> gensym(k));
+            return new SchemeSymbol(renamed, sym.line, sym.col);
+        }
+        if (template instanceof SchemeList list) {
+            List<Object> newElems = new ArrayList<>();
+            for (Object elem : list.elems) {
+                newElems.add(renameTemplate(elem, patVars, literals, renames));
+            }
+            return new SchemeList(newElems, list.line, list.col);
+        }
+        return template;
+    }
+
+    private Object expandTemplate(Object template, Map<String, Object> bindings,
+                                   Map<String, List<Object>> ellipsisBindings,
+                                   int line, int col) throws EvalError {
+        if (template instanceof SchemeSymbol sym) {
+            if (bindings.containsKey(sym.name)) return bindings.get(sym.name);
+            return template;
+        }
+        if (template instanceof SchemeList list) {
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < list.elems.size(); i++) {
+                Object elem = list.elems.get(i);
+                boolean hasEllipsis = (i + 1 < list.elems.size() &&
+                    list.elems.get(i + 1) instanceof SchemeSymbol s && s.name.equals("..."));
+                if (hasEllipsis) {
+                    java.util.Set<String> usedEVars = new java.util.HashSet<>();
+                    findEllipsisVars(elem, ellipsisBindings, usedEVars);
+                    if (!usedEVars.isEmpty()) {
+                        String eVar = usedEVars.iterator().next();
+                        List<Object> eList = ellipsisBindings.get(eVar);
+                        for (int j = 0; j < eList.size(); j++) {
+                            Map<String, Object> newBindings = new HashMap<>(bindings);
+                            for (String v : usedEVars) {
+                                List<Object> vList = ellipsisBindings.get(v);
+                                if (j < vList.size()) newBindings.put(v, vList.get(j));
+                            }
+                            Map<String, List<Object>> newEllipsis = new HashMap<>(ellipsisBindings);
+                            for (String v : usedEVars) newEllipsis.remove(v);
+                            result.add(expandTemplate(elem, newBindings, newEllipsis, line, col));
+                        }
+                    }
+                    i++; // skip "..."
+                } else {
+                    result.add(expandTemplate(elem, bindings, ellipsisBindings, line, col));
+                }
+            }
+            return new SchemeList(result, line, col);
+        }
+        return template;
+    }
+
+    private void findEllipsisVars(Object template, Map<String, List<Object>> ellipsisBindings,
+                                   java.util.Set<String> found) {
+        if (template instanceof SchemeSymbol sym) {
+            if (ellipsisBindings.containsKey(sym.name)) found.add(sym.name);
+        } else if (template instanceof SchemeList list) {
+            for (Object elem : list.elems) findEllipsisVars(elem, ellipsisBindings, found);
+        }
     }
 
     private boolean schemeEqual(Object a, Object b) {
