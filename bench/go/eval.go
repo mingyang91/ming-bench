@@ -46,6 +46,19 @@ func (e *Env) Set(name string, val *Value) {
 	e.bindings[name] = val
 }
 
+// SetExisting mutates an existing binding, walking up the scope chain.
+// Returns false if the variable is not bound in any enclosing scope.
+func (e *Env) SetExisting(name string, val *Value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = val
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.SetExisting(name, val)
+	}
+	return false
+}
+
 // Eval evaluates an expression in the given environment.
 func Eval(expr *Expr, env *Env) (*Value, error) {
 	switch expr.Type {
@@ -98,6 +111,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalBegin(expr, env)
 		case "cond":
 			return evalCond(expr, env)
+		case "set!":
+			return evalSetBang(expr, env)
 		}
 	}
 
@@ -823,6 +838,24 @@ func builtinStringSet(args []*Value, expr *Expr) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: string-set!: index out of range", expr.Line, expr.Col)
 	}
 	s.Runes[idx] = rune(args[2].IntVal)
+	return Void, nil
+}
+
+func evalSetBang(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) != 3 {
+		return nil, fmt.Errorf("%d:%d: set!: expected 2 arguments", expr.Line, expr.Col)
+	}
+	target := expr.List[1]
+	if target.Type != ExprSymbol {
+		return nil, fmt.Errorf("%d:%d: set!: first argument must be a symbol", target.Line, target.Col)
+	}
+	val, err := Eval(expr.List[2], env)
+	if err != nil {
+		return nil, err
+	}
+	if !env.SetExisting(target.StrVal, val) {
+		return nil, fmt.Errorf("%d:%d: set!: unbound variable: %s", target.Line, target.Col, target.StrVal)
+	}
 	return Void, nil
 }
 
