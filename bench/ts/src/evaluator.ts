@@ -2,15 +2,25 @@ import { EvalError } from './evalError.js';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
+interface Pos { line: number; col: number }
+
 type SchemeVal =
-  | { tag: 'number'; value: number }
-  | { tag: 'boolean'; value: boolean }
-  | { tag: 'string'; value: string }
-  | { tag: 'symbol'; value: string }
-  | { tag: 'nil' }
-  | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
-  | { tag: 'list'; elements: SchemeVal[] }  // parse-time only
-  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env };
+  | { tag: 'number'; value: number; pos?: Pos }
+  | { tag: 'boolean'; value: boolean; pos?: Pos }
+  | { tag: 'string'; value: string; pos?: Pos }
+  | { tag: 'symbol'; value: string; pos?: Pos }
+  | { tag: 'nil'; pos?: Pos }
+  | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal; pos?: Pos }
+  | { tag: 'list'; elements: SchemeVal[]; pos?: Pos }  // parse-time only
+  | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env; pos?: Pos };
+
+function posStr(pos?: Pos): string {
+  return pos ? `${pos.line}:${pos.col}: ` : '';
+}
+
+function errAt(msg: string, pos?: Pos): EvalError {
+  return new EvalError(`${posStr(pos)}${msg}`);
+}
 
 const SCM_NIL: SchemeVal = { tag: 'nil' };
 const SCM_TRUE: SchemeVal = { tag: 'boolean', value: true };
@@ -67,75 +77,87 @@ class Env {
 
 // ── Tokenizer ──────────────────────────────────────────────────────────
 
-function tokenize(input: string): string[] {
-  const tokens: string[] = [];
+interface Token { text: string; pos: Pos }
+
+function tokenize(input: string): Token[] {
+  const tokens: Token[] = [];
   let i = 0;
+  let line = 1;
+  let col = 1;
+
+  function advance(): string {
+    const ch = input[i++];
+    if (ch === '\n') { line++; col = 1; } else { col++; }
+    return ch;
+  }
+
   while (i < input.length) {
     const ch = input[i];
-    if (/\s/.test(ch)) { i++; continue; }
-    if (ch === ';') { while (i < input.length && input[i] !== '\n') i++; continue; }
-    if (ch === '(' || ch === ')') { tokens.push(ch); i++; continue; }
-    if (ch === '\'') { tokens.push("'"); i++; continue; }
+    if (/\s/.test(ch)) { advance(); continue; }
+    if (ch === ';') { while (i < input.length && input[i] !== '\n') advance(); continue; }
+    const startPos: Pos = { line, col };
+    if (ch === '(' || ch === ')') { advance(); tokens.push({ text: ch, pos: startPos }); continue; }
+    if (ch === '\'') { advance(); tokens.push({ text: "'", pos: startPos }); continue; }
     if (ch === '"') {
       let s = '"';
-      i++;
+      advance();
       while (i < input.length && input[i] !== '"') {
-        if (input[i] === '\\') { s += input[i++]; }
-        s += input[i++];
+        if (input[i] === '\\') { s += advance(); }
+        s += advance();
       }
-      if (i < input.length) { s += '"'; i++; }
-      tokens.push(s);
+      if (i < input.length) { s += '"'; advance(); }
+      tokens.push({ text: s, pos: startPos });
       continue;
     }
     let tok = '';
     while (i < input.length && !/[\s()";]/.test(input[i])) {
-      tok += input[i++];
+      tok += advance();
     }
-    tokens.push(tok);
+    tokens.push({ text: tok, pos: startPos });
   }
   return tokens;
 }
 
 // ── Parser ─────────────────────────────────────────────────────────────
 
-function parse(tokens: string[]): SchemeVal[] {
-  let pos = 0;
+function parse(tokens: Token[]): SchemeVal[] {
+  let idx = 0;
 
   function parseExpr(): SchemeVal {
-    if (pos >= tokens.length) throw new EvalError('unexpected end of input');
-    const tok = tokens[pos++];
-    if (tok === "'") {
+    if (idx >= tokens.length) throw new EvalError('unexpected end of input');
+    const tok = tokens[idx++];
+    if (tok.text === "'") {
       const inner = parseExpr();
-      return { tag: 'list', elements: [{ tag: 'symbol', value: 'quote' }, inner] };
+      return { tag: 'list', elements: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, inner], pos: tok.pos };
     }
-    if (tok === '(') {
+    if (tok.text === '(') {
       const elements: SchemeVal[] = [];
-      while (pos < tokens.length && tokens[pos] !== ')') {
+      while (idx < tokens.length && tokens[idx].text !== ')') {
         elements.push(parseExpr());
       }
-      if (pos >= tokens.length) throw new EvalError('missing closing parenthesis');
-      pos++;
-      return { tag: 'list', elements };
+      if (idx >= tokens.length) throw new EvalError(`${tok.pos.line}:${tok.pos.col}: missing closing parenthesis`);
+      idx++;
+      return { tag: 'list', elements, pos: tok.pos };
     }
-    if (tok === ')') throw new EvalError('unexpected )');
+    if (tok.text === ')') throw new EvalError(`${tok.pos.line}:${tok.pos.col}: unexpected )`);
     return parseAtom(tok);
   }
 
-  function parseAtom(tok: string): SchemeVal {
-    if (tok === '#t') return { tag: 'boolean', value: true };
-    if (tok === '#f') return { tag: 'boolean', value: false };
-    if (tok.startsWith('"') && tok.endsWith('"')) {
-      return { tag: 'string', value: tok.slice(1, -1) };
+  function parseAtom(tok: Token): SchemeVal {
+    if (tok.text === '#t') return { tag: 'boolean', value: true, pos: tok.pos };
+    if (tok.text === '#f') return { tag: 'boolean', value: false, pos: tok.pos };
+    if (tok.text.startsWith('"') && tok.text.endsWith('"')) {
+      return { tag: 'string', value: tok.text.slice(1, -1), pos: tok.pos };
     }
-    const num = Number(tok);
-    if (!isNaN(num) && tok !== '') {
-      return { tag: 'number', value: num };
+    const num = Number(tok.text);
+    if (!isNaN(num) && tok.text !== '') {
+      return { tag: 'number', value: num, pos: tok.pos };
     }
-    return { tag: 'symbol', value: tok };
+    return { tag: 'symbol', value: tok.text, pos: tok.pos };
   }
 
   const exprs: SchemeVal[] = [];
-  while (pos < tokens.length) {
+  while (idx < tokens.length) {
     exprs.push(parseExpr());
   }
   return exprs;
@@ -156,29 +178,30 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
     case 'pair':
       return expr;
     case 'symbol':
-      return env.get(expr.value);
+      try { return env.get(expr.value); }
+      catch (e) { throw errAt(`unbound variable: ${expr.value}`, expr.pos); }
     case 'list': {
       const elems = expr.elements;
-      if (elems.length === 0) throw new EvalError('empty application');
+      if (elems.length === 0) throw errAt('empty application', expr.pos);
 
       const head = elems[0];
 
       if (head.tag === 'symbol') {
         switch (head.value) {
           case 'quote': {
-            if (elems.length !== 2) throw new EvalError('quote: expected 1 argument');
+            if (elems.length !== 2) throw errAt('quote: expected 1 argument', expr.pos);
             return listToPairs(elems[1]);
           }
           case 'if': {
             if (elems.length < 3 || elems.length > 4)
-              throw new EvalError('if: expected 2-3 arguments');
+              throw errAt('if: expected 2-3 arguments', expr.pos);
             const cond = evalExpr(elems[1], env);
             if (isTruthy(cond)) return evalExpr(elems[2], env);
             if (elems.length === 4) return evalExpr(elems[3], env);
             return SCM_FALSE;
           }
           case 'define': {
-            if (elems.length < 3) throw new EvalError('define: bad syntax');
+            if (elems.length < 3) throw errAt('define: bad syntax', expr.pos);
             const target = elems[1];
             if (target.tag === 'symbol') {
               const val = evalExpr(elems[2], env);
@@ -188,7 +211,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             if (target.tag === 'list' && target.elements.length > 0 && target.elements[0].tag === 'symbol') {
               const name = target.elements[0].value;
               const params = target.elements.slice(1).map(p => {
-                if (p.tag !== 'symbol') throw new EvalError('define: param must be symbol');
+                if (p.tag !== 'symbol') throw errAt('define: param must be symbol', expr.pos);
                 return p.value;
               });
               const body = elems.slice(2);
@@ -196,14 +219,14 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
               env.set(name, lambda);
               return lambda;
             }
-            throw new EvalError('define: bad syntax');
+            throw errAt('define: bad syntax', expr.pos);
           }
           case 'lambda': {
-            if (elems.length < 3) throw new EvalError('lambda: bad syntax');
+            if (elems.length < 3) throw errAt('lambda: bad syntax', expr.pos);
             const paramList = elems[1];
-            if (paramList.tag !== 'list') throw new EvalError('lambda: params must be a list');
+            if (paramList.tag !== 'list') throw errAt('lambda: params must be a list', expr.pos);
             const params = paramList.elements.map(p => {
-              if (p.tag !== 'symbol') throw new EvalError('lambda: param must be symbol');
+              if (p.tag !== 'symbol') throw errAt('lambda: param must be symbol', expr.pos);
               return p.value;
             });
             const body = elems.slice(2);
@@ -226,7 +249,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             return result;
           }
           case 'not': {
-            if (elems.length !== 2) throw new EvalError('not: expected 1 argument');
+            if (elems.length !== 2) throw errAt('not: expected 1 argument', expr.pos);
             const val = evalExpr(elems[1], env);
             return isTruthy(val) ? SCM_FALSE : SCM_TRUE;
           }
@@ -241,7 +264,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             for (let i = 1; i < elems.length; i++) {
               const clause = elems[i];
               if (clause.tag !== 'list' || clause.elements.length < 2)
-                throw new EvalError('cond: bad clause');
+                throw errAt('cond: bad clause', expr.pos);
               const test = clause.elements[0];
               if (test.tag === 'symbol' && test.value === 'else') {
                 let result: SchemeVal = SCM_FALSE;
@@ -266,12 +289,12 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             if (elems.length >= 3 && elems[1].tag === 'symbol') {
               const name = elems[1].value;
               const bindingList = elems[2];
-              if (bindingList.tag !== 'list') throw new EvalError('let: bad syntax');
+              if (bindingList.tag !== 'list') throw errAt('let: bad syntax', expr.pos);
               const paramNames: string[] = [];
               const initVals: SchemeVal[] = [];
               for (const b of bindingList.elements) {
                 if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
-                  throw new EvalError('let: bad binding');
+                  throw errAt('let: bad binding', expr.pos);
                 paramNames.push(b.elements[0].value);
                 initVals.push(evalExpr(b.elements[1], env));
               }
@@ -292,13 +315,13 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
               return result;
             }
             // Regular let: (let ((var init) ...) body...)
-            if (elems.length < 3) throw new EvalError('let: bad syntax');
+            if (elems.length < 3) throw errAt('let: bad syntax', expr.pos);
             const bindings = elems[1];
-            if (bindings.tag !== 'list') throw new EvalError('let: bad syntax');
+            if (bindings.tag !== 'list') throw errAt('let: bad syntax', expr.pos);
             const letEnv = new Env(env);
             for (const b of bindings.elements) {
               if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
-                throw new EvalError('let: bad binding');
+                throw errAt('let: bad binding', expr.pos);
               const val = evalExpr(b.elements[1], env);
               letEnv.set(b.elements[0].value, val);
             }
@@ -316,14 +339,14 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
 
       // Try builtin first for bare symbols
       if (head.tag === 'symbol' && isBuiltin(head.value)) {
-        return applyBuiltin(head.value, args);
+        return applyBuiltin(head.value, args, expr.pos);
       }
 
       const proc = evalExpr(head, env);
 
       if (proc.tag === 'lambda') {
         if (args.length !== proc.params.length)
-          throw new EvalError(`expected ${proc.params.length} arguments, got ${args.length}`);
+          throw errAt(`expected ${proc.params.length} arguments, got ${args.length}`, expr.pos);
         const callEnv = new Env(proc.env);
         for (let i = 0; i < proc.params.length; i++) {
           callEnv.set(proc.params[i], args[i]);
@@ -335,16 +358,16 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         return result;
       }
 
-      throw new EvalError(`not a procedure: ${display(proc)}`);
+      throw errAt(`not a procedure: ${display(proc)}`, expr.pos);
     }
     default:
-      throw new EvalError(`cannot evaluate: ${display(expr)}`);
+      throw errAt(`cannot evaluate: ${display(expr)}`, expr.pos);
   }
 }
 
-function requireNumbers(name: string, args: SchemeVal[]): number[] {
+function requireNumbers(name: string, args: SchemeVal[], pos?: Pos): number[] {
   return args.map(a => {
-    if (a.tag !== 'number') throw new EvalError(`${name}: expected number`);
+    if (a.tag !== 'number') throw errAt(`${name}: expected number`, pos);
     return a.value;
   });
 }
@@ -359,88 +382,87 @@ function isBuiltin(name: string): boolean {
   return BUILTINS.has(name);
 }
 
-function applyBuiltin(name: string, args: SchemeVal[]): SchemeVal {
+function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
   switch (name) {
     case '+': {
-      const nums = requireNumbers('+', args);
+      const nums = requireNumbers('+', args, pos);
       return { tag: 'number', value: nums.reduce((a, b) => a + b, 0) };
     }
     case '-': {
-      if (args.length === 0) throw new EvalError('-: expected at least 1 argument');
-      const nums = requireNumbers('-', args);
+      if (args.length === 0) throw errAt('-: expected at least 1 argument', pos);
+      const nums = requireNumbers('-', args, pos);
       if (nums.length === 1) return { tag: 'number', value: -nums[0] };
       return { tag: 'number', value: nums.slice(1).reduce((a, b) => a - b, nums[0]) };
     }
     case '*': {
-      const nums = requireNumbers('*', args);
+      const nums = requireNumbers('*', args, pos);
       return { tag: 'number', value: nums.reduce((a, b) => a * b, 1) };
     }
     case '/': {
-      if (args.length < 2) throw new EvalError('/: expected at least 2 arguments');
-      const nums = requireNumbers('/', args);
-      if (nums[1] === 0) throw new EvalError('division by zero');
+      if (args.length < 2) throw errAt('/: expected at least 2 arguments', pos);
+      const nums = requireNumbers('/', args, pos);
+      if (nums[1] === 0) throw errAt('division by zero', pos);
       return { tag: 'number', value: Math.trunc(nums[0] / nums[1]) };
     }
     case '<': {
-      const nums = requireNumbers('<', args);
+      const nums = requireNumbers('<', args, pos);
       return { tag: 'boolean', value: nums[0] < nums[1] };
     }
     case '>': {
-      const nums = requireNumbers('>', args);
+      const nums = requireNumbers('>', args, pos);
       return { tag: 'boolean', value: nums[0] > nums[1] };
     }
     case '=': {
-      const nums = requireNumbers('=', args);
+      const nums = requireNumbers('=', args, pos);
       return { tag: 'boolean', value: nums[0] === nums[1] };
     }
     case '<=': {
-      const nums = requireNumbers('<=', args);
+      const nums = requireNumbers('<=', args, pos);
       return { tag: 'boolean', value: nums[0] <= nums[1] };
     }
     case '>=': {
-      const nums = requireNumbers('>=', args);
+      const nums = requireNumbers('>=', args, pos);
       return { tag: 'boolean', value: nums[0] >= nums[1] };
     }
     case 'cons': {
-      if (args.length !== 2) throw new EvalError('cons: expected 2 arguments');
+      if (args.length !== 2) throw errAt('cons: expected 2 arguments', pos);
       return makePair(args[0], args[1]);
     }
     case 'car': {
-      if (args.length !== 1) throw new EvalError('car: expected 1 argument');
-      if (args[0].tag !== 'pair') throw new EvalError('car: expected pair');
+      if (args.length !== 1) throw errAt('car: expected 1 argument', pos);
+      if (args[0].tag !== 'pair') throw errAt('car: expected pair', pos);
       return args[0].car;
     }
     case 'cdr': {
-      if (args.length !== 1) throw new EvalError('cdr: expected 1 argument');
-      if (args[0].tag !== 'pair') throw new EvalError('cdr: expected pair');
+      if (args.length !== 1) throw errAt('cdr: expected 1 argument', pos);
+      if (args[0].tag !== 'pair') throw errAt('cdr: expected pair', pos);
       return args[0].cdr;
     }
     case 'null?': {
-      if (args.length !== 1) throw new EvalError('null?: expected 1 argument');
+      if (args.length !== 1) throw errAt('null?: expected 1 argument', pos);
       return args[0].tag === 'nil' ? SCM_TRUE : SCM_FALSE;
     }
     case 'list': {
       return arrayToList(args);
     }
     case 'length': {
-      if (args.length !== 1) throw new EvalError('length: expected 1 argument');
+      if (args.length !== 1) throw errAt('length: expected 1 argument', pos);
       let count = 0;
       let cur = args[0];
       while (cur.tag === 'pair') {
         count++;
         cur = cur.cdr;
       }
-      if (cur.tag !== 'nil') throw new EvalError('length: expected proper list');
+      if (cur.tag !== 'nil') throw errAt('length: expected proper list', pos);
       return { tag: 'number', value: count };
     }
     case 'append': {
       if (args.length === 0) return SCM_NIL;
       if (args.length === 1) return args[0];
-      // Append all lists
       let result = args[args.length - 1];
       for (let i = args.length - 2; i >= 0; i--) {
         const items = pairToArray(args[i]);
-        if (items === null) throw new EvalError('append: expected proper list');
+        if (items === null) throw errAt('append: expected proper list', pos);
         for (let j = items.length - 1; j >= 0; j--) {
           result = makePair(items[j], result);
         }
@@ -448,22 +470,22 @@ function applyBuiltin(name: string, args: SchemeVal[]): SchemeVal {
       return result;
     }
     case 'number?':
-      if (args.length !== 1) throw new EvalError('number?: expected 1 argument');
+      if (args.length !== 1) throw errAt('number?: expected 1 argument', pos);
       return args[0].tag === 'number' ? SCM_TRUE : SCM_FALSE;
     case 'string?':
-      if (args.length !== 1) throw new EvalError('string?: expected 1 argument');
+      if (args.length !== 1) throw errAt('string?: expected 1 argument', pos);
       return args[0].tag === 'string' ? SCM_TRUE : SCM_FALSE;
     case 'boolean?':
-      if (args.length !== 1) throw new EvalError('boolean?: expected 1 argument');
+      if (args.length !== 1) throw errAt('boolean?: expected 1 argument', pos);
       return args[0].tag === 'boolean' ? SCM_TRUE : SCM_FALSE;
     case 'pair?':
-      if (args.length !== 1) throw new EvalError('pair?: expected 1 argument');
+      if (args.length !== 1) throw errAt('pair?: expected 1 argument', pos);
       return args[0].tag === 'pair' ? SCM_TRUE : SCM_FALSE;
     case 'symbol?':
-      if (args.length !== 1) throw new EvalError('symbol?: expected 1 argument');
+      if (args.length !== 1) throw errAt('symbol?: expected 1 argument', pos);
       return args[0].tag === 'symbol' ? SCM_TRUE : SCM_FALSE;
     default:
-      throw new EvalError(`unbound variable: ${name}`);
+      throw errAt(`unbound variable: ${name}`, pos);
   }
 }
 
