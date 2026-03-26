@@ -269,6 +269,7 @@ enum Value {
     Procedure(Rc<Closure>),
     CaseProcedure(Rc<CaseClosure>),
     Continuation(SchemeContinuation),
+    Multiple(Vec<Value>),
     Record(Rc<RecordValue>),
     Uninitialized(String),
     Void,
@@ -394,6 +395,7 @@ impl Value {
             | Self::Procedure(_)
             | Self::CaseProcedure(_)
             | Self::Continuation(_) => "procedure",
+            Self::Multiple(_) => "multiple values",
             Self::Record(_) => "record",
             Self::Uninitialized(_) => "uninitialized",
             Self::Void => "void",
@@ -436,9 +438,33 @@ fn render_value(value: &Value, mode: RenderMode, active_pairs: &mut HashSet<usiz
         | Value::Procedure(_)
         | Value::CaseProcedure(_)
         | Value::Continuation(_) => "#<procedure>".into(),
+        Value::Multiple(values) => {
+            if values.is_empty() {
+                "#<zero values>".into()
+            } else {
+                "#<multiple values>".into()
+            }
+        }
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Uninitialized(name) => format!("#<uninitialized {name}>"),
         Value::Void => "#<void>".into(),
+    }
+}
+
+fn pack_values(values: Vec<Value>) -> Value {
+    match values.len() {
+        1 => values
+            .into_iter()
+            .next()
+            .expect("single-value result should contain exactly one value"),
+        _ => Value::Multiple(values),
+    }
+}
+
+fn unpack_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Multiple(values) => values,
+        other => vec![other],
     }
 }
 
@@ -1040,6 +1066,8 @@ enum Builtin {
     CallCc,
     Raise,
     WithExceptionHandler,
+    Values,
+    CallWithValues,
     Apply,
 }
 
@@ -1157,6 +1185,8 @@ impl Builtin {
             Self::CallCc => "call/cc",
             Self::Raise => "raise",
             Self::WithExceptionHandler => "with-exception-handler",
+            Self::Values => "values",
+            Self::CallWithValues => "call-with-values",
             Self::Apply => "apply",
         }
     }
@@ -1309,6 +1339,8 @@ impl Env {
             ("call-with-current-continuation", Builtin::CallCc),
             ("raise", Builtin::Raise),
             ("with-exception-handler", Builtin::WithExceptionHandler),
+            ("values", Builtin::Values),
+            ("call-with-values", Builtin::CallWithValues),
             ("apply", Builtin::Apply),
         ] {
             env.define(name.into(), Value::Builtin(builtin));
@@ -3217,6 +3249,10 @@ fn apply_value_cps(
     k: ContinuationRef,
 ) -> Result<Value, EvalError> {
     match value {
+        Value::Builtin(Builtin::Values) => eval_values_cps(argument_values, k),
+        Value::Builtin(Builtin::CallWithValues) => {
+            eval_call_with_values_cps(argument_values, env, call_pos, k)
+        }
         Value::Builtin(Builtin::DynamicWind) => {
             eval_dynamic_wind_cps(argument_values, env, call_pos, k)
         }
@@ -3265,6 +3301,44 @@ fn apply_value_cps(
         }
         .with_offset(call_pos.offset)),
     }
+}
+
+fn eval_values_cps(argument_values: Vec<Value>, k: ContinuationRef) -> Result<Value, EvalError> {
+    k(pack_values(argument_values))
+}
+
+fn eval_call_with_values_cps(
+    argument_values: Vec<Value>,
+    env: EnvRef,
+    call_pos: SourcePos,
+    k: ContinuationRef,
+) -> Result<Value, EvalError> {
+    let [producer, consumer] = argument_values.as_slice() else {
+        return Err(EvalError::WrongArgCount {
+            name: "call-with-values".into(),
+            expected: "exactly 2".into(),
+            got: argument_values.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let consumer_value = consumer.clone();
+    let consumer_env = env.clone();
+    let consumer_k = k.clone();
+    apply_thunk_cps(
+        producer.clone(),
+        env,
+        call_pos,
+        Rc::new(move |produced| {
+            apply_value_cps(
+                consumer_value.clone(),
+                unpack_values(produced),
+                consumer_env.clone(),
+                call_pos,
+                consumer_k.clone(),
+            )
+        }),
+    )
 }
 
 fn eval_dynamic_wind_cps(
@@ -3619,7 +3693,9 @@ fn eval_builtin_from_values(
 ) -> Result<Value, EvalError> {
     debug_assert!(!matches!(
         builtin,
-        Builtin::DynamicWind
+        Builtin::Values
+            | Builtin::CallWithValues
+            | Builtin::DynamicWind
             | Builtin::CallCc
             | Builtin::Raise
             | Builtin::WithExceptionHandler
@@ -4631,6 +4707,8 @@ fn eval_builtin(
             message: "with-exception-handler requires continuation-aware evaluation".into(),
         }
         .with_offset(call_pos.offset)),
+        Builtin::Values => eval_values(arguments, env),
+        Builtin::CallWithValues => eval_call_with_values(arguments, env, call_pos),
         Builtin::Apply => eval_apply_builtin(arguments, env, call_pos),
     }
 }
@@ -6347,6 +6425,30 @@ fn format_case_lambda_arity(closure: &CaseClosure) -> String {
     } else {
         parts.join(" or ")
     }
+}
+
+fn eval_values(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    Ok(pack_values(eval_args(arguments, env)?))
+}
+
+fn eval_call_with_values(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [producer_expr, consumer_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "call-with-values".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let producer = eval_expr(producer_expr, env)?;
+    let consumer = eval_expr(consumer_expr, env)?;
+    let produced = apply_value_with_values(producer, Vec::new(), env, producer_expr.pos)?;
+    apply_value_with_values(consumer, unpack_values(produced), env, consumer_expr.pos)
 }
 
 fn eval_apply_builtin(
@@ -8336,6 +8438,15 @@ fn value_eqv_inner(left: &Value, right: &Value, seen_pairs: &mut HashSet<(usize,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::CaseProcedure(left), Value::CaseProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Continuation(left), Value::Continuation(right)) => left.id() == right.id(),
+        (Value::Multiple(left), Value::Multiple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left_item, right_item)| {
+                        value_eqv_inner(left_item, right_item, seen_pairs)
+                    })
+        }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Uninitialized(left), Value::Uninitialized(right)) => left == right,
         (Value::Void, Value::Void) => true,
@@ -8405,6 +8516,15 @@ fn value_equal_inner(
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::CaseProcedure(left), Value::CaseProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Continuation(left), Value::Continuation(right)) => left.id() == right.id(),
+        (Value::Multiple(left), Value::Multiple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left_item, right_item)| {
+                        value_equal_inner(left_item, right_item, seen_pairs)
+                    })
+        }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Uninitialized(left), Value::Uninitialized(right)) => left == right,
         (Value::Void, Value::Void) => true,
