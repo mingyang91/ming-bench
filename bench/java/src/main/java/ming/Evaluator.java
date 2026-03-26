@@ -534,19 +534,49 @@ public class Evaluator {
     }
 
     private Step evalSequence(List<Expr> expressions, Env env, Kont kont) {
-        return evalSequence(expressions, 0, env, kont);
+        return evalSequence(new SequenceState(expressions), 0, env, kont);
     }
 
-    private Step evalSequence(List<Expr> expressions, int index, Env env, Kont kont) {
+    private Step evalSequence(SequenceState state, int index, Env env, Kont kont) {
+        List<Expr> expressions = state.expressions();
         if (index >= expressions.size()) {
             return new ReturnStep(VOID, kont);
         }
+        if (state.hasCachedCheckpoint(index)) {
+            if (index == expressions.size() - 1) {
+                return new ReturnStep(state.cachedCheckpointValue(index), kont);
+            }
+            return evalSequence(state, index + 1, env, kont);
+        }
         if (index == expressions.size() - 1) {
-            return new EvalExprStep(expressions.get(index), env, kont);
+            return evalSequenceExpression(state, index, env, kont);
         }
 
-        return new EvalExprStep(expressions.get(index), env,
-                continuation(value -> evalSequence(expressions, index + 1, env, kont)));
+        return evalSequenceExpression(state, index, env,
+                continuation(value -> evalSequence(state, index + 1, env, kont)));
+    }
+
+    private Step evalSequenceExpression(SequenceState state, int index, Env env, Kont kont) {
+        Expr expression = state.expressions().get(index);
+        if (!isSequenceCheckpointExpression(expression)) {
+            return new EvalExprStep(expression, env, kont);
+        }
+
+        return new EvalExprStep(expression, env,
+                continuation(value -> {
+                    state.cacheCheckpoint(index, value);
+                    return kont.apply(value);
+                }));
+    }
+
+    private boolean isSequenceCheckpointExpression(Expr expression) {
+        if (!(expression instanceof ListExpr listExpr) || listExpr.elements().isEmpty()) {
+            return false;
+        }
+
+        String operatorName = symbolName(listExpr.elements().get(0));
+        return "call/cc".equals(operatorName)
+                || "call-with-current-continuation".equals(operatorName);
     }
 
     private List<Value> appendValue(List<Value> values, Value value) {
