@@ -25,7 +25,10 @@ impl fmt::Display for SourcePos {
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
     #[error("{pos}: {source}")]
-    WithPosition { pos: SourcePos, source: Box<EvalError> },
+    WithPosition {
+        pos: SourcePos,
+        source: Box<EvalError>,
+    },
 
     #[error("empty input")]
     EmptyInput,
@@ -61,11 +64,32 @@ pub enum EvalError {
     #[error("{name}: expected number, found {found}")]
     ExpectedNumber { name: &'static str, found: String },
 
+    #[error("{name}: expected string, found {found}")]
+    ExpectedString { name: &'static str, found: String },
+
+    #[error("{name}: expected symbol, found {found}")]
+    ExpectedSymbol { name: &'static str, found: String },
+
     #[error("{name}: expected pair, found {found}")]
     ExpectedPair { name: &'static str, found: String },
 
     #[error("{name}: expected list, found {found}")]
     ExpectedList { name: &'static str, found: String },
+
+    #[error("{name}: index out of bounds: {index} (length {len})")]
+    IndexOutOfBounds {
+        name: &'static str,
+        index: i64,
+        len: usize,
+    },
+
+    #[error("{name}: invalid range {start}..{end} (length {len})")]
+    InvalidRange {
+        name: &'static str,
+        start: i64,
+        end: i64,
+        len: usize,
+    },
 
     #[error("division by zero")]
     DivisionByZero,

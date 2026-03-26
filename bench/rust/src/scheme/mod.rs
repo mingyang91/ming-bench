@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 pub mod error;
 
-use error::SourcePos;
 pub use error::EvalError;
+use error::SourcePos;
 
 #[derive(Clone, Debug, PartialEq)]
 enum TokenKind {
@@ -45,15 +45,36 @@ impl Expr {
     }
 }
 
-type NativeFunc = fn(&[Value]) -> Result<Value, EvalError>;
+type NativeFunc = fn(&[Value], &EvalContext) -> Result<Value, EvalError>;
 type EnvRef = Rc<Env>;
 type PairRef = Rc<RefCell<PairCell>>;
+
+struct EvalContext {
+    output: RefCell<String>,
+}
+
+impl EvalContext {
+    fn new() -> Self {
+        Self {
+            output: RefCell::new(String::new()),
+        }
+    }
+
+    fn push_output(&self, value: &str) {
+        self.output.borrow_mut().push_str(value);
+    }
+
+    fn into_output(self) -> String {
+        self.output.into_inner()
+    }
+}
 
 #[derive(Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Char(char),
     Symbol(String),
     Nil,
     Pair(PairRef),
@@ -95,12 +116,21 @@ impl Value {
                     .replace('\t', "\\t");
                 format!("\"{escaped}\"")
             }
+            Self::Char(value) => render_char(*value),
             Self::Symbol(value) => value.clone(),
             Self::Nil => "()".to_string(),
             Self::Pair(pair) => render_pair(pair.clone()),
             Self::NativeProc { name, .. } => format!("#<procedure:{name}>"),
             Self::Closure(_) => "#<procedure>".to_string(),
             Self::Void => "#<void>".to_string(),
+        }
+    }
+
+    fn display_render(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            Self::Char(value) => value.to_string(),
+            _ => self.render(),
         }
     }
 
@@ -113,6 +143,7 @@ impl Value {
             Self::Integer(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
+            Self::Char(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::Nil => "null",
             Self::Pair(_) => "pair",
@@ -127,6 +158,26 @@ impl Value {
             other => Err(EvalError::ExpectedNumber {
                 name,
                 found: other.type_name().to_string(),
+            }),
+        }
+    }
+
+    fn as_string<'a>(&'a self, name: &'static str) -> Result<&'a str, EvalError> {
+        match self {
+            Self::String(value) => Ok(value),
+            other => Err(EvalError::ExpectedString {
+                name,
+                found: other.render(),
+            }),
+        }
+    }
+
+    fn as_symbol<'a>(&'a self, name: &'static str) -> Result<&'a str, EvalError> {
+        match self {
+            Self::Symbol(value) => Ok(value),
+            other => Err(EvalError::ExpectedSymbol {
+                name,
+                found: other.render(),
             }),
         }
     }
@@ -164,7 +215,7 @@ impl Env {
 }
 
 impl Closure {
-    fn call(&self, args: &[Value]) -> Result<Value, EvalError> {
+    fn call(&self, args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
         if args.len() != self.params.len() {
             return Err(EvalError::WrongArgCount {
                 name: "lambda",
@@ -178,7 +229,7 @@ impl Closure {
             frame.define(name.clone(), value.clone());
         }
 
-        eval_sequence(&self.body, frame)
+        eval_sequence(&self.body, frame, ctx)
     }
 }
 
@@ -257,8 +308,7 @@ impl Parser {
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
-    let (result, output) = eval_str_with_output(input)?;
-    debug_assert!(output.is_empty());
+    let (result, _) = eval_str_with_output(input)?;
     Ok(result)
 }
 
@@ -274,8 +324,9 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     }
 
     let env = default_env();
-    let last = eval_sequence(&exprs, env)?;
-    Ok((last.render(), String::new()))
+    let ctx = EvalContext::new();
+    let last = eval_sequence(&exprs, env, &ctx)?;
+    Ok((last.render(), ctx.into_output()))
 }
 
 fn default_env() -> EnvRef {
@@ -297,9 +348,21 @@ fn default_env() -> EnvRef {
         ("list", native_list as NativeFunc),
         ("length", native_length as NativeFunc),
         ("append", native_append as NativeFunc),
+        ("display", native_display as NativeFunc),
+        ("write", native_write as NativeFunc),
+        ("newline", native_newline as NativeFunc),
+        ("string-append", native_string_append as NativeFunc),
+        ("string-length", native_string_length as NativeFunc),
+        ("substring", native_substring as NativeFunc),
+        ("string->number", native_string_to_number as NativeFunc),
+        ("number->string", native_number_to_string as NativeFunc),
+        ("symbol->string", native_symbol_to_string as NativeFunc),
+        ("string->symbol", native_string_to_symbol as NativeFunc),
+        ("string-ref", native_string_ref as NativeFunc),
         ("string?", native_string_pred as NativeFunc),
         ("number?", native_number_pred as NativeFunc),
         ("boolean?", native_boolean_pred as NativeFunc),
+        ("char?", native_char_pred as NativeFunc),
         ("pair?", native_pair_pred as NativeFunc),
         ("symbol?", native_symbol_pred as NativeFunc),
     ] {
@@ -470,15 +533,15 @@ fn is_token_boundary(byte: u8) -> bool {
     )
 }
 
-fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     let mut last = Value::Void;
     for expr in exprs {
-        last = eval(expr, env.clone())?;
+        last = eval(expr, env.clone(), ctx)?;
     }
     Ok(last)
 }
 
-fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
+fn eval(expr: &Expr, env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(value) => Ok(Value::Integer(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
@@ -486,39 +549,48 @@ fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
         ExprKind::Symbol(name) => env.lookup(name).ok_or_else(|| {
             EvalError::UnboundVariable { name: name.clone() }.with_position(expr.pos)
         }),
-        ExprKind::List(items) => eval_list(expr.pos, items, env),
+        ExprKind::List(items) => eval_list(expr.pos, items, env, ctx),
     }
 }
 
-fn eval_list(pos: SourcePos, items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    let (head, tail) = items
-        .split_first()
-        .ok_or_else(|| EvalError::NotAProcedure {
+fn eval_list(
+    pos: SourcePos,
+    items: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
+    let (head, tail) = items.split_first().ok_or_else(|| {
+        EvalError::NotAProcedure {
             found: "()".to_string(),
         }
-        .with_position(pos))?;
+        .with_position(pos)
+    })?;
 
     if let ExprKind::Symbol(name) = &head.kind {
         match name.as_str() {
-            "define" => return eval_define(tail, env).map_err(|err| err.with_position(head.pos)),
-            "if" => return eval_if(tail, env).map_err(|err| err.with_position(head.pos)),
+            "define" => {
+                return eval_define(tail, env, ctx).map_err(|err| err.with_position(head.pos))
+            }
+            "if" => return eval_if(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             "quote" => return eval_quote(tail).map_err(|err| err.with_position(head.pos)),
             "lambda" => return eval_lambda(tail, env).map_err(|err| err.with_position(head.pos)),
-            "and" => return eval_and(tail, env).map_err(|err| err.with_position(head.pos)),
-            "or" => return eval_or(tail, env).map_err(|err| err.with_position(head.pos)),
-            "begin" => return eval_begin(tail, env).map_err(|err| err.with_position(head.pos)),
-            "cond" => return eval_cond(tail, env).map_err(|err| err.with_position(head.pos)),
-            "let" => return eval_let(tail, env).map_err(|err| err.with_position(head.pos)),
+            "and" => return eval_and(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
+            "or" => return eval_or(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
+            "begin" => {
+                return eval_begin(tail, env, ctx).map_err(|err| err.with_position(head.pos))
+            }
+            "cond" => return eval_cond(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
+            "let" => return eval_let(tail, env, ctx).map_err(|err| err.with_position(head.pos)),
             _ => {}
         }
     }
 
-    let procedure = eval(head, env.clone())?;
-    let args = eval_args(tail, env)?;
-    apply(procedure, &args).map_err(|err| err.with_position(head.pos))
+    let procedure = eval(head, env.clone(), ctx)?;
+    let args = eval_args(tail, env, ctx)?;
+    apply(procedure, &args, ctx).map_err(|err| err.with_position(head.pos))
 }
 
-fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     let Some(target) = args.first() else {
         return Err(EvalError::InvalidSyntax {
             message: "define requires a target".to_string(),
@@ -535,7 +607,7 @@ fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
                 });
             }
 
-            let value = eval(&args[1], env.clone())?;
+            let value = eval(&args[1], env.clone(), ctx)?;
             env.define(name.clone(), value);
             Ok(Value::Void)
         }
@@ -574,7 +646,7 @@ fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_if(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::WrongArgCount {
             name: "if",
@@ -583,10 +655,10 @@ fn eval_if(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         });
     }
 
-    if eval(&args[0], env.clone())?.is_truthy() {
-        eval(&args[1], env)
+    if eval(&args[0], env.clone(), ctx)?.is_truthy() {
+        eval(&args[1], env, ctx)
     } else {
-        eval(&args[2], env)
+        eval(&args[2], env, ctx)
     }
 }
 
@@ -617,10 +689,10 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     })))
 }
 
-fn eval_and(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     let mut last = Value::Boolean(true);
     for expr in args {
-        let value = eval(expr, env.clone())?;
+        let value = eval(expr, env.clone(), ctx)?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -629,9 +701,9 @@ fn eval_and(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(last)
 }
 
-fn eval_or(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     for expr in args {
-        let value = eval(expr, env.clone())?;
+        let value = eval(expr, env.clone(), ctx)?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -639,11 +711,11 @@ fn eval_or(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Boolean(false))
 }
 
-fn eval_begin(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    eval_sequence(args, env)
+fn eval_begin(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    eval_sequence(args, env, ctx)
 }
 
-fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_cond(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     for (index, clause) in args.iter().enumerate() {
         let ExprKind::List(items) = &clause.kind else {
             return Err(EvalError::InvalidSyntax {
@@ -663,15 +735,15 @@ fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
                     message: "cond else clause must be last".to_string(),
                 });
             }
-            return eval_sequence(body, env);
+            return eval_sequence(body, env, ctx);
         }
 
-        let test_value = eval(test, env.clone())?;
+        let test_value = eval(test, env.clone(), ctx)?;
         if test_value.is_truthy() {
             return if body.is_empty() {
                 Ok(test_value)
             } else {
-                eval_sequence(body, env)
+                eval_sequence(body, env, ctx)
             };
         }
     }
@@ -679,7 +751,7 @@ fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
-fn eval_let(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_let(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     let Some(first) = args.first() else {
         return Err(EvalError::InvalidSyntax {
             message: "let requires bindings".to_string(),
@@ -687,12 +759,17 @@ fn eval_let(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     };
 
     match &first.kind {
-        ExprKind::Symbol(name) => eval_named_let(name, &args[1..], env),
-        _ => eval_plain_let(first, &args[1..], env),
+        ExprKind::Symbol(name) => eval_named_let(name, &args[1..], env, ctx),
+        _ => eval_plain_let(first, &args[1..], env, ctx),
     }
 }
 
-fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_plain_let(
+    bindings_expr: &Expr,
+    body: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Err(EvalError::InvalidSyntax {
             message: "let requires a body".to_string(),
@@ -700,17 +777,22 @@ fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: EnvRef) -> Result<Va
     }
 
     let bindings = parse_bindings(bindings_expr)?;
-    let values = eval_binding_values(&bindings, env.clone())?;
+    let values = eval_binding_values(&bindings, env.clone(), ctx)?;
     let frame = Env::new(Some(env));
 
     for ((name, _), value) in bindings.into_iter().zip(values.into_iter()) {
         frame.define(name, value);
     }
 
-    eval_sequence(body, frame)
+    eval_sequence(body, frame, ctx)
 }
 
-fn eval_named_let(name: &str, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_named_let(
+    name: &str,
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::InvalidSyntax {
             message: "named let requires bindings and a body".to_string(),
@@ -718,7 +800,7 @@ fn eval_named_let(name: &str, args: &[Expr], env: EnvRef) -> Result<Value, EvalE
     }
 
     let bindings = parse_bindings(&args[0])?;
-    let values = eval_binding_values(&bindings, env.clone())?;
+    let values = eval_binding_values(&bindings, env.clone(), ctx)?;
     let params = bindings
         .iter()
         .map(|(binding, _)| binding.clone())
@@ -731,7 +813,7 @@ fn eval_named_let(name: &str, args: &[Expr], env: EnvRef) -> Result<Value, EvalE
     }));
 
     frame.define(name.to_string(), closure.clone());
-    apply(closure, &values)
+    apply(closure, &values, ctx)
 }
 
 fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -767,26 +849,30 @@ fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
     Ok(parsed)
 }
 
-fn eval_binding_values(bindings: &[(String, Expr)], env: EnvRef) -> Result<Vec<Value>, EvalError> {
+fn eval_binding_values(
+    bindings: &[(String, Expr)],
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<Vec<Value>, EvalError> {
     let mut values = Vec::with_capacity(bindings.len());
     for (_, expr) in bindings {
-        values.push(eval(expr, env.clone())?);
+        values.push(eval(expr, env.clone(), ctx)?);
     }
     Ok(values)
 }
 
-fn eval_args(args: &[Expr], env: EnvRef) -> Result<Vec<Value>, EvalError> {
+fn eval_args(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Vec<Value>, EvalError> {
     let mut values = Vec::with_capacity(args.len());
     for expr in args {
-        values.push(eval(expr, env.clone())?);
+        values.push(eval(expr, env.clone(), ctx)?);
     }
     Ok(values)
 }
 
-fn apply(procedure: Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply(procedure: Value, args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
     match procedure {
-        Value::NativeProc { func, .. } => func(args),
-        Value::Closure(closure) => closure.call(args),
+        Value::NativeProc { func, .. } => func(args, ctx),
+        Value::Closure(closure) => closure.call(args, ctx),
         other => Err(EvalError::NotAProcedure {
             found: other.render(),
         }),
@@ -890,7 +976,15 @@ fn render_pair(pair: PairRef) -> String {
     }
 }
 
-fn native_not(args: &[Value]) -> Result<Value, EvalError> {
+fn render_char(value: char) -> String {
+    match value {
+        ' ' => "#\\space".to_string(),
+        '\n' => "#\\newline".to_string(),
+        _ => format!("#\\{value}"),
+    }
+}
+
+fn native_not(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name: "not",
@@ -902,7 +996,7 @@ fn native_not(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Boolean(!args[0].is_truthy()))
 }
 
-fn native_cons(args: &[Value]) -> Result<Value, EvalError> {
+fn native_cons(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::WrongArgCount {
             name: "cons",
@@ -914,7 +1008,7 @@ fn native_cons(args: &[Value]) -> Result<Value, EvalError> {
     Ok(make_pair(args[0].clone(), args[1].clone()))
 }
 
-fn native_car(args: &[Value]) -> Result<Value, EvalError> {
+fn native_car(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name: "car",
@@ -928,7 +1022,7 @@ fn native_car(args: &[Value]) -> Result<Value, EvalError> {
     Ok(car)
 }
 
-fn native_cdr(args: &[Value]) -> Result<Value, EvalError> {
+fn native_cdr(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name: "cdr",
@@ -942,15 +1036,15 @@ fn native_cdr(args: &[Value]) -> Result<Value, EvalError> {
     Ok(cdr)
 }
 
-fn native_null_pred(args: &[Value]) -> Result<Value, EvalError> {
-    native_predicate("null?", args, |value| matches!(value, Value::Nil))
+fn native_null_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("null?", args, ctx, |value| matches!(value, Value::Nil))
 }
 
-fn native_list(args: &[Value]) -> Result<Value, EvalError> {
+fn native_list(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     Ok(list_from_values(args.to_vec()))
 }
 
-fn native_length(args: &[Value]) -> Result<Value, EvalError> {
+fn native_length(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name: "length",
@@ -962,7 +1056,7 @@ fn native_length(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Integer(list_to_vec(&args[0], "length")?.len() as i64))
 }
 
-fn native_append(args: &[Value]) -> Result<Value, EvalError> {
+fn native_append(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let Some(last) = args.last().cloned() else {
         return Ok(Value::Nil);
     };
@@ -978,27 +1072,222 @@ fn native_append(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
-fn native_string_pred(args: &[Value]) -> Result<Value, EvalError> {
-    native_predicate("string?", args, |value| matches!(value, Value::String(_)))
+fn native_display(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "display",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    ctx.push_output(&args[0].display_render());
+    Ok(Value::Void)
 }
 
-fn native_number_pred(args: &[Value]) -> Result<Value, EvalError> {
-    native_predicate("number?", args, |value| matches!(value, Value::Integer(_)))
+fn native_write(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "write",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    ctx.push_output(&args[0].render());
+    Ok(Value::Void)
 }
 
-fn native_boolean_pred(args: &[Value]) -> Result<Value, EvalError> {
-    native_predicate("boolean?", args, |value| matches!(value, Value::Boolean(_)))
+fn native_newline(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "newline",
+            expected: "exactly 0",
+            got: args.len(),
+        });
+    }
+
+    ctx.push_output("\n");
+    Ok(Value::Void)
 }
 
-fn native_pair_pred(args: &[Value]) -> Result<Value, EvalError> {
-    native_predicate("pair?", args, |value| matches!(value, Value::Pair(_)))
+fn native_string_append(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    let mut result = String::new();
+    for value in args {
+        result.push_str(value.as_string("string-append")?);
+    }
+    Ok(Value::String(result))
 }
 
-fn native_symbol_pred(args: &[Value]) -> Result<Value, EvalError> {
-    native_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
+fn native_string_length(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "string-length",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Integer(
+        args[0].as_string("string-length")?.chars().count() as i64,
+    ))
 }
 
-fn native_predicate<F>(name: &'static str, args: &[Value], predicate: F) -> Result<Value, EvalError>
+fn native_substring(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount {
+            name: "substring",
+            expected: "exactly 3",
+            got: args.len(),
+        });
+    }
+
+    let string = args[0].as_string("substring")?;
+    let start = args[1].as_number("substring")?;
+    let end = args[2].as_number("substring")?;
+    let chars: Vec<char> = string.chars().collect();
+    let len = chars.len();
+    let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+        return Err(EvalError::InvalidRange {
+            name: "substring",
+            start,
+            end,
+            len,
+        });
+    };
+
+    if start > end || end > len {
+        return Err(EvalError::InvalidRange {
+            name: "substring",
+            start: start as i64,
+            end: end as i64,
+            len,
+        });
+    }
+
+    Ok(Value::String(chars[start..end].iter().copied().collect()))
+}
+
+fn native_string_to_number(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "string->number",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    let string = args[0].as_string("string->number")?;
+    match string.parse::<i64>() {
+        Ok(value) => Ok(Value::Integer(value)),
+        Err(_) => Ok(Value::Boolean(false)),
+    }
+}
+
+fn native_number_to_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "number->string",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::String(
+        args[0].as_number("number->string")?.to_string(),
+    ))
+}
+
+fn native_symbol_to_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "symbol->string",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::String(
+        args[0].as_symbol("symbol->string")?.to_string(),
+    ))
+}
+
+fn native_string_to_symbol(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "string->symbol",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Symbol(
+        args[0].as_string("string->symbol")?.to_string(),
+    ))
+}
+
+fn native_string_ref(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "string-ref",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    let string = args[0].as_string("string-ref")?;
+    let index = args[1].as_number("string-ref")?;
+    let chars: Vec<char> = string.chars().collect();
+    let len = chars.len();
+    let Some(index) = usize::try_from(index).ok().filter(|index| *index < len) else {
+        return Err(EvalError::IndexOutOfBounds {
+            name: "string-ref",
+            index,
+            len,
+        });
+    };
+
+    Ok(Value::Char(chars[index]))
+}
+
+fn native_string_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("string?", args, ctx, |value| {
+        matches!(value, Value::String(_))
+    })
+}
+
+fn native_number_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("number?", args, ctx, |value| {
+        matches!(value, Value::Integer(_))
+    })
+}
+
+fn native_boolean_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("boolean?", args, ctx, |value| {
+        matches!(value, Value::Boolean(_))
+    })
+}
+
+fn native_char_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("char?", args, ctx, |value| matches!(value, Value::Char(_)))
+}
+
+fn native_pair_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("pair?", args, ctx, |value| matches!(value, Value::Pair(_)))
+}
+
+fn native_symbol_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_predicate("symbol?", args, ctx, |value| {
+        matches!(value, Value::Symbol(_))
+    })
+}
+
+fn native_predicate<F>(
+    name: &'static str,
+    args: &[Value],
+    _ctx: &EvalContext,
+    predicate: F,
+) -> Result<Value, EvalError>
 where
     F: Fn(&Value) -> bool,
 {
@@ -1013,7 +1302,7 @@ where
     Ok(Value::Boolean(predicate(&args[0])))
 }
 
-fn native_add(args: &[Value]) -> Result<Value, EvalError> {
+fn native_add(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let mut sum = 0_i64;
     for value in values_as_numbers("+", args)? {
         sum += value;
@@ -1021,7 +1310,7 @@ fn native_add(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Integer(sum))
 }
 
-fn native_sub(args: &[Value]) -> Result<Value, EvalError> {
+fn native_sub(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let values = values_as_numbers("-", args)?;
     let (first, rest) = values.split_first().ok_or(EvalError::WrongArgCount {
         name: "-",
@@ -1038,7 +1327,7 @@ fn native_sub(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Integer(result))
 }
 
-fn native_mul(args: &[Value]) -> Result<Value, EvalError> {
+fn native_mul(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let mut product = 1_i64;
     for value in values_as_numbers("*", args)? {
         product *= value;
@@ -1046,7 +1335,7 @@ fn native_mul(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Integer(product))
 }
 
-fn native_div(args: &[Value]) -> Result<Value, EvalError> {
+fn native_div(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let values = values_as_numbers("/", args)?;
     let (first, rest) = values.split_first().ok_or(EvalError::WrongArgCount {
         name: "/",
@@ -1071,19 +1360,19 @@ fn native_div(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Integer(result))
 }
 
-fn native_lt(args: &[Value]) -> Result<Value, EvalError> {
+fn native_lt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     native_compare(args, "<", |left, right| left < right)
 }
 
-fn native_gt(args: &[Value]) -> Result<Value, EvalError> {
+fn native_gt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     native_compare(args, ">", |left, right| left > right)
 }
 
-fn native_num_eq(args: &[Value]) -> Result<Value, EvalError> {
+fn native_num_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     native_compare(args, "=", |left, right| left == right)
 }
 
-fn native_lte(args: &[Value]) -> Result<Value, EvalError> {
+fn native_lte(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     native_compare(args, "<=", |left, right| left <= right)
 }
 
