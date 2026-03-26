@@ -10,10 +10,13 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-### eval_application (src/scheme/mod.rs:203) — Dispatch a parsed Scheme list to the supported level 01 builtins
-### eval_number_args (src/scheme/mod.rs:339) — Evaluate argument expressions and coerce them into integer operands for numeric builtins
-### parse_program (src/scheme/mod.rs:54) — Parse one or more top-level Scheme expressions while skipping whitespace and comments
-### parse_string (src/scheme/mod.rs:102) — Decode a Scheme string literal with basic escape handling
+### eval_application (src/scheme/mod.rs:583) — Dispatch a parsed Scheme list to the supported special forms or builtin/procedure calls
+### eval_char (src/scheme/mod.rs:1645) — Evaluate an expression and coerce it into a Scheme character for character-sensitive builtins
+### eval_number_args (src/scheme/mod.rs:1594) — Evaluate argument expressions and coerce them into integer operands for numeric builtins
+### eval_string_value (src/scheme/mod.rs:1623) — Evaluate an expression and return the shared Scheme string cell used by mutation-aware string builtins
+### parse_program (src/scheme/mod.rs:366) — Parse one or more top-level Scheme expressions while skipping whitespace and comments
+### parse_char_literal (src/scheme/mod.rs:525) — Decode `#\\...` character tokens into Scheme characters with syntax validation
+### parse_string (src/scheme/mod.rs:426) — Decode a Scheme string literal with basic escape handling
 
 ## Python Helpers (scripts/)
 
