@@ -4,7 +4,12 @@ use super::{error::SourcePos, number::Number, EvalError, Expr, ExprKind};
 enum TokenKind {
     LParen,
     RParen,
+    VectorStart,
     Quote,
+    QuasiQuote,
+    Unquote,
+    UnquoteSplicing,
+    SyntaxQuote,
     Number(Number),
     Boolean(bool),
     Char(char),
@@ -60,12 +65,19 @@ impl Parser {
                 token: ")".to_string(),
             }
             .with_position(token.pos)),
+            TokenKind::VectorStart => self.parse_vector(token.pos),
             TokenKind::Number(value) => Ok(Expr::new(ExprKind::Number(value), token.pos)),
             TokenKind::Boolean(value) => Ok(Expr::new(ExprKind::Boolean(value), token.pos)),
             TokenKind::Char(value) => Ok(Expr::new(ExprKind::Char(value), token.pos)),
             TokenKind::String(value) => Ok(Expr::new(ExprKind::String(value), token.pos)),
             TokenKind::Symbol(value) => Ok(Expr::new(ExprKind::Symbol(value), token.pos)),
             TokenKind::Quote => self.parse_quote(token.pos),
+            TokenKind::QuasiQuote => self.parse_prefixed_form(token.pos, "quasiquote"),
+            TokenKind::Unquote => self.parse_prefixed_form(token.pos, "unquote"),
+            TokenKind::UnquoteSplicing => {
+                self.parse_prefixed_form(token.pos, "unquote-splicing")
+            }
+            TokenKind::SyntaxQuote => self.parse_syntax_quote(token.pos),
         }
     }
 
@@ -85,10 +97,40 @@ impl Parser {
         Err(EvalError::UnexpectedEof.with_position(self.eof_pos))
     }
 
+    fn parse_vector(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
+        let mut items = Vec::new();
+        while self.index < self.tokens.len() {
+            if self
+                .tokens
+                .get(self.index)
+                .is_some_and(|token| matches!(token.kind, TokenKind::RParen))
+            {
+                self.index += 1;
+                return Ok(Expr::new(ExprKind::Vector(items), pos));
+            }
+            items.push(self.parse_expr()?);
+        }
+        Err(EvalError::UnexpectedEof.with_position(self.eof_pos))
+    }
+
     fn parse_quote(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
+        self.parse_prefixed_form(pos, "quote")
+    }
+
+    fn parse_prefixed_form(&mut self, pos: SourcePos, name: &str) -> Result<Expr, EvalError> {
         Ok(Expr::new(
             ExprKind::List(vec![
-                Expr::new(ExprKind::Symbol("quote".to_string()), pos),
+                Expr::new(ExprKind::Symbol(name.to_string()), pos),
+                self.parse_expr()?,
+            ]),
+            pos,
+        ))
+    }
+
+    fn parse_syntax_quote(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
+        Ok(Expr::new(
+            ExprKind::List(vec![
+                Expr::new(ExprKind::Symbol("syntax".to_string()), pos),
                 self.parse_expr()?,
             ]),
             pos,
@@ -104,7 +146,7 @@ fn tokenize(input: &str) -> Result<(Vec<Token>, SourcePos), EvalError> {
     while index < bytes.len() {
         let pos = pos_from_index(input, index);
         match bytes[index] {
-            b' ' | b'\n' | b'\r' | b'\t' => {
+            b' ' | b'\n' | b'\r' | b'\t' | 0x0b | 0x0c => {
                 index += 1;
             }
             b';' => {
@@ -132,6 +174,22 @@ fn tokenize(input: &str) -> Result<(Vec<Token>, SourcePos), EvalError> {
                     pos,
                 });
                 index += 1;
+            }
+            b'`' => {
+                tokens.push(Token {
+                    kind: TokenKind::QuasiQuote,
+                    pos,
+                });
+                index += 1;
+            }
+            b',' => {
+                let (kind, next_index) = if bytes.get(index + 1) == Some(&b'@') {
+                    (TokenKind::UnquoteSplicing, index + 2)
+                } else {
+                    (TokenKind::Unquote, index + 1)
+                };
+                tokens.push(Token { kind, pos });
+                index = next_index;
             }
             b'"' => {
                 let (value, next_index) =
@@ -217,7 +275,24 @@ fn parse_string(input: &str, mut index: usize) -> Result<(String, usize), EvalEr
 }
 
 fn parse_hash_literal(input: &str, index: usize) -> Option<(TokenKind, usize)> {
-    parse_boolean(input, index).or_else(|| parse_char_literal(input, index))
+    parse_syntax_quote(input, index)
+        .or_else(|| parse_vector_start(input, index))
+        .or_else(|| parse_boolean(input, index))
+        .or_else(|| parse_char_literal(input, index))
+}
+
+fn parse_vector_start(input: &str, index: usize) -> Option<(TokenKind, usize)> {
+    input
+        .get(index..)?
+        .starts_with("#(")
+        .then_some((TokenKind::VectorStart, index + 2))
+}
+
+fn parse_syntax_quote(input: &str, index: usize) -> Option<(TokenKind, usize)> {
+    input
+        .get(index..)?
+        .starts_with("#'")
+        .then_some((TokenKind::SyntaxQuote, index + 2))
 }
 
 fn parse_boolean(input: &str, index: usize) -> Option<(TokenKind, usize)> {
@@ -288,6 +363,6 @@ fn is_delimiter(input: &str, index: usize) -> bool {
 fn is_token_boundary(byte: u8) -> bool {
     matches!(
         byte,
-        b' ' | b'\n' | b'\r' | b'\t' | b'(' | b')' | b'\'' | b';'
+        b' ' | b'\n' | b'\r' | b'\t' | 0x0b | 0x0c | b'(' | b')' | b'\'' | b'`' | b',' | b';'
     )
 }

@@ -1,7 +1,7 @@
 use super::{
     apply_procedure, list_from_values, list_to_vec, make_mutable_string, make_pair, make_string,
-    make_vector, number::Number, pack_values, ControlProc, Env, EnvRef, EvalContext, EvalError,
-    NativeFunc, Value,
+    make_vector, number::Number, pack_values, syntax, ControlProc, Env, EnvRef, EvalContext,
+    EvalError, NativeFunc, Value,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -54,6 +54,8 @@ pub(super) fn default_env() -> EnvRef {
         ("append", native_append as NativeFunc),
         ("reverse", native_reverse as NativeFunc),
         ("member", native_member as NativeFunc),
+        ("memq", native_memq as NativeFunc),
+        ("memv", native_memv as NativeFunc),
         ("assv", native_assv as NativeFunc),
         ("assoc", native_assoc as NativeFunc),
         ("map", native_map as NativeFunc),
@@ -72,6 +74,7 @@ pub(super) fn default_env() -> EnvRef {
         ("display", native_display as NativeFunc),
         ("write", native_write as NativeFunc),
         ("newline", native_newline as NativeFunc),
+        ("error", native_error as NativeFunc),
         ("string-copy", native_string_copy as NativeFunc),
         ("make-string", native_make_string as NativeFunc),
         ("string", native_string as NativeFunc),
@@ -92,6 +95,8 @@ pub(super) fn default_env() -> EnvRef {
         ("number->string", native_number_to_string as NativeFunc),
         ("symbol->string", native_symbol_to_string as NativeFunc),
         ("string->symbol", native_string_to_symbol as NativeFunc),
+        ("syntax->datum", native_syntax_to_datum as NativeFunc),
+        ("datum->syntax", native_datum_to_syntax as NativeFunc),
         ("string-ref", native_string_ref as NativeFunc),
         ("string-set!", native_string_set as NativeFunc),
         ("string?", native_string_pred as NativeFunc),
@@ -410,9 +415,25 @@ fn native_reverse(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError
 }
 
 fn native_member(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_member_with("member", args, value_equal)
+}
+
+fn native_memq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_member_with("memq", args, value_eq)
+}
+
+fn native_memv(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_member_with("memv", args, value_eq)
+}
+
+fn native_member_with(
+    name: &'static str,
+    args: &[Value],
+    matches: fn(&Value, &Value) -> bool,
+) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::WrongArgCount {
-            name: "member",
+            name,
             expected: "exactly 2",
             got: args.len(),
         });
@@ -428,14 +449,14 @@ fn native_member(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError>
                     let borrowed = pair.borrow();
                     (borrowed.car.clone(), borrowed.cdr.clone())
                 };
-                if value_equal(needle, &item) {
+                if matches(needle, &item) {
                     return Ok(cursor);
                 }
                 cursor = next;
             }
             other => {
                 return Err(EvalError::ExpectedList {
-                    name: "member",
+                    name,
                     found: other.render(),
                 });
             }
@@ -769,6 +790,19 @@ fn native_newline(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError>
     Ok(Value::Void)
 }
 
+fn native_error(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    let message = if args.is_empty() {
+        "error".to_string()
+    } else {
+        args.iter()
+            .map(Value::display_render)
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    Err(ctx.raise(make_string(message)))
+}
+
 fn native_string_copy(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
@@ -1047,6 +1081,30 @@ fn native_string_to_symbol(args: &[Value], _ctx: &EvalContext) -> Result<Value, 
     }
 
     Ok(Value::Symbol(args[0].as_string("string->symbol")?))
+}
+
+fn native_syntax_to_datum(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "syntax->datum",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    syntax::syntax_to_datum_value(&args[0], "syntax->datum")
+}
+
+fn native_datum_to_syntax(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "datum->syntax",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    syntax::datum_to_syntax_value(&args[0], &args[1], "datum->syntax")
 }
 
 fn native_string_ref(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {

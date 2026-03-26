@@ -28,6 +28,7 @@ enum ExprKind {
     Symbol(String),
     CapturedSymbol(String, EnvRef),
     List(Vec<Expr>),
+    Vector(Vec<Expr>),
 }
 
 #[derive(Clone)]
@@ -177,6 +178,8 @@ enum Value {
         name: &'static str,
         func: NativeFunc,
     },
+    Syntax(Box<Expr>),
+    SyntaxList(Vec<Expr>),
     RecordProc(RecordProcRef),
     Closure(Rc<Closure>),
     Continuation(ContinuationRef),
@@ -228,6 +231,10 @@ enum ContinuationFrame {
         env: EnvRef,
     },
     DefineValue {
+        name: String,
+        env: EnvRef,
+    },
+    DefineSyntaxValue {
         name: String,
         env: EnvRef,
     },
@@ -355,6 +362,8 @@ impl Value {
             Self::Record(record) => format!("#<record:{}>", record.record_type.name),
             Self::ControlProc(proc) => format!("#<procedure:{}>", proc.name()),
             Self::NativeProc { name, .. } => format!("#<procedure:{name}>"),
+            Self::Syntax(_) => "#<syntax>".to_string(),
+            Self::SyntaxList(items) => format!("#<syntax-list:{}>", items.len()),
             Self::RecordProc(procedure) => format!("#<procedure:{}>", procedure.name),
             Self::Closure(_) => "#<procedure>".to_string(),
             Self::Continuation(_) => "#<procedure>".to_string(),
@@ -698,6 +707,7 @@ fn eval(expr: &Expr, env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError>
             lookup_symbol_value(name, captured_env, expr.pos)
         }
         ExprKind::List(items) => eval_list(expr.pos, items, env, ctx),
+        ExprKind::Vector(_) => quote_expr_value(expr),
     }
 }
 
@@ -1133,6 +1143,52 @@ fn expr_plain_symbol_name(expr: &Expr) -> Option<&str> {
 
 fn is_ellipsis_expr(expr: &Expr) -> bool {
     expr_symbol_name(expr).is_some_and(|name| name == "...")
+}
+
+fn quote_expr_value(expr: &Expr) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::Number(value) => Ok(Value::Number(*value)),
+        ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
+        ExprKind::Char(value) => Ok(Value::Char(*value)),
+        ExprKind::String(value) => Ok(make_string(value)),
+        ExprKind::Symbol(value) | ExprKind::CapturedSymbol(value, _) => {
+            Ok(Value::Symbol(value.clone()))
+        }
+        ExprKind::List(items) => quote_list_items(items),
+        ExprKind::Vector(items) => items
+            .iter()
+            .map(quote_expr_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(make_vector),
+    }
+}
+
+fn quote_list_items(items: &[Expr]) -> Result<Value, EvalError> {
+    let Some(dot_index) = dotted_tail_index(items) else {
+        return items
+            .iter()
+            .map(quote_expr_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(list_from_values);
+    };
+
+    let tail = quote_expr_value(&items[dot_index + 1])?;
+    items[..dot_index]
+        .iter()
+        .rev()
+        .try_fold(tail, |cdr, item| quote_expr_value(item).map(|car| make_pair(car, cdr)))
+}
+
+fn dotted_tail_index(items: &[Expr]) -> Option<usize> {
+    let mut matches = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| (expr_symbol_name(item) == Some(".")).then_some(index));
+    let dot_index = matches.next()?;
+    if matches.next().is_some() || dot_index == 0 || dot_index + 2 != items.len() {
+        return None;
+    }
+    Some(dot_index)
 }
 
 fn lookup_symbol_value(name: &str, env: &EnvRef, pos: SourcePos) -> Result<Value, EvalError> {

@@ -1,12 +1,15 @@
 use std::rc::Rc;
 
 use super::builtins::value_eq;
-use super::syntax::parse_syntax_rules;
+use super::syntax::{
+    eval_syntax_case_form, eval_syntax_form, eval_with_syntax_form, make_transformer_macro,
+    parse_syntax_rules,
+};
 use super::{
     apply_procedure, eval, eval_sequence, eval_sequence_tco, eval_tail, expr_plain_symbol_name,
-    expr_symbol_name, list_from_values, make_string, CallRequest, Closure, ClosureClause, Env,
-    EnvRef, EvalContext, EvalError, Expr, ExprKind, RecordProcedure, RecordProcedureKind,
-    RecordType, TailOutcome, Value,
+    expr_symbol_name, list_from_values, list_to_vec, make_pair, make_vector, CallRequest,
+    Closure, ClosureClause, Env, EnvRef, EvalContext, EvalError, Expr, ExprKind,
+    RecordProcedure, RecordProcedureKind, RecordType, TailOutcome, Value,
 };
 
 struct DoBinding {
@@ -23,6 +26,11 @@ type DoSetup<'a> = (Vec<DoBinding>, &'a Expr, &'a [Expr], EnvRef);
 enum LetrecMode {
     Parallel,
     Sequential,
+}
+
+enum QuasiquoteItem {
+    Value(Value),
+    Splice(Vec<Value>),
 }
 
 impl LetrecMode {
@@ -43,10 +51,14 @@ pub(super) fn eval_special_form(
     match name {
         "define" => Some(eval_define(args, env, ctx)),
         "define-record-type" => Some(eval_define_record_type(args, env)),
-        "define-syntax" => Some(eval_define_syntax(args, env)),
+        "define-syntax" => Some(eval_define_syntax(args, env, ctx)),
         "set!" => Some(eval_set(args, env, ctx)),
         "if" => Some(eval_if(args, env, ctx)),
         "quote" => Some(eval_quote(args)),
+        "quasiquote" => Some(eval_quasiquote(args, env, ctx)),
+        "syntax" => Some(eval_syntax_form(args, env, ctx)),
+        "syntax-case" => Some(eval_syntax_case_form(args, env, ctx)),
+        "with-syntax" => Some(eval_with_syntax_form(args, env, ctx)),
         "lambda" => Some(eval_lambda(args, env)),
         "case-lambda" => Some(eval_case_lambda(args, env)),
         "and" => Some(eval_and(args, env, ctx)),
@@ -73,10 +85,14 @@ pub(super) fn eval_special_form_tail(
     match name {
         "define" => Some(value_outcome(eval_define(args, env, ctx))),
         "define-record-type" => Some(value_outcome(eval_define_record_type(args, env))),
-        "define-syntax" => Some(value_outcome(eval_define_syntax(args, env))),
+        "define-syntax" => Some(value_outcome(eval_define_syntax(args, env, ctx))),
         "set!" => Some(value_outcome(eval_set(args, env, ctx))),
         "if" => Some(eval_if_tail(args, env, ctx)),
         "quote" => Some(value_outcome(eval_quote(args))),
+        "quasiquote" => Some(value_outcome(eval_quasiquote(args, env, ctx))),
+        "syntax" => Some(value_outcome(eval_syntax_form(args, env, ctx))),
+        "syntax-case" => Some(value_outcome(eval_syntax_case_form(args, env, ctx))),
+        "with-syntax" => Some(value_outcome(eval_with_syntax_form(args, env, ctx))),
         "lambda" => Some(value_outcome(eval_lambda(args, env))),
         "case-lambda" => Some(value_outcome(eval_case_lambda(args, env))),
         "and" => Some(eval_and_tail(args, env, ctx)),
@@ -106,7 +122,7 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, E
     };
 
     match &target.kind {
-        ExprKind::Symbol(name) => {
+        ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount {
                     name: "define",
@@ -127,10 +143,18 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, E
                         message: "define requires a binding name".to_string(),
                     })?;
 
-            let ExprKind::Symbol(name) = &name_expr.kind else {
-                return Err(EvalError::InvalidSyntax {
-                    message: "function name must be a symbol".to_string(),
-                });
+            let name = match &name_expr.kind {
+                ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => name,
+                ExprKind::Number(_)
+                | ExprKind::Boolean(_)
+                | ExprKind::Char(_)
+                | ExprKind::String(_)
+                | ExprKind::List(_)
+                | ExprKind::Vector(_) => {
+                    return Err(EvalError::InvalidSyntax {
+                        message: "function name must be a symbol".to_string(),
+                    });
+                }
             };
 
             if args.len() < 2 {
@@ -153,13 +177,13 @@ fn eval_define(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, E
         | ExprKind::Boolean(_)
         | ExprKind::Char(_)
         | ExprKind::String(_)
-        | ExprKind::CapturedSymbol(_, _) => Err(EvalError::InvalidSyntax {
+        | ExprKind::Vector(_) => Err(EvalError::InvalidSyntax {
             message: "define requires a symbol or function signature".to_string(),
         }),
     }
 }
 
-fn eval_define_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn eval_define_syntax(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::WrongArgCount {
             name: "define-syntax",
@@ -168,14 +192,19 @@ fn eval_define_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         });
     }
 
-    let Some(name) = expr_plain_symbol_name(&args[0]) else {
+    let Some(name) = expr_symbol_name(&args[0]) else {
         return Err(EvalError::InvalidSyntax {
             message: "define-syntax requires a symbol name".to_string(),
         });
     };
 
-    let rules = parse_syntax_rules(name, &args[1], env.clone())?;
-    env.define_syntax(name.to_string(), rules);
+    let binding = match &args[1].kind {
+        ExprKind::List(items) if items.first().and_then(expr_symbol_name) == Some("syntax-rules") => {
+            parse_syntax_rules(name, &args[1], env.clone())?
+        }
+        _ => make_transformer_macro(eval(&args[1], env.clone(), ctx)?),
+    };
+    env.define_syntax(name.to_string(), binding);
     Ok(Value::Void)
 }
 
@@ -264,7 +293,8 @@ fn eval_set(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, Eval
         | ExprKind::Boolean(_)
         | ExprKind::Char(_)
         | ExprKind::String(_)
-        | ExprKind::List(_) => {
+        | ExprKind::List(_)
+        | ExprKind::Vector(_) => {
             return Err(EvalError::InvalidSyntax {
                 message: "set! requires a symbol target".to_string(),
             });
@@ -325,6 +355,164 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     }
 
     quote_expr(&args[0])
+}
+
+fn eval_quasiquote(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "quasiquote",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    quasiquote_expr(&args[0], env, ctx, 1)
+}
+
+fn quasiquote_expr(
+    expr: &Expr,
+    env: EnvRef,
+    ctx: &EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::List(items) => quasiquote_list_form(items, env, ctx, depth),
+        ExprKind::Vector(items) => quasiquote_vector(items, env, ctx, depth),
+        ExprKind::Number(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::Symbol(_)
+        | ExprKind::CapturedSymbol(_, _) => quote_expr(expr),
+    }
+}
+
+fn quasiquote_list_form(
+    items: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    if let Some(inner) = quasiquote_form_arg(items, "unquote") {
+        return if depth == 1 {
+            eval(inner, env, ctx)
+        } else {
+            quasiquote_literal_form("unquote", inner, env, ctx, depth - 1)
+        };
+    }
+
+    if let Some(inner) = quasiquote_form_arg(items, "quasiquote") {
+        return quasiquote_literal_form("quasiquote", inner, env, ctx, depth + 1);
+    }
+
+    if let Some(inner) = quasiquote_form_arg(items, "unquote-splicing") {
+        return if depth == 1 {
+            Err(EvalError::InvalidSyntax {
+                message: "unquote-splicing is only valid within a list or vector".to_string(),
+            })
+        } else {
+            quasiquote_literal_form("unquote-splicing", inner, env, ctx, depth - 1)
+        };
+    }
+
+    quasiquote_list(items, env, ctx, depth)
+}
+
+fn quasiquote_literal_form(
+    name: &str,
+    inner: &Expr,
+    env: EnvRef,
+    ctx: &EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    Ok(list_from_values(vec![
+        Value::Symbol(name.to_string()),
+        quasiquote_expr(inner, env, ctx, depth)?,
+    ]))
+}
+
+fn quasiquote_form_arg<'a>(items: &'a [Expr], name: &str) -> Option<&'a Expr> {
+    match items {
+        [head, inner] if expr_symbol_name(head) == Some(name) => Some(inner),
+        _ => None,
+    }
+}
+
+fn quasiquote_list(
+    items: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    let (prefix, tail) = match quasiquote_dotted_tail_index(items) {
+        Some(dot_index) => (&items[..dot_index], Some(&items[dot_index + 1])),
+        None => (items, None),
+    };
+
+    let mut values = Vec::new();
+    for item in prefix {
+        match quasiquote_item(item, env.clone(), ctx, depth)? {
+            QuasiquoteItem::Value(value) => values.push(value),
+            QuasiquoteItem::Splice(spliced) => values.extend(spliced),
+        }
+    }
+
+    let tail = match tail {
+        Some(tail) => quasiquote_expr(tail, env, ctx, depth)?,
+        None => Value::Nil,
+    };
+
+    Ok(values
+        .into_iter()
+        .rev()
+        .fold(tail, |cdr, car| make_pair(car, cdr)))
+}
+
+fn quasiquote_vector(
+    items: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    let mut values = Vec::new();
+    for item in items {
+        match quasiquote_item(item, env.clone(), ctx, depth)? {
+            QuasiquoteItem::Value(value) => values.push(value),
+            QuasiquoteItem::Splice(spliced) => values.extend(spliced),
+        }
+    }
+
+    Ok(make_vector(values))
+}
+
+fn quasiquote_item(
+    item: &Expr,
+    env: EnvRef,
+    ctx: &EvalContext,
+    depth: usize,
+) -> Result<QuasiquoteItem, EvalError> {
+    if depth == 1 {
+        if let ExprKind::List(items) = &item.kind {
+            if let Some(inner) = quasiquote_form_arg(items, "unquote-splicing") {
+                let value = eval(inner, env, ctx)?;
+                return list_to_vec(&value, "quasiquote").map(QuasiquoteItem::Splice);
+            }
+        }
+    }
+
+    quasiquote_expr(item, env, ctx, depth).map(QuasiquoteItem::Value)
+}
+
+fn quasiquote_dotted_tail_index(items: &[Expr]) -> Option<usize> {
+    let mut matches = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| (expr_symbol_name(item) == Some(".")).then_some(index));
+    let dot_index = matches.next()?;
+    if matches.next().is_some() || dot_index == 0 || dot_index + 2 != items.len() {
+        return None;
+    }
+    Some(dot_index)
 }
 
 fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -540,6 +728,10 @@ fn eval_cond(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, Eva
         if test_value.is_truthy() {
             return if body.is_empty() {
                 Ok(test_value)
+            } else if let Some(recipient) = cond_recipient(body)? {
+                let procedure = eval(recipient, env, ctx)?;
+                let args = [test_value];
+                apply_procedure(procedure, &args, ctx)
             } else {
                 eval_sequence(body, env, ctx)
             };
@@ -576,6 +768,13 @@ fn eval_cond_tail(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<TailO
         if test_value.is_truthy() {
             return if body.is_empty() {
                 Ok(TailOutcome::Value(test_value))
+            } else if let Some(recipient) = cond_recipient(body)? {
+                let procedure = eval(recipient, env, ctx)?;
+                Ok(TailOutcome::Apply(CallRequest {
+                    procedure,
+                    args: vec![test_value],
+                    pos: Some(recipient.pos),
+                }))
             } else {
                 eval_sequence_tco(body, env, ctx)
             };
@@ -597,13 +796,24 @@ fn parse_guard_spec(expr: &Expr) -> Result<(String, Vec<Expr>), EvalError> {
             message: "guard requires a variable and at least zero clauses".to_string(),
         });
     };
-    let Some(name) = expr_plain_symbol_name(name_expr) else {
+    let Some(name) = expr_symbol_name(name_expr) else {
         return Err(EvalError::InvalidSyntax {
             message: "guard variable must be a symbol".to_string(),
         });
     };
 
     Ok((name.to_string(), clauses.to_vec()))
+}
+
+fn cond_recipient(body: &[Expr]) -> Result<Option<&Expr>, EvalError> {
+    match body {
+        [] => Ok(None),
+        [arrow, recipient] if expr_symbol_name(arrow) == Some("=>") => Ok(Some(recipient)),
+        [arrow, ..] if expr_symbol_name(arrow) == Some("=>") => Err(EvalError::InvalidSyntax {
+            message: "cond => clauses must contain exactly one recipient".to_string(),
+        }),
+        _ => Ok(None),
+    }
 }
 
 fn eval_guard_clauses(
@@ -796,13 +1006,15 @@ fn eval_let(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, Eval
     };
 
     match &first.kind {
-        ExprKind::Symbol(name) => eval_named_let(name, &args[1..], env, ctx),
+        ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => {
+            eval_named_let(name, &args[1..], env, ctx)
+        }
         ExprKind::Number(_)
         | ExprKind::Boolean(_)
         | ExprKind::Char(_)
         | ExprKind::String(_)
-        | ExprKind::CapturedSymbol(_, _)
-        | ExprKind::List(_) => eval_plain_let(first, &args[1..], env, ctx),
+        | ExprKind::List(_)
+        | ExprKind::Vector(_) => eval_plain_let(first, &args[1..], env, ctx),
     }
 }
 
@@ -814,13 +1026,15 @@ fn eval_let_tail(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<TailOu
     };
 
     match &first.kind {
-        ExprKind::Symbol(name) => eval_named_let_tail(name, &args[1..], env, ctx),
+        ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => {
+            eval_named_let_tail(name, &args[1..], env, ctx)
+        }
         ExprKind::Number(_)
         | ExprKind::Boolean(_)
         | ExprKind::Char(_)
         | ExprKind::String(_)
-        | ExprKind::CapturedSymbol(_, _)
-        | ExprKind::List(_) => eval_plain_let_tail(first, &args[1..], env, ctx),
+        | ExprKind::List(_)
+        | ExprKind::Vector(_) => eval_plain_let_tail(first, &args[1..], env, ctx),
     }
 }
 
@@ -1208,10 +1422,18 @@ fn parse_binding(binding: &Expr) -> Result<(String, Expr), EvalError> {
         });
     }
 
-    let ExprKind::Symbol(name) = &items[0].kind else {
-        return Err(EvalError::InvalidSyntax {
-            message: "let binding names must be symbols".to_string(),
-        });
+    let name = match &items[0].kind {
+        ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => name,
+        ExprKind::Number(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::List(_)
+        | ExprKind::Vector(_) => {
+            return Err(EvalError::InvalidSyntax {
+                message: "let binding names must be symbols".to_string(),
+            });
+        }
     };
     Ok((name.clone(), items[1].clone()))
 }
@@ -1238,10 +1460,18 @@ fn parse_do_binding(binding: &Expr) -> Result<DoBinding, EvalError> {
         });
     }
 
-    let ExprKind::Symbol(name) = &items[0].kind else {
-        return Err(EvalError::InvalidSyntax {
-            message: "do binding names must be symbols".to_string(),
-        });
+    let name = match &items[0].kind {
+        ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => name,
+        ExprKind::Number(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::Char(_)
+        | ExprKind::String(_)
+        | ExprKind::List(_)
+        | ExprKind::Vector(_) => {
+            return Err(EvalError::InvalidSyntax {
+                message: "do binding names must be symbols".to_string(),
+            });
+        }
     };
     Ok(DoBinding {
         name: name.clone(),
@@ -1320,12 +1550,14 @@ fn parse_record_field_spec(expr: &Expr) -> Result<String, EvalError> {
 fn parse_param_list(expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
     match &expr.kind {
         ExprKind::List(items) => parse_param_slice(items),
-        ExprKind::Symbol(name) => Ok((Vec::new(), Some(name.clone()))),
+        ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => {
+            Ok((Vec::new(), Some(name.clone())))
+        }
         ExprKind::Number(_)
         | ExprKind::Boolean(_)
         | ExprKind::Char(_)
         | ExprKind::String(_)
-        | ExprKind::CapturedSymbol(_, _) => Err(EvalError::InvalidSyntax {
+        | ExprKind::Vector(_) => Err(EvalError::InvalidSyntax {
             message: "lambda parameters must be a list or symbol".to_string(),
         }),
     }
@@ -1335,10 +1567,18 @@ fn parse_param_slice(items: &[Expr]) -> Result<(Vec<String>, Option<String>), Ev
     let mut params = Vec::with_capacity(items.len());
     let mut index = 0;
     while let Some(item) = items.get(index) {
-        let ExprKind::Symbol(name) = &item.kind else {
-            return Err(EvalError::InvalidSyntax {
-                message: "parameter names must be symbols".to_string(),
-            });
+        let name = match &item.kind {
+            ExprKind::Symbol(name) | ExprKind::CapturedSymbol(name, _) => name,
+            ExprKind::Number(_)
+            | ExprKind::Boolean(_)
+            | ExprKind::Char(_)
+            | ExprKind::String(_)
+            | ExprKind::List(_)
+            | ExprKind::Vector(_) => {
+                return Err(EvalError::InvalidSyntax {
+                    message: "parameter names must be symbols".to_string(),
+                });
+            }
         };
 
         if name == "." {
@@ -1347,10 +1587,18 @@ fn parse_param_slice(items: &[Expr]) -> Result<(Vec<String>, Option<String>), Ev
                     message: "rest parameter dot must be followed by a name".to_string(),
                 });
             };
-            let ExprKind::Symbol(rest_name) = &rest_expr.kind else {
-                return Err(EvalError::InvalidSyntax {
-                    message: "rest parameter name must be a symbol".to_string(),
-                });
+            let rest_name = match &rest_expr.kind {
+                ExprKind::Symbol(rest_name) | ExprKind::CapturedSymbol(rest_name, _) => rest_name,
+                ExprKind::Number(_)
+                | ExprKind::Boolean(_)
+                | ExprKind::Char(_)
+                | ExprKind::String(_)
+                | ExprKind::List(_)
+                | ExprKind::Vector(_) => {
+                    return Err(EvalError::InvalidSyntax {
+                        message: "rest parameter name must be a symbol".to_string(),
+                    });
+                }
             };
             if index + 2 != items.len() {
                 return Err(EvalError::InvalidSyntax {
@@ -1367,18 +1615,5 @@ fn parse_param_slice(items: &[Expr]) -> Result<(Vec<String>, Option<String>), Ev
 }
 
 fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
-    match &expr.kind {
-        ExprKind::Number(value) => Ok(Value::Number(*value)),
-        ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
-        ExprKind::Char(value) => Ok(Value::Char(*value)),
-        ExprKind::String(value) => Ok(make_string(value)),
-        ExprKind::Symbol(value) | ExprKind::CapturedSymbol(value, _) => {
-            Ok(Value::Symbol(value.clone()))
-        }
-        ExprKind::List(items) => items
-            .iter()
-            .map(quote_expr)
-            .collect::<Result<Vec<_>, _>>()
-            .map(list_from_values),
-    }
+    super::quote_expr_value(expr)
 }

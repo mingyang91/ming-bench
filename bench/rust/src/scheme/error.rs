@@ -83,6 +83,9 @@ pub enum EvalError {
     #[error("{name}: expected symbol, found {found}")]
     ExpectedSymbol { name: &'static str, found: String },
 
+    #[error("{name}: expected syntax object, found {found}")]
+    ExpectedSyntax { name: &'static str, found: String },
+
     #[error("{name}: expected pair, found {found}")]
     ExpectedPair { name: &'static str, found: String },
 
