@@ -65,7 +65,10 @@ pub(super) fn default_env() -> EnvRef {
         ("number?", native_number_pred as NativeFunc),
         ("boolean?", native_boolean_pred as NativeFunc),
         ("char?", native_char_pred as NativeFunc),
-        ("char-alphabetic?", native_char_alphabetic_pred as NativeFunc),
+        (
+            "char-alphabetic?",
+            native_char_alphabetic_pred as NativeFunc,
+        ),
         ("char-numeric?", native_char_numeric_pred as NativeFunc),
         ("char-upcase", native_char_upcase as NativeFunc),
         ("char-downcase", native_char_downcase as NativeFunc),
@@ -163,7 +166,10 @@ fn native_list_ref(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErro
 
     let items = list_to_vec(&args[0], "list-ref")?;
     let index = args[1].as_number("list-ref")?;
-    let Some(index) = usize::try_from(index).ok().filter(|index| *index < items.len()) else {
+    let Some(index) = usize::try_from(index)
+        .ok()
+        .filter(|index| *index < items.len())
+    else {
         return Err(EvalError::IndexOutOfBounds {
             name: "list-ref",
             index,
@@ -441,7 +447,9 @@ fn native_string_upcase(args: &[Value], _ctx: &EvalContext) -> Result<Value, Eva
         });
     }
 
-    Ok(make_string(args[0].as_string("string-upcase")?.to_uppercase()))
+    Ok(make_string(
+        args[0].as_string("string-upcase")?.to_uppercase(),
+    ))
 }
 
 fn native_string_downcase(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -657,7 +665,9 @@ fn native_char_upcase(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalE
         });
     }
 
-    Ok(Value::Char(args[0].as_char("char-upcase")?.to_ascii_uppercase()))
+    Ok(Value::Char(
+        args[0].as_char("char-upcase")?.to_ascii_uppercase(),
+    ))
 }
 
 fn native_char_downcase(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -919,11 +929,15 @@ fn native_expt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let mut result = 1_i64;
     while exponent > 0 {
         if exponent & 1 == 1 {
-            result = result.checked_mul(base).ok_or_else(|| overflow_error("expt"))?;
+            result = result
+                .checked_mul(base)
+                .ok_or_else(|| overflow_error("expt"))?;
         }
         exponent >>= 1;
         if exponent > 0 {
-            base = base.checked_mul(base).ok_or_else(|| overflow_error("expt"))?;
+            base = base
+                .checked_mul(base)
+                .ok_or_else(|| overflow_error("expt"))?;
         }
     }
 
@@ -1051,11 +1065,7 @@ where
     Ok(Value::Boolean(true))
 }
 
-fn native_compare_strings<F>(
-    args: &[Value],
-    name: &'static str,
-    cmp: F,
-) -> Result<Value, EvalError>
+fn native_compare_strings<F>(args: &[Value], name: &'static str, cmp: F) -> Result<Value, EvalError>
 where
     F: Fn(&str, &str) -> bool,
 {
