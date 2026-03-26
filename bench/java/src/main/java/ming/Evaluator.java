@@ -11,7 +11,9 @@ public class Evaluator {
 
     public Evaluator() {
         // Register builtins as procedures in the global environment
-        for (String name : new String[]{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"}) {
+        for (String name : new String[]{"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+                "cons", "car", "cdr", "null?", "list", "length",
+                "string?", "number?", "boolean?", "pair?", "symbol?", "append"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
     }
@@ -31,9 +33,19 @@ public class Evaluator {
     }
 
     // ---- Representation ----
+    static final Object NIL = new Object() {
+        @Override public String toString() { return "()"; }
+    };
+
     static final class SchemeString {
         final String value;
         SchemeString(String value) { this.value = value; }
+    }
+
+    static final class Pair {
+        Object car;
+        Object cdr;
+        Pair(Object car, Object cdr) { this.car = car; this.cdr = cdr; }
     }
 
     // ---- Environment ----
@@ -181,7 +193,7 @@ public class Evaluator {
                 switch (op) {
                     case "quote" -> {
                         if (list.size() != 2) throw new EvalError("quote: expected 1 argument");
-                        return list.get(1);
+                        return quoteDatum(list.get(1));
                     }
                     case "if" -> {
                         if (list.size() < 3 || list.size() > 4)
@@ -230,6 +242,72 @@ public class Evaluator {
                     }
                     case "and" -> { return evalAnd((List<Object>) expr, env); }
                     case "or" -> { return evalOr((List<Object>) expr, env); }
+                    case "begin" -> {
+                        Object result2 = null;
+                        for (int i = 1; i < list.size(); i++) {
+                            result2 = eval(list.get(i), env);
+                        }
+                        return result2;
+                    }
+                    case "let" -> {
+                        if (list.size() < 3) throw new EvalError("let: bad syntax");
+                        Object second = list.get(1);
+                        if (second instanceof String namedLetName) {
+                            // Named let: (let name ((var init) ...) body...)
+                            if (list.size() < 4) throw new EvalError("let: bad syntax");
+                            List<?> bindings = (List<?>) list.get(2);
+                            List<String> params = new ArrayList<>();
+                            List<Object> inits = new ArrayList<>();
+                            for (Object b : bindings) {
+                                List<?> binding = (List<?>) b;
+                                params.add((String) binding.get(0));
+                                inits.add(binding.get(1));
+                            }
+                            List<Object> body2 = new ArrayList<>();
+                            for (int i = 3; i < list.size(); i++) body2.add(list.get(i));
+                            Env letEnv = new Env(env);
+                            Lambda loopLam = new Lambda(params, body2, letEnv);
+                            letEnv.define(namedLetName, loopLam);
+                            List<Object> args2 = new ArrayList<>();
+                            for (Object init : inits) args2.add(eval(init, env));
+                            return apply(loopLam, args2);
+                        }
+                        List<?> bindings = (List<?>) second;
+                        Env letEnv = new Env(env);
+                        for (Object b : bindings) {
+                            List<?> binding = (List<?>) b;
+                            String bname = (String) binding.get(0);
+                            Object bval = eval(binding.get(1), env);
+                            letEnv.define(bname, bval);
+                        }
+                        Object result2 = null;
+                        for (int i = 2; i < list.size(); i++) {
+                            result2 = eval(list.get(i), letEnv);
+                        }
+                        return result2;
+                    }
+                    case "cond" -> {
+                        for (int i = 1; i < list.size(); i++) {
+                            List<?> clause = (List<?>) list.get(i);
+                            if (clause.get(0) instanceof String s && s.equals("else")) {
+                                Object result2 = null;
+                                for (int j = 1; j < clause.size(); j++) {
+                                    result2 = eval(clause.get(j), env);
+                                }
+                                return result2;
+                            }
+                            Object test = eval(clause.get(0), env);
+                            if (!isFalse(test)) {
+                                if (clause.size() == 1) return test;
+                                Object result2 = null;
+                                for (int j = 1; j < clause.size(); j++) {
+                                    result2 = eval(clause.get(j), env);
+                                }
+                                return result2;
+                            }
+                        }
+                        return null; // void if no clause matches
+                    }
                 }
             }
 
@@ -242,6 +320,18 @@ public class Evaluator {
             return apply(proc, args);
         }
         throw new EvalError("unknown expression type");
+    }
+
+    private Object quoteDatum(Object datum) {
+        if (datum instanceof List<?> list) {
+            if (list.isEmpty()) return NIL;
+            Object result = NIL;
+            for (int i = list.size() - 1; i >= 0; i--) {
+                result = new Pair(quoteDatum(list.get(i)), result);
+            }
+            return result;
+        }
+        return datum;
     }
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
@@ -340,6 +430,81 @@ public class Evaluator {
                 requireArgCount(args, 1, "not");
                 yield isFalse(args.get(0));
             }
+            case "cons" -> {
+                requireArgCount(args, 2, "cons");
+                yield new Pair(args.get(0), args.get(1));
+            }
+            case "car" -> {
+                requireArgCount(args, 1, "car");
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError("car: expected pair");
+                yield p.car;
+            }
+            case "cdr" -> {
+                requireArgCount(args, 1, "cdr");
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError("cdr: expected pair");
+                yield p.cdr;
+            }
+            case "null?" -> {
+                requireArgCount(args, 1, "null?");
+                yield args.get(0) == NIL;
+            }
+            case "list" -> {
+                Object result = NIL;
+                for (int i = args.size() - 1; i >= 0; i--) {
+                    result = new Pair(args.get(i), result);
+                }
+                yield result;
+            }
+            case "length" -> {
+                requireArgCount(args, 1, "length");
+                long count = 0;
+                Object cur = args.get(0);
+                while (cur instanceof Pair p) {
+                    count++;
+                    cur = p.cdr;
+                }
+                if (cur != NIL) throw new EvalError("length: not a proper list");
+                yield count;
+            }
+            case "string?" -> {
+                requireArgCount(args, 1, "string?");
+                yield args.get(0) instanceof SchemeString;
+            }
+            case "number?" -> {
+                requireArgCount(args, 1, "number?");
+                yield args.get(0) instanceof Long;
+            }
+            case "boolean?" -> {
+                requireArgCount(args, 1, "boolean?");
+                yield args.get(0) instanceof Boolean;
+            }
+            case "pair?" -> {
+                requireArgCount(args, 1, "pair?");
+                yield args.get(0) instanceof Pair;
+            }
+            case "symbol?" -> {
+                requireArgCount(args, 1, "symbol?");
+                yield args.get(0) instanceof String;
+            }
+            case "append" -> {
+                if (args.isEmpty()) yield NIL;
+                // Append all lists together
+                Object result = args.get(args.size() - 1);
+                for (int i = args.size() - 2; i >= 0; i--) {
+                    Object lst = args.get(i);
+                    // Collect elements of this list
+                    List<Object> elems = new ArrayList<>();
+                    Object cur = lst;
+                    while (cur instanceof Pair p) {
+                        elems.add(p.car);
+                        cur = p.cdr;
+                    }
+                    for (int j = elems.size() - 1; j >= 0; j--) {
+                        result = new Pair(elems.get(j), result);
+                    }
+                }
+                yield result;
+            }
             default -> throw new EvalError("unbound variable: " + name);
         };
     }
@@ -359,11 +524,28 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private String schemeToString(Object val) {
-        if (val == null) return "()";
+        if (val == null) return ""; // void
+        if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value + "\"";
         if (val instanceof String s) return s;
+        if (val instanceof Pair) {
+            StringBuilder sb = new StringBuilder("(");
+            Object cur = val;
+            boolean first = true;
+            while (cur instanceof Pair p) {
+                if (!first) sb.append(" ");
+                first = false;
+                sb.append(schemeToString(p.car));
+                cur = p.cdr;
+            }
+            if (cur != NIL) {
+                sb.append(" . ").append(schemeToString(cur));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
         if (val instanceof List<?> list) {
             StringBuilder sb = new StringBuilder("(");
             for (int i = 0; i < list.size(); i++) {
