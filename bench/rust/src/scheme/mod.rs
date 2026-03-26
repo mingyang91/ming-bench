@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 type EnvRef = Rc<Environment>;
 type MacroRef = Rc<SyntaxRulesMacro>;
+type EvalResult<T> = Result<T, RuntimeSignal>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Rational {
@@ -42,6 +43,7 @@ enum Value {
     EmptyList,
     Builtin(BuiltinName),
     Closure(Rc<Closure>),
+    Continuation(Rc<Continuation>),
     Void,
 }
 
@@ -56,6 +58,11 @@ struct Closure {
     params: Vec<String>,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct Continuation {
+    id: usize,
 }
 
 #[derive(Clone)]
@@ -96,6 +103,8 @@ enum BuiltinName {
     List,
     Length,
     Append,
+    Reverse,
+    StringAppend,
     StringPred,
     NumberPred,
     BooleanPred,
@@ -132,7 +141,19 @@ struct Environment {
     macros: RefCell<HashMap<String, MacroRef>>,
 }
 
-const BUILTINS: [(&str, BuiltinName); 29] = [
+enum RuntimeSignal {
+    Error(EvalError),
+    Raised(Value),
+    Escape { id: usize, value: Value },
+}
+
+impl From<EvalError> for RuntimeSignal {
+    fn from(error: EvalError) -> Self {
+        Self::Error(error)
+    }
+}
+
+const BUILTINS: [(&str, BuiltinName); 31] = [
     ("+", BuiltinName::Add),
     ("-", BuiltinName::Sub),
     ("*", BuiltinName::Mul),
@@ -149,6 +170,8 @@ const BUILTINS: [(&str, BuiltinName); 29] = [
     ("list", BuiltinName::List),
     ("length", BuiltinName::Length),
     ("append", BuiltinName::Append),
+    ("reverse", BuiltinName::Reverse),
+    ("string-append", BuiltinName::StringAppend),
     ("string?", BuiltinName::StringPred),
     ("number?", BuiltinName::NumberPred),
     ("boolean?", BuiltinName::BooleanPred),
@@ -165,6 +188,7 @@ const BUILTINS: [(&str, BuiltinName); 29] = [
 ];
 
 static MACRO_IDENTIFIER_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static CONTINUATION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl Rational {
     fn integer(value: i128) -> Self {
@@ -467,10 +491,20 @@ fn evaluate_program(input: &str) -> Result<(Value, String), EvalError> {
     let mut result = Value::Void;
 
     for expr in &expressions {
-        result = evaluate_expr(expr, env.clone())?;
+        result = evaluate_expr(expr, env.clone()).map_err(signal_to_eval_error)?;
     }
 
     Ok((result, String::new()))
+}
+
+fn signal_to_eval_error(signal: RuntimeSignal) -> EvalError {
+    match signal {
+        RuntimeSignal::Error(error) => error,
+        RuntimeSignal::Raised(value) => {
+            EvalError::msg(format!("uncaught exception: {}", format_value(&value)))
+        }
+        RuntimeSignal::Escape { .. } => EvalError::msg("uncaught continuation escape"),
+    }
 }
 
 fn create_global_env() -> EnvRef {
@@ -664,24 +698,24 @@ fn parse_number_literal(text: &str) -> Result<Option<Number>, EvalError> {
     Ok(None)
 }
 
-fn evaluate_expr(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_expr(expr: &Expr, env: EnvRef) -> EvalResult<Value> {
     match expr {
         Expr::Number(value) => Ok(Value::Number(value.clone())),
         Expr::Boolean(value) => Ok(Value::Boolean(*value)),
         Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => env.lookup(name),
+        Expr::Symbol(name) => env.lookup(name).map_err(RuntimeSignal::from),
         Expr::List(elements) => evaluate_list(elements, env),
     }
 }
 
-fn evaluate_list(elements: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_list(elements: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if elements.is_empty() {
-        return Err(EvalError::msg("cannot evaluate empty list"));
+        return Err(EvalError::msg("cannot evaluate empty list").into());
     }
 
     let (head, arg_exprs) = elements
         .split_first()
-        .ok_or_else(|| EvalError::msg("cannot evaluate empty list"))?;
+        .ok_or_else(|| RuntimeSignal::from(EvalError::msg("cannot evaluate empty list")))?;
 
     if let Expr::Symbol(name) = head {
         match name.as_str() {
@@ -696,11 +730,21 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
             "let" => return evaluate_let(arg_exprs, env),
             "begin" => return evaluate_begin(arg_exprs, env),
             "cond" => return evaluate_cond(arg_exprs, env),
+            "call/cc" | "call-with-current-continuation" => {
+                return evaluate_call_cc(arg_exprs, env);
+            }
+            "dynamic-wind" => return evaluate_dynamic_wind(arg_exprs, env),
+            "raise" => return evaluate_raise(arg_exprs, env),
+            "with-exception-handler" => {
+                return evaluate_with_exception_handler(arg_exprs, env);
+            }
+            "guard" => return evaluate_guard(arg_exprs, env),
             _ => {}
         }
 
         if let Some(macro_rules) = env.lookup_macro(name) {
-            let (expanded_expr, expanded_env) = expand_macro_invocation(elements, macro_rules, env)?;
+            let (expanded_expr, expanded_env) =
+                expand_macro_invocation(elements, macro_rules, env).map_err(RuntimeSignal::from)?;
             return evaluate_expr(&expanded_expr, expanded_env);
         }
     }
@@ -714,23 +758,25 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     apply_procedure(procedure, args)
 }
 
-fn evaluate_define_syntax(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_define_syntax(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if arg_exprs.len() != 2 {
-        return Err(EvalError::msg("define-syntax expects exactly 2 arguments"));
+        return Err(EvalError::msg("define-syntax expects exactly 2 arguments").into());
     }
 
     let Expr::Symbol(name) = &arg_exprs[0] else {
-        return Err(EvalError::msg("define-syntax expects a symbol name"));
+        return Err(EvalError::msg("define-syntax expects a symbol name").into());
     };
 
-    let macro_rules = Rc::new(read_syntax_rules(name.clone(), &arg_exprs[1], env.clone())?);
+    let macro_rules = Rc::new(
+        read_syntax_rules(name.clone(), &arg_exprs[1], env.clone()).map_err(RuntimeSignal::from)?,
+    );
     env.define_macro(name.clone(), macro_rules);
     Ok(Value::Void)
 }
 
-fn evaluate_define(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_define(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if arg_exprs.len() < 2 {
-        return Err(EvalError::msg("define expects a target and a value"));
+        return Err(EvalError::msg("define expects a target and a value").into());
     }
 
     let target = &arg_exprs[0];
@@ -739,9 +785,10 @@ fn evaluate_define(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> 
     match target {
         Expr::Symbol(name) => {
             if body.len() != 1 {
-                return Err(EvalError::msg(
-                    "define variable form expects exactly 1 value expression",
-                ));
+                return Err(
+                    EvalError::msg("define variable form expects exactly 1 value expression")
+                        .into(),
+                );
             }
 
             let value = evaluate_expr(&body[0], env.clone())?;
@@ -751,13 +798,13 @@ fn evaluate_define(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> 
         Expr::List(items) if !items.is_empty() => {
             let (name_expr, param_exprs) = items
                 .split_first()
-                .ok_or_else(|| EvalError::msg("invalid define form"))?;
+                .ok_or_else(|| RuntimeSignal::from(EvalError::msg("invalid define form")))?;
 
             let Expr::Symbol(name) = name_expr else {
-                return Err(EvalError::msg("define function form expects a function name"));
+                return Err(EvalError::msg("define function form expects a function name").into());
             };
 
-            let params = read_parameter_list(param_exprs)?;
+            let params = read_parameter_list(param_exprs).map_err(RuntimeSignal::from)?;
             let procedure = Value::Closure(Rc::new(Closure {
                 params,
                 body: body.to_vec(),
@@ -767,27 +814,27 @@ fn evaluate_define(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> 
             env.define(name.clone(), procedure);
             Ok(Value::Void)
         }
-        _ => Err(EvalError::msg("invalid define form")),
+        _ => Err(EvalError::msg("invalid define form").into()),
     }
 }
 
-fn evaluate_set(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_set(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if arg_exprs.len() != 2 {
-        return Err(EvalError::msg("set! expects exactly 2 arguments"));
+        return Err(EvalError::msg("set! expects exactly 2 arguments").into());
     }
 
     let Expr::Symbol(name) = &arg_exprs[0] else {
-        return Err(EvalError::msg("set! expects a symbol target"));
+        return Err(EvalError::msg("set! expects a symbol target").into());
     };
 
     let value = evaluate_expr(&arg_exprs[1], env.clone())?;
-    env.assign(name, value)?;
+    env.assign(name, value).map_err(RuntimeSignal::from)?;
     Ok(Value::Void)
 }
 
-fn evaluate_if(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_if(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if arg_exprs.len() != 3 {
-        return Err(EvalError::msg("if expects exactly 3 arguments"));
+        return Err(EvalError::msg("if expects exactly 3 arguments").into());
     }
 
     let condition = evaluate_expr(&arg_exprs[0], env.clone())?;
@@ -798,9 +845,9 @@ fn evaluate_if(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     }
 }
 
-fn evaluate_quote(arg_exprs: &[Expr]) -> Result<Value, EvalError> {
+fn evaluate_quote(arg_exprs: &[Expr]) -> EvalResult<Value> {
     if arg_exprs.len() != 1 {
-        return Err(EvalError::msg("quote expects exactly 1 argument"));
+        return Err(EvalError::msg("quote expects exactly 1 argument").into());
     }
 
     Ok(quote_expr(&arg_exprs[0]))
@@ -816,20 +863,20 @@ fn quote_expr(expr: &Expr) -> Value {
     }
 }
 
-fn evaluate_lambda(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_lambda(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if arg_exprs.len() < 2 {
-        return Err(EvalError::msg("lambda expects parameters and a body"));
+        return Err(EvalError::msg("lambda expects parameters and a body").into());
     }
 
     let params_expr = &arg_exprs[0];
     let body = &arg_exprs[1..];
 
     let Expr::List(param_exprs) = params_expr else {
-        return Err(EvalError::msg("lambda parameters must be a list"));
+        return Err(EvalError::msg("lambda parameters must be a list").into());
     };
 
     Ok(Value::Closure(Rc::new(Closure {
-        params: read_parameter_list(param_exprs)?,
+        params: read_parameter_list(param_exprs).map_err(RuntimeSignal::from)?,
         body: body.to_vec(),
         env,
     })))
@@ -1749,6 +1796,12 @@ fn is_special_form_name(name: &str) -> bool {
             | "let"
             | "begin"
             | "cond"
+            | "call/cc"
+            | "call-with-current-continuation"
+            | "dynamic-wind"
+            | "raise"
+            | "with-exception-handler"
+            | "guard"
             | "syntax-rules"
             | "else"
             | "."
@@ -1772,7 +1825,7 @@ fn fresh_macro_identifier(name: &str) -> String {
     format!("__macro_{counter}_{suffix}")
 }
 
-fn evaluate_and(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_and(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     let mut last_value = Value::Boolean(true);
 
     for expr in arg_exprs {
@@ -1785,7 +1838,7 @@ fn evaluate_and(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(last_value)
 }
 
-fn evaluate_or(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_or(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     for expr in arg_exprs {
         let value = evaluate_expr(expr, env.clone())?;
         if is_truthy(&value) {
@@ -1796,31 +1849,29 @@ fn evaluate_or(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Boolean(false))
 }
 
-fn evaluate_let(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_let(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if arg_exprs.len() < 2 {
-        return Err(EvalError::msg("let expects bindings and a body"));
+        return Err(EvalError::msg("let expects bindings and a body").into());
     }
 
     if matches!(arg_exprs.first(), Some(Expr::Symbol(_))) {
         return evaluate_named_let(arg_exprs, env);
     }
 
-    let bindings = read_let_bindings(&arg_exprs[0])?;
+    let bindings = read_let_bindings(&arg_exprs[0]).map_err(RuntimeSignal::from)?;
     evaluate_let_body(&bindings, &arg_exprs[1..], env)
 }
 
-fn evaluate_named_let(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_named_let(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if arg_exprs.len() < 3 {
-        return Err(EvalError::msg(
-            "named let expects a name, bindings, and a body",
-        ));
+        return Err(EvalError::msg("named let expects a name, bindings, and a body").into());
     }
 
     let Expr::Symbol(name) = &arg_exprs[0] else {
-        return Err(EvalError::msg("named let expects a symbol name"));
+        return Err(EvalError::msg("named let expects a symbol name").into());
     };
 
-    let bindings = read_let_bindings(&arg_exprs[1])?;
+    let bindings = read_let_bindings(&arg_exprs[1]).map_err(RuntimeSignal::from)?;
     let procedure_env = Environment::new(Some(env.clone()));
     let procedure = Rc::new(Closure {
         params: bindings.iter().map(|binding| binding.name.clone()).collect(),
@@ -1867,9 +1918,9 @@ fn read_let_bindings(bindings_expr: &Expr) -> Result<Vec<LetBinding>, EvalError>
     Ok(bindings)
 }
 
-fn evaluate_let_body(bindings: &[LetBinding], body: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_let_body(bindings: &[LetBinding], body: &[Expr], env: EnvRef) -> EvalResult<Value> {
     if body.is_empty() {
-        return Err(EvalError::msg("let expects a body"));
+        return Err(EvalError::msg("let expects a body").into());
     }
 
     let mut values = Vec::with_capacity(bindings.len());
@@ -1885,31 +1936,31 @@ fn evaluate_let_body(bindings: &[LetBinding], body: &[Expr], env: EnvRef) -> Res
     evaluate_sequence(body, let_env)
 }
 
-fn evaluate_begin(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_begin(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     evaluate_sequence(arg_exprs, env)
 }
 
-fn evaluate_cond(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_cond(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     for (index, clause_expr) in arg_exprs.iter().enumerate() {
         let Expr::List(items) = clause_expr else {
-            return Err(EvalError::msg("cond clauses must be non-empty lists"));
+            return Err(EvalError::msg("cond clauses must be non-empty lists").into());
         };
 
         if items.is_empty() {
-            return Err(EvalError::msg("cond clauses must be non-empty lists"));
+            return Err(EvalError::msg("cond clauses must be non-empty lists").into());
         }
 
         let (test_expr, body) = items
             .split_first()
-            .ok_or_else(|| EvalError::msg("cond clauses must be non-empty lists"))?;
+            .ok_or_else(|| RuntimeSignal::from(EvalError::msg("cond clauses must be non-empty lists")))?;
 
         let is_else_clause = matches!(test_expr, Expr::Symbol(name) if name == "else");
         if is_else_clause {
             if index + 1 != arg_exprs.len() {
-                return Err(EvalError::msg("else clause must be last in cond"));
+                return Err(EvalError::msg("else clause must be last in cond").into());
             }
             if body.is_empty() {
-                return Err(EvalError::msg("else clause requires a body"));
+                return Err(EvalError::msg("else clause requires a body").into());
             }
 
             return evaluate_sequence(body, env.clone());
@@ -1928,21 +1979,170 @@ fn evaluate_cond(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
-fn apply_procedure(procedure: Value, args: Vec<Value>) -> Result<Value, EvalError> {
-    match procedure {
-        Value::Builtin(name) => apply_builtin(name, &args),
-        Value::Closure(procedure) => apply_closure(procedure, args),
-        _ => Err(EvalError::msg("attempted to call a non-procedure")),
+fn fresh_continuation_id() -> usize {
+    CONTINUATION_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+fn evaluate_call_cc(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+    if arg_exprs.len() != 1 {
+        return Err(EvalError::msg("call/cc expects exactly 1 argument").into());
+    }
+
+    let procedure = evaluate_expr(&arg_exprs[0], env)?;
+    let continuation = Value::Continuation(Rc::new(Continuation {
+        id: fresh_continuation_id(),
+    }));
+    let continuation_id = match &continuation {
+        Value::Continuation(continuation) => continuation.id,
+        _ => unreachable!(),
+    };
+
+    match apply_procedure(procedure, vec![continuation]) {
+        Ok(value) => Ok(value),
+        Err(RuntimeSignal::Escape { id, value }) if id == continuation_id => Ok(value),
+        Err(signal) => Err(signal),
     }
 }
 
-fn apply_closure(procedure: Rc<Closure>, args: Vec<Value>) -> Result<Value, EvalError> {
+fn evaluate_dynamic_wind(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+    if arg_exprs.len() != 3 {
+        return Err(EvalError::msg("dynamic-wind expects exactly 3 arguments").into());
+    }
+
+    let in_thunk = evaluate_expr(&arg_exprs[0], env.clone())?;
+    let body_thunk = evaluate_expr(&arg_exprs[1], env.clone())?;
+    let out_thunk = evaluate_expr(&arg_exprs[2], env)?;
+
+    apply_procedure(in_thunk, Vec::new())?;
+    let body_result = apply_procedure(body_thunk, Vec::new());
+    let out_result = apply_procedure(out_thunk, Vec::new());
+
+    match out_result {
+        Err(signal) => Err(signal),
+        Ok(_) => body_result,
+    }
+}
+
+fn evaluate_raise(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+    if arg_exprs.len() != 1 {
+        return Err(EvalError::msg("raise expects exactly 1 argument").into());
+    }
+
+    let value = evaluate_expr(&arg_exprs[0], env)?;
+    Err(RuntimeSignal::Raised(value))
+}
+
+fn evaluate_with_exception_handler(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+    if arg_exprs.len() != 2 {
+        return Err(EvalError::msg("with-exception-handler expects exactly 2 arguments").into());
+    }
+
+    let handler = evaluate_expr(&arg_exprs[0], env.clone())?;
+    let thunk = evaluate_expr(&arg_exprs[1], env)?;
+
+    match apply_procedure(thunk, Vec::new()) {
+        Ok(value) => Ok(value),
+        Err(RuntimeSignal::Raised(value)) => apply_procedure(handler, vec![value]),
+        Err(signal) => Err(signal),
+    }
+}
+
+fn evaluate_guard(arg_exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
+    if arg_exprs.len() < 2 {
+        return Err(EvalError::msg("guard expects a clause list and a body").into());
+    }
+
+    let Expr::List(spec) = &arg_exprs[0] else {
+        return Err(EvalError::msg("guard expects a clause list").into());
+    };
+
+    let (variable_expr, clauses) = spec
+        .split_first()
+        .ok_or_else(|| RuntimeSignal::from(EvalError::msg("guard expects an exception variable")))?;
+
+    let Expr::Symbol(variable) = variable_expr else {
+        return Err(EvalError::msg("guard expects an exception variable").into());
+    };
+
+    match evaluate_sequence(&arg_exprs[1..], env.clone()) {
+        Ok(value) => Ok(value),
+        Err(RuntimeSignal::Raised(value)) => {
+            let guard_env = Environment::new(Some(env));
+            guard_env.define(variable.clone(), value.clone());
+
+            match evaluate_guard_clauses(clauses, guard_env)? {
+                Some(result) => Ok(result),
+                None => Err(RuntimeSignal::Raised(value)),
+            }
+        }
+        Err(signal) => Err(signal),
+    }
+}
+
+fn evaluate_guard_clauses(clauses: &[Expr], env: EnvRef) -> EvalResult<Option<Value>> {
+    for (index, clause_expr) in clauses.iter().enumerate() {
+        let Expr::List(items) = clause_expr else {
+            return Err(EvalError::msg("guard clauses must be non-empty lists").into());
+        };
+
+        if items.is_empty() {
+            return Err(EvalError::msg("guard clauses must be non-empty lists").into());
+        }
+
+        let (test_expr, body) = items
+            .split_first()
+            .ok_or_else(|| RuntimeSignal::from(EvalError::msg("guard clauses must be non-empty lists")))?;
+
+        if matches!(test_expr, Expr::Symbol(name) if name == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::msg("else clause must be last in guard").into());
+            }
+            if body.is_empty() {
+                return Err(EvalError::msg("else clause requires a body").into());
+            }
+
+            return evaluate_sequence(body, env.clone()).map(Some);
+        }
+
+        let test_value = evaluate_expr(test_expr, env.clone())?;
+        if is_truthy(&test_value) {
+            if body.is_empty() {
+                return Ok(Some(test_value));
+            }
+
+            return evaluate_sequence(body, env.clone()).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn apply_procedure(procedure: Value, args: Vec<Value>) -> EvalResult<Value> {
+    match procedure {
+        Value::Builtin(name) => apply_builtin(name, &args).map_err(RuntimeSignal::from),
+        Value::Closure(procedure) => apply_closure(procedure, args),
+        Value::Continuation(continuation) => apply_continuation(continuation, args),
+        _ => Err(EvalError::msg("attempted to call a non-procedure").into()),
+    }
+}
+
+fn apply_continuation(continuation: Rc<Continuation>, args: Vec<Value>) -> EvalResult<Value> {
+    if args.len() != 1 {
+        return Err(EvalError::msg("continuation expects exactly 1 argument").into());
+    }
+
+    Err(RuntimeSignal::Escape {
+        id: continuation.id,
+        value: args[0].clone(),
+    })
+}
+
+fn apply_closure(procedure: Rc<Closure>, args: Vec<Value>) -> EvalResult<Value> {
     if args.len() != procedure.params.len() {
-        return Err(EvalError::msg(format!(
-            "expected {} arguments, got {}",
-            procedure.params.len(),
-            args.len()
-        )));
+        return Err(
+            EvalError::msg(format!("expected {} arguments, got {}", procedure.params.len(), args.len()))
+                .into(),
+        );
     }
 
     let call_env = Environment::new(Some(procedure.env.clone()));
@@ -1953,7 +2153,7 @@ fn apply_closure(procedure: Rc<Closure>, args: Vec<Value>) -> Result<Value, Eval
     evaluate_sequence(&procedure.body, call_env)
 }
 
-fn evaluate_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+fn evaluate_sequence(exprs: &[Expr], env: EnvRef) -> EvalResult<Value> {
     let mut result = Value::Void;
 
     for expr in exprs {
@@ -1999,6 +2199,8 @@ fn apply_builtin(name: BuiltinName, args: &[Value]) -> Result<Value, EvalError> 
             Ok(make_exact_integer(collect_list_elements(&args[0], "length")?.len() as i128))
         }
         BuiltinName::Append => apply_append(args),
+        BuiltinName::Reverse => apply_reverse(args),
+        BuiltinName::StringAppend => apply_string_append(args),
         BuiltinName::StringPred => apply_type_predicate(args, "string?", |value| {
             matches!(value, Value::String(_))
         }),
@@ -2189,6 +2391,26 @@ fn apply_append(args: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
+fn apply_reverse(args: &[Value]) -> Result<Value, EvalError> {
+    expect_arg_count(args, 1, "reverse")?;
+    let mut elements = collect_list_elements(&args[0], "reverse")?;
+    elements.reverse();
+    Ok(build_list(elements))
+}
+
+fn apply_string_append(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = String::new();
+
+    for value in args {
+        let Value::String(text) = value else {
+            return Err(EvalError::msg("string-append expects string arguments"));
+        };
+        result.push_str(text);
+    }
+
+    Ok(Value::String(result))
+}
+
 fn apply_type_predicate<F>(args: &[Value], name: &str, predicate: F) -> Result<Value, EvalError>
 where
     F: Fn(&Value) -> bool,
@@ -2367,7 +2589,7 @@ fn format_value(value: &Value) -> String {
         Value::Symbol(name) => name.clone(),
         Value::Pair(pair) => format_pair(pair.clone()),
         Value::EmptyList => "()".into(),
-        Value::Builtin(_) | Value::Closure(_) => "#<procedure>".into(),
+        Value::Builtin(_) | Value::Closure(_) | Value::Continuation(_) => "#<procedure>".into(),
         Value::Void => String::new(),
     }
 }

@@ -92,12 +92,26 @@ type DynamicWindContext = {
   before: RuntimeValue;
   after: RuntimeValue;
 };
+type ExceptionHandlerContext = {
+  procedure: RuntimeValue;
+  stack: ContinuationFrame[];
+  winds: DynamicWindContext[];
+  handlers: ExceptionHandlerContext[];
+  pos: SourcePos;
+};
 type ContinuationProcedure = {
   kind: 'continuation';
   stack: ContinuationFrame[];
   winds: DynamicWindContext[];
+  handlers: ExceptionHandlerContext[];
 };
 type VoidValue = { kind: 'void' };
+type GuardHandlerProcedure = {
+  kind: 'guard-handler';
+  variable: string;
+  clauses: Expr[];
+  env: Environment;
+};
 type SyntaxRule = { pattern: Expr; template: Expr };
 type SyntaxRulesMacro = {
   name: string;
@@ -127,6 +141,7 @@ type RuntimeValue =
   | RecordAccessorProcedure
   | RecordMutatorProcedure
   | ContinuationProcedure
+  | GuardHandlerProcedure
   | VoidValue;
 
 type EvalContext = {
@@ -208,6 +223,11 @@ type CondTestFrame = {
   env: Environment;
   pos: SourcePos;
 };
+type ExceptionHandlerReturnFrame = {
+  kind: 'exception-handler-return';
+  handler: ExceptionHandlerContext;
+  pos: SourcePos;
+};
 type DynamicWindEnterFrame = {
   kind: 'dynamic-wind-enter';
   wind: DynamicWindContext;
@@ -224,22 +244,36 @@ type DynamicWindAfterFrame = {
   result: RuntimeValue;
   pos: SourcePos;
 };
+type WindTransferTarget = {
+  stack: ContinuationFrame[];
+  winds: DynamicWindContext[];
+  handlers: ExceptionHandlerContext[];
+};
+type WindTransferCompletion =
+  | {
+      kind: 'value';
+      value: RuntimeValue;
+      target: WindTransferTarget;
+    }
+  | {
+      kind: 'apply';
+      procedure: RuntimeValue;
+      args: RuntimeValue[];
+      target: WindTransferTarget;
+      pos?: SourcePos;
+    };
 type WindTransferAfterFrame = {
   kind: 'wind-transfer-after';
   exiting: DynamicWindContext[];
   entering: DynamicWindContext[];
-  targetStack: ContinuationFrame[];
-  targetWinds: DynamicWindContext[];
-  value: RuntimeValue;
+  completion: WindTransferCompletion;
   pos: SourcePos;
 };
 type WindTransferBeforeFrame = {
   kind: 'wind-transfer-before';
   wind: DynamicWindContext;
   entering: DynamicWindContext[];
-  targetStack: ContinuationFrame[];
-  targetWinds: DynamicWindContext[];
-  value: RuntimeValue;
+  completion: WindTransferCompletion;
   pos: SourcePos;
 };
 
@@ -254,6 +288,7 @@ type ContinuationFrame =
   | OrFrame
   | LetInitFrame
   | CondTestFrame
+  | ExceptionHandlerReturnFrame
   | DynamicWindEnterFrame
   | DynamicWindBodyFrame
   | DynamicWindAfterFrame
@@ -381,6 +416,8 @@ const BUILTIN_NAMES = [
   'call/cc',
   'call-with-current-continuation',
   'dynamic-wind',
+  'raise',
+  'with-exception-handler',
   'error',
 ] as const;
 type BuiltinName = (typeof BUILTIN_NAMES)[number];
@@ -391,6 +428,13 @@ const DEFAULT_SOURCE_POS: SourcePos = { line: 1, col: 1 };
 const ALPHABETIC_CHAR_RE = /^\p{L}$/u;
 const NUMERIC_CHAR_RE = /^\p{N}$/u;
 let macroIdentifierCounter = 0;
+
+class RaisedException {
+  constructor(
+    readonly value: RuntimeValue,
+    public pos?: SourcePos,
+  ) {}
+}
 
 function currentBenchLevel(): number {
   const globalWithProcess = globalThis as typeof globalThis & {
@@ -763,6 +807,7 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
   let action = initialAction;
   const stack: ContinuationFrame[] = [];
   const winds: DynamicWindContext[] = [];
+  const handlers: ExceptionHandlerContext[] = [];
 
   while (true) {
     let errorPos: SourcePos | undefined;
@@ -781,12 +826,12 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
             }
 
             errorPos = frame.pos;
-            action = continueWithFrame(frame, action.value, stack, winds);
+            action = continueWithFrame(frame, action.value, stack, winds, handlers);
           }
           break;
         case 'expr':
           errorPos = action.expr.pos;
-          action = evaluateExprAction(action.expr, action.env, context, stack);
+          action = evaluateExprAction(action.expr, action.env, context, stack, winds, handlers);
           break;
         case 'sequence':
           errorPos = action.pos ?? action.exprs[0]?.pos;
@@ -812,7 +857,14 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
             action = {
               kind: 'apply',
               procedure: action.args[0],
-              args: [{ kind: 'continuation', stack: stack.slice(), winds: winds.slice() }],
+              args: [
+                {
+                  kind: 'continuation',
+                  stack: stack.slice(),
+                  winds: winds.slice(),
+                  handlers: handlers.slice(),
+                },
+              ],
               pos: action.pos,
             };
             break;
@@ -842,6 +894,37 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
             break;
           }
 
+          if (
+            action.procedure.kind === 'builtin' &&
+            action.procedure.name === 'with-exception-handler'
+          ) {
+            if (action.args.length !== 2) {
+              throw new EvalError('with-exception-handler expects exactly 2 arguments');
+            }
+
+            const [handlerProcedure, thunk] = action.args;
+            const handlerContext: ExceptionHandlerContext = {
+              procedure: handlerProcedure,
+              stack: stack.slice(),
+              winds: winds.slice(),
+              handlers: handlers.slice(),
+              pos: action.pos ?? DEFAULT_SOURCE_POS,
+            };
+            stack.push({
+              kind: 'exception-handler-return',
+              handler: handlerContext,
+              pos: handlerContext.pos,
+            });
+            handlers.push(handlerContext);
+            action = {
+              kind: 'apply',
+              procedure: thunk,
+              args: [],
+              pos: action.pos,
+            };
+            break;
+          }
+
           if (action.procedure.kind === 'continuation') {
             if (action.args.length !== 1) {
               throw new EvalError('continuation expects exactly 1 argument');
@@ -854,11 +937,18 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
             action = startWindTransferAction(
               exiting,
               entering,
-              action.procedure.stack,
-              action.procedure.winds,
-              action.args[0],
+              {
+                kind: 'value',
+                value: action.args[0],
+                target: {
+                  stack: action.procedure.stack,
+                  winds: action.procedure.winds,
+                  handlers: action.procedure.handlers,
+                },
+              },
               stack,
               winds,
+              handlers,
               action.pos ?? DEFAULT_SOURCE_POS,
             );
             break;
@@ -868,6 +958,44 @@ function runEvaluation(initialAction: EvalAction, context: EvalContext): Runtime
           break;
       }
     } catch (error) {
+      if (error instanceof RaisedException) {
+        if (error.pos === undefined) {
+          error.pos = errorPos;
+        }
+
+        const handlerContext = handlers[handlers.length - 1];
+        if (handlerContext === undefined) {
+          throw new EvalError(`uncaught exception: ${formatValue(error.value)}`, error.pos);
+        }
+
+        replaceArrayContents(handlers, handlerContext.handlers);
+
+        const sharedPrefixLength = sharedDynamicWindPrefixLength(winds, handlerContext.winds);
+        const exiting = winds.slice(sharedPrefixLength).reverse();
+        const entering = handlerContext.winds.slice(sharedPrefixLength);
+
+        action = startWindTransferAction(
+          exiting,
+          entering,
+          {
+            kind: 'apply',
+            procedure: handlerContext.procedure,
+            args: [error.value],
+            target: {
+              stack: handlerContext.stack,
+              winds: handlerContext.winds,
+              handlers: handlerContext.handlers,
+            },
+            pos: handlerContext.pos,
+          },
+          stack,
+          winds,
+          handlers,
+          handlerContext.pos,
+        );
+        continue;
+      }
+
       if (errorPos !== undefined) {
         throw attachPosition(error, errorPos);
       }
@@ -904,6 +1032,7 @@ function continueWithFrame(
   value: RuntimeValue,
   stack: ContinuationFrame[],
   winds: DynamicWindContext[],
+  handlers: ExceptionHandlerContext[],
 ): EvalAction {
   switch (frame.kind) {
     case 'sequence':
@@ -992,6 +1121,14 @@ function continueWithFrame(
       }
 
       return startSequenceAction(frame.body, frame.env, stack, frame.pos);
+    case 'exception-handler-return': {
+      const currentHandler = handlers.pop();
+      if (currentHandler !== frame.handler) {
+        throw new EvalError('internal error: exception handler stack mismatch');
+      }
+
+      return { kind: 'value', value };
+    }
     case 'dynamic-wind-enter':
       winds.push(frame.wind);
       stack.push({
@@ -1029,11 +1166,10 @@ function continueWithFrame(
       return startWindTransferAction(
         frame.exiting,
         frame.entering,
-        frame.targetStack,
-        frame.targetWinds,
-        frame.value,
+        frame.completion,
         stack,
         winds,
+        handlers,
         frame.pos,
       );
     case 'wind-transfer-before':
@@ -1041,11 +1177,10 @@ function continueWithFrame(
       return startWindTransferAction(
         [],
         frame.entering,
-        frame.targetStack,
-        frame.targetWinds,
-        frame.value,
+        frame.completion,
         stack,
         winds,
+        handlers,
         frame.pos,
       );
   }
@@ -1072,11 +1207,10 @@ function sharedDynamicWindPrefixLength(
 function startWindTransferAction(
   exiting: DynamicWindContext[],
   entering: DynamicWindContext[],
-  targetStack: ContinuationFrame[],
-  targetWinds: DynamicWindContext[],
-  value: RuntimeValue,
+  completion: WindTransferCompletion,
   stack: ContinuationFrame[],
   winds: DynamicWindContext[],
+  handlers: ExceptionHandlerContext[],
   pos: SourcePos,
 ): EvalAction {
   if (exiting.length > 0) {
@@ -1090,9 +1224,7 @@ function startWindTransferAction(
       kind: 'wind-transfer-after',
       exiting: remainingExits,
       entering,
-      targetStack,
-      targetWinds,
-      value,
+      completion,
       pos,
     });
     return {
@@ -1109,9 +1241,7 @@ function startWindTransferAction(
       kind: 'wind-transfer-before',
       wind,
       entering: remainingEntries,
-      targetStack,
-      targetWinds,
-      value,
+      completion,
       pos,
     });
     return {
@@ -1122,9 +1252,19 @@ function startWindTransferAction(
     };
   }
 
-  replaceArrayContents(stack, targetStack);
-  replaceArrayContents(winds, targetWinds);
-  return { kind: 'value', value };
+  replaceArrayContents(stack, completion.target.stack);
+  replaceArrayContents(winds, completion.target.winds);
+  replaceArrayContents(handlers, completion.target.handlers);
+  if (completion.kind === 'value') {
+    return { kind: 'value', value: completion.value };
+  }
+
+  return {
+    kind: 'apply',
+    procedure: completion.procedure,
+    args: completion.args,
+    pos: completion.pos,
+  };
 }
 
 function startShortCircuitAction(
@@ -1171,6 +1311,8 @@ function evaluateExprAction(
   env: Environment,
   context: EvalContext,
   stack: ContinuationFrame[],
+  winds: DynamicWindContext[],
+  handlers: ExceptionHandlerContext[],
 ): EvalAction {
   switch (expr.kind) {
     case 'number':
@@ -1183,7 +1325,7 @@ function evaluateExprAction(
     case 'symbol':
       return { kind: 'value', value: env.lookup(expr.name) };
     case 'list':
-      return evaluateListAction(expr, env, context, stack);
+      return evaluateListAction(expr, env, context, stack, winds, handlers);
   }
 }
 
@@ -1192,6 +1334,8 @@ function evaluateListAction(
   env: Environment,
   context: EvalContext,
   stack: ContinuationFrame[],
+  winds: DynamicWindContext[],
+  handlers: ExceptionHandlerContext[],
 ): EvalAction {
   if (expr.elements.length === 0) {
     throw new EvalError('cannot evaluate empty list');
@@ -1237,6 +1381,8 @@ function evaluateListAction(
         return evaluateCaseAction(argExprs, env, context);
       case 'do':
         return evaluateDoAction(argExprs, env, context);
+      case 'guard':
+        return evaluateGuardAction(argExprs, env, stack, winds, handlers, expr.pos);
     }
 
     const macroRules = env.lookupMacro(head.name);
@@ -2531,6 +2677,7 @@ function isSpecialFormName(name: string): boolean {
     case 'cond':
     case 'case':
     case 'do':
+    case 'guard':
     case 'syntax-rules':
     case 'else':
     case '.':
@@ -2891,6 +3038,50 @@ function evaluateDoAction(argExprs: Expr[], env: Environment, context: EvalConte
   }
 }
 
+function evaluateGuardAction(
+  argExprs: Expr[],
+  env: Environment,
+  stack: ContinuationFrame[],
+  winds: DynamicWindContext[],
+  handlers: ExceptionHandlerContext[],
+  pos: SourcePos,
+): EvalAction {
+  if (argExprs.length < 2) {
+    throw new EvalError('guard expects a clause list and a body');
+  }
+
+  const specExpr = argExprs[0];
+  if (specExpr.kind !== 'list') {
+    throw new EvalError('guard expects a clause list');
+  }
+
+  const [variableExpr, ...clauses] = specExpr.elements;
+  if (variableExpr?.kind !== 'symbol') {
+    throw new EvalError('guard expects an exception variable');
+  }
+
+  const handlerContext: ExceptionHandlerContext = {
+    procedure: {
+      kind: 'guard-handler',
+      variable: variableExpr.name,
+      clauses,
+      env,
+    },
+    stack: stack.slice(),
+    winds: winds.slice(),
+    handlers: handlers.slice(),
+    pos,
+  };
+
+  stack.push({
+    kind: 'exception-handler-return',
+    handler: handlerContext,
+    pos,
+  });
+  handlers.push(handlerContext);
+  return startSequenceAction(argExprs.slice(1), env, stack, pos);
+}
+
 function readDoBindings(
   bindingsExpr: Expr,
 ): Array<{ name: string; initExpr: Expr; stepExpr?: Expr }> {
@@ -2949,9 +3140,62 @@ function applyProcedureAction(
       return { kind: 'value', value: applyRecordAccessor(procedure, args) };
     case 'record-mutator':
       return { kind: 'value', value: applyRecordMutator(procedure, args) };
+    case 'guard-handler':
+      return { kind: 'value', value: applyGuardHandler(procedure, args, context) };
     default:
       throw new EvalError('attempted to call a non-procedure');
   }
+}
+
+function applyGuardHandler(
+  procedure: GuardHandlerProcedure,
+  args: RuntimeValue[],
+  context: EvalContext,
+): RuntimeValue {
+  if (args.length !== 1) {
+    throw new EvalError('guard handler expects exactly 1 argument');
+  }
+
+  const exceptionValue = args[0];
+  const guardEnv = new Environment(procedure.env);
+  guardEnv.define(procedure.variable, exceptionValue);
+
+  return evaluateGuardClauses(procedure.clauses, guardEnv, context, exceptionValue);
+}
+
+function evaluateGuardClauses(
+  clauses: Expr[],
+  env: Environment,
+  context: EvalContext,
+  exceptionValue: RuntimeValue,
+): RuntimeValue {
+  for (let index = 0; index < clauses.length; index += 1) {
+    const clauseExpr = clauses[index];
+    if (clauseExpr.kind !== 'list' || clauseExpr.elements.length === 0) {
+      throw new EvalError('guard clauses must be non-empty lists');
+    }
+
+    const [testExpr, ...body] = clauseExpr.elements;
+    const isElseClause = testExpr.kind === 'symbol' && testExpr.name === 'else';
+
+    if (isElseClause) {
+      if (index !== clauses.length - 1) {
+        throw new EvalError('else clause must be last in guard');
+      }
+      if (body.length === 0) {
+        throw new EvalError('else clause requires a body');
+      }
+
+      return evaluateSequence(body, env, context);
+    }
+
+    const testValue = evaluateExpr(testExpr, env, context);
+    if (isTruthy(testValue)) {
+      return body.length === 0 ? testValue : evaluateSequence(body, env, context);
+    }
+  }
+
+  throw new RaisedException(exceptionValue);
 }
 
 function applyRecordConstructor(
@@ -3395,7 +3639,10 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
     case 'call/cc':
     case 'call-with-current-continuation':
     case 'dynamic-wind':
+    case 'with-exception-handler':
       throw new EvalError('internal error: continuation application must be handled by the evaluator');
+    case 'raise':
+      return applyRaise(args);
     case 'error':
       return applyError(args);
   }
@@ -4251,6 +4498,7 @@ function isCallableValue(value: RuntimeValue): boolean {
     case 'record-accessor':
     case 'record-mutator':
     case 'continuation':
+    case 'guard-handler':
       return true;
     default:
       return false;
@@ -4340,6 +4588,7 @@ function formatValueWithModeInternal(
     case 'record-accessor':
     case 'record-mutator':
     case 'continuation':
+    case 'guard-handler':
       return '#<procedure>';
     case 'void':
       return '';
@@ -4558,6 +4807,14 @@ function roundToEven(value: number): number {
   }
 
   return truncated + (value >= 0 ? 1 : -1);
+}
+
+function applyRaise(args: RuntimeValue[]): never {
+  if (args.length !== 1) {
+    throw new EvalError('raise expects exactly 1 argument');
+  }
+
+  throw new RaisedException(args[0]);
 }
 
 function applyError(args: RuntimeValue[]): never {

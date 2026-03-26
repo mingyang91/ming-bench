@@ -115,6 +115,8 @@ const BUILTIN_NAMES = [
     'call/cc',
     'call-with-current-continuation',
     'dynamic-wind',
+    'raise',
+    'with-exception-handler',
     'error',
 ];
 const NIL_VALUE = { kind: 'nil' };
@@ -123,6 +125,14 @@ const DEFAULT_SOURCE_POS = { line: 1, col: 1 };
 const ALPHABETIC_CHAR_RE = /^\p{L}$/u;
 const NUMERIC_CHAR_RE = /^\p{N}$/u;
 let macroIdentifierCounter = 0;
+class RaisedException {
+    value;
+    pos;
+    constructor(value, pos) {
+        this.value = value;
+        this.pos = pos;
+    }
+}
 function currentBenchLevel() {
     const globalWithProcess = globalThis;
     const rawLevel = globalWithProcess.process?.env?.BENCH_LEVEL;
@@ -418,6 +428,7 @@ function runEvaluation(initialAction, context) {
     let action = initialAction;
     const stack = [];
     const winds = [];
+    const handlers = [];
     while (true) {
         let errorPos;
         try {
@@ -432,12 +443,12 @@ function runEvaluation(initialAction, context) {
                             return action.value;
                         }
                         errorPos = frame.pos;
-                        action = continueWithFrame(frame, action.value, stack, winds);
+                        action = continueWithFrame(frame, action.value, stack, winds, handlers);
                     }
                     break;
                 case 'expr':
                     errorPos = action.expr.pos;
-                    action = evaluateExprAction(action.expr, action.env, context, stack);
+                    action = evaluateExprAction(action.expr, action.env, context, stack, winds, handlers);
                     break;
                 case 'sequence':
                     errorPos = action.pos ?? action.exprs[0]?.pos;
@@ -454,7 +465,14 @@ function runEvaluation(initialAction, context) {
                         action = {
                             kind: 'apply',
                             procedure: action.args[0],
-                            args: [{ kind: 'continuation', stack: stack.slice(), winds: winds.slice() }],
+                            args: [
+                                {
+                                    kind: 'continuation',
+                                    stack: stack.slice(),
+                                    winds: winds.slice(),
+                                    handlers: handlers.slice(),
+                                },
+                            ],
                             pos: action.pos,
                         };
                         break;
@@ -481,6 +499,33 @@ function runEvaluation(initialAction, context) {
                         };
                         break;
                     }
+                    if (action.procedure.kind === 'builtin' &&
+                        action.procedure.name === 'with-exception-handler') {
+                        if (action.args.length !== 2) {
+                            throw new EvalError('with-exception-handler expects exactly 2 arguments');
+                        }
+                        const [handlerProcedure, thunk] = action.args;
+                        const handlerContext = {
+                            procedure: handlerProcedure,
+                            stack: stack.slice(),
+                            winds: winds.slice(),
+                            handlers: handlers.slice(),
+                            pos: action.pos ?? DEFAULT_SOURCE_POS,
+                        };
+                        stack.push({
+                            kind: 'exception-handler-return',
+                            handler: handlerContext,
+                            pos: handlerContext.pos,
+                        });
+                        handlers.push(handlerContext);
+                        action = {
+                            kind: 'apply',
+                            procedure: thunk,
+                            args: [],
+                            pos: action.pos,
+                        };
+                        break;
+                    }
                     if (action.procedure.kind === 'continuation') {
                         if (action.args.length !== 1) {
                             throw new EvalError('continuation expects exactly 1 argument');
@@ -488,7 +533,15 @@ function runEvaluation(initialAction, context) {
                         const sharedPrefixLength = sharedDynamicWindPrefixLength(winds, action.procedure.winds);
                         const exiting = winds.slice(sharedPrefixLength).reverse();
                         const entering = action.procedure.winds.slice(sharedPrefixLength);
-                        action = startWindTransferAction(exiting, entering, action.procedure.stack, action.procedure.winds, action.args[0], stack, winds, action.pos ?? DEFAULT_SOURCE_POS);
+                        action = startWindTransferAction(exiting, entering, {
+                            kind: 'value',
+                            value: action.args[0],
+                            target: {
+                                stack: action.procedure.stack,
+                                winds: action.procedure.winds,
+                                handlers: action.procedure.handlers,
+                            },
+                        }, stack, winds, handlers, action.pos ?? DEFAULT_SOURCE_POS);
                         break;
                     }
                     action = applyProcedureAction(action.procedure, action.args, context);
@@ -496,6 +549,31 @@ function runEvaluation(initialAction, context) {
             }
         }
         catch (error) {
+            if (error instanceof RaisedException) {
+                if (error.pos === undefined) {
+                    error.pos = errorPos;
+                }
+                const handlerContext = handlers[handlers.length - 1];
+                if (handlerContext === undefined) {
+                    throw new EvalError(`uncaught exception: ${formatValue(error.value)}`, error.pos);
+                }
+                replaceArrayContents(handlers, handlerContext.handlers);
+                const sharedPrefixLength = sharedDynamicWindPrefixLength(winds, handlerContext.winds);
+                const exiting = winds.slice(sharedPrefixLength).reverse();
+                const entering = handlerContext.winds.slice(sharedPrefixLength);
+                action = startWindTransferAction(exiting, entering, {
+                    kind: 'apply',
+                    procedure: handlerContext.procedure,
+                    args: [error.value],
+                    target: {
+                        stack: handlerContext.stack,
+                        winds: handlerContext.winds,
+                        handlers: handlerContext.handlers,
+                    },
+                    pos: handlerContext.pos,
+                }, stack, winds, handlers, handlerContext.pos);
+                continue;
+            }
             if (errorPos !== undefined) {
                 throw attachPosition(error, errorPos);
             }
@@ -517,7 +595,7 @@ function startSequenceAction(exprs, env, stack, pos) {
     }
     return { kind: 'expr', expr: exprs[0], env };
 }
-function continueWithFrame(frame, value, stack, winds) {
+function continueWithFrame(frame, value, stack, winds, handlers) {
     switch (frame.kind) {
         case 'sequence':
             return startSequenceAction(frame.remainingExprs, frame.env, stack, frame.pos);
@@ -597,6 +675,13 @@ function continueWithFrame(frame, value, stack, winds) {
                 return { kind: 'value', value };
             }
             return startSequenceAction(frame.body, frame.env, stack, frame.pos);
+        case 'exception-handler-return': {
+            const currentHandler = handlers.pop();
+            if (currentHandler !== frame.handler) {
+                throw new EvalError('internal error: exception handler stack mismatch');
+            }
+            return { kind: 'value', value };
+        }
         case 'dynamic-wind-enter':
             winds.push(frame.wind);
             stack.push({
@@ -630,10 +715,10 @@ function continueWithFrame(frame, value, stack, winds) {
         case 'dynamic-wind-after':
             return { kind: 'value', value: frame.result };
         case 'wind-transfer-after':
-            return startWindTransferAction(frame.exiting, frame.entering, frame.targetStack, frame.targetWinds, frame.value, stack, winds, frame.pos);
+            return startWindTransferAction(frame.exiting, frame.entering, frame.completion, stack, winds, handlers, frame.pos);
         case 'wind-transfer-before':
             winds.push(frame.wind);
-            return startWindTransferAction([], frame.entering, frame.targetStack, frame.targetWinds, frame.value, stack, winds, frame.pos);
+            return startWindTransferAction([], frame.entering, frame.completion, stack, winds, handlers, frame.pos);
     }
 }
 function replaceArrayContents(target, source) {
@@ -647,7 +732,7 @@ function sharedDynamicWindPrefixLength(left, right) {
     }
     return index;
 }
-function startWindTransferAction(exiting, entering, targetStack, targetWinds, value, stack, winds, pos) {
+function startWindTransferAction(exiting, entering, completion, stack, winds, handlers, pos) {
     if (exiting.length > 0) {
         const [wind, ...remainingExits] = exiting;
         const currentWind = winds.pop();
@@ -658,9 +743,7 @@ function startWindTransferAction(exiting, entering, targetStack, targetWinds, va
             kind: 'wind-transfer-after',
             exiting: remainingExits,
             entering,
-            targetStack,
-            targetWinds,
-            value,
+            completion,
             pos,
         });
         return {
@@ -676,9 +759,7 @@ function startWindTransferAction(exiting, entering, targetStack, targetWinds, va
             kind: 'wind-transfer-before',
             wind,
             entering: remainingEntries,
-            targetStack,
-            targetWinds,
-            value,
+            completion,
             pos,
         });
         return {
@@ -688,9 +769,18 @@ function startWindTransferAction(exiting, entering, targetStack, targetWinds, va
             pos,
         };
     }
-    replaceArrayContents(stack, targetStack);
-    replaceArrayContents(winds, targetWinds);
-    return { kind: 'value', value };
+    replaceArrayContents(stack, completion.target.stack);
+    replaceArrayContents(winds, completion.target.winds);
+    replaceArrayContents(handlers, completion.target.handlers);
+    if (completion.kind === 'value') {
+        return { kind: 'value', value: completion.value };
+    }
+    return {
+        kind: 'apply',
+        procedure: completion.procedure,
+        args: completion.args,
+        pos: completion.pos,
+    };
 }
 function startShortCircuitAction(kind, exprs, env, stack, pos) {
     if (exprs.length === 0) {
@@ -717,7 +807,7 @@ function startApplicationAction(expr, env, stack) {
     });
     return { kind: 'expr', expr: head, env };
 }
-function evaluateExprAction(expr, env, context, stack) {
+function evaluateExprAction(expr, env, context, stack, winds, handlers) {
     switch (expr.kind) {
         case 'number':
         case 'boolean':
@@ -729,10 +819,10 @@ function evaluateExprAction(expr, env, context, stack) {
         case 'symbol':
             return { kind: 'value', value: env.lookup(expr.name) };
         case 'list':
-            return evaluateListAction(expr, env, context, stack);
+            return evaluateListAction(expr, env, context, stack, winds, handlers);
     }
 }
-function evaluateListAction(expr, env, context, stack) {
+function evaluateListAction(expr, env, context, stack, winds, handlers) {
     if (expr.elements.length === 0) {
         throw new EvalError('cannot evaluate empty list');
     }
@@ -775,6 +865,8 @@ function evaluateListAction(expr, env, context, stack) {
                 return evaluateCaseAction(argExprs, env, context);
             case 'do':
                 return evaluateDoAction(argExprs, env, context);
+            case 'guard':
+                return evaluateGuardAction(argExprs, env, stack, winds, handlers, expr.pos);
         }
         const macroRules = env.lookupMacro(head.name);
         if (macroRules !== undefined) {
@@ -1568,6 +1660,7 @@ function isSpecialFormName(name) {
         case 'cond':
         case 'case':
         case 'do':
+        case 'guard':
         case 'syntax-rules':
         case 'else':
         case '.':
@@ -1819,6 +1912,38 @@ function evaluateDoAction(argExprs, env, context) {
         }
     }
 }
+function evaluateGuardAction(argExprs, env, stack, winds, handlers, pos) {
+    if (argExprs.length < 2) {
+        throw new EvalError('guard expects a clause list and a body');
+    }
+    const specExpr = argExprs[0];
+    if (specExpr.kind !== 'list') {
+        throw new EvalError('guard expects a clause list');
+    }
+    const [variableExpr, ...clauses] = specExpr.elements;
+    if (variableExpr?.kind !== 'symbol') {
+        throw new EvalError('guard expects an exception variable');
+    }
+    const handlerContext = {
+        procedure: {
+            kind: 'guard-handler',
+            variable: variableExpr.name,
+            clauses,
+            env,
+        },
+        stack: stack.slice(),
+        winds: winds.slice(),
+        handlers: handlers.slice(),
+        pos,
+    };
+    stack.push({
+        kind: 'exception-handler-return',
+        handler: handlerContext,
+        pos,
+    });
+    handlers.push(handlerContext);
+    return startSequenceAction(argExprs.slice(1), env, stack, pos);
+}
 function readDoBindings(bindingsExpr) {
     if (bindingsExpr.kind !== 'list') {
         throw new EvalError('do bindings must be a list');
@@ -1859,9 +1984,44 @@ function applyProcedureAction(procedure, args, context) {
             return { kind: 'value', value: applyRecordAccessor(procedure, args) };
         case 'record-mutator':
             return { kind: 'value', value: applyRecordMutator(procedure, args) };
+        case 'guard-handler':
+            return { kind: 'value', value: applyGuardHandler(procedure, args, context) };
         default:
             throw new EvalError('attempted to call a non-procedure');
     }
+}
+function applyGuardHandler(procedure, args, context) {
+    if (args.length !== 1) {
+        throw new EvalError('guard handler expects exactly 1 argument');
+    }
+    const exceptionValue = args[0];
+    const guardEnv = new Environment(procedure.env);
+    guardEnv.define(procedure.variable, exceptionValue);
+    return evaluateGuardClauses(procedure.clauses, guardEnv, context, exceptionValue);
+}
+function evaluateGuardClauses(clauses, env, context, exceptionValue) {
+    for (let index = 0; index < clauses.length; index += 1) {
+        const clauseExpr = clauses[index];
+        if (clauseExpr.kind !== 'list' || clauseExpr.elements.length === 0) {
+            throw new EvalError('guard clauses must be non-empty lists');
+        }
+        const [testExpr, ...body] = clauseExpr.elements;
+        const isElseClause = testExpr.kind === 'symbol' && testExpr.name === 'else';
+        if (isElseClause) {
+            if (index !== clauses.length - 1) {
+                throw new EvalError('else clause must be last in guard');
+            }
+            if (body.length === 0) {
+                throw new EvalError('else clause requires a body');
+            }
+            return evaluateSequence(body, env, context);
+        }
+        const testValue = evaluateExpr(testExpr, env, context);
+        if (isTruthy(testValue)) {
+            return body.length === 0 ? testValue : evaluateSequence(body, env, context);
+        }
+    }
+    throw new RaisedException(exceptionValue);
 }
 function applyRecordConstructor(procedure, args) {
     if (args.length !== procedure.fieldIndexes.length) {
@@ -2247,7 +2407,10 @@ function applyBuiltin(name, args, context) {
         case 'call/cc':
         case 'call-with-current-continuation':
         case 'dynamic-wind':
+        case 'with-exception-handler':
             throw new EvalError('internal error: continuation application must be handled by the evaluator');
+        case 'raise':
+            return applyRaise(args);
         case 'error':
             return applyError(args);
     }
@@ -2866,6 +3029,7 @@ function isCallableValue(value) {
         case 'record-accessor':
         case 'record-mutator':
         case 'continuation':
+        case 'guard-handler':
             return true;
         default:
             return false;
@@ -2941,6 +3105,7 @@ function formatValueWithModeInternal(value, mode, seen) {
         case 'record-accessor':
         case 'record-mutator':
         case 'continuation':
+        case 'guard-handler':
             return '#<procedure>';
         case 'void':
             return '';
@@ -3115,6 +3280,12 @@ function roundToEven(value) {
         return truncated;
     }
     return truncated + (value >= 0 ? 1 : -1);
+}
+function applyRaise(args) {
+    if (args.length !== 1) {
+        throw new EvalError('raise expects exactly 1 argument');
+    }
+    throw new RaisedException(args[0]);
 }
 function applyError(args) {
     if (args.length === 0) {
