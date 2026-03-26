@@ -91,6 +91,7 @@ impl Evaluator {
                 "if" => self.eval_if(arguments, env),
                 "quote" => self.eval_quote(arguments),
                 "lambda" => self.eval_lambda(arguments, env),
+                "case-lambda" => self.eval_case_lambda(arguments, env),
                 "syntax" => self.eval_syntax(arguments, env),
                 "syntax-case" => self.eval_syntax_case(arguments, env),
                 "with-syntax" => self.eval_with_syntax(arguments, env),
@@ -223,6 +224,33 @@ impl Evaluator {
             body: arguments[1..].to_vec(),
             env,
         })))
+    }
+
+    fn eval_case_lambda(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        if arguments.is_empty() {
+            return Err(EvalError::message(
+                "case-lambda requires at least one clause",
+            ));
+        }
+
+        let mut clauses = Vec::with_capacity(arguments.len());
+        for clause_expr in arguments {
+            let ExprKind::List(elements) = &clause_expr.kind else {
+                return Err(EvalError::message("case-lambda clause must be a list"));
+            };
+            if elements.len() < 2 {
+                return Err(EvalError::message(
+                    "case-lambda clause requires parameters and a body",
+                ));
+            }
+
+            clauses.push(CaseLambdaClause {
+                parameters: parse_parameter_names(&elements[0])?,
+                body: elements[1..].to_vec(),
+            });
+        }
+
+        Ok(Value::CaseLambda(Rc::new(CaseLambdaValue { clauses, env })))
     }
 
     fn eval_syntax(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
@@ -668,6 +696,10 @@ impl Evaluator {
         match operator {
             Value::Builtin(builtin) => (builtin.implementation)(self, &arguments),
             Value::Closure(closure) => self.apply_closure(&closure, arguments),
+            Value::CaseLambda(case_lambda) => self.apply_case_lambda(&case_lambda, arguments),
+            Value::Continuation(continuation) => {
+                self.apply_continuation(&continuation, arguments)
+            }
             Value::RecordProcedure(procedure) => self.apply_record_procedure(procedure, arguments),
             _ => Err(EvalError::message("attempted to call a non-procedure")),
         }
@@ -678,29 +710,77 @@ impl Evaluator {
         closure: &ClosureValue,
         arguments: Vec<Value>,
     ) -> Result<Value, EvalError> {
-        let required = closure.parameters.required.len();
-        if closure.parameters.rest.is_some() {
-            require_min_args("lambda", arguments.len(), required)?;
-        } else {
-            require_exact_args("lambda", arguments.len(), required)?;
+        self.apply_parameterized_procedure(
+            &closure.parameters,
+            &closure.body,
+            closure.env.clone(),
+            arguments,
+            "lambda",
+        )
+    }
+
+    fn apply_case_lambda(
+        &self,
+        case_lambda: &CaseLambdaValue,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        for clause in &case_lambda.clauses {
+            if parameter_spec_accepts_arity(&clause.parameters, arguments.len()) {
+                return self.apply_parameterized_procedure(
+                    &clause.parameters,
+                    &clause.body,
+                    case_lambda.env.clone(),
+                    arguments,
+                    "case-lambda",
+                );
+            }
         }
 
-        let call_env = Env::new(Some(closure.env.clone()));
-        for (name, value) in closure
-            .parameters
+        Err(EvalError::message(format!(
+            "case-lambda has no matching clause for {} argument(s)",
+            arguments.len()
+        )))
+    }
+
+    fn apply_continuation(
+        &self,
+        _continuation: &ContinuationValue,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        require_exact_args("continuation", arguments.len(), 1)?;
+        Ok(arguments[0].clone())
+    }
+
+    fn apply_parameterized_procedure(
+        &self,
+        parameters: &ParameterSpec,
+        body: &[Expr],
+        env: Rc<Env>,
+        arguments: Vec<Value>,
+        procedure_name: &str,
+    ) -> Result<Value, EvalError> {
+        let required = parameters.required.len();
+        if parameters.rest.is_some() {
+            require_min_args(procedure_name, arguments.len(), required)?;
+        } else {
+            require_exact_args(procedure_name, arguments.len(), required)?;
+        }
+
+        let call_env = Env::new(Some(env));
+        for (name, value) in parameters
             .required
             .iter()
             .zip(arguments.iter().take(required).cloned())
         {
             call_env.define(name.clone(), value);
         }
-        if let Some(rest_name) = &closure.parameters.rest {
+        if let Some(rest_name) = &parameters.rest {
             call_env.define(
                 rest_name.clone(),
                 list_value(arguments[required..].to_vec()),
             );
         }
-        self.eval_sequence(&closure.body, call_env)
+        self.eval_sequence(body, call_env)
     }
 
     fn apply_record_procedure(
@@ -1004,6 +1084,7 @@ fn create_global_env() -> Rc<Env> {
     env.define_builtin("boolean?", |_, arguments| builtin_is_boolean(arguments));
     env.define_builtin("pair?", |_, arguments| builtin_is_pair(arguments));
     env.define_builtin("symbol?", |_, arguments| builtin_is_symbol(arguments));
+    env.define_builtin("procedure?", |_, arguments| builtin_is_procedure(arguments));
     env.define_builtin("vector", |_, arguments| builtin_vector(arguments));
     env.define_builtin("make-vector", |_, arguments| builtin_make_vector(arguments));
     env.define_builtin("vector-ref", |_, arguments| builtin_vector_ref(arguments));
@@ -1018,6 +1099,11 @@ fn create_global_env() -> Rc<Env> {
     env.define_builtin("list->vector", |_, arguments| {
         builtin_list_to_vector(arguments)
     });
+    env.define_builtin("call/cc", builtin_call_cc);
+    env.define_builtin(
+        "call-with-current-continuation",
+        builtin_call_with_current_continuation,
+    );
     env.define_builtin("apply", builtin_apply);
     env.define_builtin("map", builtin_map);
     env
@@ -1704,6 +1790,17 @@ fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Bool(false))
 }
 
+fn is_procedure(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Builtin(_)
+            | Value::Closure(_)
+            | Value::CaseLambda(_)
+            | Value::Continuation(_)
+            | Value::RecordProcedure(_)
+    )
+}
+
 fn eqv_values(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Int(left), Value::Int(right)) => left == right,
@@ -1717,6 +1814,8 @@ fn eqv_values(left: &Value, right: &Value) -> bool {
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Builtin(left), Value::Builtin(right)) => left.name == right.name,
         (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
+        (Value::CaseLambda(left), Value::CaseLambda(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
         (Value::RecordProcedure(left), Value::RecordProcedure(right)) => {
             record_procedure_eqv(left, right)
         }
@@ -1842,9 +1941,11 @@ fn render(value: &Value) -> String {
         Value::Pair(pair) => render_pair(pair.as_ref()),
         Value::Vector(vector) => render_vector(vector.as_ref()),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
-        Value::Builtin(_) | Value::Closure(_) | Value::RecordProcedure(_) => {
-            "#<procedure>".to_string()
-        }
+        Value::Builtin(_)
+        | Value::Closure(_)
+        | Value::CaseLambda(_)
+        | Value::Continuation(_)
+        | Value::RecordProcedure(_) => "#<procedure>".to_string(),
         Value::Void => "#<void>".to_string(),
         Value::Uninitialized => "#<uninitialized>".to_string(),
     }
@@ -2314,6 +2415,33 @@ fn builtin_apply(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, Ev
     evaluator.apply_procedure(operator, applied_arguments)
 }
 
+fn builtin_call_cc(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
+    builtin_call_with_current_continuation_impl("call/cc", evaluator, arguments)
+}
+
+fn builtin_call_with_current_continuation(
+    evaluator: &Evaluator,
+    arguments: &[Value],
+) -> Result<Value, EvalError> {
+    builtin_call_with_current_continuation_impl(
+        "call-with-current-continuation",
+        evaluator,
+        arguments,
+    )
+}
+
+fn builtin_call_with_current_continuation_impl(
+    operator: &str,
+    evaluator: &Evaluator,
+    arguments: &[Value],
+) -> Result<Value, EvalError> {
+    require_exact_args(operator, arguments.len(), 1)?;
+    evaluator.apply_procedure(
+        arguments[0].clone(),
+        vec![Value::Continuation(Rc::new(ContinuationValue))],
+    )
+}
+
 fn builtin_map(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
     require_min_args("map", arguments.len(), 2)?;
 
@@ -2361,6 +2489,10 @@ fn builtin_is_symbol(arguments: &[Value]) -> Result<Value, EvalError> {
     type_predicate("symbol?", arguments, |value| {
         matches!(value, Value::Symbol(_))
     })
+}
+
+fn builtin_is_procedure(arguments: &[Value]) -> Result<Value, EvalError> {
+    type_predicate("procedure?", arguments, is_procedure)
 }
 
 fn builtin_vector(arguments: &[Value]) -> Result<Value, EvalError> {
@@ -2480,6 +2612,8 @@ enum Value {
     Record(Rc<RecordValue>),
     Builtin(Builtin),
     Closure(Rc<ClosureValue>),
+    CaseLambda(Rc<CaseLambdaValue>),
+    Continuation(Rc<ContinuationValue>),
     RecordProcedure(RecordProcedure),
     Void,
     Uninitialized,
@@ -2529,6 +2663,21 @@ struct ClosureValue {
 }
 
 #[derive(Clone)]
+struct CaseLambdaValue {
+    clauses: Vec<CaseLambdaClause>,
+    env: Rc<Env>,
+}
+
+#[derive(Clone)]
+struct CaseLambdaClause {
+    parameters: ParameterSpec,
+    body: Vec<Expr>,
+}
+
+#[derive(Clone)]
+struct ContinuationValue;
+
+#[derive(Clone)]
 struct BindingSpec {
     name: String,
     init_expr: Expr,
@@ -2550,6 +2699,14 @@ enum PatternBinding {
 struct ParameterSpec {
     required: Vec<String>,
     rest: Option<String>,
+}
+
+fn parameter_spec_accepts_arity(parameters: &ParameterSpec, argument_count: usize) -> bool {
+    if parameters.rest.is_some() {
+        argument_count >= parameters.required.len()
+    } else {
+        argument_count == parameters.required.len()
+    }
 }
 
 struct RecordType {
