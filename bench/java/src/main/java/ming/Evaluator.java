@@ -17,6 +17,9 @@ public class Evaluator {
     private record Binding(String name, Expr valueExpression) {
     }
 
+    private record DoBinding(String name, Expr initExpression, Expr stepExpression) {
+    }
+
     private sealed interface MatchBinding permits SingleMatchBinding, RepeatedMatchBinding {
     }
 
@@ -111,6 +114,7 @@ public class Evaluator {
         environment.define("symbol?", new PrimitiveProcedureValue("symbol?", this::applySymbolPredicate));
         environment.define("procedure?", new PrimitiveProcedureValue("procedure?", this::applyProcedurePredicate));
         environment.define("eq?", new PrimitiveProcedureValue("eq?", this::applyEq));
+        environment.define("eqv?", new PrimitiveProcedureValue("eqv?", this::applyEqv));
         environment.define("equal?", new PrimitiveProcedureValue("equal?", this::applyEqual));
         environment.define("display", new PrimitiveProcedureValue("display", this::applyDisplay));
         environment.define("write", new PrimitiveProcedureValue("write", this::applyWrite));
@@ -161,6 +165,14 @@ public class Evaluator {
         environment.define("assoc", new PrimitiveProcedureValue("assoc", this::applyAssoc));
         environment.define("apply", new PrimitiveProcedureValue("apply", this::applyApply));
         environment.define("map", new PrimitiveProcedureValue("map", this::applyMap));
+        environment.define("vector", new PrimitiveProcedureValue("vector", this::applyVector));
+        environment.define("make-vector", new PrimitiveProcedureValue("make-vector", this::applyMakeVector));
+        environment.define("vector-ref", new PrimitiveProcedureValue("vector-ref", this::applyVectorRef));
+        environment.define("vector-set!", new PrimitiveProcedureValue("vector-set!", this::applyVectorSet));
+        environment.define("vector-length", new PrimitiveProcedureValue("vector-length", this::applyVectorLength));
+        environment.define("vector?", new PrimitiveProcedureValue("vector?", this::applyVectorPredicate));
+        environment.define("vector->list", new PrimitiveProcedureValue("vector->list", this::applyVectorToList));
+        environment.define("list->vector", new PrimitiveProcedureValue("list->vector", this::applyListToVector));
         return environment;
     }
 
@@ -211,6 +223,10 @@ public class Evaluator {
                 case "begin" -> evalBegin(arguments, environment);
                 case "cond" -> evalCond(arguments, environment);
                 case "let" -> evalLet(arguments, environment);
+                case "letrec" -> evalLetRec(arguments, environment, false);
+                case "letrec*" -> evalLetRec(arguments, environment, true);
+                case "case" -> evalCase(arguments, environment);
+                case "do" -> evalDo(arguments, environment);
                 case "and" -> evalAnd(arguments, environment);
                 case "or" -> evalOr(arguments, environment);
                 default -> applyProcedure(operatorExpression, arguments, environment);
@@ -430,10 +446,18 @@ public class Evaluator {
     }
 
     private Value evalIf(List<Expr> arguments, Environment environment) throws EvalError {
-        requireExactArity("if", arguments.size(), 3);
+        if (arguments.size() < 2 || arguments.size() > 3) {
+            throw new EvalError("if expected 2 or 3 argument(s)");
+        }
+
         Value condition = eval(arguments.get(0), environment);
-        Expr branch = condition.isTruthy() ? arguments.get(1) : arguments.get(2);
-        return eval(branch, environment);
+        if (condition.isTruthy()) {
+            return eval(arguments.get(1), environment);
+        }
+        if (arguments.size() == 2) {
+            return VoidValue.INSTANCE;
+        }
+        return eval(arguments.get(2), environment);
     }
 
     private Value evalQuote(List<Expr> arguments) throws EvalError {
@@ -538,6 +562,140 @@ public class Evaluator {
         return evalSequence(body, localEnvironment);
     }
 
+    private Value evalLetRec(List<Expr> arguments,
+                             Environment environment,
+                             boolean sequential) throws EvalError {
+        String formName = sequential ? "letrec*" : "letrec";
+        if (arguments.size() < 2) {
+            throw new EvalError(formName + " expected bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(arguments.getFirst(), formName);
+        List<Expr> body = arguments.subList(1, arguments.size());
+        Environment localEnvironment = new Environment(environment);
+        List<BindingCell> cells = new ArrayList<>(bindings.size());
+
+        for (Binding binding : bindings) {
+            BindingCell cell = new BindingCell(UninitializedValue.INSTANCE);
+            localEnvironment.defineCell(binding.name(), cell);
+            cells.add(cell);
+        }
+
+        if (sequential) {
+            for (int i = 0; i < bindings.size(); i++) {
+                cells.get(i).set(eval(bindings.get(i).valueExpression(), localEnvironment));
+            }
+        } else {
+            List<Value> values = new ArrayList<>(bindings.size());
+            for (Binding binding : bindings) {
+                values.add(eval(binding.valueExpression(), localEnvironment));
+            }
+            for (int i = 0; i < cells.size(); i++) {
+                cells.get(i).set(values.get(i));
+            }
+        }
+
+        return evalSequence(body, localEnvironment);
+    }
+
+    private Value evalCase(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw new EvalError("case expected a key and at least one clause");
+        }
+
+        Value key = eval(arguments.getFirst(), environment);
+        for (int i = 1; i < arguments.size(); i++) {
+            Expr clauseExpression = arguments.get(i);
+            if (!(clauseExpression instanceof ListExpr clauseList)) {
+                throw new EvalError("case clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.isEmpty()) {
+                throw new EvalError("case clause cannot be empty");
+            }
+
+            Expr datumsExpression = clauseElements.getFirst();
+            if (datumsExpression instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+                if (i != arguments.size() - 1) {
+                    throw new EvalError("case else clause must be last");
+                }
+                if (clauseElements.size() == 1) {
+                    throw new EvalError("case else clause expected a body");
+                }
+                return evalSequence(clauseElements.subList(1, clauseElements.size()), environment);
+            }
+
+            if (!(datumsExpression instanceof ListExpr datumsList)) {
+                throw new EvalError("case clause expected a datum list");
+            }
+
+            for (Expr datum : datumsList.elements()) {
+                if (eqvValue(key, quote(datum))) {
+                    if (clauseElements.size() == 1) {
+                        return VoidValue.INSTANCE;
+                    }
+                    return evalSequence(clauseElements.subList(1, clauseElements.size()), environment);
+                }
+            }
+        }
+
+        return VoidValue.INSTANCE;
+    }
+
+    private Value evalDo(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("do expected bindings and a termination clause");
+        }
+
+        List<DoBinding> bindings = parseDoBindings(arguments.getFirst());
+        if (!(arguments.get(1) instanceof ListExpr testClause)) {
+            throw new EvalError("do termination clause must be a list");
+        }
+
+        List<Expr> testClauseElements = testClause.elements();
+        if (testClauseElements.isEmpty()) {
+            throw new EvalError("do termination clause cannot be empty");
+        }
+
+        Environment loopEnvironment = new Environment(environment);
+        List<BindingCell> cells = new ArrayList<>(bindings.size());
+        for (DoBinding binding : bindings) {
+            BindingCell cell = new BindingCell(eval(binding.initExpression(), environment));
+            loopEnvironment.defineCell(binding.name(), cell);
+            cells.add(cell);
+        }
+
+        List<Expr> body = arguments.subList(2, arguments.size());
+        while (true) {
+            Value testValue = eval(testClauseElements.getFirst(), loopEnvironment);
+            if (testValue.isTruthy()) {
+                if (testClauseElements.size() == 1) {
+                    return VoidValue.INSTANCE;
+                }
+                return evalSequence(testClauseElements.subList(1, testClauseElements.size()), loopEnvironment);
+            }
+
+            if (!body.isEmpty()) {
+                evalSequence(body, loopEnvironment);
+            }
+
+            List<Value> nextValues = new ArrayList<>(bindings.size());
+            for (int i = 0; i < bindings.size(); i++) {
+                Expr stepExpression = bindings.get(i).stepExpression();
+                if (stepExpression == null) {
+                    nextValues.add(cells.get(i).get());
+                } else {
+                    nextValues.add(eval(stepExpression, loopEnvironment));
+                }
+            }
+
+            for (int i = 0; i < cells.size(); i++) {
+                cells.get(i).set(nextValues.get(i));
+            }
+        }
+    }
+
     private Value evalNamedLet(String name,
                                List<Expr> arguments,
                                Environment environment) throws EvalError {
@@ -591,6 +749,33 @@ public class Evaluator {
             }
 
             bindings.add(new Binding(symbolExpr.name(), bindingElements.get(1)));
+        }
+
+        return List.copyOf(bindings);
+    }
+
+    private List<DoBinding> parseDoBindings(Expr bindingsExpression) throws EvalError {
+        if (!(bindingsExpression instanceof ListExpr bindingsList)) {
+            throw new EvalError("do bindings must be a list");
+        }
+
+        List<DoBinding> bindings = new ArrayList<>(bindingsList.elements().size());
+        for (Expr bindingExpression : bindingsList.elements()) {
+            if (!(bindingExpression instanceof ListExpr bindingList)) {
+                throw new EvalError("do bindings must be lists");
+            }
+
+            List<Expr> bindingElements = bindingList.elements();
+            if (bindingElements.size() < 2 || bindingElements.size() > 3) {
+                throw new EvalError("do bindings must have a name, init, and optional step");
+            }
+
+            if (!(bindingElements.getFirst() instanceof SymbolExpr symbolExpr)) {
+                throw new EvalError("do bindings must start with a symbol");
+            }
+
+            Expr stepExpression = bindingElements.size() == 3 ? bindingElements.get(2) : null;
+            bindings.add(new DoBinding(symbolExpr.name(), bindingElements.get(1), stepExpression));
         }
 
         return List.copyOf(bindings);
@@ -1210,6 +1395,10 @@ public class Evaluator {
                     "begin",
                     "cond",
                     "let",
+                    "letrec",
+                    "letrec*",
+                    "case",
+                    "do",
                     "and",
                     "or",
                     "set!",
@@ -1399,6 +1588,11 @@ public class Evaluator {
     private Value applyEq(List<Value> arguments) throws EvalError {
         requireExactArity("eq?", arguments.size(), 2);
         return new BoolValue(eqValue(arguments.get(0), arguments.get(1)));
+    }
+
+    private Value applyEqv(List<Value> arguments) throws EvalError {
+        requireExactArity("eqv?", arguments.size(), 2);
+        return new BoolValue(eqvValue(arguments.get(0), arguments.get(1)));
     }
 
     private Value applyEqual(List<Value> arguments) throws EvalError {
@@ -1700,6 +1894,65 @@ public class Evaluator {
         return new ListValue(List.copyOf(results));
     }
 
+    private Value applyVector(List<Value> arguments) {
+        return new VectorValue(arguments);
+    }
+
+    private Value applyMakeVector(List<Value> arguments) throws EvalError {
+        if (arguments.size() < 1 || arguments.size() > 2) {
+            throw new EvalError("make-vector expected 1 or 2 argument(s)");
+        }
+
+        int size = expectIndex(arguments.getFirst(), "make-vector");
+        Value fill = arguments.size() == 2 ? arguments.get(1) : VoidValue.INSTANCE;
+        List<Value> elements = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            elements.add(fill);
+        }
+        return new VectorValue(elements);
+    }
+
+    private Value applyVectorRef(List<Value> arguments) throws EvalError {
+        requireExactArity("vector-ref", arguments.size(), 2);
+        VectorValue vector = expectVector(arguments.getFirst(), "vector-ref");
+        int index = expectIndex(arguments.get(1), "vector-ref");
+        if (index >= vector.length()) {
+            throw new EvalError("vector-ref index out of range");
+        }
+        return vector.element(index);
+    }
+
+    private Value applyVectorSet(List<Value> arguments) throws EvalError {
+        requireExactArity("vector-set!", arguments.size(), 3);
+        VectorValue vector = expectVector(arguments.getFirst(), "vector-set!");
+        int index = expectIndex(arguments.get(1), "vector-set!");
+        if (index >= vector.length()) {
+            throw new EvalError("vector-set! index out of range");
+        }
+        vector.setElement(index, arguments.get(2));
+        return VoidValue.INSTANCE;
+    }
+
+    private Value applyVectorLength(List<Value> arguments) throws EvalError {
+        requireExactArity("vector-length", arguments.size(), 1);
+        return new IntValue(expectVector(arguments.getFirst(), "vector-length").length());
+    }
+
+    private Value applyVectorPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("vector?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof VectorValue);
+    }
+
+    private Value applyVectorToList(List<Value> arguments) throws EvalError {
+        requireExactArity("vector->list", arguments.size(), 1);
+        return new ListValue(expectVector(arguments.getFirst(), "vector->list").elements());
+    }
+
+    private Value applyListToVector(List<Value> arguments) throws EvalError {
+        requireExactArity("list->vector", arguments.size(), 1);
+        return new VectorValue(expectList(arguments.getFirst(), "list->vector"));
+    }
+
     private Value applyAdd(List<Value> arguments) throws EvalError {
         return Numbers.add(arguments, "+");
     }
@@ -1848,6 +2101,13 @@ public class Evaluator {
         throw new EvalError(operator + " expects list arguments");
     }
 
+    private VectorValue expectVector(Value value, String operator) throws EvalError {
+        if (value instanceof VectorValue vectorValue) {
+            return vectorValue;
+        }
+        throw new EvalError(operator + " expects vector arguments");
+    }
+
     private Value car(Value value, String operator) throws EvalError {
         if (value instanceof PairValue pairValue) {
             return pairValue.car();
@@ -1889,8 +2149,18 @@ public class Evaluator {
         return false;
     }
 
-    private boolean equalValue(Value left, Value right) {
+    private boolean eqvValue(Value left, Value right) {
         if (eqValue(left, right)) {
+            return true;
+        }
+        return left instanceof ListValue leftList
+                && right instanceof ListValue rightList
+                && leftList.elements().isEmpty()
+                && rightList.elements().isEmpty();
+    }
+
+    private boolean equalValue(Value left, Value right) {
+        if (eqvValue(left, right)) {
             return true;
         }
         if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
@@ -1910,6 +2180,17 @@ public class Evaluator {
         if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
             return equalValue(leftPair.car(), rightPair.car())
                     && equalValue(leftPair.cdr(), rightPair.cdr());
+        }
+        if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
+            if (leftVector.length() != rightVector.length()) {
+                return false;
+            }
+            for (int i = 0; i < leftVector.length(); i++) {
+                if (!equalValue(leftVector.element(i), rightVector.element(i))) {
+                    return false;
+                }
+            }
+            return true;
         }
         return false;
     }

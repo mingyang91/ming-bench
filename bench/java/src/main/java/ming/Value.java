@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue, ListValue,
-        PairValue, CharValue, VoidValue, ProcedureValue, RecordValue {
+        PairValue, CharValue, VectorValue, VoidValue, ProcedureValue, RecordValue, UninitializedValue {
     String render();
 
     default boolean isTruthy() {
@@ -205,6 +205,44 @@ record PairValue(Value car, Value cdr) implements Value {
     }
 }
 
+final class VectorValue implements Value {
+    private final List<Value> elements;
+
+    VectorValue(List<Value> elements) {
+        this.elements = new ArrayList<>(elements);
+    }
+
+    int length() {
+        return elements.size();
+    }
+
+    Value element(int index) {
+        return elements.get(index);
+    }
+
+    void setElement(int index, Value value) {
+        elements.set(index, value);
+    }
+
+    List<Value> elements() {
+        return List.copyOf(elements);
+    }
+
+    @Override
+    public String render() {
+        StringBuilder builder = new StringBuilder();
+        builder.append("#(");
+        for (int i = 0; i < elements.size(); i++) {
+            if (i > 0) {
+                builder.append(' ');
+            }
+            builder.append(elements.get(i).render());
+        }
+        builder.append(')');
+        return builder.toString();
+    }
+}
+
 record RecordTypeDescriptor(String name, int fieldCount) {
     RecordTypeDescriptor {
         if (fieldCount < 0) {
@@ -249,6 +287,15 @@ enum VoidValue implements Value {
     @Override
     public String render() {
         return "#<void>";
+    }
+}
+
+enum UninitializedValue implements Value {
+    INSTANCE;
+
+    @Override
+    public String render() {
+        return "#<uninitialized>";
     }
 }
 

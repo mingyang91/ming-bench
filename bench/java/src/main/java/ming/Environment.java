@@ -45,7 +45,11 @@ final class Environment {
     Value lookup(String name) throws EvalError {
         BindingCell cell = lookupCell(name);
         if (cell != null) {
-            return cell.get();
+            Value value = cell.get();
+            if (value instanceof UninitializedValue) {
+                throw new EvalError("uninitialized binding: " + name);
+            }
+            return value;
         }
         throw new EvalError("unbound symbol: " + name);
     }
