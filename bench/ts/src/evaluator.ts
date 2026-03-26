@@ -317,6 +317,19 @@ class Runtime {
   private latestContinuationEpoch = 0;
   private windStack: WindFrame[] = [];
   private exceptionHandlers: ExceptionHandlerFrame[] = [];
+  private remainingSteps: number | undefined;
+
+  constructor(maxSteps?: number) {
+    if (maxSteps === undefined) {
+      return;
+    }
+
+    if (!Number.isInteger(maxSteps) || maxSteps < 0) {
+      throw new EvalError('step limit must be a non-negative integer');
+    }
+
+    this.remainingSteps = maxSteps;
+  }
 
   write(value: string): void {
     this.output.push(value);
@@ -419,6 +432,18 @@ class Runtime {
 
   setExceptionHandlers(stack: ExceptionHandlerFrame[]): void {
     this.exceptionHandlers = [...stack];
+  }
+
+  consumeEvalStep(loc: SourceLoc): void {
+    if (this.remainingSteps === undefined) {
+      return;
+    }
+
+    if (this.remainingSteps <= 0) {
+      throw new EvalError(`${loc.line}:${loc.col}: step limit exceeded`);
+    }
+
+    this.remainingSteps -= 1;
   }
 }
 
@@ -764,6 +789,13 @@ export function evalStr(input: string): string {
 }
 
 /**
+ * Evaluate Scheme expressions with a bounded number of eval dispatches.
+ */
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  return formatValue(evaluateProgram(input, maxSteps).result);
+}
+
+/**
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
  */
@@ -772,14 +804,14 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   return { result: formatValue(result), output };
 }
 
-function evaluateProgram(input: string): { result: Value; output: string } {
+function evaluateProgram(input: string, maxSteps?: number): { result: Value; output: string } {
   const program = new Reader(input).parseProgram();
 
   if (program.length === 0) {
     throw new EvalError('1:1: expected expression');
   }
 
-  const runtime = new Runtime();
+  const runtime = new Runtime(maxSteps);
   const env = createGlobalEnv(runtime);
   const result = evaluateSequence(program, env, runtime);
 
@@ -3604,6 +3636,7 @@ function runMachine(initial: MachineAction, runtime: Runtime): Value {
       while (action.action !== 'done') {
         switch (action.action) {
           case 'eval':
+            runtime.consumeEvalStep(action.expr);
             action = evaluateExpr(action.expr, action.env, runtime, action.cont);
             break;
           case 'sequence':
