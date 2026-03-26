@@ -11,6 +11,7 @@ import java.util.Map;
  */
 public class Evaluator {
     private final Environment globalEnv;
+    private StringBuilder activeOutput;
 
     public Evaluator() {
         globalEnv = createGlobalEnv();
@@ -21,18 +22,29 @@ public class Evaluator {
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
+        return evalProgram(input, null).render();
+    }
+
+    private Value evalProgram(String input, StringBuilder output) throws EvalError {
+        StringBuilder previousOutput = activeOutput;
+        activeOutput = output;
+
         Parser parser = new Parser(input);
         Value lastValue = null;
 
-        while (parser.hasMore()) {
-            lastValue = eval(parser.parseExpr(), globalEnv);
-        }
+        try {
+            while (parser.hasMore()) {
+                lastValue = eval(parser.parseExpr(), globalEnv);
+            }
 
-        if (lastValue == null) {
-            throw new EvalError("empty input", 1, 1);
-        }
+            if (lastValue == null) {
+                throw new EvalError("empty input", 1, 1);
+            }
 
-        return lastValue.render();
+            return lastValue;
+        } finally {
+            activeOutput = previousOutput;
+        }
     }
 
     /**
@@ -40,7 +52,9 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        return new EvalResult(evalStr(input), "");
+        StringBuilder output = new StringBuilder();
+        Value result = evalProgram(input, output);
+        return new EvalResult(result.render(), output.toString());
     }
 
     private Environment createGlobalEnv() {
@@ -94,12 +108,91 @@ public class Evaluator {
                 args -> typePredicate("pair?", args, value -> value instanceof PairValue)));
         env.define("symbol?", builtin("symbol?",
                 args -> typePredicate("symbol?", args, value -> value instanceof SymbolValue)));
+        env.define("display", builtin("display", args -> {
+            requireArity("display", args.size(), 1);
+            appendOutput(renderForDisplay(args.getFirst()));
+            return VoidValue.INSTANCE;
+        }));
+        env.define("write", builtin("write", args -> {
+            requireArity("write", args.size(), 1);
+            appendOutput(args.getFirst().render());
+            return VoidValue.INSTANCE;
+        }));
+        env.define("newline", builtin("newline", args -> {
+            requireArity("newline", args.size(), 0);
+            appendOutput("\n");
+            return VoidValue.INSTANCE;
+        }));
+        env.define("string-append", builtin("string-append",
+                args -> new StringValue(stringAppend(args))));
+        env.define("string-length", builtin("string-length", args -> {
+            requireArity("string-length", args.size(), 1);
+            return new IntValue(expectString(args.getFirst()).length());
+        }));
+        env.define("substring", builtin("substring", args -> {
+            requireArity("substring", args.size(), 3);
+            String value = expectString(args.get(0));
+            int start = expectIndex(args.get(1), "substring");
+            int end = expectIndex(args.get(2), "substring");
+            if (start > end || end > value.length()) {
+                throw new EvalError("substring indices out of range");
+            }
+            return new StringValue(value.substring(start, end));
+        }));
+        env.define("string->number", builtin("string->number", args -> {
+            requireArity("string->number", args.size(), 1);
+            String value = expectString(args.getFirst());
+            try {
+                return new IntValue(Integer.parseInt(value));
+            } catch (NumberFormatException error) {
+                return BoolValue.FALSE;
+            }
+        }));
+        env.define("number->string", builtin("number->string", args -> {
+            requireArity("number->string", args.size(), 1);
+            return new StringValue(Integer.toString(expectInt(args.getFirst())));
+        }));
+        env.define("symbol->string", builtin("symbol->string", args -> {
+            requireArity("symbol->string", args.size(), 1);
+            return new StringValue(expectSymbol(args.getFirst()));
+        }));
+        env.define("string->symbol", builtin("string->symbol", args -> {
+            requireArity("string->symbol", args.size(), 1);
+            return new SymbolValue(expectString(args.getFirst()));
+        }));
+        env.define("string-ref", builtin("string-ref", args -> {
+            requireArity("string-ref", args.size(), 2);
+            String value = expectString(args.get(0));
+            int index = expectIndex(args.get(1), "string-ref");
+            if (index >= value.length()) {
+                throw new EvalError("string-ref index out of range");
+            }
+            return new CharValue(value.charAt(index));
+        }));
+        env.define("char?", builtin("char?",
+                args -> typePredicate("char?", args, value -> value instanceof CharValue)));
 
         return env;
     }
 
     private ProcedureValue builtin(String name, BuiltinAction action) {
         return new BuiltinProcedure(name, action);
+    }
+
+    private void appendOutput(String text) {
+        if (activeOutput != null) {
+            activeOutput.append(text);
+        }
+    }
+
+    private String renderForDisplay(Value value) {
+        if (value instanceof StringValue stringValue) {
+            return stringValue.value();
+        }
+        if (value instanceof CharValue charValue) {
+            return Character.toString(charValue.value());
+        }
+        return value.render();
     }
 
     private Value eval(Expr expr, Environment env) throws EvalError {
@@ -469,6 +562,28 @@ public class Evaluator {
         throw new EvalError("expected number");
     }
 
+    private int expectIndex(Value value, String operationName) throws EvalError {
+        int index = expectInt(value);
+        if (index < 0) {
+            throw new EvalError(operationName + " index out of range");
+        }
+        return index;
+    }
+
+    private String expectString(Value value) throws EvalError {
+        if (value instanceof StringValue stringValue) {
+            return stringValue.value();
+        }
+        throw new EvalError("expected string");
+    }
+
+    private String expectSymbol(Value value) throws EvalError {
+        if (value instanceof SymbolValue symbolValue) {
+            return symbolValue.name();
+        }
+        throw new EvalError("expected symbol");
+    }
+
     private PairValue expectPair(Value value) throws EvalError {
         if (value instanceof PairValue pairValue) {
             return pairValue;
@@ -515,6 +630,14 @@ public class Evaluator {
             }
         }
         return result;
+    }
+
+    private String stringAppend(List<Value> args) throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (Value arg : args) {
+            builder.append(expectString(arg));
+        }
+        return builder.toString();
     }
 
     private Value makeList(List<Value> args) {
@@ -609,6 +732,17 @@ public class Evaluator {
         @Override
         public String render() {
             return "\"" + escapeString(value) + "\"";
+        }
+    }
+
+    private record CharValue(char value) implements Value {
+        @Override
+        public String render() {
+            return switch (value) {
+                case ' ' -> "#\\space";
+                case '\n' -> "#\\newline";
+                default -> "#\\" + value;
+            };
         }
     }
 
