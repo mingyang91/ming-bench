@@ -5,14 +5,27 @@ use std::rc::Rc;
 pub mod error;
 
 pub use error::EvalError;
+use error::SourcePos;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
-    Integer(i64),
-    Boolean(bool),
-    String(String),
-    Symbol(String),
-    List(Vec<Expr>),
+    Integer(i64, SourcePos),
+    Boolean(bool, SourcePos),
+    String(String, SourcePos),
+    Symbol(String, SourcePos),
+    List(Vec<Expr>, SourcePos),
+}
+
+impl Expr {
+    fn pos(&self) -> SourcePos {
+        match self {
+            Self::Integer(_, pos)
+            | Self::Boolean(_, pos)
+            | Self::String(_, pos)
+            | Self::Symbol(_, pos)
+            | Self::List(_, pos) => *pos,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,11 +162,18 @@ struct Procedure {
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    line: usize,
+    column: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            line: 1,
+            column: 1,
+        }
     }
 
     fn parse_all(&mut self) -> Result<Vec<Expr>, EvalError> {
@@ -168,7 +188,7 @@ impl<'a> Parser<'a> {
         }
 
         if exprs.is_empty() {
-            return Err(EvalError::EmptyInput);
+            return Err(EvalError::EmptyInput.with_position(self.current_pos()));
         }
 
         Ok(exprs)
@@ -176,20 +196,22 @@ impl<'a> Parser<'a> {
 
     fn parse_expr(&mut self) -> Result<Expr, EvalError> {
         self.skip_ws_and_comments();
+        let pos = self.current_pos();
 
         match self.peek_char() {
-            Some('(') => self.parse_list(),
+            Some('(') => self.parse_list(pos),
             Some(')') => Err(EvalError::Syntax {
                 message: "unexpected ')'".into(),
-            }),
-            Some('\'') => self.parse_quote_shorthand(),
-            Some('"') => self.parse_string(),
-            Some(_) => self.parse_atom(),
-            None => Err(EvalError::UnexpectedEof),
+            }
+            .with_position(pos)),
+            Some('\'') => self.parse_quote_shorthand(pos),
+            Some('"') => self.parse_string(pos),
+            Some(_) => self.parse_atom(pos),
+            None => Err(EvalError::UnexpectedEof.with_position(pos)),
         }
     }
 
-    fn parse_list(&mut self) -> Result<Expr, EvalError> {
+    fn parse_list(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
         self.bump_char();
         let mut items = Vec::new();
 
@@ -198,21 +220,21 @@ impl<'a> Parser<'a> {
             match self.peek_char() {
                 Some(')') => {
                     self.bump_char();
-                    return Ok(Expr::List(items));
+                    return Ok(Expr::List(items, pos));
                 }
                 Some(_) => items.push(self.parse_expr()?),
-                None => return Err(EvalError::UnexpectedEof),
+                None => return Err(EvalError::UnexpectedEof.with_position(pos)),
             }
         }
     }
 
-    fn parse_string(&mut self) -> Result<Expr, EvalError> {
+    fn parse_string(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
         self.bump_char();
         let mut value = String::new();
 
         loop {
             match self.bump_char() {
-                Some('"') => return Ok(Expr::String(value)),
+                Some('"') => return Ok(Expr::String(value, pos)),
                 Some('\\') => match self.bump_char() {
                     Some('"') => value.push('"'),
                     Some('\\') => value.push('\\'),
@@ -220,21 +242,24 @@ impl<'a> Parser<'a> {
                     Some('r') => value.push('\r'),
                     Some('t') => value.push('\t'),
                     Some(other) => value.push(other),
-                    None => return Err(EvalError::UnexpectedEof),
+                    None => return Err(EvalError::UnexpectedEof.with_position(pos)),
                 },
                 Some(ch) => value.push(ch),
-                None => return Err(EvalError::UnexpectedEof),
+                None => return Err(EvalError::UnexpectedEof.with_position(pos)),
             }
         }
     }
 
-    fn parse_quote_shorthand(&mut self) -> Result<Expr, EvalError> {
+    fn parse_quote_shorthand(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
         self.bump_char();
         let quoted = self.parse_expr()?;
-        Ok(Expr::List(vec![Expr::Symbol("quote".into()), quoted]))
+        Ok(Expr::List(
+            vec![Expr::Symbol("quote".into(), pos), quoted],
+            pos,
+        ))
     }
 
-    fn parse_atom(&mut self) -> Result<Expr, EvalError> {
+    fn parse_atom(&mut self, pos: SourcePos) -> Result<Expr, EvalError> {
         let start = self.pos;
         while let Some(ch) = self.peek_char() {
             if ch.is_whitespace() || matches!(ch, '(' | ')' | ';') {
@@ -247,15 +272,16 @@ impl<'a> Parser<'a> {
         if token.is_empty() {
             return Err(EvalError::Syntax {
                 message: "expected expression".into(),
-            });
+            }
+            .with_position(pos));
         }
 
         match token {
-            "#t" => Ok(Expr::Boolean(true)),
-            "#f" => Ok(Expr::Boolean(false)),
+            "#t" => Ok(Expr::Boolean(true, pos)),
+            "#f" => Ok(Expr::Boolean(false, pos)),
             _ => match token.parse::<i64>() {
-                Ok(value) => Ok(Expr::Integer(value)),
-                Err(_) => Ok(Expr::Symbol(token.into())),
+                Ok(value) => Ok(Expr::Integer(value, pos)),
+                Err(_) => Ok(Expr::Symbol(token.into(), pos)),
             },
         }
     }
@@ -283,9 +309,19 @@ impl<'a> Parser<'a> {
         self.input[self.pos..].chars().next()
     }
 
+    fn current_pos(&self) -> SourcePos {
+        SourcePos::new(self.line, self.column)
+    }
+
     fn bump_char(&mut self) -> Option<char> {
         let ch = self.peek_char()?;
         self.pos += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
         Some(ch)
     }
 }
@@ -360,14 +396,17 @@ fn eval_sequence(exprs: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 }
 
 fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
+    let pos = expr.pos();
+
     match expr {
-        Expr::Integer(value) => Ok(Value::Integer(*value)),
-        Expr::Boolean(value) => Ok(Value::Boolean(*value)),
-        Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => env
+        Expr::Integer(value, _) => Ok(Value::Integer(*value)),
+        Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
+        Expr::String(value, _) => Ok(Value::String(value.clone())),
+        Expr::Symbol(name, _) => env
             .lookup(name)
-            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
-        Expr::List(items) => eval_list(items, env),
+            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() })
+            .map_err(|error| error.with_position(pos)),
+        Expr::List(items, _) => eval_list(items, env).map_err(|error| error.with_position(pos)),
     }
 }
 
@@ -378,7 +417,7 @@ fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         });
     };
 
-    if let Expr::Symbol(name) = head {
+    if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => return eval_define(tail, env),
             "if" => return eval_if(tail, env),
@@ -400,7 +439,7 @@ fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 
 fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     match args {
-        [Expr::Symbol(name), value_expr] => {
+        [Expr::Symbol(name, _), value_expr] => {
             let value = if let Some(parts) = lambda_parts(value_expr) {
                 build_lambda(parts, env, Some(name.clone()))?
             } else {
@@ -409,8 +448,8 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             env.define(name.clone(), value);
             Ok(Value::Void)
         }
-        [Expr::List(signature), body @ ..] => {
-            let Some((Expr::Symbol(name), params)) = signature.split_first() else {
+        [Expr::List(signature, _), body @ ..] => {
+            let Some((Expr::Symbol(name, _), params)) = signature.split_first() else {
                 return Err(EvalError::Syntax {
                     message: "define: expected function name".into(),
                 });
@@ -421,12 +460,7 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
                 });
             }
 
-            let value = new_procedure(
-                Some(name.clone()),
-                parse_param_list(params)?,
-                body,
-                env,
-            );
+            let value = new_procedure(Some(name.clone()), parse_param_list(params)?, body, env);
             env.define(name.clone(), value);
             Ok(Value::Void)
         }
@@ -491,7 +525,7 @@ fn eval_begin(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 
 fn eval_cond(clauses: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     for (index, clause) in clauses.iter().enumerate() {
-        let Expr::List(items) = clause else {
+        let Expr::List(items, _) = clause else {
             return Err(EvalError::Syntax {
                 message: "cond: expected clause".into(),
             });
@@ -502,7 +536,7 @@ fn eval_cond(clauses: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             });
         };
 
-        if matches!(test, Expr::Symbol(name) if name == "else") {
+        if matches!(test, Expr::Symbol(name, _) if name == "else") {
             if index + 1 != clauses.len() {
                 return Err(EvalError::Syntax {
                     message: "cond: else must be last".into(),
@@ -526,7 +560,7 @@ fn eval_cond(clauses: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 
 fn eval_let(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     match args {
-        [Expr::Symbol(name), bindings, body @ ..] => eval_named_let(name, bindings, body, env),
+        [Expr::Symbol(name, _), bindings, body @ ..] => eval_named_let(name, bindings, body, env),
         [bindings, body @ ..] => eval_plain_let(bindings, body, env),
         _ => Err(EvalError::Syntax {
             message: "let: invalid syntax".into(),
@@ -581,7 +615,7 @@ fn eval_named_let(
 }
 
 fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
-    let Expr::List(bindings) = bindings_expr else {
+    let Expr::List(bindings, _) = bindings_expr else {
         return Err(EvalError::Syntax {
             message: "let: expected bindings".into(),
         });
@@ -590,8 +624,8 @@ fn parse_let_bindings(bindings_expr: &Expr) -> Result<Vec<(String, Expr)>, EvalE
     let mut parsed = Vec::with_capacity(bindings.len());
     for binding in bindings {
         match binding {
-            Expr::List(parts) => match parts.as_slice() {
-                [Expr::Symbol(name), value_expr] => {
+            Expr::List(parts, _) => match parts.as_slice() {
+                [Expr::Symbol(name, _), value_expr] => {
                     parsed.push((name.clone(), value_expr.clone()));
                 }
                 _ => {
@@ -642,7 +676,7 @@ fn new_procedure(name: Option<String>, params: Vec<String>, body: &[Expr], env: 
 }
 
 fn parse_params_expr(params: &Expr) -> Result<Vec<String>, EvalError> {
-    let Expr::List(items) = params else {
+    let Expr::List(items, _) = params else {
         return Err(EvalError::Syntax {
             message: "lambda: expected parameter list".into(),
         });
@@ -656,7 +690,7 @@ fn parse_param_list(params: &[Expr]) -> Result<Vec<String>, EvalError> {
 
     for param in params {
         match param {
-            Expr::Symbol(name) => names.push(name.clone()),
+            Expr::Symbol(name, _) => names.push(name.clone()),
             _ => {
                 return Err(EvalError::Syntax {
                     message: "lambda: expected parameter name".into(),
@@ -669,10 +703,10 @@ fn parse_param_list(params: &[Expr]) -> Result<Vec<String>, EvalError> {
 }
 
 fn lambda_parts(expr: &Expr) -> Option<&[Expr]> {
-    let Expr::List(items) = expr else {
+    let Expr::List(items, _) = expr else {
         return None;
     };
-    let (Expr::Symbol(name), tail) = items.split_first()? else {
+    let (Expr::Symbol(name, _), tail) = items.split_first()? else {
         return None;
     };
 
@@ -685,11 +719,11 @@ fn lambda_parts(expr: &Expr) -> Option<&[Expr]> {
 
 fn quote_expr(expr: &Expr) -> Value {
     match expr {
-        Expr::Integer(value) => Value::Integer(*value),
-        Expr::Boolean(value) => Value::Boolean(*value),
-        Expr::String(value) => Value::String(value.clone()),
-        Expr::Symbol(value) => Value::Symbol(value.clone()),
-        Expr::List(items) => Value::List(items.iter().map(quote_expr).collect()),
+        Expr::Integer(value, _) => Value::Integer(*value),
+        Expr::Boolean(value, _) => Value::Boolean(*value),
+        Expr::String(value, _) => Value::String(value.clone()),
+        Expr::Symbol(value, _) => Value::Symbol(value.clone()),
+        Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),
     }
 }
 
@@ -738,24 +772,28 @@ fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
         Builtin::Append => builtin_append(args),
         Builtin::List => builtin_list(args),
         Builtin::Length => builtin_length(args),
-        Builtin::NullPred => builtin_predicate("null?", args, |value| {
-            matches!(value, Value::List(items) if items.is_empty())
-        }),
-        Builtin::NumberPred => builtin_predicate("number?", args, |value| {
-            matches!(value, Value::Integer(_))
-        }),
-        Builtin::StringPred => builtin_predicate("string?", args, |value| {
-            matches!(value, Value::String(_))
-        }),
-        Builtin::BooleanPred => builtin_predicate("boolean?", args, |value| {
-            matches!(value, Value::Boolean(_))
-        }),
-        Builtin::PairPred => builtin_predicate("pair?", args, |value| {
-            matches!(value, Value::List(items) if !items.is_empty())
-        }),
-        Builtin::SymbolPred => builtin_predicate("symbol?", args, |value| {
-            matches!(value, Value::Symbol(_))
-        }),
+        Builtin::NullPred => builtin_predicate(
+            "null?",
+            args,
+            |value| matches!(value, Value::List(items) if items.is_empty()),
+        ),
+        Builtin::NumberPred => {
+            builtin_predicate("number?", args, |value| matches!(value, Value::Integer(_)))
+        }
+        Builtin::StringPred => {
+            builtin_predicate("string?", args, |value| matches!(value, Value::String(_)))
+        }
+        Builtin::BooleanPred => {
+            builtin_predicate("boolean?", args, |value| matches!(value, Value::Boolean(_)))
+        }
+        Builtin::PairPred => builtin_predicate(
+            "pair?",
+            args,
+            |value| matches!(value, Value::List(items) if !items.is_empty()),
+        ),
+        Builtin::SymbolPred => {
+            builtin_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
+        }
     }
 }
 
