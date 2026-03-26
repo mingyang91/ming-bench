@@ -399,6 +399,11 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("string-downcase", builtinProc{name: "string-downcase", fn: builtinStringDowncase})
 	scope.define("apply", builtinProc{name: "apply", fn: builtinApply})
 	scope.define("procedure?", builtinProc{name: "procedure?", fn: builtinProcedurePredicate})
+	if level18UsesCPS() {
+		scope.define("call/cc", callCCProc{})
+		scope.define("call-with-current-continuation", callCCProc{})
+		scope.defineKey(level18ApplyCPSKey, builtinProc{name: "__apply_cps", fn: builtinApplyCPS})
+	}
 	return scope
 }
 
@@ -414,6 +419,28 @@ func evalStrInternal(input string) (any, string, error) {
 	}
 
 	scope := newGlobalEnv(&output)
+	if level18UsesCPS() && programUsesCallCC(exprs) {
+		if err := predeclareLevel18TopLevelDefines(scope, exprs); err != nil {
+			return nil, output.String(), err
+		}
+
+		normalizedExprs, err := normalizeLevel18TopLevelExprs(exprs)
+		if err != nil {
+			return nil, output.String(), err
+		}
+
+		cpsExpr, err := transformLevel18Program(normalizedExprs)
+		if err != nil {
+			return nil, output.String(), err
+		}
+
+		result, err := eval(scope, cpsExpr)
+		if err != nil {
+			return nil, output.String(), err
+		}
+		return result, output.String(), nil
+	}
+
 	result := any(voidValue{})
 	for _, expr := range exprs {
 		result, err = eval(scope, expr)
@@ -836,6 +863,8 @@ func evalListTail(scope *env, expr listExpr) (any, *tailEvalState, error) {
 			return evalCaseTail(scope, args)
 		case "do":
 			return evalDoTail(scope, args)
+		case level18ApplyCPSKey:
+			return evalLevel18ApplyCPSTail(scope, args)
 		}
 
 		if macro, ok := scope.lookupMacroSymbol(head); ok {
@@ -2245,7 +2274,7 @@ func typeName(value any) string {
 		return "list"
 	case *vectorValue:
 		return "vector"
-	case builtinProc, closure, caseClosure:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc:
 		return "procedure"
 	case voidValue:
 		return "void"
@@ -2258,7 +2287,7 @@ func typeName(value any) string {
 
 func isProcedureValue(value any) bool {
 	switch value.(type) {
-	case builtinProc, closure, caseClosure:
+	case builtinProc, closure, caseClosure, continuationProc, callCCProc:
 		return true
 	default:
 		return false
