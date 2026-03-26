@@ -75,7 +75,23 @@ private[ming] object SchemeEvaluatorSupport:
       case Expr.CharLiteral(value, _)    => Value.CharValue(value)
       case Expr.Symbol(name, _)          => Value.SymbolValue(name)
       case Expr.ListExpr(items, _) =>
+        quoteList(items)
+      case Expr.VectorExpr(items, _) =>
+        Value.VectorValue(scala.collection.mutable.ArrayBuffer.from(items.map(quoteExpr)))
+
+  private def quoteList(items: List[Expr]): Value =
+    val dotIndices = items.zipWithIndex.collect { case (Expr.Symbol(".", _), index) => index }
+
+    dotIndices match
+      case Nil =>
         makeList(items.map(quoteExpr))
+      case index :: Nil if index > 0 && index == items.length - 2 =>
+        val tail = quoteExpr(items.last)
+        items.take(index).reverse.foldLeft(tail) { (cdr, item) =>
+          Value.PairValue(quoteExpr(item), cdr)
+        }
+      case _ =>
+        throw new EvalError("invalid dotted list")
 
   private def parseClosureParams(paramsExpr: List[Expr]): (List[String], Option[String]) =
     val dotIndex = paramsExpr.indexWhere {

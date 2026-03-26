@@ -3,6 +3,7 @@ package ming
 import scala.annotation.tailrec
 
 import SchemeBuiltinSupport.*
+import SchemeEvaluatorSupport.*
 import SchemeEvaluatorState.*
 import SchemeModel.*
 import SchemeRecords.*
@@ -89,6 +90,8 @@ private[ming] object SchemeEvaluator
         resume(continuation, Value.StringValue(SchemeString.fromLiteral(value)))
       case Expr.CharLiteral(value, _) =>
         resume(continuation, Value.CharValue(value))
+      case Expr.VectorExpr(items, _) =>
+        resume(continuation, Value.VectorValue(scala.collection.mutable.ArrayBuffer.from(items.map(quoteExpr))))
       case Expr.Symbol(name, _) =>
         resume(continuation, env.lookup(name))
       case Expr.ListExpr(Nil, _) =>

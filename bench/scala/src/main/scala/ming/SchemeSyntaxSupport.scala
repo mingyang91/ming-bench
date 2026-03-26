@@ -73,8 +73,25 @@ private[ming] object SchemeSyntaxSupport:
       case Value.NilValue =>
         Expr.ListExpr(Nil, pos)
       case list @ Value.PairValue(_, _) =>
-        Expr.ListExpr(properListElements(context, list).map(datumToExpr(_, pos, context)), pos)
+        pairToExpr(list, pos, context)
+      case Value.VectorValue(elements) =>
+        Expr.VectorExpr(elements.toList.map(datumToExpr(_, pos, context)), pos)
       case Value.SyntaxObject(expr, _) =>
         expr
       case other =>
         throw new EvalError(s"$context expected a datum, got ${render(other)}")
+
+  private def pairToExpr(pair: Value.PairValue, pos: SourcePos, context: String): Expr =
+    def loop(current: Value, reversedItems: List[Expr]): Expr =
+      current match
+        case Value.PairValue(car, cdr) =>
+          loop(cdr, datumToExpr(car, pos, context) :: reversedItems)
+        case Value.NilValue =>
+          Expr.ListExpr(reversedItems.reverse, pos)
+        case tail =>
+          Expr.ListExpr(
+            reversedItems.reverse ::: List(Expr.Symbol(".", pos), datumToExpr(tail, pos, context)),
+            pos
+          )
+
+    loop(pair, Nil)

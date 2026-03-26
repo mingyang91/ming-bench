@@ -59,6 +59,12 @@ private[ming] object SchemeMacroPatternMatcher:
             matchListPattern(patternItems, inputItems, bindings, macroName, literals)
           case _ =>
             None
+      case Expr.VectorExpr(patternItems, _) =>
+        input match
+          case Expr.VectorExpr(inputItems, _) =>
+            matchListPattern(patternItems, inputItems, bindings, macroName, literals)
+          case _ =>
+            None
 
   private def matchListPattern(
     patternItems: List[Expr],
@@ -152,6 +158,8 @@ private[ming] object SchemeMacroPatternMatcher:
       case (Expr.CharLiteral(a, _), Expr.CharLiteral(b, _))       => a == b
       case (Expr.Symbol(a, _), Expr.Symbol(b, _))                 => a == b
       case (Expr.ListExpr(as, _), Expr.ListExpr(bs, _)) =>
+        as.length == bs.length && as.zip(bs).forall(exprEquals.tupled)
+      case (Expr.VectorExpr(as, _), Expr.VectorExpr(bs, _)) =>
         as.length == bs.length && as.zip(bs).forall(exprEquals.tupled)
       case _ =>
         false

@@ -6,9 +6,7 @@ import SchemeEvaluatorSupport.*
 import SchemeModel.*
 import SchemeRuntime.*
 
-abstract private[ming] class SchemeEvaluatorSpecialForms:
-
-  protected def eval(expr: Expr, env: Env, continuation: Continuation): Computation
+abstract private[ming] class SchemeEvaluatorSpecialForms extends SchemeEvaluatorQuotedForms:
 
   protected def evalSequence(
     expressions: List[Expr],
@@ -49,17 +47,6 @@ abstract private[ming] class SchemeEvaluatorSpecialForms:
           )
 
     loop(expressions, Nil)
-
-  protected def evalQuote(
-    args: List[Expr],
-    continuation: Continuation,
-    pos: SourcePos
-  ): Computation =
-    args match
-      case expr :: Nil =>
-        resume(continuation, quoteExpr(expr))
-      case _ =>
-        throw new EvalError(s"quote expected 1 argument, got ${args.length}")
 
   protected def evalIf(
     args: List[Expr],
@@ -221,6 +208,22 @@ abstract private[ming] class SchemeEvaluatorSpecialForms:
         case Expr.ListExpr(Expr.Symbol("else", _) :: expressions, _) :: tail =>
           if tail.nonEmpty then throw new EvalError("cond else clause must be last")
           evalSequence(expressions, env, continuation)
+        case Expr.ListExpr(List(testExpr, Expr.Symbol("=>", _), procedureExpr), _) :: tail =>
+          eval(
+            testExpr,
+            env,
+            contextualCont(pos) { testValue =>
+              if isTruthy(testValue) then
+                eval(
+                  procedureExpr,
+                  env,
+                  contextualCont(procedureExpr.pos) { procedure =>
+                    applyProcedure(procedure, List(testValue), continuation, Some(procedureExpr.pos))
+                  }
+                )
+              else loop(tail)
+            }
+          )
         case Expr.ListExpr(testExpr :: expressions, _) :: tail =>
           eval(
             testExpr,

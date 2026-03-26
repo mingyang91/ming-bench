@@ -42,6 +42,15 @@ private[ming] object SchemeParser:
         case '\'' =>
           index += 1
           Expr.ListExpr(List(Expr.Symbol("quote", pos), parseExpr()), pos)
+        case '`' =>
+          index += 1
+          Expr.ListExpr(List(Expr.Symbol("quasiquote", pos), parseExpr()), pos)
+        case ',' =>
+          index += 1
+          if !isAtEnd && input.charAt(index) == '@' then
+            index += 1
+            Expr.ListExpr(List(Expr.Symbol("unquote-splicing", pos), parseExpr()), pos)
+          else Expr.ListExpr(List(Expr.Symbol("unquote", pos), parseExpr()), pos)
         case ')' =>
           parseError("unexpected ')'")
         case '"' =>
@@ -56,6 +65,7 @@ private[ming] object SchemeParser:
         index += 2
         Expr.ListExpr(List(Expr.Symbol("syntax", pos), parseExpr()), pos)
       else if startsWith("#\\") then parseChar(pos)
+      else if startsWith("#(") then parseVector(pos)
       else parseBoolean(pos)
 
     private def parseList(pos: SourcePos): Expr =
@@ -68,6 +78,18 @@ private[ming] object SchemeParser:
       if isAtEnd then parseError("unterminated list")
       index += 1
       Expr.ListExpr(items.toList, pos)
+
+    private def parseVector(pos: SourcePos): Expr =
+      index += 2
+      val items = ListBuffer.empty[Expr]
+      skipTrivia()
+      while !isAtEnd && input.charAt(index) != ')' do
+        items += parseExpr()
+        skipTrivia()
+
+      if isAtEnd then parseError("unterminated vector")
+      index += 1
+      Expr.VectorExpr(items.toList, pos)
 
     private def parseString(pos: SourcePos): Expr =
       index += 1

@@ -49,6 +49,10 @@ final private[ming] class SchemeMacroTemplateExpander(
         instantiateSymbol(symbolName, pos, state, renamedBindings, repetitionIndex)
       case Expr.ListExpr(items, pos) =>
         instantiateList(items, pos, state, renamedBindings, repetitionIndex)
+      case Expr.VectorExpr(items, pos) =>
+        val (instantiatedItems, nextState) =
+          instantiateItems(items, state, renamedBindings, repetitionIndex)
+        (Expr.VectorExpr(instantiatedItems, pos), nextState)
       case other =>
         (other, state)
 

@@ -70,6 +70,8 @@ private[ming] trait SchemeEvaluatorApplicationSupport extends SchemeEvaluatorSpe
     operator match
       case Expr.Symbol("quote", _) =>
         evalQuote(args, continuation, callPos)
+      case Expr.Symbol("quasiquote", _) =>
+        evalQuasiquote(args, env, continuation, callPos)
       case Expr.Symbol("syntax", _) =>
         evalSyntax(args, env, continuation, callPos)
       case Expr.Symbol("syntax-case", _) =>

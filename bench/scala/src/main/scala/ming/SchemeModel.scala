@@ -13,6 +13,7 @@ private[ming] object SchemeModel:
     case CharLiteral(value: Int, pos: SourcePos)
     case Symbol(name: String, pos: SourcePos)
     case ListExpr(items: List[Expr], pos: SourcePos)
+    case VectorExpr(items: List[Expr], pos: SourcePos)
 
   final case class ExpandedExpr(expr: Expr, env: Env)
 
@@ -38,6 +39,7 @@ private[ming] object SchemeModel:
         case Expr.CharLiteral(_, pos)        => pos
         case Expr.Symbol(_, pos)             => pos
         case Expr.ListExpr(_, pos)           => pos
+        case Expr.VectorExpr(_, pos)         => pos
 
   final class SchemeString private (private val codePoints: Array[Int], val isMutable: Boolean):
 

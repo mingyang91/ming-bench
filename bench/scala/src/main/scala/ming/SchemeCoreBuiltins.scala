@@ -172,6 +172,10 @@ private[ming] object SchemeCoreBuiltins:
       args =>
         requireMinArgCount("for-each", args, 2)
         forEachValues(args.head, args.tail)
+    ),
+    "error" -> Value.Builtin(
+      "error",
+      args => throw new EvalError(renderErrorMessage(args))
     )
   )
 
@@ -272,3 +276,7 @@ private[ming] object SchemeCoreBuiltins:
         loop(nextCursors)
 
     loop(lists)
+
+  private def renderErrorMessage(args: List[Value]): String =
+    if args.isEmpty then "error"
+    else args.map(renderForDisplay).mkString("")

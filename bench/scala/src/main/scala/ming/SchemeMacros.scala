@@ -95,6 +95,12 @@ private[ming] object SchemeMacros:
             case Expr.Symbol("...", _) => acc
             case _                     => acc ++ collectPatternVariables(item, macroName, literals)
         }
+      case Expr.VectorExpr(items, _) =>
+        items.foldLeft(Set.empty[String]) { (acc, item) =>
+          item match
+            case Expr.Symbol("...", _) => acc
+            case _                     => acc ++ collectPatternVariables(item, macroName, literals)
+        }
       case _ =>
         Set.empty
 
@@ -227,6 +233,12 @@ private[ming] object SchemeMacros:
       case Expr.Symbol(name, _) if patternVariables.contains(name) =>
         Set(name)
       case Expr.ListExpr(items, _) =>
+        items.foldLeft(Set.empty[String]) { (acc, item) =>
+          item match
+            case Expr.Symbol("...", _) => acc
+            case _                     => acc ++ collectReferencedPatternVariables(item, patternVariables)
+        }
+      case Expr.VectorExpr(items, _) =>
         items.foldLeft(Set.empty[String]) { (acc, item) =>
           item match
             case Expr.Symbol("...", _) => acc
