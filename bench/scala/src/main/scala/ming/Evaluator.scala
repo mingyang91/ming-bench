@@ -1,6 +1,7 @@
 package ming
 
-import SchemeTypes.{builtinNames, display, errAt, isTruthy, Env, Pos, Value}
+import Display.display
+import SchemeTypes.{errAt, isTruthy, Env, Pos, Value}
 
 object Evaluator:
 
@@ -21,7 +22,7 @@ object Evaluator:
   ): Env =
     val env =
       Env(scala.collection.mutable.Map.empty, None, output)
-    for name <- builtinNames do env.define(name, Value.VBuiltin(name))
+    for name <- BuiltinNames.all do env.define(name, Value.VBuiltin(name))
     env
 
   // ── Eval (trampoline for TCO) ─────────────────────────────────────
@@ -53,6 +54,8 @@ object Evaluator:
           EvalTail.evalOr(args, curEnv, eval)
         case Expr.SList(Expr.Symbol("let", _) :: rest, p) =>
           EvalTail.evalLet(rest, curEnv, p, eval)
+        case Expr.SList(Expr.Symbol("let*", _) :: rest, p) =>
+          EvalTail.evalLetStar(rest, curEnv, p, eval)
         case Expr.SList(Expr.Symbol("begin", _) :: body, _) =>
           EvalTail.evalBegin(body, curEnv, eval)
         case Expr.SList(Expr.Symbol("cond", _) :: clauses, _) =>

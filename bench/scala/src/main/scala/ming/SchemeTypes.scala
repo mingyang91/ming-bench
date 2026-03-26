@@ -2,6 +2,9 @@ package ming
 
 object SchemeTypes:
 
+  // ── Mutable pair cell ──────────────────────────────────────────────
+  class PairCell(var car: Value, var cdr: Value)
+
   // ── Values ───────────────────────────────────────────────────────────
   enum Value:
     case VNum(n: Long)
@@ -12,6 +15,7 @@ object SchemeTypes:
     case VChar(c: Char)
     case VList(elems: List[Value])
     case VDottedList(elems: List[Value], last: Value)
+    case VPair(cell: PairCell)
     case VSymbol(name: String)
     case VBuiltin(name: String)
 
@@ -41,51 +45,6 @@ object SchemeTypes:
     case VVoid
 
   type Pos = ming.Pos
-
-  def display(v: Value): String = v match
-    case Value.VNum(n)         => n.toString
-    case Value.VFloat(d)       => displayFloat(d)
-    case Value.VRational(n, d) => s"$n/$d"
-    case Value.VBool(true)     => "#t"
-    case Value.VBool(false)    => "#f"
-    case Value.VStr(chars, _)  => s"\"${new String(chars)}\""
-    case Value.VChar(c)        => displayChar(c)
-    case Value.VList(elems) =>
-      "(" + elems.map(display).mkString(" ") + ")"
-    case Value.VDottedList(elems, last) =>
-      "(" + elems.map(display).mkString(" ") + " . " + display(last) + ")"
-    case Value.VSymbol(n)          => n
-    case Value.VBuiltin(n)         => s"#<procedure $n>"
-    case Value.VLambda(_, _, _, _) => "#<procedure>"
-    case Value.VCaseLambda(_)      => "#<procedure>"
-    case Value.VMacro(_, _, _)     => "#<macro>"
-    case Value.VVector(elems) =>
-      "#(" + elems.map(display).mkString(" ") + ")"
-    case Value.VRecord(typeName, _) => s"#<record:$typeName>"
-    case Value.VVoid                => ""
-
-  private def displayFloat(d: Double): String =
-    if d == d.toLong.toDouble && !d.isInfinite then s"${d.toLong}.0"
-    else d.toString
-
-  private def displayChar(c: Char): String = c match
-    case ' '  => "#\\space"
-    case '\n' => "#\\newline"
-    case '\t' => "#\\tab"
-    case _    => s"#\\$c"
-
-  def displayStr(v: Value): String = v match
-    case Value.VStr(chars, _) => new String(chars)
-    case Value.VChar(c)       => c.toString
-    case Value.VList(elems) =>
-      "(" + elems.map(displayStr).mkString(" ") + ")"
-    case Value.VDottedList(elems, last) =>
-      "(" + elems.map(displayStr).mkString(" ") + " . " + displayStr(
-        last
-      ) + ")"
-    case Value.VVector(elems) =>
-      "#(" + elems.map(displayStr).mkString(" ") + ")"
-    case other => display(other)
 
   def errAt(pos: Pos, msg: String): EvalError =
     EvalError(s"$pos: $msg")
@@ -164,115 +123,78 @@ object SchemeTypes:
       case (Value.VNum(x), Value.VNum(y)) => x.compareTo(y)
       case _                              => toDouble(a, pos).compareTo(toDouble(b, pos))
 
-  def valuesEqual(a: Value, b: Value): Boolean = (a, b) match
-    case (Value.VNum(x), Value.VNum(y))                     => x == y
-    case (Value.VFloat(x), Value.VFloat(y))                 => x == y
-    case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
-    case (Value.VBool(x), Value.VBool(y))                   => x == y
-    case (Value.VStr(x, _), Value.VStr(y, _))               => java.util.Arrays.equals(x, y)
-    case (Value.VChar(x), Value.VChar(y))                   => x == y
-    case (Value.VSymbol(x), Value.VSymbol(y))               => x == y
-    case (Value.VList(xs), Value.VList(ys)) =>
-      xs.length == ys.length && xs
-        .zip(ys)
-        .forall((a, b) => valuesEqual(a, b))
-    case (Value.VDottedList(xs, xl), Value.VDottedList(ys, yl)) =>
-      xs.length == ys.length && xs
-        .zip(ys)
-        .forall((a, b) => valuesEqual(a, b)) && valuesEqual(xl, yl)
-    case (Value.VVector(xs), Value.VVector(ys)) =>
-      xs.length == ys.length && xs.zip(ys).forall((a, b) => valuesEqual(a, b))
-    case (Value.VVoid, Value.VVoid) => true
-    case _                          => false
+  def valuesEqual(a: Value, b: Value): Boolean = valuesEqualD(a, b, 0)
 
-  val builtinNames: List[String] = List(
-    "+",
-    "-",
-    "*",
-    "/",
-    "<",
-    ">",
-    "=",
-    "<=",
-    ">=",
-    "not",
-    "cons",
-    "car",
-    "cdr",
-    "null?",
-    "list",
-    "length",
-    "append",
-    "number?",
-    "string?",
-    "boolean?",
-    "pair?",
-    "symbol?",
-    "char?",
-    "display",
-    "write",
-    "newline",
-    "string-append",
-    "string-length",
-    "substring",
-    "string->number",
-    "number->string",
-    "symbol->string",
-    "string->symbol",
-    "string-ref",
-    "string-copy",
-    "string-set!",
-    "apply",
-    "abs",
-    "modulo",
-    "remainder",
-    "quotient",
-    "min",
-    "max",
-    "expt",
-    "zero?",
-    "positive?",
-    "negative?",
-    "odd?",
-    "even?",
-    "list-ref",
-    "list-tail",
-    "list?",
-    "assoc",
-    "map",
-    "equal?",
-    "eq?",
-    "char-alphabetic?",
-    "char-numeric?",
-    "char-upcase",
-    "char-downcase",
-    "char=?",
-    "char<?",
-    "string=?",
-    "string<?",
-    "string-ci=?",
-    "string-upcase",
-    "string-downcase",
-    "exact?",
-    "inexact?",
-    "exact->inexact",
-    "inexact->exact",
-    "numerator",
-    "denominator",
-    "rational?",
-    "integer?",
-    "procedure?",
-    "eqv?",
-    "vector",
-    "make-vector",
-    "vector-ref",
-    "vector-set!",
-    "vector-length",
-    "vector?",
-    "vector->list",
-    "list->vector",
-    "string->list",
-    "list->string",
-    "char->integer",
-    "integer->char"
-  )
+  private def valuesEqualD(a: Value, b: Value, depth: Int): Boolean =
+    if depth > 100000 then return true // cycle guard
+    (a, b) match
+      case (Value.VNum(x), Value.VNum(y))                     => x == y
+      case (Value.VFloat(x), Value.VFloat(y))                 => x == y
+      case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
+      case (Value.VBool(x), Value.VBool(y))                   => x == y
+      case (Value.VStr(x, _), Value.VStr(y, _))               => java.util.Arrays.equals(x, y)
+      case (Value.VChar(x), Value.VChar(y))                   => x == y
+      case (Value.VSymbol(x), Value.VSymbol(y))               => x == y
+      case (Value.VList(xs), Value.VList(ys)) =>
+        xs.length == ys.length && xs
+          .zip(ys)
+          .forall((a, b) => valuesEqualD(a, b, depth + 1))
+      case (Value.VDottedList(xs, xl), Value.VDottedList(ys, yl)) =>
+        xs.length == ys.length && xs
+          .zip(ys)
+          .forall((a, b) => valuesEqualD(a, b, depth + 1)) && valuesEqualD(xl, yl, depth + 1)
+      case (Value.VPair(c1), Value.VPair(c2)) =>
+        if c1 eq c2 then true
+        else valuesEqualD(c1.car, c2.car, depth + 1) && valuesEqualD(c1.cdr, c2.cdr, depth + 1)
+      case (Value.VPair(_), Value.VList(_)) | (Value.VList(_), Value.VPair(_)) =>
+        // compare structurally: convert both to element lists
+        val aElems = toScalaListOpt(a)
+        val bElems = toScalaListOpt(b)
+        (aElems, bElems) match
+          case (Some(xs), Some(ys)) =>
+            xs.length == ys.length && xs.zip(ys).forall((a, b) => valuesEqualD(a, b, depth + 1))
+          case _ => false
+      case (Value.VVector(xs), Value.VVector(ys)) =>
+        xs.length == ys.length && xs.zip(ys).forall((a, b) => valuesEqualD(a, b, depth + 1))
+      case (Value.VVoid, Value.VVoid) => true
+      case _                          => false
+
+  // ── List/pair helpers ────────────────────────────────────────────────
+  /** Convert a list-like Value to Scala List. Returns None for cycles or improper lists. */
+  def toScalaListOpt(v: Value): Option[List[Value]] =
+    val buf  = scala.collection.mutable.ListBuffer[Value]()
+    var cur  = v
+    val seen = new java.util.IdentityHashMap[PairCell, java.lang.Boolean]()
+    while true do
+      cur match
+        case Value.VList(Nil)   => return Some(buf.toList)
+        case Value.VList(elems) => buf ++= elems; return Some(buf.toList)
+        case Value.VPair(cell) =>
+          if seen.containsKey(cell) then return None
+          seen.put(cell, java.lang.Boolean.TRUE)
+          buf += cell.car
+          cur = cell.cdr
+        case _ => return None
+    None // unreachable
+
+  /** Convert a list-like Value to Scala List. Throws on cycle or improper list. */
+  def pairToScalaList(v: Value, pos: Pos): List[Value] =
+    toScalaListOpt(v).getOrElse(throw errAt(pos, "not a proper list"))
+
+  /** Build a scheme list (VPair chain ending in VList(Nil)) from Scala List. */
+  def schemeList(elems: List[Value]): Value =
+    elems.foldRight(Value.VList(Nil): Value)((h, t) => Value.VPair(new PairCell(h, t)))
+
+  /** Test if value is a proper list (with cycle detection). */
+  def isProperList(v: Value): Boolean =
+    var cur  = v
+    val seen = new java.util.IdentityHashMap[PairCell, java.lang.Boolean]()
+    while true do
+      cur match
+        case Value.VList(_) => return true
+        case Value.VPair(cell) =>
+          if seen.containsKey(cell) then return false
+          seen.put(cell, java.lang.Boolean.TRUE)
+          cur = cell.cdr
+        case _ => return false
+    false

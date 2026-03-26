@@ -1,6 +1,6 @@
 package ming
 
-import SchemeTypes.{errAt, isTruthy, Env, Pos, Value}
+import SchemeTypes.{errAt, isTruthy, schemeList, Env, Pos, Value}
 
 /** Result of a tail-position form: final value or continuation for TCO trampoline. */
 private[ming] enum TcoResult:
@@ -48,7 +48,7 @@ private[ming] object EvalTail:
     case Some(rest) =>
       if argVals.length < params.length then throw errAt(p, "wrong number of arguments")
       params.zip(argVals).foreach((pn, a) => env.define(pn, a))
-      env.define(rest, Value.VList(argVals.drop(params.length)))
+      env.define(rest, schemeList(argVals.drop(params.length)))
 
   def evalAnd(
     args: List[Expr],
@@ -129,6 +129,23 @@ private[ming] object EvalTail:
     body.init.foreach(e => evalFn(e, letEnv))
     Bounce(body.last, letEnv)
 
+  def evalLetStar(
+    rest: List[Expr],
+    env: Env,
+    p: Pos,
+    evalFn: (Expr, Env) => Value
+  ): TcoResult = rest match
+    case Expr.SList(bindings, _) :: body if body.nonEmpty =>
+      val letEnv = env.child()
+      for b <- bindings do
+        b match
+          case Expr.SList(Expr.Symbol(name, _) :: initExpr :: Nil, _) =>
+            letEnv.define(name, evalFn(initExpr, letEnv))
+          case _ => throw errAt(p, "invalid let* binding")
+      body.init.foreach(e => evalFn(e, letEnv))
+      Bounce(body.last, letEnv)
+    case _ => throw errAt(p, "invalid let*")
+
   def evalCond(
     clauses: List[Expr],
     env: Env,
@@ -141,7 +158,10 @@ private[ming] object EvalTail:
         case Expr.SList(Expr.Symbol("else", _) :: body, _) =>
           return bounceBody(body, env, evalFn)
         case Expr.SList(test :: body, _) =>
-          if isTruthy(evalFn(test, env)) then return bounceBody(body, env, evalFn)
+          val testVal = evalFn(test, env)
+          if isTruthy(testVal) then
+            if body.nonEmpty then return bounceBody(body, env, evalFn)
+            else return Done(testVal)
           else remaining = remaining.tail
         case e => throw errAt(posOf(e), "invalid cond")
     Done(Value.VVoid)

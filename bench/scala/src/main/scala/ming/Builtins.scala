@@ -1,6 +1,7 @@
 package ming
 
-import SchemeTypes.{display, displayStr, errAt, isNumeric, isTruthy, valuesEqual, Env, Pos, Value}
+import Display.{display, displayStr}
+import SchemeTypes.{errAt, isNumeric, isTruthy, pairToScalaList, schemeList, Env, PairCell, Pos, Value}
 
 object Builtins:
 
@@ -16,13 +17,24 @@ object Builtins:
       ArithmeticBuiltins.applyNumericUtils(name, args, pos)
     case "zero?" | "positive?" | "negative?" | "odd?" | "even?" =>
       ArithmeticBuiltins.applyNumericPredicates(name, args, pos)
-    case "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append" =>
+    case "gcd" | "lcm" | "truncate" | "round" =>
+      ArithmeticBuiltins.applyExtraNumeric(name, args, pos)
+    case "not" | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append" | "reverse" =>
       applyListOps(name, args, pos)
-    case "list-ref" | "list-tail" | "list?" | "assoc" | "map" | "equal?" | "eq?" | "eqv?" =>
-      applyListUtils(name, args, pos, env)
+    case "set-car!" | "set-cdr!" =>
+      applyPairMutation(name, args, pos)
+    case "cddr" =>
+      if args.length != 1 then throw errAt(pos, "cddr requires 1 argument")
+      applyCdr(applyCdr(args.head, pos), pos)
+    case "caddr" =>
+      if args.length != 1 then throw errAt(pos, "caddr requires 1 argument")
+      applyCar(applyCdr(applyCdr(args.head, pos), pos), pos)
+    case "list-ref" | "list-tail" | "list?" | "assoc" | "assv" | "member" | "map" | "for-each" | "equal?" | "eq?" |
+        "eqv?" =>
+      ListUtilBuiltins.applyListUtils(name, args, pos, env)
     case "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length" | "vector?" | "vector->list" |
         "list->vector" =>
-      applyVectorOps(name, args, pos)
+      VectorBuiltins.applyVectorOps(name, args, pos)
     case "number?" | "string?" | "boolean?" | "pair?" | "symbol?" | "char?" | "integer?" | "rational?" | "procedure?" =>
       applyTypeCheck(name, args, pos)
     case "exact?" | "inexact?" | "exact->inexact" | "inexact->exact" | "numerator" | "denominator" =>
@@ -31,13 +43,18 @@ object Builtins:
       applyIO(name, args, pos, env)
     case "apply" =>
       applyApply(args, pos, env)
+    case "error" =>
+      val msg = args.map(a => displayStr(a)).mkString(" ")
+      throw EvalError(msg)
     case "string-append" | "string-length" | "substring" | "string->number" | "number->string" | "symbol->string" |
-        "string->symbol" | "string-ref" | "string-copy" | "string-set!" | "string->list" | "list->string" =>
+        "string->symbol" | "string-ref" | "string-copy" | "string-set!" | "string->list" | "list->string" |
+        "make-string" | "string" =>
       StringCharBuiltins.applyStringOps(name, args, pos)
     case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" |
         "char->integer" | "integer->char" =>
       StringCharBuiltins.applyCharOps(name, args, pos)
-    case "string=?" | "string<?" | "string-ci=?" | "string-upcase" | "string-downcase" =>
+    case "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" | "string-ci=?" | "string-upcase" |
+        "string-downcase" =>
       StringCharBuiltins.applyStringCompare(name, args, pos)
     case s if s.startsWith("__record-") => Records.applyRecordOp(s, args, pos)
     case _                              => throw errAt(pos, s"unknown builtin: $name")
@@ -52,20 +69,18 @@ object Builtins:
       Value.VBool(!isTruthy(args.head))
     case "cons" =>
       if args.length != 2 then throw errAt(pos, "cons requires 2 arguments")
-      args(1) match
-        case Value.VList(elems) => Value.VList(args(0) :: elems)
-        case Value.VDottedList(elems, last) =>
-          Value.VDottedList(args(0) :: elems, last)
-        case _ => Value.VDottedList(List(args(0)), args(1))
+      Value.VPair(new PairCell(args(0), args(1)))
     case "car" =>
       if args.length != 1 then throw errAt(pos, "car requires 1 argument")
       args.head match
+        case Value.VPair(cell)            => cell.car
         case Value.VList(h :: _)          => h
         case Value.VDottedList(h :: _, _) => h
         case _                            => throw errAt(pos, "car: not a pair")
     case "cdr" =>
       if args.length != 1 then throw errAt(pos, "cdr requires 1 argument")
       args.head match
+        case Value.VPair(cell)                 => cell.cdr
         case Value.VList(_ :: t)               => Value.VList(t)
         case Value.VDottedList(_ :: Nil, last) => last
         case Value.VDottedList(_ :: rest, last) =>
@@ -74,22 +89,62 @@ object Builtins:
     case "null?" =>
       if args.length != 1 then throw errAt(pos, "null? requires 1 argument")
       Value.VBool(args.head == Value.VList(Nil))
-    case "list" => Value.VList(args)
+    case "list" =>
+      schemeList(args)
     case "length" =>
       if args.length != 1 then throw errAt(pos, "length requires 1 argument")
       args.head match
-        case Value.VList(elems) =>
+        case Value.VList(elems) => Value.VNum(elems.length.toLong)
+        case Value.VPair(_) =>
+          val elems = pairToScalaList(args.head, pos)
           Value.VNum(elems.length.toLong)
         case _ => throw errAt(pos, "length: not a list")
     case "append" =>
-      args.foldRight(Value.VList(Nil): Value) { (arg, acc) =>
-        (arg, acc) match
-          case (Value.VList(elems), Value.VList(accElems)) =>
-            Value.VList(elems ++ accElems)
-          case _ =>
-            throw errAt(pos, "append: not a list")
-      }
+      if args.isEmpty then Value.VList(Nil)
+      else if args.length == 1 then args.head
+      else
+        val last   = args.last
+        val prefix = args.init.flatMap(a => pairToScalaList(a, pos))
+        prefix.foldRight(last)((h, t) => Value.VPair(new PairCell(h, t)))
+    case "reverse" =>
+      if args.length != 1 then throw errAt(pos, "reverse requires 1 argument")
+      val elems = pairToScalaList(args.head, pos)
+      schemeList(elems.reverse)
     case _ => throw errAt(pos, s"unknown list op: $name")
+
+  private def applyCar(v: Value, pos: Pos): Value = v match
+    case Value.VPair(cell)            => cell.car
+    case Value.VList(h :: _)          => h
+    case Value.VDottedList(h :: _, _) => h
+    case _                            => throw errAt(pos, "car: not a pair")
+
+  private def applyCdr(v: Value, pos: Pos): Value = v match
+    case Value.VPair(cell)                  => cell.cdr
+    case Value.VList(_ :: t)                => Value.VList(t)
+    case Value.VDottedList(_ :: Nil, last)  => last
+    case Value.VDottedList(_ :: rest, last) => Value.VDottedList(rest, last)
+    case _                                  => throw errAt(pos, "cdr: not a pair")
+
+  private def applyPairMutation(
+    name: String,
+    args: List[Value],
+    pos: Pos
+  ): Value = name match
+    case "set-car!" =>
+      if args.length != 2 then throw errAt(pos, "set-car! requires 2 arguments")
+      args(0) match
+        case Value.VPair(cell) =>
+          cell.car = args(1)
+          Value.VVoid
+        case _ => throw errAt(pos, "set-car!: not a mutable pair")
+    case "set-cdr!" =>
+      if args.length != 2 then throw errAt(pos, "set-cdr! requires 2 arguments")
+      args(0) match
+        case Value.VPair(cell) =>
+          cell.cdr = args(1)
+          Value.VVoid
+        case _ => throw errAt(pos, "set-cdr!: not a mutable pair")
+    case _ => throw errAt(pos, s"unknown pair mutation: $name")
 
   private def applyTypeCheck(
     name: String,
@@ -112,6 +167,7 @@ object Builtins:
       case ("string?", _)                       => false
       case ("boolean?", _: Value.VBool)         => true
       case ("boolean?", _)                      => false
+      case ("pair?", _: Value.VPair)            => true
       case ("pair?", Value.VList(_ :: _))       => true
       case ("pair?", _: Value.VDottedList)      => true
       case ("pair?", _)                         => false
@@ -146,125 +202,6 @@ object Builtins:
       Value.VVoid
     case _ => throw errAt(pos, s"unknown IO op: $name")
 
-  private def applyListUtils(
-    name: String,
-    args: List[Value],
-    pos: Pos,
-    env: Env
-  ): Value = name match
-    case "list-ref" =>
-      if args.length != 2 then throw errAt(pos, "list-ref requires 2 arguments")
-      (args(0), args(1)) match
-        case (Value.VList(elems), Value.VNum(i)) =>
-          elems(i.toInt)
-        case _ =>
-          throw errAt(pos, "list-ref: invalid arguments")
-    case "list-tail" =>
-      if args.length != 2 then throw errAt(pos, "list-tail requires 2 arguments")
-      (args(0), args(1)) match
-        case (Value.VList(elems), Value.VNum(i)) =>
-          Value.VList(elems.drop(i.toInt))
-        case _ =>
-          throw errAt(pos, "list-tail: invalid arguments")
-    case "list?" =>
-      if args.length != 1 then throw errAt(pos, "list? requires 1 argument")
-      args.head match
-        case Value.VList(_) => Value.VBool(true)
-        case _              => Value.VBool(false)
-    case "assoc" =>
-      if args.length != 2 then throw errAt(pos, "assoc requires 2 arguments")
-      args(1) match
-        case Value.VList(elems) =>
-          elems
-            .collectFirst {
-              case v @ Value.VList(key :: _) if valuesEqual(key, args(0)) =>
-                v
-            }
-            .getOrElse(Value.VBool(false))
-        case _ => throw errAt(pos, "assoc: not a list")
-    case "map" =>
-      if args.length < 2 then throw errAt(pos, "map requires at least 2 arguments")
-      val func = args.head
-      val lists = args.tail.map {
-        case Value.VList(elems) => elems
-        case _                  => throw errAt(pos, "map: not a list")
-      }
-      val len = lists.head.length
-      val result = (0 until len).toList.map { i =>
-        val mapArgs = lists.map(_(i))
-        Evaluator.applyFunc(func, mapArgs, pos, env)
-      }
-      Value.VList(result)
-    case "equal?" =>
-      if args.length != 2 then throw errAt(pos, "equal? requires 2 arguments")
-      Value.VBool(valuesEqual(args(0), args(1)))
-    case "eq?" =>
-      if args.length != 2 then throw errAt(pos, "eq? requires 2 arguments")
-      val result = (args(0), args(1)) match
-        case (Value.VSymbol(a), Value.VSymbol(b)) => a == b
-        case (Value.VNum(a), Value.VNum(b))       => a == b
-        case (Value.VBool(a), Value.VBool(b))     => a == b
-        case (Value.VChar(a), Value.VChar(b))     => a == b
-        case (Value.VList(Nil), Value.VList(Nil)) => true
-        case (a, b)                               => a eq b
-      Value.VBool(result)
-    case "eqv?" =>
-      if args.length != 2 then throw errAt(pos, "eqv? requires 2 arguments")
-      val result = (args(0), args(1)) match
-        case (Value.VSymbol(a), Value.VSymbol(b))               => a == b
-        case (Value.VNum(a), Value.VNum(b))                     => a == b
-        case (Value.VFloat(a), Value.VFloat(b))                 => a == b
-        case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
-        case (Value.VBool(a), Value.VBool(b))                   => a == b
-        case (Value.VChar(a), Value.VChar(b))                   => a == b
-        case (Value.VList(Nil), Value.VList(Nil))               => true
-        case (a, b)                                             => a eq b
-      Value.VBool(result)
-    case _ => throw errAt(pos, s"unknown list util: $name")
-
-  private def applyVectorOps(
-    name: String,
-    args: List[Value],
-    pos: Pos
-  ): Value = name match
-    case "vector" => Value.VVector(args.toArray)
-    case "make-vector" =>
-      args match
-        case Value.VNum(n) :: Nil         => Value.VVector(Array.fill(n.toInt)(Value.VNum(0)))
-        case Value.VNum(n) :: fill :: Nil => Value.VVector(Array.fill(n.toInt)(fill))
-        case _                            => throw errAt(pos, "make-vector: invalid arguments")
-    case "vector-ref" =>
-      if args.length != 2 then throw errAt(pos, "vector-ref requires 2 arguments")
-      (args(0), args(1)) match
-        case (Value.VVector(elems), Value.VNum(i)) => elems(i.toInt)
-        case _                                     => throw errAt(pos, "vector-ref: invalid arguments")
-    case "vector-set!" =>
-      if args.length != 3 then throw errAt(pos, "vector-set! requires 3 arguments")
-      (args(0), args(1)) match
-        case (Value.VVector(elems), Value.VNum(i)) =>
-          elems(i.toInt) = args(2)
-          Value.VVoid
-        case _ => throw errAt(pos, "vector-set!: invalid arguments")
-    case "vector-length" =>
-      if args.length != 1 then throw errAt(pos, "vector-length requires 1 argument")
-      args.head match
-        case Value.VVector(elems) => Value.VNum(elems.length.toLong)
-        case _                    => throw errAt(pos, "vector-length: not a vector")
-    case "vector?" =>
-      if args.length != 1 then throw errAt(pos, "vector? requires 1 argument")
-      Value.VBool(args.head.isInstanceOf[Value.VVector])
-    case "vector->list" =>
-      if args.length != 1 then throw errAt(pos, "vector->list requires 1 argument")
-      args.head match
-        case Value.VVector(elems) => Value.VList(elems.toList)
-        case _                    => throw errAt(pos, "vector->list: not a vector")
-    case "list->vector" =>
-      if args.length != 1 then throw errAt(pos, "list->vector requires 1 argument")
-      args.head match
-        case Value.VList(elems) => Value.VVector(elems.toArray)
-        case _                  => throw errAt(pos, "list->vector: not a list")
-    case _ => throw errAt(pos, s"unknown vector op: $name")
-
   private def applyApply(
     args: List[Value],
     pos: Pos,
@@ -274,6 +211,7 @@ object Builtins:
     val func = args.head
     val lastArg = args.last match
       case Value.VList(elems) => elems
+      case Value.VPair(_)     => pairToScalaList(args.last, pos)
       case _ =>
         throw errAt(pos, "apply: last argument must be a list")
     val prefixArgs = args.slice(1, args.length - 1)

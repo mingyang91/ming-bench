@@ -78,18 +78,32 @@ object StringCharBuiltins:
     case "string->list" =>
       if args.length != 1 then throw errAt(pos, "string->list requires 1 argument")
       args.head match
-        case Value.VStr(chars, _) => Value.VList(chars.map(Value.VChar(_)).toList)
+        case Value.VStr(chars, _) => SchemeTypes.schemeList(chars.map(Value.VChar(_)).toList)
         case _                    => throw errAt(pos, "string->list: not a string")
     case "list->string" =>
       if args.length != 1 then throw errAt(pos, "list->string requires 1 argument")
-      args.head match
-        case Value.VList(elems) =>
-          val chars = elems.map {
-            case Value.VChar(c) => c
-            case _              => throw errAt(pos, "list->string: not a character")
-          }
-          Value.VStr(chars.toArray)
-        case _ => throw errAt(pos, "list->string: not a list")
+      val elems = args.head match
+        case Value.VList(elems) => elems
+        case Value.VPair(_)     => SchemeTypes.pairToScalaList(args.head, pos)
+        case _                  => throw errAt(pos, "list->string: not a list")
+      val chars = elems.map {
+        case Value.VChar(c) => c
+        case _              => throw errAt(pos, "list->string: not a character")
+      }
+      Value.VStr(chars.toArray)
+    case "make-string" =>
+      args match
+        case Value.VNum(n) :: Nil =>
+          Value.VStr(Array.fill(n.toInt)('\u0000'))
+        case Value.VNum(n) :: Value.VChar(c) :: Nil =>
+          Value.VStr(Array.fill(n.toInt)(c))
+        case _ => throw errAt(pos, "make-string: invalid arguments")
+    case "string" =>
+      val chars = args.map {
+        case Value.VChar(c) => c
+        case _              => throw errAt(pos, "string: not a character")
+      }
+      Value.VStr(chars.toArray)
     case _ => throw errAt(pos, s"unknown string op: $name")
 
   def applyCharOps(
@@ -152,6 +166,15 @@ object StringCharBuiltins:
       case "string-upcase" =>
         if args.length != 1 then throw errAt(pos, "string-upcase requires 1 argument")
         Value.VStr(asString(args.head).toUpperCase.toCharArray)
+      case "string>?" =>
+        if args.length != 2 then throw errAt(pos, "string>? requires 2 arguments")
+        Value.VBool(asString(args(0)) > asString(args(1)))
+      case "string<=?" =>
+        if args.length != 2 then throw errAt(pos, "string<=? requires 2 arguments")
+        Value.VBool(asString(args(0)) <= asString(args(1)))
+      case "string>=?" =>
+        if args.length != 2 then throw errAt(pos, "string>=? requires 2 arguments")
+        Value.VBool(asString(args(0)) >= asString(args(1)))
       case "string-downcase" =>
         if args.length != 1 then throw errAt(pos, "string-downcase requires 1 argument")
         Value.VStr(asString(args.head).toLowerCase.toCharArray)

@@ -60,23 +60,13 @@ private[ming] object EvalCompound:
           evalBody(body, env)
         case Expr.SList(Expr.SList(datums, _) :: body, _) :: rest =>
           val matched = datums.exists { d =>
-            eqvCheck(key, EvalForms.quoteToValue(d))
+            ListUtilBuiltins.eqvCheck(key, EvalForms.quoteToValue(d))
           }
           if matched then evalBody(body, env)
           else matchClauses(rest)
         case e :: _ => throw errAt(posOf(e), "invalid case clause")
       matchClauses(clauses)
     case _ => throw errAt(pos, "invalid case")
-
-  def eqvCheck(a: Value, b: Value): Boolean = (a, b) match
-    case (Value.VSymbol(x), Value.VSymbol(y))               => x == y
-    case (Value.VNum(x), Value.VNum(y))                     => x == y
-    case (Value.VFloat(x), Value.VFloat(y))                 => x == y
-    case (Value.VRational(n1, d1), Value.VRational(n2, d2)) => n1 == n2 && d1 == d2
-    case (Value.VBool(x), Value.VBool(y))                   => x == y
-    case (Value.VChar(x), Value.VChar(y))                   => x == y
-    case (Value.VList(Nil), Value.VList(Nil))               => true
-    case _                                                  => false
 
   def evalDo(
     rest: List[Expr],

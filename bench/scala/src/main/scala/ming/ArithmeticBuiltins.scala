@@ -184,6 +184,35 @@ private[ming] object ArithmeticBuiltins:
       if dv == 0.0 then throw errAt(pos, "division by zero")
       Value.VFloat(toDouble(a, pos) / dv)
 
+  def applyExtraNumeric(
+    name: String,
+    args: List[Value],
+    pos: Pos
+  ): Value = name match
+    case "gcd" =>
+      if args.isEmpty then Value.VNum(0)
+      else Value.VNum(args.map(v => math.abs(asNum(v, pos))).reduceLeft((a, b) => SchemeTypes.gcd(a, b)))
+    case "lcm" =>
+      if args.isEmpty then Value.VNum(1)
+      else
+        val vals = args.map(v => math.abs(asNum(v, pos)))
+        Value.VNum(vals.reduceLeft((a, b) => if a == 0 || b == 0 then 0L else a / SchemeTypes.gcd(a, b) * b))
+    case "truncate" =>
+      if args.length != 1 then throw errAt(pos, "truncate requires 1 argument")
+      args.head match
+        case Value.VNum(n)         => Value.VNum(n)
+        case Value.VFloat(d)       => Value.VNum(d.toLong)
+        case Value.VRational(n, d) => Value.VNum(n / d)
+        case _                     => throw errAt(pos, "expected number")
+    case "round" =>
+      if args.length != 1 then throw errAt(pos, "round requires 1 argument")
+      args.head match
+        case Value.VNum(n)         => Value.VNum(n)
+        case Value.VFloat(d)       => Value.VNum(math.round(d))
+        case Value.VRational(n, d) => Value.VNum(math.round(n.toDouble / d.toDouble))
+        case _                     => throw errAt(pos, "expected number")
+    case _ => throw errAt(pos, s"unknown numeric op: $name")
+
   private def negateValue(v: Value, pos: Pos): Value = v match
     case Value.VNum(n)         => Value.VNum(-n)
     case Value.VFloat(d)       => Value.VFloat(-d)
