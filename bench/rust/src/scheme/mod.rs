@@ -3,12 +3,14 @@ pub mod error;
 pub use error::EvalError;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 type EnvRef = Rc<Environment>;
+type MacroRef = Rc<SyntaxRulesMacro>;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum Expr {
     Number(f64),
     Boolean(bool),
@@ -41,6 +43,26 @@ struct Closure {
     params: Vec<String>,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct SyntaxRule {
+    pattern: Expr,
+    template: Expr,
+}
+
+#[derive(Clone)]
+struct SyntaxRulesMacro {
+    name: String,
+    literals: HashSet<String>,
+    rules: Vec<SyntaxRule>,
+    env: EnvRef,
+}
+
+#[derive(Clone)]
+enum PatternBinding {
+    Single(Expr),
+    Repeated(Vec<Expr>),
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +108,7 @@ struct LetBinding {
 struct Environment {
     parent: Option<EnvRef>,
     bindings: RefCell<HashMap<String, Value>>,
+    macros: RefCell<HashMap<String, MacroRef>>,
 }
 
 const BUILTINS: [(&str, BuiltinName); 21] = [
@@ -112,11 +135,14 @@ const BUILTINS: [(&str, BuiltinName); 21] = [
     ("symbol?", BuiltinName::SymbolPred),
 ];
 
+static MACRO_IDENTIFIER_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 impl Environment {
     fn new(parent: Option<EnvRef>) -> EnvRef {
         Rc::new(Self {
             parent,
             bindings: RefCell::new(HashMap::new()),
+            macros: RefCell::new(HashMap::new()),
         })
     }
 
@@ -124,13 +150,39 @@ impl Environment {
         self.bindings.borrow_mut().insert(name.into(), value);
     }
 
+    fn define_macro(&self, name: impl Into<String>, macro_rules: MacroRef) {
+        self.macros.borrow_mut().insert(name.into(), macro_rules);
+    }
+
     fn lookup(&self, name: &str) -> Result<Value, EvalError> {
+        self.lookup_optional(name)
+            .ok_or_else(|| EvalError::msg(format!("unbound symbol: {name}")))
+    }
+
+    fn lookup_optional(&self, name: &str) -> Option<Value> {
         if let Some(value) = self.bindings.borrow().get(name).cloned() {
-            return Ok(value);
+            return Some(value);
+        }
+
+        self.parent.as_ref().and_then(|parent| parent.lookup_optional(name))
+    }
+
+    fn lookup_macro(&self, name: &str) -> Option<MacroRef> {
+        if let Some(macro_rules) = self.macros.borrow().get(name).cloned() {
+            return Some(macro_rules);
+        }
+
+        self.parent.as_ref().and_then(|parent| parent.lookup_macro(name))
+    }
+
+    fn assign(&self, name: &str, value: Value) -> Result<(), EvalError> {
+        if self.bindings.borrow().contains_key(name) {
+            self.bindings.borrow_mut().insert(name.to_string(), value);
+            return Ok(());
         }
 
         if let Some(parent) = &self.parent {
-            return parent.lookup(name);
+            return parent.assign(name, value);
         }
 
         Err(EvalError::msg(format!("unbound symbol: {name}")))
@@ -362,7 +414,9 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 
     if let Expr::Symbol(name) = head {
         match name.as_str() {
+            "define-syntax" => return evaluate_define_syntax(arg_exprs, env),
             "define" => return evaluate_define(arg_exprs, env),
+            "set!" => return evaluate_set(arg_exprs, env),
             "if" => return evaluate_if(arg_exprs, env),
             "quote" => return evaluate_quote(arg_exprs),
             "lambda" => return evaluate_lambda(arg_exprs, env),
@@ -373,6 +427,11 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
             "cond" => return evaluate_cond(arg_exprs, env),
             _ => {}
         }
+
+        if let Some(macro_rules) = env.lookup_macro(name) {
+            let (expanded_expr, expanded_env) = expand_macro_invocation(elements, macro_rules, env)?;
+            return evaluate_expr(&expanded_expr, expanded_env);
+        }
     }
 
     let procedure = evaluate_expr(head, env.clone())?;
@@ -382,6 +441,20 @@ fn evaluate_list(elements: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     }
 
     apply_procedure(procedure, args)
+}
+
+fn evaluate_define_syntax(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if arg_exprs.len() != 2 {
+        return Err(EvalError::msg("define-syntax expects exactly 2 arguments"));
+    }
+
+    let Expr::Symbol(name) = &arg_exprs[0] else {
+        return Err(EvalError::msg("define-syntax expects a symbol name"));
+    };
+
+    let macro_rules = Rc::new(read_syntax_rules(name.clone(), &arg_exprs[1], env.clone())?);
+    env.define_macro(name.clone(), macro_rules);
+    Ok(Value::Void)
 }
 
 fn evaluate_define(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -425,6 +498,20 @@ fn evaluate_define(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> 
         }
         _ => Err(EvalError::msg("invalid define form")),
     }
+}
+
+fn evaluate_set(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if arg_exprs.len() != 2 {
+        return Err(EvalError::msg("set! expects exactly 2 arguments"));
+    }
+
+    let Expr::Symbol(name) = &arg_exprs[0] else {
+        return Err(EvalError::msg("set! expects a symbol target"));
+    };
+
+    let value = evaluate_expr(&arg_exprs[1], env.clone())?;
+    env.assign(name, value)?;
+    Ok(Value::Void)
 }
 
 fn evaluate_if(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -489,6 +576,929 @@ fn read_parameter_list(exprs: &[Expr]) -> Result<Vec<String>, EvalError> {
     }
 
     Ok(params)
+}
+
+fn read_syntax_rules(
+    name: String,
+    transformer_expr: &Expr,
+    env: EnvRef,
+) -> Result<SyntaxRulesMacro, EvalError> {
+    let Expr::List(items) = transformer_expr else {
+        return Err(EvalError::msg(
+            "define-syntax expects a syntax-rules transformer",
+        ));
+    };
+
+    if items.len() < 3 {
+        return Err(EvalError::msg(
+            "define-syntax expects a syntax-rules transformer",
+        ));
+    }
+
+    let Expr::Symbol(head) = &items[0] else {
+        return Err(EvalError::msg(
+            "define-syntax expects a syntax-rules transformer",
+        ));
+    };
+
+    if head != "syntax-rules" {
+        return Err(EvalError::msg(
+            "define-syntax expects a syntax-rules transformer",
+        ));
+    }
+
+    let Expr::List(literal_exprs) = &items[1] else {
+        return Err(EvalError::msg("syntax-rules literals must be a list"));
+    };
+
+    let mut literals = HashSet::new();
+    for literal_expr in literal_exprs {
+        let Expr::Symbol(literal) = literal_expr else {
+            return Err(EvalError::msg("syntax-rules literals must be identifiers"));
+        };
+        literals.insert(literal.clone());
+    }
+
+    if items.len() == 2 {
+        return Err(EvalError::msg("syntax-rules expects at least 1 rule"));
+    }
+
+    let mut rules = Vec::with_capacity(items.len() - 2);
+    for rule_expr in &items[2..] {
+        let Expr::List(rule_items) = rule_expr else {
+            return Err(EvalError::msg(
+                "syntax-rules rules must be (pattern template) pairs",
+            ));
+        };
+
+        if rule_items.len() != 2 {
+            return Err(EvalError::msg(
+                "syntax-rules rules must be (pattern template) pairs",
+            ));
+        }
+
+        rules.push(SyntaxRule {
+            pattern: rule_items[0].clone(),
+            template: rule_items[1].clone(),
+        });
+    }
+
+    Ok(SyntaxRulesMacro {
+        name,
+        literals,
+        rules,
+        env,
+    })
+}
+
+fn expand_macro_invocation(
+    elements: &[Expr],
+    macro_rules: MacroRef,
+    call_env: EnvRef,
+) -> Result<(Expr, EnvRef), EvalError> {
+    let invocation = Expr::List(elements.to_vec());
+
+    for rule in &macro_rules.rules {
+        if let Some(bindings) = match_syntax_rule(&rule.pattern, &invocation, &macro_rules.literals)? {
+            let expansion_env = Environment::new(Some(call_env.clone()));
+            let mut aliases = HashMap::new();
+            let expanded_expr = instantiate_template(
+                &rule.template,
+                &bindings,
+                &macro_rules,
+                expansion_env.clone(),
+                &mut aliases,
+                &HashMap::new(),
+                None,
+            )?;
+
+            return Ok((expanded_expr, expansion_env));
+        }
+    }
+
+    Err(EvalError::msg(format!(
+        "no matching syntax-rules clause for {}",
+        macro_rules.name
+    )))
+}
+
+fn match_syntax_rule(
+    pattern: &Expr,
+    invocation: &Expr,
+    literals: &HashSet<String>,
+) -> Result<Option<HashMap<String, PatternBinding>>, EvalError> {
+    let Expr::List(pattern_elements) = pattern else {
+        return Err(EvalError::msg(
+            "syntax-rules patterns must be non-empty lists",
+        ));
+    };
+
+    let Expr::List(invocation_elements) = invocation else {
+        return Ok(None);
+    };
+
+    if pattern_elements.is_empty() {
+        return Err(EvalError::msg(
+            "syntax-rules patterns must be non-empty lists",
+        ));
+    }
+
+    match_pattern_list(
+        pattern_elements,
+        invocation_elements,
+        literals,
+        HashMap::new(),
+        true,
+    )
+}
+
+fn match_pattern_list(
+    pattern_elements: &[Expr],
+    expr_elements: &[Expr],
+    literals: &HashSet<String>,
+    bindings: HashMap<String, PatternBinding>,
+    is_top_level: bool,
+) -> Result<Option<HashMap<String, PatternBinding>>, EvalError> {
+    let parts = split_ellipsis_parts(pattern_elements)?;
+    match_pattern_parts(&parts, expr_elements, literals, bindings, is_top_level, 0, 0)
+}
+
+fn match_pattern_parts(
+    parts: &[(Expr, bool)],
+    expr_elements: &[Expr],
+    literals: &HashSet<String>,
+    bindings: HashMap<String, PatternBinding>,
+    is_top_level: bool,
+    part_index: usize,
+    expr_index: usize,
+) -> Result<Option<HashMap<String, PatternBinding>>, EvalError> {
+    if part_index == parts.len() {
+        return Ok((expr_index == expr_elements.len()).then_some(bindings));
+    }
+
+    let (pattern, repeated) = &parts[part_index];
+    if !repeated {
+        let Some(expr) = expr_elements.get(expr_index) else {
+            return Ok(None);
+        };
+
+        let mut next_bindings = bindings.clone();
+        if !match_pattern_expr(
+            pattern,
+            expr,
+            literals,
+            &mut next_bindings,
+            is_top_level && part_index == 0,
+        )? {
+            return Ok(None);
+        }
+
+        return match_pattern_parts(
+            parts,
+            expr_elements,
+            literals,
+            next_bindings,
+            false,
+            part_index + 1,
+            expr_index + 1,
+        );
+    }
+
+    let min_remaining = count_required_pattern_parts(parts, part_index + 1);
+    let Some(max_repeats) = expr_elements.len().checked_sub(expr_index + min_remaining) else {
+        return Ok(None);
+    };
+
+    for repeat_count in 0..=max_repeats {
+        let mut next_bindings = bindings.clone();
+        let mut matched = true;
+
+        for offset in 0..repeat_count {
+            let mut local_bindings = HashMap::new();
+            if !match_pattern_expr(
+                pattern,
+                &expr_elements[expr_index + offset],
+                literals,
+                &mut local_bindings,
+                false,
+            )? {
+                matched = false;
+                break;
+            }
+
+            if !merge_repeated_pattern_bindings(&mut next_bindings, local_bindings)? {
+                matched = false;
+                break;
+            }
+        }
+
+        if !matched {
+            continue;
+        }
+
+        if !ensure_repeated_pattern_bindings(pattern, literals, &mut next_bindings)? {
+            continue;
+        }
+
+        if let Some(result) = match_pattern_parts(
+            parts,
+            expr_elements,
+            literals,
+            next_bindings,
+            false,
+            part_index + 1,
+            expr_index + repeat_count,
+        )? {
+            return Ok(Some(result));
+        }
+    }
+
+    Ok(None)
+}
+
+fn match_pattern_expr(
+    pattern: &Expr,
+    expr: &Expr,
+    literals: &HashSet<String>,
+    bindings: &mut HashMap<String, PatternBinding>,
+    ignore_keyword: bool,
+) -> Result<bool, EvalError> {
+    match pattern {
+        Expr::Number(value) => Ok(matches!(expr, Expr::Number(other) if other == value)),
+        Expr::Boolean(value) => Ok(matches!(expr, Expr::Boolean(other) if other == value)),
+        Expr::String(value) => Ok(matches!(expr, Expr::String(other) if other == value)),
+        Expr::Symbol(name) => {
+            if name == "..." {
+                return Err(EvalError::msg("invalid use of ellipsis"));
+            }
+
+            if ignore_keyword {
+                return Ok(matches!(expr, Expr::Symbol(_)));
+            }
+
+            if literals.contains(name) {
+                return Ok(matches!(expr, Expr::Symbol(other) if other == name));
+            }
+
+            bind_pattern_variable(name, expr, bindings)
+        }
+        Expr::List(pattern_items) => {
+            let Expr::List(expr_items) = expr else {
+                return Ok(false);
+            };
+
+            if let Some(result) = match_pattern_list(
+                pattern_items,
+                expr_items,
+                literals,
+                bindings.clone(),
+                false,
+            )? {
+                *bindings = result;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+fn bind_pattern_variable(
+    name: &str,
+    expr: &Expr,
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> Result<bool, EvalError> {
+    match bindings.get(name) {
+        None => {
+            bindings.insert(name.to_string(), PatternBinding::Single(expr.clone()));
+            Ok(true)
+        }
+        Some(PatternBinding::Single(existing)) => Ok(existing == expr),
+        Some(PatternBinding::Repeated(_)) => Ok(false),
+    }
+}
+
+fn merge_repeated_pattern_bindings(
+    target: &mut HashMap<String, PatternBinding>,
+    source: HashMap<String, PatternBinding>,
+) -> Result<bool, EvalError> {
+    for (name, binding) in source {
+        let PatternBinding::Single(expr) = binding else {
+            return Err(EvalError::msg("nested ellipsis patterns are not supported"));
+        };
+
+        match target.get_mut(&name) {
+            Some(PatternBinding::Repeated(values)) => values.push(expr),
+            Some(PatternBinding::Single(_)) => return Ok(false),
+            None => {
+                target.insert(name, PatternBinding::Repeated(vec![expr]));
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn ensure_repeated_pattern_bindings(
+    pattern: &Expr,
+    literals: &HashSet<String>,
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> Result<bool, EvalError> {
+    let mut names = HashSet::new();
+    collect_pattern_variables(pattern, literals, &mut names, false)?;
+
+    for name in names {
+        match bindings.get(&name) {
+            Some(PatternBinding::Single(_)) => return Ok(false),
+            Some(PatternBinding::Repeated(_)) => {}
+            None => {
+                bindings.insert(name, PatternBinding::Repeated(Vec::new()));
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn collect_pattern_variables(
+    pattern: &Expr,
+    literals: &HashSet<String>,
+    names: &mut HashSet<String>,
+    ignore_keyword: bool,
+) -> Result<(), EvalError> {
+    match pattern {
+        Expr::Number(_) | Expr::Boolean(_) | Expr::String(_) => Ok(()),
+        Expr::Symbol(name) => {
+            if name != "..." && !ignore_keyword && !literals.contains(name) {
+                names.insert(name.clone());
+            }
+            Ok(())
+        }
+        Expr::List(items) => {
+            for (part, _) in split_ellipsis_parts(items)? {
+                collect_pattern_variables(&part, literals, names, false)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn count_required_pattern_parts(parts: &[(Expr, bool)], start_index: usize) -> usize {
+    parts[start_index..]
+        .iter()
+        .filter(|(_, repeated)| !repeated)
+        .count()
+}
+
+fn split_ellipsis_parts(elements: &[Expr]) -> Result<Vec<(Expr, bool)>, EvalError> {
+    let mut parts = Vec::new();
+    let mut index = 0;
+
+    while index < elements.len() {
+        let expr = &elements[index];
+        if is_ellipsis_expr(expr) {
+            return Err(EvalError::msg("invalid use of ellipsis"));
+        }
+
+        let repeated = elements
+            .get(index + 1)
+            .is_some_and(|next| is_ellipsis_expr(next));
+        parts.push((expr.clone(), repeated));
+        index += if repeated { 2 } else { 1 };
+    }
+
+    Ok(parts)
+}
+
+fn is_ellipsis_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Symbol(name) if name == "...")
+}
+
+fn instantiate_template(
+    template: &Expr,
+    bindings: &HashMap<String, PatternBinding>,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+    local_scope: &HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    match template {
+        Expr::Number(_) | Expr::Boolean(_) | Expr::String(_) => Ok(template.clone()),
+        Expr::Symbol(name) => instantiate_template_symbol(
+            name,
+            bindings,
+            macro_rules,
+            expansion_env,
+            aliases,
+            local_scope,
+            repeat_index,
+        ),
+        Expr::List(elements) => instantiate_template_list(
+            elements,
+            bindings,
+            macro_rules,
+            expansion_env,
+            aliases,
+            local_scope,
+            repeat_index,
+        ),
+    }
+}
+
+fn instantiate_template_symbol(
+    name: &str,
+    bindings: &HashMap<String, PatternBinding>,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+    local_scope: &HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    if name == "..." {
+        return Ok(Expr::Symbol(name.to_string()));
+    }
+
+    if let Some(alias) = local_scope.get(name) {
+        return Ok(Expr::Symbol(alias.clone()));
+    }
+
+    if let Some(binding) = bindings.get(name) {
+        return match binding {
+            PatternBinding::Single(expr) => Ok(expr.clone()),
+            PatternBinding::Repeated(values) => {
+                let Some(index) = repeat_index else {
+                    return Err(EvalError::msg(
+                        "ellipsis-bound pattern variable used outside ellipsis",
+                    ));
+                };
+
+                values
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| EvalError::msg("ellipsis repetition mismatch"))
+            }
+        };
+    }
+
+    if is_special_form_name(name) {
+        return Ok(Expr::Symbol(name.to_string()));
+    }
+
+    Ok(Expr::Symbol(resolve_macro_identifier(
+        name,
+        macro_rules,
+        expansion_env,
+        aliases,
+    )?))
+}
+
+fn instantiate_template_list(
+    elements: &[Expr],
+    bindings: &HashMap<String, PatternBinding>,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+    local_scope: &HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    if is_quote_form(elements) {
+        return Ok(Expr::List(elements.to_vec()));
+    }
+
+    if let Some(Expr::Symbol(name)) = elements.first() {
+        match name.as_str() {
+            "lambda" if elements.len() >= 2 => {
+                return instantiate_lambda_template(
+                    elements,
+                    bindings,
+                    macro_rules,
+                    expansion_env,
+                    aliases,
+                    local_scope,
+                    repeat_index,
+                )
+            }
+            "let" if elements.len() >= 3 => {
+                return instantiate_let_template(
+                    elements,
+                    bindings,
+                    macro_rules,
+                    expansion_env,
+                    aliases,
+                    local_scope,
+                    repeat_index,
+                )
+            }
+            _ => {}
+        }
+    }
+
+    instantiate_generic_template_list(
+        elements,
+        bindings,
+        macro_rules,
+        expansion_env,
+        aliases,
+        local_scope,
+        repeat_index,
+    )
+}
+
+fn instantiate_generic_template_list(
+    elements: &[Expr],
+    bindings: &HashMap<String, PatternBinding>,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+    local_scope: &HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    let mut result = Vec::new();
+
+    for (part, repeated) in split_ellipsis_parts(elements)? {
+        if !repeated {
+            result.push(instantiate_template(
+                &part,
+                bindings,
+                macro_rules,
+                expansion_env.clone(),
+                aliases,
+                local_scope,
+                repeat_index,
+            )?);
+            continue;
+        }
+
+        let repeats = get_template_repeat_count(&part, bindings)?;
+        for index in 0..repeats {
+            result.push(instantiate_template(
+                &part,
+                bindings,
+                macro_rules,
+                expansion_env.clone(),
+                aliases,
+                local_scope,
+                Some(index),
+            )?);
+        }
+    }
+
+    Ok(Expr::List(result))
+}
+
+fn instantiate_lambda_template(
+    elements: &[Expr],
+    bindings: &HashMap<String, PatternBinding>,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+    local_scope: &HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    let mut body_scope = local_scope.clone();
+    let mut result = vec![elements[0].clone()];
+
+    result.push(instantiate_binding_spec(
+        &elements[1],
+        bindings,
+        macro_rules,
+        expansion_env.clone(),
+        aliases,
+        local_scope,
+        &mut body_scope,
+        repeat_index,
+    )?);
+
+    for expr in &elements[2..] {
+        result.push(instantiate_template(
+            expr,
+            bindings,
+            macro_rules,
+            expansion_env.clone(),
+            aliases,
+            &body_scope,
+            repeat_index,
+        )?);
+    }
+
+    Ok(Expr::List(result))
+}
+
+fn instantiate_let_template(
+    elements: &[Expr],
+    bindings: &HashMap<String, PatternBinding>,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+    local_scope: &HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    let mut result = vec![elements[0].clone()];
+    let mut body_scope = local_scope.clone();
+
+    let mut bindings_index = 1;
+    let mut body_start_index = 2;
+
+    if matches!(elements.get(1), Some(Expr::Symbol(_))) && elements.get(2).is_some() {
+        result.push(instantiate_binding_name(
+            &elements[1],
+            bindings,
+            macro_rules,
+            expansion_env.clone(),
+            aliases,
+            local_scope,
+            &mut body_scope,
+            repeat_index,
+        )?);
+        bindings_index = 2;
+        body_start_index = 3;
+    }
+
+    let Some(Expr::List(binding_exprs)) = elements.get(bindings_index) else {
+        return instantiate_generic_template_list(
+            elements,
+            bindings,
+            macro_rules,
+            expansion_env,
+            aliases,
+            local_scope,
+            repeat_index,
+        );
+    };
+
+    let mut instantiated_bindings = Vec::with_capacity(binding_exprs.len());
+    for binding_expr in binding_exprs {
+        if let Expr::List(items) = binding_expr {
+            if items.len() == 2 {
+                instantiated_bindings.push(Expr::List(vec![
+                    instantiate_binding_name(
+                        &items[0],
+                        bindings,
+                        macro_rules,
+                        expansion_env.clone(),
+                        aliases,
+                        local_scope,
+                        &mut body_scope,
+                        repeat_index,
+                    )?,
+                    instantiate_template(
+                        &items[1],
+                        bindings,
+                        macro_rules,
+                        expansion_env.clone(),
+                        aliases,
+                        local_scope,
+                        repeat_index,
+                    )?,
+                ]));
+                continue;
+            }
+        }
+
+        instantiated_bindings.push(instantiate_template(
+            binding_expr,
+            bindings,
+            macro_rules,
+            expansion_env.clone(),
+            aliases,
+            local_scope,
+            repeat_index,
+        )?);
+    }
+
+    result.push(Expr::List(instantiated_bindings));
+
+    for expr in &elements[body_start_index..] {
+        result.push(instantiate_template(
+            expr,
+            bindings,
+            macro_rules,
+            expansion_env.clone(),
+            aliases,
+            &body_scope,
+            repeat_index,
+        )?);
+    }
+
+    Ok(Expr::List(result))
+}
+
+fn instantiate_binding_spec(
+    spec: &Expr,
+    bindings: &HashMap<String, PatternBinding>,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+    local_scope: &HashMap<String, String>,
+    body_scope: &mut HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    match spec {
+        Expr::Symbol(_) => instantiate_binding_name(
+            spec,
+            bindings,
+            macro_rules,
+            expansion_env,
+            aliases,
+            local_scope,
+            body_scope,
+            repeat_index,
+        ),
+        Expr::List(items) => {
+            let mut result = Vec::with_capacity(items.len());
+            for item in items {
+                if matches!(item, Expr::Symbol(name) if name == ".") {
+                    result.push(item.clone());
+                } else {
+                    result.push(instantiate_binding_name(
+                        item,
+                        bindings,
+                        macro_rules,
+                        expansion_env.clone(),
+                        aliases,
+                        local_scope,
+                        body_scope,
+                        repeat_index,
+                    )?);
+                }
+            }
+            Ok(Expr::List(result))
+        }
+        _ => instantiate_template(
+            spec,
+            bindings,
+            macro_rules,
+            expansion_env,
+            aliases,
+            local_scope,
+            repeat_index,
+        ),
+    }
+}
+
+fn instantiate_binding_name(
+    expr: &Expr,
+    bindings: &HashMap<String, PatternBinding>,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+    local_scope: &HashMap<String, String>,
+    body_scope: &mut HashMap<String, String>,
+    repeat_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    let Expr::Symbol(name) = expr else {
+        return instantiate_template(
+            expr,
+            bindings,
+            macro_rules,
+            expansion_env,
+            aliases,
+            local_scope,
+            repeat_index,
+        );
+    };
+
+    if name == "." {
+        return Ok(expr.clone());
+    }
+
+    if bindings.contains_key(name) {
+        return instantiate_template(
+            expr,
+            bindings,
+            macro_rules,
+            expansion_env,
+            aliases,
+            local_scope,
+            repeat_index,
+        );
+    }
+
+    let alias = fresh_macro_identifier(name);
+    body_scope.insert(name.clone(), alias.clone());
+    Ok(Expr::Symbol(alias))
+}
+
+fn get_template_repeat_count(
+    template: &Expr,
+    bindings: &HashMap<String, PatternBinding>,
+) -> Result<usize, EvalError> {
+    let mut names = HashSet::new();
+    collect_repeated_pattern_variables(template, bindings, &mut names)?;
+    if names.is_empty() {
+        return Err(EvalError::msg(
+            "template ellipsis has no repeated pattern variables",
+        ));
+    }
+
+    let mut repeat_count = None;
+    for name in names {
+        let Some(PatternBinding::Repeated(values)) = bindings.get(&name) else {
+            continue;
+        };
+
+        match repeat_count {
+            None => repeat_count = Some(values.len()),
+            Some(existing) if existing == values.len() => {}
+            Some(_) => {
+                return Err(EvalError::msg(
+                    "ellipsis-bound pattern variables must repeat the same number of times",
+                ))
+            }
+        }
+    }
+
+    Ok(repeat_count.unwrap_or(0))
+}
+
+fn collect_repeated_pattern_variables(
+    expr: &Expr,
+    bindings: &HashMap<String, PatternBinding>,
+    names: &mut HashSet<String>,
+) -> Result<(), EvalError> {
+    match expr {
+        Expr::Number(_) | Expr::Boolean(_) | Expr::String(_) => Ok(()),
+        Expr::Symbol(name) => {
+            if matches!(bindings.get(name), Some(PatternBinding::Repeated(_))) {
+                names.insert(name.clone());
+            }
+            Ok(())
+        }
+        Expr::List(elements) => {
+            if is_quote_form(elements) {
+                return Ok(());
+            }
+
+            for (part, _) in split_ellipsis_parts(elements)? {
+                collect_repeated_pattern_variables(&part, bindings, names)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn resolve_macro_identifier(
+    name: &str,
+    macro_rules: &MacroRef,
+    expansion_env: EnvRef,
+    aliases: &mut HashMap<String, String>,
+) -> Result<String, EvalError> {
+    if let Some(alias) = aliases.get(name) {
+        return Ok(alias.clone());
+    }
+
+    let alias = fresh_macro_identifier(name);
+    aliases.insert(name.to_string(), alias.clone());
+
+    if let Some(captured_macro) = macro_rules.env.lookup_macro(name) {
+        expansion_env.define_macro(alias.clone(), captured_macro);
+    } else if let Some(value) = macro_rules.env.lookup_optional(name) {
+        expansion_env.define(alias.clone(), value);
+    }
+
+    Ok(alias)
+}
+
+fn is_quote_form(elements: &[Expr]) -> bool {
+    matches!(elements, [Expr::Symbol(name), _] if name == "quote")
+}
+
+fn is_special_form_name(name: &str) -> bool {
+    matches!(
+        name,
+        "define"
+            | "define-syntax"
+            | "set!"
+            | "if"
+            | "quote"
+            | "lambda"
+            | "and"
+            | "or"
+            | "let"
+            | "begin"
+            | "cond"
+            | "syntax-rules"
+            | "else"
+            | "."
+    )
+}
+
+fn fresh_macro_identifier(name: &str) -> String {
+    let counter = MACRO_IDENTIFIER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sanitized: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let suffix = if sanitized.is_empty() { "id" } else { &sanitized };
+    format!("__macro_{counter}_{suffix}")
 }
 
 fn evaluate_and(arg_exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
