@@ -40,6 +40,7 @@ type tokenKind int
 const (
 	tokenLParen tokenKind = iota
 	tokenRParen
+	tokenQuote
 	tokenAtom
 	tokenString
 )
@@ -90,6 +91,33 @@ func newGlobalEnv() *env {
 	root.define("=", builtinProc{name: "=", fn: comparisonBuiltin("=", func(a, b int) bool { return a == b })})
 	root.define("<=", builtinProc{name: "<=", fn: comparisonBuiltin("<=", func(a, b int) bool { return a <= b })})
 	root.define("not", builtinProc{name: "not", fn: builtinNot})
+	root.define("append", builtinProc{name: "append", fn: builtinAppend})
+	root.define("car", builtinProc{name: "car", fn: builtinCar})
+	root.define("cdr", builtinProc{name: "cdr", fn: builtinCdr})
+	root.define("cons", builtinProc{name: "cons", fn: builtinCons})
+	root.define("length", builtinProc{name: "length", fn: builtinLength})
+	root.define("list", builtinProc{name: "list", fn: builtinList})
+	root.define("null?", builtinProc{name: "null?", fn: builtinNull})
+	root.define("boolean?", builtinProc{name: "boolean?", fn: typePredicate(func(value expr) bool {
+		_, ok := value.(boolExpr)
+		return ok
+	})})
+	root.define("number?", builtinProc{name: "number?", fn: typePredicate(func(value expr) bool {
+		_, ok := value.(intExpr)
+		return ok
+	})})
+	root.define("pair?", builtinProc{name: "pair?", fn: typePredicate(func(value expr) bool {
+		list, ok := value.(listExpr)
+		return ok && len(list) > 0
+	})})
+	root.define("string?", builtinProc{name: "string?", fn: typePredicate(func(value expr) bool {
+		_, ok := value.(stringExpr)
+		return ok
+	})})
+	root.define("symbol?", builtinProc{name: "symbol?", fn: typePredicate(func(value expr) bool {
+		_, ok := value.(symbolExpr)
+		return ok
+	})})
 
 	return root
 }
@@ -122,6 +150,9 @@ func tokenize(input string) ([]token, error) {
 			input = input[size:]
 		case r == ')':
 			tokens = append(tokens, token{kind: tokenRParen, text: ")"})
+			input = input[size:]
+		case r == '\'':
+			tokens = append(tokens, token{kind: tokenQuote, text: "'"})
 			input = input[size:]
 		case r == '"':
 			text, rest, err := scanString(input[size:])
@@ -233,6 +264,12 @@ func (p *parser) parseExpr() (expr, error) {
 		}
 	case tokenRParen:
 		return nil, &EvalError{Message: "unexpected ')'"}
+	case tokenQuote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return listExpr{symbolExpr("quote"), quoted}, nil
 	case tokenString:
 		return stringExpr(tok.text), nil
 	case tokenAtom:
@@ -297,6 +334,12 @@ func evalList(environment *env, items listExpr) (expr, error) {
 			return evalDefine(environment, items[1:])
 		case "if":
 			return evalIf(environment, items[1:])
+		case "begin":
+			return evalBegin(environment, items[1:])
+		case "cond":
+			return evalCond(environment, items[1:])
+		case "let":
+			return evalLet(environment, items[1:])
 		case "quote":
 			return evalQuote(items[1:])
 		case "lambda":
@@ -371,11 +414,110 @@ func evalIf(environment *env, forms []expr) (expr, error) {
 	return evalExpr(environment, forms[2])
 }
 
+func evalBegin(environment *env, forms []expr) (expr, error) {
+	if len(forms) == 0 {
+		return voidExpr{}, nil
+	}
+	return evalSequence(environment, forms)
+}
+
+func evalCond(environment *env, forms []expr) (expr, error) {
+	for i, form := range forms {
+		clause, ok := form.(listExpr)
+		if !ok || len(clause) == 0 {
+			return nil, &EvalError{Message: "cond clauses must be non-empty lists"}
+		}
+
+		if symbol, ok := clause[0].(symbolExpr); ok && string(symbol) == "else" {
+			if i != len(forms)-1 {
+				return nil, &EvalError{Message: "cond else clause must be last"}
+			}
+			if len(clause) == 1 {
+				return voidExpr{}, nil
+			}
+			return evalSequence(environment, clause[1:])
+		}
+
+		testValue, err := evalExpr(environment, clause[0])
+		if err != nil {
+			return nil, err
+		}
+		if !isTruthy(testValue) {
+			continue
+		}
+		if len(clause) == 1 {
+			return testValue, nil
+		}
+		return evalSequence(environment, clause[1:])
+	}
+
+	return voidExpr{}, nil
+}
+
 func evalQuote(forms []expr) (expr, error) {
 	if len(forms) != 1 {
 		return nil, &EvalError{Message: "quote expects exactly 1 argument"}
 	}
 	return forms[0], nil
+}
+
+func evalLet(environment *env, forms []expr) (expr, error) {
+	if len(forms) < 2 {
+		return nil, &EvalError{Message: "let expects bindings and a body"}
+	}
+
+	if name, ok := forms[0].(symbolExpr); ok {
+		return evalNamedLet(environment, string(name), forms[1:])
+	}
+
+	bindings, ok := forms[0].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "let bindings must be a list"}
+	}
+
+	names, values, err := evalBindings(environment, bindings)
+	if err != nil {
+		return nil, err
+	}
+
+	letEnv := &env{
+		parent:   environment,
+		bindings: map[string]expr{},
+	}
+	for i, name := range names {
+		letEnv.define(name, values[i])
+	}
+
+	return evalSequence(letEnv, forms[1:])
+}
+
+func evalNamedLet(environment *env, name string, forms []expr) (expr, error) {
+	if len(forms) < 2 {
+		return nil, &EvalError{Message: "named let expects bindings and a body"}
+	}
+
+	bindings, ok := forms[0].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "named let bindings must be a list"}
+	}
+
+	names, values, err := evalBindings(environment, bindings)
+	if err != nil {
+		return nil, err
+	}
+
+	letEnv := &env{
+		parent:   environment,
+		bindings: map[string]expr{},
+	}
+	closure := closureExpr{
+		params: append([]string(nil), names...),
+		body:   append([]expr(nil), forms[1:]...),
+		env:    letEnv,
+	}
+	letEnv.define(name, closure)
+
+	return applyCallable(closure, values)
 }
 
 func evalLambda(environment *env, forms []expr) (expr, error) {
@@ -412,12 +554,43 @@ func parseParamList(items []expr) ([]string, error) {
 	return params, nil
 }
 
+func evalBindings(environment *env, bindings listExpr) ([]string, []expr, error) {
+	names := make([]string, 0, len(bindings))
+	values := make([]expr, 0, len(bindings))
+
+	for _, binding := range bindings {
+		pair, ok := binding.(listExpr)
+		if !ok || len(pair) != 2 {
+			return nil, nil, &EvalError{Message: "let bindings must have the form (name value)"}
+		}
+
+		name, ok := pair[0].(symbolExpr)
+		if !ok {
+			return nil, nil, &EvalError{Message: "let binding name must be a symbol"}
+		}
+
+		value, err := evalExpr(environment, pair[1])
+		if err != nil {
+			return nil, nil, err
+		}
+
+		names = append(names, string(name))
+		values = append(values, value)
+	}
+
+	return names, values, nil
+}
+
 func applyProcedure(environment *env, proc expr, argForms []expr) (expr, error) {
 	args, err := evalArgs(environment, argForms)
 	if err != nil {
 		return nil, err
 	}
 
+	return applyCallable(proc, args)
+}
+
+func applyCallable(proc expr, args []expr) (expr, error) {
 	switch callable := proc.(type) {
 	case builtinProc:
 		return callable.fn(args)
@@ -557,6 +730,85 @@ func builtinNot(args []expr) (expr, error) {
 	return boolExpr(!isTruthy(args[0])), nil
 }
 
+func builtinAppend(args []expr) (expr, error) {
+	result := make(listExpr, 0)
+	for _, arg := range args {
+		list, ok := arg.(listExpr)
+		if !ok {
+			return nil, &EvalError{Message: "append expects list arguments"}
+		}
+		result = append(result, list...)
+	}
+	return result, nil
+}
+
+func builtinCar(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "car expects exactly 1 argument"}
+	}
+
+	list, ok := args[0].(listExpr)
+	if !ok || len(list) == 0 {
+		return nil, &EvalError{Message: "car expects a non-empty list"}
+	}
+	return list[0], nil
+}
+
+func builtinCdr(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "cdr expects exactly 1 argument"}
+	}
+
+	list, ok := args[0].(listExpr)
+	if !ok || len(list) == 0 {
+		return nil, &EvalError{Message: "cdr expects a non-empty list"}
+	}
+	return append(listExpr(nil), list[1:]...), nil
+}
+
+func builtinCons(args []expr) (expr, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "cons expects exactly 2 arguments"}
+	}
+
+	list, ok := args[1].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "cons expects a list as its second argument"}
+	}
+
+	result := make(listExpr, 0, len(list)+1)
+	result = append(result, args[0])
+	result = append(result, list...)
+	return result, nil
+}
+
+func builtinLength(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "length expects exactly 1 argument"}
+	}
+
+	list, ok := args[0].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "length expects a list"}
+	}
+	return intExpr(len(list)), nil
+}
+
+func builtinList(args []expr) (expr, error) {
+	result := make(listExpr, len(args))
+	copy(result, args)
+	return result, nil
+}
+
+func builtinNull(args []expr) (expr, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "null? expects exactly 1 argument"}
+	}
+
+	list, ok := args[0].(listExpr)
+	return boolExpr(ok && len(list) == 0), nil
+}
+
 func comparisonBuiltin(name string, cmp func(int, int) bool) builtinFunc {
 	return func(args []expr) (expr, error) {
 		numbers, err := numericArgs(args)
@@ -573,6 +825,15 @@ func comparisonBuiltin(name string, cmp func(int, int) bool) builtinFunc {
 			}
 		}
 		return boolExpr(true), nil
+	}
+}
+
+func typePredicate(test func(expr) bool) builtinFunc {
+	return func(args []expr) (expr, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "predicate expects exactly 1 argument"}
+		}
+		return boolExpr(test(args[0])), nil
 	}
 }
 
