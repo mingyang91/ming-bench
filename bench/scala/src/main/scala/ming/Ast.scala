@@ -120,6 +120,12 @@ case class SchemeRecord(typeName: String, fields: mutable.Map[String, SchemeVal]
 class SchemeVector(val elems: Array[SchemeVal]) extends SchemeVal:
   def display: String = "#(" + elems.map(_.display).mkString(" ") + ")"
 
+class SchemeContinuation(val savedK: Any) extends SchemeVal:
+  def display: String = "#<continuation>"
+
+case object SchemeCallCC extends SchemeVal:
+  def display: String = "#<procedure:call/cc>"
+
 // ── Environment ──────────────────────────────────────────────────────
 private[ming] class Env(val bindings: mutable.Map[String, SchemeVal], val parent: Option[Env]):
 

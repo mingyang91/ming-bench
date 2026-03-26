@@ -1,150 +1,225 @@
 package ming
 
 import scala.collection.mutable
-import scala.util.boundary
-import scala.util.boundary.break
 
 object Evaluator:
-
-  // ── Tail-call trampoline signal ──────────────────────────────────────
-  private class TailCallSignal(val expr: Expr, val env: Env) extends Exception(null, null, true, false)
-
-  private def throwTailCall(expr: Expr, env: Env): Nothing =
-    throw new TailCallSignal(expr, env)
-
-  // ── Public API ───────────────────────────────────────────────────────
 
   def evalStr(input: String): String =
     val tokens = Tokenizer.tokenize(input)
     val exprs  = Parser.parseAll(tokens)
     if exprs.isEmpty then throw new EvalError("empty input")
-    val env               = makeGlobalEnv()
-    var result: SchemeVal = SchemeVoid
-    for expr <- exprs do result = eval(expr, env)
-    result.display
+    val env = makeGlobalEnv()
+    evalSequence(exprs, env).display
 
   def evalStrWithOutput(input: String): (String, String) =
     val tokens = Tokenizer.tokenize(input)
     val exprs  = Parser.parseAll(tokens)
     if exprs.isEmpty then throw new EvalError("empty input")
-    val output            = new StringBuilder
-    val env               = makeGlobalEnv(output)
-    var result: SchemeVal = SchemeVoid
-    for expr <- exprs do result = eval(expr, env)
+    val output = new StringBuilder
+    val env    = makeGlobalEnv(output)
+    val result = evalSequence(exprs, env)
     (result.display, output.toString)
 
   private def makeGlobalEnv(output: StringBuilder = new StringBuilder): Env =
     val env = new Env(mutable.Map.empty, None)
     Builtins.install(env, output)
+    env.set("call/cc", SchemeCallCC)
+    env.set("call-with-current-continuation", SchemeCallCC)
     env
 
   private[ming] def isFalsy(v: SchemeVal): Boolean = v match
     case SchemeBool(false) => true
     case _                 => false
 
-  // ── Core eval with trampoline ────────────────────────────────────────
-
   private[ming] def eval(expr: Expr, env: Env): SchemeVal =
-    var curExpr = expr
-    var curEnv  = env
-    while true do
-      try
-        val result = curExpr match
-          case IntLit(v, _)         => SchemeInt(v)
-          case FloatLit(v, _)       => SchemeFloat(v)
-          case RationalLit(n, d, _) => SchemeRational(n, d)
-          case BoolLit(v, _)        => SchemeBool(v)
-          case StringLit(v, _)      => SchemeString(v)
-          case CharLit(v, _)        => SchemeChar(v)
-          case Symbol(name, _)      => curEnv.get(name)
-          case SList(Nil, _)        => throw new EvalError("empty application")
-          case SList(elems, _)      => evalApplication(elems, curEnv)
-        return result
-      catch
-        case tc: TailCallSignal =>
-          curExpr = tc.expr
-          curEnv = tc.env
-        case e: EvalError =>
-          val msg = e.getMessage
-          if msg.matches(".*\\d+:\\d+.*") then throw e
-          else throw new EvalError(s"${curExpr.pos}: $msg")
-    throw new AssertionError("unreachable")
-
-  // ── Application dispatch ─────────────────────────────────────────────
-
-  private def evalApplication(elems: List[Expr], env: Env): SchemeVal =
-    elems.head match
-      case Symbol("and", _)                => evalAnd(elems.tail, env)
-      case Symbol("or", _)                 => evalOr(elems.tail, env)
-      case Symbol("define", _)             => evalDefine(elems.tail, env)
-      case Symbol("if", _)                 => evalIf(elems.tail, env)
-      case Symbol("quote", _)              => evalQuote(elems.tail)
-      case Symbol("lambda", _)             => evalLambda(elems.tail, env)
-      case Symbol("begin", _)              => evalBegin(elems.tail, env)
-      case Symbol("let", _)                => BindingForms.evalLet(elems.tail, env)
-      case Symbol("cond", _)               => BindingForms.evalCond(elems.tail, env)
-      case Symbol("set!", _)               => evalSet(elems.tail, env)
-      case Symbol("define-syntax", _)      => evalDefineSyntax(elems.tail, env)
-      case Symbol("define-record-type", _) => Records.evalDefineRecordType(elems.tail, env)
-      case Symbol("case-lambda", _)        => evalCaseLambda(elems.tail, env)
-      case Symbol("letrec", _)             => BindingForms.evalLetrec(elems.tail, env)
-      case Symbol("letrec*", _)            => BindingForms.evalLetrecStar(elems.tail, env)
-      case Symbol("case", _)               => BindingForms.evalCase(elems.tail, env)
-      case Symbol("do", _)                 => BindingForms.evalDo(elems.tail, env)
-      case Symbol("let*", _)               => BindingForms.evalLetStar(elems.tail, env)
-      case Symbol("when", _)               => BindingForms.evalWhen(elems.tail, env)
-      case Symbol("unless", _)             => BindingForms.evalUnless(elems.tail, env)
-      case _ =>
-        val macroVal = elems.head match
-          case Symbol(name, _) =>
-            try
-              env.get(name) match
-                case m: SchemeMacro => Some(m)
-                case _              => None
-            catch case _: EvalError => None
-          case _ => None
-        macroVal match
-          case Some(m) =>
-            val expanded = Macros.expand(m, SList(elems, elems.head.pos), env)
-            throwTailCall(expanded, env)
-          case None =>
-            val op   = eval(elems.head, env)
-            val args = elems.tail.map(e => eval(e, env))
-            applyProc(op, args)
-
-  // ── Special forms with TCO ───────────────────────────────────────────
-
-  private def evalAnd(exprs: List[Expr], env: Env): SchemeVal =
-    if exprs.isEmpty then return SchemeBool(true)
-    for expr <- exprs.init do
-      val v = eval(expr, env)
-      if isFalsy(v) then return v
-    throwTailCall(exprs.last, env)
-
-  private def evalOr(exprs: List[Expr], env: Env): SchemeVal =
-    if exprs.isEmpty then return SchemeBool(false)
-    for expr <- exprs.init do
-      val v = eval(expr, env)
-      if !isFalsy(v) then return v
-    throwTailCall(exprs.last, env)
+    run(SEval(expr, env, HaltK))
 
   private[ming] def applyProc(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
+    run(applyFunction(op, args, HaltK))
+
+  private[ming] def applyProcSafe(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
+    applyProc(op, args)
+
+  private[ming] def evalBody(exprs: List[Expr], env: Env): SchemeVal =
+    if exprs.isEmpty then SchemeVoid
+    else evalSequence(exprs, env)
+
+  private def evalSequence(exprs: List[Expr], env: Env): SchemeVal =
+    if exprs.isEmpty then SchemeVoid
+    else if exprs.size == 1 then run(SEval(exprs.head, env, HaltK))
+    else run(SEval(exprs.head, env, SeqK(exprs.tail, env, HaltK)))
+
+  private var lastPos: Pos = Pos.zero
+
+  private def run(initial: MState): SchemeVal =
+    var state = initial
+    while true do
+      state match
+        case SApply(v, HaltK) => return v
+        case _ =>
+          try state = step(state)
+          catch
+            case e: EvalError =>
+              val msg = e.getMessage
+              if msg.matches(".*\\d+:\\d+.*") then throw e
+              else throw new EvalError(s"$lastPos: $msg")
+    throw new AssertionError("unreachable")
+
+  private def step(s: MState): MState =
+    s match
+      case SEval(expr, env, k) =>
+        lastPos = expr.pos
+        evalStep(expr, env, k)
+      case SApply(v, k) => applyKont(v, k)
+
+  private def evalStep(expr: Expr, env: Env, k: Kont): MState = expr match
+    case IntLit(v, _)         => SApply(SchemeInt(v), k)
+    case FloatLit(v, _)       => SApply(SchemeFloat(v), k)
+    case RationalLit(n, d, _) => SApply(SchemeRational(n, d), k)
+    case BoolLit(v, _)        => SApply(SchemeBool(v), k)
+    case StringLit(v, _)      => SApply(SchemeString(v), k)
+    case CharLit(v, _)        => SApply(SchemeChar(v), k)
+    case Symbol(name, _)      => SApply(env.get(name), k)
+    case SList(Nil, _)        => throw new EvalError("empty application")
+    case SList(elems, _)      => dispatchForm(elems, env, k)
+
+  private def dispatchForm(elems: List[Expr], env: Env, k: Kont): MState =
+    elems.head match
+      case Symbol("if", _)      => SpecialForms.evalIfForm(elems.tail, env, k)
+      case Symbol("define", _)  => SpecialForms.evalDefineForm(elems.tail, env, k)
+      case Symbol("set!", _)    => SpecialForms.evalSetForm(elems.tail, env, k)
+      case Symbol("begin", _)   => SpecialForms.evalBeginForm(elems.tail, env, k)
+      case Symbol("quote", _)   => SApply(SpecialForms.evalQuote(elems.tail), k)
+      case Symbol("lambda", _)  => SApply(SpecialForms.makeLambda(elems.tail, env), k)
+      case Symbol("and", _)     => SpecialForms.evalAndForm(elems.tail, env, k)
+      case Symbol("or", _)      => SpecialForms.evalOrForm(elems.tail, env, k)
+      case Symbol("call/cc", _) => SpecialForms.evalCallCCForm(elems.tail, env, k)
+      case Symbol("call-with-current-continuation", _) =>
+        SpecialForms.evalCallCCForm(elems.tail, env, k)
+      case Symbol("cond", _)        => SpecialForms.evalCondForm(elems.tail, env, k)
+      case Symbol("case", _)        => SpecialForms.evalCaseForm(elems.tail, env, k)
+      case Symbol("let", _)         => SpecialForms.evalLetForm(elems.tail, env, k)
+      case Symbol("let*", _)        => SpecialForms.evalLetStarForm(elems.tail, env, k)
+      case Symbol("letrec", _)      => SpecialForms.evalLetrecForm(elems.tail, env, k)
+      case Symbol("letrec*", _)     => SpecialForms.evalLetrecStarForm(elems.tail, env, k)
+      case Symbol("do", _)          => SpecialForms.evalDoForm(elems.tail, env, k)
+      case Symbol("when", _)        => SpecialForms.evalWhenForm(elems.tail, env, k)
+      case Symbol("unless", _)      => SpecialForms.evalUnlessForm(elems.tail, env, k)
+      case Symbol("case-lambda", _) => SApply(SpecialForms.makeCaseLambda(elems.tail, env), k)
+      case Symbol("define-syntax", _) =>
+        SpecialForms.evalDefineSyntax(elems.tail, env)
+        SApply(SchemeVoid, k)
+      case Symbol("define-record-type", _) =>
+        SApply(Records.evalDefineRecordType(elems.tail, env), k)
+      case _ => dispatchMacroOrApply(elems, env, k)
+
+  private def dispatchMacroOrApply(elems: List[Expr], env: Env, k: Kont): MState =
+    val macroVal = elems.head match
+      case Symbol(name, _) =>
+        try
+          env.get(name) match
+            case m: SchemeMacro => Some(m)
+            case _              => None
+        catch case _: EvalError => None
+      case _ => None
+    macroVal match
+      case Some(m) =>
+        val expanded = Macros.expand(m, SList(elems, elems.head.pos), env)
+        SEval(expanded, env, k)
+      case None =>
+        SEval(elems.head, env, EvFunK(elems.tail, env, k))
+
+  private def applyKont(value: SchemeVal, k: Kont): MState = k match
+    case HaltK => SApply(value, HaltK)
+
+    case IfK(thenE, elseE, env, k2) =>
+      if !isFalsy(value) then SEval(thenE, env, k2)
+      else
+        elseE match
+          case Some(e) => SEval(e, env, k2)
+          case None    => SApply(SchemeVoid, k2)
+
+    case SeqK(remaining, env, k2) =>
+      if remaining.size == 1 then SEval(remaining.head, env, k2)
+      else SEval(remaining.head, env, SeqK(remaining.tail, env, k2))
+
+    case DefineK(name, env, k2) =>
+      env.set(name, value)
+      SApply(SchemeVoid, k2)
+
+    case SetBangK(name, env, k2) =>
+      env.update(name, value)
+      SApply(SchemeVoid, k2)
+
+    case EvFunK(argExprs, env, k2) =>
+      if argExprs.isEmpty then applyFunction(value, Nil, k2)
+      else
+        val rev = argExprs.reverse
+        SEval(rev.head, env, EvArgsK(value, Nil, rev.tail, env, k2))
+
+    case EvArgsK(op, done, remaining, env, k2) =>
+      val newDone = value :: done
+      if remaining.isEmpty then applyFunction(op, newDone, k2)
+      else SEval(remaining.head, env, EvArgsK(op, newDone, remaining.tail, env, k2))
+
+    case AndK(remaining, env, k2) =>
+      if isFalsy(value) then SApply(value, k2)
+      else if remaining.isEmpty then SApply(value, k2)
+      else if remaining.size == 1 then SEval(remaining.head, env, k2)
+      else SEval(remaining.head, env, AndK(remaining.tail, env, k2))
+
+    case OrK(remaining, env, k2) =>
+      if !isFalsy(value) then SApply(value, k2)
+      else if remaining.isEmpty then SApply(value, k2)
+      else if remaining.size == 1 then SEval(remaining.head, env, k2)
+      else SEval(remaining.head, env, OrK(remaining.tail, env, k2))
+
+    case CallCCK(k2) =>
+      val cont = new SchemeContinuation(k2)
+      applyFunction(value, List(cont), k2)
+
+    case CondTestK(body, remaining, env, k2) =>
+      if !isFalsy(value) then
+        if body.isEmpty then SApply(value, k2)
+        else evalBodyCEK(body, env, k2)
+      else SpecialForms.evalCondForm(remaining, env, k2)
+
+    case CaseK(clauses, env, k2) =>
+      SpecialForms.matchCaseClauses(value, clauses, env, k2)
+
+    case LetrecBindK(name, remaining, localEnv, body, k2) =>
+      localEnv.set(name, value)
+      if remaining.isEmpty then evalBodyCEK(body, localEnv, k2)
+      else
+        SEval(
+          remaining.head._2,
+          localEnv,
+          LetrecBindK(remaining.head._1, remaining.tail, localEnv, body, k2)
+        )
+
+    case TestBodyK(body, invert, env, k2) =>
+      val shouldRun = if invert then isFalsy(value) else !isFalsy(value)
+      if shouldRun then evalBodyCEK(body, env, k2)
+      else SApply(SchemeVoid, k2)
+
+  private[ming] def applyFunction(op: SchemeVal, args: List[SchemeVal], k: Kont): MState =
     op match
-      case SchemeBuiltin(_, fn) => fn(args)
+      case SchemeBuiltin("apply", _) =>
+        if args.size < 2 then throw new EvalError("apply: expected at least 2 arguments")
+        val proc = args.head
+        val lastList = SchemeListOps
+          .toScalaList(args.last)
+          .getOrElse(throw new EvalError("apply: last argument must be a list"))
+        val allArgs = args.slice(1, args.size - 1) ++ lastList
+        applyFunction(proc, allArgs, k)
+
+      case SchemeBuiltin(_, fn) =>
+        SApply(fn(args), k)
+
       case SchemeLambda(params, restParam, body, closureEnv) =>
-        val localEnv = restParam match
-          case None =>
-            if params.size != args.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
-            new Env(mutable.Map.from(params.zip(args)), Some(closureEnv))
-          case Some(rest) =>
-            if args.size < params.size then
-              throw new EvalError(s"expected at least ${params.size} arguments, got ${args.size}")
-            val (required, extra) = args.splitAt(params.size)
-            val bindings          = mutable.Map.from(params.zip(required))
-            bindings(rest) = SchemeListOps.makeList(extra)
-            new Env(bindings, Some(closureEnv))
-        for expr <- body.init do eval(expr, localEnv)
-        throwTailCall(body.last, localEnv)
+        val localEnv = bindArgs(params, restParam, args, closureEnv)
+        evalBodyCEK(body, localEnv, k)
+
       case SchemeCaseLambda(clauses) =>
         val matching = clauses.find { lam =>
           lam.restParam match
@@ -152,41 +227,44 @@ object Evaluator:
             case Some(_) => args.size >= lam.params.size
         }
         matching match
-          case Some(lam) => applyProc(lam, args)
+          case Some(lam) => applyFunction(lam, args, k)
           case None      => throw new EvalError(s"no matching clause for ${args.size} arguments")
+
+      case SchemeCallCC =>
+        if args.size != 1 then throw new EvalError("call/cc: expected 1 argument")
+        val cont = new SchemeContinuation(k)
+        applyFunction(args.head, List(cont), k)
+
+      case cont: SchemeContinuation =>
+        if args.size != 1 then throw new EvalError("continuation: expected 1 argument")
+        cont.savedK match
+          case k2: Kont => SApply(args.head, k2)
+          case _        => throw new EvalError("invalid continuation")
+
       case _ => throw new EvalError(s"not a procedure: ${op.display}")
 
-  /** Like applyProc but always returns a resolved value (catches tail calls). */
-  private[ming] def applyProcSafe(op: SchemeVal, args: List[SchemeVal]): SchemeVal =
-    try applyProc(op, args)
-    catch
-      case tc: TailCallSignal =>
-        eval(tc.expr, tc.env)
+  private def bindArgs(
+    params: List[String],
+    restParam: Option[String],
+    args: List[SchemeVal],
+    closureEnv: Env
+  ): Env =
+    restParam match
+      case None =>
+        if params.size != args.size then throw new EvalError(s"expected ${params.size} arguments, got ${args.size}")
+        new Env(mutable.Map.from(params.zip(args)), Some(closureEnv))
+      case Some(rest) =>
+        if args.size < params.size then
+          throw new EvalError(s"expected at least ${params.size} arguments, got ${args.size}")
+        val (required, extra) = args.splitAt(params.size)
+        val bindings          = mutable.Map.from(params.zip(required))
+        bindings(rest) = SchemeListOps.makeList(extra)
+        new Env(bindings, Some(closureEnv))
 
-  private def evalDefine(args: List[Expr], env: Env): SchemeVal =
-    args match
-      case SList(Symbol(name, _) :: params, _) :: body =>
-        val (paramNames, rest) = parseParams(params)
-        env.set(name, SchemeLambda(paramNames, rest, body, env))
-        SchemeVoid
-      case Symbol(name, _) :: expr :: Nil =>
-        env.set(name, eval(expr, env))
-        SchemeVoid
-      case _ => throw new EvalError("define: bad syntax")
-
-  private def evalIf(args: List[Expr], env: Env): SchemeVal =
-    args match
-      case cond :: thenExpr :: elseExpr :: Nil =>
-        if !isFalsy(eval(cond, env)) then throwTailCall(thenExpr, env)
-        else throwTailCall(elseExpr, env)
-      case cond :: thenExpr :: Nil =>
-        if !isFalsy(eval(cond, env)) then throwTailCall(thenExpr, env)
-        else SchemeVoid
-      case _ => throw new EvalError("if: bad syntax")
-
-  private def evalQuote(args: List[Expr]): SchemeVal =
-    if args.size != 1 then throw new EvalError("quote: expected 1 argument")
-    exprToVal(args.head)
+  private[ming] def evalBodyCEK(exprs: List[Expr], env: Env, k: Kont): MState =
+    if exprs.isEmpty then SApply(SchemeVoid, k)
+    else if exprs.size == 1 then SEval(exprs.head, env, k)
+    else SEval(exprs.head, env, SeqK(exprs.tail, env, k))
 
   private[ming] def exprToVal(expr: Expr): SchemeVal =
     expr match
@@ -198,77 +276,3 @@ object Evaluator:
       case CharLit(v, _)        => SchemeChar(v)
       case Symbol(name, _)      => SchemeSymbol(name)
       case SList(elems, _)      => SchemeListOps.makeList(elems.map(exprToVal))
-
-  private def parseParams(paramExprs: List[Expr]): (List[String], Option[String]) =
-    val dotIdx = paramExprs.indexWhere { case Symbol(".", _) => true; case _ => false }
-    if dotIdx < 0 then
-      val params = paramExprs.map {
-        case Symbol(n, _) => n
-        case _            => throw new EvalError("expected parameter name")
-      }
-      (params, None)
-    else
-      if dotIdx + 1 >= paramExprs.size then throw new EvalError("bad dot syntax")
-      val before = paramExprs.take(dotIdx).map {
-        case Symbol(n, _) => n
-        case _            => throw new EvalError("expected parameter name")
-      }
-      val rest = paramExprs(dotIdx + 1) match
-        case Symbol(n, _) => n
-        case _            => throw new EvalError("expected parameter name after dot")
-      (before, Some(rest))
-
-  private def evalLambda(args: List[Expr], env: Env): SchemeVal =
-    args match
-      case Symbol(name, _) :: body if body.nonEmpty =>
-        SchemeLambda(Nil, Some(name), body, env)
-      case SList(paramExprs, _) :: body if body.nonEmpty =>
-        val (params, rest) = parseParams(paramExprs)
-        SchemeLambda(params, rest, body, env)
-      case _ => throw new EvalError("lambda: bad syntax")
-
-  private def evalBegin(exprs: List[Expr], env: Env): SchemeVal =
-    if exprs.isEmpty then SchemeVoid
-    else
-      for expr <- exprs.init do eval(expr, env)
-      throwTailCall(exprs.last, env)
-
-  private def evalSet(args: List[Expr], env: Env): SchemeVal =
-    args match
-      case Symbol(name, _) :: valueExpr :: Nil =>
-        env.update(name, eval(valueExpr, env))
-        SchemeVoid
-      case _ => throw new EvalError("set!: bad syntax")
-
-  private def evalDefineSyntax(args: List[Expr], env: Env): SchemeVal =
-    args match
-      case Symbol(name, _) :: SList(
-            Symbol("syntax-rules", _) :: SList(literals, _) :: rules,
-            _
-          ) :: Nil =>
-        val litNames = literals.map {
-          case Symbol(n, _) => n
-          case _            => throw new EvalError("syntax-rules: expected literal name")
-        }
-        val parsedRules = rules.map {
-          case SList(pattern :: template :: Nil, _) => (pattern, template)
-          case _                                    => throw new EvalError("syntax-rules: bad rule")
-        }
-        env.set(name, SchemeMacro(litNames, parsedRules, env))
-        SchemeVoid
-      case _ => throw new EvalError("define-syntax: bad syntax")
-
-  private def evalCaseLambda(clauses: List[Expr], env: Env): SchemeVal =
-    val lambdas = clauses.map {
-      case SList(SList(paramExprs, _) :: body, _) if body.nonEmpty =>
-        val (params, rest) = parseParams(paramExprs)
-        SchemeLambda(params, rest, body, env)
-      case _ => throw new EvalError("case-lambda: bad clause")
-    }
-    SchemeCaseLambda(lambdas)
-
-  private[ming] def evalBody(exprs: List[Expr], env: Env): SchemeVal =
-    if exprs.isEmpty then SchemeVoid
-    else
-      for expr <- exprs.init do eval(expr, env)
-      throwTailCall(exprs.last, env)

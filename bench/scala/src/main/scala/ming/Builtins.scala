@@ -240,10 +240,12 @@ private[ming] object Builtins:
     env.set(
       "procedure?",
       typeCheck("procedure?") {
-        case _: SchemeBuiltin    => true
-        case _: SchemeLambda     => true
-        case _: SchemeCaseLambda => true
-        case _                   => false
+        case _: SchemeBuiltin      => true
+        case _: SchemeLambda       => true
+        case _: SchemeCaseLambda   => true
+        case _: SchemeContinuation => true
+        case SchemeCallCC          => true
+        case _                     => false
       }
     )
 
