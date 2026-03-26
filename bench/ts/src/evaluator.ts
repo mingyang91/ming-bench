@@ -8,8 +8,45 @@ type SchemeVal =
   | { tag: 'string'; value: string }
   | { tag: 'symbol'; value: string }
   | { tag: 'list'; value: SchemeVal[] }
+  | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
+  | { tag: 'nil' }
   | { tag: 'lambda'; params: string[]; body: SchemeVal[]; env: Env }
+  | { tag: 'builtin'; name: string }
   | { tag: 'void' };
+
+const NIL: SchemeVal = { tag: 'nil' };
+
+function makePair(car: SchemeVal, cdr: SchemeVal): SchemeVal {
+  return { tag: 'pair', car, cdr };
+}
+
+function schemeListToArray(val: SchemeVal): SchemeVal[] {
+  const result: SchemeVal[] = [];
+  let cur = val;
+  while (cur.tag === 'pair') {
+    result.push(cur.car);
+    cur = cur.cdr;
+  }
+  if (cur.tag !== 'nil') throw new EvalError('not a proper list');
+  return result;
+}
+
+function arrayToSchemeList(arr: SchemeVal[]): SchemeVal {
+  let result: SchemeVal = NIL;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    result = makePair(arr[i], result);
+  }
+  return result;
+}
+
+// Convert parsed list AST to runtime pair representation for quote
+function quoteDatum(val: SchemeVal): SchemeVal {
+  if (val.tag === 'list') {
+    if (val.value.length === 0) return NIL;
+    return arrayToSchemeList(val.value.map(quoteDatum));
+  }
+  return val;
+}
 
 // ── Environment ───────────────────────────────────────────────────
 
@@ -115,8 +152,6 @@ function toNumber(v: SchemeVal, op: string): number {
   return v.value;
 }
 
-const BUILTINS = new Set(['+', '-', '*', '/', '<', '>', '=', '<=', '>=']);
-
 function evalBuiltin(name: string, args: SchemeVal[]): SchemeVal {
   switch (name) {
     case '+': {
@@ -166,16 +201,86 @@ function evalBuiltin(name: string, args: SchemeVal[]): SchemeVal {
       if (args.length !== 2) throw new EvalError('>=: need 2 arguments');
       return { tag: 'boolean', value: toNumber(args[0], '>=') >= toNumber(args[1], '>=') };
     }
+    case 'cons': {
+      if (args.length !== 2) throw new EvalError('cons: need 2 arguments');
+      return makePair(args[0], args[1]);
+    }
+    case 'car': {
+      if (args.length !== 1) throw new EvalError('car: need 1 argument');
+      if (args[0].tag !== 'pair') throw new EvalError('car: not a pair');
+      return args[0].car;
+    }
+    case 'cdr': {
+      if (args.length !== 1) throw new EvalError('cdr: need 1 argument');
+      if (args[0].tag !== 'pair') throw new EvalError('cdr: not a pair');
+      return args[0].cdr;
+    }
+    case 'null?': {
+      if (args.length !== 1) throw new EvalError('null?: need 1 argument');
+      return { tag: 'boolean', value: args[0].tag === 'nil' };
+    }
+    case 'pair?': {
+      if (args.length !== 1) throw new EvalError('pair?: need 1 argument');
+      return { tag: 'boolean', value: args[0].tag === 'pair' };
+    }
+    case 'list': {
+      return arrayToSchemeList(args);
+    }
+    case 'length': {
+      if (args.length !== 1) throw new EvalError('length: need 1 argument');
+      const arr = schemeListToArray(args[0]);
+      return { tag: 'number', value: arr.length };
+    }
+    case 'append': {
+      if (args.length === 0) return NIL;
+      if (args.length === 1) return args[0];
+      // append all lists
+      let result = args[args.length - 1];
+      for (let i = args.length - 2; i >= 0; i--) {
+        const items = schemeListToArray(args[i]);
+        for (let j = items.length - 1; j >= 0; j--) {
+          result = makePair(items[j], result);
+        }
+      }
+      return result;
+    }
+    case 'number?': {
+      if (args.length !== 1) throw new EvalError('number?: need 1 argument');
+      return { tag: 'boolean', value: args[0].tag === 'number' };
+    }
+    case 'boolean?': {
+      if (args.length !== 1) throw new EvalError('boolean?: need 1 argument');
+      return { tag: 'boolean', value: args[0].tag === 'boolean' };
+    }
+    case 'string?': {
+      if (args.length !== 1) throw new EvalError('string?: need 1 argument');
+      return { tag: 'boolean', value: args[0].tag === 'string' };
+    }
+    case 'symbol?': {
+      if (args.length !== 1) throw new EvalError('symbol?: need 1 argument');
+      return { tag: 'boolean', value: args[0].tag === 'symbol' };
+    }
+    case 'not': {
+      if (args.length !== 1) throw new EvalError('not: need 1 argument');
+      return { tag: 'boolean', value: !isTruthy(args[0]) };
+    }
     default:
-      throw new EvalError(`unbound variable: ${name}`);
+      throw new EvalError(`unknown builtin: ${name}`);
   }
 }
 
+const BUILTIN_NAMES = new Set([
+  '+', '-', '*', '/', '<', '>', '=', '<=', '>=',
+  'cons', 'car', 'cdr', 'null?', 'pair?', 'list', 'length', 'append',
+  'number?', 'boolean?', 'string?', 'symbol?', 'not',
+]);
+
 function evaluate(expr: SchemeVal, env: Env): SchemeVal {
   if (expr.tag === 'number' || expr.tag === 'boolean' || expr.tag === 'string') return expr;
+  if (expr.tag === 'nil' || expr.tag === 'pair') return expr;
 
   if (expr.tag === 'symbol') {
-    if (BUILTINS.has(expr.value)) return expr; // builtins resolve to themselves for now
+    if (BUILTIN_NAMES.has(expr.value)) return { tag: 'builtin', name: expr.value };
     return env.get(expr.value);
   }
 
@@ -190,7 +295,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     switch (head.value) {
       case 'quote': {
         if (elems.length !== 2) throw new EvalError('quote: wrong number of arguments');
-        return elems[1];
+        return quoteDatum(elems[1]);
       }
       case 'if': {
         if (elems.length < 3 || elems.length > 4) throw new EvalError('if: wrong number of arguments');
@@ -207,7 +312,6 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           env.set(target.value, val);
           return { tag: 'void' };
         }
-        // (define (f params...) body...)
         if (target.tag === 'list' && target.value.length > 0 && target.value[0].tag === 'symbol') {
           const name = target.value[0].value;
           const params = target.value.slice(1).map(p => {
@@ -215,7 +319,8 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             return p.value;
           });
           const body = elems.slice(2);
-          env.set(name, { tag: 'lambda', params, body, env });
+          const lam: SchemeVal = { tag: 'lambda', params, body, env };
+          env.set(name, lam);
           return { tag: 'void' };
         }
         throw new EvalError('define: invalid syntax');
@@ -230,6 +335,85 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         });
         const body = elems.slice(2);
         return { tag: 'lambda', params, body, env };
+      }
+      case 'begin': {
+        if (elems.length < 2) throw new EvalError('begin: need at least 1 expression');
+        let result: SchemeVal = { tag: 'void' };
+        for (let i = 1; i < elems.length; i++) {
+          result = evaluate(elems[i], env);
+        }
+        return result;
+      }
+      case 'let': {
+        // Named let: (let name ((var init) ...) body...)
+        if (elems.length >= 3 && elems[1].tag === 'symbol') {
+          const loopName = elems[1].value;
+          const bindingsList = elems[2];
+          if (bindingsList.tag !== 'list') throw new EvalError('let: invalid bindings');
+          const paramNames: string[] = [];
+          const initVals: SchemeVal[] = [];
+          for (const b of bindingsList.value) {
+            if (b.tag !== 'list' || b.value.length !== 2 || b.value[0].tag !== 'symbol')
+              throw new EvalError('let: invalid binding');
+            paramNames.push(b.value[0].value);
+            initVals.push(evaluate(b.value[1], env));
+          }
+          const body = elems.slice(3);
+          const loopLam: SchemeVal = { tag: 'lambda', params: paramNames, body, env };
+          const loopEnv = new Env(env);
+          loopEnv.set(loopName, loopLam);
+          // Update the lambda's env to include itself
+          (loopLam as any).env = loopEnv;
+          const callEnv = new Env(loopEnv);
+          for (let i = 0; i < paramNames.length; i++) {
+            callEnv.set(paramNames[i], initVals[i]);
+          }
+          let result: SchemeVal = { tag: 'void' };
+          for (const bodyExpr of body) {
+            result = evaluate(bodyExpr, callEnv);
+          }
+          return result;
+        }
+        // Regular let: (let ((var init) ...) body...)
+        if (elems.length < 3) throw new EvalError('let: wrong number of arguments');
+        const bindings = elems[1];
+        if (bindings.tag !== 'list') throw new EvalError('let: invalid bindings');
+        const letEnv = new Env(env);
+        for (const b of bindings.value) {
+          if (b.tag !== 'list' || b.value.length !== 2 || b.value[0].tag !== 'symbol')
+            throw new EvalError('let: invalid binding');
+          const val = evaluate(b.value[1], env);
+          letEnv.set(b.value[0].value, val);
+        }
+        let result: SchemeVal = { tag: 'void' };
+        for (let i = 2; i < elems.length; i++) {
+          result = evaluate(elems[i], letEnv);
+        }
+        return result;
+      }
+      case 'cond': {
+        for (let i = 1; i < elems.length; i++) {
+          const clause = elems[i];
+          if (clause.tag !== 'list' || clause.value.length < 2)
+            throw new EvalError('cond: invalid clause');
+          const test = clause.value[0];
+          if (test.tag === 'symbol' && test.value === 'else') {
+            let result: SchemeVal = { tag: 'void' };
+            for (let j = 1; j < clause.value.length; j++) {
+              result = evaluate(clause.value[j], env);
+            }
+            return result;
+          }
+          const testVal = evaluate(test, env);
+          if (isTruthy(testVal)) {
+            let result: SchemeVal = testVal;
+            for (let j = 1; j < clause.value.length; j++) {
+              result = evaluate(clause.value[j], env);
+            }
+            return result;
+          }
+        }
+        return { tag: 'void' };
       }
       case 'and': {
         if (elems.length === 1) return { tag: 'boolean', value: true };
@@ -249,11 +433,6 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         }
         return result;
       }
-      case 'not': {
-        if (elems.length !== 2) throw new EvalError('not: wrong number of arguments');
-        const val = evaluate(elems[1], env);
-        return { tag: 'boolean', value: !isTruthy(val) };
-      }
     }
   }
 
@@ -261,8 +440,8 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
   const proc = evaluate(head, env);
   const args = elems.slice(1).map(e => evaluate(e, env));
 
-  if (proc.tag === 'symbol' && BUILTINS.has(proc.value)) {
-    return evalBuiltin(proc.value, args);
+  if (proc.tag === 'builtin') {
+    return evalBuiltin(proc.name, args);
   }
 
   if (proc.tag === 'lambda') {
@@ -292,8 +471,23 @@ function display(val: SchemeVal): string {
     case 'string': return `"${val.value}"`;
     case 'symbol': return val.value;
     case 'void': return '';
+    case 'nil': return '()';
+    case 'pair': {
+      let result = '(' + display(val.car);
+      let cur: SchemeVal = val.cdr;
+      while (cur.tag === 'pair') {
+        result += ' ' + display(cur.car);
+        cur = cur.cdr;
+      }
+      if (cur.tag !== 'nil') {
+        result += ' . ' + display(cur);
+      }
+      result += ')';
+      return result;
+    }
     case 'list': return `(${val.value.map(display).join(' ')})`;
     case 'lambda': return '#<procedure>';
+    case 'builtin': return '#<procedure>';
   }
 }
 
