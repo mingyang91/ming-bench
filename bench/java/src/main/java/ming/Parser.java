@@ -36,9 +36,15 @@ final class Parser {
         return switch (ch) {
             case '(' -> parseList();
             case '"' -> parseString();
+            case '\'' -> parseQuote();
             case ')' -> throw error("unexpected ')'");
             default -> parseAtom();
         };
+    }
+
+    private Expr parseQuote() throws EvalError {
+        advance();
+        return new ListExpr(List.of(new SymbolExpr("quote"), parseExpr()));
     }
 
     private Expr parseList() throws EvalError {

@@ -8,6 +8,9 @@ import java.util.List;
  * Agents implement this class.
  */
 public class Evaluator {
+    private record Binding(String name, Expr valueExpression) {
+    }
+
     /**
      * Evaluate one or more Scheme expressions and return the string
      * representation of the last result.
@@ -54,6 +57,18 @@ public class Evaluator {
         environment.define("=", new PrimitiveProcedureValue("=", arguments -> applyComparison("=", arguments)));
         environment.define("<=", new PrimitiveProcedureValue("<=", arguments -> applyComparison("<=", arguments)));
         environment.define("not", new PrimitiveProcedureValue("not", this::applyNot));
+        environment.define("cons", new PrimitiveProcedureValue("cons", this::applyCons));
+        environment.define("car", new PrimitiveProcedureValue("car", this::applyCar));
+        environment.define("cdr", new PrimitiveProcedureValue("cdr", this::applyCdr));
+        environment.define("list", new PrimitiveProcedureValue("list", this::applyList));
+        environment.define("append", new PrimitiveProcedureValue("append", this::applyAppend));
+        environment.define("length", new PrimitiveProcedureValue("length", this::applyLength));
+        environment.define("null?", new PrimitiveProcedureValue("null?", this::applyNullPredicate));
+        environment.define("pair?", new PrimitiveProcedureValue("pair?", this::applyPairPredicate));
+        environment.define("number?", new PrimitiveProcedureValue("number?", this::applyNumberPredicate));
+        environment.define("string?", new PrimitiveProcedureValue("string?", this::applyStringPredicate));
+        environment.define("boolean?", new PrimitiveProcedureValue("boolean?", this::applyBooleanPredicate));
+        environment.define("symbol?", new PrimitiveProcedureValue("symbol?", this::applySymbolPredicate));
         return environment;
     }
 
@@ -82,6 +97,9 @@ public class Evaluator {
                 case "if" -> evalIf(arguments, environment);
                 case "quote" -> evalQuote(arguments);
                 case "lambda" -> evalLambda(arguments, environment);
+                case "begin" -> evalBegin(arguments, environment);
+                case "cond" -> evalCond(arguments, environment);
+                case "let" -> evalLet(arguments, environment);
                 case "and" -> evalAnd(arguments, environment);
                 case "or" -> evalOr(arguments, environment);
                 default -> applyProcedure(operatorExpression, arguments, environment);
@@ -177,6 +195,121 @@ public class Evaluator {
         return new LambdaProcedureValue(null, parameters, body, environment);
     }
 
+    private Value evalBegin(List<Expr> arguments, Environment environment) throws EvalError {
+        return evalSequence(arguments, environment);
+    }
+
+    private Value evalCond(List<Expr> clauses, Environment environment) throws EvalError {
+        for (int i = 0; i < clauses.size(); i++) {
+            Expr clauseExpression = clauses.get(i);
+            if (!(clauseExpression instanceof ListExpr clauseList)) {
+                throw new EvalError("cond clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.isEmpty()) {
+                throw new EvalError("cond clause cannot be empty");
+            }
+
+            Expr testExpression = clauseElements.getFirst();
+            if (testExpression instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+                if (i != clauses.size() - 1) {
+                    throw new EvalError("cond else clause must be last");
+                }
+                if (clauseElements.size() == 1) {
+                    throw new EvalError("cond else clause expected a body");
+                }
+                return evalSequence(clauseElements.subList(1, clauseElements.size()), environment);
+            }
+
+            Value testValue = eval(testExpression, environment);
+            if (testValue.isTruthy()) {
+                if (clauseElements.size() == 1) {
+                    return testValue;
+                }
+                return evalSequence(clauseElements.subList(1, clauseElements.size()), environment);
+            }
+        }
+
+        return VoidValue.INSTANCE;
+    }
+
+    private Value evalLet(List<Expr> arguments, Environment environment) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("let expected bindings and a body");
+        }
+
+        Expr firstArgument = arguments.getFirst();
+        if (firstArgument instanceof SymbolExpr name) {
+            return evalNamedLet(name.name(), arguments.subList(1, arguments.size()), environment);
+        }
+
+        List<Binding> bindings = parseBindings(firstArgument, "let");
+        List<Expr> body = arguments.subList(1, arguments.size());
+        Environment localEnvironment = new Environment(environment);
+        for (Binding binding : bindings) {
+            localEnvironment.define(binding.name(), eval(binding.valueExpression(), environment));
+        }
+        return evalSequence(body, localEnvironment);
+    }
+
+    private Value evalNamedLet(String name,
+                               List<Expr> arguments,
+                               Environment environment) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("let expected bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(arguments.getFirst(), "let");
+        List<String> parameters = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            parameters.add(binding.name());
+        }
+
+        List<Expr> body = arguments.subList(1, arguments.size());
+        Environment localEnvironment = new Environment(environment);
+        LambdaProcedureValue procedure = new LambdaProcedureValue(
+                name,
+                List.copyOf(parameters),
+                body,
+                localEnvironment);
+        localEnvironment.define(name, procedure);
+
+        List<Value> initialValues = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            initialValues.add(eval(binding.valueExpression(), localEnvironment));
+        }
+
+        return procedure.apply(List.copyOf(initialValues), this);
+    }
+
+    private List<Binding> parseBindings(Expr bindingsExpression, String formName) throws EvalError {
+        if (!(bindingsExpression instanceof ListExpr bindingsList)) {
+            throw new EvalError(formName + " bindings must be a list");
+        }
+
+        List<Binding> bindings = new ArrayList<>(bindingsList.elements().size());
+        for (Expr bindingExpression : bindingsList.elements()) {
+            if (!(bindingExpression instanceof ListExpr bindingList)) {
+                throw new EvalError(formName + " bindings must be lists");
+            }
+
+            List<Expr> bindingElements = bindingList.elements();
+            if (bindingElements.size() != 2) {
+                throw new EvalError(formName + " bindings must have a name and value");
+            }
+
+            Expr nameExpression = bindingElements.getFirst();
+            if (!(nameExpression instanceof SymbolExpr symbolExpr)) {
+                throw new EvalError(formName + " bindings must start with a symbol");
+            }
+
+            bindings.add(new Binding(symbolExpr.name(), bindingElements.get(1)));
+        }
+
+        return List.copyOf(bindings);
+    }
+
     private List<String> parseParameterNames(List<Expr> parameterExpressions, String formName)
             throws EvalError {
         List<String> parameterNames = new ArrayList<>(parameterExpressions.size());
@@ -230,6 +363,76 @@ public class Evaluator {
     private Value applyNot(List<Value> arguments) throws EvalError {
         requireExactArity("not", arguments.size(), 1);
         return new BoolValue(!arguments.getFirst().isTruthy());
+    }
+
+    private Value applyCons(List<Value> arguments) throws EvalError {
+        requireExactArity("cons", arguments.size(), 2);
+        List<Value> tail = expectList(arguments.get(1), "cons");
+        List<Value> elements = new ArrayList<>(tail.size() + 1);
+        elements.add(arguments.getFirst());
+        elements.addAll(tail);
+        return new ListValue(List.copyOf(elements));
+    }
+
+    private Value applyCar(List<Value> arguments) throws EvalError {
+        requireExactArity("car", arguments.size(), 1);
+        List<Value> elements = expectNonEmptyList(arguments.getFirst(), "car");
+        return elements.getFirst();
+    }
+
+    private Value applyCdr(List<Value> arguments) throws EvalError {
+        requireExactArity("cdr", arguments.size(), 1);
+        List<Value> elements = expectNonEmptyList(arguments.getFirst(), "cdr");
+        return new ListValue(List.copyOf(elements.subList(1, elements.size())));
+    }
+
+    private Value applyList(List<Value> arguments) {
+        return new ListValue(List.copyOf(arguments));
+    }
+
+    private Value applyAppend(List<Value> arguments) throws EvalError {
+        List<Value> appended = new ArrayList<>();
+        for (Value argument : arguments) {
+            appended.addAll(expectList(argument, "append"));
+        }
+        return new ListValue(List.copyOf(appended));
+    }
+
+    private Value applyLength(List<Value> arguments) throws EvalError {
+        requireExactArity("length", arguments.size(), 1);
+        return new IntValue(expectList(arguments.getFirst(), "length").size());
+    }
+
+    private Value applyNullPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("null?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof ListValue listValue
+                && listValue.elements().isEmpty());
+    }
+
+    private Value applyPairPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("pair?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof ListValue listValue
+                && !listValue.elements().isEmpty());
+    }
+
+    private Value applyNumberPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("number?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof IntValue);
+    }
+
+    private Value applyStringPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("string?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof StringValue);
+    }
+
+    private Value applyBooleanPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("boolean?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof BoolValue);
+    }
+
+    private Value applySymbolPredicate(List<Value> arguments) throws EvalError {
+        requireExactArity("symbol?", arguments.size(), 1);
+        return new BoolValue(arguments.getFirst() instanceof SymbolValue);
     }
 
     private Value applyAdd(List<Value> arguments) throws EvalError {
@@ -304,6 +507,21 @@ public class Evaluator {
             return intValue.value();
         }
         throw new EvalError(operator + " expects integer arguments");
+    }
+
+    private List<Value> expectList(Value value, String operator) throws EvalError {
+        if (value instanceof ListValue listValue) {
+            return listValue.elements();
+        }
+        throw new EvalError(operator + " expects list arguments");
+    }
+
+    private List<Value> expectNonEmptyList(Value value, String operator) throws EvalError {
+        List<Value> elements = expectList(value, operator);
+        if (elements.isEmpty()) {
+            throw new EvalError(operator + " expected a non-empty list");
+        }
+        return elements;
     }
 
     private void requireExactArity(String name, int actual, int expected) throws EvalError {
