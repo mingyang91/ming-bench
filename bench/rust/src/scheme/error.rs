@@ -58,6 +58,18 @@ pub enum EvalError {
         found: &'static str,
     },
 
+    #[error("{name} expected a string, got {found}")]
+    ExpectedString {
+        name: &'static str,
+        found: &'static str,
+    },
+
+    #[error("{name} expected a symbol, got {found}")]
+    ExpectedSymbol {
+        name: &'static str,
+        found: &'static str,
+    },
+
     #[error("{name} expected a list, got {found}")]
     ExpectedList {
         name: &'static str,
@@ -68,6 +80,16 @@ pub enum EvalError {
     ExpectedPair {
         name: &'static str,
         found: &'static str,
+    },
+
+    #[error("{name} index out of bounds: {index}")]
+    IndexOutOfBounds { name: &'static str, index: i64 },
+
+    #[error("{name} expected a valid range, got {start}..{end}")]
+    InvalidRange {
+        name: &'static str,
+        start: i64,
+        end: i64,
     },
 
     #[error("division by zero")]
