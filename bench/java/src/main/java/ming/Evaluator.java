@@ -322,6 +322,7 @@ public class Evaluator {
         builtins.put(">", new BuiltinProcedure(">", args -> compare(args, ">", ordering -> ordering > 0)));
         builtins.put("=", new BuiltinProcedure("=", args -> compare(args, "=", ordering -> ordering == 0)));
         builtins.put("<=", new BuiltinProcedure("<=", args -> compare(args, "<=", ordering -> ordering <= 0)));
+        builtins.put(">=", new BuiltinProcedure(">=", args -> compare(args, ">=", ordering -> ordering >= 0)));
         builtins.put("not", new BuiltinProcedure("not", Evaluator::applyNot));
         builtins.put("cons", new BuiltinProcedure("cons", Evaluator::applyCons));
         builtins.put("car", new BuiltinProcedure("car", Evaluator::applyCar));
@@ -346,6 +347,8 @@ public class Evaluator {
         builtins.put("string-ref", new BuiltinProcedure("string-ref", Evaluator::applyStringRef));
         builtins.put("string-copy", new BuiltinProcedure("string-copy", Evaluator::applyStringCopy));
         builtins.put("string-set!", new BuiltinProcedure("string-set!", Evaluator::applyStringSet));
+        builtins.put("string->list", new BuiltinProcedure("string->list", Evaluator::applyStringToList));
+        builtins.put("list->string", new BuiltinProcedure("list->string", Evaluator::applyListToString));
         builtins.put("string=?", new BuiltinProcedure("string=?", Evaluator::applyStringEqual));
         builtins.put("string<?", new BuiltinProcedure("string<?", Evaluator::applyStringLess));
         builtins.put("string-ci=?", new BuiltinProcedure("string-ci=?", Evaluator::applyStringCiEqual));
@@ -383,6 +386,8 @@ public class Evaluator {
         builtins.put("char-numeric?", new BuiltinProcedure("char-numeric?",
                 args -> applyPredicate(args, "char-numeric?",
                         value -> value instanceof CharValue charValue && Character.isDigit(charValue.value()))));
+        builtins.put("char->integer", new BuiltinProcedure("char->integer", Evaluator::applyCharToInteger));
+        builtins.put("integer->char", new BuiltinProcedure("integer->char", Evaluator::applyIntegerToChar));
         builtins.put("char-upcase", new BuiltinProcedure("char-upcase", Evaluator::applyCharUpcase));
         builtins.put("char-downcase", new BuiltinProcedure("char-downcase", Evaluator::applyCharDowncase));
         builtins.put("char=?", new BuiltinProcedure("char=?", args -> compareChars(args, "char=?",
@@ -1186,6 +1191,26 @@ public class Evaluator {
         return VoidValue.INSTANCE;
     }
 
+    private static SchemeValue applyStringToList(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "string->list");
+        String value = requireString(arguments.getFirst(), "string->list");
+        List<SchemeValue> elements = new ArrayList<>(value.length());
+        for (int index = 0; index < value.length(); index++) {
+            elements.add(new CharValue(value.charAt(index)));
+        }
+        return buildList(elements);
+    }
+
+    private static SchemeValue applyListToString(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "list->string");
+        List<SchemeValue> elements = requireProperList(arguments.getFirst(), "list->string");
+        StringBuilder builder = new StringBuilder(elements.size());
+        for (SchemeValue element : elements) {
+            builder.append(requireChar(element, "list->string"));
+        }
+        return new StringValue(builder.toString());
+    }
+
     private static SchemeValue applyStringEqual(List<SchemeValue> arguments) throws EvalError {
         return compareStrings(arguments, "string=?", String::equals);
     }
@@ -1212,6 +1237,20 @@ public class Evaluator {
     private static SchemeValue applyCharUpcase(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 1, "char-upcase");
         return new CharValue(Character.toUpperCase(requireChar(arguments.getFirst(), "char-upcase")));
+    }
+
+    private static SchemeValue applyCharToInteger(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "char->integer");
+        return new IntValue(requireChar(arguments.getFirst(), "char->integer"));
+    }
+
+    private static SchemeValue applyIntegerToChar(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "integer->char");
+        long value = requireInteger(arguments.getFirst(), "integer->char");
+        if (value < Character.MIN_VALUE || value > Character.MAX_VALUE) {
+            throw new EvalError("integer->char: invalid character code");
+        }
+        return new CharValue((char) value);
     }
 
     private static SchemeValue applyCharDowncase(List<SchemeValue> arguments) throws EvalError {
