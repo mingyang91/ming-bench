@@ -1,4 +1,25 @@
 import { EvalError } from './evalError.js';
+const BUILTIN_NAMES = ['+', '-', '*', '/', '<', '>', '=', '<=', 'not'];
+const VOID_VALUE = { kind: 'void' };
+class Environment {
+    parent;
+    bindings = new Map();
+    constructor(parent) {
+        this.parent = parent;
+    }
+    define(name, value) {
+        this.bindings.set(name, value);
+    }
+    lookup(name) {
+        if (this.bindings.has(name)) {
+            return this.bindings.get(name);
+        }
+        if (this.parent !== undefined) {
+            return this.parent.lookup(name);
+        }
+        throw new EvalError(`unbound symbol: ${name}`);
+    }
+}
 /**
  * Evaluate one or more Scheme expressions and return the string
  * representation of the last result.
@@ -22,14 +43,22 @@ function evaluateProgram(input) {
     if (expressions.length === 0) {
         throw new EvalError('expected at least one expression');
     }
-    let result;
+    const env = createGlobalEnv();
+    let result = VOID_VALUE;
     for (const expr of expressions) {
-        result = evaluateExpr(expr);
+        result = evaluateExpr(expr, env);
     }
     return {
-        result: result,
+        result,
         output: '',
     };
+}
+function createGlobalEnv() {
+    const env = new Environment();
+    for (const name of BUILTIN_NAMES) {
+        env.define(name, { kind: 'builtin', name });
+    }
+    return env;
 }
 function parseProgram(input) {
     const tokens = tokenize(input);
@@ -172,53 +201,168 @@ function parseAtom(text) {
     }
     return { kind: 'symbol', name: text };
 }
-function evaluateExpr(expr) {
+function evaluateExpr(expr, env) {
     switch (expr.kind) {
         case 'number':
         case 'boolean':
         case 'string':
             return expr;
         case 'symbol':
-            throw new EvalError(`unbound symbol: ${expr.name}`);
+            return env.lookup(expr.name);
         case 'list':
-            return evaluateList(expr.elements);
+            return evaluateList(expr.elements, env);
     }
 }
-function evaluateList(elements) {
+function evaluateList(elements, env) {
     if (elements.length === 0) {
         throw new EvalError('cannot evaluate empty list');
     }
     const [head, ...argExprs] = elements;
-    if (head.kind !== 'symbol') {
-        throw new EvalError('first element in a list must be a procedure name');
+    if (head.kind === 'symbol') {
+        switch (head.name) {
+            case 'define':
+                return evaluateDefine(argExprs, env);
+            case 'if':
+                return evaluateIf(argExprs, env);
+            case 'quote':
+                return evaluateQuote(argExprs);
+            case 'lambda':
+                return evaluateLambda(argExprs, env);
+            case 'and':
+                return evaluateAnd(argExprs, env);
+            case 'or':
+                return evaluateOr(argExprs, env);
+        }
     }
-    if (head.name === 'and') {
-        return evaluateAnd(argExprs);
-    }
-    if (head.name === 'or') {
-        return evaluateOr(argExprs);
-    }
-    const args = argExprs.map((expr) => evaluateExpr(expr));
-    return applyBuiltin(head.name, args);
+    const procedure = evaluateExpr(head, env);
+    const args = argExprs.map((expr) => evaluateExpr(expr, env));
+    return applyProcedure(procedure, args);
 }
-function evaluateAnd(argExprs) {
+function evaluateDefine(argExprs, env) {
+    if (argExprs.length < 2) {
+        throw new EvalError('define expects a target and a value');
+    }
+    const [target, ...body] = argExprs;
+    if (target.kind === 'symbol') {
+        if (body.length !== 1) {
+            throw new EvalError('define variable form expects exactly 1 value expression');
+        }
+        const value = evaluateExpr(body[0], env);
+        env.define(target.name, value);
+        return VOID_VALUE;
+    }
+    if (target.kind === 'list' && target.elements.length > 0) {
+        const [nameExpr, ...paramExprs] = target.elements;
+        if (nameExpr.kind !== 'symbol') {
+            throw new EvalError('define function form expects a function name');
+        }
+        const params = readParameterList(paramExprs);
+        const procedure = {
+            kind: 'closure',
+            params,
+            body,
+            env,
+        };
+        env.define(nameExpr.name, procedure);
+        return VOID_VALUE;
+    }
+    throw new EvalError('invalid define form');
+}
+function evaluateIf(argExprs, env) {
+    if (argExprs.length !== 3) {
+        throw new EvalError('if expects exactly 3 arguments');
+    }
+    const condition = evaluateExpr(argExprs[0], env);
+    return isTruthy(condition) ? evaluateExpr(argExprs[1], env) : evaluateExpr(argExprs[2], env);
+}
+function evaluateQuote(argExprs) {
+    if (argExprs.length !== 1) {
+        throw new EvalError('quote expects exactly 1 argument');
+    }
+    return quoteExpr(argExprs[0]);
+}
+function quoteExpr(expr) {
+    switch (expr.kind) {
+        case 'number':
+        case 'boolean':
+        case 'string':
+            return expr;
+        case 'symbol':
+            return { kind: 'symbol', name: expr.name };
+        case 'list':
+            return { kind: 'list', elements: expr.elements.map((element) => quoteExpr(element)) };
+    }
+}
+function evaluateLambda(argExprs, env) {
+    if (argExprs.length < 2) {
+        throw new EvalError('lambda expects parameters and a body');
+    }
+    const [paramsExpr, ...body] = argExprs;
+    if (paramsExpr.kind !== 'list') {
+        throw new EvalError('lambda parameters must be a list');
+    }
+    return {
+        kind: 'closure',
+        params: readParameterList(paramsExpr.elements),
+        body,
+        env,
+    };
+}
+function readParameterList(exprs) {
+    const params = [];
+    for (const expr of exprs) {
+        if (expr.kind !== 'symbol') {
+            throw new EvalError('parameter list must contain only symbols');
+        }
+        params.push(expr.name);
+    }
+    return params;
+}
+function evaluateAnd(argExprs, env) {
     let lastValue = { kind: 'boolean', value: true };
     for (const expr of argExprs) {
-        lastValue = evaluateExpr(expr);
+        lastValue = evaluateExpr(expr, env);
         if (!isTruthy(lastValue)) {
             return lastValue;
         }
     }
     return lastValue;
 }
-function evaluateOr(argExprs) {
+function evaluateOr(argExprs, env) {
     for (const expr of argExprs) {
-        const value = evaluateExpr(expr);
+        const value = evaluateExpr(expr, env);
         if (isTruthy(value)) {
             return value;
         }
     }
     return { kind: 'boolean', value: false };
+}
+function applyProcedure(procedure, args) {
+    switch (procedure.kind) {
+        case 'builtin':
+            return applyBuiltin(procedure.name, args);
+        case 'closure':
+            return applyClosure(procedure, args);
+        default:
+            throw new EvalError('attempted to call a non-procedure');
+    }
+}
+function applyClosure(procedure, args) {
+    if (args.length !== procedure.params.length) {
+        throw new EvalError(`expected ${procedure.params.length} arguments, got ${args.length}`);
+    }
+    const callEnv = new Environment(procedure.env);
+    for (let index = 0; index < procedure.params.length; index += 1) {
+        callEnv.define(procedure.params[index], args[index]);
+    }
+    return evaluateSequence(procedure.body, callEnv);
+}
+function evaluateSequence(exprs, env) {
+    let result = VOID_VALUE;
+    for (const expr of exprs) {
+        result = evaluateExpr(expr, env);
+    }
+    return result;
 }
 function applyBuiltin(name, args) {
     switch (name) {
@@ -243,8 +387,6 @@ function applyBuiltin(name, args) {
                 throw new EvalError('not expects exactly 1 argument');
             }
             return { kind: 'boolean', value: !isTruthy(args[0]) };
-        default:
-            throw new EvalError(`unknown procedure: ${name}`);
     }
 }
 function applySubtraction(args) {
@@ -314,6 +456,15 @@ function formatValue(value) {
             return value.value ? '#t' : '#f';
         case 'string':
             return `"${escapeString(value.value)}"`;
+        case 'symbol':
+            return value.name;
+        case 'list':
+            return `(${value.elements.map((element) => formatValue(element)).join(' ')})`;
+        case 'builtin':
+        case 'closure':
+            return '#<procedure>';
+        case 'void':
+            return '';
     }
 }
 function formatNumber(value) {
