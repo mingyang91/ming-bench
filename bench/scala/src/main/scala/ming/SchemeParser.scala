@@ -25,10 +25,16 @@ private[ming] object SchemeParser:
         parseList(advance(state), start)
       case ')' =>
         SchemeFailure.raise("unexpected ')'", start)
+      case '\'' =>
+        parseQuote(advance(state), start)
       case '"' =>
         parseString(advance(state), start)
       case _ =>
         parseAtom(state, start)
+
+  private def parseQuote(state: State, start: Position): (State, Expr) =
+    val (nextState, expression) = parseExpr(state)
+    (nextState, ListExpr(List(SymbolExpr("quote", start), expression), start))
 
   private def parseList(state0: State, start: Position): (State, Expr) =
     @tailrec
