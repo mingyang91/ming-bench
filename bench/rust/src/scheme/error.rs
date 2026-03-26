@@ -126,6 +126,9 @@ pub enum EvalError {
     #[error("uncaught exception: {value}")]
     Raised { id: usize, value: String },
 
+    #[error("evaluation step limit exceeded: {max_steps}")]
+    StepLimitExceeded { max_steps: usize },
+
     #[error("division by zero")]
     DivisionByZero,
 }

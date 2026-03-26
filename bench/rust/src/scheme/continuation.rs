@@ -111,6 +111,16 @@ fn eval_expr(
     frames: Vec<ContinuationFrame>,
     ctx: &EvalContext,
 ) -> Result<MachineState, EvalError> {
+    ctx.consume_step(expr.pos)?;
+    eval_expr_after_step(expr, env, frames, ctx)
+}
+
+fn eval_expr_after_step(
+    expr: Expr,
+    env: EnvRef,
+    frames: Vec<ContinuationFrame>,
+    ctx: &EvalContext,
+) -> Result<MachineState, EvalError> {
     match &expr.kind {
         ExprKind::Number(value) => Ok(MachineState::Return(Value::Number(*value), frames)),
         ExprKind::Boolean(value) => Ok(MachineState::Return(Value::Boolean(*value), frames)),

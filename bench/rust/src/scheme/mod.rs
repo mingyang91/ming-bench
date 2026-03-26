@@ -109,20 +109,35 @@ impl ControlProc {
     }
 }
 
+#[derive(Clone, Copy)]
+struct StepBudget {
+    used: usize,
+    max_steps: usize,
+}
+
 struct EvalContext {
     output: RefCell<String>,
     gensym_counter: RefCell<usize>,
     exception_counter: RefCell<usize>,
     exceptions: RefCell<HashMap<usize, Value>>,
+    step_budget: RefCell<Option<StepBudget>>,
 }
 
 impl EvalContext {
     fn new() -> Self {
+        Self::with_step_limit(None)
+    }
+
+    fn with_step_limit(max_steps: Option<usize>) -> Self {
         Self {
             output: RefCell::new(String::new()),
             gensym_counter: RefCell::new(0),
             exception_counter: RefCell::new(0),
             exceptions: RefCell::new(HashMap::new()),
+            step_budget: RefCell::new(max_steps.map(|max_steps| StepBudget {
+                used: 0,
+                max_steps,
+            })),
         }
     }
 
@@ -159,6 +174,23 @@ impl EvalContext {
 
     fn restore_exception(&self, id: usize, value: Value) {
         self.exceptions.borrow_mut().insert(id, value);
+    }
+
+    fn consume_step(&self, pos: SourcePos) -> Result<(), EvalError> {
+        let mut budget = self.step_budget.borrow_mut();
+        let Some(budget) = budget.as_mut() else {
+            return Ok(());
+        };
+
+        if budget.used >= budget.max_steps {
+            return Err(EvalError::StepLimitExceeded {
+                max_steps: budget.max_steps,
+            }
+            .with_position(pos));
+        }
+
+        budget.used += 1;
+        Ok(())
     }
 }
 
@@ -673,9 +705,23 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     Ok(result)
 }
 
+/// Evaluate Scheme expressions with a maximum number of evaluation
+/// dispatches.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let (result, _) = eval_str_with_output_and_limit(input, Some(max_steps))?;
+    Ok(result)
+}
+
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    eval_str_with_output_and_limit(input, None)
+}
+
+fn eval_str_with_output_and_limit(
+    input: &str,
+    max_steps: Option<usize>,
+) -> Result<(String, String), EvalError> {
     let exprs = parse_program(input)?;
 
     if exprs.is_empty() {
@@ -683,7 +729,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     }
 
     let env = default_env();
-    let ctx = EvalContext::new();
+    let ctx = EvalContext::with_step_limit(max_steps);
     if program_uses_first_class_continuations(&exprs) {
         let last = eval_program_with_continuations(&exprs, env, &ctx)?;
         return Ok((last.render(), ctx.into_output()));
@@ -702,6 +748,11 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value
 }
 
 fn eval(expr: &Expr, env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    ctx.consume_step(expr.pos)?;
+    eval_after_step(expr, env, ctx)
+}
+
+fn eval_after_step(expr: &Expr, env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Number(value) => Ok(Value::Number(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
@@ -762,9 +813,18 @@ fn eval_sequence_tco(
 }
 
 fn eval_tail(expr: &Expr, env: EnvRef, ctx: &EvalContext) -> Result<TailOutcome, EvalError> {
+    ctx.consume_step(expr.pos)?;
+    eval_tail_after_step(expr, env, ctx)
+}
+
+fn eval_tail_after_step(
+    expr: &Expr,
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<TailOutcome, EvalError> {
     match &expr.kind {
         ExprKind::List(items) => eval_list_tail(expr.pos, items, env, ctx),
-        _ => eval(expr, env, ctx).map(TailOutcome::Value),
+        _ => eval_after_step(expr, env, ctx).map(TailOutcome::Value),
     }
 }
 
