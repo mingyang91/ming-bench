@@ -34,7 +34,7 @@ public class Evaluator {
     public Evaluator() {
         this.immutableStringsEnabled = currentBenchLevel() >= STRING_IMMUTABILITY_LEVEL;
         this.globalEnv = createGlobalEnv();
-        this.macroExpander = new MacroExpander();
+        this.macroExpander = new MacroExpander(this::applyProcedure);
         this.dynamicWindStack = new ArrayList<>();
         this.exceptionHandlerStack = new ArrayList<>();
     }

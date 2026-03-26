@@ -35,6 +35,15 @@ final class Parser {
         if (current == '(') {
             return parseList(startLine, startColumn);
         }
+        if (current == '#' && peekNextChar() == '\'') {
+            advance();
+            advance();
+            Expr syntaxQuoted = parseExpression();
+            return new ListExpr(
+                    List.of(new SymbolExpr("syntax", startLine, startColumn), syntaxQuoted),
+                    startLine,
+                    startColumn);
+        }
         if (current == '\'') {
             advance();
             Expr quoted = parseExpression();
@@ -271,6 +280,13 @@ final class Parser {
 
     private char currentChar() {
         return input.charAt(index);
+    }
+
+    private char peekNextChar() {
+        if (index + 1 >= input.length()) {
+            return '\0';
+        }
+        return input.charAt(index + 1);
     }
 
     private boolean isAtEnd() {

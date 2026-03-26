@@ -27,12 +27,14 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 
 struct Evaluator {
     global_env: Rc<Env>,
+    gensym_counter: RefCell<usize>,
 }
 
 impl Evaluator {
     fn new() -> Self {
         Self {
             global_env: create_global_env(),
+            gensym_counter: RefCell::new(0),
         }
     }
 
@@ -66,13 +68,13 @@ impl Evaluator {
             ExprKind::Vector(elements) => {
                 Ok(vector_value(elements.iter().map(quote_to_value).collect()))
             }
-            ExprKind::List(elements) => self.eval_list(elements, env),
+            ExprKind::List(elements) => self.eval_list(expr, elements, env),
         };
 
         result.map_err(|error| ensure_position(error, expr.position))
     }
 
-    fn eval_list(&self, elements: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+    fn eval_list(&self, expr: &Expr, elements: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
         if elements.is_empty() {
             return Err(EvalError::message("cannot evaluate an empty list"));
         }
@@ -83,11 +85,15 @@ impl Evaluator {
         if let ExprKind::Symbol(name) = &operator_expr.kind {
             return match name.as_str() {
                 "define" => self.eval_define(arguments, env),
+                "define-syntax" => self.eval_define_syntax(arguments, env),
                 "define-record-type" => self.eval_define_record_type(arguments, env),
                 "set!" => self.eval_set(arguments, env),
                 "if" => self.eval_if(arguments, env),
                 "quote" => self.eval_quote(arguments),
                 "lambda" => self.eval_lambda(arguments, env),
+                "syntax" => self.eval_syntax(arguments, env),
+                "syntax-case" => self.eval_syntax_case(arguments, env),
+                "with-syntax" => self.eval_with_syntax(arguments, env),
                 "and" => self.eval_and(arguments, env),
                 "or" => self.eval_or(arguments, env),
                 "begin" => self.eval_begin(arguments, env),
@@ -98,6 +104,9 @@ impl Evaluator {
                 "case" => self.eval_case(arguments, env),
                 "do" => self.eval_do(arguments, env),
                 _ => {
+                    if let Some(expanded) = self.expand_macro_call(expr, name, env.clone())? {
+                        return self.eval(&expanded, env);
+                    }
                     let operator = self.eval(operator_expr, env.clone())?;
                     let values = self.eval_all(arguments, env)?;
                     self.apply_procedure(operator, values)
@@ -156,6 +165,23 @@ impl Evaluator {
         }
     }
 
+    fn eval_define_syntax(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        require_exact_args("define-syntax", arguments.len(), 2)?;
+        let ExprKind::Symbol(name) = &arguments[0].kind else {
+            return Err(EvalError::message("define-syntax name must be a symbol"));
+        };
+
+        let transformer = self.eval(&arguments[1], env.clone())?;
+        let Value::Closure(transformer) = transformer else {
+            return Err(EvalError::message(
+                "define-syntax transformer must evaluate to a procedure",
+            ));
+        };
+
+        env.define_macro(name.clone(), transformer);
+        Ok(Value::Void)
+    }
+
     fn eval_set(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
         require_exact_args("set!", arguments.len(), 2)?;
 
@@ -197,6 +223,106 @@ impl Evaluator {
             body: arguments[1..].to_vec(),
             env,
         })))
+    }
+
+    fn eval_syntax(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        require_exact_args("syntax", arguments.len(), 1)?;
+        Ok(Value::Syntax(self.expand_syntax_template(
+            &arguments[0],
+            &env,
+            &HashMap::new(),
+        )?))
+    }
+
+    fn eval_syntax_case(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        if arguments.len() < 3 {
+            return Err(EvalError::message(
+                "syntax-case expects an input, literals, and at least one clause",
+            ));
+        }
+
+        let input =
+            require_syntax_value(&self.eval(&arguments[0], env.clone())?, "syntax-case")?.clone();
+        let literals = parse_syntax_literals(&arguments[1])?;
+
+        for clause in &arguments[2..] {
+            let ExprKind::List(elements) = &clause.kind else {
+                return Err(EvalError::message("syntax-case clause must be a list"));
+            };
+            if elements.len() != 2 && elements.len() != 3 {
+                return Err(EvalError::message(
+                    "syntax-case clause must have 2 or 3 elements",
+                ));
+            }
+
+            let mut bindings = HashMap::new();
+            if !match_syntax_case_pattern(&elements[0], &input, &literals, &mut bindings)? {
+                continue;
+            }
+
+            let clause_env = Env::new(Some(env.clone()));
+            bind_pattern_bindings(&clause_env, bindings);
+
+            let body_expr = if elements.len() == 3 {
+                let guard_value = self.eval(&elements[1], clause_env.clone())?;
+                if !is_truthy(&guard_value) {
+                    continue;
+                }
+                &elements[2]
+            } else {
+                &elements[1]
+            };
+
+            return self.eval(body_expr, clause_env);
+        }
+
+        Err(EvalError::message("syntax-case found no matching clause"))
+    }
+
+    fn eval_with_syntax(&self, arguments: &[Expr], env: Rc<Env>) -> Result<Value, EvalError> {
+        if arguments.len() < 2 {
+            return Err(EvalError::message(
+                "with-syntax requires bindings and a body",
+            ));
+        }
+
+        let ExprKind::List(binding_list) = &arguments[0].kind else {
+            return Err(EvalError::message("with-syntax bindings must be a list"));
+        };
+
+        let syntax_env = Env::new(Some(env.clone()));
+        for binding in binding_list {
+            let ExprKind::List(binding_parts) = &binding.kind else {
+                return Err(EvalError::message(
+                    "with-syntax binding must contain a name and expression",
+                ));
+            };
+            if binding_parts.len() != 2 {
+                return Err(EvalError::message(
+                    "with-syntax binding must contain a name and expression",
+                ));
+            }
+
+            let ExprKind::Symbol(name) = &binding_parts[0].kind else {
+                return Err(EvalError::message(
+                    "with-syntax binding name must be a symbol",
+                ));
+            };
+
+            let syntax_value = self.eval(&binding_parts[1], syntax_env.clone())?;
+            match syntax_value {
+                Value::Syntax(_) | Value::SyntaxSequence(_) => {
+                    syntax_env.define(name.clone(), syntax_value);
+                }
+                _ => {
+                    return Err(EvalError::message(
+                        "with-syntax expression must produce syntax",
+                    ))
+                }
+            }
+        }
+
+        self.eval_sequence(&arguments[1..], syntax_env)
     }
 
     fn eval_define_record_type(
@@ -643,6 +769,183 @@ impl Evaluator {
         }
         Ok(result)
     }
+
+    fn expand_macro_call(
+        &self,
+        expr: &Expr,
+        name: &str,
+        env: Rc<Env>,
+    ) -> Result<Option<Expr>, EvalError> {
+        let Some(transformer) = env.lookup_macro(name) else {
+            return Ok(None);
+        };
+
+        let expanded = self.apply_closure(&transformer, vec![Value::Syntax(expr.clone())])?;
+        let Value::Syntax(expanded_expr) = expanded else {
+            return Err(EvalError::message(
+                "macro transformer must produce a syntax object",
+            ));
+        };
+        Ok(Some(expanded_expr))
+    }
+
+    fn expand_syntax_template(
+        &self,
+        expr: &Expr,
+        env: &Rc<Env>,
+        renamed: &HashMap<String, String>,
+    ) -> Result<Expr, EvalError> {
+        match &expr.kind {
+            ExprKind::Symbol(name) => {
+                if let Some(value) = lookup_syntax_binding(env, name) {
+                    return syntax_value_to_expr(&value, "syntax");
+                }
+
+                if let Some(fresh) = renamed.get(name) {
+                    return Ok(Expr {
+                        kind: ExprKind::Symbol(fresh.clone()),
+                        position: expr.position,
+                    });
+                }
+
+                Ok(expr.clone())
+            }
+            ExprKind::Vector(elements) => {
+                let mut expanded = Vec::with_capacity(elements.len());
+                for element in elements {
+                    expanded.push(self.expand_syntax_template(element, env, renamed)?);
+                }
+                Ok(Expr {
+                    kind: ExprKind::Vector(expanded),
+                    position: expr.position,
+                })
+            }
+            ExprKind::List(elements) => {
+                self.expand_syntax_list(expr.position, elements, env, renamed)
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    fn expand_syntax_list(
+        &self,
+        position: SourceLoc,
+        elements: &[Expr],
+        env: &Rc<Env>,
+        renamed: &HashMap<String, String>,
+    ) -> Result<Expr, EvalError> {
+        if let Some(expanded) = self.expand_let_template(position, elements, env, renamed)? {
+            return Ok(expanded);
+        }
+
+        let mut expanded = Vec::new();
+        let mut index = 0;
+        while index < elements.len() {
+            if index + 1 < elements.len()
+                && matches!(&elements[index + 1].kind, ExprKind::Symbol(name) if name == "...")
+            {
+                let repeated =
+                    expand_repeated_template_piece(self, &elements[index], env, renamed)?;
+                expanded.extend(repeated);
+                index += 2;
+                continue;
+            }
+
+            expanded.push(self.expand_syntax_template(&elements[index], env, renamed)?);
+            index += 1;
+        }
+
+        Ok(Expr {
+            kind: ExprKind::List(expanded),
+            position,
+        })
+    }
+
+    fn expand_let_template(
+        &self,
+        position: SourceLoc,
+        elements: &[Expr],
+        env: &Rc<Env>,
+        renamed: &HashMap<String, String>,
+    ) -> Result<Option<Expr>, EvalError> {
+        if elements.is_empty() {
+            return Ok(None);
+        }
+        let ExprKind::Symbol(name) = &elements[0].kind else {
+            return Ok(None);
+        };
+        if name != "let" || elements.len() < 3 {
+            return Ok(None);
+        }
+
+        let ExprKind::List(binding_exprs) = &elements[1].kind else {
+            return Err(EvalError::message("syntax let bindings must be a list"));
+        };
+
+        let mut expanded_bindings = Vec::with_capacity(binding_exprs.len());
+        let mut body_renamed = renamed.clone();
+        for binding in binding_exprs {
+            let ExprKind::List(binding_parts) = &binding.kind else {
+                return Err(EvalError::message("syntax let binding must be a list"));
+            };
+            if binding_parts.len() != 2 {
+                return Err(EvalError::message(
+                    "syntax let binding must contain a name and expression",
+                ));
+            }
+
+            let binder = self.expand_template_binder(&binding_parts[0], env, &mut body_renamed)?;
+            let init = self.expand_syntax_template(&binding_parts[1], env, renamed)?;
+            expanded_bindings.push(Expr {
+                kind: ExprKind::List(vec![binder, init]),
+                position: binding.position,
+            });
+        }
+
+        let mut expanded = vec![
+            elements[0].clone(),
+            Expr {
+                kind: ExprKind::List(expanded_bindings),
+                position: elements[1].position,
+            },
+        ];
+        for body_expr in &elements[2..] {
+            expanded.push(self.expand_syntax_template(body_expr, env, &body_renamed)?);
+        }
+
+        Ok(Some(Expr {
+            kind: ExprKind::List(expanded),
+            position,
+        }))
+    }
+
+    fn expand_template_binder(
+        &self,
+        binder: &Expr,
+        env: &Rc<Env>,
+        renamed: &mut HashMap<String, String>,
+    ) -> Result<Expr, EvalError> {
+        let ExprKind::Symbol(name) = &binder.kind else {
+            return Ok(self.expand_syntax_template(binder, env, renamed)?);
+        };
+
+        if let Some(value) = lookup_syntax_binding(env, name) {
+            return syntax_value_to_expr(&value, "syntax");
+        }
+
+        let fresh = self.fresh_identifier(name);
+        renamed.insert(name.clone(), fresh.clone());
+        Ok(Expr {
+            kind: ExprKind::Symbol(fresh),
+            position: binder.position,
+        })
+    }
+
+    fn fresh_identifier(&self, base: &str) -> String {
+        let mut counter = self.gensym_counter.borrow_mut();
+        *counter += 1;
+        format!("{base}__macro{}", *counter)
+    }
 }
 
 fn create_global_env() -> Rc<Env> {
@@ -681,6 +984,21 @@ fn create_global_env() -> Rc<Env> {
     env.define_builtin("list", |_, arguments| builtin_list(arguments));
     env.define_builtin("length", |_, arguments| builtin_length(arguments));
     env.define_builtin("append", |_, arguments| builtin_append(arguments));
+    env.define_builtin("string-append", |_, arguments| {
+        builtin_string_append(arguments)
+    });
+    env.define_builtin("number->string", |_, arguments| {
+        builtin_number_to_string(arguments)
+    });
+    env.define_builtin("string->symbol", |_, arguments| {
+        builtin_string_to_symbol(arguments)
+    });
+    env.define_builtin("syntax->datum", |_, arguments| {
+        builtin_syntax_to_datum(arguments)
+    });
+    env.define_builtin("datum->syntax", |_, arguments| {
+        builtin_datum_to_syntax(arguments)
+    });
     env.define_builtin("string?", |_, arguments| builtin_is_string(arguments));
     env.define_builtin("number?", |_, arguments| builtin_is_number(arguments));
     env.define_builtin("boolean?", |_, arguments| builtin_is_boolean(arguments));
@@ -912,6 +1230,291 @@ fn parse_parameter_names_list(parameter_exprs: &[Expr]) -> Result<ParameterSpec,
         required,
         rest: None,
     })
+}
+
+fn require_syntax_value<'a>(value: &'a Value, operator: &str) -> Result<&'a Expr, EvalError> {
+    match value {
+        Value::Syntax(expr) => Ok(expr),
+        _ => Err(EvalError::message(format!(
+            "{operator} expects a syntax object"
+        ))),
+    }
+}
+
+fn syntax_value_to_expr(value: &Value, operator: &str) -> Result<Expr, EvalError> {
+    match value {
+        Value::Syntax(expr) => Ok(expr.clone()),
+        Value::SyntaxSequence(values) if values.len() == 1 => Ok(values[0].clone()),
+        _ => Err(EvalError::message(format!(
+            "{operator} expects a single syntax object"
+        ))),
+    }
+}
+
+fn lookup_syntax_binding(env: &Rc<Env>, name: &str) -> Option<Value> {
+    let cell = env.lookup_cell(name)?;
+    let value = cell.borrow().clone();
+    if matches!(value, Value::Syntax(_) | Value::SyntaxSequence(_)) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn parse_syntax_literals(expr: &Expr) -> Result<Vec<String>, EvalError> {
+    let ExprKind::List(elements) = &expr.kind else {
+        return Err(EvalError::message("syntax-case literals must be a list"));
+    };
+
+    let mut literals = Vec::with_capacity(elements.len());
+    for element in elements {
+        let ExprKind::Symbol(name) = &element.kind else {
+            return Err(EvalError::message(
+                "syntax-case literals must contain only symbols",
+            ));
+        };
+        literals.push(name.clone());
+    }
+    Ok(literals)
+}
+
+fn bind_pattern_bindings(env: &Rc<Env>, bindings: HashMap<String, PatternBinding>) {
+    for (name, binding) in bindings {
+        match binding {
+            PatternBinding::Single(expr) => env.define(name, Value::Syntax(expr)),
+            PatternBinding::Sequence(values) => env.define(name, Value::SyntaxSequence(values)),
+        }
+    }
+}
+
+fn match_syntax_case_pattern(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &[String],
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> Result<bool, EvalError> {
+    match &pattern.kind {
+        ExprKind::Int(value) => Ok(matches!(&input.kind, ExprKind::Int(other) if *other == *value)),
+        ExprKind::Rational(numerator, denominator) => Ok(matches!(
+            &input.kind,
+            ExprKind::Rational(other_numerator, other_denominator)
+                if *other_numerator == *numerator && *other_denominator == *denominator
+        )),
+        ExprKind::Inexact(value) => {
+            Ok(matches!(&input.kind, ExprKind::Inexact(other) if *other == *value))
+        }
+        ExprKind::Bool(value) => {
+            Ok(matches!(&input.kind, ExprKind::Bool(other) if *other == *value))
+        }
+        ExprKind::String(value) => {
+            Ok(matches!(&input.kind, ExprKind::String(other) if other == value))
+        }
+        ExprKind::Symbol(name) => match name.as_str() {
+            "_" => Ok(true),
+            "..." => Err(EvalError::message(
+                "syntax-case pattern contains misplaced ellipsis",
+            )),
+            _ if literals.iter().any(|literal| literal == name) => Ok(matches!(
+                &input.kind,
+                ExprKind::Symbol(other) if other == name
+            )),
+            _ => bind_single_pattern(bindings, name, input),
+        },
+        ExprKind::Vector(patterns) => {
+            let ExprKind::Vector(inputs) = &input.kind else {
+                return Ok(false);
+            };
+            if patterns.len() != inputs.len() {
+                return Ok(false);
+            }
+            for (pattern, input) in patterns.iter().zip(inputs.iter()) {
+                if !match_syntax_case_pattern(pattern, input, literals, bindings)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        ExprKind::List(patterns) => {
+            let ExprKind::List(inputs) = &input.kind else {
+                return Ok(false);
+            };
+
+            if let Some(ellipsis_index) = patterns.windows(2).position(
+                |window| matches!(&window[1].kind, ExprKind::Symbol(name) if name == "..."),
+            ) {
+                let prefix = &patterns[..ellipsis_index];
+                let repeated = &patterns[ellipsis_index];
+                let suffix = &patterns[ellipsis_index + 2..];
+
+                if inputs.len() < prefix.len() + suffix.len() {
+                    return Ok(false);
+                }
+
+                for (pattern, input) in prefix.iter().zip(inputs.iter()) {
+                    if !match_syntax_case_pattern(pattern, input, literals, bindings)? {
+                        return Ok(false);
+                    }
+                }
+
+                for (pattern, input) in suffix.iter().rev().zip(inputs.iter().rev()) {
+                    if !match_syntax_case_pattern(pattern, input, literals, bindings)? {
+                        return Ok(false);
+                    }
+                }
+
+                let repeated_inputs = &inputs[prefix.len()..inputs.len() - suffix.len()];
+                match &repeated.kind {
+                    ExprKind::Symbol(name) => match name.as_str() {
+                        "_" => Ok(true),
+                        _ if literals.iter().any(|literal| literal == name) => Ok(repeated_inputs
+                            .iter()
+                            .all(|input| matches!(&input.kind, ExprKind::Symbol(other) if other == name))),
+                        _ => bind_sequence_pattern(bindings, name, repeated_inputs),
+                    },
+                    _ => Err(EvalError::message(
+                        "syntax-case only supports ellipsis on identifier patterns",
+                    )),
+                }
+            } else {
+                if patterns.len() != inputs.len() {
+                    return Ok(false);
+                }
+                for (pattern, input) in patterns.iter().zip(inputs.iter()) {
+                    if !match_syntax_case_pattern(pattern, input, literals, bindings)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn bind_single_pattern(
+    bindings: &mut HashMap<String, PatternBinding>,
+    name: &str,
+    input: &Expr,
+) -> Result<bool, EvalError> {
+    match bindings.get(name) {
+        Some(PatternBinding::Single(existing)) => Ok(exprs_equal(existing, input)),
+        Some(PatternBinding::Sequence(_)) => Ok(false),
+        None => {
+            bindings.insert(name.to_string(), PatternBinding::Single(input.clone()));
+            Ok(true)
+        }
+    }
+}
+
+fn bind_sequence_pattern(
+    bindings: &mut HashMap<String, PatternBinding>,
+    name: &str,
+    inputs: &[Expr],
+) -> Result<bool, EvalError> {
+    let values = inputs.to_vec();
+    match bindings.get(name) {
+        Some(PatternBinding::Single(_)) => Ok(false),
+        Some(PatternBinding::Sequence(existing)) => Ok(existing.len() == values.len()
+            && existing
+                .iter()
+                .zip(values.iter())
+                .all(|(left, right)| exprs_equal(left, right))),
+        None => {
+            bindings.insert(name.to_string(), PatternBinding::Sequence(values));
+            Ok(true)
+        }
+    }
+}
+
+fn exprs_equal(left: &Expr, right: &Expr) -> bool {
+    match (&left.kind, &right.kind) {
+        (ExprKind::Int(left), ExprKind::Int(right)) => left == right,
+        (ExprKind::Rational(ln, ld), ExprKind::Rational(rn, rd)) => ln == rn && ld == rd,
+        (ExprKind::Inexact(left), ExprKind::Inexact(right)) => left == right,
+        (ExprKind::Bool(left), ExprKind::Bool(right)) => left == right,
+        (ExprKind::String(left), ExprKind::String(right)) => left == right,
+        (ExprKind::Symbol(left), ExprKind::Symbol(right)) => left == right,
+        (ExprKind::Vector(left), ExprKind::Vector(right))
+        | (ExprKind::List(left), ExprKind::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| exprs_equal(left, right))
+        }
+        _ => false,
+    }
+}
+
+fn expand_repeated_template_piece(
+    evaluator: &Evaluator,
+    expr: &Expr,
+    env: &Rc<Env>,
+    renamed: &HashMap<String, String>,
+) -> Result<Vec<Expr>, EvalError> {
+    if let ExprKind::Symbol(name) = &expr.kind {
+        if let Some(value) = lookup_syntax_binding(env, name) {
+            return match value {
+                Value::Syntax(expr) => Ok(vec![expr]),
+                Value::SyntaxSequence(values) => Ok(values),
+                _ => unreachable!("validated syntax binding"),
+            };
+        }
+    }
+
+    Ok(vec![evaluator.expand_syntax_template(expr, env, renamed)?])
+}
+
+fn datum_to_expr(value: &Value, position: SourceLoc, operator: &str) -> Result<Expr, EvalError> {
+    let kind = match value {
+        Value::Int(number) => ExprKind::Int(*number),
+        Value::Rational(number) => ExprKind::Rational(number.numerator, number.denominator),
+        Value::Inexact(number) => ExprKind::Inexact(*number),
+        Value::Bool(value) => ExprKind::Bool(*value),
+        Value::String(text) => ExprKind::String(text.clone()),
+        Value::Symbol(name) => ExprKind::Symbol(name.clone()),
+        Value::EmptyList => ExprKind::List(Vec::new()),
+        Value::Pair(_) => ExprKind::List(datum_pair_to_exprs(value, position, operator)?),
+        Value::Vector(vector) => {
+            let elements = vector.elements.borrow().clone();
+            let mut exprs = Vec::with_capacity(elements.len());
+            for element in &elements {
+                exprs.push(datum_to_expr(element, position, operator)?);
+            }
+            ExprKind::Vector(exprs)
+        }
+        Value::Syntax(expr) => return Ok(expr.clone()),
+        _ => {
+            return Err(EvalError::message(format!(
+                "{operator} expects a datum value"
+            )))
+        }
+    };
+
+    Ok(Expr { kind, position })
+}
+
+fn datum_pair_to_exprs(
+    value: &Value,
+    position: SourceLoc,
+    operator: &str,
+) -> Result<Vec<Expr>, EvalError> {
+    let mut exprs = Vec::new();
+    let mut current = value.clone();
+
+    loop {
+        match current {
+            Value::Pair(pair) => {
+                exprs.push(datum_to_expr(&pair.car, position, operator)?);
+                current = pair.cdr.clone();
+            }
+            Value::EmptyList => return Ok(exprs),
+            _ => {
+                return Err(EvalError::message(format!(
+                    "{operator} expects a datum value"
+                )))
+            }
+        }
+    }
 }
 
 fn quote_to_value(expr: &Expr) -> Value {
@@ -1234,6 +1837,7 @@ fn render(value: &Value) -> String {
         Value::Bool(false) => "#f".to_string(),
         Value::String(text) => quote_string(text),
         Value::Symbol(name) => name.clone(),
+        Value::Syntax(_) | Value::SyntaxSequence(_) => "#<syntax>".to_string(),
         Value::EmptyList => "()".to_string(),
         Value::Pair(pair) => render_pair(pair.as_ref()),
         Value::Vector(vector) => render_vector(vector.as_ref()),
@@ -1652,6 +2256,51 @@ fn builtin_append(arguments: &[Value]) -> Result<Value, EvalError> {
     Ok(result)
 }
 
+fn builtin_string_append(arguments: &[Value]) -> Result<Value, EvalError> {
+    let mut result = String::new();
+    for argument in arguments {
+        let Value::String(text) = argument else {
+            return Err(EvalError::message("string-append expects string arguments"));
+        };
+        result.push_str(text);
+    }
+    Ok(Value::String(result))
+}
+
+fn builtin_number_to_string(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("number->string", arguments.len(), 1)?;
+    let value = require_number(&arguments[0], "number->string")?;
+    Ok(Value::String(render(value)))
+}
+
+fn builtin_string_to_symbol(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("string->symbol", arguments.len(), 1)?;
+    let Value::String(text) = &arguments[0] else {
+        return Err(EvalError::message(
+            "string->symbol expects a string argument",
+        ));
+    };
+    Ok(Value::Symbol(text.clone()))
+}
+
+fn builtin_syntax_to_datum(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("syntax->datum", arguments.len(), 1)?;
+    Ok(quote_to_value(require_syntax_value(
+        &arguments[0],
+        "syntax->datum",
+    )?))
+}
+
+fn builtin_datum_to_syntax(arguments: &[Value]) -> Result<Value, EvalError> {
+    require_exact_args("datum->syntax", arguments.len(), 2)?;
+    let context = require_syntax_value(&arguments[0], "datum->syntax")?;
+    Ok(Value::Syntax(datum_to_expr(
+        &arguments[1],
+        context.position,
+        "datum->syntax",
+    )?))
+}
+
 fn builtin_apply(evaluator: &Evaluator, arguments: &[Value]) -> Result<Value, EvalError> {
     require_min_args("apply", arguments.len(), 2)?;
 
@@ -1823,6 +2472,8 @@ enum Value {
     Bool(bool),
     String(String),
     Symbol(String),
+    Syntax(Expr),
+    SyntaxSequence(Vec<Expr>),
     EmptyList,
     Pair(Rc<PairValue>),
     Vector(Rc<VectorValue>),
@@ -1888,6 +2539,11 @@ struct DoBindingSpec {
     name: String,
     init_expr: Expr,
     step_expr: Option<Expr>,
+}
+
+enum PatternBinding {
+    Single(Expr),
+    Sequence(Vec<Expr>),
 }
 
 #[derive(Clone)]
@@ -1995,6 +2651,7 @@ impl ExactNumber {
 struct Env {
     parent: Option<Rc<Env>>,
     bindings: RefCell<HashMap<String, Cell>>,
+    macro_bindings: RefCell<HashMap<String, Rc<ClosureValue>>>,
 }
 
 impl Env {
@@ -2002,6 +2659,7 @@ impl Env {
         Rc::new(Self {
             parent,
             bindings: RefCell::new(HashMap::new()),
+            macro_bindings: RefCell::new(HashMap::new()),
         })
     }
 
@@ -2025,6 +2683,20 @@ impl Env {
         let cell = Rc::new(RefCell::new(Value::Uninitialized));
         self.bindings.borrow_mut().insert(name, cell.clone());
         cell
+    }
+
+    fn define_macro(&self, name: String, transformer: Rc<ClosureValue>) {
+        self.macro_bindings.borrow_mut().insert(name, transformer);
+    }
+
+    fn lookup_macro(&self, name: &str) -> Option<Rc<ClosureValue>> {
+        if let Some(transformer) = self.macro_bindings.borrow().get(name).cloned() {
+            return Some(transformer);
+        }
+
+        self.parent
+            .as_ref()
+            .and_then(|parent| parent.lookup_macro(name))
     }
 
     fn lookup(&self, name: &str) -> Result<Value, EvalError> {
@@ -2113,6 +2785,7 @@ impl<'input> Parser<'input> {
                     position,
                 })
             }
+            '#' if self.peek_char() == Some('\'') => self.parse_syntax_quote(),
             '#' if self.peek_char() == Some('(') => self.parse_vector(),
             '"' => self.parse_string(),
             ')' => Err(self.error("unexpected ')'")),
@@ -2160,6 +2833,22 @@ impl<'input> Parser<'input> {
         self.consume(')')?;
         Ok(Expr {
             kind: ExprKind::Vector(elements),
+            position,
+        })
+    }
+
+    fn parse_syntax_quote(&mut self) -> Result<Expr, EvalError> {
+        let position = self.current_loc();
+        self.consume('#')?;
+        self.consume('\'')?;
+        Ok(Expr {
+            kind: ExprKind::List(vec![
+                Expr {
+                    kind: ExprKind::Symbol("syntax".to_string()),
+                    position,
+                },
+                self.parse_expression()?,
+            ]),
             position,
         })
     }
