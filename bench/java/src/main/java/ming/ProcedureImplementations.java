@@ -49,8 +49,20 @@ final class UserProcedure extends ProcedureValue {
         return evaluator.applyUserProcedure(displayName(), parameters, body, closureEnv, args);
     }
 
-    private String displayName() {
+    String displayName() {
         return name == null ? "lambda" : name;
+    }
+
+    ParameterSpec parameters() {
+        return parameters;
+    }
+
+    List<Expr> body() {
+        return body;
+    }
+
+    Environment closureEnv() {
+        return closureEnv;
     }
 }
 
@@ -75,5 +87,13 @@ final class CaseLambdaProcedure extends ProcedureValue {
             }
         }
         throw new EvalError("wrong number of arguments for case-lambda: got " + args.size());
+    }
+
+    List<ProcedureClause> clauses() {
+        return clauses;
+    }
+
+    Environment closureEnv() {
+        return closureEnv;
     }
 }

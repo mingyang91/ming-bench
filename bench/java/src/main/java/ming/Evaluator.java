@@ -9,6 +9,15 @@ import java.util.List;
  * Agents implement this class.
  */
 public class Evaluator {
+    private sealed interface EvalStep permits ValueStep, TailStep {
+    }
+
+    private record ValueStep(Value value) implements EvalStep {
+    }
+
+    private record TailStep(Expr expr, Environment env) implements EvalStep {
+    }
+
     private final Environment globalEnv;
     private StringBuilder activeOutput;
     private long syntheticCounter;
@@ -89,24 +98,54 @@ public class Evaluator {
     }
 
     private Value eval(Expr expr, Environment env) throws EvalError {
-        try {
-            return switch (expr) {
-                case IntExpr intExpr -> new IntValue(intExpr.value());
-                case RationalExpr rationalExpr -> NumericSupport.exactToValue(
-                        new ExactFraction(rationalExpr.numerator(), rationalExpr.denominator()));
-                case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
-                case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
-                case StringExpr stringExpr -> new StringValue(stringExpr.value());
-                case CharExpr charExpr -> new CharValue(charExpr.value());
-                case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
-                case ListExpr listExpr -> evalList(listExpr, env);
-            };
-        } catch (EvalError error) {
-            throw error.withPosition(expr.position().line(), expr.position().column());
+        Expr currentExpr = expr;
+        Environment currentEnv = env;
+
+        while (true) {
+            try {
+                switch (currentExpr) {
+                    case IntExpr intExpr -> {
+                        return new IntValue(intExpr.value());
+                    }
+                    case RationalExpr rationalExpr -> {
+                        return NumericSupport.exactToValue(
+                                new ExactFraction(rationalExpr.numerator(),
+                                        rationalExpr.denominator()));
+                    }
+                    case InexactExpr inexactExpr -> {
+                        return new InexactValue(inexactExpr.value());
+                    }
+                    case BoolExpr boolExpr -> {
+                        return BoolValue.of(boolExpr.value());
+                    }
+                    case StringExpr stringExpr -> {
+                        return new StringValue(stringExpr.value());
+                    }
+                    case CharExpr charExpr -> {
+                        return new CharValue(charExpr.value());
+                    }
+                    case SymbolExpr symbolExpr -> {
+                        return currentEnv.lookup(symbolExpr.name());
+                    }
+                    case ListExpr listExpr -> {
+                        EvalStep step = evalList(listExpr, currentEnv);
+                        if (step instanceof ValueStep valueStep) {
+                            return valueStep.value();
+                        }
+
+                        TailStep tailStep = (TailStep) step;
+                        currentExpr = tailStep.expr();
+                        currentEnv = tailStep.env();
+                    }
+                }
+            } catch (EvalError error) {
+                throw error.withPosition(currentExpr.position().line(),
+                        currentExpr.position().column());
+            }
         }
     }
 
-    private Value evalList(ListExpr listExpr, Environment env) throws EvalError {
+    private EvalStep evalList(ListExpr listExpr, Environment env) throws EvalError {
         List<Expr> elements = listExpr.elements();
         if (elements.isEmpty()) {
             throw new EvalError("cannot evaluate empty list");
@@ -117,14 +156,14 @@ public class Evaluator {
 
         if (head instanceof SymbolExpr symbolExpr) {
             return switch (symbolExpr.name()) {
-                case "define" -> evalDefine(argExprs, env);
-                case "define-syntax" -> evalDefineSyntax(argExprs, env);
-                case "define-record-type" -> evalDefineRecordType(argExprs, env);
-                case "set!" -> evalSet(argExprs, env);
+                case "define" -> valueStep(evalDefine(argExprs, env));
+                case "define-syntax" -> valueStep(evalDefineSyntax(argExprs, env));
+                case "define-record-type" -> valueStep(evalDefineRecordType(argExprs, env));
+                case "set!" -> valueStep(evalSet(argExprs, env));
                 case "if" -> evalIf(argExprs, env);
-                case "quote" -> evalQuote(argExprs);
-                case "lambda" -> evalLambda(argExprs, env);
-                case "case-lambda" -> evalCaseLambda(argExprs, env);
+                case "quote" -> valueStep(evalQuote(argExprs));
+                case "lambda" -> valueStep(evalLambda(argExprs, env));
+                case "case-lambda" -> valueStep(evalCaseLambda(argExprs, env));
                 case "begin" -> evalBegin(argExprs, env);
                 case "let" -> evalLet(argExprs, env);
                 case "letrec" -> evalLetrec(argExprs, env, false);
@@ -137,14 +176,14 @@ public class Evaluator {
                 default -> {
                     MacroBinding macro = env.lookupSyntax(symbolExpr.name());
                     if (macro != null) {
-                        yield eval(macro.expand(listExpr), env);
+                        yield tailStep(macro.expand(listExpr), env);
                     }
-                    yield applyProcedure(eval(head, env), evalArgs(argExprs, env));
+                    yield applyProcedureStep(eval(head, env), evalArgs(argExprs, env));
                 }
             };
         }
 
-        return applyProcedure(eval(head, env), evalArgs(argExprs, env));
+        return applyProcedureStep(eval(head, env), evalArgs(argExprs, env));
     }
 
     private Value evalDefine(List<Expr> argExprs, Environment env) throws EvalError {
@@ -169,8 +208,10 @@ public class Evaluator {
                 throw new EvalError("function name must be a symbol");
             }
 
-            ParameterSpec parameters = parseParameterSpec(signature.subList(1, signature.size()));
-            List<Expr> body = parseBody("define", argExprs.subList(1, argExprs.size()));
+            ParameterSpec parameters = FormParser.parseParameterSpec(
+                    signature.subList(1, signature.size()));
+            List<Expr> body = FormParser.parseBody("define",
+                    argExprs.subList(1, argExprs.size()));
             ProcedureValue procedure = new UserProcedure(this, nameExpr.name(), parameters, body,
                     env);
             env.define(nameExpr.name(), procedure);
@@ -191,19 +232,19 @@ public class Evaluator {
         return VoidValue.INSTANCE;
     }
 
-    private Value evalIf(List<Expr> argExprs, Environment env) throws EvalError {
+    private EvalStep evalIf(List<Expr> argExprs, Environment env) throws EvalError {
         if (argExprs.size() < 2 || argExprs.size() > 3) {
             throw new EvalError(
                     "wrong number of arguments for if: expected 2 or 3, got " + argExprs.size());
         }
         Value condition = eval(argExprs.get(0), env);
         if (isTruthy(condition)) {
-            return eval(argExprs.get(1), env);
+            return tailStep(argExprs.get(1), env);
         }
         if (argExprs.size() == 2) {
-            return VoidValue.INSTANCE;
+            return valueStep(VoidValue.INSTANCE);
         }
-        return eval(argExprs.get(2), env);
+        return tailStep(argExprs.get(2), env);
     }
 
     private Value evalQuote(List<Expr> argExprs) throws EvalError {
@@ -236,17 +277,18 @@ public class Evaluator {
             throw new EvalError("record predicate name must be a symbol");
         }
 
-        RecordConstructorSpec constructor = parseRecordConstructorSpec(argExprs.get(1));
-        List<RecordFieldSpec> fields = parseRecordFieldSpecs(argExprs.subList(3, argExprs.size()));
+        RecordConstructorSpec constructor = FormParser.parseRecordConstructorSpec(argExprs.get(1));
+        List<RecordFieldSpec> fields = FormParser.parseRecordFieldSpecs(
+                argExprs.subList(3, argExprs.size()));
 
         RecordType recordType;
         try {
-            recordType = new RecordType(typeExpr.name(), recordFieldNames(fields));
+            recordType = new RecordType(typeExpr.name(), FormParser.recordFieldNames(fields));
         } catch (IllegalArgumentException error) {
             throw new EvalError(error.getMessage());
         }
 
-        List<Integer> constructorFieldIndexes = resolveRecordFieldIndexes(
+        List<Integer> constructorFieldIndexes = FormParser.resolveRecordFieldIndexes(
                 constructor.fieldNames(), recordType);
         env.define(constructor.name(), new RecordConstructorProcedure(constructor.name(),
                 recordType, constructorFieldIndexes, recordProcedureSupport));
@@ -271,8 +313,8 @@ public class Evaluator {
             throw new EvalError("lambda requires parameters and a body");
         }
 
-        ParameterSpec parameters = parseLambdaParameterSpec(argExprs.getFirst());
-        List<Expr> body = parseBody("lambda", argExprs.subList(1, argExprs.size()));
+        ParameterSpec parameters = FormParser.parseLambdaParameterSpec(argExprs.getFirst());
+        List<Expr> body = FormParser.parseBody("lambda", argExprs.subList(1, argExprs.size()));
         return new UserProcedure(this, null, parameters, body, env);
     }
 
@@ -283,16 +325,16 @@ public class Evaluator {
 
         List<ProcedureClause> clauses = new ArrayList<>(argExprs.size());
         for (Expr clauseExpr : argExprs) {
-            clauses.add(parseCaseLambdaClause(clauseExpr));
+            clauses.add(FormParser.parseCaseLambdaClause(clauseExpr));
         }
         return new CaseLambdaProcedure(this, clauses, env);
     }
 
-    private Value evalBegin(List<Expr> argExprs, Environment env) throws EvalError {
-        return evalSequence(argExprs, env);
+    private EvalStep evalBegin(List<Expr> argExprs, Environment env) throws EvalError {
+        return evalSequenceStep(argExprs, env);
     }
 
-    private Value evalLet(List<Expr> argExprs, Environment env) throws EvalError {
+    private EvalStep evalLet(List<Expr> argExprs, Environment env) throws EvalError {
         if (argExprs.isEmpty()) {
             throw new EvalError("let requires bindings and a body");
         }
@@ -306,8 +348,8 @@ public class Evaluator {
                 throw new EvalError("let bindings must be a list");
             }
 
-            List<LetBinding> bindings = parseBindings(bindingsExpr.elements());
-            List<Expr> body = parseBody("let", argExprs.subList(2, argExprs.size()));
+            List<LetBinding> bindings = FormParser.parseBindings(bindingsExpr.elements());
+            List<Expr> body = FormParser.parseBody("let", argExprs.subList(2, argExprs.size()));
             return evalNamedLet(nameExpr.name(), bindings, body, env);
         }
 
@@ -315,12 +357,12 @@ public class Evaluator {
             throw new EvalError("let bindings must be a list");
         }
 
-        List<LetBinding> bindings = parseBindings(bindingsExpr.elements());
-        List<Expr> body = parseBody("let", argExprs.subList(1, argExprs.size()));
+        List<LetBinding> bindings = FormParser.parseBindings(bindingsExpr.elements());
+        List<Expr> body = FormParser.parseBody("let", argExprs.subList(1, argExprs.size()));
         return evalSimpleLet(bindings, body, env);
     }
 
-    private Value evalLetrec(List<Expr> argExprs, Environment env, boolean sequential)
+    private EvalStep evalLetrec(List<Expr> argExprs, Environment env, boolean sequential)
             throws EvalError {
         String formName = sequential ? "letrec*" : "letrec";
         if (argExprs.isEmpty()) {
@@ -330,8 +372,8 @@ public class Evaluator {
             throw new EvalError(formName + " bindings must be a list");
         }
 
-        List<LetBinding> bindings = parseBindings(bindingsExpr.elements());
-        List<Expr> body = parseBody(formName, argExprs.subList(1, argExprs.size()));
+        List<LetBinding> bindings = FormParser.parseBindings(bindingsExpr.elements());
+        List<Expr> body = FormParser.parseBody(formName, argExprs.subList(1, argExprs.size()));
 
         Environment letrecEnv = new Environment(env);
         List<Cell> bindingCells = new ArrayList<>(bindings.size());
@@ -355,20 +397,20 @@ public class Evaluator {
             }
         }
 
-        return evalSequence(body, letrecEnv);
+        return evalSequenceStep(body, letrecEnv);
     }
 
-    private Value evalSimpleLet(List<LetBinding> bindings, List<Expr> body, Environment env)
+    private EvalStep evalSimpleLet(List<LetBinding> bindings, List<Expr> body, Environment env)
             throws EvalError {
         Environment letEnv = new Environment(env);
         for (LetBinding binding : bindings) {
             letEnv.define(binding.name(), eval(binding.valueExpr(), env));
         }
-        return evalSequence(body, letEnv);
+        return evalSequenceStep(body, letEnv);
     }
 
-    private Value evalNamedLet(String name, List<LetBinding> bindings, List<Expr> body,
-                               Environment env) throws EvalError {
+    private EvalStep evalNamedLet(String name, List<LetBinding> bindings, List<Expr> body,
+                                  Environment env) throws EvalError {
         List<String> parameterNames = new ArrayList<>(bindings.size());
         List<Value> arguments = new ArrayList<>(bindings.size());
         for (LetBinding binding : bindings) {
@@ -380,10 +422,10 @@ public class Evaluator {
         ProcedureValue procedure = new UserProcedure(this, name,
                 new ParameterSpec(parameterNames, null), body, letEnv);
         letEnv.define(name, procedure);
-        return procedure.apply(arguments);
+        return applyProcedureStep(procedure, arguments);
     }
 
-    private Value evalCase(List<Expr> argExprs, Environment env) throws EvalError {
+    private EvalStep evalCase(List<Expr> argExprs, Environment env) throws EvalError {
         if (argExprs.isEmpty()) {
             throw new EvalError("case requires a key and at least zero clauses");
         }
@@ -405,7 +447,7 @@ public class Evaluator {
                 if (index != argExprs.size() - 1) {
                     throw new EvalError("case else clause must be last");
                 }
-                return evalSequenceOrVoid(clause.subList(1, clause.size()), env);
+                return evalSequenceOrVoidStep(clause.subList(1, clause.size()), env);
             }
 
             if (!(head instanceof ListExpr datumList)) {
@@ -414,15 +456,15 @@ public class Evaluator {
 
             for (Expr datumExpr : datumList.elements()) {
                 if (isEqv(key, quoteToValue(datumExpr))) {
-                    return evalSequenceOrVoid(clause.subList(1, clause.size()), env);
+                    return evalSequenceOrVoidStep(clause.subList(1, clause.size()), env);
                 }
             }
         }
 
-        return VoidValue.INSTANCE;
+        return valueStep(VoidValue.INSTANCE);
     }
 
-    private Value evalDo(List<Expr> argExprs, Environment env) throws EvalError {
+    private EvalStep evalDo(List<Expr> argExprs, Environment env) throws EvalError {
         if (argExprs.size() < 2) {
             throw new EvalError("do requires bindings and a termination clause");
         }
@@ -433,7 +475,7 @@ public class Evaluator {
             throw new EvalError("do termination clause must be a list");
         }
 
-        List<DoBinding> bindings = parseDoBindings(bindingList.elements());
+        List<FormParser.DoBinding> bindings = FormParser.parseDoBindings(bindingList.elements());
         List<Expr> terminationParts = terminationClause.elements();
         if (terminationParts.isEmpty()) {
             throw new EvalError("do termination clause requires a test");
@@ -441,7 +483,7 @@ public class Evaluator {
 
         Environment loopEnv = new Environment(env);
         List<Cell> bindingCells = new ArrayList<>(bindings.size());
-        for (DoBinding binding : bindings) {
+        for (FormParser.DoBinding binding : bindings) {
             Cell cell = new Cell(eval(binding.initExpr(), env));
             loopEnv.defineAlias(binding.name(), cell);
             bindingCells.add(cell);
@@ -450,11 +492,11 @@ public class Evaluator {
         List<Expr> body = argExprs.subList(2, argExprs.size());
         while (true) {
             if (isTruthy(eval(terminationParts.getFirst(), loopEnv))) {
-                return evalSequenceOrVoid(terminationParts.subList(1, terminationParts.size()),
+                return evalSequenceOrVoidStep(terminationParts.subList(1, terminationParts.size()),
                         loopEnv);
             }
 
-            evalSequenceOrVoid(body, loopEnv);
+            resolveStep(evalSequenceOrVoidStep(body, loopEnv));
 
             List<Value> nextValues = new ArrayList<>(bindings.size());
             for (int index = 0; index < bindings.size(); index++) {
@@ -471,7 +513,7 @@ public class Evaluator {
         }
     }
 
-    private Value evalCond(List<Expr> argExprs, Environment env) throws EvalError {
+    private EvalStep evalCond(List<Expr> argExprs, Environment env) throws EvalError {
         for (int index = 0; index < argExprs.size(); index++) {
             Expr clauseExpr = argExprs.get(index);
             if (!(clauseExpr instanceof ListExpr clauseList)) {
@@ -497,207 +539,18 @@ public class Evaluator {
             }
         }
 
-        return VoidValue.INSTANCE;
+        return valueStep(VoidValue.INSTANCE);
     }
 
-    private Value evalClauseBody(String formName, List<Expr> body, Environment env,
-                                 Value defaultValue) throws EvalError {
+    private EvalStep evalClauseBody(String formName, List<Expr> body, Environment env,
+                                    Value defaultValue) throws EvalError {
         if (body.isEmpty()) {
             if (defaultValue != null) {
-                return defaultValue;
+                return valueStep(defaultValue);
             }
             throw new EvalError(formName + " clause requires a body");
         }
-        return evalSequence(body, env);
-    }
-
-    private ParameterSpec parseLambdaParameterSpec(Expr paramsExpr) throws EvalError {
-        if (paramsExpr instanceof ListExpr paramsList) {
-            return parseParameterSpec(paramsList.elements());
-        }
-        if (paramsExpr instanceof SymbolExpr symbolExpr) {
-            if (symbolExpr.name().equals(".")) {
-                throw new EvalError("invalid parameter list");
-            }
-            return new ParameterSpec(List.of(), symbolExpr.name());
-        }
-        throw new EvalError("lambda parameters must be a list or symbol");
-    }
-
-    private ProcedureClause parseCaseLambdaClause(Expr clauseExpr) throws EvalError {
-        if (!(clauseExpr instanceof ListExpr clauseList)) {
-            throw new EvalError("case-lambda clause must be a list");
-        }
-
-        List<Expr> parts = clauseList.elements();
-        if (parts.size() < 2) {
-            throw new EvalError("case-lambda clause requires parameters and a body");
-        }
-
-        return new ProcedureClause(parseLambdaParameterSpec(parts.getFirst()),
-                parseBody("case-lambda", parts.subList(1, parts.size())));
-    }
-
-    private ParameterSpec parseParameterSpec(List<Expr> params) throws EvalError {
-        List<String> requiredParameters = new ArrayList<>(params.size());
-        String restParameter = null;
-
-        for (int index = 0; index < params.size(); index++) {
-            Expr param = params.get(index);
-            if (param instanceof SymbolExpr symbolExpr && symbolExpr.name().equals(".")) {
-                if (restParameter != null || index != params.size() - 2) {
-                    throw new EvalError("invalid parameter list");
-                }
-
-                Expr restExpr = params.get(index + 1);
-                if (!(restExpr instanceof SymbolExpr restSymbol) || restSymbol.name().equals(".")) {
-                    throw new EvalError("rest parameter must be a symbol");
-                }
-                restParameter = restSymbol.name();
-                index++;
-                continue;
-            }
-
-            if (!(param instanceof SymbolExpr symbolExpr)) {
-                throw new EvalError("parameter must be a symbol");
-            }
-            requiredParameters.add(symbolExpr.name());
-        }
-
-        return new ParameterSpec(requiredParameters, restParameter);
-    }
-
-    private List<LetBinding> parseBindings(List<Expr> bindingExprs) throws EvalError {
-        List<LetBinding> bindings = new ArrayList<>(bindingExprs.size());
-        for (Expr bindingExpr : bindingExprs) {
-            if (!(bindingExpr instanceof ListExpr bindingList)) {
-                throw new EvalError("let binding must be a list");
-            }
-
-            List<Expr> parts = bindingList.elements();
-            if (parts.size() != 2) {
-                throw new EvalError("let binding must contain a name and value");
-            }
-            if (!(parts.getFirst() instanceof SymbolExpr symbolExpr)) {
-                throw new EvalError("let binding name must be a symbol");
-            }
-
-            bindings.add(new LetBinding(symbolExpr.name(), parts.get(1)));
-        }
-        return bindings;
-    }
-
-    private List<DoBinding> parseDoBindings(List<Expr> bindingExprs) throws EvalError {
-        List<DoBinding> bindings = new ArrayList<>(bindingExprs.size());
-        for (Expr bindingExpr : bindingExprs) {
-            if (!(bindingExpr instanceof ListExpr bindingList)) {
-                throw new EvalError("do binding must be a list");
-            }
-
-            List<Expr> parts = bindingList.elements();
-            if (parts.size() < 2 || parts.size() > 3) {
-                throw new EvalError("do binding must contain a name, init, and optional step");
-            }
-            if (!(parts.getFirst() instanceof SymbolExpr symbolExpr)) {
-                throw new EvalError("do binding name must be a symbol");
-            }
-
-            Expr stepExpr = parts.size() == 3 ? parts.get(2) : null;
-            bindings.add(new DoBinding(symbolExpr.name(), parts.get(1), stepExpr));
-        }
-        return List.copyOf(bindings);
-    }
-
-    private RecordConstructorSpec parseRecordConstructorSpec(Expr constructorExpr)
-            throws EvalError {
-        if (!(constructorExpr instanceof ListExpr constructorList)) {
-            throw new EvalError("record constructor spec must be a list");
-        }
-
-        List<Expr> parts = constructorList.elements();
-        if (parts.isEmpty()) {
-            throw new EvalError("record constructor spec cannot be empty");
-        }
-        if (!(parts.getFirst() instanceof SymbolExpr nameExpr)) {
-            throw new EvalError("record constructor name must be a symbol");
-        }
-
-        List<String> fieldNames = new ArrayList<>(parts.size() - 1);
-        for (int index = 1; index < parts.size(); index++) {
-            fieldNames.add(expectExprSymbol(parts.get(index),
-                    "record constructor field must be a symbol"));
-        }
-        return new RecordConstructorSpec(nameExpr.name(), fieldNames);
-    }
-
-    private List<RecordFieldSpec> parseRecordFieldSpecs(List<Expr> fieldExprs) throws EvalError {
-        List<RecordFieldSpec> fields = new ArrayList<>(fieldExprs.size());
-        for (Expr fieldExpr : fieldExprs) {
-            if (!(fieldExpr instanceof ListExpr fieldList)) {
-                throw new EvalError("record field spec must be a list");
-            }
-
-            List<Expr> parts = fieldList.elements();
-            if (parts.size() < 2 || parts.size() > 3) {
-                throw new EvalError("record field spec must contain a field name, accessor,"
-                        + " and optional mutator");
-            }
-
-            String mutatorName = null;
-            if (parts.size() == 3) {
-                mutatorName = expectExprSymbol(parts.get(2),
-                        "record mutator name must be a symbol");
-            }
-            fields.add(new RecordFieldSpec(
-                    expectExprSymbol(parts.get(0), "record field name must be a symbol"),
-                    expectExprSymbol(parts.get(1), "record accessor name must be a symbol"),
-                    mutatorName
-            ));
-        }
-        return List.copyOf(fields);
-    }
-
-    private String expectExprSymbol(Expr expr, String errorMessage) throws EvalError {
-        if (expr instanceof SymbolExpr symbolExpr) {
-            return symbolExpr.name();
-        }
-        throw new EvalError(errorMessage);
-    }
-
-    private List<String> recordFieldNames(List<RecordFieldSpec> fields) {
-        List<String> fieldNames = new ArrayList<>(fields.size());
-        for (RecordFieldSpec field : fields) {
-            fieldNames.add(field.fieldName());
-        }
-        return fieldNames;
-    }
-
-    private List<Integer> resolveRecordFieldIndexes(List<String> fieldNames, RecordType recordType)
-            throws EvalError {
-        List<Integer> indexes = new ArrayList<>(fieldNames.size());
-        boolean[] usedIndexes = new boolean[recordType.fieldCount()];
-
-        for (String fieldName : fieldNames) {
-            int index = recordType.fieldIndex(fieldName);
-            if (index < 0) {
-                throw new EvalError("unknown record field: " + fieldName);
-            }
-            if (usedIndexes[index]) {
-                throw new EvalError("duplicate record field: " + fieldName);
-            }
-
-            usedIndexes[index] = true;
-            indexes.add(index);
-        }
-
-        return List.copyOf(indexes);
-    }
-
-    private List<Expr> parseBody(String formName, List<Expr> body) throws EvalError {
-        if (body.isEmpty()) {
-            throw new EvalError(formName + " requires a body");
-        }
-        return List.copyOf(body);
+        return evalSequenceStep(body, env);
     }
 
     private List<Value> evalArgs(List<Expr> argExprs, Environment env) throws EvalError {
@@ -708,49 +561,71 @@ public class Evaluator {
         return values;
     }
 
-    private Value evalAnd(List<Expr> argExprs, Environment env) throws EvalError {
-        Value result = BoolValue.TRUE;
-        for (Expr argExpr : argExprs) {
-            result = eval(argExpr, env);
-            if (!isTruthy(result)) {
-                return result;
+    private EvalStep evalAnd(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.isEmpty()) {
+            return valueStep(BoolValue.TRUE);
+        }
+
+        for (int index = 0; index < argExprs.size() - 1; index++) {
+            Value value = eval(argExprs.get(index), env);
+            if (!isTruthy(value)) {
+                return valueStep(value);
             }
         }
-        return result;
+        return tailStep(argExprs.get(argExprs.size() - 1), env);
     }
 
-    private Value evalOr(List<Expr> argExprs, Environment env) throws EvalError {
-        Value lastValue = BoolValue.FALSE;
-        for (Expr argExpr : argExprs) {
-            Value value = eval(argExpr, env);
-            if (isTruthy(value)) {
-                return value;
-            }
-            lastValue = value;
+    private EvalStep evalOr(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.isEmpty()) {
+            return valueStep(BoolValue.FALSE);
         }
-        return lastValue;
+
+        for (int index = 0; index < argExprs.size() - 1; index++) {
+            Value value = eval(argExprs.get(index), env);
+            if (isTruthy(value)) {
+                return valueStep(value);
+            }
+        }
+        return tailStep(argExprs.get(argExprs.size() - 1), env);
     }
 
     private Value evalSequence(List<Expr> exprs, Environment env) throws EvalError {
-        Value result = VoidValue.INSTANCE;
-        for (Expr expr : exprs) {
-            result = eval(expr, env);
-        }
-        return result;
+        return resolveStep(evalSequenceStep(exprs, env));
     }
 
     private Value evalSequenceOrVoid(List<Expr> exprs, Environment env) throws EvalError {
+        return resolveStep(evalSequenceOrVoidStep(exprs, env));
+    }
+
+    private EvalStep evalSequenceStep(List<Expr> exprs, Environment env) throws EvalError {
         if (exprs.isEmpty()) {
-            return VoidValue.INSTANCE;
+            return valueStep(VoidValue.INSTANCE);
         }
-        return evalSequence(exprs, env);
+
+        for (int index = 0; index < exprs.size() - 1; index++) {
+            eval(exprs.get(index), env);
+        }
+        return tailStep(exprs.get(exprs.size() - 1), env);
+    }
+
+    private EvalStep evalSequenceOrVoidStep(List<Expr> exprs, Environment env) throws EvalError {
+        if (exprs.isEmpty()) {
+            return valueStep(VoidValue.INSTANCE);
+        }
+        return evalSequenceStep(exprs, env);
     }
 
     Value applyUserProcedure(String displayName, ParameterSpec parameters,
                              List<Expr> body, Environment closureEnv, List<Value> args)
             throws EvalError {
+        return resolveStep(applyUserProcedureStep(displayName, parameters, body, closureEnv, args));
+    }
+
+    private EvalStep applyUserProcedureStep(String displayName, ParameterSpec parameters,
+                                            List<Expr> body, Environment closureEnv,
+                                            List<Value> args) throws EvalError {
         Environment callEnv = createCallEnv(displayName, parameters, closureEnv, args);
-        return evalSequence(body, callEnv);
+        return evalSequenceStep(body, callEnv);
     }
 
     private Environment createCallEnv(String displayName, ParameterSpec parameters,
@@ -794,12 +669,56 @@ public class Evaluator {
         return "__ming$" + kind + "$" + syntheticCounter + "$" + base;
     }
 
-    private Value applyProcedure(Value procedureValue, List<Value> argumentValues)
+    private EvalStep applyProcedureStep(Value procedureValue, List<Value> argumentValues)
             throws EvalError {
         if (!(procedureValue instanceof ProcedureValue procedure)) {
             throw new EvalError("not a procedure");
         }
-        return procedure.apply(argumentValues);
+
+        if (procedure instanceof UserProcedure userProcedure) {
+            return applyUserProcedureStep(userProcedure.displayName(),
+                    userProcedure.parameters(), userProcedure.body(),
+                    userProcedure.closureEnv(), argumentValues);
+        }
+
+        if (procedure instanceof CaseLambdaProcedure caseLambdaProcedure) {
+            return applyCaseLambdaProcedureStep(caseLambdaProcedure, argumentValues);
+        }
+
+        return valueStep(procedure.apply(argumentValues));
+    }
+
+    private Value applyProcedure(Value procedureValue, List<Value> argumentValues)
+            throws EvalError {
+        return resolveStep(applyProcedureStep(procedureValue, argumentValues));
+    }
+
+    private EvalStep applyCaseLambdaProcedureStep(CaseLambdaProcedure procedure, List<Value> args)
+            throws EvalError {
+        for (ProcedureClause clause : procedure.clauses()) {
+            if (matchesArity(clause.parameters(), args.size())) {
+                return applyUserProcedureStep("case-lambda", clause.parameters(), clause.body(),
+                        procedure.closureEnv(), args);
+            }
+        }
+        throw new EvalError("wrong number of arguments for case-lambda: got " + args.size());
+    }
+
+    private EvalStep valueStep(Value value) {
+        return new ValueStep(value);
+    }
+
+    private EvalStep tailStep(Expr expr, Environment env) {
+        return new TailStep(expr, env);
+    }
+
+    private Value resolveStep(EvalStep step) throws EvalError {
+        if (step instanceof ValueStep valueStep) {
+            return valueStep.value();
+        }
+
+        TailStep tailStep = (TailStep) step;
+        return eval(tailStep.expr(), tailStep.env());
     }
 
     private Value quoteToValue(Expr expr) throws EvalError {
@@ -1470,9 +1389,6 @@ public class Evaluator {
 
     boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
-    }
-
-    private record DoBinding(String name, Expr initExpr, Expr stepExpr) {
     }
 
 }
