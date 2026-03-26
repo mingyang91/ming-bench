@@ -69,6 +69,10 @@ public class Evaluator {
         @Override public String toString() { return "#<procedure:call/cc>"; }
     };
 
+    static final Object DYNAMIC_WIND_SENTINEL = new Object() {
+        @Override public String toString() { return "#<procedure:dynamic-wind>"; }
+    };
+
     private static class ContinuationInvoked extends RuntimeException {
         final Object value;
         final SchemeContinuation continuation;
@@ -298,6 +302,24 @@ public class Evaluator {
             }
             throw ci;
         }
+    }
+
+    private Object doDynamicWind(Object inThunk, Object bodyThunk, Object outThunk) throws EvalError {
+        // Call in-thunk
+        apply(inThunk, List.of());
+
+        Object result;
+        try {
+            result = apply(bodyThunk, List.of());
+        } catch (ContinuationInvoked ci) {
+            // Non-local exit: call out-thunk before propagating
+            apply(outThunk, List.of());
+            throw ci;
+        }
+
+        // Normal exit: call out-thunk
+        apply(outThunk, List.of());
+        return result;
     }
 
     private Env makeGlobalEnv() {
@@ -572,6 +594,10 @@ public class Evaluator {
                 if (proc == CALLCC_SENTINEL) {
                     if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
                     return doCallCC(args.get(0));
+                }
+                if (proc == DYNAMIC_WIND_SENTINEL) {
+                    if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+                    return doDynamicWind(args.get(0), args.get(1), args.get(2));
                 }
                 if (proc instanceof Lambda lam) {
                     return tailApplyLambda(lam, args);
@@ -998,6 +1024,10 @@ public class Evaluator {
         if (proc == CALLCC_SENTINEL) {
             if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
             return doCallCC(args.get(0));
+        }
+        if (proc == DYNAMIC_WIND_SENTINEL) {
+            if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+            return doDynamicWind(args.get(0), args.get(1), args.get(2));
         }
         if (proc instanceof Lambda lam) {
             if (lam.restParam != null) {
@@ -1440,6 +1470,9 @@ public class Evaluator {
         // L18: call/cc
         env.define("call/cc", CALLCC_SENTINEL);
         env.define("call-with-current-continuation", CALLCC_SENTINEL);
+
+        // L19: dynamic-wind
+        env.define("dynamic-wind", DYNAMIC_WIND_SENTINEL);
 
         // L08: apply
         env.define("apply", new BuiltinProc("apply", args -> {
