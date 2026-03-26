@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 
 /**
  * Scheme interpreter entry point.
@@ -71,6 +72,15 @@ public class Evaluator {
             }
             if ("if".equals(name)) {
                 return evalIf(elements, environment);
+            }
+            if ("begin".equals(name)) {
+                return evalBegin(elements.subList(1, elements.size()), environment);
+            }
+            if ("cond".equals(name)) {
+                return evalCond(elements.subList(1, elements.size()), environment);
+            }
+            if ("let".equals(name)) {
+                return evalLet(elements, environment);
             }
             if ("quote".equals(name)) {
                 return evalQuote(elements);
@@ -152,6 +162,24 @@ public class Evaluator {
         builtins.put("<=", new BuiltinProcedure("<=", args -> compare(args, "<=",
                 (left, right) -> left <= right)));
         builtins.put("not", new BuiltinProcedure("not", Evaluator::applyNot));
+        builtins.put("cons", new BuiltinProcedure("cons", Evaluator::applyCons));
+        builtins.put("car", new BuiltinProcedure("car", Evaluator::applyCar));
+        builtins.put("cdr", new BuiltinProcedure("cdr", Evaluator::applyCdr));
+        builtins.put("null?", new BuiltinProcedure("null?", args -> applyPredicate(args, "null?",
+                value -> value instanceof EmptyListValue)));
+        builtins.put("list", new BuiltinProcedure("list", Evaluator::applyList));
+        builtins.put("length", new BuiltinProcedure("length", Evaluator::applyLength));
+        builtins.put("append", new BuiltinProcedure("append", Evaluator::applyAppend));
+        builtins.put("string?", new BuiltinProcedure("string?", args -> applyPredicate(args, "string?",
+                value -> value instanceof StringValue)));
+        builtins.put("number?", new BuiltinProcedure("number?", args -> applyPredicate(args, "number?",
+                value -> value instanceof IntValue)));
+        builtins.put("boolean?", new BuiltinProcedure("boolean?", args -> applyPredicate(args, "boolean?",
+                value -> value instanceof BoolValue)));
+        builtins.put("pair?", new BuiltinProcedure("pair?", args -> applyPredicate(args, "pair?",
+                value -> value instanceof PairValue)));
+        builtins.put("symbol?", new BuiltinProcedure("symbol?", args -> applyPredicate(args, "symbol?",
+                value -> value instanceof SymbolValue)));
         return Map.copyOf(builtins);
     }
 
@@ -210,6 +238,93 @@ public class Evaluator {
         return VoidValue.INSTANCE;
     }
 
+    private SchemeValue evalBegin(List<SchemeExpression> expressions, Environment environment) throws EvalError {
+        return evalSequence(expressions, environment);
+    }
+
+    private SchemeValue evalCond(List<SchemeExpression> clauses, Environment environment) throws EvalError {
+        for (int index = 0; index < clauses.size(); index++) {
+            if (!(clauses.get(index) instanceof ListExpression clauseExpression)) {
+                throw new EvalError("cond: expected clause");
+            }
+
+            List<SchemeExpression> clause = clauseExpression.elements();
+            if (clause.isEmpty()) {
+                throw new EvalError("cond: expected non-empty clause");
+            }
+
+            SchemeExpression testExpression = clause.getFirst();
+            if (testExpression instanceof SymbolExpression symbol && "else".equals(symbol.name())) {
+                return evalClauseBody(clause.subList(1, clause.size()), environment, BoolValue.TRUE);
+            }
+
+            SchemeValue testValue = eval(testExpression, environment);
+            if (isTruthy(testValue)) {
+                return evalClauseBody(clause.subList(1, clause.size()), environment, testValue);
+            }
+        }
+        return VoidValue.INSTANCE;
+    }
+
+    private SchemeValue evalLet(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("let: expected bindings and body");
+        }
+
+        SchemeExpression second = elements.get(1);
+        if (second instanceof SymbolExpression nameSymbol) {
+            return evalNamedLet(nameSymbol.name(), elements, environment);
+        }
+        if (!(second instanceof ListExpression bindingsExpression)) {
+            throw new EvalError("let: expected bindings");
+        }
+
+        List<SchemeExpression> body = elements.subList(2, elements.size());
+        if (body.isEmpty()) {
+            throw new EvalError("let: expected body");
+        }
+
+        List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
+        List<SchemeValue> values = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            values.add(eval(binding.valueExpression(), environment));
+        }
+
+        Environment letEnvironment = new Environment(environment);
+        for (int index = 0; index < bindings.size(); index++) {
+            letEnvironment.define(bindings.get(index).name(), values.get(index));
+        }
+        return evalSequence(body, letEnvironment);
+    }
+
+    private SchemeValue evalNamedLet(String name, List<SchemeExpression> elements, Environment environment)
+            throws EvalError {
+        if (elements.size() < 4) {
+            throw new EvalError("let: expected named let bindings and body");
+        }
+        if (!(elements.get(2) instanceof ListExpression bindingsExpression)) {
+            throw new EvalError("let: expected bindings");
+        }
+
+        List<Binding> bindings = parseBindings(bindingsExpression.elements(), "let");
+        List<String> parameters = new ArrayList<>(bindings.size());
+        List<SchemeValue> arguments = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            parameters.add(binding.name());
+            arguments.add(eval(binding.valueExpression(), environment));
+        }
+
+        Environment letEnvironment = new Environment(environment);
+        LambdaProcedure procedure = new LambdaProcedure(
+                name,
+                List.copyOf(parameters),
+                List.copyOf(elements.subList(3, elements.size())),
+                letEnvironment
+        );
+        letEnvironment.define(name, procedure);
+        return applyLambda(procedure, arguments);
+    }
+
     private SchemeValue evalQuote(List<SchemeExpression> elements) throws EvalError {
         if (elements.size() != 2) {
             throw new EvalError("quote: expected 1 argument");
@@ -228,6 +343,25 @@ public class Evaluator {
         List<String> parameters = parseParameters(parametersExpression.elements(), "lambda");
         List<SchemeExpression> body = List.copyOf(elements.subList(2, elements.size()));
         return new LambdaProcedure(null, parameters, body, environment);
+    }
+
+    private SchemeValue evalSequence(List<SchemeExpression> expressions, Environment environment) throws EvalError {
+        SchemeValue result = VoidValue.INSTANCE;
+        for (SchemeExpression expression : expressions) {
+            result = eval(expression, environment);
+        }
+        return result;
+    }
+
+    private SchemeValue evalClauseBody(
+            List<SchemeExpression> expressions,
+            Environment environment,
+            SchemeValue defaultValue
+    ) throws EvalError {
+        if (expressions.isEmpty()) {
+            return defaultValue;
+        }
+        return evalSequence(expressions, environment);
     }
 
     private SchemeValue applyProcedure(SchemeValue callee, List<SchemeValue> arguments) throws EvalError {
@@ -251,11 +385,7 @@ public class Evaluator {
             invocationEnvironment.define(procedure.parameters().get(index), arguments.get(index));
         }
 
-        SchemeValue result = VoidValue.INSTANCE;
-        for (SchemeExpression expression : procedure.body()) {
-            result = eval(expression, invocationEnvironment);
-        }
-        return result;
+        return evalSequence(procedure.body(), invocationEnvironment);
     }
 
     private List<String> parseParameters(List<SchemeExpression> parameterExpressions, String formName)
@@ -268,6 +398,26 @@ public class Evaluator {
             parameters.add(symbol.name());
         }
         return parameters;
+    }
+
+    private List<Binding> parseBindings(List<SchemeExpression> bindingExpressions, String formName)
+            throws EvalError {
+        List<Binding> bindings = new ArrayList<>(bindingExpressions.size());
+        for (SchemeExpression bindingExpression : bindingExpressions) {
+            if (!(bindingExpression instanceof ListExpression bindingList)) {
+                throw new EvalError(formName + ": expected binding");
+            }
+
+            List<SchemeExpression> binding = bindingList.elements();
+            if (binding.size() != 2) {
+                throw new EvalError(formName + ": expected binding pair");
+            }
+            if (!(binding.getFirst() instanceof SymbolExpression symbol)) {
+                throw new EvalError(formName + ": expected binding name");
+            }
+            bindings.add(new Binding(symbol.name(), binding.get(1)));
+        }
+        return bindings;
     }
 
     private SchemeValue quote(SchemeExpression expression) throws EvalError {
@@ -341,6 +491,58 @@ public class Evaluator {
         return SchemeValue.booleanValue(!isTruthy(arguments.getFirst()));
     }
 
+    private static SchemeValue applyCons(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "cons");
+        return new PairValue(arguments.get(0), arguments.get(1));
+    }
+
+    private static SchemeValue applyCar(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "car");
+        return requirePair(arguments.getFirst(), "car").car();
+    }
+
+    private static SchemeValue applyCdr(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "cdr");
+        return requirePair(arguments.getFirst(), "cdr").cdr();
+    }
+
+    private static SchemeValue applyList(List<SchemeValue> arguments) {
+        return buildList(arguments);
+    }
+
+    private static SchemeValue applyLength(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "length");
+        return new IntValue(requireProperList(arguments.getFirst(), "length").size());
+    }
+
+    private static SchemeValue applyAppend(List<SchemeValue> arguments) throws EvalError {
+        if (arguments.isEmpty()) {
+            return EmptyListValue.INSTANCE;
+        }
+
+        SchemeValue result = arguments.getLast();
+        for (int index = arguments.size() - 2; index >= 0; index--) {
+            List<SchemeValue> elements = requireProperList(arguments.get(index), "append");
+            for (int elementIndex = elements.size() - 1; elementIndex >= 0; elementIndex--) {
+                result = new PairValue(elements.get(elementIndex), result);
+            }
+        }
+
+        if (arguments.size() == 1) {
+            requireProperList(arguments.getFirst(), "append");
+        }
+        return result;
+    }
+
+    private static SchemeValue applyPredicate(
+            List<SchemeValue> arguments,
+            String name,
+            Predicate<SchemeValue> predicate
+    ) throws EvalError {
+        requireArgumentCount(arguments, 1, name);
+        return SchemeValue.booleanValue(predicate.test(arguments.getFirst()));
+    }
+
     private static SchemeValue compare(
             List<SchemeValue> arguments,
             String name,
@@ -369,11 +571,49 @@ public class Evaluator {
         throw new EvalError(procedure + ": expected integer");
     }
 
+    private static PairValue requirePair(SchemeValue value, String procedure) throws EvalError {
+        if (value instanceof PairValue pairValue) {
+            return pairValue;
+        }
+        throw new EvalError(procedure + ": expected pair");
+    }
+
+    private static List<SchemeValue> requireProperList(SchemeValue value, String procedure) throws EvalError {
+        List<SchemeValue> elements = new ArrayList<>();
+        SchemeValue current = value;
+        while (current instanceof PairValue pair) {
+            elements.add(pair.car());
+            current = pair.cdr();
+        }
+        if (!(current instanceof EmptyListValue)) {
+            throw new EvalError(procedure + ": expected list");
+        }
+        return elements;
+    }
+
+    private static SchemeValue buildList(List<SchemeValue> elements) {
+        SchemeValue result = EmptyListValue.INSTANCE;
+        for (int index = elements.size() - 1; index >= 0; index--) {
+            result = new PairValue(elements.get(index), result);
+        }
+        return result;
+    }
+
+    private static void requireArgumentCount(List<SchemeValue> arguments, int expected, String name)
+            throws EvalError {
+        if (arguments.size() != expected) {
+            throw new EvalError(name + ": expected " + expected + " arguments");
+        }
+    }
+
     private static boolean isTruthy(SchemeValue value) {
         if (value instanceof BoolValue boolValue) {
             return boolValue.value();
         }
         return true;
+    }
+
+    private record Binding(String name, SchemeExpression valueExpression) {
     }
 
     @FunctionalInterface

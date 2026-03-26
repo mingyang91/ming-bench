@@ -37,6 +37,10 @@ final class SchemeParser {
         if (current == '"') {
             return new LiteralExpression(new StringValue(parseStringLiteral()));
         }
+        if (current == '\'') {
+            index++;
+            return new ListExpression(List.of(new SymbolExpression("quote"), parseExpression()));
+        }
 
         String token = readToken();
         if ("#t".equals(token)) {
