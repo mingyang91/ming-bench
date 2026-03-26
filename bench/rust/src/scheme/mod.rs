@@ -8,7 +8,7 @@ use builtins::apply_builtin_by_name;
 use parser::{Expr, ExprKind, Pos, parse_all};
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -48,7 +48,7 @@ enum Value {
     Str(String),
     Symbol(String),
     List(Vec<Value>),
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<(Value, Value)>>),
     Lambda {
         params: Vec<String>,
         rest_param: Option<String>,
@@ -93,7 +93,12 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
-            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Pair(a), Value::Pair(b)) => {
+                if Rc::ptr_eq(a, b) { return true; }
+                let ab = a.borrow();
+                let bb = b.borrow();
+                ab.0 == bb.0 && ab.1 == bb.1
+            }
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
@@ -105,9 +110,86 @@ impl PartialEq for Value {
     }
 }
 
+fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new((car, cdr))))
+}
+
+fn list_from_vec(items: Vec<Value>) -> Value {
+    let mut result = Value::List(vec![]);
+    for item in items.into_iter().rev() {
+        result = make_pair(item, result);
+    }
+    result
+}
+
+fn value_to_vec(val: &Value) -> Option<Vec<Value>> {
+    match val {
+        Value::List(items) => Some(items.clone()),
+        Value::Pair(_) => {
+            let mut result = Vec::new();
+            let mut current = val.clone();
+            let mut seen = HashSet::new();
+            loop {
+                match current {
+                    Value::Pair(ref p) => {
+                        let ptr = Rc::as_ptr(p) as usize;
+                        if !seen.insert(ptr) { return None; }
+                        let (car, cdr) = {
+                            let b = p.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        result.push(car);
+                        current = cdr;
+                    }
+                    Value::List(ref items) if items.is_empty() => return Some(result),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 impl Value {
-    /// `write` representation: strings are quoted
-    fn display_scheme(&self) -> String {
+    fn display_pair_impl(&self, seen: &mut HashSet<usize>, write_mode: bool) -> String {
+        if let Value::Pair(p) = self {
+            let ptr = Rc::as_ptr(p) as usize;
+            if !seen.insert(ptr) {
+                return "(...)".to_string();
+            }
+            let (car_val, cdr_val) = {
+                let b = p.borrow();
+                (b.0.clone(), b.1.clone())
+            };
+            let mut parts = vec![car_val.display_impl(seen, write_mode)];
+            let mut current = cdr_val;
+            loop {
+                match current {
+                    Value::Pair(ref p2) => {
+                        let ptr2 = Rc::as_ptr(p2) as usize;
+                        if !seen.insert(ptr2) {
+                            break;
+                        }
+                        let (c, d) = {
+                            let b = p2.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        parts.push(c.display_impl(seen, write_mode));
+                        current = d;
+                    }
+                    Value::List(ref items) if items.is_empty() => break,
+                    ref other => {
+                        return format!("({} . {})", parts.join(" "), other.display_impl(seen, write_mode));
+                    }
+                }
+            }
+            format!("({})", parts.join(" "))
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn display_impl(&self, seen: &mut HashSet<usize>, write_mode: bool) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
             Value::Float(f) => {
@@ -117,41 +199,27 @@ impl Value {
             Value::Rational(n, d) => format!("{n}/{d}"),
             Value::Boolean(true) => "#t".to_string(),
             Value::Boolean(false) => "#f".to_string(),
-            Value::Char(c) => match c {
-                ' ' => "#\\space".to_string(),
-                '\n' => "#\\newline".to_string(),
-                '\t' => "#\\tab".to_string(),
-                _ => format!("#\\{c}"),
-            },
-            Value::Str(s) => format!("\"{s}\""),
+            Value::Char(c) => {
+                if write_mode {
+                    match c {
+                        ' ' => "#\\space".to_string(),
+                        '\n' => "#\\newline".to_string(),
+                        '\t' => "#\\tab".to_string(),
+                        _ => format!("#\\{c}"),
+                    }
+                } else {
+                    c.to_string()
+                }
+            }
+            Value::Str(s) => {
+                if write_mode { format!("\"{s}\"") } else { s.clone() }
+            }
             Value::Symbol(s) => s.clone(),
             Value::List(items) => {
-                let inner: Vec<String> = items.iter().map(|v| v.display_scheme()).collect();
+                let inner: Vec<String> = items.iter().map(|v| v.display_impl(seen, write_mode)).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Pair(car, cdr) => {
-                let mut parts = vec![car.display_scheme()];
-                let mut current = cdr.as_ref();
-                loop {
-                    match current {
-                        Value::Pair(a, b) => {
-                            parts.push(a.display_scheme());
-                            current = b.as_ref();
-                        }
-                        Value::List(items) if items.is_empty() => break,
-                        Value::List(items) => {
-                            for item in items {
-                                parts.push(item.display_scheme());
-                            }
-                            break;
-                        }
-                        other => {
-                            return format!("({} . {})", parts.join(" "), other.display_scheme());
-                        }
-                    }
-                }
-                format!("({})", parts.join(" "))
-            }
+            Value::Pair(_) => self.display_pair_impl(seen, write_mode),
             Value::Lambda { .. } | Value::CaseLambda { .. } => "#<procedure>".to_string(),
             Value::Macro { .. } => "#<macro>".to_string(),
             Value::Record { .. } => "#<record>".to_string(),
@@ -159,44 +227,23 @@ impl Value {
             | Value::RecordPredicate { .. }
             | Value::RecordAccessor { .. } => "#<procedure>".to_string(),
             Value::Vector(v) => {
-                let items: Vec<String> = v.borrow().iter().map(|v| v.display_scheme()).collect();
+                let items: Vec<String> = v.borrow().iter().map(|v| v.display_impl(seen, write_mode)).collect();
                 format!("#({})", items.join(" "))
             }
             Value::Void => "".to_string(),
         }
     }
 
+    /// `write` representation: strings are quoted
+    fn display_scheme(&self) -> String {
+        let mut seen = HashSet::new();
+        self.display_impl(&mut seen, true)
+    }
+
     /// `display` representation: strings are unquoted
     fn display_output(&self) -> String {
-        match self {
-            Value::Str(s) => s.clone(),
-            Value::Char(c) => c.to_string(),
-            Value::Pair(..) => {
-                // For display, use display_output for elements
-                let mut parts = Vec::new();
-                let mut current: &Value = self;
-                loop {
-                    match current {
-                        Value::Pair(car, cdr) => {
-                            parts.push(car.display_output());
-                            current = cdr.as_ref();
-                        }
-                        Value::List(items) if items.is_empty() => break,
-                        Value::List(items) => {
-                            for item in items {
-                                parts.push(item.display_output());
-                            }
-                            break;
-                        }
-                        other => {
-                            return format!("({} . {})", parts.join(" "), other.display_output());
-                        }
-                    }
-                }
-                format!("({})", parts.join(" "))
-            }
-            other => other.display_scheme(),
-        }
+        let mut seen = HashSet::new();
+        self.display_impl(&mut seen, false)
     }
 
     fn is_truthy(&self) -> bool {
@@ -358,7 +405,7 @@ fn bind_args(
         } else {
             vec![]
         };
-        env_set(&local_env, rest.clone(), Value::List(rest_args));
+        env_set(&local_env, rest.clone(), list_from_vec(rest_args));
     }
     Ok(local_env)
 }
@@ -836,7 +883,13 @@ fn expr_to_value(expr: &Expr) -> Value {
         ExprKind::Str(s) => Value::Str(s.clone()),
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Symbol(s) => Value::Symbol(s.clone()),
-        ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
+        ExprKind::List(items) => {
+            if items.is_empty() {
+                Value::List(vec![])
+            } else {
+                list_from_vec(items.iter().map(expr_to_value).collect())
+            }
+        }
     }
 }
 
@@ -1290,7 +1343,19 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
                   "exact->inexact", "inexact->exact",
                   "numerator", "denominator",
                   "vector", "make-vector", "vector-ref", "vector-set!",
-                  "vector-length", "vector?", "vector->list", "list->vector"] {
+                  "vector-length", "vector?", "vector->list", "list->vector",
+                  "set-car!", "set-cdr!",
+                  "reverse", "memq", "memv", "member", "assq", "assv",
+                  "gcd", "lcm", "round", "truncate",
+                  "make-string", "string",
+                  "string<=?", "string>=?", "string>?",
+                  "caar", "cadr", "cdar", "cddr",
+                  "caaar", "caadr", "cadar", "caddr",
+                  "cdaar", "cdadr", "cddar", "cdddr",
+                  "caaaar", "caaadr", "caadar", "caaddr",
+                  "cadaar", "cadadr", "caddar", "cadddr",
+                  "cdaaar", "cdaadr", "cdadar", "cdaddr",
+                  "cddaar", "cddadr", "cdddar", "cddddr"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     let out = RefCell::new(String::new());
@@ -1329,7 +1394,19 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
                   "exact->inexact", "inexact->exact",
                   "numerator", "denominator",
                   "vector", "make-vector", "vector-ref", "vector-set!",
-                  "vector-length", "vector?", "vector->list", "list->vector"] {
+                  "vector-length", "vector?", "vector->list", "list->vector",
+                  "set-car!", "set-cdr!",
+                  "reverse", "memq", "memv", "member", "assq", "assv",
+                  "gcd", "lcm", "round", "truncate",
+                  "make-string", "string",
+                  "string<=?", "string>=?", "string>?",
+                  "caar", "cadr", "cdar", "cddr",
+                  "caaar", "caadr", "cadar", "caddr",
+                  "cdaar", "cdadr", "cddar", "cdddr",
+                  "caaaar", "caaadr", "caadar", "caaddr",
+                  "cadaar", "cadadr", "caddar", "cadddr",
+                  "cdaaar", "cdaadr", "cdadar", "cdaddr",
+                  "cddaar", "cddadr", "cdddar", "cddddr"] {
         env_set(&env, name.to_string(), Value::Symbol(name.to_string()));
     }
     let out = RefCell::new(String::new());
