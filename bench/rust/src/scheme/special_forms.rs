@@ -54,6 +54,7 @@ pub(super) fn eval_special_form(
         "begin" => Some(eval_begin(args, env, ctx)),
         "cond" => Some(eval_cond(args, env, ctx)),
         "let" => Some(eval_let(args, env, ctx)),
+        "let*" => Some(eval_let_star(args, env, ctx)),
         "letrec" => Some(eval_letrec(args, env, ctx)),
         "letrec*" => Some(eval_letrec_star(args, env, ctx)),
         "case" => Some(eval_case(args, env, ctx)),
@@ -82,6 +83,7 @@ pub(super) fn eval_special_form_tail(
         "begin" => Some(eval_begin_tail(args, env, ctx)),
         "cond" => Some(eval_cond_tail(args, env, ctx)),
         "let" => Some(eval_let_tail(args, env, ctx)),
+        "let*" => Some(eval_let_star_tail(args, env, ctx)),
         "letrec" => Some(eval_letrec_tail(args, env, ctx)),
         "letrec*" => Some(eval_letrec_star_tail(args, env, ctx)),
         "case" => Some(eval_case_tail(args, env, ctx)),
@@ -734,6 +736,50 @@ fn build_named_let_call(
         args: values,
         pos: None,
     })
+}
+
+fn eval_let_star(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "let* requires bindings".to_string(),
+        });
+    };
+
+    require_body("let*", body)?;
+    let frame = build_let_star_frame(bindings_expr, env, ctx)?;
+    eval_sequence(body, frame, ctx)
+}
+
+fn eval_let_star_tail(
+    args: &[Expr],
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<TailOutcome, EvalError> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "let* requires bindings".to_string(),
+        });
+    };
+
+    require_body("let*", body)?;
+    let frame = build_let_star_frame(bindings_expr, env, ctx)?;
+    eval_sequence_tco(body, frame, ctx)
+}
+
+fn build_let_star_frame(
+    bindings_expr: &Expr,
+    env: EnvRef,
+    ctx: &EvalContext,
+) -> Result<EnvRef, EvalError> {
+    let bindings = parse_bindings(bindings_expr)?;
+    let frame = Env::new(Some(env));
+
+    for (name, expr) in bindings {
+        let value = eval(&expr, frame.clone(), ctx)?;
+        frame.define(name, value);
+    }
+
+    Ok(frame)
 }
 
 fn eval_letrec(args: &[Expr], env: EnvRef, ctx: &EvalContext) -> Result<Value, EvalError> {

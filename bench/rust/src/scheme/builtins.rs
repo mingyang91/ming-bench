@@ -13,6 +13,10 @@ pub(super) fn default_env() -> EnvRef {
         ("*", native_mul as NativeFunc),
         ("/", native_div as NativeFunc),
         ("abs", native_abs as NativeFunc),
+        ("gcd", native_gcd as NativeFunc),
+        ("lcm", native_lcm as NativeFunc),
+        ("truncate", native_truncate as NativeFunc),
+        ("round", native_round as NativeFunc),
         ("quotient", native_quotient as NativeFunc),
         ("remainder", native_remainder as NativeFunc),
         ("modulo", native_modulo as NativeFunc),
@@ -33,6 +37,12 @@ pub(super) fn default_env() -> EnvRef {
         ("cons", native_cons as NativeFunc),
         ("car", native_car as NativeFunc),
         ("cdr", native_cdr as NativeFunc),
+        ("caar", native_caar as NativeFunc),
+        ("cadr", native_cadr as NativeFunc),
+        ("cdar", native_cdar as NativeFunc),
+        ("cddr", native_cddr as NativeFunc),
+        ("set-car!", native_set_car as NativeFunc),
+        ("set-cdr!", native_set_cdr as NativeFunc),
         ("null?", native_null_pred as NativeFunc),
         ("list", native_list as NativeFunc),
         ("list?", native_list_pred as NativeFunc),
@@ -40,8 +50,12 @@ pub(super) fn default_env() -> EnvRef {
         ("list-tail", native_list_tail as NativeFunc),
         ("length", native_length as NativeFunc),
         ("append", native_append as NativeFunc),
+        ("reverse", native_reverse as NativeFunc),
+        ("member", native_member as NativeFunc),
+        ("assv", native_assv as NativeFunc),
         ("assoc", native_assoc as NativeFunc),
         ("map", native_map as NativeFunc),
+        ("for-each", native_for_each as NativeFunc),
         ("eqv?", native_eqv as NativeFunc),
         ("eq?", native_eq as NativeFunc),
         ("equal?", native_equal as NativeFunc),
@@ -57,12 +71,17 @@ pub(super) fn default_env() -> EnvRef {
         ("write", native_write as NativeFunc),
         ("newline", native_newline as NativeFunc),
         ("string-copy", native_string_copy as NativeFunc),
+        ("make-string", native_make_string as NativeFunc),
+        ("string", native_string as NativeFunc),
         ("string-append", native_string_append as NativeFunc),
         ("string-length", native_string_length as NativeFunc),
         ("string->list", native_string_to_list as NativeFunc),
         ("list->string", native_list_to_string as NativeFunc),
         ("string=?", native_string_eq as NativeFunc),
         ("string<?", native_string_lt as NativeFunc),
+        ("string>?", native_string_gt as NativeFunc),
+        ("string<=?", native_string_lte as NativeFunc),
+        ("string>=?", native_string_gte as NativeFunc),
         ("string-ci=?", native_string_ci_eq as NativeFunc),
         ("string-upcase", native_string_upcase as NativeFunc),
         ("string-downcase", native_string_downcase as NativeFunc),
@@ -156,6 +175,72 @@ fn native_cdr(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let pair = args[0].as_pair("cdr")?;
     let cdr = pair.borrow().cdr.clone();
     Ok(cdr)
+}
+
+fn native_caar(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_cxr(args, "caar", b"aa")
+}
+
+fn native_cadr(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_cxr(args, "cadr", b"da")
+}
+
+fn native_cdar(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_cxr(args, "cdar", b"ad")
+}
+
+fn native_cddr(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_cxr(args, "cddr", b"dd")
+}
+
+fn native_cxr(args: &[Value], name: &'static str, ops: &[u8]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    let mut value = args[0].clone();
+    for op in ops {
+        let pair = value.as_pair(name)?;
+        value = match op {
+            b'a' => pair.borrow().car.clone(),
+            b'd' => pair.borrow().cdr.clone(),
+            _ => unreachable!("invalid composed accessor"),
+        };
+    }
+
+    Ok(value)
+}
+
+fn native_set_car(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "set-car!",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    let pair = args[0].as_pair("set-car!")?;
+    pair.borrow_mut().car = args[1].clone();
+    Ok(Value::Void)
+}
+
+fn native_set_cdr(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "set-cdr!",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    let pair = args[0].as_pair("set-cdr!")?;
+    pair.borrow_mut().cdr = args[1].clone();
+    Ok(Value::Void)
 }
 
 fn native_null_pred(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -283,6 +368,90 @@ fn native_append(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError>
     Ok(result)
 }
 
+fn native_reverse(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "reverse",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    let mut items = list_to_vec(&args[0], "reverse")?;
+    items.reverse();
+    Ok(list_from_values(items))
+}
+
+fn native_member(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "member",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    let needle = &args[0];
+    let mut cursor = args[1].clone();
+    loop {
+        match cursor.clone() {
+            Value::Nil => return Ok(Value::Boolean(false)),
+            Value::Pair(pair) => {
+                let (item, next) = {
+                    let borrowed = pair.borrow();
+                    (borrowed.car.clone(), borrowed.cdr.clone())
+                };
+                if value_equal(needle, &item) {
+                    return Ok(cursor);
+                }
+                cursor = next;
+            }
+            other => {
+                return Err(EvalError::ExpectedList {
+                    name: "member",
+                    found: other.render(),
+                });
+            }
+        }
+    }
+}
+
+fn native_assv(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "assv",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    }
+
+    let needle = &args[0];
+    let mut cursor = args[1].clone();
+    loop {
+        match cursor {
+            Value::Nil => return Ok(Value::Boolean(false)),
+            Value::Pair(pair) => {
+                let (entry, next) = {
+                    let borrowed = pair.borrow();
+                    (borrowed.car.clone(), borrowed.cdr.clone())
+                };
+                let entry_pair = entry.as_pair("assv")?;
+                let entry_key = entry_pair.borrow().car.clone();
+                if value_eq(needle, &entry_key) {
+                    return Ok(entry);
+                }
+                cursor = next;
+            }
+            other => {
+                return Err(EvalError::ExpectedList {
+                    name: "assv",
+                    found: other.render(),
+                });
+            }
+        }
+    }
+}
+
 fn native_assoc(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::WrongArgCount {
@@ -347,6 +516,35 @@ fn native_map(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
     }
 
     Ok(list_from_values(results))
+}
+
+fn native_for_each(args: &[Value], ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "for-each",
+            expected: "at least 2",
+            got: args.len(),
+        });
+    }
+
+    let procedure = args[0].clone();
+    let lists = args[1..]
+        .iter()
+        .map(|value| list_to_vec(value, "for-each"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(len) = lists.iter().map(Vec::len).min() else {
+        return Ok(Value::Void);
+    };
+
+    for index in 0..len {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        apply_procedure(procedure.clone(), &call_args, ctx)?;
+    }
+
+    Ok(Value::Void)
 }
 
 fn native_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -556,6 +754,43 @@ fn native_string_copy(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalE
     Ok(make_mutable_string(args[0].as_string("string-copy")?))
 }
 
+fn native_make_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(EvalError::WrongArgCount {
+            name: "make-string",
+            expected: "1 or 2",
+            got: args.len(),
+        });
+    }
+
+    let len = args[0].as_integer("make-string")?;
+    let Ok(len) = usize::try_from(len) else {
+        return Err(EvalError::IndexOutOfBounds {
+            name: "make-string",
+            index: len,
+            len: 0,
+        });
+    };
+    let fill = match args.get(1) {
+        Some(value) => value.as_char("make-string")?,
+        None => '\0',
+    };
+
+    let mut string = String::with_capacity(len);
+    for _ in 0..len {
+        string.push(fill);
+    }
+    Ok(make_string(string))
+}
+
+fn native_string(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    let mut string = String::with_capacity(args.len());
+    for value in args {
+        string.push(value.as_char("string")?);
+    }
+    Ok(make_string(string))
+}
+
 fn native_string_append(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let mut result = String::new();
     for value in args {
@@ -620,6 +855,18 @@ fn native_string_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalErr
 
 fn native_string_lt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     native_compare_strings(args, "string<?", |left, right| left < right)
+}
+
+fn native_string_gt(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_compare_strings(args, "string>?", |left, right| left > right)
+}
+
+fn native_string_lte(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_compare_strings(args, "string<=?", |left, right| left <= right)
+}
+
+fn native_string_gte(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    native_compare_strings(args, "string>=?", |left, right| left >= right)
 }
 
 fn native_string_ci_eq(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
@@ -1096,6 +1343,68 @@ fn native_abs(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     Ok(Value::Number(value))
 }
 
+fn native_gcd(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    let mut result = 0_i128;
+    for value in args {
+        result = gcd_i128(result, i128::from(value.as_integer("gcd")?));
+    }
+    Ok(exact_integer(i128_to_i64(result, "gcd")?))
+}
+
+fn native_lcm(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    let mut result = 1_i128;
+    for value in args {
+        let value = i128::from(value.as_integer("lcm")?);
+        if result == 0 || value == 0 {
+            result = 0;
+            continue;
+        }
+
+        let gcd = gcd_i128(result, value);
+        result = (result / gcd)
+            .checked_mul(value)
+            .ok_or_else(|| overflow_error("lcm"))?
+            .abs();
+    }
+
+    Ok(exact_integer(i128_to_i64(result, "lcm")?))
+}
+
+fn native_truncate(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "truncate",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    Ok(exact_integer(truncate_number(
+        args[0].as_number("truncate")?,
+        "truncate",
+    )?))
+}
+
+fn native_round(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "round",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    let number = args[0].as_number("round")?;
+    let rounded = match number {
+        Number::Exact(_) => match number.exact_to_inexact() {
+            Number::Inexact(value) => float_to_i64(value.round(), "round")?,
+            Number::Exact(_) => unreachable!("exact->inexact should yield an inexact number"),
+        },
+        Number::Inexact(value) => float_to_i64(value.round(), "round")?,
+    };
+    Ok(exact_integer(rounded))
+}
+
 fn native_sub(args: &[Value], _ctx: &EvalContext) -> Result<Value, EvalError> {
     let values = values_as_numbers("-", args)?;
     let (first, rest) = values.split_first().ok_or(EvalError::WrongArgCount {
@@ -1520,6 +1829,40 @@ fn value_equal(left: &Value, right: &Value) -> bool {
 fn overflow_error(name: &'static str) -> EvalError {
     EvalError::InvalidSyntax {
         message: format!("{name}: integer overflow"),
+    }
+}
+
+fn i128_to_i64(value: i128, name: &'static str) -> Result<i64, EvalError> {
+    i64::try_from(value).map_err(|_| overflow_error(name))
+}
+
+fn gcd_i128(mut left: i128, mut right: i128) -> i128 {
+    left = left.abs();
+    right = right.abs();
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn float_to_i64(value: f64, name: &'static str) -> Result<i64, EvalError> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Err(overflow_error(name));
+    }
+
+    Ok(value as i64)
+}
+
+fn truncate_number(value: Number, name: &'static str) -> Result<i64, EvalError> {
+    match value {
+        Number::Exact(_) => {
+            let numer = i128::from(value.numerator()?);
+            let denom = i128::from(value.denominator()?);
+            i128_to_i64(numer / denom, name)
+        }
+        Number::Inexact(value) => float_to_i64(value.trunc(), name),
     }
 }
 
