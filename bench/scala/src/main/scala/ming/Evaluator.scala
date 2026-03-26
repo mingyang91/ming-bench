@@ -11,6 +11,19 @@ object Evaluator:
     val env = GlobalEnv.create()
     evalSequence(exprs, env).display
 
+  def evalStrWithLimit(input: String, maxSteps: Int): String =
+    val tokens = Tokenizer.tokenize(input)
+    val exprs  = Parser.parseAll(tokens)
+    if exprs.isEmpty then throw new EvalError("empty input")
+    windStack = Nil
+    handlerStack = Nil
+    val env = GlobalEnv.create()
+    runWithLimit(
+      if exprs.size == 1 then SEval(exprs.head, env, HaltK)
+      else SEval(exprs.head, env, SeqK(exprs.tail, env, HaltK)),
+      maxSteps
+    ).display
+
   def evalStrWithOutput(input: String): (String, String) =
     val tokens = Tokenizer.tokenize(input)
     val exprs  = Parser.parseAll(tokens)
@@ -54,6 +67,39 @@ object Evaluator:
       state match
         case SApply(v, HaltK) => return v
         case _ =>
+          try state = step(state)
+          catch
+            case raised: SchemeRaisedException =>
+              if handlerStack.nonEmpty then
+                val handler = handlerStack.head
+                handlerStack = handlerStack.tail
+                state = handler match
+                  case WHHandler(proc) =>
+                    ProcApply.applyFunction(proc, List(raised.value), RaiseReturnCheckK)
+                  case GuardExHandler(variable, clauses, genv, guardK, savedWind) =>
+                    val common   = EvalHelpers.commonWindTail(windStack, savedWind)
+                    val toUnwind = windStack.take(windStack.length - common.length)
+                    val toRewind = savedWind.take(savedWind.length - common.length).reverse
+                    val actions: List[WindAction] =
+                      toUnwind.map(e => DoUnwind(e._2)) ++ toRewind.map(e => DoRewind(e._1, e))
+                    val clauseK = GuardClauseK(variable, raised.value, clauses, genv, guardK)
+                    ProcApply.processWindActions(actions, raised.value, clauseK)
+              else throw new EvalError(s"unhandled exception: ${raised.value.display}")
+            case e: EvalError =>
+              val msg = e.getMessage
+              if msg.matches(".*\\d+:\\d+.*") then throw e
+              else throw new EvalError(s"$lastPos: $msg")
+    throw new AssertionError("unreachable")
+
+  private def runWithLimit(initial: MState, maxSteps: Int): SchemeVal =
+    var state = initial
+    var steps = 0
+    while true do
+      state match
+        case SApply(v, HaltK) => return v
+        case _ =>
+          steps += 1
+          if steps > maxSteps then throw new EvalError("step limit exceeded")
           try state = step(state)
           catch
             case raised: SchemeRaisedException =>

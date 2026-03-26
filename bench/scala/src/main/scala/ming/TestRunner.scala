@@ -36,7 +36,7 @@ object TestRunner:
       val json = Files.readString(testsJsonPath)
       Gson().fromJson(json, classOf[JsonArray])
 
-    val results: List[TestResult] =
+    val jsonResults: List[TestResult] =
       testCases.iterator().asScala.toList.flatMap { elem =>
         val tc      = elem.getAsJsonObject
         val name    = tc.get("name").getAsString
@@ -54,6 +54,12 @@ object TestRunner:
           val input = Files.readString(fixturesDir.resolve(fixture))
           Some(runTest(name, kind, input, tc))
       }
+
+    val l27Results: List[TestResult] =
+      if benchLevel > 0 && benchLevel < 27 then Nil
+      else runL27Tests()
+
+    val results = jsonResults ++ l27Results
 
     results.foreach { r =>
       if r.passed then println(s"PASS ${r.name}")
@@ -112,3 +118,49 @@ object TestRunner:
     catch
       case e: Exception =>
         TestResult(name, passed = false, s"${e.getClass.getSimpleName}: ${e.getMessage}")
+
+  private def runL27Tests(): List[TestResult] =
+    List(
+      l27EvalOk("l27_step_limit_normal", "(+ 1 2)", 1000, "3"),
+      l27EvalOk(
+        "l27_step_limit_loop_within_budget",
+        "(let loop ((n 50)) (if (= n 0) 'done (loop (- n 1))))",
+        10000,
+        "done"
+      ),
+      l27EvalErr("l27_step_limit_infinite_loop", "(let loop () (loop))", 1000),
+      l27EvalErr(
+        "l27_step_limit_exceeded",
+        "(let loop ((n 1000)) (if (= n 0) 'done (loop (- n 1))))",
+        50
+      ),
+      l27EvalOk(
+        "l27_step_limit_factorial",
+        "(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 10)",
+        10000,
+        "3628800"
+      ),
+      l27EvalOk(
+        "l27_normal_eval_unaffected",
+        "(let loop ((n 100000)) (if (= n 0) 'done (loop (- n 1))))",
+        -1,
+        "done"
+      )
+    )
+
+  private def l27EvalOk(name: String, input: String, limit: Int, expected: String): TestResult =
+    try
+      val result =
+        if limit < 0 then Evaluator.evalStr(input)
+        else Evaluator.evalStrWithLimit(input, limit)
+      if result == expected then TestResult(name, passed = true, "")
+      else TestResult(name, passed = false, s"expected $expected got $result")
+    catch case e: Exception => TestResult(name, passed = false, s"${e.getClass.getSimpleName}: ${e.getMessage}")
+
+  private def l27EvalErr(name: String, input: String, limit: Int): TestResult =
+    try
+      val result = Evaluator.evalStrWithLimit(input, limit)
+      TestResult(name, passed = false, s"expected EvalError but got $result")
+    catch
+      case _: EvalError => TestResult(name, passed = true, "")
+      case e: Exception => TestResult(name, passed = false, s"${e.getClass.getSimpleName}: ${e.getMessage}")
