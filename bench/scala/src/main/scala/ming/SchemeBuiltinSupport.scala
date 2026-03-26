@@ -12,6 +12,14 @@ private[ming] object SchemeBuiltinSupport:
     if args.length < minimum then
       throw new EvalError(s"$name expected at least $minimum argument(s), got ${args.length}")
 
+  def requireNonNegativeIndex(name: String, value: Value): Int =
+    val index = requireInteger(name, value)
+    if !index.isValidInt || index.signum < 0 then throw new EvalError(s"$name index out of range")
+    index.toInt
+
+  def requireNonZeroDivisor(name: String, divisor: BigInt): Unit =
+    if divisor == 0 then throw new EvalError("division by zero")
+
   def numericArgs(name: String, args: List[Value]): List[BigInt] =
     args.map {
       case Value.IntegerValue(number) => number
@@ -48,6 +56,41 @@ private[ming] object SchemeBuiltinSupport:
       case pair @ Value.PairValue(_, _) => pair
       case other =>
         throw new EvalError(s"$name expected a pair, got ${render(other)}")
+
+  def isProperList(value: Value): Boolean =
+    @tailrec
+    def loop(current: Value): Boolean =
+      current match
+        case Value.NilValue          => true
+        case Value.PairValue(_, cdr) => loop(cdr)
+        case _                       => false
+
+    loop(value)
+
+  def eqValues(left: Value, right: Value): Boolean =
+    (left, right) match
+      case (Value.IntegerValue(a), Value.IntegerValue(b)) => a == b
+      case (Value.BooleanValue(a), Value.BooleanValue(b)) => a == b
+      case (Value.CharValue(a), Value.CharValue(b))       => a == b
+      case (Value.SymbolValue(a), Value.SymbolValue(b))   => a == b
+      case (Value.NilValue, Value.NilValue)               => true
+      case (Value.VoidValue, Value.VoidValue)             => true
+      case (Value.StringValue(a), Value.StringValue(b))   => a eq b
+      case _                                              => left.asInstanceOf[AnyRef] eq right.asInstanceOf[AnyRef]
+
+  def equalValues(left: Value, right: Value): Boolean =
+    (left, right) match
+      case (Value.IntegerValue(a), Value.IntegerValue(b)) => a == b
+      case (Value.BooleanValue(a), Value.BooleanValue(b)) => a == b
+      case (Value.StringValue(a), Value.StringValue(b))   => a.text == b.text
+      case (Value.CharValue(a), Value.CharValue(b))       => a == b
+      case (Value.SymbolValue(a), Value.SymbolValue(b))   => a == b
+      case (Value.NilValue, Value.NilValue)               => true
+      case (Value.VoidValue, Value.VoidValue)             => true
+      case (Value.PairValue(leftCar, leftCdr), Value.PairValue(rightCar, rightCdr)) =>
+        equalValues(leftCar, rightCar) && equalValues(leftCdr, rightCdr)
+      case _ =>
+        eqValues(left, right)
 
   def requireIndex(
     name: String,
