@@ -147,6 +147,14 @@ function parse(tokens: Token[]): SchemeVal[] {
   function parseAtom(tok: Token): SchemeVal {
     if (tok.text === '#t') return { tag: 'boolean', value: true, pos: tok.pos };
     if (tok.text === '#f') return { tag: 'boolean', value: false, pos: tok.pos };
+    if (tok.text.startsWith('#\\')) {
+      const rest = tok.text.slice(2);
+      if (rest === 'space') return { tag: 'char', value: ' ', pos: tok.pos };
+      if (rest === 'newline') return { tag: 'char', value: '\n', pos: tok.pos };
+      if (rest === 'tab') return { tag: 'char', value: '\t', pos: tok.pos };
+      if (rest.length === 1) return { tag: 'char', value: rest, pos: tok.pos };
+      throw new EvalError(`${tok.pos.line}:${tok.pos.col}: unknown character literal: ${tok.text}`);
+    }
     if (tok.text.startsWith('"') && tok.text.endsWith('"')) {
       return { tag: 'string', value: tok.text.slice(1, -1), pos: tok.pos };
     }
@@ -175,6 +183,7 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
     case 'number':
     case 'boolean':
     case 'string':
+    case 'char':
     case 'nil':
     case 'pair':
       return expr;
@@ -382,6 +391,7 @@ const BUILTINS = new Set([
   'string->number', 'number->string',
   'symbol->string', 'string->symbol',
   'string-ref',
+  'string-copy', 'string-set!',
 ]);
 
 function isBuiltin(name: string): boolean {
@@ -553,6 +563,20 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       if (idx < 0 || idx >= args[0].value.length)
         throw errAt('string-ref: index out of range', pos);
       return { tag: 'char', value: args[0].value[idx] };
+    }
+    case 'string-copy': {
+      if (args.length !== 1 || args[0].tag !== 'string')
+        throw errAt('string-copy: expected string', pos);
+      return { tag: 'string', value: args[0].value };
+    }
+    case 'string-set!': {
+      if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'char')
+        throw errAt('string-set!: expected string, index, char', pos);
+      const si = args[1].value;
+      if (si < 0 || si >= args[0].value.length)
+        throw errAt('string-set!: index out of range', pos);
+      (args[0] as any).value = args[0].value.substring(0, si) + args[2].value + args[0].value.substring(si + 1);
+      return SCM_FALSE;
     }
     default:
       throw errAt(`unbound variable: ${name}`, pos);
