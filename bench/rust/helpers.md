@@ -10,7 +10,10 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### evaluate_list (src/scheme/mod.rs:410) — Dispatch a list expression as a special form or procedure call
+### apply_procedure (src/scheme/mod.rs:662) — Apply builtin or closure values with arity checks and lexical scoping
+### parse_let_bindings (src/scheme/mod.rs:709) — Validate and decode `let` binding pairs into binding records
+### expect_proper_list (src/scheme/mod.rs:817) — Traverse a Scheme list and reject dotted or malformed tails
 
 ## Python Helpers (scripts/)
 

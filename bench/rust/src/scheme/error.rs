@@ -1,10 +1,20 @@
 /// Evaluation error type for the Scheme interpreter.
-///
-/// Agents must add domain-specific variants here. Using `String` as the
-/// error type is not possible — the `eval_str` signature requires this type.
-#[derive(Debug, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
-    // Add variants as needed, e.g.:
-    // #[error("unbound variable: {name}")]
-    // UnboundVariable { name: String },
+    #[error("{line}:{col}: {message}")]
+    At {
+        line: usize,
+        col: usize,
+        message: String,
+    },
+}
+
+impl EvalError {
+    pub fn at(line: usize, col: usize, message: impl Into<String>) -> Self {
+        Self::At {
+            line,
+            col,
+            message: message.into(),
+        }
+    }
 }
