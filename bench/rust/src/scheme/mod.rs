@@ -15,6 +15,8 @@ std::thread_local! {
     static CONTINUATION_JUMPS: RefCell<HashMap<usize, PendingContinuationJump>> =
         RefCell::new(HashMap::new());
     static DYNAMIC_WIND_STACK: RefCell<Vec<WindFrameRef>> = RefCell::new(Vec::new());
+    static EXCEPTION_HANDLER_STACK: RefCell<Vec<SchemeExceptionHandler>> =
+        RefCell::new(Vec::new());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,6 +322,8 @@ struct SchemePair {
 
 type ContinuationFn = dyn Fn(Value) -> Result<Value, EvalError>;
 type ContinuationRef = Rc<ContinuationFn>;
+type ExceptionHandlerFn = dyn Fn(Value) -> Result<Value, EvalError>;
+type ExceptionHandlerRef = Rc<ExceptionHandlerFn>;
 type ValuesContinuationFn = dyn Fn(Vec<Value>) -> Result<Value, EvalError>;
 type ValuesContinuationRef = Rc<ValuesContinuationFn>;
 type WindFrameRef = Rc<DynamicWindFrame>;
@@ -335,6 +339,12 @@ struct DynamicWindFrame {
 #[derive(Clone)]
 struct SchemeContinuation {
     inner: ContinuationRef,
+    wind_stack: Rc<[WindFrameRef]>,
+}
+
+#[derive(Clone)]
+struct SchemeExceptionHandler {
+    inner: ExceptionHandlerRef,
     wind_stack: Rc<[WindFrameRef]>,
 }
 
@@ -434,6 +444,23 @@ fn render_value(value: &Value, mode: RenderMode, active_pairs: &mut HashSet<usiz
 
 impl SchemeContinuation {
     fn new(inner: ContinuationRef) -> Self {
+        Self {
+            inner,
+            wind_stack: rc_wind_frames(current_dynamic_wind_stack()),
+        }
+    }
+
+    fn invoke(&self, value: Value) -> Result<Value, EvalError> {
+        (self.inner)(value)
+    }
+
+    fn id(&self) -> usize {
+        Rc::as_ptr(&self.inner) as *const () as usize
+    }
+}
+
+impl SchemeExceptionHandler {
+    fn new(inner: ExceptionHandlerRef) -> Self {
         Self {
             inner,
             wind_stack: rc_wind_frames(current_dynamic_wind_stack()),
@@ -1011,6 +1038,8 @@ enum Builtin {
     Denominator,
     DynamicWind,
     CallCc,
+    Raise,
+    WithExceptionHandler,
     Apply,
 }
 
@@ -1126,6 +1155,8 @@ impl Builtin {
             Self::Denominator => "denominator",
             Self::DynamicWind => "dynamic-wind",
             Self::CallCc => "call/cc",
+            Self::Raise => "raise",
+            Self::WithExceptionHandler => "with-exception-handler",
             Self::Apply => "apply",
         }
     }
@@ -1276,6 +1307,8 @@ impl Env {
             ("dynamic-wind", Builtin::DynamicWind),
             ("call/cc", Builtin::CallCc),
             ("call-with-current-continuation", Builtin::CallCc),
+            ("raise", Builtin::Raise),
+            ("with-exception-handler", Builtin::WithExceptionHandler),
             ("apply", Builtin::Apply),
         ] {
             env.define(name.into(), Value::Builtin(builtin));
@@ -1605,7 +1638,12 @@ fn expr_mentions_continuations(expr: &Expr) -> bool {
         ExprKind::Symbol(name) => {
             matches!(
                 name.as_str(),
-                "call/cc" | "call-with-current-continuation" | "dynamic-wind"
+                "call/cc"
+                    | "call-with-current-continuation"
+                    | "dynamic-wind"
+                    | "guard"
+                    | "raise"
+                    | "with-exception-handler"
             )
         }
         ExprKind::List(items) => items.iter().any(expr_mentions_continuations),
@@ -1621,12 +1659,30 @@ fn current_dynamic_wind_stack() -> Vec<WindFrameRef> {
     DYNAMIC_WIND_STACK.with(|stack| stack.borrow().clone())
 }
 
+fn current_exception_handler_stack() -> Vec<SchemeExceptionHandler> {
+    EXCEPTION_HANDLER_STACK.with(|stack| stack.borrow().clone())
+}
+
+fn current_exception_handler() -> Option<SchemeExceptionHandler> {
+    EXCEPTION_HANDLER_STACK.with(|stack| stack.borrow().last().cloned())
+}
+
 fn replace_dynamic_wind_stack(stack: Vec<WindFrameRef>) -> Vec<WindFrameRef> {
     DYNAMIC_WIND_STACK.with(|current| std::mem::replace(&mut *current.borrow_mut(), stack))
 }
 
+fn replace_exception_handler_stack(
+    stack: Vec<SchemeExceptionHandler>,
+) -> Vec<SchemeExceptionHandler> {
+    EXCEPTION_HANDLER_STACK.with(|current| std::mem::replace(&mut *current.borrow_mut(), stack))
+}
+
 fn push_dynamic_wind_frame(frame: WindFrameRef) {
     DYNAMIC_WIND_STACK.with(|stack| stack.borrow_mut().push(frame));
+}
+
+fn push_exception_handler(handler: SchemeExceptionHandler) {
+    EXCEPTION_HANDLER_STACK.with(|stack| stack.borrow_mut().push(handler));
 }
 
 fn pop_dynamic_wind_frame(frame: &WindFrameRef) {
@@ -1634,6 +1690,16 @@ fn pop_dynamic_wind_frame(frame: &WindFrameRef) {
         let mut stack = stack.borrow_mut();
         debug_assert!(stack.last().is_some_and(|last| Rc::ptr_eq(last, frame)));
         if stack.last().is_some_and(|last| Rc::ptr_eq(last, frame)) {
+            stack.pop();
+        }
+    });
+}
+
+fn pop_exception_handler(handler: &SchemeExceptionHandler) {
+    EXCEPTION_HANDLER_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        debug_assert!(stack.last().is_some_and(|last| last.id() == handler.id()));
+        if stack.last().is_some_and(|last| last.id() == handler.id()) {
             stack.pop();
         }
     });
@@ -1692,6 +1758,39 @@ fn rewind_dynamic_wind_cps(
     )
 }
 
+fn rewind_exception_handler_wind_cps(
+    incoming: Vec<WindFrameRef>,
+    active_stack: Vec<WindFrameRef>,
+    handler: SchemeExceptionHandler,
+    value: Value,
+) -> Result<Value, EvalError> {
+    let Some((frame, rest)) = incoming.split_first() else {
+        replace_dynamic_wind_stack(active_stack);
+        return handler.invoke(value);
+    };
+
+    let frame = frame.clone();
+    let rest = rest.to_vec();
+    let mut next_active_stack = active_stack.clone();
+    next_active_stack.push(frame.clone());
+    let next_handler = handler.clone();
+
+    apply_thunk_cps(
+        frame.before.clone(),
+        frame.env.clone(),
+        frame.call_pos,
+        Rc::new(move |_| {
+            replace_dynamic_wind_stack(next_active_stack.clone());
+            rewind_exception_handler_wind_cps(
+                rest.clone(),
+                next_active_stack.clone(),
+                next_handler.clone(),
+                value.clone(),
+            )
+        }),
+    )
+}
+
 fn unwind_dynamic_wind_cps(
     outgoing: Vec<WindFrameRef>,
     active_stack: Vec<WindFrameRef>,
@@ -1724,6 +1823,38 @@ fn unwind_dynamic_wind_cps(
     )
 }
 
+fn unwind_exception_handler_wind_cps(
+    outgoing: Vec<WindFrameRef>,
+    active_stack: Vec<WindFrameRef>,
+    incoming: Vec<WindFrameRef>,
+    handler: SchemeExceptionHandler,
+    value: Value,
+) -> Result<Value, EvalError> {
+    let Some((frame, rest)) = outgoing.split_first() else {
+        return rewind_exception_handler_wind_cps(incoming, active_stack, handler, value);
+    };
+
+    let frame = frame.clone();
+    let rest = rest.to_vec();
+    let next_incoming = incoming.clone();
+    let next_handler = handler.clone();
+
+    apply_thunk_cps(
+        frame.after.clone(),
+        frame.env.clone(),
+        frame.call_pos,
+        Rc::new(move |_| {
+            unwind_exception_handler_wind_cps(
+                rest.clone(),
+                active_stack.clone(),
+                next_incoming.clone(),
+                next_handler.clone(),
+                value.clone(),
+            )
+        }),
+    )
+}
+
 fn resume_continuation_jump(
     continuation: SchemeContinuation,
     value: Value,
@@ -1741,6 +1872,32 @@ fn resume_continuation_jump(
 
     replace_dynamic_wind_stack(active_stack.clone());
     unwind_dynamic_wind_cps(outgoing, active_stack, incoming, continuation, value)
+}
+
+fn resume_exception_jump(
+    handler: SchemeExceptionHandler,
+    value: Value,
+) -> Result<Value, EvalError> {
+    let current_stack = current_dynamic_wind_stack();
+    let shared_prefix = shared_dynamic_wind_prefix_len(&current_stack, handler.wind_stack.as_ref());
+    let active_stack = current_stack[..shared_prefix].to_vec();
+    let outgoing = current_stack[shared_prefix..]
+        .iter()
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    let incoming = handler.wind_stack[shared_prefix..].to_vec();
+
+    let mut next_handlers = current_exception_handler_stack();
+    if let Some(index) = next_handlers
+        .iter()
+        .rposition(|candidate| candidate.id() == handler.id())
+    {
+        next_handlers.truncate(index);
+    }
+    replace_exception_handler_stack(next_handlers);
+    replace_dynamic_wind_stack(active_stack.clone());
+    unwind_exception_handler_wind_cps(outgoing, active_stack, incoming, handler, value)
 }
 
 fn queue_continuation_jump(continuation: SchemeContinuation, value: Value) -> EvalError {
@@ -1783,7 +1940,8 @@ fn rc_value_lists(lists: Vec<Vec<Value>>) -> Rc<[Vec<Value>]> {
 
 fn eval_program_cps(expressions: &[Expr], output: Rc<RefCell<String>>) -> Result<Value, EvalError> {
     let env = Env::new(output);
-    let saved_stack = replace_dynamic_wind_stack(Vec::new());
+    let saved_wind_stack = replace_dynamic_wind_stack(Vec::new());
+    let saved_handler_stack = replace_exception_handler_stack(Vec::new());
     let result = {
         let mut result = eval_sequence_cps(
             rc_exprs(expressions.to_vec()),
@@ -1807,7 +1965,8 @@ fn eval_program_cps(expressions: &[Expr], output: Rc<RefCell<String>>) -> Result
             }
         }
     };
-    replace_dynamic_wind_stack(saved_stack);
+    replace_exception_handler_stack(saved_handler_stack);
+    replace_dynamic_wind_stack(saved_wind_stack);
     result
 }
 
@@ -1881,6 +2040,7 @@ fn eval_list_cps(
                 return k(eval_define_record_type(operator.pos, &arguments, &env)?)
             }
             "define-syntax" => return k(eval_define_syntax(operator.pos, &arguments, &env)?),
+            "guard" => return eval_guard_cps(operator.pos, &arguments, env, k),
             "set!" => return eval_set_cps(operator.pos, &arguments, env, k),
             "if" => return eval_if_cps(operator.pos, &arguments, env, k),
             "quote" => return k(eval_quote(operator.pos, &arguments)?),
@@ -2523,6 +2683,160 @@ fn eval_cond_cps(arguments: &[Expr], env: EnvRef, k: ContinuationRef) -> Result<
     eval_cond_clause_cps(rc_exprs(arguments.to_vec()), 0, env, k)
 }
 
+fn raise_exception_cps(value: Value, call_pos: SourcePos) -> Result<Value, EvalError> {
+    match current_exception_handler() {
+        Some(handler) => resume_exception_jump(handler, value),
+        None => Err(EvalError::UncaughtException {
+            value: value.render(),
+        }
+        .with_offset(call_pos.offset)),
+    }
+}
+
+fn eval_guard_cps(
+    pos: SourcePos,
+    arguments: &[Expr],
+    env: EnvRef,
+    k: ContinuationRef,
+) -> Result<Value, EvalError> {
+    let Some((spec, body)) = arguments.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "guard".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(pos.offset));
+    };
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "guard".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(pos.offset));
+    }
+
+    let ExprKind::List(spec_items) = &spec.kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard: first argument must be (var clause ...)".into(),
+        }
+        .with_offset(spec.pos.offset));
+    };
+    let Some((var_expr, clauses)) = spec_items.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard: first argument must be (var clause ...)".into(),
+        }
+        .with_offset(spec.pos.offset));
+    };
+    let ExprKind::Symbol(var_name) = &var_expr.kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard: exception variable must be a symbol".into(),
+        }
+        .with_offset(var_expr.pos.offset));
+    };
+
+    let exception_var = var_name.clone();
+    let clauses = rc_exprs(clauses.to_vec());
+    let handler_env = env.clone();
+    let handler_k = k.clone();
+    let handler = SchemeExceptionHandler::new(Rc::new(move |exception| {
+        let clause_env = Env::child(&handler_env);
+        clause_env.define(exception_var.clone(), exception.clone());
+        eval_guard_clause_cps(
+            clauses.clone(),
+            0,
+            exception,
+            clause_env,
+            handler_k.clone(),
+            pos,
+        )
+    }));
+
+    let finish_handler = handler.clone();
+    let finish_k = k.clone();
+    push_exception_handler(handler);
+    eval_sequence_cps(
+        rc_exprs(body.to_vec()),
+        0,
+        env,
+        Rc::new(move |value| {
+            pop_exception_handler(&finish_handler);
+            finish_k.clone()(value)
+        }),
+    )
+}
+
+fn eval_guard_clause_cps(
+    clauses: Rc<[Expr]>,
+    index: usize,
+    exception: Value,
+    env: EnvRef,
+    k: ContinuationRef,
+    raise_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    if index >= clauses.len() {
+        return raise_exception_cps(exception, raise_pos);
+    }
+
+    let clause = clauses[index].clone();
+    let ExprKind::List(items) = clause.kind else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard: clauses must be lists".into(),
+        }
+        .with_offset(clause.pos.offset));
+    };
+
+    let Some((test, body)) = items.split_first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "guard: clauses cannot be empty".into(),
+        }
+        .with_offset(clause.pos.offset));
+    };
+
+    if matches!(&test.kind, ExprKind::Symbol(name) if name == "else") {
+        if index + 1 != clauses.len() {
+            return Err(EvalError::InvalidSyntax {
+                message: "guard: else clause must be last".into(),
+            }
+            .with_offset(test.pos.offset));
+        }
+
+        return if body.is_empty() {
+            k(Value::Void)
+        } else {
+            eval_sequence_cps(rc_exprs(body.to_vec()), 0, env, k)
+        };
+    }
+
+    let body = rc_exprs(body.to_vec());
+    let next_clauses = clauses.clone();
+    let next_env = env.clone();
+    let next_k = k.clone();
+    let next_exception = exception.clone();
+    eval_expr_cps(
+        test.clone(),
+        env,
+        Rc::new(move |value| {
+            if value.is_truthy() {
+                if body.is_empty() {
+                    next_k.clone()(value)
+                } else {
+                    eval_sequence_cps(body.clone(), 0, next_env.clone(), next_k.clone())
+                }
+            } else {
+                eval_guard_clause_cps(
+                    next_clauses.clone(),
+                    index + 1,
+                    next_exception.clone(),
+                    next_env.clone(),
+                    next_k.clone(),
+                    raise_pos,
+                )
+            }
+        }),
+    )
+}
+
 fn eval_cond_clause_cps(
     clauses: Rc<[Expr]>,
     index: usize,
@@ -2907,6 +3221,10 @@ fn apply_value_cps(
             eval_dynamic_wind_cps(argument_values, env, call_pos, k)
         }
         Value::Builtin(Builtin::CallCc) => eval_call_cc_cps(argument_values, env, call_pos, k),
+        Value::Builtin(Builtin::Raise) => eval_raise_cps(argument_values, call_pos),
+        Value::Builtin(Builtin::WithExceptionHandler) => {
+            eval_with_exception_handler_cps(argument_values, env, call_pos, k)
+        }
         Value::Builtin(Builtin::Apply) => eval_apply_builtin_cps(argument_values, env, call_pos, k),
         Value::Builtin(Builtin::Map) => eval_map_cps(argument_values, env, call_pos, k),
         Value::Builtin(Builtin::ForEach) => eval_for_each_cps(argument_values, env, call_pos, k),
@@ -3025,6 +3343,61 @@ fn eval_call_cc_cps(
         env,
         call_pos,
         k,
+    )
+}
+
+fn eval_raise_cps(argument_values: Vec<Value>, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [value] = argument_values.as_slice() else {
+        return Err(EvalError::WrongArgCount {
+            name: "raise".into(),
+            expected: "exactly 1".into(),
+            got: argument_values.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    raise_exception_cps(value.clone(), call_pos)
+}
+
+fn eval_with_exception_handler_cps(
+    argument_values: Vec<Value>,
+    env: EnvRef,
+    call_pos: SourcePos,
+    k: ContinuationRef,
+) -> Result<Value, EvalError> {
+    let [handler, thunk] = argument_values.as_slice() else {
+        return Err(EvalError::WrongArgCount {
+            name: "with-exception-handler".into(),
+            expected: "exactly 2".into(),
+            got: argument_values.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let handler_proc = handler.clone();
+    let handler_env = env.clone();
+    let handler_k = k.clone();
+    let exception_handler = SchemeExceptionHandler::new(Rc::new(move |exception| {
+        apply_value_cps(
+            handler_proc.clone(),
+            vec![exception],
+            handler_env.clone(),
+            call_pos,
+            handler_k.clone(),
+        )
+    }));
+
+    let finish_handler = exception_handler.clone();
+    let finish_k = k.clone();
+    push_exception_handler(exception_handler);
+    apply_thunk_cps(
+        thunk.clone(),
+        env,
+        call_pos,
+        Rc::new(move |value| {
+            pop_exception_handler(&finish_handler);
+            finish_k.clone()(value)
+        }),
     )
 }
 
@@ -3246,7 +3619,13 @@ fn eval_builtin_from_values(
 ) -> Result<Value, EvalError> {
     debug_assert!(!matches!(
         builtin,
-        Builtin::DynamicWind | Builtin::CallCc | Builtin::Apply | Builtin::Map | Builtin::ForEach
+        Builtin::DynamicWind
+            | Builtin::CallCc
+            | Builtin::Raise
+            | Builtin::WithExceptionHandler
+            | Builtin::Apply
+            | Builtin::Map
+            | Builtin::ForEach
     ));
 
     let apply_env = Env::child(env);
@@ -4242,6 +4621,14 @@ fn eval_builtin(
         .with_offset(call_pos.offset)),
         Builtin::CallCc => Err(EvalError::InvalidArgument {
             message: "call/cc requires continuation-aware evaluation".into(),
+        }
+        .with_offset(call_pos.offset)),
+        Builtin::Raise => Err(EvalError::InvalidArgument {
+            message: "raise requires continuation-aware evaluation".into(),
+        }
+        .with_offset(call_pos.offset)),
+        Builtin::WithExceptionHandler => Err(EvalError::InvalidArgument {
+            message: "with-exception-handler requires continuation-aware evaluation".into(),
         }
         .with_offset(call_pos.offset)),
         Builtin::Apply => eval_apply_builtin(arguments, env, call_pos),

@@ -61,6 +61,8 @@ pub enum EvalError {
     },
     #[error("circular list")]
     CyclicList,
+    #[error("uncaught exception: {value}")]
+    UncaughtException { value: String },
     #[error("internal continuation jump")]
     InternalContinuationJump { id: usize },
 }
