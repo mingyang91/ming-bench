@@ -18,7 +18,8 @@ type SchemeVal =
   | { tag: 'builtin'; name: string; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
   | { tag: 'syntax'; rules: { pattern: SchemeVal; template: SchemeVal }[]; literals: string[]; defEnv: Env; pos?: Pos }
-  | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal>; pos?: Pos };
+  | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
+  | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}: ` : '';
@@ -269,7 +270,7 @@ function gensym(base: string): string {
 
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'cond', 'and', 'or',
-  'define-syntax', 'syntax-rules',
+  'define-syntax', 'syntax-rules', 'case-lambda',
 ]);
 
 function matchSyntaxPattern(
@@ -852,6 +853,7 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
         const fnArgs = lists.map(l => l[i]);
         if (fn.tag === 'builtin') result.push(evalBuiltin(fn.name, fnArgs, callPos));
         else if (fn.tag === 'lambda') result.push(applyLambda(fn, fnArgs, callPos));
+        else if (fn.tag === 'case-lambda') result.push(applyCaseLambda(fn, fnArgs, callPos));
         else throw new EvalError(`${posStr(callPos)}map: not a procedure`);
       }
       return arrayToSchemeList(result);
@@ -980,6 +982,11 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       if (args[0].tag === 'rational') return makeRational(args[0].den, 1, callPos);
       throw new EvalError(`${posStr(callPos)}denominator: expected rational`);
     }
+    case 'procedure?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}procedure?: need 1 argument`);
+      const t = args[0].tag;
+      return { tag: 'boolean', value: t === 'lambda' || t === 'builtin' || t === 'case-lambda' };
+    }
     case 'apply': {
       if (args.length < 2) throw new EvalError(`${posStr(callPos)}apply: need at least 2 arguments`);
       const fn = args[0];
@@ -992,6 +999,9 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       }
       if (fn.tag === 'lambda') {
         return applyLambda(fn, allArgs, callPos);
+      }
+      if (fn.tag === 'case-lambda') {
+        return applyCaseLambda(fn, allArgs, callPos);
       }
       throw new EvalError(`${posStr(callPos)}apply: not a procedure`);
     }
@@ -1018,7 +1028,7 @@ const BUILTIN_NAMES = new Set([
   'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase', 'char=?', 'char<?',
   'string=?', 'string<?', 'string-ci=?', 'string-upcase', 'string-downcase',
   // L11
-  'exact?', 'inexact?', 'integer?', 'rational?',
+  'exact?', 'inexact?', 'integer?', 'rational?', 'procedure?',
   'exact->inexact', 'inexact->exact',
   'numerator', 'denominator',
 ]);
@@ -1045,6 +1055,38 @@ function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], cal
     result = evaluate(bodyExpr, callEnv);
   }
   return result;
+}
+
+function applyCaseLambda(proc: SchemeVal & { tag: 'case-lambda' }, args: SchemeVal[], callPos?: Pos): SchemeVal {
+  for (const clause of proc.clauses) {
+    if (clause.rest) {
+      if (args.length >= clause.params.length) {
+        const callEnv = new Env(proc.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          callEnv.set(clause.params[i], args[i]);
+        }
+        callEnv.set(clause.rest, arrayToSchemeList(args.slice(clause.params.length)));
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of clause.body) {
+          result = evaluate(bodyExpr, callEnv);
+        }
+        return result;
+      }
+    } else {
+      if (args.length === clause.params.length) {
+        const callEnv = new Env(proc.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          callEnv.set(clause.params[i], args[i]);
+        }
+        let result: SchemeVal = { tag: 'void' };
+        for (const bodyExpr of clause.body) {
+          result = evaluate(bodyExpr, callEnv);
+        }
+        return result;
+      }
+    }
+  }
+  throw new EvalError(`${posStr(callPos)}case-lambda: no matching clause for ${args.length} arguments`);
 }
 
 function evaluate(expr: SchemeVal, env: Env): SchemeVal {
@@ -1100,6 +1142,19 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         const { params, rest } = parseParams(elems[1], expr.pos);
         const body = elems.slice(2);
         return { tag: 'lambda', params, rest, body, env };
+      }
+      case 'case-lambda': {
+        if (elems.length < 2) throw new EvalError(`${posStr(expr.pos)}case-lambda: need at least 1 clause`);
+        const clauses: { params: string[]; rest?: string; body: SchemeVal[] }[] = [];
+        for (let i = 1; i < elems.length; i++) {
+          const clause = elems[i];
+          if (clause.tag !== 'list' || clause.value.length < 2)
+            throw new EvalError(`${posStr(expr.pos)}case-lambda: invalid clause`);
+          const { params, rest } = parseParams(clause.value[0], expr.pos);
+          const body = clause.value.slice(1);
+          clauses.push({ params, rest, body });
+        }
+        return { tag: 'case-lambda', clauses, env, pos: expr.pos };
       }
       case 'set!': {
         if (elems.length !== 3) throw new EvalError(`${posStr(expr.pos)}set!: wrong number of arguments`);
@@ -1315,6 +1370,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     return applyLambda(proc, args, expr.pos);
   }
 
+  if (proc.tag === 'case-lambda') {
+    return applyCaseLambda(proc, args, expr.pos);
+  }
+
   throw new EvalError(`${posStr(expr.pos)}not a procedure`);
 }
 
@@ -1352,6 +1411,7 @@ function writeVal(val: SchemeVal): string {
     case 'list': return `(${val.value.map(writeVal).join(' ')})`;
     case 'lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
+    case 'case-lambda': return '#<procedure>';
     case 'syntax': return '#<syntax>';
     case 'record': return '#<record>';
   }
