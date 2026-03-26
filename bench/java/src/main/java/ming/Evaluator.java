@@ -783,6 +783,253 @@ public class Evaluator {
             }
             return apply(proc, callArgs);
         }));
+
+        // L09: eq? and equal?
+        env.define("eq?", new BuiltinProc("eq?", args -> {
+            requireArgCount("eq?", args, 2);
+            Object a = args.get(0), b = args.get(1);
+            if (a == b) return true;
+            if (a instanceof Long && b instanceof Long) return a.equals(b);
+            if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+            if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name.equals(sb.name);
+            if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value == cb.value;
+            return false;
+        }));
+        env.define("equal?", new BuiltinProc("equal?", args -> {
+            requireArgCount("equal?", args, 2);
+            return schemeEqual(args.get(0), args.get(1));
+        }));
+
+        // L09: map (multi-list)
+        env.define("map", new BuiltinProc("map", args -> {
+            if (args.size() < 2) throw new EvalError("map: expected at least 2 arguments");
+            Object proc = args.get(0);
+            List<Object> lists = new ArrayList<>();
+            for (int i = 1; i < args.size(); i++) lists.add(args.get(i));
+            List<Object> results = new ArrayList<>();
+            while (true) {
+                // Check if any list is exhausted
+                boolean done = false;
+                for (Object lst : lists) {
+                    if (!(lst instanceof SchemePair)) { done = true; break; }
+                }
+                if (done) break;
+                List<Object> callArgs = new ArrayList<>();
+                List<Object> newLists = new ArrayList<>();
+                for (Object lst : lists) {
+                    SchemePair p = (SchemePair) lst;
+                    callArgs.add(p.car);
+                    newLists.add(p.cdr);
+                }
+                results.add(apply(proc, callArgs));
+                lists = newLists;
+            }
+            Object result = NIL;
+            for (int i = results.size() - 1; i >= 0; i--) {
+                result = new SchemePair(results.get(i), result);
+            }
+            return result;
+        }));
+
+        // L09: Numeric utilities
+        env.define("abs", new BuiltinProc("abs", args -> {
+            requireArgCount("abs", args, 1);
+            return Math.abs(requireLong(args.get(0), "abs"));
+        }));
+        env.define("modulo", new BuiltinProc("modulo", args -> {
+            requireArgCount("modulo", args, 2);
+            long a = requireLong(args.get(0), "modulo");
+            long b = requireLong(args.get(1), "modulo");
+            return Math.floorMod(a, b);
+        }));
+        env.define("remainder", new BuiltinProc("remainder", args -> {
+            requireArgCount("remainder", args, 2);
+            long a = requireLong(args.get(0), "remainder");
+            long b = requireLong(args.get(1), "remainder");
+            return a % b;
+        }));
+        env.define("quotient", new BuiltinProc("quotient", args -> {
+            requireArgCount("quotient", args, 2);
+            long a = requireLong(args.get(0), "quotient");
+            long b = requireLong(args.get(1), "quotient");
+            // Truncate toward zero (Java's default behavior)
+            return a / b;
+        }));
+        env.define("min", new BuiltinProc("min", args -> {
+            if (args.isEmpty()) throw new EvalError("min: need at least 1 argument");
+            long result = requireLong(args.get(0), "min");
+            for (int i = 1; i < args.size(); i++) {
+                long v = requireLong(args.get(i), "min");
+                if (v < result) result = v;
+            }
+            return result;
+        }));
+        env.define("max", new BuiltinProc("max", args -> {
+            if (args.isEmpty()) throw new EvalError("max: need at least 1 argument");
+            long result = requireLong(args.get(0), "max");
+            for (int i = 1; i < args.size(); i++) {
+                long v = requireLong(args.get(i), "max");
+                if (v > result) result = v;
+            }
+            return result;
+        }));
+        env.define("expt", new BuiltinProc("expt", args -> {
+            requireArgCount("expt", args, 2);
+            long base = requireLong(args.get(0), "expt");
+            long exp = requireLong(args.get(1), "expt");
+            long result = 1;
+            for (long i = 0; i < exp; i++) result *= base;
+            return result;
+        }));
+
+        // L09: Numeric predicates
+        env.define("zero?", new BuiltinProc("zero?", args -> {
+            requireArgCount("zero?", args, 1);
+            return requireLong(args.get(0), "zero?") == 0;
+        }));
+        env.define("positive?", new BuiltinProc("positive?", args -> {
+            requireArgCount("positive?", args, 1);
+            return requireLong(args.get(0), "positive?") > 0;
+        }));
+        env.define("negative?", new BuiltinProc("negative?", args -> {
+            requireArgCount("negative?", args, 1);
+            return requireLong(args.get(0), "negative?") < 0;
+        }));
+        env.define("odd?", new BuiltinProc("odd?", args -> {
+            requireArgCount("odd?", args, 1);
+            return requireLong(args.get(0), "odd?") % 2 != 0;
+        }));
+        env.define("even?", new BuiltinProc("even?", args -> {
+            requireArgCount("even?", args, 1);
+            return requireLong(args.get(0), "even?") % 2 == 0;
+        }));
+
+        // L09: List utilities
+        env.define("list-ref", new BuiltinProc("list-ref", args -> {
+            requireArgCount("list-ref", args, 2);
+            int idx = (int) requireLong(args.get(1), "list-ref");
+            Object lst = args.get(0);
+            for (int i = 0; i < idx; i++) {
+                if (!(lst instanceof SchemePair p)) throw new EvalError("list-ref: index out of range");
+                lst = p.cdr;
+            }
+            if (!(lst instanceof SchemePair p)) throw new EvalError("list-ref: index out of range");
+            return p.car;
+        }));
+        env.define("list-tail", new BuiltinProc("list-tail", args -> {
+            requireArgCount("list-tail", args, 2);
+            int idx = (int) requireLong(args.get(1), "list-tail");
+            Object lst = args.get(0);
+            for (int i = 0; i < idx; i++) {
+                if (!(lst instanceof SchemePair p)) throw new EvalError("list-tail: index out of range");
+                lst = p.cdr;
+            }
+            return lst;
+        }));
+        env.define("list?", new BuiltinProc("list?", args -> {
+            requireArgCount("list?", args, 1);
+            Object lst = args.get(0);
+            while (lst instanceof SchemePair p) {
+                lst = p.cdr;
+            }
+            return lst == NIL;
+        }));
+        env.define("assoc", new BuiltinProc("assoc", args -> {
+            requireArgCount("assoc", args, 2);
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof SchemePair p) {
+                if (p.car instanceof SchemePair entry) {
+                    if (schemeEqual(key, entry.car)) return entry;
+                }
+                lst = p.cdr;
+            }
+            return false;
+        }));
+
+        // L09: Character operations
+        env.define("char-alphabetic?", new BuiltinProc("char-alphabetic?", args -> {
+            requireArgCount("char-alphabetic?", args, 1);
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-alphabetic?: not a character");
+            return Character.isLetter(c.value);
+        }));
+        env.define("char-numeric?", new BuiltinProc("char-numeric?", args -> {
+            requireArgCount("char-numeric?", args, 1);
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-numeric?: not a character");
+            return Character.isDigit(c.value);
+        }));
+        env.define("char-upcase", new BuiltinProc("char-upcase", args -> {
+            requireArgCount("char-upcase", args, 1);
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-upcase: not a character");
+            return new SchemeChar(Character.toUpperCase(c.value));
+        }));
+        env.define("char-downcase", new BuiltinProc("char-downcase", args -> {
+            requireArgCount("char-downcase", args, 1);
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-downcase: not a character");
+            return new SchemeChar(Character.toLowerCase(c.value));
+        }));
+        env.define("char=?", new BuiltinProc("char=?", args -> {
+            requireArgCount("char=?", args, 2);
+            if (!(args.get(0) instanceof SchemeChar a)) throw new EvalError("char=?: not a character");
+            if (!(args.get(1) instanceof SchemeChar b)) throw new EvalError("char=?: not a character");
+            return a.value == b.value;
+        }));
+        env.define("char<?", new BuiltinProc("char<?", args -> {
+            requireArgCount("char<?", args, 2);
+            if (!(args.get(0) instanceof SchemeChar a)) throw new EvalError("char<?: not a character");
+            if (!(args.get(1) instanceof SchemeChar b)) throw new EvalError("char<?: not a character");
+            return a.value < b.value;
+        }));
+
+        // L09: String comparison/case operations
+        env.define("string=?", new BuiltinProc("string=?", args -> {
+            requireArgCount("string=?", args, 2);
+            if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string=?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string=?: not a string");
+            return a.value.equals(b.value);
+        }));
+        env.define("string<?", new BuiltinProc("string<?", args -> {
+            requireArgCount("string<?", args, 2);
+            if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string<?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string<?: not a string");
+            return a.value.compareTo(b.value) < 0;
+        }));
+        env.define("string-ci=?", new BuiltinProc("string-ci=?", args -> {
+            requireArgCount("string-ci=?", args, 2);
+            if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string-ci=?: not a string");
+            if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string-ci=?: not a string");
+            return a.value.equalsIgnoreCase(b.value);
+        }));
+        env.define("string-upcase", new BuiltinProc("string-upcase", args -> {
+            requireArgCount("string-upcase", args, 1);
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-upcase: not a string");
+            return new SchemeString(s.value.toUpperCase());
+        }));
+        env.define("string-downcase", new BuiltinProc("string-downcase", args -> {
+            requireArgCount("string-downcase", args, 1);
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-downcase: not a string");
+            return new SchemeString(s.value.toLowerCase());
+        }));
+
+        // L09: >=
+        env.define(">=", new BuiltinProc(">=", args -> {
+            requireArgCount(">=", args, 2);
+            return requireLong(args.get(0), ">=") >= requireLong(args.get(1), ">=");
+        }));
+    }
+
+    private boolean schemeEqual(Object a, Object b) {
+        if (a == b) return true;
+        if (a == null || b == null) return a == b;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value.equals(sb.value);
+        if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name.equals(sb.name);
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value == cb.value;
+        if (a instanceof SchemePair pa && b instanceof SchemePair pb) {
+            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        }
+        return false;
     }
 
     private long requireLong(Object val, String op) throws EvalError {
@@ -830,7 +1077,14 @@ public class Evaluator {
             sb.append(")");
             return sb.toString();
         }
-        if (val instanceof SchemeChar c) return "#\\" + c.value;
+        if (val instanceof SchemeChar c) {
+            return switch (c.value) {
+                case ' ' -> "#\\space";
+                case '\n' -> "#\\newline";
+                case '\t' -> "#\\tab";
+                default -> "#\\" + c.value;
+            };
+        }
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         return val.toString();
