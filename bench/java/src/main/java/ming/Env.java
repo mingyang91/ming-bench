@@ -181,6 +181,11 @@ class Env {
             requireArgCount("pair?", args, 1);
             return args.get(0) instanceof Pair;
         }));
+        env.define("procedure?", Builtin.named("procedure?", args -> {
+            requireArgCount("procedure?", args, 1);
+            Object a = args.get(0);
+            return a instanceof Builtin || a instanceof Lambda || a instanceof CaseLambda;
+        }));
         env.define("symbol?", Builtin.named("symbol?", args -> {
             requireArgCount("symbol?", args, 1);
             return args.get(0) instanceof String s && !s.startsWith("\"");

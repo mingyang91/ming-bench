@@ -55,6 +55,7 @@ class SchemeValue {
         }
         if (val instanceof Builtin b) return "#<procedure " + b.name() + ">";
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         return val.toString();
     }
 

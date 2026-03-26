@@ -127,6 +127,9 @@ public class Evaluator {
                 case "define-record-type" -> {
                     return evalDefineRecordType(list, env);
                 }
+                case "case-lambda" -> {
+                    return evalCaseLambda(list, env);
+                }
                 case "define-syntax" -> {
                     if (list.size() != 3) throw new EvalError("define-syntax: bad syntax");
                     if (!(list.get(1) instanceof String name) || name.startsWith("\""))
@@ -369,6 +372,38 @@ public class Evaluator {
         return null; // void
     }
 
+    private static Object evalCaseLambda(List<?> list, Env env) throws EvalError {
+        List<Lambda> clauses = new ArrayList<>();
+        for (int i = 1; i < list.size(); i++) {
+            if (!(list.get(i) instanceof List<?> clause) || clause.size() < 2)
+                throw new EvalError("case-lambda: bad clause");
+            Object paramSpec = clause.get(0);
+            if (!(paramSpec instanceof List<?> paramList))
+                throw new EvalError("case-lambda: parameters must be a list");
+            List<String> params = new ArrayList<>();
+            String restParam = null;
+            for (int j = 0; j < paramList.size(); j++) {
+                if (!(paramList.get(j) instanceof String s))
+                    throw new EvalError("case-lambda: parameter must be symbol");
+                if (s.equals(".")) {
+                    if (j + 2 != paramList.size())
+                        throw new EvalError("case-lambda: bad dot syntax");
+                    if (!(paramList.get(j + 1) instanceof String rp))
+                        throw new EvalError("case-lambda: parameter must be symbol");
+                    restParam = rp;
+                    break;
+                }
+                params.add(s);
+            }
+            List<Object> body = new ArrayList<>();
+            for (int j = 1; j < clause.size(); j++) {
+                body.add(clause.get(j));
+            }
+            clauses.add(new Lambda(params, restParam, body, env));
+        }
+        return new CaseLambda(clauses);
+    }
+
     static boolean isFalse(Object val) {
         return val instanceof Boolean b && !b;
     }
@@ -376,6 +411,16 @@ public class Evaluator {
     static Object applyProc(Object func, List<Object> args) throws EvalError {
         if (func instanceof Builtin b) {
             return b.apply(args);
+        }
+        if (func instanceof CaseLambda cl) {
+            for (Lambda lam : cl.clauses) {
+                if (lam.restParam != null) {
+                    if (args.size() >= lam.params.size()) return applyProc(lam, args);
+                } else {
+                    if (args.size() == lam.params.size()) return applyProc(lam, args);
+                }
+            }
+            throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
         }
         if (func instanceof Lambda lam) {
             if (lam.restParam == null) {
