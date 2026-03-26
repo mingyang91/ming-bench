@@ -91,6 +91,7 @@ public class Evaluator {
         environment.define("string-copy", new PrimitiveProcedureValue("string-copy", this::applyStringCopy));
         environment.define("string-set!", new PrimitiveProcedureValue("string-set!", this::applyStringSet));
         environment.define("char?", new PrimitiveProcedureValue("char?", this::applyCharPredicate));
+        environment.define("apply", new PrimitiveProcedureValue("apply", this::applyApply));
         return environment;
     }
 
@@ -180,13 +181,14 @@ public class Evaluator {
                 throw new EvalError("define expected a function body");
             }
 
-            List<String> parameters = parseParameterNames(
+            ParameterSpec parameters = parseParameterSpec(
                     signatureElements.subList(1, signatureElements.size()),
                     "define");
             List<Expr> body = arguments.subList(1, arguments.size());
             Value procedure = new LambdaProcedureValue(
                     functionName.name(),
-                    parameters,
+                    parameters.fixedParameters(),
+                    parameters.restParameter(),
                     body,
                     environment);
             environment.define(functionName.name(), procedure);
@@ -226,14 +228,14 @@ public class Evaluator {
             throw new EvalError("lambda expected parameters and a body");
         }
 
-        Expr parametersExpression = arguments.getFirst();
-        if (!(parametersExpression instanceof ListExpr parametersList)) {
-            throw new EvalError("lambda parameters must be a list");
-        }
-
-        List<String> parameters = parseParameterNames(parametersList.elements(), "lambda");
+        ParameterSpec parameters = parseParameterSpec(arguments.getFirst(), "lambda");
         List<Expr> body = arguments.subList(1, arguments.size());
-        return new LambdaProcedureValue(null, parameters, body, environment);
+        return new LambdaProcedureValue(
+                null,
+                parameters.fixedParameters(),
+                parameters.restParameter(),
+                body,
+                environment);
     }
 
     private Value evalBegin(List<Expr> arguments, Environment environment) throws EvalError {
@@ -312,6 +314,7 @@ public class Evaluator {
         LambdaProcedureValue procedure = new LambdaProcedureValue(
                 name,
                 List.copyOf(parameters),
+                null,
                 body,
                 localEnvironment);
         localEnvironment.define(name, procedure);
@@ -351,16 +354,41 @@ public class Evaluator {
         return List.copyOf(bindings);
     }
 
-    private List<String> parseParameterNames(List<Expr> parameterExpressions, String formName)
+    private ParameterSpec parseParameterSpec(Expr parametersExpression, String formName)
+            throws EvalError {
+        if (!(parametersExpression instanceof ListExpr parametersList)) {
+            throw new EvalError(formName + " parameters must be a list");
+        }
+        return parseParameterSpec(parametersList.elements(), formName);
+    }
+
+    private ParameterSpec parseParameterSpec(List<Expr> parameterExpressions, String formName)
             throws EvalError {
         List<String> parameterNames = new ArrayList<>(parameterExpressions.size());
-        for (Expr parameterExpression : parameterExpressions) {
+        String restParameter = null;
+
+        for (int i = 0; i < parameterExpressions.size(); i++) {
+            Expr parameterExpression = parameterExpressions.get(i);
+            if (parameterExpression instanceof SymbolExpr symbolExpr && ".".equals(symbolExpr.name())) {
+                if (i != parameterExpressions.size() - 2) {
+                    throw new EvalError(formName + " parameters use invalid dotted form");
+                }
+
+                Expr restExpression = parameterExpressions.get(i + 1);
+                if (!(restExpression instanceof SymbolExpr restSymbol) || ".".equals(restSymbol.name())) {
+                    throw new EvalError(formName + " parameters must be symbols");
+                }
+                restParameter = restSymbol.name();
+                break;
+            }
+
             if (!(parameterExpression instanceof SymbolExpr symbolExpr)) {
                 throw new EvalError(formName + " parameters must be symbols");
             }
             parameterNames.add(symbolExpr.name());
         }
-        return List.copyOf(parameterNames);
+
+        return new ParameterSpec(List.copyOf(parameterNames), restParameter);
     }
 
     private Value quote(Expr expression) throws EvalError {
@@ -577,6 +605,23 @@ public class Evaluator {
     private Value applyCharPredicate(List<Value> arguments) throws EvalError {
         requireExactArity("char?", arguments.size(), 1);
         return new BoolValue(arguments.getFirst() instanceof CharValue);
+    }
+
+    private Value applyApply(List<Value> arguments) throws EvalError {
+        requireMinimumArity("apply", arguments.size(), 2);
+
+        Value operator = arguments.getFirst();
+        if (!(operator instanceof ProcedureValue procedure)) {
+            throw new EvalError("attempted to call non-procedure");
+        }
+
+        List<Value> spreadArguments = expectList(arguments.getLast(), "apply");
+        List<Value> flattenedArguments = new ArrayList<>(arguments.size() - 2 + spreadArguments.size());
+        for (int i = 1; i < arguments.size() - 1; i++) {
+            flattenedArguments.add(arguments.get(i));
+        }
+        flattenedArguments.addAll(spreadArguments);
+        return procedure.apply(List.copyOf(flattenedArguments), this);
     }
 
     private Value applyAdd(List<Value> arguments) throws EvalError {

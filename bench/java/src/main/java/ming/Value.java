@@ -146,29 +146,41 @@ record PrimitiveProcedureValue(String name, PrimitiveImplementation implementati
 final class LambdaProcedureValue implements ProcedureValue {
     private final String name;
     private final List<String> parameters;
+    private final String restParameter;
     private final List<Expr> body;
     private final Environment definingEnvironment;
 
     LambdaProcedureValue(String name,
                          List<String> parameters,
+                         String restParameter,
                          List<Expr> body,
                          Environment definingEnvironment) {
         this.name = name;
         this.parameters = List.copyOf(parameters);
+        this.restParameter = restParameter;
         this.body = List.copyOf(body);
         this.definingEnvironment = definingEnvironment;
     }
 
     @Override
     public Value apply(List<Value> arguments, Evaluator evaluator) throws EvalError {
-        if (arguments.size() != parameters.size()) {
+        if (restParameter == null && arguments.size() != parameters.size()) {
             String procedureName = name == null ? "lambda" : name;
             throw new EvalError(procedureName + " expected " + parameters.size() + " argument(s)");
+        }
+        if (restParameter != null && arguments.size() < parameters.size()) {
+            String procedureName = name == null ? "lambda" : name;
+            throw new EvalError(procedureName + " expected at least " + parameters.size() + " argument(s)");
         }
 
         Environment callEnvironment = new Environment(definingEnvironment);
         for (int i = 0; i < parameters.size(); i++) {
             callEnvironment.define(parameters.get(i), arguments.get(i));
+        }
+        if (restParameter != null) {
+            callEnvironment.define(
+                    restParameter,
+                    new ListValue(List.copyOf(arguments.subList(parameters.size(), arguments.size()))));
         }
 
         return evaluator.evalSequence(body, callEnvironment);

@@ -68,9 +68,15 @@ enum Procedure {
 #[derive(Clone)]
 struct LambdaProcedure {
     name: Option<String>,
-    parameters: Vec<String>,
+    parameters: ParameterSpec,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct ParameterSpec {
+    required: Vec<String>,
+    rest: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +104,7 @@ enum Primitive {
     SymbolPredicate,
     StringCopy,
     StringSet,
+    Apply,
 }
 
 impl Primitive {
@@ -126,6 +133,7 @@ impl Primitive {
             Self::SymbolPredicate => "symbol?",
             Self::StringCopy => "string-copy",
             Self::StringSet => "string-set!",
+            Self::Apply => "apply",
         }
     }
 }
@@ -189,6 +197,7 @@ fn global_environment() -> EnvRef {
     define_primitive(&environment, "symbol?", Primitive::SymbolPredicate);
     define_primitive(&environment, "string-copy", Primitive::StringCopy);
     define_primitive(&environment, "string-set!", Primitive::StringSet);
+    define_primitive(&environment, "apply", Primitive::Apply);
     environment
 }
 
@@ -280,11 +289,32 @@ fn apply_lambda(
     call_pos: Position,
 ) -> Result<Value, EvalError> {
     let name = lambda.name.as_deref().unwrap_or("lambda");
-    require_exact_arity(name, arguments.len(), lambda.parameters.len(), call_pos)?;
+    if lambda.parameters.rest.is_some() {
+        require_min_arity(
+            name,
+            arguments.len(),
+            lambda.parameters.required.len(),
+            call_pos,
+        )?;
+    } else {
+        require_exact_arity(
+            name,
+            arguments.len(),
+            lambda.parameters.required.len(),
+            call_pos,
+        )?;
+    }
 
     let call_environment = Environment::new(Some(lambda.env.clone()));
-    for (parameter, argument) in lambda.parameters.iter().zip(arguments.into_iter()) {
+    let mut argument_iter = arguments.into_iter();
+    for parameter in &lambda.parameters.required {
+        let argument = argument_iter
+            .next()
+            .expect("lambda arity check should ensure required arguments");
         call_environment.define(parameter, argument);
+    }
+    if let Some(rest_parameter) = &lambda.parameters.rest {
+        call_environment.define(rest_parameter, Value::List(argument_iter.collect()));
     }
 
     eval_sequence(&lambda.body, &call_environment)
@@ -421,6 +451,35 @@ fn apply_primitive(
             string[index] = value;
             Ok(Value::Void)
         }
+        Primitive::Apply => {
+            require_min_arity(primitive.name(), arguments.len(), 2, call_pos)?;
+
+            let mut arguments = arguments.into_iter();
+            let procedure_value = arguments
+                .next()
+                .expect("apply arity check should ensure a procedure argument");
+            let Value::Procedure(procedure) = procedure_value else {
+                return Err(EvalError::not_a_procedure(
+                    procedure_value.render(),
+                    call_pos,
+                ));
+            };
+
+            let mut applied_arguments: Vec<Value> = arguments.collect();
+            let tail_arguments = match applied_arguments.pop() {
+                Some(Value::List(elements)) => elements,
+                Some(_) => {
+                    return Err(EvalError::type_mismatch(
+                        "apply expects a list as its final argument",
+                        call_pos,
+                    ))
+                }
+                None => unreachable!("apply arity check should ensure a final list argument"),
+            };
+            applied_arguments.extend(tail_arguments);
+
+            apply_procedure(procedure.as_ref(), applied_arguments, call_pos)
+        }
     }
 }
 
@@ -483,7 +542,7 @@ fn eval_define(
                 return Err(EvalError::syntax("define expected a function body", pos));
             }
 
-            let parameters = parse_parameter_names(&signature[1..], "define")?;
+            let parameters = parse_parameter_spec_from_slice(&signature[1..], "define")?;
             let procedure = Value::Procedure(Rc::new(Procedure::Lambda(LambdaProcedure {
                 name: Some(name.clone()),
                 parameters,
@@ -528,14 +587,7 @@ fn eval_lambda(
         ));
     }
 
-    let ExprKind::List(parameters_expr) = &arguments[0].kind else {
-        return Err(EvalError::syntax(
-            "lambda parameters must be a list",
-            arguments[0].pos,
-        ));
-    };
-
-    let parameters = parse_parameter_names(parameters_expr, "lambda")?;
+    let parameters = parse_parameter_spec(&arguments[0], "lambda")?;
     Ok(Value::Procedure(Rc::new(Procedure::Lambda(
         LambdaProcedure {
             name: None,
@@ -630,7 +682,10 @@ fn eval_named_let(
     let local_environment = Environment::new(Some(environment.clone()));
     let procedure = Rc::new(Procedure::Lambda(LambdaProcedure {
         name: Some(name.to_string()),
-        parameters,
+        parameters: ParameterSpec {
+            required: parameters,
+            rest: None,
+        },
         body: arguments[1..].to_vec(),
         env: local_environment.clone(),
     }));
@@ -684,18 +739,67 @@ fn parse_bindings(bindings_expression: &Expr, form_name: &str) -> Result<Vec<Bin
     Ok(parsed)
 }
 
-fn parse_parameter_names(parameters: &[Expr], form_name: &str) -> Result<Vec<String>, EvalError> {
-    let mut names = Vec::with_capacity(parameters.len());
-    for parameter in parameters {
-        let ExprKind::Symbol(name) = &parameter.kind else {
-            return Err(EvalError::syntax(
-                format!("{form_name} parameters must be symbols"),
-                parameter.pos,
-            ));
-        };
-        names.push(name.clone());
+fn parse_parameter_spec(
+    parameters_expr: &Expr,
+    form_name: &str,
+) -> Result<ParameterSpec, EvalError> {
+    match &parameters_expr.kind {
+        ExprKind::List(parameters) => parse_parameter_spec_from_slice(parameters, form_name),
+        ExprKind::Symbol(name) => Ok(ParameterSpec {
+            required: Vec::new(),
+            rest: Some(name.clone()),
+        }),
+        _ => Err(EvalError::syntax(
+            format!("{form_name} parameters must be a list or symbol"),
+            parameters_expr.pos,
+        )),
     }
-    Ok(names)
+}
+
+fn parse_parameter_spec_from_slice(
+    parameters: &[Expr],
+    form_name: &str,
+) -> Result<ParameterSpec, EvalError> {
+    let mut required = Vec::with_capacity(parameters.len());
+    let mut rest = None;
+    let mut index = 0;
+
+    while index < parameters.len() {
+        match &parameters[index].kind {
+            ExprKind::Symbol(name) if name == "." => {
+                let Some(rest_parameter) = parameters.get(index + 1) else {
+                    return Err(EvalError::syntax(
+                        format!("{form_name} expected a rest parameter after '.'"),
+                        parameters[index].pos,
+                    ));
+                };
+                let ExprKind::Symbol(rest_name) = &rest_parameter.kind else {
+                    return Err(EvalError::syntax(
+                        format!("{form_name} rest parameter must be a symbol"),
+                        rest_parameter.pos,
+                    ));
+                };
+                if index + 2 != parameters.len() {
+                    return Err(EvalError::syntax(
+                        format!("{form_name} expected '.' before the final parameter"),
+                        parameters[index + 2].pos,
+                    ));
+                }
+                rest = Some(rest_name.clone());
+                break;
+            }
+            ExprKind::Symbol(name) => required.push(name.clone()),
+            _ => {
+                return Err(EvalError::syntax(
+                    format!("{form_name} parameters must be symbols"),
+                    parameters[index].pos,
+                ))
+            }
+        }
+        index += 1;
+    }
+
+    Ok(ParameterSpec { required, rest })
 }
 
 fn quote(expression: &Expr) -> Result<Value, EvalError> {
