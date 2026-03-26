@@ -208,12 +208,17 @@ func installBuiltins(env *environment) {
 		"+", "-", "*", "/", "<", ">", "=", "<=", "not",
 		"cons", "car", "cdr", "null?", "list", "length", "append",
 		"string?", "number?", "boolean?", "pair?", "symbol?",
-		"apply",
+		"apply", "eq?", "equal?",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",
 		"string->number", "number->string",
 		"symbol->string", "string->symbol",
 		"string-ref", "string-copy", "string-set!", "char?",
+		"abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+		"zero?", "positive?", "negative?", "odd?", "even?",
+		"list-ref", "list-tail", "list?", "assoc", "map",
+		"char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase", "char=?", "char<?",
+		"string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
 	} {
 		name := name
 		env.define(name, &builtinProcedure{
@@ -705,6 +710,18 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		callArgs = append(callArgs, listArgs...)
 		return applyProcedure(i, args[0], callArgs, pos)
 
+	case "eq?":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		return eqValues(args[0], args[1]), nil
+
+	case "equal?":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		return equalValues(args[0], args[1]), nil
+
 	case "+":
 		total := 0
 		for _, arg := range args {
@@ -769,6 +786,139 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return result, nil
 
+	case "abs":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if value < 0 {
+			return -value, nil
+		}
+		return value, nil
+
+	case "quotient":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		dividend, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		divisor, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if divisor == 0 {
+			return nil, newEvalError(pos, "division by zero")
+		}
+		return dividend / divisor, nil
+
+	case "remainder":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		dividend, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		divisor, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if divisor == 0 {
+			return nil, newEvalError(pos, "division by zero")
+		}
+		return dividend % divisor, nil
+
+	case "modulo":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		dividend, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		divisor, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if divisor == 0 {
+			return nil, newEvalError(pos, "division by zero")
+		}
+		remainder := dividend % divisor
+		if remainder != 0 && ((remainder > 0 && divisor < 0) || (remainder < 0 && divisor > 0)) {
+			remainder += divisor
+		}
+		return remainder, nil
+
+	case "min":
+		if len(args) == 0 {
+			return nil, newEvalError(pos, "%s expects at least 1 argument", name)
+		}
+		best, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		for _, arg := range args[1:] {
+			value, err := expectInt(arg, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			if value < best {
+				best = value
+			}
+		}
+		return best, nil
+
+	case "max":
+		if len(args) == 0 {
+			return nil, newEvalError(pos, "%s expects at least 1 argument", name)
+		}
+		best, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		for _, arg := range args[1:] {
+			value, err := expectInt(arg, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			if value > best {
+				best = value
+			}
+		}
+		return best, nil
+
+	case "expt":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		base, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		exponent, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if exponent < 0 {
+			return nil, newEvalError(pos, "%s expects a non-negative exponent", name)
+		}
+		result := 1
+		for exponent > 0 {
+			if exponent%2 == 1 {
+				result *= base
+			}
+			exponent /= 2
+			if exponent > 0 {
+				base *= base
+			}
+		}
+		return result, nil
+
 	case "<":
 		return numericCompare(name, args, pos, func(a, b int) bool { return a < b })
 	case ">":
@@ -777,6 +927,56 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		return numericCompare(name, args, pos, func(a, b int) bool { return a == b })
 	case "<=":
 		return numericCompare(name, args, pos, func(a, b int) bool { return a <= b })
+
+	case "zero?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return value == 0, nil
+
+	case "positive?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return value > 0, nil
+
+	case "negative?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return value < 0, nil
+
+	case "odd?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return value%2 != 0, nil
+
+	case "even?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return value%2 == 0, nil
 	case "not":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
@@ -848,6 +1048,91 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			}
 		}
 		return result, nil
+
+	case "list-ref":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		index, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		tail, err := listTailAt(args[0], index, pos, name)
+		if err != nil {
+			return nil, err
+		}
+		pair, ok := tail.(*pairValue)
+		if !ok {
+			return nil, newEvalError(pos, "%s index out of range", name)
+		}
+		return pair.car, nil
+
+	case "list-tail":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		index, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return listTailAt(args[0], index, pos, name)
+
+	case "list?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		return isProperList(args[0]), nil
+
+	case "assoc":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		elements, err := listElements(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		for _, element := range elements {
+			pair, ok := element.(*pairValue)
+			if !ok {
+				return nil, newEvalError(pos, "%s expects an association list", name)
+			}
+			if equalValues(args[0], pair.car) {
+				return element, nil
+			}
+		}
+		return false, nil
+
+	case "map":
+		if len(args) < 2 {
+			return nil, newEvalError(pos, "%s expects at least 2 arguments", name)
+		}
+		lists := make([][]any, len(args)-1)
+		expectedLen := -1
+		for index, arg := range args[1:] {
+			elements, err := listElements(arg, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			if expectedLen == -1 {
+				expectedLen = len(elements)
+			} else if len(elements) != expectedLen {
+				return nil, newEvalError(pos, "%s expects lists of equal length", name)
+			}
+			lists[index] = elements
+		}
+		results := make([]any, 0, expectedLen)
+		callArgs := make([]any, len(lists))
+		for index := 0; index < expectedLen; index++ {
+			for listIndex := range lists {
+				callArgs[listIndex] = lists[listIndex][index]
+			}
+			result, err := applyProcedure(i, args[0], callArgs, pos)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, result)
+		}
+		return buildList(results), nil
 
 	case "string?":
 		if len(args) != 1 {
@@ -1024,6 +1309,35 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return newMutableString(text), nil
 
+	case "string=?":
+		return stringCompare(name, args, pos, func(a, b string) bool { return a == b })
+
+	case "string<?":
+		return stringCompare(name, args, pos, func(a, b string) bool { return compareStrings(a, b) < 0 })
+
+	case "string-ci=?":
+		return stringCompare(name, args, pos, func(a, b string) bool { return strings.EqualFold(a, b) })
+
+	case "string-upcase":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return stringValue(transformString(text, unicode.ToUpper)), nil
+
+	case "string-downcase":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return stringValue(transformString(text, unicode.ToLower)), nil
+
 	case "string-set!":
 		if len(args) != 3 {
 			return nil, newEvalError(pos, "%s expects exactly 3 arguments", name)
@@ -1052,6 +1366,52 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		_, ok := args[0].(charValue)
 		return ok, nil
+
+	case "char-alphabetic?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		ch, err := expectChar(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return unicode.IsLetter(rune(ch)), nil
+
+	case "char-numeric?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		ch, err := expectChar(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return unicode.IsDigit(rune(ch)), nil
+
+	case "char-upcase":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		ch, err := expectChar(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return charValue(unicode.ToUpper(rune(ch))), nil
+
+	case "char-downcase":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		ch, err := expectChar(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return charValue(unicode.ToLower(rune(ch))), nil
+
+	case "char=?":
+		return charCompare(name, args, pos, func(a, b rune) bool { return a == b })
+
+	case "char<?":
+		return charCompare(name, args, pos, func(a, b rune) bool { return a < b })
 	default:
 		return nil, newEvalError(pos, "unknown procedure: %s", name)
 	}
@@ -1079,6 +1439,213 @@ func numericCompare(name string, args []any, pos position, compare func(int, int
 	}
 
 	return true, nil
+}
+
+func charCompare(name string, args []any, pos position, compare func(rune, rune) bool) (bool, error) {
+	if len(args) < 2 {
+		return false, newEvalError(pos, "%s expects at least 2 arguments", name)
+	}
+
+	prev, err := expectChar(args[0], pos, name)
+	if err != nil {
+		return false, err
+	}
+
+	for _, arg := range args[1:] {
+		current, err := expectChar(arg, pos, name)
+		if err != nil {
+			return false, err
+		}
+		if !compare(rune(prev), rune(current)) {
+			return false, nil
+		}
+		prev = current
+	}
+
+	return true, nil
+}
+
+func stringCompare(name string, args []any, pos position, compare func(string, string) bool) (bool, error) {
+	if len(args) < 2 {
+		return false, newEvalError(pos, "%s expects at least 2 arguments", name)
+	}
+
+	prev, err := expectString(args[0], pos, name)
+	if err != nil {
+		return false, err
+	}
+
+	for _, arg := range args[1:] {
+		current, err := expectString(arg, pos, name)
+		if err != nil {
+			return false, err
+		}
+		if !compare(prev, current) {
+			return false, nil
+		}
+		prev = current
+	}
+
+	return true, nil
+}
+
+func compareStrings(left, right string) int {
+	leftRunes := []rune(left)
+	rightRunes := []rune(right)
+	limit := len(leftRunes)
+	if len(rightRunes) < limit {
+		limit = len(rightRunes)
+	}
+
+	for index := 0; index < limit; index++ {
+		if leftRunes[index] < rightRunes[index] {
+			return -1
+		}
+		if leftRunes[index] > rightRunes[index] {
+			return 1
+		}
+	}
+
+	switch {
+	case len(leftRunes) < len(rightRunes):
+		return -1
+	case len(leftRunes) > len(rightRunes):
+		return 1
+	default:
+		return 0
+	}
+}
+
+func transformString(text string, transform func(rune) rune) string {
+	runes := []rune(text)
+	for index, value := range runes {
+		runes[index] = transform(value)
+	}
+	return string(runes)
+}
+
+func listTailAt(value any, index int, pos position, procedure string) (any, error) {
+	if index < 0 {
+		return nil, newEvalError(pos, "%s index out of range", procedure)
+	}
+	if index == 0 {
+		switch value.(type) {
+		case emptyList, *pairValue:
+			return value, nil
+		default:
+			return nil, newEvalError(pos, "%s expects a list", procedure)
+		}
+	}
+
+	current := value
+	for step := 0; step < index; step++ {
+		pair, ok := current.(*pairValue)
+		if !ok {
+			return nil, newEvalError(pos, "%s index out of range", procedure)
+		}
+		current = pair.cdr
+	}
+
+	return current, nil
+}
+
+func isProperList(value any) bool {
+	for {
+		switch current := value.(type) {
+		case emptyList:
+			return true
+		case *pairValue:
+			value = current.cdr
+		default:
+			return false
+		}
+	}
+}
+
+func eqValues(left, right any) bool {
+	switch l := left.(type) {
+	case int:
+		r, ok := right.(int)
+		return ok && l == r
+	case bool:
+		r, ok := right.(bool)
+		return ok && l == r
+	case stringValue:
+		r, ok := right.(stringValue)
+		return ok && l == r
+	case symbolValue:
+		r, ok := right.(symbolValue)
+		return ok && l == r
+	case charValue:
+		r, ok := right.(charValue)
+		return ok && l == r
+	case emptyList:
+		_, ok := right.(emptyList)
+		return ok
+	case *mutableString:
+		r, ok := right.(*mutableString)
+		return ok && l == r
+	case *pairValue:
+		r, ok := right.(*pairValue)
+		return ok && l == r
+	case *builtinProcedure:
+		r, ok := right.(*builtinProcedure)
+		return ok && l == r
+	case *lambdaProcedure:
+		r, ok := right.(*lambdaProcedure)
+		return ok && l == r
+	default:
+		return false
+	}
+}
+
+func equalValues(left, right any) bool {
+	switch l := left.(type) {
+	case int:
+		r, ok := right.(int)
+		return ok && l == r
+	case bool:
+		r, ok := right.(bool)
+		return ok && l == r
+	case stringValue:
+		switch r := right.(type) {
+		case stringValue:
+			return l == r
+		case *mutableString:
+			return string(l) == r.String()
+		default:
+			return false
+		}
+	case *mutableString:
+		switch r := right.(type) {
+		case stringValue:
+			return l.String() == string(r)
+		case *mutableString:
+			return l.String() == r.String()
+		default:
+			return false
+		}
+	case symbolValue:
+		r, ok := right.(symbolValue)
+		return ok && l == r
+	case charValue:
+		r, ok := right.(charValue)
+		return ok && l == r
+	case emptyList:
+		_, ok := right.(emptyList)
+		return ok
+	case *pairValue:
+		r, ok := right.(*pairValue)
+		return ok && equalValues(l.car, r.car) && equalValues(l.cdr, r.cdr)
+	case *builtinProcedure:
+		r, ok := right.(*builtinProcedure)
+		return ok && l == r
+	case *lambdaProcedure:
+		r, ok := right.(*lambdaProcedure)
+		return ok && l == r
+	default:
+		return false
+	}
 }
 
 func expectInt(value any, pos position, procedure string) (int, error) {
