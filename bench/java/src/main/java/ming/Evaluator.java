@@ -47,7 +47,7 @@ public class Evaluator {
                     }
                     case "quote" -> {
                         if (list.size() != 2) throw new EvalError("quote: expected 1 argument");
-                        return list.get(1);
+                        return SchemeValue.quotedToScheme(list.get(1));
                     }
                     case "lambda" -> {
                         return evalLambda(list, env);
@@ -67,6 +67,19 @@ public class Evaluator {
                             if (!isFalse(result)) return result;
                         }
                         return result;
+                    }
+                    case "begin" -> {
+                        Object result = null;
+                        for (int i = 1; i < list.size(); i++) {
+                            result = eval(list.get(i), env);
+                        }
+                        return result;
+                    }
+                    case "let" -> {
+                        return evalLet(list, env);
+                    }
+                    case "cond" -> {
+                        return evalCond(list, env);
                     }
                 }
             }
@@ -138,6 +151,84 @@ public class Evaluator {
             body.add(list.get(i));
         }
         return new Lambda(params, body, env);
+    }
+
+    private static Object evalLet(List<?> list, Env env) throws EvalError {
+        if (list.size() < 3) throw new EvalError("let: bad syntax");
+        int offset = 1;
+        String name = null;
+
+        // Named let? (let name ((var init) ...) body ...)
+        if (list.get(1) instanceof String s && !s.startsWith("\"")) {
+            name = s;
+            offset = 2;
+        }
+
+        if (offset >= list.size()) throw new EvalError("let: bad syntax");
+        Object bindingsObj = list.get(offset);
+        if (!(bindingsObj instanceof List<?> bindings))
+            throw new EvalError("let: bindings must be a list");
+
+        List<String> params = new ArrayList<>();
+        List<Object> inits = new ArrayList<>();
+        for (Object b : bindings) {
+            if (!(b instanceof List<?> binding) || binding.size() != 2)
+                throw new EvalError("let: bad binding");
+            if (!(binding.get(0) instanceof String p))
+                throw new EvalError("let: binding name must be symbol");
+            params.add(p);
+            inits.add(eval(binding.get(1), env));
+        }
+
+        List<Object> body = new ArrayList<>();
+        for (int i = offset + 1; i < list.size(); i++) {
+            body.add(list.get(i));
+        }
+
+        if (name != null) {
+            // Named let: create recursive lambda
+            Env letEnv = new Env(env);
+            Lambda lambda = new Lambda(params, body, letEnv);
+            letEnv.define(name, lambda);
+            return applyProc(lambda, inits);
+        } else {
+            // Regular let
+            Env letEnv = new Env(env);
+            for (int i = 0; i < params.size(); i++) {
+                letEnv.define(params.get(i), inits.get(i));
+            }
+            Object result = null;
+            for (Object bodyExpr : body) {
+                result = eval(bodyExpr, letEnv);
+            }
+            return result;
+        }
+    }
+
+    private static Object evalCond(List<?> list, Env env) throws EvalError {
+        for (int i = 1; i < list.size(); i++) {
+            Object clause = list.get(i);
+            if (!(clause instanceof List<?> c) || c.isEmpty())
+                throw new EvalError("cond: bad clause");
+            Object test = c.get(0);
+            if (test instanceof String s && s.equals("else")) {
+                Object result = null;
+                for (int j = 1; j < c.size(); j++) {
+                    result = eval(c.get(j), env);
+                }
+                return result;
+            }
+            Object val = eval(test, env);
+            if (!isFalse(val)) {
+                if (c.size() == 1) return val;
+                Object result = null;
+                for (int j = 1; j < c.size(); j++) {
+                    result = eval(c.get(j), env);
+                }
+                return result;
+            }
+        }
+        return null; // void
     }
 
     static boolean isFalse(Object val) {
