@@ -2077,11 +2077,12 @@ function evaluateList(
     }
   }
 
-  return makeEvalAction(head, env, (operator) => (
-    evaluateArguments(args, env, (evaluatedArgs) => (
-      applyProcedure(operator, evaluatedArgs, head, runtime, cont)
-    ))
-  ));
+  return makeEvalAction(head, env, (operator) => {
+    const singleOperator = expectSingleValue(operator, head);
+    return evaluateArguments(args, env, (evaluatedArgs) => (
+      applyProcedure(singleOperator, evaluatedArgs, head, runtime, cont)
+    ));
+  });
 }
 
 function evalDefineSyntax(
@@ -3218,7 +3219,13 @@ function evaluateArguments(
 
   const expr = exprs[index];
   return makeEvalAction(expr, env, (value) => (
-    evaluateArguments(exprs, env, cont, index - 1, [{ expr, value }, ...evaluated])
+    evaluateArguments(
+      exprs,
+      env,
+      cont,
+      index - 1,
+      [{ expr, value: expectSingleValue(value, expr) }, ...evaluated],
+    )
   ));
 }
 
@@ -3403,6 +3410,16 @@ function makeValues(values: Value[]): Value {
 
 function valuesFromResult(value: Value): Value[] {
   return isMultipleValuesValue(value) ? value.values : [value];
+}
+
+function expectSingleValue(value: Value, expr: Expr): Value {
+  if (!isMultipleValuesValue(value)) {
+    return value;
+  }
+
+  throw new EvalError(
+    `${expr.line}:${expr.col}: expected exactly 1 value, received ${value.values.length}`,
+  );
 }
 
 function parseSyntaxRulesTransformer(

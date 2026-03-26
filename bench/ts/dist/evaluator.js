@@ -1367,7 +1367,10 @@ function evaluateList(expr, env, runtime, cont) {
                 return evalWithSyntax(args, head, env, runtime, cont);
         }
     }
-    return makeEvalAction(head, env, (operator) => (evaluateArguments(args, env, (evaluatedArgs) => (applyProcedure(operator, evaluatedArgs, head, runtime, cont)))));
+    return makeEvalAction(head, env, (operator) => {
+        const singleOperator = expectSingleValue(operator, head);
+        return evaluateArguments(args, env, (evaluatedArgs) => (applyProcedure(singleOperator, evaluatedArgs, head, runtime, cont)));
+    });
 }
 function evalDefineSyntax(args, head, env, runtime, cont) {
     if (args.length !== 2) {
@@ -2095,7 +2098,7 @@ function evaluateArguments(exprs, env, cont, index = exprs.length - 1, evaluated
         return cont(evaluated);
     }
     const expr = exprs[index];
-    return makeEvalAction(expr, env, (value) => (evaluateArguments(exprs, env, cont, index - 1, [{ expr, value }, ...evaluated])));
+    return makeEvalAction(expr, env, (value) => (evaluateArguments(exprs, env, cont, index - 1, [{ expr, value: expectSingleValue(value, expr) }, ...evaluated])));
 }
 function evaluateExpressions(exprs, env, cont, index = 0, values = []) {
     if (index >= exprs.length) {
@@ -2204,6 +2207,12 @@ function makeValues(values) {
 }
 function valuesFromResult(value) {
     return isMultipleValuesValue(value) ? value.values : [value];
+}
+function expectSingleValue(value, expr) {
+    if (!isMultipleValuesValue(value)) {
+        return value;
+    }
+    throw new EvalError(`${expr.line}:${expr.col}: expected exactly 1 value, received ${value.values.length}`);
 }
 function parseSyntaxRulesTransformer(expr, definitionEnv) {
     if (expr.type !== 'list' || exprSymbolName(expr.elements[0]) !== 'syntax-rules') {
