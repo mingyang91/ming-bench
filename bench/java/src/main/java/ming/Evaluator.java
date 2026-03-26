@@ -26,7 +26,8 @@ public class Evaluator {
                 "string->number", "number->string",
                 "symbol->string", "string->symbol",
                 "string-ref", "char?",
-                "string-copy", "string-set!"}) {
+                "string-copy", "string-set!",
+                "apply"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
     }
@@ -117,10 +118,12 @@ public class Evaluator {
 
     static final class Lambda {
         final List<String> params;
+        final String restParam; // null if no rest param
         final List<Object> body;
         final Env closureEnv;
-        Lambda(List<String> params, List<Object> body, Env closureEnv) {
+        Lambda(List<String> params, String restParam, List<Object> body, Env closureEnv) {
             this.params = params;
+            this.restParam = restParam;
             this.body = body;
             this.closureEnv = closureEnv;
         }
@@ -305,18 +308,26 @@ public class Evaluator {
                             return null;
                         }
                         if (target instanceof List<?> sig) {
-                            // (define (f params...) body...)
+                            // (define (f params...) body...) or (define (f x . rest) body...)
                             if (sig.isEmpty()) throw posError("define: bad syntax");
                             String name = (String) unwrap(sig.get(0));
                             List<String> params = new ArrayList<>();
+                            String restParam = null;
                             for (int i = 1; i < sig.size(); i++) {
-                                params.add((String) unwrap(sig.get(i)));
+                                String p = (String) unwrap(sig.get(i));
+                                if (p.equals(".")) {
+                                    if (i + 1 < sig.size()) {
+                                        restParam = (String) unwrap(sig.get(i + 1));
+                                    }
+                                    break;
+                                }
+                                params.add(p);
                             }
                             List<Object> body = new ArrayList<>();
                             for (int i = 2; i < list.size(); i++) {
                                 body.add(list.get(i));
                             }
-                            env.define(name, new Lambda(params, body, env));
+                            env.define(name, new Lambda(params, restParam, body, env));
                             return null;
                         }
                         throw posError("define: bad syntax");
@@ -324,12 +335,26 @@ public class Evaluator {
                     case "lambda" -> {
                         if (list.size() < 3) throw posError("lambda: bad syntax");
                         Object paramListRaw = unwrap(list.get(1));
-                        List<?> paramList = (List<?>) paramListRaw;
                         List<String> params = new ArrayList<>();
-                        for (Object p : paramList) params.add((String) unwrap(p));
+                        String restParam = null;
+                        if (paramListRaw instanceof List<?> paramList) {
+                            for (int i = 0; i < paramList.size(); i++) {
+                                String p = (String) unwrap(paramList.get(i));
+                                if (p.equals(".")) {
+                                    if (i + 1 < paramList.size()) {
+                                        restParam = (String) unwrap(paramList.get(i + 1));
+                                    }
+                                    break;
+                                }
+                                params.add(p);
+                            }
+                        } else if (paramListRaw instanceof String sym) {
+                            // (lambda args body...) — single rest param
+                            restParam = sym;
+                        }
                         List<Object> body = new ArrayList<>();
                         for (int i = 2; i < list.size(); i++) body.add(list.get(i));
-                        return new Lambda(params, body, env);
+                        return new Lambda(params, restParam, body, env);
                     }
                     case "and" -> { return evalAnd((List<Object>) list, env); }
                     case "or" -> { return evalOr((List<Object>) list, env); }
@@ -358,7 +383,7 @@ public class Evaluator {
                             List<Object> body2 = new ArrayList<>();
                             for (int i = 3; i < list.size(); i++) body2.add(list.get(i));
                             Env letEnv = new Env(env);
-                            Lambda loopLam = new Lambda(params, body2, letEnv);
+                            Lambda loopLam = new Lambda(params, null, body2, letEnv);
                             letEnv.define(namedLetName, loopLam);
                             List<Object> args2 = new ArrayList<>();
                             for (Object init : inits) args2.add(eval(init, env));
@@ -451,12 +476,25 @@ public class Evaluator {
             return applyBuiltin(bp.name, args);
         }
         if (proc instanceof Lambda lam) {
-            if (args.size() != lam.params.size()) {
-                throw posError("wrong number of arguments: expected " + lam.params.size() + ", got " + args.size());
+            if (lam.restParam != null) {
+                if (args.size() < lam.params.size()) {
+                    throw posError("wrong number of arguments: expected at least " + lam.params.size() + ", got " + args.size());
+                }
+            } else {
+                if (args.size() != lam.params.size()) {
+                    throw posError("wrong number of arguments: expected " + lam.params.size() + ", got " + args.size());
+                }
             }
             Env callEnv = new Env(lam.closureEnv);
             for (int i = 0; i < lam.params.size(); i++) {
                 callEnv.define(lam.params.get(i), args.get(i));
+            }
+            if (lam.restParam != null) {
+                Object rest = NIL;
+                for (int i = args.size() - 1; i >= lam.params.size(); i--) {
+                    rest = new Pair(args.get(i), rest);
+                }
+                callEnv.define(lam.restParam, rest);
             }
             Object result = null;
             for (Object bodyExpr : lam.body) {
@@ -696,6 +734,22 @@ public class Evaluator {
                 chars[idx] = c.value;
                 s.value = new String(chars);
                 yield null; // void
+            }
+            case "apply" -> {
+                if (args.size() < 2) throw posError("apply: need at least 2 arguments");
+                Object proc = args.get(0);
+                // Collect prefix args, then flatten the last arg (a list)
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 1; i < args.size() - 1; i++) {
+                    callArgs.add(args.get(i));
+                }
+                Object lastArg = args.get(args.size() - 1);
+                Object cur = lastArg;
+                while (cur instanceof Pair p) {
+                    callArgs.add(p.car);
+                    cur = p.cdr;
+                }
+                yield apply(proc, callArgs);
             }
             default -> throw posError("unbound variable: " + name);
         };
