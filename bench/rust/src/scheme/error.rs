@@ -4,7 +4,12 @@
 /// error type is not possible — the `eval_str` signature requires this type.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
-    // Add variants as needed, e.g.:
-    // #[error("unbound variable: {name}")]
-    // UnboundVariable { name: String },
+    #[error("{0}")]
+    Message(String),
+}
+
+impl EvalError {
+    pub fn msg(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
 }

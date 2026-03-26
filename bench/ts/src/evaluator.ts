@@ -9,7 +9,8 @@ type ListExpr = { kind: 'list'; elements: Expr[] };
 type Expr = NumberExpr | BooleanExpr | StringExpr | SymbolExpr | ListExpr;
 
 type SymbolValue = { kind: 'symbol'; name: string };
-type ListValue = { kind: 'list'; elements: RuntimeValue[] };
+type NilValue = { kind: 'nil' };
+type PairValue = { kind: 'pair'; car: RuntimeValue; cdr: RuntimeValue };
 type BuiltinProcedure = { kind: 'builtin'; name: BuiltinName };
 type ClosureProcedure = { kind: 'closure'; params: string[]; body: Expr[]; env: Environment };
 type VoidValue = { kind: 'void' };
@@ -19,7 +20,8 @@ type RuntimeValue =
   | BooleanExpr
   | StringExpr
   | SymbolValue
-  | ListValue
+  | NilValue
+  | PairValue
   | BuiltinProcedure
   | ClosureProcedure
   | VoidValue;
@@ -27,11 +29,35 @@ type RuntimeValue =
 type Token =
   | { kind: 'paren'; value: '(' | ')' }
   | { kind: 'atom'; value: string }
-  | { kind: 'string'; value: string };
+  | { kind: 'string'; value: string }
+  | { kind: 'quote' };
 
-const BUILTIN_NAMES = ['+', '-', '*', '/', '<', '>', '=', '<=', 'not'] as const;
+const BUILTIN_NAMES = [
+  '+',
+  '-',
+  '*',
+  '/',
+  '<',
+  '>',
+  '=',
+  '<=',
+  'not',
+  'cons',
+  'car',
+  'cdr',
+  'null?',
+  'list',
+  'append',
+  'length',
+  'string?',
+  'number?',
+  'boolean?',
+  'pair?',
+  'symbol?',
+] as const;
 type BuiltinName = (typeof BUILTIN_NAMES)[number];
 
+const NIL_VALUE: NilValue = { kind: 'nil' };
 const VOID_VALUE: VoidValue = { kind: 'void' };
 
 class Environment {
@@ -143,6 +169,12 @@ function tokenize(input: string): Token[] {
       continue;
     }
 
+    if (char === "'") {
+      tokens.push({ kind: 'quote' });
+      index += 1;
+      continue;
+    }
+
     if (char === '"') {
       const parsed = parseStringToken(input, index);
       tokens.push({ kind: 'string', value: parsed.value });
@@ -224,6 +256,20 @@ function parseExpr(tokens: Token[], index: number): { expr: Expr; nextIndex: num
   const token = tokens[index];
   if (token === undefined) {
     throw new EvalError('unexpected end of input');
+  }
+
+  if (token.kind === 'quote') {
+    const parsed = parseExpr(tokens, index + 1);
+    return {
+      expr: {
+        kind: 'list',
+        elements: [
+          { kind: 'symbol', name: 'quote' },
+          parsed.expr,
+        ],
+      },
+      nextIndex: parsed.nextIndex,
+    };
   }
 
   if (token.kind === 'paren') {
@@ -314,6 +360,12 @@ function evaluateList(elements: Expr[], env: Environment): RuntimeValue {
         return evaluateAnd(argExprs, env);
       case 'or':
         return evaluateOr(argExprs, env);
+      case 'begin':
+        return evaluateBegin(argExprs, env);
+      case 'let':
+        return evaluateLet(argExprs, env);
+      case 'cond':
+        return evaluateCond(argExprs, env);
     }
   }
 
@@ -386,7 +438,7 @@ function quoteExpr(expr: Expr): RuntimeValue {
     case 'symbol':
       return { kind: 'symbol', name: expr.name };
     case 'list':
-      return { kind: 'list', elements: expr.elements.map((element) => quoteExpr(element)) };
+      return buildList(expr.elements.map((element) => quoteExpr(element)));
   }
 }
 
@@ -444,6 +496,115 @@ function evaluateOr(argExprs: Expr[], env: Environment): RuntimeValue {
   }
 
   return { kind: 'boolean', value: false };
+}
+
+function evaluateBegin(argExprs: Expr[], env: Environment): RuntimeValue {
+  return evaluateSequence(argExprs, env);
+}
+
+function evaluateLet(argExprs: Expr[], env: Environment): RuntimeValue {
+  if (argExprs.length < 2) {
+    throw new EvalError('let expects bindings and a body');
+  }
+
+  let name: string | undefined;
+  let bindingsExpr: Expr;
+  let body: Expr[];
+
+  if (argExprs[0].kind === 'symbol') {
+    if (argExprs.length < 3) {
+      throw new EvalError('named let expects a name, bindings, and a body');
+    }
+
+    name = argExprs[0].name;
+    bindingsExpr = argExprs[1];
+    body = argExprs.slice(2);
+  } else {
+    bindingsExpr = argExprs[0];
+    body = argExprs.slice(1);
+  }
+
+  const bindings = readLetBindings(bindingsExpr);
+  const values = bindings.initExprs.map((expr) => evaluateExpr(expr, env));
+
+  if (name === undefined) {
+    const letEnv = new Environment(env);
+    for (let index = 0; index < bindings.names.length; index += 1) {
+      letEnv.define(bindings.names[index], values[index]);
+    }
+
+    return evaluateSequence(body, letEnv);
+  }
+
+  const letEnv = new Environment(env);
+  const procedure: ClosureProcedure = {
+    kind: 'closure',
+    params: bindings.names,
+    body,
+    env: letEnv,
+  };
+  letEnv.define(name, procedure);
+  return applyClosure(procedure, values);
+}
+
+function readLetBindings(bindingsExpr: Expr): { names: string[]; initExprs: Expr[] } {
+  if (bindingsExpr.kind !== 'list') {
+    throw new EvalError('let bindings must be a list');
+  }
+
+  const names: string[] = [];
+  const initExprs: Expr[] = [];
+
+  for (const bindingExpr of bindingsExpr.elements) {
+    if (bindingExpr.kind !== 'list' || bindingExpr.elements.length !== 2) {
+      throw new EvalError('let bindings must contain (name value) pairs');
+    }
+
+    const [nameExpr, initExpr] = bindingExpr.elements;
+    if (nameExpr.kind !== 'symbol') {
+      throw new EvalError('let binding name must be a symbol');
+    }
+
+    names.push(nameExpr.name);
+    initExprs.push(initExpr);
+  }
+
+  return { names, initExprs };
+}
+
+function evaluateCond(argExprs: Expr[], env: Environment): RuntimeValue {
+  for (let index = 0; index < argExprs.length; index += 1) {
+    const clauseExpr = argExprs[index];
+    if (clauseExpr.kind !== 'list' || clauseExpr.elements.length === 0) {
+      throw new EvalError('cond clauses must be non-empty lists');
+    }
+
+    const [testExpr, ...body] = clauseExpr.elements;
+    const isElseClause = testExpr.kind === 'symbol' && testExpr.name === 'else';
+
+    if (isElseClause) {
+      if (index !== argExprs.length - 1) {
+        throw new EvalError('cond else clause must be last');
+      }
+      if (body.length === 0) {
+        throw new EvalError('cond else clause expects at least 1 expression');
+      }
+      return evaluateSequence(body, env);
+    }
+
+    const testValue = evaluateExpr(testExpr, env);
+    if (!isTruthy(testValue)) {
+      continue;
+    }
+
+    if (body.length === 0) {
+      return testValue;
+    }
+
+    return evaluateSequence(body, env);
+  }
+
+  return VOID_VALUE;
 }
 
 function applyProcedure(procedure: RuntimeValue, args: RuntimeValue[]): RuntimeValue {
@@ -506,6 +667,45 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[]): RuntimeValue {
         throw new EvalError('not expects exactly 1 argument');
       }
       return { kind: 'boolean', value: !isTruthy(args[0]) };
+    case 'cons':
+      if (args.length !== 2) {
+        throw new EvalError('cons expects exactly 2 arguments');
+      }
+      return { kind: 'pair', car: args[0], cdr: args[1] };
+    case 'car':
+      if (args.length !== 1) {
+        throw new EvalError('car expects exactly 1 argument');
+      }
+      return expectPair(args[0], 'car').car;
+    case 'cdr':
+      if (args.length !== 1) {
+        throw new EvalError('cdr expects exactly 1 argument');
+      }
+      return expectPair(args[0], 'cdr').cdr;
+    case 'null?':
+      if (args.length !== 1) {
+        throw new EvalError('null? expects exactly 1 argument');
+      }
+      return { kind: 'boolean', value: args[0].kind === 'nil' };
+    case 'list':
+      return buildList(args);
+    case 'append':
+      return applyAppend(args);
+    case 'length':
+      if (args.length !== 1) {
+        throw new EvalError('length expects exactly 1 argument');
+      }
+      return makeNumber(listLength(args[0]));
+    case 'string?':
+      return applyTypePredicate(args, 'string?', (value) => value.kind === 'string');
+    case 'number?':
+      return applyTypePredicate(args, 'number?', (value) => value.kind === 'number');
+    case 'boolean?':
+      return applyTypePredicate(args, 'boolean?', (value) => value.kind === 'boolean');
+    case 'pair?':
+      return applyTypePredicate(args, 'pair?', (value) => value.kind === 'pair');
+    case 'symbol?':
+      return applyTypePredicate(args, 'symbol?', (value) => value.kind === 'symbol');
   }
 }
 
@@ -575,6 +775,80 @@ function expectNumber(value: RuntimeValue, procedure: string): number {
   return value.value;
 }
 
+function expectPair(value: RuntimeValue, procedure: string): PairValue {
+  if (value.kind !== 'pair') {
+    throw new EvalError(`${procedure} expects a pair`);
+  }
+  return value;
+}
+
+function buildList(elements: RuntimeValue[]): RuntimeValue {
+  let list: RuntimeValue = NIL_VALUE;
+
+  for (let index = elements.length - 1; index >= 0; index -= 1) {
+    list = {
+      kind: 'pair',
+      car: elements[index],
+      cdr: list,
+    };
+  }
+
+  return list;
+}
+
+function applyAppend(args: RuntimeValue[]): RuntimeValue {
+  if (args.length === 0) {
+    return NIL_VALUE;
+  }
+
+  let result = args[args.length - 1];
+
+  for (let index = args.length - 2; index >= 0; index -= 1) {
+    const elements = listToArray(args[index], 'append');
+    for (let elementIndex = elements.length - 1; elementIndex >= 0; elementIndex -= 1) {
+      result = {
+        kind: 'pair',
+        car: elements[elementIndex],
+        cdr: result,
+      };
+    }
+  }
+
+  return result;
+}
+
+function listLength(value: RuntimeValue): number {
+  return listToArray(value, 'length').length;
+}
+
+function listToArray(value: RuntimeValue, procedure: string): RuntimeValue[] {
+  const elements: RuntimeValue[] = [];
+  let current = value;
+
+  while (current.kind === 'pair') {
+    elements.push(current.car);
+    current = current.cdr;
+  }
+
+  if (current.kind !== 'nil') {
+    throw new EvalError(`${procedure} expects a proper list`);
+  }
+
+  return elements;
+}
+
+function applyTypePredicate(
+  args: RuntimeValue[],
+  name: string,
+  predicate: (value: RuntimeValue) => boolean,
+): RuntimeValue {
+  if (args.length !== 1) {
+    throw new EvalError(`${name} expects exactly 1 argument`);
+  }
+
+  return { kind: 'boolean', value: predicate(args[0]) };
+}
+
 function isTruthy(value: RuntimeValue): boolean {
   return value.kind !== 'boolean' || value.value;
 }
@@ -596,8 +870,10 @@ function formatValue(value: RuntimeValue): string {
       return `"${escapeString(value.value)}"`;
     case 'symbol':
       return value.name;
-    case 'list':
-      return `(${value.elements.map((element) => formatValue(element)).join(' ')})`;
+    case 'nil':
+      return '()';
+    case 'pair':
+      return formatPair(value);
     case 'builtin':
     case 'closure':
       return '#<procedure>';
@@ -632,5 +908,21 @@ function isWhitespace(char: string): boolean {
 }
 
 function isDelimiter(char: string): boolean {
-  return isWhitespace(char) || char === '(' || char === ')' || char === ';';
+  return isWhitespace(char) || char === '(' || char === ')' || char === "'" || char === ';';
+}
+
+function formatPair(value: PairValue): string {
+  const parts: string[] = [];
+  let current: RuntimeValue = value;
+
+  while (current.kind === 'pair') {
+    parts.push(formatValue(current.car));
+    current = current.cdr;
+  }
+
+  if (current.kind === 'nil') {
+    return `(${parts.join(' ')})`;
+  }
+
+  return `(${parts.join(' ')} . ${formatValue(current)})`;
 }
