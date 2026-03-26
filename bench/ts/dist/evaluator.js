@@ -16,6 +16,7 @@ const BUILTIN_NAMES = [
     '>',
     '=',
     '<=',
+    '>=',
     'zero?',
     'positive?',
     'negative?',
@@ -64,6 +65,8 @@ const BUILTIN_NAMES = [
     'string-ref',
     'string-copy',
     'string-set!',
+    'string->list',
+    'list->string',
     'string=?',
     'string<?',
     'string-ci=?',
@@ -72,6 +75,8 @@ const BUILTIN_NAMES = [
     'char?',
     'char-alphabetic?',
     'char-numeric?',
+    'char->integer',
+    'integer->char',
     'char-upcase',
     'char-downcase',
     'char=?',
@@ -92,6 +97,15 @@ const DEFAULT_SOURCE_POS = { line: 1, col: 1 };
 const ALPHABETIC_CHAR_RE = /^\p{L}$/u;
 const NUMERIC_CHAR_RE = /^\p{N}$/u;
 let macroIdentifierCounter = 0;
+function currentBenchLevel() {
+    const globalWithProcess = globalThis;
+    const rawLevel = globalWithProcess.process?.env?.BENCH_LEVEL;
+    if (rawLevel === undefined) {
+        return Number.POSITIVE_INFINITY;
+    }
+    const parsedLevel = Number.parseInt(rawLevel, 10);
+    return Number.isFinite(parsedLevel) ? parsedLevel : Number.POSITIVE_INFINITY;
+}
 class Environment {
     parent;
     bindings = new Map();
@@ -160,7 +174,10 @@ function evaluateProgram(input) {
         throw new EvalError('expected at least one expression');
     }
     const env = createGlobalEnv();
-    const context = { output: [] };
+    const context = {
+        output: [],
+        immutableStrings: currentBenchLevel() >= 15,
+    };
     let result = VOID_VALUE;
     for (const expr of expressions) {
         result = evaluateExpr(expr, env, context);
@@ -1574,6 +1591,8 @@ function applyBuiltin(name, args, context) {
             return applyComparison(args, '=', (comparison) => comparison === 0);
         case '<=':
             return applyComparison(args, '<=', (comparison) => comparison <= 0);
+        case '>=':
+            return applyComparison(args, '>=', (comparison) => comparison >= 0);
         case 'zero?':
             return applyNumericPredicate(args, 'zero?', (value) => compareNumbers(value, makeExactInteger(0)) === 0);
         case 'positive?':
@@ -1738,9 +1757,13 @@ function applyBuiltin(name, args, context) {
             if (args.length !== 1) {
                 throw new EvalError('string-copy expects exactly 1 argument');
             }
-            return makeString(expectStringValue(args[0], 'string-copy').value);
+            return makeString(expectStringValue(args[0], 'string-copy').value, !context.immutableStrings);
         case 'string-set!':
             return applyStringSet(args);
+        case 'string->list':
+            return applyStringToList(args);
+        case 'list->string':
+            return applyListToString(args);
         case 'string=?':
             return applyStringComparison(args, 'string=?', (value) => value, (left, right) => left === right);
         case 'string<?':
@@ -1757,6 +1780,16 @@ function applyBuiltin(name, args, context) {
             return applyCharPredicate(args, 'char-alphabetic?', (value) => ALPHABETIC_CHAR_RE.test(value));
         case 'char-numeric?':
             return applyCharPredicate(args, 'char-numeric?', (value) => NUMERIC_CHAR_RE.test(value));
+        case 'char->integer':
+            if (args.length !== 1) {
+                throw new EvalError('char->integer expects exactly 1 argument');
+            }
+            return makeNumber(charCodePoint(expectChar(args[0], 'char->integer').value));
+        case 'integer->char':
+            if (args.length !== 1) {
+                throw new EvalError('integer->char expects exactly 1 argument');
+            }
+            return makeChar(integerToChar(expectInteger(args[0], 'integer->char'), 'integer->char'));
         case 'char-upcase':
             return applyCharCase(args, 'char-upcase', (value) => value.toLocaleUpperCase());
         case 'char-downcase':
@@ -1985,19 +2018,33 @@ function applyStringSet(args) {
     if (args.length !== 3) {
         throw new EvalError('string-set! expects exactly 3 arguments');
     }
-    const target = expectStringValue(args[0], 'string-set!');
+    const stringValue = expectStringValue(args[0], 'string-set!');
     const index = expectIndex(args[1], 'string-set!');
-    const char = expectChar(args[2], 'string-set!');
-    const chars = stringChars(target.value);
-    if (!target.mutable) {
-        throw new EvalError('string-set! expects a mutable string');
+    const replacement = expectChar(args[2], 'string-set!');
+    if (!stringValue.mutable) {
+        throw new EvalError('string-set! is not supported on immutable strings');
     }
+    const chars = stringChars(stringValue.value);
     if (index >= chars.length) {
         throw new EvalError('string-set! index out of range');
     }
-    chars[index] = char.value;
-    target.value = chars.join('');
+    chars[index] = replacement.value;
+    stringValue.value = chars.join('');
     return VOID_VALUE;
+}
+function applyStringToList(args) {
+    if (args.length !== 1) {
+        throw new EvalError('string->list expects exactly 1 argument');
+    }
+    return buildList(stringChars(expectStringValue(args[0], 'string->list').value).map((char) => makeChar(char)));
+}
+function applyListToString(args) {
+    if (args.length !== 1) {
+        throw new EvalError('list->string expects exactly 1 argument');
+    }
+    return makeString(listToArray(args[0], 'list->string')
+        .map((value) => expectChar(value, 'list->string').value)
+        .join(''));
 }
 function applyStringComparison(args, name, normalize, predicate) {
     if (args.length < 2) {
@@ -2284,7 +2331,7 @@ function makeBoolean(value) {
         value,
     };
 }
-function makeString(value, mutable = true) {
+function makeString(value, mutable = false) {
     return {
         kind: 'string',
         value,
@@ -2386,6 +2433,20 @@ function charCodePoint(value) {
         throw new EvalError('character values must contain exactly 1 character');
     }
     return codePoint;
+}
+function integerToChar(value, procedure) {
+    const codePoint = numberToJsNumber(value);
+    if (!Number.isSafeInteger(codePoint)) {
+        throw new EvalError(`${procedure} expects a valid character code point`);
+    }
+    if (codePoint < 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+        throw new EvalError(`${procedure} expects a valid character code point`);
+    }
+    const char = String.fromCodePoint(codePoint);
+    if (stringChars(char).length !== 1) {
+        throw new EvalError(`${procedure} expects a valid character code point`);
+    }
+    return char;
 }
 function parseNumberString(value) {
     const parsed = parseNumberStringValue(value);
