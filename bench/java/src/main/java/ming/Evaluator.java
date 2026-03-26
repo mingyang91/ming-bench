@@ -15,6 +15,8 @@ public class Evaluator {
     private final Environment globalEnv = new Environment(null);
     private final Map<String, String[]> recordTypes = new HashMap<>();
     private StringBuilder outputBuffer = null;
+    private long stepCounter;
+    private long maxSteps;
 
     private static final String[] BUILTIN_NAMES = {
         "+", "-", "*", "/", "<", ">", "=", "<=", ">=",
@@ -97,6 +99,16 @@ public class Evaluator {
             return new EvalResult(schemeToString(lastResult), outputBuffer.toString());
         } finally {
             outputBuffer = null;
+        }
+    }
+
+    public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
+        this.stepCounter = 0;
+        this.maxSteps = maxSteps;
+        try {
+            return evalStr(input);
+        } finally {
+            this.maxSteps = 0;
         }
     }
 
@@ -429,6 +441,9 @@ public class Evaluator {
     // evalStep does one step of evaluation; returns TailCall for tail positions
     @SuppressWarnings("unchecked")
     private Object evalStep(Object expr, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
+        if (maxSteps > 0 && ++stepCounter > maxSteps) {
+            throw new EvalError("step limit exceeded");
+        }
         // Unwrap Located and add position to any errors
         if (expr instanceof SchemeReader.Located loc) {
             try {
