@@ -337,7 +337,7 @@ function isTruthy(val: SchemeVal): boolean {
 
 const SPECIAL_FORMS_SET = new Set([
   'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
-  'set!', 'cond', 'let', 'letrec', 'letrec*', 'case', 'do',
+  'set!', 'cond', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'define-syntax', 'syntax-rules',
 ]);
 
@@ -611,7 +611,7 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
           case 'cond': {
             for (let i = 1; i < elems.length; i++) {
               const clause = elems[i];
-              if (clause.tag !== 'list' || clause.elements.length < 2)
+              if (clause.tag !== 'list' || clause.elements.length < 1)
                 throw errAt('cond: bad clause', expr.pos);
               const test = clause.elements[0];
               if (test.tag === 'symbol' && test.value === 'else') {
@@ -675,6 +675,24 @@ function evalExpr(initExpr: SchemeVal, initEnv: Env): SchemeVal {
               evalExpr(elems[i], letEnv);
             }
             expr = elems[elems.length - 1]; env = letEnv; continue trampoline;
+          }
+          case 'let*': {
+            if (elems.length < 3) throw errAt('let*: bad syntax', expr.pos);
+            const bindings = elems[1];
+            if (bindings.tag !== 'list') throw errAt('let*: bad syntax', expr.pos);
+            let letStarEnv = new Env(env);
+            for (const b of bindings.elements) {
+              if (b.tag !== 'list' || b.elements.length !== 2 || b.elements[0].tag !== 'symbol')
+                throw errAt('let*: bad binding', expr.pos);
+              const val = evalExpr(b.elements[1], letStarEnv);
+              const nextEnv = new Env(letStarEnv);
+              nextEnv.set(b.elements[0].value, val);
+              letStarEnv = nextEnv;
+            }
+            for (let i = 2; i < elems.length - 1; i++) {
+              evalExpr(elems[i], letStarEnv);
+            }
+            expr = elems[elems.length - 1]; env = letStarEnv; continue trampoline;
           }
           case 'letrec': {
             if (elems.length < 3) throw errAt('letrec: bad syntax', expr.pos);
@@ -1126,16 +1144,22 @@ const BUILTINS = new Set([
   'apply',
   'abs', 'modulo', 'remainder', 'quotient', 'min', 'max', 'expt',
   'zero?', 'positive?', 'negative?', 'odd?', 'even?',
-  'list-ref', 'list-tail', 'list?', 'assoc', 'map',
+  'list-ref', 'list-tail', 'list?', 'assoc', 'map', 'for-each',
+  'reverse', 'member', 'assv',
+  'set-car!', 'set-cdr!',
+  'caar', 'cadr', 'cdar', 'cddr', 'caddr',
   'eq?', 'eqv?', 'equal?',
   'vector', 'make-vector', 'vector-ref', 'vector-set!',
   'vector-length', 'vector?', 'vector->list', 'list->vector',
   'char-alphabetic?', 'char-numeric?', 'char-upcase', 'char-downcase',
   'char=?', 'char<?',
-  'string=?', 'string<?', 'string-ci=?',
+  'string=?', 'string<?', 'string>?', 'string<=?', 'string>=?',
+  'string-ci=?',
   'string-upcase', 'string-downcase',
+  'make-string', 'string',
   'exact?', 'inexact?', 'exact->inexact', 'inexact->exact',
   'numerator', 'denominator', 'integer?', 'rational?',
+  'gcd', 'lcm', 'truncate', 'round', 'floor', 'ceiling',
   'procedure?',
 ]);
 
@@ -1484,11 +1508,17 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       return cur;
     }
     case 'list?': {
-      let cur = args[0];
-      while (cur.tag === 'pair') {
-        cur = cur.cdr;
+      // Tortoise-and-hare cycle detection
+      let slow = args[0];
+      let fast = args[0];
+      while (fast.tag === 'pair') {
+        slow = (slow as any).cdr;
+        fast = fast.cdr;
+        if (fast.tag !== 'pair') break;
+        fast = fast.cdr;
+        if (slow === fast) return SCM_FALSE; // cycle detected
       }
-      return cur.tag === 'nil' ? SCM_TRUE : SCM_FALSE;
+      return fast.tag === 'nil' ? SCM_TRUE : SCM_FALSE;
     }
     case 'assoc': {
       if (args.length !== 2) throw errAt('assoc: expected 2 arguments', pos);
@@ -1620,6 +1650,21 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
         throw errAt('string<?: expected 2 strings', pos);
       return args[0].value < args[1].value ? SCM_TRUE : SCM_FALSE;
     }
+    case 'string>?': {
+      if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+        throw errAt('string>?: expected 2 strings', pos);
+      return args[0].value > args[1].value ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'string<=?': {
+      if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+        throw errAt('string<=?: expected 2 strings', pos);
+      return args[0].value <= args[1].value ? SCM_TRUE : SCM_FALSE;
+    }
+    case 'string>=?': {
+      if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
+        throw errAt('string>=?: expected 2 strings', pos);
+      return args[0].value >= args[1].value ? SCM_TRUE : SCM_FALSE;
+    }
     case 'string-ci=?': {
       if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string')
         throw errAt('string-ci=?: expected 2 strings', pos);
@@ -1691,6 +1736,138 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
       if (args.length !== 1) throw errAt('rational?: expected 1 argument', pos);
       return isNumeric(args[0]) && isExact(args[0]) ? SCM_TRUE : SCM_FALSE;
     }
+    case 'caar': {
+      if (args.length !== 1) throw errAt('caar: expected 1 argument', pos);
+      if (args[0].tag !== 'pair' || args[0].car.tag !== 'pair') throw errAt('caar: expected pair', pos);
+      return args[0].car.car;
+    }
+    case 'cadr': {
+      if (args.length !== 1) throw errAt('cadr: expected 1 argument', pos);
+      if (args[0].tag !== 'pair' || args[0].cdr.tag !== 'pair') throw errAt('cadr: expected pair', pos);
+      return args[0].cdr.car;
+    }
+    case 'cdar': {
+      if (args.length !== 1) throw errAt('cdar: expected 1 argument', pos);
+      if (args[0].tag !== 'pair' || args[0].car.tag !== 'pair') throw errAt('cdar: expected pair', pos);
+      return args[0].car.cdr;
+    }
+    case 'cddr': {
+      if (args.length !== 1) throw errAt('cddr: expected 1 argument', pos);
+      if (args[0].tag !== 'pair' || args[0].cdr.tag !== 'pair') throw errAt('cddr: expected pair', pos);
+      return args[0].cdr.cdr;
+    }
+    case 'caddr': {
+      if (args.length !== 1) throw errAt('caddr: expected 1 argument', pos);
+      if (args[0].tag !== 'pair' || args[0].cdr.tag !== 'pair') throw errAt('caddr: expected pair', pos);
+      const cddr = args[0].cdr.cdr;
+      if (cddr.tag !== 'pair') throw errAt('caddr: expected pair', pos);
+      return cddr.car;
+    }
+    case 'set-car!': {
+      if (args.length !== 2) throw errAt('set-car!: expected 2 arguments', pos);
+      if (args[0].tag !== 'pair') throw errAt('set-car!: expected pair', pos);
+      (args[0] as any).car = args[1];
+      return SCM_NIL;
+    }
+    case 'set-cdr!': {
+      if (args.length !== 2) throw errAt('set-cdr!: expected 2 arguments', pos);
+      if (args[0].tag !== 'pair') throw errAt('set-cdr!: expected pair', pos);
+      (args[0] as any).cdr = args[1];
+      return SCM_NIL;
+    }
+    case 'for-each': {
+      if (args.length < 2) throw errAt('for-each: expected at least 2 arguments', pos);
+      const proc = args[0];
+      const lists = args.slice(1).map(a => {
+        const arr = pairToArray(a);
+        if (arr === null) throw errAt('for-each: expected proper list', pos);
+        return arr;
+      });
+      const len = lists[0].length;
+      for (const l of lists) {
+        if (l.length !== len) throw errAt('for-each: lists must have equal length', pos);
+      }
+      for (let i = 0; i < len; i++) {
+        const feArgs = lists.map(l => l[i]);
+        applyProc(proc, feArgs, pos);
+      }
+      return SCM_NIL;
+    }
+    case 'reverse': {
+      if (args.length !== 1) throw errAt('reverse: expected 1 argument', pos);
+      const items = pairToArray(args[0]);
+      if (items === null) throw errAt('reverse: expected proper list', pos);
+      return arrayToList(items.reverse());
+    }
+    case 'member': {
+      if (args.length !== 2) throw errAt('member: expected 2 arguments', pos);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        if (schemeEqual(args[0], cur.car)) return cur;
+        cur = cur.cdr;
+      }
+      return SCM_FALSE;
+    }
+    case 'assv': {
+      if (args.length !== 2) throw errAt('assv: expected 2 arguments', pos);
+      let cur = args[1];
+      while (cur.tag === 'pair') {
+        const entry = cur.car;
+        if (entry.tag === 'pair' && schemeEqv(args[0], entry.car)) return entry;
+        cur = cur.cdr;
+      }
+      return SCM_FALSE;
+    }
+    case 'make-string': {
+      if (args.length < 1 || args.length > 2) throw errAt('make-string: expected 1-2 arguments', pos);
+      if (args[0].tag !== 'number') throw errAt('make-string: expected number', pos);
+      const ch = args.length === 2 && args[1].tag === 'char' ? args[1].value : '\0';
+      return { tag: 'string', value: ch.repeat(args[0].value) };
+    }
+    case 'string': {
+      // (string char ...) → string from chars
+      for (const a of args) {
+        if (a.tag !== 'char') throw errAt('string: expected char arguments', pos);
+      }
+      return { tag: 'string', value: args.map(a => (a as any).value).join('') };
+    }
+    case 'gcd': {
+      requireNumeric('gcd', args, pos);
+      if (args.length === 0) return { tag: 'number', value: 0, exact: true };
+      let result = Math.abs(toFloat(args[0]));
+      for (let i = 1; i < args.length; i++) result = gcd(result, Math.abs(toFloat(args[i])));
+      return { tag: 'number', value: result, exact: true };
+    }
+    case 'lcm': {
+      requireNumeric('lcm', args, pos);
+      if (args.length === 0) return { tag: 'number', value: 1, exact: true };
+      let result = Math.abs(toFloat(args[0]));
+      for (let i = 1; i < args.length; i++) {
+        const b = Math.abs(toFloat(args[i]));
+        result = result === 0 && b === 0 ? 0 : (result / gcd(result, b)) * b;
+      }
+      return { tag: 'number', value: result, exact: true };
+    }
+    case 'truncate': {
+      if (args.length !== 1) throw errAt('truncate: expected 1 argument', pos);
+      if (!isNumeric(args[0])) throw errAt('truncate: expected number', pos);
+      return { tag: 'number', value: Math.trunc(toFloat(args[0])), exact: isExact(args[0]) };
+    }
+    case 'round': {
+      if (args.length !== 1) throw errAt('round: expected 1 argument', pos);
+      if (!isNumeric(args[0])) throw errAt('round: expected number', pos);
+      return { tag: 'number', value: Math.round(toFloat(args[0])), exact: isExact(args[0]) };
+    }
+    case 'floor': {
+      if (args.length !== 1) throw errAt('floor: expected 1 argument', pos);
+      if (!isNumeric(args[0])) throw errAt('floor: expected number', pos);
+      return { tag: 'number', value: Math.floor(toFloat(args[0])), exact: isExact(args[0]) };
+    }
+    case 'ceiling': {
+      if (args.length !== 1) throw errAt('ceiling: expected 1 argument', pos);
+      if (!isNumeric(args[0])) throw errAt('ceiling: expected number', pos);
+      return { tag: 'number', value: Math.ceil(toFloat(args[0])), exact: isExact(args[0]) };
+    }
     default:
       throw errAt(`unbound variable: ${name}`, pos);
   }
@@ -1717,13 +1894,17 @@ function display(val: SchemeVal): string {
     case 'symbol': return val.value;
     case 'nil': return '()';
     case 'pair': {
+      const seen = new Set<SchemeVal>();
+      seen.add(val);
       let result = '(' + display(val.car);
       let cur: SchemeVal = val.cdr;
       while (cur.tag === 'pair') {
+        if (seen.has(cur)) { result += ' ...'; break; }
+        seen.add(cur);
         result += ' ' + display(cur.car);
         cur = cur.cdr;
       }
-      if (cur.tag !== 'nil') {
+      if (cur.tag !== 'nil' && !seen.has(cur)) {
         result += ' . ' + display(cur);
       }
       result += ')';
@@ -1745,13 +1926,17 @@ function displayFormat(val: SchemeVal): string {
   if (val.tag === 'string') return val.value;
   if (val.tag === 'char') return val.value;
   if (val.tag === 'pair') {
+    const seen = new Set<SchemeVal>();
+    seen.add(val);
     let result = '(' + displayFormat(val.car);
     let cur: SchemeVal = val.cdr;
     while (cur.tag === 'pair') {
+      if (seen.has(cur)) { result += ' ...'; break; }
+      seen.add(cur);
       result += ' ' + displayFormat(cur.car);
       cur = cur.cdr;
     }
-    if (cur.tag !== 'nil') {
+    if (cur.tag !== 'nil' && !seen.has(cur)) {
       result += ' . ' + displayFormat(cur);
     }
     result += ')';
