@@ -19,6 +19,7 @@ public class Evaluator {
     private ExceptionHandlerFrame currentExceptionHandler;
     private StringBuilder activeOutput;
     private Environment activeTransformerDefinitionEnv;
+    private StepBudget activeStepBudget;
     private long syntheticCounter;
     private final RecordProcedureSupport recordProcedureSupport;
 
@@ -35,6 +36,16 @@ public class Evaluator {
      */
     public String evalStr(String input) throws EvalError {
         return renderResult(evalProgram(input, null));
+    }
+
+    public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
+        StepBudget previousStepBudget = activeStepBudget;
+        activeStepBudget = StepBudget.limited(maxSteps);
+        try {
+            return renderResult(evalProgram(input, null));
+        } finally {
+            activeStepBudget = previousStepBudget;
+        }
     }
 
     private Value evalProgram(String input, StringBuilder output) throws EvalError {
@@ -160,7 +171,11 @@ public class Evaluator {
     }
 
     Bounce evalExpr(Expr expr, Environment env, Continuation cont) {
-        return withPosition(expr.position(), () -> switch (expr) {
+        return withPosition(expr.position(), () -> {
+            if (activeStepBudget != null) {
+                activeStepBudget.consume();
+            }
+            return switch (expr) {
             case IntExpr intExpr -> deliver(cont, new IntValue(intExpr.value()));
             case RationalExpr rationalExpr -> deliver(cont, NumericSupport.exactToValue(
                     new ExactFraction(rationalExpr.numerator(), rationalExpr.denominator())));
@@ -170,6 +185,7 @@ public class Evaluator {
             case CharExpr charExpr -> deliver(cont, new CharValue(charExpr.value()));
             case SymbolExpr symbolExpr -> deliver(cont, env.lookup(symbolExpr.name()));
             case ListExpr listExpr -> evalList(listExpr, env, cont);
+            };
         });
     }
 
