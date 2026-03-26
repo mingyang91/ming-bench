@@ -666,6 +666,8 @@ fn is_builtin(name: &str) -> bool {
             | "symbol->string" | "string->symbol"
             | "string-ref"
             | "string-copy"
+            | "string->list" | "list->string"
+            | "char->integer" | "integer->char"
             | "apply"
             | "abs" | "modulo" | "remainder" | "quotient"
             | "min" | "max" | "expt"
@@ -1252,41 +1254,48 @@ fn eval_string_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError>
             "string-set! requires 3 arguments at {}", p
         )));
     }
-    let var_name = match &args[0] {
-        Expr::Symbol(name, _) => name.clone(),
+    // String literals are immutable
+    if matches!(&args[0], Expr::Str(_, _)) {
+        return Err(EvalError::Type(format!(
+            "string-set!: strings are immutable at {}", p
+        )));
+    }
+    let name = match &args[0] {
+        Expr::Symbol(s, _) => s.clone(),
         _ => return Err(EvalError::Type(format!(
-            "string-set!: first argument must be a variable at {}", p
+            "string-set!: expected string variable at {}", p
         ))),
     };
-    let idx_val = eval(&args[1], env)?;
-    let idx = idx_val.as_integer_at(p)? as usize;
-    let char_val = eval(&args[2], env)?;
-    let ch = match &char_val {
-        Value::Char(c) => *c,
-        _ => return Err(EvalError::Type(format!(
-            "string-set!: expected char, got {} at {}", char_val, p
-        ))),
-    };
-    // Look up the string, modify it, store back
-    let current = env_get(env, &var_name).ok_or_else(|| {
-        EvalError::UnboundVariable(format!("{} at {}", var_name, p))
+    let val = env_get(env, &name).ok_or_else(|| {
+        EvalError::UnboundVariable(format!("{} at {}", name, p))
     })?;
-    let mut s = match current {
+    let mut s = match val {
         Value::Str(s) => s,
         _ => return Err(EvalError::Type(format!(
-            "string-set!: expected string, got {} at {}", current, p
+            "string-set!: expected string at {}", p
         ))),
     };
-    let chars: Vec<char> = s.chars().collect();
-    if idx >= chars.len() {
+    let idx = match eval(&args[1], env)? {
+        Value::Integer(i) => i as usize,
+        _ => return Err(EvalError::Type(format!(
+            "string-set!: expected integer index at {}", p
+        ))),
+    };
+    let ch = match eval(&args[2], env)? {
+        Value::Char(c) => c,
+        _ => return Err(EvalError::Type(format!(
+            "string-set!: expected char at {}", p
+        ))),
+    };
+    if idx >= s.len() {
         return Err(EvalError::Type(format!(
             "string-set!: index out of range at {}", p
         )));
     }
-    let mut new_chars = chars;
-    new_chars[idx] = ch;
-    s = new_chars.into_iter().collect();
-    env_set_existing(env, &var_name, Value::Str(s));
+    // Replace char at index (assumes ASCII-safe for single-byte chars)
+    let bytes = unsafe { s.as_bytes_mut() };
+    bytes[idx] = ch as u8;
+    env_set_existing(env, &name, Value::Str(s));
     Ok(Value::Nil)
 }
 
@@ -2283,6 +2292,51 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             ensure_args(op, args, 1, p)?;
             let s = args[0].as_string_at(p)?;
             Ok(Value::Str(s.to_string()))
+        }
+        "string->list" => {
+            ensure_args(op, args, 1, p)?;
+            let s = args[0].as_string_at(p)?;
+            let list = s.chars().rev().fold(Value::Nil, |acc, c| {
+                Value::Pair(Rc::new(Value::Char(c)), Rc::new(acc))
+            });
+            Ok(list)
+        }
+        "list->string" => {
+            ensure_args(op, args, 1, p)?;
+            let mut chars = Vec::new();
+            let mut cur = &args[0];
+            loop {
+                match cur {
+                    Value::Pair(car, cdr) => {
+                        match car.as_ref() {
+                            Value::Char(c) => chars.push(*c),
+                            other => return Err(EvalError::Type(format!(
+                                "list->string: expected char, got {} at {}", other, p
+                            ))),
+                        }
+                        cur = cdr.as_ref();
+                    }
+                    Value::Nil => break,
+                    _ => return Err(EvalError::Type(format!(
+                        "list->string: expected proper list at {}", p
+                    ))),
+                }
+            }
+            Ok(Value::Str(chars.into_iter().collect()))
+        }
+        "char->integer" => {
+            ensure_args(op, args, 1, p)?;
+            match &args[0] {
+                Value::Char(c) => Ok(Value::Integer(*c as i64)),
+                other => Err(EvalError::Type(format!(
+                    "char->integer: expected char, got {} at {}", other, p
+                ))),
+            }
+        }
+        "integer->char" => {
+            ensure_args(op, args, 1, p)?;
+            let n = args[0].as_integer_at(p)?;
+            Ok(Value::Char(char::from_u32(n as u32).unwrap_or('\u{FFFD}')))
         }
         "apply" => {
             if args.len() < 2 {
