@@ -37,13 +37,15 @@ object Evaluator:
   private def eval(expr: Expr, env: Env): SchemeVal =
     try
       expr match
-        case IntLit(v, _)    => SchemeInt(v)
-        case BoolLit(v, _)   => SchemeBool(v)
-        case StringLit(v, _) => SchemeString(v)
-        case CharLit(v, _)   => SchemeChar(v)
-        case Symbol(name, _) => env.get(name)
-        case SList(Nil, _)   => throw new EvalError("empty application")
-        case SList(elems, _) => evalApplication(elems, env)
+        case IntLit(v, _)         => SchemeInt(v)
+        case FloatLit(v, _)       => SchemeFloat(v)
+        case RationalLit(n, d, _) => SchemeRational(n, d)
+        case BoolLit(v, _)        => SchemeBool(v)
+        case StringLit(v, _)      => SchemeString(v)
+        case CharLit(v, _)        => SchemeChar(v)
+        case Symbol(name, _)      => env.get(name)
+        case SList(Nil, _)        => throw new EvalError("empty application")
+        case SList(elems, _)      => evalApplication(elems, env)
     catch
       case e: EvalError =>
         val msg = e.getMessage
@@ -150,12 +152,14 @@ object Evaluator:
 
   private def exprToVal(expr: Expr): SchemeVal =
     expr match
-      case IntLit(v, _)    => SchemeInt(v)
-      case BoolLit(v, _)   => SchemeBool(v)
-      case StringLit(v, _) => SchemeString(v)
-      case CharLit(v, _)   => SchemeChar(v)
-      case Symbol(name, _) => SchemeSymbol(name)
-      case SList(elems, _) => SchemeList(elems.map(exprToVal))
+      case IntLit(v, _)         => SchemeInt(v)
+      case FloatLit(v, _)       => SchemeFloat(v)
+      case RationalLit(n, d, _) => SchemeRational(n, d)
+      case BoolLit(v, _)        => SchemeBool(v)
+      case StringLit(v, _)      => SchemeString(v)
+      case CharLit(v, _)        => SchemeChar(v)
+      case Symbol(name, _)      => SchemeSymbol(name)
+      case SList(elems, _)      => SchemeList(elems.map(exprToVal))
 
   private def parseParams(paramExprs: List[Expr]): (List[String], Option[String]) =
     val dotIdx = paramExprs.indexWhere { case Symbol(".", _) => true; case _ => false }

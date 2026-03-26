@@ -13,12 +13,14 @@ object Pos:
 sealed trait Expr:
   def pos: Pos
 
-case class IntLit(value: Long, pos: Pos = Pos.zero)      extends Expr
-case class BoolLit(value: Boolean, pos: Pos = Pos.zero)  extends Expr
-case class StringLit(value: String, pos: Pos = Pos.zero) extends Expr
-case class CharLit(value: Char, pos: Pos = Pos.zero)     extends Expr
-case class Symbol(name: String, pos: Pos = Pos.zero)     extends Expr
-case class SList(elems: List[Expr], pos: Pos = Pos.zero) extends Expr
+case class IntLit(value: Long, pos: Pos = Pos.zero)               extends Expr
+case class FloatLit(value: Double, pos: Pos = Pos.zero)           extends Expr
+case class RationalLit(num: Long, den: Long, pos: Pos = Pos.zero) extends Expr
+case class BoolLit(value: Boolean, pos: Pos = Pos.zero)           extends Expr
+case class StringLit(value: String, pos: Pos = Pos.zero)          extends Expr
+case class CharLit(value: Char, pos: Pos = Pos.zero)              extends Expr
+case class Symbol(name: String, pos: Pos = Pos.zero)              extends Expr
+case class SList(elems: List[Expr], pos: Pos = Pos.zero)          extends Expr
 
 // ── Scheme values ────────────────────────────────────────────────────
 sealed trait SchemeVal:
@@ -26,6 +28,15 @@ sealed trait SchemeVal:
 
 case class SchemeInt(value: Long) extends SchemeVal:
   def display: String = value.toString
+
+case class SchemeRational(num: Long, den: Long) extends SchemeVal:
+  def display: String = s"$num/$den"
+
+case class SchemeFloat(value: Double) extends SchemeVal:
+
+  def display: String =
+    if value == value.toLong && !value.isInfinite then s"${value.toLong}.0"
+    else value.toString
 
 case class SchemeBool(value: Boolean) extends SchemeVal:
   def display: String = if value then "#t" else "#f"

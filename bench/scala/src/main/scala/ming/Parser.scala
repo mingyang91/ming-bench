@@ -142,4 +142,27 @@ private[ming] object Parser:
     else
       s.toLongOption match
         case Some(n) => IntLit(n, p)
+        case None =>
+          parseRationalOrFloat(s, p)
+
+  private def parseRationalOrFloat(s: String, p: Pos): Expr =
+    val slashIdx = s.indexOf('/')
+    if slashIdx > 0 && slashIdx < s.length - 1 then
+      val numStr = s.substring(0, slashIdx)
+      val denStr = s.substring(slashIdx + 1)
+      (numStr.toLongOption, denStr.toLongOption) match
+        case (Some(n), Some(d)) if d != 0 =>
+          val g    = gcd(math.abs(n), math.abs(d))
+          val sign = if d < 0 then -1L else 1L
+          val sn   = sign * n / g
+          val sd   = sign * d / g
+          if sd == 1L then IntLit(sn, p)
+          else RationalLit(sn, sd, p)
+        case _ => Symbol(s, p)
+    else
+      s.toDoubleOption match
+        case Some(d) => FloatLit(d, p)
         case None    => Symbol(s, p)
+
+  private def gcd(a: Long, b: Long): Long =
+    if b == 0 then a else gcd(b, a % b)
