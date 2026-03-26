@@ -123,6 +123,19 @@ fn make_pair(car: Value, cdr: Value) -> Value {
 
 static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+static WIND_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn next_wind_id() -> usize {
+    WIND_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Clone)]
+struct WindEntry {
+    id: usize,
+    in_thunk: Value,
+    out_thunk: Value,
+}
+
 // Restart context: the body context captured when a call/cc continuation is created.
 // Used by reentrant continuations to replay from the correct position.
 struct RestartCtx {
@@ -142,6 +155,8 @@ thread_local! {
     // Current body context: set by eval_body_cps before evaluating each expression.
     // read by apply_cps_callcc to build the restart function.
     static BODY_CTX: RefCell<Option<RestartCtx>> = RefCell::new(None);
+    // Dynamic-wind stack: tracks active dynamic-wind in/out thunks.
+    static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
 }
 
 fn write_output(s: &str) {
@@ -772,6 +787,7 @@ fn is_builtin(name: &str) -> bool {
             | "gcd" | "lcm" | "truncate" | "round" | "floor" | "ceiling"
             | "make-string" | "string" | "string>?" | "string<=?" | "string>=?"
             | "call/cc" | "call-with-current-continuation"
+            | "dynamic-wind"
     )
 }
 
@@ -842,6 +858,7 @@ fn eval_step(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "do" => return eval_do(&elems[1..], env, p),
                     "let*" => return eval_let_star(&elems[1..], env, p),
                     "when" => return eval_when(&elems[1..], env, p),
+                    "dynamic-wind" => return eval_dynamic_wind(&elems[1..], env, p),
                     _ => {
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
                             return eval_macro(&literals, &rules, &def_env, elems, env, p);
@@ -858,6 +875,33 @@ fn eval_step(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             apply_value(&func, &args, p)
         }
     }
+}
+
+fn eval_dynamic_wind(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity(format!("dynamic-wind expects 3 arguments at {}", p)));
+    }
+    let in_thunk = eval(&args[0], env)?;
+    let body_thunk = eval(&args[1], env)?;
+    let out_thunk = eval(&args[2], env)?;
+
+    force(apply_value(&in_thunk, &[], p)?)?;
+
+    let wind_id = next_wind_id();
+    WIND_STACK.with(|ws| ws.borrow_mut().push(WindEntry {
+        id: wind_id,
+        in_thunk: in_thunk.clone(),
+        out_thunk: out_thunk.clone(),
+    }));
+
+    let body_result = (|| -> Result<Value, EvalError> {
+        force(apply_value(&body_thunk, &[], p)?)
+    })();
+
+    WIND_STACK.with(|ws| ws.borrow_mut().pop());
+    force(apply_value(&out_thunk, &[], p)?)?;
+
+    body_result
 }
 
 fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, EvalError> {
@@ -3467,6 +3511,58 @@ fn eval_cps(expr: &Expr, env: &Env, k: ContFn) -> Result<Value, EvalError> {
                         };
                         return eval_cps(&branch, env, k);
                     }
+                    "dynamic-wind" => {
+                        if elems.len() != 4 {
+                            return Err(EvalError::Arity(format!(
+                                "dynamic-wind expects 3 arguments at {}", pos
+                            )));
+                        }
+                        let in_thunk = force(eval(&elems[1], env)?)?;
+                        let body_thunk = force(eval(&elems[2], env)?)?;
+                        let out_thunk = force(eval(&elems[3], env)?)?;
+
+                        // Call in-thunk
+                        force(apply_value(&in_thunk, &[], pos)?)?;
+
+                        // Push to wind stack
+                        let wind_id = next_wind_id();
+                        WIND_STACK.with(|ws| ws.borrow_mut().push(WindEntry {
+                            id: wind_id,
+                            in_thunk: in_thunk.clone(),
+                            out_thunk: out_thunk.clone(),
+                        }));
+
+                        // Call body-thunk via CPS; body_k handles normal completion
+                        let out_thunk2 = out_thunk.clone();
+                        let cleaned_up = Rc::new(RefCell::new(false));
+                        let cleaned_up2 = cleaned_up.clone();
+                        let body_k = ContFn::new(move |body_val| {
+                            *cleaned_up2.borrow_mut() = true;
+                            WIND_STACK.with(|ws| ws.borrow_mut().pop());
+                            force(apply_value(&out_thunk2, &[], pos)?)?;
+                            k.call(body_val)
+                        });
+
+                        let result = apply_cps_value(body_thunk, vec![], pos, body_k);
+
+                        match result {
+                            Ok(v) => return Ok(v),
+                            Err(EvalError::ContinuationEscape(id, val)) => {
+                                if !*cleaned_up.borrow() {
+                                    WIND_STACK.with(|ws| ws.borrow_mut().pop());
+                                    force(apply_value(&out_thunk, &[], pos)?)?;
+                                }
+                                return Err(EvalError::ContinuationEscape(id, val));
+                            }
+                            Err(e) => {
+                                if !*cleaned_up.borrow() {
+                                    WIND_STACK.with(|ws| ws.borrow_mut().pop());
+                                    force(apply_value(&out_thunk, &[], pos)?)?;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
                     // Other recognized special forms that produce values without calling
                     // user lambdas: evaluate eagerly and pass result to k.
                     // ContinuationEscape propagates via ? if any nested call invokes a continuation.
@@ -3683,6 +3779,8 @@ fn apply_cps_callcc(f: Value, pos: Pos, outer_k: ContFn) -> Result<Value, EvalEr
 
     // Build the restart function for reentrant invocations.
     // Take the current BODY_CTX (if available) to build a proper restart.
+    // Also save the wind stack for rewinding on re-entry.
+    let saved_wind: Vec<WindEntry> = WIND_STACK.with(|ws| ws.borrow().clone());
     let restart_fn: ContFn = BODY_CTX.with(|ctx| {
         if let Some(rc) = ctx.borrow().as_ref() {
             // Clone the restart context
@@ -3690,7 +3788,24 @@ fn apply_cps_callcc(f: Value, pos: Pos, outer_k: ContFn) -> Result<Value, EvalEr
             let r_idx = rc.body_idx;
             let r_env = rc.body_env.clone();
             let r_outer_k = rc.outer_k.clone();
+            let sw = saved_wind.clone();
             ContFn::new(move |v| {
+                // Rewind wind stack: unwind current, rewind to saved
+                let current_wind = WIND_STACK.with(|ws| ws.borrow().clone());
+                let common_len = current_wind.iter().zip(sw.iter())
+                    .take_while(|(c, s)| c.id == s.id)
+                    .count();
+                // Unwind current entries beyond common prefix (innermost first)
+                for entry in current_wind[common_len..].iter().rev() {
+                    force(apply_value(&entry.out_thunk, &[], Pos::default())?)?;
+                }
+                // Rewind to saved entries beyond common prefix (outermost first)
+                for entry in &sw[common_len..] {
+                    force(apply_value(&entry.in_thunk, &[], Pos::default())?)?;
+                }
+                // Restore wind stack to saved state
+                WIND_STACK.with(|ws| *ws.borrow_mut() = sw.clone());
+
                 // Push override so the replayed call/cc returns v
                 CC_OVERRIDE_STACK.with(|s| s.borrow_mut().push(v));
                 // Re-evaluate the body from the start position
@@ -3709,6 +3824,7 @@ fn apply_cps_callcc(f: Value, pos: Pos, outer_k: ContFn) -> Result<Value, EvalEr
         func: ContFn::new(move |v| {
             let is_active = ACTIVE_CC.with(|ac| ac.borrow().contains(&id));
             if is_active {
+                // Escape: throw to unwind the stack (prevents stack overflow)
                 Err(EvalError::ContinuationEscape(id, Box::new(v)))
             } else {
                 // Reentrant: use restart function
@@ -3720,8 +3836,21 @@ fn apply_cps_callcc(f: Value, pos: Pos, outer_k: ContFn) -> Result<Value, EvalEr
     // Register this call/cc as active
     ACTIVE_CC.with(|ac| ac.borrow_mut().push(id));
 
-    // Apply f to cont_val, using outer_k as the continuation of the whole call/cc
-    let result = apply_cps_value(f, vec![cont_val], pos, outer_k.clone());
+    // Track whether the lambda passed to call/cc has "returned" (i.e., called outer_k).
+    // If it has, any subsequent ContinuationEscape is from a logically external call
+    // (the CPS chain extended past the lambda return). In that case, use restart_fn
+    // for correct dynamic-wind handling. If the lambda hasn't returned, it's a true
+    // escape and outer_k is used for stack efficiency (important for ctak-style code).
+    let lambda_returned = Rc::new(RefCell::new(false));
+    let lambda_returned2 = lambda_returned.clone();
+    let outer_k_for_escape = outer_k.clone();
+    let tracked_outer_k = ContFn::new(move |v| {
+        *lambda_returned2.borrow_mut() = true;
+        outer_k.call(v)
+    });
+
+    // Apply f to cont_val, using tracked_outer_k as the continuation
+    let result = apply_cps_value(f, vec![cont_val], pos, tracked_outer_k);
 
     // Remove from active
     ACTIVE_CC.with(|ac| {
@@ -3734,8 +3863,14 @@ fn apply_cps_callcc(f: Value, pos: Pos, outer_k: ContFn) -> Result<Value, EvalEr
     match result {
         Ok(v) => Ok(v),
         Err(EvalError::ContinuationEscape(eid, val)) if eid == id => {
-            // Escape: the continuation was called within dynamic extent
-            outer_k.call(*val)
+            if *lambda_returned.borrow() {
+                // Lambda already returned; this escape is from outside the call/cc body
+                // (via CPS chain). Use restart_fn for correct dynamic-wind handling.
+                restart_fn.call(*val)
+            } else {
+                // True escape from within the lambda body. Use outer_k for stack efficiency.
+                outer_k_for_escape.call(*val)
+            }
         }
         Err(e) => Err(e),
     }
@@ -3812,7 +3947,6 @@ fn apply_cps_value(func: Value, args: Vec<Value>, pos: Pos, k: ContFn) -> Result
             )))
         }
         Value::Continuation { id, func } => {
-            // Already handled in apply_value; duplicate logic here for CPS path
             if args.len() != 1 {
                 return Err(EvalError::Arity(format!(
                     "continuation expects 1 argument, got {} at {}", args.len(), pos
@@ -3840,6 +3974,7 @@ fn apply_cps_value(func: Value, args: Vec<Value>, pos: Pos, k: ContFn) -> Result
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
+    WIND_STACK.with(|ws| ws.borrow_mut().clear());
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
@@ -3863,6 +3998,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     OUTPUT.with(|out| out.borrow_mut().clear());
+    WIND_STACK.with(|ws| ws.borrow_mut().clear());
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
     if exprs.is_empty() {
