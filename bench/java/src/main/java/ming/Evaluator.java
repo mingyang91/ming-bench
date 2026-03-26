@@ -18,6 +18,7 @@ public class Evaluator {
     private StringBuilder outputBuffer;
     private ContinuationContext currentContinuation;
     private List<WindFrame> currentWinds = List.of();
+    private TailGuardContext currentTailGuard;
     private SyntaxTemplateContext currentSyntaxTemplateContext;
     private List<SyntaxScope> currentSyntaxScopes = List.of();
 
@@ -66,26 +67,39 @@ public class Evaluator {
     private SchemeValue eval(SchemeExpression expression, Environment environment) throws EvalError {
         SchemeExpression currentExpression = expression;
         Environment currentEnvironment = environment;
-        while (true) {
-            try {
-                if (currentExpression instanceof LiteralExpression literal) {
-                    return literal.value();
-                }
+        TailGuardContext savedTailGuard = currentTailGuard;
+        try {
+            while (true) {
+                try {
+                    if (currentExpression instanceof LiteralExpression literal) {
+                        return literal.value();
+                    }
 
-                if (currentExpression instanceof SymbolExpression symbol) {
-                    return currentEnvironment.lookup(symbol.name());
-                }
+                    if (currentExpression instanceof SymbolExpression symbol) {
+                        return currentEnvironment.lookup(symbol.name());
+                    }
 
-                TailStep step = evalListTail((ListExpression) currentExpression, currentEnvironment);
-                if (step.isDone()) {
-                    return step.value();
-                }
+                    TailStep step = evalListTail((ListExpression) currentExpression, currentEnvironment);
+                    if (step.isDone()) {
+                        return step.value();
+                    }
 
-                currentExpression = step.nextExpression();
-                currentEnvironment = step.nextEnvironment();
-            } catch (EvalError error) {
-                throw error.withPosition(currentExpression.position());
+                    currentExpression = step.nextExpression();
+                    currentEnvironment = step.nextEnvironment();
+                } catch (RaisedException raised) {
+                    TailStep recoveryStep = recoverTailGuard(savedTailGuard, raised.value());
+                    if (recoveryStep.isDone()) {
+                        return recoveryStep.value();
+                    }
+
+                    currentExpression = recoveryStep.nextExpression();
+                    currentEnvironment = recoveryStep.nextEnvironment();
+                } catch (EvalError error) {
+                    throw error.withPosition(currentExpression.position());
+                }
             }
+        } finally {
+            currentTailGuard = savedTailGuard;
         }
     }
 
@@ -268,7 +282,7 @@ public class Evaluator {
                 return TailStep.done(evalCaseLambda(elements, environment));
             }
             if ("guard".equals(name)) {
-                return TailStep.done(evalGuard(elements, environment));
+                return evalGuardTail(elements, environment);
             }
             if ("do".equals(name)) {
                 return TailStep.done(evalDo(elements, environment));
@@ -369,31 +383,29 @@ public class Evaluator {
     }
 
     private SchemeValue evalGuard(List<SchemeExpression> elements, Environment environment) throws EvalError {
-        if (elements.size() < 3) {
-            throw new EvalError("guard: expected clauses and body");
-        }
-        if (!(elements.get(1) instanceof ListExpression guardExpression)) {
-            throw new EvalError("guard: expected exception variable and clauses");
-        }
-
-        List<SchemeExpression> guardElements = guardExpression.elements();
-        if (guardElements.isEmpty()) {
-            throw new EvalError("guard: expected exception variable");
-        }
-        if (!(guardElements.getFirst() instanceof SymbolExpression exceptionVariable)) {
-            throw new EvalError("guard: expected exception variable");
-        }
+        GuardSpec guardSpec = parseGuard(elements);
 
         try {
-            return evalSequence(elements.subList(2, elements.size()), environment);
+            return evalSequence(guardSpec.body(), environment);
         } catch (RaisedException raised) {
             return evalGuardClauses(
-                    exceptionVariable.name(),
-                    guardElements.subList(1, guardElements.size()),
+                    guardSpec.exceptionVariable(),
+                    guardSpec.clauses(),
                     environment,
                     raised.value()
             );
         }
+    }
+
+    private TailStep evalGuardTail(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        GuardSpec guardSpec = parseGuard(elements);
+        currentTailGuard = new TailGuardContext(
+                guardSpec.exceptionVariable(),
+                guardSpec.clauses(),
+                environment,
+                currentTailGuard
+        );
+        return tailSequence(guardSpec.body(), environment, VoidValue.INSTANCE);
     }
 
     private SchemeValue evalAnd(List<SchemeExpression> expressions, Environment environment) throws EvalError {
@@ -1503,6 +1515,84 @@ public class Evaluator {
         throw new RaisedException(exceptionValue);
     }
 
+    private TailStep evalGuardClausesTail(
+            String exceptionVariable,
+            List<SchemeExpression> clauses,
+            Environment environment,
+            SchemeValue exceptionValue
+    ) throws EvalError {
+        Environment guardEnvironment = new Environment(environment);
+        guardEnvironment.define(exceptionVariable, exceptionValue);
+
+        for (int index = 0; index < clauses.size(); index++) {
+            if (!(clauses.get(index) instanceof ListExpression clauseExpression)) {
+                throw new EvalError("guard: expected clause");
+            }
+
+            List<SchemeExpression> clause = clauseExpression.elements();
+            if (clause.isEmpty()) {
+                throw new EvalError("guard: expected non-empty clause");
+            }
+
+            SchemeExpression testExpression = clause.getFirst();
+            if (testExpression instanceof SymbolExpression symbol && "else".equals(symbol.name())) {
+                return evalClauseBodyTail(clause.subList(1, clause.size()), guardEnvironment, BoolValue.TRUE);
+            }
+
+            SchemeValue testValue = evalNonTail(testExpression, guardEnvironment);
+            if (isTruthy(testValue)) {
+                return evalClauseBodyTail(clause.subList(1, clause.size()), guardEnvironment, testValue);
+            }
+        }
+
+        throw new RaisedException(exceptionValue);
+    }
+
+    private TailStep recoverTailGuard(TailGuardContext savedTailGuard, SchemeValue exceptionValue) throws EvalError {
+        RaisedException pending = new RaisedException(exceptionValue);
+        while (true) {
+            if (currentTailGuard == savedTailGuard) {
+                throw pending;
+            }
+
+            TailGuardContext guard = currentTailGuard;
+            currentTailGuard = guard.parent();
+            try {
+                return evalGuardClausesTail(
+                        guard.exceptionVariable(),
+                        guard.clauses(),
+                        guard.environment(),
+                        pending.value()
+                );
+            } catch (RaisedException raised) {
+                pending = raised;
+            }
+        }
+    }
+
+    private GuardSpec parseGuard(List<SchemeExpression> elements) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("guard: expected clauses and body");
+        }
+        if (!(elements.get(1) instanceof ListExpression guardExpression)) {
+            throw new EvalError("guard: expected exception variable and clauses");
+        }
+
+        List<SchemeExpression> guardElements = guardExpression.elements();
+        if (guardElements.isEmpty()) {
+            throw new EvalError("guard: expected exception variable");
+        }
+        if (!(guardElements.getFirst() instanceof SymbolExpression exceptionVariable)) {
+            throw new EvalError("guard: expected exception variable");
+        }
+
+        return new GuardSpec(
+                exceptionVariable.name(),
+                List.copyOf(guardElements.subList(1, guardElements.size())),
+                List.copyOf(elements.subList(2, elements.size()))
+        );
+    }
+
     private TailStep evalAndTail(List<SchemeExpression> expressions, Environment environment) throws EvalError {
         if (expressions.isEmpty()) {
             return TailStep.done(BoolValue.TRUE);
@@ -2489,7 +2579,11 @@ public class Evaluator {
     private SchemeValue applyCallWithValues(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 2, "call-with-values");
 
-        SchemeValue produced = applyThunk(arguments.getFirst());
+        ContinuationContext consumerContinuation = new ContinuationContext(
+                value -> applyProcedure(arguments.get(1), unpackValues(value)),
+                currentContinuation
+        );
+        SchemeValue produced = withActiveContinuation(consumerContinuation, () -> applyThunk(arguments.getFirst()));
         return applyProcedure(arguments.get(1), unpackValues(produced));
     }
 
@@ -2591,11 +2685,10 @@ public class Evaluator {
 
     private SchemeValue applyContinuation(ContinuationProcedure continuationProcedure, List<SchemeValue> arguments)
             throws EvalError {
-        requireArgumentCount(arguments, 1, "continuation");
         CapturedContinuation continuation = (CapturedContinuation) continuationProcedure.continuation();
         throw new ContinuationJump(
                 continuation.context(),
-                arguments.getFirst(),
+                packValues(arguments),
                 List.copyOf(currentWinds),
                 continuation.winds()
         );
@@ -3506,6 +3599,9 @@ public class Evaluator {
     private record ParameterSpec(List<String> fixedParameters, String restParameter) {
     }
 
+    private record GuardSpec(String exceptionVariable, List<SchemeExpression> clauses, List<SchemeExpression> body) {
+    }
+
     private record RecordAccessorSpec(String fieldName, String accessorName) {
     }
 
@@ -3550,6 +3646,14 @@ public class Evaluator {
     }
 
     private record WindFrame(SchemeValue inThunk, SchemeValue outThunk) {
+    }
+
+    private record TailGuardContext(
+            String exceptionVariable,
+            List<SchemeExpression> clauses,
+            Environment environment,
+            TailGuardContext parent
+    ) {
     }
 
     private record CapturedContinuation(ContinuationContext context, List<WindFrame> winds) {
