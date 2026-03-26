@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -50,6 +51,21 @@ enum Value {
         rules: Vec<(Expr, Expr)>,
         def_env: EnvRef,
     },
+    Record {
+        type_id: usize,
+        fields: Vec<Value>,
+    },
+    RecordConstructor {
+        type_id: usize,
+        num_fields: usize,
+    },
+    RecordPredicate {
+        type_id: usize,
+    },
+    RecordAccessor {
+        type_id: usize,
+        field_index: usize,
+    },
 }
 
 impl PartialEq for Value {
@@ -67,6 +83,7 @@ impl PartialEq for Value {
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             (Value::Macro { .. }, Value::Macro { .. }) => false,
+            (Value::Record { type_id: a, fields: af }, Value::Record { type_id: b, fields: bf }) => a == b && af == bf,
             _ => false,
         }
     }
@@ -121,6 +138,10 @@ impl Value {
             }
             Value::Lambda { .. } => "#<procedure>".to_string(),
             Value::Macro { .. } => "#<macro>".to_string(),
+            Value::Record { .. } => "#<record>".to_string(),
+            Value::RecordConstructor { .. }
+            | Value::RecordPredicate { .. }
+            | Value::RecordAccessor { .. } => "#<procedure>".to_string(),
             Value::Void => "".to_string(),
         }
     }
@@ -464,6 +485,7 @@ fn eval_expr(expr: &Expr, env: &EnvRef, out: &RefCell<String>) -> Result<Value, 
                     }
                     "string-set!" => return eval_string_set(&items[1..], env, p, out),
                     "define-syntax" => return eval_define_syntax(&items[1..], env, p),
+                    "define-record-type" => return eval_define_record_type(&items[1..], env, p),
                     _ => {
                         // Check if op is a macro
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
@@ -747,6 +769,31 @@ fn apply_func(func: &Value, args: &[Value], call_pos: Pos, out: &RefCell<String>
             }
             Ok(result)
         }
+        Value::RecordConstructor { type_id, num_fields } => {
+            if args.len() != *num_fields {
+                return Err(EvalError::Arity(format!(
+                    "{call_pos}: record constructor expected {} args, got {}", num_fields, args.len()
+                )));
+            }
+            Ok(Value::Record { type_id: *type_id, fields: args.to_vec() })
+        }
+        Value::RecordPredicate { type_id } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: record predicate expects 1 argument")));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Record { type_id: tid, .. } if tid == type_id)))
+        }
+        Value::RecordAccessor { type_id, field_index } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!("{call_pos}: record accessor expects 1 argument")));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, fields } if tid == type_id => {
+                    Ok(fields[*field_index].clone())
+                }
+                _ => Err(EvalError::Type(format!("{call_pos}: record accessor: wrong type"))),
+            }
+        }
         Value::Symbol(s) => apply_builtin_by_name(s, args, call_pos, out, apply_func),
         _ => Err(EvalError::Type(format!("{call_pos}: not a procedure: {}", func.display_scheme()))),
     }
@@ -800,11 +847,86 @@ fn eval_string_set(args: &[Expr], env: &EnvRef, p: Pos, out: &RefCell<String>) -
     }
 }
 
+// --- Records ---
+
+fn eval_define_record_type(args: &[Expr], env: &EnvRef, p: Pos) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field-name ...) predicate (field-name accessor) ...)
+    if args.len() < 3 {
+        return Err(EvalError::Arity(format!("{p}: define-record-type requires at least 3 arguments")));
+    }
+    // arg 0: type name (ignored, just used for identity)
+    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // arg 1: constructor spec (constructor-name field-name ...)
+    let (constructor_name, constructor_fields) = match &args[1].kind {
+        ExprKind::List(items) if !items.is_empty() => {
+            let name = match &items[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Type(format!("{p}: define-record-type: expected constructor name"))),
+            };
+            let fields: Vec<String> = items[1..].iter().map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
+                _ => Err(EvalError::Type(format!("{p}: define-record-type: expected field name"))),
+            }).collect::<Result<Vec<_>, _>>()?;
+            (name, fields)
+        }
+        _ => return Err(EvalError::Type(format!("{p}: define-record-type: expected constructor spec"))),
+    };
+
+    // arg 2: predicate name
+    let predicate_name = match &args[2].kind {
+        ExprKind::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type(format!("{p}: define-record-type: expected predicate name"))),
+    };
+
+    // remaining args: field specs (field-name accessor-name)
+    let mut field_specs: Vec<(String, String)> = Vec::new();
+    for arg in &args[3..] {
+        match &arg.kind {
+            ExprKind::List(items) if items.len() >= 2 => {
+                let field_name = match &items[0].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type(format!("{p}: define-record-type: expected field name"))),
+                };
+                let accessor_name = match &items[1].kind {
+                    ExprKind::Symbol(s) => s.clone(),
+                    _ => return Err(EvalError::Type(format!("{p}: define-record-type: expected accessor name"))),
+                };
+                field_specs.push((field_name, accessor_name));
+            }
+            _ => return Err(EvalError::Type(format!("{p}: define-record-type: expected field spec"))),
+        }
+    }
+
+    // Bind constructor
+    env_set(env, constructor_name, Value::RecordConstructor {
+        type_id,
+        num_fields: constructor_fields.len(),
+    });
+
+    // Bind predicate
+    env_set(env, predicate_name, Value::RecordPredicate { type_id });
+
+    // Bind accessors - map field name to index in constructor fields
+    for (field_name, accessor_name) in &field_specs {
+        let field_index = constructor_fields.iter().position(|f| f == field_name)
+            .ok_or_else(|| EvalError::Type(format!(
+                "{p}: define-record-type: field '{field_name}' not in constructor"
+            )))?;
+        env_set(env, accessor_name.clone(), Value::RecordAccessor {
+            type_id,
+            field_index,
+        });
+    }
+
+    Ok(Value::Void)
+}
+
 // --- Macro support ---
 
 const SYNTAX_KEYWORDS: &[&str] = &[
     "if", "let", "begin", "set!", "cond", "and", "or", "quote",
-    "lambda", "define", "define-syntax", "string-set!",
+    "lambda", "define", "define-syntax", "define-record-type", "string-set!",
 ];
 
 #[derive(Clone)]
