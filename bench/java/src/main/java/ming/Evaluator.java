@@ -36,6 +36,11 @@ public class Evaluator {
             throw new EvalError("unbound variable: " + name);
         }
         void define(String name, Object val) { bindings.put(name, val); }
+        void set(String name, Object val) throws EvalError {
+            if (bindings.containsKey(name)) { bindings.put(name, val); return; }
+            if (parent != null) { parent.set(name, val); return; }
+            throw new EvalError("set!: unbound variable: " + name);
+        }
     }
 
     private static final String[] BUILTIN_NAMES = {
@@ -296,6 +301,15 @@ public class Evaluator {
                             return lambda;
                         }
                         throw new EvalError("define: bad syntax");
+                    }
+                    case "set!" -> {
+                        if (list.size() != 3) throw new EvalError("set!: bad syntax");
+                        Object target = list.get(1);
+                        if (target instanceof Located lt) target = lt.expr();
+                        if (!(target instanceof String name)) throw new EvalError("set!: not a variable");
+                        Object val = eval(list.get(2), env);
+                        env.set(name, val);
+                        return null;
                     }
                     case "if" -> {
                         if (list.size() < 3) throw new EvalError("if: bad syntax");
