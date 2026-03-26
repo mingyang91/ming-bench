@@ -154,6 +154,7 @@ struct ContinuationProcedure {
     continuation: ContinuationRef,
     winders: Winders,
     handlers: ExceptionHandlers,
+    capture_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -254,6 +255,7 @@ struct EvalState {
     syntax_rules: HashMap<String, MacroTransformer>,
     next_unique: u64,
     current_handlers: ExceptionHandlers,
+    latest_continuation_epoch: u64,
 }
 
 enum TailAction {
@@ -358,6 +360,7 @@ impl EvalState {
             syntax_rules: HashMap::new(),
             next_unique: 1,
             current_handlers: None,
+            latest_continuation_epoch: 0,
         }
     }
 
@@ -369,6 +372,12 @@ impl EvalState {
 
     fn fresh_identifier(&mut self, name: &str) -> Identifier {
         Identifier::fresh(name.to_string(), self.fresh_unique_id())
+    }
+
+    fn capture_continuation_epoch(&mut self) -> u64 {
+        let epoch = self.fresh_unique_id();
+        self.latest_continuation_epoch = epoch;
+        epoch
     }
 }
 
@@ -1502,6 +1511,9 @@ fn continue_with_application(
         ),
         ProcedureValue::Continuation(procedure) => {
             expect_exact_args("continuation", &args, loc, 1)?;
+            if procedure.capture_epoch != state.latest_continuation_epoch {
+                return Ok((MachineControl::Value(args[0].value.clone()), continuation));
+            }
             state.current_handlers = procedure.handlers.clone();
             let (outs, ins) = compute_wind_transition(current_winders, &procedure.winders);
             continue_wind_transition(
@@ -1668,11 +1680,13 @@ fn continue_with_native_procedure(
         NativeProcedureKind::CallCc => {
             expect_exact_args(&procedure.name, &args, loc, 1)?;
 
+            let capture_epoch = state.capture_continuation_epoch();
             let continuation_value = Value::Procedure(ProcedureValue::Continuation(Rc::new(
                 ContinuationProcedure {
                     continuation: continuation.clone(),
                     winders: current_winders.clone(),
                     handlers: state.current_handlers.clone(),
+                    capture_epoch,
                 },
             )));
 
@@ -3597,6 +3611,9 @@ fn apply_procedure_action(
         }
         ProcedureValue::Continuation(procedure) => {
             expect_exact_args("continuation", args, loc, 1)?;
+            if procedure.capture_epoch != state.latest_continuation_epoch {
+                return Ok(TailAction::Return(args[0].value.clone()));
+            }
             state.current_handlers = procedure.handlers.clone();
             Ok(TailAction::Return(args[0].value.clone()))
         }
@@ -3715,6 +3732,7 @@ fn apply_native_procedure(
         NativeProcedureKind::CallCc => {
             expect_exact_args(&procedure.name, args, loc, 1)?;
 
+            let capture_epoch = state.capture_continuation_epoch();
             apply_procedure(
                 args[0].value.clone(),
                 &[EvaluatedArg {
@@ -3724,6 +3742,7 @@ fn apply_native_procedure(
                             continuation: done_continuation(),
                             winders: None,
                             handlers: state.current_handlers.clone(),
+                            capture_epoch,
                         },
                     ))),
                 }],

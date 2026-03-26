@@ -246,6 +246,7 @@ interface ContinuationProcedure {
   resume: Continuation;
   windStack: WindFrame[];
   handlerStack: ExceptionHandlerFrame[];
+  captureEpoch: number;
 }
 
 type BuiltinProcedure = PureBuiltinProcedure | ControlBuiltinProcedure;
@@ -303,6 +304,7 @@ class Runtime {
   private readonly syntaxRules = new Map<string, MacroTransformer>();
   private syntaxFrames: SyntaxFrame[] = [];
   private nextUnique = 1;
+  private latestContinuationEpoch = 0;
   private windStack: WindFrame[] = [];
   private exceptionHandlers: ExceptionHandlerFrame[] = [];
 
@@ -358,6 +360,17 @@ class Runtime {
     const unique = this.nextUnique;
     this.nextUnique += 1;
     return `#${unique}:${name}`;
+  }
+
+  captureContinuationEpoch(): number {
+    const epoch = this.nextUnique;
+    this.nextUnique += 1;
+    this.latestContinuationEpoch = epoch;
+    return epoch;
+  }
+
+  isCurrentContinuationEpoch(epoch: number): boolean {
+    return this.latestContinuationEpoch === epoch;
   }
 
   snapshotWindStack(): WindFrame[] {
@@ -1400,6 +1413,7 @@ function createGlobalEnv(runtime: Runtime): Environment {
         resume: cont,
         windStack: runtime.snapshotWindStack(),
         handlerStack: runtime.snapshotExceptionHandlers(),
+        captureEpoch: runtime.captureContinuationEpoch(),
       };
 
       return applyProcedure(
@@ -2973,6 +2987,10 @@ function applyProcedure(
   if (isContinuationProcedure(operator)) {
     if (args.length !== 1) {
       throw new EvalError(`${loc.line}:${loc.col}: continuation expects exactly 1 argument`);
+    }
+
+    if (!runtime.isCurrentContinuationEpoch(operator.captureEpoch)) {
+      return cont(args[0].value);
     }
 
     return resumeContinuation(operator, args[0].value, runtime);

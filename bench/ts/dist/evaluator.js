@@ -7,6 +7,7 @@ class Runtime {
     syntaxRules = new Map();
     syntaxFrames = [];
     nextUnique = 1;
+    latestContinuationEpoch = 0;
     windStack = [];
     exceptionHandlers = [];
     write(value) {
@@ -49,6 +50,15 @@ class Runtime {
         const unique = this.nextUnique;
         this.nextUnique += 1;
         return `#${unique}:${name}`;
+    }
+    captureContinuationEpoch() {
+        const epoch = this.nextUnique;
+        this.nextUnique += 1;
+        this.latestContinuationEpoch = epoch;
+        return epoch;
+    }
+    isCurrentContinuationEpoch(epoch) {
+        return this.latestContinuationEpoch === epoch;
     }
     snapshotWindStack() {
         return [...this.windStack];
@@ -861,6 +871,7 @@ function createGlobalEnv(runtime) {
                 resume: cont,
                 windStack: runtime.snapshotWindStack(),
                 handlerStack: runtime.snapshotExceptionHandlers(),
+                captureEpoch: runtime.captureContinuationEpoch(),
             };
             return applyProcedure(args[0].value, [{ expr: plainSymbolExpr(name, loc), value: continuation }], loc, runtime, cont);
         }));
@@ -1929,6 +1940,9 @@ function applyProcedure(operator, args, loc, runtime, cont) {
     if (isContinuationProcedure(operator)) {
         if (args.length !== 1) {
             throw new EvalError(`${loc.line}:${loc.col}: continuation expects exactly 1 argument`);
+        }
+        if (!runtime.isCurrentContinuationEpoch(operator.captureEpoch)) {
+            return cont(args[0].value);
         }
         return resumeContinuation(operator, args[0].value, runtime);
     }
