@@ -485,6 +485,9 @@ enum ContinuationFrame {
         lists: Vec<Vec<Value>>,
         index: usize,
     },
+    CallWithValues {
+        consumer: Value,
+    },
     DynamicWindAfterIn {
         wind: DynamicWindRef,
         body_thunk: Value,
@@ -504,7 +507,7 @@ struct ExceptionHandler {
     kind: ExceptionHandlerKind,
     frames: Vec<ContinuationFrame>,
     winds: Vec<DynamicWindRef>,
-    outer_handlers: Vec<ExceptionHandlerRef>,
+    outer_handler_depth: usize,
     position: Option<Position>,
 }
 
@@ -574,6 +577,10 @@ enum EvalStep {
     Expr(Expr, EnvRef),
     Sequence(Vec<Expr>, EnvRef),
     Apply(Value, Vec<Value>),
+    WithExceptionHandler {
+        handler: ExceptionHandlerRef,
+        step: Box<EvalStep>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -589,6 +596,7 @@ enum EvalAction {
     HandleException {
         value: Value,
         handler: ExceptionHandlerRef,
+        outer_handlers: Vec<ExceptionHandlerRef>,
     },
     UncaughtException {
         value: Value,
@@ -884,7 +892,14 @@ impl Procedure {
                         });
                     }
 
-                    let produced = apply_procedure(args[0].clone(), Vec::new(), context)?;
+                    let produced = apply_procedure_with_frame(
+                        args[0].clone(),
+                        Vec::new(),
+                        ContinuationFrame::CallWithValues {
+                            consumer: args[1].clone(),
+                        },
+                        context,
+                    )?;
                     Ok(EvalStep::Apply(args[1].clone(), unpack_values(produced)))
                 } else if *name == "dynamic-wind" {
                     if args.len() != 3 {
@@ -957,16 +972,8 @@ impl Procedure {
                 winds,
                 handlers,
             } => {
-                if args.len() != 1 {
-                    return Err(EvalError::WrongArgCountDynamic {
-                        name: "continuation".into(),
-                        expected: "exactly 1 argument".into(),
-                        got: args.len(),
-                    });
-                }
-
                 signal_continuation(
-                    args[0].clone(),
+                    pack_values(args),
                     frames.clone(),
                     winds.clone(),
                     handlers.clone(),
@@ -1394,12 +1401,18 @@ impl<'a> Parser<'a> {
 }
 
 fn resolve_eval_step(mut step: EvalStep, context: &mut EvalContext) -> Result<Value, EvalError> {
+    let mut exception_handler_guards = Vec::new();
+
     loop {
         step = match step {
             EvalStep::Value(value) => return Ok(value),
             EvalStep::Expr(expr, env) => eval_expr_step(expr, env, context)?,
             EvalStep::Sequence(expressions, env) => eval_sequence_step(expressions, env, context)?,
             EvalStep::Apply(procedure, args) => apply_procedure_step(procedure, args, context)?,
+            EvalStep::WithExceptionHandler { handler, step } => {
+                exception_handler_guards.push(push_exception_handler(context, handler));
+                *step
+            }
         };
     }
 }
@@ -1485,8 +1498,12 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
                     .clone_from(&handlers);
                 resume_continuation_frames(value, frames, context)
             }
-            EvalAction::HandleException { value, handler } => {
-                handle_exception(value, &handler, context)
+            EvalAction::HandleException {
+                value,
+                handler,
+                outer_handlers,
+            } => {
+                handle_exception(value, &handler, outer_handlers, context)
             }
             EvalAction::UncaughtException { value, position } => {
                 let _position_guard = push_position(context, position);
@@ -1519,9 +1536,12 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
                 } else if payload.downcast_ref::<ExceptionSignal>().is_some() {
                     let jump = take_exception_jump();
                     if let Some(handler) = jump.handlers.last().cloned() {
+                        let outer_handlers =
+                            jump.handlers[..handler.outer_handler_depth].to_vec();
                         action = EvalAction::HandleException {
                             value: jump.value,
                             handler,
+                            outer_handlers,
                         };
                     } else {
                         action = EvalAction::UncaughtException {
@@ -1540,11 +1560,11 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
 fn handle_exception(
     value: Value,
     handler: &ExceptionHandlerRef,
+    outer_handlers: Vec<ExceptionHandlerRef>,
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     let frames = handler.frames.clone();
     let winds = handler.winds.clone();
-    let outer_handlers = handler.outer_handlers.clone();
     let position = handler.position;
 
     let _position_guard = push_position(context, position);
@@ -1888,6 +1908,9 @@ fn resume_continuation_frames(
             } => {
                 expect_single_value(value)?;
                 apply_for_each_from_index(procedure, &lists, index, context)?
+            }
+            ContinuationFrame::CallWithValues { consumer } => {
+                apply_procedure(consumer, unpack_values(value), context)?
             }
             ContinuationFrame::DynamicWindAfterIn { wind, body_thunk } => {
                 expect_single_value(value)?;
@@ -2732,13 +2755,14 @@ fn eval_guard_step(
         },
         frames: context.frames.borrow().clone(),
         winds: context.dynamic_winds.borrow().clone(),
-        outer_handlers: context.exception_handlers.borrow().clone(),
+        outer_handler_depth: context.exception_handlers.borrow().len(),
         position: current_position(context),
     });
 
-    let _handler_guard = push_exception_handler(context, handler);
-    let result = eval_sequence(body, env, context)?;
-    Ok(EvalStep::Value(result))
+    Ok(EvalStep::WithExceptionHandler {
+        handler,
+        step: Box::new(EvalStep::Sequence(body.to_vec(), env.clone())),
+    })
 }
 
 fn eval_guard_handler(
@@ -5025,7 +5049,7 @@ fn apply_builtin(
                 },
                 frames: context.frames.borrow().clone(),
                 winds: context.dynamic_winds.borrow().clone(),
-                outer_handlers: context.exception_handlers.borrow().clone(),
+                outer_handler_depth: context.exception_handlers.borrow().len(),
                 position: current_position(context),
             });
 
