@@ -9,7 +9,6 @@ import java.util.Set;
 
 final class SyntaxRulesMacro implements MacroTransformer {
     private static final Set<String> CORE_SYNTAX = SyntaxMatcher.CORE_SYNTAX;
-    private static long nextMacroId = 1L;
 
     private final long macroId;
     private final String name;
@@ -22,9 +21,10 @@ final class SyntaxRulesMacro implements MacroTransformer {
             String name,
             Set<String> literalIdentifiers,
             List<SyntaxRule> rules,
-            Environment definitionEnvironment
+            Environment definitionEnvironment,
+            long macroId
     ) {
-        this.macroId = nextMacroId++;
+        this.macroId = macroId;
         this.name = name;
         this.literalIdentifiers = literalIdentifiers;
         this.rules = rules;

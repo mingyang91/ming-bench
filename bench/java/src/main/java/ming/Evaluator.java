@@ -1,12 +1,14 @@
 package ming;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 
 /**
@@ -15,13 +17,10 @@ import java.util.function.Predicate;
  */
 public class Evaluator {
     private final Map<String, BuiltinProcedure> builtins = createBuiltins();
-    private StringBuilder outputBuffer;
-    private Long remainingSteps;
-    private ContinuationContext currentContinuation;
-    private List<WindFrame> currentWinds = List.of();
-    private TailGuardContext currentTailGuard;
-    private SyntaxTemplateContext currentSyntaxTemplateContext;
-    private List<SyntaxScope> currentSyntaxScopes = List.of();
+    private final ThreadLocal<ArrayDeque<EvaluationState>> evaluationStates =
+            ThreadLocal.withInitial(ArrayDeque::new);
+    private final AtomicLong macroAliasIds = new AtomicLong(1L);
+    private final AtomicLong templateAliasIds = new AtomicLong(1L);
 
     /**
      * Evaluate one or more Scheme expressions and return the string
@@ -59,10 +58,9 @@ public class Evaluator {
             throw new EvalError("step limit must be non-negative");
         }
 
-        StringBuilder previousOutputBuffer = outputBuffer;
-        Long previousRemainingSteps = remainingSteps;
-        outputBuffer = captureOutput ? new StringBuilder() : null;
-        remainingSteps = maxSteps;
+        ArrayDeque<EvaluationState> states = evaluationStates.get();
+        EvaluationState state = new EvaluationState(captureOutput ? new StringBuilder() : null, maxSteps);
+        states.addLast(state);
         try {
             Environment environment = createTopLevelEnvironment();
             SchemeValue result;
@@ -74,18 +72,37 @@ public class Evaluator {
                 throw new EvalError("uncaught exception: " + raised.value().render());
             }
             result = requireSingleValue(result);
-            String output = outputBuffer == null ? "" : outputBuffer.toString();
+            String output = state.outputBuffer == null ? "" : state.outputBuffer.toString();
             return new EvalResult(result.render(), output);
         } finally {
-            outputBuffer = previousOutputBuffer;
-            remainingSteps = previousRemainingSteps;
+            states.removeLast();
+            if (states.isEmpty()) {
+                evaluationStates.remove();
+            }
         }
+    }
+
+    private EvaluationState currentState() {
+        EvaluationState state = evaluationStates.get().peekLast();
+        if (state == null) {
+            throw new IllegalStateException("evaluation state not initialized");
+        }
+        return state;
+    }
+
+    private long nextMacroAliasId() {
+        return macroAliasIds.getAndIncrement();
+    }
+
+    private long nextTemplateAliasId() {
+        return templateAliasIds.getAndIncrement();
     }
 
     private SchemeValue eval(SchemeExpression expression, Environment environment) throws EvalError {
         SchemeExpression currentExpression = expression;
         Environment currentEnvironment = environment;
-        TailGuardContext savedTailGuard = currentTailGuard;
+        EvaluationState state = currentState();
+        TailGuardContext savedTailGuard = state.currentTailGuard;
         try {
             while (true) {
                 try {
@@ -118,7 +135,7 @@ public class Evaluator {
                 }
             }
         } finally {
-            currentTailGuard = savedTailGuard;
+            state.currentTailGuard = savedTailGuard;
         }
     }
 
@@ -140,21 +157,23 @@ public class Evaluator {
     }
 
     private void consumeStep() throws EvalError {
-        if (remainingSteps == null) {
+        EvaluationState state = currentState();
+        if (state.remainingSteps == null) {
             return;
         }
-        if (remainingSteps <= 0L) {
+        if (state.remainingSteps <= 0L) {
             throw new EvalError("step limit exceeded");
         }
-        remainingSteps--;
+        state.remainingSteps--;
     }
 
     private SchemeValue runWithContinuations(RootComputation computation) throws EvalError {
+        EvaluationState state = currentState();
         RootComputation currentComputation = computation;
-        ContinuationContext previousContinuation = currentContinuation;
-        List<WindFrame> previousWinds = currentWinds;
-        currentContinuation = null;
-        currentWinds = List.of();
+        ContinuationContext previousContinuation = state.currentContinuation;
+        List<WindFrame> previousWinds = state.currentWinds;
+        state.currentContinuation = null;
+        state.currentWinds = List.of();
         try {
             while (true) {
                 try {
@@ -164,8 +183,8 @@ public class Evaluator {
                 }
             }
         } finally {
-            currentContinuation = previousContinuation;
-            currentWinds = previousWinds;
+            state.currentContinuation = previousContinuation;
+            state.currentWinds = previousWinds;
         }
     }
 
@@ -191,36 +210,39 @@ public class Evaluator {
             Environment environment,
             ContinuationFrame frame
     ) throws EvalError {
-        ContinuationContext savedContinuation = currentContinuation;
-        currentContinuation = new ContinuationContext(
+        EvaluationState state = currentState();
+        ContinuationContext savedContinuation = state.currentContinuation;
+        state.currentContinuation = new ContinuationContext(
                 value -> frame.resume(requireSingleValue(value)),
                 savedContinuation
         );
         try {
             return evalNonTail(expression, environment);
         } finally {
-            currentContinuation = savedContinuation;
+            state.currentContinuation = savedContinuation;
         }
     }
 
     private SchemeValue withActiveContinuation(ContinuationContext continuation, RootComputation computation)
             throws EvalError {
-        ContinuationContext previousContinuation = currentContinuation;
-        currentContinuation = continuation;
+        EvaluationState state = currentState();
+        ContinuationContext previousContinuation = state.currentContinuation;
+        state.currentContinuation = continuation;
         try {
             return computation.run();
         } finally {
-            currentContinuation = previousContinuation;
+            state.currentContinuation = previousContinuation;
         }
     }
 
     private SchemeValue withActiveWinds(List<WindFrame> winds, RootComputation computation) throws EvalError {
-        List<WindFrame> previousWinds = currentWinds;
-        currentWinds = winds;
+        EvaluationState state = currentState();
+        List<WindFrame> previousWinds = state.currentWinds;
+        state.currentWinds = winds;
         try {
             return computation.run();
         } finally {
-            currentWinds = previousWinds;
+            state.currentWinds = previousWinds;
         }
     }
 
@@ -239,7 +261,7 @@ public class Evaluator {
             withActiveWinds(activeWinds, () -> applyThunk(frame.inThunk()));
         }
 
-        currentWinds = List.copyOf(target);
+        currentState().currentWinds = List.copyOf(target);
     }
 
     private TailStep evalListTail(ListExpression expression, Environment environment) throws EvalError {
@@ -437,11 +459,12 @@ public class Evaluator {
 
     private TailStep evalGuardTail(List<SchemeExpression> elements, Environment environment) throws EvalError {
         GuardSpec guardSpec = parseGuard(elements);
-        currentTailGuard = new TailGuardContext(
+        EvaluationState state = currentState();
+        state.currentTailGuard = new TailGuardContext(
                 guardSpec.exceptionVariable(),
                 guardSpec.clauses(),
                 environment,
-                currentTailGuard
+                state.currentTailGuard
         );
         return tailSequence(guardSpec.body(), environment, VoidValue.INSTANCE);
     }
@@ -649,7 +672,7 @@ public class Evaluator {
             if (!(transformerValue instanceof ProcedureValue procedureValue)) {
                 throw new EvalError("define-syntax: expected a transformer procedure");
             }
-            macro = new ProcedureMacro(symbol.name(), procedureValue, environment);
+            macro = new ProcedureMacro(symbol.name(), procedureValue, environment, nextTemplateAliasId());
         }
 
         environment.defineMacro(symbol.name(), macro);
@@ -1242,10 +1265,11 @@ public class Evaluator {
             SyntaxTemplateContext templateContext,
             ListExpression invocation
     ) throws EvalError {
-        SyntaxTemplateContext previousTemplateContext = currentSyntaxTemplateContext;
-        List<SyntaxScope> previousSyntaxScopes = currentSyntaxScopes;
-        currentSyntaxTemplateContext = templateContext;
-        currentSyntaxScopes = List.of();
+        EvaluationState state = currentState();
+        SyntaxTemplateContext previousTemplateContext = state.currentSyntaxTemplateContext;
+        List<SyntaxScope> previousSyntaxScopes = state.currentSyntaxScopes;
+        state.currentSyntaxTemplateContext = templateContext;
+        state.currentSyntaxScopes = List.of();
         try {
             SchemeValue expanded = requireSingleValue(
                     applyProcedure(transformer, List.of(new SyntaxValue(invocation, UseSiteSyntaxContext.INSTANCE)))
@@ -1255,8 +1279,8 @@ public class Evaluator {
             }
             return syntaxValue.expression();
         } finally {
-            currentSyntaxTemplateContext = previousTemplateContext;
-            currentSyntaxScopes = previousSyntaxScopes;
+            state.currentSyntaxTemplateContext = previousTemplateContext;
+            state.currentSyntaxScopes = previousSyntaxScopes;
         }
     }
 
@@ -1273,9 +1297,10 @@ public class Evaluator {
             }
         }
 
-        SyntaxContext syntaxContext = currentSyntaxTemplateContext == null
+        EvaluationState state = currentState();
+        SyntaxContext syntaxContext = state.currentSyntaxTemplateContext == null
                 ? UseSiteSyntaxContext.INSTANCE
-                : currentSyntaxTemplateContext;
+                : state.currentSyntaxTemplateContext;
         SchemeExpression expanded = SyntaxMatcher.expandTemplate(
                 template,
                 currentSyntaxBindings(),
@@ -1430,7 +1455,8 @@ public class Evaluator {
                 macroName,
                 Set.copyOf(literalIdentifiers),
                 List.copyOf(rules),
-                environment
+                environment,
+                nextMacroAliasId()
         );
     }
 
@@ -1453,27 +1479,29 @@ public class Evaluator {
             Map<String, SyntaxMatcher.PatternBinding> bindings,
             RootComputation computation
     ) throws EvalError {
-        List<SyntaxScope> previousSyntaxScopes = currentSyntaxScopes;
+        EvaluationState state = currentState();
+        List<SyntaxScope> previousSyntaxScopes = state.currentSyntaxScopes;
         List<SyntaxScope> scopes = new ArrayList<>(previousSyntaxScopes.size() + 1);
         scopes.addAll(previousSyntaxScopes);
         scopes.add(new SyntaxScope(Map.copyOf(bindings)));
-        currentSyntaxScopes = List.copyOf(scopes);
+        state.currentSyntaxScopes = List.copyOf(scopes);
         try {
             return computation.run();
         } finally {
-            currentSyntaxScopes = previousSyntaxScopes;
+            state.currentSyntaxScopes = previousSyntaxScopes;
         }
     }
 
     private Map<String, SyntaxMatcher.PatternBinding> currentSyntaxBindings() {
-        if (currentSyntaxScopes.isEmpty()) {
+        List<SyntaxScope> syntaxScopes = currentState().currentSyntaxScopes;
+        if (syntaxScopes.isEmpty()) {
             return Map.of();
         }
 
         Map<String, SyntaxMatcher.PatternBinding> bindings = new HashMap<>();
-        for (int index = currentSyntaxScopes.size() - 1; index >= 0; index--) {
+        for (int index = syntaxScopes.size() - 1; index >= 0; index--) {
             for (Map.Entry<String, SyntaxMatcher.PatternBinding> entry :
-                    currentSyntaxScopes.get(index).bindings().entrySet()) {
+                    syntaxScopes.get(index).bindings().entrySet()) {
                 bindings.putIfAbsent(entry.getKey(), entry.getValue());
             }
         }
@@ -1481,8 +1509,9 @@ public class Evaluator {
     }
 
     private SyntaxMatcher.PatternBinding lookupSyntaxBinding(String name) {
-        for (int index = currentSyntaxScopes.size() - 1; index >= 0; index--) {
-            SyntaxMatcher.PatternBinding binding = currentSyntaxScopes.get(index).bindings().get(name);
+        List<SyntaxScope> syntaxScopes = currentState().currentSyntaxScopes;
+        for (int index = syntaxScopes.size() - 1; index >= 0; index--) {
+            SyntaxMatcher.PatternBinding binding = syntaxScopes.get(index).bindings().get(name);
             if (binding != null) {
                 return binding;
             }
@@ -1621,14 +1650,15 @@ public class Evaluator {
     }
 
     private TailStep recoverTailGuard(TailGuardContext savedTailGuard, SchemeValue exceptionValue) throws EvalError {
+        EvaluationState state = currentState();
         RaisedException pending = new RaisedException(exceptionValue);
         while (true) {
-            if (currentTailGuard == savedTailGuard) {
+            if (state.currentTailGuard == savedTailGuard) {
                 throw pending;
             }
 
-            TailGuardContext guard = currentTailGuard;
-            currentTailGuard = guard.parent();
+            TailGuardContext guard = state.currentTailGuard;
+            state.currentTailGuard = guard.parent();
             try {
                 return evalGuardClausesTail(
                         guard.exceptionVariable(),
@@ -2123,7 +2153,7 @@ public class Evaluator {
     }
 
     private boolean shouldSuspendSequence(SchemeExpression expression, SchemeValue value) {
-        return currentWinds.isEmpty()
+        return currentState().currentWinds.isEmpty()
                 && value instanceof VoidValue
                 && isSuspendingCallCcExpression(expression);
     }
@@ -2747,7 +2777,7 @@ public class Evaluator {
 
         ContinuationContext consumerContinuation = new ContinuationContext(
                 value -> applyProcedure(arguments.get(1), unpackValues(value)),
-                currentContinuation
+                currentState().currentContinuation
         );
         SchemeValue produced = withActiveContinuation(consumerContinuation, () -> applyThunk(arguments.getFirst()));
         return applyProcedure(arguments.get(1), unpackValues(produced));
@@ -2768,10 +2798,11 @@ public class Evaluator {
 
     private SchemeValue applyCallWithCurrentContinuation(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 1, "call/cc");
+        EvaluationState state = currentState();
         return applyProcedure(
                 arguments.getFirst(),
                 List.of(new ContinuationProcedure(
-                        new CapturedContinuation(currentContinuation, List.copyOf(currentWinds))
+                        new CapturedContinuation(state.currentContinuation, List.copyOf(state.currentWinds))
                 ))
         );
     }
@@ -2803,9 +2834,10 @@ public class Evaluator {
         WindFrame wind = new WindFrame(inThunk, outThunk);
         pushWind(wind);
 
+        EvaluationState state = currentState();
         ContinuationContext bodyContinuation = new ContinuationContext(
                 value -> finishDynamicWind(wind, value),
-                currentContinuation
+                state.currentContinuation
         );
 
         try {
@@ -2836,26 +2868,29 @@ public class Evaluator {
     }
 
     private void pushWind(WindFrame wind) {
-        List<WindFrame> winds = new ArrayList<>(currentWinds.size() + 1);
-        winds.addAll(currentWinds);
+        EvaluationState state = currentState();
+        List<WindFrame> winds = new ArrayList<>(state.currentWinds.size() + 1);
+        winds.addAll(state.currentWinds);
         winds.add(wind);
-        currentWinds = List.copyOf(winds);
+        state.currentWinds = List.copyOf(winds);
     }
 
     private void popWind(WindFrame wind) {
-        if (currentWinds.isEmpty() || currentWinds.getLast() != wind) {
+        EvaluationState state = currentState();
+        if (state.currentWinds.isEmpty() || state.currentWinds.getLast() != wind) {
             return;
         }
-        currentWinds = copyWindPrefix(currentWinds, currentWinds.size() - 1);
+        state.currentWinds = copyWindPrefix(state.currentWinds, state.currentWinds.size() - 1);
     }
 
     private SchemeValue applyContinuation(ContinuationProcedure continuationProcedure, List<SchemeValue> arguments)
             throws EvalError {
         CapturedContinuation continuation = (CapturedContinuation) continuationProcedure.continuation();
+        EvaluationState state = currentState();
         throw new ContinuationJump(
                 continuation.context(),
                 packValues(arguments),
-                List.copyOf(currentWinds),
+                List.copyOf(state.currentWinds),
                 continuation.winds()
         );
     }
@@ -3848,8 +3883,9 @@ public class Evaluator {
     }
 
     private void emit(String text) {
-        if (outputBuffer != null) {
-            outputBuffer.append(text);
+        EvaluationState state = currentState();
+        if (state.outputBuffer != null) {
+            state.outputBuffer.append(text);
         }
     }
 
@@ -3889,6 +3925,23 @@ public class Evaluator {
     }
 
     private record VectorComparison(VectorValue left, VectorValue right) {
+    }
+
+    private static final class EvaluationState {
+        private final StringBuilder outputBuffer;
+        private Long remainingSteps;
+        private ContinuationContext currentContinuation;
+        private List<WindFrame> currentWinds;
+        private TailGuardContext currentTailGuard;
+        private SyntaxTemplateContext currentSyntaxTemplateContext;
+        private List<SyntaxScope> currentSyntaxScopes;
+
+        private EvaluationState(StringBuilder outputBuffer, Long remainingSteps) {
+            this.outputBuffer = outputBuffer;
+            this.remainingSteps = remainingSteps;
+            this.currentWinds = List.of();
+            this.currentSyntaxScopes = List.of();
+        }
     }
 
     private static List<WindFrame> copyWindPrefix(List<WindFrame> winds, int size) {

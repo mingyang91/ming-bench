@@ -57,14 +57,12 @@ enum UseSiteSyntaxContext implements SyntaxContext {
 }
 
 final class SyntaxTemplateContext implements SyntaxContext {
-    private static long nextTemplateId = 1L;
-
     private final long templateId;
     private final Environment definitionEnvironment;
     private final Map<String, String> identifierAliases = new HashMap<>();
 
-    SyntaxTemplateContext(Environment definitionEnvironment) {
-        this.templateId = nextTemplateId++;
+    SyntaxTemplateContext(Environment definitionEnvironment, long templateId) {
+        this.templateId = templateId;
         this.definitionEnvironment = definitionEnvironment;
     }
 

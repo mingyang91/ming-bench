@@ -9,10 +9,15 @@ final class ProcedureMacro implements MacroTransformer {
     private final ProcedureValue transformer;
     private final SyntaxTemplateContext templateContext;
 
-    ProcedureMacro(String name, ProcedureValue transformer, Environment definitionEnvironment) {
+    ProcedureMacro(
+            String name,
+            ProcedureValue transformer,
+            Environment definitionEnvironment,
+            long templateId
+    ) {
         this.name = name;
         this.transformer = transformer;
-        this.templateContext = new SyntaxTemplateContext(definitionEnvironment);
+        this.templateContext = new SyntaxTemplateContext(definitionEnvironment, templateId);
     }
 
     @Override
