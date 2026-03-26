@@ -55,6 +55,14 @@ public class Evaluator {
         }
     }
 
+    // --- TCO trampoline marker ---
+
+    private static class TailCall {
+        final Object expr;
+        final Env env;
+        TailCall(Object expr, Env env) { this.expr = expr; this.env = env; }
+    }
+
     // --- CaseLambda ---
 
     private static class CaseLambda {
@@ -356,6 +364,14 @@ public class Evaluator {
     // --- Eval ---
 
     private Object eval(Object expr, Env env) throws EvalError {
+        Object result = evalTail(expr, env);
+        while (result instanceof TailCall tc) {
+            result = evalTail(tc.expr, tc.env);
+        }
+        return result;
+    }
+
+    private Object evalTail(Object expr, Env env) throws EvalError {
         if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar || expr instanceof SchemeRational || expr instanceof SchemeInexact || expr instanceof SchemeVector) {
             return expr;
         }
@@ -409,23 +425,74 @@ public class Evaluator {
                 try {
                     Object headVal = env.lookup(sym.name);
                     if (headVal instanceof SyntaxRulesMacro macro) {
-                        return eval(expandMacro(macro, list, env), env);
+                        return new TailCall(expandMacro(macro, list, env), env);
                     }
                 } catch (EvalError ignored) {}
             }
-            // Function call
+            // Function call — inline Lambda/CaseLambda for TCO
             try {
                 Object proc = eval(first, env);
                 List<Object> args = new ArrayList<>();
                 for (int i = 1; i < list.elems.size(); i++) {
                     args.add(eval(list.elems.get(i), env));
                 }
-                return apply(proc, args);
+                if (proc instanceof Lambda lam) {
+                    return tailApplyLambda(lam, args);
+                }
+                if (proc instanceof CaseLambda cl) {
+                    Lambda matched = findMatchingClause(cl, args);
+                    return tailApplyLambda(matched, args);
+                }
+                if (proc instanceof BuiltinProc bp) {
+                    return bp.apply(args);
+                }
+                throw new EvalError("not a procedure: " + schemeToString(proc));
             } catch (EvalError e) {
                 throw addPosition(e, list.line, list.col);
             }
         }
         throw new EvalError("cannot eval: " + expr);
+    }
+
+    private Env bindLambdaArgs(Lambda lam, List<Object> args) throws EvalError {
+        if (lam.restParam != null) {
+            if (args.size() < lam.params.size())
+                throw new EvalError("lambda: expected at least " + lam.params.size() + " arguments, got " + args.size());
+        } else {
+            if (args.size() != lam.params.size())
+                throw new EvalError("lambda: expected " + lam.params.size() + " arguments, got " + args.size());
+        }
+        Env callEnv = new Env(lam.closureEnv);
+        for (int i = 0; i < lam.params.size(); i++) {
+            callEnv.define(lam.params.get(i), args.get(i));
+        }
+        if (lam.restParam != null) {
+            Object rest = NIL;
+            for (int i = args.size() - 1; i >= lam.params.size(); i--) {
+                rest = new SchemePair(args.get(i), rest);
+            }
+            callEnv.define(lam.restParam, rest);
+        }
+        return callEnv;
+    }
+
+    private Object tailApplyLambda(Lambda lam, List<Object> args) throws EvalError {
+        Env callEnv = bindLambdaArgs(lam, args);
+        for (int i = 0; i < lam.body.size() - 1; i++) {
+            eval(lam.body.get(i), callEnv);
+        }
+        return new TailCall(lam.body.get(lam.body.size() - 1), callEnv);
+    }
+
+    private Lambda findMatchingClause(CaseLambda cl, List<Object> args) throws EvalError {
+        for (Lambda clause : cl.clauses) {
+            if (clause.restParam != null) {
+                if (args.size() >= clause.params.size()) return clause;
+            } else {
+                if (args.size() == clause.params.size()) return clause;
+            }
+        }
+        throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
     }
 
     private Object evalDefine(List<Object> elems, Env env) throws EvalError {
@@ -462,10 +529,10 @@ public class Evaluator {
         if (elems.size() < 3 || elems.size() > 4) throw new EvalError("if: bad syntax");
         Object cond = eval(elems.get(1), env);
         if (isTruthy(cond)) {
-            return eval(elems.get(2), env);
+            return new TailCall(elems.get(2), env);
         } else {
             if (elems.size() == 4) {
-                return eval(elems.get(3), env);
+                return new TailCall(elems.get(3), env);
             }
             return null; // void
         }
@@ -516,29 +583,29 @@ public class Evaluator {
     }
 
     private Object evalAnd(List<Object> elems, Env env) throws EvalError {
-        Object result = Boolean.TRUE;
-        for (int i = 1; i < elems.size(); i++) {
-            result = eval(elems.get(i), env);
+        if (elems.size() <= 1) return Boolean.TRUE;
+        for (int i = 1; i < elems.size() - 1; i++) {
+            Object result = eval(elems.get(i), env);
             if (!isTruthy(result)) return result;
         }
-        return result;
+        return new TailCall(elems.get(elems.size() - 1), env);
     }
 
     private Object evalOr(List<Object> elems, Env env) throws EvalError {
-        Object result = Boolean.FALSE;
-        for (int i = 1; i < elems.size(); i++) {
-            result = eval(elems.get(i), env);
+        if (elems.size() <= 1) return Boolean.FALSE;
+        for (int i = 1; i < elems.size() - 1; i++) {
+            Object result = eval(elems.get(i), env);
             if (isTruthy(result)) return result;
         }
-        return result;
+        return new TailCall(elems.get(elems.size() - 1), env);
     }
 
     private Object evalBegin(List<Object> elems, Env env) throws EvalError {
-        Object result = null;
-        for (int i = 1; i < elems.size(); i++) {
-            result = eval(elems.get(i), env);
+        if (elems.size() <= 1) return null;
+        for (int i = 1; i < elems.size() - 1; i++) {
+            eval(elems.get(i), env);
         }
-        return result;
+        return new TailCall(elems.get(elems.size() - 1), env);
     }
 
     private Object evalLet(List<Object> elems, Env env) throws EvalError {
@@ -564,20 +631,20 @@ public class Evaluator {
         List<Object> body = elems.subList(bindingsIdx + 1, elems.size());
 
         if (name != null) {
-            // Named let: create a lambda and call it
+            // Named let: create a lambda and call it (TCO)
             Lambda loopLam = new Lambda(paramNames, null, body, env);
             Env letEnv = new Env(env);
             letEnv.define(name, loopLam);
             loopLam.closureEnv = letEnv; // self-reference
             List<Object> initVals = new ArrayList<>();
             for (Object e : initExprs) initVals.add(eval(e, env));
-            return apply(loopLam, initVals);
+            return tailApplyLambda(loopLam, initVals);
         } else {
             Env letEnv = new Env(env);
             for (int i = 0; i < paramNames.size(); i++) {
                 letEnv.define(paramNames.get(i), eval(initExprs.get(i), env));
             }
-            return evalBody(body, letEnv);
+            return tailBody(body, letEnv);
         }
     }
 
@@ -587,20 +654,19 @@ public class Evaluator {
             if (clause.elems.isEmpty()) throw new EvalError("cond: empty clause");
             Object test = clause.elems.get(0);
             if (test instanceof SchemeSymbol sym && sym.name.equals("else")) {
-                Object result = null;
-                for (int j = 1; j < clause.elems.size(); j++) {
-                    result = eval(clause.elems.get(j), env);
+                if (clause.elems.size() <= 1) return null;
+                for (int j = 1; j < clause.elems.size() - 1; j++) {
+                    eval(clause.elems.get(j), env);
                 }
-                return result;
+                return new TailCall(clause.elems.get(clause.elems.size() - 1), env);
             }
             Object testVal = eval(test, env);
             if (isTruthy(testVal)) {
                 if (clause.elems.size() == 1) return testVal;
-                Object result = null;
-                for (int j = 1; j < clause.elems.size(); j++) {
-                    result = eval(clause.elems.get(j), env);
+                for (int j = 1; j < clause.elems.size() - 1; j++) {
+                    eval(clause.elems.get(j), env);
                 }
-                return result;
+                return new TailCall(clause.elems.get(clause.elems.size() - 1), env);
             }
         }
         return null; // void - no clause matched
@@ -615,21 +681,21 @@ public class Evaluator {
             if (clause.elems.isEmpty()) throw new EvalError("case: empty clause");
             Object first = clause.elems.get(0);
             if (first instanceof SchemeSymbol sym && sym.name.equals("else")) {
-                Object result = null;
-                for (int j = 1; j < clause.elems.size(); j++) {
-                    result = eval(clause.elems.get(j), env);
+                if (clause.elems.size() <= 1) return null;
+                for (int j = 1; j < clause.elems.size() - 1; j++) {
+                    eval(clause.elems.get(j), env);
                 }
-                return result;
+                return new TailCall(clause.elems.get(clause.elems.size() - 1), env);
             }
             // first should be a list of datums
             SchemeList datums = (SchemeList) first;
             for (Object datum : datums.elems) {
                 if (schemeEqv(key, quoteDatum(datum))) {
-                    Object result = null;
-                    for (int j = 1; j < clause.elems.size(); j++) {
-                        result = eval(clause.elems.get(j), env);
+                    if (clause.elems.size() <= 1) return null;
+                    for (int j = 1; j < clause.elems.size() - 1; j++) {
+                        eval(clause.elems.get(j), env);
                     }
-                    return result;
+                    return new TailCall(clause.elems.get(clause.elems.size() - 1), env);
                 }
             }
         }
@@ -667,7 +733,7 @@ public class Evaluator {
             Object val = eval(initExprs.get(i), letEnv);
             letEnv.define(names.get(i), val);
         }
-        return evalBody(elems.subList(2, elems.size()), letEnv);
+        return tailBody(elems.subList(2, elems.size()), letEnv);
     }
 
     private Object evalLetrecStar(List<Object> elems, Env env) throws EvalError {
@@ -681,7 +747,7 @@ public class Evaluator {
             Object val = eval(binding.elems.get(1), letEnv);
             letEnv.define(name, val);
         }
-        return evalBody(elems.subList(2, elems.size()), letEnv);
+        return tailBody(elems.subList(2, elems.size()), letEnv);
     }
 
     private Object evalLetStar(List<Object> elems, Env env) throws EvalError {
@@ -695,7 +761,7 @@ public class Evaluator {
             Object val = eval(binding.elems.get(1), letEnv);
             letEnv.define(name, val);
         }
-        return evalBody(elems.subList(2, elems.size()), letEnv);
+        return tailBody(elems.subList(2, elems.size()), letEnv);
     }
 
     private Object evalDo(List<Object> elems, Env env) throws EvalError {
@@ -759,6 +825,13 @@ public class Evaluator {
             result = eval(expr, env);
         }
         return result;
+    }
+
+    private Object tailBody(List<Object> body, Env env) throws EvalError {
+        for (int i = 0; i < body.size() - 1; i++) {
+            eval(body.get(i), env);
+        }
+        return new TailCall(body.get(body.size() - 1), env);
     }
 
     private EvalError addPosition(EvalError e, int line, int col) {
