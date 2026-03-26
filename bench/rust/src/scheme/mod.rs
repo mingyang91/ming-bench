@@ -12,8 +12,8 @@ use builtins::{apply_builtin, eqv_values};
 pub use error::EvalError;
 use macros::{env_with_expansion_aliases, expand_macro_call, parse_syntax_rules};
 use model::{
-    Builtin, Env, EnvRef, Expr, Params, Procedure, ProcedureClause, ProcedureKind, SchemeString,
-    Value,
+    list_from_values, Builtin, Env, EnvRef, Expr, Params, Procedure, ProcedureClause,
+    ProcedureKind, SchemeString, Value,
 };
 use parser::Parser;
 use records::{apply_record_procedure, eval_define_record_type};
@@ -59,9 +59,13 @@ fn initial_env() -> EnvRef {
         Builtin::Modulo,
         Builtin::Remainder,
         Builtin::Quotient,
+        Builtin::Gcd,
+        Builtin::Lcm,
         Builtin::Min,
         Builtin::Max,
         Builtin::Expt,
+        Builtin::Truncate,
+        Builtin::Round,
         Builtin::ZeroPred,
         Builtin::PositivePred,
         Builtin::NegativePred,
@@ -90,12 +94,17 @@ fn initial_env() -> EnvRef {
         Builtin::Cons,
         Builtin::Car,
         Builtin::Cdr,
+        Builtin::Cddr,
+        Builtin::SetCar,
+        Builtin::SetCdr,
         Builtin::Append,
+        Builtin::Reverse,
         Builtin::List,
         Builtin::Length,
         Builtin::ListRef,
         Builtin::ListTail,
         Builtin::ListPred,
+        Builtin::Member,
         Builtin::Vector,
         Builtin::MakeVector,
         Builtin::VectorRef,
@@ -105,7 +114,11 @@ fn initial_env() -> EnvRef {
         Builtin::VectorToList,
         Builtin::ListToVector,
         Builtin::Assoc,
+        Builtin::Assv,
         Builtin::Map,
+        Builtin::ForEach,
+        Builtin::MakeString,
+        Builtin::String,
         Builtin::StringAppend,
         Builtin::StringLength,
         Builtin::Substring,
@@ -136,6 +149,9 @@ fn initial_env() -> EnvRef {
         Builtin::CharLess,
         Builtin::StringEqual,
         Builtin::StringLess,
+        Builtin::StringGreater,
+        Builtin::StringLessEqual,
+        Builtin::StringGreaterEqual,
         Builtin::StringCiEqual,
         Builtin::StringUpcase,
         Builtin::StringDowncase,
@@ -162,7 +178,11 @@ enum TailAction {
     Continue { expr: Expr, env: EnvRef },
 }
 
-fn tail_sequence(exprs: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+fn tail_sequence(
+    exprs: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
     let Some((last, prefix)) = exprs.split_last() else {
         return Ok(TailAction::Return(Value::Void));
     };
@@ -240,6 +260,7 @@ fn eval_tail_list(
             "begin" => return eval_tail_begin(tail, env, output),
             "cond" => return eval_tail_cond(tail, env, output),
             "let" => return eval_tail_let(tail, env, output),
+            "let*" => return eval_tail_let_star(tail, env, output),
             "letrec" => return eval_tail_letrec(tail, env, output, false),
             "letrec*" => return eval_tail_letrec(tail, env, output, true),
             "case" => return eval_tail_case(tail, env, output),
@@ -376,7 +397,11 @@ fn eval_tail_cond(
     Ok(TailAction::Return(Value::Void))
 }
 
-fn eval_tail_let(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<TailAction, EvalError> {
+fn eval_tail_let(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
     match args {
         [Expr::Symbol(name, _), bindings, body @ ..] => {
             eval_tail_named_let(name, bindings, body, env, output)
@@ -386,6 +411,33 @@ fn eval_tail_let(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Tai
             message: "let: invalid syntax".into(),
         }),
     }
+}
+
+fn eval_tail_let_star(
+    args: &[Expr],
+    env: &EnvRef,
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::Syntax {
+            message: "let*: invalid syntax".into(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "let*: expected body".into(),
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let let_env = Env::new(Some(env.clone()));
+    for (name, value_expr) in bindings {
+        let value = eval(&value_expr, &let_env, output)?;
+        let_env.define(name, value);
+    }
+
+    tail_sequence(body, &let_env, output)
 }
 
 fn eval_tail_plain_let(
@@ -638,6 +690,7 @@ fn eval_list(items: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value,
             "begin" => return eval_begin(tail, env, output),
             "cond" => return eval_cond(tail, env, output),
             "let" => return eval_let(tail, env, output),
+            "let*" => return eval_let_star(tail, env, output),
             "letrec" => return eval_letrec(tail, env, output, false),
             "letrec*" => return eval_letrec(tail, env, output, true),
             "case" => return eval_case(tail, env, output),
@@ -832,6 +885,29 @@ fn eval_let(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, E
             message: "let: invalid syntax".into(),
         }),
     }
+}
+
+fn eval_let_star(args: &[Expr], env: &EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::Syntax {
+            message: "let*: invalid syntax".into(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "let*: expected body".into(),
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings_expr)?;
+    let let_env = Env::new(Some(env.clone()));
+    for (name, value_expr) in bindings {
+        let value = eval(&value_expr, &let_env, output)?;
+        let_env.define(name, value);
+    }
+
+    eval_sequence(body, &let_env, output)
 }
 
 fn eval_plain_let(
@@ -1318,7 +1394,7 @@ fn quote_expr(expr: &Expr) -> Value {
         Expr::String(value, _) => Value::String(SchemeString::literal(value)),
         Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
-        Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),
+        Expr::List(items, _) => list_from_values(items.iter().map(quote_expr)),
     }
 }
 
@@ -1333,7 +1409,11 @@ fn apply(callable: Value, args: &[Value], output: &mut String) -> Result<Value, 
     }
 }
 
-fn apply_tail(callable: Value, args: &[Value], output: &mut String) -> Result<TailAction, EvalError> {
+fn apply_tail(
+    callable: Value,
+    args: &[Value],
+    output: &mut String,
+) -> Result<TailAction, EvalError> {
     match callable {
         Value::Builtin(builtin) => apply_builtin(builtin, args, output).map(TailAction::Return),
         Value::Procedure(procedure) => prepare_tail_procedure(&procedure, args, output),
@@ -1382,7 +1462,7 @@ fn prepare_tail_procedure(
     if let Some(rest) = &clause.params.rest {
         call_env.define(
             rest.clone(),
-            Value::List(args[clause.params.required.len()..].to_vec()),
+            list_from_values(args[clause.params.required.len()..].iter().cloned()),
         );
     }
 

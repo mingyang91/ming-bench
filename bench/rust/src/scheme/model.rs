@@ -39,9 +39,13 @@ pub(super) enum Builtin {
     Modulo,
     Remainder,
     Quotient,
+    Gcd,
+    Lcm,
     Min,
     Max,
     Expt,
+    Truncate,
+    Round,
     ZeroPred,
     PositivePred,
     NegativePred,
@@ -70,12 +74,17 @@ pub(super) enum Builtin {
     Cons,
     Car,
     Cdr,
+    Cddr,
+    SetCar,
+    SetCdr,
     Append,
+    Reverse,
     List,
     Length,
     ListRef,
     ListTail,
     ListPred,
+    Member,
     Vector,
     MakeVector,
     VectorRef,
@@ -85,7 +94,11 @@ pub(super) enum Builtin {
     VectorToList,
     ListToVector,
     Assoc,
+    Assv,
     Map,
+    ForEach,
+    MakeString,
+    String,
     StringAppend,
     StringLength,
     Substring,
@@ -116,6 +129,9 @@ pub(super) enum Builtin {
     CharLess,
     StringEqual,
     StringLess,
+    StringGreater,
+    StringLessEqual,
+    StringGreaterEqual,
     StringCiEqual,
     StringUpcase,
     StringDowncase,
@@ -133,9 +149,13 @@ impl Builtin {
             Builtin::Modulo => "modulo",
             Builtin::Remainder => "remainder",
             Builtin::Quotient => "quotient",
+            Builtin::Gcd => "gcd",
+            Builtin::Lcm => "lcm",
             Builtin::Min => "min",
             Builtin::Max => "max",
             Builtin::Expt => "expt",
+            Builtin::Truncate => "truncate",
+            Builtin::Round => "round",
             Builtin::ZeroPred => "zero?",
             Builtin::PositivePred => "positive?",
             Builtin::NegativePred => "negative?",
@@ -164,12 +184,17 @@ impl Builtin {
             Builtin::Cons => "cons",
             Builtin::Car => "car",
             Builtin::Cdr => "cdr",
+            Builtin::Cddr => "cddr",
+            Builtin::SetCar => "set-car!",
+            Builtin::SetCdr => "set-cdr!",
             Builtin::Append => "append",
+            Builtin::Reverse => "reverse",
             Builtin::List => "list",
             Builtin::Length => "length",
             Builtin::ListRef => "list-ref",
             Builtin::ListTail => "list-tail",
             Builtin::ListPred => "list?",
+            Builtin::Member => "member",
             Builtin::Vector => "vector",
             Builtin::MakeVector => "make-vector",
             Builtin::VectorRef => "vector-ref",
@@ -179,7 +204,11 @@ impl Builtin {
             Builtin::VectorToList => "vector->list",
             Builtin::ListToVector => "list->vector",
             Builtin::Assoc => "assoc",
+            Builtin::Assv => "assv",
             Builtin::Map => "map",
+            Builtin::ForEach => "for-each",
+            Builtin::MakeString => "make-string",
+            Builtin::String => "string",
             Builtin::StringAppend => "string-append",
             Builtin::StringLength => "string-length",
             Builtin::Substring => "substring",
@@ -210,6 +239,9 @@ impl Builtin {
             Builtin::CharLess => "char<?",
             Builtin::StringEqual => "string=?",
             Builtin::StringLess => "string<?",
+            Builtin::StringGreater => "string>?",
+            Builtin::StringLessEqual => "string<=?",
+            Builtin::StringGreaterEqual => "string>=?",
             Builtin::StringCiEqual => "string-ci=?",
             Builtin::StringUpcase => "string-upcase",
             Builtin::StringDowncase => "string-downcase",
@@ -317,6 +349,53 @@ impl SchemeVector {
     pub(super) fn shares_storage(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.items, &other.items)
     }
+
+    pub(super) fn id(&self) -> usize {
+        Rc::as_ptr(&self.items) as usize
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct SchemePair {
+    cell: Rc<RefCell<PairValue>>,
+}
+
+#[derive(Clone)]
+struct PairValue {
+    car: Value,
+    cdr: Value,
+}
+
+impl SchemePair {
+    pub(super) fn new(car: Value, cdr: Value) -> Self {
+        Self {
+            cell: Rc::new(RefCell::new(PairValue { car, cdr })),
+        }
+    }
+
+    pub(super) fn car(&self) -> Value {
+        self.cell.borrow().car.clone()
+    }
+
+    pub(super) fn cdr(&self) -> Value {
+        self.cell.borrow().cdr.clone()
+    }
+
+    pub(super) fn set_car(&self, value: Value) {
+        self.cell.borrow_mut().car = value;
+    }
+
+    pub(super) fn set_cdr(&self, value: Value) {
+        self.cell.borrow_mut().cdr = value;
+    }
+
+    pub(super) fn shares_storage(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.cell, &other.cell)
+    }
+
+    pub(super) fn id(&self) -> usize {
+        Rc::as_ptr(&self.cell) as usize
+    }
 }
 
 #[derive(Clone)]
@@ -326,8 +405,8 @@ pub(super) enum Value {
     String(SchemeString),
     Symbol(String),
     Char(char),
-    List(Vec<Value>),
-    Pair(Box<Value>, Box<Value>),
+    EmptyList,
+    Pair(SchemePair),
     Vector(SchemeVector),
     Builtin(Builtin),
     Procedure(Rc<Procedure>),
@@ -344,8 +423,8 @@ impl Value {
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
             Value::Char(_) => "char",
-            Value::List(_) => "list",
-            Value::Pair(_, _) => "pair",
+            Value::EmptyList => "list",
+            Value::Pair(_) => "pair",
             Value::Vector(_) => "vector",
             Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_) => "procedure",
             Value::Record(_) => "record",
@@ -363,6 +442,38 @@ impl Value {
 
     pub(super) fn render_display(&self) -> String {
         render_value(self, RenderMode::Display)
+    }
+}
+
+pub(super) fn list_from_values<I>(items: I) -> Value
+where
+    I: IntoIterator<Item = Value>,
+{
+    let mut items = items.into_iter().collect::<Vec<_>>();
+    let mut list = Value::EmptyList;
+
+    while let Some(item) = items.pop() {
+        list = Value::Pair(SchemePair::new(item, list));
+    }
+
+    list
+}
+
+pub(super) fn is_proper_list(value: &Value) -> bool {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+
+    loop {
+        match current {
+            Value::EmptyList => return true,
+            Value::Pair(pair) => {
+                if !seen.insert(pair.id()) {
+                    return false;
+                }
+                current = pair.cdr();
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -693,6 +804,7 @@ pub(super) fn is_core_syntax(name: &str) -> bool {
             | "begin"
             | "cond"
             | "let"
+            | "let*"
             | "letrec"
             | "letrec*"
             | "case"
@@ -709,6 +821,17 @@ pub(super) fn fresh_identifier(base: &str) -> String {
 }
 
 fn render_value(value: &Value, mode: RenderMode) -> String {
+    let mut state = RenderState::default();
+    render_value_with_state(value, mode, &mut state)
+}
+
+#[derive(Default)]
+struct RenderState {
+    active_pairs: HashSet<usize>,
+    active_vectors: HashSet<usize>,
+}
+
+fn render_value_with_state(value: &Value, mode: RenderMode, state: &mut RenderState) -> String {
     match value {
         Value::Number(value) => value.render(),
         Value::Boolean(true) => "#t".into(),
@@ -719,9 +842,9 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         },
         Value::Symbol(value) => value.clone(),
         Value::Char(ch) => render_char(*ch, mode),
-        Value::List(items) => render_list(items, mode),
-        Value::Pair(head, tail) => render_pair(head, tail, mode),
-        Value::Vector(vector) => render_vector(vector, mode),
+        Value::EmptyList => "()".into(),
+        Value::Pair(pair) => render_pair(pair, mode, state),
+        Value::Vector(vector) => render_vector(vector, mode, state),
         Value::Builtin(_) | Value::Procedure(_) | Value::RecordProcedure(_) => {
             "#<procedure>".into()
         }
@@ -730,49 +853,56 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
     }
 }
 
-fn render_list(items: &[Value], mode: RenderMode) -> String {
-    let parts: Vec<String> = items
-        .iter()
-        .map(|value| render_value(value, mode))
-        .collect();
-    format!("({})", parts.join(" "))
-}
+fn render_pair(pair: &SchemePair, mode: RenderMode, state: &mut RenderState) -> String {
+    if !state.active_pairs.insert(pair.id()) {
+        return "#<cycle>".into();
+    }
 
-fn render_pair(head: &Value, tail: &Value, mode: RenderMode) -> String {
     let mut rendered = String::new();
     rendered.push('(');
-    rendered.push_str(&render_value(head, mode));
-    render_pair_tail(tail, mode, &mut rendered);
+    rendered.push_str(&render_value_with_state(&pair.car(), mode, state));
+    render_pair_tail(&pair.cdr(), mode, state, &mut rendered);
     rendered.push(')');
+    state.active_pairs.remove(&pair.id());
     rendered
 }
 
-fn render_pair_tail(tail: &Value, mode: RenderMode, rendered: &mut String) {
+fn render_pair_tail(
+    tail: &Value,
+    mode: RenderMode,
+    state: &mut RenderState,
+    rendered: &mut String,
+) {
     match tail {
-        Value::List(items) => {
-            for item in items {
-                rendered.push(' ');
-                rendered.push_str(&render_value(item, mode));
+        Value::EmptyList => {}
+        Value::Pair(pair) => {
+            if !state.active_pairs.insert(pair.id()) {
+                rendered.push_str(" . #<cycle>");
+                return;
             }
-        }
-        Value::Pair(head, next) => {
             rendered.push(' ');
-            rendered.push_str(&render_value(head, mode));
-            render_pair_tail(next, mode, rendered);
+            rendered.push_str(&render_value_with_state(&pair.car(), mode, state));
+            render_pair_tail(&pair.cdr(), mode, state, rendered);
+            state.active_pairs.remove(&pair.id());
         }
         other => {
             rendered.push_str(" . ");
-            rendered.push_str(&render_value(other, mode));
+            rendered.push_str(&render_value_with_state(other, mode, state));
         }
     }
 }
 
-fn render_vector(vector: &SchemeVector, mode: RenderMode) -> String {
+fn render_vector(vector: &SchemeVector, mode: RenderMode, state: &mut RenderState) -> String {
+    if !state.active_vectors.insert(vector.id()) {
+        return "#<cycle>".into();
+    }
+
     let parts: Vec<String> = vector
         .to_vec()
         .iter()
-        .map(|value| render_value(value, mode))
+        .map(|value| render_value_with_state(value, mode, state))
         .collect();
+    state.active_vectors.remove(&vector.id());
     format!("#({})", parts.join(" "))
 }
 

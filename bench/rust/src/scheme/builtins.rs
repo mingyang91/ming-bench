@@ -1,9 +1,12 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::{
     apply,
-    model::{Builtin, SchemeString, SchemeVector, Value},
+    model::{
+        is_proper_list, list_from_values, Builtin, SchemePair, SchemeString, SchemeVector, Value,
+    },
     number::Number,
     wrong_arg_count, EvalError,
 };
@@ -22,9 +25,13 @@ pub(super) fn apply_builtin(
         Builtin::Modulo => builtin_modulo(args),
         Builtin::Remainder => builtin_remainder(args),
         Builtin::Quotient => builtin_quotient(args),
+        Builtin::Gcd => builtin_gcd(args),
+        Builtin::Lcm => builtin_lcm(args),
         Builtin::Min => builtin_min_max("min", args, |ordering| ordering == Ordering::Less),
         Builtin::Max => builtin_min_max("max", args, |ordering| ordering == Ordering::Greater),
         Builtin::Expt => builtin_expt(args),
+        Builtin::Truncate => builtin_truncate(args),
+        Builtin::Round => builtin_round(args),
         Builtin::ZeroPred => builtin_number_predicate("zero?", args, Number::is_zero),
         Builtin::PositivePred => builtin_number_predicate("positive?", args, |value| {
             matches!(value.compare(Number::exact_int(0)), Some(Ordering::Greater))
@@ -77,14 +84,17 @@ pub(super) fn apply_builtin(
         Builtin::Cons => builtin_cons(args),
         Builtin::Car => builtin_car(args),
         Builtin::Cdr => builtin_cdr(args),
+        Builtin::Cddr => builtin_cddr(args),
+        Builtin::SetCar => builtin_set_car(args),
+        Builtin::SetCdr => builtin_set_cdr(args),
         Builtin::Append => builtin_append(args),
+        Builtin::Reverse => builtin_reverse(args),
         Builtin::List => builtin_list(args),
         Builtin::Length => builtin_length(args),
         Builtin::ListRef => builtin_list_ref(args),
         Builtin::ListTail => builtin_list_tail(args),
-        Builtin::ListPred => {
-            builtin_predicate("list?", args, |value| matches!(value, Value::List(_)))
-        }
+        Builtin::ListPred => builtin_predicate("list?", args, is_proper_list),
+        Builtin::Member => builtin_member(args),
         Builtin::Vector => builtin_vector(args),
         Builtin::MakeVector => builtin_make_vector(args),
         Builtin::VectorRef => builtin_vector_ref(args),
@@ -96,7 +106,11 @@ pub(super) fn apply_builtin(
         Builtin::VectorToList => builtin_vector_to_list(args),
         Builtin::ListToVector => builtin_list_to_vector(args),
         Builtin::Assoc => builtin_assoc(args),
+        Builtin::Assv => builtin_assv(args),
         Builtin::Map => builtin_map(args, output),
+        Builtin::ForEach => builtin_for_each(args, output),
+        Builtin::MakeString => builtin_make_string(args),
+        Builtin::String => builtin_string(args),
         Builtin::StringAppend => builtin_string_append(args),
         Builtin::StringLength => builtin_string_length(args),
         Builtin::Substring => builtin_substring(args),
@@ -109,11 +123,9 @@ pub(super) fn apply_builtin(
         Builtin::StringCopy => builtin_string_copy(args),
         Builtin::StringToList => builtin_string_to_list(args),
         Builtin::ListToString => builtin_list_to_string(args),
-        Builtin::NullPred => builtin_predicate(
-            "null?",
-            args,
-            |value| matches!(value, Value::List(items) if items.is_empty()),
-        ),
+        Builtin::NullPred => {
+            builtin_predicate("null?", args, |value| matches!(value, Value::EmptyList))
+        }
         Builtin::NumberPred => {
             builtin_predicate("number?", args, |value| matches!(value, Value::Number(_)))
         }
@@ -152,6 +164,11 @@ pub(super) fn apply_builtin(
         Builtin::CharLess => compare_chars("char<?", args, |left, right| left < right),
         Builtin::StringEqual => compare_strings("string=?", args, |left, right| left == right),
         Builtin::StringLess => compare_strings("string<?", args, |left, right| left < right),
+        Builtin::StringGreater => compare_strings("string>?", args, |left, right| left > right),
+        Builtin::StringLessEqual => compare_strings("string<=?", args, |left, right| left <= right),
+        Builtin::StringGreaterEqual => {
+            compare_strings("string>=?", args, |left, right| left >= right)
+        }
         Builtin::StringCiEqual => builtin_string_ci_equal(args),
         Builtin::StringUpcase => {
             builtin_string_map("string-upcase", args, |value| value.to_ascii_uppercase())
@@ -175,11 +192,11 @@ fn builtin_apply(args: &[Value], output: &mut String) -> Result<Value, EvalError
     let (list_arg, prefix_args) = prefix_and_list
         .split_last()
         .expect("prefix_and_list is known to be non-empty");
-    let list_items = expect_list("apply", list_arg)?;
+    let list_items = collect_list("apply", list_arg)?;
 
     let mut applied_args = Vec::with_capacity(prefix_args.len() + list_items.len());
     applied_args.extend(prefix_args.iter().cloned());
-    applied_args.extend(list_items.iter().cloned());
+    applied_args.extend(list_items);
     apply(callable.clone(), &applied_args, output)
 }
 
@@ -288,6 +305,26 @@ fn builtin_quotient(args: &[Value]) -> Result<Value, EvalError> {
     }
 }
 
+fn builtin_gcd(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = 0i64;
+    for arg in args {
+        result = gcd_i64(result, expect_exact_integer("gcd", arg)?);
+    }
+    Ok(Value::Number(Number::exact_int(result.abs())))
+}
+
+fn builtin_lcm(args: &[Value]) -> Result<Value, EvalError> {
+    let mut result = 1i64;
+    if args.is_empty() {
+        return Ok(Value::Number(Number::exact_int(1)));
+    }
+
+    for arg in args {
+        result = lcm_i64(result, expect_exact_integer("lcm", arg)?);
+    }
+    Ok(Value::Number(Number::exact_int(result.abs())))
+}
+
 fn builtin_min_max<F>(name: &str, args: &[Value], choose: F) -> Result<Value, EvalError>
 where
     F: Fn(Ordering) -> bool,
@@ -320,6 +357,22 @@ fn builtin_expt(args: &[Value]) -> Result<Value, EvalError> {
             Ok(Value::Number(Number::exact_int(result)))
         }
         _ => Err(wrong_arg_count("expt", "2", args.len())),
+    }
+}
+
+fn builtin_truncate(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::Number(truncate_number(expect_number(
+            "truncate", value,
+        )?))),
+        _ => Err(wrong_arg_count("truncate", "1", args.len())),
+    }
+}
+
+fn builtin_round(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(Value::Number(round_number(expect_number("round", value)?))),
+        _ => Err(wrong_arg_count("round", "1", args.len())),
     }
 }
 
@@ -402,61 +455,82 @@ fn builtin_newline(args: &[Value], output: &mut String) -> Result<Value, EvalErr
 
 fn builtin_cons(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [head, tail] => match tail {
-            Value::List(items) => {
-                let mut new_items = Vec::with_capacity(items.len() + 1);
-                new_items.push(head.clone());
-                new_items.extend(items.iter().cloned());
-                Ok(Value::List(new_items))
-            }
-            _ => Ok(Value::Pair(Box::new(head.clone()), Box::new(tail.clone()))),
-        },
+        [head, tail] => Ok(Value::Pair(SchemePair::new(head.clone(), tail.clone()))),
         _ => Err(wrong_arg_count("cons", "2", args.len())),
     }
 }
 
 fn builtin_car(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [Value::List(items)] if !items.is_empty() => Ok(items[0].clone()),
-        [Value::Pair(head, _)] => Ok((**head).clone()),
-        [value] => Err(EvalError::TypeMismatch {
-            name: "car".into(),
-            expected: "pair".into(),
-            got: value.type_name().into(),
-        }),
+        [value] => Ok(expect_pair("car", value)?.car()),
         _ => Err(wrong_arg_count("car", "1", args.len())),
     }
 }
 
 fn builtin_cdr(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [Value::List(items)] if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
-        [Value::Pair(_, tail)] => Ok((**tail).clone()),
-        [value] => Err(EvalError::TypeMismatch {
-            name: "cdr".into(),
-            expected: "pair".into(),
-            got: value.type_name().into(),
-        }),
+        [value] => Ok(expect_pair("cdr", value)?.cdr()),
         _ => Err(wrong_arg_count("cdr", "1", args.len())),
+    }
+}
+
+fn builtin_cddr(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => {
+            let tail = expect_pair("cddr", value)?.cdr();
+            Ok(expect_pair("cddr", &tail)?.cdr())
+        }
+        _ => Err(wrong_arg_count("cddr", "1", args.len())),
+    }
+}
+
+fn builtin_set_car(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [pair_value, value] => {
+            expect_pair("set-car!", pair_value)?.set_car(value.clone());
+            Ok(Value::Void)
+        }
+        _ => Err(wrong_arg_count("set-car!", "2", args.len())),
+    }
+}
+
+fn builtin_set_cdr(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [pair_value, value] => {
+            expect_pair("set-cdr!", pair_value)?.set_cdr(value.clone());
+            Ok(Value::Void)
+        }
+        _ => Err(wrong_arg_count("set-cdr!", "2", args.len())),
     }
 }
 
 fn builtin_append(args: &[Value]) -> Result<Value, EvalError> {
     let mut items = Vec::new();
     for value in args {
-        items.extend(expect_list("append", value)?.iter().cloned());
+        items.extend(collect_list("append", value)?);
     }
-    Ok(Value::List(items))
+    Ok(list_from_values(items))
+}
+
+fn builtin_reverse(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => {
+            let mut items = collect_list("reverse", value)?;
+            items.reverse();
+            Ok(list_from_values(items))
+        }
+        _ => Err(wrong_arg_count("reverse", "1", args.len())),
+    }
 }
 
 fn builtin_list(args: &[Value]) -> Result<Value, EvalError> {
-    Ok(Value::List(args.to_vec()))
+    Ok(list_from_values(args.iter().cloned()))
 }
 
 fn builtin_length(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value] => Ok(Value::Number(Number::exact_int(
-            expect_list("length", value)?.len() as i64,
+            collect_list("length", value)?.len() as i64,
         ))),
         _ => Err(wrong_arg_count("length", "1", args.len())),
     }
@@ -465,16 +539,15 @@ fn builtin_length(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_list_ref(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [list, index_value] => {
-            let items = expect_list("list-ref", list)?;
             let index = expect_exact_integer("list-ref", index_value)?;
-            if index < 0 || index as usize >= items.len() {
+            if index < 0 {
                 return Err(EvalError::IndexOutOfBounds {
                     name: "list-ref".into(),
                     index,
-                    len: items.len(),
+                    len: 0,
                 });
             }
-            Ok(items[index as usize].clone())
+            list_ref_value("list-ref", list, index as usize)
         }
         _ => Err(wrong_arg_count("list-ref", "2", args.len())),
     }
@@ -483,16 +556,15 @@ fn builtin_list_ref(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_list_tail(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [list, index_value] => {
-            let items = expect_list("list-tail", list)?;
             let index = expect_exact_integer("list-tail", index_value)?;
-            if index < 0 || index as usize > items.len() {
+            if index < 0 {
                 return Err(EvalError::IndexOutOfBounds {
                     name: "list-tail".into(),
                     index,
-                    len: items.len(),
+                    len: 0,
                 });
             }
-            Ok(Value::List(items[index as usize..].to_vec()))
+            list_tail_value("list-tail", list, index as usize)
         }
         _ => Err(wrong_arg_count("list-tail", "2", args.len())),
     }
@@ -588,7 +660,7 @@ fn builtin_vector_length(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [vector_value] => Ok(Value::List(
+        [vector_value] => Ok(list_from_values(
             expect_vector("vector->list", vector_value)?.to_vec(),
         )),
         _ => Err(wrong_arg_count("vector->list", "1", args.len())),
@@ -597,9 +669,10 @@ fn builtin_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [list_value] => Ok(Value::Vector(SchemeVector::new(
-            expect_list("list->vector", list_value)?.to_vec(),
-        ))),
+        [list_value] => Ok(Value::Vector(SchemeVector::new(collect_list(
+            "list->vector",
+            list_value,
+        )?))),
         _ => Err(wrong_arg_count("list->vector", "1", args.len())),
     }
 }
@@ -607,10 +680,9 @@ fn builtin_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_assoc(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [key, list] => {
-            for entry in expect_list("assoc", list)? {
-                let entry_key = match entry {
-                    Value::List(items) if !items.is_empty() => &items[0],
-                    Value::Pair(head, _) => head,
+            for entry in collect_list("assoc", list)? {
+                let entry_key = match &entry {
+                    Value::Pair(pair) => pair.car(),
                     _ => {
                         return Err(EvalError::TypeMismatch {
                             name: "assoc".into(),
@@ -620,13 +692,73 @@ fn builtin_assoc(args: &[Value]) -> Result<Value, EvalError> {
                     }
                 };
 
-                if equal_values(key, entry_key) {
-                    return Ok(entry.clone());
+                if equal_values(key, &entry_key) {
+                    return Ok(entry);
                 }
             }
             Ok(Value::Boolean(false))
         }
         _ => Err(wrong_arg_count("assoc", "2", args.len())),
+    }
+}
+
+fn builtin_assv(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [key, list] => {
+            for entry in collect_list("assv", list)? {
+                let entry_key = match &entry {
+                    Value::Pair(pair) => pair.car(),
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            name: "assv".into(),
+                            expected: "pair".into(),
+                            got: entry.type_name().into(),
+                        });
+                    }
+                };
+
+                if eqv_values(key, &entry_key) {
+                    return Ok(entry);
+                }
+            }
+            Ok(Value::Boolean(false))
+        }
+        _ => Err(wrong_arg_count("assv", "2", args.len())),
+    }
+}
+
+fn builtin_member(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [key, list] => {
+            let mut current = list.clone();
+            let mut seen = HashSet::new();
+
+            loop {
+                match current {
+                    Value::EmptyList => return Ok(Value::Boolean(false)),
+                    Value::Pair(pair) => {
+                        if !seen.insert(pair.id()) {
+                            return Err(EvalError::CircularList {
+                                name: "member".into(),
+                            });
+                        }
+
+                        if equal_values(key, &pair.car()) {
+                            return Ok(Value::Pair(pair));
+                        }
+                        current = pair.cdr();
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            name: "member".into(),
+                            expected: "list".into(),
+                            got: other.type_name().into(),
+                        });
+                    }
+                }
+            }
+        }
+        _ => Err(wrong_arg_count("member", "2", args.len())),
     }
 }
 
@@ -641,10 +773,10 @@ fn builtin_map(args: &[Value], output: &mut String) -> Result<Value, EvalError> 
 
     let mut lists = Vec::with_capacity(list_args.len());
     for list in list_args {
-        lists.push(expect_list("map", list)?);
+        lists.push(collect_list("map", list)?);
     }
 
-    let len = lists.iter().map(|list| list.len()).min().unwrap_or(0);
+    let len = lists.iter().map(Vec::len).min().unwrap_or(0);
     let mut results = Vec::with_capacity(len);
 
     for index in 0..len {
@@ -655,7 +787,76 @@ fn builtin_map(args: &[Value], output: &mut String) -> Result<Value, EvalError> 
         results.push(apply(callable.clone(), &mapped_args, output)?);
     }
 
-    Ok(Value::List(results))
+    Ok(list_from_values(results))
+}
+
+fn builtin_for_each(args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+    let [callable, list_args @ ..] = args else {
+        return Err(wrong_arg_count("for-each", "at least 2", 0));
+    };
+
+    if list_args.is_empty() {
+        return Err(wrong_arg_count("for-each", "at least 2", 1));
+    }
+
+    let mut lists = Vec::with_capacity(list_args.len());
+    for list in list_args {
+        lists.push(collect_list("for-each", list)?);
+    }
+
+    let len = lists.iter().map(Vec::len).min().unwrap_or(0);
+    for index in 0..len {
+        let mut call_args = Vec::with_capacity(lists.len());
+        for list in &lists {
+            call_args.push(list[index].clone());
+        }
+        apply(callable.clone(), &call_args, output)?;
+    }
+
+    Ok(Value::Void)
+}
+
+fn builtin_make_string(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [len_value] => {
+            let len = expect_exact_integer("make-string", len_value)?;
+            if len < 0 {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: "make-string".into(),
+                    index: len,
+                    len: 0,
+                });
+            }
+            Ok(Value::String(SchemeString::fresh(
+                "\0".repeat(len as usize),
+            )))
+        }
+        [len_value, fill_value] => {
+            let len = expect_exact_integer("make-string", len_value)?;
+            if len < 0 {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: "make-string".into(),
+                    index: len,
+                    len: 0,
+                });
+            }
+            let fill = expect_char("make-string", fill_value)?;
+            Ok(Value::String(SchemeString::fresh(
+                std::iter::repeat_n(fill, len as usize).collect(),
+            )))
+        }
+        _ => Err(wrong_arg_count("make-string", "1 or 2", args.len())),
+    }
+}
+
+fn builtin_string(args: &[Value]) -> Result<Value, EvalError> {
+    let chars = args
+        .iter()
+        .map(|value| expect_char("string", value))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::String(SchemeString::fresh(
+        chars.into_iter().collect::<String>(),
+    )))
 }
 
 fn builtin_string_append(args: &[Value]) -> Result<Value, EvalError> {
@@ -806,12 +1007,11 @@ fn builtin_string_copy(args: &[Value]) -> Result<Value, EvalError> {
 
 fn builtin_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
     match args {
-        [value] => Ok(Value::List(
+        [value] => Ok(list_from_values(
             expect_string("string->list", value)?
                 .chars()
                 .into_iter()
-                .map(Value::Char)
-                .collect(),
+                .map(Value::Char),
         )),
         _ => Err(wrong_arg_count("string->list", "1", args.len())),
     }
@@ -820,9 +1020,9 @@ fn builtin_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
 fn builtin_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
     match args {
         [value] => {
-            let chars = expect_list("list->string", value)?
-                .iter()
-                .map(|item| expect_char("list->string", item))
+            let chars = collect_list("list->string", value)?
+                .into_iter()
+                .map(|item| expect_char("list->string", &item))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::String(SchemeString::fresh(
                 chars.into_iter().collect::<String>(),
@@ -1029,7 +1229,7 @@ where
 }
 
 fn is_pair(value: &Value) -> bool {
-    matches!(value, Value::Pair(_, _)) || matches!(value, Value::List(items) if !items.is_empty())
+    matches!(value, Value::Pair(_))
 }
 
 fn eq_values(left: &Value, right: &Value) -> bool {
@@ -1045,7 +1245,8 @@ pub(super) fn eqv_values(left: &Value, right: &Value) -> bool {
         (Value::String(left), Value::String(right)) => left.shares_storage(right),
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
-        (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(left), Value::Pair(right)) => left.shares_storage(right),
         (Value::Vector(left), Value::Vector(right)) => left.shares_storage(right),
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -1057,6 +1258,17 @@ pub(super) fn eqv_values(left: &Value, right: &Value) -> bool {
 }
 
 fn equal_values(left: &Value, right: &Value) -> bool {
+    let mut seen_pairs = HashSet::new();
+    let mut seen_vectors = HashSet::new();
+    equal_values_inner(left, right, &mut seen_pairs, &mut seen_vectors)
+}
+
+fn equal_values_inner(
+    left: &Value,
+    right: &Value,
+    seen_pairs: &mut HashSet<(usize, usize)>,
+    seen_vectors: &mut HashSet<(usize, usize)>,
+) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
             left.compare(*right) == Some(Ordering::Equal)
@@ -1067,24 +1279,28 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         }
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
-        (Value::List(left), Value::List(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| equal_values(left, right))
-        }
-        (Value::Pair(left_head, left_tail), Value::Pair(right_head, right_tail)) => {
-            equal_values(left_head, right_head) && equal_values(left_tail, right_tail)
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(left), Value::Pair(right)) => {
+            let key = (left.id(), right.id());
+            if !seen_pairs.insert(key) {
+                return true;
+            }
+            equal_values_inner(&left.car(), &right.car(), seen_pairs, seen_vectors)
+                && equal_values_inner(&left.cdr(), &right.cdr(), seen_pairs, seen_vectors)
         }
         (Value::Vector(left), Value::Vector(right)) => {
+            let key = (left.id(), right.id());
+            if !seen_vectors.insert(key) {
+                return true;
+            }
+
             let left = left.to_vec();
             let right = right.to_vec();
             left.len() == right.len()
                 && left
                     .iter()
                     .zip(right.iter())
-                    .all(|(left, right)| equal_values(left, right))
+                    .all(|(left, right)| equal_values_inner(left, right, seen_pairs, seen_vectors))
         }
         (Value::Builtin(left), Value::Builtin(right)) => left == right,
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -1092,6 +1308,43 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         (Value::RecordProcedure(left), Value::RecordProcedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
+    }
+}
+
+fn truncate_number(number: Number) -> Number {
+    match number {
+        Number::ExactInt(value) => Number::ExactInt(value),
+        Number::ExactRational { numer, denom } => Number::ExactInt(numer / denom),
+        Number::Inexact(value) => Number::Inexact(value.trunc()),
+    }
+}
+
+fn round_number(number: Number) -> Number {
+    match number {
+        Number::ExactInt(value) => Number::ExactInt(value),
+        Number::ExactRational { numer, denom } => {
+            Number::ExactInt((numer as f64 / denom as f64).round() as i64)
+        }
+        Number::Inexact(value) => Number::Inexact(value.round()),
+    }
+}
+
+fn gcd_i64(left: i64, right: i64) -> i64 {
+    let mut left = left.abs();
+    let mut right = right.abs();
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn lcm_i64(left: i64, right: i64) -> i64 {
+    if left == 0 || right == 0 {
+        0
+    } else {
+        (left / gcd_i64(left, right)) * right
     }
 }
 
@@ -1164,14 +1417,118 @@ fn expect_char(name: &str, value: &Value) -> Result<char, EvalError> {
     }
 }
 
-fn expect_list<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalError> {
+fn expect_pair(name: &str, value: &Value) -> Result<SchemePair, EvalError> {
     match value {
-        Value::List(items) => Ok(items),
+        Value::Pair(pair) => Ok(pair.clone()),
         _ => Err(EvalError::TypeMismatch {
             name: name.into(),
-            expected: "list".into(),
+            expected: "pair".into(),
             got: value.type_name().into(),
         }),
+    }
+}
+
+fn collect_list(name: &str, value: &Value) -> Result<Vec<Value>, EvalError> {
+    let mut items = Vec::new();
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+
+    loop {
+        match current {
+            Value::EmptyList => return Ok(items),
+            Value::Pair(pair) => {
+                if !seen.insert(pair.id()) {
+                    return Err(EvalError::CircularList { name: name.into() });
+                }
+                items.push(pair.car());
+                current = pair.cdr();
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    name: name.into(),
+                    expected: "list".into(),
+                    got: other.type_name().into(),
+                })
+            }
+        }
+    }
+}
+
+fn list_ref_value(name: &str, value: &Value, index: usize) -> Result<Value, EvalError> {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+    let mut len = 0usize;
+
+    loop {
+        match current {
+            Value::EmptyList => {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: name.into(),
+                    index: index as i64,
+                    len,
+                })
+            }
+            Value::Pair(pair) => {
+                if !seen.insert(pair.id()) {
+                    return Err(EvalError::CircularList { name: name.into() });
+                }
+                if len == index {
+                    return Ok(pair.car());
+                }
+                len += 1;
+                current = pair.cdr();
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    name: name.into(),
+                    expected: "list".into(),
+                    got: other.type_name().into(),
+                })
+            }
+        }
+    }
+}
+
+fn list_tail_value(name: &str, value: &Value, index: usize) -> Result<Value, EvalError> {
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+    let mut offset = 0usize;
+
+    loop {
+        if offset == index {
+            return match current {
+                Value::EmptyList | Value::Pair(_) => Ok(current),
+                other => Err(EvalError::TypeMismatch {
+                    name: name.into(),
+                    expected: "list".into(),
+                    got: other.type_name().into(),
+                }),
+            };
+        }
+
+        match current {
+            Value::EmptyList => {
+                return Err(EvalError::IndexOutOfBounds {
+                    name: name.into(),
+                    index: index as i64,
+                    len: offset,
+                })
+            }
+            Value::Pair(pair) => {
+                if !seen.insert(pair.id()) {
+                    return Err(EvalError::CircularList { name: name.into() });
+                }
+                current = pair.cdr();
+                offset += 1;
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    name: name.into(),
+                    expected: "list".into(),
+                    got: other.type_name().into(),
+                })
+            }
+        }
     }
 }
 

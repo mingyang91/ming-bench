@@ -2,7 +2,9 @@ use std::rc::Rc;
 
 use super::{
     error::EvalError,
-    model::{EnvRef, Expr, RecordInstance, RecordProcedure, RecordProcedureKind, RecordType, Value},
+    model::{
+        EnvRef, Expr, RecordInstance, RecordProcedure, RecordProcedureKind, RecordType, Value,
+    },
     wrong_arg_count,
 };
 
@@ -15,8 +17,10 @@ pub(super) fn eval_define_record_type(args: &[Expr], env: &EnvRef) -> Result<Val
 
     let type_name = parse_named_symbol(type_name_expr, "define-record-type: expected type name")?;
     let (constructor_name, constructor_arity) = parse_record_constructor(constructor_expr)?;
-    let predicate_name =
-        parse_named_symbol(predicate_expr, "define-record-type: expected predicate name")?;
+    let predicate_name = parse_named_symbol(
+        predicate_expr,
+        "define-record-type: expected predicate name",
+    )?;
     let accessor_names = field_exprs
         .iter()
         .map(parse_record_field)
@@ -89,11 +93,13 @@ pub(super) fn apply_record_procedure(
 fn parse_named_symbol(expr: &Expr, message: &str) -> Result<String, EvalError> {
     match expr {
         Expr::Symbol(name, _) => Ok(name.clone()),
-        Expr::Number(_, _) | Expr::Boolean(_, _) | Expr::String(_, _) | Expr::Char(_, _) | Expr::List(_, _) => {
-            Err(EvalError::Syntax {
-                message: message.into(),
-            })
-        }
+        Expr::Number(_, _)
+        | Expr::Boolean(_, _)
+        | Expr::String(_, _)
+        | Expr::Char(_, _)
+        | Expr::List(_, _) => Err(EvalError::Syntax {
+            message: message.into(),
+        }),
     }
 }
 
@@ -110,7 +116,10 @@ fn parse_record_constructor(expr: &Expr) -> Result<(String, usize), EvalError> {
         });
     };
 
-    if !params.iter().all(|param| matches!(param, Expr::Symbol(_, _))) {
+    if !params
+        .iter()
+        .all(|param| matches!(param, Expr::Symbol(_, _)))
+    {
         return Err(EvalError::Syntax {
             message: "define-record-type: expected constructor field name".into(),
         });
