@@ -66,6 +66,12 @@ private[ming] object SchemeCoreBuiltins:
         requireArgCount("eq?", args, 2)
         Value.BooleanValue(eqValues(args.head, args(1)))
     ),
+    "eqv?" -> Value.Builtin(
+      "eqv?",
+      args =>
+        requireArgCount("eqv?", args, 2)
+        Value.BooleanValue(eqvValues(args.head, args(1)))
+    ),
     "equal?" -> Value.Builtin(
       "equal?",
       args =>

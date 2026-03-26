@@ -5,6 +5,8 @@ import SchemeRuntime.*
 
 private[ming] object SchemeEvaluatorSupport:
 
+  final case class DoBinding(name: String, initExpr: Expr, stepExpr: Option[Expr])
+
   def parseBindings(bindingsExpr: Expr): List[(String, Expr)] =
     bindingsExpr match
       case Expr.ListExpr(bindings, _) =>
@@ -33,6 +35,24 @@ private[ming] object SchemeEvaluatorSupport:
   def buildCaseClosure(clausesExpr: List[Expr], env: Env): Value.CaseClosure =
     if clausesExpr.isEmpty then throw new EvalError("case-lambda expected at least 1 clause")
     Value.CaseClosure(clausesExpr.map(parseCaseLambdaClause(_, env)))
+
+  def parseDoBindings(bindingsExpr: Expr): List[DoBinding] =
+    bindingsExpr match
+      case Expr.ListExpr(bindings, _) =>
+        val parsed = bindings.map {
+          case Expr.ListExpr(List(Expr.Symbol(name, _), initExpr), _) =>
+            DoBinding(name, initExpr, None)
+          case Expr.ListExpr(List(Expr.Symbol(name, _), initExpr, stepExpr), _) =>
+            DoBinding(name, initExpr, Some(stepExpr))
+          case Expr.ListExpr(List(_, _), _) | Expr.ListExpr(List(_, _, _), _) =>
+            throw new EvalError("do bindings must have symbol names")
+          case _ =>
+            throw new EvalError("do bindings must contain (name init) or (name init step) forms")
+        }
+        ensureDistinct(parsed.map(_.name), "do bindings")
+        parsed
+      case _ =>
+        throw new EvalError("do bindings must be a list")
 
   def quoteExpr(expr: Expr): Value =
     expr match

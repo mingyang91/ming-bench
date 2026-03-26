@@ -39,6 +39,8 @@ private[ming] object SchemeRuntime:
       case pair: Value.PairValue      => renderPair(pair, render)
       case Value.RecordValue(recordType, _) =>
         s"#<record ${recordType.name}>"
+      case Value.VectorValue(elements) =>
+        elements.iterator.map(render).mkString("#(", " ", ")")
       case Value.Builtin(name, _) => s"#<procedure:$name>"
       case Value.Closure(Some(name), _, _, _, _) =>
         s"#<procedure:$name>"
@@ -46,6 +48,8 @@ private[ming] object SchemeRuntime:
         "#<procedure>"
       case Value.CaseClosure(_) =>
         "#<procedure>"
+      case Value.UninitializedValue(name) =>
+        s"#<uninitialized:$name>"
       case Value.VoidValue =>
         "#<void>"
 

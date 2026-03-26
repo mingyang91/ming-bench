@@ -27,6 +27,10 @@ private[ming] object SchemePredicateBuiltins:
       case Value.PairValue(_, _) => true
       case _                     => false
     },
+    "vector?" -> predicateBuiltin("vector?") {
+      case Value.VectorValue(_) => true
+      case _                    => false
+    },
     "list?" -> predicateBuiltin("list?")(isProperList),
     "symbol?" -> predicateBuiltin("symbol?") {
       case Value.SymbolValue(_) => true

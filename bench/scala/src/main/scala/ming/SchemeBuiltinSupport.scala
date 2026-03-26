@@ -1,6 +1,7 @@
 package ming
 
 import scala.annotation.tailrec
+import scala.collection.mutable
 import scala.util.{Failure, Success, Try}
 
 import SchemeModel.*
@@ -62,6 +63,12 @@ private[ming] object SchemeBuiltinSupport:
       case other =>
         throw new EvalError(s"$name expected a pair, got ${SchemeRuntime.render(other)}")
 
+  def requireVector(name: String, value: Value): mutable.ArrayBuffer[Value] =
+    value match
+      case Value.VectorValue(elements) => elements
+      case other =>
+        throw new EvalError(s"$name expected a vector, got ${SchemeRuntime.render(other)}")
+
   def isProperList(value: Value): Boolean =
     @tailrec
     def loop(current: Value): Boolean =
@@ -86,6 +93,18 @@ private[ming] object SchemeBuiltinSupport:
       case (Value.StringValue(a), Value.StringValue(b))   => a eq b
       case _                                              => left.asInstanceOf[AnyRef] eq right.asInstanceOf[AnyRef]
 
+  def eqvValues(left: Value, right: Value): Boolean =
+    (left, right) match
+      case (leftNumber, rightNumber) if isNumber(leftNumber) && isNumber(rightNumber) =>
+        SchemeNumbers.equal(leftNumber, rightNumber)
+      case (Value.BooleanValue(a), Value.BooleanValue(b)) => a == b
+      case (Value.CharValue(a), Value.CharValue(b))       => a == b
+      case (Value.SymbolValue(a), Value.SymbolValue(b))   => a == b
+      case (Value.NilValue, Value.NilValue)               => true
+      case (Value.VoidValue, Value.VoidValue)             => true
+      case (Value.StringValue(a), Value.StringValue(b))   => a eq b
+      case _                                              => left.asInstanceOf[AnyRef] eq right.asInstanceOf[AnyRef]
+
   def equalValues(left: Value, right: Value): Boolean =
     (left, right) match
       case (leftNumber, rightNumber) if isNumber(leftNumber) && isNumber(rightNumber) =>
@@ -98,6 +117,9 @@ private[ming] object SchemeBuiltinSupport:
       case (Value.VoidValue, Value.VoidValue)             => true
       case (Value.PairValue(leftCar, leftCdr), Value.PairValue(rightCar, rightCdr)) =>
         equalValues(leftCar, rightCar) && equalValues(leftCdr, rightCdr)
+      case (Value.VectorValue(leftElements), Value.VectorValue(rightElements)) =>
+        leftElements.length == rightElements.length &&
+        leftElements.iterator.zip(rightElements.iterator).forall(equalValues)
       case _ =>
         eqValues(left, right)
 

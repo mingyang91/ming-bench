@@ -86,6 +86,7 @@ private[ming] object SchemeModel:
     case NilValue
     case PairValue(car: Value, cdr: Value)
     case RecordValue(recordType: RecordType, fields: Vector[Value])
+    case VectorValue(elements: mutable.ArrayBuffer[Value])
     case Builtin(name: String, implementation: List[Value] => Value)
 
     case Closure(
@@ -96,6 +97,7 @@ private[ming] object SchemeModel:
       env: Env
     )
     case CaseClosure(clauses: List[CaseLambdaClause])
+    case UninitializedValue(name: String)
     case VoidValue
 
   final class BindingCell(var value: Value)
@@ -129,5 +131,10 @@ private[ming] object SchemeModel:
 
     def lookup(name: String): Value =
       lookupValueCell(name) match
-        case Some(cell) => cell.value
-        case None       => throw new EvalError(s"unbound variable: $name")
+        case Some(cell) =>
+          cell.value match
+            case Value.UninitializedValue(_) =>
+              throw new EvalError(s"uninitialized binding: $name")
+            case value =>
+              value
+        case None => throw new EvalError(s"unbound variable: $name")
