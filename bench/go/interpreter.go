@@ -541,6 +541,9 @@ func evalList(environment *env, items listExpr) (expr, error) {
 		case "define":
 			value, err := evalDefine(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
+		case "define-record-type":
+			value, err := evalDefineRecordType(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "define-syntax":
 			value, err := evalDefineSyntax(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
@@ -895,6 +898,14 @@ func applyCallable(proc expr, args []expr) (expr, error) {
 			callEnv.define(callable.restParam, listExpr{items: rest})
 		}
 		return evalSequence(callEnv, callable.body)
+	case recordConstructorProc:
+		return applyRecordConstructor(callable, args)
+	case recordPredicateProc:
+		return applyRecordPredicate(callable, args)
+	case recordAccessorProc:
+		return applyRecordAccessor(callable, args)
+	case recordMutatorProc:
+		return applyRecordMutator(callable, args)
 	default:
 		return nil, &EvalError{Message: "first list element is not a procedure"}
 	}
@@ -1948,6 +1959,16 @@ func renderExpr(value expr) string {
 		return "#<procedure:" + v.name + ">"
 	case closureExpr:
 		return "#<procedure>"
+	case recordConstructorProc:
+		return "#<procedure:" + v.recordType.constructorName + ">"
+	case recordPredicateProc:
+		return "#<procedure:" + v.name + ">"
+	case recordAccessorProc:
+		return "#<procedure:" + v.name + ">"
+	case recordMutatorProc:
+		return "#<procedure:" + v.name + ">"
+	case *recordExpr:
+		return "#<record:" + v.recordType.name + ">"
 	case macroExpr:
 		return "#<macro>"
 	default:
