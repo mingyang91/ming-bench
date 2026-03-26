@@ -17,6 +17,7 @@ type tokenKind int
 const (
 	tokenLParen tokenKind = iota
 	tokenRParen
+	tokenQuote
 	tokenAtom
 	tokenString
 )
@@ -105,15 +106,7 @@ func (p *lambdaProcedure) Call(i *interpreter, args []any, pos position) (any, e
 		callEnv.define(name, args[index])
 	}
 
-	result := any(voidValue{})
-	for _, bodyExpr := range p.body {
-		var err error
-		result, err = i.eval(bodyExpr, callEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return result, nil
+	return i.evalSequence(p.body, callEnv)
 }
 
 type environment struct {
@@ -172,7 +165,11 @@ func evalInput(input string) (string, string, error) {
 }
 
 func installBuiltins(env *environment) {
-	for _, name := range []string{"+", "-", "*", "/", "<", ">", "=", "<=", "not"} {
+	for _, name := range []string{
+		"+", "-", "*", "/", "<", ">", "=", "<=", "not",
+		"cons", "car", "cdr", "null?", "list", "length", "append",
+		"string?", "number?", "boolean?", "pair?", "symbol?",
+	} {
 		name := name
 		env.define(name, &builtinProcedure{
 			name: name,
@@ -225,10 +222,16 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 			return i.evalAnd(list.elements[1:], env)
 		case "or":
 			return i.evalOr(list.elements[1:], env)
+		case "begin":
+			return i.evalBegin(list.elements[1:], env)
 		case "if":
 			return i.evalIf(list.elements[1:], operator.pos, env)
+		case "cond":
+			return i.evalCond(list.elements[1:], operator.pos, env)
 		case "define":
 			return i.evalDefine(list.elements[1:], operator.pos, env)
+		case "let":
+			return i.evalLet(list.elements[1:], operator.pos, env)
 		case "quote":
 			return i.evalQuote(list.elements[1:], operator.pos)
 		case "lambda":
@@ -251,6 +254,18 @@ func (i *interpreter) evalList(list *listExpr, env *environment) (any, error) {
 	}
 
 	return applyProcedure(i, operatorValue, args, list.elements[0].exprPos())
+}
+
+func (i *interpreter) evalSequence(expressions []expr, env *environment) (any, error) {
+	result := any(voidValue{})
+	for _, expression := range expressions {
+		var err error
+		result, err = i.eval(expression, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 func (i *interpreter) evalAnd(args []expr, env *environment) (any, error) {
@@ -287,6 +302,10 @@ func (i *interpreter) evalOr(args []expr, env *environment) (any, error) {
 	return false, nil
 }
 
+func (i *interpreter) evalBegin(args []expr, env *environment) (any, error) {
+	return i.evalSequence(args, env)
+}
+
 func (i *interpreter) evalIf(args []expr, pos position, env *environment) (any, error) {
 	if len(args) < 2 || len(args) > 3 {
 		return nil, newEvalError(pos, "if expects 2 or 3 arguments")
@@ -303,6 +322,35 @@ func (i *interpreter) evalIf(args []expr, pos position, env *environment) (any, 
 	if len(args) == 3 {
 		return i.eval(args[2], env)
 	}
+	return voidValue{}, nil
+}
+
+func (i *interpreter) evalCond(args []expr, pos position, env *environment) (any, error) {
+	for index, clauseExpr := range args {
+		clause, ok := clauseExpr.(*listExpr)
+		if !ok || len(clause.elements) == 0 {
+			return nil, newEvalError(clauseExpr.exprPos(), "cond clauses must be non-empty lists")
+		}
+
+		if symbol, ok := clause.elements[0].(*symbolExpr); ok && symbol.value == "else" {
+			if index != len(args)-1 {
+				return nil, newEvalError(symbol.pos, "cond else clause must be last")
+			}
+			return i.evalSequence(clause.elements[1:], env)
+		}
+
+		testValue, err := i.eval(clause.elements[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testValue) {
+			if len(clause.elements) == 1 {
+				return testValue, nil
+			}
+			return i.evalSequence(clause.elements[1:], env)
+		}
+	}
+
 	return voidValue{}, nil
 }
 
@@ -358,6 +406,68 @@ func (i *interpreter) evalQuote(args []expr, pos position) (any, error) {
 	return datumFromExpr(args[0])
 }
 
+func (i *interpreter) evalLet(args []expr, pos position, env *environment) (any, error) {
+	if len(args) < 2 {
+		return nil, newEvalError(pos, "let expects bindings and a body")
+	}
+
+	if name, ok := args[0].(*symbolExpr); ok {
+		return i.evalNamedLet(name, args[1:], pos, env)
+	}
+
+	return i.evalPlainLet(args, pos, env)
+}
+
+func (i *interpreter) evalNamedLet(name *symbolExpr, args []expr, pos position, env *environment) (any, error) {
+	if len(args) < 2 {
+		return nil, newEvalError(pos, "named let expects bindings and a body")
+	}
+
+	bindings, err := parseLetBindings(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	params := make([]string, 0, len(bindings))
+	values := make([]any, 0, len(bindings))
+	for _, binding := range bindings {
+		value, err := i.eval(binding.valueExpr, env)
+		if err != nil {
+			return nil, err
+		}
+		params = append(params, binding.name)
+		values = append(values, value)
+	}
+
+	letEnv := newEnvironment(env)
+	procedure := &lambdaProcedure{
+		params: params,
+		body:   args[1:],
+		env:    letEnv,
+	}
+	letEnv.define(name.value, procedure)
+
+	return procedure.Call(i, values, name.pos)
+}
+
+func (i *interpreter) evalPlainLet(args []expr, _ position, env *environment) (any, error) {
+	bindings, err := parseLetBindings(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	letEnv := newEnvironment(env)
+	for _, binding := range bindings {
+		value, err := i.eval(binding.valueExpr, env)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.define(binding.name, value)
+	}
+
+	return i.evalSequence(args[1:], letEnv)
+}
+
 func (i *interpreter) evalLambda(args []expr, pos position, env *environment) (any, error) {
 	if len(args) < 2 {
 		return nil, newEvalError(pos, "lambda expects parameters and a body")
@@ -378,6 +488,38 @@ func (i *interpreter) evalLambda(args []expr, pos position, env *environment) (a
 		body:   args[1:],
 		env:    env,
 	}, nil
+}
+
+type letBinding struct {
+	name      string
+	valueExpr expr
+}
+
+func parseLetBindings(expression expr) ([]letBinding, error) {
+	bindingsList, ok := expression.(*listExpr)
+	if !ok {
+		return nil, newEvalError(expression.exprPos(), "let bindings must be a list")
+	}
+
+	bindings := make([]letBinding, 0, len(bindingsList.elements))
+	for _, bindingExpr := range bindingsList.elements {
+		binding, ok := bindingExpr.(*listExpr)
+		if !ok || len(binding.elements) != 2 {
+			return nil, newEvalError(bindingExpr.exprPos(), "let bindings must contain a name and value")
+		}
+
+		name, ok := binding.elements[0].(*symbolExpr)
+		if !ok {
+			return nil, newEvalError(binding.elements[0].exprPos(), "let binding name must be a symbol")
+		}
+
+		bindings = append(bindings, letBinding{
+			name:      name.value,
+			valueExpr: binding.elements[1],
+		})
+	}
+
+	return bindings, nil
 }
 
 func parseParameterExprs(expressions []expr) ([]string, error) {
@@ -508,6 +650,107 @@ func applyBuiltin(name string, args []any, pos position) (any, error) {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
 		return !isTruthy(args[0]), nil
+
+	case "cons":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		return &pairValue{car: args[0], cdr: args[1]}, nil
+
+	case "car":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		pair, err := expectPair(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return pair.car, nil
+
+	case "cdr":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		pair, err := expectPair(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return pair.cdr, nil
+
+	case "null?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(emptyList)
+		return ok, nil
+
+	case "list":
+		return buildList(args), nil
+
+	case "length":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		elements, err := listElements(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return len(elements), nil
+
+	case "append":
+		result := any(emptyList{})
+		if len(args) > 0 {
+			if _, err := listElements(args[len(args)-1], pos, name); err != nil {
+				return nil, err
+			}
+			result = args[len(args)-1]
+		}
+
+		for index := len(args) - 2; index >= 0; index-- {
+			elements, err := listElements(args[index], pos, name)
+			if err != nil {
+				return nil, err
+			}
+			for elementIndex := len(elements) - 1; elementIndex >= 0; elementIndex-- {
+				result = &pairValue{car: elements[elementIndex], cdr: result}
+			}
+		}
+		return result, nil
+
+	case "string?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(stringValue)
+		return ok, nil
+
+	case "number?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(int)
+		return ok, nil
+
+	case "boolean?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(bool)
+		return ok, nil
+
+	case "pair?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(*pairValue)
+		return ok, nil
+
+	case "symbol?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := args[0].(symbolValue)
+		return ok, nil
 	default:
 		return nil, newEvalError(pos, "unknown procedure: %s", name)
 	}
@@ -543,6 +786,37 @@ func expectInt(value any, pos position, procedure string) (int, error) {
 		return 0, newEvalError(pos, "%s expects numeric arguments", procedure)
 	}
 	return n, nil
+}
+
+func expectPair(value any, pos position, procedure string) (*pairValue, error) {
+	pair, ok := value.(*pairValue)
+	if !ok {
+		return nil, newEvalError(pos, "%s expects a pair", procedure)
+	}
+	return pair, nil
+}
+
+func listElements(value any, pos position, procedure string) ([]any, error) {
+	elements := []any{}
+	for {
+		switch current := value.(type) {
+		case emptyList:
+			return elements, nil
+		case *pairValue:
+			elements = append(elements, current.car)
+			value = current.cdr
+		default:
+			return nil, newEvalError(pos, "%s expects a proper list", procedure)
+		}
+	}
+}
+
+func buildList(values []any) any {
+	result := any(emptyList{})
+	for index := len(values) - 1; index >= 0; index-- {
+		result = &pairValue{car: values[index], cdr: result}
+	}
+	return result
 }
 
 func isTruthy(value any) bool {
@@ -648,6 +922,10 @@ func lex(input string) ([]token, error) {
 			tokens = append(tokens, token{kind: tokenRParen, text: ")", pos: pos})
 			index++
 			column++
+		case '\'':
+			tokens = append(tokens, token{kind: tokenQuote, text: "'", pos: pos})
+			index++
+			column++
 		case '"':
 			text, width, err := lexString(input[index:], pos)
 			if err != nil {
@@ -660,7 +938,7 @@ func lex(input string) ([]token, error) {
 			start := index
 			for index < len(input) {
 				current := input[index]
-				if current == '(' || current == ')' || current == '"' || current == ';' || unicode.IsSpace(rune(current)) {
+				if current == '(' || current == ')' || current == '\'' || current == '"' || current == ';' || unicode.IsSpace(rune(current)) {
 					break
 				}
 				index++
@@ -743,6 +1021,18 @@ func (p *tokenParser) parseExpr() (expr, error) {
 		return p.parseList(current.pos)
 	case tokenRParen:
 		return nil, newEvalError(current.pos, "unexpected )")
+	case tokenQuote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &listExpr{
+			elements: []expr{
+				&symbolExpr{value: "quote", pos: current.pos},
+				quoted,
+			},
+			pos: current.pos,
+		}, nil
 	case tokenString:
 		return &stringExpr{value: current.text, pos: current.pos}, nil
 	case tokenAtom:
