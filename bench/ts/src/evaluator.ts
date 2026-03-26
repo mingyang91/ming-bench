@@ -192,6 +192,20 @@ type Value =
   | UninitializedValue
   | ProcedureValue;
 
+interface EvalExprStep {
+  evalStep: 'expr';
+  expr: Expr;
+  env: Environment;
+}
+
+interface EvalSequenceStep {
+  evalStep: 'sequence';
+  exprs: Expr[];
+  env: Environment;
+}
+
+type EvalOutcome = Value | EvalExprStep | EvalSequenceStep;
+
 const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
 const VOID_VALUE: VoidValue = { kind: 'void' };
 const STRING_IMMUTABILITY_LEVEL = 15;
@@ -909,7 +923,10 @@ function createGlobalEnv(runtime: Runtime): Environment {
         expr: arg.expr,
         value: lists[listIndex][index],
       }));
-      results.push(applyProcedure(procedure, appliedArgs, args[0].expr, runtime));
+      results.push(resolveEvalOutcome(
+        applyProcedure(procedure, appliedArgs, args[0].expr, runtime),
+        runtime,
+      ));
     }
 
     return makeList(results);
@@ -983,7 +1000,10 @@ function createGlobalEnv(runtime: Runtime): Environment {
       })),
     ];
 
-    return applyProcedure(procedureArg.value, appliedArgs, procedureArg.expr, runtime);
+    return resolveEvalOutcome(
+      applyProcedure(procedureArg.value, appliedArgs, procedureArg.expr, runtime),
+      runtime,
+    );
   }));
 
   env.define('string?', predicateBuiltin('string?', isSchemeStringValue));
@@ -1416,6 +1436,10 @@ function builtin(
 }
 
 function evaluate(expr: Expr, env: Environment, runtime: Runtime): Value {
+  return resolveEvalOutcome(makeExprStep(expr, env), runtime);
+}
+
+function evaluateExpr(expr: Expr, env: Environment, runtime: Runtime): EvalOutcome {
   switch (expr.type) {
     case 'number':
     case 'boolean':
@@ -1431,7 +1455,7 @@ function evaluate(expr: Expr, env: Environment, runtime: Runtime): Value {
   }
 }
 
-function evaluateList(expr: ListExpr, env: Environment, runtime: Runtime): Value {
+function evaluateList(expr: ListExpr, env: Environment, runtime: Runtime): EvalOutcome {
   if (expr.elements.length === 0) {
     throw new EvalError(`${expr.line}:${expr.col}: cannot evaluate empty list`);
   }
@@ -1445,7 +1469,7 @@ function evaluateList(expr: ListExpr, env: Environment, runtime: Runtime): Value
 
     const transformer = runtime.lookupSyntaxRule(head.value);
     if (transformer !== undefined) {
-      return evaluate(expandMacro(transformer, expr, runtime), env, runtime);
+      return makeExprStep(expandMacro(transformer, expr, runtime), env);
     }
 
     switch (head.value) {
@@ -1468,7 +1492,7 @@ function evaluateList(expr: ListExpr, env: Environment, runtime: Runtime): Value
       case 'or':
         return evalOr(args, env, runtime);
       case 'begin':
-        return evalBegin(args, env, runtime);
+        return evalBegin(args, env);
       case 'cond':
         return evalCond(args, head, env, runtime);
       case 'let':
@@ -1667,17 +1691,17 @@ function evalSet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runt
   return VOID_VALUE;
 }
 
-function evalIf(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
+function evalIf(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): EvalOutcome {
   if (args.length !== 2 && args.length !== 3) {
     throw new EvalError(`${head.line}:${head.col}: if expects 2 or 3 arguments`);
   }
 
   const condition = evaluate(args[0], env, runtime);
   if (isTruthy(condition)) {
-    return evaluate(args[1], env, runtime);
+    return makeExprStep(args[1], env);
   }
 
-  return args[2] === undefined ? VOID_VALUE : evaluate(args[2], env, runtime);
+  return args[2] === undefined ? VOID_VALUE : makeExprStep(args[2], env);
 }
 
 function evalQuote(args: Expr[], head: SymbolExpr): Value {
@@ -1720,37 +1744,51 @@ function evalCaseLambda(args: Expr[], head: SymbolExpr, env: Environment): Value
   };
 }
 
-function evalAnd(args: Expr[], env: Environment, runtime: Runtime): Value {
-  let result: Value = true;
+function evalAnd(args: Expr[], env: Environment, runtime: Runtime): EvalOutcome {
+  if (args.length === 0) {
+    return true;
+  }
 
-  for (const arg of args) {
-    result = evaluate(arg, env, runtime);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (index === args.length - 1) {
+      return makeExprStep(arg, env);
+    }
+
+    const result = evaluate(arg, env, runtime);
     if (!isTruthy(result)) {
       return result;
     }
   }
 
-  return result;
+  return true;
 }
 
-function evalOr(args: Expr[], env: Environment, runtime: Runtime): Value {
-  let result: Value = false;
+function evalOr(args: Expr[], env: Environment, runtime: Runtime): EvalOutcome {
+  if (args.length === 0) {
+    return false;
+  }
 
-  for (const arg of args) {
-    result = evaluate(arg, env, runtime);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (index === args.length - 1) {
+      return makeExprStep(arg, env);
+    }
+
+    const result = evaluate(arg, env, runtime);
     if (isTruthy(result)) {
       return result;
     }
   }
 
-  return result;
+  return false;
 }
 
-function evalBegin(args: Expr[], env: Environment, runtime: Runtime): Value {
-  return evaluateSequence(args, env, runtime);
+function evalBegin(args: Expr[], env: Environment): EvalOutcome {
+  return makeSequenceStep(args, env);
 }
 
-function evalCond(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
+function evalCond(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): EvalOutcome {
   for (let index = 0; index < args.length; index += 1) {
     const clause = args[index];
     if (clause.type !== 'list' || clause.elements.length === 0) {
@@ -1765,7 +1803,7 @@ function evalCond(args: Expr[], head: SymbolExpr, env: Environment, runtime: Run
         throw new EvalError(`${testExpr.line}:${testExpr.col}: else must be the last cond clause`);
       }
 
-      return evaluateSequence(body, env, runtime);
+      return makeSequenceStep(body, env);
     }
 
     const testValue = evaluate(testExpr, env, runtime);
@@ -1774,14 +1812,14 @@ function evalCond(args: Expr[], head: SymbolExpr, env: Environment, runtime: Run
         return testValue;
       }
 
-      return evaluateSequence(body, env, runtime);
+      return makeSequenceStep(body, env);
     }
   }
 
   return VOID_VALUE;
 }
 
-function evalLet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
+function evalLet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): EvalOutcome {
   if (args.length < 2) {
     throw new EvalError(`${head.line}:${head.col}: let expects bindings and a body`);
   }
@@ -1798,7 +1836,7 @@ function evalLet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runt
     letEnv.define(symbolLookupName(binding.name), evaluate(binding.valueExpr, env, runtime));
   }
 
-  return evaluateSequence(body, letEnv, runtime);
+  return makeSequenceStep(body, letEnv);
 }
 
 function evalLetrec(
@@ -1807,7 +1845,7 @@ function evalLetrec(
   env: Environment,
   runtime: Runtime,
   sequential: boolean,
-): Value {
+): EvalOutcome {
   if (args.length < 2) {
     throw new EvalError(`${head.line}:${head.col}: ${head.value} expects bindings and a body`);
   }
@@ -1834,10 +1872,15 @@ function evalLetrec(
     }
   }
 
-  return evaluateSequence(body, letrecEnv, runtime);
+  return makeSequenceStep(body, letrecEnv);
 }
 
-function evalNamedLet(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
+function evalNamedLet(
+  args: Expr[],
+  head: SymbolExpr,
+  env: Environment,
+  runtime: Runtime,
+): EvalOutcome {
   if (args.length < 3) {
     throw new EvalError(`${head.line}:${head.col}: named let expects a name, bindings, and a body`);
   }
@@ -1866,7 +1909,7 @@ function evalNamedLet(args: Expr[], head: SymbolExpr, env: Environment, runtime:
   return applyProcedure(procedure, evaluatedArgs, nameExpr, runtime);
 }
 
-function evalCase(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
+function evalCase(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): EvalOutcome {
   if (args.length < 1) {
     throw new EvalError(`${head.line}:${head.col}: case expects a key and at least 1 clause`);
   }
@@ -1887,7 +1930,7 @@ function evalCase(args: Expr[], head: SymbolExpr, env: Environment, runtime: Run
         throw new EvalError(`${datumExpr.line}:${datumExpr.col}: else must be the last case clause`);
       }
 
-      return evaluateSequence(body, env, runtime);
+      return makeSequenceStep(body, env);
     }
 
     if (datumExpr.type !== 'list') {
@@ -1896,7 +1939,7 @@ function evalCase(args: Expr[], head: SymbolExpr, env: Environment, runtime: Run
 
     for (const datum of datumExpr.elements) {
       if (isEqv(key, quoteExpr(datum))) {
-        return evaluateSequence(body, env, runtime);
+        return makeSequenceStep(body, env);
       }
     }
   }
@@ -1904,7 +1947,7 @@ function evalCase(args: Expr[], head: SymbolExpr, env: Environment, runtime: Run
   return VOID_VALUE;
 }
 
-function evalDo(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): Value {
+function evalDo(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runtime): EvalOutcome {
   if (args.length < 2) {
     throw new EvalError(`${head.line}:${head.col}: do expects bindings and a termination clause`);
   }
@@ -1928,7 +1971,7 @@ function evalDo(args: Expr[], head: SymbolExpr, env: Environment, runtime: Runti
 
   while (true) {
     if (isTruthy(evaluate(testExpr, loopEnv, runtime))) {
-      return resultExprs.length === 0 ? VOID_VALUE : evaluateSequence(resultExprs, loopEnv, runtime);
+      return resultExprs.length === 0 ? VOID_VALUE : makeSequenceStep(resultExprs, loopEnv);
     }
 
     evaluateSequence(body, loopEnv, runtime);
@@ -1951,7 +1994,7 @@ function applyProcedure(
   args: EvaluatedArg[],
   loc: SourceLoc,
   runtime: Runtime,
-): Value {
+): EvalOutcome {
   if (!isProcedure(operator)) {
     throw new EvalError(`${loc.line}:${loc.col}: not a procedure`);
   }
@@ -1968,7 +2011,7 @@ function applyProcedure(
       );
     }
 
-    return applyProcedureClause(operator.env, clause, args, runtime);
+    return applyProcedureClause(operator.env, clause, args);
   }
 
   if (!procedureClauseMatchesArity(operator, args.length)) {
@@ -1983,7 +2026,7 @@ function applyProcedure(
     );
   }
 
-  return applyProcedureClause(operator.env, operator, args, runtime);
+  return applyProcedureClause(operator.env, operator, args);
 }
 
 function quoteExpr(expr: Expr): Value {
@@ -2078,13 +2121,43 @@ function parseCaseLambdaClause(expr: Expr, head: SymbolExpr): ProcedureClause {
 }
 
 function evaluateSequence(exprs: Expr[], env: Environment, runtime: Runtime): Value {
-  let result: Value = VOID_VALUE;
+  return resolveEvalOutcome(makeSequenceStep(exprs, env), runtime);
+}
 
-  for (const expr of exprs) {
-    result = evaluate(expr, env, runtime);
+function evaluateSequenceStep(exprs: Expr[], env: Environment, runtime: Runtime): EvalOutcome {
+  if (exprs.length === 0) {
+    return VOID_VALUE;
   }
 
-  return result;
+  for (let index = 0; index < exprs.length - 1; index += 1) {
+    evaluate(exprs[index], env, runtime);
+  }
+
+  return makeExprStep(exprs[exprs.length - 1], env);
+}
+
+function resolveEvalOutcome(initial: EvalOutcome, runtime: Runtime): Value {
+  let outcome = initial;
+
+  while (isEvalStep(outcome)) {
+    outcome = outcome.evalStep === 'expr'
+      ? evaluateExpr(outcome.expr, outcome.env, runtime)
+      : evaluateSequenceStep(outcome.exprs, outcome.env, runtime);
+  }
+
+  return outcome;
+}
+
+function makeExprStep(expr: Expr, env: Environment): EvalExprStep {
+  return { evalStep: 'expr', expr, env };
+}
+
+function makeSequenceStep(exprs: Expr[], env: Environment): EvalSequenceStep {
+  return { evalStep: 'sequence', exprs, env };
+}
+
+function isEvalStep(outcome: EvalOutcome): outcome is EvalExprStep | EvalSequenceStep {
+  return typeof outcome === 'object' && outcome !== null && 'evalStep' in outcome;
 }
 
 function makeList(elements: Value[]): Value {
@@ -3135,8 +3208,7 @@ function applyProcedureClause(
   env: Environment,
   clause: ProcedureClause,
   args: EvaluatedArg[],
-  runtime: Runtime,
-): Value {
+): EvalOutcome {
   const callEnv = new Environment(env);
   for (let index = 0; index < clause.params.length; index += 1) {
     callEnv.define(symbolLookupName(clause.params[index]), args[index].value);
@@ -3149,7 +3221,7 @@ function applyProcedureClause(
     );
   }
 
-  return evaluateSequence(clause.body, callEnv, runtime);
+  return makeSequenceStep(clause.body, callEnv);
 }
 
 function currentBenchLevel(): number | undefined {
