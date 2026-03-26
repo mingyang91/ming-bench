@@ -17,7 +17,8 @@ type SchemeVal =
   | { tag: 'lambda'; params: string[]; restParam?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; pos?: Pos }
   | { tag: 'macro'; rules: MacroRule[]; defEnv: Env; pos?: Pos }
-  | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal>; pos?: Pos };
+  | { tag: 'record'; typeName: string; typeId: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
+  | { tag: 'case-lambda'; clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[]; pos?: Pos };
 
 interface MacroRule {
   pattern: SchemeVal[];  // pattern elements (after macro name)
@@ -544,6 +545,26 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
             const body = elems.slice(2);
             return { tag: 'lambda', params, restParam, body, env };
           }
+          case 'case-lambda': {
+            const clauses: { params: string[]; restParam?: string; body: SchemeVal[]; env: Env }[] = [];
+            for (let i = 1; i < elems.length; i++) {
+              const clause = elems[i];
+              if (clause.tag !== 'list' || clause.elements.length < 2)
+                throw errAt('case-lambda: bad clause', expr.pos);
+              const paramList = clause.elements[0];
+              if (paramList.tag === 'symbol') {
+                clauses.push({ params: [], restParam: paramList.value, body: clause.elements.slice(1), env });
+              } else if (paramList.tag === 'list') {
+                const { params, restParam } = parseParams(paramList.elements, expr.pos);
+                clauses.push({ params, restParam, body: clause.elements.slice(1), env });
+              } else if (paramList.tag === 'nil') {
+                clauses.push({ params: [], body: clause.elements.slice(1), env });
+              } else {
+                throw errAt('case-lambda: bad formals', expr.pos);
+              }
+            }
+            return { tag: 'case-lambda' as const, clauses, pos: expr.pos };
+          }
           case 'and': {
             let result: SchemeVal = SCM_TRUE;
             for (let i = 1; i < elems.length; i++) {
@@ -769,6 +790,10 @@ function evalExpr(expr: SchemeVal, env: Env): SchemeVal {
         return applyLambda(proc, args, expr.pos);
       }
 
+      if (proc.tag === 'case-lambda') {
+        return applyCaseLambda(proc, args, expr.pos);
+      }
+
       if (proc.tag === 'builtin') {
         return applyBuiltin(proc.name, args, expr.pos);
       }
@@ -805,8 +830,41 @@ function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], pos
   return result;
 }
 
+function applyCaseLambda(proc: SchemeVal & { tag: 'case-lambda' }, args: SchemeVal[], pos?: Pos): SchemeVal {
+  for (const clause of proc.clauses) {
+    if (clause.restParam) {
+      if (args.length >= clause.params.length) {
+        const callEnv = new Env(clause.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          callEnv.set(clause.params[i], args[i]);
+        }
+        callEnv.set(clause.restParam, arrayToList(args.slice(clause.params.length)));
+        let result: SchemeVal = SCM_FALSE;
+        for (const bodyExpr of clause.body) {
+          result = evalExpr(bodyExpr, callEnv);
+        }
+        return result;
+      }
+    } else {
+      if (args.length === clause.params.length) {
+        const callEnv = new Env(clause.env);
+        for (let i = 0; i < clause.params.length; i++) {
+          callEnv.set(clause.params[i], args[i]);
+        }
+        let result: SchemeVal = SCM_FALSE;
+        for (const bodyExpr of clause.body) {
+          result = evalExpr(bodyExpr, callEnv);
+        }
+        return result;
+      }
+    }
+  }
+  throw errAt(`case-lambda: no matching clause for ${args.length} arguments`, pos);
+}
+
 function applyProc(proc: SchemeVal, args: SchemeVal[], pos?: Pos): SchemeVal {
   if (proc.tag === 'lambda') return applyLambda(proc, args, pos);
+  if (proc.tag === 'case-lambda') return applyCaseLambda(proc, args, pos);
   if (proc.tag === 'builtin') return applyBuiltin(proc.name, args, pos);
   throw errAt(`not a procedure: ${display(proc)}`, pos);
 }
@@ -870,6 +928,7 @@ const BUILTINS = new Set([
   'string-upcase', 'string-downcase',
   'exact?', 'inexact?', 'exact->inexact', 'inexact->exact',
   'numerator', 'denominator', 'integer?', 'rational?',
+  'procedure?',
 ]);
 
 function isBuiltin(name: string): boolean {
@@ -995,6 +1054,9 @@ function applyBuiltin(name: string, args: SchemeVal[], pos?: Pos): SchemeVal {
     case 'char?':
       if (args.length !== 1) throw errAt('char?: expected 1 argument', pos);
       return args[0].tag === 'char' ? SCM_TRUE : SCM_FALSE;
+    case 'procedure?':
+      if (args.length !== 1) throw errAt('procedure?: expected 1 argument', pos);
+      return (args[0].tag === 'lambda' || args[0].tag === 'builtin' || args[0].tag === 'case-lambda') ? SCM_TRUE : SCM_FALSE;
     case 'display': {
       if (args.length !== 1) throw errAt('display: expected 1 argument', pos);
       outputBuffer.push(displayFormat(args[0]));
@@ -1378,6 +1440,7 @@ function display(val: SchemeVal): string {
     case 'list': return `(${val.elements.map(display).join(' ')})`;
     case 'char': return `#\\${val.value === ' ' ? 'space' : val.value === '\n' ? 'newline' : val.value}`;
     case 'lambda': return '#<procedure>';
+    case 'case-lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'record': return `#<record ${val.typeName}>`;
