@@ -17,13 +17,23 @@ type SchemeVal =
   | { tag: 'lambda'; params: string[]; rest?: string; body: SchemeVal[]; env: Env; pos?: Pos }
   | { tag: 'builtin'; name: string; pos?: Pos }
   | { tag: 'void'; pos?: Pos }
-  | { tag: 'syntax'; rules: { pattern: SchemeVal; template: SchemeVal }[]; literals: string[]; defEnv: Env; pos?: Pos };
+  | { tag: 'syntax'; rules: { pattern: SchemeVal; template: SchemeVal }[]; literals: string[]; defEnv: Env; pos?: Pos }
+  | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal>; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}: ` : '';
 }
 
 const NIL: SchemeVal = { tag: 'nil' };
+
+// Unique record type identity
+let _recordTypeCounter = 0;
+function newRecordTypeId(): symbol {
+  return Symbol(`record-type-${_recordTypeCounter++}`);
+}
+
+// Native functions (for record constructors, predicates, accessors)
+const _nativeFns = new Map<string, (args: SchemeVal[]) => SchemeVal>();
 
 function makePair(car: SchemeVal, cdr: SchemeVal): SchemeVal {
   return { tag: 'pair', car, cdr };
@@ -470,6 +480,10 @@ function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
 let _outputBuf: string[] = [];
 
 function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal {
+  // Check native functions (record constructors, predicates, accessors)
+  const nativeFn = _nativeFns.get(name);
+  if (nativeFn) return nativeFn(args);
+
   switch (name) {
     case '+': {
       const allExact = args.every(a => a.tag === 'rational');
@@ -1192,6 +1206,64 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         }
         return result;
       }
+      case 'define-record-type': {
+        // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+        if (elems.length < 4) throw new EvalError(`${posStr(expr.pos)}define-record-type: invalid syntax`);
+        const rtId = newRecordTypeId();
+        // Parse constructor: (make-name field1 field2 ...)
+        const ctorForm = elems[2];
+        if (ctorForm.tag !== 'list' || ctorForm.value.length < 1 || ctorForm.value[0].tag !== 'symbol')
+          throw new EvalError(`${posStr(expr.pos)}define-record-type: invalid constructor`);
+        const ctorName = ctorForm.value[0].value;
+        const ctorFields = ctorForm.value.slice(1).map(f => {
+          if (f.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}define-record-type: field must be symbol`);
+          return f.value;
+        });
+        // Register constructor as native function
+        const ctorKey = `__native_${ctorName}_${_recordTypeCounter}`;
+        _nativeFns.set(ctorKey, (args: SchemeVal[]) => {
+          if (args.length !== ctorFields.length)
+            throw new EvalError(`${ctorName}: expected ${ctorFields.length} arguments, got ${args.length}`);
+          const fields = new Map<string, SchemeVal>();
+          for (let i = 0; i < ctorFields.length; i++) {
+            fields.set(ctorFields[i], args[i]);
+          }
+          return { tag: 'record', type: rtId, fields };
+        });
+        env.set(ctorName, { tag: 'builtin', name: ctorKey });
+
+        // Predicate
+        const predName = elems[3];
+        if (predName.tag !== 'symbol') throw new EvalError(`${posStr(expr.pos)}define-record-type: predicate must be symbol`);
+        const predKey = `__native_${predName.value}_${_recordTypeCounter}`;
+        _nativeFns.set(predKey, (args: SchemeVal[]) => {
+          if (args.length !== 1) throw new EvalError(`${predName.value}: expected 1 argument`);
+          return { tag: 'boolean', value: args[0].tag === 'record' && args[0].type === rtId };
+        });
+        env.set(predName.value, { tag: 'builtin', name: predKey });
+
+        // Field accessors
+        for (let i = 4; i < elems.length; i++) {
+          const fieldSpec = elems[i];
+          if (fieldSpec.tag !== 'list' || fieldSpec.value.length < 2)
+            throw new EvalError(`${posStr(expr.pos)}define-record-type: invalid field spec`);
+          const fieldName = fieldSpec.value[0];
+          const accessorName = fieldSpec.value[1];
+          if (fieldName.tag !== 'symbol' || accessorName.tag !== 'symbol')
+            throw new EvalError(`${posStr(expr.pos)}define-record-type: field spec must contain symbols`);
+          const fn = fieldName.value;
+          const accKey = `__native_${accessorName.value}_${_recordTypeCounter}`;
+          _nativeFns.set(accKey, (args: SchemeVal[]) => {
+            if (args.length !== 1) throw new EvalError(`${accessorName.value}: expected 1 argument`);
+            if (args[0].tag !== 'record' || args[0].type !== rtId)
+              throw new EvalError(`${accessorName.value}: not a valid record`);
+            return args[0].fields.get(fn)!;
+          });
+          env.set(accessorName.value, { tag: 'builtin', name: accKey });
+        }
+
+        return { tag: 'void' };
+      }
       case 'define-syntax': {
         if (elems.length !== 3) throw new EvalError(`${posStr(expr.pos)}define-syntax: wrong number of arguments`);
         const name = elems[1];
@@ -1281,6 +1353,7 @@ function writeVal(val: SchemeVal): string {
     case 'lambda': return '#<procedure>';
     case 'builtin': return '#<procedure>';
     case 'syntax': return '#<syntax>';
+    case 'record': return '#<record>';
   }
 }
 
