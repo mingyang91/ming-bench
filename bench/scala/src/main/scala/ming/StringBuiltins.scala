@@ -80,7 +80,7 @@ private[ming] object StringBuiltins:
         args =>
           if args.size != 1 then throw new EvalError("string-copy: expected 1 argument")
           args.head match
-            case ss: SchemeString => new SchemeString(ss.chars.clone())
+            case ss: SchemeString => new SchemeString(ss.chars.clone(), immutable = false)
             case _                => throw new EvalError("string-copy: expected string")
       )
     )
@@ -92,9 +92,68 @@ private[ming] object StringBuiltins:
           if args.size != 3 then throw new EvalError("string-set!: expected 3 arguments")
           (args(0), args(1), args(2)) match
             case (ss: SchemeString, SchemeInt(i), SchemeChar(c)) =>
+              if ss.immutable then throw new EvalError("string-set!: strings are immutable")
               ss.chars(i.toInt) = c
-              SchemeVoid
+              SchemeList(Nil) // void
             case _ => throw new EvalError("string-set!: expected string, int, char")
+      )
+    )
+    env.set(
+      "string->list",
+      SchemeBuiltin(
+        "string->list",
+        args =>
+          if args.size != 1 then throw new EvalError("string->list: expected 1 argument")
+          args.head match
+            case SchemeString(s) => SchemeList(s.toList.map(SchemeChar(_)))
+            case _               => throw new EvalError("string->list: expected string")
+      )
+    )
+    env.set(
+      "list->string",
+      SchemeBuiltin(
+        "list->string",
+        args =>
+          if args.size != 1 then throw new EvalError("list->string: expected 1 argument")
+          def extractChars(v: SchemeVal): List[Char] = v match
+            case SchemeList(elems) => elems.map {
+              case SchemeChar(c) => c
+              case _ => throw new EvalError("list->string: expected list of chars")
+            }
+            case SchemePair(_, _) =>
+              var chars = List.newBuilder[Char]
+              var curr = v
+              while curr match
+                case SchemePair(SchemeChar(c), rest) =>
+                  chars += c; curr = rest; true
+                case SchemeList(Nil) => false
+                case _ => throw new EvalError("list->string: expected list of chars")
+              do ()
+              chars.result()
+            case _ => throw new EvalError("list->string: expected list")
+          SchemeString(extractChars(args.head).mkString)
+      )
+    )
+    env.set(
+      "char->integer",
+      SchemeBuiltin(
+        "char->integer",
+        args =>
+          if args.size != 1 then throw new EvalError("char->integer: expected 1 argument")
+          args.head match
+            case SchemeChar(c) => SchemeInt(c.toLong)
+            case _             => throw new EvalError("char->integer: expected char")
+      )
+    )
+    env.set(
+      "integer->char",
+      SchemeBuiltin(
+        "integer->char",
+        args =>
+          if args.size != 1 then throw new EvalError("integer->char: expected 1 argument")
+          args.head match
+            case SchemeInt(n) => SchemeChar(n.toChar)
+            case _            => throw new EvalError("integer->char: expected integer")
       )
     )
 

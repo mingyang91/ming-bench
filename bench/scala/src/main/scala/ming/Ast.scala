@@ -41,7 +41,7 @@ case class SchemeFloat(value: Double) extends SchemeVal:
 case class SchemeBool(value: Boolean) extends SchemeVal:
   def display: String = if value then "#t" else "#f"
 
-class SchemeString(val chars: Array[Char]) extends SchemeVal:
+class SchemeString(val chars: Array[Char], val immutable: Boolean = true) extends SchemeVal:
   def value: String   = new String(chars)
   def display: String = "\"" + value + "\""
 
