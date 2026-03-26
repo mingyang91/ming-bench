@@ -23,14 +23,14 @@ public class Evaluator {
         "string-append", "string-length", "substring", "string-ref",
         "string->number", "number->string",
         "symbol->string", "string->symbol",
-        "string-copy", "string-set!",
+        "string-copy", "string-set!", "string->list", "list->string",
         "apply",
         "eq?", "eqv?", "equal?",
         "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
         "zero?", "positive?", "negative?", "odd?", "even?",
         "list-ref", "list-tail", "list?", "assoc", "map",
         "char-alphabetic?", "char-numeric?", "char=?", "char<?",
-        "char-upcase", "char-downcase",
+        "char-upcase", "char-downcase", "char->integer", "integer->char",
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
@@ -481,14 +481,14 @@ public class Evaluator {
                          "string-append", "string-length", "substring", "string-ref",
                          "string->number", "number->string",
                          "symbol->string", "string->symbol",
-                         "string-copy", "string-set!",
+                         "string-copy", "string-set!", "string->list", "list->string",
                          "apply",
                          "eq?", "eqv?", "equal?",
                          "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
                          "zero?", "positive?", "negative?", "odd?", "even?",
                          "list-ref", "list-tail", "list?", "assoc", "map",
                          "char-alphabetic?", "char-numeric?", "char=?", "char<?",
-                         "char-upcase", "char-downcase",
+                         "char-upcase", "char-downcase", "char->integer", "integer->char",
                          "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
                          "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
@@ -933,11 +933,11 @@ public class Evaluator {
                 applyIoBuiltin(name, args);
             case "string-append", "string-length", "substring", "string-ref",
                  "string->number", "number->string", "symbol->string", "string->symbol",
-                 "string-copy", "string-set!", "string=?", "string<?", "string-ci=?",
+                 "string-copy", "string-set!", "string->list", "list->string", "string=?", "string<?", "string-ci=?",
                  "string-upcase", "string-downcase" ->
                 applyStringBuiltin(name, args);
             case "char-alphabetic?", "char-numeric?", "char=?", "char<?",
-                 "char-upcase", "char-downcase" ->
+                 "char-upcase", "char-downcase", "char->integer", "integer->char" ->
                 applyCharBuiltin(name, args);
             case "apply" -> {
                 if (args.size() < 2) throw new EvalError("apply: expected at least 2 arguments");
@@ -1294,12 +1294,31 @@ public class Evaluator {
             case "string-copy" -> new SchemeString(requireString(args.get(0)));
             case "string-set!" -> {
                 Object target = args.get(0);
-                int idx = (int) requireLong(args.get(1));
-                Object charVal = args.get(2);
-                if (!(charVal instanceof SchemeChar ch)) throw new EvalError("string-set!: expected char");
-                if (!(target instanceof SchemeString ss)) throw new EvalError("string-set!: string is immutable");
-                ss.setCharAt(idx, ch.value());
-                yield VOID;
+                if (target instanceof SchemeString ss) {
+                    int idx = (int) requireLong(args.get(1));
+                    if (!(args.get(2) instanceof SchemeChar ch)) throw new EvalError("string-set!: expected char");
+                    ss.setCharAt(idx, ch.value());
+                    yield VOID;
+                }
+                throw new EvalError("string-set!: strings are immutable");
+            }
+            case "string->list" -> {
+                String s = requireString(args.get(0));
+                Object result = null;
+                for (int i = s.length() - 1; i >= 0; i--) {
+                    result = new SchemePair(new SchemeChar(s.charAt(i)), result == null ? SchemeNil.INSTANCE : result);
+                }
+                yield result == null ? SchemeNil.INSTANCE : result;
+            }
+            case "list->string" -> {
+                StringBuilder sb = new StringBuilder();
+                Object lst = args.get(0);
+                while (lst instanceof SchemePair p) {
+                    if (!(p.car instanceof SchemeChar ch)) throw new EvalError("list->string: expected char");
+                    sb.append(ch.value());
+                    lst = p.cdr;
+                }
+                yield "\"" + sb.toString() + "\"";
             }
             case "string=?" -> requireString(args.get(0)).equals(requireString(args.get(1)));
             case "string<?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) < 0;
@@ -1337,6 +1356,14 @@ public class Evaluator {
             case "char-downcase" -> {
                 if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char-downcase: expected char");
                 yield new SchemeChar(Character.toLowerCase(ch.value()));
+            }
+            case "char->integer" -> {
+                if (!(args.get(0) instanceof SchemeChar ch)) throw new EvalError("char->integer: expected char");
+                yield (long) ch.value();
+            }
+            case "integer->char" -> {
+                long n = requireLong(args.get(0));
+                yield new SchemeChar((char) n);
             }
             default -> throw new EvalError("unknown char procedure: " + name);
         };
