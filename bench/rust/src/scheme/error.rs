@@ -43,6 +43,16 @@ pub enum EvalError {
     TypeMismatch { expected: String, found: String },
     #[error("division by zero")]
     DivisionByZero,
+    #[error("expected non-negative index, got {index}")]
+    NegativeIndex { index: i64 },
+    #[error("index out of bounds: index {index}, length {len}")]
+    IndexOutOfBounds { index: usize, len: usize },
+    #[error("invalid range: start {start}, end {end}, length {len}")]
+    InvalidRange {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
 }
 
 impl EvalError {

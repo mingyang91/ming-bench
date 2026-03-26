@@ -41,11 +41,18 @@ enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Char(char),
     Symbol(String),
     List(Vec<Value>),
     Builtin(Builtin),
     Procedure(Rc<Closure>),
     Void,
+}
+
+#[derive(Clone, Copy)]
+enum RenderMode {
+    Write,
+    Display,
 }
 
 impl Value {
@@ -58,6 +65,7 @@ impl Value {
             Self::Integer(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
+            Self::Char(_) => "char",
             Self::Symbol(_) => "symbol",
             Self::List(_) => "list",
             Self::Builtin(_) | Self::Procedure(_) => "procedure",
@@ -66,31 +74,54 @@ impl Value {
     }
 
     fn render(&self) -> String {
+        self.render_with(RenderMode::Write)
+    }
+
+    fn render_display(&self) -> String {
+        self.render_with(RenderMode::Display)
+    }
+
+    fn render_with(&self, mode: RenderMode) -> String {
         match self {
             Self::Integer(value) => value.to_string(),
             Self::Boolean(true) => "#t".into(),
             Self::Boolean(false) => "#f".into(),
-            Self::String(value) => format!("{value:?}"),
+            Self::String(value) => match mode {
+                RenderMode::Write => format!("{value:?}"),
+                RenderMode::Display => value.clone(),
+            },
+            Self::Char(value) => render_char(*value, mode),
             Self::Symbol(name) => name.clone(),
-            Self::List(items) => render_list(items),
+            Self::List(items) => render_list(items, mode),
             Self::Builtin(_) | Self::Procedure(_) => "#<procedure>".into(),
             Self::Void => "#<void>".into(),
         }
     }
 }
 
-fn render_list(items: &[Value]) -> String {
+fn render_list(items: &[Value], mode: RenderMode) -> String {
     let mut rendered = String::from("(");
 
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
             rendered.push(' ');
         }
-        rendered.push_str(&item.render());
+        rendered.push_str(&item.render_with(mode));
     }
 
     rendered.push(')');
     rendered
+}
+
+fn render_char(value: char, mode: RenderMode) -> String {
+    match mode {
+        RenderMode::Display => value.to_string(),
+        RenderMode::Write => match value {
+            ' ' => "#\\space".into(),
+            '\n' => "#\\newline".into(),
+            other => format!("#\\{other}"),
+        },
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +147,18 @@ enum Builtin {
     BooleanPred,
     PairPred,
     SymbolPred,
+    Display,
+    Write,
+    Newline,
+    StringAppend,
+    StringLength,
+    Substring,
+    StringToNumber,
+    NumberToString,
+    SymbolToString,
+    StringToSymbol,
+    StringRef,
+    CharPred,
 }
 
 impl Builtin {
@@ -142,6 +185,18 @@ impl Builtin {
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
+            Self::Display => "display",
+            Self::Write => "write",
+            Self::Newline => "newline",
+            Self::StringAppend => "string-append",
+            Self::StringLength => "string-length",
+            Self::Substring => "substring",
+            Self::StringToNumber => "string->number",
+            Self::NumberToString => "number->string",
+            Self::SymbolToString => "symbol->string",
+            Self::StringToSymbol => "string->symbol",
+            Self::StringRef => "string-ref",
+            Self::CharPred => "char?",
         }
     }
 }
@@ -157,13 +212,15 @@ type EnvRef = Rc<Env>;
 struct Env {
     bindings: RefCell<HashMap<String, Value>>,
     parent: Option<EnvRef>,
+    output: Rc<RefCell<String>>,
 }
 
 impl Env {
-    fn new() -> EnvRef {
+    fn new(output: Rc<RefCell<String>>) -> EnvRef {
         let env = Rc::new(Self {
             bindings: RefCell::new(HashMap::new()),
             parent: None,
+            output,
         });
 
         for (name, builtin) in [
@@ -188,6 +245,18 @@ impl Env {
             ("boolean?", Builtin::BooleanPred),
             ("pair?", Builtin::PairPred),
             ("symbol?", Builtin::SymbolPred),
+            ("display", Builtin::Display),
+            ("write", Builtin::Write),
+            ("newline", Builtin::Newline),
+            ("string-append", Builtin::StringAppend),
+            ("string-length", Builtin::StringLength),
+            ("substring", Builtin::Substring),
+            ("string->number", Builtin::StringToNumber),
+            ("number->string", Builtin::NumberToString),
+            ("symbol->string", Builtin::SymbolToString),
+            ("string->symbol", Builtin::StringToSymbol),
+            ("string-ref", Builtin::StringRef),
+            ("char?", Builtin::CharPred),
         ] {
             env.define(name.into(), Value::Builtin(builtin));
         }
@@ -199,6 +268,7 @@ impl Env {
         Rc::new(Self {
             bindings: RefCell::new(HashMap::new()),
             parent: Some(parent.clone()),
+            output: parent.output.clone(),
         })
     }
 
@@ -212,6 +282,10 @@ impl Env {
         }
 
         self.parent.as_ref().and_then(|parent| parent.lookup(name))
+    }
+
+    fn write_output(&self, text: &str) {
+        self.output.borrow_mut().push_str(text);
     }
 }
 
@@ -258,10 +332,10 @@ impl<'a> Parser<'a> {
     fn parse_quote(&mut self) -> Result<Expr, EvalError> {
         let pos = self.current_pos();
         self.next_char();
-        Ok(Expr::new(ExprKind::List(vec![
-            Expr::symbol("quote", pos),
-            self.parse_expr()?,
-        ]), pos))
+        Ok(Expr::new(
+            ExprKind::List(vec![Expr::symbol("quote", pos), self.parse_expr()?]),
+            pos,
+        ))
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
@@ -305,10 +379,8 @@ impl<'a> Parser<'a> {
                         'r' => value.push('\r'),
                         't' => value.push('\t'),
                         other => {
-                            return Err(
-                                EvalError::InvalidEscape { escape: other }
-                                    .with_offset(escape_pos.offset),
-                            )
+                            return Err(EvalError::InvalidEscape { escape: other }
+                                .with_offset(escape_pos.offset))
                         }
                     }
                 }
@@ -380,8 +452,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn eval_program(expressions: &[Expr]) -> Result<Value, EvalError> {
-    let env = Env::new();
+fn eval_program(expressions: &[Expr], output: Rc<RefCell<String>>) -> Result<Value, EvalError> {
+    let env = Env::new(output);
     eval_sequence(expressions, &env)
 }
 
@@ -400,9 +472,9 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
         ExprKind::Integer(value) => Ok(Value::Integer(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
         ExprKind::String(value) => Ok(Value::String(value.clone())),
-        ExprKind::Symbol(name) => env
-            .lookup(name)
-            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }.with_offset(expr.pos.offset)),
+        ExprKind::Symbol(name) => env.lookup(name).ok_or_else(|| {
+            EvalError::UnboundVariable { name: name.clone() }.with_offset(expr.pos.offset)
+        }),
         ExprKind::List(items) => eval_application(expr.pos, items, env),
     }
 }
@@ -440,12 +512,10 @@ fn apply_value(
     match value {
         Value::Builtin(builtin) => eval_builtin(builtin, arguments, env, call_pos),
         Value::Procedure(closure) => apply_closure(closure, arguments, env, call_pos),
-        other => Err(
-            EvalError::NotAProcedure {
-                found: other.kind().into(),
-            }
-            .with_offset(call_pos.offset),
-        ),
+        other => Err(EvalError::NotAProcedure {
+            found: other.kind().into(),
+        }
+        .with_offset(call_pos.offset)),
     }
 }
 
@@ -461,16 +531,22 @@ fn eval_builtin(
         Builtin::Mul => eval_mul(arguments, env),
         Builtin::Div => eval_div(arguments, env, call_pos),
         Builtin::LessThan => {
-            eval_compare(builtin.name(), arguments, env, call_pos, |left, right| left < right)
+            eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
+                left < right
+            })
         }
         Builtin::GreaterThan => {
-            eval_compare(builtin.name(), arguments, env, call_pos, |left, right| left > right)
+            eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
+                left > right
+            })
         }
-        Builtin::Equal => {
-            eval_compare(builtin.name(), arguments, env, call_pos, |left, right| left == right)
-        }
+        Builtin::Equal => eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
+            left == right
+        }),
         Builtin::LessEqual => {
-            eval_compare(builtin.name(), arguments, env, call_pos, |left, right| left <= right)
+            eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
+                left <= right
+            })
         }
         Builtin::Not => eval_not(arguments, env, call_pos),
         Builtin::Cons => eval_cons(arguments, env, call_pos),
@@ -498,11 +574,23 @@ fn eval_builtin(
             call_pos,
             |value| matches!(value, Value::List(items) if !items.is_empty()),
         ),
-        Builtin::SymbolPred => {
-            eval_type_predicate(arguments, env, "symbol?", call_pos, |value| {
-                matches!(value, Value::Symbol(_))
-            })
-        }
+        Builtin::SymbolPred => eval_type_predicate(arguments, env, "symbol?", call_pos, |value| {
+            matches!(value, Value::Symbol(_))
+        }),
+        Builtin::Display => eval_display(arguments, env, call_pos),
+        Builtin::Write => eval_write(arguments, env, call_pos),
+        Builtin::Newline => eval_newline(arguments, env, call_pos),
+        Builtin::StringAppend => eval_string_append(arguments, env),
+        Builtin::StringLength => eval_string_length(arguments, env, call_pos),
+        Builtin::Substring => eval_substring(arguments, env, call_pos),
+        Builtin::StringToNumber => eval_string_to_number(arguments, env, call_pos),
+        Builtin::NumberToString => eval_number_to_string(arguments, env, call_pos),
+        Builtin::SymbolToString => eval_symbol_to_string(arguments, env, call_pos),
+        Builtin::StringToSymbol => eval_string_to_symbol(arguments, env, call_pos),
+        Builtin::StringRef => eval_string_ref(arguments, env, call_pos),
+        Builtin::CharPred => eval_type_predicate(arguments, env, "char?", call_pos, |value| {
+            matches!(value, Value::Char(_))
+        }),
     }
 }
 
@@ -522,14 +610,12 @@ fn apply_closure_values(
     call_pos: SourcePos,
 ) -> Result<Value, EvalError> {
     if argument_values.len() != closure.params.len() {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "procedure".into(),
-                expected: format!("exactly {}", closure.params.len()),
-                got: argument_values.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "procedure".into(),
+            expected: format!("exactly {}", closure.params.len()),
+            got: argument_values.len(),
+        }
+        .with_offset(call_pos.offset));
     }
 
     let call_env = Env::child(&closure.env);
@@ -550,27 +636,23 @@ fn eval_args(arguments: &[Expr], env: &EnvRef) -> Result<Vec<Value>, EvalError> 
 
 fn eval_define(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     if arguments.len() < 2 {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "define".into(),
-                expected: "at least 2".into(),
-                got: arguments.len(),
-            }
-            .with_offset(pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "define".into(),
+            expected: "at least 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(pos.offset));
     }
 
     match &arguments[0].kind {
         ExprKind::Symbol(name) => {
             if arguments.len() != 2 {
-                return Err(
-                    EvalError::WrongArgCount {
-                        name: "define".into(),
-                        expected: "exactly 2".into(),
-                        got: arguments.len(),
-                    }
-                    .with_offset(pos.offset),
-                );
+                return Err(EvalError::WrongArgCount {
+                    name: "define".into(),
+                    expected: "exactly 2".into(),
+                    got: arguments.len(),
+                }
+                .with_offset(pos.offset));
             }
 
             let value = eval_expr(&arguments[1], env)?;
@@ -578,21 +660,18 @@ fn eval_define(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value
             Ok(Value::Void)
         }
         ExprKind::List(signature) => {
-            let (name_expr, params) =
-                signature
-                    .split_first()
-                    .ok_or_else(|| EvalError::InvalidSyntax {
-                        message: "define: expected function name".into(),
-                    }
-                    .with_offset(arguments[0].pos.offset))?;
+            let (name_expr, params) = signature.split_first().ok_or_else(|| {
+                EvalError::InvalidSyntax {
+                    message: "define: expected function name".into(),
+                }
+                .with_offset(arguments[0].pos.offset)
+            })?;
 
             let ExprKind::Symbol(name) = &name_expr.kind else {
-                return Err(
-                    EvalError::InvalidSyntax {
-                        message: "define: expected function name".into(),
-                    }
-                    .with_offset(name_expr.pos.offset),
-                );
+                return Err(EvalError::InvalidSyntax {
+                    message: "define: expected function name".into(),
+                }
+                .with_offset(name_expr.pos.offset));
             };
 
             let closure = Value::Procedure(Rc::new(Closure {
@@ -604,25 +683,21 @@ fn eval_define(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value
             env.define(name.clone(), closure);
             Ok(Value::Void)
         }
-        _ => Err(
-            EvalError::InvalidSyntax {
-                message: "define: expected symbol or function signature".into(),
-            }
-            .with_offset(arguments[0].pos.offset),
-        ),
+        _ => Err(EvalError::InvalidSyntax {
+            message: "define: expected symbol or function signature".into(),
+        }
+        .with_offset(arguments[0].pos.offset)),
     }
 }
 
 fn eval_if(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let [condition, consequent, alternate] = arguments else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "if".into(),
-                expected: "exactly 3".into(),
-                got: arguments.len(),
-            }
-            .with_offset(pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "if".into(),
+            expected: "exactly 3".into(),
+            got: arguments.len(),
+        }
+        .with_offset(pos.offset));
     };
 
     if eval_expr(condition, env)?.is_truthy() {
@@ -634,14 +709,12 @@ fn eval_if(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, Ev
 
 fn eval_quote(pos: SourcePos, arguments: &[Expr]) -> Result<Value, EvalError> {
     let [quoted] = arguments else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "quote".into(),
-                expected: "exactly 1".into(),
-                got: arguments.len(),
-            }
-            .with_offset(pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "quote".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(pos.offset));
     };
 
     Ok(quote_expr(quoted))
@@ -658,25 +731,22 @@ fn quote_expr(expr: &Expr) -> Value {
 }
 
 fn eval_lambda(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let (param_list, body) =
-        arguments.split_first().ok_or_else(|| {
-            EvalError::WrongArgCount {
-                name: "lambda".into(),
-                expected: "at least 2".into(),
-                got: 0,
-            }
-            .with_offset(pos.offset)
-        })?;
+    let (param_list, body) = arguments.split_first().ok_or_else(|| {
+        EvalError::WrongArgCount {
+            name: "lambda".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(pos.offset)
+    })?;
 
     if body.is_empty() {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "lambda".into(),
-                expected: "at least 2".into(),
-                got: 1,
-            }
-            .with_offset(pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "lambda".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(pos.offset));
     }
 
     Ok(Value::Procedure(Rc::new(Closure {
@@ -692,14 +762,12 @@ fn eval_begin(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 
 fn eval_let(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let Some((first, rest)) = arguments.split_first() else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "let".into(),
-                expected: "at least 2".into(),
-                got: 0,
-            }
-            .with_offset(pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(pos.offset));
     };
 
     match &first.kind {
@@ -710,14 +778,12 @@ fn eval_let(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, E
 
 fn eval_plain_let(bindings_expr: &Expr, body: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     if body.is_empty() {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "let".into(),
-                expected: "at least 2".into(),
-                got: 1,
-            }
-            .with_offset(bindings_expr.pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(bindings_expr.pos.offset));
     }
 
     let bindings = parse_bindings(bindings_expr, "let")?;
@@ -738,25 +804,21 @@ fn eval_named_let(
     pos: SourcePos,
 ) -> Result<Value, EvalError> {
     let Some((bindings_expr, body)) = arguments.split_first() else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "let".into(),
-                expected: "at least 3".into(),
-                got: 1,
-            }
-            .with_offset(pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 3".into(),
+            got: 1,
+        }
+        .with_offset(pos.offset));
     };
 
     if body.is_empty() {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "let".into(),
-                expected: "at least 3".into(),
-                got: 2,
-            }
-            .with_offset(pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "let".into(),
+            expected: "at least 3".into(),
+            got: 2,
+        }
+        .with_offset(pos.offset));
     }
 
     let bindings = parse_bindings(bindings_expr, "let")?;
@@ -779,12 +841,10 @@ fn eval_named_let(
 
 fn parse_bindings(bindings_expr: &Expr, form_name: &str) -> Result<Vec<(String, Expr)>, EvalError> {
     let ExprKind::List(bindings) = &bindings_expr.kind else {
-        return Err(
-            EvalError::InvalidSyntax {
-                message: format!("{form_name}: expected binding list"),
-            }
-            .with_offset(bindings_expr.pos.offset),
-        );
+        return Err(EvalError::InvalidSyntax {
+            message: format!("{form_name}: expected binding list"),
+        }
+        .with_offset(bindings_expr.pos.offset));
     };
 
     bindings
@@ -792,19 +852,15 @@ fn parse_bindings(bindings_expr: &Expr, form_name: &str) -> Result<Vec<(String, 
         .map(|binding| match &binding.kind {
             ExprKind::List(parts) if parts.len() == 2 => match &parts[0].kind {
                 ExprKind::Symbol(name) => Ok((name.clone(), parts[1].clone())),
-                _ => Err(
-                    EvalError::InvalidSyntax {
-                        message: format!("{form_name}: binding name must be a symbol"),
-                    }
-                    .with_offset(parts[0].pos.offset),
-                ),
-            },
-            _ => Err(
-                EvalError::InvalidSyntax {
-                    message: format!("{form_name}: each binding must have exactly 2 elements"),
+                _ => Err(EvalError::InvalidSyntax {
+                    message: format!("{form_name}: binding name must be a symbol"),
                 }
-                .with_offset(binding.pos.offset),
-            ),
+                .with_offset(parts[0].pos.offset)),
+            },
+            _ => Err(EvalError::InvalidSyntax {
+                message: format!("{form_name}: each binding must have exactly 2 elements"),
+            }
+            .with_offset(binding.pos.offset)),
         })
         .collect()
 }
@@ -819,31 +875,25 @@ fn eval_binding_values(bindings: &[(String, Expr)], env: &EnvRef) -> Result<Vec<
 fn eval_cond(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     for (index, clause) in arguments.iter().enumerate() {
         let ExprKind::List(items) = &clause.kind else {
-            return Err(
-                EvalError::InvalidSyntax {
-                    message: "cond: clauses must be lists".into(),
-                }
-                .with_offset(clause.pos.offset),
-            );
+            return Err(EvalError::InvalidSyntax {
+                message: "cond: clauses must be lists".into(),
+            }
+            .with_offset(clause.pos.offset));
         };
 
         let Some((test, body)) = items.split_first() else {
-            return Err(
-                EvalError::InvalidSyntax {
-                    message: "cond: clauses cannot be empty".into(),
-                }
-                .with_offset(clause.pos.offset),
-            );
+            return Err(EvalError::InvalidSyntax {
+                message: "cond: clauses cannot be empty".into(),
+            }
+            .with_offset(clause.pos.offset));
         };
 
         if matches!(&test.kind, ExprKind::Symbol(name) if name == "else") {
             if index + 1 != arguments.len() {
-                return Err(
-                    EvalError::InvalidSyntax {
-                        message: "cond: else clause must be last".into(),
-                    }
-                    .with_offset(test.pos.offset),
-                );
+                return Err(EvalError::InvalidSyntax {
+                    message: "cond: else clause must be last".into(),
+                }
+                .with_offset(test.pos.offset));
             }
 
             return if body.is_empty() {
@@ -868,12 +918,10 @@ fn eval_cond(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 
 fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
     let ExprKind::List(params) = &expr.kind else {
-        return Err(
-            EvalError::InvalidSyntax {
-                message: "lambda: expected parameter list".into(),
-            }
-            .with_offset(expr.pos.offset),
-        );
+        return Err(EvalError::InvalidSyntax {
+            message: "lambda: expected parameter list".into(),
+        }
+        .with_offset(expr.pos.offset));
     };
 
     parse_params(params)
@@ -884,12 +932,10 @@ fn parse_params(params: &[Expr]) -> Result<Vec<String>, EvalError> {
         .iter()
         .map(|param| match &param.kind {
             ExprKind::Symbol(name) => Ok(name.clone()),
-            _ => Err(
-                EvalError::InvalidSyntax {
-                    message: "lambda: parameters must be symbols".into(),
-                }
-                .with_offset(param.pos.offset),
-            ),
+            _ => Err(EvalError::InvalidSyntax {
+                message: "lambda: parameters must be symbols".into(),
+            }
+            .with_offset(param.pos.offset)),
         })
         .collect()
 }
@@ -903,14 +949,12 @@ fn eval_sub(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
     let numbers = eval_number_args(arguments, env)?;
 
     match numbers.as_slice() {
-        [] => Err(
-            EvalError::WrongArgCount {
-                name: "-".into(),
-                expected: "at least 1".into(),
-                got: 0,
-            }
-            .with_offset(call_pos.offset),
-        ),
+        [] => Err(EvalError::WrongArgCount {
+            name: "-".into(),
+            expected: "at least 1".into(),
+            got: 0,
+        }
+        .with_offset(call_pos.offset)),
         [value] => Ok(Value::Integer(-value)),
         [first, rest @ ..] => Ok(Value::Integer(
             rest.iter().fold(*first, |acc, value| acc - value),
@@ -927,25 +971,21 @@ fn eval_mul(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 
 fn eval_div(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     let Some((first_expr, rest)) = arguments.split_first() else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "/".into(),
-                expected: "at least 2".into(),
-                got: 0,
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "/".into(),
+            expected: "at least 2".into(),
+            got: 0,
+        }
+        .with_offset(call_pos.offset));
     };
 
     if rest.is_empty() {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "/".into(),
-                expected: "at least 2".into(),
-                got: 1,
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "/".into(),
+            expected: "at least 2".into(),
+            got: 1,
+        }
+        .with_offset(call_pos.offset));
     }
 
     let mut total = eval_number(first_expr, env)?;
@@ -971,14 +1011,12 @@ fn eval_compare(
     let numbers = eval_number_args(arguments, env)?;
 
     if numbers.len() < 2 {
-        return Err(
-            EvalError::WrongArgCount {
-                name: name.into(),
-                expected: "at least 2".into(),
-                got: numbers.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "at least 2".into(),
+            got: numbers.len(),
+        }
+        .with_offset(call_pos.offset));
     }
 
     let is_match = numbers.windows(2).all(|pair| predicate(pair[0], pair[1]));
@@ -988,14 +1026,12 @@ fn eval_compare(
 
 fn eval_not(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     if arguments.len() != 1 {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "not".into(),
-                expected: "exactly 1".into(),
-                got: arguments.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "not".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
     }
 
     let value = eval_expr(&arguments[0], env)?;
@@ -1004,14 +1040,12 @@ fn eval_not(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
 
 fn eval_cons(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     let [head_expr, tail_expr] = arguments else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "cons".into(),
-                expected: "exactly 2".into(),
-                got: arguments.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "cons".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
     };
 
     let head = eval_expr(head_expr, env)?;
@@ -1022,75 +1056,61 @@ fn eval_cons(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Va
             items.insert(0, head);
             Ok(Value::List(items))
         }
-        other => Err(
-            EvalError::TypeMismatch {
-                expected: "list".into(),
-                found: other.kind().into(),
-            }
-            .with_offset(tail_expr.pos.offset),
-        ),
+        other => Err(EvalError::TypeMismatch {
+            expected: "list".into(),
+            found: other.kind().into(),
+        }
+        .with_offset(tail_expr.pos.offset)),
     }
 }
 
 fn eval_car(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     let [list_expr] = arguments else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "car".into(),
-                expected: "exactly 1".into(),
-                got: arguments.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "car".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
     };
 
     match eval_expr(list_expr, env)? {
         Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
-        Value::List(_) => Err(
-            EvalError::TypeMismatch {
-                expected: "pair".into(),
-                found: "list".into(),
-            }
-            .with_offset(list_expr.pos.offset),
-        ),
-        other => Err(
-            EvalError::TypeMismatch {
-                expected: "pair".into(),
-                found: other.kind().into(),
-            }
-            .with_offset(list_expr.pos.offset),
-        ),
+        Value::List(_) => Err(EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: "list".into(),
+        }
+        .with_offset(list_expr.pos.offset)),
+        other => Err(EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: other.kind().into(),
+        }
+        .with_offset(list_expr.pos.offset)),
     }
 }
 
 fn eval_cdr(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     let [list_expr] = arguments else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "cdr".into(),
-                expected: "exactly 1".into(),
-                got: arguments.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "cdr".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
     };
 
     match eval_expr(list_expr, env)? {
         Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
-        Value::List(_) => Err(
-            EvalError::TypeMismatch {
-                expected: "pair".into(),
-                found: "list".into(),
-            }
-            .with_offset(list_expr.pos.offset),
-        ),
-        other => Err(
-            EvalError::TypeMismatch {
-                expected: "pair".into(),
-                found: other.kind().into(),
-            }
-            .with_offset(list_expr.pos.offset),
-        ),
+        Value::List(_) => Err(EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: "list".into(),
+        }
+        .with_offset(list_expr.pos.offset)),
+        other => Err(EvalError::TypeMismatch {
+            expected: "pair".into(),
+            found: other.kind().into(),
+        }
+        .with_offset(list_expr.pos.offset)),
     }
 }
 
@@ -1100,14 +1120,12 @@ fn eval_null_pred(
     call_pos: SourcePos,
 ) -> Result<Value, EvalError> {
     let [list_expr] = arguments else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "null?".into(),
-                expected: "exactly 1".into(),
-                got: arguments.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "null?".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
     };
 
     let value = eval_expr(list_expr, env)?;
@@ -1120,31 +1138,23 @@ fn eval_list_builtin(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalErro
     Ok(Value::List(eval_args(arguments, env)?))
 }
 
-fn eval_length(
-    arguments: &[Expr],
-    env: &EnvRef,
-    call_pos: SourcePos,
-) -> Result<Value, EvalError> {
+fn eval_length(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     let [list_expr] = arguments else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: "length".into(),
-                expected: "exactly 1".into(),
-                got: arguments.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: "length".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
     };
 
     match eval_expr(list_expr, env)? {
         Value::List(items) => Ok(Value::Integer(items.len() as i64)),
-        other => Err(
-            EvalError::TypeMismatch {
-                expected: "list".into(),
-                found: other.kind().into(),
-            }
-            .with_offset(list_expr.pos.offset),
-        ),
+        other => Err(EvalError::TypeMismatch {
+            expected: "list".into(),
+            found: other.kind().into(),
+        }
+        .with_offset(list_expr.pos.offset)),
     }
 }
 
@@ -1156,18 +1166,225 @@ fn eval_append(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         match value {
             Value::List(mut list_items) => items.append(&mut list_items),
             other => {
-                return Err(
-                    EvalError::TypeMismatch {
-                        expected: "list".into(),
-                        found: other.kind().into(),
-                    }
-                    .with_offset(argument.pos.offset),
-                );
+                return Err(EvalError::TypeMismatch {
+                    expected: "list".into(),
+                    found: other.kind().into(),
+                }
+                .with_offset(argument.pos.offset));
             }
         }
     }
 
     Ok(Value::List(items))
+}
+
+fn eval_display(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "display".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let value = eval_expr(expr, env)?;
+    env.write_output(&value.render_display());
+    Ok(Value::Void)
+}
+
+fn eval_write(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "write".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let value = eval_expr(expr, env)?;
+    env.write_output(&value.render());
+    Ok(Value::Void)
+}
+
+fn eval_newline(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
+    if !arguments.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "newline".into(),
+            expected: "exactly 0".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    }
+
+    env.write_output("\n");
+    Ok(Value::Void)
+}
+
+fn eval_string_append(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let mut combined = String::new();
+
+    for argument in arguments {
+        combined.push_str(&eval_string(argument, env)?);
+    }
+
+    Ok(Value::String(combined))
+}
+
+fn eval_string_length(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "string-length".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::Integer(
+        eval_string(expr, env)?.chars().count() as i64
+    ))
+}
+
+fn eval_substring(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [string_expr, start_expr, end_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "substring".into(),
+            expected: "exactly 3".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let value = eval_string(string_expr, env)?;
+    let start = eval_index(start_expr, env)?;
+    let end = eval_index(end_expr, env)?;
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len();
+
+    if start > len {
+        return Err(
+            EvalError::IndexOutOfBounds { index: start, len }.with_offset(start_expr.pos.offset)
+        );
+    }
+
+    if end > len {
+        return Err(
+            EvalError::IndexOutOfBounds { index: end, len }.with_offset(end_expr.pos.offset)
+        );
+    }
+
+    if start > end {
+        return Err(EvalError::InvalidRange { start, end, len }.with_offset(start_expr.pos.offset));
+    }
+
+    Ok(Value::String(chars[start..end].iter().collect()))
+}
+
+fn eval_string_to_number(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "string->number".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    match eval_string(expr, env)?.parse::<i64>() {
+        Ok(value) => Ok(Value::Integer(value)),
+        Err(_) => Ok(Value::Boolean(false)),
+    }
+}
+
+fn eval_number_to_string(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "number->string".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::String(eval_number(expr, env)?.to_string()))
+}
+
+fn eval_symbol_to_string(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "symbol->string".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::String(eval_symbol(expr, env)?))
+}
+
+fn eval_string_to_symbol(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "string->symbol".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::Symbol(eval_string(expr, env)?))
+}
+
+fn eval_string_ref(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [string_expr, index_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "string-ref".into(),
+            expected: "exactly 2".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let value = eval_string(string_expr, env)?;
+    let index = eval_index(index_expr, env)?;
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len();
+
+    if index >= len {
+        return Err(EvalError::IndexOutOfBounds { index, len }.with_offset(index_expr.pos.offset));
+    }
+
+    Ok(Value::Char(chars[index]))
 }
 
 fn eval_type_predicate(
@@ -1178,14 +1395,12 @@ fn eval_type_predicate(
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Value, EvalError> {
     let [expr] = arguments else {
-        return Err(
-            EvalError::WrongArgCount {
-                name: name.into(),
-                expected: "exactly 1".into(),
-                got: arguments.len(),
-            }
-            .with_offset(call_pos.offset),
-        );
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
     };
 
     let value = eval_expr(expr, env)?;
@@ -1230,13 +1445,42 @@ fn eval_number_args(arguments: &[Expr], env: &EnvRef) -> Result<Vec<i64>, EvalEr
 fn eval_number(expr: &Expr, env: &EnvRef) -> Result<i64, EvalError> {
     match eval_expr(expr, env)? {
         Value::Integer(value) => Ok(value),
-        other => Err(
-            EvalError::TypeMismatch {
-                expected: "number".into(),
-                found: other.kind().into(),
-            }
-            .with_offset(expr.pos.offset),
-        ),
+        other => Err(EvalError::TypeMismatch {
+            expected: "number".into(),
+            found: other.kind().into(),
+        }
+        .with_offset(expr.pos.offset)),
+    }
+}
+
+fn eval_string(expr: &Expr, env: &EnvRef) -> Result<String, EvalError> {
+    match eval_expr(expr, env)? {
+        Value::String(value) => Ok(value),
+        other => Err(EvalError::TypeMismatch {
+            expected: "string".into(),
+            found: other.kind().into(),
+        }
+        .with_offset(expr.pos.offset)),
+    }
+}
+
+fn eval_symbol(expr: &Expr, env: &EnvRef) -> Result<String, EvalError> {
+    match eval_expr(expr, env)? {
+        Value::Symbol(value) => Ok(value),
+        other => Err(EvalError::TypeMismatch {
+            expected: "symbol".into(),
+            found: other.kind().into(),
+        }
+        .with_offset(expr.pos.offset)),
+    }
+}
+
+fn eval_index(expr: &Expr, env: &EnvRef) -> Result<usize, EvalError> {
+    let index = eval_number(expr, env)?;
+    if index < 0 {
+        Err(EvalError::NegativeIndex { index }.with_offset(expr.pos.offset))
+    } else {
+        Ok(index as usize)
     }
 }
 
@@ -1252,14 +1496,22 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let expressions = Parser::new(input)
         .parse_program()
         .map_err(|err| err.resolve_positions(input))?;
-    let value = eval_program(&expressions).map_err(|err| err.resolve_positions(input))?;
+    let output = Rc::new(RefCell::new(String::new()));
+    let value = eval_program(&expressions, output).map_err(|err| err.resolve_positions(input))?;
     Ok(value.render())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    Ok((eval_str(input)?, String::new()))
+    let expressions = Parser::new(input)
+        .parse_program()
+        .map_err(|err| err.resolve_positions(input))?;
+    let output = Rc::new(RefCell::new(String::new()));
+    let value =
+        eval_program(&expressions, output.clone()).map_err(|err| err.resolve_positions(input))?;
+    let captured_output = output.borrow().clone();
+    Ok((value.render(), captured_output))
 }
 
 #[cfg(test)]
