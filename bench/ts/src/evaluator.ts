@@ -2736,5 +2736,5 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
     k = { tag: 'seq', rest: exprs.slice(1), env: globalEnv, k: { tag: 'halt' } };
   }
   const result = evaluate(exprs[0], globalEnv, k);
-  return { result: writeVal(result), output: _outputBuf.join('') };
+  return { result: displayVal(result), output: _outputBuf.join('') };
 }
