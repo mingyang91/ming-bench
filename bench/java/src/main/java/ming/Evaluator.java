@@ -55,6 +55,16 @@ public class Evaluator {
         }
     }
 
+    // --- CaseLambda ---
+
+    private static class CaseLambda {
+        final List<Lambda> clauses;
+
+        CaseLambda(List<Lambda> clauses) {
+            this.clauses = clauses;
+        }
+    }
+
     // --- Syntax Rules Macro ---
 
     private static class SyntaxRulesMacro {
@@ -75,7 +85,7 @@ public class Evaluator {
     }
 
     private static final java.util.Set<String> SPECIAL_FORMS = java.util.Set.of(
-        "define", "if", "quote", "lambda", "and", "or", "set!", "begin", "let", "cond",
+        "define", "if", "quote", "lambda", "case-lambda", "and", "or", "set!", "begin", "let", "cond",
         "define-syntax", "syntax-rules", "define-record-type"
     );
 
@@ -353,6 +363,7 @@ public class Evaluator {
                             return quoteDatum(list.elems.get(1));
                         }
                         case "lambda" -> { return evalLambda(list.elems, env); }
+                        case "case-lambda" -> { return evalCaseLambda(list.elems, env); }
                         case "and" -> { return evalAnd(list.elems, env); }
                         case "or" -> { return evalOr(list.elems, env); }
                         case "set!" -> {
@@ -462,6 +473,23 @@ public class Evaluator {
         }
         List<Object> body = elems.subList(2, elems.size());
         return new Lambda(params, restParam, body, env);
+    }
+
+    private CaseLambda evalCaseLambda(List<Object> elems, Env env) throws EvalError {
+        // (case-lambda (formals body...) ...)
+        if (elems.size() < 2) throw new EvalError("case-lambda: bad syntax");
+        List<Lambda> clauses = new ArrayList<>();
+        for (int i = 1; i < elems.size(); i++) {
+            if (!(elems.get(i) instanceof SchemeList clause) || clause.elems.size() < 2) {
+                throw new EvalError("case-lambda: bad clause");
+            }
+            // Build a synthetic lambda form: (lambda formals body...)
+            List<Object> lambdaElems = new ArrayList<>();
+            lambdaElems.add(new SchemeSymbol("lambda", 0, 0));
+            lambdaElems.addAll(clause.elems);
+            clauses.add(evalLambda(lambdaElems, env));
+        }
+        return new CaseLambda(clauses);
     }
 
     private Object evalAnd(List<Object> elems, Env env) throws EvalError {
@@ -597,6 +625,20 @@ public class Evaluator {
                 callEnv.define(lam.restParam, rest);
             }
             return evalBody(lam.body, callEnv);
+        }
+        if (proc instanceof CaseLambda cl) {
+            for (Lambda clause : cl.clauses) {
+                if (clause.restParam != null) {
+                    if (args.size() >= clause.params.size()) {
+                        return apply(clause, args);
+                    }
+                } else {
+                    if (args.size() == clause.params.size()) {
+                        return apply(clause, args);
+                    }
+                }
+            }
+            throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
         }
         if (proc instanceof BuiltinProc bp) {
             return bp.apply(args);
@@ -933,6 +975,13 @@ public class Evaluator {
         env.define("char?", new BuiltinProc("char?", args -> {
             requireArgCount("char?", args, 1);
             return args.get(0) instanceof SchemeChar;
+        }));
+
+        // L13: procedure?
+        env.define("procedure?", new BuiltinProc("procedure?", args -> {
+            requireArgCount("procedure?", args, 1);
+            Object v = args.get(0);
+            return v instanceof Lambda || v instanceof CaseLambda || v instanceof BuiltinProc;
         }));
 
         // L08: apply
@@ -1513,6 +1562,7 @@ public class Evaluator {
             };
         }
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         if (val instanceof SchemeRecord r) return "#<record:" + r.type.name + ">";
         return val.toString();
