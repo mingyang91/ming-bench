@@ -16,6 +16,7 @@ import java.util.function.Predicate;
 public class Evaluator {
     private final Map<String, BuiltinProcedure> builtins = createBuiltins();
     private StringBuilder outputBuffer;
+    private Long remainingSteps;
     private ContinuationContext currentContinuation;
     private List<WindFrame> currentWinds = List.of();
     private TailGuardContext currentTailGuard;
@@ -38,14 +39,30 @@ public class Evaluator {
         return evaluateProgram(input, true);
     }
 
+    /**
+     * Evaluate Scheme expressions with a maximum number of eval dispatches.
+     */
+    public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
+        return evaluateProgram(input, false, maxSteps).result();
+    }
+
     private EvalResult evaluateProgram(String input, boolean captureOutput) throws EvalError {
+        return evaluateProgram(input, captureOutput, null);
+    }
+
+    private EvalResult evaluateProgram(String input, boolean captureOutput, Long maxSteps) throws EvalError {
         List<SchemeExpression> expressions = new SchemeParser(input).parseProgram();
         if (expressions.isEmpty()) {
             throw new EvalError("empty input");
         }
+        if (maxSteps != null && maxSteps < 0L) {
+            throw new EvalError("step limit must be non-negative");
+        }
 
         StringBuilder previousOutputBuffer = outputBuffer;
+        Long previousRemainingSteps = remainingSteps;
         outputBuffer = captureOutput ? new StringBuilder() : null;
+        remainingSteps = maxSteps;
         try {
             Environment environment = createTopLevelEnvironment();
             SchemeValue result;
@@ -61,6 +78,7 @@ public class Evaluator {
             return new EvalResult(result.render(), output);
         } finally {
             outputBuffer = previousOutputBuffer;
+            remainingSteps = previousRemainingSteps;
         }
     }
 
@@ -71,6 +89,7 @@ public class Evaluator {
         try {
             while (true) {
                 try {
+                    consumeStep();
                     if (currentExpression instanceof LiteralExpression literal) {
                         return literal.value();
                     }
@@ -105,6 +124,7 @@ public class Evaluator {
 
     private SchemeValue evalNonTail(SchemeExpression expression, Environment environment) throws EvalError {
         try {
+            consumeStep();
             SchemeValue value;
             if (expression instanceof LiteralExpression literal) {
                 value = literal.value();
@@ -117,6 +137,16 @@ public class Evaluator {
         } catch (EvalError error) {
             throw error.withPosition(expression.position());
         }
+    }
+
+    private void consumeStep() throws EvalError {
+        if (remainingSteps == null) {
+            return;
+        }
+        if (remainingSteps <= 0L) {
+            throw new EvalError("step limit exceeded");
+        }
+        remainingSteps--;
     }
 
     private SchemeValue runWithContinuations(RootComputation computation) throws EvalError {
