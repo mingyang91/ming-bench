@@ -150,10 +150,16 @@ struct NativeProcedure {
 }
 
 #[derive(Clone)]
+struct ContinuationProcedure {
+    continuation: ContinuationRef,
+}
+
+#[derive(Clone)]
 enum NativeProcedureKind {
     Map,
     Apply,
     ForEach,
+    CallCc,
     RecordConstructor(Rc<RecordType>),
     RecordPredicate(Rc<RecordType>),
     RecordAccessor {
@@ -171,6 +177,7 @@ enum ProcedureValue {
     Builtin(BuiltinProcedure),
     Closure(Rc<ClosureProcedure>),
     Native(Rc<NativeProcedure>),
+    Continuation(Rc<ContinuationProcedure>),
 }
 
 #[derive(Clone)]
@@ -227,6 +234,70 @@ struct EvalState {
 enum TailAction {
     Return(Value),
     Continue { expr: Expr, env: Environment },
+}
+
+type ContinuationRef = Rc<Continuation>;
+
+#[derive(Clone)]
+enum Continuation {
+    Done,
+    Frame(ContinuationFrame, ContinuationRef),
+}
+
+#[derive(Clone)]
+enum ContinuationFrame {
+    Sequence {
+        exprs: Rc<Vec<Expr>>,
+        next_index: usize,
+        env: Environment,
+    },
+    DefineValue {
+        name: Identifier,
+        env: Environment,
+    },
+    SetValue {
+        target: Identifier,
+        env: Environment,
+        loc: SourceLoc,
+    },
+    IfTest {
+        consequent: Expr,
+        alternate: Option<Expr>,
+        env: Environment,
+    },
+    ApplyOperator {
+        arg_exprs: Rc<Vec<Expr>>,
+        env: Environment,
+        loc: SourceLoc,
+    },
+    ApplyArgument {
+        operator: Value,
+        arg_exprs: Rc<Vec<Expr>>,
+        evaluated: Vec<EvaluatedArg>,
+        current_index: usize,
+        env: Environment,
+        loc: SourceLoc,
+    },
+    MapResult {
+        operator: Value,
+        list_arg_exprs: Rc<Vec<Expr>>,
+        lists: Rc<Vec<Vec<Value>>>,
+        next_index: usize,
+        results: Vec<Value>,
+        operator_loc: SourceLoc,
+    },
+    ForEachStep {
+        operator: Value,
+        list_arg_exprs: Rc<Vec<Expr>>,
+        lists: Rc<Vec<Vec<Value>>>,
+        next_index: usize,
+        operator_loc: SourceLoc,
+    },
+}
+
+enum MachineControl {
+    Expr(Expr, Environment),
+    Value(Value),
 }
 
 impl EvalState {
@@ -589,11 +660,7 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 
     let env = create_global_env();
     let mut state = EvalState::new();
-    let mut result = Value::Void;
-
-    for expr in &program {
-        result = evaluate(expr, &env, &mut state)?;
-    }
+    let result = evaluate_program(&program, &env, &mut state)?;
 
     Ok(format_value(&result))
 }
@@ -657,6 +724,14 @@ fn create_global_env() -> Environment {
     env.define("map", native("map", NativeProcedureKind::Map));
     env.define("apply", native("apply", NativeProcedureKind::Apply));
     env.define("for-each", native("for-each", NativeProcedureKind::ForEach));
+    env.define("call/cc", native("call/cc", NativeProcedureKind::CallCc));
+    env.define(
+        "call-with-current-continuation",
+        native(
+            "call-with-current-continuation",
+            NativeProcedureKind::CallCc,
+        ),
+    );
     env.define("eq?", builtin("eq?", builtin_eq));
     env.define("eqv?", builtin("eqv?", builtin_eqv));
     env.define("equal?", builtin("equal?", builtin_equal));
@@ -707,7 +782,1251 @@ fn native(name: impl Into<String>, kind: NativeProcedureKind) -> Value {
 }
 
 fn evaluate(expr: &Expr, env: &Environment, state: &mut EvalState) -> Result<Value, EvalError> {
-    evaluate_tail(expr.clone(), env.clone(), state)
+    run_machine(
+        MachineControl::Expr(expr.clone(), env.clone()),
+        done_continuation(),
+        state,
+    )
+}
+
+fn evaluate_program(
+    program: &[Expr],
+    env: &Environment,
+    state: &mut EvalState,
+) -> Result<Value, EvalError> {
+    let (control, continuation) = start_sequence(program, env, done_continuation());
+    run_machine(control, continuation, state)
+}
+
+fn done_continuation() -> ContinuationRef {
+    Rc::new(Continuation::Done)
+}
+
+fn push_continuation(
+    continuation: &ContinuationRef,
+    frame: ContinuationFrame,
+) -> ContinuationRef {
+    Rc::new(Continuation::Frame(frame, continuation.clone()))
+}
+
+fn start_sequence(
+    exprs: &[Expr],
+    env: &Environment,
+    continuation: ContinuationRef,
+) -> (MachineControl, ContinuationRef) {
+    let Some(first) = exprs.first() else {
+        return (MachineControl::Value(Value::Void), continuation);
+    };
+
+    let continuation = if exprs.len() > 1 {
+        push_continuation(
+            &continuation,
+            ContinuationFrame::Sequence {
+                exprs: Rc::new(exprs.to_vec()),
+                next_index: 1,
+                env: env.clone(),
+            },
+        )
+    } else {
+        continuation
+    };
+
+    (MachineControl::Expr(first.clone(), env.clone()), continuation)
+}
+
+fn run_machine(
+    mut control: MachineControl,
+    mut continuation: ContinuationRef,
+    state: &mut EvalState,
+) -> Result<Value, EvalError> {
+    loop {
+        match control {
+            MachineControl::Expr(expr, env) => match &expr.kind {
+                ExprKind::Number(value) => {
+                    control = MachineControl::Value(Value::Number(*value));
+                }
+                ExprKind::Boolean(value) => {
+                    control = MachineControl::Value(Value::Boolean(*value));
+                }
+                ExprKind::String(value) => {
+                    control = MachineControl::Value(Value::String(value.clone()));
+                }
+                ExprKind::Symbol(identifier) => {
+                    control = MachineControl::Value(env.lookup_identifier(identifier, expr.loc)?);
+                }
+                ExprKind::List(elements) => {
+                    if elements.is_empty() {
+                        return Err(err_at(expr.loc, "cannot evaluate empty list"));
+                    }
+
+                    let head = &elements[0];
+                    let args = &elements[1..];
+
+                    if let Some(symbol) = expr_plain_symbol(head) {
+                        if symbol == "define-syntax" {
+                            control = MachineControl::Value(eval_define_syntax(
+                                args, head, &env, state,
+                            )?);
+                            continue;
+                        }
+
+                        if let Some(transformer) = state.syntax_rules.get(symbol).cloned() {
+                            control = MachineControl::Expr(
+                                expand_macro(&transformer, &expr, state)?,
+                                env,
+                            );
+                            continue;
+                        }
+
+                        match symbol {
+                            "define-record-type" => {
+                                control = MachineControl::Value(eval_define_record_type(
+                                    args, head, &env, state,
+                                )?);
+                                continue;
+                            }
+                            "define" => {
+                                if args.len() < 2 {
+                                    return Err(err_at(
+                                        head.loc,
+                                        "define expects a name and value",
+                                    ));
+                                }
+
+                                let target = &args[0];
+                                if let Some(name) = expr_identifier(target) {
+                                    if args.len() != 2 {
+                                        return Err(err_at(
+                                            head.loc,
+                                            "define expects exactly 2 arguments",
+                                        ));
+                                    }
+
+                                    continuation = push_continuation(
+                                        &continuation,
+                                        ContinuationFrame::DefineValue {
+                                            name: name.clone(),
+                                            env: env.clone(),
+                                        },
+                                    );
+                                    control = MachineControl::Expr(
+                                        args[1].clone(),
+                                        env,
+                                    );
+                                    continue;
+                                }
+
+                                control = MachineControl::Value(eval_define(
+                                    args, head, &env, state,
+                                )?);
+                                continue;
+                            }
+                            "set!" => {
+                                if args.len() != 2 {
+                                    return Err(err_at(
+                                        head.loc,
+                                        "set! expects exactly 2 arguments",
+                                    ));
+                                }
+
+                                let target = &args[0];
+                                let Some(identifier) = expr_identifier(target) else {
+                                    return Err(err_at(
+                                        target.loc,
+                                        "set! target must be a symbol",
+                                    ));
+                                };
+
+                                continuation = push_continuation(
+                                    &continuation,
+                                    ContinuationFrame::SetValue {
+                                        target: identifier.clone(),
+                                        env: env.clone(),
+                                        loc: target.loc,
+                                    },
+                                );
+                                control = MachineControl::Expr(args[1].clone(), env);
+                                continue;
+                            }
+                            "if" => {
+                                if !(2..=3).contains(&args.len()) {
+                                    return Err(err_at(
+                                        head.loc,
+                                        "if expects exactly 2 or 3 arguments",
+                                    ));
+                                }
+
+                                continuation = push_continuation(
+                                    &continuation,
+                                    ContinuationFrame::IfTest {
+                                        consequent: args[1].clone(),
+                                        alternate: args.get(2).cloned(),
+                                        env: env.clone(),
+                                    },
+                                );
+                                control = MachineControl::Expr(args[0].clone(), env);
+                                continue;
+                            }
+                            "quote" => {
+                                control = MachineControl::Value(eval_quote(args, head)?);
+                                continue;
+                            }
+                            "lambda" => {
+                                control = MachineControl::Value(eval_lambda(args, head, &env)?);
+                                continue;
+                            }
+                            "begin" => {
+                                (control, continuation) =
+                                    start_sequence(args, &env, continuation);
+                                continue;
+                            }
+                            _ => {
+                                if let Some(desugared) =
+                                    desugar_special_form(symbol, args, head.loc, state)?
+                                {
+                                    control = MachineControl::Expr(desugared, env);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    continuation = push_continuation(
+                        &continuation,
+                        ContinuationFrame::ApplyOperator {
+                            arg_exprs: Rc::new(args.to_vec()),
+                            env: env.clone(),
+                            loc: head.loc,
+                        },
+                    );
+                    control = MachineControl::Expr(head.clone(), env);
+                }
+            },
+            MachineControl::Value(value) => {
+                let (frame, rest) = match continuation.as_ref() {
+                    Continuation::Done => return Ok(value),
+                    Continuation::Frame(frame, rest) => (frame.clone(), rest.clone()),
+                };
+                continuation = rest;
+
+                match frame {
+                    ContinuationFrame::Sequence {
+                        exprs,
+                        next_index,
+                        env,
+                    } => {
+                        if next_index >= exprs.len() {
+                            control = MachineControl::Value(value);
+                            continue;
+                        }
+
+                        if next_index + 1 < exprs.len() {
+                            continuation = push_continuation(
+                                &continuation,
+                                ContinuationFrame::Sequence {
+                                    exprs: exprs.clone(),
+                                    next_index: next_index + 1,
+                                    env: env.clone(),
+                                },
+                            );
+                        }
+
+                        control = MachineControl::Expr(exprs[next_index].clone(), env);
+                    }
+                    ContinuationFrame::DefineValue { name, env } => {
+                        env.define_identifier(&name, value);
+                        control = MachineControl::Value(Value::Void);
+                    }
+                    ContinuationFrame::SetValue { target, env, loc } => {
+                        env.set_identifier(&target, value, loc)?;
+                        control = MachineControl::Value(Value::Void);
+                    }
+                    ContinuationFrame::IfTest {
+                        consequent,
+                        alternate,
+                        env,
+                    } => {
+                        if is_truthy(&value) {
+                            control = MachineControl::Expr(consequent, env);
+                        } else if let Some(alternate) = alternate {
+                            control = MachineControl::Expr(alternate, env);
+                        } else {
+                            control = MachineControl::Value(Value::Void);
+                        }
+                    }
+                    ContinuationFrame::ApplyOperator { arg_exprs, env, loc } => {
+                        if arg_exprs.is_empty() {
+                            (control, continuation) = continue_with_application(
+                                value,
+                                Vec::new(),
+                                loc,
+                                continuation,
+                                state,
+                            )?;
+                            continue;
+                        }
+
+                        continuation = push_continuation(
+                            &continuation,
+                            ContinuationFrame::ApplyArgument {
+                                operator: value,
+                                arg_exprs: arg_exprs.clone(),
+                                evaluated: Vec::new(),
+                                current_index: arg_exprs.len() - 1,
+                                env: env.clone(),
+                                loc,
+                            },
+                        );
+                        control = MachineControl::Expr(
+                            arg_exprs[arg_exprs.len() - 1].clone(),
+                            env,
+                        );
+                    }
+                    ContinuationFrame::ApplyArgument {
+                        operator,
+                        arg_exprs,
+                        mut evaluated,
+                        current_index,
+                        env,
+                        loc,
+                    } => {
+                        evaluated.insert(0, EvaluatedArg {
+                            expr: arg_exprs[current_index].clone(),
+                            value,
+                        });
+
+                        if current_index > 0 {
+                            let next_index = current_index - 1;
+                            continuation = push_continuation(
+                                &continuation,
+                                ContinuationFrame::ApplyArgument {
+                                    operator,
+                                    arg_exprs: arg_exprs.clone(),
+                                    evaluated,
+                                    current_index: next_index,
+                                    env: env.clone(),
+                                    loc,
+                                },
+                            );
+                            control =
+                                MachineControl::Expr(arg_exprs[next_index].clone(), env);
+                            continue;
+                        }
+
+                        (control, continuation) = continue_with_application(
+                            operator,
+                            evaluated,
+                            loc,
+                            continuation,
+                            state,
+                        )?;
+                    }
+                    ContinuationFrame::MapResult {
+                        operator,
+                        list_arg_exprs,
+                        lists,
+                        next_index,
+                        mut results,
+                        operator_loc,
+                    } => {
+                        results.push(value);
+
+                        if next_index >= lists[0].len() {
+                            control = MachineControl::Value(make_list(results));
+                            continue;
+                        }
+
+                        let next_continuation = push_continuation(
+                            &continuation,
+                            ContinuationFrame::MapResult {
+                                operator: operator.clone(),
+                                list_arg_exprs: list_arg_exprs.clone(),
+                                lists: lists.clone(),
+                                next_index: next_index + 1,
+                                results,
+                                operator_loc,
+                            },
+                        );
+                        (control, continuation) = continue_with_application(
+                            operator,
+                            build_indexed_args(&list_arg_exprs, &lists, next_index),
+                            operator_loc,
+                            next_continuation,
+                            state,
+                        )?;
+                    }
+                    ContinuationFrame::ForEachStep {
+                        operator,
+                        list_arg_exprs,
+                        lists,
+                        next_index,
+                        operator_loc,
+                    } => {
+                        if next_index >= lists[0].len() {
+                            control = MachineControl::Value(Value::Void);
+                            continue;
+                        }
+
+                        let next_continuation = push_continuation(
+                            &continuation,
+                            ContinuationFrame::ForEachStep {
+                                operator: operator.clone(),
+                                list_arg_exprs: list_arg_exprs.clone(),
+                                lists: lists.clone(),
+                                next_index: next_index + 1,
+                                operator_loc,
+                            },
+                        );
+                        (control, continuation) = continue_with_application(
+                            operator,
+                            build_indexed_args(&list_arg_exprs, &lists, next_index),
+                            operator_loc,
+                            next_continuation,
+                            state,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn continue_with_application(
+    operator: Value,
+    args: Vec<EvaluatedArg>,
+    loc: SourceLoc,
+    continuation: ContinuationRef,
+    state: &mut EvalState,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    let Value::Procedure(procedure) = operator else {
+        return Err(err_at(loc, "not a procedure"));
+    };
+
+    match procedure {
+        ProcedureValue::Builtin(procedure) => Ok((
+            MachineControl::Value((procedure.call)(&args, loc)?),
+            continuation,
+        )),
+        ProcedureValue::Closure(procedure) => {
+            let call_env = bind_closure_arguments(&procedure, &args, loc)?;
+            Ok(start_sequence(&procedure.body, &call_env, continuation))
+        }
+        ProcedureValue::Native(procedure) => {
+            continue_with_native_procedure(&procedure, args, loc, continuation, state)
+        }
+        ProcedureValue::Continuation(procedure) => {
+            expect_exact_args("continuation", &args, loc, 1)?;
+            Ok((
+                MachineControl::Value(args[0].value.clone()),
+                procedure.continuation.clone(),
+            ))
+        }
+    }
+}
+
+fn continue_with_native_procedure(
+    procedure: &NativeProcedure,
+    args: Vec<EvaluatedArg>,
+    loc: SourceLoc,
+    continuation: ContinuationRef,
+    state: &mut EvalState,
+) -> Result<(MachineControl, ContinuationRef), EvalError> {
+    match &procedure.kind {
+        NativeProcedureKind::Map => {
+            if args.len() < 2 {
+                return Err(err_at(
+                    loc,
+                    "map expects a procedure and at least 1 list",
+                ));
+            }
+
+            let operator = args[0].value.clone();
+            let list_args = &args[1..];
+            let lists = list_args
+                .iter()
+                .map(|arg| expect_proper_list(&arg.value, arg.expr.loc))
+                .collect::<Result<Vec<_>, EvalError>>()?;
+
+            let expected_len = lists[0].len();
+            for (index, list) in lists.iter().enumerate().skip(1) {
+                if list.len() != expected_len {
+                    return Err(err_at(
+                        list_args[index].expr.loc,
+                        "map lists must have the same length",
+                    ));
+                }
+            }
+
+            if expected_len == 0 {
+                return Ok((MachineControl::Value(Value::EmptyList), continuation));
+            }
+
+            let list_arg_exprs = Rc::new(
+                list_args
+                    .iter()
+                    .map(|arg| arg.expr.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let lists = Rc::new(lists);
+            let next_continuation = push_continuation(
+                &continuation,
+                ContinuationFrame::MapResult {
+                    operator: operator.clone(),
+                    list_arg_exprs: list_arg_exprs.clone(),
+                    lists: lists.clone(),
+                    next_index: 1,
+                    results: Vec::new(),
+                    operator_loc: args[0].expr.loc,
+                },
+            );
+
+            continue_with_application(
+                operator,
+                build_indexed_args(&list_arg_exprs, &lists, 0),
+                args[0].expr.loc,
+                next_continuation,
+                state,
+            )
+        }
+        NativeProcedureKind::Apply => {
+            if args.len() < 2 {
+                return Err(err_at(
+                    loc,
+                    "apply expects a procedure and an argument list",
+                ));
+            }
+
+            let operator = args[0].value.clone();
+            let mut applied_args = args[1..args.len() - 1].to_vec();
+            let tail_list = expect_proper_list(
+                &args[args.len() - 1].value,
+                args[args.len() - 1].expr.loc,
+            )?;
+            applied_args.extend(tail_list.into_iter().map(|value| EvaluatedArg {
+                expr: args[args.len() - 1].expr.clone(),
+                value,
+            }));
+
+            continue_with_application(
+                operator,
+                applied_args,
+                args[0].expr.loc,
+                continuation,
+                state,
+            )
+        }
+        NativeProcedureKind::ForEach => {
+            if args.len() < 2 {
+                return Err(err_at(
+                    loc,
+                    "for-each expects a procedure and at least 1 list",
+                ));
+            }
+
+            let operator = args[0].value.clone();
+            let list_args = &args[1..];
+            let lists = list_args
+                .iter()
+                .map(|arg| expect_proper_list(&arg.value, arg.expr.loc))
+                .collect::<Result<Vec<_>, EvalError>>()?;
+
+            let expected_len = lists[0].len();
+            for (index, list) in lists.iter().enumerate().skip(1) {
+                if list.len() != expected_len {
+                    return Err(err_at(
+                        list_args[index].expr.loc,
+                        "for-each lists must have the same length",
+                    ));
+                }
+            }
+
+            if expected_len == 0 {
+                return Ok((MachineControl::Value(Value::Void), continuation));
+            }
+
+            let list_arg_exprs = Rc::new(
+                list_args
+                    .iter()
+                    .map(|arg| arg.expr.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let lists = Rc::new(lists);
+            let next_continuation = push_continuation(
+                &continuation,
+                ContinuationFrame::ForEachStep {
+                    operator: operator.clone(),
+                    list_arg_exprs: list_arg_exprs.clone(),
+                    lists: lists.clone(),
+                    next_index: 1,
+                    operator_loc: args[0].expr.loc,
+                },
+            );
+
+            continue_with_application(
+                operator,
+                build_indexed_args(&list_arg_exprs, &lists, 0),
+                args[0].expr.loc,
+                next_continuation,
+                state,
+            )
+        }
+        NativeProcedureKind::CallCc => {
+            expect_exact_args(&procedure.name, &args, loc, 1)?;
+
+            let continuation_value =
+                Value::Procedure(ProcedureValue::Continuation(Rc::new(
+                    ContinuationProcedure {
+                        continuation: continuation.clone(),
+                    },
+                )));
+
+            continue_with_application(
+                args[0].value.clone(),
+                vec![EvaluatedArg {
+                    expr: args[0].expr.clone(),
+                    value: continuation_value,
+                }],
+                args[0].expr.loc,
+                continuation,
+                state,
+            )
+        }
+        NativeProcedureKind::RecordConstructor(type_info) => {
+            expect_exact_args(&procedure.name, &args, loc, type_info.field_count)?;
+            Ok((
+                MachineControl::Value(Value::Record(Rc::new(RecordValue {
+                    type_info: type_info.clone(),
+                    fields: RefCell::new(
+                        args.iter().map(|arg| arg.value.clone()).collect(),
+                    ),
+                }))),
+                continuation,
+            ))
+        }
+        NativeProcedureKind::RecordPredicate(type_info) => {
+            expect_exact_args(&procedure.name, &args, loc, 1)?;
+            Ok((
+                MachineControl::Value(Value::Boolean(matches!(
+                    &args[0].value,
+                    Value::Record(record) if record.type_info.type_id == type_info.type_id
+                ))),
+                continuation,
+            ))
+        }
+        NativeProcedureKind::RecordAccessor {
+            type_info,
+            field_index,
+        } => {
+            expect_exact_args(&procedure.name, &args, loc, 1)?;
+            let Value::Record(record) = &args[0].value else {
+                return Err(err_at(
+                    args[0].expr.loc,
+                    format!("expected {}", type_info.name),
+                ));
+            };
+
+            if record.type_info.type_id != type_info.type_id {
+                return Err(err_at(
+                    args[0].expr.loc,
+                    format!("expected {}", type_info.name),
+                ));
+            }
+
+            Ok((
+                MachineControl::Value(record.fields.borrow()[*field_index].clone()),
+                continuation,
+            ))
+        }
+        NativeProcedureKind::RecordMutator {
+            type_info,
+            field_index,
+        } => {
+            expect_exact_args(&procedure.name, &args, loc, 2)?;
+            let Value::Record(record) = &args[0].value else {
+                return Err(err_at(
+                    args[0].expr.loc,
+                    format!("expected {}", type_info.name),
+                ));
+            };
+
+            if record.type_info.type_id != type_info.type_id {
+                return Err(err_at(
+                    args[0].expr.loc,
+                    format!("expected {}", type_info.name),
+                ));
+            }
+
+            record.fields.borrow_mut()[*field_index] = args[1].value.clone();
+            Ok((MachineControl::Value(Value::Void), continuation))
+        }
+    }
+}
+
+fn build_indexed_args(
+    list_arg_exprs: &[Expr],
+    lists: &[Vec<Value>],
+    item_index: usize,
+) -> Vec<EvaluatedArg> {
+    list_arg_exprs
+        .iter()
+        .enumerate()
+        .map(|(list_index, expr)| EvaluatedArg {
+            expr: expr.clone(),
+            value: lists[list_index][item_index].clone(),
+        })
+        .collect()
+}
+
+fn desugar_special_form(
+    symbol: &str,
+    args: &[Expr],
+    head_loc: SourceLoc,
+    state: &mut EvalState,
+) -> Result<Option<Expr>, EvalError> {
+    match symbol {
+        "and" => Ok(Some(make_and_expr(args, head_loc, state))),
+        "or" => Ok(Some(make_or_expr(args, head_loc, state))),
+        "cond" => Ok(Some(desugar_cond(args, head_loc, state)?)),
+        "let" => Ok(Some(desugar_let(args, head_loc)?)),
+        "let*" => Ok(Some(desugar_let_star(args, head_loc)?)),
+        "letrec" => Ok(Some(desugar_letrec(args, head_loc, state, false)?)),
+        "letrec*" => Ok(Some(desugar_letrec(args, head_loc, state, true)?)),
+        "case" => Ok(Some(desugar_case(args, head_loc, state)?)),
+        "do" => Ok(Some(desugar_do(args, head_loc, state)?)),
+        _ => Ok(None),
+    }
+}
+
+fn make_and_expr(args: &[Expr], loc: SourceLoc, state: &mut EvalState) -> Expr {
+    let _ = state;
+
+    match args {
+        [] => boolean_expr(true, loc),
+        [expr] => expr.clone(),
+        [first, rest @ ..] => list_expr(
+            vec![
+                plain_symbol_expr("if", loc),
+                first.clone(),
+                make_and_expr(rest, loc, state),
+                boolean_expr(false, loc),
+            ],
+            loc,
+        ),
+    }
+}
+
+fn make_or_expr(args: &[Expr], loc: SourceLoc, state: &mut EvalState) -> Expr {
+    match args {
+        [] => boolean_expr(false, loc),
+        [expr] => expr.clone(),
+        [first, rest @ ..] => {
+            let temp = state.fresh_identifier("or");
+            let temp_expr = identifier_expr(temp.clone(), loc);
+            let body = list_expr(
+                vec![
+                    plain_symbol_expr("if", loc),
+                    temp_expr.clone(),
+                    temp_expr,
+                    make_or_expr(rest, loc, state),
+                ],
+                loc,
+            );
+            wrap_with_temp_binding(temp, first.clone(), body, loc)
+        }
+    }
+}
+
+fn desugar_cond(
+    args: &[Expr],
+    head_loc: SourceLoc,
+    state: &mut EvalState,
+) -> Result<Expr, EvalError> {
+    let _ = head_loc;
+    desugar_cond_clauses(args, head_loc, state)
+}
+
+fn desugar_cond_clauses(
+    clauses: &[Expr],
+    head_loc: SourceLoc,
+    state: &mut EvalState,
+) -> Result<Expr, EvalError> {
+    let Some((clause, rest)) = clauses.split_first() else {
+        return Ok(void_expr(head_loc));
+    };
+
+    let Some(clause_elements) = expr_list(clause) else {
+        return Err(err_at(head_loc, "cond clauses must be non-empty lists"));
+    };
+
+    if clause_elements.is_empty() {
+        return Err(err_at(head_loc, "cond clauses must be non-empty lists"));
+    }
+
+    let test_expr = &clause_elements[0];
+    let body = &clause_elements[1..];
+    let is_else_clause = matches!(expr_plain_symbol(test_expr), Some("else"));
+
+    if is_else_clause {
+        if !rest.is_empty() {
+            return Err(err_at(
+                test_expr.loc,
+                "else must be the last cond clause",
+            ));
+        }
+
+        return Ok(begin_expr(body.to_vec(), clause.loc));
+    }
+
+    let rest_expr = desugar_cond_clauses(rest, head_loc, state)?;
+    if body.is_empty() {
+        let temp = state.fresh_identifier("cond");
+        let temp_expr = identifier_expr(temp.clone(), test_expr.loc);
+        let branch = list_expr(
+            vec![
+                plain_symbol_expr("if", clause.loc),
+                temp_expr.clone(),
+                temp_expr,
+                rest_expr,
+            ],
+            clause.loc,
+        );
+        return Ok(wrap_with_temp_binding(
+            temp,
+            test_expr.clone(),
+            branch,
+            clause.loc,
+        ));
+    }
+
+    Ok(list_expr(
+        vec![
+            plain_symbol_expr("if", clause.loc),
+            test_expr.clone(),
+            begin_expr(body.to_vec(), clause.loc),
+            rest_expr,
+        ],
+        clause.loc,
+    ))
+}
+
+fn desugar_let(args: &[Expr], head_loc: SourceLoc) -> Result<Expr, EvalError> {
+    if args.len() < 2 {
+        return Err(err_at(head_loc, "let expects bindings and a body"));
+    }
+
+    if matches!(args[0].kind, ExprKind::Symbol(_)) {
+        return desugar_named_let(args, head_loc);
+    }
+
+    let bindings = parse_let_bindings(&args[0], head_loc)?;
+    let params = list_expr(
+        bindings
+            .iter()
+            .map(|binding| identifier_expr(binding.name.clone(), head_loc))
+            .collect(),
+        head_loc,
+    );
+    let mut lambda = vec![plain_symbol_expr("lambda", head_loc), params];
+    lambda.extend(args[1..].to_vec());
+
+    let mut application = vec![list_expr(lambda, head_loc)];
+    application.extend(bindings.into_iter().map(|binding| binding.value_expr));
+    Ok(list_expr(application, head_loc))
+}
+
+fn desugar_named_let(args: &[Expr], head_loc: SourceLoc) -> Result<Expr, EvalError> {
+    if args.len() < 3 {
+        return Err(err_at(
+            head_loc,
+            "named let expects a name, bindings, and a body",
+        ));
+    }
+
+    let name_expr = &args[0];
+    let Some(name) = expr_identifier(name_expr) else {
+        return Err(err_at(name_expr.loc, "named let name must be a symbol"));
+    };
+
+    let bindings = parse_let_bindings(&args[1], head_loc)?;
+    let params = list_expr(
+        bindings
+            .iter()
+            .map(|binding| identifier_expr(binding.name.clone(), head_loc))
+            .collect(),
+        head_loc,
+    );
+    let mut lambda = vec![plain_symbol_expr("lambda", head_loc), params];
+    lambda.extend(args[2..].to_vec());
+    let binding = list_expr(
+        vec![identifier_expr(name.clone(), name_expr.loc), list_expr(lambda, head_loc)],
+        head_loc,
+    );
+
+    let mut call = vec![identifier_expr(name.clone(), name_expr.loc)];
+    call.extend(
+        bindings
+            .iter()
+            .map(|binding| binding.value_expr.clone()),
+    );
+
+    Ok(list_expr(
+        vec![
+            plain_symbol_expr("letrec", head_loc),
+            list_expr(vec![binding], head_loc),
+            list_expr(call, head_loc),
+        ],
+        head_loc,
+    ))
+}
+
+fn desugar_let_star(args: &[Expr], head_loc: SourceLoc) -> Result<Expr, EvalError> {
+    if args.len() < 2 {
+        return Err(err_at(head_loc, "let* expects bindings and a body"));
+    }
+
+    let bindings = parse_let_bindings(&args[0], head_loc)?;
+    Ok(desugar_let_star_bindings(
+        &bindings,
+        args[1..].to_vec(),
+        head_loc,
+    ))
+}
+
+fn desugar_let_star_bindings(
+    bindings: &[LetBinding],
+    body: Vec<Expr>,
+    head_loc: SourceLoc,
+) -> Expr {
+    let Some((first, rest)) = bindings.split_first() else {
+        return begin_expr(body, head_loc);
+    };
+
+    let binding = list_expr(
+        vec![
+            identifier_expr(first.name.clone(), head_loc),
+            first.value_expr.clone(),
+        ],
+        head_loc,
+    );
+
+    list_expr(
+        vec![
+            plain_symbol_expr("let", head_loc),
+            list_expr(vec![binding], head_loc),
+            desugar_let_star_bindings(rest, body, head_loc),
+        ],
+        head_loc,
+    )
+}
+
+fn desugar_letrec(
+    args: &[Expr],
+    head_loc: SourceLoc,
+    state: &mut EvalState,
+    sequential: bool,
+) -> Result<Expr, EvalError> {
+    let message = if sequential {
+        "letrec* expects bindings and a body"
+    } else {
+        "letrec expects bindings and a body"
+    };
+
+    if args.len() < 2 {
+        return Err(err_at(head_loc, message));
+    }
+
+    let bindings = parse_let_bindings(&args[0], head_loc)?;
+    let params = list_expr(
+        bindings
+            .iter()
+            .map(|binding| identifier_expr(binding.name.clone(), head_loc))
+            .collect(),
+        head_loc,
+    );
+
+    let mut outer_body = Vec::new();
+    if sequential {
+        for binding in &bindings {
+            outer_body.push(list_expr(
+                vec![
+                    plain_symbol_expr("set!", head_loc),
+                    identifier_expr(binding.name.clone(), head_loc),
+                    binding.value_expr.clone(),
+                ],
+                head_loc,
+            ));
+        }
+        outer_body.extend(args[1..].to_vec());
+    } else {
+        let temp_names = (0..bindings.len())
+            .map(|_| state.fresh_identifier("letrec"))
+            .collect::<Vec<_>>();
+        let temp_params = list_expr(
+            temp_names
+                .iter()
+                .map(|identifier| identifier_expr(identifier.clone(), head_loc))
+                .collect(),
+            head_loc,
+        );
+        let mut inner_body = Vec::new();
+        for (binding, temp) in bindings.iter().zip(temp_names.iter()) {
+            inner_body.push(list_expr(
+                vec![
+                    plain_symbol_expr("set!", head_loc),
+                    identifier_expr(binding.name.clone(), head_loc),
+                    identifier_expr(temp.clone(), head_loc),
+                ],
+                head_loc,
+            ));
+        }
+        inner_body.extend(args[1..].to_vec());
+
+        let mut inner_lambda = vec![plain_symbol_expr("lambda", head_loc), temp_params];
+        inner_lambda.extend(inner_body);
+
+        let mut inner_application = vec![list_expr(inner_lambda, head_loc)];
+        inner_application.extend(
+            bindings
+                .iter()
+                .map(|binding| binding.value_expr.clone()),
+        );
+        outer_body.push(list_expr(inner_application, head_loc));
+    }
+
+    let mut outer_lambda = vec![plain_symbol_expr("lambda", head_loc), params];
+    outer_lambda.extend(outer_body);
+
+    let mut outer_application = vec![list_expr(outer_lambda, head_loc)];
+    outer_application.extend(
+        bindings
+            .iter()
+            .map(|_| boolean_expr(false, head_loc)),
+    );
+    Ok(list_expr(outer_application, head_loc))
+}
+
+fn desugar_case(
+    args: &[Expr],
+    head_loc: SourceLoc,
+    state: &mut EvalState,
+) -> Result<Expr, EvalError> {
+    if args.is_empty() {
+        return Err(err_at(
+            head_loc,
+            "case expects a key and at least 1 clause",
+        ));
+    }
+
+    let key = state.fresh_identifier("case-key");
+    let mut cond_clauses = Vec::new();
+
+    for (index, clause) in args[1..].iter().enumerate() {
+        let Some(parts) = expr_list(clause) else {
+            return Err(err_at(head_loc, "case clauses must be non-empty lists"));
+        };
+
+        if parts.is_empty() {
+            return Err(err_at(head_loc, "case clauses must be non-empty lists"));
+        }
+
+        let datums_expr = &parts[0];
+        let body = &parts[1..];
+
+        if matches!(expr_plain_symbol(datums_expr), Some("else")) {
+            if index != args.len() - 2 {
+                return Err(err_at(
+                    datums_expr.loc,
+                    "else must be the last case clause",
+                ));
+            }
+
+            let mut clause_expr = vec![plain_symbol_expr("else", datums_expr.loc)];
+            clause_expr.extend(body.to_vec());
+            cond_clauses.push(list_expr(clause_expr, clause.loc));
+            continue;
+        }
+
+        let Some(datums) = expr_list(datums_expr) else {
+            return Err(err_at(
+                datums_expr.loc,
+                "case clause datums must be a list",
+            ));
+        };
+
+        let tests = datums
+            .iter()
+            .map(|datum| {
+                list_expr(
+                    vec![
+                        plain_symbol_expr("eqv?", datums_expr.loc),
+                        identifier_expr(key.clone(), datums_expr.loc),
+                        quoted_expr(datum.clone(), datums_expr.loc),
+                    ],
+                    datums_expr.loc,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut clause_expr = vec![make_or_expr(&tests, datums_expr.loc, state)];
+        clause_expr.extend(body.to_vec());
+        cond_clauses.push(list_expr(clause_expr, clause.loc));
+    }
+
+    let cond_expr = list_expr(
+        std::iter::once(plain_symbol_expr("cond", head_loc))
+            .chain(cond_clauses)
+            .collect(),
+        head_loc,
+    );
+    Ok(wrap_with_temp_binding(
+        key,
+        args[0].clone(),
+        cond_expr,
+        head_loc,
+    ))
+}
+
+fn desugar_do(
+    args: &[Expr],
+    head_loc: SourceLoc,
+    state: &mut EvalState,
+) -> Result<Expr, EvalError> {
+    if args.len() < 2 {
+        return Err(err_at(head_loc, "do expects bindings and a test clause"));
+    }
+
+    let bindings = parse_do_bindings(&args[0], head_loc)?;
+    let Some(test_clause) = expr_list(&args[1]) else {
+        return Err(err_at(args[1].loc, "do test clause must be a list"));
+    };
+
+    if test_clause.is_empty() {
+        return Err(err_at(args[1].loc, "do test clause must be non-empty"));
+    }
+
+    let loop_name = state.fresh_identifier("do-loop");
+    let let_bindings = list_expr(
+        bindings
+            .iter()
+            .map(|binding| {
+                list_expr(
+                    vec![
+                        identifier_expr(binding.name.clone(), head_loc),
+                        binding.init_expr.clone(),
+                    ],
+                    head_loc,
+                )
+            })
+            .collect(),
+        head_loc,
+    );
+
+    let mut recursive_call = vec![identifier_expr(loop_name.clone(), head_loc)];
+    recursive_call.extend(bindings.iter().map(|binding| {
+        binding
+            .step_expr
+            .clone()
+            .unwrap_or_else(|| identifier_expr(binding.name.clone(), head_loc))
+    }));
+
+    let false_branch = if args.len() == 2 {
+        list_expr(recursive_call, head_loc)
+    } else {
+        let mut body = args[2..].to_vec();
+        body.push(list_expr(recursive_call, head_loc));
+        begin_expr(body, head_loc)
+    };
+
+    let if_expr = list_expr(
+        vec![
+            plain_symbol_expr("if", head_loc),
+            test_clause[0].clone(),
+            begin_expr(test_clause[1..].to_vec(), head_loc),
+            false_branch,
+        ],
+        head_loc,
+    );
+
+    Ok(list_expr(
+        vec![
+            plain_symbol_expr("let", head_loc),
+            identifier_expr(loop_name, head_loc),
+            let_bindings,
+            if_expr,
+        ],
+        head_loc,
+    ))
+}
+
+fn identifier_expr(identifier: Identifier, loc: SourceLoc) -> Expr {
+    Expr {
+        kind: ExprKind::Symbol(identifier),
+        loc,
+    }
+}
+
+fn list_expr(elements: Vec<Expr>, loc: SourceLoc) -> Expr {
+    Expr {
+        kind: ExprKind::List(elements),
+        loc,
+    }
+}
+
+fn boolean_expr(value: bool, loc: SourceLoc) -> Expr {
+    Expr {
+        kind: ExprKind::Boolean(value),
+        loc,
+    }
+}
+
+fn void_expr(loc: SourceLoc) -> Expr {
+    list_expr(
+        vec![
+            plain_symbol_expr("if", loc),
+            boolean_expr(false, loc),
+            boolean_expr(false, loc),
+        ],
+        loc,
+    )
+}
+
+fn begin_expr(exprs: Vec<Expr>, loc: SourceLoc) -> Expr {
+    match exprs.len() {
+        0 => void_expr(loc),
+        1 => exprs.into_iter().next().expect("single expression"),
+        _ => list_expr(
+            std::iter::once(plain_symbol_expr("begin", loc))
+                .chain(exprs)
+                .collect(),
+            loc,
+        ),
+    }
+}
+
+fn quoted_expr(expr: Expr, loc: SourceLoc) -> Expr {
+    list_expr(vec![plain_symbol_expr("quote", loc), expr], loc)
+}
+
+fn wrap_with_temp_binding(
+    identifier: Identifier,
+    value_expr: Expr,
+    body_expr: Expr,
+    loc: SourceLoc,
+) -> Expr {
+    list_expr(
+        vec![
+            list_expr(
+                vec![
+                    plain_symbol_expr("lambda", loc),
+                    list_expr(vec![identifier_expr(identifier, loc)], loc),
+                    body_expr,
+                ],
+                loc,
+            ),
+            value_expr,
+        ],
+        loc,
+    )
 }
 
 fn evaluate_tail(
@@ -1689,8 +3008,14 @@ fn apply_procedure(
     loc: SourceLoc,
     state: &mut EvalState,
 ) -> Result<Value, EvalError> {
-    let action = apply_procedure_action(operator, args, loc, state)?;
-    apply_tail_action(action, state)
+    let (control, continuation) = continue_with_application(
+        operator,
+        args.to_vec(),
+        loc,
+        done_continuation(),
+        state,
+    )?;
+    run_machine(control, continuation, state)
 }
 
 fn apply_procedure_action(
@@ -1711,6 +3036,10 @@ fn apply_procedure_action(
         ProcedureValue::Closure(procedure) => {
             let call_env = bind_closure_arguments(&procedure, args, loc)?;
             prepare_tail_sequence(&procedure.body, &call_env, state)
+        }
+        ProcedureValue::Continuation(_) => {
+            expect_exact_args("continuation", args, loc, 1)?;
+            Ok(TailAction::Return(args[0].value.clone()))
         }
     }
 }
@@ -1819,6 +3148,23 @@ fn apply_native_procedure(
             }
 
             Ok(Value::Void)
+        }
+        NativeProcedureKind::CallCc => {
+            expect_exact_args(&procedure.name, args, loc, 1)?;
+
+            apply_procedure(
+                args[0].value.clone(),
+                &[EvaluatedArg {
+                    expr: args[0].expr.clone(),
+                    value: Value::Procedure(ProcedureValue::Continuation(Rc::new(
+                        ContinuationProcedure {
+                            continuation: done_continuation(),
+                        },
+                    ))),
+                }],
+                args[0].expr.loc,
+                state,
+            )
         }
         NativeProcedureKind::RecordConstructor(type_info) => {
             expect_exact_args(&procedure.name, args, loc, type_info.field_count)?;

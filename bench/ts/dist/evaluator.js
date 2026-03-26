@@ -285,10 +285,7 @@ function evaluateProgram(input) {
     }
     const runtime = new Runtime();
     const env = createGlobalEnv(runtime);
-    let result = VOID_VALUE;
-    for (const expr of program) {
-        result = evaluate(expr, env, runtime);
-    }
+    const result = evaluateSequence(program, env, runtime);
     return { result, output: runtime.readOutput() };
 }
 function createGlobalEnv(runtime) {
@@ -617,7 +614,7 @@ function createGlobalEnv(runtime) {
         }
         return makeList(expectProperList(args[0].value, args[0].expr).slice().reverse());
     }));
-    env.define('map', builtin('map', (args, loc) => {
+    env.define('map', controlBuiltin('map', (args, loc, runtime, cont) => {
         if (args.length < 2) {
             throw new EvalError(`${loc.line}:${loc.col}: map expects a procedure and at least 1 list`);
         }
@@ -630,17 +627,19 @@ function createGlobalEnv(runtime) {
                 throw new EvalError(`${listArgs[index].expr.line}:${listArgs[index].expr.col}: map lists must have the same length`);
             }
         }
-        const results = [];
-        for (let index = 0; index < expectedLength; index += 1) {
+        const loop = (index, results) => {
+            if (index >= expectedLength) {
+                return cont(makeList(results));
+            }
             const appliedArgs = listArgs.map((arg, listIndex) => ({
                 expr: arg.expr,
                 value: lists[listIndex][index],
             }));
-            results.push(resolveEvalOutcome(applyProcedure(procedure, appliedArgs, args[0].expr, runtime), runtime));
-        }
-        return makeList(results);
+            return applyProcedure(procedure, appliedArgs, args[0].expr, runtime, (value) => (loop(index + 1, [...results, value])));
+        };
+        return loop(0, []);
     }));
-    env.define('for-each', builtin('for-each', (args, loc) => {
+    env.define('for-each', controlBuiltin('for-each', (args, loc, runtime, cont) => {
         if (args.length < 2) {
             throw new EvalError(`${loc.line}:${loc.col}: for-each expects a procedure and at least 1 list`);
         }
@@ -653,14 +652,17 @@ function createGlobalEnv(runtime) {
                 throw new EvalError(`${listArgs[index].expr.line}:${listArgs[index].expr.col}: for-each lists must have the same length`);
             }
         }
-        for (let index = 0; index < expectedLength; index += 1) {
+        const loop = (index) => {
+            if (index >= expectedLength) {
+                return cont(VOID_VALUE);
+            }
             const appliedArgs = listArgs.map((arg, listIndex) => ({
                 expr: arg.expr,
                 value: lists[listIndex][index],
             }));
-            resolveEvalOutcome(applyProcedure(procedure, appliedArgs, args[0].expr, runtime), runtime);
-        }
-        return VOID_VALUE;
+            return applyProcedure(procedure, appliedArgs, args[0].expr, runtime, () => loop(index + 1));
+        };
+        return loop(0);
     }));
     env.define('eq?', builtin('eq?', (args, loc) => {
         if (args.length !== 2) {
@@ -736,7 +738,7 @@ function createGlobalEnv(runtime) {
         }
         return false;
     }));
-    env.define('apply', builtin('apply', (args, loc) => {
+    env.define('apply', controlBuiltin('apply', (args, loc, runtime, cont) => {
         if (args.length < 2) {
             throw new EvalError(`${loc.line}:${loc.col}: apply expects at least 2 arguments`);
         }
@@ -751,8 +753,23 @@ function createGlobalEnv(runtime) {
                 value,
             })),
         ];
-        return resolveEvalOutcome(applyProcedure(procedureArg.value, appliedArgs, procedureArg.expr, runtime), runtime);
+        return applyProcedure(procedureArg.value, appliedArgs, procedureArg.expr, runtime, cont);
     }));
+    const defineCallCcBuiltin = (name) => {
+        env.define(name, controlBuiltin(name, (args, loc, runtime, cont) => {
+            if (args.length !== 1) {
+                throw new EvalError(`${loc.line}:${loc.col}: ${name} expects exactly 1 argument`);
+            }
+            const continuation = {
+                kind: 'procedure',
+                name: 'continuation',
+                resume: cont,
+            };
+            return applyProcedure(args[0].value, [{ expr: plainSymbolExpr(name, loc), value: continuation }], loc, runtime, cont);
+        }));
+    };
+    defineCallCcBuiltin('call/cc');
+    defineCallCcBuiltin('call-with-current-continuation');
     env.define('string?', predicateBuiltin('string?', isSchemeStringValue));
     env.define('number?', predicateBuiltin('number?', isNumberValue));
     env.define('integer?', predicateBuiltin('integer?', (value) => (isNumberValue(value) && isIntegerNumberValue(value))));
@@ -1118,79 +1135,80 @@ function predicateBuiltin(name, predicate) {
 function builtin(name, call) {
     return { kind: 'procedure', name, call };
 }
-function evaluate(expr, env, runtime) {
-    return resolveEvalOutcome(makeExprStep(expr, env), runtime);
+function controlBuiltin(name, invoke) {
+    return { kind: 'procedure', name, invoke };
 }
-function evaluateExpr(expr, env, runtime) {
+function evaluate(expr, env, runtime) {
+    return runMachine(makeEvalAction(expr, env, finishWithValue), runtime);
+}
+function evaluateExpr(expr, env, runtime, cont) {
     switch (expr.type) {
         case 'number':
         case 'boolean':
-            return expr.value;
+            return cont(expr.value);
         case 'string':
-            return makeString(expr.value);
+            return cont(makeString(expr.value));
         case 'char':
-            return { kind: 'char', value: expr.value };
+            return cont({ kind: 'char', value: expr.value });
         case 'symbol':
-            return env.lookupSymbol(expr, expr);
+            return cont(env.lookupSymbol(expr, expr));
         case 'list':
-            return evaluateList(expr, env, runtime);
+            return evaluateList(expr, env, runtime, cont);
     }
 }
-function evaluateList(expr, env, runtime) {
+function evaluateList(expr, env, runtime, cont) {
     if (expr.elements.length === 0) {
         throw new EvalError(`${expr.line}:${expr.col}: cannot evaluate empty list`);
     }
     const [head, ...args] = expr.elements;
     if (head.type === 'symbol') {
         if (head.value === 'define-syntax') {
-            return evalDefineSyntax(args, head, env, runtime);
+            return evalDefineSyntax(args, head, env, runtime, cont);
         }
         const transformer = runtime.lookupSyntaxRule(head.value);
         if (transformer !== undefined) {
-            return makeExprStep(expandMacro(transformer, expr, runtime), env);
+            return makeEvalAction(expandMacro(transformer, expr, runtime), env, cont);
         }
         switch (head.value) {
             case 'define-record-type':
-                return evalDefineRecordType(args, head, env);
+                return evalDefineRecordType(args, head, env, cont);
             case 'define':
-                return evalDefine(args, head, env, runtime);
+                return evalDefine(args, head, env, runtime, cont);
             case 'set!':
-                return evalSet(args, head, env, runtime);
+                return evalSet(args, head, env, runtime, cont);
             case 'if':
-                return evalIf(args, head, env, runtime);
+                return evalIf(args, head, env, runtime, cont);
             case 'quote':
-                return evalQuote(args, head);
+                return evalQuote(args, head, cont);
             case 'lambda':
-                return evalLambda(args, head, env);
+                return evalLambda(args, head, env, cont);
             case 'case-lambda':
-                return evalCaseLambda(args, head, env);
+                return evalCaseLambda(args, head, env, cont);
             case 'and':
-                return evalAnd(args, env, runtime);
+                return evalAnd(args, env, runtime, cont);
             case 'or':
-                return evalOr(args, env, runtime);
+                return evalOr(args, env, runtime, cont);
             case 'begin':
-                return evalBegin(args, env);
+                return evalBegin(args, env, cont);
             case 'cond':
-                return evalCond(args, head, env, runtime);
+                return evalCond(args, head, env, runtime, cont);
             case 'let':
-                return evalLet(args, head, env, runtime);
+                return evalLet(args, head, env, runtime, cont);
             case 'let*':
-                return evalLetStar(args, head, env, runtime);
+                return evalLetStar(args, head, env, runtime, cont);
             case 'letrec':
-                return evalLetrec(args, head, env, runtime, false);
+                return evalLetrec(args, head, env, runtime, false, cont);
             case 'letrec*':
-                return evalLetrec(args, head, env, runtime, true);
+                return evalLetrec(args, head, env, runtime, true, cont);
             case 'case':
-                return evalCase(args, head, env, runtime);
+                return evalCase(args, head, env, runtime, cont);
             case 'do':
-                return evalDo(args, head, env, runtime);
+                return evalDo(args, head, env, runtime, cont);
         }
     }
-    const operator = evaluate(head, env, runtime);
-    const evaluatedArgs = args.map((arg) => ({ expr: arg, value: evaluate(arg, env, runtime) }));
-    return applyProcedure(operator, evaluatedArgs, head, runtime);
+    return makeEvalAction(head, env, (operator) => (evaluateArguments(args, env, (evaluatedArgs) => (applyProcedure(operator, evaluatedArgs, head, runtime, cont)))));
 }
-function evalDefineSyntax(args, head, env, runtime) {
+function evalDefineSyntax(args, head, env, runtime, cont) {
     if (args.length !== 2) {
         throw new EvalError(`${head.line}:${head.col}: define-syntax expects exactly 2 arguments`);
     }
@@ -1199,9 +1217,9 @@ function evalDefineSyntax(args, head, env, runtime) {
         throw new EvalError(`${nameExpr.line}:${nameExpr.col}: macro name must be a symbol`);
     }
     runtime.defineSyntaxRule(nameExpr.value, parseMacroTransformer(args[1], env));
-    return VOID_VALUE;
+    return cont(VOID_VALUE);
 }
-function evalDefineRecordType(args, head, env) {
+function evalDefineRecordType(args, head, env, cont) {
     if (args.length < 3) {
         throw new EvalError(`${head.line}:${head.col}: define-record-type expects a type, constructor, predicate, and fields`);
     }
@@ -1263,9 +1281,9 @@ function evalDefineRecordType(args, head, env) {
             return expectRecordOfType(callArgs[0], recordType).fields[fieldIndex];
         }));
     }
-    return VOID_VALUE;
+    return cont(VOID_VALUE);
 }
-function evalDefine(args, head, env, runtime) {
+function evalDefine(args, head, env, runtime, cont) {
     if (args.length < 2) {
         throw new EvalError(`${head.line}:${head.col}: define expects a name and value`);
     }
@@ -1274,8 +1292,10 @@ function evalDefine(args, head, env, runtime) {
         if (args.length !== 2) {
             throw new EvalError(`${head.line}:${head.col}: define expects exactly 2 arguments`);
         }
-        env.define(symbolLookupName(target), evaluate(args[1], env, runtime));
-        return VOID_VALUE;
+        return makeEvalAction(args[1], env, (value) => {
+            env.define(symbolLookupName(target), value);
+            return cont(VOID_VALUE);
+        });
     }
     if (target.type !== 'list' || target.elements.length === 0) {
         throw new EvalError(`${head.line}:${head.col}: invalid define target`);
@@ -1295,9 +1315,9 @@ function evalDefine(args, head, env, runtime) {
         env,
     };
     env.define(symbolLookupName(nameExpr), proc);
-    return VOID_VALUE;
+    return cont(VOID_VALUE);
 }
-function evalSet(args, head, env, runtime) {
+function evalSet(args, head, env, runtime, cont) {
     if (args.length !== 2) {
         throw new EvalError(`${head.line}:${head.col}: set! expects exactly 2 arguments`);
     }
@@ -1305,26 +1325,29 @@ function evalSet(args, head, env, runtime) {
     if (target.type !== 'symbol') {
         throw new EvalError(`${target.line}:${target.col}: set! target must be a symbol`);
     }
-    env.assignSymbol(target, evaluate(args[1], env, runtime), target);
-    return VOID_VALUE;
+    return makeEvalAction(args[1], env, (value) => {
+        env.assignSymbol(target, value, target);
+        return cont(VOID_VALUE);
+    });
 }
-function evalIf(args, head, env, runtime) {
+function evalIf(args, head, env, runtime, cont) {
     if (args.length !== 2 && args.length !== 3) {
         throw new EvalError(`${head.line}:${head.col}: if expects 2 or 3 arguments`);
     }
-    const condition = evaluate(args[0], env, runtime);
-    if (isTruthy(condition)) {
-        return makeExprStep(args[1], env);
-    }
-    return args[2] === undefined ? VOID_VALUE : makeExprStep(args[2], env);
+    return makeEvalAction(args[0], env, (condition) => {
+        if (isTruthy(condition)) {
+            return makeEvalAction(args[1], env, cont);
+        }
+        return args[2] === undefined ? cont(VOID_VALUE) : makeEvalAction(args[2], env, cont);
+    });
 }
-function evalQuote(args, head) {
+function evalQuote(args, head, cont) {
     if (args.length !== 1) {
         throw new EvalError(`${head.line}:${head.col}: quote expects exactly 1 argument`);
     }
-    return quoteExpr(args[0]);
+    return cont(quoteExpr(args[0]));
 }
-function evalLambda(args, head, env) {
+function evalLambda(args, head, env, cont) {
     if (args.length < 2) {
         throw new EvalError(`${head.line}:${head.col}: lambda expects parameters and a body`);
     }
@@ -1333,111 +1356,120 @@ function evalLambda(args, head, env) {
         throw new EvalError(`${paramsExpr.line}:${paramsExpr.col}: lambda parameters must be a list`);
     }
     const { params, restParam } = parseProcedureParameters(paramsExpr.elements);
-    return {
+    return cont({
         kind: 'procedure',
         params,
         restParam,
         body: args.slice(1),
         env,
-    };
+    });
 }
-function evalCaseLambda(args, head, env) {
+function evalCaseLambda(args, head, env, cont) {
     if (args.length === 0) {
         throw new EvalError(`${head.line}:${head.col}: case-lambda expects at least 1 clause`);
     }
-    return {
+    return cont({
         kind: 'procedure',
         clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr, head)),
         env,
-    };
+    });
 }
-function evalAnd(args, env, runtime) {
+function evalAnd(args, env, runtime, cont, index = 0) {
     if (args.length === 0) {
-        return true;
+        return cont(true);
     }
-    for (let index = 0; index < args.length; index += 1) {
-        const arg = args[index];
-        if (index === args.length - 1) {
-            return makeExprStep(arg, env);
-        }
-        const result = evaluate(arg, env, runtime);
-        if (!isTruthy(result)) {
-            return result;
-        }
+    const arg = args[index];
+    if (arg === undefined) {
+        return cont(true);
     }
-    return true;
+    if (index === args.length - 1) {
+        return makeEvalAction(arg, env, cont);
+    }
+    return makeEvalAction(arg, env, (result) => (isTruthy(result)
+        ? evalAnd(args, env, runtime, cont, index + 1)
+        : cont(result)));
 }
-function evalOr(args, env, runtime) {
+function evalOr(args, env, runtime, cont, index = 0) {
     if (args.length === 0) {
-        return false;
+        return cont(false);
     }
-    for (let index = 0; index < args.length; index += 1) {
-        const arg = args[index];
-        if (index === args.length - 1) {
-            return makeExprStep(arg, env);
-        }
-        const result = evaluate(arg, env, runtime);
-        if (isTruthy(result)) {
-            return result;
-        }
+    const arg = args[index];
+    if (arg === undefined) {
+        return cont(false);
     }
-    return false;
-}
-function evalBegin(args, env) {
-    return makeSequenceStep(args, env);
-}
-function evalCond(args, head, env, runtime) {
-    for (let index = 0; index < args.length; index += 1) {
-        const clause = args[index];
-        if (clause.type !== 'list' || clause.elements.length === 0) {
-            throw new EvalError(`${head.line}:${head.col}: cond clauses must be non-empty lists`);
-        }
-        const [testExpr, ...body] = clause.elements;
-        const isElseClause = testExpr.type === 'symbol' && testExpr.value === 'else';
-        if (isElseClause) {
-            if (index !== args.length - 1) {
-                throw new EvalError(`${testExpr.line}:${testExpr.col}: else must be the last cond clause`);
-            }
-            return makeSequenceStep(body, env);
-        }
-        const testValue = evaluate(testExpr, env, runtime);
-        if (isTruthy(testValue)) {
-            if (body.length === 0) {
-                return testValue;
-            }
-            return makeSequenceStep(body, env);
-        }
+    if (index === args.length - 1) {
+        return makeEvalAction(arg, env, cont);
     }
-    return VOID_VALUE;
+    return makeEvalAction(arg, env, (result) => (isTruthy(result)
+        ? cont(result)
+        : evalOr(args, env, runtime, cont, index + 1)));
 }
-function evalLet(args, head, env, runtime) {
+function evalBegin(args, env, cont) {
+    return makeSequenceAction(args, 0, env, cont);
+}
+function evalCond(args, head, env, runtime, cont, index = 0) {
+    if (index >= args.length) {
+        return cont(VOID_VALUE);
+    }
+    const clause = args[index];
+    if (clause.type !== 'list' || clause.elements.length === 0) {
+        throw new EvalError(`${head.line}:${head.col}: cond clauses must be non-empty lists`);
+    }
+    const [testExpr, ...body] = clause.elements;
+    const isElseClause = testExpr.type === 'symbol' && testExpr.value === 'else';
+    if (isElseClause) {
+        if (index !== args.length - 1) {
+            throw new EvalError(`${testExpr.line}:${testExpr.col}: else must be the last cond clause`);
+        }
+        return makeSequenceAction(body, 0, env, cont);
+    }
+    return makeEvalAction(testExpr, env, (testValue) => {
+        if (!isTruthy(testValue)) {
+            return evalCond(args, head, env, runtime, cont, index + 1);
+        }
+        if (body.length === 0) {
+            return cont(testValue);
+        }
+        return makeSequenceAction(body, 0, env, cont);
+    });
+}
+function evalLet(args, head, env, runtime, cont) {
     if (args.length < 2) {
         throw new EvalError(`${head.line}:${head.col}: let expects bindings and a body`);
     }
     if (args[0].type === 'symbol') {
-        return evalNamedLet(args, head, env, runtime);
+        return evalNamedLet(args, head, env, runtime, cont);
     }
     const bindings = parseLetBindings(args[0], head);
     const body = args.slice(1);
-    const letEnv = new Environment(env);
-    for (const binding of bindings) {
-        letEnv.define(symbolLookupName(binding.name), evaluate(binding.valueExpr, env, runtime));
-    }
-    return makeSequenceStep(body, letEnv);
+    return evaluateExpressions(bindings.map((binding) => binding.valueExpr), env, (values) => {
+        const letEnv = new Environment(env);
+        for (let index = 0; index < bindings.length; index += 1) {
+            letEnv.define(symbolLookupName(bindings[index].name), values[index]);
+        }
+        return makeSequenceAction(body, 0, letEnv, cont);
+    });
 }
-function evalLetStar(args, head, env, runtime) {
+function evalLetStar(args, head, env, runtime, cont) {
     if (args.length < 2) {
         throw new EvalError(`${head.line}:${head.col}: let* expects bindings and a body`);
     }
     const bindings = parseLetBindings(args[0], head);
     const body = args.slice(1);
     const letStarEnv = new Environment(env);
-    for (const binding of bindings) {
-        letStarEnv.define(symbolLookupName(binding.name), evaluate(binding.valueExpr, letStarEnv, runtime));
-    }
-    return makeSequenceStep(body, letStarEnv);
+    const bindNext = (index) => {
+        if (index >= bindings.length) {
+            return makeSequenceAction(body, 0, letStarEnv, cont);
+        }
+        const binding = bindings[index];
+        return makeEvalAction(binding.valueExpr, letStarEnv, (value) => {
+            letStarEnv.define(symbolLookupName(binding.name), value);
+            return bindNext(index + 1);
+        });
+    };
+    return bindNext(0);
 }
-function evalLetrec(args, head, env, runtime, sequential) {
+function evalLetrec(args, head, env, runtime, sequential, cont) {
     if (args.length < 2) {
         throw new EvalError(`${head.line}:${head.col}: ${head.value} expects bindings and a body`);
     }
@@ -1445,25 +1477,37 @@ function evalLetrec(args, head, env, runtime, sequential) {
     const body = args.slice(1);
     const letrecEnv = new Environment(env);
     if (sequential) {
-        for (const binding of bindings) {
+        const initSequential = (index) => {
+            if (index >= bindings.length) {
+                return makeSequenceAction(body, 0, letrecEnv, cont);
+            }
+            const binding = bindings[index];
             const cell = { value: makeUninitialized(binding.name.value) };
             letrecEnv.defineCell(symbolLookupName(binding.name), cell);
-            cell.value = evaluate(binding.valueExpr, letrecEnv, runtime);
-        }
+            return makeEvalAction(binding.valueExpr, letrecEnv, (value) => {
+                cell.value = value;
+                return initSequential(index + 1);
+            });
+        };
+        return initSequential(0);
     }
-    else {
-        const cells = bindings.map((binding) => {
-            const cell = { value: makeUninitialized(binding.name.value) };
-            letrecEnv.defineCell(symbolLookupName(binding.name), cell);
-            return cell;
+    const cells = bindings.map((binding) => {
+        const cell = { value: makeUninitialized(binding.name.value) };
+        letrecEnv.defineCell(symbolLookupName(binding.name), cell);
+        return cell;
+    });
+    const initParallel = (index) => {
+        if (index >= bindings.length) {
+            return makeSequenceAction(body, 0, letrecEnv, cont);
+        }
+        return makeEvalAction(bindings[index].valueExpr, letrecEnv, (value) => {
+            cells[index].value = value;
+            return initParallel(index + 1);
         });
-        for (let index = 0; index < bindings.length; index += 1) {
-            cells[index].value = evaluate(bindings[index].valueExpr, letrecEnv, runtime);
-        }
-    }
-    return makeSequenceStep(body, letrecEnv);
+    };
+    return initParallel(0);
 }
-function evalNamedLet(args, head, env, runtime) {
+function evalNamedLet(args, head, env, runtime, cont) {
     if (args.length < 3) {
         throw new EvalError(`${head.line}:${head.col}: named let expects a name, bindings, and a body`);
     }
@@ -1472,51 +1516,54 @@ function evalNamedLet(args, head, env, runtime) {
         throw new EvalError(`${nameExpr.line}:${nameExpr.col}: named let name must be a symbol`);
     }
     const bindings = parseLetBindings(args[1], head);
-    const evaluatedArgs = bindings.map((binding) => ({
-        expr: binding.valueExpr,
-        value: evaluate(binding.valueExpr, env, runtime),
-    }));
-    const letEnv = new Environment(env);
-    const procedure = {
-        kind: 'procedure',
-        name: nameExpr.value,
-        params: bindings.map((binding) => binding.name),
-        body: args.slice(2),
-        env: letEnv,
-    };
-    letEnv.define(symbolLookupName(nameExpr), procedure);
-    return applyProcedure(procedure, evaluatedArgs, nameExpr, runtime);
+    return evaluateArguments(bindings.map((binding) => binding.valueExpr), env, (evaluatedArgs) => {
+        const letEnv = new Environment(env);
+        const procedure = {
+            kind: 'procedure',
+            name: nameExpr.value,
+            params: bindings.map((binding) => binding.name),
+            body: args.slice(2),
+            env: letEnv,
+        };
+        letEnv.define(symbolLookupName(nameExpr), procedure);
+        return applyProcedure(procedure, evaluatedArgs, nameExpr, runtime, cont);
+    });
 }
-function evalCase(args, head, env, runtime) {
+function evalCase(args, head, env, runtime, cont) {
     if (args.length < 1) {
         throw new EvalError(`${head.line}:${head.col}: case expects a key and at least 1 clause`);
     }
-    const key = evaluate(args[0], env, runtime);
-    for (let index = 1; index < args.length; index += 1) {
-        const clause = args[index];
-        if (clause.type !== 'list' || clause.elements.length === 0) {
-            throw new EvalError(`${head.line}:${head.col}: case clauses must be non-empty lists`);
-        }
-        const [datumExpr, ...body] = clause.elements;
-        const isElseClause = datumExpr.type === 'symbol' && datumExpr.value === 'else';
-        if (isElseClause) {
-            if (index !== args.length - 1) {
-                throw new EvalError(`${datumExpr.line}:${datumExpr.col}: else must be the last case clause`);
+    return makeEvalAction(args[0], env, (key) => {
+        const checkClause = (index) => {
+            if (index >= args.length - 1) {
+                return cont(VOID_VALUE);
             }
-            return makeSequenceStep(body, env);
-        }
-        if (datumExpr.type !== 'list') {
-            throw new EvalError(`${datumExpr.line}:${datumExpr.col}: case datums must be a list`);
-        }
-        for (const datum of datumExpr.elements) {
-            if (isEqv(key, quoteExpr(datum))) {
-                return makeSequenceStep(body, env);
+            const clause = args[index + 1];
+            if (clause.type !== 'list' || clause.elements.length === 0) {
+                throw new EvalError(`${head.line}:${head.col}: case clauses must be non-empty lists`);
             }
-        }
-    }
-    return VOID_VALUE;
+            const [datumExpr, ...body] = clause.elements;
+            const isElseClause = datumExpr.type === 'symbol' && datumExpr.value === 'else';
+            if (isElseClause) {
+                if (index + 1 !== args.length - 1) {
+                    throw new EvalError(`${datumExpr.line}:${datumExpr.col}: else must be the last case clause`);
+                }
+                return makeSequenceAction(body, 0, env, cont);
+            }
+            if (datumExpr.type !== 'list') {
+                throw new EvalError(`${datumExpr.line}:${datumExpr.col}: case datums must be a list`);
+            }
+            for (const datum of datumExpr.elements) {
+                if (isEqv(key, quoteExpr(datum))) {
+                    return makeSequenceAction(body, 0, env, cont);
+                }
+            }
+            return checkClause(index + 1);
+        };
+        return checkClause(0);
+    });
 }
-function evalDo(args, head, env, runtime) {
+function evalDo(args, head, env, runtime, cont) {
     if (args.length < 2) {
         throw new EvalError(`${head.line}:${head.col}: do expects bindings and a termination clause`);
     }
@@ -1527,41 +1574,66 @@ function evalDo(args, head, env, runtime) {
     }
     const [testExpr, ...resultExprs] = testClause.elements;
     const body = args.slice(2);
-    const loopEnv = new Environment(env);
-    const cells = bindings.map((binding) => {
-        const cell = {
-            value: evaluate(binding.initExpr, env, runtime),
-        };
-        loopEnv.defineCell(symbolLookupName(binding.name), cell);
-        return { binding, cell };
+    return evaluateExpressions(bindings.map((binding) => binding.initExpr), env, (values) => {
+        const loopEnv = new Environment(env);
+        const cells = bindings.map((binding, index) => {
+            const cell = { value: values[index] };
+            loopEnv.defineCell(symbolLookupName(binding.name), cell);
+            return { binding, cell };
+        });
+        return evalDoLoop(testExpr, resultExprs, body, cells, loopEnv, runtime, cont);
     });
-    while (true) {
-        if (isTruthy(evaluate(testExpr, loopEnv, runtime))) {
-            return resultExprs.length === 0 ? VOID_VALUE : makeSequenceStep(resultExprs, loopEnv);
-        }
-        evaluateSequence(body, loopEnv, runtime);
-        const nextValues = cells.map(({ binding }) => (binding.stepExpr === undefined ? undefined : evaluate(binding.stepExpr, loopEnv, runtime)));
-        for (let index = 0; index < cells.length; index += 1) {
-            const nextValue = nextValues[index];
-            if (nextValue !== undefined) {
-                cells[index].cell.value = nextValue;
-            }
-        }
-    }
 }
-function applyProcedure(operator, args, loc, runtime) {
+function evalDoLoop(testExpr, resultExprs, body, cells, loopEnv, runtime, cont) {
+    return makeEvalAction(testExpr, loopEnv, (testValue) => {
+        if (isTruthy(testValue)) {
+            return resultExprs.length === 0
+                ? cont(VOID_VALUE)
+                : makeSequenceAction(resultExprs, 0, loopEnv, cont);
+        }
+        return makeSequenceAction(body, 0, loopEnv, (_ignored) => (evalDoSteps(cells, loopEnv, (nextValues) => {
+            for (let index = 0; index < cells.length; index += 1) {
+                const nextValue = nextValues[index];
+                if (nextValue !== undefined) {
+                    cells[index].cell.value = nextValue;
+                }
+            }
+            return evalDoLoop(testExpr, resultExprs, body, cells, loopEnv, runtime, cont);
+        })));
+    });
+}
+function evalDoSteps(cells, loopEnv, cont, index = 0, values = []) {
+    if (index >= cells.length) {
+        return cont(values);
+    }
+    const stepExpr = cells[index].binding.stepExpr;
+    if (stepExpr === undefined) {
+        return evalDoSteps(cells, loopEnv, cont, index + 1, [...values, undefined]);
+    }
+    return makeEvalAction(stepExpr, loopEnv, (value) => (evalDoSteps(cells, loopEnv, cont, index + 1, [...values, value])));
+}
+function applyProcedure(operator, args, loc, runtime, cont) {
     if (!isProcedure(operator)) {
         throw new EvalError(`${loc.line}:${loc.col}: not a procedure`);
     }
-    if (isBuiltinProcedure(operator)) {
-        return operator.call(args, loc);
+    if (isContinuationProcedure(operator)) {
+        if (args.length !== 1) {
+            throw new EvalError(`${loc.line}:${loc.col}: continuation expects exactly 1 argument`);
+        }
+        return operator.resume(args[0].value);
+    }
+    if (isControlBuiltinProcedure(operator)) {
+        return operator.invoke(args, loc, runtime, cont);
+    }
+    if (isPureBuiltinProcedure(operator)) {
+        return cont(operator.call(args, loc));
     }
     if (isCaseLambdaProcedure(operator)) {
         const clause = findMatchingCaseLambdaClause(operator, args.length);
         if (clause === undefined) {
             throw new EvalError(`${loc.line}:${loc.col}: ${procedureDisplayName(operator)} has no matching clause for ${args.length} arguments`);
         }
-        return applyProcedureClause(operator.env, clause, args);
+        return applyProcedureClause(operator.env, clause, args, cont);
     }
     if (!procedureClauseMatchesArity(operator, args.length)) {
         if (operator.restParam === undefined) {
@@ -1569,7 +1641,7 @@ function applyProcedure(operator, args, loc, runtime) {
         }
         throw new EvalError(`${loc.line}:${loc.col}: ${procedureDisplayName(operator)} expects at least ${operator.params.length} arguments`);
     }
-    return applyProcedureClause(operator.env, operator, args);
+    return applyProcedureClause(operator.env, operator, args, cont);
 }
 function quoteExpr(expr) {
     switch (expr.type) {
@@ -1643,34 +1715,48 @@ function parseCaseLambdaClause(expr, head) {
     };
 }
 function evaluateSequence(exprs, env, runtime) {
-    return resolveEvalOutcome(makeSequenceStep(exprs, env), runtime);
+    return runMachine(makeSequenceAction(exprs, 0, env, finishWithValue), runtime);
 }
-function evaluateSequenceStep(exprs, env, runtime) {
-    if (exprs.length === 0) {
-        return VOID_VALUE;
+function stepSequence(exprs, index, env, runtime, cont) {
+    if (index >= exprs.length) {
+        return cont(VOID_VALUE);
     }
-    for (let index = 0; index < exprs.length - 1; index += 1) {
-        evaluate(exprs[index], env, runtime);
+    if (index === exprs.length - 1) {
+        return makeEvalAction(exprs[index], env, cont);
     }
-    return makeExprStep(exprs[exprs.length - 1], env);
+    return makeEvalAction(exprs[index], env, (_ignored) => (makeSequenceAction(exprs, index + 1, env, cont)));
 }
-function resolveEvalOutcome(initial, runtime) {
-    let outcome = initial;
-    while (isEvalStep(outcome)) {
-        outcome = outcome.evalStep === 'expr'
-            ? evaluateExpr(outcome.expr, outcome.env, runtime)
-            : evaluateSequenceStep(outcome.exprs, outcome.env, runtime);
+function evaluateArguments(exprs, env, cont, index = exprs.length - 1, evaluated = []) {
+    if (index < 0) {
+        return cont(evaluated);
     }
-    return outcome;
+    const expr = exprs[index];
+    return makeEvalAction(expr, env, (value) => (evaluateArguments(exprs, env, cont, index - 1, [{ expr, value }, ...evaluated])));
 }
-function makeExprStep(expr, env) {
-    return { evalStep: 'expr', expr, env };
+function evaluateExpressions(exprs, env, cont, index = 0, values = []) {
+    if (index >= exprs.length) {
+        return cont(values);
+    }
+    const expr = exprs[index];
+    return makeEvalAction(expr, env, (value) => (evaluateExpressions(exprs, env, cont, index + 1, [...values, value])));
 }
-function makeSequenceStep(exprs, env) {
-    return { evalStep: 'sequence', exprs, env };
+function runMachine(initial, runtime) {
+    let action = initial;
+    while (action.action !== 'done') {
+        action = action.action === 'eval'
+            ? evaluateExpr(action.expr, action.env, runtime, action.cont)
+            : stepSequence(action.exprs, action.index, action.env, runtime, action.cont);
+    }
+    return action.value;
 }
-function isEvalStep(outcome) {
-    return typeof outcome === 'object' && outcome !== null && 'evalStep' in outcome;
+function finishWithValue(value) {
+    return { action: 'done', value };
+}
+function makeEvalAction(expr, env, cont) {
+    return { action: 'eval', expr, env, cont };
+}
+function makeSequenceAction(exprs, index, env, cont) {
+    return { action: 'sequence', exprs, index, env, cont };
 }
 function makeList(elements) {
     let result = EMPTY_LIST;
@@ -2429,7 +2515,16 @@ function isProcedure(value) {
     return typeof value === 'object' && value !== null && value.kind === 'procedure';
 }
 function isBuiltinProcedure(value) {
+    return 'call' in value || 'invoke' in value;
+}
+function isPureBuiltinProcedure(value) {
     return 'call' in value;
+}
+function isControlBuiltinProcedure(value) {
+    return 'invoke' in value;
+}
+function isContinuationProcedure(value) {
+    return 'resume' in value;
 }
 function isCaseLambdaProcedure(value) {
     return 'clauses' in value;
@@ -2475,7 +2570,7 @@ function procedureClauseMatchesArity(clause, argCount) {
 function findMatchingCaseLambdaClause(proc, argCount) {
     return proc.clauses.find((clause) => procedureClauseMatchesArity(clause, argCount));
 }
-function applyProcedureClause(env, clause, args) {
+function applyProcedureClause(env, clause, args, cont) {
     const callEnv = new Environment(env);
     for (let index = 0; index < clause.params.length; index += 1) {
         callEnv.define(symbolLookupName(clause.params[index]), args[index].value);
@@ -2483,7 +2578,7 @@ function applyProcedureClause(env, clause, args) {
     if (clause.restParam !== undefined) {
         callEnv.define(symbolLookupName(clause.restParam), makeList(args.slice(clause.params.length).map((arg) => arg.value)));
     }
-    return makeSequenceStep(clause.body, callEnv);
+    return makeSequenceAction(clause.body, 0, callEnv, cont);
 }
 function currentBenchLevel() {
     const benchLevel = globalThis.process?.env?.BENCH_LEVEL;
