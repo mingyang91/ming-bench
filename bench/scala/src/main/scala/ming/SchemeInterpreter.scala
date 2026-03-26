@@ -1,6 +1,6 @@
 package ming
 
-import scala.collection.mutable.ListBuffer
+import SchemeModel.*
 
 object SchemeInterpreter:
 
@@ -8,25 +8,29 @@ object SchemeInterpreter:
     render(evalProgram(input))
 
   def evalToStringWithOutput(input: String): (String, String) =
-    (evalToString(input), "")
+    (render(evalProgram(input)), "")
 
   private def evalProgram(input: String): Value =
-    val expressions = Parser(input).parseProgram()
+    val expressions = SchemeParser.parseProgram(input)
     if expressions.isEmpty then throw new EvalError("empty program")
+    evalSequence(expressions, baseEnv())
 
-    var result: Value = Value.BooleanValue(false)
-    expressions.foreach(expr => result = eval(expr, baseEnv))
-    result
-
-  private def eval(expr: Expr, env: Map[String, Value]): Value =
+  private def eval(expr: Expr, env: Env): Value =
     expr match
       case Expr.IntegerLiteral(value) => Value.IntegerValue(value)
       case Expr.BooleanLiteral(value) => Value.BooleanValue(value)
       case Expr.StringLiteral(value)  => Value.StringValue(value)
-      case Expr.Symbol(name) =>
-        env.getOrElse(name, throw new EvalError(s"unbound variable: $name"))
+      case Expr.Symbol(name)          => env.lookup(name)
       case Expr.ListExpr(Nil) =>
         throw new EvalError("cannot evaluate an empty list")
+      case Expr.ListExpr(Expr.Symbol("quote") :: args) =>
+        evalQuote(args)
+      case Expr.ListExpr(Expr.Symbol("if") :: args) =>
+        evalIf(args, env)
+      case Expr.ListExpr(Expr.Symbol("define") :: args) =>
+        evalDefine(args, env)
+      case Expr.ListExpr(Expr.Symbol("lambda") :: args) =>
+        evalLambda(args, env)
       case Expr.ListExpr(Expr.Symbol("and") :: rest) =>
         evalAnd(rest, env)
       case Expr.ListExpr(Expr.Symbol("or") :: rest) =>
@@ -34,7 +38,63 @@ object SchemeInterpreter:
       case Expr.ListExpr(operator :: args) =>
         apply(eval(operator, env), args.map(eval(_, env)))
 
-  private def evalAnd(args: List[Expr], env: Map[String, Value]): Value =
+  private def evalQuote(args: List[Expr]): Value =
+    args match
+      case expr :: Nil => quoteExpr(expr)
+      case _ =>
+        throw new EvalError(s"quote expected 1 argument, got ${args.length}")
+
+  private def evalIf(args: List[Expr], env: Env): Value =
+    args match
+      case condition :: whenTrue :: whenFalse :: Nil =>
+        if isTruthy(eval(condition, env)) then eval(whenTrue, env)
+        else eval(whenFalse, env)
+      case _ =>
+        throw new EvalError(s"if expected 3 arguments, got ${args.length}")
+
+  private def evalDefine(args: List[Expr], env: Env): Value =
+    args match
+      case Expr.Symbol(name) :: valueExpr :: Nil =>
+        env.define(name, eval(valueExpr, env))
+        Value.VoidValue
+      case Expr.ListExpr(Expr.Symbol(name) :: params) :: body if body.nonEmpty =>
+        env.define(name, buildClosure(params, body, env, Some(name)))
+        Value.VoidValue
+      case _ =>
+        throw new EvalError("invalid define form")
+
+  private def evalLambda(args: List[Expr], env: Env): Value =
+    args match
+      case Expr.ListExpr(params) :: body if body.nonEmpty =>
+        buildClosure(params, body, env, None)
+      case _ =>
+        throw new EvalError("invalid lambda form")
+
+  private def buildClosure(
+    paramsExpr: List[Expr],
+    body: List[Expr],
+    env: Env,
+    name: Option[String]
+  ): Value =
+    val params = paramsExpr.map {
+      case Expr.Symbol(paramName) => paramName
+      case _                      => throw new EvalError("lambda parameters must be symbols")
+    }
+    if params.distinct.length != params.length then throw new EvalError("lambda parameters must be distinct")
+    Value.Closure(name, params, body, env)
+
+  private def quoteExpr(expr: Expr): Value =
+    expr match
+      case Expr.IntegerLiteral(value) => Value.IntegerValue(value)
+      case Expr.BooleanLiteral(value) => Value.BooleanValue(value)
+      case Expr.StringLiteral(value)  => Value.StringValue(value)
+      case Expr.Symbol(name)          => Value.SymbolValue(name)
+      case Expr.ListExpr(items) =>
+        items.foldRight(Value.NilValue: Value) { (item, rest) =>
+          Value.PairValue(quoteExpr(item), rest)
+        }
+
+  private def evalAnd(args: List[Expr], env: Env): Value =
     var result: Value = Value.BooleanValue(true)
     val iterator      = args.iterator
     while iterator.hasNext do
@@ -42,7 +102,7 @@ object SchemeInterpreter:
       if !isTruthy(result) then return result
     result
 
-  private def evalOr(args: List[Expr], env: Map[String, Value]): Value =
+  private def evalOr(args: List[Expr], env: Env): Value =
     var result: Value = Value.BooleanValue(false)
     val iterator      = args.iterator
     while iterator.hasNext do
@@ -53,8 +113,22 @@ object SchemeInterpreter:
   private def apply(procedure: Value, args: List[Value]): Value =
     procedure match
       case Value.Builtin(_, implementation) => implementation(args)
+      case closure: Value.Closure           => applyClosure(closure, args)
       case other =>
         throw new EvalError(s"not a procedure: ${render(other)}")
+
+  private def applyClosure(closure: Value.Closure, args: List[Value]): Value =
+    requireArgCount(closure.name.getOrElse("lambda"), args, closure.params.length)
+    val callEnv = new Env(Some(closure.env))
+    closure.params.zip(args).foreach { case (name, value) =>
+      callEnv.define(name, value)
+    }
+    evalSequence(closure.body, callEnv)
+
+  private def evalSequence(expressions: List[Expr], env: Env): Value =
+    var result: Value = Value.VoidValue
+    expressions.foreach(expr => result = eval(expr, env))
+    result
 
   private def isTruthy(value: Value): Boolean =
     value match
@@ -66,7 +140,39 @@ object SchemeInterpreter:
       case Value.IntegerValue(number) => number.toString
       case Value.BooleanValue(flag)   => if flag then "#t" else "#f"
       case Value.StringValue(text)    => s""""${escapeString(text)}""""
+      case Value.SymbolValue(name)    => name
+      case Value.NilValue             => "()"
+      case pair: Value.PairValue      => renderPair(pair)
       case Value.Builtin(name, _)     => s"#<procedure:$name>"
+      case Value.Closure(Some(name), _, _, _) =>
+        s"#<procedure:$name>"
+      case Value.Closure(None, _, _, _) =>
+        "#<procedure>"
+      case Value.VoidValue =>
+        "#<void>"
+
+  private def renderPair(pair: Value.PairValue): String =
+    val builder        = new StringBuilder("(")
+    var current: Value = pair
+    var first          = true
+
+    while true do
+      current match
+        case Value.PairValue(car, cdr) =>
+          if !first then builder.append(" ")
+          builder.append(render(car))
+          current = cdr
+          first = false
+        case Value.NilValue =>
+          builder.append(")")
+          return builder.result()
+        case other =>
+          builder.append(" . ")
+          builder.append(render(other))
+          builder.append(")")
+          return builder.result()
+
+    builder.result()
 
   private def escapeString(text: String): String =
     text.flatMap {
@@ -101,7 +207,15 @@ object SchemeInterpreter:
         Value.BooleanValue(numbers.zip(numbers.tail).forall(predicate.tupled))
     )
 
-  private val baseEnv: Map[String, Value] = Map(
+  private def baseEnv(): Env =
+    val env = new Env(None)
+    builtinBindings.foreach { case (name, value) =>
+      env.define(name, value)
+    }
+
+    env
+
+  private val builtinBindings: List[(String, Value)] = List(
     "+" -> Value.Builtin(
       "+",
       args => Value.IntegerValue(numericArgs("+", args).foldLeft(BigInt(0))(_ + _))
@@ -142,120 +256,3 @@ object SchemeInterpreter:
         Value.BooleanValue(!isTruthy(args.head))
     )
   )
-
-  private enum Expr:
-    case IntegerLiteral(value: BigInt)
-    case BooleanLiteral(value: Boolean)
-    case StringLiteral(value: String)
-    case Symbol(name: String)
-    case ListExpr(items: List[Expr])
-
-  private enum Value:
-    case IntegerValue(value: BigInt)
-    case BooleanValue(value: Boolean)
-    case StringValue(value: String)
-    case Builtin(name: String, implementation: List[Value] => Value)
-
-  final private class Parser(input: String):
-    private var index = 0
-
-    def parseProgram(): List[Expr] =
-      val expressions = ListBuffer.empty[Expr]
-      skipTrivia()
-      while !isAtEnd do
-        expressions += parseExpr()
-        skipTrivia()
-      expressions.toList
-
-    private def parseExpr(): Expr =
-      skipTrivia()
-      if isAtEnd then parseError("unexpected end of input")
-
-      input.charAt(index) match
-        case '(' =>
-          index += 1
-          parseList()
-        case ')' =>
-          parseError("unexpected ')'")
-        case '"' =>
-          parseString()
-        case '#' =>
-          parseBoolean()
-        case _ =>
-          parseAtom()
-
-    private def parseList(): Expr =
-      val items = ListBuffer.empty[Expr]
-      skipTrivia()
-      while !isAtEnd && input.charAt(index) != ')' do
-        items += parseExpr()
-        skipTrivia()
-
-      if isAtEnd then parseError("unterminated list")
-      index += 1
-      Expr.ListExpr(items.toList)
-
-    private def parseString(): Expr =
-      index += 1
-      val builder = new StringBuilder
-
-      while !isAtEnd && input.charAt(index) != '"' do
-        val char = input.charAt(index)
-        if char == '\\' then
-          index += 1
-          if isAtEnd then parseError("unterminated string escape")
-          val escaped = input.charAt(index)
-          builder +=
-            (escaped match
-              case '"'   => '"'
-              case '\\'  => '\\'
-              case 'n'   => '\n'
-              case 'r'   => '\r'
-              case 't'   => '\t'
-              case other => other)
-        else builder += char
-        index += 1
-
-      if isAtEnd then parseError("unterminated string literal")
-      index += 1
-      Expr.StringLiteral(builder.result())
-
-    private def parseBoolean(): Expr =
-      if startsWith("#t") && tokenBoundary(index + 2) then
-        index += 2
-        Expr.BooleanLiteral(true)
-      else if startsWith("#f") && tokenBoundary(index + 2) then
-        index += 2
-        Expr.BooleanLiteral(false)
-      else parseError("invalid boolean literal")
-
-    private def parseAtom(): Expr =
-      val start = index
-      while !isAtEnd && !isDelimiter(input.charAt(index)) do index += 1
-
-      val token = input.substring(start, index)
-      if token.matches("-?\\d+") then Expr.IntegerLiteral(BigInt(token))
-      else Expr.Symbol(token)
-
-    private def skipTrivia(): Unit =
-      var keepSkipping = true
-      while keepSkipping && !isAtEnd do
-        while !isAtEnd && input.charAt(index).isWhitespace do index += 1
-
-        if !isAtEnd && input.charAt(index) == ';' then while !isAtEnd && input.charAt(index) != '\n' do index += 1
-        else keepSkipping = false
-
-    private def startsWith(prefix: String): Boolean =
-      input.regionMatches(index, prefix, 0, prefix.length)
-
-    private def tokenBoundary(boundary: Int): Boolean =
-      boundary >= input.length || isDelimiter(input.charAt(boundary))
-
-    private def isDelimiter(char: Char): Boolean =
-      char.isWhitespace || char == '(' || char == ')' || char == ';'
-
-    private def isAtEnd: Boolean =
-      index >= input.length
-
-    private def parseError(message: String): Nothing =
-      throw new EvalError(s"$message at offset $index")
