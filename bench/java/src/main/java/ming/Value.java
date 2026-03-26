@@ -1,6 +1,7 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 
 sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue, ListValue,
@@ -166,52 +167,153 @@ record CharValue(char value) implements Value {
 }
 
 record ListValue(List<Value> elements) implements Value {
+    ListValue {
+        elements = List.copyOf(elements);
+    }
+
+    boolean isEmpty() {
+        return elements.isEmpty();
+    }
+
     @Override
     public String render() {
-        StringBuilder builder = new StringBuilder();
-        builder.append('(');
-        for (int i = 0; i < elements.size(); i++) {
-            if (i > 0) {
-                builder.append(' ');
-            }
-            builder.append(elements.get(i).render());
-        }
-        builder.append(')');
-        return builder.toString();
+        return ValueRenderer.render(this);
     }
 }
 
-record PairValue(Value car, Value cdr) implements Value {
+final class PairValue implements Value {
+    private Value car;
+    private Value cdr;
+
+    PairValue(Value car, Value cdr) {
+        this.car = car;
+        this.cdr = cdr;
+    }
+
+    Value car() {
+        return car;
+    }
+
+    Value cdr() {
+        return cdr;
+    }
+
+    void setCar(Value value) {
+        car = value;
+    }
+
+    void setCdr(Value value) {
+        cdr = value;
+    }
+
     @Override
     public String render() {
+        return ValueRenderer.render(this);
+    }
+}
+
+final class ValueRenderer {
+    private static final String CYCLE_MARKER = "#<cycle>";
+
+    private ValueRenderer() {
+    }
+
+    static String render(Value value) {
         StringBuilder builder = new StringBuilder();
-        builder.append('(');
-        appendRender(builder, this);
-        builder.append(')');
+        appendValue(builder, value, new IdentityHashMap<>());
         return builder.toString();
     }
 
-    private static void appendRender(StringBuilder builder, Value value) {
+    private static void appendValue(StringBuilder builder,
+                                    Value value,
+                                    IdentityHashMap<PairValue, Boolean> activePairs) {
         if (value instanceof PairValue pairValue) {
-            builder.append(pairValue.car().render());
-            if (pairValue.cdr() instanceof ListValue listValue) {
-                for (Value element : listValue.elements()) {
-                    builder.append(' ');
-                    builder.append(element.render());
-                }
-                return;
-            }
-            if (pairValue.cdr() instanceof PairValue nextPair) {
-                builder.append(' ');
-                appendRender(builder, nextPair);
-                return;
-            }
-            builder.append(" . ");
-            builder.append(pairValue.cdr().render());
+            appendPair(builder, pairValue, activePairs);
+            return;
+        }
+        if (value instanceof ListValue listValue) {
+            appendList(builder, listValue, activePairs);
+            return;
+        }
+        builder.append(value.render());
+    }
+
+    private static void appendList(StringBuilder builder,
+                                   ListValue listValue,
+                                   IdentityHashMap<PairValue, Boolean> activePairs) {
+        if (listValue.isEmpty()) {
+            builder.append("()");
             return;
         }
 
-        builder.append(value.render());
+        builder.append('(');
+        for (int i = 0; i < listValue.elements().size(); i++) {
+            if (i > 0) {
+                builder.append(' ');
+            }
+            appendValue(builder, listValue.elements().get(i), activePairs);
+        }
+        builder.append(')');
+    }
+
+    private static void appendPair(StringBuilder builder,
+                                   PairValue pairValue,
+                                   IdentityHashMap<PairValue, Boolean> activePairs) {
+        if (activePairs.put(pairValue, Boolean.TRUE) != null) {
+            builder.append(CYCLE_MARKER);
+            return;
+        }
+
+        try {
+            builder.append('(');
+            appendPairContents(builder, pairValue, activePairs);
+            builder.append(')');
+        } finally {
+            activePairs.remove(pairValue);
+        }
+    }
+
+    private static void appendPairContents(StringBuilder builder,
+                                           PairValue pairValue,
+                                           IdentityHashMap<PairValue, Boolean> activePairs) {
+        appendValue(builder, pairValue.car(), activePairs);
+        appendPairTail(builder, pairValue.cdr(), activePairs);
+    }
+
+    private static void appendPairTail(StringBuilder builder,
+                                       Value tail,
+                                       IdentityHashMap<PairValue, Boolean> activePairs) {
+        if (tail instanceof PairValue nextPair) {
+            if (activePairs.containsKey(nextPair)) {
+                builder.append(" . ");
+                builder.append(CYCLE_MARKER);
+                return;
+            }
+
+            builder.append(' ');
+            activePairs.put(nextPair, Boolean.TRUE);
+            try {
+                appendPairContents(builder, nextPair, activePairs);
+            } finally {
+                activePairs.remove(nextPair);
+            }
+            return;
+        }
+
+        if (tail instanceof ListValue listValue) {
+            if (listValue.isEmpty()) {
+                return;
+            }
+
+            for (Value element : listValue.elements()) {
+                builder.append(' ');
+                appendValue(builder, element, activePairs);
+            }
+            return;
+        }
+
+        builder.append(" . ");
+        appendValue(builder, tail, activePairs);
     }
 }
 
@@ -386,7 +488,7 @@ final class LambdaProcedureValue implements ProcedureValue {
         if (restParameter != null) {
             callEnvironment.define(
                     restParameter,
-                    new ListValue(List.copyOf(arguments.subList(parameters.size(), arguments.size()))));
+                    SchemeLists.fromElements(arguments.subList(parameters.size(), arguments.size())));
         }
 
         return callEnvironment;
@@ -440,9 +542,9 @@ final class CaseLambdaProcedureValue implements ProcedureValue {
             if (parameters.restParameter() != null) {
                 callEnvironment.define(
                         parameters.restParameter(),
-                        new ListValue(List.copyOf(arguments.subList(
+                        SchemeLists.fromElements(arguments.subList(
                                 parameters.fixedParameters().size(),
-                                arguments.size()))));
+                                arguments.size())));
             }
             return new TailCallSequence(clause.body(), callEnvironment);
         }
