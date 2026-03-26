@@ -13,8 +13,14 @@ type expr interface{}
 type intExpr int
 type boolExpr bool
 type stringExpr string
-type symbolExpr string
-type listExpr []expr
+type symbolExpr struct {
+	name string
+	pos  sourcePos
+}
+type listExpr struct {
+	items []expr
+	pos   sourcePos
+}
 type voidExpr struct{}
 
 type builtinFunc func([]expr) (expr, error)
@@ -48,11 +54,30 @@ const (
 type token struct {
 	kind tokenKind
 	text string
+	pos  sourcePos
 }
 
 type parser struct {
 	tokens []token
 	pos    int
+}
+
+func (p sourcePos) advance(r rune) sourcePos {
+	if r == '\n' {
+		return sourcePos{Line: p.Line + 1, Col: 1}
+	}
+	return sourcePos{Line: p.Line, Col: p.Col + 1}
+}
+
+func formPos(form expr) sourcePos {
+	switch v := form.(type) {
+	case symbolExpr:
+		return v.pos
+	case listExpr:
+		return v.pos
+	default:
+		return sourcePos{}
+	}
 }
 
 func evalProgram(input string) (string, error) {
@@ -67,7 +92,7 @@ func evalProgram(input string) (string, error) {
 		return "", err
 	}
 	if len(program) == 0 {
-		return "", &EvalError{Message: "empty program"}
+		return "", errorAt(sourcePos{Line: 1, Col: 1}, "empty program")
 	}
 
 	environment := newGlobalEnv()
@@ -108,7 +133,7 @@ func newGlobalEnv() *env {
 	})})
 	root.define("pair?", builtinProc{name: "pair?", fn: typePredicate(func(value expr) bool {
 		list, ok := value.(listExpr)
-		return ok && len(list) > 0
+		return ok && len(list.items) > 0
 	})})
 	root.define("string?", builtinProc{name: "string?", fn: typePredicate(func(value expr) bool {
 		_, ok := value.(stringExpr)
@@ -137,67 +162,81 @@ func (e *env) lookup(name string) (expr, bool) {
 
 func tokenize(input string) ([]token, error) {
 	var tokens []token
+	pos := sourcePos{Line: 1, Col: 1}
 
 	for len(input) > 0 {
 		r, size := utf8.DecodeRuneInString(input)
+		start := pos
 		switch {
 		case unicode.IsSpace(r):
 			input = input[size:]
+			pos = pos.advance(r)
 		case r == ';':
-			input = skipLineComment(input[size:])
+			input = input[size:]
+			pos = pos.advance(r)
+			input, pos = skipLineComment(input, pos)
 		case r == '(':
-			tokens = append(tokens, token{kind: tokenLParen, text: "("})
+			tokens = append(tokens, token{kind: tokenLParen, text: "(", pos: start})
 			input = input[size:]
+			pos = pos.advance(r)
 		case r == ')':
-			tokens = append(tokens, token{kind: tokenRParen, text: ")"})
+			tokens = append(tokens, token{kind: tokenRParen, text: ")", pos: start})
 			input = input[size:]
+			pos = pos.advance(r)
 		case r == '\'':
-			tokens = append(tokens, token{kind: tokenQuote, text: "'"})
+			tokens = append(tokens, token{kind: tokenQuote, text: "'", pos: start})
 			input = input[size:]
+			pos = pos.advance(r)
 		case r == '"':
-			text, rest, err := scanString(input[size:])
+			text, rest, nextPos, err := scanString(input[size:], pos.advance(r), start)
 			if err != nil {
 				return nil, err
 			}
-			tokens = append(tokens, token{kind: tokenString, text: text})
+			tokens = append(tokens, token{kind: tokenString, text: text, pos: start})
 			input = rest
+			pos = nextPos
 		default:
-			text, rest := scanAtom(input)
-			tokens = append(tokens, token{kind: tokenAtom, text: text})
+			text, rest, nextPos := scanAtom(input, pos)
+			tokens = append(tokens, token{kind: tokenAtom, text: text, pos: start})
 			input = rest
+			pos = nextPos
 		}
 	}
 
 	return tokens, nil
 }
 
-func skipLineComment(input string) string {
+func skipLineComment(input string, pos sourcePos) (string, sourcePos) {
 	for len(input) > 0 {
 		r, size := utf8.DecodeRuneInString(input)
 		input = input[size:]
+		pos = pos.advance(r)
 		if r == '\n' {
-			return input
+			return input, pos
 		}
 	}
-	return ""
+	return "", pos
 }
 
-func scanString(input string) (string, string, error) {
+func scanString(input string, pos sourcePos, start sourcePos) (string, string, sourcePos, error) {
 	var b strings.Builder
 
 	for len(input) > 0 {
 		r, size := utf8.DecodeRuneInString(input)
 		input = input[size:]
+		current := pos
+		pos = pos.advance(r)
 
 		switch r {
 		case '"':
-			return b.String(), input, nil
+			return b.String(), input, pos, nil
 		case '\\':
 			if len(input) == 0 {
-				return "", "", &EvalError{Message: "unterminated string escape"}
+				return "", "", pos, errorAt(current, "unterminated string escape")
 			}
 			esc, escSize := utf8.DecodeRuneInString(input)
 			input = input[escSize:]
+			pos = pos.advance(esc)
 			switch esc {
 			case '"', '\\':
 				b.WriteRune(esc)
@@ -213,16 +252,17 @@ func scanString(input string) (string, string, error) {
 		}
 	}
 
-	return "", "", &EvalError{Message: "unterminated string literal"}
+	return "", "", pos, errorAt(start, "unterminated string literal")
 }
 
-func scanAtom(input string) (string, string) {
+func scanAtom(input string, pos sourcePos) (string, string, sourcePos) {
 	for i, r := range input {
 		if unicode.IsSpace(r) || r == '(' || r == ')' || r == ';' {
-			return input[:i], input[i:]
+			return input[:i], input[i:], pos
 		}
+		pos = pos.advance(r)
 	}
-	return input, ""
+	return input, "", pos
 }
 
 func (p *parser) parseProgram() ([]expr, error) {
@@ -239,7 +279,7 @@ func (p *parser) parseProgram() ([]expr, error) {
 
 func (p *parser) parseExpr() (expr, error) {
 	if p.pos >= len(p.tokens) {
-		return nil, &EvalError{Message: "unexpected end of input"}
+		return nil, errorAt(sourcePos{Line: 1, Col: 1}, "unexpected end of input")
 	}
 
 	tok := p.tokens[p.pos]
@@ -250,11 +290,11 @@ func (p *parser) parseExpr() (expr, error) {
 		var items []expr
 		for {
 			if p.pos >= len(p.tokens) {
-				return nil, &EvalError{Message: "unterminated list"}
+				return nil, errorAt(tok.pos, "unterminated list")
 			}
 			if p.tokens[p.pos].kind == tokenRParen {
 				p.pos++
-				return listExpr(items), nil
+				return listExpr{items: items, pos: tok.pos}, nil
 			}
 			item, err := p.parseExpr()
 			if err != nil {
@@ -263,35 +303,41 @@ func (p *parser) parseExpr() (expr, error) {
 			items = append(items, item)
 		}
 	case tokenRParen:
-		return nil, &EvalError{Message: "unexpected ')'"}
+		return nil, errorAt(tok.pos, "unexpected ')'")
 	case tokenQuote:
 		quoted, err := p.parseExpr()
 		if err != nil {
-			return nil, err
+			return nil, attachPos(err, tok.pos)
 		}
-		return listExpr{symbolExpr("quote"), quoted}, nil
+		return listExpr{
+			items: []expr{
+				symbolExpr{name: "quote", pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
 	case tokenString:
 		return stringExpr(tok.text), nil
 	case tokenAtom:
-		return parseAtom(tok.text), nil
+		return parseAtom(tok), nil
 	default:
-		return nil, &EvalError{Message: "unknown token"}
+		return nil, errorAt(tok.pos, "unknown token")
 	}
 }
 
-func parseAtom(text string) expr {
-	switch text {
+func parseAtom(tok token) expr {
+	switch tok.text {
 	case "#t":
 		return boolExpr(true)
 	case "#f":
 		return boolExpr(false)
 	}
 
-	if n, err := strconv.Atoi(text); err == nil {
+	if n, err := strconv.Atoi(tok.text); err == nil {
 		return intExpr(n)
 	}
 
-	return symbolExpr(text)
+	return symbolExpr{name: tok.text, pos: tok.pos}
 }
 
 func evalSequence(environment *env, forms []expr) (expr, error) {
@@ -299,7 +345,7 @@ func evalSequence(environment *env, forms []expr) (expr, error) {
 	for _, form := range forms {
 		value, err := evalExpr(environment, form)
 		if err != nil {
-			return nil, err
+			return nil, attachPos(err, formPos(form))
 		}
 		result = value
 	}
@@ -311,9 +357,9 @@ func evalExpr(environment *env, form expr) (expr, error) {
 	case intExpr, boolExpr, stringExpr:
 		return v, nil
 	case symbolExpr:
-		value, ok := environment.lookup(string(v))
+		value, ok := environment.lookup(v.name)
 		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("unbound symbol: %s", string(v))}
+			return nil, errorAt(v.pos, fmt.Sprintf("unbound symbol: %s", v.name))
 		}
 		return value, nil
 	case listExpr:
@@ -324,39 +370,48 @@ func evalExpr(environment *env, form expr) (expr, error) {
 }
 
 func evalList(environment *env, items listExpr) (expr, error) {
-	if len(items) == 0 {
-		return nil, &EvalError{Message: "cannot evaluate empty list"}
+	if len(items.items) == 0 {
+		return nil, errorAt(items.pos, "cannot evaluate empty list")
 	}
 
-	if operator, ok := items[0].(symbolExpr); ok {
-		switch string(operator) {
+	if operator, ok := items.items[0].(symbolExpr); ok {
+		switch operator.name {
 		case "define":
-			return evalDefine(environment, items[1:])
+			value, err := evalDefine(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "if":
-			return evalIf(environment, items[1:])
+			value, err := evalIf(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "begin":
-			return evalBegin(environment, items[1:])
+			value, err := evalBegin(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "cond":
-			return evalCond(environment, items[1:])
+			value, err := evalCond(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "let":
-			return evalLet(environment, items[1:])
+			value, err := evalLet(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "quote":
-			return evalQuote(items[1:])
+			value, err := evalQuote(items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "lambda":
-			return evalLambda(environment, items[1:])
+			value, err := evalLambda(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "and":
-			return evalAnd(environment, items[1:])
+			value, err := evalAnd(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "or":
-			return evalOr(environment, items[1:])
+			value, err := evalOr(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		}
 	}
 
-	operatorValue, err := evalExpr(environment, items[0])
+	operatorValue, err := evalExpr(environment, items.items[0])
 	if err != nil {
 		return nil, err
 	}
 
-	return applyProcedure(environment, operatorValue, items[1:])
+	return applyProcedure(environment, operatorValue, items.items[1:], items.pos)
 }
 
 func evalDefine(environment *env, forms []expr) (expr, error) {
@@ -373,17 +428,17 @@ func evalDefine(environment *env, forms []expr) (expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		environment.define(string(target), value)
+		environment.define(target.name, value)
 		return voidExpr{}, nil
 	case listExpr:
-		if len(target) == 0 {
+		if len(target.items) == 0 {
 			return nil, &EvalError{Message: "define function name cannot be empty"}
 		}
-		name, ok := target[0].(symbolExpr)
+		name, ok := target.items[0].(symbolExpr)
 		if !ok {
 			return nil, &EvalError{Message: "define function name must be a symbol"}
 		}
-		params, err := parseParamList(target[1:])
+		params, err := parseParamList(target.items[1:])
 		if err != nil {
 			return nil, err
 		}
@@ -392,7 +447,7 @@ func evalDefine(environment *env, forms []expr) (expr, error) {
 			body:   append([]expr(nil), forms[1:]...),
 			env:    environment,
 		}
-		environment.define(string(name), closure)
+		environment.define(name.name, closure)
 		return voidExpr{}, nil
 	default:
 		return nil, &EvalError{Message: "define target must be a symbol or parameter list"}
@@ -424,31 +479,31 @@ func evalBegin(environment *env, forms []expr) (expr, error) {
 func evalCond(environment *env, forms []expr) (expr, error) {
 	for i, form := range forms {
 		clause, ok := form.(listExpr)
-		if !ok || len(clause) == 0 {
+		if !ok || len(clause.items) == 0 {
 			return nil, &EvalError{Message: "cond clauses must be non-empty lists"}
 		}
 
-		if symbol, ok := clause[0].(symbolExpr); ok && string(symbol) == "else" {
+		if symbol, ok := clause.items[0].(symbolExpr); ok && symbol.name == "else" {
 			if i != len(forms)-1 {
 				return nil, &EvalError{Message: "cond else clause must be last"}
 			}
-			if len(clause) == 1 {
+			if len(clause.items) == 1 {
 				return voidExpr{}, nil
 			}
-			return evalSequence(environment, clause[1:])
+			return evalSequence(environment, clause.items[1:])
 		}
 
-		testValue, err := evalExpr(environment, clause[0])
+		testValue, err := evalExpr(environment, clause.items[0])
 		if err != nil {
 			return nil, err
 		}
 		if !isTruthy(testValue) {
 			continue
 		}
-		if len(clause) == 1 {
+		if len(clause.items) == 1 {
 			return testValue, nil
 		}
-		return evalSequence(environment, clause[1:])
+		return evalSequence(environment, clause.items[1:])
 	}
 
 	return voidExpr{}, nil
@@ -467,7 +522,7 @@ func evalLet(environment *env, forms []expr) (expr, error) {
 	}
 
 	if name, ok := forms[0].(symbolExpr); ok {
-		return evalNamedLet(environment, string(name), forms[1:])
+		return evalNamedLet(environment, name.name, forms[1:])
 	}
 
 	bindings, ok := forms[0].(listExpr)
@@ -530,7 +585,7 @@ func evalLambda(environment *env, forms []expr) (expr, error) {
 		return nil, &EvalError{Message: "lambda parameters must be a list"}
 	}
 
-	params, err := parseParamList(paramList)
+	params, err := parseParamList(paramList.items)
 	if err != nil {
 		return nil, err
 	}
@@ -549,45 +604,46 @@ func parseParamList(items []expr) ([]string, error) {
 		if !ok {
 			return nil, &EvalError{Message: "parameter name must be a symbol"}
 		}
-		params = append(params, string(symbol))
+		params = append(params, symbol.name)
 	}
 	return params, nil
 }
 
 func evalBindings(environment *env, bindings listExpr) ([]string, []expr, error) {
-	names := make([]string, 0, len(bindings))
-	values := make([]expr, 0, len(bindings))
+	names := make([]string, 0, len(bindings.items))
+	values := make([]expr, 0, len(bindings.items))
 
-	for _, binding := range bindings {
+	for _, binding := range bindings.items {
 		pair, ok := binding.(listExpr)
-		if !ok || len(pair) != 2 {
+		if !ok || len(pair.items) != 2 {
 			return nil, nil, &EvalError{Message: "let bindings must have the form (name value)"}
 		}
 
-		name, ok := pair[0].(symbolExpr)
+		name, ok := pair.items[0].(symbolExpr)
 		if !ok {
 			return nil, nil, &EvalError{Message: "let binding name must be a symbol"}
 		}
 
-		value, err := evalExpr(environment, pair[1])
+		value, err := evalExpr(environment, pair.items[1])
 		if err != nil {
 			return nil, nil, err
 		}
 
-		names = append(names, string(name))
+		names = append(names, name.name)
 		values = append(values, value)
 	}
 
 	return names, values, nil
 }
 
-func applyProcedure(environment *env, proc expr, argForms []expr) (expr, error) {
+func applyProcedure(environment *env, proc expr, argForms []expr, callPos sourcePos) (expr, error) {
 	args, err := evalArgs(environment, argForms)
 	if err != nil {
-		return nil, err
+		return nil, attachPos(err, callPos)
 	}
 
-	return applyCallable(proc, args)
+	value, err := applyCallable(proc, args)
+	return value, attachPos(err, callPos)
 }
 
 func applyCallable(proc expr, args []expr) (expr, error) {
@@ -731,15 +787,15 @@ func builtinNot(args []expr) (expr, error) {
 }
 
 func builtinAppend(args []expr) (expr, error) {
-	result := make(listExpr, 0)
+	result := make([]expr, 0)
 	for _, arg := range args {
 		list, ok := arg.(listExpr)
 		if !ok {
 			return nil, &EvalError{Message: "append expects list arguments"}
 		}
-		result = append(result, list...)
+		result = append(result, list.items...)
 	}
-	return result, nil
+	return listExpr{items: result}, nil
 }
 
 func builtinCar(args []expr) (expr, error) {
@@ -748,10 +804,10 @@ func builtinCar(args []expr) (expr, error) {
 	}
 
 	list, ok := args[0].(listExpr)
-	if !ok || len(list) == 0 {
+	if !ok || len(list.items) == 0 {
 		return nil, &EvalError{Message: "car expects a non-empty list"}
 	}
-	return list[0], nil
+	return list.items[0], nil
 }
 
 func builtinCdr(args []expr) (expr, error) {
@@ -760,10 +816,11 @@ func builtinCdr(args []expr) (expr, error) {
 	}
 
 	list, ok := args[0].(listExpr)
-	if !ok || len(list) == 0 {
+	if !ok || len(list.items) == 0 {
 		return nil, &EvalError{Message: "cdr expects a non-empty list"}
 	}
-	return append(listExpr(nil), list[1:]...), nil
+	items := append([]expr(nil), list.items[1:]...)
+	return listExpr{items: items}, nil
 }
 
 func builtinCons(args []expr) (expr, error) {
@@ -776,10 +833,10 @@ func builtinCons(args []expr) (expr, error) {
 		return nil, &EvalError{Message: "cons expects a list as its second argument"}
 	}
 
-	result := make(listExpr, 0, len(list)+1)
+	result := make([]expr, 0, len(list.items)+1)
 	result = append(result, args[0])
-	result = append(result, list...)
-	return result, nil
+	result = append(result, list.items...)
+	return listExpr{items: result}, nil
 }
 
 func builtinLength(args []expr) (expr, error) {
@@ -791,13 +848,13 @@ func builtinLength(args []expr) (expr, error) {
 	if !ok {
 		return nil, &EvalError{Message: "length expects a list"}
 	}
-	return intExpr(len(list)), nil
+	return intExpr(len(list.items)), nil
 }
 
 func builtinList(args []expr) (expr, error) {
-	result := make(listExpr, len(args))
+	result := make([]expr, len(args))
 	copy(result, args)
-	return result, nil
+	return listExpr{items: result}, nil
 }
 
 func builtinNull(args []expr) (expr, error) {
@@ -806,7 +863,7 @@ func builtinNull(args []expr) (expr, error) {
 	}
 
 	list, ok := args[0].(listExpr)
-	return boolExpr(ok && len(list) == 0), nil
+	return boolExpr(ok && len(list.items) == 0), nil
 }
 
 func comparisonBuiltin(name string, cmp func(int, int) bool) builtinFunc {
@@ -866,10 +923,10 @@ func renderExpr(value expr) string {
 	case stringExpr:
 		return strconv.Quote(string(v))
 	case symbolExpr:
-		return string(v)
+		return v.name
 	case listExpr:
-		parts := make([]string, 0, len(v))
-		for _, item := range v {
+		parts := make([]string, 0, len(v.items))
+		for _, item := range v.items {
 			parts = append(parts, renderExpr(item))
 		}
 		return "(" + strings.Join(parts, " ") + ")"
