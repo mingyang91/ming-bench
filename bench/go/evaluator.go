@@ -79,9 +79,11 @@ type builtinProc struct {
 }
 
 type closure struct {
-	params []string
-	body   []any
-	env    *env
+	params     []string
+	restParam  string
+	hasRest    bool
+	body       []any
+	env        *env
 }
 
 func newEnv(parent *env) *env {
@@ -199,6 +201,7 @@ func newGlobalEnv(output *strings.Builder) *env {
 			return ok
 		})
 	}})
+	scope.define("apply", builtinProc{name: "apply", fn: builtinApply})
 	return scope
 }
 
@@ -592,15 +595,17 @@ func evalDefine(scope *env, args []any) (any, error) {
 			return nil, &EvalError{Message: "define function name must be a symbol"}
 		}
 
-		params, err := parseParams(target.elements[1:])
+		params, restParam, hasRest, err := parseParamList(target.elements[1:])
 		if err != nil {
 			return nil, err
 		}
 
 		proc := closure{
-			params: params,
-			body:   args[1:],
-			env:    scope,
+			params:    params,
+			restParam: restParam,
+			hasRest:   hasRest,
+			body:      args[1:],
+			env:       scope,
 		}
 		scope.define(name.name, proc)
 		return voidValue{}, nil
@@ -659,20 +664,17 @@ func evalLambda(scope *env, args []any) (any, error) {
 		return nil, &EvalError{Message: "lambda expects parameters and a body"}
 	}
 
-	paramsExpr, ok := args[0].(listExpr)
-	if !ok {
-		return nil, &EvalError{Message: "lambda parameters must be a list"}
-	}
-
-	params, err := parseParams(paramsExpr.elements)
+	params, restParam, hasRest, err := parseFormals(args[0])
 	if err != nil {
 		return nil, err
 	}
 
 	return closure{
-		params: params,
-		body:   args[1:],
-		env:    scope,
+		params:    params,
+		restParam: restParam,
+		hasRest:   hasRest,
+		body:      args[1:],
+		env:       scope,
 	}, nil
 }
 
@@ -816,16 +818,43 @@ func evalBindings(scope *env, bindings []any) ([]string, []any, error) {
 	return names, values, nil
 }
 
-func parseParams(params []any) ([]string, error) {
+func parseFormals(formals any) ([]string, string, bool, error) {
+	switch formals := formals.(type) {
+	case symbolExpr:
+		return nil, formals.name, true, nil
+	case listExpr:
+		return parseParamList(formals.elements)
+	default:
+		return nil, "", false, &EvalError{Message: "lambda parameters must be a list or symbol"}
+	}
+}
+
+func parseParamList(params []any) ([]string, string, bool, error) {
 	names := make([]string, 0, len(params))
-	for _, param := range params {
-		name, ok := param.(symbolExpr)
+	for i := 0; i < len(params); i++ {
+		name, ok := params[i].(symbolExpr)
 		if !ok {
-			return nil, &EvalError{Message: "parameter names must be symbols"}
+			return nil, "", false, &EvalError{Message: "parameter names must be symbols"}
 		}
+
+		if name.name == "." {
+			if i == len(params)-1 {
+				return nil, "", false, &EvalError{Message: "dot must be followed by a rest parameter"}
+			}
+
+			rest, ok := params[i+1].(symbolExpr)
+			if !ok || rest.name == "." {
+				return nil, "", false, &EvalError{Message: "rest parameter name must be a symbol"}
+			}
+			if i+2 != len(params) {
+				return nil, "", false, &EvalError{Message: "dot must appear before the final parameter"}
+			}
+			return names, rest.name, true, nil
+		}
+
 		names = append(names, name.name)
 	}
-	return names, nil
+	return names, "", false, nil
 }
 
 func applyProcedure(proc any, args []any) (any, error) {
@@ -833,13 +862,19 @@ func applyProcedure(proc any, args []any) (any, error) {
 	case builtinProc:
 		return callable.fn(args)
 	case closure:
-		if len(args) != len(callable.params) {
+		if !callable.hasRest && len(args) != len(callable.params) {
 			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(callable.params), len(args))}
+		}
+		if callable.hasRest && len(args) < len(callable.params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(callable.params), len(args))}
 		}
 
 		callScope := newEnv(callable.env)
 		for i, param := range callable.params {
 			callScope.define(param, args[i])
+		}
+		if callable.hasRest {
+			callScope.define(callable.restParam, makeListValue(args[len(callable.params):]))
 		}
 
 		return evalSequence(callScope, callable.body)
@@ -1236,6 +1271,23 @@ func builtinStringSet(args []any) (any, error) {
 
 	s.runes[index] = rune(ch)
 	return voidValue{}, nil
+}
+
+func builtinApply(args []any) (any, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "apply expects at least 2 arguments"}
+	}
+
+	restArgs, err := properListElements(args[len(args)-1], "apply")
+	if err != nil {
+		return nil, err
+	}
+
+	callArgs := make([]any, 0, len(args)-2+len(restArgs))
+	callArgs = append(callArgs, args[1:len(args)-1]...)
+	callArgs = append(callArgs, restArgs...)
+
+	return applyProcedure(args[0], callArgs)
 }
 
 func expectInt(value any) (int64, error) {
