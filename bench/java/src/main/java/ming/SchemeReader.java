@@ -130,6 +130,10 @@ class SchemeReader {
                         tokens.add(new Token("#(", line, startCol));
                         i += 2;
                         col += 2;
+                    } else if (next == '\'') {
+                        tokens.add(new Token("#'", line, startCol));
+                        i += 2;
+                        col += 2;
                     } else {
                         String sym = readSymbol(input, i);
                         tokens.add(new Token(sym, line, startCol));
@@ -178,6 +182,14 @@ class SchemeReader {
             quoteExpr.add(new SchemeSymbol("quote"));
             quoteExpr.add(quoted);
             return new Located(quoteExpr, token.line(), token.col());
+        }
+
+        if (token.value().equals("#'")) {
+            Object syntaxed = parse(tokens, pos);
+            List<Object> syntaxExpr = new ArrayList<>();
+            syntaxExpr.add(new SchemeSymbol("syntax"));
+            syntaxExpr.add(syntaxed);
+            return new Located(syntaxExpr, token.line(), token.col());
         }
 
         if (token.value().equals("#(")) {

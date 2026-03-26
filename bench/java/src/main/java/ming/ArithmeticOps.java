@@ -180,4 +180,48 @@ final class ArithmeticOps {
             default -> throw new EvalError("unknown arithmetic procedure: " + name);
         };
     }
+
+    static Object applyNumericType(String name, List<Object> args) throws EvalError {
+        return switch (name) {
+            case "number?" -> isNumber(args.get(0));
+            case "integer?" -> {
+                Object v = args.get(0);
+                if (v instanceof Long) yield true;
+                if (v instanceof Double d) yield d == Math.floor(d) && !Double.isInfinite(d);
+                yield false;
+            }
+            case "rational?" -> args.get(0) instanceof Long || args.get(0) instanceof SchemeRational;
+            case "exact?" -> args.get(0) instanceof Long || args.get(0) instanceof SchemeRational;
+            case "inexact?" -> args.get(0) instanceof Double;
+            case "exact->inexact" -> toDouble(args.get(0));
+            case "inexact->exact" -> {
+                Object v = args.get(0);
+                if (v instanceof Long || v instanceof SchemeRational) yield v;
+                if (v instanceof Double d) {
+                    if (d == Math.floor(d) && !Double.isInfinite(d)) yield d.longValue();
+                    long bits = Double.doubleToLongBits(d);
+                    long mantissa = bits & 0x000fffffffffffffL;
+                    int exponent = (int) ((bits >> 52) & 0x7ffL) - 1023 - 52;
+                    mantissa |= 0x0010000000000000L;
+                    if ((bits & 0x8000000000000000L) != 0) mantissa = -mantissa;
+                    if (exponent >= 0) yield mantissa * (1L << exponent);
+                    else yield SchemeRational.make(mantissa, 1L << (-exponent));
+                }
+                throw new EvalError("inexact->exact: expected number");
+            }
+            case "numerator" -> {
+                Object v = args.get(0);
+                if (v instanceof Long l) yield l;
+                if (v instanceof SchemeRational r) yield r.numerator;
+                throw new EvalError("numerator: expected rational");
+            }
+            case "denominator" -> {
+                Object v = args.get(0);
+                if (v instanceof Long) yield 1L;
+                if (v instanceof SchemeRational r) yield r.denominator;
+                throw new EvalError("denominator: expected rational");
+            }
+            default -> throw new EvalError("unknown numeric type procedure: " + name);
+        };
+    }
 }

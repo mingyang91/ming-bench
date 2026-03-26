@@ -47,7 +47,8 @@ public class Evaluator {
         "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
         "reverse", "memq", "memv", "member", "assq", "assv",
         "gcd", "lcm", "truncate", "round",
-        "make-string", "string", "string>?", "string<=?", "string>=?"
+        "make-string", "string", "string>?", "string<=?", "string>=?",
+        "syntax->datum", "datum->syntax"
     };
 
     {
@@ -178,6 +179,8 @@ public class Evaluator {
 
     // dynamic-wind stack: each entry is {inThunk, outThunk}
     private final List<Object[]> windStack = new ArrayList<>();
+
+    private final SyntaxCaseHandler syntaxCase = new SyntaxCaseHandler(this::eval);
 
     // --- Evaluator ---
 
@@ -406,7 +409,8 @@ public class Evaluator {
         "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
         "reverse", "memq", "memv", "member", "assq", "assv",
         "gcd", "lcm", "truncate", "round",
-        "make-string", "string", "string>?", "string<=?", "string>=?" -> {
+        "make-string", "string", "string>?", "string<=?", "string>=?",
+        "syntax->datum", "datum->syntax" -> {
                         return evalBuiltin(name, args, env);
                     }
                     case "define-record-type" -> {
@@ -428,21 +432,36 @@ public class Evaluator {
                     case "define-syntax" -> {
                         if (args.size() != 2) throw new EvalError("define-syntax: bad syntax");
                         String macroName = ((SchemeSymbol) unwrap(args.get(0))).name();
-                        List<?> srForm = (List<?>) unwrap(args.get(1));
-                        Object srHead = unwrap(srForm.get(0));
-                        if (!(srHead instanceof SchemeSymbol ss) || !ss.name().equals("syntax-rules"))
-                            throw new EvalError("define-syntax: expected syntax-rules");
-                        List<?> litList = (List<?>) unwrap(srForm.get(1));
-                        List<String> literals = new ArrayList<>();
-                        for (Object lit : litList)
-                            literals.add(((SchemeSymbol) unwrap(lit)).name());
-                        List<Object[]> rules = new ArrayList<>();
-                        for (int i = 2; i < srForm.size(); i++) {
-                            List<?> rule = (List<?>) unwrap(srForm.get(i));
-                            rules.add(new Object[]{deepUnwrap(rule.get(0)), deepUnwrap(rule.get(1))});
+                        Object rhs = unwrap(args.get(1));
+                        if (rhs instanceof List<?> srForm) {
+                            Object srHead = unwrap(srForm.get(0));
+                            if (srHead instanceof SchemeSymbol ss && ss.name().equals("syntax-rules")) {
+                                List<?> litList = (List<?>) unwrap(srForm.get(1));
+                                List<String> literals = new ArrayList<>();
+                                for (Object lit : litList)
+                                    literals.add(((SchemeSymbol) unwrap(lit)).name());
+                                List<Object[]> rules = new ArrayList<>();
+                                for (int i = 2; i < srForm.size(); i++) {
+                                    List<?> rule = (List<?>) unwrap(srForm.get(i));
+                                    rules.add(new Object[]{deepUnwrap(rule.get(0)), deepUnwrap(rule.get(1))});
+                                }
+                                env.define(macroName, new SyntaxRules(literals, rules, env));
+                                return VOID;
+                            }
                         }
-                        env.define(macroName, new SyntaxRules(literals, rules, env));
+                        // Evaluate as expression (lambda transformer)
+                        Object transformer = eval(args.get(1), env);
+                        env.define(macroName, new SyntaxCaseHandler.MacroTransformer(transformer, env));
                         return VOID;
+                    }
+                    case "syntax-case" -> {
+                        return syntaxCase.evalSyntaxCase(args, env);
+                    }
+                    case "syntax" -> {
+                        return syntaxCase.evalSyntax(args, env);
+                    }
+                    case "with-syntax" -> {
+                        return syntaxCase.evalWithSyntax(args, env);
                     }
                     default -> {
                         // Check if this is a macro call
@@ -453,6 +472,20 @@ public class Evaluator {
                                 List<Object> deepForm = (List<Object>) deepUnwrap(list);
                                 Object expanded = sr.expand(deepForm, env);
                                 return new TailCall(expanded, env);
+                            }
+                            if (val instanceof SyntaxCaseHandler.MacroTransformer mt) {
+                                @SuppressWarnings("unchecked")
+                                List<Object> deepForm = (List<Object>) deepUnwrap(list);
+                                Object syntaxObj = new SyntaxObject(deepForm, env);
+                                Environment prevDefEnv = syntaxCase.currentMacroDefEnv;
+                                syntaxCase.currentMacroDefEnv = mt.defEnv();
+                                try {
+                                    Object result = applyResolved(mt.transformer(), List.of(syntaxObj));
+                                    if (result instanceof SyntaxObject so) result = so.datum();
+                                    return new TailCall(result, env);
+                                } finally {
+                                    syntaxCase.currentMacroDefEnv = prevDefEnv;
+                                }
                             }
                         } catch (EvalError ignored) {}
                         // Fall through to procedure call
@@ -1020,7 +1053,7 @@ public class Evaluator {
                 applyListBuiltin(name, args);
             case "number?", "integer?", "rational?", "exact?", "inexact?",
                  "exact->inexact", "inexact->exact", "numerator", "denominator" ->
-                applyNumericTypeBuiltin(name, args);
+                ArithmeticOps.applyNumericType(name, args);
             case "string?", "boolean?", "pair?", "symbol?", "char?", "procedure?" ->
                 applyTypePredicateBuiltin(name, args);
             case "display", "write", "newline" ->
@@ -1030,10 +1063,22 @@ public class Evaluator {
                  "string-copy", "string-set!", "string->list", "list->string", "string=?", "string<?", "string-ci=?",
                  "string-upcase", "string-downcase",
                  "make-string", "string", "string>?", "string<=?", "string>=?" ->
-                applyStringBuiltin(name, args);
+                StringCharBuiltins.applyStringBuiltin(name, args);
             case "char-alphabetic?", "char-numeric?", "char=?", "char<?",
                  "char-upcase", "char-downcase", "char->integer", "integer->char" ->
-                applyCharBuiltin(name, args);
+                StringCharBuiltins.applyCharBuiltin(name, args);
+            case "syntax->datum" -> {
+                if (args.size() != 1) throw new EvalError("syntax->datum: expected 1 argument");
+                Object arg = args.get(0);
+                yield (arg instanceof SyntaxObject so) ? so.datum() : arg;
+            }
+            case "datum->syntax" -> {
+                if (args.size() != 2) throw new EvalError("datum->syntax: expected 2 arguments");
+                Object templateId = args.get(0);
+                Object datum = args.get(1);
+                Environment ctx = (templateId instanceof SyntaxObject so) ? so.context() : globalEnv;
+                yield new SyntaxObject(datum, ctx);
+            }
             case "apply" -> {
                 if (args.size() < 2) throw new EvalError("apply: expected at least 2 arguments");
                 Object applyProc = args.get(0);
@@ -1333,50 +1378,6 @@ public class Evaluator {
         };
     }
 
-    private Object applyNumericTypeBuiltin(String name, List<Object> args) throws EvalError {
-        return switch (name) {
-            case "number?" -> ArithmeticOps.isNumber(args.get(0));
-            case "integer?" -> {
-                Object v = args.get(0);
-                if (v instanceof Long) yield true;
-                if (v instanceof Double d) yield d == Math.floor(d) && !Double.isInfinite(d);
-                yield false;
-            }
-            case "rational?" -> args.get(0) instanceof Long || args.get(0) instanceof SchemeRational;
-            case "exact?" -> args.get(0) instanceof Long || args.get(0) instanceof SchemeRational;
-            case "inexact?" -> args.get(0) instanceof Double;
-            case "exact->inexact" -> ArithmeticOps.toDouble(args.get(0));
-            case "inexact->exact" -> {
-                Object v = args.get(0);
-                if (v instanceof Long || v instanceof SchemeRational) yield v;
-                if (v instanceof Double d) {
-                    if (d == Math.floor(d) && !Double.isInfinite(d)) yield d.longValue();
-                    long bits = Double.doubleToLongBits(d);
-                    long mantissa = bits & 0x000fffffffffffffL;
-                    int exponent = (int) ((bits >> 52) & 0x7ffL) - 1023 - 52;
-                    mantissa |= 0x0010000000000000L;
-                    if ((bits & 0x8000000000000000L) != 0) mantissa = -mantissa;
-                    if (exponent >= 0) yield mantissa * (1L << exponent);
-                    else yield SchemeRational.make(mantissa, 1L << (-exponent));
-                }
-                throw new EvalError("inexact->exact: expected number");
-            }
-            case "numerator" -> {
-                Object v = args.get(0);
-                if (v instanceof Long l) yield l;
-                if (v instanceof SchemeRational r) yield r.numerator;
-                throw new EvalError("numerator: expected rational");
-            }
-            case "denominator" -> {
-                Object v = args.get(0);
-                if (v instanceof Long) yield 1L;
-                if (v instanceof SchemeRational r) yield r.denominator;
-                throw new EvalError("denominator: expected rational");
-            }
-            default -> throw new EvalError("unknown numeric type procedure: " + name);
-        };
-    }
-
     private Object applyTypePredicateBuiltin(String name, List<Object> args) {
         return switch (name) {
             case "string?" -> { Object sv = args.get(0); yield sv instanceof String || sv instanceof SchemeString; }
@@ -1397,14 +1398,6 @@ public class Evaluator {
             default -> { }
         }
         return VOID;
-    }
-
-    private Object applyStringBuiltin(String name, List<Object> args) throws EvalError {
-        return StringCharBuiltins.applyStringBuiltin(name, args);
-    }
-
-    private Object applyCharBuiltin(String name, List<Object> args) throws EvalError {
-        return StringCharBuiltins.applyCharBuiltin(name, args);
     }
 
     private Object evalBuiltin(String name, List<Object> args, Environment env) throws EvalError, ContinuationException, SchemeRaiseException {
