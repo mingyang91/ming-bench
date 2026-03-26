@@ -61,6 +61,8 @@ pub enum EvalError {
     },
     #[error("circular list")]
     CyclicList,
+    #[error("step limit exceeded after {max_steps} steps")]
+    StepLimitExceeded { max_steps: usize },
     #[error("uncaught exception: {value}")]
     UncaughtException { value: String },
     #[error("internal continuation jump")]

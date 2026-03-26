@@ -22,6 +22,7 @@ std::thread_local! {
         RefCell::new(Vec::new());
     static SYNTAX_TEMPLATE_STACK: RefCell<Vec<SyntaxTemplateContext>> =
         RefCell::new(Vec::new());
+    static EVAL_STEP_BUDGET: RefCell<Option<EvalStepBudget>> = RefCell::new(None);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +54,12 @@ enum ExprKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourcePos {
     offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvalStepBudget {
+    max_steps: usize,
+    remaining_steps: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1845,6 +1852,39 @@ fn replace_exception_handler_stack(
     EXCEPTION_HANDLER_STACK.with(|current| std::mem::replace(&mut *current.borrow_mut(), stack))
 }
 
+fn replace_eval_step_budget(budget: Option<EvalStepBudget>) -> Option<EvalStepBudget> {
+    EVAL_STEP_BUDGET.with(|current| std::mem::replace(&mut *current.borrow_mut(), budget))
+}
+
+fn with_eval_step_budget<T>(
+    budget: Option<EvalStepBudget>,
+    f: impl FnOnce() -> Result<T, EvalError>,
+) -> Result<T, EvalError> {
+    let saved_budget = replace_eval_step_budget(budget);
+    let result = f();
+    replace_eval_step_budget(saved_budget);
+    result
+}
+
+fn consume_eval_step(pos: SourcePos) -> Result<(), EvalError> {
+    EVAL_STEP_BUDGET.with(|current| {
+        let mut budget = current.borrow_mut();
+        let Some(budget) = budget.as_mut() else {
+            return Ok(());
+        };
+
+        if budget.remaining_steps == 0 {
+            return Err(EvalError::StepLimitExceeded {
+                max_steps: budget.max_steps,
+            }
+            .with_offset(pos.offset));
+        }
+
+        budget.remaining_steps -= 1;
+        Ok(())
+    })
+}
+
 fn push_dynamic_wind_frame(frame: WindFrameRef) {
     DYNAMIC_WIND_STACK.with(|stack| stack.borrow_mut().push(frame));
 }
@@ -2185,6 +2225,7 @@ fn eval_sequence_cps(
 
 fn eval_expr_cps(expr: Expr, env: EnvRef, k: ContinuationRef) -> Result<Value, EvalError> {
     let pos = expr.pos;
+    consume_eval_step(pos)?;
 
     match expr.kind {
         ExprKind::Number(value) => k(Value::Number(value)),
@@ -3474,9 +3515,10 @@ fn apply_value_cps(
             let call_env = create_closure_call_env(clause.as_ref(), argument_values, call_pos)?;
             eval_sequence_cps(clause.body.clone(), 0, call_env, k)
         }
-        Value::Continuation(continuation) => {
-            Err(queue_continuation_jump(continuation, pack_values(argument_values)))
-        }
+        Value::Continuation(continuation) => Err(queue_continuation_jump(
+            continuation,
+            pack_values(argument_values),
+        )),
         other => Err(EvalError::NotAProcedure {
             found: other.kind().into(),
         }
@@ -3910,7 +3952,10 @@ enum TailTarget<'a> {
 
 enum TailControl<'a> {
     Return(Value),
-    Continue { target: TailTarget<'a>, env: EnvRef },
+    Continue {
+        target: TailTarget<'a>,
+        env: EnvRef,
+    },
     PushGuard {
         frame: DirectGuardFrame,
         target: TailTarget<'static>,
@@ -3952,11 +3997,9 @@ fn into_owned_control(control: TailControl<'_>) -> TailControl<'static> {
             target: into_owned_target(target),
             env,
         },
-        TailControl::PushGuard { frame, target, env } => TailControl::PushGuard {
-            frame,
-            target,
-            env,
-        },
+        TailControl::PushGuard { frame, target, env } => {
+            TailControl::PushGuard { frame, target, env }
+        }
     }
 }
 
@@ -3988,22 +4031,24 @@ fn eval_tail_target<'a>(target: TailTarget<'a>, env: &EnvRef) -> Result<Value, E
 
     loop {
         let control = match target {
-            TailTarget::OwnedExpr(expr) => match eval_expr_control(
-                &expr,
-                &env,
-                owned_expr_target,
-                owned_sequence_target,
-            ) {
-                Ok(control) => into_owned_control(control),
-                Err(EvalError::InternalRaised { id }) => handle_direct_raise(&mut guard_frames, id)?,
-                Err(error) => return Err(error),
-            },
-            TailTarget::OwnedSequence(expressions) => match eval_owned_sequence_control(expressions, &env)
-            {
-                Ok(control) => control,
-                Err(EvalError::InternalRaised { id }) => handle_direct_raise(&mut guard_frames, id)?,
-                Err(error) => return Err(error),
-            },
+            TailTarget::OwnedExpr(expr) => {
+                match eval_expr_control(&expr, &env, owned_expr_target, owned_sequence_target) {
+                    Ok(control) => into_owned_control(control),
+                    Err(EvalError::InternalRaised { id }) => {
+                        handle_direct_raise(&mut guard_frames, id)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            TailTarget::OwnedSequence(expressions) => {
+                match eval_owned_sequence_control(expressions, &env) {
+                    Ok(control) => control,
+                    Err(EvalError::InternalRaised { id }) => {
+                        handle_direct_raise(&mut guard_frames, id)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             TailTarget::Expr(_) | TailTarget::Sequence(_) => unreachable!(),
         };
 
@@ -4083,6 +4128,8 @@ where
     FExpr: Copy + Fn(&'a Expr) -> TailTarget<'a>,
     FSeq: Copy + Fn(&'a [Expr]) -> TailTarget<'a>,
 {
+    consume_eval_step(expr.pos)?;
+
     match &expr.kind {
         ExprKind::Number(value) => Ok(TailControl::Return(Value::Number(*value))),
         ExprKind::Boolean(value) => Ok(TailControl::Return(Value::Boolean(*value))),
@@ -4622,12 +4669,7 @@ where
         if value.is_truthy() {
             if let Some(recipient) = arrow_recipient {
                 let procedure = eval_expr(recipient, env)?;
-                return tail_apply_value_with_values(
-                    procedure,
-                    vec![value],
-                    env,
-                    recipient.pos,
-                );
+                return tail_apply_value_with_values(procedure, vec![value], env, recipient.pos);
             }
 
             return if body.is_empty() {
@@ -6730,11 +6772,7 @@ fn eval_quote(pos: SourcePos, arguments: &[Expr]) -> Result<Value, EvalError> {
     Ok(quote_expr(quoted))
 }
 
-fn eval_quasiquote(
-    pos: SourcePos,
-    arguments: &[Expr],
-    env: &EnvRef,
-) -> Result<Value, EvalError> {
+fn eval_quasiquote(pos: SourcePos, arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let [template] = arguments else {
         return Err(EvalError::WrongArgCount {
             name: "quasiquote".into(),
@@ -6795,13 +6833,18 @@ fn eval_quasiquote_expr(expr: &Expr, env: &EnvRef, depth: usize) -> Result<Value
 fn eval_quasiquote_list(items: &[Expr], env: &EnvRef, depth: usize) -> Result<Value, EvalError> {
     if let Some((heads, tail)) = split_quoted_dotted_list(items) {
         let mut result = eval_quasiquote_expr(tail, env, depth)?;
-        for value in eval_quasiquote_list_items(heads, env, depth)?.into_iter().rev() {
+        for value in eval_quasiquote_list_items(heads, env, depth)?
+            .into_iter()
+            .rev()
+        {
             result = Value::Pair(SchemePair::new(value, result));
         }
         return Ok(result);
     }
 
-    Ok(make_proper_list(eval_quasiquote_list_items(items, env, depth)?))
+    Ok(make_proper_list(eval_quasiquote_list_items(
+        items, env, depth,
+    )?))
 }
 
 fn eval_quasiquote_list_items(
@@ -6857,9 +6900,12 @@ fn quote_expr(expr: &Expr) -> Value {
 
 fn quote_list_expr(items: &[Expr]) -> Value {
     if let Some((heads, tail)) = split_quoted_dotted_list(items) {
-        return heads.iter().rev().fold(quote_expr(tail), |tail_value, head| {
-            Value::Pair(SchemePair::new(quote_expr(head), tail_value))
-        });
+        return heads
+            .iter()
+            .rev()
+            .fold(quote_expr(tail), |tail_value, head| {
+                Value::Pair(SchemePair::new(quote_expr(head), tail_value))
+            });
     }
 
     make_proper_list(items.iter().map(quote_expr).collect())
@@ -9915,6 +9961,23 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
     let output = Rc::new(RefCell::new(String::new()));
     let value = eval_program(&expressions, output).map_err(|err| err.resolve_positions(input))?;
+    Ok(value.render())
+}
+
+/// Evaluate Scheme expressions with a fixed eval-dispatch budget.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let expressions = Parser::new(input)
+        .parse_program()
+        .map_err(|err| err.resolve_positions(input))?;
+    let output = Rc::new(RefCell::new(String::new()));
+    let value = with_eval_step_budget(
+        Some(EvalStepBudget {
+            max_steps,
+            remaining_steps: max_steps,
+        }),
+        || eval_program(&expressions, output),
+    )
+    .map_err(|err| err.resolve_positions(input))?;
     Ok(value.render())
 }
 
