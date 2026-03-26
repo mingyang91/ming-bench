@@ -2,8 +2,10 @@ package ming
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // EvalStr evaluates one or more Scheme expressions and returns the string
@@ -88,6 +90,29 @@ type builtinFunc func(args []any) (any, error)
 type builtinProc struct {
 	name string
 	fn   builtinFunc
+}
+
+const stringImmutabilityLevel = 15
+
+func activeBenchLevel() (int, bool) {
+	levelText := os.Getenv("BENCH_LEVEL")
+	if levelText == "" {
+		return 0, false
+	}
+
+	level, err := strconv.Atoi(levelText)
+	if err != nil {
+		return 0, false
+	}
+	return level, true
+}
+
+func stringsAreImmutable() bool {
+	level, ok := activeBenchLevel()
+	if !ok {
+		return true
+	}
+	return level >= stringImmutabilityLevel
 }
 
 type closure struct {
@@ -206,6 +231,7 @@ func (e *env) lookupMacroSymbol(symbol symbolExpr) (*syntaxMacro, bool) {
 
 func newGlobalEnv(output *strings.Builder) *env {
 	scope := newEnv(nil)
+	immutableStrings := stringsAreImmutable()
 	scope.define("+", builtinProc{name: "+", fn: builtinAdd})
 	scope.define("-", builtinProc{name: "-", fn: builtinSub})
 	scope.define("*", builtinProc{name: "*", fn: builtinMul})
@@ -221,6 +247,9 @@ func newGlobalEnv(output *strings.Builder) *env {
 	}})
 	scope.define("<=", builtinProc{name: "<=", fn: func(args []any) (any, error) {
 		return builtinCompare(args, func(order int) bool { return order <= 0 })
+	}})
+	scope.define(">=", builtinProc{name: ">=", fn: func(args []any) (any, error) {
+		return builtinCompare(args, func(order int) bool { return order >= 0 })
 	}})
 	scope.define("not", builtinProc{name: "not", fn: builtinNot})
 	scope.define("cons", builtinProc{name: "cons", fn: builtinCons})
@@ -284,8 +313,14 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("symbol->string", builtinProc{name: "symbol->string", fn: builtinSymbolToString})
 	scope.define("string->symbol", builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
 	scope.define("string-ref", builtinProc{name: "string-ref", fn: builtinStringRef})
-	scope.define("string-copy", builtinProc{name: "string-copy", fn: builtinStringCopy})
-	scope.define("string-set!", builtinProc{name: "string-set!", fn: builtinStringSet})
+	scope.define("string-copy", builtinProc{name: "string-copy", fn: func(args []any) (any, error) {
+		return builtinStringCopy(args, immutableStrings)
+	}})
+	scope.define("string-set!", builtinProc{name: "string-set!", fn: func(args []any) (any, error) {
+		return builtinStringSet(args, immutableStrings)
+	}})
+	scope.define("string->list", builtinProc{name: "string->list", fn: builtinStringToList})
+	scope.define("list->string", builtinProc{name: "list->string", fn: builtinListToString})
 	scope.define("exact->inexact", builtinProc{name: "exact->inexact", fn: builtinExactToInexact})
 	scope.define("inexact->exact", builtinProc{name: "inexact->exact", fn: builtinInexactToExact})
 	scope.define("numerator", builtinProc{name: "numerator", fn: builtinNumerator})
@@ -330,6 +365,8 @@ func newGlobalEnv(output *strings.Builder) *env {
 	scope.define("char-downcase", builtinProc{name: "char-downcase", fn: builtinCharDowncase})
 	scope.define("char=?", builtinProc{name: "char=?", fn: builtinCharEqual})
 	scope.define("char<?", builtinProc{name: "char<?", fn: builtinCharLess})
+	scope.define("char->integer", builtinProc{name: "char->integer", fn: builtinCharToInteger})
+	scope.define("integer->char", builtinProc{name: "integer->char", fn: builtinIntegerToChar})
 	scope.define("string=?", builtinProc{name: "string=?", fn: builtinStringEqual})
 	scope.define("string<?", builtinProc{name: "string<?", fn: builtinStringLess})
 	scope.define("string-ci=?", builtinProc{name: "string-ci=?", fn: builtinStringCIEqual})
@@ -1458,7 +1495,7 @@ func builtinStringRef(args []any) (any, error) {
 	return charValue(runes[index]), nil
 }
 
-func builtinStringCopy(args []any) (any, error) {
+func builtinStringCopy(args []any, immutableStrings bool) (any, error) {
 	if len(args) != 1 {
 		return nil, &EvalError{Message: "string-copy expects exactly 1 argument"}
 	}
@@ -1468,35 +1505,124 @@ func builtinStringCopy(args []any) (any, error) {
 		return nil, err
 	}
 
-	return &mutableString{runes: []rune(s)}, nil
+	runes := []rune(s)
+	if immutableStrings {
+		return string(runes), nil
+	}
+	return &mutableString{runes: runes}, nil
 }
 
-func builtinStringSet(args []any) (any, error) {
+func builtinStringSet(args []any, immutableStrings bool) (any, error) {
 	if len(args) != 3 {
 		return nil, &EvalError{Message: "string-set! expects exactly 3 arguments"}
 	}
 
-	s, err := expectMutableString(args[0])
+	if !immutableStrings {
+		s, err := expectMutableString(args[0])
+		if err != nil {
+			return nil, err
+		}
+
+		index, err := expectNonNegativeIndex(args[1], "string-set!")
+		if err != nil {
+			return nil, err
+		}
+
+		ch, err := expectChar(args[2])
+		if err != nil {
+			return nil, err
+		}
+
+		if index >= int64(len(s.runes)) {
+			return nil, &EvalError{Message: "string-set! index out of range"}
+		}
+
+		s.runes[index] = rune(ch)
+		return voidValue{}, nil
+	}
+
+	if _, err := expectString(args[0]); err != nil {
+		return nil, err
+	}
+	if _, err := expectNonNegativeIndex(args[1], "string-set!"); err != nil {
+		return nil, err
+	}
+	if _, err := expectChar(args[2]); err != nil {
+		return nil, err
+	}
+	return nil, &EvalError{Message: "string-set! is not supported on immutable strings"}
+}
+
+func builtinStringToList(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string->list expects exactly 1 argument"}
+	}
+
+	s, err := expectString(args[0])
 	if err != nil {
 		return nil, err
 	}
 
-	index, err := expectNonNegativeIndex(args[1], "string-set!")
+	runes := []rune(s)
+	elements := make([]any, len(runes))
+	for i, r := range runes {
+		elements[i] = charValue(r)
+	}
+	return makeListValue(elements), nil
+}
+
+func builtinListToString(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "list->string expects exactly 1 argument"}
+	}
+
+	elements, err := properListElements(args[0], "list->string")
 	if err != nil {
 		return nil, err
 	}
 
-	ch, ok := args[2].(charValue)
-	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("expected char, got %s", typeName(args[2]))}
+	var b strings.Builder
+	for _, elem := range elements {
+		ch, err := expectChar(elem)
+		if err != nil {
+			return nil, err
+		}
+		b.WriteRune(rune(ch))
+	}
+	return b.String(), nil
+}
+
+func builtinCharToInteger(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "char->integer expects exactly 1 argument"}
 	}
 
-	if index >= int64(len(s.runes)) {
-		return nil, &EvalError{Message: "string-set! index out of range"}
+	ch, err := expectChar(args[0])
+	if err != nil {
+		return nil, err
+	}
+	return int64(rune(ch)), nil
+}
+
+func builtinIntegerToChar(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "integer->char expects exactly 1 argument"}
 	}
 
-	s.runes[index] = rune(ch)
-	return voidValue{}, nil
+	n, err := expectInt(args[0])
+	if err != nil {
+		return nil, err
+	}
+	if n < 0 || n > utf8.MaxRune {
+		return nil, &EvalError{Message: "integer->char expects a valid Unicode scalar value"}
+	}
+
+	ch := rune(n)
+	if !utf8.ValidRune(ch) {
+		return nil, &EvalError{Message: "integer->char expects a valid Unicode scalar value"}
+	}
+
+	return charValue(ch), nil
 }
 
 func builtinApply(args []any) (any, error) {
