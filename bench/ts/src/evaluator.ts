@@ -464,10 +464,140 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return result;
   }));
 
+  env.define('abs', builtin('abs', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: abs expects exactly 1 argument`);
+    }
+
+    return Math.abs(expectNumber(args[0]));
+  }));
+
+  env.define('quotient', builtin('quotient', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: quotient expects exactly 2 arguments`);
+    }
+
+    const dividend = expectIndexArg(args[0]);
+    const divisor = expectIndexArg(args[1]);
+    if (divisor === 0) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: division by zero`);
+    }
+
+    return Math.trunc(dividend / divisor);
+  }));
+
+  env.define('remainder', builtin('remainder', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: remainder expects exactly 2 arguments`);
+    }
+
+    const dividend = expectIndexArg(args[0]);
+    const divisor = expectIndexArg(args[1]);
+    if (divisor === 0) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: division by zero`);
+    }
+
+    return dividend % divisor;
+  }));
+
+  env.define('modulo', builtin('modulo', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: modulo expects exactly 2 arguments`);
+    }
+
+    const dividend = expectIndexArg(args[0]);
+    const divisor = expectIndexArg(args[1]);
+    if (divisor === 0) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: division by zero`);
+    }
+
+    return dividend - (divisor * Math.floor(dividend / divisor));
+  }));
+
+  env.define('min', builtin('min', (args, loc) => {
+    if (args.length === 0) {
+      throw new EvalError(`${loc.line}:${loc.col}: min expects at least 1 argument`);
+    }
+
+    let result = expectNumber(args[0]);
+    for (const arg of args.slice(1)) {
+      const value = expectNumber(arg);
+      if (value < result) {
+        result = value;
+      }
+    }
+
+    return result;
+  }));
+
+  env.define('max', builtin('max', (args, loc) => {
+    if (args.length === 0) {
+      throw new EvalError(`${loc.line}:${loc.col}: max expects at least 1 argument`);
+    }
+
+    let result = expectNumber(args[0]);
+    for (const arg of args.slice(1)) {
+      const value = expectNumber(arg);
+      if (value > result) {
+        result = value;
+      }
+    }
+
+    return result;
+  }));
+
+  env.define('expt', builtin('expt', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: expt expects exactly 2 arguments`);
+    }
+
+    return Math.pow(expectNumber(args[0]), expectIndexArg(args[1]));
+  }));
+
   env.define('<', comparisonBuiltin('<', (left, right) => left < right));
   env.define('>', comparisonBuiltin('>', (left, right) => left > right));
   env.define('=', comparisonBuiltin('=', (left, right) => left === right));
   env.define('<=', comparisonBuiltin('<=', (left, right) => left <= right));
+
+  env.define('zero?', builtin('zero?', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: zero? expects exactly 1 argument`);
+    }
+
+    return expectNumber(args[0]) === 0;
+  }));
+
+  env.define('positive?', builtin('positive?', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: positive? expects exactly 1 argument`);
+    }
+
+    return expectNumber(args[0]) > 0;
+  }));
+
+  env.define('negative?', builtin('negative?', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: negative? expects exactly 1 argument`);
+    }
+
+    return expectNumber(args[0]) < 0;
+  }));
+
+  env.define('odd?', builtin('odd?', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: odd? expects exactly 1 argument`);
+    }
+
+    return Math.abs(expectIndexArg(args[0]) % 2) === 1;
+  }));
+
+  env.define('even?', builtin('even?', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: even? expects exactly 1 argument`);
+    }
+
+    return expectIndexArg(args[0]) % 2 === 0;
+  }));
 
   env.define('not', builtin('not', (args, loc) => {
     if (args.length !== 1) {
@@ -519,6 +649,50 @@ function createGlobalEnv(runtime: Runtime): Environment {
     return expectProperList(args[0].value, args[0].expr).length;
   }));
 
+  env.define('list-ref', builtin('list-ref', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: list-ref expects exactly 2 arguments`);
+    }
+
+    const elements = expectProperList(args[0].value, args[0].expr);
+    const index = expectIndexArg(args[1]);
+    if (index < 0 || index >= elements.length) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: list-ref index out of bounds`);
+    }
+
+    return elements[index];
+  }));
+
+  env.define('list-tail', builtin('list-tail', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: list-tail expects exactly 2 arguments`);
+    }
+
+    expectProperList(args[0].value, args[0].expr);
+
+    const index = expectIndexArg(args[1]);
+    if (index < 0) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: list-tail index out of bounds`);
+    }
+
+    let current = args[0].value;
+    let remaining = index;
+    while (remaining > 0) {
+      if (!isPair(current)) {
+        throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: list-tail index out of bounds`);
+      }
+
+      current = current.cdr;
+      remaining -= 1;
+    }
+
+    if (!isPair(current) && !isEmptyList(current)) {
+      throw new EvalError(`${args[0].expr.line}:${args[0].expr.col}: expected proper list`);
+    }
+
+    return current;
+  }));
+
   env.define('append', builtin('append', (args) => {
     if (args.length === 0) {
       return EMPTY_LIST;
@@ -534,6 +708,76 @@ function createGlobalEnv(runtime: Runtime): Environment {
     }
 
     return result;
+  }));
+
+  env.define('map', builtin('map', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: map expects a procedure and at least 1 list`);
+    }
+
+    const procedure = args[0].value;
+    const listArgs = args.slice(1);
+    const lists = listArgs.map((arg) => expectProperList(arg.value, arg.expr));
+    const expectedLength = lists[0].length;
+
+    for (let index = 1; index < lists.length; index += 1) {
+      if (lists[index].length !== expectedLength) {
+        throw new EvalError(`${listArgs[index].expr.line}:${listArgs[index].expr.col}: map lists must have the same length`);
+      }
+    }
+
+    const results: Value[] = [];
+    for (let index = 0; index < expectedLength; index += 1) {
+      const appliedArgs = listArgs.map((arg, listIndex) => ({
+        expr: arg.expr,
+        value: lists[listIndex][index],
+      }));
+      results.push(applyProcedure(procedure, appliedArgs, args[0].expr));
+    }
+
+    return makeList(results);
+  }));
+
+  env.define('eq?', builtin('eq?', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: eq? expects exactly 2 arguments`);
+    }
+
+    return isEq(args[0].value, args[1].value);
+  }));
+
+  env.define('equal?', builtin('equal?', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: equal? expects exactly 2 arguments`);
+    }
+
+    return isEqual(args[0].value, args[1].value);
+  }));
+
+  env.define('assoc', builtin('assoc', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: assoc expects exactly 2 arguments`);
+    }
+
+    let current = args[1].value;
+    while (isPair(current)) {
+      const entry = current.car;
+      if (!isPair(entry)) {
+        throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: assoc expects an association list`);
+      }
+
+      if (isEqual(args[0].value, entry.car)) {
+        return entry;
+      }
+
+      current = current.cdr;
+    }
+
+    if (!isEmptyList(current)) {
+      throw new EvalError(`${args[1].expr.line}:${args[1].expr.col}: expected proper list`);
+    }
+
+    return false;
   }));
 
   env.define('apply', builtin('apply', (args, loc) => {
@@ -561,8 +805,15 @@ function createGlobalEnv(runtime: Runtime): Environment {
   env.define('number?', predicateBuiltin('number?', (value) => typeof value === 'number'));
   env.define('boolean?', predicateBuiltin('boolean?', (value) => typeof value === 'boolean'));
   env.define('pair?', predicateBuiltin('pair?', isPair));
+  env.define('list?', predicateBuiltin('list?', isProperList));
   env.define('symbol?', predicateBuiltin('symbol?', isSchemeSymbolValue));
   env.define('char?', predicateBuiltin('char?', isSchemeCharValue));
+  env.define('char-alphabetic?', predicateBuiltin('char-alphabetic?', (value) => (
+    isSchemeCharValue(value) && isAlphabeticChar(value.value)
+  )));
+  env.define('char-numeric?', predicateBuiltin('char-numeric?', (value) => (
+    isSchemeCharValue(value) && isNumericChar(value.value)
+  )));
 
   env.define('display', builtin('display', (args, loc) => {
     if (args.length !== 1) {
@@ -670,6 +921,108 @@ function createGlobalEnv(runtime: Runtime): Environment {
     }
 
     return { kind: 'char', value: chars[index] };
+  }));
+
+  env.define('char=?', builtin('char=?', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: char=? expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (expectCharArg(args[index]).value !== expectCharArg(args[index + 1]).value) {
+        return false;
+      }
+    }
+
+    return true;
+  }));
+
+  env.define('char<?', builtin('char<?', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: char<? expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (!(expectCharArg(args[index]).value < expectCharArg(args[index + 1]).value)) {
+        return false;
+      }
+    }
+
+    return true;
+  }));
+
+  env.define('char-upcase', builtin('char-upcase', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: char-upcase expects exactly 1 argument`);
+    }
+
+    return { kind: 'char', value: expectCharArg(args[0]).value.toUpperCase() };
+  }));
+
+  env.define('char-downcase', builtin('char-downcase', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: char-downcase expects exactly 1 argument`);
+    }
+
+    return { kind: 'char', value: expectCharArg(args[0]).value.toLowerCase() };
+  }));
+
+  env.define('string=?', builtin('string=?', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: string=? expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (expectStringArg(args[index]) !== expectStringArg(args[index + 1])) {
+        return false;
+      }
+    }
+
+    return true;
+  }));
+
+  env.define('string<?', builtin('string<?', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: string<? expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (!(expectStringArg(args[index]) < expectStringArg(args[index + 1]))) {
+        return false;
+      }
+    }
+
+    return true;
+  }));
+
+  env.define('string-ci=?', builtin('string-ci=?', (args, loc) => {
+    if (args.length < 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: string-ci=? expects at least 2 arguments`);
+    }
+
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (expectStringArg(args[index]).toLowerCase() !== expectStringArg(args[index + 1]).toLowerCase()) {
+        return false;
+      }
+    }
+
+    return true;
+  }));
+
+  env.define('string-upcase', builtin('string-upcase', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: string-upcase expects exactly 1 argument`);
+    }
+
+    return makeString(expectStringArg(args[0]).toUpperCase());
+  }));
+
+  env.define('string-downcase', builtin('string-downcase', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: string-downcase expects exactly 1 argument`);
+    }
+
+    return makeString(expectStringArg(args[0]).toLowerCase());
   }));
 
   env.define('string-copy', builtin('string-copy', (args, loc) => {
@@ -1206,6 +1559,92 @@ function expectProperList(value: Value, loc: SourceLoc): Value[] {
   return elements;
 }
 
+function isEq(left: Value, right: Value): boolean {
+  if (typeof left === 'number' || typeof left === 'boolean') {
+    return left === right;
+  }
+
+  if (typeof right === 'number' || typeof right === 'boolean') {
+    return false;
+  }
+
+  if (isSchemeSymbolValue(left) && isSchemeSymbolValue(right)) {
+    return left.value === right.value;
+  }
+
+  if (isSchemeCharValue(left) && isSchemeCharValue(right)) {
+    return left.value === right.value;
+  }
+
+  if (isEmptyList(left) && isEmptyList(right)) {
+    return true;
+  }
+
+  if (isSchemeStringValue(left) && isSchemeStringValue(right)) {
+    return left === right;
+  }
+
+  if (isPair(left) && isPair(right)) {
+    return left === right;
+  }
+
+  if (isProcedure(left) && isProcedure(right)) {
+    return left === right;
+  }
+
+  return left.kind === 'void' && right.kind === 'void';
+}
+
+function isEqual(left: Value, right: Value): boolean {
+  if (isEq(left, right)) {
+    return true;
+  }
+
+  if (typeof left === 'number' || typeof left === 'boolean') {
+    return false;
+  }
+
+  if (typeof right === 'number' || typeof right === 'boolean') {
+    return false;
+  }
+
+  if (isSchemeStringValue(left) && isSchemeStringValue(right)) {
+    return schemeStringText(left) === schemeStringText(right);
+  }
+
+  if (isSchemeSymbolValue(left) && isSchemeSymbolValue(right)) {
+    return left.value === right.value;
+  }
+
+  if (isSchemeCharValue(left) && isSchemeCharValue(right)) {
+    return left.value === right.value;
+  }
+
+  if (isEmptyList(left) && isEmptyList(right)) {
+    return true;
+  }
+
+  if (isPair(left) && isPair(right)) {
+    return isEqual(left.car, right.car) && isEqual(left.cdr, right.cdr);
+  }
+
+  if (isProcedure(left) && isProcedure(right)) {
+    return left === right;
+  }
+
+  return left.kind === 'void' && right.kind === 'void';
+}
+
+function isProperList(value: Value): boolean {
+  let current = value;
+
+  while (isPair(current)) {
+    current = current.cdr;
+  }
+
+  return isEmptyList(current);
+}
+
 function isTruthy(value: Value): boolean {
   return value !== false;
 }
@@ -1388,4 +1827,12 @@ function parseStringNumber(value: string): number | false {
 
 function isWhitespace(ch: string): boolean {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+}
+
+function isAlphabeticChar(value: string): boolean {
+  return /^[A-Za-z]$/.test(value);
+}
+
+function isNumericChar(value: string): boolean {
+  return /^[0-9]$/.test(value);
 }
