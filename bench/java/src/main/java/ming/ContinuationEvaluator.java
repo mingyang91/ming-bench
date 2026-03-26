@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 final class ContinuationEvaluator {
-    private record Binding(String name, Expr valueExpression) {
+    record Binding(String name, Expr valueExpression) {
     }
 
     static final class WindFrame {
@@ -197,10 +197,15 @@ final class ContinuationEvaluator {
                 case "set!" -> evalSet(arguments, environment, continuation);
                 case "if" -> evalIf(arguments, environment, continuation);
                 case "quote" -> evalQuote(arguments, continuation);
+                case "quasiquote" -> new ReturnValueState(owner.evalQuasiquote(arguments, environment), continuation);
                 case "lambda" -> evalLambda(arguments, environment, continuation);
                 case "begin" -> evaluateSequence(arguments, environment, continuation);
                 case "cond" -> evalCond(arguments, environment, continuation);
+                case "case" -> evalCase(arguments, environment, continuation);
                 case "let" -> evalLet(arguments, environment, continuation, listExpr.line(), listExpr.column());
+                case "let*" -> evalLetStar(arguments, environment, continuation);
+                case "letrec" -> evalLetRec(arguments, environment, continuation, false);
+                case "letrec*" -> evalLetRec(arguments, environment, continuation, true);
                 case "and" -> evalAnd(arguments, environment, continuation);
                 case "or" -> evalOr(arguments, environment, continuation);
                 case "guard" -> evalGuard(arguments, environment, continuation, listExpr.line(), listExpr.column());
@@ -545,12 +550,56 @@ final class ContinuationEvaluator {
                     if (condKont.clauseElements().size() == 1) {
                         yield new ReturnValueState(value, condKont.next());
                     }
+                    if (isCondArrowClause(condKont.clauseElements())) {
+                        Expr recipientExpression = condKont.clauseElements().get(2);
+                        yield new EvalExprState(
+                                recipientExpression,
+                                condKont.environment(),
+                                new CondArrowApplyKont(
+                                        value,
+                                        condKont.next(),
+                                        recipientExpression.line(),
+                                        recipientExpression.column()));
+                    }
                     yield evaluateSequence(
                             condKont.clauseElements().subList(1, condKont.clauseElements().size()),
                             condKont.environment(),
                             condKont.next());
                 }
                 yield evalCond(condKont.remainingClauses(), condKont.environment(), condKont.next());
+            }
+            case CaseKeyKont caseKeyKont ->
+                    evalCaseClauses(value, caseKeyKont.clauses(), caseKeyKont.environment(), caseKeyKont.next());
+            case CondArrowApplyKont condArrowApplyKont ->
+                    applyProcedure(
+                            value,
+                            List.of(condArrowApplyKont.argument()),
+                            condArrowApplyKont.next(),
+                            condArrowApplyKont.line(),
+                            condArrowApplyKont.column());
+            case LetStarBindKont letStarBindKont -> {
+                letStarBindKont.environment().define(letStarBindKont.name(), value);
+                yield evalLetStarBindings(
+                        letStarBindKont.remainingBindings(),
+                        letStarBindKont.body(),
+                        letStarBindKont.environment(),
+                        letStarBindKont.next());
+            }
+            case LetRecBindKont letRecBindKont -> {
+                List<Value> evaluatedValues = new ArrayList<>(letRecBindKont.evaluatedValues());
+                evaluatedValues.add(value);
+                if (letRecBindKont.sequential()) {
+                    letRecBindKont.cells().get(letRecBindKont.index()).set(value);
+                }
+                yield evalLetRecBindings(
+                        letRecBindKont.bindings(),
+                        letRecBindKont.cells(),
+                        letRecBindKont.sequential(),
+                        letRecBindKont.index() + 1,
+                        evaluatedValues,
+                        letRecBindKont.body(),
+                        letRecBindKont.environment(),
+                        letRecBindKont.next());
             }
             case WithExceptionHandlerBodyKont withExceptionHandlerBodyKont -> {
                 if (activeHandlers == withExceptionHandlerBodyKont.handlerFrame()) {
@@ -585,6 +634,17 @@ final class ContinuationEvaluator {
                 if (value.isTruthy()) {
                     if (guardCondKont.clauseElements().size() == 1) {
                         yield new ReturnValueState(value, guardCondKont.next());
+                    }
+                    if (isCondArrowClause(guardCondKont.clauseElements())) {
+                        Expr recipientExpression = guardCondKont.clauseElements().get(2);
+                        yield new EvalExprState(
+                                recipientExpression,
+                                guardCondKont.environment(),
+                                new CondArrowApplyKont(
+                                        value,
+                                        guardCondKont.next(),
+                                        recipientExpression.line(),
+                                        recipientExpression.column()));
                     }
                     yield evaluateSequence(
                             guardCondKont.clauseElements().subList(1, guardCondKont.clauseElements().size()),
@@ -810,6 +870,62 @@ final class ContinuationEvaluator {
                 new CondKont(clauseElements, clauses.subList(1, clauses.size()), environment, continuation));
     }
 
+    private MachineState evalCase(List<Expr> arguments,
+                                  Environment environment,
+                                  Kont continuation) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw new EvalError("case expected a key and at least one clause");
+        }
+
+        return new EvalExprState(
+                arguments.getFirst(),
+                environment,
+                new CaseKeyKont(arguments.subList(1, arguments.size()), environment, continuation));
+    }
+
+    private MachineState evalCaseClauses(Value key,
+                                         List<Expr> clauses,
+                                         Environment environment,
+                                         Kont continuation) throws EvalError {
+        for (int i = 0; i < clauses.size(); i++) {
+            Expr clauseExpression = clauses.get(i);
+            if (!(clauseExpression instanceof ListExpr clauseList)) {
+                throw new EvalError("case clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clauseList.elements();
+            if (clauseElements.isEmpty()) {
+                throw new EvalError("case clause cannot be empty");
+            }
+
+            Expr datumsExpression = clauseElements.getFirst();
+            if (datumsExpression instanceof SymbolExpr symbolExpr && "else".equals(symbolExpr.name())) {
+                if (i != clauses.size() - 1) {
+                    throw new EvalError("case else clause must be last");
+                }
+                if (clauseElements.size() == 1) {
+                    throw new EvalError("case else clause expected a body");
+                }
+                return evaluateSequence(clauseElements.subList(1, clauseElements.size()), environment, continuation);
+            }
+
+            if (!(datumsExpression instanceof ListExpr datumsList)) {
+                throw new EvalError("case clause expected a datum list");
+            }
+
+            for (Expr datum : datumsList.elements()) {
+                if (eqvValue(key, quote(datum))) {
+                    if (clauseElements.size() == 1) {
+                        return new ReturnValueState(VoidValue.INSTANCE, continuation);
+                    }
+                    return evaluateSequence(clauseElements.subList(1, clauseElements.size()), environment, continuation);
+                }
+            }
+        }
+
+        return new ReturnValueState(VoidValue.INSTANCE, continuation);
+    }
+
     private MachineState evalGuardClauses(List<Expr> clauses,
                                           Environment environment,
                                           Value exceptionValue,
@@ -918,6 +1034,89 @@ final class ContinuationEvaluator {
                 continuation,
                 line,
                 column);
+    }
+
+    private MachineState evalLetStar(List<Expr> arguments,
+                                     Environment environment,
+                                     Kont continuation) throws EvalError {
+        if (arguments.size() < 2) {
+            throw new EvalError("let* expected bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(arguments.getFirst(), "let*");
+        return evalLetStarBindings(
+                bindings,
+                arguments.subList(1, arguments.size()),
+                new Environment(environment),
+                continuation);
+    }
+
+    private MachineState evalLetStarBindings(List<Binding> bindings,
+                                             List<Expr> body,
+                                             Environment environment,
+                                             Kont continuation) throws EvalError {
+        if (bindings.isEmpty()) {
+            return evaluateSequence(body, environment, continuation);
+        }
+
+        Binding binding = bindings.getFirst();
+        return new EvalExprState(
+                binding.valueExpression(),
+                environment,
+                new LetStarBindKont(binding.name(), bindings.subList(1, bindings.size()), body, environment, continuation));
+    }
+
+    private MachineState evalLetRec(List<Expr> arguments,
+                                    Environment environment,
+                                    Kont continuation,
+                                    boolean sequential) throws EvalError {
+        String formName = sequential ? "letrec*" : "letrec";
+        if (arguments.size() < 2) {
+            throw new EvalError(formName + " expected bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(arguments.getFirst(), formName);
+        Environment localEnvironment = new Environment(environment);
+        List<BindingCell> cells = new ArrayList<>(bindings.size());
+
+        for (Binding binding : bindings) {
+            BindingCell cell = new BindingCell(UninitializedValue.INSTANCE);
+            localEnvironment.defineCell(binding.name(), cell);
+            cells.add(cell);
+        }
+
+        return evalLetRecBindings(
+                bindings,
+                cells,
+                sequential,
+                0,
+                new ArrayList<>(bindings.size()),
+                arguments.subList(1, arguments.size()),
+                localEnvironment,
+                continuation);
+    }
+
+    private MachineState evalLetRecBindings(List<Binding> bindings,
+                                            List<BindingCell> cells,
+                                            boolean sequential,
+                                            int index,
+                                            List<Value> evaluatedValues,
+                                            List<Expr> body,
+                                            Environment environment,
+                                            Kont continuation) throws EvalError {
+        if (index >= bindings.size()) {
+            if (!sequential) {
+                for (int i = 0; i < cells.size(); i++) {
+                    cells.get(i).set(evaluatedValues.get(i));
+                }
+            }
+            return evaluateSequence(body, environment, continuation);
+        }
+
+        return new EvalExprState(
+                bindings.get(index).valueExpression(),
+                environment,
+                new LetRecBindKont(bindings, cells, sequential, index, evaluatedValues, body, environment, continuation));
     }
 
     private MachineState evalAnd(List<Expr> arguments,
@@ -1144,14 +1343,80 @@ final class ContinuationEvaluator {
             case StringExpr stringExpr -> new StringValue(stringExpr.value(), false);
             case CharExpr charExpr -> new CharValue(charExpr.value());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
-            case ListExpr listExpr -> {
-                List<Value> elements = new ArrayList<>(listExpr.elements().size());
-                for (Expr element : listExpr.elements()) {
-                    elements.add(quote(element));
-                }
-                yield SchemeLists.fromElements(elements);
-            }
+            case ListExpr listExpr -> quoteList(listExpr.elements());
         };
+    }
+
+    private Value quoteList(List<Expr> elements) throws EvalError {
+        int dotIndex = dottedTailIndex(elements);
+        if (dotIndex < 0) {
+            List<Value> quotedElements = new ArrayList<>(elements.size());
+            for (Expr element : elements) {
+                quotedElements.add(quote(element));
+            }
+            return SchemeLists.fromElements(quotedElements);
+        }
+
+        Value tail = quote(elements.getLast());
+        for (int i = dotIndex - 1; i >= 0; i--) {
+            tail = new PairValue(quote(elements.get(i)), tail);
+        }
+        return tail;
+    }
+
+    private boolean isCondArrowClause(List<Expr> clauseElements) {
+        return clauseElements.size() == 3
+                && clauseElements.get(1) instanceof SymbolExpr symbolExpr
+                && "=>".equals(symbolExpr.name());
+    }
+
+    private int dottedTailIndex(List<Expr> elements) throws EvalError {
+        int dotIndex = -1;
+        for (int i = 0; i < elements.size(); i++) {
+            if (elements.get(i) instanceof SymbolExpr symbolExpr && ".".equals(symbolExpr.name())) {
+                if (dotIndex >= 0) {
+                    throw new EvalError("invalid dotted list");
+                }
+                dotIndex = i;
+            }
+        }
+
+        if (dotIndex < 0) {
+            return -1;
+        }
+        if (dotIndex == 0 || dotIndex != elements.size() - 2) {
+            throw new EvalError("invalid dotted list");
+        }
+        return dotIndex;
+    }
+
+    private boolean eqValue(Value left, Value right) {
+        if (left == right) {
+            return true;
+        }
+        if (Numbers.equals(left, right)) {
+            return true;
+        }
+        if (left instanceof BoolValue leftBool && right instanceof BoolValue rightBool) {
+            return leftBool.value() == rightBool.value();
+        }
+        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
+            return leftChar.value() == rightChar.value();
+        }
+        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
+            return leftSymbol.name().equals(rightSymbol.name());
+        }
+        return false;
+    }
+
+    private boolean eqvValue(Value left, Value right) {
+        if (eqValue(left, right)) {
+            return true;
+        }
+        return left instanceof ListValue leftList
+                && right instanceof ListValue rightList
+                && leftList.elements().isEmpty()
+                && rightList.elements().isEmpty();
     }
 
     private void requireExactArity(String name, int actual, int expected) throws EvalError {
@@ -1163,7 +1428,7 @@ final class ContinuationEvaluator {
 
 sealed interface Kont permits HaltKont, SequenceKont, IfKont, DefineKont, SetKont,
         ApplyOperatorKont, ApplyArgsKont, CallWithValuesProducerKont, CallCcReturnKont,
-        AndKont, OrKont, CondKont,
+        AndKont, OrKont, CondKont, CaseKeyKont, CondArrowApplyKont, LetStarBindKont, LetRecBindKont,
         WithExceptionHandlerBodyKont, GuardBodyKont,
         ExceptionHandlerInvokeKont, GuardHandlerInvokeKont, GuardCondKont,
         DynamicWindInExprKont, DynamicWindBodyExprKont, DynamicWindOutExprKont,
@@ -1222,6 +1487,32 @@ record CondKont(List<Expr> clauseElements,
                 List<Expr> remainingClauses,
                 Environment environment,
                 Kont next) implements Kont {
+}
+
+record CaseKeyKont(List<Expr> clauses, Environment environment, Kont next) implements Kont {
+}
+
+record CondArrowApplyKont(Value argument,
+                          Kont next,
+                          int line,
+                          int column) implements Kont {
+}
+
+record LetStarBindKont(String name,
+                       List<ContinuationEvaluator.Binding> remainingBindings,
+                       List<Expr> body,
+                       Environment environment,
+                       Kont next) implements Kont {
+}
+
+record LetRecBindKont(List<ContinuationEvaluator.Binding> bindings,
+                      List<BindingCell> cells,
+                      boolean sequential,
+                      int index,
+                      List<Value> evaluatedValues,
+                      List<Expr> body,
+                      Environment environment,
+                      Kont next) implements Kont {
 }
 
 record WithExceptionHandlerBodyKont(ContinuationEvaluator.ProcedureExceptionHandlerFrame handlerFrame,

@@ -41,6 +41,8 @@ final class Parser {
             case '(' -> parseList();
             case '"' -> parseString();
             case '\'' -> parseQuote();
+            case '`' -> parseQuasiquote();
+            case ',' -> parseUnquote();
             case ')' -> throw error("unexpected ')'");
             default -> parseAtom();
         };
@@ -63,6 +65,31 @@ final class Parser {
         advance();
         return new ListExpr(
                 List.of(new SymbolExpr("syntax", startLine, startColumn), parseExpr()),
+                startLine,
+                startColumn);
+    }
+
+    private Expr parseQuasiquote() throws EvalError {
+        int startLine = line;
+        int startColumn = column;
+        advance();
+        return new ListExpr(
+                List.of(new SymbolExpr("quasiquote", startLine, startColumn), parseExpr()),
+                startLine,
+                startColumn);
+    }
+
+    private Expr parseUnquote() throws EvalError {
+        int startLine = line;
+        int startColumn = column;
+        advance();
+        String name = "unquote";
+        if (!isAtEnd() && peek() == '@') {
+            advance();
+            name = "unquote-splicing";
+        }
+        return new ListExpr(
+                List.of(new SymbolExpr(name, startLine, startColumn), parseExpr()),
                 startLine,
                 startColumn);
     }

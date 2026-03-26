@@ -250,7 +250,10 @@ public class Evaluator {
         environment.define("list-ref", new PrimitiveProcedureValue("list-ref", this::applyListRef));
         environment.define("list-tail", new PrimitiveProcedureValue("list-tail", this::applyListTail));
         environment.define("assoc", new PrimitiveProcedureValue("assoc", this::applyAssoc));
+        environment.define("assq", new PrimitiveProcedureValue("assq", this::applyAssq));
         environment.define("assv", new PrimitiveProcedureValue("assv", this::applyAssv));
+        environment.define("memq", new PrimitiveProcedureValue("memq", this::applyMemq));
+        environment.define("memv", new PrimitiveProcedureValue("memv", this::applyMemv));
         environment.define("member", new PrimitiveProcedureValue("member", this::applyMember));
         environment.define("apply", new PrimitiveProcedureValue("apply", this::applyApply));
         environment.define("map", new PrimitiveProcedureValue("map", this::applyMap));
@@ -353,6 +356,7 @@ public class Evaluator {
                 case "set!" -> new TailCallValue(evalSet(arguments, environment));
                 case "if" -> evalTailIf(arguments, environment);
                 case "quote" -> new TailCallValue(evalQuote(arguments));
+                case "quasiquote" -> new TailCallValue(evalQuasiquote(arguments, environment));
                 case "syntax" -> new TailCallValue(evalSyntax(arguments));
                 case "syntax-case" -> new TailCallValue(evalSyntaxCase(arguments, environment));
                 case "with-syntax" -> new TailCallValue(evalWithSyntax(arguments, environment));
@@ -412,6 +416,7 @@ public class Evaluator {
                 case "set!" -> evalSet(arguments, environment);
                 case "if" -> evalIf(arguments, environment);
                 case "quote" -> evalQuote(arguments);
+                case "quasiquote" -> evalQuasiquote(arguments, environment);
                 case "syntax" -> evalSyntax(arguments);
                 case "syntax-case" -> evalSyntaxCase(arguments, environment);
                 case "with-syntax" -> evalWithSyntax(arguments, environment);
@@ -534,6 +539,10 @@ public class Evaluator {
             if (testValue.isTruthy()) {
                 if (clauseElements.size() == 1) {
                     return new TailCallValue(testValue);
+                }
+                if (isCondArrowClause(clauseElements)) {
+                    Value recipient = eval(clauseElements.get(2), environment);
+                    return applyProcedureTailValue(recipient, List.of(testValue));
                 }
                 return new TailCallSequence(clauseElements.subList(1, clauseElements.size()), environment);
             }
@@ -939,6 +948,11 @@ public class Evaluator {
         return quote(arguments.getFirst());
     }
 
+    Value evalQuasiquote(List<Expr> arguments, Environment environment) throws EvalError {
+        requireExactArity("quasiquote", arguments.size(), 1);
+        return evalQuasiquote(arguments.getFirst(), environment, 1);
+    }
+
     private Value evalSyntax(List<Expr> arguments) throws EvalError {
         requireExactArity("syntax", arguments.size(), 1);
         Expr template = arguments.getFirst();
@@ -1113,11 +1127,21 @@ public class Evaluator {
                 if (clauseElements.size() == 1) {
                     return testValue;
                 }
+                if (isCondArrowClause(clauseElements)) {
+                    Value recipient = eval(clauseElements.get(2), environment);
+                    return applyProcedureValue(recipient, List.of(testValue));
+                }
                 return evalSequence(clauseElements.subList(1, clauseElements.size()), environment);
             }
         }
 
         return VoidValue.INSTANCE;
+    }
+
+    private boolean isCondArrowClause(List<Expr> clauseElements) {
+        return clauseElements.size() == 3
+                && clauseElements.get(1) instanceof SymbolExpr symbolExpr
+                && "=>".equals(symbolExpr.name());
     }
 
     private Value evalLet(List<Expr> arguments, Environment environment) throws EvalError {
@@ -2094,14 +2118,126 @@ public class Evaluator {
             case StringExpr stringExpr -> new StringValue(stringExpr.value(), false);
             case CharExpr charExpr -> new CharValue(charExpr.value());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
-            case ListExpr listExpr -> {
-                List<Value> elements = new ArrayList<>(listExpr.elements().size());
-                for (Expr element : listExpr.elements()) {
-                    elements.add(quote(element));
-                }
-                yield SchemeLists.fromElements(elements);
-            }
+            case ListExpr listExpr -> quoteList(listExpr.elements());
         };
+    }
+
+    private Value quoteList(List<Expr> elements) throws EvalError {
+        int dotIndex = dottedTailIndex(elements);
+        if (dotIndex < 0) {
+            List<Value> quotedElements = new ArrayList<>(elements.size());
+            for (Expr element : elements) {
+                quotedElements.add(quote(element));
+            }
+            return SchemeLists.fromElements(quotedElements);
+        }
+
+        Value tail = quote(elements.getLast());
+        for (int i = dotIndex - 1; i >= 0; i--) {
+            tail = new PairValue(quote(elements.get(i)), tail);
+        }
+        return tail;
+    }
+
+    private Value evalQuasiquote(Expr expression,
+                                 Environment environment,
+                                 int depth) throws EvalError {
+        if (expression instanceof ListExpr listExpr) {
+            List<Expr> elements = listExpr.elements();
+            if (isTaggedForm(elements, "unquote")) {
+                requireTaggedArity("unquote", elements, 1);
+                if (depth == 1) {
+                    return eval(elements.get(1), environment);
+                }
+                return SchemeLists.fromElements(List.of(
+                        new SymbolValue("unquote"),
+                        evalQuasiquote(elements.get(1), environment, depth - 1)));
+            }
+            if (isTaggedForm(elements, "unquote-splicing")) {
+                requireTaggedArity("unquote-splicing", elements, 1);
+                if (depth == 1) {
+                    throw new EvalError("unquote-splicing expected within list");
+                }
+                return SchemeLists.fromElements(List.of(
+                        new SymbolValue("unquote-splicing"),
+                        evalQuasiquote(elements.get(1), environment, depth - 1)));
+            }
+            if (isTaggedForm(elements, "quasiquote")) {
+                requireTaggedArity("quasiquote", elements, 1);
+                return SchemeLists.fromElements(List.of(
+                        new SymbolValue("quasiquote"),
+                        evalQuasiquote(elements.get(1), environment, depth + 1)));
+            }
+            return evalQuasiquoteList(elements, environment, depth);
+        }
+
+        return quote(expression);
+    }
+
+    private Value evalQuasiquoteList(List<Expr> elements,
+                                     Environment environment,
+                                     int depth) throws EvalError {
+        int dotIndex = dottedTailIndex(elements);
+        int prefixLength = dotIndex < 0 ? elements.size() : dotIndex;
+        Value tail = dotIndex < 0
+                ? SchemeLists.fromElements(List.of())
+                : evalQuasiquote(elements.getLast(), environment, depth);
+
+        for (int i = prefixLength - 1; i >= 0; i--) {
+            Expr element = elements.get(i);
+            if (isSplicingForm(element) && depth == 1) {
+                ListExpr splicingExpression = (ListExpr) element;
+                Value spliced = eval(splicingExpression.elements().get(1), environment);
+                List<Value> values = expectList(spliced, "quasiquote");
+                for (int j = values.size() - 1; j >= 0; j--) {
+                    tail = new PairValue(values.get(j), tail);
+                }
+                continue;
+            }
+            tail = new PairValue(evalQuasiquote(element, environment, depth), tail);
+        }
+        return tail;
+    }
+
+    private boolean isTaggedForm(List<Expr> elements, String name) {
+        return elements.size() == 2
+                && elements.getFirst() instanceof SymbolExpr symbolExpr
+                && name.equals(symbolExpr.name());
+    }
+
+    private boolean isSplicingForm(Expr expression) {
+        return expression instanceof ListExpr listExpr
+                && isTaggedForm(listExpr.elements(), "unquote-splicing");
+    }
+
+    private void requireTaggedArity(String name, List<Expr> elements, int expectedArguments) throws EvalError {
+        if (elements.size() != expectedArguments + 1) {
+            throw new EvalError(name + " expected " + expectedArguments + " argument(s)");
+        }
+    }
+
+    private int dottedTailIndex(List<Expr> elements) throws EvalError {
+        int dotIndex = -1;
+        for (int i = 0; i < elements.size(); i++) {
+            if (isDotSymbol(elements.get(i))) {
+                if (dotIndex >= 0) {
+                    throw new EvalError("invalid dotted list");
+                }
+                dotIndex = i;
+            }
+        }
+
+        if (dotIndex < 0) {
+            return -1;
+        }
+        if (dotIndex == 0 || dotIndex != elements.size() - 2) {
+            throw new EvalError("invalid dotted list");
+        }
+        return dotIndex;
+    }
+
+    private boolean isDotSymbol(Expr expression) {
+        return expression instanceof SymbolExpr symbolExpr && ".".equals(symbolExpr.name());
     }
 
     private Value evalAnd(List<Expr> arguments, Environment environment) throws EvalError {
@@ -2163,11 +2299,20 @@ public class Evaluator {
     }
 
     private Value applyAppend(List<Value> arguments) throws EvalError {
-        List<Value> appended = new ArrayList<>();
-        for (Value argument : arguments) {
-            appended.addAll(expectList(argument, "append"));
+        if (arguments.isEmpty()) {
+            return SchemeLists.fromElements(List.of());
         }
-        return SchemeLists.fromElements(appended);
+
+        List<Value> prefixElements = new ArrayList<>();
+        for (int i = 0; i < arguments.size() - 1; i++) {
+            prefixElements.addAll(expectList(arguments.get(i), "append"));
+        }
+
+        Value result = arguments.getLast();
+        for (int i = prefixElements.size() - 1; i >= 0; i--) {
+            result = new PairValue(prefixElements.get(i), result);
+        }
+        return result;
     }
 
     private Value applyReverse(List<Value> arguments) throws EvalError {
@@ -2330,6 +2475,18 @@ public class Evaluator {
         return new BoolValue(false);
     }
 
+    private Value applyAssq(List<Value> arguments) throws EvalError {
+        requireExactArity("assq", arguments.size(), 2);
+        Value key = arguments.getFirst();
+        List<Value> entries = expectList(arguments.get(1), "assq");
+        for (Value entry : entries) {
+            if (eqValue(key, car(entry, "assq"))) {
+                return entry;
+            }
+        }
+        return new BoolValue(false);
+    }
+
     private Value applyMember(List<Value> arguments) throws EvalError {
         requireExactArity("member", arguments.size(), 2);
         Value key = arguments.getFirst();
@@ -2352,6 +2509,54 @@ public class Evaluator {
         }
 
         throw new EvalError("member expects list arguments");
+    }
+
+    private Value applyMemq(List<Value> arguments) throws EvalError {
+        requireExactArity("memq", arguments.size(), 2);
+        Value key = arguments.getFirst();
+        Value current = arguments.get(1);
+
+        while (current instanceof PairValue pairValue) {
+            if (eqValue(key, pairValue.car())) {
+                return current;
+            }
+            current = pairValue.cdr();
+        }
+
+        if (current instanceof ListValue listValue) {
+            for (int i = 0; i < listValue.elements().size(); i++) {
+                if (eqValue(key, listValue.elements().get(i))) {
+                    return SchemeLists.fromElements(listValue.elements().subList(i, listValue.elements().size()));
+                }
+            }
+            return new BoolValue(false);
+        }
+
+        throw new EvalError("memq expects list arguments");
+    }
+
+    private Value applyMemv(List<Value> arguments) throws EvalError {
+        requireExactArity("memv", arguments.size(), 2);
+        Value key = arguments.getFirst();
+        Value current = arguments.get(1);
+
+        while (current instanceof PairValue pairValue) {
+            if (eqvValue(key, pairValue.car())) {
+                return current;
+            }
+            current = pairValue.cdr();
+        }
+
+        if (current instanceof ListValue listValue) {
+            for (int i = 0; i < listValue.elements().size(); i++) {
+                if (eqvValue(key, listValue.elements().get(i))) {
+                    return SchemeLists.fromElements(listValue.elements().subList(i, listValue.elements().size()));
+                }
+            }
+            return new BoolValue(false);
+        }
+
+        throw new EvalError("memv expects list arguments");
     }
 
     private Value applyDisplay(List<Value> arguments) throws EvalError {
@@ -3179,6 +3384,7 @@ public class Evaluator {
             case CharValue charValue -> new CharExpr(charValue.value(), line, column);
             case SymbolValue symbolValue -> new SymbolExpr(symbolValue.name(), line, column);
             case SyntaxValue syntaxValue -> syntaxValue.expression();
+            case PairValue pairValue -> pairDatumToExpr(pairValue, line, column);
             default -> {
                 List<Value> values = expectList(datum, "datum->syntax");
                 List<Expr> expressions = new ArrayList<>(values.size());
@@ -3188,6 +3394,28 @@ public class Evaluator {
                 yield new ListExpr(List.copyOf(expressions), line, column);
             }
         };
+    }
+
+    private Expr pairDatumToExpr(PairValue pairValue, int line, int column) throws EvalError {
+        List<Expr> expressions = new ArrayList<>();
+        IdentityHashMap<PairValue, Boolean> seenPairs = new IdentityHashMap<>();
+        Value current = pairValue;
+
+        while (current instanceof PairValue currentPair) {
+            if (seenPairs.put(currentPair, Boolean.TRUE) != null) {
+                throw new EvalError("datum->syntax expected acyclic pair data");
+            }
+            expressions.add(datumToExpr(currentPair.car(), line, column));
+            current = currentPair.cdr();
+        }
+
+        if (SchemeLists.isEmpty(current)) {
+            return new ListExpr(List.copyOf(expressions), line, column);
+        }
+
+        expressions.add(new SymbolExpr(".", line, column));
+        expressions.add(datumToExpr(current, line, column));
+        return new ListExpr(List.copyOf(expressions), line, column);
     }
 
     private boolean eqValue(Value left, Value right) {
