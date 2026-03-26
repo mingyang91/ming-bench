@@ -108,6 +108,8 @@ pub(super) fn initial_env() -> EnvRef {
         Builtin::StringCiEqual,
         Builtin::StringUpcase,
         Builtin::StringDowncase,
+        Builtin::Raise,
+        Builtin::WithExceptionHandler,
         Builtin::DynamicWind,
         Builtin::Apply,
         Builtin::CallCc,

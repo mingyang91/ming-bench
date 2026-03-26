@@ -14,13 +14,14 @@ mod records;
 use builtins::eqv_values;
 use continuation_runtime::{apply_cps, CpsRuntime, CpsRuntimeRef};
 pub use error::EvalError;
+use error::SourcePos;
 use evaluator::{
     apply, build_case_lambda, build_lambda, case_lambda_clauses, eval_define_syntax, eval_quote,
     eval_sequence, lambda_parts, new_procedure, parse_do_bindings, parse_do_test_clause,
     parse_let_bindings, parse_param_list, quote_expr, wrong_arg_count, DoLoopState,
 };
 use macros::{env_with_expansion_aliases, expand_macro_call};
-use model::{ContinuationProc, Env, EnvRef, Expr, Params, SchemeString, Value};
+use model::{fresh_identifier, ContinuationProc, Env, EnvRef, Expr, Params, SchemeString, Value};
 use parser::Parser;
 use records::eval_define_record_type;
 
@@ -88,6 +89,7 @@ fn terminal_continuation() -> Continuation {
 fn run_cps_program(exprs: Vec<Expr>, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
     let runtime = CpsRuntime::new();
     runtime.reset_winders();
+    runtime.reset_handlers();
 
     let mut work = CpsWork::EvalSequence {
         exprs,
@@ -121,6 +123,7 @@ fn run_cps_program(exprs: Vec<Expr>, env: EnvRef, output: &mut String) -> Result
     };
 
     runtime.reset_winders();
+    runtime.reset_handlers();
     result
 }
 
@@ -133,7 +136,12 @@ fn expr_uses_continuations(expr: &Expr) -> bool {
         Expr::Symbol(name, _) => {
             matches!(
                 name.as_str(),
-                "call/cc" | "call-with-current-continuation" | "dynamic-wind"
+                "call/cc"
+                    | "call-with-current-continuation"
+                    | "dynamic-wind"
+                    | "guard"
+                    | "raise"
+                    | "with-exception-handler"
             )
         }
         Expr::List(items, _) => items.iter().any(expr_uses_continuations),
@@ -282,6 +290,10 @@ fn eval_list_cps(
             "or" => return eval_or_cps(tail.to_vec(), env, output, k, runtime),
             "begin" => return eval_sequence_cps(tail.to_vec(), env, output, k, runtime),
             "cond" => return eval_cond_cps(tail.to_vec(), env, output, k, runtime),
+            "guard" => {
+                let expanded = expand_guard_form(tail, head.pos())?;
+                return eval_cps(expanded, env, output, k, runtime);
+            }
             "let" => return eval_let_cps(tail.to_vec(), env, output, k, runtime),
             "let*" => return eval_let_star_cps(tail.to_vec(), env, output, k, runtime),
             "letrec" => return eval_letrec_cps(tail.to_vec(), env, output, k, runtime, false),
@@ -329,6 +341,99 @@ fn eval_list_cps(
         }),
         runtime,
     )
+}
+
+fn expand_guard_form(args: &[Expr], pos: SourcePos) -> Result<Expr, EvalError> {
+    let [Expr::List(spec, _), body @ ..] = args else {
+        return Err(EvalError::Syntax {
+            message: "guard: invalid syntax".into(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::Syntax {
+            message: "guard: expected body".into(),
+        });
+    }
+
+    let Some((Expr::Symbol(var, var_pos), clauses)) = spec.split_first() else {
+        return Err(EvalError::Syntax {
+            message: "guard: expected variable name".into(),
+        });
+    };
+
+    let mut cond_clauses = clauses.to_vec();
+    if !guard_has_else_clause(clauses) {
+        cond_clauses.push(Expr::List(
+            vec![
+                Expr::Symbol("else".into(), pos),
+                Expr::List(
+                    vec![
+                        Expr::Symbol("raise".into(), pos),
+                        Expr::Symbol(var.clone(), *var_pos),
+                    ],
+                    pos,
+                ),
+            ],
+            pos,
+        ));
+    }
+
+    let guard_return = fresh_identifier("guard_return");
+    let cond_expr = Expr::List(
+        std::iter::once(Expr::Symbol("cond".into(), pos))
+            .chain(cond_clauses)
+            .collect(),
+        pos,
+    );
+
+    Ok(Expr::List(
+        vec![
+            Expr::Symbol("call/cc".into(), pos),
+            Expr::List(
+                vec![
+                    Expr::Symbol("lambda".into(), pos),
+                    Expr::List(vec![Expr::Symbol(guard_return.clone(), pos)], pos),
+                    Expr::List(
+                        vec![
+                            Expr::Symbol("with-exception-handler".into(), pos),
+                            Expr::List(
+                                vec![
+                                    Expr::Symbol("lambda".into(), pos),
+                                    Expr::List(vec![Expr::Symbol(var.clone(), *var_pos)], pos),
+                                    Expr::List(
+                                        vec![Expr::Symbol(guard_return, pos), cond_expr],
+                                        pos,
+                                    ),
+                                ],
+                                pos,
+                            ),
+                            Expr::List(
+                                std::iter::once(Expr::Symbol("lambda".into(), pos))
+                                    .chain(std::iter::once(Expr::List(Vec::new(), pos)))
+                                    .chain(body.iter().cloned())
+                                    .collect(),
+                                pos,
+                            ),
+                        ],
+                        pos,
+                    ),
+                ],
+                pos,
+            ),
+        ],
+        pos,
+    ))
+}
+
+fn guard_has_else_clause(clauses: &[Expr]) -> bool {
+    clauses.iter().any(|clause| {
+        matches!(
+            clause,
+            Expr::List(items, _)
+                if matches!(items.first(), Some(Expr::Symbol(name, _)) if name == "else")
+        )
+    })
 }
 
 fn eval_define_cps(
@@ -634,9 +739,15 @@ fn eval_let_cps(
     runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     match args.as_slice() {
-        [Expr::Symbol(name, _), bindings, body @ ..] => {
-            eval_named_let_cps(name, bindings.clone(), body.to_vec(), env, output, k, runtime)
-        }
+        [Expr::Symbol(name, _), bindings, body @ ..] => eval_named_let_cps(
+            name,
+            bindings.clone(),
+            body.to_vec(),
+            env,
+            output,
+            k,
+            runtime,
+        ),
         [bindings, body @ ..] => {
             eval_plain_let_cps(bindings.clone(), body.to_vec(), env, output, k, runtime)
         }
@@ -733,7 +844,13 @@ fn eval_named_let_cps(
                 &let_env,
             );
             let_env.define(let_name.clone(), procedure.clone());
-            apply_cps(procedure, values, output, let_k.clone(), let_runtime.clone())
+            apply_cps(
+                procedure,
+                values,
+                output,
+                let_k.clone(),
+                let_runtime.clone(),
+            )
         }),
         runtime,
     )

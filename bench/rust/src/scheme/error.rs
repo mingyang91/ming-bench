@@ -111,6 +111,9 @@ pub enum EvalError {
     #[error("application: expected procedure, got {got}")]
     NotAProcedure { got: String },
 
+    #[error("uncaught exception: {value}")]
+    UncaughtException { value: String },
+
     #[error("internal continuation jump")]
     ContinuationJump { jump: ContinuationJumpData },
 }
@@ -232,6 +235,9 @@ impl PartialEq for EvalError {
                 },
             ) => left_name == right_name && left_code == right_code,
             (Self::NotAProcedure { got: left }, Self::NotAProcedure { got: right }) => {
+                left == right
+            }
+            (Self::UncaughtException { value: left }, Self::UncaughtException { value: right }) => {
                 left == right
             }
             (Self::ContinuationJump { .. }, Self::ContinuationJump { .. }) => false,

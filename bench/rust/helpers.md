@@ -10,7 +10,9 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### expand_guard_form (src/scheme/mod.rs:346) — Lower `guard` into `call/cc` plus `with-exception-handler`
+### raise_cps (src/scheme/continuation_runtime.rs:251) — Unwind to the active exception handler and apply it
+### apply_with_exception_handler_cps (src/scheme/continuation_runtime.rs:283) — Install a dynamic exception handler around a thunk in CPS
 
 ## Python Helpers (scripts/)
 

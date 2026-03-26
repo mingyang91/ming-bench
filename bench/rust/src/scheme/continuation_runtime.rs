@@ -4,13 +4,14 @@ use std::rc::Rc;
 
 use super::builtins::apply_builtin;
 use super::error::{ContinuationJumpData, EvalError};
+use super::eval_sequence_cps;
 use super::evaluator::wrong_arg_count;
 use super::model::{list_from_values, Builtin, ContinuationProc, Env, Procedure, Value};
 use super::records::apply_record_procedure;
-use super::eval_sequence_cps;
 
 type Continuation = ContinuationProc;
 type WindFrameRef = Rc<WindFrame>;
+type ExceptionHandlerFrameRef = Rc<ExceptionHandlerFrame>;
 
 #[derive(Clone)]
 struct WindFrame {
@@ -18,11 +19,19 @@ struct WindFrame {
     out_thunk: Value,
 }
 
+#[derive(Clone)]
+struct ExceptionHandlerFrame {
+    handler: Value,
+    return_k: Continuation,
+    winders: Vec<WindFrameRef>,
+}
+
 pub(super) type CpsRuntimeRef = Rc<CpsRuntime>;
 
 #[derive(Default)]
 pub(super) struct CpsRuntime {
     winders: RefCell<Vec<WindFrameRef>>,
+    handlers: RefCell<Vec<ExceptionHandlerFrameRef>>,
 }
 
 impl CpsRuntime {
@@ -32,6 +41,10 @@ impl CpsRuntime {
 
     pub(super) fn reset_winders(&self) {
         self.winders.borrow_mut().clear();
+    }
+
+    pub(super) fn reset_handlers(&self) {
+        self.handlers.borrow_mut().clear();
     }
 
     fn current_winders(&self) -> Vec<WindFrameRef> {
@@ -46,6 +59,24 @@ impl CpsRuntime {
         let mut winders = self.winders.borrow_mut();
         let current = winders.pop().expect("dynamic-wind stack is not empty");
         debug_assert!(Rc::ptr_eq(&current, frame));
+    }
+
+    fn push_handler(&self, frame: ExceptionHandlerFrameRef) {
+        self.handlers.borrow_mut().push(frame);
+    }
+
+    fn pop_handler(&self) -> Option<ExceptionHandlerFrameRef> {
+        self.handlers.borrow_mut().pop()
+    }
+
+    fn pop_handler_if_current(&self, frame: &ExceptionHandlerFrameRef) {
+        let mut handlers = self.handlers.borrow_mut();
+        if handlers
+            .last()
+            .is_some_and(|current| Rc::ptr_eq(current, frame))
+        {
+            handlers.pop();
+        }
     }
 }
 
@@ -166,6 +197,10 @@ pub(super) fn apply_cps(
     runtime: CpsRuntimeRef,
 ) -> Result<Value, EvalError> {
     match callable {
+        Value::Builtin(Builtin::Raise) => apply_raise_cps(args, output, runtime),
+        Value::Builtin(Builtin::WithExceptionHandler) => {
+            apply_with_exception_handler_cps(args, output, k, runtime)
+        }
         Value::Builtin(Builtin::CallCc) => match args.as_slice() {
             [procedure] => apply_cps(
                 procedure.clone(),
@@ -200,6 +235,87 @@ pub(super) fn apply_cps(
             got: value.type_name().into(),
         }),
     }
+}
+
+fn apply_raise_cps(
+    args: Vec<Value>,
+    output: &mut String,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
+    match args.as_slice() {
+        [value] => raise_cps(value.clone(), output, runtime),
+        _ => Err(wrong_arg_count("raise", "1", args.len())),
+    }
+}
+
+fn raise_cps(
+    value: Value,
+    output: &mut String,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
+    let Some(frame) = runtime.pop_handler() else {
+        return Err(EvalError::UncaughtException {
+            value: value.render(),
+        });
+    };
+
+    let handler = frame.handler.clone();
+    let return_k = frame.return_k.clone();
+    let target_winders = frame.winders.clone();
+    let handler_runtime = runtime.clone();
+    transition_to_winders(
+        runtime,
+        target_winders,
+        value,
+        output,
+        Rc::new(move |exception, output| {
+            apply_cps(
+                handler.clone(),
+                vec![exception],
+                output,
+                return_k.clone(),
+                handler_runtime.clone(),
+            )
+        }),
+    )
+}
+
+fn apply_with_exception_handler_cps(
+    args: Vec<Value>,
+    output: &mut String,
+    k: Continuation,
+    runtime: CpsRuntimeRef,
+) -> Result<Value, EvalError> {
+    let [handler, thunk] = args.as_slice() else {
+        return Err(wrong_arg_count("with-exception-handler", "2", args.len()));
+    };
+
+    let frame = Rc::new(ExceptionHandlerFrame {
+        handler: handler.clone(),
+        return_k: k.clone(),
+        winders: runtime.current_winders(),
+    });
+    runtime.push_handler(frame.clone());
+
+    let frame_for_normal_return = frame.clone();
+    let pop_runtime = runtime.clone();
+    let normal_k = k.clone();
+    let result = apply_cps(
+        thunk.clone(),
+        Vec::new(),
+        output,
+        Rc::new(move |value, output| {
+            pop_runtime.pop_handler_if_current(&frame_for_normal_return);
+            normal_k.clone()(value, output)
+        }),
+        runtime.clone(),
+    );
+
+    if result.is_err() {
+        runtime.pop_handler_if_current(&frame);
+    }
+
+    result
 }
 
 fn apply_procedure_cps(
