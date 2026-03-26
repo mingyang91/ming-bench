@@ -49,7 +49,26 @@ enum Value {
         rules: Vec<(Expr, Expr)>,
         def_env: Env,
     },
+    Record {
+        type_id: usize,
+        type_name: String,
+        fields: Vec<(String, Value)>,
+    },
+    RecordConstructor {
+        type_id: usize,
+        type_name: String,
+        field_names: Vec<String>,
+    },
+    RecordPredicate {
+        type_id: usize,
+    },
+    RecordAccessor {
+        type_id: usize,
+        field_name: String,
+    },
 }
+
+static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static OUTPUT: RefCell<String> = RefCell::new(String::new());
@@ -173,6 +192,10 @@ impl fmt::Display for Value {
             }
             Value::Lambda { .. } => write!(f, "#<procedure>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
+            Value::Record { type_name, .. } => write!(f, "#<record:{}>", type_name),
+            Value::RecordConstructor { type_name, .. } => write!(f, "#<procedure>"),
+            Value::RecordPredicate { .. } => write!(f, "#<procedure>"),
+            Value::RecordAccessor { .. } => write!(f, "#<procedure>"),
         }
     }
 }
@@ -673,6 +696,7 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "string-set!" => return eval_string_set(&elems[1..], env, p),
                     "set!" => return eval_set(&elems[1..], env, p),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, p),
+                    "define-record-type" => return eval_define_record_type(&elems[1..], env, p),
                     _ => {
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
                             return eval_macro(&literals, &rules, &def_env, elems, env, p);
@@ -733,6 +757,56 @@ fn apply_value(func: &Value, args: &[Value], call_pos: Pos) -> Result<Value, Eva
                 result = eval(expr, &local_env)?;
             }
             Ok(result)
+        }
+        Value::RecordConstructor { type_id, type_name, field_names } => {
+            if args.len() != field_names.len() {
+                return Err(EvalError::Arity(format!(
+                    "{} constructor expects {} arguments, got {} at {}",
+                    type_name, field_names.len(), args.len(), call_pos
+                )));
+            }
+            let fields: Vec<(String, Value)> = field_names.iter()
+                .zip(args.iter())
+                .map(|(n, v)| (n.clone(), v.clone()))
+                .collect();
+            Ok(Value::Record {
+                type_id: *type_id,
+                type_name: type_name.clone(),
+                fields,
+            })
+        }
+        Value::RecordPredicate { type_id } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "record predicate expects 1 argument, got {} at {}",
+                    args.len(), call_pos
+                )));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, .. } => Ok(Value::Boolean(*tid == *type_id)),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        Value::RecordAccessor { type_id, field_name } => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity(format!(
+                    "record accessor expects 1 argument, got {} at {}",
+                    args.len(), call_pos
+                )));
+            }
+            match &args[0] {
+                Value::Record { type_id: tid, fields, .. } if *tid == *type_id => {
+                    for (name, val) in fields {
+                        if name == field_name {
+                            return Ok(val.clone());
+                        }
+                    }
+                    Err(EvalError::Type(format!("no field {} at {}", field_name, call_pos)))
+                }
+                _ => Err(EvalError::Type(format!(
+                    "record accessor: wrong type at {}", call_pos
+                ))),
+            }
         }
         _ => Err(EvalError::Type(format!(
             "not a procedure: {} at {}",
@@ -1130,13 +1204,104 @@ fn eval_set(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     Ok(Value::Nil)
 }
 
+// --- Records (define-record-type) ---
+
+fn eval_define_record_type(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+    if args.len() < 3 {
+        return Err(EvalError::Arity(format!(
+            "define-record-type requires at least 3 arguments at {}", p
+        )));
+    }
+
+    // Parse type name
+    let _type_name = match &args[0] {
+        Expr::Symbol(s, _) => s.clone(),
+        _ => return Err(EvalError::Type(format!(
+            "define-record-type: expected type name symbol at {}", p
+        ))),
+    };
+
+    // Parse constructor: (constructor-name field1 field2 ...)
+    let (ctor_name, ctor_fields) = match &args[1] {
+        Expr::List(elems, _) if !elems.is_empty() => {
+            let name = match &elems[0] {
+                Expr::Symbol(s, _) => s.clone(),
+                _ => return Err(EvalError::Type(format!(
+                    "define-record-type: expected constructor name at {}", p
+                ))),
+            };
+            let fields: Result<Vec<String>, EvalError> = elems[1..].iter().map(|e| match e {
+                Expr::Symbol(s, _) => Ok(s.clone()),
+                _ => Err(EvalError::Type(format!(
+                    "define-record-type: expected field name at {}", p
+                ))),
+            }).collect();
+            (name, fields?)
+        }
+        _ => return Err(EvalError::Type(format!(
+            "define-record-type: expected constructor spec at {}", p
+        ))),
+    };
+
+    // Parse predicate name
+    let pred_name = match &args[2] {
+        Expr::Symbol(s, _) => s.clone(),
+        _ => return Err(EvalError::Type(format!(
+            "define-record-type: expected predicate name at {}", p
+        ))),
+    };
+
+    // Allocate unique type id
+    let type_id = RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Parse field specs: (field-name accessor-name)
+    for field_spec in &args[3..] {
+        match field_spec {
+            Expr::List(elems, _) if elems.len() >= 2 => {
+                let field_name = match &elems[0] {
+                    Expr::Symbol(s, _) => s.clone(),
+                    _ => return Err(EvalError::Type(format!(
+                        "define-record-type: expected field name at {}", p
+                    ))),
+                };
+                let accessor_name = match &elems[1] {
+                    Expr::Symbol(s, _) => s.clone(),
+                    _ => return Err(EvalError::Type(format!(
+                        "define-record-type: expected accessor name at {}", p
+                    ))),
+                };
+                env_set(env, accessor_name, Value::RecordAccessor {
+                    type_id,
+                    field_name,
+                });
+            }
+            _ => return Err(EvalError::Type(format!(
+                "define-record-type: expected field spec at {}", p
+            ))),
+        }
+    }
+
+    // Bind constructor
+    env_set(env, ctor_name, Value::RecordConstructor {
+        type_id,
+        type_name: _type_name.clone(),
+        field_names: ctor_fields,
+    });
+
+    // Bind predicate
+    env_set(env, pred_name, Value::RecordPredicate { type_id });
+
+    Ok(Value::Nil)
+}
+
 // --- Macros (syntax-rules) ---
 
 fn is_special_form(name: &str) -> bool {
     matches!(
         name,
         "define" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "begin"
-            | "cond" | "string-set!" | "set!" | "define-syntax"
+            | "cond" | "string-set!" | "set!" | "define-syntax" | "define-record-type"
     )
 }
 
