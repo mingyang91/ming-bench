@@ -5,12 +5,14 @@ type ExprBase = { pos: SourcePos };
 type NumberExpr = ExprBase & { kind: 'number'; value: number };
 type BooleanExpr = ExprBase & { kind: 'boolean'; value: boolean };
 type StringExpr = ExprBase & { kind: 'string'; value: string };
+type CharExpr = ExprBase & { kind: 'char'; value: string };
 type SymbolExpr = ExprBase & { kind: 'symbol'; name: string };
 type ListExpr = ExprBase & { kind: 'list'; elements: Expr[] };
 
-type Expr = NumberExpr | BooleanExpr | StringExpr | SymbolExpr | ListExpr;
+type Expr = NumberExpr | BooleanExpr | StringExpr | CharExpr | SymbolExpr | ListExpr;
 
 type CharValue = { kind: 'char'; value: string };
+type StringValue = { kind: 'string'; value: string; mutable: boolean };
 type SymbolValue = { kind: 'symbol'; name: string };
 type NilValue = { kind: 'nil' };
 type PairValue = { kind: 'pair'; car: RuntimeValue; cdr: RuntimeValue };
@@ -21,7 +23,7 @@ type VoidValue = { kind: 'void' };
 type RuntimeValue =
   | NumberExpr
   | BooleanExpr
-  | StringExpr
+  | StringValue
   | CharValue
   | SymbolValue
   | NilValue
@@ -73,6 +75,8 @@ const BUILTIN_NAMES = [
   'symbol->string',
   'string->symbol',
   'string-ref',
+  'string-copy',
+  'string-set!',
   'char?',
 ] as const;
 type BuiltinName = (typeof BUILTIN_NAMES)[number];
@@ -365,6 +369,10 @@ function parseAtom(token: Extract<Token, { kind: 'atom' }>): Expr {
     return { kind: 'boolean', value: false, pos: token.pos };
   }
 
+  if (token.value.startsWith('#\\')) {
+    return { kind: 'char', value: parseCharLiteral(token), pos: token.pos };
+  }
+
   if (/^[+-]?\d+$/.test(token.value)) {
     return { kind: 'number', value: Number.parseInt(token.value, 10), pos: token.pos };
   }
@@ -372,13 +380,34 @@ function parseAtom(token: Extract<Token, { kind: 'atom' }>): Expr {
   return { kind: 'symbol', name: token.value, pos: token.pos };
 }
 
+function parseCharLiteral(token: Extract<Token, { kind: 'atom' }>): string {
+  const literal = token.value.slice(2);
+
+  switch (literal) {
+    case 'space':
+      return ' ';
+    case 'newline':
+      return '\n';
+  }
+
+  const chars = stringChars(literal);
+  if (chars.length === 1) {
+    return chars[0];
+  }
+
+  throw new EvalError('invalid character literal', token.pos);
+}
+
 function evaluateExpr(expr: Expr, env: Environment, context: EvalContext): RuntimeValue {
   try {
     switch (expr.kind) {
       case 'number':
       case 'boolean':
-      case 'string':
         return expr;
+      case 'string':
+        return makeString(expr.value);
+      case 'char':
+        return makeChar(expr.value);
       case 'symbol':
         return env.lookup(expr.name);
       case 'list':
@@ -485,8 +514,11 @@ function quoteExpr(expr: Expr): RuntimeValue {
   switch (expr.kind) {
     case 'number':
     case 'boolean':
-    case 'string':
       return expr;
+    case 'string':
+      return makeString(expr.value);
+    case 'char':
+      return makeChar(expr.value);
     case 'symbol':
       return { kind: 'symbol', name: expr.name };
     case 'list':
@@ -790,14 +822,14 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       if (args.length !== 1) {
         throw new EvalError('string-length expects exactly 1 argument');
       }
-      return makeNumber(stringChars(expectString(args[0], 'string-length')).length);
+      return makeNumber(stringChars(expectStringValue(args[0], 'string-length').value).length);
     case 'substring':
       return applySubstring(args);
     case 'string->number':
       if (args.length !== 1) {
         throw new EvalError('string->number expects exactly 1 argument');
       }
-      return parseNumberString(expectString(args[0], 'string->number'));
+      return parseNumberString(expectStringValue(args[0], 'string->number').value);
     case 'number->string':
       if (args.length !== 1) {
         throw new EvalError('number->string expects exactly 1 argument');
@@ -812,9 +844,16 @@ function applyBuiltin(name: BuiltinName, args: RuntimeValue[], context: EvalCont
       if (args.length !== 1) {
         throw new EvalError('string->symbol expects exactly 1 argument');
       }
-      return { kind: 'symbol', name: expectString(args[0], 'string->symbol') };
+      return { kind: 'symbol', name: expectStringValue(args[0], 'string->symbol').value };
     case 'string-ref':
       return applyStringRef(args);
+    case 'string-copy':
+      if (args.length !== 1) {
+        throw new EvalError('string-copy expects exactly 1 argument');
+      }
+      return makeString(expectStringValue(args[0], 'string-copy').value);
+    case 'string-set!':
+      return applyStringSet(args);
     case 'char?':
       return applyTypePredicate(args, 'char?', (value) => value.kind === 'char');
   }
@@ -880,7 +919,7 @@ function applyComparison(
 }
 
 function applyStringAppend(args: RuntimeValue[]): RuntimeValue {
-  return makeString(args.map((arg) => expectString(arg, 'string-append')).join(''));
+  return makeString(args.map((arg) => expectStringValue(arg, 'string-append').value).join(''));
 }
 
 function applySubstring(args: RuntimeValue[]): RuntimeValue {
@@ -888,7 +927,7 @@ function applySubstring(args: RuntimeValue[]): RuntimeValue {
     throw new EvalError('substring expects exactly 3 arguments');
   }
 
-  const chars = stringChars(expectString(args[0], 'substring'));
+  const chars = stringChars(expectStringValue(args[0], 'substring').value);
   const start = expectIndex(args[1], 'substring');
   const end = expectIndex(args[2], 'substring');
 
@@ -904,7 +943,7 @@ function applyStringRef(args: RuntimeValue[]): RuntimeValue {
     throw new EvalError('string-ref expects exactly 2 arguments');
   }
 
-  const chars = stringChars(expectString(args[0], 'string-ref'));
+  const chars = stringChars(expectStringValue(args[0], 'string-ref').value);
   const index = expectIndex(args[1], 'string-ref');
 
   if (index >= chars.length) {
@@ -914,6 +953,29 @@ function applyStringRef(args: RuntimeValue[]): RuntimeValue {
   return makeChar(chars[index]);
 }
 
+function applyStringSet(args: RuntimeValue[]): RuntimeValue {
+  if (args.length !== 3) {
+    throw new EvalError('string-set! expects exactly 3 arguments');
+  }
+
+  const target = expectStringValue(args[0], 'string-set!');
+  const index = expectIndex(args[1], 'string-set!');
+  const char = expectChar(args[2], 'string-set!');
+  const chars = stringChars(target.value);
+
+  if (!target.mutable) {
+    throw new EvalError('string-set! expects a mutable string');
+  }
+
+  if (index >= chars.length) {
+    throw new EvalError('string-set! index out of range');
+  }
+
+  chars[index] = char.value;
+  target.value = chars.join('');
+  return VOID_VALUE;
+}
+
 function expectNumber(value: RuntimeValue, procedure: string): number {
   if (value.kind !== 'number') {
     throw new EvalError(`${procedure} expects numeric arguments`);
@@ -921,11 +983,18 @@ function expectNumber(value: RuntimeValue, procedure: string): number {
   return value.value;
 }
 
-function expectString(value: RuntimeValue, procedure: string): string {
+function expectStringValue(value: RuntimeValue, procedure: string): StringValue {
   if (value.kind !== 'string') {
     throw new EvalError(`${procedure} expects string arguments`);
   }
-  return value.value;
+  return value;
+}
+
+function expectChar(value: RuntimeValue, procedure: string): CharValue {
+  if (value.kind !== 'char') {
+    throw new EvalError(`${procedure} expects a character`);
+  }
+  return value;
 }
 
 function expectSymbol(value: RuntimeValue, procedure: string): SymbolValue {
@@ -1037,11 +1106,11 @@ function makeBoolean(value: boolean): BooleanExpr {
   };
 }
 
-function makeString(value: string): StringExpr {
+function makeString(value: string, mutable = true): StringValue {
   return {
     kind: 'string',
-    pos: DEFAULT_SOURCE_POS,
     value,
+    mutable,
   };
 }
 
