@@ -149,16 +149,25 @@ public class Evaluator {
             if (sig.isEmpty() || !(sig.get(0) instanceof String name))
                 throw new EvalError("define: bad syntax");
             List<String> params = new ArrayList<>();
+            String restParam = null;
             for (int i = 1; i < sig.size(); i++) {
                 if (!(sig.get(i) instanceof String p))
                     throw new EvalError("define: parameter must be symbol");
+                if (p.equals(".")) {
+                    if (i + 2 != sig.size())
+                        throw new EvalError("define: bad dot syntax");
+                    if (!(sig.get(i + 1) instanceof String rp))
+                        throw new EvalError("define: parameter must be symbol");
+                    restParam = rp;
+                    break;
+                }
                 params.add(p);
             }
             List<Object> body = new ArrayList<>();
             for (int i = 2; i < list.size(); i++) {
                 body.add(list.get(i));
             }
-            Lambda lambda = new Lambda(params, body, env);
+            Lambda lambda = new Lambda(params, restParam, body, env);
             env.define(name, lambda);
             return null; // void
         }
@@ -182,15 +191,24 @@ public class Evaluator {
         if (!(paramSpec instanceof List<?> paramList))
             throw new EvalError("lambda: parameters must be a list");
         List<String> params = new ArrayList<>();
-        for (Object p : paramList) {
-            if (!(p instanceof String s)) throw new EvalError("lambda: parameter must be symbol");
+        String restParam = null;
+        for (int j = 0; j < paramList.size(); j++) {
+            if (!(paramList.get(j) instanceof String s)) throw new EvalError("lambda: parameter must be symbol");
+            if (s.equals(".")) {
+                if (j + 2 != paramList.size())
+                    throw new EvalError("lambda: bad dot syntax");
+                if (!(paramList.get(j + 1) instanceof String rp))
+                    throw new EvalError("lambda: parameter must be symbol");
+                restParam = rp;
+                break;
+            }
             params.add(s);
         }
         List<Object> body = new ArrayList<>();
         for (int i = 2; i < list.size(); i++) {
             body.add(list.get(i));
         }
-        return new Lambda(params, body, env);
+        return new Lambda(params, restParam, body, env);
     }
 
     private static Object evalLet(List<?> list, Env env) throws EvalError {
@@ -228,7 +246,7 @@ public class Evaluator {
         if (name != null) {
             // Named let: create recursive lambda
             Env letEnv = new Env(env);
-            Lambda lambda = new Lambda(params, body, letEnv);
+            Lambda lambda = new Lambda(params, null, body, letEnv);
             letEnv.define(name, lambda);
             return applyProc(lambda, inits);
         } else {
@@ -280,11 +298,23 @@ public class Evaluator {
             return b.apply(args);
         }
         if (func instanceof Lambda lam) {
-            if (args.size() != lam.params.size())
-                throw new EvalError("lambda: expected " + lam.params.size() + " arguments, got " + args.size());
+            if (lam.restParam == null) {
+                if (args.size() != lam.params.size())
+                    throw new EvalError("lambda: expected " + lam.params.size() + " arguments, got " + args.size());
+            } else {
+                if (args.size() < lam.params.size())
+                    throw new EvalError("lambda: expected at least " + lam.params.size() + " arguments, got " + args.size());
+            }
             Env localEnv = new Env(lam.closure);
             for (int i = 0; i < lam.params.size(); i++) {
                 localEnv.define(lam.params.get(i), args.get(i));
+            }
+            if (lam.restParam != null) {
+                Object rest = SchemeValue.NIL;
+                for (int i = args.size() - 1; i >= lam.params.size(); i--) {
+                    rest = new Pair(args.get(i), rest);
+                }
+                localEnv.define(lam.restParam, rest);
             }
             Object result = null;
             for (Object bodyExpr : lam.body) {

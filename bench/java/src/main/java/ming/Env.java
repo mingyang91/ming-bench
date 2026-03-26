@@ -149,6 +149,23 @@ class Env {
             return result;
         }));
 
+        // apply
+        env.define("apply", Builtin.named("apply", args -> {
+            if (args.size() < 2) throw new EvalError("apply: need at least 2 arguments");
+            Object func = args.get(0);
+            Object lastArg = args.get(args.size() - 1);
+            List<Object> callArgs = new ArrayList<>();
+            for (int i = 1; i < args.size() - 1; i++) {
+                callArgs.add(args.get(i));
+            }
+            Object cur = lastArg;
+            while (cur instanceof Pair p) {
+                callArgs.add(p.car);
+                cur = p.cdr;
+            }
+            return Evaluator.applyProc(func, callArgs);
+        }));
+
         // Type predicates
         env.define("boolean?", Builtin.named("boolean?", args -> {
             requireArgCount("boolean?", args, 1);
