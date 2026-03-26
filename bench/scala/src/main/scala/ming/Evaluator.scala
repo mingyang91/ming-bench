@@ -61,6 +61,7 @@ object Evaluator:
       case Symbol("begin", _)  => evalBegin(elems.tail, env)
       case Symbol("let", _)    => evalLet(elems.tail, env)
       case Symbol("cond", _)   => evalCond(elems.tail, env)
+      case Symbol("set!", _)   => evalSet(elems.tail, env)
       case _ =>
         val op   = eval(elems.head, env)
         val args = elems.tail.map(e => eval(e, env))
@@ -189,6 +190,13 @@ object Evaluator:
             if !isFalsy(testVal) then break(if body.isEmpty then testVal else evalBody(body, env))
           case _ => throw new EvalError("cond: bad clause")
       SchemeVoid
+
+  private def evalSet(args: List[Expr], env: Env): SchemeVal =
+    args match
+      case Symbol(name, _) :: valueExpr :: Nil =>
+        env.update(name, eval(valueExpr, env))
+        SchemeVoid
+      case _ => throw new EvalError("set!: bad syntax")
 
   private def evalBody(exprs: List[Expr], env: Env): SchemeVal =
     var result: SchemeVal = SchemeVoid
