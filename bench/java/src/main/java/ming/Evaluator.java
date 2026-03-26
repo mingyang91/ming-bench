@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Predicate;
 
 /**
@@ -18,10 +19,12 @@ public class Evaluator {
     private static final UninitializedValue UNINITIALIZED = new UninitializedValue();
 
     private final Env globalEnv;
+    private final MacroExpander macroExpander;
     private StringBuilder outputBuffer;
 
     public Evaluator() {
         this.globalEnv = createGlobalEnv();
+        this.macroExpander = new MacroExpander();
     }
 
     /**
@@ -156,7 +159,7 @@ public class Evaluator {
                 case BoolExpr boolExpr -> boolValue(boolExpr.value());
                 case CharExpr charExpr -> new CharValue(charExpr.value());
                 case StringExpr stringExpr -> immutableString(stringExpr.value());
-                case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
+                case SymbolExpr symbolExpr -> macroExpander.lookupSymbol(symbolExpr.name(), env);
                 case ListExpr listExpr -> evalList(listExpr, env);
             };
         } catch (EvalError error) {
@@ -172,8 +175,19 @@ public class Evaluator {
 
         Expr operatorExpr = elements.get(0);
         List<Expr> arguments = elements.subList(1, elements.size());
-        if (operatorExpr instanceof SymbolExpr symbolExpr) {
-            return switch (symbolExpr.name()) {
+        String operatorName = symbolName(operatorExpr);
+        if (operatorName != null) {
+            if ("define-syntax".equals(operatorName)) {
+                macroExpander.defineSyntax(arguments, env);
+                return VOID;
+            }
+
+            Optional<Expr> expandedMacro = macroExpander.expandInvocation(operatorName, listExpr);
+            if (expandedMacro.isPresent()) {
+                return eval(expandedMacro.get(), env);
+            }
+
+            return switch (operatorName) {
                 case "define" -> evalDefine(arguments, env);
                 case "set!" -> evalSet(arguments, env);
                 case "if" -> evalIf(arguments, env);
@@ -235,8 +249,15 @@ public class Evaluator {
             throw new EvalError("set! target must be a symbol");
         }
 
-        env.set(symbolExpr.name(), eval(arguments.get(1), env));
+        macroExpander.setSymbol(symbolExpr.name(), eval(arguments.get(1), env), env);
         return VOID;
+    }
+
+    private String symbolName(Expr expr) {
+        if (expr instanceof SymbolExpr symbolExpr) {
+            return symbolExpr.name();
+        }
+        return null;
     }
 
     private Value evalIf(List<Expr> arguments, Env env) throws EvalError {
@@ -1189,7 +1210,7 @@ public class Evaluator {
         return new StringValue(new StringBuilder(value), false);
     }
 
-    private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
+    sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
             CharValue, EmptyListValue, PairValue, BuiltinValue, ClosureValue, VoidValue,
             UninitializedValue {
     }
@@ -1258,15 +1279,27 @@ public class Evaluator {
         Value apply(List<Value> arguments) throws EvalError;
     }
 
-    private static final class Cell {
+    static final class Cell {
         private Value value;
 
         private Cell(Value value) {
             this.value = value;
         }
+
+        Value get() {
+            return value;
+        }
+
+        void set(Value newValue) {
+            value = newValue;
+        }
+
+        boolean isUninitialized() {
+            return value == UNINITIALIZED;
+        }
     }
 
-    private static final class Env {
+    static final class Env {
         private final Env parent;
         private final Map<String, Cell> bindings = new HashMap<>();
 
@@ -1274,33 +1307,33 @@ public class Evaluator {
             this.parent = parent;
         }
 
-        private void define(String name, Value value) {
+        void define(String name, Value value) {
             bindings.put(name, new Cell(value));
         }
 
-        private Cell definePlaceholder(String name) {
+        Cell definePlaceholder(String name) {
             Cell cell = new Cell(UNINITIALIZED);
             bindings.put(name, cell);
             return cell;
         }
 
-        private Value lookup(String name) throws EvalError {
+        Value lookup(String name) throws EvalError {
             Cell cell = lookupCell(name);
-            if (cell == null || cell.value == UNINITIALIZED) {
+            if (cell == null || cell.isUninitialized()) {
                 throw new EvalError("unbound variable: " + name);
             }
-            return cell.value;
+            return cell.get();
         }
 
-        private void set(String name, Value value) throws EvalError {
+        void set(String name, Value value) throws EvalError {
             Cell cell = lookupCell(name);
-            if (cell == null || cell.value == UNINITIALIZED) {
+            if (cell == null || cell.isUninitialized()) {
                 throw new EvalError("unbound variable: " + name);
             }
-            cell.value = value;
+            cell.set(value);
         }
 
-        private Cell lookupCell(String name) {
+        Cell lookupCell(String name) {
             if (bindings.containsKey(name)) {
                 return bindings.get(name);
             }
