@@ -64,6 +64,16 @@ public class Evaluator {
         }
     }
 
+    // ===== Exception handling (raise/guard/with-exception-handler) =====
+
+    static final class SchemeException extends RuntimeException {
+        final Object value;
+        SchemeException(Object value) {
+            super(null, null, true, false);
+            this.value = value;
+        }
+    }
+
     // ===== dynamic-wind support =====
 
     static final Object DYNAMIC_WIND = new Object() {
@@ -382,6 +392,11 @@ public class Evaluator {
                         catch (ContinuationReturn cr) { val = cr.value; k = cr.kont; }
                         ev = false; continue mainLoop;
                     }
+                    case "guard" -> {
+                        try { val = evalGuard(list, env); }
+                        catch (ContinuationReturn cr) { val = cr.value; k = cr.kont; }
+                        ev = false; continue mainLoop;
+                    }
                     default -> { /* fall through to application */ }
                 }}
 
@@ -530,7 +545,9 @@ public class Evaluator {
                 }
             }
 
-        }} catch (EvalError e) {
+        }} catch (SchemeException se) {
+            throw new EvalError("unhandled exception: " + SchemeValue.toStr(se.value));
+        } catch (EvalError e) {
             if (lastSrc != null && !e.getMessage().matches(".*\\d+:\\d+.*"))
                 throw new EvalError(e.getMessage() + " [" + lastSrc.line + ":" + lastSrc.col + "]");
             throw e;
@@ -713,6 +730,9 @@ public class Evaluator {
                     case "case" -> {
                         return evalCase(list, env);
                     }
+                    case "guard" -> {
+                        return evalGuard(list, env);
+                    }
                 }
             }
 
@@ -768,6 +788,12 @@ public class Evaluator {
                     if (idx2 >= 0) { ws.remove(idx2); applyProc(outTh, List.of()); }
                     throw cr;
                 }
+                catch (SchemeException se) {
+                    var ws = WIND_STACK.get();
+                    int idx2 = ws.lastIndexOf(entry);
+                    if (idx2 >= 0) { ws.remove(idx2); applyProc(outTh, List.of()); }
+                    throw se;
+                }
                 WIND_STACK.get().remove(WIND_STACK.get().size() - 1);
                 applyProc(outTh, List.of());
                 return result;
@@ -780,6 +806,52 @@ public class Evaluator {
                 }
                 throw e;
             }
+        }
+    }
+
+    // ===== guard special form =====
+
+    @SuppressWarnings("unchecked")
+    private static Object evalGuard(List<?> list, Env env) throws EvalError {
+        // (guard (var clause ...) body ...)
+        if (list.size() < 3) throw new EvalError("guard: bad syntax");
+        if (!(list.get(1) instanceof List<?> guardSpec) || guardSpec.isEmpty())
+            throw new EvalError("guard: bad syntax");
+        if (!(guardSpec.get(0) instanceof String varName))
+            throw new EvalError("guard: expected variable name");
+        List<List<?>> clauses = new ArrayList<>();
+        for (int i = 1; i < guardSpec.size(); i++) {
+            if (!(guardSpec.get(i) instanceof List<?> clause))
+                throw new EvalError("guard: bad clause");
+            clauses.add(clause);
+        }
+        List<Object> body = new ArrayList<>();
+        for (int i = 2; i < list.size(); i++) body.add(list.get(i));
+        try {
+            Object result = null;
+            for (Object expr : body) result = eval(expr, env);
+            return result;
+        } catch (SchemeException se) {
+            Env guardEnv = new Env(env);
+            guardEnv.define(varName, se.value);
+            for (List<?> clause : clauses) {
+                if (clause.isEmpty()) throw new EvalError("guard: bad clause");
+                Object test = clause.get(0);
+                if (test instanceof String cs && cs.equals("else")) {
+                    if (clause.size() == 1) return null;
+                    Object result = null;
+                    for (int j = 1; j < clause.size(); j++) result = eval(clause.get(j), guardEnv);
+                    return result;
+                }
+                Object testVal = eval(test, guardEnv);
+                if (!isFalse(testVal)) {
+                    if (clause.size() == 1) return testVal;
+                    Object result = null;
+                    for (int j = 1; j < clause.size(); j++) result = eval(clause.get(j), guardEnv);
+                    return result;
+                }
+            }
+            throw se; // no clause matched, re-raise
         }
     }
 
@@ -835,6 +907,12 @@ public class Evaluator {
                 int idx = ws.lastIndexOf(entry);
                 if (idx >= 0) { ws.remove(idx); applyProc(outTh, List.of()); }
                 throw cr;
+            }
+            catch (SchemeException se) {
+                var ws = WIND_STACK.get();
+                int idx = ws.lastIndexOf(entry);
+                if (idx >= 0) { ws.remove(idx); applyProc(outTh, List.of()); }
+                throw se;
             }
             WIND_STACK.get().remove(WIND_STACK.get().size() - 1);
             applyProc(outTh, List.of());

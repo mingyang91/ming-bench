@@ -831,6 +831,23 @@ class Env {
         // dynamic-wind
         env.define("dynamic-wind", Evaluator.DYNAMIC_WIND);
 
+        // raise
+        env.define("raise", Builtin.named("raise", args -> {
+            if (args.size() != 1) throw new EvalError("raise: expected 1 argument");
+            throw new Evaluator.SchemeException(args.get(0));
+        }));
+
+        // with-exception-handler
+        env.define("with-exception-handler", Builtin.named("with-exception-handler", args -> {
+            if (args.size() != 2) throw new EvalError("with-exception-handler: expected 2 arguments");
+            Object handler = args.get(0), thunk = args.get(1);
+            try {
+                return Evaluator.applyProc(thunk, List.of());
+            } catch (Evaluator.SchemeException se) {
+                return Evaluator.applyProc(handler, List.of(se.value));
+            }
+        }));
+
         return env;
     }
 
