@@ -133,6 +133,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return evalLambda(expr, env)
 		case "let":
 			return evalLet(expr, env)
+		case "let*":
+			return evalLetStar(expr, env)
 		case "begin":
 			return evalBegin(expr, env)
 		case "cond":
@@ -199,6 +201,8 @@ func evalList(expr *Expr, env *Env) (*Value, error) {
 			return builtinApply(args, expr, env)
 		case "map":
 			return builtinMap(args, expr, env)
+		case "for-each":
+			return builtinForEach(args, expr, env)
 		}
 		if fn, ok := builtinRegistry[name]; ok {
 			return fn(args, expr)
@@ -414,6 +418,31 @@ func MakeDefaultEnv() *Env {
 		"vector?":        builtinVectorQ,
 		"vector->list":   builtinVectorToList,
 		"list->vector":   builtinListToVector,
+		// L17 builtins
+		"set-car!":  builtinSetCar,
+		"set-cdr!":  builtinSetCdr,
+		"caar":      builtinCaar,
+		"cadr":      builtinCadr,
+		"cdar":      builtinCdar,
+		"cddr":      builtinCddr,
+		"caddr":     builtinCaddr,
+		"cadddr":    builtinCadddr,
+		"for-each":  nil, // special-cased
+		"reverse":   builtinReverse,
+		"memq":      builtinMemq,
+		"memv":      builtinMemv,
+		"assq":      builtinAssq,
+		"member":    builtinMember,
+		"assv":        builtinAssv,
+		"gcd":         builtinGcd,
+		"lcm":         builtinLcm,
+		"truncate":    builtinTruncate,
+		"round":       builtinRound,
+		"make-string": builtinMakeString,
+		"string":      builtinString,
+		"string>?":    builtinStringGtQ,
+		"string<=?":   builtinStringLeQ,
+		"string>=?":   builtinStringGeQ,
 	}
 
 	for name, fn := range builtins {
@@ -849,6 +878,35 @@ func evalLet(expr *Expr, env *Env) (*Value, error) {
 	return tailCall(body[len(body)-1], letEnv), nil
 }
 
+func evalLetStar(expr *Expr, env *Env) (*Value, error) {
+	if len(expr.List) < 3 {
+		return nil, fmt.Errorf("%d:%d: let*: too few arguments", expr.Line, expr.Col)
+	}
+	bindingExpr := expr.List[1]
+	body := expr.List[2:]
+	if bindingExpr.Type != ExprList {
+		return nil, fmt.Errorf("%d:%d: let*: bindings must be a list", bindingExpr.Line, bindingExpr.Col)
+	}
+	letEnv := NewEnv(env)
+	for _, b := range bindingExpr.List {
+		if b.Type != ExprList || len(b.List) != 2 || b.List[0].Type != ExprSymbol {
+			return nil, fmt.Errorf("%d:%d: let*: bad binding", b.Line, b.Col)
+		}
+		v, err := Eval(b.List[1], letEnv)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.Set(b.List[0].StrVal, v)
+	}
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := Eval(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return tailCall(body[len(body)-1], letEnv), nil
+}
+
 func evalBegin(expr *Expr, env *Env) (*Value, error) {
 	body := expr.List[1:]
 	if len(body) == 0 {
@@ -865,7 +923,7 @@ func evalBegin(expr *Expr, env *Env) (*Value, error) {
 
 func evalCond(expr *Expr, env *Env) (*Value, error) {
 	for _, clause := range expr.List[1:] {
-		if clause.Type != ExprList || len(clause.List) < 2 {
+		if clause.Type != ExprList || len(clause.List) < 1 {
 			return nil, fmt.Errorf("%d:%d: cond: bad clause", clause.Line, clause.Col)
 		}
 		test := clause.List[0]
@@ -884,6 +942,10 @@ func evalCond(expr *Expr, env *Env) (*Value, error) {
 			return nil, err
 		}
 		if cond.IsTruthy() {
+			if len(clause.List) == 1 {
+				// Single-expression clause: ((expr)) returns expr's value
+				return cond, nil
+			}
 			body := clause.List[1:]
 			for _, bodyExpr := range body[:len(body)-1] {
 				_, err = Eval(bodyExpr, env)
@@ -916,6 +978,176 @@ func builtinCdr(args []*Value, expr *Expr) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: cdr: expected a pair", expr.Line, expr.Col)
 	}
 	return args[0].Cdr, nil
+}
+
+func builtinSetCar(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: set-car!: expected a pair and a value", expr.Line, expr.Col)
+	}
+	args[0].Car = args[1]
+	return Void, nil
+}
+
+func builtinSetCdr(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: set-cdr!: expected a pair and a value", expr.Line, expr.Col)
+	}
+	args[0].Cdr = args[1]
+	return Void, nil
+}
+
+func builtinCaar(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypePair || args[0].Car.Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: caar: expected a pair", expr.Line, expr.Col)
+	}
+	return args[0].Car.Car, nil
+}
+
+func builtinCadr(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: cadr: expected a pair", expr.Line, expr.Col)
+	}
+	return args[0].Cdr.Car, nil
+}
+
+func builtinCdar(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypePair || args[0].Car.Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: cdar: expected a pair", expr.Line, expr.Col)
+	}
+	return args[0].Car.Cdr, nil
+}
+
+func builtinCddr(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: cddr: expected a pair", expr.Line, expr.Col)
+	}
+	return args[0].Cdr.Cdr, nil
+}
+
+func builtinCaddr(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair || args[0].Cdr.Cdr.Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: caddr: expected a pair", expr.Line, expr.Col)
+	}
+	return args[0].Cdr.Cdr.Car, nil
+}
+
+func builtinCadddr(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 || args[0].Type != TypePair || args[0].Cdr.Type != TypePair || args[0].Cdr.Cdr.Type != TypePair || args[0].Cdr.Cdr.Cdr.Type != TypePair {
+		return nil, fmt.Errorf("%d:%d: cadddr: expected a pair", expr.Line, expr.Col)
+	}
+	return args[0].Cdr.Cdr.Cdr.Car, nil
+}
+
+func builtinReverse(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: reverse: expected 1 argument", expr.Line, expr.Col)
+	}
+	result := Nil
+	v := args[0]
+	for v.Type == TypePair {
+		result = &Value{Type: TypePair, Car: v.Car, Cdr: result}
+		v = v.Cdr
+	}
+	return result, nil
+}
+
+func builtinMemq(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: memq: expected 2 arguments", expr.Line, expr.Col)
+	}
+	obj := args[0]
+	lst := args[1]
+	for lst.Type == TypePair {
+		if eqIdentity(obj, lst.Car) {
+			return lst, nil
+		}
+		lst = lst.Cdr
+	}
+	return BoolValue(false), nil
+}
+
+func builtinMemv(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: memv: expected 2 arguments", expr.Line, expr.Col)
+	}
+	obj := args[0]
+	lst := args[1]
+	for lst.Type == TypePair {
+		if eqvCompare(obj, lst.Car) {
+			return lst, nil
+		}
+		lst = lst.Cdr
+	}
+	return BoolValue(false), nil
+}
+
+func builtinAssq(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: assq: expected 2 arguments", expr.Line, expr.Col)
+	}
+	key := args[0]
+	lst := args[1]
+	for lst.Type == TypePair {
+		if lst.Car.Type == TypePair && eqIdentity(key, lst.Car.Car) {
+			return lst.Car, nil
+		}
+		lst = lst.Cdr
+	}
+	return BoolValue(false), nil
+}
+
+func builtinAssv(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: assv: expected 2 arguments", expr.Line, expr.Col)
+	}
+	key := args[0]
+	lst := args[1]
+	for lst.Type == TypePair {
+		if lst.Car.Type == TypePair && eqvCompare(key, lst.Car.Car) {
+			return lst.Car, nil
+		}
+		lst = lst.Cdr
+	}
+	return BoolValue(false), nil
+}
+
+func builtinMember(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("%d:%d: member: expected 2 arguments", expr.Line, expr.Col)
+	}
+	obj := args[0]
+	lst := args[1]
+	for lst.Type == TypePair {
+		if valuesEqual(obj, lst.Car) {
+			return lst, nil
+		}
+		lst = lst.Cdr
+	}
+	return BoolValue(false), nil
+}
+
+// eqIdentity checks eq? identity (pointer equality for pairs, value equality for atoms).
+func eqIdentity(a, b *Value) bool {
+	if a == b {
+		return true
+	}
+	if a.Type != b.Type {
+		return false
+	}
+	switch a.Type {
+	case TypeInt:
+		return a.IntVal == b.IntVal
+	case TypeBool:
+		return a.BoolVal == b.BoolVal
+	case TypeSymbol:
+		return a.StrVal == b.StrVal
+	case TypeChar:
+		return a.IntVal == b.IntVal
+	case TypeNil:
+		return true
+	default:
+		return false
+	}
 }
 
 func builtinNullQ(args []*Value, expr *Expr) (*Value, error) {
@@ -1079,6 +1311,8 @@ func builtinApply(args []*Value, expr *Expr, env *Env) (*Value, error) {
 			return builtinApply(callArgs, expr, env)
 		case "map":
 			return builtinMap(callArgs, expr, env)
+		case "for-each":
+			return builtinForEach(callArgs, expr, env)
 		}
 		if bfn, ok := builtinRegistry[name]; ok {
 			return bfn(callArgs, expr)
@@ -1516,14 +1750,33 @@ func builtinListQ(args []*Value, expr *Expr) (*Value, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("%d:%d: list?: expected 1 argument", expr.Line, expr.Col)
 	}
-	v := args[0]
-	for v.Type == TypePair {
-		v = v.Cdr
+	// Tortoise-and-hare cycle detection
+	slow := args[0]
+	fast := args[0]
+	for fast.Type == TypePair {
+		fast = fast.Cdr
+		if fast.Type != TypePair {
+			break
+		}
+		fast = fast.Cdr
+		slow = slow.Cdr
+		if slow == fast {
+			return BoolValue(false), nil // cycle detected
+		}
 	}
-	return BoolValue(v.Type == TypeNil), nil
+	return BoolValue(fast.Type == TypeNil), nil
 }
 
+type equalPair struct{ a, b *Value }
+
 func valuesEqual(a, b *Value) bool {
+	return valuesEqualSeen(a, b, make(map[equalPair]bool))
+}
+
+func valuesEqualSeen(a, b *Value, seen map[equalPair]bool) bool {
+	if a == b {
+		return true
+	}
 	if a.Type != b.Type {
 		return false
 	}
@@ -1541,13 +1794,18 @@ func valuesEqual(a, b *Value) bool {
 	case TypeNil:
 		return true
 	case TypePair:
-		return valuesEqual(a.Car, b.Car) && valuesEqual(a.Cdr, b.Cdr)
+		key := equalPair{a, b}
+		if seen[key] {
+			return true // assume equal for cycles
+		}
+		seen[key] = true
+		return valuesEqualSeen(a.Car, b.Car, seen) && valuesEqualSeen(a.Cdr, b.Cdr, seen)
 	case TypeVector:
 		if len(a.VecElems) != len(b.VecElems) {
 			return false
 		}
 		for i := range a.VecElems {
-			if !valuesEqual(a.VecElems[i], b.VecElems[i]) {
+			if !valuesEqualSeen(a.VecElems[i], b.VecElems[i], seen) {
 				return false
 			}
 		}
@@ -1646,6 +1904,69 @@ func builtinMap(args []*Value, expr *Expr, env *Env) (*Value, error) {
 		out = &Value{Type: TypePair, Car: result[i], Cdr: out}
 	}
 	return out, nil
+}
+
+func builtinForEach(args []*Value, expr *Expr, env *Env) (*Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("%d:%d: for-each: expected at least 2 arguments", expr.Line, expr.Col)
+	}
+	fn := args[0]
+	lists := args[1:]
+
+	for {
+		allPair := true
+		for _, l := range lists {
+			if l.Type != TypePair {
+				allPair = false
+				break
+			}
+		}
+		if !allPair {
+			break
+		}
+		callArgs := make([]*Value, len(lists))
+		for i, l := range lists {
+			callArgs[i] = l.Car
+		}
+		var val *Value
+		var err error
+		if fn.Type == TypeLambda {
+			if fn.Clauses != nil {
+				val, err = callCaseLambda(fn, callArgs, expr)
+			} else {
+				val, err = callLambda(fn, callArgs, expr)
+			}
+		} else if fn.Type == TypeSymbol && len(fn.StrVal) > 10 && fn.StrVal[:10] == "__builtin:" {
+			name := fn.StrVal[10:]
+			if bfn, ok := builtinRegistry[name]; ok && bfn != nil {
+				val, err = bfn(callArgs, expr)
+			} else {
+				switch name {
+				case "display":
+					val, err = builtinDisplay(callArgs, expr, env)
+				case "write":
+					val, err = builtinWrite(callArgs, expr, env)
+				default:
+					return nil, fmt.Errorf("%d:%d: for-each: not a procedure", expr.Line, expr.Col)
+				}
+			}
+		} else {
+			return nil, fmt.Errorf("%d:%d: for-each: first argument is not a procedure", expr.Line, expr.Col)
+		}
+		if err != nil {
+			return nil, err
+		}
+		for val != nil && val.Type == TypeTailCall {
+			val, err = evalInner(val.TailExpr, val.TailEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for i := range lists {
+			lists[i] = lists[i].Cdr
+		}
+	}
+	return Void, nil
 }
 
 func builtinEqQ(args []*Value, expr *Expr) (*Value, error) {
@@ -1754,6 +2075,132 @@ func builtinStringDowncase(args []*Value, expr *Expr) (*Value, error) {
 		return nil, fmt.Errorf("%d:%d: string-downcase: expected 1 string argument", expr.Line, expr.Col)
 	}
 	return StringValue(strings.ToLower(args[0].StrContent())), nil
+}
+
+func builtinGcd(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) == 0 {
+		return IntValue(0), nil
+	}
+	result := args[0].IntVal
+	if result < 0 {
+		result = -result
+	}
+	for _, a := range args[1:] {
+		b := a.IntVal
+		if b < 0 {
+			b = -b
+		}
+		result = gcd(result, b)
+	}
+	return IntValue(result), nil
+}
+
+func builtinLcm(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) == 0 {
+		return IntValue(1), nil
+	}
+	result := args[0].IntVal
+	if result < 0 {
+		result = -result
+	}
+	for _, a := range args[1:] {
+		b := a.IntVal
+		if b < 0 {
+			b = -b
+		}
+		if result == 0 && b == 0 {
+			result = 0
+		} else {
+			result = result / gcd(result, b) * b
+		}
+	}
+	return IntValue(result), nil
+}
+
+func builtinTruncate(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: truncate: expected 1 argument", expr.Line, expr.Col)
+	}
+	switch args[0].Type {
+	case TypeInt:
+		return args[0], nil
+	case TypeFloat:
+		return IntValue(int64(args[0].FloatVal)), nil
+	case TypeRational:
+		return IntValue(args[0].Num / args[0].Denom), nil
+	default:
+		return nil, fmt.Errorf("%d:%d: truncate: expected number", expr.Line, expr.Col)
+	}
+}
+
+func builtinRound(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%d:%d: round: expected 1 argument", expr.Line, expr.Col)
+	}
+	switch args[0].Type {
+	case TypeInt:
+		return args[0], nil
+	case TypeFloat:
+		f := args[0].FloatVal
+		// Banker's rounding (round half to even)
+		rounded := int64(f + 0.5)
+		if f-float64(int64(f)) == 0.5 && rounded%2 != 0 {
+			rounded--
+		}
+		return IntValue(rounded), nil
+	case TypeRational:
+		return IntValue(args[0].Num / args[0].Denom), nil
+	default:
+		return nil, fmt.Errorf("%d:%d: round: expected number", expr.Line, expr.Col)
+	}
+}
+
+func builtinMakeString(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) < 1 || len(args) > 2 || args[0].Type != TypeInt {
+		return nil, fmt.Errorf("%d:%d: make-string: expected int [char]", expr.Line, expr.Col)
+	}
+	n := int(args[0].IntVal)
+	ch := ' '
+	if len(args) == 2 && args[1].Type == TypeChar {
+		ch = rune(args[1].IntVal)
+	}
+	runes := make([]rune, n)
+	for i := range runes {
+		runes[i] = ch
+	}
+	return MutableStringValue(string(runes)), nil
+}
+
+func builtinString(args []*Value, expr *Expr) (*Value, error) {
+	runes := make([]rune, len(args))
+	for i, a := range args {
+		if a.Type != TypeChar {
+			return nil, fmt.Errorf("%d:%d: string: expected char argument", expr.Line, expr.Col)
+		}
+		runes[i] = rune(a.IntVal)
+	}
+	return StringValue(string(runes)), nil
+}
+
+func builtinStringGtQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string>?: expected 2 string arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].StrContent() > args[1].StrContent()), nil
+}
+
+func builtinStringLeQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string<=?: expected 2 string arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].StrContent() <= args[1].StrContent()), nil
+}
+
+func builtinStringGeQ(args []*Value, expr *Expr) (*Value, error) {
+	if len(args) != 2 || args[0].Type != TypeString || args[1].Type != TypeString {
+		return nil, fmt.Errorf("%d:%d: string>=?: expected 2 string arguments", expr.Line, expr.Col)
+	}
+	return BoolValue(args[0].StrContent() >= args[1].StrContent()), nil
 }
 
 func evalSetBang(expr *Expr, env *Env) (*Value, error) {

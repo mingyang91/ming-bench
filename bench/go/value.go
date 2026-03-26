@@ -167,7 +167,8 @@ func (v *Value) String() string {
 		}
 		return s
 	case TypePair:
-		return "(" + pairInner(v) + ")"
+		seen := make(map[*Value]bool)
+		return "(" + pairInner(v, seen) + ")"
 	case TypeRecord:
 		return fmt.Sprintf("#<%s>", v.RecordTag)
 	case TypeVector:
@@ -181,13 +182,17 @@ func (v *Value) String() string {
 	}
 }
 
-func pairInner(v *Value) string {
+func pairInner(v *Value, seen map[*Value]bool) string {
+	if seen[v] {
+		return "..."
+	}
+	seen[v] = true
 	s := v.Car.String()
 	switch v.Cdr.Type {
 	case TypeNil:
 		return s
 	case TypePair:
-		return s + " " + pairInner(v.Cdr)
+		return s + " " + pairInner(v.Cdr, seen)
 	default:
 		return s + " . " + v.Cdr.String()
 	}
@@ -201,7 +206,8 @@ func (v *Value) DisplayString() string {
 	case TypeChar:
 		return string(rune(v.IntVal))
 	case TypePair:
-		return "(" + pairInnerDisplay(v) + ")"
+		seen := make(map[*Value]bool)
+		return "(" + pairInnerDisplay(v, seen) + ")"
 	case TypeVector:
 		parts := make([]string, len(v.VecElems))
 		for i, e := range v.VecElems {
@@ -213,13 +219,17 @@ func (v *Value) DisplayString() string {
 	}
 }
 
-func pairInnerDisplay(v *Value) string {
+func pairInnerDisplay(v *Value, seen map[*Value]bool) string {
+	if seen[v] {
+		return "..."
+	}
+	seen[v] = true
 	s := v.Car.DisplayString()
 	switch v.Cdr.Type {
 	case TypeNil:
 		return s
 	case TypePair:
-		return s + " " + pairInnerDisplay(v.Cdr)
+		return s + " " + pairInnerDisplay(v.Cdr, seen)
 	default:
 		return s + " . " + v.Cdr.DisplayString()
 	}
