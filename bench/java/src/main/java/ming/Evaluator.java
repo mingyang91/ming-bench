@@ -227,9 +227,24 @@ public class Evaluator {
     // --- Output buffer ---
     private StringBuilder outputBuffer = new StringBuilder();
 
+    // --- Step limiting ---
+    private long stepLimit = 0; // 0 = no limit
+    private long stepCount = 0;
+
     // --- Public API ---
 
     public String evalStr(String input) throws EvalError {
+        stepLimit = 0;
+        stepCount = 0;
+        List<Object> exprs = parse(input);
+        Env env = makeGlobalEnv();
+        Object result = evalTopLevel(exprs, env);
+        return schemeToString(result);
+    }
+
+    public String evalStrWithLimit(String input, long maxSteps) throws EvalError {
+        stepLimit = maxSteps;
+        stepCount = 0;
         List<Object> exprs = parse(input);
         Env env = makeGlobalEnv();
         Object result = evalTopLevel(exprs, env);
@@ -669,9 +684,17 @@ public class Evaluator {
 
     // --- Eval ---
 
+    private void checkStepLimit() throws EvalError {
+        if (stepLimit > 0 && ++stepCount > stepLimit) {
+            throw new EvalError("step limit exceeded");
+        }
+    }
+
     private Object eval(Object expr, Env env) throws EvalError {
+        checkStepLimit();
         Object result = evalTail(expr, env);
         while (result instanceof TailCall tc) {
+            checkStepLimit();
             result = evalTail(tc.expr, tc.env);
         }
         return result;

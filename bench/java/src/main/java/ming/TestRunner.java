@@ -145,6 +145,22 @@ public class TestRunner {
         }
 
         System.out.println(passed + " passed, " + failed + " failed out of " + total + " tests");
+
+        // Delegate to standalone surprise-level tests if applicable
+        if (benchLevel == 0 || benchLevel >= 27) {
+            try {
+                Class.forName("ming.L27Tests").getMethod("main", String[].class)
+                    .invoke(null, (Object) new String[0]);
+                // L27Tests calls System.exit — if we reach here, it passed (exit 0 was suppressed)
+            } catch (ClassNotFoundException ignored) {
+                // L27Tests not present — skip
+            } catch (Exception e) {
+                // If L27Tests.main called System.exit(1), it would throw SecurityException or
+                // the JVM would exit. If we get here via InvocationTargetException, tests failed.
+                System.exit(1);
+            }
+        }
+
         System.exit(failed > 0 ? 1 : 0);
     }
 }
