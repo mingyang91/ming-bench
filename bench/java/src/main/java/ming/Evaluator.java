@@ -6,6 +6,8 @@ import java.util.List;
 import java.util.Map;
 
 import static ming.SchemeFormatter.schemeToString;
+import static ming.SchemeReader.deepUnwrap;
+import static ming.SchemeReader.unwrap;
 
 public class Evaluator {
 
@@ -36,7 +38,16 @@ public class Evaluator {
         "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
-        "procedure?"
+        "procedure?",
+        "set-car!", "set-cdr!",
+        "for-each",
+        "caar", "cadr", "cdar", "cddr", "caddr", "cadar", "caddar",
+        "caaar", "caadr", "cdaar", "cdadr", "cddar", "cdddr",
+        "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
+        "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
+        "reverse", "memq", "memv", "member", "assq", "assv",
+        "gcd", "lcm", "truncate", "round",
+        "make-string", "string", "string>?", "string<=?", "string>=?"
     };
 
     {
@@ -45,32 +56,14 @@ public class Evaluator {
         }
     }
 
-    // Source position tracking
-    private record Token(String value, int line, int col) {}
-    private record Located(Object expr, int line, int col) {}
-
-    private static Object unwrap(Object o) {
-        return o instanceof Located loc ? loc.expr() : o;
-    }
-
-    // Deep-unwrap: remove all Located wrappers recursively
-    @SuppressWarnings("unchecked")
-    static Object deepUnwrap(Object o) {
-        o = unwrap(o);
-        if (o instanceof List<?> list) {
-            List<Object> result = new ArrayList<>(list.size());
-            for (Object elem : list) result.add(deepUnwrap(elem));
-            return result;
-        }
-        return o;
-    }
+    private final SchemeReader reader = new SchemeReader();
 
     public String evalStr(String input) throws EvalError {
-        List<Token> tokens = tokenize(input);
+        var tokens = reader.tokenize(input);
         int[] pos = {0};
         Object lastResult = null;
         while (pos[0] < tokens.size()) {
-            Object expr = parse(tokens, pos);
+            Object expr = reader.parse(tokens, pos);
             lastResult = eval(expr, globalEnv);
         }
         if (lastResult == null) {
@@ -82,11 +75,11 @@ public class Evaluator {
     public EvalResult evalStrWithOutput(String input) throws EvalError {
         outputBuffer = new StringBuilder();
         try {
-            List<Token> tokens = tokenize(input);
+            var tokens = reader.tokenize(input);
             int[] pos = {0};
             Object lastResult = null;
             while (pos[0] < tokens.size()) {
-                Object expr = parse(tokens, pos);
+                Object expr = reader.parse(tokens, pos);
                 lastResult = eval(expr, globalEnv);
             }
             if (lastResult == null) {
@@ -96,233 +89,6 @@ public class Evaluator {
         } finally {
             outputBuffer = null;
         }
-    }
-
-    // --- Tokenizer ---
-
-    private List<Token> tokenize(String input) throws EvalError {
-        List<Token> tokens = new ArrayList<>();
-        int i = 0;
-        int len = input.length();
-        int line = 1;
-        int col = 1;
-        while (i < len) {
-            char c = input.charAt(i);
-            if (c == '\n') {
-                line++;
-                col = 1;
-                i++;
-            } else if (Character.isWhitespace(c)) {
-                col++;
-                i++;
-            } else if (c == ';') {
-                while (i < len && input.charAt(i) != '\n') {
-                    i++;
-                    col++;
-                }
-            } else if (c == '\'') {
-                tokens.add(new Token("'", line, col));
-                i++;
-                col++;
-            } else if (c == '(') {
-                tokens.add(new Token("(", line, col));
-                i++;
-                col++;
-            } else if (c == ')') {
-                tokens.add(new Token(")", line, col));
-                i++;
-                col++;
-            } else if (c == '"') {
-                int startLine = line;
-                int startCol = col;
-                StringBuilder sb = new StringBuilder();
-                sb.append('"');
-                i++;
-                col++;
-                while (i < len && input.charAt(i) != '"') {
-                    if (input.charAt(i) == '\\') {
-                        sb.append(input.charAt(i));
-                        i++;
-                        col++;
-                        if (i < len) {
-                            sb.append(input.charAt(i));
-                            i++;
-                            col++;
-                        }
-                    } else {
-                        if (input.charAt(i) == '\n') {
-                            line++;
-                            col = 1;
-                        } else {
-                            col++;
-                        }
-                        sb.append(input.charAt(i));
-                        i++;
-                    }
-                }
-                if (i < len) {
-                    sb.append('"');
-                    i++;
-                    col++;
-                }
-                tokens.add(new Token(sb.toString(), startLine, startCol));
-            } else if (c == '#') {
-                int startCol = col;
-                if (i + 1 < len) {
-                    char next = input.charAt(i + 1);
-                    if (next == 't') {
-                        tokens.add(new Token("#t", line, startCol));
-                        i += 2;
-                        col += 2;
-                    } else if (next == 'f') {
-                        tokens.add(new Token("#f", line, startCol));
-                        i += 2;
-                        col += 2;
-                    } else if (next == '\\') {
-                        // Character literal: #\x or #\space, #\newline, etc.
-                        if (i + 2 < len) {
-                            // Try to read a named character or single char
-                            int charStart = i + 2;
-                            int charEnd = charStart;
-                            while (charEnd < len && !Character.isWhitespace(input.charAt(charEnd))
-                                    && input.charAt(charEnd) != ')' && input.charAt(charEnd) != '('
-                                    && input.charAt(charEnd) != '"' && input.charAt(charEnd) != ';') {
-                                charEnd++;
-                            }
-                            String charName = input.substring(charStart, charEnd);
-                            String tok = "#\\" + charName;
-                            tokens.add(new Token(tok, line, startCol));
-                            int tokLen = tok.length();
-                            i += tokLen;
-                            col += tokLen;
-                        } else {
-                            tokens.add(new Token("#\\", line, startCol));
-                            i += 2;
-                            col += 2;
-                        }
-                    } else if (next == '(') {
-                        tokens.add(new Token("#(", line, startCol));
-                        i += 2;
-                        col += 2;
-                    } else {
-                        String sym = readSymbol(input, i);
-                        tokens.add(new Token(sym, line, startCol));
-                        i += sym.length();
-                        col += sym.length();
-                    }
-                } else {
-                    tokens.add(new Token("#", line, startCol));
-                    i++;
-                    col++;
-                }
-            } else {
-                int startCol = col;
-                String sym = readSymbol(input, i);
-                tokens.add(new Token(sym, line, startCol));
-                i += sym.length();
-                col += sym.length();
-            }
-        }
-        return tokens;
-    }
-
-    private String readSymbol(String input, int start) {
-        int i = start;
-        int len = input.length();
-        while (i < len) {
-            char c = input.charAt(i);
-            if (Character.isWhitespace(c) || c == '(' || c == ')' || c == '"' || c == ';' || c == '\'') {
-                break;
-            }
-            i++;
-        }
-        return input.substring(start, i);
-    }
-
-    // --- Parser ---
-
-    private Object parse(List<Token> tokens, int[] pos) throws EvalError {
-        if (pos[0] >= tokens.size()) {
-            throw new EvalError("unexpected end of input");
-        }
-        Token token = tokens.get(pos[0]);
-        pos[0]++;
-
-        if (token.value().equals("'")) {
-            Object quoted = parse(tokens, pos);
-            List<Object> quoteExpr = new ArrayList<>();
-            quoteExpr.add(new SchemeSymbol("quote"));
-            quoteExpr.add(quoted);
-            return new Located(quoteExpr, token.line(), token.col());
-        }
-
-        if (token.value().equals("#(")) {
-            List<Object> elems = new ArrayList<>();
-            while (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
-                elems.add(parse(tokens, pos));
-            }
-            if (pos[0] >= tokens.size()) throw new EvalError("missing closing parenthesis");
-            pos[0]++;
-            // Build (vector e1 e2 ...) form
-            List<Object> vecForm = new ArrayList<>();
-            vecForm.add(new SchemeSymbol("vector"));
-            vecForm.addAll(elems);
-            return new Located(vecForm, token.line(), token.col());
-        }
-
-        if (token.value().equals("(")) {
-            List<Object> list = new ArrayList<>();
-            while (pos[0] < tokens.size() && !tokens.get(pos[0]).value().equals(")")) {
-                list.add(parse(tokens, pos));
-            }
-            if (pos[0] >= tokens.size()) {
-                throw new EvalError("missing closing parenthesis");
-            }
-            pos[0]++; // skip ')'
-            return new Located(list, token.line(), token.col());
-        } else if (token.value().equals(")")) {
-            throw new EvalError("unexpected )");
-        } else {
-            return new Located(parseAtom(token.value()), token.line(), token.col());
-        }
-    }
-
-    private Object parseAtom(String token) {
-        if (token.equals("#t")) {
-            return Boolean.TRUE;
-        }
-        if (token.equals("#f")) {
-            return Boolean.FALSE;
-        }
-        if (token.startsWith("#\\")) {
-            String charName = token.substring(2);
-            if (charName.equals("space")) return new SchemeChar(' ');
-            if (charName.equals("newline")) return new SchemeChar('\n');
-            if (charName.equals("tab")) return new SchemeChar('\t');
-            if (charName.length() == 1) return new SchemeChar(charName.charAt(0));
-            return new SchemeChar(charName.charAt(0)); // fallback
-        }
-        if (token.startsWith("\"") && token.endsWith("\"")) {
-            return token; // keep as quoted string
-        }
-        // Try integer
-        try {
-            return Long.parseLong(token);
-        } catch (NumberFormatException e) {}
-        // Try rational literal: num/den
-        int slash = token.indexOf('/');
-        if (slash > 0 && slash < token.length() - 1) {
-            try {
-                long num = Long.parseLong(token.substring(0, slash));
-                long den = Long.parseLong(token.substring(slash + 1));
-                return SchemeRational.make(num, den);
-            } catch (NumberFormatException e) {}
-        }
-        // Try floating point (inexact)
-        try {
-            return Double.parseDouble(token);
-        } catch (NumberFormatException e) {}
-        return new SchemeSymbol(token);
     }
 
     // --- Evaluator ---
@@ -377,7 +143,7 @@ public class Evaluator {
     @SuppressWarnings("unchecked")
     private Object evalStep(Object expr, Environment env) throws EvalError {
         // Unwrap Located and add position to any errors
-        if (expr instanceof Located loc) {
+        if (expr instanceof SchemeReader.Located loc) {
             try {
                 return evalStep(loc.expr(), env);
             } catch (EvalError e) {
@@ -472,6 +238,9 @@ public class Evaluator {
                     case "let" -> {
                         return evalLet(args, env);
                     }
+                    case "let*" -> {
+                        return evalLetStar(args, env);
+                    }
                     case "letrec" -> {
                         return evalLetrec(args, env);
                     }
@@ -526,7 +295,16 @@ public class Evaluator {
                          "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
                          "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
-        "procedure?" -> {
+        "procedure?",
+        "set-car!", "set-cdr!",
+        "for-each",
+        "caar", "cadr", "cdar", "cddr", "caddr", "cadar", "caddar",
+        "caaar", "caadr", "cdaar", "cdadr", "cddar", "cdddr",
+        "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
+        "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
+        "reverse", "memq", "memv", "member", "assq", "assv",
+        "gcd", "lcm", "truncate", "round",
+        "make-string", "string", "string>?", "string<=?", "string>=?" -> {
                         return evalBuiltin(name, args, env);
                     }
                     case "define-record-type" -> {
@@ -608,6 +386,26 @@ public class Evaluator {
             letEnv.define(varName, val);
         }
         // Eval all but last body expression, return TailCall for last
+        for (int i = 1; i < args.size() - 1; i++) {
+            eval(args.get(i), letEnv);
+        }
+        if (args.size() > 1) {
+            return new TailCall(args.get(args.size() - 1), letEnv);
+        }
+        return VOID;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalLetStar(List<Object> args, Environment env) throws EvalError {
+        if (args.size() < 2) throw new EvalError("let*: bad syntax");
+        List<?> bindings = (List<?>) unwrap(args.get(0));
+        Environment letEnv = new Environment(env);
+        for (Object binding : bindings) {
+            List<?> b = (List<?>) unwrap(binding);
+            String varName = ((SchemeSymbol) unwrap(b.get(0))).name();
+            Object val = eval(b.get(1), letEnv);
+            letEnv.define(varName, val);
+        }
         for (int i = 1; i < args.size() - 1; i++) {
             eval(args.get(i), letEnv);
         }
@@ -959,7 +757,8 @@ public class Evaluator {
     private Object applyBuiltin(String name, List<Object> args) throws EvalError {
         return switch (name) {
             case "+", "-", "*", "/", "abs", "modulo", "remainder", "quotient",
-                 "min", "max", "expt", "zero?", "positive?", "negative?", "odd?", "even?" ->
+                 "min", "max", "expt", "zero?", "positive?", "negative?", "odd?", "even?",
+                 "gcd", "lcm", "truncate", "round" ->
                 applyArithmeticBuiltin(name, args);
             case "<" -> toDouble(args.get(0)) < toDouble(args.get(1));
             case ">" -> toDouble(args.get(0)) > toDouble(args.get(1));
@@ -968,7 +767,13 @@ public class Evaluator {
             case ">=" -> toDouble(args.get(0)) >= toDouble(args.get(1));
             case "not" -> args.get(0).equals(Boolean.FALSE);
             case "cons", "car", "cdr", "null?", "list", "length", "append",
-                 "list-ref", "list-tail", "list?", "assoc", "map" ->
+                 "list-ref", "list-tail", "list?", "assoc", "map",
+                 "set-car!", "set-cdr!", "for-each",
+                 "caar", "cadr", "cdar", "cddr", "caddr", "cadar", "caddar",
+                 "caaar", "caadr", "cdaar", "cdadr", "cddar", "cdddr",
+                 "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
+                 "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
+                 "reverse", "memq", "memv", "member", "assq", "assv" ->
                 applyListBuiltin(name, args);
             case "number?", "integer?", "rational?", "exact?", "inexact?",
                  "exact->inexact", "inexact->exact", "numerator", "denominator" ->
@@ -980,7 +785,8 @@ public class Evaluator {
             case "string-append", "string-length", "substring", "string-ref",
                  "string->number", "number->string", "symbol->string", "string->symbol",
                  "string-copy", "string-set!", "string->list", "list->string", "string=?", "string<?", "string-ci=?",
-                 "string-upcase", "string-downcase" ->
+                 "string-upcase", "string-downcase",
+                 "make-string", "string", "string>?", "string<=?", "string>=?" ->
                 applyStringBuiltin(name, args);
             case "char-alphabetic?", "char-numeric?", "char=?", "char<?",
                  "char-upcase", "char-downcase", "char->integer", "integer->char" ->
@@ -1142,8 +948,53 @@ public class Evaluator {
             case "negative?" -> requireLong(args.get(0)) < 0;
             case "odd?" -> Math.abs(requireLong(args.get(0))) % 2 == 1;
             case "even?" -> requireLong(args.get(0)) % 2 == 0;
+            case "gcd" -> {
+                if (args.isEmpty()) yield 0L;
+                long result = Math.abs(requireLong(args.get(0)));
+                for (int i = 1; i < args.size(); i++) {
+                    long b = Math.abs(requireLong(args.get(i)));
+                    while (b != 0) { long t = b; b = result % b; result = t; }
+                }
+                yield result;
+            }
+            case "lcm" -> {
+                if (args.isEmpty()) yield 1L;
+                long result = Math.abs(requireLong(args.get(0)));
+                for (int i = 1; i < args.size(); i++) {
+                    long b = Math.abs(requireLong(args.get(i)));
+                    if (result == 0 && b == 0) { result = 0; continue; }
+                    long g = result; long t = b;
+                    while (t != 0) { long tmp = t; t = g % t; g = tmp; }
+                    result = result / g * b;
+                }
+                yield result;
+            }
+            case "truncate" -> {
+                Object v = args.get(0);
+                if (v instanceof Long) yield v;
+                if (v instanceof Double d) { long r = (long) d.doubleValue(); yield r; }
+                if (v instanceof SchemeRational r) { long res = r.numerator / r.denominator; yield res; }
+                throw new EvalError("truncate: not a number");
+            }
+            case "round" -> {
+                Object v = args.get(0);
+                if (v instanceof Long) yield v;
+                if (v instanceof Double d) { long r = Math.round(d); yield r; }
+                if (v instanceof SchemeRational r) { long res = (r.numerator + r.denominator / 2) / r.denominator; yield res; }
+                throw new EvalError("round: not a number");
+            }
             default -> throw new EvalError("unknown arithmetic procedure: " + name);
         };
+    }
+
+    private Object applyCxr(String name, Object val) throws EvalError {
+        // Process cxr name from right to left (inner to outer): c[ad]+r
+        // e.g., cadr = car(cdr(x)), so process 'd' then 'a'
+        for (int i = name.length() - 2; i >= 1; i--) {
+            if (!(val instanceof SchemePair p)) throw new EvalError(name + ": not a pair");
+            val = name.charAt(i) == 'a' ? p.car : p.cdr;
+        }
+        return val;
     }
 
     private Object applyListBuiltin(String name, List<Object> args) throws EvalError {
@@ -1165,8 +1016,15 @@ public class Evaluator {
             }
             case "length" -> {
                 Object val = args.get(0);
+                Object slow = val, fast = val;
                 long len = 0;
-                while (val instanceof SchemePair p) { len++; val = p.cdr; }
+                while (val instanceof SchemePair p) {
+                    len++;
+                    val = p.cdr;
+                    // Cycle detection with tortoise-and-hare
+                    if (len % 2 == 0 && slow instanceof SchemePair sp) slow = sp.cdr;
+                    if (val == slow && len > 0 && val instanceof SchemePair) throw new EvalError("length: not a proper list");
+                }
                 if (!(val instanceof SchemeNil)) throw new EvalError("length: not a proper list");
                 yield len;
             }
@@ -1206,9 +1064,18 @@ public class Evaluator {
                 yield lst;
             }
             case "list?" -> {
-                Object val = args.get(0);
-                while (val instanceof SchemePair p) val = p.cdr;
-                yield val instanceof SchemeNil;
+                // Tortoise-and-hare cycle detection
+                Object slow = args.get(0);
+                Object fast = args.get(0);
+                while (fast instanceof SchemePair fp) {
+                    fast = fp.cdr;
+                    if (fast instanceof SchemeNil) { yield true; }
+                    if (!(fast instanceof SchemePair fp2)) { yield false; }
+                    fast = ((SchemePair) fast).cdr;
+                    slow = ((SchemePair) slow).cdr;
+                    if (slow == fast) { yield false; } // cycle detected
+                }
+                yield fast instanceof SchemeNil;
             }
             case "assoc" -> {
                 Object key = args.get(0);
@@ -1241,6 +1108,100 @@ public class Evaluator {
                 Object result = SchemeNil.INSTANCE;
                 for (int i = results.size() - 1; i >= 0; i--) result = new SchemePair(results.get(i), result);
                 yield result;
+            }
+            case "set-car!" -> {
+                if (!(args.get(0) instanceof SchemePair p)) throw new EvalError("set-car!: not a pair");
+                p.car = args.get(1);
+                yield VOID;
+            }
+            case "set-cdr!" -> {
+                if (!(args.get(0) instanceof SchemePair p)) throw new EvalError("set-cdr!: not a pair");
+                p.cdr = args.get(1);
+                yield VOID;
+            }
+            case "for-each" -> {
+                if (args.size() < 2) throw new EvalError("for-each: expected at least 2 arguments");
+                Object proc = args.get(0);
+                List<List<Object>> lists = new ArrayList<>();
+                for (int i = 1; i < args.size(); i++) {
+                    List<Object> elems = new ArrayList<>();
+                    Object cur = args.get(i);
+                    while (cur instanceof SchemePair p) { elems.add(p.car); cur = p.cdr; }
+                    lists.add(elems);
+                }
+                int len = lists.get(0).size();
+                for (int i = 0; i < len; i++) {
+                    List<Object> callArgs = new ArrayList<>();
+                    for (List<Object> l : lists) callArgs.add(l.get(i));
+                    applyResolved(proc, callArgs);
+                }
+                yield VOID;
+            }
+            case "caar", "cadr", "cdar", "cddr", "caddr", "cadar", "caddar",
+                 "caaar", "caadr", "cdaar", "cdadr", "cddar", "cdddr",
+                 "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
+                 "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr" -> {
+                yield applyCxr(name, args.get(0));
+            }
+            case "reverse" -> {
+                Object lst = args.get(0);
+                Object result = SchemeNil.INSTANCE;
+                while (lst instanceof SchemePair p) {
+                    result = new SchemePair(p.car, result);
+                    lst = p.cdr;
+                }
+                yield result;
+            }
+            case "memq" -> {
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof SchemePair p) {
+                    if (schemeEqv(key, p.car)) yield lst;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "memv" -> {
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof SchemePair p) {
+                    if (schemeEqv(key, p.car)) yield lst;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "member" -> {
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof SchemePair p) {
+                    if (schemeEqual(key, p.car)) yield lst;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "assq" -> {
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof SchemePair p) {
+                    if (p.car instanceof SchemePair entry) {
+                        Object k = entry.car;
+                        if (k == key || k.equals(key) ||
+                            (k instanceof SchemeSymbol sk && key instanceof SchemeSymbol sy && sk.name().equals(sy.name()))) {
+                            yield entry;
+                        }
+                    }
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
+            }
+            case "assv" -> {
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof SchemePair p) {
+                    if (p.car instanceof SchemePair entry && schemeEqv(key, entry.car)) yield entry;
+                    lst = p.cdr;
+                }
+                yield Boolean.FALSE;
             }
             default -> throw new EvalError("unknown list procedure: " + name);
         };
@@ -1371,6 +1332,24 @@ public class Evaluator {
             case "string-ci=?" -> requireString(args.get(0)).equalsIgnoreCase(requireString(args.get(1)));
             case "string-upcase" -> "\"" + requireString(args.get(0)).toUpperCase() + "\"";
             case "string-downcase" -> "\"" + requireString(args.get(0)).toLowerCase() + "\"";
+            case "make-string" -> {
+                int len = (int) requireLong(args.get(0));
+                char ch = args.size() > 1 && args.get(1) instanceof SchemeChar sc ? sc.value() : ' ';
+                StringBuilder sb = new StringBuilder(len);
+                for (int i = 0; i < len; i++) sb.append(ch);
+                yield new SchemeString(sb.toString());
+            }
+            case "string" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object arg : args) {
+                    if (!(arg instanceof SchemeChar ch)) throw new EvalError("string: expected char");
+                    sb.append(ch.value());
+                }
+                yield "\"" + sb + "\"";
+            }
+            case "string>?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) > 0;
+            case "string<=?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) <= 0;
+            case "string>=?" -> requireString(args.get(0)).compareTo(requireString(args.get(1))) >= 0;
             default -> throw new EvalError("unknown string procedure: " + name);
         };
     }
@@ -1467,13 +1446,19 @@ public class Evaluator {
     }
 
     private boolean schemeEqual(Object a, Object b) {
+        return schemeEqualRec(a, b, 0);
+    }
+
+    private boolean schemeEqualRec(Object a, Object b, int depth) {
+        if (a == b) return true;
+        if (depth > 100000) return false; // prevent infinite recursion on cycles
         if (a instanceof SchemePair pa && b instanceof SchemePair pb) {
-            return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+            return schemeEqualRec(pa.car, pb.car, depth + 1) && schemeEqualRec(pa.cdr, pb.cdr, depth + 1);
         }
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.length() != vb.length()) return false;
             for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqual(va.elements[i], vb.elements[i])) return false;
+                if (!schemeEqualRec(va.elements[i], vb.elements[i], depth + 1)) return false;
             }
             return true;
         }
