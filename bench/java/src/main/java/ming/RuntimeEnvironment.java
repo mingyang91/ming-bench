@@ -5,9 +5,21 @@ import java.util.List;
 import java.util.Map;
 
 record Formals(List<String> parameters, String restParameter) {
+    int fixedCount() {
+        return parameters.size();
+    }
+
+    boolean matchesArity(int argumentCount) {
+        return restParameter == null
+                ? argumentCount == fixedCount()
+                : argumentCount >= fixedCount();
+    }
 }
 
 record BindingSpec(String name, Expr initExpr) {
+}
+
+record ProcedureClause(Formals formals, List<Expr> body) {
 }
 
 record ExactRational(long numerator, long denominator) {

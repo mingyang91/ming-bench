@@ -121,6 +121,7 @@ public class Evaluator {
                 typePredicate("pair?", arguments, value -> value instanceof PairValue)));
         env.define("symbol?", new BuiltinValue("symbol?", arguments ->
                 typePredicate("symbol?", arguments, value -> value instanceof SymbolValue)));
+        env.define("procedure?", new BuiltinValue("procedure?", this::procedurePredicate));
         env.define("eq?", new BuiltinValue("eq?", this::eq));
         env.define("equal?", new BuiltinValue("equal?", this::equal));
         env.define("display", new BuiltinValue("display", this::display));
@@ -207,6 +208,7 @@ public class Evaluator {
                 case "if" -> evalIf(arguments, env);
                 case "quote" -> evalQuote(arguments);
                 case "lambda" -> evalLambda(arguments, env);
+                case "case-lambda" -> evalCaseLambda(arguments, env);
                 case "and" -> evalAnd(arguments, env);
                 case "or" -> evalOr(arguments, env);
                 case "begin" -> evalBegin(arguments, env);
@@ -424,6 +426,25 @@ public class Evaluator {
                 env);
     }
 
+    private Value evalCaseLambda(List<Expr> arguments, Env env) throws EvalError {
+        if (arguments.isEmpty()) {
+            throw new EvalError("case-lambda requires at least one clause");
+        }
+
+        List<ProcedureClause> clauses = new ArrayList<>(arguments.size());
+        for (Expr argument : arguments) {
+            if (!(argument instanceof ListExpr clauseExpr) || clauseExpr.elements().size() < 2) {
+                throw new EvalError("case-lambda clause must include parameters and a body");
+            }
+
+            List<Expr> clauseElements = clauseExpr.elements();
+            clauses.add(new ProcedureClause(
+                    parseFormals(clauseElements.get(0)),
+                    List.copyOf(clauseElements.subList(1, clauseElements.size()))));
+        }
+        return new CaseLambdaValue(List.copyOf(clauses), env);
+    }
+
     private Formals parseFormals(Expr parameterExpr) throws EvalError {
         if (parameterExpr instanceof SymbolExpr symbolExpr) {
             return new Formals(List.of(), symbolExpr.name());
@@ -611,21 +632,48 @@ public class Evaluator {
         return switch (operator) {
             case BuiltinValue builtinValue -> builtinValue.implementation().apply(arguments);
             case ClosureValue closureValue -> applyClosure(closureValue, arguments);
+            case CaseLambdaValue caseLambdaValue -> applyCaseLambda(caseLambdaValue, arguments);
             default -> throw new EvalError("attempted to call a non-procedure");
         };
     }
 
     private Value applyClosure(ClosureValue closure, List<Value> arguments) throws EvalError {
-        Formals formals = closure.formals();
-        int fixedCount = formals.parameters().size();
+        return applyProcedureClause(
+                closure.formals(),
+                closure.body(),
+                closure.env(),
+                arguments,
+                "lambda");
+    }
+
+    private Value applyCaseLambda(CaseLambdaValue caseLambda, List<Value> arguments)
+            throws EvalError {
+        for (ProcedureClause clause : caseLambda.clauses()) {
+            if (clause.formals().matchesArity(arguments.size())) {
+                return applyProcedureClause(
+                        clause.formals(),
+                        clause.body(),
+                        caseLambda.env(),
+                        arguments,
+                        "case-lambda");
+            }
+        }
+
+        throw new EvalError("case-lambda has no matching clause for "
+                + arguments.size() + " argument(s)");
+    }
+
+    private Value applyProcedureClause(Formals formals, List<Expr> body, Env definitionEnv,
+            List<Value> arguments, String procedureName) throws EvalError {
+        int fixedCount = formals.fixedCount();
         if (formals.restParameter() == null) {
-            requireExactArgs("lambda", arguments, fixedCount);
+            requireExactArgs(procedureName, arguments, fixedCount);
         } else if (arguments.size() < fixedCount) {
-            throw new EvalError("lambda expected at least "
+            throw new EvalError(procedureName + " expected at least "
                     + fixedCount + " argument(s)");
         }
 
-        Env callEnv = new Env(closure.env());
+        Env callEnv = new Env(definitionEnv);
         for (int i = 0; i < fixedCount; i++) {
             callEnv.define(formals.parameters().get(i), arguments.get(i));
         }
@@ -633,7 +681,7 @@ public class Evaluator {
             callEnv.define(formals.restParameter(),
                     listValue(arguments.subList(fixedCount, arguments.size())));
         }
-        return evalSequence(closure.body(), callEnv);
+        return evalSequence(body, callEnv);
     }
 
     private Value evalSequence(List<Expr> expressions, Env env) throws EvalError {
@@ -1209,6 +1257,11 @@ public class Evaluator {
         return boolValue(equalValues(arguments.get(0), arguments.get(1)));
     }
 
+    private Value procedurePredicate(List<Value> arguments) throws EvalError {
+        requireExactArgs("procedure?", arguments, 1);
+        return boolValue(isProcedure(arguments.get(0)));
+    }
+
     private Value numberPredicate(List<Value> arguments) throws EvalError {
         requireExactArgs("number?", arguments, 1);
         return boolValue(isNumber(arguments.get(0)));
@@ -1345,6 +1398,12 @@ public class Evaluator {
 
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
+    }
+
+    private boolean isProcedure(Value value) {
+        return value instanceof BuiltinValue
+                || value instanceof ClosureValue
+                || value instanceof CaseLambdaValue;
     }
 
     private BoolValue boolValue(boolean value) {

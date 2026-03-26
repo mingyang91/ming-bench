@@ -4,7 +4,8 @@ import java.util.List;
 
 sealed interface Value permits IntValue, RationalValue, InexactValue, BoolValue,
         StringValue, SymbolValue, CharValue, EmptyListValue, PairValue, BuiltinValue,
-        ClosureValue, RecordTypeValue, RecordInstanceValue, VoidValue, UninitializedValue {
+        ClosureValue, CaseLambdaValue, RecordTypeValue, RecordInstanceValue, VoidValue,
+        UninitializedValue {
 }
 
 record IntValue(long value) implements Value {
@@ -57,6 +58,9 @@ record BuiltinValue(String name, BuiltinFunction implementation) implements Valu
 }
 
 record ClosureValue(Formals formals, List<Expr> body, Env env) implements Value {
+}
+
+record CaseLambdaValue(List<ProcedureClause> clauses, Env env) implements Value {
 }
 
 record RecordTypeValue(String name) implements Value {
