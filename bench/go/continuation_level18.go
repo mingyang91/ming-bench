@@ -345,6 +345,13 @@ func (m *level18Machine) stepList(items listExpr) error {
 		switch operator.name {
 		case "define":
 			return m.stepDefine(environment, items.items[1:], operator.pos)
+		case "define-syntax":
+			value, err := evalDefineSyntax(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.returnValue(value, m.cont)
+			return nil
 		case "set!":
 			return m.stepSet(environment, items.items[1:], operator.pos)
 		case "if":
@@ -368,6 +375,31 @@ func (m *level18Machine) stepList(items listExpr) error {
 				return attachPos(&EvalError{Message: "quote expects exactly 1 argument"}, operator.pos)
 			}
 			m.returnValue(quoteDatum(items.items[1]), m.cont)
+			return nil
+		case "syntax":
+			value, err := evalSyntax(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.returnValue(value, m.cont)
+			return nil
+		case "syntax-case":
+			value, err := evalSyntaxCase(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			m.returnValue(value, m.cont)
+			return nil
+		case "with-syntax":
+			step, err := evalWithSyntax(environment, items.items[1:])
+			if err != nil {
+				return attachPos(err, operator.pos)
+			}
+			if step.tail {
+				m.eval(step.nextEnv, step.nextForm, m.cont)
+			} else {
+				m.returnValue(step.value, m.cont)
+			}
 			return nil
 		case "lambda":
 			value, err := evalLambda(environment, items.items[1:])

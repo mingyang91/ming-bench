@@ -63,6 +63,7 @@ const (
 	tokenLParen tokenKind = iota
 	tokenRParen
 	tokenQuote
+	tokenSyntaxQuote
 	tokenAtom
 	tokenString
 )
@@ -228,6 +229,10 @@ func newGlobalEnv(rt *runtime) *env {
 	if currentBenchLevel() >= 21 {
 		root.define("call-with-values", builtinProc{name: "call-with-values", fn: builtinCallWithValues})
 		root.define("values", builtinProc{name: "values", fn: builtinValues})
+	}
+	if currentBenchLevel() >= 22 {
+		root.define("syntax->datum", builtinProc{name: "syntax->datum", fn: builtinSyntaxToDatum})
+		root.define("datum->syntax", builtinProc{name: "datum->syntax", fn: builtinDatumToSyntax})
 	}
 	root.define("char-alphabetic?", builtinProc{name: "char-alphabetic?", fn: builtinCharAlphabetic})
 	root.define("char->integer", builtinProc{name: "char->integer", fn: builtinCharToInteger})
@@ -402,6 +407,11 @@ func tokenize(input string) ([]token, error) {
 			tokens = append(tokens, token{kind: tokenQuote, text: "'", pos: start})
 			input = input[size:]
 			pos = pos.advance(r)
+		case r == '#' && strings.HasPrefix(input, "#'"):
+			tokens = append(tokens, token{kind: tokenSyntaxQuote, text: "#'", pos: start})
+			input = input[2:]
+			pos = pos.advance('#')
+			pos = pos.advance('\'')
 		case r == '"':
 			text, rest, nextPos, err := scanString(input[size:], pos.advance(r), start)
 			if err != nil {
@@ -472,7 +482,7 @@ func scanString(input string, pos sourcePos, start sourcePos) (string, string, s
 
 func scanAtom(input string, pos sourcePos) (string, string, sourcePos) {
 	for i, r := range input {
-		if unicode.IsSpace(r) || r == '(' || r == ')' || r == ';' {
+		if unicode.IsSpace(r) || r == '(' || r == ')' || r == '\'' || r == ';' || (r == '#' && strings.HasPrefix(input[i:], "#'")) {
 			return input[:i], input[i:], pos
 		}
 		pos = pos.advance(r)
@@ -527,6 +537,18 @@ func (p *parser) parseExpr() (expr, error) {
 		return listExpr{
 			items: []expr{
 				symbolExpr{name: "quote", pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
+	case tokenSyntaxQuote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, attachPos(err, tok.pos)
+		}
+		return listExpr{
+			items: []expr{
+				symbolExpr{name: "syntax", pos: tok.pos},
 				quoted,
 			},
 			pos: tok.pos,
@@ -696,6 +718,15 @@ func evalListStep(environment *env, items listExpr) (evalStep, error) {
 		case "quote":
 			value, err := evalQuote(items.items[1:])
 			return doneStep(value), attachPos(err, operator.pos)
+		case "syntax":
+			value, err := evalSyntax(environment, items.items[1:])
+			return doneStep(value), attachPos(err, operator.pos)
+		case "syntax-case":
+			value, err := evalSyntaxCase(environment, items.items[1:])
+			return doneStep(value), attachPos(err, operator.pos)
+		case "with-syntax":
+			step, err := evalWithSyntax(environment, items.items[1:])
+			return step, attachPos(err, operator.pos)
 		case "lambda":
 			value, err := evalLambda(environment, items.items[1:])
 			return doneStep(value), attachPos(err, operator.pos)
@@ -2201,6 +2232,10 @@ func renderExpr(value expr) string {
 		return "#<record:" + v.recordType.name + ">"
 	case macroExpr:
 		return "#<macro>"
+	case *syntaxExpr:
+		return "#<syntax>"
+	case *syntaxListExpr:
+		return "#<syntax-list>"
 	case uninitializedExpr:
 		return "#<uninitialized>"
 	default:

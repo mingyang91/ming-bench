@@ -4,6 +4,7 @@ import "fmt"
 
 type macroExpr struct {
 	name     string
+	transformer expr
 	literals map[string]struct{}
 	rules    []macroRule
 	defEnv   *env
@@ -37,13 +38,45 @@ func evalDefineSyntax(environment *env, forms []expr) (expr, error) {
 		return nil, &EvalError{Message: "define-syntax name must be a symbol"}
 	}
 
-	transformer, err := compileSyntaxRules(environment, name.name, forms[1])
+	if transformer, ok, err := tryCompileSyntaxRules(environment, name.name, forms[1]); err != nil {
+		return nil, err
+	} else if ok {
+		environment.define(name.name, transformer)
+		return voidExpr{}, nil
+	}
+
+	transformer, err := evalSingleExpr(environment, forms[1], "define-syntax")
 	if err != nil {
 		return nil, err
 	}
+	if !isProcedure(transformer) {
+		return nil, errorAt(name.pos, "define-syntax requires a transformer procedure")
+	}
 
-	environment.define(name.name, transformer)
+	environment.define(name.name, macroExpr{
+		name:        name.name,
+		transformer: transformer,
+		defEnv:      environment,
+	})
 	return voidExpr{}, nil
+}
+
+func tryCompileSyntaxRules(environment *env, macroName string, form expr) (macroExpr, bool, error) {
+	rulesForm, ok := form.(listExpr)
+	if !ok || len(rulesForm.items) == 0 {
+		return macroExpr{}, false, nil
+	}
+
+	head, ok := rulesForm.items[0].(symbolExpr)
+	if !ok || head.name != "syntax-rules" {
+		return macroExpr{}, false, nil
+	}
+
+	transformer, err := compileSyntaxRules(environment, macroName, form)
+	if err != nil {
+		return macroExpr{}, true, err
+	}
+	return transformer, true, nil
 }
 
 func compileSyntaxRules(environment *env, macroName string, form expr) (macroExpr, error) {
@@ -103,6 +136,10 @@ func compileSyntaxRules(environment *env, macroName string, form expr) (macroExp
 }
 
 func expandMacro(macro macroExpr, call listExpr) (expr, error) {
+	if macro.transformer != nil {
+		return expandProcedureMacro(macro, call)
+	}
+
 	for _, rule := range macro.rules {
 		bindings := newSyntaxBindings()
 		if !matchMacroPattern(rule.pattern, call, macro.literals, bindings) {
@@ -117,6 +154,27 @@ func expandMacro(macro macroExpr, call listExpr) (expr, error) {
 	}
 
 	return nil, &EvalError{Message: fmt.Sprintf("no matching syntax-rules pattern for %s", macro.name)}
+}
+
+func expandProcedureMacro(macro macroExpr, call listExpr) (expr, error) {
+	result, err := applyCallable(macro.transformer, []expr{
+		&syntaxExpr{datum: cloneSyntax(call)},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	single, err := expectSingleValue(result, "macro transformer")
+	if err != nil {
+		return nil, err
+	}
+
+	syntax, ok := single.(*syntaxExpr)
+	if !ok {
+		return nil, &EvalError{Message: "macro transformer must return a syntax object"}
+	}
+
+	return cloneSyntax(syntax.datum), nil
 }
 
 func newSyntaxBindings() *syntaxBindings {
