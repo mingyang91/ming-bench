@@ -406,7 +406,7 @@ impl SchemeString {
         Self::new(value, false)
     }
 
-    fn mutable_copy(&self) -> Self {
+    fn copy(&self) -> Self {
         Self::new(self.as_string(), true)
     }
 
@@ -657,6 +657,7 @@ enum Builtin {
     Div,
     LessThan,
     GreaterThan,
+    GreaterEqual,
     Equal,
     Eq,
     Eqv,
@@ -710,6 +711,8 @@ enum Builtin {
     SymbolToString,
     StringToSymbol,
     StringRef,
+    StringToList,
+    ListToString,
     Vector,
     MakeVector,
     VectorRef,
@@ -725,6 +728,8 @@ enum Builtin {
     CharDowncase,
     CharEqual,
     CharLess,
+    CharToInteger,
+    IntegerToChar,
     StringEqual,
     StringLess,
     StringCiEqual,
@@ -746,6 +751,7 @@ impl Builtin {
             Self::Div => "/",
             Self::LessThan => "<",
             Self::GreaterThan => ">",
+            Self::GreaterEqual => ">=",
             Self::Equal => "=",
             Self::Eq => "eq?",
             Self::Eqv => "eqv?",
@@ -799,6 +805,8 @@ impl Builtin {
             Self::SymbolToString => "symbol->string",
             Self::StringToSymbol => "string->symbol",
             Self::StringRef => "string-ref",
+            Self::StringToList => "string->list",
+            Self::ListToString => "list->string",
             Self::Vector => "vector",
             Self::MakeVector => "make-vector",
             Self::VectorRef => "vector-ref",
@@ -814,6 +822,8 @@ impl Builtin {
             Self::CharDowncase => "char-downcase",
             Self::CharEqual => "char=?",
             Self::CharLess => "char<?",
+            Self::CharToInteger => "char->integer",
+            Self::IntegerToChar => "integer->char",
             Self::StringEqual => "string=?",
             Self::StringLess => "string<?",
             Self::StringCiEqual => "string-ci=?",
@@ -869,6 +879,7 @@ impl Env {
             ("/", Builtin::Div),
             ("<", Builtin::LessThan),
             (">", Builtin::GreaterThan),
+            (">=", Builtin::GreaterEqual),
             ("=", Builtin::Equal),
             ("eq?", Builtin::Eq),
             ("eqv?", Builtin::Eqv),
@@ -922,6 +933,8 @@ impl Env {
             ("symbol->string", Builtin::SymbolToString),
             ("string->symbol", Builtin::StringToSymbol),
             ("string-ref", Builtin::StringRef),
+            ("string->list", Builtin::StringToList),
+            ("list->string", Builtin::ListToString),
             ("vector", Builtin::Vector),
             ("make-vector", Builtin::MakeVector),
             ("vector-ref", Builtin::VectorRef),
@@ -937,6 +950,8 @@ impl Env {
             ("char-downcase", Builtin::CharDowncase),
             ("char=?", Builtin::CharEqual),
             ("char<?", Builtin::CharLess),
+            ("char->integer", Builtin::CharToInteger),
+            ("integer->char", Builtin::IntegerToChar),
             ("string=?", Builtin::StringEqual),
             ("string<?", Builtin::StringLess),
             ("string-ci=?", Builtin::StringCiEqual),
@@ -1463,6 +1478,11 @@ fn eval_builtin(
                 left.greater_than(right)
             })
         }
+        Builtin::GreaterEqual => {
+            eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
+                !left.less_than(right)
+            })
+        }
         Builtin::Equal => eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
             left.equals(right)
         }),
@@ -1564,6 +1584,8 @@ fn eval_builtin(
         Builtin::SymbolToString => eval_symbol_to_string(arguments, env, call_pos),
         Builtin::StringToSymbol => eval_string_to_symbol(arguments, env, call_pos),
         Builtin::StringRef => eval_string_ref(arguments, env, call_pos),
+        Builtin::StringToList => eval_string_to_list(arguments, env, call_pos),
+        Builtin::ListToString => eval_list_to_string(arguments, env, call_pos),
         Builtin::Vector => eval_vector(arguments, env),
         Builtin::MakeVector => eval_make_vector(arguments, env, call_pos),
         Builtin::VectorRef => eval_vector_ref(arguments, env, call_pos),
@@ -1605,6 +1627,8 @@ fn eval_builtin(
                 left < right
             })
         }
+        Builtin::CharToInteger => eval_char_to_integer(arguments, env, call_pos),
+        Builtin::IntegerToChar => eval_integer_to_char(arguments, env, call_pos),
         Builtin::StringEqual => {
             eval_string_compare("string=?", arguments, env, call_pos, |left, right| {
                 left == right
@@ -4187,7 +4211,7 @@ fn eval_string_copy(
         .with_offset(call_pos.offset));
     };
 
-    Ok(Value::String(eval_string_value(expr, env)?.mutable_copy()))
+    Ok(Value::String(eval_string_value(expr, env)?.copy()))
 }
 
 fn eval_string_set(
@@ -4359,6 +4383,59 @@ fn eval_string_ref(
     }
 
     Ok(Value::Char(chars[index]))
+}
+
+fn eval_string_to_list(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [string_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "string->list".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::List(
+        eval_string(string_expr, env)?
+            .chars()
+            .map(Value::Char)
+            .collect(),
+    ))
+}
+
+fn eval_list_to_string(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [list_expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "list->string".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let chars = eval_list_items(list_expr, env)?
+        .into_iter()
+        .map(|value| match value {
+            Value::Char(ch) => Ok(ch),
+            other => Err(EvalError::TypeMismatch {
+                expected: "char".into(),
+                found: other.kind().into(),
+            }
+            .with_offset(list_expr.pos.offset)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Value::String(SchemeString::immutable(
+        chars.into_iter().collect::<String>(),
+    )))
 }
 
 fn eval_vector(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
@@ -4568,6 +4645,55 @@ fn eval_char_compare(
     Ok(Value::Boolean(
         chars.windows(2).all(|pair| predicate(pair[0], pair[1])),
     ))
+}
+
+fn eval_char_to_integer(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "char->integer".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::Number(Number::integer(
+        i64::from(eval_char(expr, env)? as u32),
+    )))
+}
+
+fn eval_integer_to_char(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "integer->char".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let code = eval_exact_integer(expr, env)?;
+    let value = if code < 0 {
+        None
+    } else {
+        char::from_u32(code as u32)
+    };
+
+    match value {
+        Some(ch) => Ok(Value::Char(ch)),
+        None => Err(EvalError::InvalidArgument {
+            message: format!("integer->char: invalid Unicode scalar value {code}"),
+        }
+        .with_offset(expr.pos.offset)),
+    }
 }
 
 fn eval_string_compare(
