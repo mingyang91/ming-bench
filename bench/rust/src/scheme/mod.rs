@@ -1,19 +1,22 @@
 mod builtins;
 pub mod error;
+mod macros;
 
 pub use error::{EvalError, SourcePos};
+use macros::{MacroEnvRef, MacroEnvironment};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 enum Expr {
     Integer(i64, SourcePos),
     Boolean(bool, SourcePos),
     String(String, SourcePos),
     Char(char, SourcePos),
     Symbol(String, SourcePos),
+    CapturedSymbol(String, BindingRef, SourcePos),
     List(Vec<Expr>, SourcePos),
 }
 
@@ -25,6 +28,7 @@ impl Expr {
             | Self::String(_, position)
             | Self::Char(_, position)
             | Self::Symbol(_, position)
+            | Self::CapturedSymbol(_, _, position)
             | Self::List(_, position) => *position,
         }
     }
@@ -54,6 +58,7 @@ struct Procedure {
     rest_param: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
+    macro_env: MacroEnvRef,
 }
 
 #[derive(Clone)]
@@ -710,20 +715,25 @@ fn eval_program(exprs: &[Expr], output: OutputRef) -> Result<Value, EvalError> {
     }
 
     let env = builtins::default_env(output);
-    eval_sequence(exprs, &env)
+    let macro_env = MacroEnvironment::new(None);
+    eval_sequence(exprs, &env, &macro_env)
 }
 
-fn eval_sequence(exprs: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_sequence(
+    exprs: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<Value, EvalError> {
     let mut last = Value::Void;
 
     for expr in exprs {
-        last = eval_expr(expr, env)?;
+        last = eval_expr(expr, env, macro_env)?;
     }
 
     Ok(last)
 }
 
-fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_expr(expr: &Expr, env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     match expr {
         Expr::Integer(value, _) => Ok(Value::Integer(*value)),
         Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
@@ -732,13 +742,19 @@ fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
         Expr::Symbol(name, position) => env_lookup(env, name).ok_or_else(|| {
             EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
         }),
+        Expr::CapturedSymbol(_, binding, _) => Ok(binding.borrow().clone()),
         Expr::List(items, position) => {
-            eval_list(items, env).map_err(|err| err.with_position(*position))
+            eval_list(items, *position, env, macro_env).map_err(|err| err.with_position(*position))
         }
     }
 }
 
-fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_list(
+    items: &[Expr],
+    position: SourcePos,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<Value, EvalError> {
     let Some(head) = items.first() else {
         return Err(EvalError::SyntaxError {
             message: "cannot evaluate empty list".into(),
@@ -750,59 +766,76 @@ fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => {
-                return eval_define(&items[1..], env)
+                return eval_define(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "define-syntax" => {
+                return macros::eval_define_syntax(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "if" => {
-                return eval_if(&items[1..], env).map_err(|err| err.with_position(head_position))
+                return eval_if(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
             }
             "quote" => {
                 return eval_quote(&items[1..]).map_err(|err| err.with_position(head_position))
             }
             "lambda" => {
-                return eval_lambda(&items[1..], env)
+                return eval_lambda(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "set!" => {
-                return eval_set(&items[1..], env).map_err(|err| err.with_position(head_position))
+                return eval_set(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
             }
             "and" => {
-                return eval_and(&items[1..], env).map_err(|err| err.with_position(head_position))
+                return eval_and(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
             }
             "or" => {
-                return eval_or(&items[1..], env).map_err(|err| err.with_position(head_position))
+                return eval_or(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
             }
             "begin" => {
-                return eval_begin(&items[1..], env).map_err(|err| err.with_position(head_position))
+                return eval_begin(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
             }
             "cond" => {
-                return eval_cond(&items[1..], env).map_err(|err| err.with_position(head_position))
+                return eval_cond(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
             }
             "let" => {
-                return eval_let(&items[1..], env).map_err(|err| err.with_position(head_position))
+                return eval_let(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
             }
             _ => {}
         }
+    }
+
+    if let Some(expanded) = macros::expand_macro_call(items, position, macro_env)
+        .map_err(|err| err.with_position(head_position))?
+    {
+        return eval_expr(&expanded, env, macro_env);
     }
 
     let callable = match head {
         Expr::Symbol(name, position) => env_lookup(env, name).ok_or_else(|| {
             EvalError::UnknownOperator { name: name.clone() }.with_position(*position)
         })?,
-        _ => eval_expr(head, env)?,
+        _ => eval_expr(head, env, macro_env)?,
     };
 
     let mut args = Vec::with_capacity(items.len().saturating_sub(1));
     for expr in &items[1..] {
-        args.push(eval_expr(expr, env)?);
+        args.push(eval_expr(expr, env, macro_env)?);
     }
 
     apply_callable(callable, &args).map_err(|err| err.with_position(head_position))
 }
 
-fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     if let [Expr::Symbol(name, _), value_expr] = args {
-        let value = eval_expr(value_expr, env)?;
+        let value = eval_expr(value_expr, env, macro_env)?;
         env_define(env, name.clone(), value);
         return Ok(Value::Void);
     }
@@ -826,6 +859,7 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             rest_param,
             body: body.to_vec(),
             env: Rc::clone(env),
+            macro_env: Rc::clone(macro_env),
         }));
 
         env_define(env, name.clone(), procedure);
@@ -837,20 +871,20 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     })
 }
 
-fn eval_if(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     match args {
         [condition, consequent] => {
-            if eval_expr(condition, env)?.is_truthy() {
-                eval_expr(consequent, env)
+            if eval_expr(condition, env, macro_env)?.is_truthy() {
+                eval_expr(consequent, env, macro_env)
             } else {
                 Ok(Value::Void)
             }
         }
         [condition, consequent, alternate] => {
-            if eval_expr(condition, env)?.is_truthy() {
-                eval_expr(consequent, env)
+            if eval_expr(condition, env, macro_env)?.is_truthy() {
+                eval_expr(consequent, env, macro_env)
             } else {
-                eval_expr(alternate, env)
+                eval_expr(alternate, env, macro_env)
             }
         }
         _ => Err(EvalError::WrongArgCount {
@@ -879,6 +913,7 @@ fn quote_to_value(expr: &Expr) -> Result<Value, EvalError> {
         Expr::String(value, _) => Ok(Value::String(value.clone())),
         Expr::Char(value, _) => Ok(Value::Char(*value)),
         Expr::Symbol(name, _) => Ok(Value::Symbol(name.clone())),
+        Expr::CapturedSymbol(name, _, _) => Ok(Value::Symbol(name.clone())),
         Expr::List(items, _) => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {
@@ -889,7 +924,7 @@ fn quote_to_value(expr: &Expr) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_lambda(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     let Some((params_expr, body)) = args.split_first() else {
         return Err(EvalError::SyntaxError {
             message: "lambda requires a parameter list and body".into(),
@@ -908,18 +943,24 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         rest_param,
         body: body.to_vec(),
         env: Rc::clone(env),
+        macro_env: Rc::clone(macro_env),
     })))
 }
 
-fn eval_set(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_set(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol(name, position), value_expr] => {
-            let value = eval_expr(value_expr, env)?;
+            let value = eval_expr(value_expr, env, macro_env)?;
             if env_set(env, name, value) {
                 Ok(Value::Void)
             } else {
                 Err(EvalError::UnboundVariable { name: name.clone() }.with_position(*position))
             }
+        }
+        [Expr::CapturedSymbol(_, binding, _), value_expr] => {
+            let value = eval_expr(value_expr, env, macro_env)?;
+            *binding.borrow_mut() = value;
+            Ok(Value::Void)
         }
         [_, _] => Err(EvalError::SyntaxError {
             message: "set! target must be a symbol".into(),
@@ -1018,14 +1059,15 @@ fn apply_procedure(procedure: &Procedure, args: &[Value]) -> Result<Value, EvalE
         );
     }
 
-    eval_sequence(&procedure.body, &call_env)
+    let call_macro_env = MacroEnvironment::new(Some(Rc::clone(&procedure.macro_env)));
+    eval_sequence(&procedure.body, &call_env, &call_macro_env)
 }
 
-fn eval_and(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     let mut last = Value::Boolean(true);
 
     for expr in args {
-        let value = eval_expr(expr, env)?;
+        let value = eval_expr(expr, env, macro_env)?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -1035,9 +1077,9 @@ fn eval_and(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(last)
 }
 
-fn eval_or(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     for expr in args {
-        let value = eval_expr(expr, env)?;
+        let value = eval_expr(expr, env, macro_env)?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -1046,11 +1088,11 @@ fn eval_or(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Boolean(false))
 }
 
-fn eval_begin(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    eval_sequence(args, env)
+fn eval_begin(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
+    eval_sequence(args, env, macro_env)
 }
 
-fn eval_cond(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_cond(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     for (index, clause) in args.iter().enumerate() {
         let Expr::List(items, _) = clause else {
             return Err(EvalError::SyntaxError {
@@ -1074,16 +1116,16 @@ fn eval_cond(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
             return if body.is_empty() {
                 Ok(Value::Void)
             } else {
-                eval_sequence(body, env)
+                eval_sequence(body, env, macro_env)
             };
         }
 
-        let test_value = eval_expr(test, env)?;
+        let test_value = eval_expr(test, env, macro_env)?;
         if test_value.is_truthy() {
             return if body.is_empty() {
                 Ok(test_value)
             } else {
-                eval_sequence(body, env)
+                eval_sequence(body, env, macro_env)
             };
         }
     }
@@ -1091,11 +1133,11 @@ fn eval_cond(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
-fn eval_let(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_let(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
     match args {
-        [Expr::List(bindings, _), body @ ..] => eval_plain_let(bindings, body, env),
+        [Expr::List(bindings, _), body @ ..] => eval_plain_let(bindings, body, env, macro_env),
         [Expr::Symbol(name, _), Expr::List(bindings, _), body @ ..] => {
-            eval_named_let(name, bindings, body, env)
+            eval_named_let(name, bindings, body, env, macro_env)
         }
         _ => Err(EvalError::SyntaxError {
             message: "invalid let".into(),
@@ -1103,27 +1145,11 @@ fn eval_let(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_plain_let(bindings: &[Expr], body: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    if body.is_empty() {
-        return Err(EvalError::SyntaxError {
-            message: "let requires a body".into(),
-        });
-    }
-
-    let bindings = parse_let_bindings(bindings, env)?;
-    let let_env = Environment::new(Some(Rc::clone(env)));
-    for (name, value) in bindings {
-        env_define(&let_env, name, value);
-    }
-
-    eval_sequence(body, &let_env)
-}
-
-fn eval_named_let(
-    name: &str,
+fn eval_plain_let(
     bindings: &[Expr],
     body: &[Expr],
     env: &EnvRef,
+    macro_env: &MacroEnvRef,
 ) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Err(EvalError::SyntaxError {
@@ -1131,7 +1157,30 @@ fn eval_named_let(
         });
     }
 
-    let bindings = parse_let_bindings(bindings, env)?;
+    let bindings = parse_let_bindings(bindings, env, macro_env)?;
+    let let_env = Environment::new(Some(Rc::clone(env)));
+    for (name, value) in bindings {
+        env_define(&let_env, name, value);
+    }
+
+    let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
+    eval_sequence(body, &let_env, &let_macro_env)
+}
+
+fn eval_named_let(
+    name: &str,
+    bindings: &[Expr],
+    body: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<Value, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "let requires a body".into(),
+        });
+    }
+
+    let bindings = parse_let_bindings(bindings, env, macro_env)?;
     let params = bindings
         .iter()
         .map(|(param, _)| param.clone())
@@ -1147,13 +1196,18 @@ fn eval_named_let(
         rest_param: None,
         body: body.to_vec(),
         env: Rc::clone(&let_env),
+        macro_env: Rc::clone(macro_env),
     }));
     env_define(&let_env, name.to_string(), procedure.clone());
 
     apply_callable(procedure, &args)
 }
 
-fn parse_let_bindings(bindings: &[Expr], env: &EnvRef) -> Result<Vec<(String, Value)>, EvalError> {
+fn parse_let_bindings(
+    bindings: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<Vec<(String, Value)>, EvalError> {
     let mut parsed = Vec::with_capacity(bindings.len());
 
     for binding in bindings {
@@ -1169,7 +1223,7 @@ fn parse_let_bindings(bindings: &[Expr], env: &EnvRef) -> Result<Vec<(String, Va
             });
         };
 
-        parsed.push((name.clone(), eval_expr(value_expr, env)?));
+        parsed.push((name.clone(), eval_expr(value_expr, env, macro_env)?));
     }
 
     Ok(parsed)
