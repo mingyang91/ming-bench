@@ -27,7 +27,7 @@ impl Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 enum ExprKind {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     String(String),
     Char(char),
@@ -40,9 +40,213 @@ struct SourcePos {
     offset: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Number {
+    Exact { num: i64, den: i64 },
+    Inexact(f64),
+}
+
+impl Number {
+    fn integer(value: i64) -> Self {
+        Self::Exact { num: value, den: 1 }
+    }
+
+    fn rational(num: i64, den: i64) -> Self {
+        debug_assert_ne!(den, 0, "rational denominator must be non-zero");
+
+        if num == 0 {
+            return Self::integer(0);
+        }
+
+        let mut num = num;
+        let mut den = den;
+        if den < 0 {
+            num = -num;
+            den = -den;
+        }
+
+        let gcd = gcd_i64(num, den);
+        Self::Exact {
+            num: num / gcd,
+            den: den / gcd,
+        }
+    }
+
+    fn is_exact(self) -> bool {
+        matches!(self, Self::Exact { .. })
+    }
+
+    fn is_inexact(self) -> bool {
+        matches!(self, Self::Inexact(_))
+    }
+
+    fn is_integer(self) -> bool {
+        match self {
+            Self::Exact { den, .. } => den == 1,
+            Self::Inexact(value) => value.is_finite() && value.fract() == 0.0,
+        }
+    }
+
+    fn is_rational(self) -> bool {
+        match self {
+            Self::Exact { .. } => true,
+            Self::Inexact(value) => value.is_finite(),
+        }
+    }
+
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Exact { num, den } => num as f64 / den as f64,
+            Self::Inexact(value) => value,
+        }
+    }
+
+    fn render(self) -> String {
+        match self {
+            Self::Exact { num, den: 1 } => num.to_string(),
+            Self::Exact { num, den } => format!("{num}/{den}"),
+            Self::Inexact(value) => render_inexact(value),
+        }
+    }
+
+    fn negate(self) -> Self {
+        match self {
+            Self::Exact { num, den } => Self::rational(-num, den),
+            Self::Inexact(value) => Self::Inexact(-value),
+        }
+    }
+
+    fn abs(self) -> Self {
+        match self {
+            Self::Exact { num, den } => Self::rational(num.abs(), den),
+            Self::Inexact(value) => Self::Inexact(value.abs()),
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        match (self, other) {
+            (
+                Self::Exact {
+                    num: left_num,
+                    den: left_den,
+                },
+                Self::Exact {
+                    num: right_num,
+                    den: right_den,
+                },
+            ) => Self::rational(
+                left_num * right_den + right_num * left_den,
+                left_den * right_den,
+            ),
+            _ => Self::Inexact(self.as_f64() + other.as_f64()),
+        }
+    }
+
+    fn sub(self, other: Self) -> Self {
+        self.add(other.negate())
+    }
+
+    fn mul(self, other: Self) -> Self {
+        match (self, other) {
+            (
+                Self::Exact {
+                    num: left_num,
+                    den: left_den,
+                },
+                Self::Exact {
+                    num: right_num,
+                    den: right_den,
+                },
+            ) => Self::rational(left_num * right_num, left_den * right_den),
+            _ => Self::Inexact(self.as_f64() * other.as_f64()),
+        }
+    }
+
+    fn div(self, other: Self) -> Self {
+        match (self, other) {
+            (
+                Self::Exact {
+                    num: left_num,
+                    den: left_den,
+                },
+                Self::Exact {
+                    num: right_num,
+                    den: right_den,
+                },
+            ) => Self::rational(left_num * right_den, left_den * right_num),
+            _ => Self::Inexact(self.as_f64() / other.as_f64()),
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        match self {
+            Self::Exact { num, .. } => num == 0,
+            Self::Inexact(value) => value == 0.0,
+        }
+    }
+
+    fn equals(self, other: Self) -> bool {
+        match (self, other) {
+            (
+                Self::Exact {
+                    num: left_num,
+                    den: left_den,
+                },
+                Self::Exact {
+                    num: right_num,
+                    den: right_den,
+                },
+            ) => {
+                (left_num as i128) * (right_den as i128) == (right_num as i128) * (left_den as i128)
+            }
+            _ => self.as_f64() == other.as_f64(),
+        }
+    }
+
+    fn less_than(self, other: Self) -> bool {
+        match (self, other) {
+            (
+                Self::Exact {
+                    num: left_num,
+                    den: left_den,
+                },
+                Self::Exact {
+                    num: right_num,
+                    den: right_den,
+                },
+            ) => {
+                (left_num as i128) * (right_den as i128) < (right_num as i128) * (left_den as i128)
+            }
+            _ => self.as_f64() < other.as_f64(),
+        }
+    }
+
+    fn less_equal(self, other: Self) -> bool {
+        self.less_than(other) || self.equals(other)
+    }
+
+    fn greater_than(self, other: Self) -> bool {
+        !self.less_equal(other)
+    }
+
+    fn exact_parts(self) -> Option<(i64, i64)> {
+        match self {
+            Self::Exact { num, den } => Some((num, den)),
+            Self::Inexact(_) => None,
+        }
+    }
+
+    fn exact_integer(self) -> Option<i64> {
+        match self {
+            Self::Exact { num, den: 1 } => Some(num),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum Value {
-    Integer(i64),
+    Number(Number),
     Boolean(bool),
     String(SchemeString),
     Char(char),
@@ -82,7 +286,7 @@ impl Value {
 
     fn kind(&self) -> &'static str {
         match self {
-            Self::Integer(_) => "number",
+            Self::Number(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
             Self::Char(_) => "char",
@@ -104,7 +308,7 @@ impl Value {
 
     fn render_with(&self, mode: RenderMode) -> String {
         match self {
-            Self::Integer(value) => value.to_string(),
+            Self::Number(value) => value.render(),
             Self::Boolean(true) => "#t".into(),
             Self::Boolean(false) => "#f".into(),
             Self::String(value) => {
@@ -216,6 +420,125 @@ fn render_char(value: char, mode: RenderMode) -> String {
     }
 }
 
+fn gcd_i64(left: i64, right: i64) -> i64 {
+    let mut left = i128::from(left).abs();
+    let mut right = i128::from(right).abs();
+
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+
+    left as i64
+}
+
+fn render_inexact(value: f64) -> String {
+    let rendered = format!("{value:?}");
+    if rendered.contains('.') || rendered.contains('e') || rendered.contains('E') {
+        rendered
+    } else {
+        format!("{rendered}.0")
+    }
+}
+
+fn parse_number_token(token: &str) -> Option<Number> {
+    if let Ok(value) = token.parse::<i64>() {
+        return Some(Number::integer(value));
+    }
+
+    if let Some(value) = parse_rational_token(token) {
+        return Some(value);
+    }
+
+    parse_inexact_token(token).map(Number::Inexact)
+}
+
+fn parse_rational_token(token: &str) -> Option<Number> {
+    let (numerator, denominator) = token.split_once('/')?;
+    if numerator.is_empty() || denominator.is_empty() {
+        return None;
+    }
+
+    let numerator = numerator.parse::<i64>().ok()?;
+    let denominator = denominator.parse::<i64>().ok()?;
+    if denominator == 0 {
+        return None;
+    }
+
+    Some(Number::rational(numerator, denominator))
+}
+
+fn parse_inexact_token(token: &str) -> Option<f64> {
+    if !(token.contains('.') || token.contains('e') || token.contains('E')) {
+        return None;
+    }
+
+    token.parse::<f64>().ok()
+}
+
+fn parse_decimal_as_exact(token: &str) -> Option<Number> {
+    let (mantissa, exponent) = if let Some(index) = token.find(|ch| matches!(ch, 'e' | 'E')) {
+        (&token[..index], token[index + 1..].parse::<i32>().ok()?)
+    } else {
+        (token, 0)
+    };
+
+    let (negative, mantissa) = if let Some(rest) = mantissa.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = mantissa.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, mantissa)
+    };
+
+    let (integer_part, fractional_part) = match mantissa.split_once('.') {
+        Some((integer_part, fractional_part)) => (integer_part, fractional_part),
+        None => (mantissa, ""),
+    };
+
+    if (integer_part.is_empty() && fractional_part.is_empty())
+        || !integer_part.chars().all(|ch| ch.is_ascii_digit())
+        || !fractional_part.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let digits = format!("{integer_part}{fractional_part}");
+    if digits.is_empty() {
+        return None;
+    }
+
+    let mut numerator = digits.parse::<i128>().ok()?;
+    if negative {
+        numerator = -numerator;
+    }
+
+    let scale = fractional_part.len() as i32 - exponent;
+    let denominator = if scale > 0 {
+        checked_pow10(scale as u32)?
+    } else {
+        1
+    };
+
+    if scale < 0 {
+        numerator = numerator.checked_mul(checked_pow10((-scale) as u32)?)?;
+    }
+
+    Some(Number::rational(
+        i64::try_from(numerator).ok()?,
+        i64::try_from(denominator).ok()?,
+    ))
+}
+
+fn checked_pow10(exponent: u32) -> Option<i128> {
+    let mut value = 1_i128;
+    for _ in 0..exponent {
+        value = value.checked_mul(10)?;
+    }
+    Some(value)
+}
+
 #[derive(Clone, Copy)]
 enum Builtin {
     Add,
@@ -255,6 +578,10 @@ enum Builtin {
     Map,
     StringPred,
     NumberPred,
+    ExactPred,
+    InexactPred,
+    IntegerPred,
+    RationalPred,
     BooleanPred,
     PairPred,
     SymbolPred,
@@ -283,6 +610,10 @@ enum Builtin {
     StringCiEqual,
     StringUpcase,
     StringDowncase,
+    ExactToInexact,
+    InexactToExact,
+    Numerator,
+    Denominator,
     Apply,
 }
 
@@ -326,6 +657,10 @@ impl Builtin {
             Self::Map => "map",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
+            Self::ExactPred => "exact?",
+            Self::InexactPred => "inexact?",
+            Self::IntegerPred => "integer?",
+            Self::RationalPred => "rational?",
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
@@ -354,6 +689,10 @@ impl Builtin {
             Self::StringCiEqual => "string-ci=?",
             Self::StringUpcase => "string-upcase",
             Self::StringDowncase => "string-downcase",
+            Self::ExactToInexact => "exact->inexact",
+            Self::InexactToExact => "inexact->exact",
+            Self::Numerator => "numerator",
+            Self::Denominator => "denominator",
             Self::Apply => "apply",
         }
     }
@@ -427,6 +766,10 @@ impl Env {
             ("map", Builtin::Map),
             ("string?", Builtin::StringPred),
             ("number?", Builtin::NumberPred),
+            ("exact?", Builtin::ExactPred),
+            ("inexact?", Builtin::InexactPred),
+            ("integer?", Builtin::IntegerPred),
+            ("rational?", Builtin::RationalPred),
             ("boolean?", Builtin::BooleanPred),
             ("pair?", Builtin::PairPred),
             ("symbol?", Builtin::SymbolPred),
@@ -455,6 +798,10 @@ impl Env {
             ("string-ci=?", Builtin::StringCiEqual),
             ("string-upcase", Builtin::StringUpcase),
             ("string-downcase", Builtin::StringDowncase),
+            ("exact->inexact", Builtin::ExactToInexact),
+            ("inexact->exact", Builtin::InexactToExact),
+            ("numerator", Builtin::Numerator),
+            ("denominator", Builtin::Denominator),
             ("apply", Builtin::Apply),
         ] {
             env.define(name.into(), Value::Builtin(builtin));
@@ -676,9 +1023,9 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::new(ExprKind::Char(value), pos));
                 }
 
-                match token.parse::<i64>() {
-                    Ok(value) => Ok(Expr::new(ExprKind::Integer(value), pos)),
-                    Err(_) => Ok(Expr::symbol(token, pos)),
+                match parse_number_token(token) {
+                    Some(value) => Ok(Expr::new(ExprKind::Number(value), pos)),
+                    None => Ok(Expr::symbol(token, pos)),
                 }
             }
         }
@@ -769,7 +1116,7 @@ fn eval_sequence(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError>
 
 fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     match &expr.kind {
-        ExprKind::Integer(value) => Ok(Value::Integer(*value)),
+        ExprKind::Number(value) => Ok(Value::Number(*value)),
         ExprKind::Boolean(value) => Ok(Value::Boolean(*value)),
         ExprKind::String(value) => Ok(Value::String(SchemeString::immutable(value.clone()))),
         ExprKind::Char(value) => Ok(Value::Char(*value)),
@@ -847,22 +1194,22 @@ fn eval_builtin(
         Builtin::Div => eval_div(arguments, env, call_pos),
         Builtin::LessThan => {
             eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
-                left < right
+                left.less_than(right)
             })
         }
         Builtin::GreaterThan => {
             eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
-                left > right
+                left.greater_than(right)
             })
         }
         Builtin::Equal => eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
-            left == right
+            left.equals(right)
         }),
         Builtin::Eq => eval_eq(arguments, env, call_pos),
         Builtin::EqualDeep => eval_equal(arguments, env, call_pos),
         Builtin::LessEqual => {
             eval_compare(builtin.name(), arguments, env, call_pos, |left, right| {
-                left <= right
+                left.less_equal(right)
             })
         }
         Builtin::Not => eval_not(arguments, env, call_pos),
@@ -873,21 +1220,25 @@ fn eval_builtin(
         Builtin::Min => eval_min(arguments, env, call_pos),
         Builtin::Max => eval_max(arguments, env, call_pos),
         Builtin::Expt => eval_expt(arguments, env, call_pos),
-        Builtin::ZeroPred => eval_number_predicate(arguments, env, "zero?", call_pos, |value| {
-            value == 0
-        }),
+        Builtin::ZeroPred => {
+            eval_number_predicate(arguments, env, "zero?", call_pos, |value| value.is_zero())
+        }
         Builtin::PositivePred => {
-            eval_number_predicate(arguments, env, "positive?", call_pos, |value| value > 0)
+            eval_number_predicate(arguments, env, "positive?", call_pos, |value| {
+                value.greater_than(Number::integer(0))
+            })
         }
         Builtin::NegativePred => {
-            eval_number_predicate(arguments, env, "negative?", call_pos, |value| value < 0)
+            eval_number_predicate(arguments, env, "negative?", call_pos, |value| {
+                value.less_than(Number::integer(0))
+            })
         }
-        Builtin::OddPred => eval_number_predicate(arguments, env, "odd?", call_pos, |value| {
-            value % 2 != 0
-        }),
-        Builtin::EvenPred => eval_number_predicate(arguments, env, "even?", call_pos, |value| {
-            value % 2 == 0
-        }),
+        Builtin::OddPred => {
+            eval_integer_number_predicate(arguments, env, "odd?", call_pos, |value| value % 2 != 0)
+        }
+        Builtin::EvenPred => {
+            eval_integer_number_predicate(arguments, env, "even?", call_pos, |value| value % 2 == 0)
+        }
         Builtin::Cons => eval_cons(arguments, env, call_pos),
         Builtin::Car => eval_car(arguments, env, call_pos),
         Builtin::Cdr => eval_cdr(arguments, env, call_pos),
@@ -906,20 +1257,32 @@ fn eval_builtin(
             matches!(value, Value::String(_))
         }),
         Builtin::NumberPred => eval_type_predicate(arguments, env, "number?", call_pos, |value| {
-            matches!(value, Value::Integer(_))
+            matches!(value, Value::Number(_))
         }),
+        Builtin::ExactPred => {
+            eval_number_property(arguments, env, "exact?", call_pos, |value| value.is_exact())
+        }
+        Builtin::InexactPred => {
+            eval_number_property(arguments, env, "inexact?", call_pos, |value| {
+                value.is_inexact()
+            })
+        }
+        Builtin::IntegerPred => {
+            eval_number_property(arguments, env, "integer?", call_pos, |value| {
+                value.is_integer()
+            })
+        }
+        Builtin::RationalPred => {
+            eval_number_property(arguments, env, "rational?", call_pos, |value| {
+                value.is_rational()
+            })
+        }
         Builtin::BooleanPred => {
             eval_type_predicate(arguments, env, "boolean?", call_pos, |value| {
                 matches!(value, Value::Boolean(_))
             })
         }
-        Builtin::PairPred => eval_type_predicate(
-            arguments,
-            env,
-            "pair?",
-            call_pos,
-            is_pair,
-        ),
+        Builtin::PairPred => eval_type_predicate(arguments, env, "pair?", call_pos, is_pair),
         Builtin::SymbolPred => eval_type_predicate(arguments, env, "symbol?", call_pos, |value| {
             matches!(value, Value::Symbol(_))
         }),
@@ -945,7 +1308,9 @@ fn eval_builtin(
             })
         }
         Builtin::CharNumericPred => {
-            eval_char_predicate(arguments, env, "char-numeric?", call_pos, |ch| ch.is_numeric())
+            eval_char_predicate(arguments, env, "char-numeric?", call_pos, |ch| {
+                ch.is_numeric()
+            })
         }
         Builtin::CharUpcase => eval_char_transform(arguments, env, "char-upcase", call_pos, |ch| {
             ch.to_uppercase().next().unwrap_or(ch)
@@ -956,16 +1321,24 @@ fn eval_builtin(
             })
         }
         Builtin::CharEqual => {
-            eval_char_compare("char=?", arguments, env, call_pos, |left, right| left == right)
+            eval_char_compare("char=?", arguments, env, call_pos, |left, right| {
+                left == right
+            })
         }
         Builtin::CharLess => {
-            eval_char_compare("char<?", arguments, env, call_pos, |left, right| left < right)
+            eval_char_compare("char<?", arguments, env, call_pos, |left, right| {
+                left < right
+            })
         }
         Builtin::StringEqual => {
-            eval_string_compare("string=?", arguments, env, call_pos, |left, right| left == right)
+            eval_string_compare("string=?", arguments, env, call_pos, |left, right| {
+                left == right
+            })
         }
         Builtin::StringLess => {
-            eval_string_compare("string<?", arguments, env, call_pos, |left, right| left < right)
+            eval_string_compare("string<?", arguments, env, call_pos, |left, right| {
+                left < right
+            })
         }
         Builtin::StringCiEqual => {
             eval_string_compare("string-ci=?", arguments, env, call_pos, |left, right| {
@@ -982,6 +1355,10 @@ fn eval_builtin(
                 value.chars().flat_map(|ch| ch.to_lowercase()).collect()
             })
         }
+        Builtin::ExactToInexact => eval_exact_to_inexact(arguments, env, call_pos),
+        Builtin::InexactToExact => eval_inexact_to_exact(arguments, env, call_pos),
+        Builtin::Numerator => eval_numerator(arguments, env, call_pos),
+        Builtin::Denominator => eval_denominator(arguments, env, call_pos),
         Builtin::Apply => eval_apply_builtin(arguments, env, call_pos),
     }
 }
@@ -1252,11 +1629,13 @@ fn match_pattern(
     bindings: &mut MatchBindings,
 ) -> Result<bool, EvalError> {
     match (&pattern.kind, &target.kind) {
-        (ExprKind::Integer(left), ExprKind::Integer(right)) => Ok(left == right),
+        (ExprKind::Number(left), ExprKind::Number(right)) => Ok(left == right),
         (ExprKind::Boolean(left), ExprKind::Boolean(right)) => Ok(left == right),
         (ExprKind::String(left), ExprKind::String(right)) => Ok(left == right),
         (ExprKind::Char(left), ExprKind::Char(right)) => Ok(left == right),
-        (ExprKind::Symbol(name), _) => match_pattern_symbol(name, pattern.pos, target, transformer, bindings),
+        (ExprKind::Symbol(name), _) => {
+            match_pattern_symbol(name, pattern.pos, target, transformer, bindings)
+        }
         (ExprKind::List(patterns), ExprKind::List(targets)) => {
             match_pattern_list(patterns, targets, transformer, bindings)
         }
@@ -1319,10 +1698,7 @@ fn match_pattern_list(
             return Ok(false);
         }
 
-        for (pattern, target) in suffix
-            .iter()
-            .zip(&targets[targets.len() - suffix.len()..])
-        {
+        for (pattern, target) in suffix.iter().zip(&targets[targets.len() - suffix.len()..]) {
             if !match_pattern(pattern, target, transformer, bindings)? {
                 return Ok(false);
             }
@@ -1380,9 +1756,9 @@ fn match_repeated_pattern(
 }
 
 fn ellipsis_index(items: &[Expr]) -> Option<usize> {
-    items.windows(2).position(|window| {
-        matches!(&window[1].kind, ExprKind::Symbol(name) if name == "...")
-    })
+    items
+        .windows(2)
+        .position(|window| matches!(&window[1].kind, ExprKind::Symbol(name) if name == "..."))
 }
 
 fn expand_template(
@@ -1392,10 +1768,9 @@ fn expand_template(
     repetition_index: Option<usize>,
 ) -> Result<Expr, EvalError> {
     match &template.kind {
-        ExprKind::Integer(_)
-        | ExprKind::Boolean(_)
-        | ExprKind::String(_)
-        | ExprKind::Char(_) => Ok(template.clone()),
+        ExprKind::Number(_) | ExprKind::Boolean(_) | ExprKind::String(_) | ExprKind::Char(_) => {
+            Ok(template.clone())
+        }
         ExprKind::Symbol(name) => {
             expand_template_symbol(name, template.pos, state, bound_renames, repetition_index)
         }
@@ -1560,12 +1935,14 @@ fn expand_let_template(
         }
 
         let init = expand_template(&parts[1], state, bound_renames, repetition_index)?;
-        let name =
-            expand_binding_identifier(&parts[0], state, &mut body_scope, repetition_index)?;
+        let name = expand_binding_identifier(&parts[0], state, &mut body_scope, repetition_index)?;
         expanded_bindings.push(Expr::new(ExprKind::List(vec![name, init]), binding.pos));
     }
 
-    expanded.push(Expr::new(ExprKind::List(expanded_bindings), bindings_expr.pos));
+    expanded.push(Expr::new(
+        ExprKind::List(expanded_bindings),
+        bindings_expr.pos,
+    ));
 
     for body_expr in &items[binding_index + 1..] {
         expanded.push(expand_template(
@@ -1594,8 +1971,7 @@ fn expand_lambda_template(
     };
 
     let mut body_scope = bound_renames.clone();
-    let params =
-        expand_lambda_params(params_expr, state, &mut body_scope, repetition_index)?;
+    let params = expand_lambda_params(params_expr, state, &mut body_scope, repetition_index)?;
     let mut expanded = vec![Expr::symbol("lambda", items[0].pos), params];
 
     for body_expr in body {
@@ -1822,7 +2198,7 @@ fn eval_quote(pos: SourcePos, arguments: &[Expr]) -> Result<Value, EvalError> {
 
 fn quote_expr(expr: &Expr) -> Value {
     match &expr.kind {
-        ExprKind::Integer(value) => Value::Integer(*value),
+        ExprKind::Number(value) => Value::Number(*value),
         ExprKind::Boolean(value) => Value::Boolean(*value),
         ExprKind::String(value) => Value::String(SchemeString::immutable(value.clone())),
         ExprKind::Char(value) => Value::Char(*value),
@@ -2156,7 +2532,11 @@ fn apply_value_with_values(
 
 fn eval_add(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let numbers = eval_number_args(arguments, env)?;
-    Ok(Value::Integer(numbers.into_iter().sum()))
+    Ok(Value::Number(
+        numbers
+            .into_iter()
+            .fold(Number::integer(0), |acc, value| acc.add(value)),
+    ))
 }
 
 fn eval_eq(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
@@ -2199,17 +2579,21 @@ fn eval_sub(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
             got: 0,
         }
         .with_offset(call_pos.offset)),
-        [value] => Ok(Value::Integer(-value)),
-        [first, rest @ ..] => Ok(Value::Integer(
-            rest.iter().fold(*first, |acc, value| acc - value),
+        [value] => Ok(Value::Number(value.negate())),
+        [first, rest @ ..] => Ok(Value::Number(
+            rest.iter()
+                .copied()
+                .fold(*first, |acc, value| acc.sub(value)),
         )),
     }
 }
 
 fn eval_mul(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     let numbers = eval_number_args(arguments, env)?;
-    Ok(Value::Integer(
-        numbers.into_iter().fold(1_i64, |acc, value| acc * value),
+    Ok(Value::Number(
+        numbers
+            .into_iter()
+            .fold(Number::integer(1), |acc, value| acc.mul(value)),
     ))
 }
 
@@ -2236,13 +2620,13 @@ fn eval_div(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
 
     for divisor_expr in rest {
         let divisor = eval_number(divisor_expr, env)?;
-        if divisor == 0 {
+        if divisor.is_zero() {
             return Err(EvalError::DivisionByZero.with_offset(divisor_expr.pos.offset));
         }
-        total /= divisor;
+        total = total.div(divisor);
     }
 
-    Ok(Value::Integer(total))
+    Ok(Value::Number(total))
 }
 
 fn eval_compare(
@@ -2250,7 +2634,7 @@ fn eval_compare(
     arguments: &[Expr],
     env: &EnvRef,
     call_pos: SourcePos,
-    predicate: impl Fn(i64, i64) -> bool,
+    predicate: impl Fn(Number, Number) -> bool,
 ) -> Result<Value, EvalError> {
     let numbers = eval_number_args(arguments, env)?;
 
@@ -2292,34 +2676,23 @@ fn eval_abs(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
         .with_offset(call_pos.offset));
     };
 
-    let value = eval_number(expr, env)?;
-    let value = value
-        .checked_abs()
-        .ok_or_else(|| EvalError::InvalidArgument {
-            message: "abs: integer overflow".into(),
-        }
-        .with_offset(expr.pos.offset))?;
-    Ok(Value::Integer(value))
+    Ok(Value::Number(eval_number(expr, env)?.abs()))
 }
 
-fn eval_modulo(
-    arguments: &[Expr],
-    env: &EnvRef,
-    call_pos: SourcePos,
-) -> Result<Value, EvalError> {
+fn eval_modulo(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
     let (dividend, divisor) = eval_division_operands("modulo", arguments, env, call_pos)?;
-    let remainder = dividend
-        .checked_rem(divisor)
-        .ok_or_else(|| EvalError::InvalidArgument {
+    let remainder = dividend.checked_rem(divisor).ok_or_else(|| {
+        EvalError::InvalidArgument {
             message: "modulo: integer overflow".into(),
         }
-        .with_offset(call_pos.offset))?;
+        .with_offset(call_pos.offset)
+    })?;
     let value = if remainder != 0 && (remainder > 0) != (divisor > 0) {
         remainder + divisor
     } else {
         remainder
     };
-    Ok(Value::Integer(value))
+    Ok(Value::Number(Number::integer(value)))
 }
 
 fn eval_remainder(
@@ -2328,13 +2701,13 @@ fn eval_remainder(
     call_pos: SourcePos,
 ) -> Result<Value, EvalError> {
     let (dividend, divisor) = eval_division_operands("remainder", arguments, env, call_pos)?;
-    let value = dividend
-        .checked_rem(divisor)
-        .ok_or_else(|| EvalError::InvalidArgument {
+    let value = dividend.checked_rem(divisor).ok_or_else(|| {
+        EvalError::InvalidArgument {
             message: "remainder: integer overflow".into(),
         }
-        .with_offset(call_pos.offset))?;
-    Ok(Value::Integer(value))
+        .with_offset(call_pos.offset)
+    })?;
+    Ok(Value::Number(Number::integer(value)))
 }
 
 fn eval_quotient(
@@ -2343,18 +2716,18 @@ fn eval_quotient(
     call_pos: SourcePos,
 ) -> Result<Value, EvalError> {
     let (dividend, divisor) = eval_division_operands("quotient", arguments, env, call_pos)?;
-    let value = dividend
-        .checked_div(divisor)
-        .ok_or_else(|| EvalError::InvalidArgument {
+    let value = dividend.checked_div(divisor).ok_or_else(|| {
+        EvalError::InvalidArgument {
             message: "quotient: integer overflow".into(),
         }
-        .with_offset(call_pos.offset))?;
-    Ok(Value::Integer(value))
+        .with_offset(call_pos.offset)
+    })?;
+    Ok(Value::Number(Number::integer(value)))
 }
 
 fn eval_min(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
-    let numbers = eval_number_args(arguments, env)?;
-    let value = numbers.into_iter().min().ok_or_else(|| {
+    let mut numbers = eval_number_args(arguments, env)?.into_iter();
+    let first = numbers.next().ok_or_else(|| {
         EvalError::WrongArgCount {
             name: "min".into(),
             expected: "at least 1".into(),
@@ -2362,12 +2735,22 @@ fn eval_min(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
         }
         .with_offset(call_pos.offset)
     })?;
-    Ok(Value::Integer(value))
+    let value = numbers.fold(
+        first,
+        |acc, number| {
+            if number.less_than(acc) {
+                number
+            } else {
+                acc
+            }
+        },
+    );
+    Ok(Value::Number(value))
 }
 
 fn eval_max(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
-    let numbers = eval_number_args(arguments, env)?;
-    let value = numbers.into_iter().max().ok_or_else(|| {
+    let mut numbers = eval_number_args(arguments, env)?.into_iter();
+    let first = numbers.next().ok_or_else(|| {
         EvalError::WrongArgCount {
             name: "max".into(),
             expected: "at least 1".into(),
@@ -2375,7 +2758,14 @@ fn eval_max(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Val
         }
         .with_offset(call_pos.offset)
     })?;
-    Ok(Value::Integer(value))
+    let value = numbers.fold(first, |acc, number| {
+        if number.greater_than(acc) {
+            number
+        } else {
+            acc
+        }
+    });
+    Ok(Value::Number(value))
 }
 
 fn eval_expt(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
@@ -2388,8 +2778,8 @@ fn eval_expt(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Va
         .with_offset(call_pos.offset));
     };
 
-    let base = eval_number(base_expr, env)?;
-    let exponent = eval_number(exponent_expr, env)?;
+    let base = eval_exact_integer(base_expr, env)?;
+    let exponent = eval_exact_integer(exponent_expr, env)?;
     if exponent < 0 {
         return Err(EvalError::InvalidArgument {
             message: "expt: exponent must be non-negative".into(),
@@ -2397,16 +2787,35 @@ fn eval_expt(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Va
         .with_offset(exponent_expr.pos.offset));
     }
 
-    let value = base
-        .checked_pow(exponent as u32)
-        .ok_or_else(|| EvalError::InvalidArgument {
+    let value = base.checked_pow(exponent as u32).ok_or_else(|| {
+        EvalError::InvalidArgument {
             message: "expt: integer overflow".into(),
         }
-        .with_offset(call_pos.offset))?;
-    Ok(Value::Integer(value))
+        .with_offset(call_pos.offset)
+    })?;
+    Ok(Value::Number(Number::integer(value)))
 }
 
 fn eval_number_predicate(
+    arguments: &[Expr],
+    env: &EnvRef,
+    name: &str,
+    call_pos: SourcePos,
+    predicate: impl Fn(Number) -> bool,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::Boolean(predicate(eval_number(expr, env)?)))
+}
+
+fn eval_integer_number_predicate(
     arguments: &[Expr],
     env: &EnvRef,
     name: &str,
@@ -2422,7 +2831,121 @@ fn eval_number_predicate(
         .with_offset(call_pos.offset));
     };
 
+    Ok(Value::Boolean(predicate(eval_exact_integer(expr, env)?)))
+}
+
+fn eval_number_property(
+    arguments: &[Expr],
+    env: &EnvRef,
+    name: &str,
+    call_pos: SourcePos,
+    predicate: impl Fn(Number) -> bool,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: name.into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
     Ok(Value::Boolean(predicate(eval_number(expr, env)?)))
+}
+
+fn eval_exact_to_inexact(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "exact->inexact".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    Ok(Value::Number(Number::Inexact(
+        eval_number(expr, env)?.as_f64(),
+    )))
+}
+
+fn eval_inexact_to_exact(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "inexact->exact".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let number = eval_number(expr, env)?;
+    match number {
+        exact @ Number::Exact { .. } => Ok(Value::Number(exact)),
+        Number::Inexact(value) => parse_decimal_as_exact(&render_inexact(value))
+            .map(Value::Number)
+            .ok_or_else(|| {
+                EvalError::InvalidArgument {
+                    message: "inexact->exact: unsupported inexact value".into(),
+                }
+                .with_offset(expr.pos.offset)
+            }),
+    }
+}
+
+fn eval_numerator(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "numerator".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let number = eval_number(expr, env)?;
+    let (numerator, _) = number.exact_parts().ok_or_else(|| {
+        EvalError::InvalidArgument {
+            message: "numerator: expected exact number".into(),
+        }
+        .with_offset(expr.pos.offset)
+    })?;
+    Ok(Value::Number(Number::integer(numerator)))
+}
+
+fn eval_denominator(
+    arguments: &[Expr],
+    env: &EnvRef,
+    call_pos: SourcePos,
+) -> Result<Value, EvalError> {
+    let [expr] = arguments else {
+        return Err(EvalError::WrongArgCount {
+            name: "denominator".into(),
+            expected: "exactly 1".into(),
+            got: arguments.len(),
+        }
+        .with_offset(call_pos.offset));
+    };
+
+    let number = eval_number(expr, env)?;
+    let (_, denominator) = number.exact_parts().ok_or_else(|| {
+        EvalError::InvalidArgument {
+            message: "denominator: expected exact number".into(),
+        }
+        .with_offset(expr.pos.offset)
+    })?;
+    Ok(Value::Number(Number::integer(denominator)))
 }
 
 fn eval_cons(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<Value, EvalError> {
@@ -2582,7 +3105,7 @@ fn eval_length(arguments: &[Expr], env: &EnvRef, call_pos: SourcePos) -> Result<
     };
 
     match eval_expr(list_expr, env)? {
-        Value::List(items) => Ok(Value::Integer(items.len() as i64)),
+        Value::List(items) => Ok(Value::Number(Number::integer(items.len() as i64))),
         other => Err(EvalError::TypeMismatch {
             expected: "list".into(),
             found: other.kind().into(),
@@ -2753,9 +3276,9 @@ fn eval_string_length(
         .with_offset(call_pos.offset));
     };
 
-    Ok(Value::Integer(
-        eval_string(expr, env)?.chars().count() as i64
-    ))
+    Ok(Value::Number(Number::integer(
+        eval_string(expr, env)?.chars().count() as i64,
+    )))
 }
 
 fn eval_string_copy(
@@ -2859,9 +3382,9 @@ fn eval_string_to_number(
         .with_offset(call_pos.offset));
     };
 
-    match eval_string(expr, env)?.parse::<i64>() {
-        Ok(value) => Ok(Value::Integer(value)),
-        Err(_) => Ok(Value::Boolean(false)),
+    match parse_number_token(&eval_string(expr, env)?) {
+        Some(value) => Ok(Value::Number(value)),
+        None => Ok(Value::Boolean(false)),
     }
 }
 
@@ -2880,7 +3403,7 @@ fn eval_number_to_string(
     };
 
     Ok(Value::String(SchemeString::immutable(
-        eval_number(expr, env)?.to_string(),
+        eval_number(expr, env)?.render(),
     )))
 }
 
@@ -3005,7 +3528,9 @@ fn eval_char_compare(
         .with_offset(call_pos.offset));
     }
 
-    Ok(Value::Boolean(chars.windows(2).all(|pair| predicate(pair[0], pair[1]))))
+    Ok(Value::Boolean(
+        chars.windows(2).all(|pair| predicate(pair[0], pair[1])),
+    ))
 }
 
 fn eval_string_compare(
@@ -3050,9 +3575,9 @@ fn eval_string_transform(
         .with_offset(call_pos.offset));
     };
 
-    Ok(Value::String(SchemeString::immutable(transform(eval_string(
-        expr, env,
-    )?))))
+    Ok(Value::String(SchemeString::immutable(transform(
+        eval_string(expr, env)?,
+    ))))
 }
 
 fn eval_type_predicate(
@@ -3103,7 +3628,7 @@ fn eval_or(arguments: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(last_value)
 }
 
-fn eval_number_args(arguments: &[Expr], env: &EnvRef) -> Result<Vec<i64>, EvalError> {
+fn eval_number_args(arguments: &[Expr], env: &EnvRef) -> Result<Vec<Number>, EvalError> {
     arguments
         .iter()
         .map(|argument| eval_number(argument, env))
@@ -3125,8 +3650,8 @@ fn eval_division_operands(
         .with_offset(call_pos.offset));
     };
 
-    let dividend = eval_number(dividend_expr, env)?;
-    let divisor = eval_number(divisor_expr, env)?;
+    let dividend = eval_exact_integer(dividend_expr, env)?;
+    let divisor = eval_exact_integer(divisor_expr, env)?;
     if divisor == 0 {
         return Err(EvalError::DivisionByZero.with_offset(divisor_expr.pos.offset));
     }
@@ -3134,15 +3659,26 @@ fn eval_division_operands(
     Ok((dividend, divisor))
 }
 
-fn eval_number(expr: &Expr, env: &EnvRef) -> Result<i64, EvalError> {
+fn eval_number(expr: &Expr, env: &EnvRef) -> Result<Number, EvalError> {
     match eval_expr(expr, env)? {
-        Value::Integer(value) => Ok(value),
+        Value::Number(value) => Ok(value),
         other => Err(EvalError::TypeMismatch {
             expected: "number".into(),
             found: other.kind().into(),
         }
         .with_offset(expr.pos.offset)),
     }
+}
+
+fn eval_exact_integer(expr: &Expr, env: &EnvRef) -> Result<i64, EvalError> {
+    let value = eval_number(expr, env)?;
+    value.exact_integer().ok_or_else(|| {
+        EvalError::TypeMismatch {
+            expected: "integer".into(),
+            found: "number".into(),
+        }
+        .with_offset(expr.pos.offset)
+    })
 }
 
 fn eval_string(expr: &Expr, env: &EnvRef) -> Result<String, EvalError> {
@@ -3190,7 +3726,7 @@ fn eval_char(expr: &Expr, env: &EnvRef) -> Result<char, EvalError> {
 }
 
 fn eval_index(expr: &Expr, env: &EnvRef) -> Result<usize, EvalError> {
-    let index = eval_number(expr, env)?;
+    let index = eval_exact_integer(expr, env)?;
     if index < 0 {
         Err(EvalError::NegativeIndex { index }.with_offset(expr.pos.offset))
     } else {
@@ -3223,7 +3759,7 @@ fn pair_head(value: &Value) -> Option<&Value> {
 
 fn value_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.equals(*right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::String(left), Value::String(right)) => left.as_string() == right.as_string(),
         (Value::Char(left), Value::Char(right)) => left == right,
