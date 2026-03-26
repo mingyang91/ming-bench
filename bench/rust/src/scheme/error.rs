@@ -14,6 +14,8 @@ pub enum EvalError {
     EmptyList,
     #[error("syntax error: invalid escape sequence \\{escape}")]
     InvalidEscape { escape: char },
+    #[error("syntax error: {message}")]
+    InvalidSyntax { message: String },
     #[error("unbound variable: {name}")]
     UnboundVariable { name: String },
     #[error("unknown procedure: {name}")]
