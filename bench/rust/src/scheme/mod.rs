@@ -539,6 +539,7 @@ enum Expr {
     Char(char, Pos),
     Symbol(String, Pos),
     List(Vec<Expr>, Pos),
+    DottedList(Vec<Expr>, Box<Expr>, Pos), // (a b . c) => elems=[a,b], tail=c
 }
 
 impl Expr {
@@ -552,6 +553,7 @@ impl Expr {
             Expr::Char(_, p) => *p,
             Expr::Symbol(_, p) => *p,
             Expr::List(_, p) => *p,
+            Expr::DottedList(_, _, p) => *p,
         }
     }
 }
@@ -574,7 +576,7 @@ fn tokenize(input: &str) -> Vec<(String, Pos)> {
                 line += 1;
                 col = 1;
             }
-            ' ' | '\t' | '\r' => {
+            ' ' | '\t' | '\r' | '\x0b' | '\x0c' => {
                 i += 1;
                 col += 1;
             }
@@ -598,6 +600,23 @@ fn tokenize(input: &str) -> Vec<(String, Pos)> {
                 tokens.push(("'".into(), Pos { line, col }));
                 i += 1;
                 col += 1;
+            }
+            '`' => {
+                tokens.push(("`".into(), Pos { line, col }));
+                i += 1;
+                col += 1;
+            }
+            ',' => {
+                let start_pos = Pos { line, col };
+                i += 1;
+                col += 1;
+                if i < chars.len() && chars[i] == '@' {
+                    tokens.push((",@".into(), start_pos));
+                    i += 1;
+                    col += 1;
+                } else {
+                    tokens.push((",".into(), start_pos));
+                }
             }
             '"' => {
                 let start_pos = Pos { line, col };
@@ -639,7 +658,7 @@ fn tokenize(input: &str) -> Vec<(String, Pos)> {
                 while i < chars.len()
                     && !matches!(
                         chars[i],
-                        ' ' | '\t' | '\n' | '\r' | '(' | ')' | '"' | ';' | '\''
+                        ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' | '(' | ')' | '"' | ';' | '\'' | '`' | ','
                     )
                 {
                     tok.push(chars[i]);
@@ -674,6 +693,24 @@ impl Parser {
                 vec![Expr::Symbol("quote".into(), tpos), inner],
                 tpos,
             ))
+        } else if tok == "`" {
+            let inner = self.parse_expr()?;
+            Ok(Expr::List(
+                vec![Expr::Symbol("quasiquote".into(), tpos), inner],
+                tpos,
+            ))
+        } else if tok == "," {
+            let inner = self.parse_expr()?;
+            Ok(Expr::List(
+                vec![Expr::Symbol("unquote".into(), tpos), inner],
+                tpos,
+            ))
+        } else if tok == ",@" {
+            let inner = self.parse_expr()?;
+            Ok(Expr::List(
+                vec![Expr::Symbol("unquote-splicing".into(), tpos), inner],
+                tpos,
+            ))
         } else if tok == "#" {
             // Check for #' (syntax shorthand)
             if self.pos < self.tokens.len() && self.tokens[self.pos].0 == "'" {
@@ -689,7 +726,13 @@ impl Parser {
         } else if tok == "(" {
             let list_pos = tpos;
             let mut elems = Vec::new();
+            let mut dotted_tail = None;
             while self.pos < self.tokens.len() && self.tokens[self.pos].0 != ")" {
+                if self.tokens[self.pos].0 == "." {
+                    self.pos += 1; // skip '.'
+                    dotted_tail = Some(Box::new(self.parse_expr()?));
+                    break;
+                }
                 elems.push(self.parse_expr()?);
             }
             if self.pos >= self.tokens.len() {
@@ -699,7 +742,11 @@ impl Parser {
                 )));
             }
             self.pos += 1; // skip ')'
-            Ok(Expr::List(elems, list_pos))
+            if let Some(tail) = dotted_tail {
+                Ok(Expr::DottedList(elems, tail, list_pos))
+            } else {
+                Ok(Expr::List(elems, list_pos))
+            }
         } else if tok == ")" {
             Err(EvalError::Parse(format!("unexpected ')' at {}", tpos)))
         } else if tok == "#t" {
@@ -878,6 +925,15 @@ fn eval_step(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         }
                         return Ok(expr_to_value(&elems[1]));
                     }
+                    "quasiquote" => {
+                        if elems.len() != 2 {
+                            return Err(EvalError::Arity(format!(
+                                "quasiquote expects 1 argument at {}",
+                                p
+                            )));
+                        }
+                        return eval_quasiquote(&elems[1], env, 0);
+                    }
                     "lambda" => return eval_lambda(&elems[1..], env, p),
                     "case-lambda" => return eval_case_lambda(&elems[1..], env, p),
                     "and" => return eval_and(&elems[1..], env),
@@ -917,6 +973,9 @@ fn eval_step(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                 .map(|e| eval(e, env))
                 .collect::<Result<_, _>>()?;
             apply_value(&func, &args, p)
+        }
+        Expr::DottedList(_, _, _) => {
+            Err(EvalError::Type(format!("cannot evaluate dotted list at {}", p)))
         }
     }
 }
@@ -1252,6 +1311,35 @@ fn eval_define(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
             env_set(env, name.clone(), lambda);
             Ok(Value::Symbol(name))
         }
+        Expr::DottedList(name_and_params, tail, _) => {
+            if name_and_params.is_empty() {
+                return Err(EvalError::Parse(format!("define: empty dotted list at {}", p)));
+            }
+            let name = match &name_and_params[0] {
+                Expr::Symbol(s, _) => s.clone(),
+                _ => return Err(EvalError::Type(format!("define: expected symbol as function name at {}", p))),
+            };
+            let mut params = Vec::new();
+            for pe in &name_and_params[1..] {
+                match pe {
+                    Expr::Symbol(s, _) => params.push(s.clone()),
+                    _ => return Err(EvalError::Type(format!("define: expected symbol in params at {}", p))),
+                }
+            }
+            let rest_param = match tail.as_ref() {
+                Expr::Symbol(s, _) => Some(s.clone()),
+                _ => return Err(EvalError::Type(format!("define: expected symbol after dot at {}", p))),
+            };
+            let body = args[1..].to_vec();
+            let lambda = Value::Lambda {
+                params,
+                rest_param,
+                body,
+                env: env.clone(),
+            };
+            env_set(env, name.clone(), lambda);
+            Ok(Value::Symbol(name))
+        }
         _ => Err(EvalError::Type(format!(
             "define: expected symbol or list at {}",
             p
@@ -1285,6 +1373,20 @@ fn eval_lambda(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
     }
     let (params, rest_param) = match &args[0] {
         Expr::List(param_exprs, _) => parse_params(param_exprs, p)?,
+        Expr::DottedList(param_exprs, tail, _) => {
+            let mut params = Vec::new();
+            for pe in param_exprs {
+                match pe {
+                    Expr::Symbol(s, _) => params.push(s.clone()),
+                    _ => return Err(EvalError::Type(format!("lambda: expected symbol in params at {}", p))),
+                }
+            }
+            let rest = match tail.as_ref() {
+                Expr::Symbol(s, _) => s.clone(),
+                _ => return Err(EvalError::Type(format!("lambda: expected symbol after dot at {}", p))),
+            };
+            (params, Some(rest))
+        }
         Expr::Symbol(s, _) => {
             (vec![], Some(s.clone()))
         }
@@ -1321,6 +1423,20 @@ fn eval_case_lambda(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError
                 }
                 let (params, rest_param) = match &elems[0] {
                     Expr::List(param_exprs, _) => parse_params(param_exprs, *cp)?,
+                    Expr::DottedList(param_exprs, tail, _) => {
+                        let mut params = Vec::new();
+                        for pe in param_exprs {
+                            match pe {
+                                Expr::Symbol(s, _) => params.push(s.clone()),
+                                _ => return Err(EvalError::Type(format!("case-lambda: expected symbol in params at {}", cp))),
+                            }
+                        }
+                        let rest = match tail.as_ref() {
+                            Expr::Symbol(s, _) => s.clone(),
+                            _ => return Err(EvalError::Type(format!("case-lambda: expected symbol after dot at {}", cp))),
+                        };
+                        (params, Some(rest))
+                    }
                     Expr::Symbol(s, _) => (vec![], Some(s.clone())),
                     _ => return Err(EvalError::Type(format!(
                         "case-lambda: expected parameter list at {}", cp
@@ -1355,6 +1471,112 @@ fn expr_to_value(expr: &Expr) -> Value {
             } else {
                 vec_to_list(elems.iter().map(expr_to_value).collect())
             }
+        }
+        Expr::DottedList(elems, tail, _) => {
+            let tail_val = expr_to_value(tail);
+            let mut result = tail_val;
+            for e in elems.iter().rev() {
+                result = Value::Pair(Rc::new(RefCell::new((expr_to_value(e), result))));
+            }
+            result
+        }
+    }
+}
+
+fn eval_quasiquote(expr: &Expr, env: &Env, depth: usize) -> Result<Value, EvalError> {
+    match expr {
+        Expr::List(elems, _) if !elems.is_empty() => {
+            if let Expr::Symbol(s, _) = &elems[0] {
+                if s == "unquote" && elems.len() == 2 {
+                    if depth == 0 {
+                        return eval(&elems[1], env);
+                    } else {
+                        let inner = eval_quasiquote(&elems[1], env, depth - 1)?;
+                        return Ok(vec_to_list(vec![Value::Symbol("unquote".into()), inner]));
+                    }
+                }
+                if s == "quasiquote" && elems.len() == 2 {
+                    let inner = eval_quasiquote(&elems[1], env, depth + 1)?;
+                    return Ok(vec_to_list(vec![Value::Symbol("quasiquote".into()), inner]));
+                }
+            }
+            // Process list elements, handling unquote-splicing
+            let mut result: Vec<Value> = Vec::new();
+            for elem in elems {
+                if let Expr::List(sub, _) = elem {
+                    if sub.len() == 2 {
+                        if let Expr::Symbol(s, _) = &sub[0] {
+                            if s == "unquote-splicing" {
+                                if depth == 0 {
+                                    let val = eval(&sub[1], env)?;
+                                    // Splice the list
+                                    let mut cur = val;
+                                    loop {
+                                        match cur {
+                                            Value::Nil => break,
+                                            Value::Pair(pr) => {
+                                                let pair = pr.borrow();
+                                                result.push(pair.0.clone());
+                                                cur = pair.1.clone();
+                                            }
+                                            _ => {
+                                                result.push(cur);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                result.push(eval_quasiquote(elem, env, depth)?);
+            }
+            Ok(vec_to_list(result))
+        }
+        Expr::DottedList(elems, tail, _) => {
+            // Handle dotted quasiquote like `(a b . ,c)
+            let mut result: Vec<Value> = Vec::new();
+            for elem in elems {
+                if let Expr::List(sub, _) = elem {
+                    if sub.len() == 2 {
+                        if let Expr::Symbol(s, _) = &sub[0] {
+                            if s == "unquote-splicing" && depth == 0 {
+                                let val = eval(&sub[1], env)?;
+                                let mut cur = val;
+                                loop {
+                                    match cur {
+                                        Value::Nil => break,
+                                        Value::Pair(pr) => {
+                                            let pair = pr.borrow();
+                                            result.push(pair.0.clone());
+                                            cur = pair.1.clone();
+                                        }
+                                        _ => {
+                                            result.push(cur);
+                                            break;
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                result.push(eval_quasiquote(elem, env, depth)?);
+            }
+            let tail_val = eval_quasiquote(tail, env, depth)?;
+            // Build dotted list
+            let mut cur = tail_val;
+            for v in result.into_iter().rev() {
+                cur = Value::Pair(Rc::new(RefCell::new((v, cur))));
+            }
+            Ok(cur)
+        }
+        _ => {
+            // Atom — return as data
+            Ok(expr_to_value(expr))
         }
     }
 }
@@ -1527,6 +1749,15 @@ fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
                 }
                 let test = eval(&parts[0], env)?;
                 if test.is_truthy() {
+                    // Check for => syntax: (cond (test => proc))
+                    if parts.len() == 3 {
+                        if let Expr::Symbol(s, _) = &parts[1] {
+                            if s == "=>" {
+                                let proc = eval(&parts[2], env)?;
+                                return Ok(force(apply_value(&proc, &[test], parts[2].pos())?)?);
+                            }
+                        }
+                    }
                     let body = &parts[1..];
                     if body.is_empty() {
                         return Ok(test);
@@ -1705,7 +1936,7 @@ fn eval_define_record_type(args: &[Expr], env: &Env, p: Pos) -> Result<Value, Ev
 fn is_special_form(name: &str) -> bool {
     matches!(
         name,
-        "define" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "begin"
+        "define" | "if" | "quote" | "quasiquote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "begin"
             | "cond" | "string-set!" | "set!" | "define-syntax" | "define-record-type"
             | "letrec" | "letrec*" | "case" | "do" | "let*" | "when"
             | "guard" | "dynamic-wind"
@@ -1809,8 +2040,60 @@ fn match_one(
         }
         Expr::List(pelems, _) => match input {
             Expr::List(ielems, _) => match_list(pelems, ielems, literals, bindings),
+            Expr::DottedList(ielems, itail, _) => {
+                // A proper list pattern can match a dotted list input only if the pattern
+                // has enough elements. Convert dotted input to flat list for matching.
+                // Actually, a proper list pattern cannot match a dotted list.
+                let _ = (ielems, itail);
+                false
+            }
             _ => false,
         },
+        Expr::DottedList(pelems, ptail, _) => {
+            // Pattern like (a b . rest): match fixed elements, bind rest to remaining
+            match input {
+                Expr::List(ielems, ipos) => {
+                    if ielems.len() < pelems.len() {
+                        return false;
+                    }
+                    // Match fixed elements
+                    for (pe, ie) in pelems.iter().zip(ielems.iter()) {
+                        if !match_one(pe, ie, literals, bindings) {
+                            return false;
+                        }
+                    }
+                    // Bind tail to remaining elements as a list
+                    let rest: Vec<Expr> = ielems[pelems.len()..].to_vec();
+                    let rest_expr = Expr::List(rest, *ipos);
+                    match_one(ptail, &rest_expr, literals, bindings)
+                }
+                Expr::DottedList(ielems, itail, ipos) => {
+                    if ielems.len() < pelems.len() {
+                        return false;
+                    }
+                    for (pe, ie) in pelems.iter().zip(ielems.iter()) {
+                        if !match_one(pe, ie, literals, bindings) {
+                            return false;
+                        }
+                    }
+                    let remaining_elems: Vec<Expr> = ielems[pelems.len()..].to_vec();
+                    let rest_expr = if remaining_elems.is_empty() {
+                        (**itail).clone()
+                    } else {
+                        Expr::DottedList(remaining_elems, itail.clone(), *ipos)
+                    };
+                    match_one(ptail, &rest_expr, literals, bindings)
+                }
+                _ => {
+                    // Input is an atom, pattern has fixed elements — no match unless pelems is empty
+                    if pelems.is_empty() {
+                        match_one(ptail, input, literals, bindings)
+                    } else {
+                        false
+                    }
+                }
+            }
+        }
         Expr::Integer(n, _) => matches!(input, Expr::Integer(m, _) if m == n),
         Expr::Float(f, _) => matches!(input, Expr::Float(g, _) if (g - f).abs() < f64::EPSILON),
         Expr::Rational(n, d, _) => matches!(input, Expr::Rational(n2, d2, _) if n2 == n && d2 == d),
@@ -1894,6 +2177,12 @@ fn collect_pvars_inner(pattern: &Expr, literals: &[String], vars: &mut Vec<Strin
                 collect_pvars_inner(e, literals, vars);
             }
         }
+        Expr::DottedList(elems, tail, _) => {
+            for e in elems {
+                collect_pvars_inner(e, literals, vars);
+            }
+            collect_pvars_inner(tail, literals, vars);
+        }
         _ => {}
     }
 }
@@ -1953,6 +2242,43 @@ fn expand_template(
             }
             Expr::List(result, *pos)
         }
+        Expr::DottedList(elems, tail, pos) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                if i + 1 < elems.len() {
+                    if let Expr::Symbol(s, _) = &elems[i + 1] {
+                        if s == "..." {
+                            let sub = &elems[i];
+                            let evars = find_ellipsis_vars(sub, bindings);
+                            if let Some(first_var) = evars.first() {
+                                if let Some(PatBinding::List(items)) = bindings.get(first_var) {
+                                    let count = items.len();
+                                    for j in 0..count {
+                                        let mut sub_bindings = bindings.clone();
+                                        for v in &evars {
+                                            if let Some(PatBinding::List(vitems)) = bindings.get(v) {
+                                                sub_bindings.insert(
+                                                    v.clone(),
+                                                    PatBinding::Single(vitems[j].clone()),
+                                                );
+                                            }
+                                        }
+                                        result.push(expand_template(sub, &sub_bindings, gensym_map));
+                                    }
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                result.push(expand_template(&elems[i], bindings, gensym_map));
+                i += 1;
+            }
+            let expanded_tail = expand_template(tail, bindings, gensym_map);
+            Expr::DottedList(result, Box::new(expanded_tail), *pos)
+        }
         _ => template.clone(),
     }
 }
@@ -1978,6 +2304,12 @@ fn find_evars_inner(
             for e in elems {
                 find_evars_inner(e, bindings, vars);
             }
+        }
+        Expr::DottedList(elems, tail, _) => {
+            for e in elems {
+                find_evars_inner(e, bindings, vars);
+            }
+            find_evars_inner(tail, bindings, vars);
         }
         _ => {}
     }
@@ -2009,6 +2341,12 @@ fn collect_template_symbols(
             for e in elems {
                 collect_template_symbols(e, pat_vars, gensym_map);
             }
+        }
+        Expr::DottedList(elems, tail, _) => {
+            for e in elems {
+                collect_template_symbols(e, pat_vars, gensym_map);
+            }
+            collect_template_symbols(tail, pat_vars, gensym_map);
         }
         _ => {}
     }
@@ -2663,35 +3001,20 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             }
             Ok(num_to_value(acc))
         }
-        "<" => {
-            ensure_args(op, args, 2, p)?;
-            let a = num_to_f64(&to_num(&args[0], p)?);
-            let b = num_to_f64(&to_num(&args[1], p)?);
-            Ok(Value::Boolean(a < b))
-        }
-        ">" => {
-            ensure_args(op, args, 2, p)?;
-            let a = num_to_f64(&to_num(&args[0], p)?);
-            let b = num_to_f64(&to_num(&args[1], p)?);
-            Ok(Value::Boolean(a > b))
-        }
-        "=" => {
-            ensure_args(op, args, 2, p)?;
-            let a = num_to_f64(&to_num(&args[0], p)?);
-            let b = num_to_f64(&to_num(&args[1], p)?);
-            Ok(Value::Boolean((a - b).abs() < f64::EPSILON))
-        }
-        "<=" => {
-            ensure_args(op, args, 2, p)?;
-            let a = num_to_f64(&to_num(&args[0], p)?);
-            let b = num_to_f64(&to_num(&args[1], p)?);
-            Ok(Value::Boolean(a <= b))
-        }
-        ">=" => {
-            ensure_args(op, args, 2, p)?;
-            let a = num_to_f64(&to_num(&args[0], p)?);
-            let b = num_to_f64(&to_num(&args[1], p)?);
-            Ok(Value::Boolean(a >= b))
+        "<" | ">" | "=" | "<=" | ">=" => {
+            if args.len() < 2 {
+                return Err(EvalError::Arity(format!("{} expects at least 2 arguments, got {} at {}", op, args.len(), p)));
+            }
+            let nums: Vec<f64> = args.iter().map(|a| Ok(num_to_f64(&to_num(a, p)?))).collect::<Result<_, EvalError>>()?;
+            let result = nums.windows(2).all(|w| match op {
+                "<" => w[0] < w[1],
+                ">" => w[0] > w[1],
+                "=" => (w[0] - w[1]).abs() < f64::EPSILON,
+                "<=" => w[0] <= w[1],
+                ">=" => w[0] >= w[1],
+                _ => unreachable!(),
+            });
+            Ok(Value::Boolean(result))
         }
         "not" => {
             ensure_args(op, args, 1, p)?;
@@ -3712,7 +4035,7 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             if args.is_empty() {
                 return Err(EvalError::Type("error".to_string()));
             }
-            let msg = format!("{}", args[0]);
+            let msg: String = args.iter().map(|a| format!("{}", a)).collect::<Vec<_>>().join("");
             Err(EvalError::Type(format!("error: {}", msg)))
         }
         "raise" => {
