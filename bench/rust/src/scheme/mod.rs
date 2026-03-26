@@ -141,6 +141,24 @@ impl Env {
             .cloned()
             .or_else(|| self.parent.as_ref().and_then(|parent| parent.get(name)))
     }
+
+    fn set(&self, name: &str, value: Value) -> Result<(), EvalError> {
+        {
+            let mut values = self.values.borrow_mut();
+            if let Some(slot) = values.get_mut(name) {
+                *slot = value;
+                return Ok(());
+            }
+        }
+
+        if let Some(parent) = &self.parent {
+            parent.set(name, value)
+        } else {
+            Err(EvalError::UnboundVariable {
+                name: name.to_string(),
+            })
+        }
+    }
 }
 
 impl Procedure {
@@ -541,6 +559,7 @@ fn eval_application(
             "let" => return eval_let(tail, env, context),
             "or" => return eval_or(tail, env, context),
             "quote" => return eval_quote(tail),
+            "set!" => return eval_set(tail, env, context),
             _ => {}
         }
     }
@@ -717,6 +736,27 @@ fn eval_if(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Val
     } else {
         eval_expr_in_env(&args[2], env, context)
     }
+}
+
+fn eval_set(args: &[Expr], env: &EnvRef, context: &mut EvalContext) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "set!",
+            expected: "exactly 2 arguments",
+            got: args.len(),
+        });
+    }
+
+    let Expr::Symbol(name) = &args[0] else {
+        return Err(EvalError::InvalidForm {
+            name: "set!",
+            message: "expected a symbol as the binding target",
+        });
+    };
+
+    let value = eval_expr_in_env(&args[1], env, context)?;
+    env.set(name, value)?;
+    Ok(Value::Void)
 }
 
 fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
