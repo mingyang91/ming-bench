@@ -6,10 +6,12 @@ import java.util.Locale;
 
 final class GlobalEnvironmentFactory {
     private final Evaluator evaluator;
+    private final CollectionProcedures collections;
     private final Environment env = new Environment(null);
 
     private GlobalEnvironmentFactory(Evaluator evaluator) {
         this.evaluator = evaluator;
+        this.collections = evaluator.collectionProcedures();
     }
 
     static Environment create(Evaluator evaluator) {
@@ -24,6 +26,7 @@ final class GlobalEnvironmentFactory {
         factory.installStringProcedures();
         factory.installCharacterProcedures();
         factory.installExactnessProcedures();
+        factory.installUtilityProcedures();
         return factory.env;
     }
 
@@ -42,6 +45,10 @@ final class GlobalEnvironmentFactory {
         define("modulo", args -> new IntValue(evaluator.modulo(args)));
         define("min", evaluator::minBuiltin);
         define("max", evaluator::maxBuiltin);
+        define("gcd", evaluator::gcdBuiltin);
+        define("lcm", evaluator::lcmBuiltin);
+        define("truncate", evaluator::truncateBuiltin);
+        define("round", evaluator::roundBuiltin);
         define("expt", args -> new IntValue(evaluator.expt(args)));
         define("<", args -> BoolValue.of(
                 evaluator.compareIncreasing(args, Comparison.STRICTLY_LESS)));
@@ -85,43 +92,63 @@ final class GlobalEnvironmentFactory {
             evaluator.requireArity("cdr", args.size(), 1);
             return evaluator.expectPair(args.getFirst()).cdr();
         });
+        define("set-car!", collections::setCarBuiltin);
+        define("set-cdr!", collections::setCdrBuiltin);
         define("null?", args -> {
             evaluator.requireArity("null?", args.size(), 1);
             return BoolValue.of(args.getFirst() instanceof EmptyListValue);
         });
-        define("list", evaluator::makeList);
+        define("list", collections::makeList);
         define("length", args -> {
             evaluator.requireArity("length", args.size(), 1);
-            return new IntValue(evaluator.lengthOfList(args.getFirst()));
+            return new IntValue(collections.lengthOfList(args.getFirst()));
         });
-        define("list-ref", evaluator::listRef);
-        define("list-tail", evaluator::listTailBuiltin);
+        define("list-ref", collections::listRef);
+        define("list-tail", collections::listTailBuiltin);
+        define("reverse", collections::reverseBuiltin);
         define("list?", args -> {
             evaluator.requireArity("list?", args.size(), 1);
-            return BoolValue.of(evaluator.isProperList(args.getFirst()));
+            return BoolValue.of(collections.isProperList(args.getFirst()));
         });
-        define("append", evaluator::appendLists);
-        define("apply", evaluator::applyBuiltin);
-        define("map", evaluator::mapBuiltin);
-        define("assoc", evaluator::assocBuiltin);
+        define("append", collections::appendLists);
+        define("apply", collections::applyBuiltin);
+        define("map", collections::mapBuiltin);
+        define("for-each", collections::forEachBuiltin);
+        define("member", collections::memberBuiltin);
+        define("assv", collections::assvBuiltin);
+        define("assoc", collections::assocBuiltin);
+        installCxrProcedures();
+    }
+
+    private void installCxrProcedures() {
+        String[] names = {
+                "caar", "cadr", "cdar", "cddr",
+                "caaar", "caadr", "cadar", "caddr", "cdaar", "cdadr", "cddar", "cdddr",
+                "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr",
+                "caddar", "cadddr", "cdaaar", "cdaadr", "cdadar", "cdaddr",
+                "cddaar", "cddadr", "cdddar", "cddddr"
+        };
+        for (String name : names) {
+            define(name, args -> collections.cxrBuiltin(name, args));
+        }
     }
 
     private void installVectorProcedures() {
         define("vector", args -> new VectorValue(args));
-        define("make-vector", evaluator::makeVectorBuiltin);
-        define("vector-ref", evaluator::vectorRefBuiltin);
-        define("vector-set!", evaluator::vectorSetBuiltin);
+        define("make-vector", collections::makeVectorBuiltin);
+        define("vector-ref", collections::vectorRefBuiltin);
+        define("vector-set!", collections::vectorSetBuiltin);
         define("vector-length", args -> {
             evaluator.requireArity("vector-length", args.size(), 1);
             return new IntValue(evaluator.expectVectorValue(args.getFirst()).length());
         });
         define("vector->list", args -> {
             evaluator.requireArity("vector->list", args.size(), 1);
-            return evaluator.makeList(evaluator.expectVectorValue(args.getFirst()).elements());
+            return collections.makeList(evaluator.expectVectorValue(args.getFirst()).elements());
         });
         define("list->vector", args -> {
             evaluator.requireArity("list->vector", args.size(), 1);
-            return new VectorValue(evaluator.listElements(args.getFirst()));
+            return new VectorValue(collections.listElements(args.getFirst()));
         });
     }
 
@@ -186,6 +213,28 @@ final class GlobalEnvironmentFactory {
     }
 
     private void installStringProcedures() {
+        define("make-string", args -> {
+            if (args.size() < 1 || args.size() > 2) {
+                throw new EvalError(
+                        "wrong number of arguments for make-string: expected 1 or 2, got "
+                                + args.size());
+            }
+
+            int length = evaluator.expectIndex(args.getFirst(), "make-string");
+            char fill = args.size() == 2 ? evaluator.expectChar(args.get(1)) : '\0';
+            StringBuilder builder = new StringBuilder(length);
+            for (int index = 0; index < length; index++) {
+                builder.append(fill);
+            }
+            return new StringValue(builder.toString());
+        });
+        define("string", args -> {
+            StringBuilder builder = new StringBuilder(args.size());
+            for (Value arg : args) {
+                builder.append(evaluator.expectChar(arg));
+            }
+            return new StringValue(builder.toString());
+        });
         define("string-append", args -> new StringValue(evaluator.stringAppend(args)));
         define("string-length", args -> {
             evaluator.requireArity("string-length", args.size(), 1);
@@ -234,12 +283,12 @@ final class GlobalEnvironmentFactory {
             for (int index = 0; index < value.length(); index++) {
                 characters.add(new CharValue(value.charAt(index)));
             }
-            return evaluator.makeList(characters);
+            return collections.makeList(characters);
         });
         define("list->string", args -> {
             evaluator.requireArity("list->string", args.size(), 1);
 
-            List<Value> elements = evaluator.listElements(args.getFirst());
+            List<Value> elements = collections.listElements(args.getFirst());
             StringBuilder builder = new StringBuilder(elements.size());
             for (Value element : elements) {
                 builder.append(evaluator.expectChar(element));
@@ -254,6 +303,45 @@ final class GlobalEnvironmentFactory {
                 evaluator.compareStrings(args, "string=?", StringComparison.EQUAL)));
         define("string<?", args -> BoolValue.of(
                 evaluator.compareStrings(args, "string<?", StringComparison.LESS)));
+        define("string>?", args -> {
+            evaluator.requireAtLeast("string>?", args.size(), 2);
+
+            String previous = evaluator.expectString(args.getFirst());
+            for (int index = 1; index < args.size(); index++) {
+                String current = evaluator.expectString(args.get(index));
+                if (previous.compareTo(current) <= 0) {
+                    return BoolValue.FALSE;
+                }
+                previous = current;
+            }
+            return BoolValue.TRUE;
+        });
+        define("string<=?", args -> {
+            evaluator.requireAtLeast("string<=?", args.size(), 2);
+
+            String previous = evaluator.expectString(args.getFirst());
+            for (int index = 1; index < args.size(); index++) {
+                String current = evaluator.expectString(args.get(index));
+                if (previous.compareTo(current) > 0) {
+                    return BoolValue.FALSE;
+                }
+                previous = current;
+            }
+            return BoolValue.TRUE;
+        });
+        define("string>=?", args -> {
+            evaluator.requireAtLeast("string>=?", args.size(), 2);
+
+            String previous = evaluator.expectString(args.getFirst());
+            for (int index = 1; index < args.size(); index++) {
+                String current = evaluator.expectString(args.get(index));
+                if (previous.compareTo(current) < 0) {
+                    return BoolValue.FALSE;
+                }
+                previous = current;
+            }
+            return BoolValue.TRUE;
+        });
         define("string-ci=?", args -> {
             evaluator.requireAtLeast("string-ci=?", args.size(), 2);
 
@@ -340,5 +428,9 @@ final class GlobalEnvironmentFactory {
         });
         define("numerator", evaluator::numeratorBuiltin);
         define("denominator", evaluator::denominatorBuiltin);
+    }
+
+    private void installUtilityProcedures() {
+        define("error", evaluator::errorBuiltin);
     }
 }

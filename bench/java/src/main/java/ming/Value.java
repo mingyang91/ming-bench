@@ -3,6 +3,7 @@ package ming;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -131,14 +132,34 @@ record SymbolValue(String name) implements Value {
     }
 }
 
-record PairValue(Value car, Value cdr) implements Value {
+final class PairValue implements Value {
+    private Value car;
+    private Value cdr;
+
+    PairValue(Value car, Value cdr) {
+        this.car = car;
+        this.cdr = cdr;
+    }
+
+    Value car() {
+        return car;
+    }
+
+    Value cdr() {
+        return cdr;
+    }
+
+    void setCar(Value value) {
+        car = value;
+    }
+
+    void setCdr(Value value) {
+        cdr = value;
+    }
+
     @Override
     public String render() {
-        StringBuilder builder = new StringBuilder();
-        builder.append('(');
-        ValueFormatting.appendListContents(builder, this);
-        builder.append(')');
-        return builder.toString();
+        return ValueFormatting.render(this);
     }
 }
 
@@ -167,11 +188,7 @@ final class VectorValue implements Value {
 
     @Override
     public String render() {
-        StringBuilder builder = new StringBuilder();
-        builder.append("#(");
-        ValueFormatting.appendVectorContents(builder, elements);
-        builder.append(')');
-        return builder.toString();
+        return ValueFormatting.render(this);
     }
 }
 
@@ -365,25 +382,10 @@ final class ValueFormatting {
     private ValueFormatting() {
     }
 
-    static void appendListContents(StringBuilder builder, Value value) {
-        Value current = value;
-        boolean first = true;
-
-        while (current instanceof PairValue pairValue) {
-            if (!first) {
-                builder.append(' ');
-            }
-            builder.append(pairValue.car().render());
-            current = pairValue.cdr();
-            first = false;
-        }
-
-        if (!(current instanceof EmptyListValue)) {
-            if (!first) {
-                builder.append(" . ");
-            }
-            builder.append(current.render());
-        }
+    static String render(Value value) {
+        StringBuilder builder = new StringBuilder();
+        appendValue(builder, value, new IdentityHashMap<>());
+        return builder.toString();
     }
 
     static String escapeString(String value) {
@@ -402,12 +404,90 @@ final class ValueFormatting {
         return builder.toString();
     }
 
-    static void appendVectorContents(StringBuilder builder, List<Value> elements) {
+    private static void appendValue(StringBuilder builder, Value value,
+                                    IdentityHashMap<Value, Boolean> active) {
+        if (value instanceof PairValue pairValue) {
+            appendPair(builder, pairValue, active);
+            return;
+        }
+        if (value instanceof VectorValue vectorValue) {
+            appendVector(builder, vectorValue, active);
+            return;
+        }
+        builder.append(value.render());
+    }
+
+    private static void appendPair(StringBuilder builder, PairValue pairValue,
+                                   IdentityHashMap<Value, Boolean> active) {
+        if (active.containsKey(pairValue)) {
+            builder.append("#<cycle>");
+            return;
+        }
+
+        List<PairValue> markedPairs = new ArrayList<>();
+
+        try {
+            builder.append('(');
+
+            Value current = pairValue;
+            boolean first = true;
+            while (current instanceof PairValue currentPair) {
+                if (active.put(currentPair, Boolean.TRUE) != null) {
+                    if (!first) {
+                        builder.append(" . ");
+                    }
+                    builder.append("#<cycle>");
+                    current = EmptyListValue.INSTANCE;
+                    break;
+                }
+                markedPairs.add(currentPair);
+
+                if (!first) {
+                    builder.append(' ');
+                }
+                appendValue(builder, currentPair.car(), active);
+                current = currentPair.cdr();
+                first = false;
+            }
+
+            if (!(current instanceof EmptyListValue)) {
+                if (!first) {
+                    builder.append(" . ");
+                }
+                appendValue(builder, current, active);
+            }
+
+            builder.append(')');
+        } finally {
+            for (int index = markedPairs.size() - 1; index >= 0; index--) {
+                active.remove(markedPairs.get(index));
+            }
+        }
+    }
+
+    private static void appendVector(StringBuilder builder, VectorValue vectorValue,
+                                     IdentityHashMap<Value, Boolean> active) {
+        if (active.put(vectorValue, Boolean.TRUE) != null) {
+            builder.append("#<cycle>");
+            return;
+        }
+
+        try {
+            builder.append("#(");
+            appendVectorContents(builder, vectorValue.elements(), active);
+            builder.append(')');
+        } finally {
+            active.remove(vectorValue);
+        }
+    }
+
+    private static void appendVectorContents(StringBuilder builder, List<Value> elements,
+                                             IdentityHashMap<Value, Boolean> active) {
         for (int index = 0; index < elements.size(); index++) {
             if (index > 0) {
                 builder.append(' ');
             }
-            builder.append(elements.get(index).render());
+            appendValue(builder, elements.get(index), active);
         }
     }
 }

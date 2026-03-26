@@ -2,6 +2,7 @@ package ming;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 
 /**
@@ -18,6 +19,7 @@ public class Evaluator {
     private record TailStep(Expr expr, Environment env) implements EvalStep {
     }
 
+    private final CollectionProcedures collectionProcedures;
     private final Environment globalEnv;
     private StringBuilder activeOutput;
     private long syntheticCounter;
@@ -34,6 +36,7 @@ public class Evaluator {
     };
 
     public Evaluator() {
+        collectionProcedures = new CollectionProcedures(this);
         globalEnv = GlobalEnvironmentFactory.create(this);
     }
 
@@ -79,6 +82,10 @@ public class Evaluator {
 
     ProcedureValue builtin(String name, BuiltinAction action) {
         return new BuiltinProcedure(name, action);
+    }
+
+    CollectionProcedures collectionProcedures() {
+        return collectionProcedures;
     }
 
     void appendOutput(String text) {
@@ -166,6 +173,7 @@ public class Evaluator {
                 case "case-lambda" -> valueStep(evalCaseLambda(argExprs, env));
                 case "begin" -> evalBegin(argExprs, env);
                 case "let" -> evalLet(argExprs, env);
+                case "let*" -> evalLetStar(argExprs, env);
                 case "letrec" -> evalLetrec(argExprs, env, false);
                 case "letrec*" -> evalLetrec(argExprs, env, true);
                 case "cond" -> evalCond(argExprs, env);
@@ -360,6 +368,24 @@ public class Evaluator {
         List<LetBinding> bindings = FormParser.parseBindings(bindingsExpr.elements());
         List<Expr> body = FormParser.parseBody("let", argExprs.subList(1, argExprs.size()));
         return evalSimpleLet(bindings, body, env);
+    }
+
+    private EvalStep evalLetStar(List<Expr> argExprs, Environment env) throws EvalError {
+        if (argExprs.isEmpty()) {
+            throw new EvalError("let* requires bindings and a body");
+        }
+        if (!(argExprs.getFirst() instanceof ListExpr bindingsExpr)) {
+            throw new EvalError("let* bindings must be a list");
+        }
+
+        List<LetBinding> bindings = FormParser.parseBindings(bindingsExpr.elements());
+        List<Expr> body = FormParser.parseBody("let*", argExprs.subList(1, argExprs.size()));
+
+        Environment letEnv = new Environment(env);
+        for (LetBinding binding : bindings) {
+            letEnv.define(binding.name(), eval(binding.valueExpr(), letEnv));
+        }
+        return evalSequenceStep(body, letEnv);
     }
 
     private EvalStep evalLetrec(List<Expr> argExprs, Environment env, boolean sequential)
@@ -638,8 +664,8 @@ public class Evaluator {
             callEnv.define(parameters.requiredParameters().get(index), args.get(index));
         }
         if (parameters.restParameter() != null) {
-            callEnv.define(parameters.restParameter(), makeList(args.subList(requiredCount,
-                    args.size())));
+            callEnv.define(parameters.restParameter(),
+                    collectionProcedures.makeList(args.subList(requiredCount, args.size())));
         }
         return callEnv;
     }
@@ -688,7 +714,7 @@ public class Evaluator {
         return valueStep(procedure.apply(argumentValues));
     }
 
-    private Value applyProcedure(Value procedureValue, List<Value> argumentValues)
+    Value applyProcedure(Value procedureValue, List<Value> argumentValues)
             throws EvalError {
         return resolveStep(applyProcedureStep(procedureValue, argumentValues));
     }
@@ -1018,187 +1044,67 @@ public class Evaluator {
         throw new EvalError("expected record of type " + recordType.name());
     }
 
-    int lengthOfList(Value value) throws EvalError {
-        int length = 0;
-        Value current = value;
-        while (current instanceof PairValue pairValue) {
-            length++;
-            current = pairValue.cdr();
+    Value gcdBuiltin(List<Value> args) throws EvalError {
+        BigInteger result = BigInteger.ZERO;
+        for (Value arg : args) {
+            result = result.gcd(NumericSupport.expectExactInteger(arg).abs());
         }
-        if (current instanceof EmptyListValue) {
-            return length;
-        }
-        throw new EvalError("expected list");
+        return NumericSupport.integerToValue(result);
     }
 
-    List<Value> listElements(Value value) throws EvalError {
-        List<Value> elements = new ArrayList<>();
-        Value current = value;
-        while (current instanceof PairValue pairValue) {
-            elements.add(pairValue.car());
-            current = pairValue.cdr();
-        }
-        if (current instanceof EmptyListValue) {
-            return elements;
-        }
-        throw new EvalError("expected list");
-    }
+    Value lcmBuiltin(List<Value> args) throws EvalError {
+        BigInteger result = BigInteger.ONE;
+        boolean sawArgument = false;
 
-    Value listRef(List<Value> args) throws EvalError {
-        requireArity("list-ref", args.size(), 2);
-
-        int index = expectIndex(args.get(1), "list-ref");
-        Value current = args.getFirst();
-        for (int remaining = index; remaining >= 0; remaining--) {
-            if (!(current instanceof PairValue pairValue)) {
-                throw new EvalError("list-ref index out of range");
+        for (Value arg : args) {
+            BigInteger value = NumericSupport.expectExactInteger(arg).abs();
+            sawArgument = true;
+            if (value.signum() == 0) {
+                result = BigInteger.ZERO;
+                break;
             }
-            if (remaining == 0) {
-                return pairValue.car();
-            }
-            current = pairValue.cdr();
+            result = result.divide(result.gcd(value)).multiply(value);
         }
 
-        throw new EvalError("list-ref index out of range");
+        if (!sawArgument) {
+            return new IntValue(1);
+        }
+        return NumericSupport.integerToValue(result);
     }
 
-    Value listTailBuiltin(List<Value> args) throws EvalError {
-        requireArity("list-tail", args.size(), 2);
-        return listTail(args.getFirst(), expectIndex(args.get(1), "list-tail"));
+    Value truncateBuiltin(List<Value> args) throws EvalError {
+        requireArity("truncate", args.size(), 1);
+
+        Value value = expectNumber(args.getFirst());
+        if (value instanceof InexactValue inexactValue) {
+            double raw = inexactValue.value();
+            return new InexactValue(raw < 0.0 ? Math.ceil(raw) : Math.floor(raw));
+        }
+
+        ExactFraction fraction = NumericSupport.toExactFraction(value);
+        return NumericSupport.integerToValue(
+                fraction.numerator().divide(fraction.denominator()));
     }
 
-    private Value listTail(Value value, int index) throws EvalError {
-        Value current = value;
-        for (int remaining = index; remaining > 0; remaining--) {
-            if (!(current instanceof PairValue pairValue)) {
-                throw new EvalError("list-tail index out of range");
-            }
-            current = pairValue.cdr();
-        }
-        if (current instanceof PairValue || current instanceof EmptyListValue) {
-            return current;
-        }
-        throw new EvalError("list-tail index out of range");
-    }
+    Value roundBuiltin(List<Value> args) throws EvalError {
+        requireArity("round", args.size(), 1);
 
-    boolean isProperList(Value value) {
-        Value current = value;
-        while (current instanceof PairValue pairValue) {
-            current = pairValue.cdr();
-        }
-        return current instanceof EmptyListValue;
-    }
-
-    Value makeVectorBuiltin(List<Value> args) throws EvalError {
-        if (args.size() < 1 || args.size() > 2) {
-            throw new EvalError("wrong number of arguments for make-vector: expected 1 or 2, got "
-                    + args.size());
+        Value value = expectNumber(args.getFirst());
+        if (value instanceof InexactValue inexactValue) {
+            return new InexactValue(Math.rint(inexactValue.value()));
         }
 
-        int length = expectIndex(args.getFirst(), "make-vector");
-        Value fill = args.size() == 2 ? args.get(1) : VoidValue.INSTANCE;
-        List<Value> elements = new ArrayList<>(length);
-        for (int index = 0; index < length; index++) {
-            elements.add(fill);
+        ExactFraction fraction = NumericSupport.toExactFraction(value);
+        BigInteger[] quotientAndRemainder = fraction.numerator().divideAndRemainder(
+                fraction.denominator());
+        BigInteger quotient = quotientAndRemainder[0];
+        BigInteger doubledRemainder = quotientAndRemainder[1].abs().multiply(BigInteger.TWO);
+        int relation = doubledRemainder.compareTo(fraction.denominator());
+
+        if (relation > 0 || (relation == 0 && quotient.testBit(0))) {
+            quotient = quotient.add(BigInteger.valueOf(fraction.signum()));
         }
-        return new VectorValue(elements);
-    }
-
-    Value vectorRefBuiltin(List<Value> args) throws EvalError {
-        requireArity("vector-ref", args.size(), 2);
-
-        VectorValue vector = expectVectorValue(args.getFirst());
-        int index = expectIndex(args.get(1), "vector-ref");
-        if (index >= vector.length()) {
-            throw new EvalError("vector-ref index out of range");
-        }
-        return vector.element(index);
-    }
-
-    Value vectorSetBuiltin(List<Value> args) throws EvalError {
-        requireArity("vector-set!", args.size(), 3);
-
-        VectorValue vector = expectVectorValue(args.getFirst());
-        int index = expectIndex(args.get(1), "vector-set!");
-        if (index >= vector.length()) {
-            throw new EvalError("vector-set! index out of range");
-        }
-        vector.setElement(index, args.get(2));
-        return VoidValue.INSTANCE;
-    }
-
-    Value appendLists(List<Value> args) throws EvalError {
-        if (args.isEmpty()) {
-            return EmptyListValue.INSTANCE;
-        }
-
-        Value result = args.get(args.size() - 1);
-        for (int argIndex = args.size() - 2; argIndex >= 0; argIndex--) {
-            List<Value> elements = listElements(args.get(argIndex));
-            for (int elementIndex = elements.size() - 1; elementIndex >= 0; elementIndex--) {
-                result = new PairValue(elements.get(elementIndex), result);
-            }
-        }
-        return result;
-    }
-
-    Value applyBuiltin(List<Value> args) throws EvalError {
-        requireAtLeast("apply", args.size(), 2);
-
-        List<Value> expandedArgs = new ArrayList<>();
-        for (int index = 1; index < args.size() - 1; index++) {
-            expandedArgs.add(args.get(index));
-        }
-        expandedArgs.addAll(listElements(args.get(args.size() - 1)));
-
-        return applyProcedure(args.getFirst(), expandedArgs);
-    }
-
-    Value mapBuiltin(List<Value> args) throws EvalError {
-        requireAtLeast("map", args.size(), 2);
-
-        Value procedure = args.getFirst();
-        List<List<Value>> listArguments = new ArrayList<>(args.size() - 1);
-        Integer expectedLength = null;
-
-        for (int index = 1; index < args.size(); index++) {
-            List<Value> elements = listElements(args.get(index));
-            if (expectedLength == null) {
-                expectedLength = elements.size();
-            } else if (elements.size() != expectedLength) {
-                throw new EvalError("map lists must have the same length");
-            }
-            listArguments.add(elements);
-        }
-
-        List<Value> results = new ArrayList<>(expectedLength == null ? 0 : expectedLength);
-        for (int elementIndex = 0; elementIndex < expectedLength; elementIndex++) {
-            List<Value> invocationArgs = new ArrayList<>(listArguments.size());
-            for (List<Value> listArgument : listArguments) {
-                invocationArgs.add(listArgument.get(elementIndex));
-            }
-            results.add(applyProcedure(procedure, invocationArgs));
-        }
-        return makeList(results);
-    }
-
-    Value assocBuiltin(List<Value> args) throws EvalError {
-        requireArity("assoc", args.size(), 2);
-
-        Value key = args.get(0);
-        Value current = args.get(1);
-        while (current instanceof PairValue pairValue) {
-            Value entry = pairValue.car();
-            PairValue association = expectPair(entry);
-            if (isEqual(key, association.car())) {
-                return entry;
-            }
-            current = pairValue.cdr();
-        }
-        if (current instanceof EmptyListValue) {
-            return BoolValue.FALSE;
-        }
-        throw new EvalError("expected list");
+        return NumericSupport.integerToValue(quotient);
     }
 
     String stringAppend(List<Value> args) throws EvalError {
@@ -1317,6 +1223,12 @@ public class Evaluator {
     }
 
     boolean isEqual(Value left, Value right) throws EvalError {
+        return isEqual(left, right, new IdentityHashMap<>());
+    }
+
+    private boolean isEqual(Value left, Value right,
+                            IdentityHashMap<Value, IdentityHashMap<Value, Boolean>> seenPairs)
+            throws EvalError {
         if (left == right) {
             return true;
         }
@@ -1336,15 +1248,21 @@ public class Evaluator {
             return leftSymbol.name().equals(rightSymbol.name());
         }
         if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
-            return isEqual(leftPair.car(), rightPair.car())
-                    && isEqual(leftPair.cdr(), rightPair.cdr());
+            if (alreadyCompared(leftPair, rightPair, seenPairs)) {
+                return true;
+            }
+            return isEqual(leftPair.car(), rightPair.car(), seenPairs)
+                    && isEqual(leftPair.cdr(), rightPair.cdr(), seenPairs);
         }
         if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
             if (leftVector.length() != rightVector.length()) {
                 return false;
             }
+            if (alreadyCompared(leftVector, rightVector, seenPairs)) {
+                return true;
+            }
             for (int index = 0; index < leftVector.length(); index++) {
-                if (!isEqual(leftVector.element(index), rightVector.element(index))) {
+                if (!isEqual(leftVector.element(index), rightVector.element(index), seenPairs)) {
                     return false;
                 }
             }
@@ -1353,18 +1271,47 @@ public class Evaluator {
         return false;
     }
 
-    Value makeList(List<Value> args) {
-        Value result = EmptyListValue.INSTANCE;
-        for (int index = args.size() - 1; index >= 0; index--) {
-            result = new PairValue(args.get(index), result);
+    Value errorBuiltin(List<Value> args) throws EvalError {
+        requireAtLeast("error", args.size(), 1);
+
+        Value messageValue = args.getFirst();
+        StringBuilder builder = new StringBuilder();
+        if (messageValue instanceof StringValue stringValue) {
+            builder.append(stringValue.value());
+        } else {
+            builder.append(messageValue.render());
         }
-        return result;
+
+        for (int index = 1; index < args.size(); index++) {
+            if (index == 1) {
+                builder.append(':');
+            }
+            builder.append(' ');
+            builder.append(args.get(index).render());
+        }
+
+        throw new EvalError(builder.toString());
     }
 
     BoolValue typePredicate(String name, List<Value> args, ValuePredicate predicate)
             throws EvalError {
         requireArity(name, args.size(), 1);
         return BoolValue.of(predicate.matches(args.getFirst()));
+    }
+
+    private boolean alreadyCompared(Value left, Value right,
+                                    IdentityHashMap<Value,
+                                            IdentityHashMap<Value, Boolean>> seenPairs) {
+        IdentityHashMap<Value, Boolean> rightValues = seenPairs.get(left);
+        if (rightValues == null) {
+            rightValues = new IdentityHashMap<>();
+            seenPairs.put(left, rightValues);
+        } else if (rightValues.containsKey(right)) {
+            return true;
+        }
+
+        rightValues.put(right, Boolean.TRUE);
+        return false;
     }
 
     void requireArity(String name, int actual, int expected)
