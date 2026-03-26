@@ -1,11 +1,14 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class Evaluator {
 
     private final Environment globalEnv = new Environment(null);
+    private final Map<String, String[]> recordTypes = new HashMap<>();
     private StringBuilder outputBuffer = null;
 
     private static final String[] BUILTIN_NAMES = {
@@ -378,42 +381,7 @@ public class Evaluator {
                         return VOID;
                     }
                     case "define" -> {
-                        if (args.size() < 2) throw new EvalError("define: bad syntax");
-                        Object target = unwrap(args.get(0));
-                        if (target instanceof SchemeSymbol s) {
-                            Object val = eval(args.get(1), env);
-                            env.define(s.name(), val);
-                            return VOID;
-                        }
-                        if (target instanceof List<?> sig) {
-                            // (define (f params...) body) or (define (f x . rest) body)
-                            if (sig.isEmpty()) throw new EvalError("define: bad syntax");
-                            String fname = ((SchemeSymbol) unwrap(sig.get(0))).name();
-                            List<String> params = new ArrayList<>();
-                            String restParam = null;
-                            for (int i = 1; i < sig.size(); i++) {
-                                String pname = ((SchemeSymbol) unwrap(sig.get(i))).name();
-                                if (pname.equals(".")) {
-                                    if (i + 1 < sig.size()) {
-                                        restParam = ((SchemeSymbol) unwrap(sig.get(i + 1))).name();
-                                    }
-                                    break;
-                                }
-                                params.add(pname);
-                            }
-                            Object body;
-                            if (args.size() == 2) {
-                                body = args.get(1);
-                            } else {
-                                List<Object> beginList = new ArrayList<>();
-                                beginList.add(new SchemeSymbol("begin"));
-                                beginList.addAll(args.subList(1, args.size()));
-                                body = beginList;
-                            }
-                            env.define(fname, new SchemeLambda(params, restParam, body, env));
-                            return VOID;
-                        }
-                        throw new EvalError("define: bad syntax");
+                        return evalDefine(args, env);
                     }
                     case "set!" -> {
                         if (args.size() != 2) throw new EvalError("set!: bad syntax");
@@ -440,16 +408,7 @@ public class Evaluator {
                             }
                             params.add(pname);
                         }
-                        Object body;
-                        if (args.size() == 2) {
-                            body = args.get(1);
-                        } else {
-                            List<Object> beginList = new ArrayList<>();
-                            beginList.add(new SchemeSymbol("begin"));
-                            beginList.addAll(args.subList(1, args.size()));
-                            body = beginList;
-                        }
-                        return new SchemeLambda(params, restParam, body, env);
+                        return new SchemeLambda(params, restParam, wrapBodyInBegin(args, 1), env);
                     }
                     case "begin" -> {
                         Object result = VOID;
@@ -473,15 +432,7 @@ public class Evaluator {
                                 params.add(((SchemeSymbol) unwrap(b.get(0))).name());
                                 inits.add(eval(b.get(1), env));
                             }
-                            Object body;
-                            if (args.size() == 3) {
-                                body = args.get(2);
-                            } else {
-                                List<Object> beginList = new ArrayList<>();
-                                beginList.add(new SchemeSymbol("begin"));
-                                beginList.addAll(args.subList(2, args.size()));
-                                body = beginList;
-                            }
+                            Object body = wrapBodyInBegin(args, 2);
                             Environment letEnv = new Environment(env);
                             SchemeLambda loopLam = new SchemeLambda(params, body, letEnv);
                             letEnv.define(loopName.name(), loopLam);
@@ -566,6 +517,9 @@ public class Evaluator {
                          "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase" -> {
                         return evalBuiltin(name, args, env);
                     }
+                    case "define-record-type" -> {
+                        return evalDefineRecordType(args, env);
+                    }
                     case "define-syntax" -> {
                         if (args.size() != 2) throw new EvalError("define-syntax: bad syntax");
                         String macroName = ((SchemeSymbol) unwrap(args.get(0))).name();
@@ -610,6 +564,72 @@ public class Evaluator {
             return apply(proc, evaledArgs);
         }
         throw new EvalError("cannot evaluate: " + expr);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object evalDefine(List<Object> args, Environment env) throws EvalError {
+        if (args.size() < 2) throw new EvalError("define: bad syntax");
+        Object target = unwrap(args.get(0));
+        if (target instanceof SchemeSymbol s) {
+            Object val = eval(args.get(1), env);
+            env.define(s.name(), val);
+            return VOID;
+        }
+        if (target instanceof List<?> sig) {
+            if (sig.isEmpty()) throw new EvalError("define: bad syntax");
+            String fname = ((SchemeSymbol) unwrap(sig.get(0))).name();
+            List<String> params = new ArrayList<>();
+            String restParam = null;
+            for (int i = 1; i < sig.size(); i++) {
+                String pname = ((SchemeSymbol) unwrap(sig.get(i))).name();
+                if (pname.equals(".")) {
+                    if (i + 1 < sig.size()) {
+                        restParam = ((SchemeSymbol) unwrap(sig.get(i + 1))).name();
+                    }
+                    break;
+                }
+                params.add(pname);
+            }
+            Object body = wrapBodyInBegin(args, 1);
+            env.define(fname, new SchemeLambda(params, restParam, body, env));
+            return VOID;
+        }
+        throw new EvalError("define: bad syntax");
+    }
+
+    private Object evalDefineRecordType(List<Object> args, Environment env) throws EvalError {
+        if (args.size() < 3) throw new EvalError("define-record-type: bad syntax");
+        String typeName = ((SchemeSymbol) unwrap(args.get(0))).name();
+        List<?> ctorSpec = (List<?>) unwrap(args.get(1));
+        String ctorName = ((SchemeSymbol) unwrap(ctorSpec.get(0))).name();
+        List<String> ctorFields = new ArrayList<>();
+        for (int i = 1; i < ctorSpec.size(); i++)
+            ctorFields.add(((SchemeSymbol) unwrap(ctorSpec.get(i))).name());
+        String predName = ((SchemeSymbol) unwrap(args.get(2))).name();
+        List<String> fieldNames = new ArrayList<>();
+        List<String> accessorNames = new ArrayList<>();
+        for (int i = 3; i < args.size(); i++) {
+            List<?> fieldSpec = (List<?>) unwrap(args.get(i));
+            fieldNames.add(((SchemeSymbol) unwrap(fieldSpec.get(0))).name());
+            accessorNames.add(((SchemeSymbol) unwrap(fieldSpec.get(1))).name());
+        }
+        recordTypes.put(typeName, ctorFields.toArray(new String[0]));
+        env.define(ctorName, new BuiltinProcedure("record-ctor:" + typeName));
+        env.define(predName, new BuiltinProcedure("record-pred:" + typeName));
+        for (int i = 0; i < fieldNames.size(); i++) {
+            env.define(accessorNames.get(i), new BuiltinProcedure("record-acc:" + typeName + ":" + fieldNames.get(i)));
+        }
+        return VOID;
+    }
+
+    private Object wrapBodyInBegin(List<Object> args, int bodyStart) {
+        if (args.size() == bodyStart + 1) {
+            return args.get(bodyStart);
+        }
+        List<Object> beginList = new ArrayList<>();
+        beginList.add(new SchemeSymbol("begin"));
+        beginList.addAll(args.subList(bodyStart, args.size()));
+        return beginList;
     }
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
@@ -737,7 +757,31 @@ public class Evaluator {
                 yield a == b || a.equals(b);
             }
             case "equal?" -> schemeEqual(args.get(0), args.get(1));
-            default -> throw new EvalError("unknown procedure: " + name);
+            default -> {
+                if (name.startsWith("record-ctor:")) {
+                    String recType = name.substring("record-ctor:".length());
+                    String[] fieldNames = recordTypes.get(recType);
+                    if (fieldNames == null) throw new EvalError("unknown record type: " + recType);
+                    if (args.size() != fieldNames.length)
+                        throw new EvalError(recType + " constructor: expected " + fieldNames.length + " arguments, got " + args.size());
+                    yield new SchemeRecord(recType, fieldNames, args.toArray());
+                } else if (name.startsWith("record-pred:")) {
+                    String recType = name.substring("record-pred:".length());
+                    yield args.get(0) instanceof SchemeRecord r && r.typeName.equals(recType);
+                } else if (name.startsWith("record-acc:")) {
+                    String rest = name.substring("record-acc:".length());
+                    int colonIdx = rest.indexOf(':');
+                    String recType = rest.substring(0, colonIdx);
+                    String fieldName = rest.substring(colonIdx + 1);
+                    if (!(args.get(0) instanceof SchemeRecord r) || !r.typeName.equals(recType))
+                        throw new EvalError(name + ": not a " + recType);
+                    Object val = r.getField(fieldName);
+                    if (val == null) throw new EvalError(name + ": no such field " + fieldName);
+                    yield val;
+                } else {
+                    throw new EvalError("unknown procedure: " + name);
+                }
+            }
         };
     }
 
