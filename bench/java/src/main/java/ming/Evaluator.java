@@ -1,10 +1,12 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Predicate;
 
 /**
@@ -86,6 +88,9 @@ public class Evaluator {
             if ("define".equals(name)) {
                 return evalDefine(elements, environment);
             }
+            if ("define-syntax".equals(name)) {
+                return evalDefineSyntax(elements, environment);
+            }
             if ("set!".equals(name)) {
                 return evalSet(elements, environment);
             }
@@ -106,6 +111,11 @@ public class Evaluator {
             }
             if ("lambda".equals(name)) {
                 return evalLambda(elements, environment);
+            }
+
+            SyntaxRulesMacro macro = environment.lookupMacro(name);
+            if (macro != null) {
+                return eval(macro.expand(expression), environment);
             }
         }
 
@@ -176,6 +186,18 @@ public class Evaluator {
 
         SchemeValue value = eval(elements.get(2), environment);
         environment.set(symbol.name(), value);
+        return VoidValue.INSTANCE;
+    }
+
+    private SchemeValue evalDefineSyntax(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() != 3) {
+            throw new EvalError("define-syntax: expected a name and transformer");
+        }
+        if (!(elements.get(1) instanceof SymbolExpression symbol)) {
+            throw new EvalError("define-syntax: expected macro name");
+        }
+
+        environment.defineMacro(symbol.name(), parseSyntaxRules(symbol.name(), elements.get(2), environment));
         return VoidValue.INSTANCE;
     }
 
@@ -431,6 +453,56 @@ public class Evaluator {
                 parameters.fixedParameters(),
                 parameters.restParameter(),
                 body,
+                environment
+        );
+    }
+
+    private SyntaxRulesMacro parseSyntaxRules(
+            String macroName,
+            SchemeExpression transformerExpression,
+            Environment environment
+    ) throws EvalError {
+        if (!(transformerExpression instanceof ListExpression rulesExpression)) {
+            throw new EvalError("define-syntax: expected syntax-rules transformer");
+        }
+
+        List<SchemeExpression> rulesElements = rulesExpression.elements();
+        if (rulesElements.size() < 3) {
+            throw new EvalError("syntax-rules: expected literals and at least one rule");
+        }
+        if (!(rulesElements.getFirst() instanceof SymbolExpression symbol)
+                || !"syntax-rules".equals(symbol.name())) {
+            throw new EvalError("define-syntax: expected syntax-rules transformer");
+        }
+        if (!(rulesElements.get(1) instanceof ListExpression literalsExpression)) {
+            throw new EvalError("syntax-rules: expected literal identifier list");
+        }
+
+        Set<String> literalIdentifiers = new HashSet<>();
+        for (SchemeExpression literal : literalsExpression.elements()) {
+            if (!(literal instanceof SymbolExpression literalSymbol)) {
+                throw new EvalError("syntax-rules: expected literal identifier");
+            }
+            literalIdentifiers.add(literalSymbol.name());
+        }
+
+        List<SyntaxRulesMacro.SyntaxRule> rules = new ArrayList<>(rulesElements.size() - 2);
+        for (int index = 2; index < rulesElements.size(); index++) {
+            SchemeExpression ruleExpression = rulesElements.get(index);
+            if (!(ruleExpression instanceof ListExpression ruleList)) {
+                throw new EvalError("syntax-rules: expected rule");
+            }
+            List<SchemeExpression> ruleElements = ruleList.elements();
+            if (ruleElements.size() != 2) {
+                throw new EvalError("syntax-rules: expected pattern and template");
+            }
+            rules.add(new SyntaxRulesMacro.SyntaxRule(ruleElements.get(0), ruleElements.get(1)));
+        }
+
+        return new SyntaxRulesMacro(
+                macroName,
+                Set.copyOf(literalIdentifiers),
+                List.copyOf(rules),
                 environment
         );
     }
