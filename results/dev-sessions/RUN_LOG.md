@@ -3,6 +3,13 @@
 Historical record of all benchmark rounds. Latest first.
 Data sources: `cargo xtask results`, `cargo xtask tokens`, session narratives.
 
+### Compare: cl-def-r28 vs cl-qg-r28 — 2026-03-25
+**Winner:** QG — completed 25 levels vs Default's 22 (REGRESSION at L22 broke L16 TCO)
+**Levels:** cl-def-r28 22/26 vs cl-qg-r28 25/26
+**Cost:** cl-def-r28 $202 vs cl-qg-r28 $215
+**Key insight:** Default's L22 syntax-case regressed L16 TCO, halting the run; QG survived because its cleaner architecture absorbed the syntax-case addition without breaking prior levels.
+**Verdict:** First R28 round where QG decisively outperforms Default on level completion (+3 levels). Both agents blew the L17 turn limit (94/101 vs 90 cap) — the Rc<RefCell> pair mutation rewrite is genuinely hard. Default's fatal flaw was coupling between its TCO trampoline and syntax-case macro expansion, causing a regression the fix-it pass couldn't repair. QG's CEK machine (built at L18) cleanly separated concerns, so L22 additions didn't cascade. Gate friction was negligible (0 clippy/nesting hits) — the R15 QG redesign eliminated cosmetic overhead.
+
 ---
 
 ## R27 — 2026-03-25

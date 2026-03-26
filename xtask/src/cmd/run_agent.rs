@@ -630,6 +630,10 @@ fn run_levels_mode(
             break;
         }
 
+        // status.txt is already written by run_single_level() on PASS/FAIL.
+        // This means a crash during regression/gate below still has status.txt
+        // recorded, and resume will correctly skip this level.
+
         // --- Step 1: Regression check (BEFORE quality gate) ---
         // Regression fix agent also sees default strategy — correct, it's fixing functional breakage
         if let RegCheckOutcome::Broken = check_and_fix_regressions(
@@ -855,12 +859,26 @@ fn inject_surprise_level(
     Ok(())
 }
 
+/// Decides whether to skip a level on resume.
+/// Returns:
+///   true  → skip (already PASSED)
+///   false → needs work (will be retried)
+///
+/// Special case: if the level dir has agent-output.txt but no status.txt,
+/// the orchestrator was likely killed between agent completion and test scoring.
+/// We re-run tests instead of discarding the agent's work.
 fn should_skip_level(resume: bool, level_dir: &Path, level: &str) -> bool {
     if !resume {
         return false;
     }
     let status_file = level_dir.join("status.txt");
     if !status_file.is_file() {
+        // No status recorded. If agent output exists, the orchestrator crashed
+        // after the agent finished but before scoring. Keep the dir — run_single_level
+        // will re-test the agent's existing work.
+        if level_dir.join("agent-output.txt").is_file() {
+            println!("Resuming L{level} — agent output exists but no status (orchestrator crash recovery)");
+        }
         return false;
     }
     if let Ok(content) = fs::read_to_string(&status_file) {
@@ -1942,7 +1960,8 @@ fn install_signal_handlers() {
     }
 }
 
-/// Cleanup context — not RAII because we need manual control over the commit step.
+/// Cleanup context — always releases lock on drop (panic, error, or signal).
+/// On signal interruption, also commits+pushes agent work before exiting.
 struct CleanupContext {
     worktree_dir: PathBuf,
     name: String,
@@ -1951,16 +1970,17 @@ struct CleanupContext {
 
 impl Drop for CleanupContext {
     fn drop(&mut self) {
-        if !INTERRUPTED.load(Ordering::Relaxed) {
-            return;
-        }
-        eprintln!("\n=== Cleaning up ===");
-
-        if self.worktree_dir.is_dir() {
-            commit_and_push_interrupted(&self.worktree_dir, &self.name);
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            eprintln!("\n=== Cleaning up (interrupted) ===");
+            if self.worktree_dir.is_dir() {
+                commit_and_push_interrupted(&self.worktree_dir, &self.name);
+            }
         }
 
-        let _ = fs::remove_file(&self.lockfile);
+        // Always release the lock — on success, error, panic, or signal.
+        if self.lockfile.is_file() {
+            let _ = fs::remove_file(&self.lockfile);
+        }
     }
 }
 
