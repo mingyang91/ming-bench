@@ -18,6 +18,7 @@ public class Evaluator {
     private static final UninitializedValue UNINITIALIZED = new UninitializedValue();
 
     private final Env globalEnv;
+    private StringBuilder outputBuffer;
 
     public Evaluator() {
         this.globalEnv = createGlobalEnv();
@@ -28,16 +29,7 @@ public class Evaluator {
      * representation of the last result.
      */
     public String evalStr(String input) throws EvalError {
-        List<Expr> expressions = new Parser(input).parseProgram();
-        if (expressions.isEmpty()) {
-            throw new EvalError("input did not contain any expressions");
-        }
-
-        Value result = VOID;
-        for (Expr expression : expressions) {
-            result = eval(expression, globalEnv);
-        }
-        return render(result);
+        return evalProgram(input, false).result();
     }
 
     /**
@@ -45,7 +37,27 @@ public class Evaluator {
      * and any captured output from display/write/newline.
      */
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        return new EvalResult(evalStr(input), "");
+        return evalProgram(input, true);
+    }
+
+    private EvalResult evalProgram(String input, boolean captureOutput) throws EvalError {
+        List<Expr> expressions = new Parser(input).parseProgram();
+        if (expressions.isEmpty()) {
+            throw new EvalError("input did not contain any expressions");
+        }
+
+        StringBuilder previousOutput = outputBuffer;
+        outputBuffer = captureOutput ? new StringBuilder() : null;
+        try {
+            Value result = VOID;
+            for (Expr expression : expressions) {
+                result = eval(expression, globalEnv);
+            }
+            String output = outputBuffer == null ? "" : outputBuffer.toString();
+            return new EvalResult(render(result), output);
+        } finally {
+            outputBuffer = previousOutput;
+        }
     }
 
     private Env createGlobalEnv() {
@@ -77,6 +89,19 @@ public class Evaluator {
                 typePredicate("pair?", arguments, value -> value instanceof PairValue)));
         env.define("symbol?", new BuiltinValue("symbol?", arguments ->
                 typePredicate("symbol?", arguments, value -> value instanceof SymbolValue)));
+        env.define("display", new BuiltinValue("display", this::display));
+        env.define("write", new BuiltinValue("write", this::write));
+        env.define("newline", new BuiltinValue("newline", this::newline));
+        env.define("string-append", new BuiltinValue("string-append", this::stringAppend));
+        env.define("string-length", new BuiltinValue("string-length", this::stringLength));
+        env.define("substring", new BuiltinValue("substring", this::substring));
+        env.define("string->number", new BuiltinValue("string->number", this::stringToNumber));
+        env.define("number->string", new BuiltinValue("number->string", this::numberToString));
+        env.define("symbol->string", new BuiltinValue("symbol->string", this::symbolToString));
+        env.define("string->symbol", new BuiltinValue("string->symbol", this::stringToSymbol));
+        env.define("string-ref", new BuiltinValue("string-ref", this::stringRef));
+        env.define("char?", new BuiltinValue("char?", arguments ->
+                typePredicate("char?", arguments, value -> value instanceof CharValue)));
         return env;
     }
 
@@ -364,6 +389,24 @@ public class Evaluator {
         return result;
     }
 
+    private Value display(List<Value> arguments) throws EvalError {
+        requireExactArgs("display", arguments, 1);
+        appendOutput(renderDisplay(arguments.get(0)));
+        return VOID;
+    }
+
+    private Value write(List<Value> arguments) throws EvalError {
+        requireExactArgs("write", arguments, 1);
+        appendOutput(render(arguments.get(0)));
+        return VOID;
+    }
+
+    private Value newline(List<Value> arguments) throws EvalError {
+        requireExactArgs("newline", arguments, 0);
+        appendOutput("\n");
+        return VOID;
+    }
+
     private Value quoteToValue(Expr expr) {
         return switch (expr) {
             case IntExpr intExpr -> new IntValue(intExpr.value());
@@ -436,6 +479,65 @@ public class Evaluator {
 
     private Value list(List<Value> arguments) {
         return listValue(arguments);
+    }
+
+    private Value stringAppend(List<Value> arguments) throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (Value argument : arguments) {
+            builder.append(requireString(argument, "string-append"));
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private Value stringLength(List<Value> arguments) throws EvalError {
+        requireExactArgs("string-length", arguments, 1);
+        return new IntValue(requireString(arguments.get(0), "string-length").length());
+    }
+
+    private Value substring(List<Value> arguments) throws EvalError {
+        requireExactArgs("substring", arguments, 3);
+        String value = requireString(arguments.get(0), "substring");
+        int start = requireIndex(arguments.get(1), "substring");
+        int end = requireIndex(arguments.get(2), "substring");
+        if (start > end || end > value.length()) {
+            throw new EvalError("substring index out of bounds");
+        }
+        return new StringValue(value.substring(start, end));
+    }
+
+    private Value stringToNumber(List<Value> arguments) throws EvalError {
+        requireExactArgs("string->number", arguments, 1);
+        String value = requireString(arguments.get(0), "string->number");
+        try {
+            return new IntValue(Long.parseLong(value));
+        } catch (NumberFormatException error) {
+            return FALSE;
+        }
+    }
+
+    private Value numberToString(List<Value> arguments) throws EvalError {
+        requireExactArgs("number->string", arguments, 1);
+        return new StringValue(Long.toString(requireInt(arguments.get(0), "number->string")));
+    }
+
+    private Value symbolToString(List<Value> arguments) throws EvalError {
+        requireExactArgs("symbol->string", arguments, 1);
+        return new StringValue(requireSymbol(arguments.get(0), "symbol->string"));
+    }
+
+    private Value stringToSymbol(List<Value> arguments) throws EvalError {
+        requireExactArgs("string->symbol", arguments, 1);
+        return new SymbolValue(requireString(arguments.get(0), "string->symbol"));
+    }
+
+    private Value stringRef(List<Value> arguments) throws EvalError {
+        requireExactArgs("string-ref", arguments, 2);
+        String value = requireString(arguments.get(0), "string-ref");
+        int index = requireIndex(arguments.get(1), "string-ref");
+        if (index >= value.length()) {
+            throw new EvalError("string-ref index out of bounds");
+        }
+        return new CharValue(value.charAt(index));
     }
 
     private Value length(List<Value> arguments) throws EvalError {
@@ -528,6 +630,28 @@ public class Evaluator {
         throw new EvalError(operator + " expects numeric arguments");
     }
 
+    private String requireString(Value value, String operator) throws EvalError {
+        if (value instanceof StringValue stringValue) {
+            return stringValue.value();
+        }
+        throw new EvalError(operator + " expects string arguments");
+    }
+
+    private String requireSymbol(Value value, String operator) throws EvalError {
+        if (value instanceof SymbolValue symbolValue) {
+            return symbolValue.name();
+        }
+        throw new EvalError(operator + " expects symbol arguments");
+    }
+
+    private int requireIndex(Value value, String operator) throws EvalError {
+        long index = requireInt(value, operator);
+        if (index < 0L || index > Integer.MAX_VALUE) {
+            throw new EvalError(operator + " expects a valid index");
+        }
+        return (int) index;
+    }
+
     private PairValue requirePair(Value value, String operator) throws EvalError {
         if (value instanceof PairValue pairValue) {
             return pairValue;
@@ -557,13 +681,25 @@ public class Evaluator {
     }
 
     private String render(Value value) {
+        return renderValue(value, false);
+    }
+
+    private String renderDisplay(Value value) {
+        return renderValue(value, true);
+    }
+
+    private String renderValue(Value value, boolean displayMode) {
         return switch (value) {
             case IntValue intValue -> Long.toString(intValue.value());
             case BoolValue boolValue -> boolValue.value() ? "#t" : "#f";
-            case StringValue stringValue -> quote(stringValue.value());
+            case StringValue stringValue ->
+                    displayMode ? stringValue.value() : quote(stringValue.value());
             case SymbolValue symbolValue -> symbolValue.name();
             case EmptyListValue ignored -> "()";
-            case PairValue pairValue -> renderPair(pairValue);
+            case CharValue charValue -> displayMode
+                    ? Character.toString(charValue.value())
+                    : renderChar(charValue.value());
+            case PairValue pairValue -> renderPair(pairValue, displayMode);
             case BuiltinValue ignored -> "#<procedure>";
             case ClosureValue ignored -> "#<procedure>";
             case VoidValue ignored -> "#<void>";
@@ -571,7 +707,7 @@ public class Evaluator {
         };
     }
 
-    private String renderPair(PairValue pairValue) {
+    private String renderPair(PairValue pairValue, boolean displayMode) {
         StringBuilder builder = new StringBuilder();
         builder.append('(');
 
@@ -581,18 +717,32 @@ public class Evaluator {
             if (!first) {
                 builder.append(' ');
             }
-            builder.append(render(pair.car()));
+            builder.append(renderValue(pair.car(), displayMode));
             current = pair.cdr();
             first = false;
         }
 
         if (!(current instanceof EmptyListValue)) {
             builder.append(" . ");
-            builder.append(render(current));
+            builder.append(renderValue(current, displayMode));
         }
 
         builder.append(')');
         return builder.toString();
+    }
+
+    private String renderChar(char value) {
+        return switch (value) {
+            case ' ' -> "#\\space";
+            case '\n' -> "#\\newline";
+            default -> "#\\" + value;
+        };
+    }
+
+    private void appendOutput(String value) {
+        if (outputBuffer != null) {
+            outputBuffer.append(value);
+        }
     }
 
     private String quote(String value) {
@@ -621,7 +771,7 @@ public class Evaluator {
     }
 
     private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
-            EmptyListValue, PairValue, BuiltinValue, ClosureValue, VoidValue,
+            CharValue, EmptyListValue, PairValue, BuiltinValue, ClosureValue, VoidValue,
             UninitializedValue {
     }
 
@@ -650,6 +800,9 @@ public class Evaluator {
     }
 
     private record SymbolValue(String name) implements Value {
+    }
+
+    private record CharValue(char value) implements Value {
     }
 
     private record EmptyListValue() implements Value {
