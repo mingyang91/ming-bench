@@ -139,6 +139,12 @@ func matchSyntaxPattern(pattern expr, input expr, literals map[string]struct{}) 
 	case *integerExpr:
 		other, ok := input.(*integerExpr)
 		return map[string]syntaxCapture{}, ok && p.value == other.value
+	case *rationalExpr:
+		other, ok := input.(*rationalExpr)
+		return map[string]syntaxCapture{}, ok && p.value == other.value
+	case *inexactExpr:
+		other, ok := input.(*inexactExpr)
+		return map[string]syntaxCapture{}, ok && p.value == other.value
 	case *booleanExpr:
 		other, ok := input.(*booleanExpr)
 		return map[string]syntaxCapture{}, ok && p.value == other.value
@@ -278,6 +284,12 @@ func exprEqual(left expr, right expr) bool {
 	case *integerExpr:
 		r, ok := right.(*integerExpr)
 		return ok && l.value == r.value
+	case *rationalExpr:
+		r, ok := right.(*rationalExpr)
+		return ok && l.value == r.value
+	case *inexactExpr:
+		r, ok := right.(*inexactExpr)
+		return ok && l.value == r.value
 	case *booleanExpr:
 		r, ok := right.(*booleanExpr)
 		return ok && l.value == r.value
@@ -318,6 +330,10 @@ func (s *templateState) expand(template expr, path []int, renames map[string]str
 	switch t := template.(type) {
 	case *integerExpr:
 		return &integerExpr{value: t.value, pos: t.pos}, nil
+	case *rationalExpr:
+		return &rationalExpr{value: t.value, pos: t.pos}, nil
+	case *inexactExpr:
+		return &inexactExpr{value: t.value, pos: t.pos}, nil
 	case *booleanExpr:
 		return &booleanExpr{value: t.value, pos: t.pos}, nil
 	case *stringExpr:
@@ -721,6 +737,10 @@ func cloneExpr(expression expr) expr {
 		return nil
 	case *integerExpr:
 		return &integerExpr{value: e.value, pos: e.pos}
+	case *rationalExpr:
+		return &rationalExpr{value: e.value, pos: e.pos}
+	case *inexactExpr:
+		return &inexactExpr{value: e.value, pos: e.pos}
 	case *booleanExpr:
 		return &booleanExpr{value: e.value, pos: e.pos}
 	case *stringExpr:

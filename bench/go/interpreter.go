@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -38,6 +39,20 @@ type integerExpr struct {
 }
 
 func (e *integerExpr) exprPos() position { return e.pos }
+
+type rationalExpr struct {
+	value rationalValue
+	pos   position
+}
+
+func (e *rationalExpr) exprPos() position { return e.pos }
+
+type inexactExpr struct {
+	value inexactValue
+	pos   position
+}
+
+func (e *inexactExpr) exprPos() position { return e.pos }
 
 type booleanExpr struct {
 	value bool
@@ -236,11 +251,11 @@ func installBuiltins(env *environment) {
 	for _, name := range []string{
 		"+", "-", "*", "/", "<", ">", "=", "<=", "not",
 		"cons", "car", "cdr", "null?", "list", "length", "append",
-		"string?", "number?", "boolean?", "pair?", "symbol?",
+		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?",
 		"apply", "eq?", "equal?",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",
-		"string->number", "number->string",
+		"string->number", "number->string", "exact->inexact", "inexact->exact", "numerator", "denominator",
 		"symbol->string", "string->symbol",
 		"string-ref", "string-copy", "string-set!", "char?",
 		"abs", "modulo", "remainder", "quotient", "min", "max", "expt",
@@ -272,6 +287,10 @@ func parseProgram(input string) ([]expr, error) {
 func (i *interpreter) eval(expression expr, env *environment) (any, error) {
 	switch e := expression.(type) {
 	case *integerExpr:
+		return e.value, nil
+	case *rationalExpr:
+		return e.value, nil
+	case *inexactExpr:
 		return e.value, nil
 	case *booleanExpr:
 		return e.value, nil
@@ -738,6 +757,10 @@ func datumFromExpr(expression expr) (any, error) {
 	switch e := expression.(type) {
 	case *integerExpr:
 		return e.value, nil
+	case *rationalExpr:
+		return e.value, nil
+	case *inexactExpr:
+		return e.value, nil
 	case *booleanExpr:
 		return e.value, nil
 	case *stringExpr:
@@ -801,81 +824,84 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		return equalValues(args[0], args[1]), nil
 
 	case "+":
-		total := 0
+		total := exactNumeric(0, 1)
 		for _, arg := range args {
-			n, err := expectInt(arg, pos, name)
-			if err != nil {
-				return nil, err
+			numeric, ok := numericFromValue(arg)
+			if !ok {
+				return nil, newEvalError(pos, "%s expects numeric arguments", name)
 			}
-			total += n
+			total = addNumericValues(total, numeric)
 		}
-		return total, nil
+		return numericResult(total), nil
 
 	case "-":
 		if len(args) == 0 {
 			return nil, newEvalError(pos, "%s expects at least 1 argument", name)
 		}
-		first, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		first, ok := numericFromValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects numeric arguments", name)
 		}
 		if len(args) == 1 {
-			return -first, nil
+			return numericResult(subtractNumericValues(exactNumeric(0, 1), first)), nil
 		}
 		result := first
 		for _, arg := range args[1:] {
-			n, err := expectInt(arg, pos, name)
-			if err != nil {
-				return nil, err
+			numeric, ok := numericFromValue(arg)
+			if !ok {
+				return nil, newEvalError(pos, "%s expects numeric arguments", name)
 			}
-			result -= n
+			result = subtractNumericValues(result, numeric)
 		}
-		return result, nil
+		return numericResult(result), nil
 
 	case "*":
-		product := 1
+		product := exactNumeric(1, 1)
 		for _, arg := range args {
-			n, err := expectInt(arg, pos, name)
-			if err != nil {
-				return nil, err
+			numeric, ok := numericFromValue(arg)
+			if !ok {
+				return nil, newEvalError(pos, "%s expects numeric arguments", name)
 			}
-			product *= n
+			product = multiplyNumericValues(product, numeric)
 		}
-		return product, nil
+		return numericResult(product), nil
 
 	case "/":
 		if len(args) < 2 {
 			return nil, newEvalError(pos, "%s expects at least 2 arguments", name)
 		}
-		first, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		first, ok := numericFromValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects numeric arguments", name)
 		}
 		result := first
 		for _, arg := range args[1:] {
-			n, err := expectInt(arg, pos, name)
-			if err != nil {
-				return nil, err
+			numeric, ok := numericFromValue(arg)
+			if !ok {
+				return nil, newEvalError(pos, "%s expects numeric arguments", name)
 			}
-			if n == 0 {
+			if numeric.isZero() {
 				return nil, newEvalError(pos, "division by zero")
 			}
-			result /= n
+			result = divideNumericValues(result, numeric)
 		}
-		return result, nil
+		return numericResult(result), nil
 
 	case "abs":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
-		value, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		numeric, ok := numericFromValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects numeric arguments", name)
 		}
-		if value < 0 {
-			return -value, nil
+		if numeric.exact {
+			if numeric.numerator < 0 {
+				numeric.numerator = -numeric.numerator
+			}
+			return numericResult(numeric), nil
 		}
-		return value, nil
+		return inexactValue(normalizeInexactFloat(math.Abs(numeric.inexact))), nil
 
 	case "quotient":
 		if len(args) != 2 {
@@ -936,17 +962,19 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if len(args) == 0 {
 			return nil, newEvalError(pos, "%s expects at least 1 argument", name)
 		}
-		best, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		best := args[0]
+		bestNumeric, ok := numericFromValue(best)
+		if !ok {
+			return nil, newEvalError(pos, "%s expects numeric arguments", name)
 		}
 		for _, arg := range args[1:] {
-			value, err := expectInt(arg, pos, name)
-			if err != nil {
-				return nil, err
+			value, ok := numericFromValue(arg)
+			if !ok {
+				return nil, newEvalError(pos, "%s expects numeric arguments", name)
 			}
-			if value < best {
-				best = value
+			if compareNumericValues(value, bestNumeric) < 0 {
+				best = arg
+				bestNumeric = value
 			}
 		}
 		return best, nil
@@ -955,17 +983,19 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if len(args) == 0 {
 			return nil, newEvalError(pos, "%s expects at least 1 argument", name)
 		}
-		best, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		best := args[0]
+		bestNumeric, ok := numericFromValue(best)
+		if !ok {
+			return nil, newEvalError(pos, "%s expects numeric arguments", name)
 		}
 		for _, arg := range args[1:] {
-			value, err := expectInt(arg, pos, name)
-			if err != nil {
-				return nil, err
+			value, ok := numericFromValue(arg)
+			if !ok {
+				return nil, newEvalError(pos, "%s expects numeric arguments", name)
 			}
-			if value > best {
-				best = value
+			if compareNumericValues(value, bestNumeric) > 0 {
+				best = arg
+				bestNumeric = value
 			}
 		}
 		return best, nil
@@ -998,43 +1028,43 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		return result, nil
 
 	case "<":
-		return numericCompare(name, args, pos, func(a, b int) bool { return a < b })
+		return numericCompare(name, args, pos, func(cmp int) bool { return cmp < 0 })
 	case ">":
-		return numericCompare(name, args, pos, func(a, b int) bool { return a > b })
+		return numericCompare(name, args, pos, func(cmp int) bool { return cmp > 0 })
 	case "=":
-		return numericCompare(name, args, pos, func(a, b int) bool { return a == b })
+		return numericCompare(name, args, pos, func(cmp int) bool { return cmp == 0 })
 	case "<=":
-		return numericCompare(name, args, pos, func(a, b int) bool { return a <= b })
+		return numericCompare(name, args, pos, func(cmp int) bool { return cmp <= 0 })
 
 	case "zero?":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
-		value, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		numeric, ok := numericFromValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects numeric arguments", name)
 		}
-		return value == 0, nil
+		return numeric.isZero(), nil
 
 	case "positive?":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
-		value, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		numeric, ok := numericFromValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects numeric arguments", name)
 		}
-		return value > 0, nil
+		return compareNumericValues(numeric, exactNumeric(0, 1)) > 0, nil
 
 	case "negative?":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
-		value, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		numeric, ok := numericFromValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects numeric arguments", name)
 		}
-		return value < 0, nil
+		return compareNumericValues(numeric, exactNumeric(0, 1)) < 0, nil
 
 	case "odd?":
 		if len(args) != 1 {
@@ -1227,8 +1257,76 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
-		_, ok := args[0].(int)
+		_, ok := numericFromValue(args[0])
 		return ok, nil
+
+	case "integer?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		numeric, ok := numericFromValue(args[0])
+		return ok && numeric.isInteger(), nil
+
+	case "rational?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		_, ok := numericFromValue(args[0])
+		return ok, nil
+
+	case "exact?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		numeric, ok := numericFromValue(args[0])
+		return ok && numeric.exact, nil
+
+	case "inexact?":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		numeric, ok := numericFromValue(args[0])
+		return ok && !numeric.exact, nil
+
+	case "exact->inexact":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, ok := exactToInexact(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects a number", name)
+		}
+		return value, nil
+
+	case "inexact->exact":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		value, ok := inexactToExact(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects a number", name)
+		}
+		return value, nil
+
+	case "numerator":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		numeric, ok := numericFromValue(args[0])
+		if !ok || !numeric.exact {
+			return nil, newEvalError(pos, "%s expects an exact number", name)
+		}
+		return numeric.numerator, nil
+
+	case "denominator":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		numeric, ok := numericFromValue(args[0])
+		if !ok || !numeric.exact {
+			return nil, newEvalError(pos, "%s expects an exact number", name)
+		}
+		return numeric.denominator, nil
 
 	case "boolean?":
 		if len(args) != 1 {
@@ -1323,8 +1421,8 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if err != nil {
 			return nil, err
 		}
-		value, convErr := strconv.Atoi(text)
-		if convErr != nil {
+		value, ok := parseNumberLiteral(text)
+		if !ok {
 			return false, nil
 		}
 		return value, nil
@@ -1333,11 +1431,11 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
-		value, err := expectInt(args[0], pos, name)
-		if err != nil {
-			return nil, err
+		text, ok := formatNumericValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects a number", name)
 		}
-		return stringValue(strconv.Itoa(value)), nil
+		return stringValue(text), nil
 
 	case "symbol->string":
 		if len(args) != 1 {
@@ -1495,22 +1593,22 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 	}
 }
 
-func numericCompare(name string, args []any, pos position, compare func(int, int) bool) (bool, error) {
+func numericCompare(name string, args []any, pos position, compare func(int) bool) (bool, error) {
 	if len(args) < 2 {
 		return false, newEvalError(pos, "%s expects at least 2 arguments", name)
 	}
 
-	prev, err := expectInt(args[0], pos, name)
-	if err != nil {
-		return false, err
+	prev, ok := numericFromValue(args[0])
+	if !ok {
+		return false, newEvalError(pos, "%s expects numeric arguments", name)
 	}
 
 	for _, arg := range args[1:] {
-		current, err := expectInt(arg, pos, name)
-		if err != nil {
-			return false, err
+		current, ok := numericFromValue(arg)
+		if !ok {
+			return false, newEvalError(pos, "%s expects numeric arguments", name)
 		}
-		if !compare(prev, current) {
+		if !compare(compareNumericValues(prev, current)) {
 			return false, nil
 		}
 		prev = current
@@ -1641,6 +1739,11 @@ func isProperList(value any) bool {
 }
 
 func eqValues(left, right any) bool {
+	if leftNumeric, ok := numericFromValue(left); ok {
+		rightNumeric, ok := numericFromValue(right)
+		return ok && compareNumericValues(leftNumeric, rightNumeric) == 0
+	}
+
 	switch l := left.(type) {
 	case int:
 		r, ok := right.(int)
@@ -1678,6 +1781,11 @@ func eqValues(left, right any) bool {
 }
 
 func equalValues(left, right any) bool {
+	if leftNumeric, ok := numericFromValue(left); ok {
+		rightNumeric, ok := numericFromValue(right)
+		return ok && compareNumericValues(leftNumeric, rightNumeric) == 0
+	}
+
 	switch l := left.(type) {
 	case int:
 		r, ok := right.(int)
@@ -1727,11 +1835,11 @@ func equalValues(left, right any) bool {
 }
 
 func expectInt(value any, pos position, procedure string) (int, error) {
-	n, ok := value.(int)
-	if !ok {
+	numeric, ok := numericFromValue(value)
+	if !ok || !numeric.exact || !numeric.isInteger() {
 		return 0, newEvalError(pos, "%s expects numeric arguments", procedure)
 	}
-	return n, nil
+	return numeric.numerator, nil
 }
 
 func expectString(value any, pos position, procedure string) (string, error) {
@@ -1806,13 +1914,15 @@ func isTruthy(value any) bool {
 }
 
 func formatValue(value any) string {
+	if text, ok := formatNumericValue(value); ok {
+		return text
+	}
+
 	switch v := value.(type) {
 	case nil:
 		return ""
 	case voidValue:
 		return ""
-	case int:
-		return strconv.Itoa(v)
 	case bool:
 		if v {
 			return "#t"
@@ -2082,8 +2192,15 @@ func parseAtom(tok token) expr {
 		return &charExpr{value: value, pos: tok.pos}
 	}
 
-	if value, err := strconv.Atoi(tok.text); err == nil {
-		return &integerExpr{value: value, pos: tok.pos}
+	if value, ok := parseNumberLiteral(tok.text); ok {
+		switch number := value.(type) {
+		case int:
+			return &integerExpr{value: number, pos: tok.pos}
+		case rationalValue:
+			return &rationalExpr{value: number, pos: tok.pos}
+		case inexactValue:
+			return &inexactExpr{value: number, pos: tok.pos}
+		}
 	}
 
 	return &symbolExpr{value: tok.text, pos: tok.pos}
