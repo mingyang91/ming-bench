@@ -192,6 +192,8 @@ final class ContinuationEvaluator {
 
             return switch (symbolExpr.name()) {
                 case "define" -> evalDefine(arguments, environment, continuation);
+                case "define-record-type" -> new ReturnValueState(owner.defineRecordType(arguments, environment),
+                        continuation);
                 case "set!" -> evalSet(arguments, environment, continuation);
                 case "if" -> evalIf(arguments, environment, continuation);
                 case "quote" -> evalQuote(arguments, continuation);
@@ -407,6 +409,17 @@ final class ContinuationEvaluator {
                 continuationProcedureValue.continuation(),
                 line,
                 column);
+    }
+
+    private Value prepareContinuationValue(List<Value> arguments,
+                                           ContinuationProcedureValue continuationProcedureValue) throws EvalError {
+        if (arguments.size() == 1) {
+            return arguments.getFirst();
+        }
+        if (continuationProcedureValue.continuation() instanceof CallWithValuesProducerKont) {
+            return owner.packValues(arguments);
+        }
+        throw new EvalError("continuation expected 1 argument(s)");
     }
 
     private List<WindFrame> windFramesOuterToInner(WindFrame frame) {
@@ -1006,8 +1019,11 @@ final class ContinuationEvaluator {
             }
 
             if (operator instanceof ContinuationProcedureValue continuationProcedureValue) {
-                requireExactArity("continuation", arguments.size(), 1);
-                return transferToContinuation(arguments.getFirst(), continuationProcedureValue, line, column);
+                return transferToContinuation(
+                        prepareContinuationValue(arguments, continuationProcedureValue),
+                        continuationProcedureValue,
+                        line,
+                        column);
             }
 
             if (operator instanceof PrimitiveProcedureValue primitiveProcedureValue) {

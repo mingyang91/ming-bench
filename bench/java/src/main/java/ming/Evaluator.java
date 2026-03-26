@@ -780,6 +780,10 @@ public class Evaluator {
         return evalDefineSyntax(arguments, environment);
     }
 
+    Value defineRecordType(List<Expr> arguments, Environment environment) throws EvalError {
+        return evalDefineRecordType(arguments, environment);
+    }
+
     private Value evalDefineRecordType(List<Expr> arguments, Environment environment) throws EvalError {
         if (arguments.size() < 3) {
             throw new EvalError(
@@ -2035,6 +2039,8 @@ public class Evaluator {
                     "and",
                     "or",
                     "set!",
+                    "guard",
+                    "dynamic-wind",
                     "syntax",
                     "syntax-case",
                     "with-syntax",
