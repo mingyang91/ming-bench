@@ -17,6 +17,18 @@ enum Expr {
     List(Vec<Expr>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Position {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PositionedExpr {
+    expr: Expr,
+    position: Position,
+}
+
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
@@ -147,19 +159,28 @@ impl Value {
 struct Parser<'a> {
     input: &'a str,
     offset: usize,
+    line: usize,
+    column: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, offset: 0 }
+        Self {
+            input,
+            offset: 0,
+            line: 1,
+            column: 1,
+        }
     }
 
-    fn parse_program(&mut self) -> Result<Vec<Expr>, EvalError> {
+    fn parse_program(&mut self) -> Result<Vec<PositionedExpr>, EvalError> {
         let mut expressions = Vec::new();
         self.skip_ignored();
 
         while !self.is_eof() {
-            expressions.push(self.parse_expr()?);
+            let position = self.current_position();
+            let expr = self.parse_expr()?;
+            expressions.push(PositionedExpr { expr, position });
             self.skip_ignored();
         }
 
@@ -170,7 +191,7 @@ impl<'a> Parser<'a> {
         self.skip_ignored();
 
         let Some(ch) = self.peek_char() else {
-            return Err(EvalError::UnexpectedEof);
+            return Err(self.error(EvalError::UnexpectedEof));
         };
 
         match ch {
@@ -178,7 +199,7 @@ impl<'a> Parser<'a> {
             '\'' => self.parse_quote_shorthand(),
             '"' => self.parse_string(),
             '#' => self.parse_boolean(),
-            ')' => Err(EvalError::UnexpectedToken { token: ")".into() }),
+            ')' => Err(self.error(EvalError::UnexpectedToken { token: ")".into() })),
             '-' if self
                 .peek_second_char()
                 .is_some_and(|next| next.is_ascii_digit()) =>
@@ -209,7 +230,7 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::List(items));
                 }
                 Some(_) => items.push(self.parse_expr()?),
-                None => return Err(EvalError::UnexpectedEof),
+                None => return Err(self.error(EvalError::UnexpectedEof)),
             }
         }
     }
@@ -222,7 +243,9 @@ impl<'a> Parser<'a> {
             match ch {
                 '"' => return Ok(Expr::String(value)),
                 '\\' => {
-                    let escaped = self.bump_char().ok_or(EvalError::UnterminatedString)?;
+                    let escaped = self
+                        .bump_char()
+                        .ok_or_else(|| self.error(EvalError::UnterminatedString))?;
                     value.push(match escaped {
                         'n' => '\n',
                         't' => '\t',
@@ -235,7 +258,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Err(EvalError::UnterminatedString)
+        Err(self.error(EvalError::UnterminatedString))
     }
 
     fn parse_boolean(&mut self) -> Result<Expr, EvalError> {
@@ -243,10 +266,10 @@ impl<'a> Parser<'a> {
         match self.bump_char() {
             Some('t') => Ok(Expr::Boolean(true)),
             Some('f') => Ok(Expr::Boolean(false)),
-            Some(other) => Err(EvalError::InvalidBoolean {
+            Some(other) => Err(self.error(EvalError::InvalidBoolean {
                 literal: format!("#{other}"),
-            }),
-            None => Err(EvalError::UnexpectedEof),
+            })),
+            None => Err(self.error(EvalError::UnexpectedEof)),
         }
     }
 
@@ -264,16 +287,18 @@ impl<'a> Parser<'a> {
 
         let literal = &self.input[start..self.offset];
         if !saw_digit {
-            return Err(EvalError::InvalidNumber {
+            return Err(self.error(EvalError::InvalidNumber {
                 literal: literal.into(),
-            });
+            }));
         }
 
         literal
             .parse::<i64>()
             .map(Expr::Integer)
-            .map_err(|_| EvalError::InvalidNumber {
-                literal: literal.into(),
+            .map_err(|_| {
+                self.error(EvalError::InvalidNumber {
+                    literal: literal.into(),
+                })
             })
     }
 
@@ -292,7 +317,7 @@ impl<'a> Parser<'a> {
                 .peek_char()
                 .map(|ch| ch.to_string())
                 .unwrap_or_else(|| "<eof>".into());
-            return Err(EvalError::UnexpectedToken { token });
+            return Err(self.error(EvalError::UnexpectedToken { token }));
         }
 
         Ok(Expr::Symbol(self.input[start..self.offset].into()))
@@ -319,10 +344,10 @@ impl<'a> Parser<'a> {
     fn expect_char(&mut self, expected: char) -> Result<(), EvalError> {
         match self.bump_char() {
             Some(ch) if ch == expected => Ok(()),
-            Some(ch) => Err(EvalError::UnexpectedToken {
+            Some(ch) => Err(self.error(EvalError::UnexpectedToken {
                 token: ch.to_string(),
-            }),
-            None => Err(EvalError::UnexpectedEof),
+            })),
+            None => Err(self.error(EvalError::UnexpectedEof)),
         }
     }
 
@@ -330,6 +355,12 @@ impl<'a> Parser<'a> {
         let mut chars = self.input[self.offset..].chars();
         let ch = chars.next()?;
         self.offset += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
         Some(ch)
     }
 
@@ -345,6 +376,18 @@ impl<'a> Parser<'a> {
 
     fn is_eof(&self) -> bool {
         self.offset >= self.input.len()
+    }
+
+    fn current_position(&self) -> Position {
+        Position {
+            line: self.line,
+            column: self.column,
+        }
+    }
+
+    fn error(&self, error: EvalError) -> EvalError {
+        let position = self.current_position();
+        error.with_position(position.line, position.column)
     }
 }
 
@@ -990,15 +1033,20 @@ fn expect_pair_arg<'a>(name: &'static str, args: &'a [Value]) -> Result<&'a [Val
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut parser = Parser::new(input);
     let program = parser.parse_program()?;
-    let env = root_env();
-    let mut last_value = None;
-
-    for expression in &program {
-        last_value = Some(eval_expr_in_env(expression, &env)?);
+    if program.is_empty() {
+        return Err(EvalError::EmptyInput.with_position(1, 1));
     }
 
-    let value = last_value.ok_or(EvalError::EmptyInput)?;
-    Ok(value.render())
+    let env = root_env();
+    let mut last_value = Value::Void;
+
+    for expression in &program {
+        last_value = eval_expr_in_env(&expression.expr, &env).map_err(|error| {
+            error.with_position(expression.position.line, expression.position.column)
+        })?;
+    }
+
+    Ok(last_value.render())
 }
 
 /// Evaluate Scheme expressions, returning both the result value and
