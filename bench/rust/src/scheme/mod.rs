@@ -117,6 +117,13 @@ enum Value {
     },
     // Multiple return values (from `values`)
     Values(Vec<Value>),
+    // Syntax object (wraps an Expr for syntax-case macros)
+    Syntax(Box<Expr>),
+    // Transformer macro (lambda-based macro from define-syntax)
+    TransformerMacro {
+        transformer: Box<Value>,
+        def_env: Env,
+    },
 }
 
 fn make_pair(car: Value, cdr: Value) -> Value {
@@ -159,6 +166,8 @@ thread_local! {
     static BODY_CTX: RefCell<Option<RestartCtx>> = RefCell::new(None);
     // Dynamic-wind stack: tracks active dynamic-wind in/out thunks.
     static WIND_STACK: RefCell<Vec<WindEntry>> = RefCell::new(Vec::new());
+    // Stack of syntax-case pattern bindings (for syntax template expansion)
+    static SYNTAX_BINDINGS: RefCell<Vec<HashMap<String, PatBinding>>> = RefCell::new(Vec::new());
 }
 
 fn write_output(s: &str) {
@@ -188,6 +197,7 @@ fn display_value(val: &Value) -> String {
             s.push(')');
             s
         }
+        Value::Syntax(_) | Value::TransformerMacro { .. } => val.to_string(),
         other => other.to_string(),
     }
 }
@@ -333,6 +343,8 @@ impl fmt::Display for Value {
                     write!(f, "")
                 }
             }
+            Value::Syntax(_) => write!(f, "#<syntax>"),
+            Value::TransformerMacro { .. } => write!(f, "#<macro>"),
         }
     }
 }
@@ -662,6 +674,18 @@ impl Parser {
                 vec![Expr::Symbol("quote".into(), tpos), inner],
                 tpos,
             ))
+        } else if tok == "#" {
+            // Check for #' (syntax shorthand)
+            if self.pos < self.tokens.len() && self.tokens[self.pos].0 == "'" {
+                self.pos += 1; // consume the '
+                let inner = self.parse_expr()?;
+                Ok(Expr::List(
+                    vec![Expr::Symbol("syntax".into(), tpos), inner],
+                    tpos,
+                ))
+            } else {
+                Ok(Expr::Symbol(tok, tpos))
+            }
         } else if tok == "(" {
             let list_pos = tpos;
             let mut elems = Vec::new();
@@ -800,6 +824,7 @@ fn is_builtin(name: &str) -> bool {
             | "dynamic-wind"
             | "raise" | "with-exception-handler"
             | "values" | "call-with-values"
+            | "syntax->datum" | "datum->syntax"
     )
 }
 
@@ -872,9 +897,15 @@ fn eval_step(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "when" => return eval_when(&elems[1..], env, p),
                     "dynamic-wind" => return eval_dynamic_wind(&elems[1..], env, p),
                     "guard" => return eval_guard(&elems[1..], env, p),
+                    "syntax-case" => return eval_syntax_case(&elems[1..], env, p),
+                    "syntax" => return eval_syntax_template(&elems[1..], env, p),
+                    "with-syntax" => return eval_with_syntax(&elems[1..], env, p),
                     _ => {
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
                             return eval_macro(&literals, &rules, &def_env, elems, env, p);
+                        }
+                        if let Some(Value::TransformerMacro { transformer, def_env }) = env_get(env, op) {
+                            return eval_transformer_macro(&transformer, &def_env, elems, env, p);
                         }
                     }
                 }
@@ -1674,6 +1705,7 @@ fn is_special_form(name: &str) -> bool {
         "define" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "begin"
             | "cond" | "string-set!" | "set!" | "define-syntax" | "define-record-type"
             | "letrec" | "letrec*" | "case" | "do" | "let*" | "when"
+            | "syntax-case" | "syntax" | "with-syntax"
     )
 }
 
@@ -1689,54 +1721,63 @@ fn eval_define_syntax(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalErr
             "define-syntax: expected symbol at {}", p
         ))),
     };
-    let sr = match &args[1] {
-        Expr::List(elems, _) => elems,
-        _ => return Err(EvalError::Type(format!(
-            "define-syntax: expected syntax-rules at {}", p
-        ))),
-    };
-    if sr.len() < 2 {
-        return Err(EvalError::Parse(format!(
-            "define-syntax: invalid syntax-rules at {}", p
-        )));
-    }
-    match &sr[0] {
-        Expr::Symbol(s, _) if s == "syntax-rules" => {}
-        _ => return Err(EvalError::Type(format!(
-            "define-syntax: expected syntax-rules at {}", p
-        ))),
-    }
-    let literals = match &sr[1] {
-        Expr::List(lits, _) => lits
-            .iter()
-            .map(|l| match l {
-                Expr::Symbol(s, _) => Ok(s.clone()),
-                _ => Err(EvalError::Type(format!(
-                    "define-syntax: expected symbol in literals at {}", p
-                ))),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => return Err(EvalError::Type(format!(
-            "define-syntax: expected literals list at {}", p
-        ))),
-    };
-    let mut rules = Vec::new();
-    for rule in &sr[2..] {
-        match rule {
-            Expr::List(parts, _) if parts.len() == 2 => {
-                rules.push((parts[0].clone(), parts[1].clone()));
-            }
-            _ => return Err(EvalError::Type(format!(
-                "define-syntax: invalid rule at {}", p
-            ))),
+    // Check if it's a syntax-rules form or a transformer expression (lambda)
+    let is_syntax_rules = match &args[1] {
+        Expr::List(elems, _) if !elems.is_empty() => {
+            matches!(&elems[0], Expr::Symbol(s, _) if s == "syntax-rules")
         }
-    }
-    let mac = Value::Macro {
-        literals,
-        rules,
-        def_env: env.clone(),
+        _ => false,
     };
-    env_set(env, name.clone(), mac);
+    if is_syntax_rules {
+        let sr = match &args[1] {
+            Expr::List(elems, _) => elems,
+            _ => unreachable!(),
+        };
+        if sr.len() < 2 {
+            return Err(EvalError::Parse(format!(
+                "define-syntax: invalid syntax-rules at {}", p
+            )));
+        }
+        let literals = match &sr[1] {
+            Expr::List(lits, _) => lits
+                .iter()
+                .map(|l| match l {
+                    Expr::Symbol(s, _) => Ok(s.clone()),
+                    _ => Err(EvalError::Type(format!(
+                        "define-syntax: expected symbol in literals at {}", p
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err(EvalError::Type(format!(
+                "define-syntax: expected literals list at {}", p
+            ))),
+        };
+        let mut rules = Vec::new();
+        for rule in &sr[2..] {
+            match rule {
+                Expr::List(parts, _) if parts.len() == 2 => {
+                    rules.push((parts[0].clone(), parts[1].clone()));
+                }
+                _ => return Err(EvalError::Type(format!(
+                    "define-syntax: invalid rule at {}", p
+                ))),
+            }
+        }
+        let mac = Value::Macro {
+            literals,
+            rules,
+            def_env: env.clone(),
+        };
+        env_set(env, name.clone(), mac);
+    } else {
+        // Transformer macro: evaluate the expression (should be a lambda)
+        let transformer = eval(&args[1], env)?;
+        let mac = Value::TransformerMacro {
+            transformer: Box::new(transformer),
+            def_env: env.clone(),
+        };
+        env_set(env, name.clone(), mac);
+    }
     Ok(Value::Symbol(name))
 }
 
@@ -1955,6 +1996,12 @@ fn collect_template_symbols(
             }
         }
         Expr::List(elems, _) => {
+            // Skip quoted forms — symbols inside quote are data, not bindings
+            if let Some(Expr::Symbol(s, _)) = elems.first() {
+                if s == "quote" {
+                    return;
+                }
+            }
             for e in elems {
                 collect_template_symbols(e, pat_vars, gensym_map);
             }
@@ -1995,6 +2042,265 @@ fn eval_macro(
     Err(EvalError::Type(format!(
         "no matching macro pattern at {}", p
     )))
+}
+
+// --- syntax-case support ---
+
+/// Convert a Value back to an Expr (inverse of expr_to_value).
+fn value_to_expr(val: &Value, p: Pos) -> Expr {
+    match val {
+        Value::Integer(n) => Expr::Integer(*n, p),
+        Value::Float(f) => Expr::Float(*f, p),
+        Value::Rational(n, d) => Expr::Rational(*n, *d, p),
+        Value::Boolean(b) => Expr::Boolean(*b, p),
+        Value::Str(s) => Expr::Str(s.clone(), p),
+        Value::Char(c) => Expr::Char(*c, p),
+        Value::Symbol(s) => Expr::Symbol(s.clone(), p),
+        Value::Nil => Expr::List(vec![], p),
+        Value::Pair(_) => {
+            let mut elems = Vec::new();
+            let mut cur = val.clone();
+            loop {
+                match cur {
+                    Value::Pair(pr) => {
+                        let (car, cdr) = {
+                            let b = pr.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        elems.push(value_to_expr(&car, p));
+                        cur = cdr;
+                    }
+                    Value::Nil => break,
+                    other => {
+                        // improper list: add dot notation
+                        elems.push(Expr::Symbol(".".into(), p));
+                        elems.push(value_to_expr(&other, p));
+                        break;
+                    }
+                }
+            }
+            Expr::List(elems, p)
+        }
+        Value::Syntax(e) => (**e).clone(),
+        _ => Expr::Symbol(format!("{}", val), p),
+    }
+}
+
+/// Evaluate a syntax-case expression.
+/// (syntax-case expr (literal ...) clause ...)
+/// clause = (pattern output-expr) | (pattern fender output-expr)
+fn eval_syntax_case(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("syntax-case requires at least 2 arguments at {}", p)));
+    }
+    // Evaluate the expression to get a syntax object
+    let stx_val = eval(&args[0], env)?;
+    let stx_expr = match &stx_val {
+        Value::Syntax(e) => (**e).clone(),
+        _ => return Err(EvalError::Type(format!("syntax-case: expected syntax object, got {} at {}", stx_val, p))),
+    };
+
+    // Parse literals
+    let literals = match &args[1] {
+        Expr::List(lits, _) => lits
+            .iter()
+            .map(|l| match l {
+                Expr::Symbol(s, _) => Ok(s.clone()),
+                _ => Err(EvalError::Type(format!("syntax-case: expected symbol in literals at {}", p))),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(EvalError::Type(format!("syntax-case: expected literals list at {}", p))),
+    };
+
+    // Try each clause
+    for clause in &args[2..] {
+        let clause_elems = match clause {
+            Expr::List(elems, _) if elems.len() >= 2 => elems,
+            _ => return Err(EvalError::Type(format!("syntax-case: invalid clause at {}", p))),
+        };
+
+        let pattern = &clause_elems[0];
+        let (fender, output) = if clause_elems.len() == 3 {
+            (Some(&clause_elems[1]), &clause_elems[2])
+        } else {
+            (None, &clause_elems[1])
+        };
+
+        let mut bindings = HashMap::new();
+        let matched = match pattern {
+            Expr::List(pat_elems, _) => {
+                match &stx_expr {
+                    Expr::List(input_elems, _) => match_list(pat_elems, input_elems, &literals, &mut bindings),
+                    _ => false,
+                }
+            }
+            Expr::Symbol(name, _) if !literals.contains(name) && name != "_" => {
+                bindings.insert(name.clone(), PatBinding::Single(stx_expr.clone()));
+                true
+            }
+            _ => match_one(pattern, &stx_expr, &literals, &mut bindings),
+        };
+
+        if matched {
+            // If there's a fender, evaluate it with bindings in scope
+            if let Some(fender_expr) = fender {
+                // Push bindings for fender evaluation
+                SYNTAX_BINDINGS.with(|sb| sb.borrow_mut().push(bindings.clone()));
+                let fender_val = eval(fender_expr, env);
+                SYNTAX_BINDINGS.with(|sb| sb.borrow_mut().pop());
+                match fender_val {
+                    Ok(v) if !v.is_truthy() => continue,
+                    Err(e) => return Err(e),
+                    _ => {}
+                }
+            }
+
+            // Push bindings and evaluate the output expression
+            SYNTAX_BINDINGS.with(|sb| sb.borrow_mut().push(bindings));
+            let result = eval(output, env);
+            SYNTAX_BINDINGS.with(|sb| sb.borrow_mut().pop());
+            return result;
+        }
+    }
+
+    Err(EvalError::Type(format!("syntax-case: no matching pattern at {}", p)))
+}
+
+/// Evaluate a (syntax template) / #'template expression.
+/// Expands pattern variables from SYNTAX_BINDINGS and wraps as Syntax.
+fn eval_syntax_template(args: &[Expr], _env: &Env, p: Pos) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("syntax expects 1 argument at {}", p)));
+    }
+    let template = &args[0];
+
+    let bindings = SYNTAX_BINDINGS.with(|sb| {
+        let stack = sb.borrow();
+        if let Some(top) = stack.last() {
+            top.clone()
+        } else {
+            HashMap::new()
+        }
+    });
+
+    let pat_vars: Vec<String> = bindings.keys().cloned().collect();
+    let mut gensym_map = HashMap::new();
+    collect_template_symbols(template, &pat_vars, &mut gensym_map);
+
+    let expanded = expand_template(template, &bindings, &gensym_map);
+    Ok(Value::Syntax(Box::new(expanded)))
+}
+
+/// Evaluate (with-syntax ((pattern expr) ...) body ...)
+fn eval_with_syntax(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity(format!("with-syntax requires bindings and body at {}", p)));
+    }
+    let binding_list = match &args[0] {
+        Expr::List(b, _) => b,
+        _ => return Err(EvalError::Type(format!("with-syntax: expected bindings list at {}", p))),
+    };
+
+    // Start with current bindings from enclosing syntax-case
+    let mut new_bindings = SYNTAX_BINDINGS.with(|sb| {
+        let stack = sb.borrow();
+        if let Some(top) = stack.last() {
+            top.clone()
+        } else {
+            HashMap::new()
+        }
+    });
+
+    for b in binding_list {
+        let pair = match b {
+            Expr::List(elems, _) if elems.len() == 2 => elems,
+            _ => return Err(EvalError::Type(format!("with-syntax: invalid binding at {}", p))),
+        };
+        let pat_name = match &pair[0] {
+            Expr::Symbol(s, _) => s.clone(),
+            _ => return Err(EvalError::Type(format!("with-syntax: expected symbol pattern at {}", p))),
+        };
+        let val = eval(&pair[1], env)?;
+        // The value should be a syntax object
+        let expr = match &val {
+            Value::Syntax(e) => (**e).clone(),
+            _ => value_to_expr(&val, p),
+        };
+        new_bindings.insert(pat_name, PatBinding::Single(expr));
+    }
+
+    // Push new bindings and evaluate body
+    SYNTAX_BINDINGS.with(|sb| sb.borrow_mut().push(new_bindings));
+    let mut result = Value::Boolean(false);
+    for expr in &args[1..] {
+        result = eval(expr, env)?;
+    }
+    SYNTAX_BINDINGS.with(|sb| sb.borrow_mut().pop());
+    Ok(result)
+}
+
+/// Evaluate a transformer macro call.
+/// Converts the call form to a syntax object, calls the transformer, and evals the result.
+fn eval_transformer_macro(
+    transformer: &Value,
+    def_env: &Env,
+    input: &[Expr],
+    env: &Env,
+    p: Pos,
+) -> Result<Value, EvalError> {
+    // The input slice is the full form elements (macro-name arg ...)
+    // Wrap as a syntax object
+    let input_expr = Expr::List(input.to_vec(), p);
+    let stx = Value::Syntax(Box::new(input_expr));
+
+    // Call the transformer lambda with the syntax object
+    let result = apply_value(transformer, &[stx], p)?;
+    let result = force(result)?;
+
+    // The result should be a syntax object — unwrap and eval
+    match &result {
+        Value::Syntax(expanded) => {
+            // Copy gensym bindings directly into the use-site env so that
+            // define/set! work in the right scope
+            copy_gensym_bindings(expanded, def_env, env, env);
+            eval(expanded, env)
+        }
+        _ => {
+            // If the result is not a syntax object, return it directly
+            Ok(result)
+        }
+    }
+}
+
+/// Find all gensym'd symbols in an expr and copy their original bindings
+/// from def_env or use_env into target_env.
+fn copy_gensym_bindings(expr: &Expr, def_env: &Env, use_env: &Env, target_env: &Env) {
+    match expr {
+        Expr::Symbol(name, _) if name.contains("##") => {
+            // Extract original name before ##
+            if let Some(idx) = name.find("##") {
+                let orig = &name[..idx];
+                // Try def_env first, then use_env
+                if let Some(val) = env_get(def_env, orig) {
+                    env_set(target_env, name.clone(), val);
+                } else if let Some(val) = env_get(use_env, orig) {
+                    env_set(target_env, name.clone(), val);
+                }
+            }
+        }
+        Expr::List(elems, _) => {
+            // Skip quoted forms - symbols inside quote are data, not references
+            if let Some(Expr::Symbol(s, _)) = elems.first() {
+                if s == "quote" {
+                    return;
+                }
+            }
+            for e in elems {
+                copy_gensym_bindings(e, def_env, use_env, target_env);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn eval_letrec(args: &[Expr], env: &Env, p: Pos) -> Result<Value, EvalError> {
@@ -3419,6 +3725,21 @@ fn apply_builtin(op: &str, args: &[Value], p: Pos) -> Result<Value, EvalError> {
             };
             force(apply_value(&consumer, &call_args, p)?)
         }
+        "syntax->datum" => {
+            ensure_args("syntax->datum", args, 1, p)?;
+            match &args[0] {
+                Value::Syntax(e) => Ok(expr_to_value(e)),
+                other => Ok(other.clone()),
+            }
+        }
+        "datum->syntax" => {
+            ensure_args("datum->syntax", args, 2, p)?;
+            // (datum->syntax template-id datum)
+            // template-id provides hygiene context (we ignore it for simplicity)
+            // datum is the value to convert to a syntax object
+            let datum = &args[1];
+            Ok(Value::Syntax(Box::new(value_to_expr(datum, p))))
+        }
         _ => Err(EvalError::UnboundVariable(format!("{} at {}", op, p))),
     }
 }
@@ -3690,7 +4011,8 @@ fn eval_cps(expr: &Expr, env: &Env, k: ContFn) -> Result<Value, EvalError> {
                     // user lambdas: evaluate eagerly and pass result to k.
                     // ContinuationEscape propagates via ? if any nested call invokes a continuation.
                     "lambda" | "case-lambda" | "quote" | "define-syntax"
-                    | "define-record-type" | "string-set!" => {
+                    | "define-record-type" | "string-set!"
+                    | "syntax-case" | "syntax" | "with-syntax" => {
                         let v = eval(expr, env)?;
                         let v = force(v)?;
                         return k.call(v);
@@ -3713,6 +4035,11 @@ fn eval_cps(expr: &Expr, env: &Env, k: ContFn) -> Result<Value, EvalError> {
                         if let Some(Value::Macro { literals, rules, def_env }) = env_get(env, op) {
                             // Expand macro and re-evaluate via CPS
                             let expanded = eval_macro(&literals, &rules, &def_env, elems, env, pos)?;
+                            return k.call(force(expanded)?);
+                        }
+                        // Check if this is a transformer macro
+                        if let Some(Value::TransformerMacro { transformer, def_env }) = env_get(env, op) {
+                            let expanded = eval_transformer_macro(&transformer, &def_env, elems, env, pos)?;
                             return k.call(force(expanded)?);
                         }
                         // Otherwise: user function call or builtin — fall through to general application
