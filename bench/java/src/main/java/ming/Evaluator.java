@@ -40,7 +40,8 @@ public class Evaluator {
                 "string=?", "string<?", "string-ci=?",
                 "string-upcase", "string-downcase",
                 "exact?", "inexact?", "exact->inexact", "inexact->exact",
-                "numerator", "denominator", "integer?", "rational?"}) {
+                "numerator", "denominator", "integer?", "rational?",
+                "procedure?"}) {
             globalEnv.define(name, new BuiltinProc(name));
         }
     }
@@ -174,6 +175,11 @@ public class Evaluator {
             this.body = body;
             this.closureEnv = closureEnv;
         }
+    }
+
+    static final class CaseLambda {
+        final List<Lambda> clauses;
+        CaseLambda(List<Lambda> clauses) { this.clauses = clauses; }
     }
 
     // ---- Record types ----
@@ -484,6 +490,36 @@ public class Evaluator {
                         for (int i = 2; i < list.size(); i++) body.add(list.get(i));
                         return new Lambda(params, restParam, body, env);
                     }
+                    case "case-lambda" -> {
+                        if (list.size() < 2) throw posError("case-lambda: bad syntax");
+                        List<Lambda> clauses = new ArrayList<>();
+                        for (int ci = 1; ci < list.size(); ci++) {
+                            Object clauseRaw = unwrap(list.get(ci));
+                            if (!(clauseRaw instanceof List<?> clause) || clause.size() < 2)
+                                throw posError("case-lambda: bad clause");
+                            Object paramListRaw = unwrap(clause.get(0));
+                            List<String> params = new ArrayList<>();
+                            String restParam = null;
+                            if (paramListRaw instanceof List<?> paramList) {
+                                for (int i = 0; i < paramList.size(); i++) {
+                                    String p = (String) unwrap(paramList.get(i));
+                                    if (p.equals(".")) {
+                                        if (i + 1 < paramList.size()) {
+                                            restParam = (String) unwrap(paramList.get(i + 1));
+                                        }
+                                        break;
+                                    }
+                                    params.add(p);
+                                }
+                            } else if (paramListRaw instanceof String sym) {
+                                restParam = sym;
+                            }
+                            List<Object> body = new ArrayList<>();
+                            for (int i = 1; i < clause.size(); i++) body.add(clause.get(i));
+                            clauses.add(new Lambda(params, restParam, body, env));
+                        }
+                        return new CaseLambda(clauses);
+                    }
                     case "and" -> { return evalAnd((List<Object>) list, env); }
                     case "or" -> { return evalOr((List<Object>) list, env); }
                     case "begin" -> {
@@ -574,54 +610,7 @@ public class Evaluator {
                         return null;
                     }
                     case "define-record-type" -> {
-                        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
-                        if (list.size() < 4) throw posError("define-record-type: bad syntax");
-                        String typeName = (String) unwrap(list.get(1));
-                        List<?> ctorSpec = (List<?>) unwrap(list.get(2));
-                        String ctorName = (String) unwrap(ctorSpec.get(0));
-                        List<String> ctorFields = new ArrayList<>();
-                        for (int i = 1; i < ctorSpec.size(); i++) {
-                            ctorFields.add((String) unwrap(ctorSpec.get(i)));
-                        }
-                        String predName = (String) unwrap(list.get(3));
-
-                        // Collect field accessors
-                        List<String> allFieldNames = new ArrayList<>(ctorFields);
-                        Map<String, String> fieldAccessors = new HashMap<>();
-                        for (int i = 4; i < list.size(); i++) {
-                            List<?> fieldSpec = (List<?>) unwrap(list.get(i));
-                            String fieldName = (String) unwrap(fieldSpec.get(0));
-                            String accessorName = (String) unwrap(fieldSpec.get(1));
-                            fieldAccessors.put(fieldName, accessorName);
-                        }
-
-                        RecordType rt = new RecordType(typeName, allFieldNames);
-
-                        // Define constructor
-                        final RecordType rtFinal = rt;
-                        final List<String> ctorFieldsFinal = ctorFields;
-                        env.define(ctorName, new BuiltinProc("__record-ctor__" + typeName));
-                        // We need a lambda-based constructor approach. Let's use Lambda.
-                        List<String> params = new ArrayList<>(ctorFields);
-                        // Build constructor as a special lambda that creates records
-                        // Instead, let's define a custom callable. Use Lambda with a trick:
-                        // Actually, let's just store the record type info and handle in apply.
-
-                        // Store record type and define constructor as a lambda
-                        env.define(ctorName, new RecordConstructor(rt, ctorFields));
-
-                        // Define predicate
-                        env.define(predName, new RecordPredicate(rt));
-
-                        // Define accessors
-                        for (int i = 0; i < allFieldNames.size(); i++) {
-                            String fn = allFieldNames.get(i);
-                            String accName = fieldAccessors.get(fn);
-                            if (accName != null) {
-                                env.define(accName, new RecordAccessor(rt, i));
-                            }
-                        }
-                        return null;
+                        return evalDefineRecordType(list, env);
                     }
                 }
                 // Check if head is a macro
@@ -670,6 +659,41 @@ public class Evaluator {
         throw posError("unknown expression type");
     }
 
+    private Object evalDefineRecordType(List<?> list, Env env) throws EvalError {
+        // (define-record-type <name> (constructor field...) predicate (field accessor)...)
+        if (list.size() < 4) throw posError("define-record-type: bad syntax");
+        String typeName = (String) unwrap(list.get(1));
+        List<?> ctorSpec = (List<?>) unwrap(list.get(2));
+        String ctorName = (String) unwrap(ctorSpec.get(0));
+        List<String> ctorFields = new ArrayList<>();
+        for (int i = 1; i < ctorSpec.size(); i++) {
+            ctorFields.add((String) unwrap(ctorSpec.get(i)));
+        }
+        String predName = (String) unwrap(list.get(3));
+
+        List<String> allFieldNames = new ArrayList<>(ctorFields);
+        Map<String, String> fieldAccessors = new HashMap<>();
+        for (int i = 4; i < list.size(); i++) {
+            List<?> fieldSpec = (List<?>) unwrap(list.get(i));
+            String fieldName = (String) unwrap(fieldSpec.get(0));
+            String accessorName = (String) unwrap(fieldSpec.get(1));
+            fieldAccessors.put(fieldName, accessorName);
+        }
+
+        RecordType rt = new RecordType(typeName, allFieldNames);
+        env.define(ctorName, new RecordConstructor(rt, ctorFields));
+        env.define(predName, new RecordPredicate(rt));
+
+        for (int i = 0; i < allFieldNames.size(); i++) {
+            String fn = allFieldNames.get(i);
+            String accName = fieldAccessors.get(fn);
+            if (accName != null) {
+                env.define(accName, new RecordAccessor(rt, i));
+            }
+        }
+        return null;
+    }
+
     private Object quoteDatum(Object datum) {
         datum = unwrap(datum);
         if (datum instanceof List<?> list) {
@@ -713,6 +737,16 @@ public class Evaluator {
                 result = eval(bodyExpr, callEnv);
             }
             return result;
+        }
+        if (proc instanceof CaseLambda cl) {
+            for (Lambda lam : cl.clauses) {
+                if (lam.restParam != null) {
+                    if (args.size() >= lam.params.size()) return apply(lam, args);
+                } else {
+                    if (args.size() == lam.params.size()) return apply(lam, args);
+                }
+            }
+            throw posError("no matching clause for " + args.size() + " arguments");
         }
         if (proc instanceof RecordConstructor rc) {
             if (args.size() != rc.fieldOrder.size()) {
@@ -844,7 +878,7 @@ public class Evaluator {
         return switch (sym) {
             case "if", "define", "lambda", "quote", "set!", "begin", "cond",
                  "let", "and", "or", "define-syntax", "syntax-rules",
-                 "define-record-type" -> true;
+                 "define-record-type", "case-lambda" -> true;
             default -> false;
         };
     }

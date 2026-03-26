@@ -63,6 +63,17 @@ final class Builtins {
                  "numerator", "denominator", "integer?", "rational?" ->
                 applyExact(name, args);
 
+            case "procedure?" -> {
+                requireArgCount(args, 1, "procedure?");
+                Object val = args.get(0);
+                yield val instanceof Evaluator.BuiltinProc
+                    || val instanceof Evaluator.Lambda
+                    || val instanceof Evaluator.CaseLambda
+                    || val instanceof Evaluator.RecordConstructor
+                    || val instanceof Evaluator.RecordPredicate
+                    || val instanceof Evaluator.RecordAccessor;
+            }
+
             // Higher-order
             case "apply" -> applyApply(args);
             case "map" -> applyMap(args);
