@@ -43,11 +43,13 @@ public class Evaluator {
 
     private static class Lambda {
         final List<String> params;
+        final String restParam; // null if no rest arg
         final List<Object> body; // implicit begin
         Env closureEnv;
 
-        Lambda(List<String> params, List<Object> body, Env closureEnv) {
+        Lambda(List<String> params, String restParam, List<Object> body, Env closureEnv) {
             this.params = params;
+            this.restParam = restParam;
             this.body = body;
             this.closureEnv = closureEnv;
         }
@@ -335,12 +337,18 @@ public class Evaluator {
             if (nameAndParams.elems.isEmpty()) throw new EvalError("define: bad syntax");
             String fname = ((SchemeSymbol) nameAndParams.elems.get(0)).name;
             List<String> params = new ArrayList<>();
+            String restParam = null;
             for (int i = 1; i < nameAndParams.elems.size(); i++) {
-                params.add(((SchemeSymbol) nameAndParams.elems.get(i)).name);
+                Object p = nameAndParams.elems.get(i);
+                if (p instanceof SchemeSymbol s && s.name.equals(".")) {
+                    if (i != nameAndParams.elems.size() - 2) throw new EvalError("define: bad dotted syntax");
+                    restParam = ((SchemeSymbol) nameAndParams.elems.get(i + 1)).name;
+                    break;
+                }
+                params.add(((SchemeSymbol) p).name);
             }
-            // Multi-body: implicit begin
             List<Object> body = elems.subList(2, elems.size());
-            Lambda lambda = new Lambda(params, body, env);
+            Lambda lambda = new Lambda(params, restParam, body, env);
             env.define(fname, lambda);
             return null; // void
         }
@@ -362,13 +370,29 @@ public class Evaluator {
 
     private Lambda evalLambda(List<Object> elems, Env env) throws EvalError {
         if (elems.size() < 3) throw new EvalError("lambda: bad syntax");
-        SchemeList paramList = (SchemeList) elems.get(1);
+        Object paramSpec = elems.get(1);
         List<String> params = new ArrayList<>();
-        for (Object p : paramList.elems) {
-            params.add(((SchemeSymbol) p).name);
+        String restParam = null;
+        if (paramSpec instanceof SchemeSymbol sym) {
+            // (lambda args body...) — single rest param
+            restParam = sym.name;
+        } else if (paramSpec instanceof SchemeList paramList) {
+            // Check for dotted pair: (x y . rest)
+            List<Object> pelems = paramList.elems;
+            for (int i = 0; i < pelems.size(); i++) {
+                Object p = pelems.get(i);
+                if (p instanceof SchemeSymbol s && s.name.equals(".")) {
+                    if (i != pelems.size() - 2) throw new EvalError("lambda: bad dotted syntax");
+                    restParam = ((SchemeSymbol) pelems.get(i + 1)).name;
+                    break;
+                }
+                params.add(((SchemeSymbol) p).name);
+            }
+        } else {
+            throw new EvalError("lambda: bad syntax");
         }
         List<Object> body = elems.subList(2, elems.size());
-        return new Lambda(params, body, env);
+        return new Lambda(params, restParam, body, env);
     }
 
     private Object evalAnd(List<Object> elems, Env env) throws EvalError {
@@ -421,7 +445,7 @@ public class Evaluator {
 
         if (name != null) {
             // Named let: create a lambda and call it
-            Lambda loopLam = new Lambda(paramNames, body, env);
+            Lambda loopLam = new Lambda(paramNames, null, body, env);
             Env letEnv = new Env(env);
             letEnv.define(name, loopLam);
             loopLam.closureEnv = letEnv; // self-reference
@@ -482,12 +506,26 @@ public class Evaluator {
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof Lambda lam) {
-            if (args.size() != lam.params.size()) {
-                throw new EvalError("lambda: expected " + lam.params.size() + " arguments, got " + args.size());
+            if (lam.restParam != null) {
+                if (args.size() < lam.params.size()) {
+                    throw new EvalError("lambda: expected at least " + lam.params.size() + " arguments, got " + args.size());
+                }
+            } else {
+                if (args.size() != lam.params.size()) {
+                    throw new EvalError("lambda: expected " + lam.params.size() + " arguments, got " + args.size());
+                }
             }
             Env callEnv = new Env(lam.closureEnv);
             for (int i = 0; i < lam.params.size(); i++) {
                 callEnv.define(lam.params.get(i), args.get(i));
+            }
+            if (lam.restParam != null) {
+                // Build rest list from remaining args
+                Object rest = NIL;
+                for (int i = args.size() - 1; i >= lam.params.size(); i--) {
+                    rest = new SchemePair(args.get(i), rest);
+                }
+                callEnv.define(lam.restParam, rest);
             }
             return evalBody(lam.body, callEnv);
         }
@@ -725,6 +763,25 @@ public class Evaluator {
         env.define("char?", new BuiltinProc("char?", args -> {
             requireArgCount("char?", args, 1);
             return args.get(0) instanceof SchemeChar;
+        }));
+
+        // L08: apply
+        env.define("apply", new BuiltinProc("apply", args -> {
+            if (args.size() < 2) throw new EvalError("apply: expected at least 2 arguments");
+            Object proc = args.get(0);
+            // Last arg must be a list; preceding args are prepended
+            Object lastArg = args.get(args.size() - 1);
+            List<Object> callArgs = new ArrayList<>();
+            for (int i = 1; i < args.size() - 1; i++) {
+                callArgs.add(args.get(i));
+            }
+            // Unpack the last arg (a scheme list) into callArgs
+            Object cur = lastArg;
+            while (cur instanceof SchemePair p) {
+                callArgs.add(p.car);
+                cur = p.cdr;
+            }
+            return apply(proc, callArgs);
         }));
     }
 
