@@ -120,15 +120,43 @@ final class CallCcProcedure extends ProcedureValue {
     }
 }
 
+final class DynamicWindProcedure extends ProcedureValue {
+    private final String name;
+
+    DynamicWindProcedure(String name) {
+        this.name = name;
+    }
+
+    String name() {
+        return name;
+    }
+
+    @Override
+    Value apply(List<Value> args) throws EvalError {
+        throw new EvalError(name + " cannot be applied directly");
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:" + name + ">";
+    }
+}
+
 final class ContinuationProcedure extends ProcedureValue {
     private final Evaluator.Continuation continuation;
+    private final WindFrame windContext;
 
-    ContinuationProcedure(Evaluator.Continuation continuation) {
+    ContinuationProcedure(Evaluator.Continuation continuation, WindFrame windContext) {
         this.continuation = continuation;
+        this.windContext = windContext;
     }
 
     Evaluator.Continuation continuation() {
         return continuation;
+    }
+
+    WindFrame windContext() {
+        return windContext;
     }
 
     @Override

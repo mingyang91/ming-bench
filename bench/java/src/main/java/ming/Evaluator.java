@@ -11,7 +11,7 @@ import java.util.List;
  */
 public class Evaluator {
     @FunctionalInterface
-    private interface Bounce {
+    interface Bounce {
         Bounce run() throws EvalError;
     }
 
@@ -35,6 +35,7 @@ public class Evaluator {
     }
 
     private final CollectionProcedures collectionProcedures;
+    private final DynamicWindSupport dynamicWindSupport;
     private final Environment globalEnv;
     private StringBuilder activeOutput;
     private long syntheticCounter;
@@ -52,6 +53,7 @@ public class Evaluator {
 
     public Evaluator() {
         collectionProcedures = new CollectionProcedures(this);
+        dynamicWindSupport = new DynamicWindSupport(this::invokeThunk);
         globalEnv = GlobalEnvironmentFactory.create(this);
     }
 
@@ -65,7 +67,9 @@ public class Evaluator {
 
     private Value evalProgram(String input, StringBuilder output) throws EvalError {
         StringBuilder previousOutput = activeOutput;
+        WindFrame previousWind = dynamicWindSupport.currentWind();
         activeOutput = output;
+        dynamicWindSupport.restore(null);
 
         Parser parser = new Parser(input);
         List<Expr> exprs = new ArrayList<>();
@@ -82,6 +86,7 @@ public class Evaluator {
             return run(halt -> evalSequenceBounce(exprs, globalEnv, halt));
         } finally {
             activeOutput = previousOutput;
+            dynamicWindSupport.restore(previousWind);
         }
     }
 
@@ -138,6 +143,10 @@ public class Evaluator {
 
     private Bounce deliverValues(ValueListContinuation cont, List<Value> values) {
         return () -> cont.resume(values);
+    }
+
+    private Bounce invokeThunk(Value thunk, Continuation cont) throws EvalError {
+        return applyProcedureCps(thunk, List.of(), cont);
     }
 
     private Bounce withPosition(SourcePos position, Bounce bounce) {
@@ -856,13 +865,20 @@ public class Evaluator {
 
         if (procedure instanceof ContinuationProcedure continuationProcedure) {
             requireArity("continuation", argumentValues.size(), 1);
-            return deliver(continuationProcedure.continuation(), argumentValues.getFirst());
+            return dynamicWindSupport.transfer(continuationProcedure, argumentValues.getFirst());
         }
 
         if (procedure instanceof CallCcProcedure callCcProcedure) {
             requireArity(callCcProcedure.name(), argumentValues.size(), 1);
             return applyProcedureCps(argumentValues.getFirst(),
-                    List.of(new ContinuationProcedure(cont)), cont);
+                    List.of(new ContinuationProcedure(cont, dynamicWindSupport.currentWind())),
+                    cont);
+        }
+
+        if (procedure instanceof DynamicWindProcedure dynamicWindProcedure) {
+            requireArity(dynamicWindProcedure.name(), argumentValues.size(), 3);
+            return dynamicWindSupport.apply(argumentValues.get(0), argumentValues.get(1),
+                    argumentValues.get(2), cont);
         }
 
         if (procedure instanceof UserProcedure userProcedure) {

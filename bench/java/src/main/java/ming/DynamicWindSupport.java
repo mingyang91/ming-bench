@@ -1,0 +1,115 @@
+package ming;
+
+import java.util.ArrayList;
+import java.util.IdentityHashMap;
+import java.util.List;
+
+final class DynamicWindSupport {
+    @FunctionalInterface
+    interface ThunkInvoker {
+        Evaluator.Bounce invoke(Value thunk, Evaluator.Continuation cont) throws EvalError;
+    }
+
+    private final ThunkInvoker thunkInvoker;
+    private WindFrame currentWind;
+
+    DynamicWindSupport(ThunkInvoker thunkInvoker) {
+        this.thunkInvoker = thunkInvoker;
+    }
+
+    WindFrame currentWind() {
+        return currentWind;
+    }
+
+    void restore(WindFrame windFrame) {
+        currentWind = windFrame;
+    }
+
+    Evaluator.Bounce apply(Value inThunk, Value bodyThunk, Value outThunk,
+                           Evaluator.Continuation cont) throws EvalError {
+        return invokeThunk(inThunk, ignored -> enterBody(inThunk, bodyThunk, outThunk, cont));
+    }
+
+    Evaluator.Bounce transfer(ContinuationProcedure continuationProcedure, Value value)
+            throws EvalError {
+        return switchWind(continuationProcedure.windContext(),
+                deliver(continuationProcedure.continuation(), value));
+    }
+
+    private Evaluator.Bounce enterBody(Value inThunk, Value bodyThunk, Value outThunk,
+                                       Evaluator.Continuation cont) throws EvalError {
+        WindFrame frame = new WindFrame(currentWind, inThunk, outThunk);
+        currentWind = frame;
+        return invokeThunk(bodyThunk, bodyValue -> leaveBody(frame, bodyValue, cont));
+    }
+
+    private Evaluator.Bounce leaveBody(WindFrame frame, Value bodyValue,
+                                       Evaluator.Continuation cont) throws EvalError {
+        currentWind = frame.parent();
+        return invokeThunk(frame.outThunk(), ignored -> deliver(cont, bodyValue));
+    }
+
+    private Evaluator.Bounce switchWind(WindFrame targetWind, Evaluator.Bounce next)
+            throws EvalError {
+        WindFrame commonWind = findCommonWind(currentWind, targetWind);
+        List<WindFrame> exitFrames = collectWindFrames(currentWind, commonWind);
+        List<WindFrame> entryFrames = collectWindFrames(targetWind, commonWind);
+        return runWindExits(exitFrames, 0, entryFrames, entryFrames.size() - 1, next);
+    }
+
+    private Evaluator.Bounce runWindExits(List<WindFrame> exitFrames, int exitIndex,
+                                          List<WindFrame> entryFrames, int entryIndex,
+                                          Evaluator.Bounce next) throws EvalError {
+        if (exitIndex >= exitFrames.size()) {
+            return runWindEntries(entryFrames, entryIndex, next);
+        }
+
+        WindFrame frame = exitFrames.get(exitIndex);
+        currentWind = frame.parent();
+        return invokeThunk(frame.outThunk(), ignored ->
+                runWindExits(exitFrames, exitIndex + 1, entryFrames, entryIndex, next));
+    }
+
+    private Evaluator.Bounce runWindEntries(List<WindFrame> entryFrames, int entryIndex,
+                                            Evaluator.Bounce next) throws EvalError {
+        if (entryIndex < 0) {
+            return next;
+        }
+
+        WindFrame frame = entryFrames.get(entryIndex);
+        return invokeThunk(frame.inThunk(), ignored -> {
+            currentWind = frame;
+            return runWindEntries(entryFrames, entryIndex - 1, next);
+        });
+    }
+
+    private List<WindFrame> collectWindFrames(WindFrame top, WindFrame stopExclusive) {
+        List<WindFrame> frames = new ArrayList<>();
+        for (WindFrame frame = top; frame != stopExclusive; frame = frame.parent()) {
+            frames.add(frame);
+        }
+        return frames;
+    }
+
+    private WindFrame findCommonWind(WindFrame left, WindFrame right) {
+        IdentityHashMap<WindFrame, Boolean> leftAncestors = new IdentityHashMap<>();
+        for (WindFrame frame = left; frame != null; frame = frame.parent()) {
+            leftAncestors.put(frame, Boolean.TRUE);
+        }
+        for (WindFrame frame = right; frame != null; frame = frame.parent()) {
+            if (leftAncestors.containsKey(frame)) {
+                return frame;
+            }
+        }
+        return null;
+    }
+
+    private Evaluator.Bounce deliver(Evaluator.Continuation cont, Value value) {
+        return () -> cont.resume(value);
+    }
+
+    private Evaluator.Bounce invokeThunk(Value thunk, Evaluator.Continuation cont)
+            throws EvalError {
+        return thunkInvoker.invoke(thunk, cont);
+    }
+}
