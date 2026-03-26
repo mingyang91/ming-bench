@@ -86,7 +86,9 @@ final class Builtins {
                     || val instanceof Evaluator.CaseLambda
                     || val instanceof Evaluator.RecordConstructor
                     || val instanceof Evaluator.RecordPredicate
-                    || val instanceof Evaluator.RecordAccessor;
+                    || val instanceof Evaluator.RecordAccessor
+                    || val instanceof Evaluator.SchemeCont
+                    || val instanceof Evaluator.CallccProc;
             }
 
             // Vectors
@@ -810,7 +812,7 @@ final class Builtins {
         for (int i = 1; i < args.size() - 1; i++) callArgs.add(args.get(i));
         Object cur = args.get(args.size() - 1);
         while (cur instanceof Evaluator.Pair p) { callArgs.add(p.car); cur = p.cdr; }
-        return evaluator.apply(proc, callArgs);
+        return new Evaluator.TailCall(proc, callArgs);
     }
 
     private Object applyMap(List<Object> args) throws EvalError {
