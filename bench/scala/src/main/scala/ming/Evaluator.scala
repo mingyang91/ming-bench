@@ -54,18 +54,19 @@ object Evaluator:
 
   private def evalApplication(elems: List[Expr], env: Env): SchemeVal =
     elems.head match
-      case Symbol("and", _)           => evalAnd(elems.tail, env)
-      case Symbol("or", _)            => evalOr(elems.tail, env)
-      case Symbol("define", _)        => evalDefine(elems.tail, env)
-      case Symbol("if", _)            => evalIf(elems.tail, env)
-      case Symbol("quote", _)         => evalQuote(elems.tail)
-      case Symbol("lambda", _)        => evalLambda(elems.tail, env)
-      case Symbol("begin", _)         => evalBegin(elems.tail, env)
-      case Symbol("let", _)           => evalLet(elems.tail, env)
-      case Symbol("cond", _)          => evalCond(elems.tail, env)
-      case Symbol("set!", _)          => evalSet(elems.tail, env)
-      case Symbol("define-syntax", _) => evalDefineSyntax(elems.tail, env)
-      case _                          =>
+      case Symbol("and", _)                => evalAnd(elems.tail, env)
+      case Symbol("or", _)                 => evalOr(elems.tail, env)
+      case Symbol("define", _)             => evalDefine(elems.tail, env)
+      case Symbol("if", _)                 => evalIf(elems.tail, env)
+      case Symbol("quote", _)              => evalQuote(elems.tail)
+      case Symbol("lambda", _)             => evalLambda(elems.tail, env)
+      case Symbol("begin", _)              => evalBegin(elems.tail, env)
+      case Symbol("let", _)                => evalLet(elems.tail, env)
+      case Symbol("cond", _)               => evalCond(elems.tail, env)
+      case Symbol("set!", _)               => evalSet(elems.tail, env)
+      case Symbol("define-syntax", _)      => evalDefineSyntax(elems.tail, env)
+      case Symbol("define-record-type", _) => Records.evalDefineRecordType(elems.tail, env)
+      case _                               =>
         // Check for macro call
         val macroVal = elems.head match
           case Symbol(name, _) =>

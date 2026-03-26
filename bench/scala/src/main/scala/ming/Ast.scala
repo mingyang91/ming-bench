@@ -100,6 +100,9 @@ case object SchemeVoid extends SchemeVal:
 case class SchemeMacro(literals: List[String], rules: List[(Expr, Expr)], defEnv: Env) extends SchemeVal:
   def display: String = "#<macro>"
 
+case class SchemeRecord(typeName: String, fields: mutable.Map[String, SchemeVal]) extends SchemeVal:
+  def display: String = s"#<$typeName>"
+
 // ── Environment ──────────────────────────────────────────────────────
 private[ming] class Env(val bindings: mutable.Map[String, SchemeVal], val parent: Option[Env]):
 
