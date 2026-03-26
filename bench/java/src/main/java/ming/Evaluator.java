@@ -39,6 +39,19 @@ public class Evaluator {
         }
     }
 
+    public String evalStrWithLimit(String input, int maxSteps) throws EvalError {
+        List<Object> exprs = Parser.parse(input);
+        Env env = Env.global();
+        WIND_STACK.get().clear();
+        STEP_LIMIT.set(new long[]{maxSteps});
+        try {
+            Object result = runCEK(exprs, env);
+            return SchemeValue.toStr(result);
+        } finally {
+            STEP_LIMIT.remove();
+        }
+    }
+
     static final ThreadLocal<StringBuilder> OUTPUT = new ThreadLocal<>();
 
     static void emitOutput(String s) {
@@ -98,6 +111,9 @@ public class Evaluator {
     record DynamicWindEntry(Object inThunk, Object outThunk) {}
 
     static final ThreadLocal<List<DynamicWindEntry>> WIND_STACK = ThreadLocal.withInitial(ArrayList::new);
+
+    // Step-limited evaluation (L27)
+    static final ThreadLocal<long[]> STEP_LIMIT = ThreadLocal.withInitial(() -> null);
 
     // ===== syntax-case support =====
 
@@ -428,6 +444,13 @@ public class Evaluator {
         SourceList lastSrc = null;
 
         try { mainLoop: while (true) { try {
+
+            // Step limit check
+            long[] stepLim = STEP_LIMIT.get();
+            if (stepLim != null) {
+                if (stepLim[0] <= 0) throw new EvalError("step limit exceeded");
+                stepLim[0]--;
+            }
 
             // ---- function application ----
             if (fn != null) {

@@ -144,6 +144,29 @@ public class TestRunner {
             }
         }
 
+        // Run standalone L27 tests if level includes 27
+        if (levelArg.equals("all") || benchLevel >= 27) {
+            try {
+                int beforePassed = L27Tests.passed;
+                int beforeFailed = L27Tests.failed;
+                L27Tests.passed = 0;
+                L27Tests.failed = 0;
+                L27Tests.testStepLimitNormal();
+                L27Tests.testStepLimitLoopWithinBudget();
+                L27Tests.testStepLimitInfiniteLoop();
+                L27Tests.testStepLimitExceeded();
+                L27Tests.testStepLimitFactorial();
+                L27Tests.testNormalEvalUnaffected();
+                passed += L27Tests.passed;
+                failed += L27Tests.failed;
+                total += L27Tests.passed + L27Tests.failed;
+            } catch (Exception e) {
+                System.out.println("FAIL l27_unexpected: " + e);
+                failed++;
+                total++;
+            }
+        }
+
         System.out.println(passed + " passed, " + failed + " failed out of " + total + " tests");
         System.exit(failed > 0 ? 1 : 0);
     }
