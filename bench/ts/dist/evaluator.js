@@ -21,6 +21,18 @@ const BUILTIN_NAMES = [
     'boolean?',
     'pair?',
     'symbol?',
+    'display',
+    'write',
+    'newline',
+    'string-append',
+    'string-length',
+    'substring',
+    'string->number',
+    'number->string',
+    'symbol->string',
+    'string->symbol',
+    'string-ref',
+    'char?',
 ];
 const NIL_VALUE = { kind: 'nil' };
 const VOID_VALUE = { kind: 'void' };
@@ -68,13 +80,14 @@ function evaluateProgram(input) {
         throw new EvalError('expected at least one expression');
     }
     const env = createGlobalEnv();
+    const context = { output: [] };
     let result = VOID_VALUE;
     for (const expr of expressions) {
-        result = evaluateExpr(expr, env);
+        result = evaluateExpr(expr, env, context);
     }
     return {
         result,
-        output: '',
+        output: context.output.join(''),
     };
 }
 function createGlobalEnv() {
@@ -260,7 +273,7 @@ function parseAtom(token) {
     }
     return { kind: 'symbol', name: token.value, pos: token.pos };
 }
-function evaluateExpr(expr, env) {
+function evaluateExpr(expr, env, context) {
     try {
         switch (expr.kind) {
             case 'number':
@@ -270,14 +283,14 @@ function evaluateExpr(expr, env) {
             case 'symbol':
                 return env.lookup(expr.name);
             case 'list':
-                return evaluateList(expr.elements, env);
+                return evaluateList(expr.elements, env, context);
         }
     }
     catch (error) {
         throw attachPosition(error, expr.pos);
     }
 }
-function evaluateList(elements, env) {
+function evaluateList(elements, env, context) {
     if (elements.length === 0) {
         throw new EvalError('cannot evaluate empty list');
     }
@@ -285,30 +298,30 @@ function evaluateList(elements, env) {
     if (head.kind === 'symbol') {
         switch (head.name) {
             case 'define':
-                return evaluateDefine(argExprs, env);
+                return evaluateDefine(argExprs, env, context);
             case 'if':
-                return evaluateIf(argExprs, env);
+                return evaluateIf(argExprs, env, context);
             case 'quote':
                 return evaluateQuote(argExprs);
             case 'lambda':
                 return evaluateLambda(argExprs, env);
             case 'and':
-                return evaluateAnd(argExprs, env);
+                return evaluateAnd(argExprs, env, context);
             case 'or':
-                return evaluateOr(argExprs, env);
+                return evaluateOr(argExprs, env, context);
             case 'begin':
-                return evaluateBegin(argExprs, env);
+                return evaluateBegin(argExprs, env, context);
             case 'let':
-                return evaluateLet(argExprs, env);
+                return evaluateLet(argExprs, env, context);
             case 'cond':
-                return evaluateCond(argExprs, env);
+                return evaluateCond(argExprs, env, context);
         }
     }
-    const procedure = evaluateExpr(head, env);
-    const args = argExprs.map((expr) => evaluateExpr(expr, env));
-    return applyProcedure(procedure, args);
+    const procedure = evaluateExpr(head, env, context);
+    const args = argExprs.map((expr) => evaluateExpr(expr, env, context));
+    return applyProcedure(procedure, args, context);
 }
-function evaluateDefine(argExprs, env) {
+function evaluateDefine(argExprs, env, context) {
     if (argExprs.length < 2) {
         throw new EvalError('define expects a target and a value');
     }
@@ -317,7 +330,7 @@ function evaluateDefine(argExprs, env) {
         if (body.length !== 1) {
             throw new EvalError('define variable form expects exactly 1 value expression');
         }
-        const value = evaluateExpr(body[0], env);
+        const value = evaluateExpr(body[0], env, context);
         env.define(target.name, value);
         return VOID_VALUE;
     }
@@ -338,12 +351,14 @@ function evaluateDefine(argExprs, env) {
     }
     throw new EvalError('invalid define form');
 }
-function evaluateIf(argExprs, env) {
+function evaluateIf(argExprs, env, context) {
     if (argExprs.length !== 3) {
         throw new EvalError('if expects exactly 3 arguments');
     }
-    const condition = evaluateExpr(argExprs[0], env);
-    return isTruthy(condition) ? evaluateExpr(argExprs[1], env) : evaluateExpr(argExprs[2], env);
+    const condition = evaluateExpr(argExprs[0], env, context);
+    return isTruthy(condition)
+        ? evaluateExpr(argExprs[1], env, context)
+        : evaluateExpr(argExprs[2], env, context);
 }
 function evaluateQuote(argExprs) {
     if (argExprs.length !== 1) {
@@ -388,29 +403,29 @@ function readParameterList(exprs) {
     }
     return params;
 }
-function evaluateAnd(argExprs, env) {
+function evaluateAnd(argExprs, env, context) {
     let lastValue = makeBoolean(true);
     for (const expr of argExprs) {
-        lastValue = evaluateExpr(expr, env);
+        lastValue = evaluateExpr(expr, env, context);
         if (!isTruthy(lastValue)) {
             return lastValue;
         }
     }
     return lastValue;
 }
-function evaluateOr(argExprs, env) {
+function evaluateOr(argExprs, env, context) {
     for (const expr of argExprs) {
-        const value = evaluateExpr(expr, env);
+        const value = evaluateExpr(expr, env, context);
         if (isTruthy(value)) {
             return value;
         }
     }
     return makeBoolean(false);
 }
-function evaluateBegin(argExprs, env) {
-    return evaluateSequence(argExprs, env);
+function evaluateBegin(argExprs, env, context) {
+    return evaluateSequence(argExprs, env, context);
 }
-function evaluateLet(argExprs, env) {
+function evaluateLet(argExprs, env, context) {
     if (argExprs.length < 2) {
         throw new EvalError('let expects bindings and a body');
     }
@@ -430,13 +445,13 @@ function evaluateLet(argExprs, env) {
         body = argExprs.slice(1);
     }
     const bindings = readLetBindings(bindingsExpr);
-    const values = bindings.initExprs.map((expr) => evaluateExpr(expr, env));
+    const values = bindings.initExprs.map((expr) => evaluateExpr(expr, env, context));
     if (name === undefined) {
         const letEnv = new Environment(env);
         for (let index = 0; index < bindings.names.length; index += 1) {
             letEnv.define(bindings.names[index], values[index]);
         }
-        return evaluateSequence(body, letEnv);
+        return evaluateSequence(body, letEnv, context);
     }
     const letEnv = new Environment(env);
     const procedure = {
@@ -446,7 +461,7 @@ function evaluateLet(argExprs, env) {
         env: letEnv,
     };
     letEnv.define(name, procedure);
-    return applyClosure(procedure, values);
+    return applyClosure(procedure, values, context);
 }
 function readLetBindings(bindingsExpr) {
     if (bindingsExpr.kind !== 'list') {
@@ -467,7 +482,7 @@ function readLetBindings(bindingsExpr) {
     }
     return { names, initExprs };
 }
-function evaluateCond(argExprs, env) {
+function evaluateCond(argExprs, env, context) {
     for (let index = 0; index < argExprs.length; index += 1) {
         const clauseExpr = argExprs[index];
         if (clauseExpr.kind !== 'list' || clauseExpr.elements.length === 0) {
@@ -482,30 +497,30 @@ function evaluateCond(argExprs, env) {
             if (body.length === 0) {
                 throw new EvalError('cond else clause expects at least 1 expression');
             }
-            return evaluateSequence(body, env);
+            return evaluateSequence(body, env, context);
         }
-        const testValue = evaluateExpr(testExpr, env);
+        const testValue = evaluateExpr(testExpr, env, context);
         if (!isTruthy(testValue)) {
             continue;
         }
         if (body.length === 0) {
             return testValue;
         }
-        return evaluateSequence(body, env);
+        return evaluateSequence(body, env, context);
     }
     return VOID_VALUE;
 }
-function applyProcedure(procedure, args) {
+function applyProcedure(procedure, args, context) {
     switch (procedure.kind) {
         case 'builtin':
-            return applyBuiltin(procedure.name, args);
+            return applyBuiltin(procedure.name, args, context);
         case 'closure':
-            return applyClosure(procedure, args);
+            return applyClosure(procedure, args, context);
         default:
             throw new EvalError('attempted to call a non-procedure');
     }
 }
-function applyClosure(procedure, args) {
+function applyClosure(procedure, args, context) {
     if (args.length !== procedure.params.length) {
         throw new EvalError(`expected ${procedure.params.length} arguments, got ${args.length}`);
     }
@@ -513,16 +528,16 @@ function applyClosure(procedure, args) {
     for (let index = 0; index < procedure.params.length; index += 1) {
         callEnv.define(procedure.params[index], args[index]);
     }
-    return evaluateSequence(procedure.body, callEnv);
+    return evaluateSequence(procedure.body, callEnv, context);
 }
-function evaluateSequence(exprs, env) {
+function evaluateSequence(exprs, env, context) {
     let result = VOID_VALUE;
     for (const expr of exprs) {
-        result = evaluateExpr(expr, env);
+        result = evaluateExpr(expr, env, context);
     }
     return result;
 }
-function applyBuiltin(name, args) {
+function applyBuiltin(name, args, context) {
     switch (name) {
         case '+':
             return makeNumber(args.map((arg) => expectNumber(arg, '+')).reduce((sum, value) => sum + value, 0));
@@ -584,6 +599,57 @@ function applyBuiltin(name, args) {
             return applyTypePredicate(args, 'pair?', (value) => value.kind === 'pair');
         case 'symbol?':
             return applyTypePredicate(args, 'symbol?', (value) => value.kind === 'symbol');
+        case 'display':
+            if (args.length !== 1) {
+                throw new EvalError('display expects exactly 1 argument');
+            }
+            context.output.push(formatDisplayValue(args[0]));
+            return VOID_VALUE;
+        case 'write':
+            if (args.length !== 1) {
+                throw new EvalError('write expects exactly 1 argument');
+            }
+            context.output.push(formatValue(args[0]));
+            return VOID_VALUE;
+        case 'newline':
+            if (args.length !== 0) {
+                throw new EvalError('newline expects exactly 0 arguments');
+            }
+            context.output.push('\n');
+            return VOID_VALUE;
+        case 'string-append':
+            return applyStringAppend(args);
+        case 'string-length':
+            if (args.length !== 1) {
+                throw new EvalError('string-length expects exactly 1 argument');
+            }
+            return makeNumber(stringChars(expectString(args[0], 'string-length')).length);
+        case 'substring':
+            return applySubstring(args);
+        case 'string->number':
+            if (args.length !== 1) {
+                throw new EvalError('string->number expects exactly 1 argument');
+            }
+            return parseNumberString(expectString(args[0], 'string->number'));
+        case 'number->string':
+            if (args.length !== 1) {
+                throw new EvalError('number->string expects exactly 1 argument');
+            }
+            return makeString(formatNumber(expectNumber(args[0], 'number->string')));
+        case 'symbol->string':
+            if (args.length !== 1) {
+                throw new EvalError('symbol->string expects exactly 1 argument');
+            }
+            return makeString(expectSymbol(args[0], 'symbol->string').name);
+        case 'string->symbol':
+            if (args.length !== 1) {
+                throw new EvalError('string->symbol expects exactly 1 argument');
+            }
+            return { kind: 'symbol', name: expectString(args[0], 'string->symbol') };
+        case 'string-ref':
+            return applyStringRef(args);
+        case 'char?':
+            return applyTypePredicate(args, 'char?', (value) => value.kind === 'char');
     }
 }
 function applySubtraction(args) {
@@ -630,11 +696,56 @@ function applyComparison(args, name, predicate) {
     }
     return makeBoolean(true);
 }
+function applyStringAppend(args) {
+    return makeString(args.map((arg) => expectString(arg, 'string-append')).join(''));
+}
+function applySubstring(args) {
+    if (args.length !== 3) {
+        throw new EvalError('substring expects exactly 3 arguments');
+    }
+    const chars = stringChars(expectString(args[0], 'substring'));
+    const start = expectIndex(args[1], 'substring');
+    const end = expectIndex(args[2], 'substring');
+    if (start > end || end > chars.length) {
+        throw new EvalError('substring indices out of range');
+    }
+    return makeString(chars.slice(start, end).join(''));
+}
+function applyStringRef(args) {
+    if (args.length !== 2) {
+        throw new EvalError('string-ref expects exactly 2 arguments');
+    }
+    const chars = stringChars(expectString(args[0], 'string-ref'));
+    const index = expectIndex(args[1], 'string-ref');
+    if (index >= chars.length) {
+        throw new EvalError('string-ref index out of range');
+    }
+    return makeChar(chars[index]);
+}
 function expectNumber(value, procedure) {
     if (value.kind !== 'number') {
         throw new EvalError(`${procedure} expects numeric arguments`);
     }
     return value.value;
+}
+function expectString(value, procedure) {
+    if (value.kind !== 'string') {
+        throw new EvalError(`${procedure} expects string arguments`);
+    }
+    return value.value;
+}
+function expectSymbol(value, procedure) {
+    if (value.kind !== 'symbol') {
+        throw new EvalError(`${procedure} expects a symbol`);
+    }
+    return value;
+}
+function expectIndex(value, procedure) {
+    const numericValue = expectNumber(value, procedure);
+    if (!Number.isInteger(numericValue) || numericValue < 0) {
+        throw new EvalError(`${procedure} expects a non-negative integer index`);
+    }
+    return numericValue;
 }
 function expectPair(value, procedure) {
     if (value.kind !== 'pair') {
@@ -708,20 +819,44 @@ function makeBoolean(value) {
         value,
     };
 }
+function makeString(value) {
+    return {
+        kind: 'string',
+        pos: DEFAULT_SOURCE_POS,
+        value,
+    };
+}
+function makeChar(value) {
+    if (stringChars(value).length !== 1) {
+        throw new EvalError('character values must contain exactly 1 character');
+    }
+    return {
+        kind: 'char',
+        value,
+    };
+}
 function formatValue(value) {
+    return formatValueWithMode(value, 'write');
+}
+function formatDisplayValue(value) {
+    return formatValueWithMode(value, 'display');
+}
+function formatValueWithMode(value, mode) {
     switch (value.kind) {
         case 'number':
             return formatNumber(value.value);
         case 'boolean':
             return value.value ? '#t' : '#f';
         case 'string':
-            return `"${escapeString(value.value)}"`;
+            return mode === 'display' ? value.value : `"${escapeString(value.value)}"`;
+        case 'char':
+            return mode === 'display' ? value.value : formatChar(value.value);
         case 'symbol':
             return value.name;
         case 'nil':
             return '()';
         case 'pair':
-            return formatPair(value);
+            return formatPair(value, mode);
         case 'builtin':
         case 'closure':
             return '#<procedure>';
@@ -752,17 +887,37 @@ function isWhitespace(char) {
 function isDelimiter(char) {
     return isWhitespace(char) || char === '(' || char === ')' || char === "'" || char === ';';
 }
-function formatPair(value) {
+function formatPair(value, mode) {
     const parts = [];
     let current = value;
     while (current.kind === 'pair') {
-        parts.push(formatValue(current.car));
+        parts.push(formatValueWithMode(current.car, mode));
         current = current.cdr;
     }
     if (current.kind === 'nil') {
         return `(${parts.join(' ')})`;
     }
-    return `(${parts.join(' ')} . ${formatValue(current)})`;
+    return `(${parts.join(' ')} . ${formatValueWithMode(current, mode)})`;
+}
+function formatChar(value) {
+    switch (value) {
+        case ' ':
+            return '#\\space';
+        case '\n':
+            return '#\\newline';
+        default:
+            return `#\\${value}`;
+    }
+}
+function stringChars(value) {
+    return Array.from(value);
+}
+function parseNumberString(value) {
+    const trimmed = value.trim();
+    if (/^[+-]?(?:\d+|\d+\.\d+|\.\d+)$/.test(trimmed)) {
+        return makeNumber(Number(trimmed));
+    }
+    return makeBoolean(false);
 }
 function attachPosition(error, pos) {
     if (error instanceof EvalError) {
