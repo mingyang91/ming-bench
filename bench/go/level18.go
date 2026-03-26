@@ -258,10 +258,7 @@ func prepareApplyCPSCall(proc any, args []any, k any, runtime *runtimeState) (an
 		callArgs = append(callArgs, args...)
 		return prepareProcedureCall(callable, callArgs)
 	case continuationProc:
-		if len(args) != 1 {
-			return nil, nil, &EvalError{Message: "continuation expects exactly 1 argument"}
-		}
-		value, next, err := prepareContinuationJump(runtime, callable, args[0])
+		value, next, err := prepareContinuationJump(runtime, callable, continuationResultValue(args))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -320,6 +317,17 @@ func prepareBuiltinApplyRuntimeCPS(args []any, k any, runtime *runtimeState) (an
 	callArgs = append(callArgs, restArgs...)
 
 	return prepareApplyCPSCall(args[0], callArgs, k, runtime)
+}
+
+func continuationResultValue(args []any) any {
+	switch len(args) {
+	case 0:
+		return multipleValues{}
+	case 1:
+		return args[0]
+	default:
+		return multipleValues{values: append([]any(nil), args...)}
+	}
 }
 
 func evalLevel18ApplyCPSTail(scope *env, args []any) (any, *tailEvalState, error) {
