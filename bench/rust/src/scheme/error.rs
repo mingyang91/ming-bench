@@ -129,6 +129,9 @@ pub enum EvalError {
     #[error("{message}")]
     RaisedError { message: String },
 
+    #[error("uncaught exception: {value}")]
+    UncaughtException { value: String },
+
     #[error("{name} index out of bounds: {index}")]
     IndexOutOfBounds { name: &'static str, index: i64 },
 

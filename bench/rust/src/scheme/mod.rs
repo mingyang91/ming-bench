@@ -188,6 +188,7 @@ enum Procedure {
         frames: Vec<ContinuationFrame>,
         position: Option<Position>,
         winds: Vec<DynamicWindRef>,
+        handlers: Vec<Rc<ExceptionHandler>>,
     },
     RecordConstructor {
         name: String,
@@ -315,6 +316,12 @@ enum ContinuationFrame {
         remaining: Vec<Expr>,
         env: EnvRef,
     },
+    GuardTest {
+        exception: Value,
+        body: Vec<Expr>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
     If {
         consequent: Expr,
         alternate: Option<Expr>,
@@ -385,11 +392,35 @@ enum ContinuationFrame {
     },
 }
 
+type ExceptionHandlerRef = Rc<ExceptionHandler>;
+
+#[derive(Debug)]
+struct ExceptionHandler {
+    kind: ExceptionHandlerKind,
+    frames: Vec<ContinuationFrame>,
+    winds: Vec<DynamicWindRef>,
+    outer_handlers: Vec<ExceptionHandlerRef>,
+    position: Option<Position>,
+}
+
+#[derive(Debug)]
+enum ExceptionHandlerKind {
+    Procedure {
+        handler: Value,
+    },
+    Guard {
+        variable: String,
+        clauses: Vec<Expr>,
+        env: EnvRef,
+    },
+}
+
 #[derive(Debug)]
 struct EvalContext {
     output: String,
     frames: Rc<RefCell<Vec<ContinuationFrame>>>,
     dynamic_winds: Rc<RefCell<Vec<DynamicWindRef>>>,
+    exception_handlers: Rc<RefCell<Vec<ExceptionHandlerRef>>>,
     position: Rc<RefCell<Option<Position>>>,
 }
 
@@ -398,14 +429,26 @@ struct ContinuationJump {
     value: Value,
     frames: Vec<ContinuationFrame>,
     winds: Vec<DynamicWindRef>,
+    handlers: Vec<ExceptionHandlerRef>,
     position: Option<Position>,
 }
 
 #[derive(Debug)]
 struct ContinuationSignal;
 
+#[derive(Debug, Clone)]
+struct ExceptionJump {
+    value: Value,
+    handlers: Vec<ExceptionHandlerRef>,
+    position: Option<Position>,
+}
+
+#[derive(Debug)]
+struct ExceptionSignal;
+
 thread_local! {
     static CONTINUATION_JUMP: RefCell<Option<ContinuationJump>> = const { RefCell::new(None) };
+    static EXCEPTION_JUMP: RefCell<Option<ExceptionJump>> = const { RefCell::new(None) };
 }
 
 impl Default for EvalContext {
@@ -414,6 +457,7 @@ impl Default for EvalContext {
             output: String::new(),
             frames: Rc::new(RefCell::new(Vec::new())),
             dynamic_winds: Rc::new(RefCell::new(Vec::new())),
+            exception_handlers: Rc::new(RefCell::new(Vec::new())),
             position: Rc::new(RefCell::new(None)),
         }
     }
@@ -434,6 +478,15 @@ enum EvalAction {
         value: Value,
         frames: Vec<ContinuationFrame>,
         winds: Vec<DynamicWindRef>,
+        handlers: Vec<ExceptionHandlerRef>,
+        position: Option<Position>,
+    },
+    HandleException {
+        value: Value,
+        handler: ExceptionHandlerRef,
+    },
+    UncaughtException {
+        value: Value,
         position: Option<Position>,
     },
 }
@@ -449,17 +502,28 @@ fn current_bench_level() -> u32 {
     })
 }
 
+fn continuations_are_enabled_in_current_level() -> bool {
+    current_bench_level() >= 18
+}
+
+fn exceptions_are_enabled_in_current_level() -> bool {
+    current_bench_level() >= 20
+}
+
 fn strings_are_mutable_in_current_level() -> bool {
     current_bench_level() < 15
 }
 
 struct ContinuationFrameGuard {
     frames: Rc<RefCell<Vec<ContinuationFrame>>>,
+    active: bool,
 }
 
 impl Drop for ContinuationFrameGuard {
     fn drop(&mut self) {
-        self.frames.borrow_mut().pop();
+        if self.active {
+            self.frames.borrow_mut().pop();
+        }
     }
 }
 
@@ -474,13 +538,39 @@ impl Drop for PositionGuard {
     }
 }
 
+struct ExceptionHandlerGuard {
+    handlers: Rc<RefCell<Vec<ExceptionHandlerRef>>>,
+    expected: ExceptionHandlerRef,
+    active: bool,
+}
+
+impl Drop for ExceptionHandlerGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        let popped = self.handlers.borrow_mut().pop();
+        debug_assert!(
+            popped
+                .as_ref()
+                .is_some_and(|handler| Rc::ptr_eq(handler, &self.expected)),
+            "exception handler stack must unwind in LIFO order",
+        );
+    }
+}
+
 fn push_continuation_frame(
     context: &EvalContext,
     frame: ContinuationFrame,
 ) -> ContinuationFrameGuard {
-    context.frames.borrow_mut().push(frame);
+    let active = continuations_are_enabled_in_current_level();
+    if active {
+        context.frames.borrow_mut().push(frame);
+    }
     ContinuationFrameGuard {
         frames: context.frames.clone(),
+        active,
     }
 }
 
@@ -494,6 +584,21 @@ fn push_position(context: &EvalContext, position: Option<Position>) -> PositionG
 
 fn current_position(context: &EvalContext) -> Option<Position> {
     *context.position.borrow()
+}
+
+fn push_exception_handler(
+    context: &EvalContext,
+    handler: ExceptionHandlerRef,
+) -> ExceptionHandlerGuard {
+    let active = exceptions_are_enabled_in_current_level();
+    if active {
+        context.exception_handlers.borrow_mut().push(handler.clone());
+    }
+    ExceptionHandlerGuard {
+        handlers: context.exception_handlers.clone(),
+        expected: handler,
+        active,
+    }
 }
 
 fn push_dynamic_wind(wind: DynamicWindRef, context: &EvalContext) {
@@ -547,6 +652,7 @@ fn signal_continuation(
     value: Value,
     frames: Vec<ContinuationFrame>,
     winds: Vec<DynamicWindRef>,
+    handlers: Vec<ExceptionHandlerRef>,
     position: Option<Position>,
 ) -> ! {
     CONTINUATION_JUMP.with(|slot| {
@@ -554,6 +660,7 @@ fn signal_continuation(
             value,
             frames,
             winds,
+            handlers,
             position,
         });
     });
@@ -564,6 +671,27 @@ fn take_continuation_jump() -> ContinuationJump {
     CONTINUATION_JUMP
         .with(|slot| slot.borrow_mut().take())
         .expect("continuation signal must carry a jump payload")
+}
+
+fn signal_exception(
+    value: Value,
+    handlers: Vec<ExceptionHandlerRef>,
+    position: Option<Position>,
+) -> ! {
+    EXCEPTION_JUMP.with(|slot| {
+        *slot.borrow_mut() = Some(ExceptionJump {
+            value,
+            handlers,
+            position,
+        });
+    });
+    panic_any(ExceptionSignal);
+}
+
+fn take_exception_jump() -> ExceptionJump {
+    EXCEPTION_JUMP
+        .with(|slot| slot.borrow_mut().take())
+        .expect("exception signal must carry a jump payload")
 }
 
 impl Env {
@@ -633,6 +761,7 @@ impl Procedure {
                         frames: context.frames.borrow().clone(),
                         position: current_position(context),
                         winds: context.dynamic_winds.borrow().clone(),
+                        handlers: context.exception_handlers.borrow().clone(),
                     }));
 
                     Ok(EvalStep::Apply(args[0].clone(), vec![continuation]))
@@ -705,6 +834,7 @@ impl Procedure {
                 frames,
                 position,
                 winds,
+                handlers,
             } => {
                 if args.len() != 1 {
                     return Err(EvalError::WrongArgCountDynamic {
@@ -714,7 +844,13 @@ impl Procedure {
                     });
                 }
 
-                signal_continuation(args[0].clone(), frames.clone(), winds.clone(), *position);
+                signal_continuation(
+                    args[0].clone(),
+                    frames.clone(),
+                    winds.clone(),
+                    handlers.clone(),
+                    *position,
+                );
             }
             Self::RecordConstructor {
                 name,
@@ -1152,11 +1288,33 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
                 value,
                 frames,
                 winds,
+                handlers,
                 position,
             } => {
                 let _position_guard = push_position(context, position);
                 transition_dynamic_winds(&winds, context)?;
+                context
+                    .exception_handlers
+                    .borrow_mut()
+                    .clone_from(&handlers);
                 resume_continuation_frames(value, frames, context)
+            }
+            EvalAction::HandleException { value, handler } => {
+                handle_exception(value, &handler, context)
+            }
+            EvalAction::UncaughtException { value, position } => {
+                let _position_guard = push_position(context, position);
+                transition_dynamic_winds(&[], context)?;
+                context.exception_handlers.borrow_mut().clear();
+
+                let error = EvalError::UncaughtException {
+                    value: value.render(),
+                };
+                if let Some(position) = position {
+                    Err(error.with_position(position.line, position.column))
+                } else {
+                    Err(error)
+                }
             }
         }));
 
@@ -1169,14 +1327,60 @@ fn run_eval_action(mut action: EvalAction, context: &mut EvalContext) -> Result<
                         value: jump.value,
                         frames: jump.frames,
                         winds: jump.winds,
+                        handlers: jump.handlers,
                         position: jump.position,
                     };
+                } else if payload.downcast_ref::<ExceptionSignal>().is_some() {
+                    let jump = take_exception_jump();
+                    if let Some(handler) = jump.handlers.last().cloned() {
+                        action = EvalAction::HandleException {
+                            value: jump.value,
+                            handler,
+                        };
+                    } else {
+                        action = EvalAction::UncaughtException {
+                            value: jump.value,
+                            position: jump.position,
+                        };
+                    }
                 } else {
                     resume_unwind(payload);
                 }
             }
         }
     }
+}
+
+fn handle_exception(
+    value: Value,
+    handler: &ExceptionHandlerRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let frames = handler.frames.clone();
+    let winds = handler.winds.clone();
+    let outer_handlers = handler.outer_handlers.clone();
+    let position = handler.position;
+
+    let _position_guard = push_position(context, position);
+    transition_dynamic_winds(&winds, context)?;
+    context.frames.borrow_mut().clone_from(&frames);
+    context
+        .exception_handlers
+        .borrow_mut()
+        .clone_from(&outer_handlers);
+
+    let result = match &handler.kind {
+        ExceptionHandlerKind::Procedure { handler } => {
+            apply_procedure(handler.clone(), vec![value], context)?
+        }
+        ExceptionHandlerKind::Guard {
+            variable,
+            clauses,
+            env,
+        } => eval_guard_handler(value, variable, clauses, env, context)?,
+    };
+
+    resume_continuation_frames(result, frames, context)
 }
 
 fn eval_top_level_state(
@@ -1232,7 +1436,9 @@ fn resume_continuation_frames(
     context: &mut EvalContext,
 ) -> Result<Value, EvalError> {
     while let Some(frame) = frames.pop() {
-        *context.frames.borrow_mut() = frames.clone();
+        if continuations_are_enabled_in_current_level() {
+            context.frames.borrow_mut().clone_from(&frames);
+        }
         value = match frame {
             ContinuationFrame::Program(state) => eval_top_level_state(state, context)?,
             ContinuationFrame::ApplicationOperator { args, env } => {
@@ -1284,6 +1490,22 @@ fn resume_continuation_frames(
                     }
                 } else {
                     eval_cond_clauses(&remaining, &env, context)?
+                }
+            }
+            ContinuationFrame::GuardTest {
+                exception,
+                body,
+                remaining,
+                env,
+            } => {
+                if value.is_truthy() {
+                    if body.is_empty() {
+                        value
+                    } else {
+                        eval_sequence(&body, &env, context)?
+                    }
+                } else {
+                    eval_guard_clauses(&exception, &remaining, &env, context)?
                 }
             }
             ContinuationFrame::If {
@@ -1427,7 +1649,9 @@ fn resume_continuation_frames(
         };
     }
 
-    context.frames.borrow_mut().clear();
+    if continuations_are_enabled_in_current_level() {
+        context.frames.borrow_mut().clear();
+    }
     Ok(value)
 }
 
@@ -1896,6 +2120,7 @@ fn eval_application_step(
             "define" => return eval_define_step(tail, &env, context),
             "define-record-type" => return eval_define_record_type_step(tail, &env),
             "do" => return eval_do_step(tail, &env, context),
+            "guard" => return eval_guard_step(tail, &env, context),
             "if" => return eval_if_step(tail, &env, context),
             "lambda" => return eval_lambda_step(tail, &env),
             "let" => return eval_let_step(tail, &env, context),
@@ -2148,6 +2373,138 @@ fn eval_cond_step(
     }
 
     Ok(EvalStep::Value(Value::Void))
+}
+
+fn eval_guard_step(
+    args: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<EvalStep, EvalError> {
+    let Some((spec, body)) = args.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "guard",
+            expected: "a guard spec and at least 1 body expression",
+            got: 0,
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::InvalidForm {
+            name: "guard",
+            message: "expected at least one body expression",
+        });
+    }
+
+    let Expr::List(spec_items) = spec else {
+        return Err(EvalError::InvalidForm {
+            name: "guard",
+            message: "expected a guard variable and clauses",
+        });
+    };
+
+    let Some((variable_expr, clauses)) = spec_items.split_first() else {
+        return Err(EvalError::InvalidForm {
+            name: "guard",
+            message: "expected a guard variable",
+        });
+    };
+
+    let Expr::Symbol(variable) = variable_expr else {
+        return Err(EvalError::InvalidForm {
+            name: "guard",
+            message: "expected the guard variable to be a symbol",
+        });
+    };
+
+    let handler = Rc::new(ExceptionHandler {
+        kind: ExceptionHandlerKind::Guard {
+            variable: variable.clone(),
+            clauses: clauses.to_vec(),
+            env: env.clone(),
+        },
+        frames: context.frames.borrow().clone(),
+        winds: context.dynamic_winds.borrow().clone(),
+        outer_handlers: context.exception_handlers.borrow().clone(),
+        position: current_position(context),
+    });
+
+    let _handler_guard = push_exception_handler(context, handler);
+    let result = eval_sequence(body, env, context)?;
+    Ok(EvalStep::Value(result))
+}
+
+fn eval_guard_handler(
+    exception: Value,
+    variable: &str,
+    clauses: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    let guard_env = Env::new(Some(env.clone()));
+    guard_env.define(variable.to_string(), exception.clone());
+    eval_guard_clauses(&exception, clauses, &guard_env, context)
+}
+
+fn eval_guard_clauses(
+    exception: &Value,
+    clauses: &[Expr],
+    env: &EnvRef,
+    context: &mut EvalContext,
+) -> Result<Value, EvalError> {
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::InvalidForm {
+                name: "guard",
+                message: "expected clauses to be lists",
+            });
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::InvalidForm {
+                name: "guard",
+                message: "expected each clause to contain a test",
+            });
+        };
+
+        if matches!(test, Expr::Symbol(symbol) if symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::InvalidForm {
+                    name: "guard",
+                    message: "else clause must be last",
+                });
+            }
+
+            if body.is_empty() {
+                return Err(EvalError::InvalidForm {
+                    name: "guard",
+                    message: "else clause must contain a body",
+                });
+            }
+
+            return eval_sequence(body, env, context);
+        }
+
+        let frame = ContinuationFrame::GuardTest {
+            exception: exception.clone(),
+            body: body.to_vec(),
+            remaining: clauses[index + 1..].to_vec(),
+            env: env.clone(),
+        };
+        let value = eval_expr_with_frame(test, env, frame, context)?;
+        if value.is_truthy() {
+            return if body.is_empty() {
+                Ok(value)
+            } else {
+                eval_sequence(body, env, context)
+            };
+        }
+    }
+
+    signal_exception(
+        exception.clone(),
+        context.exception_handlers.borrow().clone(),
+        current_position(context),
+    )
 }
 
 fn eval_define_step(
@@ -3144,6 +3501,7 @@ fn root_env() -> EnvRef {
         "positive?",
         "procedure?",
         "quotient",
+        "raise",
         "rational?",
         "remainder",
         "reverse",
@@ -3178,6 +3536,7 @@ fn root_env() -> EnvRef {
         "vector-ref",
         "vector-set!",
         "vector?",
+        "with-exception-handler",
         "write",
         "zero?",
     ] {
@@ -3672,6 +4031,21 @@ fn apply_builtin(
 
             Ok(Value::Number(Number::integer(left / right)))
         }
+        "raise" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    name: "raise",
+                    expected: "exactly 1 argument",
+                    got: args.len(),
+                });
+            }
+
+            signal_exception(
+                args[0].clone(),
+                context.exception_handlers.borrow().clone(),
+                current_position(context),
+            )
+        }
         "rational?" => predicate_builtin(
             "rational?",
             args,
@@ -3923,6 +4297,33 @@ fn apply_builtin(
             Ok(Value::Void)
         }
         "vector?" => predicate_builtin("vector?", args, |value| matches!(value, Value::Vector(_))),
+        "with-exception-handler" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "with-exception-handler",
+                    expected: "exactly 2 arguments",
+                    got: args.len(),
+                });
+            }
+
+            if !matches!(args[0], Value::Procedure(_)) || !matches!(args[1], Value::Procedure(_))
+            {
+                return Err(EvalError::NotAProcedure);
+            }
+
+            let handler = Rc::new(ExceptionHandler {
+                kind: ExceptionHandlerKind::Procedure {
+                    handler: args[0].clone(),
+                },
+                frames: context.frames.borrow().clone(),
+                winds: context.dynamic_winds.borrow().clone(),
+                outer_handlers: context.exception_handlers.borrow().clone(),
+                position: current_position(context),
+            });
+
+            let _handler_guard = push_exception_handler(context, handler);
+            apply_procedure(args[1].clone(), Vec::new(), context)
+        }
         "eq?" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArgCount {
