@@ -1477,7 +1477,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let env = Env::new();
     let last = eval_seq(&exprs, &env)?;
     let output = env.output.borrow().clone();
-    Ok((last.to_string(), output))
+    Ok((builtins::display_format(&last), output))
 }
 
 #[cfg(test)]

@@ -354,7 +354,7 @@ pub fn builtin_is_procedure(args: &[Val], _env: &Env) -> Result<Val, EvalError> 
     Ok(Val::Bool(matches!(args[0], Val::Lambda { .. } | Val::CaseLambda { .. } | Val::Builtin(_) | Val::CallCC | Val::DynamicWind | Val::Continuation(..) | Val::Values | Val::CallWithValues)))
 }
 
-fn display_format(val: &Val) -> String {
+pub(crate) fn display_format(val: &Val) -> String {
     match val {
         Val::Str(s) => s.clone(),
         Val::Char(c) => c.to_string(),
