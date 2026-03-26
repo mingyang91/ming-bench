@@ -53,6 +53,13 @@ type stringExpr struct {
 
 func (e *stringExpr) exprPos() position { return e.pos }
 
+type charExpr struct {
+	value rune
+	pos   position
+}
+
+func (e *charExpr) exprPos() position { return e.pos }
+
 type symbolExpr struct {
 	value string
 	pos   position
@@ -72,6 +79,19 @@ type symbolValue string
 type charValue rune
 type emptyList struct{}
 type voidValue struct{}
+
+type mutableString struct {
+	runes []rune
+}
+
+func newMutableString(text string) *mutableString {
+	runes := []rune(text)
+	return &mutableString{runes: append([]rune(nil), runes...)}
+}
+
+func (s *mutableString) String() string {
+	return string(s.runes)
+}
 
 type pairValue struct {
 	car any
@@ -174,7 +194,7 @@ func installBuiltins(env *environment) {
 		"string-append", "string-length", "substring",
 		"string->number", "number->string",
 		"symbol->string", "string->symbol",
-		"string-ref", "char?",
+		"string-ref", "string-copy", "string-set!", "char?",
 	} {
 		name := name
 		env.define(name, &builtinProcedure{
@@ -204,6 +224,8 @@ func (i *interpreter) eval(expression expr, env *environment) (any, error) {
 		return e.value, nil
 	case *stringExpr:
 		return stringValue(e.value), nil
+	case *charExpr:
+		return charValue(e.value), nil
 	case *symbolExpr:
 		value, ok := env.lookup(e.value)
 		if !ok {
@@ -548,6 +570,8 @@ func datumFromExpr(expression expr) (any, error) {
 		return e.value, nil
 	case *stringExpr:
 		return stringValue(e.value), nil
+	case *charExpr:
+		return charValue(e.value), nil
 	case *symbolExpr:
 		return symbolValue(e.value), nil
 	case *listExpr:
@@ -727,7 +751,11 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
 		}
-		_, ok := args[0].(stringValue)
+		switch args[0].(type) {
+		case stringValue, *mutableString:
+			return true, nil
+		}
+		ok := false
 		return ok, nil
 
 	case "number?":
@@ -884,6 +912,38 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return charValue(runes[index]), nil
 
+	case "string-copy":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		text, err := expectString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return newMutableString(text), nil
+
+	case "string-set!":
+		if len(args) != 3 {
+			return nil, newEvalError(pos, "%s expects exactly 3 arguments", name)
+		}
+		text, err := expectMutableString(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		index, err := expectInt(args[1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		ch, err := expectChar(args[2], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if index < 0 || index >= len(text.runes) {
+			return nil, newEvalError(pos, "%s index out of range", name)
+		}
+		text.runes[index] = rune(ch)
+		return voidValue{}, nil
+
 	case "char?":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
@@ -928,11 +988,14 @@ func expectInt(value any, pos position, procedure string) (int, error) {
 }
 
 func expectString(value any, pos position, procedure string) (string, error) {
-	text, ok := value.(stringValue)
-	if !ok {
+	switch text := value.(type) {
+	case stringValue:
+		return string(text), nil
+	case *mutableString:
+		return text.String(), nil
+	default:
 		return "", newEvalError(pos, "%s expects a string", procedure)
 	}
-	return string(text), nil
 }
 
 func expectSymbol(value any, pos position, procedure string) (string, error) {
@@ -941,6 +1004,22 @@ func expectSymbol(value any, pos position, procedure string) (string, error) {
 		return "", newEvalError(pos, "%s expects a symbol", procedure)
 	}
 	return string(symbol), nil
+}
+
+func expectMutableString(value any, pos position, procedure string) (*mutableString, error) {
+	text, ok := value.(*mutableString)
+	if !ok {
+		return nil, newEvalError(pos, "%s expects a mutable string", procedure)
+	}
+	return text, nil
+}
+
+func expectChar(value any, pos position, procedure string) (charValue, error) {
+	ch, ok := value.(charValue)
+	if !ok {
+		return 0, newEvalError(pos, "%s expects a character", procedure)
+	}
+	return ch, nil
 }
 
 func expectPair(value any, pos position, procedure string) (*pairValue, error) {
@@ -994,6 +1073,8 @@ func formatValue(value any) string {
 		return "#f"
 	case stringValue:
 		return strconv.Quote(string(v))
+	case *mutableString:
+		return strconv.Quote(v.String())
 	case symbolValue:
 		return string(v)
 	case charValue:
@@ -1013,6 +1094,8 @@ func formatDisplayValue(value any) string {
 	switch v := value.(type) {
 	case stringValue:
 		return string(v)
+	case *mutableString:
+		return v.String()
 	case charValue:
 		return string(rune(v))
 	default:
@@ -1248,9 +1331,33 @@ func parseAtom(tok token) expr {
 		return &booleanExpr{value: false, pos: tok.pos}
 	}
 
+	if value, ok := parseCharLiteral(tok.text); ok {
+		return &charExpr{value: value, pos: tok.pos}
+	}
+
 	if value, err := strconv.Atoi(tok.text); err == nil {
 		return &integerExpr{value: value, pos: tok.pos}
 	}
 
 	return &symbolExpr{value: tok.text, pos: tok.pos}
+}
+
+func parseCharLiteral(text string) (rune, bool) {
+	if !strings.HasPrefix(text, "#\\") {
+		return 0, false
+	}
+
+	name := text[2:]
+	switch name {
+	case "space":
+		return ' ', true
+	case "newline":
+		return '\n', true
+	}
+
+	runes := []rune(name)
+	if len(runes) != 1 {
+		return 0, false
+	}
+	return runes[0], true
 }
