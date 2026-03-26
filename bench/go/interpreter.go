@@ -198,6 +198,7 @@ func newGlobalEnv(rt *runtime) *env {
 	root.define("cons", builtinProc{name: "cons", fn: builtinCons})
 	root.define("display", builtinProc{name: "display", fn: makeDisplayBuiltin(rt)})
 	root.define("eq?", builtinProc{name: "eq?", fn: builtinEq})
+	root.define("eqv?", builtinProc{name: "eqv?", fn: builtinEqv})
 	root.define("equal?", builtinProc{name: "equal?", fn: builtinEqual})
 	root.define("even?", builtinProc{name: "even?", fn: builtinEven})
 	root.define("exact?", builtinProc{name: "exact?", fn: builtinExact})
@@ -270,6 +271,14 @@ func newGlobalEnv(rt *runtime) *env {
 		return ok
 	})})
 	root.define("symbol->string", builtinProc{name: "symbol->string", fn: builtinSymbolToString})
+	root.define("vector", builtinProc{name: "vector", fn: builtinVector})
+	root.define("make-vector", builtinProc{name: "make-vector", fn: builtinMakeVector})
+	root.define("vector->list", builtinProc{name: "vector->list", fn: builtinVectorToList})
+	root.define("list->vector", builtinProc{name: "list->vector", fn: builtinListToVector})
+	root.define("vector-length", builtinProc{name: "vector-length", fn: builtinVectorLength})
+	root.define("vector-ref", builtinProc{name: "vector-ref", fn: builtinVectorRef})
+	root.define("vector-set!", builtinProc{name: "vector-set!", fn: builtinVectorSet})
+	root.define("vector?", builtinProc{name: "vector?", fn: builtinVectorPred})
 	root.define("write", builtinProc{name: "write", fn: makeWriteBuiltin(rt)})
 	root.define("zero?", builtinProc{name: "zero?", fn: builtinZero})
 
@@ -528,6 +537,9 @@ func evalExpr(environment *env, form expr) (expr, error) {
 		if !ok {
 			return nil, errorAt(v.pos, fmt.Sprintf("unbound symbol: %s", v.name))
 		}
+		if _, ok := value.(uninitializedExpr); ok {
+			return nil, errorAt(v.pos, fmt.Sprintf("uninitialized binding: %s", v.name))
+		}
 		return value, nil
 	case listExpr:
 		return evalList(environment, v)
@@ -564,8 +576,20 @@ func evalList(environment *env, items listExpr) (expr, error) {
 		case "cond":
 			value, err := evalCond(environment, items.items[1:])
 			return value, attachPos(err, operator.pos)
+		case "do":
+			value, err := evalDo(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
+		case "case":
+			value, err := evalCase(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
 		case "let":
 			value, err := evalLet(environment, items.items[1:])
+			return value, attachPos(err, operator.pos)
+		case "letrec":
+			value, err := evalLetrec(environment, items.items[1:], false)
+			return value, attachPos(err, operator.pos)
+		case "letrec*":
+			value, err := evalLetrec(environment, items.items[1:], true)
 			return value, attachPos(err, operator.pos)
 		case "quote":
 			value, err := evalQuote(items.items[1:])
@@ -672,8 +696,8 @@ func evalSet(environment *env, forms []expr) (expr, error) {
 }
 
 func evalIf(environment *env, forms []expr) (expr, error) {
-	if len(forms) != 3 {
-		return nil, &EvalError{Message: "if expects exactly 3 arguments"}
+	if len(forms) != 2 && len(forms) != 3 {
+		return nil, &EvalError{Message: "if expects 2 or 3 arguments"}
 	}
 
 	condition, err := evalExpr(environment, forms[0])
@@ -682,6 +706,9 @@ func evalIf(environment *env, forms []expr) (expr, error) {
 	}
 	if isTruthy(condition) {
 		return evalExpr(environment, forms[1])
+	}
+	if len(forms) == 2 {
+		return voidExpr{}, nil
 	}
 	return evalExpr(environment, forms[2])
 }
@@ -1928,6 +1955,9 @@ func eqExpr(a, b expr) bool {
 	case *pairExpr:
 		right, ok := b.(*pairExpr)
 		return ok && left == right
+	case *vectorExpr:
+		right, ok := b.(*vectorExpr)
+		return ok && left == right
 	case builtinProc:
 		right, ok := b.(builtinProc)
 		return ok && left.name == right.name
@@ -1976,6 +2006,17 @@ func equalExpr(a, b expr) bool {
 	case *pairExpr:
 		right, ok := b.(*pairExpr)
 		return ok && equalExpr(left.car, right.car) && equalExpr(left.cdr, right.cdr)
+	case *vectorExpr:
+		right, ok := b.(*vectorExpr)
+		if !ok || len(left.items) != len(right.items) {
+			return false
+		}
+		for i := range left.items {
+			if !equalExpr(left.items[i], right.items[i]) {
+				return false
+			}
+		}
+		return true
 	case builtinProc:
 		right, ok := b.(builtinProc)
 		return ok && left.name == right.name
@@ -2017,6 +2058,8 @@ func renderExpr(value expr) string {
 		return "(" + strings.Join(parts, " ") + ")"
 	case *pairExpr:
 		return renderPair(v, renderExpr)
+	case *vectorExpr:
+		return renderVector(v, renderExpr)
 	case voidExpr:
 		return ""
 	case builtinProc:
@@ -2037,6 +2080,8 @@ func renderExpr(value expr) string {
 		return "#<record:" + v.recordType.name + ">"
 	case macroExpr:
 		return "#<macro>"
+	case uninitializedExpr:
+		return "#<uninitialized>"
 	default:
 		return ""
 	}
@@ -2056,6 +2101,10 @@ func displayExpr(value expr) string {
 		return "(" + strings.Join(parts, " ") + ")"
 	case *pairExpr:
 		return renderPair(v, displayExpr)
+	case *vectorExpr:
+		return renderVector(v, displayExpr)
+	case uninitializedExpr:
+		return "#<uninitialized>"
 	default:
 		return renderExpr(value)
 	}
