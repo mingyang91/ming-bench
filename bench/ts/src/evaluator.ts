@@ -19,7 +19,8 @@ type SchemeVal =
   | { tag: 'void'; pos?: Pos }
   | { tag: 'syntax'; rules: { pattern: SchemeVal; template: SchemeVal }[]; literals: string[]; defEnv: Env; pos?: Pos }
   | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal>; pos?: Pos }
-  | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos };
+  | { tag: 'case-lambda'; clauses: { params: string[]; rest?: string; body: SchemeVal[] }[]; env: Env; pos?: Pos }
+  | { tag: 'vector'; value: SchemeVal[]; pos?: Pos };
 
 function posStr(pos?: Pos): string {
   return pos ? `${pos.line}:${pos.col}: ` : '';
@@ -164,6 +165,12 @@ function tokenize(input: string): Token[] {
       continue;
     }
     if (ch === '#') {
+      if (i + 1 < input.length && input[i + 1] === '(') {
+        const p = curPos();
+        tokens.push({ text: '#(', pos: p });
+        advance(); advance();
+        continue;
+      }
       if (i + 1 < input.length && (input[i + 1] === 't' || input[i + 1] === 'f')) {
         const p = curPos();
         tokens.push({ text: input.substring(i, i + 2), pos: p });
@@ -192,6 +199,15 @@ function parse(tokens: Token[]): SchemeVal[] {
     if (tok.text === "'") {
       const datum = parseExpr();
       return { tag: 'list', value: [{ tag: 'symbol', value: 'quote', pos: tok.pos }, datum], pos: tok.pos };
+    }
+    if (tok.text === '#(') {
+      const elems: SchemeVal[] = [];
+      while (idx < tokens.length && tokens[idx].text !== ')') {
+        elems.push(parseExpr());
+      }
+      if (idx >= tokens.length) throw new EvalError(`${tok.pos.line}:${tok.pos.col}: missing closing paren`);
+      idx++;
+      return { tag: 'list', value: [{ tag: 'symbol', value: 'vector', pos: tok.pos }, ...elems], pos: tok.pos };
     }
     if (tok.text === '(') {
       const elems: SchemeVal[] = [];
@@ -271,6 +287,7 @@ function gensym(base: string): string {
 const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'lambda', 'set!', 'begin', 'let', 'cond', 'and', 'or',
   'define-syntax', 'syntax-rules', 'case-lambda',
+  'letrec', 'letrec*', 'case', 'do',
 ]);
 
 function matchSyntaxPattern(
@@ -462,6 +479,14 @@ function schemeEqual(a: SchemeVal, b: SchemeVal): boolean {
     case 'char': return a.value === (b as typeof a).value;
     case 'nil': return true;
     case 'pair': return b.tag === 'pair' && schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    case 'vector': {
+      if (b.tag !== 'vector') return false;
+      if (a.value.length !== b.value.length) return false;
+      for (let i = 0; i < a.value.length; i++) {
+        if (!schemeEqual(a.value[i], b.value[i])) return false;
+      }
+      return true;
+    }
     default: return a === b;
   }
 }
@@ -474,6 +499,7 @@ function schemeEq(a: SchemeVal, b: SchemeVal): boolean {
     case 'symbol': return a.value === (b as typeof a).value;
     case 'char': return a.value === (b as typeof a).value;
     case 'nil': return true;
+    case 'void': return true;
     default: return a === b;
   }
 }
@@ -866,6 +892,53 @@ function evalBuiltin(name: string, args: SchemeVal[], callPos?: Pos): SchemeVal 
       if (args.length !== 2) throw new EvalError(`${posStr(callPos)}eq?: need 2 arguments`);
       return { tag: 'boolean', value: schemeEq(args[0], args[1]) };
     }
+    case 'eqv?': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}eqv?: need 2 arguments`);
+      return { tag: 'boolean', value: schemeEq(args[0], args[1]) };
+    }
+    // ── L14: Vectors ──
+    case 'vector': {
+      return { tag: 'vector', value: [...args] };
+    }
+    case 'make-vector': {
+      if (args.length < 1 || args.length > 2) throw new EvalError(`${posStr(callPos)}make-vector: need 1-2 arguments`);
+      const len = toNumber(args[0], 'make-vector', callPos);
+      const fill: SchemeVal = args.length === 2 ? args[1] : makeExactInt(0);
+      return { tag: 'vector', value: Array.from({ length: len }, () => fill) };
+    }
+    case 'vector-ref': {
+      if (args.length !== 2) throw new EvalError(`${posStr(callPos)}vector-ref: need 2 arguments`);
+      if (args[0].tag !== 'vector') throw new EvalError(`${posStr(callPos)}vector-ref: not a vector`);
+      const idx = toNumber(args[1], 'vector-ref', callPos);
+      if (idx < 0 || idx >= args[0].value.length) throw new EvalError(`${posStr(callPos)}vector-ref: index out of range`);
+      return args[0].value[idx];
+    }
+    case 'vector-set!': {
+      if (args.length !== 3) throw new EvalError(`${posStr(callPos)}vector-set!: need 3 arguments`);
+      if (args[0].tag !== 'vector') throw new EvalError(`${posStr(callPos)}vector-set!: not a vector`);
+      const idx = toNumber(args[1], 'vector-set!', callPos);
+      if (idx < 0 || idx >= args[0].value.length) throw new EvalError(`${posStr(callPos)}vector-set!: index out of range`);
+      args[0].value[idx] = args[2];
+      return { tag: 'void' };
+    }
+    case 'vector-length': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}vector-length: need 1 argument`);
+      if (args[0].tag !== 'vector') throw new EvalError(`${posStr(callPos)}vector-length: not a vector`);
+      return makeExactInt(args[0].value.length);
+    }
+    case 'vector?': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}vector?: need 1 argument`);
+      return { tag: 'boolean', value: args[0].tag === 'vector' };
+    }
+    case 'vector->list': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}vector->list: need 1 argument`);
+      if (args[0].tag !== 'vector') throw new EvalError(`${posStr(callPos)}vector->list: not a vector`);
+      return arrayToSchemeList(args[0].value);
+    }
+    case 'list->vector': {
+      if (args.length !== 1) throw new EvalError(`${posStr(callPos)}list->vector: need 1 argument`);
+      return { tag: 'vector', value: schemeListToArray(args[0]) };
+    }
     // ── L09: Character utilities ──
     case 'char-alphabetic?': {
       if (args.length !== 1) throw new EvalError(`${posStr(callPos)}char-alphabetic?: need 1 argument`);
@@ -1031,6 +1104,10 @@ const BUILTIN_NAMES = new Set([
   'exact?', 'inexact?', 'integer?', 'rational?', 'procedure?',
   'exact->inexact', 'inexact->exact',
   'numerator', 'denominator',
+  // L14
+  'eqv?',
+  'vector', 'make-vector', 'vector-ref', 'vector-set!', 'vector-length', 'vector?',
+  'vector->list', 'list->vector',
 ]);
 
 function applyLambda(proc: SchemeVal & { tag: 'lambda' }, args: SchemeVal[], callPos?: Pos): SchemeVal {
@@ -1218,6 +1295,130 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           result = evaluate(elems[i], letEnv);
         }
         return result;
+      }
+      case 'letrec': {
+        if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}letrec: wrong number of arguments`);
+        const bindings = elems[1];
+        if (bindings.tag !== 'list') throw new EvalError(`${posStr(expr.pos)}letrec: invalid bindings`);
+        const letrecEnv = new Env(env);
+        // First, bind all vars to undefined placeholder
+        const names: string[] = [];
+        for (const b of bindings.value) {
+          if (b.tag !== 'list' || b.value.length !== 2 || b.value[0].tag !== 'symbol')
+            throw new EvalError(`${posStr(expr.pos)}letrec: invalid binding`);
+          names.push(b.value[0].value);
+          letrecEnv.set(b.value[0].value, { tag: 'void' });
+        }
+        // Then evaluate inits in the letrec env (all bindings visible)
+        for (let i = 0; i < bindings.value.length; i++) {
+          const b = bindings.value[i];
+          const val = evaluate(b.value[1], letrecEnv);
+          letrecEnv.set(names[i], val);
+        }
+        let result: SchemeVal = { tag: 'void' };
+        for (let i = 2; i < elems.length; i++) {
+          result = evaluate(elems[i], letrecEnv);
+        }
+        return result;
+      }
+      case 'letrec*': {
+        if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}letrec*: wrong number of arguments`);
+        const bindings = elems[1];
+        if (bindings.tag !== 'list') throw new EvalError(`${posStr(expr.pos)}letrec*: invalid bindings`);
+        const letrecEnv = new Env(env);
+        for (const b of bindings.value) {
+          if (b.tag !== 'list' || b.value.length !== 2 || b.value[0].tag !== 'symbol')
+            throw new EvalError(`${posStr(expr.pos)}letrec*: invalid binding`);
+          const val = evaluate(b.value[1], letrecEnv);
+          letrecEnv.set(b.value[0].value, val);
+        }
+        let result: SchemeVal = { tag: 'void' };
+        for (let i = 2; i < elems.length; i++) {
+          result = evaluate(elems[i], letrecEnv);
+        }
+        return result;
+      }
+      case 'case': {
+        if (elems.length < 2) throw new EvalError(`${posStr(expr.pos)}case: wrong number of arguments`);
+        const key = evaluate(elems[1], env);
+        for (let i = 2; i < elems.length; i++) {
+          const clause = elems[i];
+          if (clause.tag !== 'list' || clause.value.length < 2)
+            throw new EvalError(`${posStr(expr.pos)}case: invalid clause`);
+          const datums = clause.value[0];
+          if (datums.tag === 'symbol' && datums.value === 'else') {
+            let result: SchemeVal = { tag: 'void' };
+            for (let j = 1; j < clause.value.length; j++) {
+              result = evaluate(clause.value[j], env);
+            }
+            return result;
+          }
+          if (datums.tag !== 'list') throw new EvalError(`${posStr(expr.pos)}case: datums must be a list`);
+          for (const datum of datums.value) {
+            const d = quoteDatum(datum);
+            if (schemeEq(key, d)) {
+              let result: SchemeVal = { tag: 'void' };
+              for (let j = 1; j < clause.value.length; j++) {
+                result = evaluate(clause.value[j], env);
+              }
+              return result;
+            }
+          }
+        }
+        return { tag: 'void' };
+      }
+      case 'do': {
+        // (do ((var init step) ...) (test expr ...) body ...)
+        if (elems.length < 3) throw new EvalError(`${posStr(expr.pos)}do: wrong number of arguments`);
+        const varSpecs = elems[1];
+        const testClause = elems[2];
+        if (varSpecs.tag !== 'list') throw new EvalError(`${posStr(expr.pos)}do: invalid variable specs`);
+        if (testClause.tag !== 'list' || testClause.value.length < 1)
+          throw new EvalError(`${posStr(expr.pos)}do: invalid test clause`);
+
+        const doEnv = new Env(env);
+        const vars: { name: string; step?: SchemeVal }[] = [];
+        for (const spec of varSpecs.value) {
+          if (spec.tag !== 'list' || spec.value.length < 2 || spec.value[0].tag !== 'symbol')
+            throw new EvalError(`${posStr(expr.pos)}do: invalid variable spec`);
+          const name = spec.value[0].value;
+          const init = evaluate(spec.value[1], env);
+          doEnv.set(name, init);
+          vars.push({ name, step: spec.value.length >= 3 ? spec.value[2] : undefined });
+        }
+
+        // Iteration loop
+        for (;;) {
+          // Test
+          const testVal = evaluate(testClause.value[0], doEnv);
+          if (isTruthy(testVal)) {
+            // Test is true — evaluate result expressions
+            if (testClause.value.length === 1) return { tag: 'void' };
+            let result: SchemeVal = { tag: 'void' };
+            for (let j = 1; j < testClause.value.length; j++) {
+              result = evaluate(testClause.value[j], doEnv);
+            }
+            return result;
+          }
+          // Execute body
+          for (let i = 3; i < elems.length; i++) {
+            evaluate(elems[i], doEnv);
+          }
+          // Parallel step: evaluate all steps using current values, then update
+          const newVals: (SchemeVal | undefined)[] = [];
+          for (const v of vars) {
+            if (v.step !== undefined) {
+              newVals.push(evaluate(v.step, doEnv));
+            } else {
+              newVals.push(undefined);
+            }
+          }
+          for (let i = 0; i < vars.length; i++) {
+            if (newVals[i] !== undefined) {
+              doEnv.set(vars[i].name, newVals[i]!);
+            }
+          }
+        }
       }
       case 'cond': {
         for (let i = 1; i < elems.length; i++) {
@@ -1414,6 +1615,7 @@ function writeVal(val: SchemeVal): string {
     case 'case-lambda': return '#<procedure>';
     case 'syntax': return '#<syntax>';
     case 'record': return '#<record>';
+    case 'vector': return `#(${val.value.map(writeVal).join(' ')})`;
   }
 }
 
