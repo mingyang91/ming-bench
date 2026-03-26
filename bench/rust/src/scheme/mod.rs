@@ -128,6 +128,18 @@ fn env_set(env: &Env, name: String, val: Value) {
     env.borrow_mut().bindings.insert(name, val);
 }
 
+fn env_set_existing(env: &Env, name: &str, val: Value) -> bool {
+    let mut inner = env.borrow_mut();
+    if inner.bindings.contains_key(name) {
+        inner.bindings.insert(name.to_string(), val);
+        true
+    } else if let Some(ref parent) = inner.parent {
+        env_set_existing(parent, name, val)
+    } else {
+        false
+    }
+}
+
 fn global_env() -> Env {
     let env = new_env(None);
     for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
@@ -372,6 +384,7 @@ fn eval(expr: &Expr, env: &Env, out: &Output) -> Result<Value, EvalError> {
                     "let" => return eval_let(&list[1..], env, span, out),
                     "begin" => return eval_begin(&list[1..], env, out),
                     "cond" => return eval_cond(&list[1..], env, span, out),
+                    "set!" => return eval_set(&list[1..], env, span, out),
                     _ => {}
                 }
             }
@@ -592,6 +605,21 @@ fn eval_cond(clauses: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Va
             }
             _ => return Err(err_at(span, "cond: bad clause")),
         }
+    }
+    Ok(Value::Void)
+}
+
+fn eval_set(args: &[Expr], env: &Env, span: Span, out: &Output) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(err_at(span, "set!: expected 2 parts"));
+    }
+    let name = match &args[0].kind {
+        ExprKind::Symbol(s) => s,
+        _ => return Err(err_at(span, "set!: expected symbol")),
+    };
+    let val = eval(&args[1], env, out)?;
+    if !env_set_existing(env, name, val) {
+        return Err(err_at(span, format!("set!: unbound variable: {}", name)));
     }
     Ok(Value::Void)
 }
