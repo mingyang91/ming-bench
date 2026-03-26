@@ -361,6 +361,7 @@ const SPECIAL_FORMS_SET = new Set([
   'quote', 'if', 'define', 'lambda', 'and', 'or', 'not', 'begin',
   'set!', 'cond', 'let', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'define-syntax', 'syntax-rules', 'syntax-case', 'syntax', 'with-syntax',
+  'define-record-type', 'case-lambda', 'dynamic-wind', 'guard',
 ]);
 
 function isEllipsis(val: SchemeVal): boolean {
@@ -1209,7 +1210,7 @@ function evalK(expr: SchemeVal, env: Env, k: Cont): Bounce {
             return evalBeginK(guardBody, env, (val) => {
               const idx = exceptionHandlers.lastIndexOf(handlerFn);
               if (idx !== -1) exceptionHandlers.splice(idx, 1);
-              return k(val);
+              return bounce(() => k(val));
             });
           }
         }
@@ -1256,9 +1257,13 @@ function evalListLeftK(exprs: SchemeVal[], env: Env, k: (vals: SchemeVal[]) => B
 
 function applyK(proc: SchemeVal, args: SchemeVal[], k: Cont, pos?: Pos): Bounce {
   if (proc.tag === 'continuation') {
-    if (args.length !== 1) throw errAt('continuation: expected 1 argument', pos);
     const targetStack = proc.windStack;
-    const val = args[0];
+    if (args.length === 1) {
+      const val = args[0];
+      return bounce(() => doWindSwitch(windStack, targetStack, () => proc.k(val)));
+    }
+    // Multiple values: wrap in a values object
+    const val: SchemeVal = { tag: 'values', vals: args };
     return bounce(() => doWindSwitch(windStack, targetStack, () => proc.k(val)));
   }
 
