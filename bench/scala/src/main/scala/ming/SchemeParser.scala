@@ -52,7 +52,10 @@ private[ming] object SchemeParser:
           parseAtom(pos)
 
     private def parseHashLiteral(pos: SourcePos): Expr =
-      if startsWith("#\\") then parseChar(pos)
+      if startsWith("#'") then
+        index += 2
+        Expr.ListExpr(List(Expr.Symbol("syntax", pos), parseExpr()), pos)
+      else if startsWith("#\\") then parseChar(pos)
       else parseBoolean(pos)
 
     private def parseList(pos: SourcePos): Expr =

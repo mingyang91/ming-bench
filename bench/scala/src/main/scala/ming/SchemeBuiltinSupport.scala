@@ -64,6 +64,13 @@ private[ming] object SchemeBuiltinSupport:
       case other =>
         throw new EvalError(s"$name expected a symbol, got ${SchemeRuntime.render(other)}")
 
+  def requireSyntaxObject(name: String, value: Value): Value.SyntaxObject =
+    value match
+      case syntaxObject @ Value.SyntaxObject(_, _) =>
+        syntaxObject
+      case other =>
+        throw new EvalError(s"$name expected a syntax object, got ${SchemeRuntime.render(other)}")
+
   def requirePair(name: String, value: Value): Value.PairValue =
     value match
       case pair @ Value.PairValue(_, _) => pair

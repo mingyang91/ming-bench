@@ -16,6 +16,13 @@ private[ming] object SchemeModel:
 
   final case class ExpandedExpr(expr: Expr, env: Env)
 
+  final case class SyntaxContext(
+    definitionEnv: Env,
+    useSiteEnv: Env,
+    patternBindings: Map[String, Vector[Expr]],
+    patternVariables: Set[String]
+  )
+
   trait SyntaxTransformer:
     def expand(invocation: Expr, useSiteEnv: Env): ExpandedExpr
 
@@ -107,6 +114,8 @@ private[ming] object SchemeModel:
       env: Env
     )
     case CaseClosure(clauses: List[CaseLambdaClause])
+    case SyntaxObject(expr: Expr, contextEnv: Env)
+    case SyntaxContextValue(context: SyntaxContext)
     case MultiValues(values: List[Value])
     case UninitializedValue(name: String)
     case VoidValue

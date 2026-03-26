@@ -10,6 +10,7 @@ import SchemeRuntime.*
 
 private[ming] object SchemeEvaluator
     extends SchemeEvaluatorSpecialForms
+    with SchemeEvaluatorMacroForms
     with SchemeEvaluatorGuardForms
     with SchemeEvaluatorBindingForms
     with SchemeEvaluatorProcedureSupport
@@ -22,6 +23,13 @@ private[ming] object SchemeEvaluator
 
   def applyProcedure(procedure: Value, args: List[Value]): Value =
     withFreshDynamicContext(run(applyProcedure(procedure, args, finalContinuation, None)))
+
+  private[ming] def applyProcedureInCurrentContext(
+    procedure: Value,
+    args: List[Value],
+    pos: Option[SourcePos]
+  ): Value =
+    run(applyProcedure(procedure, args, finalContinuation, pos))
 
   override protected def eval(expr: Expr, env: Env, continuation: Continuation): Computation =
     evalExpr(expr, env, continuation)

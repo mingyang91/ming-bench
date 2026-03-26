@@ -10,4 +10,5 @@ private[ming] object SchemeBuiltins:
       SchemeVectorBuiltins.bindings ++
       SchemeOutputBuiltins.bindings(output) ++
       SchemeTextBuiltins.bindings ++
-      SchemePredicateBuiltins.bindings
+      SchemePredicateBuiltins.bindings ++
+      SchemeMacroBuiltins.bindings

@@ -3,7 +3,6 @@ package ming
 import SchemeBuiltinSupport.*
 import SchemeEvaluatorState.*
 import SchemeEvaluatorSupport.*
-import SchemeMacros.*
 import SchemeModel.*
 import SchemeRuntime.*
 
@@ -145,13 +144,28 @@ abstract private[ming] class SchemeEvaluatorSpecialForms:
     env: Env,
     continuation: Continuation,
     pos: SourcePos
-  ): Computation =
-    args match
-      case Expr.Symbol(name, _) :: transformer :: Nil =>
-        env.defineSyntax(name, parseSyntaxRules(name, transformer, env))
-        resume(continuation, Value.VoidValue)
-      case _ =>
-        throw new EvalError("invalid define-syntax form")
+  ): Computation
+
+  protected def evalSyntax(
+    args: List[Expr],
+    env: Env,
+    continuation: Continuation,
+    pos: SourcePos
+  ): Computation
+
+  protected def evalSyntaxCase(
+    args: List[Expr],
+    env: Env,
+    continuation: Continuation,
+    pos: SourcePos
+  ): Computation
+
+  protected def evalWithSyntax(
+    args: List[Expr],
+    env: Env,
+    continuation: Continuation,
+    pos: SourcePos
+  ): Computation
 
   protected def evalLambda(
     args: List[Expr],

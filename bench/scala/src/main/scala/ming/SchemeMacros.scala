@@ -3,6 +3,7 @@ package ming
 import java.util.UUID
 
 import SchemeModel.*
+import SchemeSyntaxSupport.*
 
 private[ming] object SchemeMacros:
 
@@ -18,7 +19,10 @@ private[ming] object SchemeMacros:
     "cond",
     "let",
     "define-syntax",
-    "syntax-rules"
+    "syntax-rules",
+    "syntax",
+    "syntax-case",
+    "with-syntax"
   )
 
   private[ming] type PatternBindings = Map[String, Vector[Expr]]
@@ -46,6 +50,22 @@ private[ming] object SchemeMacros:
       case _ =>
         throw new EvalError("invalid syntax-rules form")
 
+  def buildProcedureSyntaxTransformer(
+    name: String,
+    procedure: Value,
+    definitionEnv: Env
+  ): SyntaxTransformer =
+    new ProcedureSyntaxTransformer(name, procedure, definitionEnv)
+
+  def expandSyntaxTemplate(template: Expr, context: SyntaxContext): ExpandedExpr =
+    val syntheticRule = SyntaxRule(template, template, context.patternVariables)
+    new SchemeMacroTemplateExpander(
+      syntheticRule,
+      context.patternBindings,
+      context.useSiteEnv,
+      context.definitionEnv
+    ).expand(template)
+
   private def parseRule(name: String, literals: Set[String], ruleExpr: Expr): SyntaxRule =
     ruleExpr match
       case Expr.ListExpr(List(pattern, template), _) =>
@@ -53,7 +73,7 @@ private[ming] object SchemeMacros:
       case _ =>
         throw new EvalError("syntax-rules clauses must contain a pattern and template")
 
-  private def collectPatternVariables(
+  private[ming] def collectPatternVariables(
     pattern: Expr,
     macroName: String,
     literals: Set[String]
@@ -101,6 +121,43 @@ private[ming] object SchemeMacros:
       invocation match
         case Expr.ListExpr(operator :: rest, pos) =>
           Expr.ListExpr(Expr.Symbol(name, operator.pos) :: rest, pos)
+        case other =>
+          other
+
+  final private class ProcedureSyntaxTransformer(
+    name: String,
+    procedure: Value,
+    definitionEnv: Env
+  ) extends SyntaxTransformer:
+
+    override def expand(invocation: Expr, useSiteEnv: Env): ExpandedExpr =
+      val context = SyntaxContext(definitionEnv, useSiteEnv, Map.empty, Set.empty)
+      val result = SchemeEvaluator.applyProcedureInCurrentContext(
+        contextualizeProcedure(procedure, context),
+        List(Value.SyntaxObject(invocation, useSiteEnv)),
+        Some(invocation.pos)
+      )
+
+      result match
+        case Value.SyntaxObject(expr, contextEnv) =>
+          ExpandedExpr(expr, contextEnv)
+        case _ =>
+          throw new EvalError(s"syntax transformer $name must return a syntax object")
+
+    private def contextualizeProcedure(procedure: Value, context: SyntaxContext): Value =
+      procedure match
+        case Value.Closure(name, fixedParams, restParam, body, closureEnv) =>
+          Value.Closure(
+            name,
+            fixedParams,
+            restParam,
+            body,
+            injectMacroContext(closureEnv, context)
+          )
+        case Value.CaseClosure(clauses) =>
+          Value.CaseClosure(
+            clauses.map(clause => clause.copy(env = injectMacroContext(clause.env, context)))
+          )
         case other =>
           other
 

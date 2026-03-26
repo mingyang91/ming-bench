@@ -70,6 +70,10 @@ private[ming] trait SchemeEvaluatorApplicationSupport extends SchemeEvaluatorSpe
     operator match
       case Expr.Symbol("quote", _) =>
         evalQuote(args, continuation, callPos)
+      case Expr.Symbol("syntax", _) =>
+        evalSyntax(args, env, continuation, callPos)
+      case Expr.Symbol("syntax-case", _) =>
+        evalSyntaxCase(args, env, continuation, callPos)
       case Expr.Symbol("if", _) =>
         evalIf(args, env, continuation, callPos)
       case Expr.Symbol("case", _) =>
@@ -78,6 +82,8 @@ private[ming] trait SchemeEvaluatorApplicationSupport extends SchemeEvaluatorSpe
         evalDefine(args, env, continuation, callPos)
       case Expr.Symbol("define-syntax", _) =>
         evalDefineSyntax(args, env, continuation, callPos)
+      case Expr.Symbol("with-syntax", _) =>
+        evalWithSyntax(args, env, continuation, callPos)
       case Expr.Symbol("define-record-type", _) =>
         resume(continuation, defineRecordType(args, env))
       case Expr.Symbol("lambda", _) =>

@@ -105,6 +105,10 @@ private[ming] object SchemeRuntime:
         "#<procedure>"
       case Value.CaseClosure(_) =>
         "#<procedure>"
+      case Value.SyntaxObject(_, _) =>
+        "#<syntax>"
+      case Value.SyntaxContextValue(_) =>
+        "#<syntax-context>"
       case Value.MultiValues(_) =>
         "#<values>"
       case Value.UninitializedValue(name) =>
