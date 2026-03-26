@@ -19,6 +19,9 @@ pub enum EvalError {
     #[error("invalid integer literal: {value}")]
     InvalidInteger { value: String },
 
+    #[error("invalid syntax: {message}")]
+    InvalidSyntax { message: String },
+
     #[error("unbound variable: {name}")]
     UnboundVariable { name: String },
 

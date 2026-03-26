@@ -1,3 +1,7 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 pub mod error;
 
 pub use error::EvalError;
@@ -21,11 +25,33 @@ enum Expr {
     List(Vec<Expr>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+type NativeFunc = fn(&[Value]) -> Result<Value, EvalError>;
+type EnvRef = Rc<Env>;
+
+#[derive(Clone)]
 enum Value {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Symbol(String),
+    List(Vec<Value>),
+    NativeProc {
+        name: &'static str,
+        func: NativeFunc,
+    },
+    Closure(Rc<Closure>),
+    Void,
+}
+
+struct Closure {
+    params: Vec<String>,
+    body: Vec<Expr>,
+    env: EnvRef,
+}
+
+struct Env {
+    bindings: RefCell<HashMap<String, Value>>,
+    parent: Option<EnvRef>,
 }
 
 impl Value {
@@ -42,6 +68,18 @@ impl Value {
                     .replace('\t', "\\t");
                 format!("\"{escaped}\"")
             }
+            Self::Symbol(value) => value.clone(),
+            Self::List(items) => {
+                let rendered = items
+                    .iter()
+                    .map(Value::render)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("({rendered})")
+            }
+            Self::NativeProc { name, .. } => format!("#<procedure:{name}>"),
+            Self::Closure(_) => "#<procedure>".to_string(),
+            Self::Void => "#<void>".to_string(),
         }
     }
 
@@ -54,6 +92,10 @@ impl Value {
             Self::Integer(_) => "number",
             Self::Boolean(_) => "boolean",
             Self::String(_) => "string",
+            Self::Symbol(_) => "symbol",
+            Self::List(_) => "list",
+            Self::NativeProc { .. } | Self::Closure(_) => "procedure",
+            Self::Void => "void",
         }
     }
 
@@ -65,6 +107,46 @@ impl Value {
                 found: other.type_name().to_string(),
             }),
         }
+    }
+}
+
+impl Env {
+    fn new(parent: Option<EnvRef>) -> EnvRef {
+        Rc::new(Self {
+            bindings: RefCell::new(HashMap::new()),
+            parent,
+        })
+    }
+
+    fn define(&self, name: String, value: Value) {
+        self.bindings.borrow_mut().insert(name, value);
+    }
+
+    fn lookup(&self, name: &str) -> Option<Value> {
+        if let Some(value) = self.bindings.borrow().get(name).cloned() {
+            return Some(value);
+        }
+
+        self.parent.as_ref().and_then(|parent| parent.lookup(name))
+    }
+}
+
+impl Closure {
+    fn call(&self, args: &[Value]) -> Result<Value, EvalError> {
+        if args.len() != self.params.len() {
+            return Err(EvalError::WrongArgCount {
+                name: "lambda",
+                expected: "the declared arity",
+                got: args.len(),
+            });
+        }
+
+        let frame = Env::new(Some(self.env.clone()));
+        for (name, value) in self.params.iter().zip(args.iter()) {
+            frame.define(name.clone(), value.clone());
+        }
+
+        eval_sequence(&self.body, frame)
     }
 }
 
@@ -142,12 +224,27 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         return Err(EvalError::EmptyInput);
     }
 
-    let mut last = Value::Boolean(false);
-    for expr in &exprs {
-        last = eval(expr)?;
-    }
-
+    let env = default_env();
+    let last = eval_sequence(&exprs, env)?;
     Ok((last.render(), String::new()))
+}
+
+fn default_env() -> EnvRef {
+    let env = Env::new(None);
+    for (name, func) in [
+        ("+", native_add as NativeFunc),
+        ("-", native_sub as NativeFunc),
+        ("*", native_mul as NativeFunc),
+        ("/", native_div as NativeFunc),
+        ("<", native_lt as NativeFunc),
+        (">", native_gt as NativeFunc),
+        ("=", native_num_eq as NativeFunc),
+        ("<=", native_lte as NativeFunc),
+        ("not", native_not as NativeFunc),
+    ] {
+        env.define(name.to_string(), Value::NativeProc { name, func });
+    }
+    env
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, EvalError> {
@@ -259,48 +356,153 @@ fn is_delimiter(input: &str, index: usize) -> bool {
     }
 }
 
-fn eval(expr: &Expr) -> Result<Value, EvalError> {
+fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let mut last = Value::Void;
+    for expr in exprs {
+        last = eval(expr, env.clone())?;
+    }
+    Ok(last)
+}
+
+fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
     match expr {
         Expr::Integer(value) => Ok(Value::Integer(*value)),
         Expr::Boolean(value) => Ok(Value::Boolean(*value)),
         Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => Err(EvalError::UnboundVariable { name: name.clone() }),
-        Expr::List(items) => eval_list(items),
+        Expr::Symbol(name) => env
+            .lookup(name)
+            .ok_or_else(|| EvalError::UnboundVariable { name: name.clone() }),
+        Expr::List(items) => eval_list(items, env),
     }
 }
 
-fn eval_list(items: &[Expr]) -> Result<Value, EvalError> {
+fn eval_list(items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     let (head, tail) = items
         .split_first()
         .ok_or_else(|| EvalError::NotAProcedure {
             found: "()".to_string(),
         })?;
 
-    let Expr::Symbol(name) = head else {
-        let found = eval(head)?.type_name().to_string();
-        return Err(EvalError::NotAProcedure { found });
+    if let Expr::Symbol(name) = head {
+        match name.as_str() {
+            "define" => return eval_define(tail, env),
+            "if" => return eval_if(tail, env),
+            "quote" => return eval_quote(tail),
+            "lambda" => return eval_lambda(tail, env),
+            "and" => return eval_and(tail, env),
+            "or" => return eval_or(tail, env),
+            _ => {}
+        }
+    }
+
+    let procedure = eval(head, env.clone())?;
+    let args = eval_args(tail, env)?;
+    apply(procedure, &args)
+}
+
+fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let Some(target) = args.first() else {
+        return Err(EvalError::InvalidSyntax {
+            message: "define requires a target".to_string(),
+        });
     };
 
-    match name.as_str() {
-        "and" => eval_and(tail),
-        "or" => eval_or(tail),
-        "not" => eval_not(tail),
-        "+" => eval_add(tail),
-        "-" => eval_sub(tail),
-        "*" => eval_mul(tail),
-        "/" => eval_div(tail),
-        "<" => eval_compare(tail, "<", |left, right| left < right),
-        ">" => eval_compare(tail, ">", |left, right| left > right),
-        "=" => eval_compare(tail, "=", |left, right| left == right),
-        "<=" => eval_compare(tail, "<=", |left, right| left <= right),
-        _ => Err(EvalError::UnboundVariable { name: name.clone() }),
+    match target {
+        Expr::Symbol(name) => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArgCount {
+                    name: "define",
+                    expected: "exactly 2",
+                    got: args.len(),
+                });
+            }
+
+            let value = eval(&args[1], env.clone())?;
+            env.define(name.clone(), value);
+            Ok(Value::Void)
+        }
+        Expr::List(signature) => {
+            let (name_expr, params_exprs) =
+                signature
+                    .split_first()
+                    .ok_or_else(|| EvalError::InvalidSyntax {
+                        message: "define requires a binding name".to_string(),
+                    })?;
+
+            let Expr::Symbol(name) = name_expr else {
+                return Err(EvalError::InvalidSyntax {
+                    message: "function name must be a symbol".to_string(),
+                });
+            };
+
+            if args.len() < 2 {
+                return Err(EvalError::InvalidSyntax {
+                    message: "function definition requires a body".to_string(),
+                });
+            }
+
+            let params = parse_param_slice(params_exprs)?;
+            let closure = Value::Closure(Rc::new(Closure {
+                params,
+                body: args[1..].to_vec(),
+                env: env.clone(),
+            }));
+            env.define(name.clone(), closure);
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::InvalidSyntax {
+            message: "define requires a symbol or function signature".to_string(),
+        }),
     }
 }
 
-fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::WrongArgCount {
+            name: "if",
+            expected: "exactly 3",
+            got: args.len(),
+        });
+    }
+
+    if eval(&args[0], env.clone())?.is_truthy() {
+        eval(&args[1], env)
+    } else {
+        eval(&args[2], env)
+    }
+}
+
+fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "quote",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    }
+
+    quote_expr(&args[0])
+}
+
+fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::InvalidSyntax {
+            message: "lambda requires parameters and a body".to_string(),
+        });
+    }
+
+    let params = parse_param_list(&args[0])?;
+    Ok(Value::Closure(Rc::new(Closure {
+        params,
+        body: args[1..].to_vec(),
+        env,
+    })))
+}
+
+fn eval_and(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     let mut last = Value::Boolean(true);
     for expr in args {
-        let value = eval(expr)?;
+        let value = eval(expr, env.clone())?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -309,9 +511,9 @@ fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(last)
 }
 
-fn eval_or(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     for expr in args {
-        let value = eval(expr)?;
+        let value = eval(expr, env.clone())?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -319,7 +521,63 @@ fn eval_or(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(Value::Boolean(false))
 }
 
-fn eval_not(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_args(args: &[Expr], env: EnvRef) -> Result<Vec<Value>, EvalError> {
+    let mut values = Vec::with_capacity(args.len());
+    for expr in args {
+        values.push(eval(expr, env.clone())?);
+    }
+    Ok(values)
+}
+
+fn apply(procedure: Value, args: &[Value]) -> Result<Value, EvalError> {
+    match procedure {
+        Value::NativeProc { func, .. } => func(args),
+        Value::Closure(closure) => closure.call(args),
+        other => Err(EvalError::NotAProcedure {
+            found: other.render(),
+        }),
+    }
+}
+
+fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
+    match expr {
+        Expr::List(items) => parse_param_slice(items),
+        _ => Err(EvalError::InvalidSyntax {
+            message: "lambda parameters must be a list".to_string(),
+        }),
+    }
+}
+
+fn parse_param_slice(items: &[Expr]) -> Result<Vec<String>, EvalError> {
+    let mut params = Vec::with_capacity(items.len());
+    for item in items {
+        let Expr::Symbol(name) = item else {
+            return Err(EvalError::InvalidSyntax {
+                message: "parameter names must be symbols".to_string(),
+            });
+        };
+        params.push(name.clone());
+    }
+    Ok(params)
+}
+
+fn quote_expr(expr: &Expr) -> Result<Value, EvalError> {
+    match expr {
+        Expr::Integer(value) => Ok(Value::Integer(*value)),
+        Expr::Boolean(value) => Ok(Value::Boolean(*value)),
+        Expr::String(value) => Ok(Value::String(value.clone())),
+        Expr::Symbol(value) => Ok(Value::Symbol(value.clone())),
+        Expr::List(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(quote_expr(item)?);
+            }
+            Ok(Value::List(values))
+        }
+    }
+}
+
+fn native_not(args: &[Value]) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::WrongArgCount {
             name: "not",
@@ -328,20 +586,19 @@ fn eval_not(args: &[Expr]) -> Result<Value, EvalError> {
         });
     }
 
-    let value = eval(&args[0])?;
-    Ok(Value::Boolean(!value.is_truthy()))
+    Ok(Value::Boolean(!args[0].is_truthy()))
 }
 
-fn eval_add(args: &[Expr]) -> Result<Value, EvalError> {
+fn native_add(args: &[Value]) -> Result<Value, EvalError> {
     let mut sum = 0_i64;
-    for value in eval_numbers("+", args)? {
+    for value in values_as_numbers("+", args)? {
         sum += value;
     }
     Ok(Value::Integer(sum))
 }
 
-fn eval_sub(args: &[Expr]) -> Result<Value, EvalError> {
-    let values = eval_numbers("-", args)?;
+fn native_sub(args: &[Value]) -> Result<Value, EvalError> {
+    let values = values_as_numbers("-", args)?;
     let (first, rest) = values.split_first().ok_or(EvalError::WrongArgCount {
         name: "-",
         expected: "at least 1",
@@ -357,16 +614,16 @@ fn eval_sub(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(Value::Integer(result))
 }
 
-fn eval_mul(args: &[Expr]) -> Result<Value, EvalError> {
+fn native_mul(args: &[Value]) -> Result<Value, EvalError> {
     let mut product = 1_i64;
-    for value in eval_numbers("*", args)? {
+    for value in values_as_numbers("*", args)? {
         product *= value;
     }
     Ok(Value::Integer(product))
 }
 
-fn eval_div(args: &[Expr]) -> Result<Value, EvalError> {
-    let values = eval_numbers("/", args)?;
+fn native_div(args: &[Value]) -> Result<Value, EvalError> {
+    let values = values_as_numbers("/", args)?;
     let (first, rest) = values.split_first().ok_or(EvalError::WrongArgCount {
         name: "/",
         expected: "at least 1",
@@ -390,11 +647,27 @@ fn eval_div(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(Value::Integer(result))
 }
 
-fn eval_compare<F>(args: &[Expr], name: &'static str, cmp: F) -> Result<Value, EvalError>
+fn native_lt(args: &[Value]) -> Result<Value, EvalError> {
+    native_compare(args, "<", |left, right| left < right)
+}
+
+fn native_gt(args: &[Value]) -> Result<Value, EvalError> {
+    native_compare(args, ">", |left, right| left > right)
+}
+
+fn native_num_eq(args: &[Value]) -> Result<Value, EvalError> {
+    native_compare(args, "=", |left, right| left == right)
+}
+
+fn native_lte(args: &[Value]) -> Result<Value, EvalError> {
+    native_compare(args, "<=", |left, right| left <= right)
+}
+
+fn native_compare<F>(args: &[Value], name: &'static str, cmp: F) -> Result<Value, EvalError>
 where
     F: Fn(i64, i64) -> bool,
 {
-    let values = eval_numbers(name, args)?;
+    let values = values_as_numbers(name, args)?;
     if values.len() < 2 {
         return Err(EvalError::WrongArgCount {
             name,
@@ -411,10 +684,10 @@ where
     Ok(Value::Boolean(true))
 }
 
-fn eval_numbers(name: &'static str, args: &[Expr]) -> Result<Vec<i64>, EvalError> {
+fn values_as_numbers(name: &'static str, args: &[Value]) -> Result<Vec<i64>, EvalError> {
     let mut values = Vec::with_capacity(args.len());
-    for expr in args {
-        values.push(eval(expr)?.as_number(name)?);
+    for value in args {
+        values.push(value.as_number(name)?);
     }
     Ok(values)
 }
