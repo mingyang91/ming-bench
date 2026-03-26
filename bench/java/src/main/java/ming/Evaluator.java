@@ -272,6 +272,20 @@ public class Evaluator {
         try {
             return Long.parseLong(token);
         } catch (NumberFormatException e) {
+            // Try rational literal: digits/digits
+            int slash = token.indexOf('/');
+            if (slash > 0 && slash < token.length() - 1) {
+                try {
+                    long num = Long.parseLong(token.substring(0, slash));
+                    long den = Long.parseLong(token.substring(slash + 1));
+                    if (den != 0) return makeRational(num, den);
+                } catch (NumberFormatException ignored) {}
+            }
+            // Try floating-point literal
+            try {
+                double d = Double.parseDouble(token);
+                return new SchemeInexact(d);
+            } catch (NumberFormatException ignored) {}
             return new SchemeSymbol(token, lc[0], lc[1]);
         }
     }
@@ -292,7 +306,7 @@ public class Evaluator {
     // --- Eval ---
 
     private Object eval(Object expr, Env env) throws EvalError {
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar || expr instanceof SchemeRational || expr instanceof SchemeInexact) {
             return expr;
         }
         if (expr instanceof SchemeSymbol sym) {
@@ -582,47 +596,87 @@ public class Evaluator {
 
     private void registerBuiltins(Env env) {
         env.define("+", new BuiltinProc("+", args -> {
-            long sum = 0;
-            for (Object a : args) sum += requireLong(a, "+");
-            return sum;
+            Object result = 0L;
+            for (Object a : args) {
+                a = requireNumber(a, "+");
+                if (a instanceof SchemeInexact || result instanceof SchemeInexact) {
+                    result = new SchemeInexact(toDouble(result) + toDouble(a));
+                } else {
+                    result = exactAdd(result, a);
+                }
+            }
+            return result;
         }));
         env.define("-", new BuiltinProc("-", args -> {
             if (args.isEmpty()) throw new EvalError("-: need at least 1 argument");
-            if (args.size() == 1) return -requireLong(args.get(0), "-");
-            long result = requireLong(args.get(0), "-");
-            for (int i = 1; i < args.size(); i++) result -= requireLong(args.get(i), "-");
+            Object first = requireNumber(args.get(0), "-");
+            if (args.size() == 1) {
+                if (first instanceof SchemeInexact d) return new SchemeInexact(-d.value);
+                if (first instanceof SchemeRational r) return makeRational(-r.num, r.den);
+                return -((Long) first);
+            }
+            Object result = first;
+            for (int i = 1; i < args.size(); i++) {
+                Object a = requireNumber(args.get(i), "-");
+                if (a instanceof SchemeInexact || result instanceof SchemeInexact) {
+                    result = new SchemeInexact(toDouble(result) - toDouble(a));
+                } else {
+                    result = exactSub(result, a);
+                }
+            }
             return result;
         }));
         env.define("*", new BuiltinProc("*", args -> {
-            long product = 1;
-            for (Object a : args) product *= requireLong(a, "*");
-            return product;
+            Object result = 1L;
+            for (Object a : args) {
+                a = requireNumber(a, "*");
+                if (a instanceof SchemeInexact || result instanceof SchemeInexact) {
+                    result = new SchemeInexact(toDouble(result) * toDouble(a));
+                } else {
+                    result = exactMul(result, a);
+                }
+            }
+            return result;
         }));
         env.define("/", new BuiltinProc("/", args -> {
             if (args.isEmpty()) throw new EvalError("/: need at least 1 argument");
-            long result = requireLong(args.get(0), "/");
+            Object result = requireNumber(args.get(0), "/");
+            if (args.size() == 1) {
+                // (/ x) = 1/x
+                if (result instanceof SchemeInexact d) return new SchemeInexact(1.0 / d.value);
+                return exactDiv(1L, result);
+            }
             for (int i = 1; i < args.size(); i++) {
-                long divisor = requireLong(args.get(i), "/");
-                if (divisor == 0) throw new EvalError("division by zero");
-                result /= divisor;
+                Object a = requireNumber(args.get(i), "/");
+                if (a instanceof SchemeInexact || result instanceof SchemeInexact) {
+                    double dv = toDouble(a);
+                    if (dv == 0.0) throw new EvalError("division by zero");
+                    result = new SchemeInexact(toDouble(result) / dv);
+                } else {
+                    result = exactDiv(result, a);
+                }
             }
             return result;
         }));
         env.define("<", new BuiltinProc("<", args -> {
             requireArgCount("<", args, 2);
-            return requireLong(args.get(0), "<") < requireLong(args.get(1), "<");
+            requireNumber(args.get(0), "<"); requireNumber(args.get(1), "<");
+            return numCompare(args.get(0), args.get(1)) < 0;
         }));
         env.define(">", new BuiltinProc(">", args -> {
             requireArgCount(">", args, 2);
-            return requireLong(args.get(0), ">") > requireLong(args.get(1), ">");
+            requireNumber(args.get(0), ">"); requireNumber(args.get(1), ">");
+            return numCompare(args.get(0), args.get(1)) > 0;
         }));
         env.define("=", new BuiltinProc("=", args -> {
             requireArgCount("=", args, 2);
-            return requireLong(args.get(0), "=") == requireLong(args.get(1), "=");
+            requireNumber(args.get(0), "="); requireNumber(args.get(1), "=");
+            return numCompare(args.get(0), args.get(1)) == 0;
         }));
         env.define("<=", new BuiltinProc("<=", args -> {
             requireArgCount("<=", args, 2);
-            return requireLong(args.get(0), "<=") <= requireLong(args.get(1), "<=");
+            requireNumber(args.get(0), "<="); requireNumber(args.get(1), "<=");
+            return numCompare(args.get(0), args.get(1)) <= 0;
         }));
         env.define("not", new BuiltinProc("not", args -> {
             requireArgCount("not", args, 1);
@@ -690,7 +744,68 @@ public class Evaluator {
         // L03: Type predicates
         env.define("number?", new BuiltinProc("number?", args -> {
             requireArgCount("number?", args, 1);
-            return args.get(0) instanceof Long;
+            return isNumber(args.get(0));
+        }));
+        env.define("integer?", new BuiltinProc("integer?", args -> {
+            requireArgCount("integer?", args, 1);
+            Object a = args.get(0);
+            if (a instanceof Long) return true;
+            if (a instanceof SchemeRational r) return r.isInteger();
+            if (a instanceof SchemeInexact d) return d.value == Math.floor(d.value) && !Double.isInfinite(d.value);
+            return false;
+        }));
+        env.define("rational?", new BuiltinProc("rational?", args -> {
+            requireArgCount("rational?", args, 1);
+            Object a = args.get(0);
+            return a instanceof Long || a instanceof SchemeRational;
+        }));
+        env.define("exact?", new BuiltinProc("exact?", args -> {
+            requireArgCount("exact?", args, 1);
+            return isExact(args.get(0));
+        }));
+        env.define("inexact?", new BuiltinProc("inexact?", args -> {
+            requireArgCount("inexact?", args, 1);
+            return args.get(0) instanceof SchemeInexact;
+        }));
+        env.define("exact->inexact", new BuiltinProc("exact->inexact", args -> {
+            requireArgCount("exact->inexact", args, 1);
+            return new SchemeInexact(toDouble(args.get(0)));
+        }));
+        env.define("inexact->exact", new BuiltinProc("inexact->exact", args -> {
+            requireArgCount("inexact->exact", args, 1);
+            Object a = args.get(0);
+            if (isExact(a)) return a;
+            if (a instanceof SchemeInexact d) {
+                // Convert to rational: use denominator power of 2
+                double v = d.value;
+                // Simple approach: multiply until integer
+                long den = 1;
+                double tmp = v;
+                while (tmp != Math.floor(tmp) && den < 1_000_000_000L) {
+                    tmp = v * (den * 2);
+                    den *= 2;
+                }
+                if (tmp == Math.floor(tmp)) {
+                    return makeRational((long) tmp, den);
+                }
+                // Fallback
+                return makeRational(Math.round(v), 1);
+            }
+            throw new EvalError("inexact->exact: not a number");
+        }));
+        env.define("numerator", new BuiltinProc("numerator", args -> {
+            requireArgCount("numerator", args, 1);
+            Object a = args.get(0);
+            if (a instanceof Long l) return l;
+            if (a instanceof SchemeRational r) return r.num;
+            throw new EvalError("numerator: not an exact number");
+        }));
+        env.define("denominator", new BuiltinProc("denominator", args -> {
+            requireArgCount("denominator", args, 1);
+            Object a = args.get(0);
+            if (a instanceof Long) return 1L;
+            if (a instanceof SchemeRational r) return r.den;
+            throw new EvalError("denominator: not an exact number");
         }));
         env.define("string?", new BuiltinProc("string?", args -> {
             requireArgCount("string?", args, 1);
@@ -758,7 +873,7 @@ public class Evaluator {
         }));
         env.define("number->string", new BuiltinProc("number->string", args -> {
             requireArgCount("number->string", args, 1);
-            return new SchemeString(String.valueOf(requireLong(args.get(0), "number->string")));
+            return new SchemeString(schemeToString(requireNumber(args.get(0), "number->string")));
         }));
         env.define("symbol->string", new BuiltinProc("symbol->string", args -> {
             requireArgCount("symbol->string", args, 1);
@@ -1046,7 +1161,8 @@ public class Evaluator {
         // L09: >=
         env.define(">=", new BuiltinProc(">=", args -> {
             requireArgCount(">=", args, 2);
-            return requireLong(args.get(0), ">=") >= requireLong(args.get(1), ">=");
+            requireNumber(args.get(0), ">="); requireNumber(args.get(1), ">=");
+            return numCompare(args.get(0), args.get(1)) >= 0;
         }));
     }
 
@@ -1234,7 +1350,9 @@ public class Evaluator {
     private boolean schemeEqual(Object a, Object b) {
         if (a == b) return true;
         if (a == null || b == null) return a == b;
-        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (isNumber(a) && isNumber(b)) {
+            try { return numCompare(a, b) == 0; } catch (EvalError e) { return false; }
+        }
         if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value.equals(sb.value);
         if (a instanceof SchemeSymbol sa && b instanceof SchemeSymbol sb) return sa.name.equals(sb.name);
@@ -1261,6 +1379,12 @@ public class Evaluator {
         if (val == null) return "void";
         if (val == NIL) return "()";
         if (val instanceof Long l) return l.toString();
+        if (val instanceof SchemeRational r) return r.num + "/" + r.den;
+        if (val instanceof SchemeInexact d) {
+            double v = d.value;
+            if (v == Math.floor(v) && !Double.isInfinite(v)) return String.valueOf(v);
+            return String.valueOf(v);
+        }
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value + "\"";
         if (val instanceof SchemeSymbol s) return s.name;
@@ -1339,4 +1463,100 @@ public class Evaluator {
     }
     record SchemeList(List<Object> elems, int line, int col) {}
     record SchemeChar(char value) {}
+
+    // --- Rational number ---
+    static class SchemeRational {
+        final long num;
+        final long den;
+        SchemeRational(long num, long den) {
+            if (den == 0) throw new ArithmeticException("division by zero");
+            if (den < 0) { num = -num; den = -den; }
+            long g = gcd(Math.abs(num), den);
+            this.num = num / g;
+            this.den = den / g;
+        }
+        private static long gcd(long a, long b) {
+            while (b != 0) { long t = b; b = a % b; a = t; }
+            return a;
+        }
+        boolean isInteger() { return den == 1; }
+        long toLong() { return num / den; }
+    }
+
+    // --- Inexact (floating-point) number ---
+    record SchemeInexact(double value) {}
+
+    // Helper: make a rational or Long if it simplifies to integer
+    private static Object makeRational(long num, long den) {
+        SchemeRational r = new SchemeRational(num, den);
+        return r.isInteger() ? r.toLong() : r;
+    }
+
+    // Convert any number to double
+    private static double toDouble(Object val) throws EvalError {
+        if (val instanceof Long l) return (double) l;
+        if (val instanceof SchemeRational r) return (double) r.num / r.den;
+        if (val instanceof SchemeInexact d) return d.value;
+        throw new EvalError("not a number: " + val);
+    }
+
+    // Check if a value is an exact number
+    private static boolean isExact(Object val) {
+        return val instanceof Long || val instanceof SchemeRational;
+    }
+
+    // Check if a value is a number
+    private static boolean isNumber(Object val) {
+        return val instanceof Long || val instanceof SchemeRational || val instanceof SchemeInexact;
+    }
+
+    // Require a number, returning it as-is
+    private Object requireNumber(Object val, String op) throws EvalError {
+        if (isNumber(val)) return val;
+        throw new EvalError(op + ": not a number: " + schemeToString(val));
+    }
+
+    // Exact addition of two exact numbers
+    private static Object exactAdd(Object a, Object b) {
+        long an, ad, bn, bd;
+        if (a instanceof Long l) { an = l; ad = 1; } else { SchemeRational r = (SchemeRational) a; an = r.num; ad = r.den; }
+        if (b instanceof Long l) { bn = l; bd = 1; } else { SchemeRational r = (SchemeRational) b; bn = r.num; bd = r.den; }
+        return makeRational(an * bd + bn * ad, ad * bd);
+    }
+
+    // Exact subtraction
+    private static Object exactSub(Object a, Object b) {
+        long an, ad, bn, bd;
+        if (a instanceof Long l) { an = l; ad = 1; } else { SchemeRational r = (SchemeRational) a; an = r.num; ad = r.den; }
+        if (b instanceof Long l) { bn = l; bd = 1; } else { SchemeRational r = (SchemeRational) b; bn = r.num; bd = r.den; }
+        return makeRational(an * bd - bn * ad, ad * bd);
+    }
+
+    // Exact multiplication
+    private static Object exactMul(Object a, Object b) {
+        long an, ad, bn, bd;
+        if (a instanceof Long l) { an = l; ad = 1; } else { SchemeRational r = (SchemeRational) a; an = r.num; ad = r.den; }
+        if (b instanceof Long l) { bn = l; bd = 1; } else { SchemeRational r = (SchemeRational) b; bn = r.num; bd = r.den; }
+        return makeRational(an * bn, ad * bd);
+    }
+
+    // Exact division
+    private static Object exactDiv(Object a, Object b) throws EvalError {
+        long an, ad, bn, bd;
+        if (a instanceof Long l) { an = l; ad = 1; } else { SchemeRational r = (SchemeRational) a; an = r.num; ad = r.den; }
+        if (b instanceof Long l) { bn = l; bd = 1; } else { SchemeRational r = (SchemeRational) b; bn = r.num; bd = r.den; }
+        if (bn == 0) throw new EvalError("division by zero");
+        return makeRational(an * bd, ad * bn);
+    }
+
+    // Compare two numbers, returning negative/zero/positive
+    private static int numCompare(Object a, Object b) throws EvalError {
+        if (isExact(a) && isExact(b)) {
+            long an, ad, bn, bd;
+            if (a instanceof Long l) { an = l; ad = 1; } else { SchemeRational r = (SchemeRational) a; an = r.num; ad = r.den; }
+            if (b instanceof Long l) { bn = l; bd = 1; } else { SchemeRational r = (SchemeRational) b; bn = r.num; bd = r.den; }
+            return Long.compare(an * bd, bn * ad);
+        }
+        return Double.compare(toDouble(a), toDouble(b));
+    }
 }
