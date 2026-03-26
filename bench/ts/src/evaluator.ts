@@ -87,6 +87,11 @@ interface VectorValue {
   elements: Value[];
 }
 
+interface SyntaxValue {
+  kind: 'syntax';
+  expr: Expr;
+}
+
 interface VoidValue {
   kind: 'void';
 }
@@ -211,15 +216,29 @@ interface MacroRule {
   template: Expr;
 }
 
-interface MacroTransformer {
+interface SyntaxRulesTransformer {
+  kind: 'syntax-rules';
   literals: Set<string>;
   rules: MacroRule[];
   definitionEnv: Environment;
 }
 
+interface ProcedureMacroTransformer {
+  kind: 'procedure';
+  procedure: ProcedureValue;
+  definitionEnv: Environment;
+}
+
+type MacroTransformer = SyntaxRulesTransformer | ProcedureMacroTransformer;
+
 type MacroBinding =
   | { kind: 'single'; expr: Expr }
   | { kind: 'repeated'; exprs: Expr[] };
+
+interface SyntaxFrame {
+  bindings: Map<string, MacroBinding>;
+  definitionEnv: Environment;
+}
 
 interface ContinuationProcedure {
   kind: 'procedure';
@@ -246,6 +265,7 @@ type Value =
   | EmptyListValue
   | PairValue
   | VectorValue
+  | SyntaxValue
   | RecordValue
   | VoidValue
   | MultipleValuesValue
@@ -281,6 +301,7 @@ const STRING_IMMUTABILITY_LEVEL = 15;
 class Runtime {
   private readonly output: string[] = [];
   private readonly syntaxRules = new Map<string, MacroTransformer>();
+  private syntaxFrames: SyntaxFrame[] = [];
   private nextUnique = 1;
   private windStack: WindFrame[] = [];
   private exceptionHandlers: ExceptionHandlerFrame[] = [];
@@ -303,6 +324,34 @@ class Runtime {
 
   hasSyntaxRule(name: string): boolean {
     return this.syntaxRules.has(name);
+  }
+
+  pushSyntaxFrame(frame: SyntaxFrame): void {
+    this.syntaxFrames = [...this.syntaxFrames, frame];
+  }
+
+  syntaxFrameDepth(): number {
+    return this.syntaxFrames.length;
+  }
+
+  restoreSyntaxFrames(depth: number): void {
+    this.syntaxFrames = this.syntaxFrames.slice(0, depth);
+  }
+
+  currentSyntaxBindings(): Map<string, MacroBinding> {
+    const bindings = new Map<string, MacroBinding>();
+
+    for (const frame of this.syntaxFrames) {
+      for (const [name, binding] of frame.bindings) {
+        bindings.set(name, cloneMacroBinding(binding));
+      }
+    }
+
+    return bindings;
+  }
+
+  currentSyntaxDefinitionEnv(): Environment | undefined {
+    return this.syntaxFrames[this.syntaxFrames.length - 1]?.definitionEnv;
   }
 
   freshLookupName(name: string): string {
@@ -467,6 +516,10 @@ class Reader {
     const loc = this.currentLoc();
     const ch = this.peek();
 
+    if (ch === '#' && this.peekNext() === '\'') {
+      return this.parseSyntaxQuoted(loc);
+    }
+
     if (ch === '(') {
       return this.parseList(loc);
     }
@@ -512,6 +565,20 @@ class Reader {
       type: 'list',
       elements: [
         { type: 'symbol', value: 'quote', ...loc },
+        this.parseExpr(),
+      ],
+      ...loc,
+    };
+  }
+
+  private parseSyntaxQuoted(loc: SourceLoc): ListExpr {
+    this.advance();
+    this.advance();
+
+    return {
+      type: 'list',
+      elements: [
+        { type: 'symbol', value: 'syntax', ...loc },
         this.parseExpr(),
       ],
       ...loc,
@@ -638,6 +705,10 @@ class Reader {
 
   private peek(): string {
     return this.input[this.index] ?? '';
+  }
+
+  private peekNext(): string {
+    return this.input[this.index + 1] ?? '';
   }
 
   private advance(): string {
@@ -1506,6 +1577,23 @@ function createGlobalEnv(runtime: Runtime): Environment {
     };
   }));
 
+  env.define('syntax->datum', builtin('syntax->datum', (args, loc) => {
+    if (args.length !== 1) {
+      throw new EvalError(`${loc.line}:${loc.col}: syntax->datum expects exactly 1 argument`);
+    }
+
+    return quoteExpr(expectSyntaxValue(args[0].value, args[0].expr).expr);
+  }));
+
+  env.define('datum->syntax', builtin('datum->syntax', (args, loc) => {
+    if (args.length !== 2) {
+      throw new EvalError(`${loc.line}:${loc.col}: datum->syntax expects exactly 2 arguments`);
+    }
+
+    expectSyntaxValue(args[0].value, args[0].expr);
+    return makeSyntax(datumToExpr(args[1].value, args[1].expr));
+  }));
+
   env.define('string-ref', builtin('string-ref', (args, loc) => {
     if (args.length !== 2) {
       throw new EvalError(`${loc.line}:${loc.col}: string-ref expects exactly 2 arguments`);
@@ -1954,6 +2042,8 @@ function evaluateList(
         return evalIf(args, head, env, runtime, cont);
       case 'quote':
         return evalQuote(args, head, cont);
+      case 'syntax':
+        return evalSyntax(args, head, env, runtime, cont);
       case 'lambda':
         return evalLambda(args, head, env, cont);
       case 'case-lambda':
@@ -1980,6 +2070,10 @@ function evaluateList(
         return evalDo(args, head, env, runtime, cont);
       case 'guard':
         return evalGuard(args, head, env, runtime, cont);
+      case 'syntax-case':
+        return evalSyntaxCase(args, head, env, runtime, cont);
+      case 'with-syntax':
+        return evalWithSyntax(args, head, env, runtime, cont);
     }
   }
 
@@ -2006,8 +2100,24 @@ function evalDefineSyntax(
     throw new EvalError(`${nameExpr.line}:${nameExpr.col}: macro name must be a symbol`);
   }
 
-  runtime.defineSyntaxRule(nameExpr.value, parseMacroTransformer(args[1], env));
-  return cont(VOID_VALUE);
+  const syntaxRules = parseSyntaxRulesTransformer(args[1], env);
+  if (syntaxRules !== undefined) {
+    runtime.defineSyntaxRule(nameExpr.value, syntaxRules);
+    return cont(VOID_VALUE);
+  }
+
+  return makeEvalAction(args[1], env, (transformerValue) => {
+    if (!isProcedure(transformerValue)) {
+      throw new EvalError(`${args[1].line}:${args[1].col}: define-syntax expects a transformer procedure`);
+    }
+
+    runtime.defineSyntaxRule(nameExpr.value, {
+      kind: 'procedure',
+      procedure: transformerValue,
+      definitionEnv: env,
+    });
+    return cont(VOID_VALUE);
+  });
 }
 
 function evalDefineRecordType(
@@ -2216,6 +2326,143 @@ function evalQuote(args: Expr[], head: SymbolExpr, cont: Continuation): MachineA
   }
 
   return cont(quoteExpr(args[0]));
+}
+
+function evalSyntax(
+  args: Expr[],
+  head: SymbolExpr,
+  env: Environment,
+  runtime: Runtime,
+  cont: Continuation,
+): MachineAction {
+  if (args.length !== 1) {
+    throw new EvalError(`${head.line}:${head.col}: syntax expects exactly 1 argument`);
+  }
+
+  const expanded = expandTemplate(args[0], runtime.currentSyntaxBindings());
+  const definitionEnv = runtime.currentSyntaxDefinitionEnv() ?? env;
+  return cont(makeSyntax(hygienizeExpr(expanded, new Map(), definitionEnv, runtime)));
+}
+
+function evalSyntaxCase(
+  args: Expr[],
+  head: SymbolExpr,
+  env: Environment,
+  runtime: Runtime,
+  cont: Continuation,
+): MachineAction {
+  if (args.length < 3) {
+    throw new EvalError(`${head.line}:${head.col}: syntax-case expects an input, literals, and at least 1 clause`);
+  }
+
+  const literals = parseSyntaxLiterals(args[1], 'syntax-case');
+  return makeEvalAction(args[0], env, (value) => (
+    evalSyntaxCaseClauses(args.slice(2), expectSyntaxValue(value, args[0]), literals, env, runtime, cont)
+  ));
+}
+
+function evalSyntaxCaseClauses(
+  clauses: Expr[],
+  syntax: SyntaxValue,
+  literals: Set<string>,
+  env: Environment,
+  runtime: Runtime,
+  cont: Continuation,
+  index = 0,
+): MachineAction {
+  if (index >= clauses.length) {
+    throw new EvalError(`${syntax.expr.line}:${syntax.expr.col}: no matching syntax-case clause`);
+  }
+
+  const clause = clauses[index];
+  if (clause.type !== 'list' || (clause.elements.length !== 2 && clause.elements.length !== 3)) {
+    throw new EvalError(`${clause.line}:${clause.col}: syntax-case clauses must have 2 or 3 parts`);
+  }
+
+  const [pattern, maybeFender, body] = clause.elements;
+  const bindings = new Map<string, MacroBinding>();
+  if (!matchPatternOnce(pattern, syntax.expr, literals, bindings)) {
+    return evalSyntaxCaseClauses(clauses, syntax, literals, env, runtime, cont, index + 1);
+  }
+
+  const definitionEnv = runtime.currentSyntaxDefinitionEnv() ?? env;
+  const bodyEnv = createSyntaxBodyEnv(bindings, env);
+  const syntaxFrameDepth = runtime.syntaxFrameDepth();
+  runtime.pushSyntaxFrame({ bindings, definitionEnv });
+
+  const finishClause = (value: Value): MachineAction => {
+    runtime.restoreSyntaxFrames(syntaxFrameDepth);
+    return cont(value);
+  };
+
+  if (body === undefined) {
+    return makeEvalAction(maybeFender, bodyEnv, finishClause);
+  }
+
+  return makeEvalAction(maybeFender, bodyEnv, (fenderValue) => {
+    if (!isTruthy(fenderValue)) {
+      runtime.restoreSyntaxFrames(syntaxFrameDepth);
+      return evalSyntaxCaseClauses(clauses, syntax, literals, env, runtime, cont, index + 1);
+    }
+
+    return makeEvalAction(body, bodyEnv, finishClause);
+  });
+}
+
+function evalWithSyntax(
+  args: Expr[],
+  head: SymbolExpr,
+  env: Environment,
+  runtime: Runtime,
+  cont: Continuation,
+): MachineAction {
+  if (args.length < 2) {
+    throw new EvalError(`${head.line}:${head.col}: with-syntax expects bindings and a body`);
+  }
+
+  if (args[0].type !== 'list') {
+    throw new EvalError(`${args[0].line}:${args[0].col}: with-syntax bindings must be a list`);
+  }
+
+  return evalWithSyntaxBindings(args[0].elements, env, runtime, (bindings) => {
+    const definitionEnv = runtime.currentSyntaxDefinitionEnv() ?? env;
+    const bodyEnv = createSyntaxBodyEnv(bindings, env);
+    const syntaxFrameDepth = runtime.syntaxFrameDepth();
+    runtime.pushSyntaxFrame({ bindings, definitionEnv });
+    return makeSequenceAction(args.slice(1), 0, bodyEnv, (value) => {
+      runtime.restoreSyntaxFrames(syntaxFrameDepth);
+      return cont(value);
+    });
+  });
+}
+
+function evalWithSyntaxBindings(
+  specs: Expr[],
+  env: Environment,
+  runtime: Runtime,
+  cont: (bindings: Map<string, MacroBinding>) => MachineAction,
+  index = 0,
+  bindings = new Map<string, MacroBinding>(),
+): MachineAction {
+  if (index >= specs.length) {
+    return cont(bindings);
+  }
+
+  const spec = specs[index];
+  if (spec.type !== 'list' || spec.elements.length !== 2) {
+    throw new EvalError(`${spec.line}:${spec.col}: with-syntax bindings must be pairs`);
+  }
+
+  const [pattern, valueExpr] = spec.elements;
+  return makeEvalAction(valueExpr, env, (value) => {
+    const syntax = expectSyntaxValue(value, valueExpr);
+    const nextBindings = cloneMacroBindings(bindings);
+    if (!matchPatternOnce(pattern, syntax.expr, new Set(), nextBindings)) {
+      throw new EvalError(`${pattern.line}:${pattern.col}: with-syntax pattern did not match`);
+    }
+
+    return evalWithSyntaxBindings(specs, env, runtime, cont, index + 1, nextBindings);
+  });
 }
 
 function evalLambda(
@@ -2784,6 +3031,85 @@ function quoteList(elements: Expr[]): Value {
   return makeList(elements.map(quoteExpr));
 }
 
+function makeSyntax(expr: Expr): SyntaxValue {
+  return {
+    kind: 'syntax',
+    expr: cloneExpr(expr),
+  };
+}
+
+function createSyntaxBodyEnv(bindings: Map<string, MacroBinding>, env: Environment): Environment {
+  const bodyEnv = new Environment(env);
+
+  for (const [name, binding] of bindings) {
+    bodyEnv.define(
+      name,
+      binding.kind === 'single'
+        ? makeSyntax(binding.expr)
+        : makeList(binding.exprs.map((expr) => makeSyntax(expr))),
+    );
+  }
+
+  return bodyEnv;
+}
+
+function parseSyntaxLiterals(
+  expr: Expr,
+  formName: string,
+): Set<string> {
+  if (expr.type !== 'list') {
+    throw new EvalError(`${expr.line}:${expr.col}: ${formName} literals must be a list`);
+  }
+
+  const literals = new Set<string>();
+  for (const literal of expr.elements) {
+    if (literal.type !== 'symbol') {
+      throw new EvalError(`${literal.line}:${literal.col}: ${formName} literals must be symbols`);
+    }
+
+    literals.add(literal.value);
+  }
+
+  return literals;
+}
+
+function datumToExpr(value: Value, loc: SourceLoc): Expr {
+  if (isNumberValue(value)) {
+    return { type: 'number', value, line: loc.line, col: loc.col };
+  }
+
+  if (typeof value === 'boolean') {
+    return { type: 'boolean', value, line: loc.line, col: loc.col };
+  }
+
+  if (isSchemeStringValue(value)) {
+    return { type: 'string', value: schemeStringText(value), line: loc.line, col: loc.col };
+  }
+
+  if (isSchemeCharValue(value)) {
+    return { type: 'char', value: value.value, line: loc.line, col: loc.col };
+  }
+
+  if (isSchemeSymbolValue(value)) {
+    return plainSymbolExpr(value.value, loc);
+  }
+
+  if (isEmptyList(value)) {
+    return { type: 'list', elements: [], line: loc.line, col: loc.col };
+  }
+
+  if (isPair(value)) {
+    return {
+      type: 'list',
+      elements: expectProperList(value, loc).map((element) => datumToExpr(element, loc)),
+      line: loc.line,
+      col: loc.col,
+    };
+  }
+
+  throw new EvalError(`${loc.line}:${loc.col}: datum->syntax expects a datum`);
+}
+
 function parseLetBindings(expr: Expr, head: SymbolExpr): LetBinding[] {
   if (expr.type !== 'list') {
     throw new EvalError(`${expr.line}:${expr.col}: let bindings must be a list`);
@@ -3079,24 +3405,19 @@ function valuesFromResult(value: Value): Value[] {
   return isMultipleValuesValue(value) ? value.values : [value];
 }
 
-function parseMacroTransformer(expr: Expr, definitionEnv: Environment): MacroTransformer {
-  if (expr.type !== 'list' || expr.elements.length < 2 || exprSymbolName(expr.elements[0]) !== 'syntax-rules') {
-    throw new EvalError(`${expr.line}:${expr.col}: define-syntax expects a syntax-rules form`);
+function parseSyntaxRulesTransformer(
+  expr: Expr,
+  definitionEnv: Environment,
+): SyntaxRulesTransformer | undefined {
+  if (expr.type !== 'list' || exprSymbolName(expr.elements[0]) !== 'syntax-rules') {
+    return undefined;
   }
 
-  const literalExpr = expr.elements[1];
-  if (literalExpr.type !== 'list') {
-    throw new EvalError(`${literalExpr.line}:${literalExpr.col}: syntax-rules literals must be a list`);
+  if (expr.elements.length < 2) {
+    throw new EvalError(`${expr.line}:${expr.col}: syntax-rules expects literals and clauses`);
   }
 
-  const literals = new Set<string>();
-  for (const literal of literalExpr.elements) {
-    if (literal.type !== 'symbol') {
-      throw new EvalError(`${literal.line}:${literal.col}: syntax-rules literals must be symbols`);
-    }
-    literals.add(literal.value);
-  }
-
+  const literals = parseSyntaxLiterals(expr.elements[1], 'syntax-rules');
   const rules: MacroRule[] = [];
   for (const ruleExpr of expr.elements.slice(2)) {
     if (ruleExpr.type !== 'list' || ruleExpr.elements.length !== 2) {
@@ -3113,10 +3434,22 @@ function parseMacroTransformer(expr: Expr, definitionEnv: Environment): MacroTra
     throw new EvalError(`${expr.line}:${expr.col}: syntax-rules requires at least one rule`);
   }
 
-  return { literals, rules, definitionEnv };
+  return { kind: 'syntax-rules', literals, rules, definitionEnv };
 }
 
 function expandMacro(transformer: MacroTransformer, invocation: Expr, runtime: Runtime): Expr {
+  if (transformer.kind === 'syntax-rules') {
+    return expandSyntaxRulesMacro(transformer, invocation, runtime);
+  }
+
+  return expandProcedureMacro(transformer, invocation, runtime);
+}
+
+function expandSyntaxRulesMacro(
+  transformer: SyntaxRulesTransformer,
+  invocation: Expr,
+  runtime: Runtime,
+): Expr {
   for (const rule of transformer.rules) {
     const bindings = matchMacroRule(rule, invocation, transformer.literals);
     if (bindings !== undefined) {
@@ -3126,6 +3459,35 @@ function expandMacro(transformer: MacroTransformer, invocation: Expr, runtime: R
   }
 
   throw new EvalError(`${invocation.line}:${invocation.col}: no matching syntax-rules clause`);
+}
+
+function expandProcedureMacro(
+  transformer: ProcedureMacroTransformer,
+  invocation: Expr,
+  runtime: Runtime,
+): Expr {
+  const syntaxFrameDepth = runtime.syntaxFrameDepth();
+  runtime.pushSyntaxFrame({
+    bindings: new Map(),
+    definitionEnv: transformer.definitionEnv,
+  });
+
+  try {
+    const result = runMachine(
+      applyProcedure(
+        transformer.procedure,
+        [{ expr: invocation, value: makeSyntax(invocation) }],
+        invocation,
+        runtime,
+        finishWithValue,
+      ),
+      runtime,
+    );
+
+    return expectSyntaxValue(result, invocation).expr;
+  } finally {
+    runtime.restoreSyntaxFrames(syntaxFrameDepth);
+  }
 }
 
 function matchMacroRule(
@@ -3215,6 +3577,9 @@ function matchPatternOnce(
     case 'char':
       return pattern.type === datum.type && pattern.value === datum.value;
     case 'symbol':
+      if (pattern.value === '_') {
+        return true;
+      }
       if (literals.has(pattern.value)) {
         return datum.type === 'symbol' && datum.value === pattern.value;
       }
@@ -3231,6 +3596,10 @@ function matchPatternRepeated(
   literals: Set<string>,
   bindings: Map<string, MacroBinding>,
 ): boolean {
+  if (pattern.type === 'symbol' && pattern.value === '_') {
+    return true;
+  }
+
   if (pattern.type === 'symbol' && !literals.has(pattern.value)) {
     return bindMacroValue(pattern.value, { kind: 'repeated', exprs: [datum] }, bindings);
   }
@@ -3243,7 +3612,7 @@ function initializeRepeatedBinding(
   literals: Set<string>,
   bindings: Map<string, MacroBinding>,
 ): boolean {
-  if (pattern.type !== 'symbol' || literals.has(pattern.value)) {
+  if (pattern.type !== 'symbol' || pattern.value === '_' || literals.has(pattern.value)) {
     return true;
   }
 
@@ -3279,16 +3648,17 @@ function bindMacroValue(
   return false;
 }
 
+function cloneMacroBinding(binding: MacroBinding): MacroBinding {
+  return binding.kind === 'single'
+    ? binding
+    : { kind: 'repeated', exprs: [...binding.exprs] };
+}
+
 function cloneMacroBindings(bindings: Map<string, MacroBinding>): Map<string, MacroBinding> {
   const cloned = new Map<string, MacroBinding>();
 
   for (const [name, binding] of bindings) {
-    cloned.set(
-      name,
-      binding.kind === 'single'
-        ? binding
-        : { kind: 'repeated', exprs: [...binding.exprs] },
-    );
+    cloned.set(name, cloneMacroBinding(binding));
   }
 
   return cloned;
@@ -3767,11 +4137,11 @@ function isEllipsis(expr: Expr): boolean {
 }
 
 function plainSymbolExpr(name: string, loc: SourceLoc): SymbolExpr {
-  return { type: 'symbol', value: name, ...loc };
+  return { type: 'symbol', value: name, line: loc.line, col: loc.col };
 }
 
 function introducedSymbolExpr(name: string, loc: SourceLoc): SymbolExpr {
-  return { type: 'symbol', value: name, introduced: true, ...loc };
+  return { type: 'symbol', value: name, introduced: true, line: loc.line, col: loc.col };
 }
 
 function cloneExpr(expr: Expr): Expr {
@@ -3800,6 +4170,7 @@ function isSpecialFormName(name: string): boolean {
     'set!',
     'if',
     'quote',
+    'syntax',
     'lambda',
     'case-lambda',
     'and',
@@ -3813,6 +4184,8 @@ function isSpecialFormName(name: string): boolean {
     'case',
     'do',
     'guard',
+    'syntax-case',
+    'with-syntax',
   ].includes(name);
 }
 
@@ -3901,6 +4274,14 @@ function expectVectorArg(arg: EvaluatedArg): VectorValue {
   return arg.value;
 }
 
+function expectSyntaxValue(value: Value, loc: SourceLoc): SyntaxValue {
+  if (!isSyntaxValue(value)) {
+    throw new EvalError(`${loc.line}:${loc.col}: expected syntax`);
+  }
+
+  return value;
+}
+
 function expectProcedureArg(arg: EvaluatedArg): ProcedureValue {
   if (!isProcedure(arg.value)) {
     throw new EvalError(`${arg.expr.line}:${arg.expr.col}: not a procedure`);
@@ -3980,6 +4361,10 @@ function isEq(left: Value, right: Value): boolean {
     return left === right;
   }
 
+  if (isSyntaxValue(left) && isSyntaxValue(right)) {
+    return left === right;
+  }
+
   if (isProcedure(left) && isProcedure(right)) {
     return left === right;
   }
@@ -4027,6 +4412,10 @@ function isEqual(left: Value, right: Value): boolean {
   if (isVectorValue(left) && isVectorValue(right)) {
     return left.elements.length === right.elements.length
       && left.elements.every((element, index) => isEqual(element, right.elements[index]));
+  }
+
+  if (isSyntaxValue(left) && isSyntaxValue(right)) {
+    return syntaxEq(left.expr, right.expr);
   }
 
   if (isProcedure(left) && isProcedure(right)) {
@@ -4082,6 +4471,10 @@ function isExactNumberValue(value: NumberValue): value is ExactNumberValue {
 
 function isProcedure(value: Value): value is ProcedureValue {
   return typeof value === 'object' && value !== null && value.kind === 'procedure';
+}
+
+function isSyntaxValue(value: Value): value is SyntaxValue {
+  return typeof value === 'object' && value !== null && value.kind === 'syntax';
 }
 
 function isBuiltinProcedure(value: ProcedureValue): value is BuiltinProcedure {
@@ -4241,6 +4634,8 @@ function formatValue(value: Value): string {
       return formatPair(value);
     case 'vector':
       return formatVector(value, formatValue);
+    case 'syntax':
+      return '#<syntax>';
     case 'record':
       return `#<record ${value.recordType.name}>`;
     case 'void':
@@ -4272,6 +4667,8 @@ function formatDisplayValue(value: Value): string {
       return formatDisplayPair(value);
     case 'vector':
       return formatVector(value, formatDisplayValue);
+    case 'syntax':
+      return '#<syntax>';
     case 'record':
       return `#<record ${value.recordType.name}>`;
     case 'void':
