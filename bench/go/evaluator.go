@@ -51,6 +51,8 @@ type pairValue struct {
 	cdr any
 }
 
+type charValue rune
+
 type emptyListValue struct{}
 
 type voidValue struct{}
@@ -98,7 +100,7 @@ func (e *env) lookup(name string) (any, bool) {
 	return nil, false
 }
 
-func newGlobalEnv() *env {
+func newGlobalEnv(output *strings.Builder) *env {
 	scope := newEnv(nil)
 	scope.define("+", builtinProc{name: "+", fn: builtinAdd})
 	scope.define("-", builtinProc{name: "-", fn: builtinSub})
@@ -159,10 +161,34 @@ func newGlobalEnv() *env {
 			return ok
 		})
 	}})
+	scope.define("display", builtinProc{name: "display", fn: func(args []any) (any, error) {
+		return builtinDisplay(args, output)
+	}})
+	scope.define("write", builtinProc{name: "write", fn: func(args []any) (any, error) {
+		return builtinWrite(args, output)
+	}})
+	scope.define("newline", builtinProc{name: "newline", fn: func(args []any) (any, error) {
+		return builtinNewline(args, output)
+	}})
+	scope.define("string-append", builtinProc{name: "string-append", fn: builtinStringAppend})
+	scope.define("string-length", builtinProc{name: "string-length", fn: builtinStringLength})
+	scope.define("substring", builtinProc{name: "substring", fn: builtinSubstring})
+	scope.define("string->number", builtinProc{name: "string->number", fn: builtinStringToNumber})
+	scope.define("number->string", builtinProc{name: "number->string", fn: builtinNumberToString})
+	scope.define("symbol->string", builtinProc{name: "symbol->string", fn: builtinSymbolToString})
+	scope.define("string->symbol", builtinProc{name: "string->symbol", fn: builtinStringToSymbol})
+	scope.define("string-ref", builtinProc{name: "string-ref", fn: builtinStringRef})
+	scope.define("char?", builtinProc{name: "char?", fn: func(args []any) (any, error) {
+		return builtinPredicate("char?", args, func(value any) bool {
+			_, ok := value.(charValue)
+			return ok
+		})
+	}})
 	return scope
 }
 
 func evalStrInternal(input string) (any, string, error) {
+	var output strings.Builder
 	p := parser{input: input}
 	exprs, err := p.parseProgram()
 	if err != nil {
@@ -172,16 +198,16 @@ func evalStrInternal(input string) (any, string, error) {
 		return nil, "", sourcePos{line: 1, col: 1}.errorf("empty input")
 	}
 
-	scope := newGlobalEnv()
+	scope := newGlobalEnv(&output)
 	result := any(voidValue{})
 	for _, expr := range exprs {
 		result, err = eval(scope, expr)
 		if err != nil {
-			return nil, "", err
+			return nil, output.String(), err
 		}
 	}
 
-	return result, "", nil
+	return result, output.String(), nil
 }
 
 func (p *parser) parseProgram() ([]any, error) {
@@ -962,12 +988,188 @@ func builtinAppend(args []any) (any, error) {
 	return result, nil
 }
 
+func builtinDisplay(args []any, output *strings.Builder) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "display expects exactly 1 argument"}
+	}
+	writeOutput(output, formatDisplayValue(args[0]))
+	return voidValue{}, nil
+}
+
+func builtinWrite(args []any, output *strings.Builder) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "write expects exactly 1 argument"}
+	}
+	writeOutput(output, formatValue(args[0]))
+	return voidValue{}, nil
+}
+
+func builtinNewline(args []any, output *strings.Builder) (any, error) {
+	if len(args) != 0 {
+		return nil, &EvalError{Message: "newline expects exactly 0 arguments"}
+	}
+	writeOutput(output, "\n")
+	return voidValue{}, nil
+}
+
+func builtinStringAppend(args []any) (any, error) {
+	var b strings.Builder
+	for _, arg := range args {
+		s, err := expectString(arg)
+		if err != nil {
+			return nil, err
+		}
+		b.WriteString(s)
+	}
+	return b.String(), nil
+}
+
+func builtinStringLength(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string-length expects exactly 1 argument"}
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+	return int64(len([]rune(s))), nil
+}
+
+func builtinSubstring(args []any) (any, error) {
+	if len(args) != 3 {
+		return nil, &EvalError{Message: "substring expects exactly 3 arguments"}
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	start, err := expectNonNegativeIndex(args[1], "substring")
+	if err != nil {
+		return nil, err
+	}
+	end, err := expectNonNegativeIndex(args[2], "substring")
+	if err != nil {
+		return nil, err
+	}
+
+	runes := []rune(s)
+	if start > end || end > int64(len(runes)) {
+		return nil, &EvalError{Message: "substring index out of range"}
+	}
+	return string(runes[start:end]), nil
+}
+
+func builtinStringToNumber(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string->number expects exactly 1 argument"}
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	n, parseErr := strconv.ParseInt(s, 10, 64)
+	if parseErr != nil {
+		return false, nil
+	}
+	return n, nil
+}
+
+func builtinNumberToString(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "number->string expects exactly 1 argument"}
+	}
+
+	n, err := expectInt(args[0])
+	if err != nil {
+		return nil, err
+	}
+	return strconv.FormatInt(n, 10), nil
+}
+
+func builtinSymbolToString(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "symbol->string expects exactly 1 argument"}
+	}
+
+	symbol, err := expectSymbol(args[0])
+	if err != nil {
+		return nil, err
+	}
+	return symbol.name, nil
+}
+
+func builtinStringToSymbol(args []any) (any, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "string->symbol expects exactly 1 argument"}
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+	return symbolExpr{name: s}, nil
+}
+
+func builtinStringRef(args []any) (any, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "string-ref expects exactly 2 arguments"}
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	index, err := expectNonNegativeIndex(args[1], "string-ref")
+	if err != nil {
+		return nil, err
+	}
+
+	runes := []rune(s)
+	if index >= int64(len(runes)) {
+		return nil, &EvalError{Message: "string-ref index out of range"}
+	}
+	return charValue(runes[index]), nil
+}
+
 func expectInt(value any) (int64, error) {
 	n, ok := value.(int64)
 	if !ok {
 		return 0, &EvalError{Message: fmt.Sprintf("expected number, got %s", typeName(value))}
 	}
 	return n, nil
+}
+
+func expectString(value any) (string, error) {
+	s, ok := value.(string)
+	if !ok {
+		return "", &EvalError{Message: fmt.Sprintf("expected string, got %s", typeName(value))}
+	}
+	return s, nil
+}
+
+func expectSymbol(value any) (symbolExpr, error) {
+	symbol, ok := value.(symbolExpr)
+	if !ok {
+		return symbolExpr{}, &EvalError{Message: fmt.Sprintf("expected symbol, got %s", typeName(value))}
+	}
+	return symbol, nil
+}
+
+func expectNonNegativeIndex(value any, builtinName string) (int64, error) {
+	index, err := expectInt(value)
+	if err != nil {
+		return 0, err
+	}
+	if index < 0 {
+		return 0, &EvalError{Message: fmt.Sprintf("%s expects a non-negative index", builtinName)}
+	}
+	return index, nil
 }
 
 func quoteDatum(expr any) any {
@@ -1028,6 +1230,8 @@ func typeName(value any) string {
 		return "number"
 	case bool:
 		return "boolean"
+	case charValue:
+		return "char"
 	case string:
 		return "string"
 	case symbolExpr:
@@ -1060,6 +1264,8 @@ func formatValue(value any) string {
 		return "#f"
 	case string:
 		return strconv.Quote(v)
+	case charValue:
+		return formatChar(v)
 	case symbolExpr:
 		return v.name
 	case emptyListValue:
@@ -1079,6 +1285,35 @@ func formatValue(value any) string {
 	default:
 		return ""
 	}
+}
+
+func formatDisplayValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case charValue:
+		return string(rune(v))
+	default:
+		return formatValue(value)
+	}
+}
+
+func formatChar(value charValue) string {
+	switch rune(value) {
+	case ' ':
+		return "#\\space"
+	case '\n':
+		return "#\\newline"
+	default:
+		return "#\\" + string(rune(value))
+	}
+}
+
+func writeOutput(output *strings.Builder, text string) {
+	if output == nil {
+		return
+	}
+	output.WriteString(text)
 }
 
 func formatPairValue(pair pairValue) string {
