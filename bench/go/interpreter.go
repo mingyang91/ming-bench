@@ -112,19 +112,27 @@ func (p *builtinProcedure) Call(i *interpreter, args []any, pos position) (any, 
 }
 
 type lambdaProcedure struct {
-	params []string
-	body   []expr
-	env    *environment
+	params   []string
+	restName string
+	hasRest  bool
+	body     []expr
+	env      *environment
 }
 
 func (p *lambdaProcedure) Call(i *interpreter, args []any, pos position) (any, error) {
-	if len(args) != len(p.params) {
+	if !p.hasRest && len(args) != len(p.params) {
 		return nil, newEvalError(pos, "wrong number of arguments: expected %d, got %d", len(p.params), len(args))
+	}
+	if p.hasRest && len(args) < len(p.params) {
+		return nil, newEvalError(pos, "wrong number of arguments: expected at least %d, got %d", len(p.params), len(args))
 	}
 
 	callEnv := newEnvironment(p.env)
 	for index, name := range p.params {
 		callEnv.define(name, args[index])
+	}
+	if p.hasRest {
+		callEnv.define(p.restName, buildList(args[len(p.params):]))
 	}
 
 	return i.evalSequence(p.body, callEnv)
@@ -200,6 +208,7 @@ func installBuiltins(env *environment) {
 		"+", "-", "*", "/", "<", ">", "=", "<=", "not",
 		"cons", "car", "cdr", "null?", "list", "length", "append",
 		"string?", "number?", "boolean?", "pair?", "symbol?",
+		"apply",
 		"display", "write", "newline",
 		"string-append", "string-length", "substring",
 		"string->number", "number->string",
@@ -427,9 +436,11 @@ func (i *interpreter) evalDefine(args []expr, pos position, env *environment) (a
 		}
 
 		procedure := &lambdaProcedure{
-			params: params,
-			body:   args[1:],
-			env:    env,
+			params:   params.required,
+			restName: params.restName,
+			hasRest:  params.hasRest,
+			body:     args[1:],
+			env:      env,
 		}
 		env.define(name.value, procedure)
 		return voidValue{}, nil
@@ -535,26 +546,29 @@ func (i *interpreter) evalLambda(args []expr, pos position, env *environment) (a
 		return nil, newEvalError(pos, "lambda expects parameters and a body")
 	}
 
-	paramsExpr, ok := args[0].(*listExpr)
-	if !ok {
-		return nil, newEvalError(args[0].exprPos(), "lambda parameters must be a list")
-	}
-
-	params, err := parseParameterExprs(paramsExpr.elements)
+	params, err := parseLambdaParameters(args[0])
 	if err != nil {
 		return nil, err
 	}
 
 	return &lambdaProcedure{
-		params: params,
-		body:   args[1:],
-		env:    env,
+		params:   params.required,
+		restName: params.restName,
+		hasRest:  params.hasRest,
+		body:     args[1:],
+		env:      env,
 	}, nil
 }
 
 type letBinding struct {
 	name      string
 	valueExpr expr
+}
+
+type parameterSpec struct {
+	required []string
+	restName string
+	hasRest  bool
 }
 
 func parseLetBindings(expression expr) ([]letBinding, error) {
@@ -584,16 +598,57 @@ func parseLetBindings(expression expr) ([]letBinding, error) {
 	return bindings, nil
 }
 
-func parseParameterExprs(expressions []expr) ([]string, error) {
-	params := make([]string, 0, len(expressions))
-	for _, expression := range expressions {
+func parseLambdaParameters(expression expr) (parameterSpec, error) {
+	switch params := expression.(type) {
+	case *listExpr:
+		return parseParameterExprs(params.elements)
+	case *symbolExpr:
+		return parameterSpec{
+			restName: params.value,
+			hasRest:  true,
+		}, nil
+	default:
+		return parameterSpec{}, newEvalError(expression.exprPos(), "lambda parameters must be a list or symbol")
+	}
+}
+
+func parseParameterExprs(expressions []expr) (parameterSpec, error) {
+	spec := parameterSpec{
+		required: make([]string, 0, len(expressions)),
+	}
+	sawDot := false
+
+	for index, expression := range expressions {
 		symbol, ok := expression.(*symbolExpr)
 		if !ok {
-			return nil, newEvalError(expression.exprPos(), "parameter name must be a symbol")
+			return parameterSpec{}, newEvalError(expression.exprPos(), "parameter name must be a symbol")
 		}
-		params = append(params, symbol.value)
+
+		if symbol.value == "." {
+			if sawDot || index == len(expressions)-1 {
+				return parameterSpec{}, newEvalError(symbol.pos, "invalid dotted parameter list")
+			}
+			sawDot = true
+			continue
+		}
+
+		if sawDot {
+			if index != len(expressions)-1 {
+				return parameterSpec{}, newEvalError(expression.exprPos(), "invalid dotted parameter list")
+			}
+			spec.restName = symbol.value
+			spec.hasRest = true
+			continue
+		}
+
+		spec.required = append(spec.required, symbol.value)
 	}
-	return params, nil
+
+	if sawDot && !spec.hasRest {
+		return parameterSpec{}, newEvalError(expressions[len(expressions)-1].exprPos(), "invalid dotted parameter list")
+	}
+
+	return spec, nil
 }
 
 func datumFromExpr(expression expr) (any, error) {
@@ -637,6 +692,19 @@ func applyProcedure(i *interpreter, operator any, args []any, pos position) (any
 
 func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, error) {
 	switch name {
+	case "apply":
+		if len(args) < 2 {
+			return nil, newEvalError(pos, "%s expects at least 2 arguments", name)
+		}
+		listArgs, err := listElements(args[len(args)-1], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		callArgs := make([]any, 0, len(args)-2+len(listArgs))
+		callArgs = append(callArgs, args[1:len(args)-1]...)
+		callArgs = append(callArgs, listArgs...)
+		return applyProcedure(i, args[0], callArgs, pos)
+
 	case "+":
 		total := 0
 		for _, arg := range args {
