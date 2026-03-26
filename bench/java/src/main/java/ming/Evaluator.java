@@ -58,6 +58,8 @@ public class Evaluator {
         globalEnv.define("call-with-current-continuation", new BuiltinProcedure("call/cc"));
         globalEnv.define("raise", new BuiltinProcedure("raise"));
         globalEnv.define("with-exception-handler", new BuiltinProcedure("with-exception-handler"));
+        globalEnv.define("values", new BuiltinProcedure("values"));
+        globalEnv.define("call-with-values", new BuiltinProcedure("call-with-values"));
     }
 
     private final SchemeReader reader = new SchemeReader();
@@ -979,6 +981,23 @@ public class Evaluator {
             case "with-exception-handler" -> {
                 if (args.size() != 2) throw new EvalError("with-exception-handler: expected 2 arguments");
                 yield evalWithExceptionHandler(args.get(0), args.get(1));
+            }
+            case "values" -> {
+                if (args.size() == 1) yield args.get(0);
+                yield new SchemeValues(new ArrayList<>(args));
+            }
+            case "call-with-values" -> {
+                if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+                Object producer = args.get(0);
+                Object consumer = args.get(1);
+                Object produced = trampoline(apply(producer, List.of()));
+                List<Object> consumerArgs;
+                if (produced instanceof SchemeValues sv) {
+                    consumerArgs = sv.values();
+                } else {
+                    consumerArgs = List.of(produced);
+                }
+                yield trampoline(apply(consumer, consumerArgs));
             }
             case "+", "-", "*", "/", "abs", "modulo", "remainder", "quotient",
                  "min", "max", "expt", "zero?", "positive?", "negative?", "odd?", "even?",
