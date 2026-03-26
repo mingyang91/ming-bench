@@ -45,9 +45,14 @@ public class Evaluator {
         outputBuffer = captureOutput ? new StringBuilder() : null;
         try {
             Environment environment = createTopLevelEnvironment();
-            SchemeValue result = runWithContinuations(
-                    () -> evalSequenceToValue(expressions, 0, environment, VoidValue.INSTANCE)
-            );
+            SchemeValue result;
+            try {
+                result = runWithContinuations(
+                        () -> evalSequenceToValue(expressions, 0, environment, VoidValue.INSTANCE)
+                );
+            } catch (RaisedException raised) {
+                throw new EvalError("uncaught exception: " + raised.value().render());
+            }
             String output = outputBuffer == null ? "" : outputBuffer.toString();
             return new EvalResult(result.render(), output);
         } finally {
@@ -247,6 +252,9 @@ public class Evaluator {
             if ("case-lambda".equals(name)) {
                 return TailStep.done(evalCaseLambda(elements, environment));
             }
+            if ("guard".equals(name)) {
+                return TailStep.done(evalGuard(elements, environment));
+            }
             if ("do".equals(name)) {
                 return TailStep.done(evalDo(elements, environment));
             }
@@ -320,6 +328,9 @@ public class Evaluator {
             if ("case-lambda".equals(name)) {
                 return evalCaseLambda(elements, environment);
             }
+            if ("guard".equals(name)) {
+                return evalGuard(elements, environment);
+            }
             if ("do".equals(name)) {
                 return evalDo(elements, environment);
             }
@@ -331,6 +342,34 @@ public class Evaluator {
         }
 
         return evalApplication(elements, environment);
+    }
+
+    private SchemeValue evalGuard(List<SchemeExpression> elements, Environment environment) throws EvalError {
+        if (elements.size() < 3) {
+            throw new EvalError("guard: expected clauses and body");
+        }
+        if (!(elements.get(1) instanceof ListExpression guardExpression)) {
+            throw new EvalError("guard: expected exception variable and clauses");
+        }
+
+        List<SchemeExpression> guardElements = guardExpression.elements();
+        if (guardElements.isEmpty()) {
+            throw new EvalError("guard: expected exception variable");
+        }
+        if (!(guardElements.getFirst() instanceof SymbolExpression exceptionVariable)) {
+            throw new EvalError("guard: expected exception variable");
+        }
+
+        try {
+            return evalSequence(elements.subList(2, elements.size()), environment);
+        } catch (RaisedException raised) {
+            return evalGuardClauses(
+                    exceptionVariable.name(),
+                    guardElements.subList(1, guardElements.size()),
+                    environment,
+                    raised.value()
+            );
+        }
     }
 
     private SchemeValue evalAnd(List<SchemeExpression> expressions, Environment environment) throws EvalError {
@@ -661,6 +700,9 @@ public class Evaluator {
         builtins.put("call/cc", callWithCurrentContinuation);
         builtins.put("call-with-current-continuation", callWithCurrentContinuation);
         builtins.put("dynamic-wind", new BuiltinProcedure("dynamic-wind", this::applyDynamicWind));
+        builtins.put("raise", new BuiltinProcedure("raise", Evaluator::applyRaise));
+        builtins.put("with-exception-handler",
+                new BuiltinProcedure("with-exception-handler", this::applyWithExceptionHandler));
         builtins.put("string-append", new BuiltinProcedure("string-append", Evaluator::applyStringAppend));
         builtins.put("make-string", new BuiltinProcedure("make-string", Evaluator::applyMakeString));
         builtins.put("string", new BuiltinProcedure("string", Evaluator::applyString));
@@ -1190,6 +1232,39 @@ public class Evaluator {
             return defaultValue;
         }
         return evalSequence(expressions, environment);
+    }
+
+    private SchemeValue evalGuardClauses(
+            String exceptionVariable,
+            List<SchemeExpression> clauses,
+            Environment environment,
+            SchemeValue exceptionValue
+    ) throws EvalError {
+        Environment guardEnvironment = new Environment(environment);
+        guardEnvironment.define(exceptionVariable, exceptionValue);
+
+        for (int index = 0; index < clauses.size(); index++) {
+            if (!(clauses.get(index) instanceof ListExpression clauseExpression)) {
+                throw new EvalError("guard: expected clause");
+            }
+
+            List<SchemeExpression> clause = clauseExpression.elements();
+            if (clause.isEmpty()) {
+                throw new EvalError("guard: expected non-empty clause");
+            }
+
+            SchemeExpression testExpression = clause.getFirst();
+            if (testExpression instanceof SymbolExpression symbol && "else".equals(symbol.name())) {
+                return evalClauseBody(clause.subList(1, clause.size()), guardEnvironment, BoolValue.TRUE);
+            }
+
+            SchemeValue testValue = evalNonTail(testExpression, guardEnvironment);
+            if (isTruthy(testValue)) {
+                return evalClauseBody(clause.subList(1, clause.size()), guardEnvironment, testValue);
+            }
+        }
+
+        throw new RaisedException(exceptionValue);
     }
 
     private TailStep evalAndTail(List<SchemeExpression> expressions, Environment environment) throws EvalError {
@@ -1903,6 +1978,21 @@ public class Evaluator {
         );
     }
 
+    private static SchemeValue applyRaise(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 1, "raise");
+        throw new RaisedException(arguments.getFirst());
+    }
+
+    private SchemeValue applyWithExceptionHandler(List<SchemeValue> arguments) throws EvalError {
+        requireArgumentCount(arguments, 2, "with-exception-handler");
+
+        try {
+            return applyThunk(arguments.get(1));
+        } catch (RaisedException raised) {
+            return applyProcedure(arguments.get(0), List.of(raised.value()));
+        }
+    }
+
     private SchemeValue applyDynamicWind(List<SchemeValue> arguments) throws EvalError {
         requireArgumentCount(arguments, 3, "dynamic-wind");
 
@@ -1931,6 +2021,10 @@ public class Evaluator {
                 throw outError;
             }
             throw error;
+        } catch (RaisedException raised) {
+            popWind(wind);
+            applyThunk(outThunk);
+            throw raised;
         } catch (ContinuationJump jump) {
             popWind(wind);
             throw jump;
@@ -2920,6 +3014,19 @@ public class Evaluator {
 
         private List<WindFrame> targetWinds() {
             return targetWinds;
+        }
+    }
+
+    private static final class RaisedException extends RuntimeException {
+        private final SchemeValue value;
+
+        private RaisedException(SchemeValue value) {
+            super(null, null, false, false);
+            this.value = value;
+        }
+
+        private SchemeValue value() {
+            return value;
         }
     }
 
