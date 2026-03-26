@@ -1241,7 +1241,7 @@ public class Evaluator {
                 }
             }
             if (proc instanceof SchemeCont sc) {
-                Object value = args.isEmpty() ? null : args.get(0);
+                Object value = args.isEmpty() ? null : args.size() == 1 ? args.get(0) : new SchemeValues(args);
                 return performWindTransition(sc.capturedWind, value, v -> {
                     if (trampolineDepth > 1) throw new ContinuationInvoked(sc.k, v);
                     return new BounceApplyK(sc.k, v);
@@ -1327,7 +1327,7 @@ public class Evaluator {
                 return result;
             }
             if (proc instanceof SchemeCont sc) {
-                Object value = args.isEmpty() ? null : args.get(0);
+                Object value = args.isEmpty() ? null : args.size() == 1 ? args.get(0) : new SchemeValues(args);
                 throw new ContinuationInvoked(sc.k, value);
             }
             if (proc instanceof CallccProc) {
