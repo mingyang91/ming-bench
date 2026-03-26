@@ -6,6 +6,7 @@ import java.util.List;
 public class Evaluator {
 
     private final Environment globalEnv = new Environment(null);
+    private StringBuilder outputBuffer = null;
 
     // Source position tracking
     private record Token(String value, int line, int col) {}
@@ -30,8 +31,22 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        String result = evalStr(input);
-        return new EvalResult(result, "");
+        outputBuffer = new StringBuilder();
+        try {
+            List<Token> tokens = tokenize(input);
+            int[] pos = {0};
+            Object lastResult = null;
+            while (pos[0] < tokens.size()) {
+                Object expr = parse(tokens, pos);
+                lastResult = eval(expr, globalEnv);
+            }
+            if (lastResult == null) {
+                throw new EvalError("no expression");
+            }
+            return new EvalResult(schemeToString(lastResult), outputBuffer.toString());
+        } finally {
+            outputBuffer = null;
+        }
     }
 
     // --- Tokenizer ---
@@ -420,7 +435,11 @@ public class Evaluator {
                     case "+", "-", "*", "/", "<", ">", "=", "<=", ">=",
                          "not",
                          "cons", "car", "cdr", "null?", "list", "length", "append",
-                         "number?", "string?", "boolean?", "pair?", "symbol?" -> {
+                         "number?", "string?", "boolean?", "pair?", "symbol?", "char?",
+                         "display", "write", "newline",
+                         "string-append", "string-length", "substring", "string-ref",
+                         "string->number", "number->string",
+                         "symbol->string", "string->symbol" -> {
                         return evalBuiltin(name, args, env);
                     }
                     default -> {
@@ -610,6 +629,85 @@ public class Evaluator {
                 requireArgCount(name, args, 1);
                 return eval(args.get(0), env) instanceof SchemeSymbol;
             }
+            case "char?" -> {
+                requireArgCount(name, args, 1);
+                return eval(args.get(0), env) instanceof SchemeChar;
+            }
+            case "display" -> {
+                requireArgCount(name, args, 1);
+                Object val = eval(args.get(0), env);
+                if (outputBuffer != null) {
+                    outputBuffer.append(displayString(val));
+                }
+                return VOID;
+            }
+            case "write" -> {
+                requireArgCount(name, args, 1);
+                Object val = eval(args.get(0), env);
+                if (outputBuffer != null) {
+                    outputBuffer.append(schemeToString(val));
+                }
+                return VOID;
+            }
+            case "newline" -> {
+                if (outputBuffer != null) {
+                    outputBuffer.append("\n");
+                }
+                return VOID;
+            }
+            case "string-append" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object arg : args) {
+                    Object val = eval(arg, env);
+                    sb.append(requireString(val));
+                }
+                return "\"" + sb + "\"";
+            }
+            case "string-length" -> {
+                requireArgCount(name, args, 1);
+                String s = requireString(eval(args.get(0), env));
+                return (long) s.length();
+            }
+            case "substring" -> {
+                if (args.size() < 2 || args.size() > 3)
+                    throw new EvalError("substring: expected 2 or 3 arguments");
+                String s = requireString(eval(args.get(0), env));
+                int start = (int) requireLong(eval(args.get(1), env));
+                int end = args.size() == 3 ? (int) requireLong(eval(args.get(2), env)) : s.length();
+                return "\"" + s.substring(start, end) + "\"";
+            }
+            case "string-ref" -> {
+                requireArgCount(name, args, 2);
+                String s = requireString(eval(args.get(0), env));
+                int idx = (int) requireLong(eval(args.get(1), env));
+                return new SchemeChar(s.charAt(idx));
+            }
+            case "string->number" -> {
+                requireArgCount(name, args, 1);
+                String s = requireString(eval(args.get(0), env));
+                try {
+                    return Long.parseLong(s);
+                } catch (NumberFormatException e) {
+                    return Boolean.FALSE;
+                }
+            }
+            case "number->string" -> {
+                requireArgCount(name, args, 1);
+                long n = requireLong(eval(args.get(0), env));
+                return "\"" + n + "\"";
+            }
+            case "symbol->string" -> {
+                requireArgCount(name, args, 1);
+                Object val = eval(args.get(0), env);
+                if (!(val instanceof SchemeSymbol sym))
+                    throw new EvalError("symbol->string: not a symbol");
+                return "\"" + sym.name() + "\"";
+            }
+            case "string->symbol" -> {
+                requireArgCount(name, args, 1);
+                String s = requireString(eval(args.get(0), env));
+                return new SchemeSymbol(s);
+            }
             default -> throw new EvalError("unknown procedure: " + name);
         }
     }
@@ -617,6 +715,27 @@ public class Evaluator {
     private long requireLong(Object val) throws EvalError {
         if (val instanceof Long l) return l;
         throw new EvalError("expected number, got: " + schemeToString(val));
+    }
+
+    private String requireString(Object val) throws EvalError {
+        if (val instanceof String s) {
+            if (s.startsWith("\"") && s.endsWith("\"")) {
+                return s.substring(1, s.length() - 1);
+            }
+            return s;
+        }
+        throw new EvalError("expected string, got: " + schemeToString(val));
+    }
+
+    /** display format: strings without quotes, everything else like schemeToString */
+    private String displayString(Object val) {
+        if (val instanceof String s) {
+            if (s.startsWith("\"") && s.endsWith("\"")) {
+                return s.substring(1, s.length() - 1);
+            }
+            return s;
+        }
+        return schemeToString(val);
     }
 
     private void requireArgCount(String name, List<?> args, int expected) throws EvalError {
@@ -631,6 +750,7 @@ public class Evaluator {
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof String s) return s;
         if (val instanceof SchemeSymbol sym) return sym.name();
+        if (val instanceof SchemeChar ch) return "#\\" + ch.value();
         if (val instanceof SchemeNil) return "()";
         if (val instanceof SchemePair p) {
             StringBuilder sb = new StringBuilder("(");
