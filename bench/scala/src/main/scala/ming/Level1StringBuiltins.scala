@@ -11,6 +11,8 @@ private[ming] object Level1StringBuiltins:
     "newline"          -> BuiltinValue("newline", newline),
     "string-copy"      -> BuiltinValue("string-copy", stringCopy),
     "string-set!"      -> BuiltinValue("string-set!", stringSet),
+    "string->list"     -> BuiltinValue("string->list", stringToList),
+    "list->string"     -> BuiltinValue("list->string", listToString),
     "string-append"    -> BuiltinValue("string-append", stringAppend),
     "string-length"    -> BuiltinValue("string-length", stringLength),
     "substring"        -> BuiltinValue("substring", substring),
@@ -24,6 +26,8 @@ private[ming] object Level1StringBuiltins:
     "string-ci=?"      -> BuiltinValue("string-ci=?", stringCiEqual),
     "string-upcase"    -> BuiltinValue("string-upcase", stringUpcase),
     "string-downcase"  -> BuiltinValue("string-downcase", stringDowncase),
+    "char->integer"    -> BuiltinValue("char->integer", charToInteger),
+    "integer->char"    -> BuiltinValue("integer->char", integerToChar),
     "char-alphabetic?" -> BuiltinValue("char-alphabetic?", unaryCharPredicate("char-alphabetic?")(_.isLetter)),
     "char-numeric?"    -> BuiltinValue("char-numeric?", unaryCharPredicate("char-numeric?")(_.isDigit)),
     "char-upcase"      -> BuiltinValue("char-upcase", charUpcase),
@@ -49,20 +53,34 @@ private[ming] object Level1StringBuiltins:
 
   private def stringCopy(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "string-copy", position)
-    MutableStringValue(expectString(value, "string-copy", position))
+    val text  = expectString(value, "string-copy", position)
+    if BenchRuntime.stringsAreImmutable then StringValue(text)
+    else MutableStringValue(text)
 
   private def stringSet(arguments: List[Value], position: Position): Value =
     expectExact(arguments, 3, "string-set!", position) match
       case stringValue :: indexValue :: charValue :: Nil =>
-        val mutableString = expectMutableString(stringValue, "string-set!", position)
-        val index         = expectIndex(indexValue, "string-set!", position)
-        val char          = expectChar(charValue, "string-set!", position)
-        if index >= mutableString.text.length then SchemeFailure.raise("string-set! index out of bounds", position)
+        if BenchRuntime.stringsAreImmutable then
+          expectString(stringValue, "string-set!", position)
+          SchemeFailure.raise("string-set! cannot mutate immutable strings", position)
+        else
+          val mutableString = expectMutableString(stringValue, "string-set!", position)
+          val index         = expectIndex(indexValue, "string-set!", position)
+          val char          = expectChar(charValue, "string-set!", position)
+          if index >= mutableString.text.length then SchemeFailure.raise("string-set! index out of bounds", position)
 
-        mutableString.update(index, char)
-        VoidValue
+          mutableString.update(index, char)
+          VoidValue
       case _ =>
         throw new IllegalStateException("validated three-argument list")
+
+  private def stringToList(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "string->list", position)
+    buildList(expectString(value, "string->list", position).toList.map(CharValue(_)))
+
+  private def listToString(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "list->string", position)
+    StringValue(expectProperList(value, "list->string", position).map(expectChar(_, "list->string", position)).mkString)
 
   private def stringAppend(arguments: List[Value], position: Position): Value =
     StringValue(arguments.map(expectString(_, "string-append", position)).mkString)
@@ -122,6 +140,18 @@ private[ming] object Level1StringBuiltins:
   private def stringDowncase(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "string-downcase", position)
     StringValue(expectString(value, "string-downcase", position).toLowerCase(Locale.ROOT))
+
+  private def charToInteger(arguments: List[Value], position: Position): Value =
+    val value = expectSingleArgument(arguments, "char->integer", position)
+    IntValue(expectChar(value, "char->integer", position).toInt)
+
+  private def integerToChar(arguments: List[Value], position: Position): Value =
+    val value    = expectSingleArgument(arguments, "integer->char", position)
+    val codeUnit = expectInteger(value, "integer->char", position)
+    if codeUnit < Char.MinValue.toInt || codeUnit > Char.MaxValue.toInt then
+      SchemeFailure.raise("integer->char expected a valid character code", position)
+
+    CharValue(codeUnit.toInt.toChar)
 
   private def charUpcase(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "char-upcase", position)

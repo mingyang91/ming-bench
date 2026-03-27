@@ -24,6 +24,7 @@ object TestRunner:
     val benchLevel = levelArg match
       case "all" => 0
       case s     => s.toIntOption.getOrElse(0)
+    System.setProperty("bench.level", benchLevel.toString)
 
     val testsJsonPath = Path.of(
       Option(System.getenv("TESTS_JSON")).getOrElse("../tests.json")

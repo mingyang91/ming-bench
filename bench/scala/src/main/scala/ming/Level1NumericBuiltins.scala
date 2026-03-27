@@ -16,6 +16,7 @@ private[ming] object Level1NumericBuiltins:
     ">"              -> BuiltinValue(">", compareNumbers(">")(_ > 0)),
     "="              -> BuiltinValue("=", compareNumbers("=")(_ == 0)),
     "<="             -> BuiltinValue("<=", compareNumbers("<=")(_ <= 0)),
+    ">="             -> BuiltinValue(">=", compareNumbers(">=")(_ >= 0)),
     "abs"            -> BuiltinValue("abs", abs),
     "modulo"         -> BuiltinValue("modulo", modulo),
     "remainder"      -> BuiltinValue("remainder", remainder),
