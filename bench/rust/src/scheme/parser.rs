@@ -42,6 +42,22 @@ impl<'a> Parser<'a> {
         self.skip_ignored();
         let pos = self.current_position();
 
+        if self.input[self.pos..].starts_with("#'") {
+            self.bump_char();
+            self.bump_char();
+            let quoted = self.parse_expr()?;
+            return Ok(Expr::List {
+                items: vec![
+                    Expr::Symbol {
+                        name: "syntax".to_string(),
+                        pos,
+                    },
+                    quoted,
+                ],
+                pos,
+            });
+        }
+
         match self.peek_char() {
             Some('(') => self.parse_list(),
             Some('\'') => {

@@ -11,6 +11,7 @@ use runtime::*;
 use text::SchemeString;
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -167,7 +168,7 @@ fn eval_list_machine(
                 cont,
             }),
             "define-syntax" => Ok(MachineState::Return {
-                value: with_position(macros::define_syntax(args, env), head_pos)?,
+                value: with_position(macros::define_syntax(args, env, output), head_pos)?,
                 cont,
             }),
             "set!" => eval_set_machine(args, head_pos, env, cont),
@@ -1563,8 +1564,8 @@ fn eval_tail_named_head(
         "let*" => eval_tail_let_star(args, head_pos, env, output),
         "letrec" => eval_tail_letrec(args, head_pos, env, output, LetrecMode::Parallel),
         "letrec*" => eval_tail_letrec(args, head_pos, env, output, LetrecMode::Sequential),
-        "lambda" | "case-lambda" | "define" | "define-record-type" | "define-syntax" | "set!"
-        | "do" => with_position(
+        "lambda" | "case-lambda" | "define" | "define-record-type" | "define-syntax"
+        | "syntax" | "syntax-case" | "with-syntax" | "set!" | "do" => with_position(
             eval_list(items, env, output).map(TailEvalResult::Value),
             list_pos,
         ),
@@ -2029,6 +2030,15 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
         Expr::Symbol { name, .. } if name == "case-lambda" => {
             with_position(eval_case_lambda(args, env), head_pos)
         }
+        Expr::Symbol { name, .. } if name == "syntax" => {
+            with_position(eval_syntax(args, env), head_pos)
+        }
+        Expr::Symbol { name, .. } if name == "syntax-case" => {
+            with_position(eval_syntax_case(args, head_pos, env, output), head_pos)
+        }
+        Expr::Symbol { name, .. } if name == "with-syntax" => {
+            with_position(eval_with_syntax(args, head_pos, env, output), head_pos)
+        }
         Expr::Symbol { name, .. } if name == "define" => {
             with_position(eval_define(args, env, output), head_pos)
         }
@@ -2036,7 +2046,7 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
             with_position(eval_define_record_type(args, env), head_pos)
         }
         Expr::Symbol { name, .. } if name == "define-syntax" => {
-            with_position(macros::define_syntax(args, env), head_pos)
+            with_position(macros::define_syntax(args, env, output), head_pos)
         }
         Expr::Symbol { name, .. } if name == "set!" => {
             with_position(eval_set(args, env, output), head_pos)
@@ -2128,6 +2138,218 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     };
 
     Ok(builtins::quote_expr(quoted))
+}
+
+fn eval_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let [template] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "syntax",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let expr = if let Some(context) = env.syntax_context() {
+        let mut context = context.borrow_mut();
+        with_position(macros::expand_syntax_template(template, &mut context), template.pos())?
+    } else {
+        template.clone()
+    };
+
+    Ok(Value::Syntax(Rc::new(SyntaxObject { expr })))
+}
+
+fn eval_syntax_case(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [input_expr, literals_expr, clauses @ ..] = args else {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name: "syntax-case",
+            min: 3,
+            got: args.len(),
+        }
+        .with_position(head_pos.line, head_pos.col));
+    };
+
+    let input = eval_single(input_expr, env.clone(), output)?;
+    let syntax = input
+        .as_syntax()
+        .map_err(|error| error.with_position(input_expr.pos().line, input_expr.pos().col))?;
+    let literals =
+        with_position(macros::parse_syntax_rule_literals(literals_expr), literals_expr.pos())?;
+
+    for clause in clauses {
+        let Expr::List {
+            items: clause_items,
+            pos: clause_pos,
+        } = clause
+        else {
+            return Err(EvalError::ParseError {
+                message: "syntax-case clauses must be lists".to_string(),
+            }
+            .with_position(head_pos.line, head_pos.col));
+        };
+
+        let Some((pattern, rest)) = clause_items.split_first() else {
+            return Err(EvalError::ParseError {
+                message: "syntax-case clauses cannot be empty".to_string(),
+            }
+            .with_position(clause_pos.line, clause_pos.col));
+        };
+
+        let (fender, body): (Option<&Expr>, &[Expr]) = match rest {
+            [body] => (None, rest),
+            [fender, body] => (Some(fender), std::slice::from_ref(body)),
+            _ => (None, rest),
+        };
+
+        if body.is_empty() {
+            return Err(EvalError::ParseError {
+                message: "syntax-case clauses require a body".to_string(),
+            }
+            .with_position(clause_pos.line, clause_pos.col));
+        }
+
+        let Some(bindings) = macros::match_syntax_pattern(pattern, &syntax.expr, &literals) else {
+            continue;
+        };
+
+        let clause_env = Environment::new(Some(env.clone()));
+        bind_macro_bindings(&clause_env, &bindings);
+        clause_env.set_syntax_context(Some(extend_syntax_context(
+            env.clone(),
+            env.syntax_context(),
+            bindings,
+        )));
+
+        if let Some(fender_expr) = fender {
+            if !eval(fender_expr, clause_env.clone(), output)?.is_truthy() {
+                continue;
+            }
+        }
+
+        return eval_begin(body, clause_env, output);
+    }
+
+    Err(EvalError::ParseError {
+        message: "syntax-case did not match any clause".to_string(),
+    }
+    .with_position(head_pos.line, head_pos.col))
+}
+
+fn eval_with_syntax(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "with-syntax",
+            expected: "at least 2",
+            got: args.len(),
+        }
+        .with_position(head_pos.line, head_pos.col));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "with-syntax",
+            expected: "at least 2",
+            got: 1,
+        }
+        .with_position(head_pos.line, head_pos.col));
+    }
+
+    let Expr::List {
+        items: raw_bindings,
+        pos: bindings_pos,
+    } = bindings_expr
+    else {
+        return Err(EvalError::ParseError {
+            message: "with-syntax bindings must be a list".to_string(),
+        }
+        .with_position(head_pos.line, head_pos.col));
+    };
+
+    let mut syntax_bindings = HashMap::new();
+    for binding_expr in raw_bindings {
+        let Expr::List {
+            items: binding_parts,
+            pos: binding_pos,
+        } = binding_expr
+        else {
+            return Err(EvalError::ParseError {
+                message: "with-syntax bindings must be (pattern value) pairs".to_string(),
+            }
+            .with_position(bindings_pos.line, bindings_pos.col));
+        };
+
+        let [pattern, value_expr] = binding_parts.as_slice() else {
+            return Err(EvalError::ParseError {
+                message: "with-syntax bindings must be (pattern value) pairs".to_string(),
+            }
+            .with_position(binding_pos.line, binding_pos.col));
+        };
+
+        let value = eval_single(value_expr, env.clone(), output)?;
+        let syntax = value
+            .as_syntax()
+            .map_err(|error| error.with_position(value_expr.pos().line, value_expr.pos().col))?;
+        let Some(bound) = macros::match_syntax_pattern(pattern, &syntax.expr, &HashSet::new())
+        else {
+            return Err(EvalError::ParseError {
+                message: "with-syntax binding did not match pattern".to_string(),
+            }
+            .with_position(binding_pos.line, binding_pos.col));
+        };
+
+        syntax_bindings.extend(bound);
+    }
+
+    let body_env = Environment::new(Some(env.clone()));
+    bind_macro_bindings(&body_env, &syntax_bindings);
+    body_env.set_syntax_context(Some(extend_syntax_context(
+        env.clone(),
+        env.syntax_context(),
+        syntax_bindings,
+    )));
+    eval_begin(body, body_env, output)
+}
+
+fn bind_macro_bindings(env: &EnvRef, bindings: &HashMap<String, MacroBinding>) {
+    for (name, binding) in bindings {
+        env.define(name.clone(), macro_binding_to_value(binding));
+    }
+}
+
+fn macro_binding_to_value(binding: &MacroBinding) -> Value {
+    match binding {
+        MacroBinding::Single(expr) => Value::Syntax(Rc::new(SyntaxObject { expr: expr.clone() })),
+        MacroBinding::Repeated(values) => list_from_values(values.iter().cloned().map(|expr| {
+            Value::Syntax(Rc::new(SyntaxObject { expr }))
+        })),
+    }
+}
+
+fn extend_syntax_context(
+    env: EnvRef,
+    base: Option<SyntaxContextRef>,
+    bindings: HashMap<String, MacroBinding>,
+) -> SyntaxContextRef {
+    let mut context = base.map(|context| context.borrow().clone()).unwrap_or_else(|| {
+        MacroExpansionContext {
+            bindings: HashMap::new(),
+            macro_env: Environment::new(Some(env.clone())),
+            def_env: env,
+            free_names: HashMap::new(),
+        }
+    });
+    context.bindings.extend(bindings);
+    Rc::new(RefCell::new(context))
 }
 
 fn eval_begin(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {

@@ -39,6 +39,8 @@ impl Expr {
 pub(super) type EnvRef = Rc<Environment>;
 pub(super) type BindingRef = Rc<RefCell<Value>>;
 pub(super) type MacroRef = Rc<MacroTransformer>;
+pub(super) type SyntaxRef = Rc<SyntaxObject>;
+pub(super) type SyntaxContextRef = Rc<RefCell<MacroExpansionContext>>;
 pub(super) type BuiltinFn = fn(&[EvaluatedArg], &mut String) -> Result<Value, EvalError>;
 
 #[derive(Clone, Debug)]
@@ -233,6 +235,12 @@ impl EvaluatedArg {
             .as_vector()
             .map_err(|error| error.with_position(self.pos.line, self.pos.col))
     }
+
+    pub(super) fn as_syntax(&self) -> Result<SyntaxRef, EvalError> {
+        self.value
+            .as_syntax()
+            .map_err(|error| error.with_position(self.pos.line, self.pos.col))
+    }
 }
 
 #[derive(Clone)]
@@ -247,9 +255,15 @@ pub(super) enum Value {
     Vector(Rc<VectorValue>),
     Record(Rc<RecordValue>),
     Procedure(Rc<Procedure>),
+    Syntax(SyntaxRef),
     Values(Vec<Value>),
     Uninitialized,
     Void,
+}
+
+#[derive(Clone)]
+pub(super) struct SyntaxObject {
+    pub(super) expr: Expr,
 }
 
 pub(super) struct PairValue {
@@ -343,10 +357,16 @@ pub(super) enum Procedure {
 }
 
 #[derive(Clone)]
-pub(super) struct MacroTransformer {
-    pub(super) literals: HashSet<String>,
-    pub(super) rules: Vec<MacroRule>,
-    pub(super) def_env: EnvRef,
+pub(super) enum MacroTransformer {
+    SyntaxRules {
+        literals: HashSet<String>,
+        rules: Vec<MacroRule>,
+        def_env: EnvRef,
+    },
+    Procedure {
+        procedure: Value,
+        def_env: EnvRef,
+    },
 }
 
 #[derive(Clone)]
@@ -361,6 +381,7 @@ pub(super) enum MacroBinding {
     Repeated(Vec<Expr>),
 }
 
+#[derive(Clone)]
 pub(super) struct MacroExpansionContext {
     pub(super) bindings: HashMap<String, MacroBinding>,
     pub(super) macro_env: EnvRef,
@@ -393,11 +414,17 @@ pub(super) struct Environment {
     parent: Option<EnvRef>,
     bindings: RefCell<HashMap<String, BindingRef>>,
     macros: RefCell<HashMap<String, MacroRef>>,
+    syntax_context: RefCell<Option<SyntaxContextRef>>,
 }
 
 impl Environment {
     pub(super) fn new(parent: Option<EnvRef>) -> EnvRef {
         Rc::new(Self {
+            syntax_context: RefCell::new(
+                parent
+                    .as_ref()
+                    .and_then(|parent| parent.syntax_context()),
+            ),
             parent,
             bindings: RefCell::new(HashMap::new()),
             macros: RefCell::new(HashMap::new()),
@@ -432,6 +459,10 @@ impl Environment {
         self.macros.borrow_mut().insert(name.into(), transformer);
     }
 
+    pub(super) fn set_syntax_context(&self, context: Option<SyntaxContextRef>) {
+        *self.syntax_context.borrow_mut() = context;
+    }
+
     pub(super) fn set(&self, name: &str, value: Value) -> Result<(), EvalError> {
         let Some(binding) = self.lookup_binding(name) else {
             return Err(EvalError::UnboundSymbol {
@@ -461,6 +492,10 @@ impl Environment {
         self.parent
             .as_ref()
             .and_then(|parent| parent.lookup_macro(name))
+    }
+
+    pub(super) fn syntax_context(&self) -> Option<SyntaxContextRef> {
+        self.syntax_context.borrow().clone()
     }
 }
 
@@ -539,6 +574,16 @@ impl Value {
         }
     }
 
+    pub(super) fn as_syntax(&self) -> Result<SyntaxRef, EvalError> {
+        match self {
+            Self::Syntax(value) => Ok(value.clone()),
+            _ => Err(EvalError::TypeMismatch {
+                expected: "syntax object",
+                found: self.render(),
+            }),
+        }
+    }
+
     pub(super) fn render(&self) -> String {
         render_value(self, RenderMode::Write)
     }
@@ -609,6 +654,7 @@ fn render_value_with_state(
         }
         Value::Record(record) => format!("#<record:{}>", record.record_type.name),
         Value::Procedure(_) => "#<procedure>".to_string(),
+        Value::Syntax(_) => "#<syntax>".to_string(),
         Value::Values(_) => "#<values>".to_string(),
         Value::Uninitialized => "#<uninitialized>".to_string(),
         Value::Void => "#<void>".to_string(),
@@ -715,6 +761,7 @@ pub(super) fn values_eq(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Syntax(left), Value::Syntax(right)) => Rc::ptr_eq(left, right),
         (Value::Values(left), Value::Values(right)) => {
             left.len() == right.len()
                 && left
@@ -802,6 +849,7 @@ fn values_equal_with_state(
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Syntax(left), Value::Syntax(right)) => Rc::ptr_eq(left, right),
         (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,

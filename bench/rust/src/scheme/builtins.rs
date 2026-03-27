@@ -2,7 +2,9 @@ mod procedure;
 mod sequence;
 
 use self::procedure::exact_int;
-pub(super) use self::procedure::{apply_procedure, quote_expr};
+pub(super) use self::procedure::{
+    apply_procedure, apply_procedure_with_syntax_context, datum_to_expr, quote_expr,
+};
 use self::sequence::{
     apply_append, apply_assoc, apply_assv, apply_car, apply_cddr, apply_cdr, apply_cons,
     apply_for_each, apply_length, apply_list, apply_list_pred, apply_list_ref, apply_list_tail,
@@ -14,7 +16,7 @@ use super::{
     list_from_values,
     number::{parse_number_token, Number, Rational},
     values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg, Procedure,
-    RecordType, RecordValue, SchemeString, Value,
+    RecordType, RecordValue, SchemeString, SyntaxObject, Value,
 };
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
@@ -121,6 +123,8 @@ pub(super) fn default_env() -> EnvRef {
         ("procedure?", apply_procedure_pred as BuiltinFn),
         ("apply", apply_apply as BuiltinFn),
         ("values", apply_values as BuiltinFn),
+        ("syntax->datum", apply_syntax_to_datum as BuiltinFn),
+        ("datum->syntax", apply_datum_to_syntax as BuiltinFn),
         ("display", apply_display as BuiltinFn),
         ("write", apply_write as BuiltinFn),
         ("newline", apply_newline as BuiltinFn),
@@ -836,6 +840,39 @@ fn apply_values(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, Ev
             args.iter().map(|arg| arg.value.clone()).collect(),
         )),
     }
+}
+
+fn apply_syntax_to_datum(
+    args: &[EvaluatedArg],
+    _output: &mut String,
+) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "syntax->datum",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(quote_expr(&value.as_syntax()?.expr))
+}
+
+fn apply_datum_to_syntax(
+    args: &[EvaluatedArg],
+    _output: &mut String,
+) -> Result<Value, EvalError> {
+    let [context, datum] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "datum->syntax",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    };
+
+    let syntax = context.as_syntax()?;
+    Ok(Value::Syntax(Rc::new(SyntaxObject {
+        expr: datum_to_expr(&datum.value, syntax.expr.pos())?,
+    })))
 }
 
 fn apply_zero_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {

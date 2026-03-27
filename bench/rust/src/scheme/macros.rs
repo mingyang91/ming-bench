@@ -1,21 +1,42 @@
 use super::{
-    EnvRef, Environment, EvalError, Expr, LambdaParams, MacroBinding, MacroExpansionContext,
-    MacroRef, MacroRule, MacroTransformer, Position, Value,
+    EnvRef, EvalError, EvaluatedArg, Expr, LambdaParams, MacroBinding, MacroExpansionContext,
+    MacroRef, MacroRule, MacroTransformer, Position, SyntaxObject, Value,
 };
+use crate::scheme::builtins::apply_procedure_with_syntax_context;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static MACRO_GENSYM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub(super) fn define_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-    let [Expr::Symbol { name, .. }, rules_expr] = args else {
+pub(super) fn define_syntax(
+    args: &[Expr],
+    env: EnvRef,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let [Expr::Symbol { name, .. }, transformer_expr] = args else {
         return Err(EvalError::ParseError {
             message: "invalid define-syntax form".to_string(),
         });
     };
 
-    let transformer = parse_syntax_rules(rules_expr, env.clone())?;
+    let transformer = if is_syntax_rules_form(transformer_expr) {
+        parse_syntax_rules(transformer_expr, env.clone())?
+    } else {
+        let procedure = super::eval_single(transformer_expr, env.clone(), output)?;
+        let Value::Procedure(_) = procedure else {
+            return Err(EvalError::ParseError {
+                message: "define-syntax transformer must be a procedure".to_string(),
+            });
+        };
+
+        MacroTransformer::Procedure {
+            procedure,
+            def_env: env.clone(),
+        }
+    };
+
     env.define_macro(name.clone(), Rc::new(transformer));
     Ok(Value::Void)
 }
@@ -25,23 +46,16 @@ pub(super) fn expand_macro_call(
     env: EnvRef,
     transformer: MacroRef,
 ) -> Result<(Expr, EnvRef), EvalError> {
-    for rule in &transformer.rules {
-        if let Some(bindings) = match_macro_rule(rule, items, &transformer.literals) {
-            let macro_env = Environment::new(Some(env));
-            let mut context = MacroExpansionContext {
-                bindings,
-                macro_env: macro_env.clone(),
-                def_env: transformer.def_env.clone(),
-                free_names: HashMap::new(),
-            };
-            let expanded = expand_macro_template(&rule.template, &mut context, &HashMap::new())?;
-            return Ok((expanded, macro_env));
+    match transformer.as_ref() {
+        MacroTransformer::SyntaxRules {
+            literals,
+            rules,
+            def_env,
+        } => expand_syntax_rules_call(items, env, literals, rules, def_env),
+        MacroTransformer::Procedure { procedure, def_env } => {
+            expand_procedure_macro_call(items, env, procedure, def_env)
         }
     }
-
-    Err(EvalError::ParseError {
-        message: "macro invocation did not match any syntax-rules clause".to_string(),
-    })
 }
 
 pub(super) fn parse_lambda_params(expr: &Expr) -> Result<LambdaParams, EvalError> {
@@ -180,14 +194,14 @@ fn parse_syntax_rules(expr: &Expr, env: EnvRef) -> Result<MacroTransformer, Eval
         });
     }
 
-    Ok(MacroTransformer {
+    Ok(MacroTransformer::SyntaxRules {
         literals,
         rules: parsed_rules,
         def_env: env,
     })
 }
 
-fn parse_syntax_rule_literals(expr: &Expr) -> Result<HashSet<String>, EvalError> {
+pub(super) fn parse_syntax_rule_literals(expr: &Expr) -> Result<HashSet<String>, EvalError> {
     let Expr::List { items, .. } = expr else {
         return Err(EvalError::ParseError {
             message: "syntax-rules literals must be a list".to_string(),
@@ -204,6 +218,101 @@ fn parse_syntax_rule_literals(expr: &Expr) -> Result<HashSet<String>, EvalError>
         literals.insert(name.clone());
     }
     Ok(literals)
+}
+
+pub(super) fn match_syntax_pattern(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &HashSet<String>,
+) -> Option<HashMap<String, MacroBinding>> {
+    let mut bindings = HashMap::new();
+    if match_single_pattern(pattern, input, literals, &mut bindings) {
+        Some(bindings)
+    } else {
+        None
+    }
+}
+
+pub(super) fn expand_syntax_template(
+    expr: &Expr,
+    context: &mut MacroExpansionContext,
+) -> Result<Expr, EvalError> {
+    expand_macro_template(expr, context, &HashMap::new())
+}
+
+fn is_syntax_rules_form(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::List { items, .. }
+            if matches!(
+                items.first(),
+                Some(Expr::Symbol { name, .. }) if name == "syntax-rules"
+            )
+    )
+}
+
+fn expand_syntax_rules_call(
+    items: &[Expr],
+    env: EnvRef,
+    literals: &HashSet<String>,
+    rules: &[MacroRule],
+    def_env: &EnvRef,
+) -> Result<(Expr, EnvRef), EvalError> {
+    for rule in rules {
+        if let Some(bindings) = match_macro_rule(rule, items, literals) {
+            let macro_env = env.clone();
+            let mut context = MacroExpansionContext {
+                bindings,
+                macro_env: macro_env.clone(),
+                def_env: def_env.clone(),
+                free_names: HashMap::new(),
+            };
+            let expanded = expand_macro_template(&rule.template, &mut context, &HashMap::new())?;
+            return Ok((expanded, macro_env));
+        }
+    }
+
+    Err(EvalError::ParseError {
+        message: "macro invocation did not match any syntax-rules clause".to_string(),
+    })
+}
+
+fn expand_procedure_macro_call(
+    items: &[Expr],
+    env: EnvRef,
+    procedure: &Value,
+    def_env: &EnvRef,
+) -> Result<(Expr, EnvRef), EvalError> {
+    let pos = items
+        .first()
+        .map(Expr::pos)
+        .expect("macro invocations are never empty");
+    let macro_env = env.clone();
+    let syntax_context = Rc::new(RefCell::new(MacroExpansionContext {
+        bindings: HashMap::new(),
+        macro_env: macro_env.clone(),
+        def_env: def_env.clone(),
+        free_names: HashMap::new(),
+    }));
+    let mut output = String::new();
+    let result = apply_procedure_with_syntax_context(
+        procedure.clone(),
+        &[EvaluatedArg {
+            value: Value::Syntax(Rc::new(SyntaxObject {
+                expr: Expr::List {
+                    items: items.to_vec(),
+                    pos,
+                },
+            })),
+            pos,
+        }],
+        &mut output,
+        Some(syntax_context),
+    )?;
+    let syntax = result
+        .as_syntax()
+        .map_err(|error| error.with_position(pos.line, pos.col))?;
+    Ok((syntax.expr.clone(), macro_env))
 }
 
 fn match_macro_rule(
@@ -300,7 +409,7 @@ fn match_repeated_pattern(
     bindings: &mut HashMap<String, MacroBinding>,
 ) -> bool {
     match pattern {
-        Expr::Symbol { name, .. } if name != "..." && !literals.contains(name) => {
+        Expr::Symbol { name, .. } if name != "..." && name != "_" && !literals.contains(name) => {
             match bindings.get(name) {
                 Some(MacroBinding::Repeated(existing)) => existing == inputs,
                 Some(MacroBinding::Single(_)) => false,
@@ -335,6 +444,7 @@ fn match_single_pattern(
         Expr::String { value, .. } => {
             matches!(input, Expr::String { value: other, .. } if other == value)
         }
+        Expr::Symbol { name, .. } if name == "_" => true,
         Expr::Symbol { name, .. } if name == "..." => false,
         Expr::Symbol { name, .. } if literals.contains(name) => {
             matches!(input, Expr::Symbol { name: other, .. } if other == name)
@@ -451,6 +561,12 @@ fn expand_macro_list(
     repetition_index: Option<usize>,
 ) -> Result<Expr, EvalError> {
     if let Some(Expr::Symbol { name, .. }) = items.first() {
+        if name == "quote" {
+            return Ok(Expr::List {
+                items: items.to_vec(),
+                pos,
+            });
+        }
         if !context.bindings.contains_key(name) {
             if name == "let" {
                 if let Some(expanded) = expand_macro_let(items, context, scope, repetition_index)? {
@@ -788,6 +904,8 @@ fn is_special_form_keyword(name: &str) -> bool {
             | "or"
             | "if"
             | "quote"
+            | "syntax"
+            | "syntax-case"
             | "begin"
             | "cond"
             | "guard"
@@ -796,6 +914,7 @@ fn is_special_form_keyword(name: &str) -> bool {
             | "case-lambda"
             | "define"
             | "define-syntax"
+            | "with-syntax"
             | "set!"
             | "else"
             | "."

@@ -1,7 +1,8 @@
 use super::super::text::SchemeString;
 use super::super::{
     eval_program_tail, list_from_values, unpack_values, EnvRef, Environment, EvalError,
-    EvaluatedArg, Expr, LambdaParams, Position, Procedure, TailEvalResult, Value,
+    EvaluatedArg, Expr, LambdaParams, Position, Procedure, SyntaxContextRef, TailEvalResult,
+    Value,
 };
 use super::{
     apply_record_accessor, apply_record_constructor, apply_record_mutator, apply_record_predicate,
@@ -19,10 +20,50 @@ pub(crate) fn quote_expr(expr: &Expr) -> Value {
     }
 }
 
+pub(crate) fn datum_to_expr(value: &Value, pos: Position) -> Result<Expr, EvalError> {
+    match value {
+        Value::Bool(value) => Ok(Expr::Bool { value: *value, pos }),
+        Value::Number(value) => Ok(Expr::Number { value: *value, pos }),
+        Value::Char(value) => Ok(Expr::Char { value: *value, pos }),
+        Value::String(value) => Ok(Expr::String {
+            value: value.to_plain_string(),
+            pos,
+        }),
+        Value::Symbol(value) => Ok(Expr::Symbol {
+            name: value.clone(),
+            pos,
+        }),
+        Value::List(_) | Value::Pair(_) => {
+            let items = value.as_list()?;
+            Ok(Expr::List {
+                items: items
+                    .iter()
+                    .map(|item| datum_to_expr(item, pos))
+                    .collect::<Result<Vec<_>, _>>()?,
+                pos,
+            })
+        }
+        Value::Syntax(syntax) => Ok(syntax.expr.clone()),
+        _ => Err(EvalError::TypeMismatch {
+            expected: "datum",
+            found: value.render(),
+        }),
+    }
+}
+
 pub(crate) fn apply_procedure(
     value: Value,
     args: &[EvaluatedArg],
     output: &mut String,
+) -> Result<Value, EvalError> {
+    apply_procedure_with_syntax_context(value, args, output, None)
+}
+
+pub(crate) fn apply_procedure_with_syntax_context(
+    value: Value,
+    args: &[EvaluatedArg],
+    output: &mut String,
+    syntax_context: Option<SyntaxContextRef>,
 ) -> Result<Value, EvalError> {
     let mut current_value = value;
     let mut current_args = args.to_vec();
@@ -77,7 +118,12 @@ pub(crate) fn apply_procedure(
                 };
 
                 return with_call_position(
-                    apply_procedure(thunk_arg.value.clone(), &[], output),
+                    apply_procedure_with_syntax_context(
+                        thunk_arg.value.clone(),
+                        &[],
+                        output,
+                        syntax_context.clone(),
+                    ),
                     call_pos,
                 );
             }
@@ -112,15 +158,30 @@ pub(crate) fn apply_procedure(
                 };
 
                 with_call_position(
-                    apply_procedure(before_arg.value.clone(), &[], output),
+                    apply_procedure_with_syntax_context(
+                        before_arg.value.clone(),
+                        &[],
+                        output,
+                        syntax_context.clone(),
+                    ),
                     call_pos,
                 )?;
                 let body_value = with_call_position(
-                    apply_procedure(body_arg.value.clone(), &[], output),
+                    apply_procedure_with_syntax_context(
+                        body_arg.value.clone(),
+                        &[],
+                        output,
+                        syntax_context.clone(),
+                    ),
                     call_pos,
                 )?;
                 with_call_position(
-                    apply_procedure(after_arg.value.clone(), &[], output),
+                    apply_procedure_with_syntax_context(
+                        after_arg.value.clone(),
+                        &[],
+                        output,
+                        syntax_context.clone(),
+                    ),
                     call_pos,
                 )?;
                 return Ok(body_value);
@@ -138,7 +199,12 @@ pub(crate) fn apply_procedure(
                 };
 
                 let produced = with_call_position(
-                    apply_procedure(producer_arg.value.clone(), &[], output),
+                    apply_procedure_with_syntax_context(
+                        producer_arg.value.clone(),
+                        &[],
+                        output,
+                        syntax_context.clone(),
+                    ),
                     call_pos,
                 )?;
                 current_value = consumer_arg.value.clone();
@@ -169,6 +235,9 @@ pub(crate) fn apply_procedure(
                     prepare_lambda_call_env("lambda", params, env, &current_args),
                     call_pos,
                 )?;
+                if let Some(context) = syntax_context.clone() {
+                    call_env.set_syntax_context(Some(context));
+                }
                 match eval_program_tail(body, call_env, output)? {
                     TailEvalResult::Value(value) => return Ok(value),
                     TailEvalResult::Call {
@@ -199,6 +268,9 @@ pub(crate) fn apply_procedure(
                     prepare_lambda_call_env("case-lambda", &clause.params, env, &current_args),
                     call_pos,
                 )?;
+                if let Some(context) = syntax_context.clone() {
+                    call_env.set_syntax_context(Some(context));
+                }
 
                 match eval_program_tail(&clause.body, call_env, output)? {
                     TailEvalResult::Value(value) => return Ok(value),
