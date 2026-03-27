@@ -26,6 +26,10 @@ type exceptionHandlerReturnFrame struct {
 	next    continuation
 }
 
+func (*exceptionHandlerReturnFrame) acceptsMultipleValues() bool {
+	return true
+}
+
 type raiseInvokeHandlerFrame struct {
 	handler procedure
 	pos     SourcePos
@@ -35,6 +39,10 @@ type raiseInvokeHandlerFrame struct {
 type restoreHandlersFrame struct {
 	handlers *exceptionHandlerFrame
 	next     continuation
+}
+
+func (*restoreHandlersFrame) acceptsMultipleValues() bool {
+	return true
 }
 
 type guardClauseFrame struct {

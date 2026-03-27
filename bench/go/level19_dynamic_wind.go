@@ -22,6 +22,10 @@ type dynamicWindBodyFrame struct {
 	next continuation
 }
 
+func (*dynamicWindBodyFrame) acceptsMultipleValues() bool {
+	return true
+}
+
 type windTransitionExitFrame struct {
 	exits      []*windFrame
 	entries    []*windFrame

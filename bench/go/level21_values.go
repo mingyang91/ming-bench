@@ -56,14 +56,18 @@ func (f *callWithValuesProducerFrame) resume(m *machine, v value) error {
 	return applyProcedureState(m, f.consumer, producedValues(v), f.pos, f.next)
 }
 
-func evalValues(args []value) (value, error) {
-	if len(args) == 1 {
-		return args[0], nil
+func valuesResult(items []value) value {
+	if len(items) == 1 {
+		return items[0]
 	}
 
-	items := make([]value, len(args))
-	copy(items, args)
-	return multiValuesValue{items: items}, nil
+	result := make([]value, len(items))
+	copy(result, items)
+	return multiValuesValue{items: result}
+}
+
+func evalValues(args []value) (value, error) {
+	return valuesResult(args), nil
 }
 
 func parseCallWithValuesArgs(args []value, name string) (procedure, procedure, error) {

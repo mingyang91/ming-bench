@@ -117,6 +117,10 @@ type callCCReturnFrame struct {
 	next continuation
 }
 
+func (*callCCReturnFrame) acceptsMultipleValues() bool {
+	return true
+}
+
 func (p callCCProc) schemeString() string {
 	return "#<procedure:" + p.name + ">"
 }
@@ -152,11 +156,7 @@ func (continuationProc) isTruthy() bool {
 }
 
 func (p continuationProc) call(args []value) (value, error) {
-	if len(args) != 1 {
-		return nil, newCurrentEvalError("continuation expects exactly 1 argument")
-	}
-
-	return evalValueWithControlTransition(args[0], nil, p.wind, nil, p.handlers, p.captured)
+	return evalValueWithControlTransition(valuesResult(args), nil, p.wind, nil, p.handlers, p.captured)
 }
 
 func (m *machine) run() (value, error) {
@@ -822,10 +822,7 @@ func applyProcedureState(m *machine, proc procedure, args []value, pos SourcePos
 		}
 		return startRaise(m, args[0])
 	case continuationProc:
-		if len(args) != 1 {
-			return newCurrentEvalError("continuation expects exactly 1 argument")
-		}
-		return startControlTransition(m, p.wind, p.handlers, p.captured, args[0])
+		return startControlTransition(m, p.wind, p.handlers, p.captured, valuesResult(args))
 	case guardHandlerProc:
 		if len(args) != 1 {
 			return newCurrentEvalError("guard handler expects exactly 1 argument")
