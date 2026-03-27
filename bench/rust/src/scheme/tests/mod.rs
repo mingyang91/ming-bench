@@ -4,3 +4,6 @@ include!(concat!(env!("OUT_DIR"), "/tests_generated.rs"));
 
 // L27 — injected as surprise level.
 mod level27;
+
+// L28 — injected as surprise level.
+mod level28;

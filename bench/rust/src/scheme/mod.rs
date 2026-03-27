@@ -7317,7 +7317,11 @@ pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, Eval
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let (last, output) = eval_program(input)?;
-    Ok((last.render(), output))
+    let result = match last {
+        Value::String(value) => value.contents(),
+        _ => last.render(),
+    };
+    Ok((result, output))
 }
 
 #[cfg(test)]
