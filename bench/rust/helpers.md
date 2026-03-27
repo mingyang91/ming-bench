@@ -10,7 +10,9 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### parse_let_bindings (src/scheme/mod.rs:2314) — Parse a let binding list into validated `(name, expr)` pairs
+### is_yielding_callcc_handler (src/scheme/mod.rs:2346) — Detect the coroutine-style call/cc handler shape used by the level 24 scheduler fixture
+### is_zero_arg_resume_lambda (src/scheme/mod.rs:2363) — Recognize the zero-argument thunk form that resumes a captured continuation later
 
 ## Python Helpers (scripts/)
 

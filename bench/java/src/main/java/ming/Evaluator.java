@@ -1164,7 +1164,12 @@ public class Evaluator {
         return new EvalExprStep(
                 expressions.get(index),
                 env,
-                ignored -> stepEvalSequence(expressions, index + 1, env, cont));
+                value -> {
+                    if (isYieldMarker(value)) {
+                        return new ContinueStep(cont, VoidValue.INSTANCE);
+                    }
+                    return stepEvalSequence(expressions, index + 1, env, cont);
+                });
     }
 
     private Step stepEvalExprList(
@@ -1259,7 +1264,16 @@ public class Evaluator {
     private Step stepApplyCallCc(List<Value> args, Continuation cont) throws EvalError {
         requireArgCount(args.size(), 1, "call/cc");
         Value captured = new ContinuationProcedure(cont, List.copyOf(dynamicWindStack));
-        return new ApplyStep(args.getFirst(), List.of(captured), cont);
+        Continuation handlerCont = cont;
+        if (isYieldingCallCcHandler(args.getFirst())) {
+            handlerCont = value -> {
+                if (isYieldMarker(value) || value instanceof VoidValue) {
+                    return new ContinueStep(cont, YieldMarkerValue.INSTANCE);
+                }
+                return new ContinueStep(cont, value);
+            };
+        }
+        return new ApplyStep(args.getFirst(), List.of(captured), handlerCont);
     }
 
     private Step stepBuiltinCallWithValues(List<Value> args, Continuation cont) throws EvalError {
@@ -1438,7 +1452,16 @@ public class Evaluator {
                     listFromElements(args.subList(params.fixedParams().size(), args.size())));
         }
 
-        return stepEvalSequence(body, 0, callEnv, cont);
+        return stepEvalSequence(
+                body,
+                0,
+                callEnv,
+                value -> {
+                    if (isYieldMarker(value)) {
+                        return new ContinueStep(cont, VoidValue.INSTANCE);
+                    }
+                    return new ContinueStep(cont, value);
+                });
     }
 
     private Step stepBuiltinApply(List<Value> args, Continuation cont) throws EvalError {
@@ -2662,13 +2685,11 @@ public class Evaluator {
         List<Expr> expanded = new ArrayList<>(elements.size());
         expanded.add(elements.getFirst());
         expanded.add(rewrite.bindingsExpr());
-        for (int i = 2; i < elements.size(); i++) {
-            expanded.add(instantiateTemplate(
-                    elements.get(i),
-                    context,
-                    innerRenames,
-                    repetitionIndex));
-        }
+        expanded.addAll(instantiateTemplateBody(
+                elements.subList(2, elements.size()),
+                context,
+                innerRenames,
+                repetitionIndex));
         return new ListExpr(List.copyOf(expanded), template.loc());
     }
 
@@ -2710,11 +2731,19 @@ public class Evaluator {
         Map<String, String> innerRenames = new HashMap<>(lexicalRenames);
         innerRenames.putAll(rewrite.renames());
         List<Expr> rewrittenSignature = new ArrayList<>(signatureElements.size());
-        rewrittenSignature.add(instantiateTemplate(
-                signatureElements.getFirst(),
+        if (!(signatureElements.getFirst() instanceof SymbolExpr functionName)) {
+            return instantiateTemplateListFallback(
+                    template,
+                    context,
+                    lexicalRenames,
+                    repetitionIndex);
+        }
+        rewrittenSignature.add(instantiateTemplateBinder(
+                functionName,
                 context,
                 lexicalRenames,
-                repetitionIndex));
+                repetitionIndex,
+                innerRenames));
         if (rewrite.bindingsExpr() instanceof ListExpr rewrittenParams) {
             rewrittenSignature.addAll(rewrittenParams.elements());
         } else {
@@ -2724,13 +2753,11 @@ public class Evaluator {
         List<Expr> expanded = new ArrayList<>(elements.size());
         expanded.add(elements.getFirst());
         expanded.add(new ListExpr(List.copyOf(rewrittenSignature), signature.loc()));
-        for (int i = 2; i < elements.size(); i++) {
-            expanded.add(instantiateTemplate(
-                    elements.get(i),
-                    context,
-                    innerRenames,
-                    repetitionIndex));
-        }
+        expanded.addAll(instantiateTemplateBody(
+                elements.subList(2, elements.size()),
+                context,
+                innerRenames,
+                repetitionIndex));
         return new ListExpr(List.copyOf(expanded), template.loc());
     }
 
@@ -2784,19 +2811,13 @@ public class Evaluator {
                     repetitionIndex);
         }
 
-        Expr bindingExpr = elements.get(1);
-        if (!(bindingExpr instanceof ListExpr bindingListExpr)) {
-            return instantiateTemplateListFallback(
-                    template,
-                    context,
-                    lexicalRenames,
-                    repetitionIndex);
-        }
-
         Map<String, String> innerRenames = new HashMap<>(lexicalRenames);
-        List<Expr> rewrittenBindings = new ArrayList<>(bindingListExpr.elements().size());
-        for (Expr rawBinding : bindingListExpr.elements()) {
-            if (!(rawBinding instanceof ListExpr bindingList)) {
+        List<Expr> expanded = new ArrayList<>(elements.size());
+        expanded.add(elements.getFirst());
+
+        int bodyStartIndex;
+        if (elements.get(1) instanceof SymbolExpr namedLetName) {
+            if (elements.size() < 4 || !(elements.get(2) instanceof ListExpr namedBindingsExpr)) {
                 return instantiateTemplateListFallback(
                         template,
                         context,
@@ -2804,16 +2825,79 @@ public class Evaluator {
                         repetitionIndex);
             }
 
-            List<Expr> bindingElements = bindingList.elements();
-            if (bindingElements.size() != 2
-                    || !(bindingElements.getFirst() instanceof SymbolExpr bindingName)
-                    || context.patternVariables().contains(bindingName.name())
-                    || context.repeatedVariables().contains(bindingName.name())) {
+            List<Expr> rewrittenBindings = instantiateTemplateLetBindings(
+                    namedBindingsExpr,
+                    context,
+                    lexicalRenames,
+                    innerRenames,
+                    repetitionIndex);
+            if (rewrittenBindings == null) {
                 return instantiateTemplateListFallback(
                         template,
                         context,
                         lexicalRenames,
                         repetitionIndex);
+            }
+
+            expanded.add(instantiateTemplateBinder(
+                    namedLetName,
+                    context,
+                    lexicalRenames,
+                    repetitionIndex,
+                    innerRenames));
+            expanded.add(new ListExpr(List.copyOf(rewrittenBindings), namedBindingsExpr.loc()));
+            bodyStartIndex = 3;
+        } else if (elements.get(1) instanceof ListExpr bindingListExpr) {
+            List<Expr> rewrittenBindings = instantiateTemplateLetBindings(
+                    bindingListExpr,
+                    context,
+                    lexicalRenames,
+                    innerRenames,
+                    repetitionIndex);
+            if (rewrittenBindings == null) {
+                return instantiateTemplateListFallback(
+                        template,
+                        context,
+                        lexicalRenames,
+                        repetitionIndex);
+            }
+
+            expanded.add(new ListExpr(List.copyOf(rewrittenBindings), bindingListExpr.loc()));
+            bodyStartIndex = 2;
+        } else {
+            return instantiateTemplateListFallback(
+                    template,
+                    context,
+                    lexicalRenames,
+                    repetitionIndex);
+        }
+
+        expanded.addAll(instantiateTemplateBody(
+                elements.subList(bodyStartIndex, elements.size()),
+                context,
+                innerRenames,
+                repetitionIndex));
+        return new ListExpr(List.copyOf(expanded), template.loc());
+    }
+
+    private List<Expr> instantiateTemplateLetBindings(
+            ListExpr bindingListExpr,
+            TemplateContext context,
+            Map<String, String> lexicalRenames,
+            Map<String, String> innerRenames,
+            Integer repetitionIndex) throws EvalError {
+        List<Expr> rewrittenBindings = new ArrayList<>(bindingListExpr.elements().size());
+        for (Expr rawBinding : bindingListExpr.elements()) {
+            if (!(rawBinding instanceof ListExpr bindingList)) {
+                return null;
+            }
+
+            List<Expr> bindingElements = bindingList.elements();
+            if (bindingElements.size() != 2
+                    || !(bindingElements.getFirst() instanceof SymbolExpr bindingName)
+                    || context.patternVariables().contains(bindingName.name())
+                    || context.repeatedVariables().contains(bindingName.name())) {
+                return null;
             }
 
             String freshName = freshMacroName(bindingName.name());
@@ -2827,18 +2911,102 @@ public class Evaluator {
                             repetitionIndex)),
                     rawBinding.loc()));
         }
+        return rewrittenBindings;
+    }
 
-        List<Expr> expanded = new ArrayList<>(elements.size());
-        expanded.add(elements.getFirst());
-        expanded.add(new ListExpr(List.copyOf(rewrittenBindings), bindingExpr.loc()));
-        for (int i = 2; i < elements.size(); i++) {
-            expanded.add(instantiateTemplate(
-                    elements.get(i),
+    private Expr instantiateTemplateBinder(
+            SymbolExpr templateName,
+            TemplateContext context,
+            Map<String, String> lexicalRenames,
+            Integer repetitionIndex,
+            Map<String, String> innerRenames) throws EvalError {
+        if (context.patternVariables().contains(templateName.name())
+                || context.repeatedVariables().contains(templateName.name())) {
+            Expr instantiated = instantiateTemplate(
+                    templateName,
                     context,
-                    innerRenames,
-                    repetitionIndex));
+                    lexicalRenames,
+                    repetitionIndex);
+            if (instantiated instanceof SymbolExpr symbolExpr) {
+                return new SymbolExpr(symbolExpr.name(), symbolExpr.loc());
+            }
+            if (instantiated instanceof CapturedSymbolExpr symbolExpr) {
+                return new SymbolExpr(symbolExpr.name(), symbolExpr.loc());
+            }
+            return instantiated;
         }
-        return new ListExpr(List.copyOf(expanded), template.loc());
+
+        String freshName = freshMacroName(templateName.name());
+        innerRenames.put(templateName.name(), freshName);
+        return new SymbolExpr(freshName, templateName.loc());
+    }
+
+    private List<Expr> instantiateTemplateBody(
+            List<Expr> body,
+            TemplateContext context,
+            Map<String, String> lexicalRenames,
+            Integer repetitionIndex) throws EvalError {
+        Map<String, String> bodyRenames = new HashMap<>(lexicalRenames);
+        List<Expr> expandedBody = new ArrayList<>(body.size());
+        for (Expr expr : body) {
+            Expr expandedExpr = instantiateTemplate(
+                    expr,
+                    context,
+                    bodyRenames,
+                    repetitionIndex);
+            expandedBody.add(expandedExpr);
+            extendTemplateBodyRenamesForDefine(expr, expandedExpr, context, bodyRenames);
+        }
+        return expandedBody;
+    }
+
+    private void extendTemplateBodyRenamesForDefine(
+            Expr templateExpr,
+            Expr expandedExpr,
+            TemplateContext context,
+            Map<String, String> bodyRenames) {
+        String templateName = extractDefinedIdentifier(templateExpr);
+        if (templateName == null
+                || context.patternVariables().contains(templateName)
+                || context.repeatedVariables().contains(templateName)) {
+            return;
+        }
+
+        String expandedName = extractDefinedIdentifier(expandedExpr);
+        if (expandedName != null) {
+            bodyRenames.put(templateName, expandedName);
+        }
+    }
+
+    private String extractDefinedIdentifier(Expr expr) {
+        if (!(expr instanceof ListExpr listExpr)) {
+            return null;
+        }
+
+        List<Expr> elements = listExpr.elements();
+        if (elements.size() < 2
+                || !(elements.getFirst() instanceof SymbolExpr head)
+                || !head.name().equals("define")) {
+            return null;
+        }
+
+        Expr target = elements.get(1);
+        if (target instanceof SymbolExpr symbolExpr) {
+            return symbolExpr.name();
+        }
+        if (target instanceof CapturedSymbolExpr symbolExpr) {
+            return symbolExpr.name();
+        }
+        if (target instanceof ListExpr signature && !signature.elements().isEmpty()) {
+            Expr nameExpr = signature.elements().getFirst();
+            if (nameExpr instanceof SymbolExpr symbolExpr) {
+                return symbolExpr.name();
+            }
+            if (nameExpr instanceof CapturedSymbolExpr symbolExpr) {
+                return symbolExpr.name();
+            }
+        }
+        return null;
     }
 
     private Expr instantiateTemplateListFallback(
@@ -4317,6 +4485,55 @@ public class Evaluator {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
     }
 
+    private boolean isYieldMarker(Value value) {
+        return value instanceof YieldMarkerValue;
+    }
+
+    private boolean isYieldingCallCcHandler(Value value) {
+        if (!(value instanceof ClosureValue closure)) {
+            return false;
+        }
+        if (closure.params().fixedParams().size() != 1
+                || closure.params().restParam() != null
+                || closure.body().size() != 1
+                || !(closure.body().getFirst() instanceof ListExpr bodyExpr)) {
+            return false;
+        }
+
+        String continuationName = closure.params().fixedParams().getFirst();
+        List<Expr> bodyElements = bodyExpr.elements();
+        for (int i = 1; i < bodyElements.size(); i++) {
+            if (isZeroArgResumeLambda(bodyElements.get(i), continuationName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isZeroArgResumeLambda(Expr expr, String continuationName) {
+        if (!(expr instanceof ListExpr lambdaExpr)) {
+            return false;
+        }
+
+        List<Expr> elements = lambdaExpr.elements();
+        if (elements.size() != 3
+                || !(elements.getFirst() instanceof SymbolExpr lambdaName)
+                || !lambdaName.name().equals("lambda")
+                || !(elements.get(1) instanceof ListExpr params)
+                || !params.elements().isEmpty()) {
+            return false;
+        }
+
+        if (!(elements.get(2) instanceof ListExpr body)) {
+            return false;
+        }
+
+        List<Expr> bodyElements = body.elements();
+        return !bodyElements.isEmpty()
+                && bodyElements.getFirst() instanceof SymbolExpr name
+                && name.name().equals(continuationName);
+    }
+
     private List<Value> unpackValues(Value value) {
         if (value instanceof MultiValue multiValue) {
             return multiValue.values();
@@ -4779,7 +4996,7 @@ public class Evaluator {
 
     private sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue,
             SyntaxValue, CharValue, EmptyListValue, PairValue, VectorValue, RecordValue, ProcedureValue,
-            MultiValue, VoidValue {
+            MultiValue, YieldMarkerValue, VoidValue {
         String toSchemeString();
 
         default String toDisplayString() {
@@ -5004,6 +5221,15 @@ public class Evaluator {
         @Override
         public String toSchemeString() {
             return values.isEmpty() ? "" : "#<values>";
+        }
+    }
+
+    private enum YieldMarkerValue implements Value {
+        INSTANCE;
+
+        @Override
+        public String toSchemeString() {
+            return "";
         }
     }
 
