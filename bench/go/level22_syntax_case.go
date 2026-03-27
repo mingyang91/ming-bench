@@ -364,15 +364,7 @@ func syntaxExprToDatum(expr locatedExpr) (value, error) {
 	case templateSymbolExpr:
 		return symbolValue(form), nil
 	case listExpr:
-		items := make([]value, len(form))
-		for i, item := range form {
-			datum, err := syntaxExprToDatum(item)
-			if err != nil {
-				return nil, err
-			}
-			items[i] = datum
-		}
-		return listFromValues(items), nil
+		return exprListToDatum(form, syntaxExprToDatum)
 	default:
 		return nil, newEvalError(expr.pos, "unsupported syntax datum")
 	}
@@ -396,21 +388,43 @@ func datumToSyntaxExpr(v value, context syntaxContext) (locatedExpr, error) {
 	case emptyListValue:
 		return locatedExpr{form: listExpr{}, pos: defaultSourcePos()}, nil
 	case pairValue:
-		items, err := properListElements(datum)
+		items, err := datumPairToSyntaxList(datum, context, make(map[*pairCell]struct{}))
 		if err != nil {
-			return locatedExpr{}, newCurrentEvalError("'datum->syntax' expects a proper list datum")
+			return locatedExpr{}, err
 		}
-
-		exprs := make([]locatedExpr, len(items))
-		for i, item := range items {
-			expr, err := datumToSyntaxExpr(item, context)
-			if err != nil {
-				return locatedExpr{}, err
-			}
-			exprs[i] = expr
-		}
-		return locatedExpr{form: listExpr(exprs), pos: defaultSourcePos()}, nil
+		return locatedExpr{form: items, pos: defaultSourcePos()}, nil
 	default:
 		return locatedExpr{}, newCurrentEvalError("'datum->syntax' cannot convert %s", v.schemeString())
+	}
+}
+
+func datumPairToSyntaxList(v value, context syntaxContext, seen map[*pairCell]struct{}) (listExpr, error) {
+	items := make([]locatedExpr, 0)
+	current := v
+
+	for {
+		switch datum := current.(type) {
+		case emptyListValue:
+			return listExpr(items), nil
+		case pairValue:
+			if _, ok := seen[datum.cell]; ok {
+				return nil, newCurrentEvalError("'datum->syntax' cannot convert cyclic list")
+			}
+			seen[datum.cell] = struct{}{}
+
+			expr, err := datumToSyntaxExpr(datum.carValue(), context)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, expr)
+			current = datum.cdrValue()
+		default:
+			tailExpr, err := datumToSyntaxExpr(datum, context)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, locatedExpr{form: symbolExpr("."), pos: defaultSourcePos()}, tailExpr)
+			return listExpr(items), nil
+		}
 	}
 }

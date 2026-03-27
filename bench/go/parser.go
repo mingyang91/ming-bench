@@ -24,6 +24,9 @@ const (
 	tokenLeftParen tokenKind = iota
 	tokenRightParen
 	tokenQuote
+	tokenQuasiQuote
+	tokenUnquote
+	tokenUnquoteSplicing
 	tokenSyntaxQuote
 	tokenAtom
 	tokenString
@@ -117,6 +120,22 @@ func tokenize(input string) ([]token, error) {
 			tokens = append(tokens, token{kind: tokenQuote, value: "'", pos: pos})
 			advance(input[i])
 			i++
+		case '`':
+			tokens = append(tokens, token{kind: tokenQuasiQuote, value: "`", pos: pos})
+			advance(input[i])
+			i++
+		case ',':
+			if i+1 < len(input) && input[i+1] == '@' {
+				tokens = append(tokens, token{kind: tokenUnquoteSplicing, value: ",@", pos: pos})
+				advance(input[i])
+				i++
+				advance(input[i])
+				i++
+				continue
+			}
+			tokens = append(tokens, token{kind: tokenUnquote, value: ",", pos: pos})
+			advance(input[i])
+			i++
 		case '"':
 			value, next, nextPos, err := readStringToken(input, i, pos)
 			if err != nil {
@@ -132,7 +151,9 @@ func tokenize(input string) ([]token, error) {
 				!unicode.IsSpace(rune(input[i])) &&
 				input[i] != '(' &&
 				input[i] != ')' &&
-				input[i] != '\'' {
+				input[i] != '\'' &&
+				input[i] != '`' &&
+				input[i] != ',' {
 				advance(input[i])
 				i++
 			}
@@ -218,6 +239,42 @@ func (p *parser) parseExpr() (locatedExpr, error) {
 		return locatedExpr{
 			form: listExpr{
 				{form: symbolExpr("quote"), pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
+	case tokenQuasiQuote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return locatedExpr{}, err
+		}
+		return locatedExpr{
+			form: listExpr{
+				{form: symbolExpr("quasiquote"), pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
+	case tokenUnquote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return locatedExpr{}, err
+		}
+		return locatedExpr{
+			form: listExpr{
+				{form: symbolExpr("unquote"), pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
+	case tokenUnquoteSplicing:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return locatedExpr{}, err
+		}
+		return locatedExpr{
+			form: listExpr{
+				{form: symbolExpr("unquote-splicing"), pos: tok.pos},
 				quoted,
 			},
 			pos: tok.pos,

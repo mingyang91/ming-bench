@@ -103,6 +103,12 @@ type condFrame struct {
 	next    continuation
 }
 
+type condRecipientFrame struct {
+	test         value
+	recipientPos SourcePos
+	next         continuation
+}
+
 type callCCProc struct {
 	name string
 }
@@ -281,6 +287,17 @@ func (m *machine) evalList(items listExpr, env *env, cont continuation) error {
 			}
 			m.setValue(v, cont)
 			return nil
+		case "quasiquote":
+			v, err := evalQuasiquote(items[1:], env)
+			if err != nil {
+				return err
+			}
+			m.setValue(v, cont)
+			return nil
+		case "unquote":
+			return newCurrentEvalError("'unquote' outside quasiquote")
+		case "unquote-splicing":
+			return newCurrentEvalError("'unquote-splicing' outside quasiquote")
 		case "let":
 			return startLet(m, items[1:], env, cont)
 		case "lambda":
@@ -506,9 +523,31 @@ func (f *condFrame) resume(m *machine, v value) error {
 			m.setValue(v, f.next)
 			return nil
 		}
+		recipient, hasRecipient, err := parseCondRecipientClause(clause)
+		if err != nil {
+			return err
+		}
+		if hasRecipient {
+			m.setExpr(recipient, f.env, &condRecipientFrame{
+				test:         v,
+				recipientPos: recipient.pos,
+				next:         f.next,
+			})
+			return nil
+		}
 		return startSequence(m, clause[1:], f.env, f.next)
 	}
 	return advanceCond(m, f.clauses, f.index+1, f.env, f.next)
+}
+
+func (f *condRecipientFrame) resume(m *machine, v value) error {
+	proc, ok := v.(procedure)
+	if !ok {
+		setCurrentEvalPos(f.recipientPos)
+		return newCurrentEvalError("attempt to call non-procedure: %s", v.schemeString())
+	}
+
+	return applyProcedureState(m, proc, []value{f.test}, f.recipientPos, f.next)
 }
 
 func (f *callCCReturnFrame) resume(m *machine, v value) error {
@@ -645,6 +684,10 @@ func advanceCond(m *machine, clauses []locatedExpr, index int, env *env, cont co
 			return nil
 		}
 		return startSequence(m, clause[1:], env, cont)
+	}
+
+	if _, _, err := parseCondRecipientClause(clause); err != nil {
+		return err
 	}
 
 	m.setExpr(clause[0], env, &condFrame{

@@ -504,6 +504,7 @@ func newGlobalEnv() *env {
 	global.define("syntax->datum", builtinProc{name: "syntax->datum", fn: evalSyntaxToDatum})
 	global.define("datum->syntax", builtinProc{name: "datum->syntax", fn: evalDatumToSyntax})
 	global.define("display", builtinProc{name: "display", fn: evalDisplay})
+	global.define("error", builtinProc{name: "error", fn: evalErrorBuiltin})
 	global.define("write", builtinProc{name: "write", fn: evalWrite})
 	global.define("newline", builtinProc{name: "newline", fn: evalNewline})
 	global.define("apply", builtinProc{name: "apply", fn: evalApply})
@@ -718,6 +719,12 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalSet(items[1:], env)
 		case "quote":
 			return evalQuote(items[1:])
+		case "quasiquote":
+			return evalQuasiquote(items[1:], env)
+		case "unquote":
+			return nil, newCurrentEvalError("'unquote' outside quasiquote")
+		case "unquote-splicing":
+			return nil, newCurrentEvalError("'unquote-splicing' outside quasiquote")
 		case "let":
 			return evalLet(items[1:], env)
 		case "let*":
@@ -812,6 +819,13 @@ func evalListExprTail(items listExpr, env *env) (value, *tailCall, error) {
 		case "quote":
 			v, err := evalQuote(items[1:])
 			return v, nil, err
+		case "quasiquote":
+			v, err := evalQuasiquote(items[1:], env)
+			return v, nil, err
+		case "unquote":
+			return nil, nil, newCurrentEvalError("'unquote' outside quasiquote")
+		case "unquote-splicing":
+			return nil, nil, newCurrentEvalError("'unquote-splicing' outside quasiquote")
 		case "let":
 			return evalLetTail(items[1:], env)
 		case "let*":
@@ -1080,6 +1094,126 @@ func evalQuote(parts []locatedExpr) (value, error) {
 	return quoteExpr(parts[0])
 }
 
+func evalQuasiquote(parts []locatedExpr, env *env) (value, error) {
+	if len(parts) != 1 {
+		return nil, newCurrentEvalError("'quasiquote' expects exactly 1 argument")
+	}
+
+	return evalQuasiquoteExpr(parts[0], env, 1)
+}
+
+func evalQuasiquoteExpr(expr locatedExpr, env *env, depth int) (value, error) {
+	if list, ok := expr.form.(listExpr); ok {
+		if len(list) == 2 {
+			if keyword, ok := list[0].form.(symbolExpr); ok {
+				switch string(keyword) {
+				case "quasiquote":
+					nested, err := evalQuasiquoteExpr(list[1], env, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					return listFromValues([]value{symbolValue("quasiquote"), nested}), nil
+				case "unquote":
+					if depth == 1 {
+						return evalExpr(list[1], env)
+					}
+					nested, err := evalQuasiquoteExpr(list[1], env, depth-1)
+					if err != nil {
+						return nil, err
+					}
+					return listFromValues([]value{symbolValue("unquote"), nested}), nil
+				case "unquote-splicing":
+					if depth == 1 {
+						return nil, newEvalError(expr.pos, "'unquote-splicing' outside list context")
+					}
+					nested, err := evalQuasiquoteExpr(list[1], env, depth-1)
+					if err != nil {
+						return nil, err
+					}
+					return listFromValues([]value{symbolValue("unquote-splicing"), nested}), nil
+				}
+			}
+		}
+
+		return evalQuasiquoteList(list, env, depth)
+	}
+
+	return quoteExpr(expr)
+}
+
+func evalQuasiquoteList(items listExpr, env *env, depth int) (value, error) {
+	dotIndex := -1
+	for i, item := range items {
+		name, ok := item.form.(symbolExpr)
+		if !ok || string(name) != "." {
+			continue
+		}
+		if dotIndex != -1 {
+			return nil, newEvalError(item.pos, "invalid dotted list")
+		}
+		dotIndex = i
+	}
+
+	end := len(items)
+	result := value(emptyList)
+	if dotIndex != -1 {
+		if dotIndex == 0 || dotIndex != len(items)-2 {
+			return nil, newEvalError(items[dotIndex].pos, "invalid dotted list")
+		}
+
+		tail, splice, err := evalQuasiquoteListItem(items[len(items)-1], env, depth)
+		if err != nil {
+			return nil, err
+		}
+		if splice {
+			return nil, newEvalError(items[len(items)-1].pos, "'unquote-splicing' cannot appear in dotted tail")
+		}
+
+		result = tail[0]
+		end = dotIndex
+	}
+
+	for i := end - 1; i >= 0; i-- {
+		values, splice, err := evalQuasiquoteListItem(items[i], env, depth)
+		if err != nil {
+			return nil, err
+		}
+		if splice {
+			for j := len(values) - 1; j >= 0; j-- {
+				result = newPair(values[j], result)
+			}
+			continue
+		}
+		result = newPair(values[0], result)
+	}
+
+	return result, nil
+}
+
+func evalQuasiquoteListItem(item locatedExpr, env *env, depth int) ([]value, bool, error) {
+	if list, ok := item.form.(listExpr); ok && len(list) == 2 {
+		if keyword, ok := list[0].form.(symbolExpr); ok && string(keyword) == "unquote-splicing" && depth == 1 {
+			spliced, err := evalExpr(list[1], env)
+			if err != nil {
+				return nil, false, err
+			}
+			elems, err := properListElements(spliced)
+			if err != nil {
+				restore := pushEvalPos(item.pos)
+				defer restore()
+				return nil, false, newCurrentEvalError("'unquote-splicing' expects a list")
+			}
+			return elems, true, nil
+		}
+	}
+
+	v, err := evalQuasiquoteExpr(item, env, depth)
+	if err != nil {
+		return nil, false, err
+	}
+	return []value{v}, false, nil
+}
+
 func evalLambda(parts []locatedExpr, env *env) (value, error) {
 	if len(parts) < 2 {
 		return nil, newCurrentEvalError("'lambda' expects a parameter list and body")
@@ -1145,6 +1279,11 @@ func evalCond(clauses []locatedExpr, env *env) (value, error) {
 			return evalSequence(clause[1:], env)
 		}
 
+		recipient, hasRecipient, err := parseCondRecipientClause(clause)
+		if err != nil {
+			return nil, err
+		}
+
 		test, err := evalExpr(clause[0], env)
 		if err != nil {
 			return nil, err
@@ -1152,6 +1291,9 @@ func evalCond(clauses []locatedExpr, env *env) (value, error) {
 		if test.isTruthy() {
 			if len(clause) == 1 {
 				return test, nil
+			}
+			if hasRecipient {
+				return applyCondRecipient(recipient, test, env)
 			}
 			return evalSequence(clause[1:], env)
 		}
@@ -1177,6 +1319,11 @@ func evalCondTail(clauses []locatedExpr, env *env) (value, *tailCall, error) {
 			return evalSequenceTail(clause[1:], env)
 		}
 
+		recipient, hasRecipient, err := parseCondRecipientClause(clause)
+		if err != nil {
+			return nil, nil, err
+		}
+
 		test, err := evalExpr(clause[0], env)
 		if err != nil {
 			return nil, nil, err
@@ -1185,11 +1332,63 @@ func evalCondTail(clauses []locatedExpr, env *env) (value, *tailCall, error) {
 			if len(clause) == 1 {
 				return test, nil, nil
 			}
+			if hasRecipient {
+				return applyCondRecipientTail(recipient, test, env)
+			}
 			return evalSequenceTail(clause[1:], env)
 		}
 	}
 
 	return voidValue{}, nil, nil
+}
+
+func parseCondRecipientClause(clause listExpr) (locatedExpr, bool, error) {
+	if len(clause) < 2 {
+		return locatedExpr{}, false, nil
+	}
+
+	keyword, ok := clause[1].form.(symbolExpr)
+	if !ok || string(keyword) != "=>" {
+		return locatedExpr{}, false, nil
+	}
+
+	if len(clause) != 3 {
+		return locatedExpr{}, false, newEvalError(clause[1].pos, "'cond' => clause expects exactly 1 recipient expression")
+	}
+
+	return clause[2], true, nil
+}
+
+func applyCondRecipient(recipientExpr locatedExpr, test value, env *env) (value, error) {
+	recipient, err := evalExpr(recipientExpr, env)
+	if err != nil {
+		return nil, err
+	}
+
+	proc, ok := recipient.(procedure)
+	if !ok {
+		restore := pushEvalPos(recipientExpr.pos)
+		defer restore()
+		return nil, newCurrentEvalError("attempt to call non-procedure: %s", recipient.schemeString())
+	}
+
+	return proc.call([]value{test})
+}
+
+func applyCondRecipientTail(recipientExpr locatedExpr, test value, env *env) (value, *tailCall, error) {
+	recipient, err := evalExpr(recipientExpr, env)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	proc, ok := recipient.(procedure)
+	if !ok {
+		restore := pushEvalPos(recipientExpr.pos)
+		defer restore()
+		return nil, nil, newCurrentEvalError("attempt to call non-procedure: %s", recipient.schemeString())
+	}
+
+	return applyProcedureTail(proc, []value{test})
 }
 
 func evalLet(parts []locatedExpr, env *env) (value, error) {
@@ -1522,14 +1721,45 @@ func quoteExpr(e locatedExpr) (value, error) {
 }
 
 func quoteList(items listExpr) (value, error) {
+	return exprListToDatum(items, quoteExpr)
+}
+
+func exprListToDatum(items listExpr, convert func(locatedExpr) (value, error)) (value, error) {
+	dotIndex := -1
+	for i, item := range items {
+		name, ok := item.form.(symbolExpr)
+		if !ok || string(name) != "." {
+			continue
+		}
+		if dotIndex != -1 {
+			return nil, newEvalError(item.pos, "invalid dotted list")
+		}
+		dotIndex = i
+	}
+
+	end := len(items)
 	result := value(emptyList)
-	for i := len(items) - 1; i >= 0; i-- {
-		v, err := quoteExpr(items[i])
+	if dotIndex != -1 {
+		if dotIndex == 0 || dotIndex != len(items)-2 {
+			return nil, newEvalError(items[dotIndex].pos, "invalid dotted list")
+		}
+
+		tail, err := convert(items[len(items)-1])
+		if err != nil {
+			return nil, err
+		}
+		result = tail
+		end = dotIndex
+	}
+
+	for i := end - 1; i >= 0; i-- {
+		v, err := convert(items[i])
 		if err != nil {
 			return nil, err
 		}
 		result = newPair(v, result)
 	}
+
 	return result, nil
 }
 
@@ -1830,6 +2060,19 @@ func evalDisplay(args []value) (value, error) {
 	}
 	appendOutput(formatValue(args[0], outputModeDisplay))
 	return voidValue{}, nil
+}
+
+func evalErrorBuiltin(args []value) (value, error) {
+	if len(args) == 0 {
+		return nil, newCurrentEvalError("'error' expects at least 1 argument")
+	}
+
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, formatValue(arg, outputModeDisplay))
+	}
+
+	return nil, newCurrentEvalError(strings.Join(parts, " "))
 }
 
 func evalWrite(args []value) (value, error) {

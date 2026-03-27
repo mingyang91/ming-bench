@@ -9,6 +9,7 @@ import (
 func registerLevel09Builtins(global *env) {
 	global.define("abs", builtinProc{name: "abs", fn: evalAbs})
 	global.define("assoc", builtinProc{name: "assoc", fn: evalAssoc})
+	global.define("assq", builtinProc{name: "assq", fn: evalAssq})
 	global.define("assv", builtinProc{name: "assv", fn: evalAssv})
 	global.define("char-alphabetic?", builtinProc{name: "char-alphabetic?", fn: evalCharAlphabeticPred})
 	global.define("char-numeric?", builtinProc{name: "char-numeric?", fn: evalCharNumericPred})
@@ -28,6 +29,8 @@ func registerLevel09Builtins(global *env) {
 	global.define("map", builtinProc{name: "map", fn: evalMapBuiltin})
 	global.define("max", builtinProc{name: "max", fn: evalMax})
 	global.define("member", builtinProc{name: "member", fn: evalMember})
+	global.define("memq", builtinProc{name: "memq", fn: evalMemq})
+	global.define("memv", builtinProc{name: "memv", fn: evalMemv})
 	global.define("min", builtinProc{name: "min", fn: evalMin})
 	global.define("modulo", builtinProc{name: "modulo", fn: evalModulo})
 	global.define("odd?", builtinProc{name: "odd?", fn: evalOddPred})
@@ -63,49 +66,15 @@ func evalAbs(args []value) (value, error) {
 }
 
 func evalAssoc(args []value) (value, error) {
-	if len(args) != 2 {
-		return nil, newCurrentEvalError("'assoc' expects exactly 2 arguments")
-	}
+	return evalAssocLike(args, "assoc", schemeEqual)
+}
 
-	items, err := properListElements(args[1])
-	if err != nil {
-		return nil, err
-	}
-
-	for _, item := range items {
-		pair, ok := item.(pairValue)
-		if !ok {
-			return nil, newCurrentEvalError("'assoc' expects a list of pairs, got %s", item.schemeString())
-		}
-		if schemeEqual(args[0], pair.carValue()) {
-			return pair, nil
-		}
-	}
-
-	return boolValue(false), nil
+func evalAssq(args []value) (value, error) {
+	return evalAssocLike(args, "assq", schemeEq)
 }
 
 func evalAssv(args []value) (value, error) {
-	if len(args) != 2 {
-		return nil, newCurrentEvalError("'assv' expects exactly 2 arguments")
-	}
-
-	items, err := properListElements(args[1])
-	if err != nil {
-		return nil, err
-	}
-
-	for _, item := range items {
-		pair, ok := item.(pairValue)
-		if !ok {
-			return nil, newCurrentEvalError("'assv' expects a list of pairs, got %s", item.schemeString())
-		}
-		if schemeEqv(args[0], pair.carValue()) {
-			return pair, nil
-		}
-	}
-
-	return boolValue(false), nil
+	return evalAssocLike(args, "assv", schemeEqv)
 }
 
 func evalCharAlphabeticPred(args []value) (value, error) {
@@ -205,7 +174,7 @@ func evalLCM(args []value) (value, error) {
 			continue
 		}
 
-		result = absInt(result/gcd(result, n) * n)
+		result = absInt(result / gcd(result, n) * n)
 	}
 
 	return newExactInteger(result), nil
@@ -357,8 +326,43 @@ func evalForEach(args []value) (value, error) {
 }
 
 func evalMember(args []value) (value, error) {
+	return evalMemberLike(args, "member", schemeEqual)
+}
+
+func evalMemq(args []value) (value, error) {
+	return evalMemberLike(args, "memq", schemeEq)
+}
+
+func evalMemv(args []value) (value, error) {
+	return evalMemberLike(args, "memv", schemeEqv)
+}
+
+func evalAssocLike(args []value, name string, match func(value, value) bool) (value, error) {
 	if len(args) != 2 {
-		return nil, newCurrentEvalError("'member' expects exactly 2 arguments")
+		return nil, newCurrentEvalError("'%s' expects exactly 2 arguments", name)
+	}
+
+	items, err := properListElements(args[1])
+	if err != nil {
+		return nil, err
+	}
+
+	for _, item := range items {
+		pair, ok := item.(pairValue)
+		if !ok {
+			return nil, newCurrentEvalError("'%s' expects a list of pairs, got %s", name, item.schemeString())
+		}
+		if match(args[0], pair.carValue()) {
+			return pair, nil
+		}
+	}
+
+	return boolValue(false), nil
+}
+
+func evalMemberLike(args []value, name string, match func(value, value) bool) (value, error) {
+	if len(args) != 2 {
+		return nil, newCurrentEvalError("'%s' expects exactly 2 arguments", name)
 	}
 
 	current := args[1]
@@ -370,15 +374,15 @@ func evalMember(args []value) (value, error) {
 			return boolValue(false), nil
 		case pairValue:
 			if _, exists := seen[list.cell]; exists {
-				return nil, newCurrentEvalError("'member' expects a proper list, got %s", args[1].schemeString())
+				return nil, newCurrentEvalError("'%s' expects a proper list, got %s", name, args[1].schemeString())
 			}
 			seen[list.cell] = struct{}{}
-			if schemeEqual(args[0], list.carValue()) {
+			if match(args[0], list.carValue()) {
 				return current, nil
 			}
 			current = list.cdrValue()
 		default:
-			return nil, newCurrentEvalError("'member' expects a proper list, got %s", args[1].schemeString())
+			return nil, newCurrentEvalError("'%s' expects a proper list, got %s", name, args[1].schemeString())
 		}
 	}
 }
