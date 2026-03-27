@@ -1,6 +1,10 @@
 pub mod error;
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 pub use error::EvalError;
 
@@ -72,6 +76,61 @@ struct ProcedureClause {
     params: Vec<String>,
     rest_param: Option<String>,
     body: Vec<Expr>,
+}
+
+#[derive(Clone)]
+struct SyntaxRulesMacro {
+    literals: HashSet<String>,
+    rules: Vec<SyntaxRule>,
+}
+
+#[derive(Clone)]
+struct SyntaxRule {
+    pattern: Expr,
+    template: Expr,
+}
+
+#[derive(Clone, Default)]
+struct MacroBindings {
+    singles: HashMap<String, Expr>,
+    repeated: HashMap<String, Vec<Expr>>,
+}
+
+impl MacroBindings {
+    fn bind_single(&mut self, name: &str, expression: &Expr) -> bool {
+        match self.singles.get(name) {
+            Some(existing) => same_syntax(existing, expression),
+            None => {
+                self.singles.insert(name.to_string(), expression.clone());
+                true
+            }
+        }
+    }
+
+    fn bind_repeated(&mut self, name: &str, expressions: &[Expr]) {
+        self.repeated
+            .insert(name.to_string(), expressions.to_vec());
+    }
+
+    fn merge(&mut self, other: MacroBindings) -> bool {
+        for (name, expression) in other.singles {
+            if !self.bind_single(&name, &expression) {
+                return false;
+            }
+        }
+
+        for (name, expressions) in other.repeated {
+            match self.repeated.get(&name) {
+                Some(existing) if !same_syntax_list(existing, &expressions) => return false,
+                Some(_) => {}
+                None => {
+                    self.repeated.insert(name, expressions);
+                }
+            }
+        }
+
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,6 +255,7 @@ impl EvalContext {
 struct Environment {
     parent: Option<EnvRef>,
     bindings: RefCell<HashMap<String, Value>>,
+    macros: RefCell<HashMap<String, SyntaxRulesMacro>>,
 }
 
 impl Environment {
@@ -203,6 +263,7 @@ impl Environment {
         Rc::new(Self {
             parent: None,
             bindings: RefCell::new(HashMap::from_iter(initial_bindings)),
+            macros: RefCell::new(HashMap::new()),
         })
     }
 
@@ -210,6 +271,7 @@ impl Environment {
         Rc::new(Self {
             parent: Some(parent),
             bindings: RefCell::new(HashMap::from_iter(initial_bindings)),
+            macros: RefCell::new(HashMap::new()),
         })
     }
 
@@ -221,6 +283,12 @@ impl Environment {
         self.bindings
             .borrow_mut()
             .insert(name.to_string(), Value::Uninitialized);
+    }
+
+    fn define_macro(&self, name: &str, macro_definition: SyntaxRulesMacro) {
+        self.macros
+            .borrow_mut()
+            .insert(name.to_string(), macro_definition);
     }
 
     fn lookup(&self, name: &str, position: Position) -> EvalResult<Value> {
@@ -237,6 +305,16 @@ impl Environment {
             Some(parent) => parent.lookup(name, position),
             None => Err(error_at(format!("unbound symbol: {name}"), position)),
         }
+    }
+
+    fn lookup_macro(&self, name: &str) -> Option<SyntaxRulesMacro> {
+        if let Some(macro_definition) = self.macros.borrow().get(name).cloned() {
+            return Some(macro_definition);
+        }
+
+        self.parent
+            .as_ref()
+            .and_then(|parent| parent.lookup_macro(name))
     }
 }
 
@@ -469,6 +547,105 @@ fn eval_sequence(
     Ok(result)
 }
 
+enum EvalOutcome {
+    Value(Value),
+    TailCall {
+        function: Value,
+        arguments: Vec<Value>,
+        position: Position,
+    },
+}
+
+fn eval_sequence_tail(
+    expressions: &[Expr],
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    let Some((last_expression, prefix_expressions)) = expressions.split_last() else {
+        return Ok(EvalOutcome::Value(Value::Void));
+    };
+
+    for expression in prefix_expressions {
+        eval(expression, env.clone(), context)?;
+    }
+
+    eval_tail(last_expression, env, context)
+}
+
+fn eval_tail(expression: &Expr, env: EnvRef, context: &mut EvalContext) -> EvalResult<EvalOutcome> {
+    match expression {
+        Expr::Int(value, _) => Ok(EvalOutcome::Value(Value::Int(*value))),
+        Expr::Bool(value, _) => Ok(EvalOutcome::Value(Value::Bool(*value))),
+        Expr::String(value, _) => Ok(EvalOutcome::Value(Value::String(value.clone()))),
+        Expr::Char(ch, _) => Ok(EvalOutcome::Value(Value::Char(*ch))),
+        Expr::Symbol(name, position) => Ok(EvalOutcome::Value(env.lookup(name, *position)?)),
+        Expr::List(items, position) => eval_list_tail(items, *position, env, context),
+    }
+}
+
+fn eval_list_tail(
+    items: &[Expr],
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    let Some((head, rest)) = items.split_first() else {
+        return Err(error_at("cannot evaluate an empty list", position));
+    };
+
+    if let Expr::Symbol(name, _) = head {
+        if let Some(macro_definition) = env.lookup_macro(name) {
+            let expanded = expand_macro(name, &macro_definition, items, position)?;
+            return eval_tail(&expanded, env, context);
+        }
+    }
+
+    match head {
+        Expr::Symbol(name, _) if name == "and" => eval_and_tail(rest, env, context),
+        Expr::Symbol(name, _) if name == "begin" => eval_sequence_tail(rest, env, context),
+        Expr::Symbol(name, _) if name == "case" => eval_case_tail(rest, position, env, context),
+        Expr::Symbol(name, _) if name == "case-lambda" => {
+            Ok(EvalOutcome::Value(eval_case_lambda(rest, position, env)?))
+        }
+        Expr::Symbol(name, _) if name == "cond" => eval_cond_tail(rest, env, context),
+        Expr::Symbol(name, _) if name == "or" => eval_or_tail(rest, env, context),
+        Expr::Symbol(name, _) if name == "define" => {
+            Ok(EvalOutcome::Value(eval_define(rest, position, env, context)?))
+        }
+        Expr::Symbol(name, _) if name == "define-record-type" => Ok(EvalOutcome::Value(
+            eval_define_record_type(rest, position, env)?,
+        )),
+        Expr::Symbol(name, _) if name == "define-syntax" => {
+            Ok(EvalOutcome::Value(eval_define_syntax(rest, position, env)?))
+        }
+        Expr::Symbol(name, _) if name == "if" => eval_if_tail(rest, position, env, context),
+        Expr::Symbol(name, _) if name == "let" => eval_let_tail(rest, position, env, context),
+        Expr::Symbol(name, _) if name == "quote" => {
+            Ok(EvalOutcome::Value(eval_quote(rest, position)?))
+        }
+        Expr::Symbol(name, _) if name == "lambda" => {
+            Ok(EvalOutcome::Value(eval_lambda(rest, position, env)?))
+        }
+        _ => {
+            let function =
+                expect_single_value_result(eval(head, env.clone(), context)?, head.position())?;
+            let mut evaluated_arguments = Vec::with_capacity(rest.len());
+            for argument in rest {
+                evaluated_arguments.push(expect_single_value_result(
+                    eval(argument, env.clone(), context)?,
+                    argument.position(),
+                )?);
+            }
+
+            Ok(EvalOutcome::TailCall {
+                function,
+                arguments: evaluated_arguments,
+                position,
+            })
+        }
+    }
+}
+
 fn eval(expression: &Expr, env: EnvRef, context: &mut EvalContext) -> EvalResult<Value> {
     match expression {
         Expr::Int(value, _) => Ok(Value::Int(*value)),
@@ -490,15 +667,26 @@ fn eval_list(
         return Err(error_at("cannot evaluate an empty list", position));
     };
 
+    if let Expr::Symbol(name, _) = head {
+        if let Some(macro_definition) = env.lookup_macro(name) {
+            let expanded = expand_macro(name, &macro_definition, items, position)?;
+            return eval(&expanded, env, context);
+        }
+    }
+
     match head {
         Expr::Symbol(name, _) if name == "and" => eval_and(rest, env, context),
         Expr::Symbol(name, _) if name == "begin" => eval_sequence(rest, env, context),
+        Expr::Symbol(name, _) if name == "case" => eval_case(rest, position, env, context),
         Expr::Symbol(name, _) if name == "case-lambda" => eval_case_lambda(rest, position, env),
         Expr::Symbol(name, _) if name == "cond" => eval_cond(rest, env, context),
         Expr::Symbol(name, _) if name == "or" => eval_or(rest, env, context),
         Expr::Symbol(name, _) if name == "define" => eval_define(rest, position, env, context),
         Expr::Symbol(name, _) if name == "define-record-type" => {
             eval_define_record_type(rest, position, env)
+        }
+        Expr::Symbol(name, _) if name == "define-syntax" => {
+            eval_define_syntax(rest, position, env)
         }
         Expr::Symbol(name, _) if name == "if" => eval_if(rest, position, env, context),
         Expr::Symbol(name, _) if name == "let" => eval_let(rest, position, env, context),
@@ -545,6 +733,32 @@ fn eval_and(expressions: &[Expr], env: EnvRef, context: &mut EvalContext) -> Eva
     eval(&expressions[expressions.len() - 1], env, context)
 }
 
+fn eval_and_tail(
+    expressions: &[Expr],
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    if expressions.is_empty() {
+        return Ok(EvalOutcome::Value(Value::Bool(true)));
+    }
+
+    let Some((last_expression, prefix_expressions)) = expressions.split_last() else {
+        return Ok(EvalOutcome::Value(Value::Bool(true)));
+    };
+
+    for expression in prefix_expressions {
+        let value = expect_single_value_result(
+            eval(expression, env.clone(), context)?,
+            expression.position(),
+        )?;
+        if !is_truthy(&value) {
+            return Ok(EvalOutcome::Value(value));
+        }
+    }
+
+    eval_tail(last_expression, env, context)
+}
+
 fn eval_or(expressions: &[Expr], env: EnvRef, context: &mut EvalContext) -> EvalResult<Value> {
     if expressions.is_empty() {
         return Ok(Value::Bool(false));
@@ -561,6 +775,32 @@ fn eval_or(expressions: &[Expr], env: EnvRef, context: &mut EvalContext) -> Eval
     }
 
     eval(&expressions[expressions.len() - 1], env, context)
+}
+
+fn eval_or_tail(
+    expressions: &[Expr],
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    if expressions.is_empty() {
+        return Ok(EvalOutcome::Value(Value::Bool(false)));
+    }
+
+    let Some((last_expression, prefix_expressions)) = expressions.split_last() else {
+        return Ok(EvalOutcome::Value(Value::Bool(false)));
+    };
+
+    for expression in prefix_expressions {
+        let value = expect_single_value_result(
+            eval(expression, env.clone(), context)?,
+            expression.position(),
+        )?;
+        if is_truthy(&value) {
+            return Ok(EvalOutcome::Value(value));
+        }
+    }
+
+    eval_tail(last_expression, env, context)
 }
 
 fn eval_cond(clauses: &[Expr], env: EnvRef, context: &mut EvalContext) -> EvalResult<Value> {
@@ -601,6 +841,76 @@ fn eval_cond(clauses: &[Expr], env: EnvRef, context: &mut EvalContext) -> EvalRe
     }
 
     Ok(Value::Void)
+}
+
+fn eval_cond_tail(
+    clauses: &[Expr],
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    for (index, clause) in clauses.iter().enumerate() {
+        match clause {
+            Expr::List(items, clause_position) if !items.is_empty() => {
+                if matches!(&items[0], Expr::Symbol(name, _) if name == "else") {
+                    if index + 1 != clauses.len() {
+                        return Err(error_at("cond else clause must be last", *clause_position));
+                    }
+                    if items.len() == 1 {
+                        return Err(error_at(
+                            "cond else clause must have a body",
+                            *clause_position,
+                        ));
+                    }
+                    return eval_sequence_tail(&items[1..], env, context);
+                }
+
+                let test_value = expect_single_value_result(
+                    eval(&items[0], env.clone(), context)?,
+                    items[0].position(),
+                )?;
+                if is_truthy(&test_value) {
+                    if items.len() == 1 {
+                        return Ok(EvalOutcome::Value(test_value));
+                    }
+                    return eval_sequence_tail(&items[1..], env, context);
+                }
+            }
+            _ => {
+                return Err(error_at(
+                    "cond expected non-empty list clauses",
+                    clause.position(),
+                ))
+            }
+        }
+    }
+
+    Ok(EvalOutcome::Value(Value::Void))
+}
+
+fn eval_case(
+    arguments: &[Expr],
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let body = select_case_clause(arguments, position, env.clone(), context)?;
+    match body {
+        Some(body) => eval_sequence(body, env, context),
+        None => Ok(Value::Void),
+    }
+}
+
+fn eval_case_tail(
+    arguments: &[Expr],
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    let body = select_case_clause(arguments, position, env.clone(), context)?;
+    match body {
+        Some(body) => eval_sequence_tail(body, env, context),
+        None => Ok(EvalOutcome::Value(Value::Void)),
+    }
 }
 
 fn eval_case_lambda(arguments: &[Expr], position: Position, env: EnvRef) -> EvalResult<Value> {
@@ -683,6 +993,23 @@ fn eval_procedure_define(
     Ok(Value::Void)
 }
 
+fn eval_define_syntax(
+    arguments: &[Expr],
+    position: Position,
+    env: EnvRef,
+) -> EvalResult<Value> {
+    let [Expr::Symbol(name, _), transformer_expression] = arguments else {
+        return Err(error_at(
+            "define-syntax expected (define-syntax name (syntax-rules ...))",
+            position,
+        ));
+    };
+
+    let macro_definition = parse_syntax_rules(transformer_expression, position)?;
+    env.define_macro(name, macro_definition);
+    Ok(Value::Void)
+}
+
 fn eval_define_record_type(
     arguments: &[Expr],
     position: Position,
@@ -756,6 +1083,28 @@ fn eval_if(
     }
 }
 
+fn eval_if_tail(
+    arguments: &[Expr],
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    match arguments {
+        [condition, consequent, alternate] => {
+            let condition_value = expect_single_value_result(
+                eval(condition, env.clone(), context)?,
+                condition.position(),
+            )?;
+            if is_truthy(&condition_value) {
+                eval_tail(consequent, env, context)
+            } else {
+                eval_tail(alternate, env, context)
+            }
+        }
+        _ => Err(error_at("if expected 3 argument(s)", position)),
+    }
+}
+
 fn eval_let(
     arguments: &[Expr],
     position: Position,
@@ -773,6 +1122,23 @@ fn eval_let(
     }
 }
 
+fn eval_let_tail(
+    arguments: &[Expr],
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    match arguments {
+        [Expr::Symbol(name, _), bindings_expression, body @ ..] if !body.is_empty() => {
+            eval_named_let_tail(name, bindings_expression, body, position, env, context)
+        }
+        [bindings_expression, body @ ..] if !body.is_empty() => {
+            eval_unnamed_let_tail(bindings_expression, body, position, env, context)
+        }
+        _ => Err(error_at("let expected bindings and body", position)),
+    }
+}
+
 fn eval_unnamed_let(
     bindings_expression: &Expr,
     body: &[Expr],
@@ -780,23 +1146,19 @@ fn eval_unnamed_let(
     env: EnvRef,
     context: &mut EvalContext,
 ) -> EvalResult<Value> {
-    let bindings = parse_bindings(bindings_expression, position, "let")?;
-    let mut bound_values = Vec::with_capacity(bindings.len());
-    for (_, expression) in &bindings {
-        bound_values.push(expect_single_value_result(
-            eval(expression, env.clone(), context)?,
-            expression.position(),
-        )?);
-    }
-    let child_env = Environment::child(
-        env,
-        bindings
-            .into_iter()
-            .zip(bound_values)
-            .map(|((name, _), value)| (name, value))
-            .collect(),
-    );
+    let child_env = eval_let_bindings(bindings_expression, position, env, context)?;
     eval_sequence(body, child_env, context)
+}
+
+fn eval_unnamed_let_tail(
+    bindings_expression: &Expr,
+    body: &[Expr],
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    let child_env = eval_let_bindings(bindings_expression, position, env, context)?;
+    eval_sequence_tail(body, child_env, context)
 }
 
 fn eval_named_let(
@@ -826,6 +1188,39 @@ fn eval_named_let(
     };
     closure_env.define(name, closure.clone());
     apply(closure, arguments, position, context)
+}
+
+fn eval_named_let_tail(
+    name: &str,
+    bindings_expression: &Expr,
+    body: &[Expr],
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EvalOutcome> {
+    let bindings = parse_bindings(bindings_expression, position, "let")?;
+    let mut arguments = Vec::with_capacity(bindings.len());
+    for (_, expression) in &bindings {
+        arguments.push(expect_single_value_result(
+            eval(expression, env.clone(), context)?,
+            expression.position(),
+        )?);
+    }
+
+    let closure_env = Environment::child(env, Vec::new());
+    let closure = Value::Closure {
+        params: bindings.iter().map(|(binding_name, _)| binding_name.clone()).collect(),
+        rest_param: None,
+        body: body.to_vec(),
+        env: closure_env.clone(),
+        name: Some(name.to_string()),
+    };
+    closure_env.define(name, closure.clone());
+    Ok(EvalOutcome::TailCall {
+        function: closure,
+        arguments,
+        position,
+    })
 }
 
 fn eval_quote(arguments: &[Expr], position: Position) -> EvalResult<Value> {
@@ -999,6 +1394,337 @@ fn parse_binding(binding: &Expr, form_name: &str) -> EvalResult<(String, Expr)> 
     }
 }
 
+fn eval_let_bindings(
+    bindings_expression: &Expr,
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<EnvRef> {
+    let bindings = parse_bindings(bindings_expression, position, "let")?;
+    let mut bound_values = Vec::with_capacity(bindings.len());
+    for (_, expression) in &bindings {
+        bound_values.push(expect_single_value_result(
+            eval(expression, env.clone(), context)?,
+            expression.position(),
+        )?);
+    }
+
+    Ok(Environment::child(
+        env,
+        bindings
+            .into_iter()
+            .zip(bound_values)
+            .map(|((name, _), value)| (name, value))
+            .collect(),
+    ))
+}
+
+fn select_case_clause<'a>(
+    arguments: &'a [Expr],
+    position: Position,
+    env: EnvRef,
+    context: &mut EvalContext,
+) -> EvalResult<Option<&'a [Expr]>> {
+    let [key_expression, clauses @ ..] = arguments else {
+        return Err(error_at("case expected a key and at least one clause", position));
+    };
+    if clauses.is_empty() {
+        return Err(error_at("case expected a key and at least one clause", position));
+    }
+
+    let key =
+        expect_single_value_result(eval(key_expression, env, context)?, key_expression.position())?;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        match clause {
+            Expr::List(items, clause_position) if !items.is_empty() => {
+                if matches!(&items[0], Expr::Symbol(name, _) if name == "else") {
+                    if index + 1 != clauses.len() {
+                        return Err(error_at("case else clause must be last", *clause_position));
+                    }
+                    if items.len() == 1 {
+                        return Err(error_at("case else clause must have a body", *clause_position));
+                    }
+                    return Ok(Some(&items[1..]));
+                }
+
+                if items.len() == 1 {
+                    return Err(error_at("case clause must have a body", *clause_position));
+                }
+
+                let Expr::List(datum_expressions, _) = &items[0] else {
+                    return Err(error_at(
+                        "case expected clauses of the form ((datum ...) body ...)",
+                        *clause_position,
+                    ));
+                };
+
+                if datum_expressions
+                    .iter()
+                    .map(quote)
+                    .any(|datum| eq_values(&key, &datum))
+                {
+                    return Ok(Some(&items[1..]));
+                }
+            }
+            _ => {
+                return Err(error_at(
+                    "case expected non-empty list clauses",
+                    clause.position(),
+                ))
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_syntax_rules(
+    transformer_expression: &Expr,
+    position: Position,
+) -> EvalResult<SyntaxRulesMacro> {
+    let Expr::List(items, transformer_position) = transformer_expression else {
+        return Err(error_at(
+            "define-syntax expected a syntax-rules transformer",
+            transformer_expression.position(),
+        ));
+    };
+
+    let [Expr::Symbol(keyword, _), literals_expression, rule_expressions @ ..] = items.as_slice()
+    else {
+        return Err(error_at(
+            "define-syntax expected a syntax-rules transformer",
+            position,
+        ));
+    };
+    if keyword != "syntax-rules" {
+        return Err(error_at(
+            "define-syntax expected a syntax-rules transformer",
+            *transformer_position,
+        ));
+    }
+    if rule_expressions.is_empty() {
+        return Err(error_at(
+            "syntax-rules expected at least one rule",
+            *transformer_position,
+        ));
+    }
+
+    let Expr::List(literal_expressions, literals_position) = literals_expression else {
+        return Err(error_at(
+            "syntax-rules expected a literal identifier list",
+            literals_expression.position(),
+        ));
+    };
+
+    let literals = literal_expressions
+        .iter()
+        .map(|expression| {
+            expect_symbol_expression(expression, "syntax-rules expected literal identifiers")
+                .map(ToString::to_string)
+        })
+        .collect::<EvalResult<HashSet<_>>>()?;
+    let rules = rule_expressions
+        .iter()
+        .map(parse_syntax_rule)
+        .collect::<EvalResult<Vec<_>>>()?;
+
+    if literal_expressions.len() != literals.len() {
+        return Err(error_at(
+            "syntax-rules expected distinct literal identifiers",
+            *literals_position,
+        ));
+    }
+
+    Ok(SyntaxRulesMacro { literals, rules })
+}
+
+fn parse_syntax_rule(rule_expression: &Expr) -> EvalResult<SyntaxRule> {
+    let Expr::List(items, position) = rule_expression else {
+        return Err(error_at(
+            "syntax-rules expected rules of the form (pattern template)",
+            rule_expression.position(),
+        ));
+    };
+
+    match items.as_slice() {
+        [pattern, template] => Ok(SyntaxRule {
+            pattern: pattern.clone(),
+            template: template.clone(),
+        }),
+        _ => Err(error_at(
+            "syntax-rules expected rules of the form (pattern template)",
+            *position,
+        )),
+    }
+}
+
+fn expand_macro(
+    macro_name: &str,
+    macro_definition: &SyntaxRulesMacro,
+    application: &[Expr],
+    position: Position,
+) -> EvalResult<Expr> {
+    let input = Expr::List(application.to_vec(), position);
+    for rule in &macro_definition.rules {
+        if let Some(bindings) =
+            match_pattern(&rule.pattern, &input, &macro_definition.literals, macro_name)
+        {
+            return instantiate_template(&rule.template, &bindings);
+        }
+    }
+
+    Err(error_at(
+        format!("no syntax-rules clause matched {macro_name}"),
+        position,
+    ))
+}
+
+fn match_pattern(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &HashSet<String>,
+    macro_name: &str,
+) -> Option<MacroBindings> {
+    match pattern {
+        Expr::Int(value, _) => matches!(input, Expr::Int(other, _) if other == value)
+            .then(MacroBindings::default),
+        Expr::Bool(value, _) => matches!(input, Expr::Bool(other, _) if other == value)
+            .then(MacroBindings::default),
+        Expr::String(value, _) => matches!(input, Expr::String(other, _) if other == value)
+            .then(MacroBindings::default),
+        Expr::Char(value, _) => matches!(input, Expr::Char(other, _) if other == value)
+            .then(MacroBindings::default),
+        Expr::Symbol(name, _) if name == "_" => Some(MacroBindings::default()),
+        Expr::Symbol(name, _) if name == macro_name || literals.contains(name) => {
+            matches!(input, Expr::Symbol(other, _) if other == name).then(MacroBindings::default)
+        }
+        Expr::Symbol(name, _) if name == "..." => None,
+        Expr::Symbol(name, _) => {
+            let mut bindings = MacroBindings::default();
+            bindings.bind_single(name, input).then_some(bindings)
+        }
+        Expr::List(pattern_items, _) => match input {
+            Expr::List(input_items, _) => match_list_pattern(pattern_items, input_items, literals, macro_name),
+            _ => None,
+        },
+    }
+}
+
+fn match_list_pattern(
+    pattern_items: &[Expr],
+    input_items: &[Expr],
+    literals: &HashSet<String>,
+    macro_name: &str,
+) -> Option<MacroBindings> {
+    let repeated_pattern = repeated_pattern(pattern_items);
+    let prefix_len = repeated_pattern.map_or(pattern_items.len(), |index| index);
+
+    if repeated_pattern.is_none() && pattern_items.len() != input_items.len() {
+        return None;
+    }
+    if repeated_pattern.is_some() && input_items.len() < prefix_len {
+        return None;
+    }
+
+    let mut bindings = MacroBindings::default();
+    for (pattern, input) in pattern_items.iter().take(prefix_len).zip(input_items.iter()) {
+        let matched = match_pattern(pattern, input, literals, macro_name)?;
+        if !bindings.merge(matched) {
+            return None;
+        }
+    }
+
+    match repeated_pattern {
+        Some(index) => {
+            let Expr::Symbol(name, _) = &pattern_items[index] else {
+                return None;
+            };
+            if name == "_" || name == "..." || literals.contains(name) || name == macro_name {
+                return None;
+            }
+            bindings.bind_repeated(name, &input_items[prefix_len..]);
+            Some(bindings)
+        }
+        None => Some(bindings),
+    }
+}
+
+fn repeated_pattern(pattern_items: &[Expr]) -> Option<usize> {
+    match pattern_items {
+        [.., _, Expr::Symbol(ellipsis, _)] if ellipsis == "..." => {
+            Some(pattern_items.len().saturating_sub(2))
+        }
+        _ => None,
+    }
+}
+
+fn instantiate_template(template: &Expr, bindings: &MacroBindings) -> EvalResult<Expr> {
+    match template {
+        Expr::Symbol(name, _) => Ok(bindings
+            .singles
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| template.clone())),
+        Expr::List(items, position) => {
+            let mut instantiated = Vec::new();
+            let mut index = 0;
+            while index < items.len() {
+                if index + 1 < items.len() && is_ellipsis_symbol(&items[index + 1]) {
+                    instantiated.extend(instantiate_repeated_template_item(&items[index], bindings)?);
+                    index += 2;
+                } else {
+                    instantiated.push(instantiate_template(&items[index], bindings)?);
+                    index += 1;
+                }
+            }
+            Ok(Expr::List(instantiated, *position))
+        }
+        _ => Ok(template.clone()),
+    }
+}
+
+fn instantiate_repeated_template_item(
+    template: &Expr,
+    bindings: &MacroBindings,
+) -> EvalResult<Vec<Expr>> {
+    match template {
+        Expr::Symbol(name, position) => bindings
+            .repeated
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error_at(format!("macro template expected repeated binding for {name}"), *position)),
+        _ => Err(error_at(
+            "macro template expected a repeated variable before ellipsis",
+            template.position(),
+        )),
+    }
+}
+
+fn is_ellipsis_symbol(expression: &Expr) -> bool {
+    matches!(expression, Expr::Symbol(name, _) if name == "...")
+}
+
+fn same_syntax(left: &Expr, right: &Expr) -> bool {
+    match (left, right) {
+        (Expr::Int(left, _), Expr::Int(right, _)) => left == right,
+        (Expr::Bool(left, _), Expr::Bool(right, _)) => left == right,
+        (Expr::String(left, _), Expr::String(right, _)) => left == right,
+        (Expr::Char(left, _), Expr::Char(right, _)) => left == right,
+        (Expr::Symbol(left, _), Expr::Symbol(right, _)) => left == right,
+        (Expr::List(left, _), Expr::List(right, _)) => same_syntax_list(left, right),
+        _ => false,
+    }
+}
+
+fn same_syntax_list(left: &[Expr], right: &[Expr]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| same_syntax(left, right))
+}
+
 struct RecordTypeDefinition {
     type_name: String,
     constructor_name: String,
@@ -1168,66 +1894,99 @@ fn quote(expression: &Expr) -> Value {
 }
 
 fn apply(
-    function: Value,
-    arguments: Vec<Value>,
-    position: Position,
+    mut function: Value,
+    mut arguments: Vec<Value>,
+    mut position: Position,
     context: &mut EvalContext,
 ) -> EvalResult<Value> {
-    match function {
-        Value::Builtin { function, .. } => function(&arguments, position, context),
-        Value::Closure {
-            params,
-            rest_param,
-            body,
-            env,
-            name: _,
-        } => apply_closure(
-            &params,
-            rest_param.as_deref(),
-            &body,
-            env,
-            arguments,
-            position,
-            context,
-        ),
-        Value::CaseClosure {
-            clauses,
-            env,
-            name: _,
-        } => apply_case_closure(&clauses, env, arguments, position, context),
-        Value::Continuation => apply_continuation(&arguments, position),
-        Value::RecordConstructor {
-            name,
-            record_type,
-            field_indices,
-        } => apply_record_constructor(&name, record_type, &field_indices, arguments, position),
-        Value::RecordPredicate { name, record_type } => {
-            apply_record_predicate(&name, record_type, &arguments, position)
+    loop {
+        match function {
+            Value::Builtin {
+                function: builtin_function,
+                ..
+            } => return builtin_function(&arguments, position, context),
+            Value::Closure {
+                params,
+                rest_param,
+                body,
+                env,
+                name: _,
+            } => {
+                let call_env =
+                    bind_call_env(&params, rest_param.as_deref(), env, arguments, position)?;
+                match eval_sequence_tail(&body, call_env, context)? {
+                    EvalOutcome::Value(value) => return Ok(value),
+                    EvalOutcome::TailCall {
+                        function: next_function,
+                        arguments: next_arguments,
+                        position: next_position,
+                    } => {
+                        function = next_function;
+                        arguments = next_arguments;
+                        position = next_position;
+                    }
+                }
+            }
+            Value::CaseClosure {
+                clauses,
+                env,
+                name: _,
+            } => {
+                let clause = select_case_lambda_clause(&clauses, arguments.len(), position)?;
+                let call_env = bind_call_env(
+                    &clause.params,
+                    clause.rest_param.as_deref(),
+                    env,
+                    arguments,
+                    position,
+                )?;
+                match eval_sequence_tail(&clause.body, call_env, context)? {
+                    EvalOutcome::Value(value) => return Ok(value),
+                    EvalOutcome::TailCall {
+                        function: next_function,
+                        arguments: next_arguments,
+                        position: next_position,
+                    } => {
+                        function = next_function;
+                        arguments = next_arguments;
+                        position = next_position;
+                    }
+                }
+            }
+            Value::Continuation => return apply_continuation(&arguments, position),
+            Value::RecordConstructor {
+                name,
+                record_type,
+                field_indices,
+            } => return apply_record_constructor(&name, record_type, &field_indices, arguments, position),
+            Value::RecordPredicate { name, record_type } => {
+                return apply_record_predicate(&name, record_type, &arguments, position)
+            }
+            Value::RecordAccessor {
+                name,
+                record_type,
+                field_index,
+            } => return apply_record_accessor(&name, record_type, field_index, &arguments, position),
+            other => {
+                return Err(error_at(
+                    format!(
+                        "attempted to call a non-procedure value: {}",
+                        other.render()
+                    ),
+                    position,
+                ))
+            }
         }
-        Value::RecordAccessor {
-            name,
-            record_type,
-            field_index,
-        } => apply_record_accessor(&name, record_type, field_index, &arguments, position),
-        other => Err(error_at(
-            format!(
-                "attempted to call a non-procedure value: {}",
-                other.render()
-            ),
-            position,
-        )),
     }
 }
 
-fn apply_closure(
+fn bind_call_env(
     parameters: &[String],
     rest_param: Option<&str>,
-    body: &[Expr],
     closure_env: EnvRef,
     arguments: Vec<Value>,
     position: Position,
-    context: &mut EvalContext,
-) -> EvalResult<Value> {
+) -> EvalResult<EnvRef> {
     match rest_param {
         Some(_) if arguments.len() < parameters.len() => {
             return Err(error_at(
@@ -1263,34 +2022,21 @@ fn apply_closure(
         bindings.push((rest_name.to_string(), build_list(rest_arguments)));
     }
 
-    let call_env = Environment::child(closure_env, bindings);
-    eval_sequence(body, call_env, context)
+    Ok(Environment::child(closure_env, bindings))
 }
 
-fn apply_case_closure(
-    clauses: &[ProcedureClause],
-    closure_env: EnvRef,
-    arguments: Vec<Value>,
+fn select_case_lambda_clause<'a>(
+    clauses: &'a [ProcedureClause],
+    argument_count: usize,
     position: Position,
-    context: &mut EvalContext,
-) -> EvalResult<Value> {
-    let argument_count = arguments.len();
-
+) -> EvalResult<&'a ProcedureClause> {
     for clause in clauses {
         let matches = match clause.rest_param {
             Some(_) => argument_count >= clause.params.len(),
             None => argument_count == clause.params.len(),
         };
         if matches {
-            return apply_closure(
-                &clause.params,
-                clause.rest_param.as_deref(),
-                &clause.body,
-                closure_env.clone(),
-                arguments,
-                position,
-                context,
-            );
+            return Ok(clause);
         }
     }
 
