@@ -169,6 +169,8 @@ public class Evaluator {
     private final MacroExpander macroExpander = new MacroExpander();
     private int nextEvalId = 0;
     private StringBuilder outputBuffer;
+    private int stepLimit = -1;
+    private int stepCount = 0;
     private Env syntaxDefEnv;
     private final List<DynamicWindEntry> windStack = new ArrayList<>();
     private final List<Object> exceptionHandlers = new ArrayList<>();
@@ -188,6 +190,17 @@ public class Evaluator {
             result = eval(bf, env);
         }
         return schemeToString(result);
+    }
+
+    public String evalStrWithLimit(String input, int maxSteps) throws EvalError {
+        stepLimit = maxSteps;
+        stepCount = 0;
+        try {
+            return evalStr(input);
+        } finally {
+            stepLimit = -1;
+            stepCount = 0;
+        }
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
@@ -255,6 +268,9 @@ public class Evaluator {
 
         while (true) {
           try {
+            if (stepLimit >= 0 && ++stepCount > stepLimit) {
+                throw new EvalError("step limit exceeded");
+            }
             if (evaluating) {
                 int eLine = 0, eCol = 0;
                 if (current instanceof SchemeParser.Located loc) {

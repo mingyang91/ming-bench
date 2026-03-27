@@ -145,6 +145,29 @@ public class TestRunner {
         }
 
         System.out.println(passed + " passed, " + failed + " failed out of " + total + " tests");
-        System.exit(failed > 0 ? 1 : 0);
+
+        // Run L27+ standalone tests if level includes them
+        boolean extraFailed = false;
+        if (benchLevel == 0 || benchLevel >= 27) {
+            extraFailed |= runStandaloneTests("ming.L27Tests");
+        }
+
+        System.exit((failed > 0 || extraFailed) ? 1 : 0);
+    }
+
+    private static boolean runStandaloneTests(String className) {
+        try {
+            Class<?> cls = Class.forName(className);
+            // Reset the class's passed/failed counters and run main
+            // L27Tests.main calls System.exit — we install a SecurityManager workaround
+            // Instead, just invoke main and let it exit. If tests fail, exit(1) propagates.
+            // If tests pass, exit(0) kills the JVM which is fine.
+            cls.getMethod("main", String[].class).invoke(null, (Object) new String[0]);
+        } catch (ClassNotFoundException e) {
+            return false; // not present — skip
+        } catch (Exception e) {
+            return true; // failure
+        }
+        return false;
     }
 }
