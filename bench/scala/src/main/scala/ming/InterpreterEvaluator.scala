@@ -7,13 +7,13 @@ private[ming] object InterpreterEvaluator:
   private val halt: Continuation = value => FinalStep(value)
 
   def evalSequence(expressions: List[Expr], env: Environment): Value =
-    run(deferSequence(expressions, env, halt))
+    DynamicWindRuntime.withWindState(run(deferSequence(expressions, env, halt)))
 
   def eval(expression: Expr, env: Environment): Value =
-    run(deferExpr(expression, env, halt))
+    DynamicWindRuntime.withWindState(run(deferExpr(expression, env, halt)))
 
   def applyFunction(function: Value, arguments: List[Value], position: Position): Value =
-    run(deferApplication(function, arguments, position, halt))
+    DynamicWindRuntime.withWindState(run(deferApplication(function, arguments, position, halt)))
 
   def done(value: Value, continuation: Continuation): EvaluationStep =
     ReturnStep(value, continuation)
@@ -108,10 +108,14 @@ private[ming] object InterpreterEvaluator:
         applyClosure(parameters, restParameter, body, closureEnv, arguments, position, continuation)
       case CaseLambdaValue(clauses, _) =>
         applyCaseLambda(clauses, arguments, position, continuation)
-      case ContinuationValue(savedContinuation) =>
+      case ContinuationValue(savedContinuation, savedWindFrames) =>
         arguments match
           case value :: Nil =>
-            done(value, savedContinuation)
+            DynamicWindRuntime.transferToContinuation(
+              value,
+              savedContinuation,
+              savedWindFrames
+            )
           case _ =>
             SchemeFailure.raise(
               s"continuation expected 1 argument(s), got ${arguments.length}",
