@@ -67,6 +67,17 @@ public class Evaluator {
     static final Object WITH_EXCEPTION_HANDLER_PROC = new Object() {
         @Override public String toString() { return "#<procedure with-exception-handler>"; }
     };
+    static final Object VALUES_PROC = new Object() {
+        @Override public String toString() { return "#<procedure values>"; }
+    };
+    static final Object CALL_WITH_VALUES_PROC = new Object() {
+        @Override public String toString() { return "#<procedure call-with-values>"; }
+    };
+
+    static class MultipleValues {
+        final List<Object> values;
+        MultipleValues(List<Object> values) { this.values = values; }
+    }
 
     static class SchemeRaise extends RuntimeException {
         final Object value;
@@ -139,6 +150,7 @@ public class Evaluator {
     private record GuardAfterFrame() {}
     private record WEHAfterFrame() {}
     private record RaiseReturnFrame() {}
+    private record CallWithValuesFrame(Object consumer) {}
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "begin", "let", "let*", "set!", "define", "quote", "lambda", "case-lambda",
@@ -194,13 +206,16 @@ public class Evaluator {
         env.define("dynamic-wind", DYNAMIC_WIND_PROC);
         env.define("raise", RAISE_PROC);
         env.define("with-exception-handler", WITH_EXCEPTION_HANDLER_PROC);
+        env.define("values", VALUES_PROC);
+        env.define("call-with-values", CALL_WITH_VALUES_PROC);
         env.define("procedure?", new BuiltinProc("procedure?", args -> {
             if (args.size() != 1) throw new EvalError("procedure?: expected 1 arg");
             Object v = args.get(0);
             return (v instanceof Lambda || v instanceof CaseLambda || v instanceof BuiltinProc
                     || v instanceof Continuation || v == CALLCC_PROC
                     || v == DYNAMIC_WIND_PROC || v == RAISE_PROC
-                    || v == WITH_EXCEPTION_HANDLER_PROC) ? Boolean.TRUE : Boolean.FALSE;
+                    || v == WITH_EXCEPTION_HANDLER_PROC
+                    || v == VALUES_PROC || v == CALL_WITH_VALUES_PROC) ? Boolean.TRUE : Boolean.FALSE;
         }));
         return env;
     }
@@ -578,6 +593,17 @@ public class Evaluator {
             exceptionHandlers.remove(exceptionHandlers.size() - 1);
             return new CekState(current, env, false);
         }
+        if (frame instanceof CallWithValuesFrame f) {
+            List<Object> vals;
+            if (current instanceof MultipleValues mv) {
+                vals = mv.values;
+            } else {
+                vals = List.of(current);
+            }
+            doApply(f.consumer, vals, kont, 0, 0, evalId);
+            Env newEnv = applyResult[1] != null ? (Env) applyResult[1] : env;
+            return new CekState(applyResult[0], newEnv, (Boolean) applyResult[2]);
+        }
         if (frame instanceof RaiseReturnFrame) {
             throw new EvalError("raise: handler returned");
         }
@@ -731,6 +757,21 @@ public class Evaluator {
             kont.add(new WEHAfterFrame());
             proc = thunk; args = List.of();
             // Fall through to apply thunk
+        }
+        if (proc == VALUES_PROC) {
+            if (args.size() == 1) {
+                applyResult = new Object[]{args.get(0), null, false};
+            } else {
+                applyResult = new Object[]{new MultipleValues(new ArrayList<>(args)), null, false};
+            }
+            return;
+        }
+        if (proc == CALL_WITH_VALUES_PROC) {
+            if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments" + posStr);
+            Object producer = args.get(0), consumer = args.get(1);
+            kont.add(new CallWithValuesFrame(consumer));
+            proc = producer; args = List.of();
+            // Fall through to apply producer
         }
         if (proc == CALLCC_PROC) {
             if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument" + posStr);
