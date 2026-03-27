@@ -481,6 +481,7 @@ enum Builtin {
     CharLessThan,
     CharToInteger,
     IntegerToChar,
+    CallCc,
     Apply,
     Map,
     ForEach,
@@ -523,6 +524,7 @@ enum Procedure {
     RecordConstructor(RecordConstructor),
     RecordPredicate(RecordPredicate),
     RecordAccessor(RecordAccessor),
+    Continuation(CapturedContinuation),
 }
 
 #[derive(Clone)]
@@ -1251,6 +1253,11 @@ fn root_env() -> EnvRef {
         ("char<?", Builtin::CharLessThan),
         ("char->integer", Builtin::CharToInteger),
         ("integer->char", Builtin::IntegerToChar),
+        ("call/cc", Builtin::CallCc),
+        (
+            "call-with-current-continuation",
+            Builtin::CallCc,
+        ),
         ("apply", Builtin::Apply),
         ("map", Builtin::Map),
         ("for-each", Builtin::ForEach),
@@ -1377,7 +1384,8 @@ fn install_prelude(env: &EnvRef) {
     let exprs = parser
         .parse_program()
         .expect("standard prelude must parse");
-    let _ = eval_sequence(&exprs, env).expect("standard prelude must evaluate");
+    let _ = eval_sequence_with_continuations(&exprs, env)
+        .expect("standard prelude must evaluate");
 }
 
 fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
@@ -1518,6 +1526,7 @@ fn apply_values(operator: Value, args: &[Value], env: &EnvRef) -> Result<Value, 
             }
             Procedure::RecordPredicate(predicate) => apply_record_predicate(predicate, args),
             Procedure::RecordAccessor(accessor) => apply_record_accessor(accessor, args),
+            Procedure::Continuation(_) => Err(continuation_context_error()),
         },
         _ => Err(EvalError::InvalidApplication),
     }
@@ -1554,6 +1563,7 @@ fn tail_apply_values(operator: Value, args: &[Value], env: &EnvRef) -> Result<Ta
             Procedure::RecordAccessor(accessor) => {
                 apply_record_accessor(accessor, args).map(TailOutcome::Value)
             }
+            Procedure::Continuation(_) => Err(continuation_context_error()),
         },
         _ => Err(EvalError::InvalidApplication),
     }
@@ -1654,6 +1664,10 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         Builtin::CharLessThan => eval_char_compare("char<?", values, |left, right| left < right),
         Builtin::CharToInteger => eval_char_to_integer(values),
         Builtin::IntegerToChar => eval_integer_to_char(values),
+        Builtin::CallCc => Err(EvalError::InvalidArgument {
+            name: "call/cc".to_owned(),
+            message: "internal continuation requires continuation-aware evaluation".to_owned(),
+        }),
         Builtin::Apply => eval_apply_builtin(values, env),
         Builtin::Map => eval_map_builtin(values, env),
         Builtin::ForEach => eval_for_each_builtin(values, env),
@@ -4758,6 +4772,809 @@ fn values_equal_inner(
     }
 }
 
+#[derive(Clone)]
+enum MachineState {
+    Expr(Expr, EnvRef),
+    Value(Value),
+}
+
+#[derive(Clone)]
+enum EvalCont {
+    Done,
+    Frame(EvalFrame, Rc<EvalCont>),
+}
+
+type EvalContRef = Rc<EvalCont>;
+
+#[derive(Clone)]
+struct CapturedContinuation {
+    cont: EvalContRef,
+}
+
+#[derive(Clone)]
+enum ArgOperand {
+    Expr(Expr),
+    Value(Value),
+}
+
+#[derive(Clone)]
+enum EvalFrame {
+    Sequence {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    DefineValue {
+        name: String,
+        env: EnvRef,
+    },
+    SetValue {
+        name: String,
+        env: EnvRef,
+        pos: SourcePos,
+    },
+    If {
+        consequent: Expr,
+        alternate: Option<Expr>,
+        env: EnvRef,
+    },
+    ApplyOperator {
+        operator_expr: Expr,
+        args: Vec<ArgOperand>,
+        env: EnvRef,
+        pos: SourcePos,
+    },
+    ApplyArgs {
+        operator: Value,
+        operator_expr: Expr,
+        prefix_operands: Vec<ArgOperand>,
+        current_operand: Expr,
+        evaluated: Vec<Value>,
+        remaining: Vec<ArgOperand>,
+        env: EnvRef,
+        pos: SourcePos,
+    },
+    ReplayApplication {
+        operator_expr: Expr,
+        prefix_operands: Vec<ArgOperand>,
+        suffix_operands: Vec<ArgOperand>,
+        env: EnvRef,
+        pos: SourcePos,
+    },
+}
+
+fn done_cont() -> EvalContRef {
+    Rc::new(EvalCont::Done)
+}
+
+fn push_cont(frame: EvalFrame, next: EvalContRef) -> EvalContRef {
+    Rc::new(EvalCont::Frame(frame, next))
+}
+
+fn continuation_context_error() -> EvalError {
+    EvalError::InvalidArgument {
+        name: "continuation".to_owned(),
+        message: "internal continuation cannot be applied in this context".to_owned(),
+    }
+}
+
+fn capture_continuation(cont: &EvalContRef) -> EvalContRef {
+    match cont.as_ref() {
+        EvalCont::Done => done_cont(),
+        EvalCont::Frame(frame, next) => push_cont(
+            match frame {
+                EvalFrame::Sequence { .. }
+                | EvalFrame::DefineValue { .. }
+                | EvalFrame::SetValue { .. }
+                | EvalFrame::If { .. }
+                | EvalFrame::ApplyOperator { .. }
+                | EvalFrame::ReplayApplication { .. } => frame.clone(),
+                EvalFrame::ApplyArgs {
+                    operator_expr,
+                    prefix_operands,
+                    remaining,
+                    env,
+                    pos,
+                    ..
+                } => EvalFrame::ReplayApplication {
+                    operator_expr: operator_expr.clone(),
+                    prefix_operands: prefix_operands.clone(),
+                    suffix_operands: remaining.clone(),
+                    env: env.clone(),
+                    pos: *pos,
+                },
+            },
+            capture_continuation(next),
+        ),
+    }
+}
+
+fn symbol_expr(name: impl Into<String>, pos: SourcePos) -> Expr {
+    Expr::Symbol(name.into(), pos)
+}
+
+fn list_expr(items: Vec<Expr>, pos: SourcePos) -> Expr {
+    Expr::List(items, pos)
+}
+
+fn begin_expr(exprs: &[Expr], pos: SourcePos) -> Expr {
+    if exprs.len() == 1 {
+        exprs[0].clone()
+    } else {
+        let mut items = vec![symbol_expr("begin", pos)];
+        items.extend(exprs.iter().cloned());
+        list_expr(items, pos)
+    }
+}
+
+fn enter_sequence(exprs: &[Expr], env: &EnvRef, cont: EvalContRef) -> (MachineState, EvalContRef) {
+    match exprs.split_first() {
+        None => (MachineState::Value(Value::Void), cont),
+        Some((first, rest)) => {
+            let cont = if rest.is_empty() {
+                cont
+            } else {
+                push_cont(
+                    EvalFrame::Sequence {
+                        remaining: rest.to_vec(),
+                        env: env.clone(),
+                    },
+                    cont,
+                )
+            };
+            (MachineState::Expr(first.clone(), env.clone()), cont)
+        }
+    }
+}
+
+fn expand_let_expr(args: &[Expr], pos: SourcePos) -> Result<Expr, EvalError> {
+    let (head, tail) = args
+        .split_first()
+        .ok_or_else(|| EvalError::Parse("let requires bindings".to_owned()))?;
+
+    match head {
+        Expr::List(bindings, _) => {
+            if tail.is_empty() {
+                return Err(EvalError::Parse("let requires a body".to_owned()));
+            }
+
+            let bindings = parse_bindings(bindings, "let")?;
+            let mut lambda_items = vec![
+                symbol_expr("lambda", pos),
+                list_expr(
+                    bindings
+                        .iter()
+                        .map(|(name, _)| symbol_expr(name.clone(), pos))
+                        .collect(),
+                    pos,
+                ),
+            ];
+            lambda_items.extend(tail.iter().cloned());
+
+            let mut call_items = vec![list_expr(lambda_items, pos)];
+            call_items.extend(bindings.into_iter().map(|(_, expr)| expr));
+            Ok(list_expr(call_items, pos))
+        }
+        Expr::Symbol(name, _) => {
+            let (bindings_expr, body) = tail
+                .split_first()
+                .ok_or_else(|| EvalError::Parse("let requires bindings".to_owned()))?;
+            if body.is_empty() {
+                return Err(EvalError::Parse("let requires a body".to_owned()));
+            }
+
+            let bindings = match bindings_expr {
+                Expr::List(bindings, _) => parse_bindings(bindings, "let")?,
+                _ => {
+                    return Err(EvalError::Parse("let bindings must be a list".to_owned()));
+                }
+            };
+
+            let mut signature_items = vec![symbol_expr(name.clone(), pos)];
+            signature_items.extend(
+                bindings
+                    .iter()
+                    .map(|(binding, _)| symbol_expr(binding.clone(), pos)),
+            );
+
+            let mut define_items = vec![
+                symbol_expr("define", pos),
+                list_expr(signature_items, pos),
+            ];
+            define_items.extend(body.iter().cloned());
+
+            let mut invoke_items = vec![symbol_expr(name.clone(), pos)];
+            invoke_items.extend(bindings.into_iter().map(|(_, expr)| expr));
+
+            let inner_lambda = list_expr(
+                vec![
+                    symbol_expr("lambda", pos),
+                    list_expr(Vec::new(), pos),
+                    list_expr(define_items, pos),
+                    list_expr(invoke_items, pos),
+                ],
+                pos,
+            );
+
+            Ok(list_expr(vec![inner_lambda], pos))
+        }
+        _ => Err(EvalError::Parse("let requires bindings".to_owned())),
+    }
+}
+
+fn expand_cond_expr(args: &[Expr], env: &EnvRef, pos: SourcePos) -> Result<Expr, EvalError> {
+    fn expand_cond_clauses(clauses: &[Expr], env: &EnvRef, pos: SourcePos) -> Result<Expr, EvalError> {
+        let Some((clause, rest)) = clauses.split_first() else {
+            return Ok(begin_expr(&[], pos));
+        };
+
+        let items = match clause {
+            Expr::List(items, _) => items,
+            _ => return Err(EvalError::Parse("cond clauses must be lists".to_owned())),
+        };
+
+        let (test, body) = items
+            .split_first()
+            .ok_or_else(|| EvalError::Parse("cond clause cannot be empty".to_owned()))?;
+
+        if matches!(test, Expr::Symbol(symbol, _) if symbol == "else") {
+            if !rest.is_empty() {
+                return Err(EvalError::Parse("cond else clause must be last".to_owned()));
+            }
+            return Ok(begin_expr(body, pos));
+        }
+
+        let alternate = expand_cond_clauses(rest, env, pos)?;
+        if body.is_empty() {
+            let temp = env.fresh_symbol("cond");
+            let temp_symbol = symbol_expr(temp.clone(), pos);
+            let lambda = list_expr(
+                vec![
+                    symbol_expr("lambda", pos),
+                    list_expr(vec![symbol_expr(temp, pos)], pos),
+                    list_expr(
+                        vec![
+                            symbol_expr("if", pos),
+                            temp_symbol.clone(),
+                            temp_symbol,
+                            alternate,
+                        ],
+                        pos,
+                    ),
+                ],
+                pos,
+            );
+
+            Ok(list_expr(vec![lambda, test.clone()], pos))
+        } else {
+            Ok(list_expr(
+                vec![
+                    symbol_expr("if", pos),
+                    test.clone(),
+                    begin_expr(body, pos),
+                    alternate,
+                ],
+                pos,
+            ))
+        }
+    }
+
+    expand_cond_clauses(args, env, pos)
+}
+
+fn machine_start_define(
+    args: &[Expr],
+    env: &EnvRef,
+    cont: EvalContRef,
+) -> Result<(MachineState, EvalContRef), EvalError> {
+    let (target, body) = args
+        .split_first()
+        .ok_or_else(|| EvalError::Parse("define requires a target".to_owned()))?;
+
+    match target {
+        Expr::Symbol(name, _) => {
+            if body.len() != 1 {
+                return Err(EvalError::WrongArgCount {
+                    name: "define".to_owned(),
+                    expected: "exactly 2 forms".to_owned(),
+                    got: args.len(),
+                });
+            }
+
+            Ok((
+                MachineState::Expr(body[0].clone(), env.clone()),
+                push_cont(
+                    EvalFrame::DefineValue {
+                        name: name.clone(),
+                        env: env.clone(),
+                    },
+                    cont,
+                ),
+            ))
+        }
+        Expr::List(signature, _) => {
+            let (name_expr, params_exprs) = signature
+                .split_first()
+                .ok_or_else(|| EvalError::Parse("define requires a function name".to_owned()))?;
+            let name = expect_symbol(name_expr, "define function name")?;
+
+            if body.is_empty() {
+                return Err(EvalError::Parse(
+                    "define requires a function body".to_owned(),
+                ));
+            }
+
+            let params = parse_params(params_exprs, "define")?;
+            let procedure = Value::Procedure(Rc::new(Procedure::Lambda(Lambda {
+                name: Some(name.clone()),
+                params,
+                body: body.to_vec(),
+                env: env.clone(),
+            })));
+
+            env.define(name, procedure);
+            Ok((MachineState::Value(Value::Void), cont))
+        }
+        _ => Err(EvalError::Parse(
+            "define target must be a symbol".to_owned(),
+        )),
+    }
+}
+
+fn machine_start_set(
+    args: &[Expr],
+    env: &EnvRef,
+    cont: EvalContRef,
+    pos: SourcePos,
+) -> Result<(MachineState, EvalContRef), EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "set!".to_owned(),
+            expected: "exactly 2 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let name = expect_symbol(&args[0], "set! target")?;
+    Ok((
+        MachineState::Expr(args[1].clone(), env.clone()),
+        push_cont(
+            EvalFrame::SetValue {
+                name,
+                env: env.clone(),
+                pos,
+            },
+            cont,
+        ),
+    ))
+}
+
+fn machine_start_if(
+    args: &[Expr],
+    env: &EnvRef,
+    cont: EvalContRef,
+) -> Result<(MachineState, EvalContRef), EvalError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(EvalError::WrongArgCount {
+            name: "if".to_owned(),
+            expected: "2 or 3 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    Ok((
+        MachineState::Expr(args[0].clone(), env.clone()),
+        push_cont(
+            EvalFrame::If {
+                consequent: args[1].clone(),
+                alternate: args.get(2).cloned(),
+                env: env.clone(),
+            },
+            cont,
+        ),
+    ))
+}
+
+fn machine_enter_list(
+    items: Vec<Expr>,
+    pos: SourcePos,
+    env: EnvRef,
+    cont: EvalContRef,
+) -> Result<(MachineState, EvalContRef), EvalError> {
+    let (head, args) = items
+        .split_first()
+        .ok_or_else(|| EvalError::InvalidApplication.with_position(pos))?;
+
+    if let Expr::Symbol(name, _) = head {
+        match name.as_str() {
+            "define" => return machine_start_define(args, &env, cont).map_err(|err| err.with_position(pos)),
+            "define-record-type" => {
+                return Ok((
+                    MachineState::Value(
+                        eval_define_record_type(args, &env)
+                            .map_err(|err| err.with_position(pos))?,
+                    ),
+                    cont,
+                ))
+            }
+            "define-syntax" => {
+                return Ok((
+                    MachineState::Value(
+                        eval_define_syntax(args, &env)
+                            .map_err(|err| err.with_position(pos))?,
+                    ),
+                    cont,
+                ))
+            }
+            "set!" => return machine_start_set(args, &env, cont, pos).map_err(|err| err.with_position(pos)),
+            "if" => return machine_start_if(args, &env, cont).map_err(|err| err.with_position(pos)),
+            "quote" => {
+                return Ok((
+                    MachineState::Value(eval_quote(args).map_err(|err| err.with_position(pos))?),
+                    cont,
+                ))
+            }
+            "lambda" => {
+                return Ok((
+                    MachineState::Value(eval_lambda(args, &env).map_err(|err| err.with_position(pos))?),
+                    cont,
+                ))
+            }
+            "case-lambda" => {
+                return Ok((
+                    MachineState::Value(
+                        eval_case_lambda(args, &env).map_err(|err| err.with_position(pos))?,
+                    ),
+                    cont,
+                ))
+            }
+            "begin" => return Ok(enter_sequence(args, &env, cont)),
+            "cond" => {
+                let expanded = expand_cond_expr(args, &env, pos).map_err(|err| err.with_position(pos))?;
+                return Ok((MachineState::Expr(expanded, env), cont));
+            }
+            "let" => {
+                let expanded = expand_let_expr(args, pos).map_err(|err| err.with_position(pos))?;
+                return Ok((MachineState::Expr(expanded, env), cont));
+            }
+            "case" => {
+                return Ok((
+                    MachineState::Value(eval_case(args, &env).map_err(|err| err.with_position(pos))?),
+                    cont,
+                ))
+            }
+            "let*" => {
+                return Ok((
+                    MachineState::Value(eval_let_star(args, &env).map_err(|err| err.with_position(pos))?),
+                    cont,
+                ))
+            }
+            "letrec" => {
+                return Ok((
+                    MachineState::Value(eval_letrec(args, &env).map_err(|err| err.with_position(pos))?),
+                    cont,
+                ))
+            }
+            "letrec*" => {
+                return Ok((
+                    MachineState::Value(
+                        eval_letrec_star(args, &env).map_err(|err| err.with_position(pos))?,
+                    ),
+                    cont,
+                ))
+            }
+            "and" => {
+                return Ok((
+                    MachineState::Value(eval_and(args, &env).map_err(|err| err.with_position(pos))?),
+                    cont,
+                ))
+            }
+            "or" => {
+                return Ok((
+                    MachineState::Value(eval_or(args, &env).map_err(|err| err.with_position(pos))?),
+                    cont,
+                ))
+            }
+            "do" => {
+                return Ok((
+                    MachineState::Value(eval_do(args, &env).map_err(|err| err.with_position(pos))?),
+                    cont,
+                ))
+            }
+            _ => {}
+        }
+
+        if let Some(macro_def) = env.lookup_macro(name) {
+            let expanded = expand_macro_use(&macro_def, &Expr::List(items.clone(), pos))
+                .map_err(|err| err.with_position(pos))?;
+            return Ok((MachineState::Expr(expanded, env), cont));
+        }
+    }
+
+    Ok((
+        MachineState::Expr(head.clone(), env.clone()),
+        push_cont(
+            EvalFrame::ApplyOperator {
+                operator_expr: head.clone(),
+                args: args.iter().cloned().map(ArgOperand::Expr).collect(),
+                env,
+                pos,
+            },
+            cont,
+        ),
+    ))
+}
+
+fn machine_apply(
+    operator: Value,
+    args: Vec<Value>,
+    env: &EnvRef,
+    cont: EvalContRef,
+) -> Result<(MachineState, EvalContRef), EvalError> {
+    match operator {
+        Value::Procedure(procedure) => match procedure.as_ref() {
+            Procedure::Builtin(Builtin::CallCc) => {
+                if args.len() != 1 {
+                    return Err(EvalError::WrongArgCount {
+                        name: "call/cc".to_owned(),
+                        expected: "exactly 1 argument".to_owned(),
+                        got: args.len(),
+                    });
+                }
+
+                let continuation = Value::Procedure(Rc::new(Procedure::Continuation(
+                    CapturedContinuation {
+                        cont: capture_continuation(&cont),
+                    },
+                )));
+                machine_apply(args[0].clone(), vec![continuation], env, cont)
+            }
+            Procedure::Builtin(Builtin::Apply) => {
+                if args.len() < 2 {
+                    return Err(EvalError::WrongArgCount {
+                        name: "apply".to_owned(),
+                        expected: "at least 2 arguments".to_owned(),
+                        got: args.len(),
+                    });
+                }
+
+                let operator = args[0].clone();
+                let mut applied_args = args[1..args.len() - 1].to_vec();
+                let tail = expect_list("apply", &args[args.len() - 1])?;
+                applied_args.extend(tail);
+                machine_apply(operator, applied_args, env, cont)
+            }
+            Procedure::Builtin(builtin) => Ok((
+                MachineState::Value(apply_builtin(*builtin, &args, env)?),
+                cont,
+            )),
+            Procedure::Lambda(lambda) => {
+                let call_env = prepare_lambda_call(
+                    lambda,
+                    &args,
+                    lambda.name.as_deref().unwrap_or("lambda"),
+                )?;
+                Ok(enter_sequence(&lambda.body, &call_env, cont))
+            }
+            Procedure::CaseLambda(case_lambda) => {
+                let clause = select_case_lambda_clause(case_lambda, &args)?;
+                let call_env = prepare_lambda_call(
+                    clause,
+                    &args,
+                    case_lambda.name.as_deref().unwrap_or("case-lambda"),
+                )?;
+                Ok(enter_sequence(&clause.body, &call_env, cont))
+            }
+            Procedure::RecordConstructor(constructor) => Ok((
+                MachineState::Value(apply_record_constructor(constructor, &args)?),
+                cont,
+            )),
+            Procedure::RecordPredicate(predicate) => Ok((
+                MachineState::Value(apply_record_predicate(predicate, &args)?),
+                cont,
+            )),
+            Procedure::RecordAccessor(accessor) => Ok((
+                MachineState::Value(apply_record_accessor(accessor, &args)?),
+                cont,
+            )),
+            Procedure::Continuation(captured) => {
+                if args.len() != 1 {
+                    return Err(EvalError::WrongArgCount {
+                        name: "continuation".to_owned(),
+                        expected: "exactly 1 argument".to_owned(),
+                        got: args.len(),
+                    });
+                }
+
+                Ok((MachineState::Value(args[0].clone()), captured.cont.clone()))
+            }
+        },
+        _ => Err(EvalError::InvalidApplication),
+    }
+}
+
+fn advance_apply_args(
+    operator: Value,
+    operator_expr: Expr,
+    mut prefix_operands: Vec<ArgOperand>,
+    mut evaluated: Vec<Value>,
+    remaining: Vec<ArgOperand>,
+    env: EnvRef,
+    pos: SourcePos,
+    next: EvalContRef,
+) -> Result<(MachineState, EvalContRef), EvalError> {
+    let mut remaining_iter = remaining.into_iter();
+
+    while let Some(operand) = remaining_iter.next() {
+        match operand {
+            ArgOperand::Value(value) => {
+                prefix_operands.push(ArgOperand::Value(value.clone()));
+                evaluated.push(value);
+            }
+            ArgOperand::Expr(expr) => {
+                return Ok((
+                    MachineState::Expr(expr.clone(), env.clone()),
+                    push_cont(
+                        EvalFrame::ApplyArgs {
+                            operator,
+                            operator_expr,
+                            prefix_operands,
+                            current_operand: expr,
+                            evaluated,
+                            remaining: remaining_iter.collect(),
+                            env,
+                            pos,
+                        },
+                        next,
+                    ),
+                ));
+            }
+        }
+    }
+
+    machine_apply(operator, evaluated, &env, next).map_err(|err| err.with_position(pos))
+}
+
+fn run_with_continuations(initial: MachineState, initial_cont: EvalContRef) -> Result<Value, EvalError> {
+    let mut state = initial;
+    let mut cont = initial_cont;
+
+    loop {
+        match state {
+            MachineState::Expr(expr, env) => match expr {
+                Expr::Number(value, _) => state = MachineState::Value(Value::Number(value)),
+                Expr::Boolean(value, _) => state = MachineState::Value(Value::Boolean(value)),
+                Expr::String(value, _) => {
+                    state = MachineState::Value(Value::String(SchemeString::new(value)))
+                }
+                Expr::Char(value, _) => state = MachineState::Value(Value::Char(value)),
+                Expr::Symbol(name, pos) => {
+                    let value = env
+                        .lookup(&name)
+                        .ok_or_else(|| EvalError::UnboundSymbol(name).with_position(pos))?;
+                    state = MachineState::Value(value);
+                }
+                Expr::List(items, pos) => {
+                    let (next_state, next_cont) = machine_enter_list(items, pos, env, cont)?;
+                    state = next_state;
+                    cont = next_cont;
+                }
+            },
+            MachineState::Value(value) => {
+                let (frame, next) = match cont.as_ref() {
+                    EvalCont::Done => return Ok(value),
+                    EvalCont::Frame(frame, next) => (frame.clone(), next.clone()),
+                };
+
+                match frame {
+                    EvalFrame::Sequence { remaining, env } => {
+                        let (next_state, next_cont) = enter_sequence(&remaining, &env, next);
+                        state = next_state;
+                        cont = next_cont;
+                    }
+                    EvalFrame::DefineValue { name, env } => {
+                        env.define(name, value);
+                        state = MachineState::Value(Value::Void);
+                        cont = next;
+                    }
+                    EvalFrame::SetValue { name, env, pos } => {
+                        if env.set(&name, value) {
+                            state = MachineState::Value(Value::Void);
+                            cont = next;
+                        } else {
+                            return Err(EvalError::UnboundSymbol(name).with_position(pos));
+                        }
+                    }
+                    EvalFrame::If {
+                        consequent,
+                        alternate,
+                        env,
+                    } => {
+                        if value.is_truthy() {
+                            state = MachineState::Expr(consequent, env);
+                            cont = next;
+                        } else if let Some(alternate) = alternate {
+                            state = MachineState::Expr(alternate, env);
+                            cont = next;
+                        } else {
+                            state = MachineState::Value(Value::Void);
+                            cont = next;
+                        }
+                    }
+                    EvalFrame::ApplyOperator {
+                        operator_expr,
+                        args,
+                        env,
+                        pos,
+                    } => {
+                        let (next_state, next_cont) = advance_apply_args(
+                            value,
+                            operator_expr,
+                            Vec::new(),
+                            Vec::new(),
+                            args,
+                            env,
+                            pos,
+                            next,
+                        )?;
+                        state = next_state;
+                        cont = next_cont;
+                    }
+                    EvalFrame::ApplyArgs {
+                        operator,
+                        operator_expr,
+                        mut prefix_operands,
+                        current_operand,
+                        mut evaluated,
+                        remaining,
+                        env,
+                        pos,
+                    } => {
+                        prefix_operands.push(ArgOperand::Expr(current_operand));
+                        evaluated.push(value);
+                        let (next_state, next_cont) = advance_apply_args(
+                            operator,
+                            operator_expr,
+                            prefix_operands,
+                            evaluated,
+                            remaining,
+                            env,
+                            pos,
+                            next,
+                        )?;
+                        state = next_state;
+                        cont = next_cont;
+                    }
+                    EvalFrame::ReplayApplication {
+                        operator_expr,
+                        mut prefix_operands,
+                        suffix_operands,
+                        env,
+                        pos,
+                    } => {
+                        prefix_operands.push(ArgOperand::Value(value));
+                        prefix_operands.extend(suffix_operands);
+                        state = MachineState::Expr(operator_expr.clone(), env.clone());
+                        cont = push_cont(
+                            EvalFrame::ApplyOperator {
+                                operator_expr,
+                                args: prefix_operands,
+                                env,
+                                pos,
+                            },
+                            next,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn eval_sequence_with_continuations(exprs: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let (initial, cont) = enter_sequence(exprs, env, done_cont());
+    run_with_continuations(initial, cont)
+}
+
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 ///
@@ -4770,7 +5587,7 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_program()?;
     let env = root_env();
-    let last = eval_sequence(&exprs, &env)
+    let last = eval_sequence_with_continuations(&exprs, &env)
         .map_err(|err| err.with_position(SourcePos { line: 1, col: 1 }))?;
     let output = env.output.borrow().clone();
     Ok((last, output))
