@@ -317,6 +317,20 @@ public class Evaluator {
             if (args.size() != 1) throw new EvalError("char?: expected 1 arg");
             return args.get(0) instanceof SchemeChar ? Boolean.TRUE : Boolean.FALSE;
         }));
+        // L06: string-copy and string-set!
+        env.define("string-copy", new BuiltinProc("string-copy", args -> {
+            if (args.size() != 1) throw new EvalError("string-copy: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: expected string");
+            return s.copy();
+        }));
+        env.define("string-set!", new BuiltinProc("string-set!", args -> {
+            if (args.size() != 3) throw new EvalError("string-set!: expected 3 args");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: expected string");
+            int idx = (int) asLong(args.get(1));
+            if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: expected char");
+            s.setChar(idx, c.value());
+            return Boolean.FALSE; // void
+        }));
         return env;
     }
 
@@ -378,6 +392,32 @@ public class Evaluator {
                     } else if (next == 'f') {
                         tokens.add(new Token(Boolean.FALSE, line, startCol));
                         i += 2; col += 2;
+                    } else if (next == '\\') {
+                        // Character literal #\x or #\space etc.
+                        i += 2; col += 2;
+                        if (i >= len) throw new EvalError("unexpected end after #\\ at " + line + ":" + startCol);
+                        // Read the character name
+                        StringBuilder charName = new StringBuilder();
+                        while (i < len && !Character.isWhitespace(input.charAt(i))
+                                && input.charAt(i) != '(' && input.charAt(i) != ')'
+                                && input.charAt(i) != '"' && input.charAt(i) != ';') {
+                            charName.append(input.charAt(i));
+                            i++; col++;
+                        }
+                        String cn = charName.toString();
+                        char ch;
+                        if (cn.length() == 1) {
+                            ch = cn.charAt(0);
+                        } else if (cn.equals("space")) {
+                            ch = ' ';
+                        } else if (cn.equals("newline")) {
+                            ch = '\n';
+                        } else if (cn.equals("tab")) {
+                            ch = '\t';
+                        } else {
+                            throw new EvalError("unknown character name: " + cn + " at " + line + ":" + startCol);
+                        }
+                        tokens.add(new Token(new SchemeChar(ch), line, startCol));
                     } else {
                         throw new EvalError("unexpected token: #" + next + " at " + line + ":" + startCol);
                     }
@@ -757,7 +797,19 @@ public class Evaluator {
     }
 
     // Internal type to distinguish Scheme strings from symbols (Java Strings)
-    record SchemeString(String value) {}
+    static class SchemeString {
+        private char[] chars;
+        SchemeString(String value) { this.chars = value.toCharArray(); }
+        String value() { return new String(chars); }
+        char charAt(int i) { return chars[i]; }
+        int length() { return chars.length; }
+        void setChar(int i, char c) { chars[i] = c; }
+        SchemeString copy() { return new SchemeString(value()); }
+        @Override public boolean equals(Object o) {
+            return o instanceof SchemeString s && value().equals(s.value());
+        }
+        @Override public int hashCode() { return value().hashCode(); }
+    }
 
     // Internal type for Scheme characters
     record SchemeChar(char value) {}
