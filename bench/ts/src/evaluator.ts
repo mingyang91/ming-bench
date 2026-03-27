@@ -3,7 +3,7 @@ import { EvalError } from './evalError.js';
 // ── Types ──────────────────────────────────────────────────────────────
 
 type SchemeValBase =
-  | { tag: 'number'; val: number }
+  | { tag: 'number'; val: number; exact?: boolean; num?: number; den?: number }
   | { tag: 'boolean'; val: boolean }
   | { tag: 'string'; val: string }
   | { tag: 'symbol'; val: string }
@@ -40,6 +40,86 @@ function quoteSyntax(val: SchemeVal): SchemeVal {
     return arrayToList(val.val.map(quoteSyntax));
   }
   return val;
+}
+
+// ── Rational helpers ──────────────────────────────────────────────────
+
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function makeRational(num: number, den: number): SchemeVal {
+  if (den === 0) throw new EvalError('division by zero');
+  if (den < 0) { num = -num; den = -den; }
+  if (num === 0) return { tag: 'number', val: 0, exact: true, num: 0, den: 1 };
+  const g = gcd(Math.abs(num), den);
+  num = num / g; den = den / g;
+  return { tag: 'number', val: num / den, exact: true, num, den };
+}
+
+function makeExactInt(n: number): SchemeVal {
+  return { tag: 'number', val: n, exact: true, num: n, den: 1 };
+}
+
+function makeInexact(n: number): SchemeVal {
+  return { tag: 'number', val: n, exact: false };
+}
+
+function getNum(v: SchemeVal & { tag: 'number' }): number {
+  return v.num ?? v.val;
+}
+
+function getDen(v: SchemeVal & { tag: 'number' }): number {
+  return v.den ?? 1;
+}
+
+function isExact(v: SchemeVal): boolean {
+  return v.tag === 'number' && v.exact !== false;
+}
+
+function floatToRational(x: number): SchemeVal {
+  if (Number.isInteger(x)) return makeExactInt(x);
+  const sign = x < 0 ? -1 : 1;
+  const ax = Math.abs(x);
+  for (let den = 1; den <= 1000000; den++) {
+    const num = Math.round(ax * den);
+    if (Math.abs(num / den - ax) < 1e-12) {
+      return makeRational(sign * num, den);
+    }
+  }
+  const den = 1000000000;
+  const num = Math.round(ax * den);
+  return makeRational(sign * num, den);
+}
+
+function numBinOp(
+  a: SchemeVal & { tag: 'number' },
+  b: SchemeVal & { tag: 'number' },
+  op: 'add' | 'sub' | 'mul' | 'div'
+): SchemeVal {
+  const aExact = a.exact !== false;
+  const bExact = b.exact !== false;
+  if (aExact && bExact) {
+    const an = getNum(a), ad = getDen(a), bn = getNum(b), bd = getDen(b);
+    switch (op) {
+      case 'add': return makeRational(an * bd + bn * ad, ad * bd);
+      case 'sub': return makeRational(an * bd - bn * ad, ad * bd);
+      case 'mul': return makeRational(an * bn, ad * bd);
+      case 'div':
+        if (bn === 0) throw new EvalError('division by zero');
+        return makeRational(an * bd, ad * bn);
+    }
+  }
+  switch (op) {
+    case 'add': return makeInexact(a.val + b.val);
+    case 'sub': return makeInexact(a.val - b.val);
+    case 'mul': return makeInexact(a.val * b.val);
+    case 'div':
+      if (b.val === 0) throw new EvalError('division by zero');
+      return makeInexact(a.val / b.val);
+  }
 }
 
 // ── Parser ─────────────────────────────────────────────────────────────
@@ -133,8 +213,21 @@ function parseAtom(tok: Token): SchemeVal {
     throw new EvalError(`${tok.pos}: unknown character name: ${name}`);
   }
   if (tok.text.startsWith('"')) return { tag: 'string', val: tok.text.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\'), pos: tok.pos };
+  // rational literal: e.g. 1/3, -5/2
+  const ratMatch = /^(-?\d+)\/(\d+)$/.exec(tok.text);
+  if (ratMatch) {
+    const num = parseInt(ratMatch[1], 10);
+    const den = parseInt(ratMatch[2], 10);
+    const r = makeRational(num, den);
+    return { ...r, pos: tok.pos };
+  }
   const n = Number(tok.text);
-  if (!isNaN(n) && tok.text !== '') return { tag: 'number', val: n, pos: tok.pos };
+  if (!isNaN(n) && tok.text !== '') {
+    if (tok.text.includes('.') || tok.text.includes('e') || tok.text.includes('E')) {
+      return { tag: 'number', val: n, exact: false, pos: tok.pos };
+    }
+    return { tag: 'number', val: n, exact: true, num: n, den: 1, pos: tok.pos };
+  }
   return { tag: 'symbol', val: tok.text, pos: tok.pos };
 }
 
@@ -196,32 +289,47 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   // Arithmetic
   envSet(env, '+', { tag: 'procedure', val: (args) => {
     for (const a of args) if (a.tag !== 'number') throw new EvalError('expected number');
-    const nums = args.map(a => (a as { tag: 'number'; val: number }).val);
-    return { tag: 'number', val: nums.reduce((a, b) => a + b, 0) };
+    if (args.length === 0) return makeExactInt(0);
+    let result = args[0] as SchemeVal & { tag: 'number' };
+    for (let i = 1; i < args.length; i++) {
+      result = numBinOp(result, args[i] as SchemeVal & { tag: 'number' }, 'add') as SchemeVal & { tag: 'number' };
+    }
+    return result;
   }});
 
   envSet(env, '*', { tag: 'procedure', val: (args) => {
     for (const a of args) if (a.tag !== 'number') throw new EvalError('expected number');
-    const nums = args.map(a => (a as { tag: 'number'; val: number }).val);
-    return { tag: 'number', val: nums.reduce((a, b) => a * b, 1) };
+    if (args.length === 0) return makeExactInt(1);
+    let result = args[0] as SchemeVal & { tag: 'number' };
+    for (let i = 1; i < args.length; i++) {
+      result = numBinOp(result, args[i] as SchemeVal & { tag: 'number' }, 'mul') as SchemeVal & { tag: 'number' };
+    }
+    return result;
   }});
 
   envSet(env, '-', { tag: 'procedure', val: (args) => {
     if (args.length === 0) throw new EvalError('- requires at least 1 argument');
     for (const a of args) if (a.tag !== 'number') throw new EvalError('expected number');
-    const nums = args.map(a => (a as { tag: 'number'; val: number }).val);
-    if (nums.length === 1) return { tag: 'number', val: -nums[0] };
-    return { tag: 'number', val: nums.slice(1).reduce((a, b) => a - b, nums[0]) };
+    if (args.length === 1) {
+      const a = args[0] as SchemeVal & { tag: 'number' };
+      if (a.exact !== false) return makeRational(-getNum(a), getDen(a));
+      return makeInexact(-a.val);
+    }
+    let result = args[0] as SchemeVal & { tag: 'number' };
+    for (let i = 1; i < args.length; i++) {
+      result = numBinOp(result, args[i] as SchemeVal & { tag: 'number' }, 'sub') as SchemeVal & { tag: 'number' };
+    }
+    return result;
   }});
 
   envSet(env, '/', { tag: 'procedure', val: (args) => {
     if (args.length < 2) throw new EvalError('/ requires at least 2 arguments');
     for (const a of args) if (a.tag !== 'number') throw new EvalError('expected number');
-    const nums = args.map(a => (a as { tag: 'number'; val: number }).val);
-    return { tag: 'number', val: nums.slice(1).reduce((a, b) => {
-      if (b === 0) throw new EvalError('division by zero');
-      return Math.trunc(a / b);
-    }, nums[0]) };
+    let result = args[0] as SchemeVal & { tag: 'number' };
+    for (let i = 1; i < args.length; i++) {
+      result = numBinOp(result, args[i] as SchemeVal & { tag: 'number' }, 'div') as SchemeVal & { tag: 'number' };
+    }
+    return result;
   }});
 
   // Comparisons
@@ -351,7 +459,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   // I/O
   const displayVal = (v: SchemeVal): string => {
     switch (v.tag) {
-      case 'number': return String(v.val);
+      case 'number': return displayNumber(v);
       case 'boolean': return v.val ? '#t' : '#f';
       case 'string': return v.val;
       case 'symbol': return v.val;
@@ -549,6 +657,53 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   envSet(env, 'even?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('even?: expected number');
     return { tag: 'boolean', val: args[0].val % 2 === 0 };
+  }});
+
+  // Exact/rational predicates and conversions (L11)
+  envSet(env, 'exact?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('exact?: expected number');
+    return { tag: 'boolean', val: args[0].exact !== false };
+  }});
+
+  envSet(env, 'inexact?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('inexact?: expected number');
+    return { tag: 'boolean', val: args[0].exact === false };
+  }});
+
+  envSet(env, 'integer?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('integer? requires 1 argument');
+    if (args[0].tag !== 'number') return { tag: 'boolean', val: false };
+    if (args[0].exact !== false) {
+      return { tag: 'boolean', val: getDen(args[0] as SchemeVal & { tag: 'number' }) === 1 };
+    }
+    return { tag: 'boolean', val: Number.isInteger(args[0].val) };
+  }});
+
+  envSet(env, 'rational?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('rational? requires 1 argument');
+    if (args[0].tag !== 'number') return { tag: 'boolean', val: false };
+    return { tag: 'boolean', val: args[0].exact !== false };
+  }});
+
+  envSet(env, 'exact->inexact', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('exact->inexact: expected number');
+    return makeInexact(args[0].val);
+  }});
+
+  envSet(env, 'inexact->exact', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('inexact->exact: expected number');
+    if (args[0].exact !== false) return args[0];
+    return floatToRational(args[0].val);
+  }});
+
+  envSet(env, 'numerator', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('numerator: expected number');
+    return makeExactInt(getNum(args[0] as SchemeVal & { tag: 'number' }));
+  }});
+
+  envSet(env, 'denominator', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('denominator: expected number');
+    return makeExactInt(getDen(args[0] as SchemeVal & { tag: 'number' }));
   }});
 
   // List utilities
@@ -1133,9 +1288,24 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
   }
 }
 
+function displayNumber(val: SchemeVal & { tag: 'number' }): string {
+  if (val.exact !== false) {
+    const den = val.den ?? 1;
+    const num = val.num ?? val.val;
+    if (den !== 1) return `${num}/${den}`;
+    return String(num);
+  }
+  // Inexact: ensure floats show decimal point
+  const s = String(val.val);
+  if (Number.isFinite(val.val) && !s.includes('.') && !s.includes('e') && !s.includes('E')) {
+    return s + '.0';
+  }
+  return s;
+}
+
 function display(val: SchemeVal): string {
   switch (val.tag) {
-    case 'number': return String(val.val);
+    case 'number': return displayNumber(val);
     case 'boolean': return val.val ? '#t' : '#f';
     case 'string': return `"${val.val}"`;
     case 'symbol': return val.val;
