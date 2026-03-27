@@ -29,6 +29,8 @@ thread_local! {
     static SYNTAX_CASE_BINDINGS: RefCell<Option<MacroBindings>> = RefCell::new(None);
     static MACRO_DEF_ENV: RefCell<Option<Env>> = RefCell::new(None);
     static TAIL_FRAME: RefCell<Option<ContinuationFrame>> = RefCell::new(None);
+    static STEP_COUNTER: RefCell<usize> = RefCell::new(0);
+    static STEP_LIMIT: RefCell<Option<usize>> = RefCell::new(None);
 }
 
 #[derive(Debug, Clone)]
@@ -728,9 +730,29 @@ fn with_span(err: EvalError, span: Span) -> EvalError {
     EvalError::Generic(format!("{} at {}", msg, span))
 }
 
+fn check_step_limit() -> Result<(), EvalError> {
+    STEP_LIMIT.with(|limit| {
+        if let Some(max) = *limit.borrow() {
+            STEP_COUNTER.with(|counter| {
+                let mut c = counter.borrow_mut();
+                *c += 1;
+                if *c > max {
+                    Err(EvalError::StepLimitExceeded)
+                } else {
+                    Ok(())
+                }
+            })
+        } else {
+            Ok(())
+        }
+    })
+}
+
 fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
+    check_step_limit()?;
     let mut result = eval_inner(expr, env).map_err(|e| with_span(e, expr.span))?;
     while let Value::TailCall(tc) = result {
+        check_step_limit()?;
         let (next_expr, next_env) = *tc;
         result = eval_inner(&next_expr, &next_env).map_err(|e| with_span(e, next_expr.span))?;
     }
@@ -4279,6 +4301,23 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let last = eval_top_level_loop(&exprs, &env)?;
     let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
     Ok((last.to_string(), output))
+}
+
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let tokens = tokenize(input)?;
+    let exprs = parse_all(&tokens)?;
+    if exprs.is_empty() {
+        return Err(EvalError::Parse("no expressions".into()));
+    }
+    let env = Env::new();
+    seed_builtins(&env);
+    init_callcc_state();
+    STEP_COUNTER.with(|c| *c.borrow_mut() = 0);
+    STEP_LIMIT.with(|l| *l.borrow_mut() = Some(max_steps));
+    let result = eval_top_level_loop(&exprs, &env);
+    STEP_LIMIT.with(|l| *l.borrow_mut() = None);
+    STEP_COUNTER.with(|c| *c.borrow_mut() = 0);
+    Ok(result?.to_string())
 }
 
 pub fn eval_str(input: &str) -> Result<String, EvalError> {

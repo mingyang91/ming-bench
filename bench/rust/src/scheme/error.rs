@@ -24,4 +24,7 @@ pub enum EvalError {
 
     #[error("raised exception")]
     RaisedException,
+
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }
