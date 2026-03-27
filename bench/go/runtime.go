@@ -51,7 +51,8 @@ type letBinding struct {
 
 type env struct {
 	parent *env
-	vars   map[string]value
+	vars   map[string]*binding
+	macros map[string]*macroBinding
 }
 
 type outputMode int
@@ -250,18 +251,23 @@ func (p closureValue) call(args []value) (value, error) {
 func newEnv(parent *env) *env {
 	return &env{
 		parent: parent,
-		vars:   make(map[string]value),
+		vars:   make(map[string]*binding),
+		macros: make(map[string]*macroBinding),
 	}
 }
 
 func (e *env) define(name string, v value) {
-	e.vars[name] = v
+	e.defineBinding(name, &binding{value: v})
+}
+
+func (e *env) defineBinding(name string, b *binding) {
+	e.vars[name] = b
 }
 
 func (e *env) set(name string, v value) bool {
 	for current := e; current != nil; current = current.parent {
-		if _, ok := current.vars[name]; ok {
-			current.vars[name] = v
+		if binding, ok := current.vars[name]; ok {
+			binding.value = v
 			return true
 		}
 	}
@@ -269,9 +275,34 @@ func (e *env) set(name string, v value) bool {
 }
 
 func (e *env) lookup(name string) (value, bool) {
+	binding, ok := e.lookupBinding(name)
+	if !ok {
+		return nil, false
+	}
+	return binding.value, true
+}
+
+func (e *env) lookupBinding(name string) (*binding, bool) {
 	for current := e; current != nil; current = current.parent {
-		if v, ok := current.vars[name]; ok {
-			return v, true
+		if binding, ok := current.vars[name]; ok {
+			return binding, true
+		}
+	}
+	return nil, false
+}
+
+func (e *env) defineMacro(name string, transformer *syntaxRulesMacro) {
+	e.defineMacroBinding(name, &macroBinding{transformer: transformer})
+}
+
+func (e *env) defineMacroBinding(name string, macro *macroBinding) {
+	e.macros[name] = macro
+}
+
+func (e *env) lookupMacro(name string) (*macroBinding, bool) {
+	for current := e; current != nil; current = current.parent {
+		if macro, ok := current.macros[name]; ok {
+			return macro, true
 		}
 	}
 	return nil, false
@@ -409,6 +440,8 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalCond(items[1:], env)
 		case "define":
 			return evalDefine(items[1:], env)
+		case "define-syntax":
+			return evalDefineSyntax(items[1:], env)
 		case "set!":
 			return evalSet(items[1:], env)
 		case "quote":
@@ -417,6 +450,14 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalLet(items[1:], env)
 		case "lambda":
 			return evalLambda(items[1:], env)
+		}
+
+		if macro, found := env.lookupMacro(string(operator)); found {
+			expanded, expansionEnv, err := expandMacroCall(items, macro, env)
+			if err != nil {
+				return nil, err
+			}
+			return evalExpr(expanded, expansionEnv)
 		}
 	}
 
