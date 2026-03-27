@@ -11,6 +11,17 @@ use super::{
     Value,
 };
 
+enum Handler {
+    Proc(Value),
+    Guard {
+        var: String,
+        clauses: Vec<Expr>,
+        env: Env,
+        guard_k: Rc<Kont>,
+        guard_winders: Vec<Rc<(Value, Value)>>,
+    },
+}
+
 enum Ctrl {
     Eval(Expr, Env),
     Val(Value),
@@ -285,7 +296,7 @@ fn try_eval_simple(expr: &Expr, env: &Env, output: &mut String) -> Option<Result
                 if op == "quote" && items.len() == 2 {
                     return Some(Ok(expr_to_value(&items[1])));
                 }
-                if is_builtin(op) && op != "dynamic-wind" {
+                if is_builtin(op) && op != "dynamic-wind" && op != "raise" && op != "with-exception-handler" {
                     let mut args = Vec::with_capacity(items.len() - 1);
                     for item in &items[1..] {
                         match try_eval_simple(item, env, output)? {
@@ -318,13 +329,95 @@ fn try_fast_call(items: &[Expr], env: &Env, k: Rc<Kont>, output: &mut String) ->
     Some(Ok((Ctrl::Apply(func, args), k)))
 }
 
-fn cek_step_eval(expr: Expr, env: Env, k: Rc<Kont>, output: &mut String) -> Result<(Ctrl, Rc<Kont>), EvalError> {
+fn guard_clause_matched(
+    body: &[Expr],
+    guard_env: &Env,
+    guard_k: &Rc<Kont>,
+    guard_winders: &[Rc<(Value, Value)>],
+    winders: &mut Vec<Rc<(Value, Value)>>,
+) -> Result<(Ctrl, Rc<Kont>), EvalError> {
+    let common_len = winders.iter().zip(guard_winders.iter())
+        .take_while(|(a, b)| Rc::ptr_eq(a, b))
+        .count();
+    let mut ops: Vec<(bool, Rc<(Value, Value)>)> = Vec::new();
+    for i in (common_len..winders.len()).rev() {
+        ops.push((false, winders[i].clone()));
+    }
+    for w in guard_winders.iter().skip(common_len) {
+        ops.push((true, w.clone()));
+    }
+    if ops.is_empty() {
+        cek_seq(body, guard_env.clone(), guard_k.clone())
+    } else {
+        let body_k = Rc::new(Kont::GuardBody {
+            body: body.to_vec(),
+            env: guard_env.clone(),
+            next: guard_k.clone(),
+        });
+        let (is_rewind, entry) = ops[0].clone();
+        let remaining = ops[1..].to_vec();
+        let next_k = Rc::new(Kont::WindShift {
+            ops: remaining,
+            val: Value::Boolean(false),
+            saved_k: body_k,
+        });
+        if is_rewind {
+            winders.push(entry.clone());
+            Ok((Ctrl::Apply(entry.0.clone(), vec![]), next_k))
+        } else {
+            winders.pop();
+            Ok((Ctrl::Apply(entry.1.clone(), vec![]), next_k))
+        }
+    }
+}
+
+fn start_guard_clause(
+    exn: &Value,
+    clauses: &[Expr],
+    guard_env: &Env,
+    guard_k: &Rc<Kont>,
+    guard_winders: &[Rc<(Value, Value)>],
+    winders: &mut Vec<Rc<(Value, Value)>>,
+) -> Result<(Ctrl, Rc<Kont>), EvalError> {
+    if clauses.is_empty() {
+        // Re-raise: no matching clause
+        return Ok((
+            Ctrl::Apply(Value::Builtin("raise".into()), vec![exn.clone()]),
+            Rc::new(Kont::RaiseReturn),
+        ));
+    }
+    let items = match &clauses[0].kind {
+        ExprKind::List(items) if !items.is_empty() => items,
+        _ => return Err(EvalError::Type("guard: invalid clause".into())),
+    };
+    // Check for else
+    if let ExprKind::Symbol(s) = &items[0].kind {
+        if s == "else" {
+            return guard_clause_matched(&items[1..], guard_env, guard_k, guard_winders, winders);
+        }
+    }
+    let body = items[1..].to_vec();
+    let rest = clauses[1..].to_vec();
+    Ok((
+        Ctrl::Eval(items[0].clone(), guard_env.clone()),
+        Rc::new(Kont::GuardTest {
+            exn: exn.clone(),
+            body,
+            rest_clauses: rest,
+            guard_env: guard_env.clone(),
+            guard_k: guard_k.clone(),
+            guard_winders: guard_winders.to_vec(),
+        }),
+    ))
+}
+
+fn cek_step_eval(expr: Expr, env: Env, k: Rc<Kont>, output: &mut String, winders: &[Rc<(Value, Value)>], handlers: &mut Vec<Handler>) -> Result<(Ctrl, Rc<Kont>), EvalError> {
     let span = expr.span;
-    let result = cek_step_eval_inner(&expr, env, k, output);
+    let result = cek_step_eval_inner(&expr, env, k, output, winders, handlers);
     result.map_err(|e| with_span(span, e))
 }
 
-fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String) -> Result<(Ctrl, Rc<Kont>), EvalError> {
+fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String, winders: &[Rc<(Value, Value)>], handlers: &mut Vec<Handler>) -> Result<(Ctrl, Rc<Kont>), EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok((Ctrl::Val(Value::Integer(*n)), k)),
         ExprKind::Rational(n, d) => Ok((Ctrl::Val(make_rational(*n, *d)), k)),
@@ -424,6 +517,33 @@ fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String) 
                         Ok((Ctrl::Eval(items[1].clone(), env),
                             Rc::new(Kont::CallCC { next: k })))
                     }
+                    "guard" => {
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity("guard requires clauses and body".into()));
+                        }
+                        let clause_header = match &items[1].kind {
+                            ExprKind::List(parts) if parts.len() >= 2 => parts,
+                            _ => return Err(EvalError::Type("guard: invalid clause header".into())),
+                        };
+                        let var = match &clause_header[0].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Type("guard: expected variable name".into())),
+                        };
+                        let clauses = clause_header[1..].to_vec();
+                        let body = items[2..].to_vec();
+                        let guard_k = k;
+                        let guard_winders = winders.to_vec();
+                        let mut guard_env = env.clone();
+                        guard_env.push(new_frame());
+                        handlers.push(Handler::Guard {
+                            var,
+                            clauses,
+                            env: guard_env,
+                            guard_k: guard_k.clone(),
+                            guard_winders,
+                        });
+                        cek_seq(&body, env, Rc::new(Kont::PopHandler { next: guard_k }))
+                    }
                     _ => {
                         if let Ok(macro_val @ Value::Macro { .. }) = env_lookup(&env, op) {
                             let (expanded, hygiene_frame) = expand_macro_only(&macro_val, items, &env)?;
@@ -446,7 +566,7 @@ fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String) 
     }
 }
 
-fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec<Rc<(Value, Value)>>) -> Result<(Ctrl, Rc<Kont>), EvalError> {
+fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec<Rc<(Value, Value)>>, handlers: &mut Vec<Handler>) -> Result<(Ctrl, Rc<Kont>), EvalError> {
     match &*k {
         Kont::Halt => unreachable!(),
         Kont::Seq { rest, env, next } => {
@@ -617,10 +737,27 @@ fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec
                 }
             }
         }
+        Kont::PopHandler { next } => {
+            handlers.pop();
+            Ok((Ctrl::Val(val), next.clone()))
+        }
+        Kont::RaiseReturn => {
+            Err(EvalError::Type("raise: exception handler returned".into()))
+        }
+        Kont::GuardTest { exn, body, rest_clauses, guard_env, guard_k, guard_winders } => {
+            if is_truthy(&val) {
+                guard_clause_matched(body, guard_env, guard_k, guard_winders, winders)
+            } else {
+                start_guard_clause(exn, rest_clauses, guard_env, guard_k, guard_winders, winders)
+            }
+        }
+        Kont::GuardBody { body, env, next } => {
+            cek_seq(body, env.clone(), next.clone())
+        }
     }
 }
 
-fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut String, winders: &mut Vec<Rc<(Value, Value)>>) -> Result<(Ctrl, Rc<Kont>), EvalError> {
+fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut String, winders: &mut Vec<Rc<(Value, Value)>>, handlers: &mut Vec<Handler>) -> Result<(Ctrl, Rc<Kont>), EvalError> {
     match func {
         Value::Procedure(ref params, ref rest, ref body, ref closure_env) => {
             if rest.is_some() {
@@ -687,6 +824,31 @@ fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut Strin
                         entry,
                         next: k,
                     })))
+            } else if name == "raise" {
+                if args.len() != 1 {
+                    return Err(EvalError::Arity("raise requires 1 argument".into()));
+                }
+                if handlers.is_empty() {
+                    return Err(EvalError::Type(format!("unhandled exception: {}", args[0])));
+                }
+                let handler = handlers.pop().expect("handlers checked non-empty above");
+                match handler {
+                    Handler::Proc(f) => {
+                        Ok((Ctrl::Apply(f, args), Rc::new(Kont::RaiseReturn)))
+                    }
+                    Handler::Guard { var, clauses, env: guard_env, guard_k, guard_winders } => {
+                        env_define(&guard_env, var, args[0].clone());
+                        start_guard_clause(&args[0], &clauses, &guard_env, &guard_k, &guard_winders, winders)
+                    }
+                }
+            } else if name == "with-exception-handler" {
+                if args.len() != 2 {
+                    return Err(EvalError::Arity("with-exception-handler requires 2 arguments".into()));
+                }
+                let handler = args[0].clone();
+                let thunk = args[1].clone();
+                handlers.push(Handler::Proc(handler));
+                Ok((Ctrl::Apply(thunk, vec![]), Rc::new(Kont::PopHandler { next: k })))
             } else if name == "apply" {
                 if args.len() < 2 {
                     return Err(EvalError::Arity("apply requires at least 2 arguments".into()));
@@ -760,6 +922,7 @@ pub(crate) fn cek_run(exprs: Vec<Expr>, env: Env, output: &mut String) -> Result
     };
     let mut last_span = Span::default();
     let mut winders: Vec<Rc<(Value, Value)>> = Vec::new();
+    let mut handlers: Vec<Handler> = Vec::new();
 
     loop {
         if let Ctrl::Val(ref v) = ctrl {
@@ -771,10 +934,10 @@ pub(crate) fn cek_run(exprs: Vec<Expr>, env: Env, output: &mut String) -> Result
             Ctrl::Eval(ref expr, _) => {
                 last_span = expr.span;
                 let Ctrl::Eval(expr, env) = ctrl else { unreachable!() };
-                cek_step_eval(expr, env, k, output)?
+                cek_step_eval(expr, env, k, output, &winders, &mut handlers)?
             }
-            Ctrl::Val(val) => cek_step_val(val, k, output, &mut winders)?,
-            Ctrl::Apply(func, args) => cek_step_apply(func, args, k, output, &mut winders)
+            Ctrl::Val(val) => cek_step_val(val, k, output, &mut winders, &mut handlers)?,
+            Ctrl::Apply(func, args) => cek_step_apply(func, args, k, output, &mut winders, &mut handlers)
                 .map_err(|e| with_span(last_span, e))?,
         };
         ctrl = new_ctrl;

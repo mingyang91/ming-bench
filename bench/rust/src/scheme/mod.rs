@@ -1058,7 +1058,8 @@ pub(crate) fn is_builtin(op: &str) -> bool {
         | "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
         | "vector?" | "vector->list" | "list->vector"
         | "error"
-        | "dynamic-wind")
+        | "dynamic-wind"
+        | "raise" | "with-exception-handler")
     || (op.len() > 2 && op.starts_with('c') && op.ends_with('r')
         && op[1..op.len()-1].bytes().all(|b| b == b'a' || b == b'd'))
 }
@@ -1412,6 +1413,10 @@ pub(crate) enum Kont {
     DynWindAfterBody { entry: Rc<(Value, Value)>, next: Rc<Kont> },
     DynWindAfterOut { result: Value, next: Rc<Kont> },
     WindShift { ops: Vec<(bool, Rc<(Value, Value)>)>, val: Value, saved_k: Rc<Kont> },
+    PopHandler { next: Rc<Kont> },
+    RaiseReturn,
+    GuardTest { exn: Value, body: Vec<Expr>, rest_clauses: Vec<Expr>, guard_env: Env, guard_k: Rc<Kont>, guard_winders: Vec<Rc<(Value, Value)>> },
+    GuardBody { body: Vec<Expr>, env: Env, next: Rc<Kont> },
 }
 
 impl fmt::Debug for Kont {
