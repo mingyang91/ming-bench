@@ -54,6 +54,7 @@ enum Expr {
     Int(i128, Position),
     Bool(bool, Position),
     String(String, Position),
+    Char(char, Position),
     Symbol(String, Position),
     List(Vec<Expr>, Position),
 }
@@ -64,6 +65,7 @@ impl Expr {
             Self::Int(_, position)
             | Self::Bool(_, position)
             | Self::String(_, position)
+            | Self::Char(_, position)
             | Self::Symbol(_, position)
             | Self::List(_, position) => *position,
         }
@@ -316,6 +318,7 @@ impl Parser {
         let expression = match token.as_str() {
             "#t" => Expr::Bool(true, start),
             "#f" => Expr::Bool(false, start),
+            _ if token.starts_with("#\\") => Expr::Char(parse_character_literal(&token, start)?, start),
             _ if is_integer_token(&token) => {
                 let value = token
                     .parse::<i128>()
@@ -378,6 +381,24 @@ impl Parser {
     }
 }
 
+fn parse_character_literal(token: &str, position: Position) -> EvalResult<char> {
+    let Some(body) = token.strip_prefix("#\\") else {
+        return Err(error_at("invalid character literal", position));
+    };
+
+    match body {
+        "space" => Ok(' '),
+        "newline" => Ok('\n'),
+        _ => {
+            let mut chars = body.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) => Ok(ch),
+                _ => Err(error_at("invalid character literal", position)),
+            }
+        }
+    }
+}
+
 fn eval_sequence(
     expressions: &[Expr],
     env: EnvRef,
@@ -395,6 +416,7 @@ fn eval(expression: &Expr, env: EnvRef, context: &mut EvalContext) -> EvalResult
         Expr::Int(value, _) => Ok(Value::Int(*value)),
         Expr::Bool(value, _) => Ok(Value::Bool(*value)),
         Expr::String(value, _) => Ok(Value::String(value.clone())),
+        Expr::Char(ch, _) => Ok(Value::Char(*ch)),
         Expr::Symbol(name, position) => env.lookup(name, *position),
         Expr::List(items, position) => eval_list(items, *position, env, context),
     }
@@ -728,6 +750,7 @@ fn quote(expression: &Expr) -> Value {
         Expr::Int(value, _) => Value::Int(*value),
         Expr::Bool(value, _) => Value::Bool(*value),
         Expr::String(value, _) => Value::String(value.clone()),
+        Expr::Char(ch, _) => Value::Char(*ch),
         Expr::Symbol(name, _) => Value::Symbol(name.clone()),
         Expr::List(items, _) => build_list(items.iter().map(quote).collect()),
     }
@@ -818,6 +841,36 @@ fn root_bindings() -> Vec<(String, Value)> {
         builtin("string->symbol", string_to_symbol),
         builtin("string-ref", string_ref),
         builtin("char?", is_char),
+        builtin("abs", abs),
+        builtin("modulo", modulo),
+        builtin("remainder", remainder),
+        builtin("quotient", quotient),
+        builtin("min", min),
+        builtin("max", max),
+        builtin("expt", expt),
+        builtin("zero?", is_zero),
+        builtin("positive?", is_positive),
+        builtin("negative?", is_negative),
+        builtin("odd?", is_odd),
+        builtin("even?", is_even),
+        builtin("list-ref", list_ref),
+        builtin("list-tail", list_tail),
+        builtin("list?", is_list),
+        builtin("eq?", is_eq),
+        builtin("equal?", is_equal),
+        builtin("assoc", assoc),
+        builtin("map", map),
+        builtin("char-alphabetic?", is_char_alphabetic),
+        builtin("char-numeric?", is_char_numeric),
+        builtin("char-upcase", char_upcase),
+        builtin("char-downcase", char_downcase),
+        builtin("char=?", char_equal),
+        builtin("char<?", char_less_than),
+        builtin("string=?", string_equal),
+        builtin("string<?", string_less_than),
+        builtin("string-ci=?", string_ci_equal),
+        builtin("string-upcase", string_upcase),
+        builtin("string-downcase", string_downcase),
     ]
 }
 
@@ -1183,6 +1236,356 @@ fn is_char(
     })
 }
 
+fn abs(arguments: &[Value], position: Position, _context: &mut EvalContext) -> EvalResult<Value> {
+    let value = expect_single_argument(arguments, "abs", position)?;
+    let number = expect_number(value, "abs", position)?;
+    let result = number
+        .checked_abs()
+        .ok_or_else(|| error_at("abs overflowed", position))?;
+    Ok(Value::Int(result))
+}
+
+fn modulo(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let (left, right) = expect_two_arguments(arguments, "modulo", position)?;
+    let dividend = expect_number(left, "modulo", position)?;
+    let divisor = expect_number(right, "modulo", position)?;
+    ensure_non_zero_divisor("modulo", divisor, position)?;
+
+    let remainder = dividend % divisor;
+    let result = if remainder == 0 || same_sign(remainder, divisor) {
+        remainder
+    } else {
+        remainder + divisor
+    };
+    Ok(Value::Int(result))
+}
+
+fn remainder(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let (left, right) = expect_two_arguments(arguments, "remainder", position)?;
+    let dividend = expect_number(left, "remainder", position)?;
+    let divisor = expect_number(right, "remainder", position)?;
+    ensure_non_zero_divisor("remainder", divisor, position)?;
+    Ok(Value::Int(dividend % divisor))
+}
+
+fn quotient(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let (left, right) = expect_two_arguments(arguments, "quotient", position)?;
+    let dividend = expect_number(left, "quotient", position)?;
+    let divisor = expect_number(right, "quotient", position)?;
+    ensure_non_zero_divisor("quotient", divisor, position)?;
+    Ok(Value::Int(dividend / divisor))
+}
+
+fn min(arguments: &[Value], position: Position, _context: &mut EvalContext) -> EvalResult<Value> {
+    let numbers = numeric_arguments_at_least(arguments, 1, "min", position)?;
+    Ok(Value::Int(
+        *numbers
+            .iter()
+            .min()
+            .expect("min requires at least one number"),
+    ))
+}
+
+fn max(arguments: &[Value], position: Position, _context: &mut EvalContext) -> EvalResult<Value> {
+    let numbers = numeric_arguments_at_least(arguments, 1, "max", position)?;
+    Ok(Value::Int(
+        *numbers
+            .iter()
+            .max()
+            .expect("max requires at least one number"),
+    ))
+}
+
+fn expt(arguments: &[Value], position: Position, _context: &mut EvalContext) -> EvalResult<Value> {
+    let (base_value, exponent_value) = expect_two_arguments(arguments, "expt", position)?;
+    let base = expect_number(base_value, "expt", position)?;
+    let exponent = expect_number(exponent_value, "expt", position)?;
+    let exponent = u32::try_from(exponent)
+        .map_err(|_| error_at("expt expected a non-negative exponent", position))?;
+    let result = base
+        .checked_pow(exponent)
+        .ok_or_else(|| error_at("expt overflowed", position))?;
+    Ok(Value::Int(result))
+}
+
+fn is_zero(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    numeric_unary_predicate(arguments, "zero?", position, |number| number == 0)
+}
+
+fn is_positive(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    numeric_unary_predicate(arguments, "positive?", position, |number| number > 0)
+}
+
+fn is_negative(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    numeric_unary_predicate(arguments, "negative?", position, |number| number < 0)
+}
+
+fn is_odd(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    numeric_unary_predicate(arguments, "odd?", position, |number| number % 2 != 0)
+}
+
+fn is_even(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    numeric_unary_predicate(arguments, "even?", position, |number| number % 2 == 0)
+}
+
+fn list_ref(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    expect_exact(arguments, 2, "list-ref", position)?;
+    let index = expect_index(&arguments[1], "list-ref", position)?;
+    let mut current = &arguments[0];
+    let mut remaining = index;
+
+    loop {
+        match current {
+            Value::Pair(head, tail) => {
+                if remaining == 0 {
+                    return Ok((**head).clone());
+                }
+                remaining -= 1;
+                current = tail.as_ref();
+            }
+            _ => return Err(error_at("list-ref index out of range", position)),
+        }
+    }
+}
+
+fn list_tail(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    expect_exact(arguments, 2, "list-tail", position)?;
+    let mut remaining = expect_index(&arguments[1], "list-tail", position)?;
+    let mut current = &arguments[0];
+
+    while remaining > 0 {
+        match current {
+            Value::Pair(_, tail) => {
+                current = tail.as_ref();
+                remaining -= 1;
+            }
+            _ => return Err(error_at("list-tail index out of range", position)),
+        }
+    }
+
+    Ok(current.clone())
+}
+
+fn is_list(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    unary_predicate(arguments, "list?", position, is_proper_list)
+}
+
+fn is_eq(arguments: &[Value], position: Position, _context: &mut EvalContext) -> EvalResult<Value> {
+    let (left, right) = expect_two_arguments(arguments, "eq?", position)?;
+    Ok(Value::Bool(eq_values(left, right)))
+}
+
+fn is_equal(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let (left, right) = expect_two_arguments(arguments, "equal?", position)?;
+    Ok(Value::Bool(equal_values(left, right)))
+}
+
+fn assoc(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let (key, list) = expect_two_arguments(arguments, "assoc", position)?;
+    let mut current = list;
+
+    loop {
+        match current {
+            Value::EmptyList => return Ok(Value::Bool(false)),
+            Value::Pair(entry, tail) => {
+                let (entry_key, _) = expect_pair(entry, "assoc", position)?;
+                if equal_values(key, entry_key) {
+                    return Ok((**entry).clone());
+                }
+                current = tail.as_ref();
+            }
+            _ => {
+                return Err(error_at(
+                    "assoc expected an association list",
+                    position,
+                ))
+            }
+        }
+    }
+}
+
+fn map(arguments: &[Value], position: Position, context: &mut EvalContext) -> EvalResult<Value> {
+    expect_at_least(arguments, 2, "map", position)?;
+
+    let procedure = arguments[0].clone();
+    let lists: Vec<Vec<Value>> = arguments[1..]
+        .iter()
+        .map(|value| expect_proper_list(value, "map", position))
+        .collect::<EvalResult<_>>()?;
+
+    let expected_len = lists[0].len();
+    if lists.iter().any(|list| list.len() != expected_len) {
+        return Err(error_at("map expected lists of equal length", position));
+    }
+
+    let mut results = Vec::with_capacity(expected_len);
+    for index in 0..expected_len {
+        let call_arguments = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        results.push(apply(procedure.clone(), call_arguments, position, context)?);
+    }
+
+    Ok(build_list(results))
+}
+
+fn is_char_alphabetic(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    char_unary_predicate(arguments, "char-alphabetic?", position, |ch| ch.is_alphabetic())
+}
+
+fn is_char_numeric(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    char_unary_predicate(arguments, "char-numeric?", position, |ch| ch.is_numeric())
+}
+
+fn char_upcase(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let value = expect_single_argument(arguments, "char-upcase", position)?;
+    Ok(Value::Char(uppercase_char(expect_char(value, "char-upcase", position)?)))
+}
+
+fn char_downcase(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let value = expect_single_argument(arguments, "char-downcase", position)?;
+    Ok(Value::Char(lowercase_char(expect_char(value, "char-downcase", position)?)))
+}
+
+fn char_equal(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    compare_characters(arguments, "char=?", position, |left, right| left == right)
+}
+
+fn char_less_than(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    compare_characters(arguments, "char<?", position, |left, right| left < right)
+}
+
+fn string_equal(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    compare_strings(arguments, "string=?", position, |left, right| left == right)
+}
+
+fn string_less_than(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    compare_strings(arguments, "string<?", position, |left, right| left < right)
+}
+
+fn string_ci_equal(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    compare_strings(arguments, "string-ci=?", position, |left, right| {
+        left.to_lowercase() == right.to_lowercase()
+    })
+}
+
+fn string_upcase(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let value = expect_single_argument(arguments, "string-upcase", position)?;
+    Ok(Value::String(
+        expect_string(value, "string-upcase", position)?
+            .chars()
+            .flat_map(char::to_uppercase)
+            .collect(),
+    ))
+}
+
+fn string_downcase(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let value = expect_single_argument(arguments, "string-downcase", position)?;
+    Ok(Value::String(
+        expect_string(value, "string-downcase", position)?
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect(),
+    ))
+}
+
 fn unary_predicate(
     arguments: &[Value],
     name: &str,
@@ -1266,11 +1669,41 @@ fn expect_number(value: &Value, name: &str, position: Position) -> EvalResult<i1
     }
 }
 
+fn numeric_unary_predicate(
+    arguments: &[Value],
+    name: &str,
+    position: Position,
+    predicate: impl Fn(i128) -> bool,
+) -> EvalResult<Value> {
+    let value = expect_single_argument(arguments, name, position)?;
+    Ok(Value::Bool(predicate(expect_number(value, name, position)?)))
+}
+
+fn char_unary_predicate(
+    arguments: &[Value],
+    name: &str,
+    position: Position,
+    predicate: impl Fn(char) -> bool,
+) -> EvalResult<Value> {
+    let value = expect_single_argument(arguments, name, position)?;
+    Ok(Value::Bool(predicate(expect_char(value, name, position)?)))
+}
+
 fn expect_string<'a>(value: &'a Value, name: &str, position: Position) -> EvalResult<&'a str> {
     match value {
         Value::String(text) => Ok(text),
         other => Err(error_at(
             format!("{name} expected a string, got {}", other.type_name()),
+            position,
+        )),
+    }
+}
+
+fn expect_char(value: &Value, name: &str, position: Position) -> EvalResult<char> {
+    match value {
+        Value::Char(ch) => Ok(*ch),
+        other => Err(error_at(
+            format!("{name} expected a character, got {}", other.type_name()),
             position,
         )),
     }
@@ -1351,6 +1784,102 @@ fn numeric_arguments_at_least(
 ) -> EvalResult<Vec<i128>> {
     expect_at_least(arguments, minimum, name, position)?;
     numeric_arguments(arguments, name, position)
+}
+
+fn compare_characters(
+    arguments: &[Value],
+    name: &str,
+    position: Position,
+    predicate: impl Fn(char, char) -> bool,
+) -> EvalResult<Value> {
+    expect_at_least(arguments, 2, name, position)?;
+    let characters = arguments
+        .iter()
+        .map(|value| expect_char(value, name, position))
+        .collect::<EvalResult<Vec<_>>>()?;
+    Ok(Value::Bool(
+        characters
+            .windows(2)
+            .all(|window| predicate(window[0], window[1])),
+    ))
+}
+
+fn compare_strings(
+    arguments: &[Value],
+    name: &str,
+    position: Position,
+    predicate: impl Fn(&str, &str) -> bool,
+) -> EvalResult<Value> {
+    expect_at_least(arguments, 2, name, position)?;
+    let strings = arguments
+        .iter()
+        .map(|value| expect_string(value, name, position))
+        .collect::<EvalResult<Vec<_>>>()?;
+    Ok(Value::Bool(
+        strings
+            .windows(2)
+            .all(|window| predicate(window[0], window[1])),
+    ))
+}
+
+fn ensure_non_zero_divisor(name: &str, divisor: i128, position: Position) -> EvalResult<()> {
+    if divisor == 0 {
+        return Err(error_at(format!("{name} division by zero"), position));
+    }
+    Ok(())
+}
+
+fn same_sign(left: i128, right: i128) -> bool {
+    left.is_negative() == right.is_negative()
+}
+
+fn is_proper_list(value: &Value) -> bool {
+    let mut current = value;
+    loop {
+        match current {
+            Value::EmptyList => return true,
+            Value::Pair(_, tail) => current = tail.as_ref(),
+            _ => return false,
+        }
+    }
+}
+
+fn eq_values(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Builtin { name: left, .. }, Value::Builtin { name: right, .. }) => left == right,
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
+fn equal_values(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(left_head, left_tail), Value::Pair(right_head, right_tail)) => {
+            equal_values(left_head, right_head) && equal_values(left_tail, right_tail)
+        }
+        (Value::Builtin { name: left, .. }, Value::Builtin { name: right, .. }) => left == right,
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
+fn uppercase_char(ch: char) -> char {
+    ch.to_uppercase().next().unwrap_or(ch)
+}
+
+fn lowercase_char(ch: char) -> char {
+    ch.to_lowercase().next().unwrap_or(ch)
 }
 
 fn is_truthy(value: &Value) -> bool {
