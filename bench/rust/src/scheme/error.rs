@@ -44,6 +44,8 @@ pub enum EvalError {
     ExpectedList { name: String },
     #[error("{name} expects a non-empty list")]
     ExpectedPair { name: String },
+    #[error("{name} expects a {record_type} record")]
+    ExpectedRecord { name: String, record_type: String },
     #[error("{name} index {index} out of bounds for length {len}")]
     IndexOutOfBounds {
         name: String,
