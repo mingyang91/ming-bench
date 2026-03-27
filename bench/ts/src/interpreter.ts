@@ -34,6 +34,14 @@ type MacroTransformer = {
   rules: MacroRule[];
   definitionEnv: Env;
 };
+type EqualityState = {
+  seenPairs: Map<PairValue, Set<PairValue>>;
+  seenVectors: Map<VectorValue, Set<VectorValue>>;
+};
+type FormatState = {
+  activePairs: Set<PairValue>;
+  activeVectors: Set<VectorValue>;
+};
 type TemplateContext = {
   macro: MacroTransformer;
   captures: Map<string, PatternCapture>;
@@ -114,6 +122,7 @@ const CORE_SYNTAX = new Set([
   'if',
   'lambda',
   'let',
+  'let*',
   'letrec',
   'letrec*',
   'or',
@@ -905,6 +914,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('apply', (args, position) => applyBuiltin(args, position, macroEnv)),
     builtin('append', (args) => appendValues(args)),
     builtin('assoc', (args) => assocBuiltin(args)),
+    builtin('assv', (args) => assvBuiltin(args)),
     builtin('boolean?', (args) => unaryPredicate('boolean?', args, (value) => typeof value === 'boolean')),
     builtin('car', (args) => {
       assertExactArity('car', args, 1);
@@ -913,6 +923,10 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('cdr', (args) => {
       assertExactArity('cdr', args, 1);
       return expectPair('cdr', args[0]!).cdr;
+    }),
+    builtin('cddr', (args) => {
+      assertExactArity('cddr', args, 1);
+      return expectPair('cddr', expectPair('cddr', args[0]!).cdr).cdr;
     }),
     builtin('char-alphabetic?', (args) => {
       assertExactArity('char-alphabetic?', args, 1);
@@ -971,6 +985,8 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       unaryPredicate('exact?', args, (value) => num.isNumericValue(value) && num.isExactNumeric(value)),
     ),
     builtin('expt', (args) => exptNumbers(args)),
+    builtin('for-each', (args, position) => forEachBuiltin(args, position, macroEnv)),
+    builtin('gcd', (args) => gcdBuiltin(args)),
     builtin('inexact->exact', (args) => {
       assertExactArity('inexact->exact', args, 1);
       return num.inexactToExact(expectNumberValue('inexact->exact', args[0]!));
@@ -1008,11 +1024,14 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       assertExactArity('list?', args, 1);
       return isProperListValue(args[0]!);
     }),
+    builtin('lcm', (args) => lcmBuiltin(args)),
+    builtin('make-string', (args) => makeStringBuiltin(args)),
     builtin('make-vector', (args) => makeVectorBuiltin(args)),
     builtin('map', (args, position) => mapBuiltin(args, position, macroEnv)),
     builtin('max', (args) =>
       extremum('max', args, (left, right) => (num.numericCompare(left, right) >= 0 ? left : right)),
     ),
+    builtin('member', (args) => memberBuiltin(args)),
     builtin('min', (args) =>
       extremum('min', args, (left, right) => (num.numericCompare(left, right) <= 0 ? left : right)),
     ),
@@ -1044,6 +1063,12 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('quotient', (args) => quotientNumbers(args)),
     builtin('rational?', (args) => unaryPredicate('rational?', args, (value) => num.isNumericValue(value))),
     builtin('remainder', (args) => remainderNumbers(args)),
+    builtin('round', (args) => roundBuiltin(args)),
+    builtin('reverse', (args) => {
+      assertExactArity('reverse', args, 1);
+      return makeList(expectProperList('reverse', args[0]!).slice().reverse());
+    }),
+    builtin('string', (args) => stringBuiltin(args)),
     builtin('string->number', (args) => {
       assertExactArity('string->number', args, 1);
       return num.parseStringNumber(expectStringValue('string->number', args[0]!));
@@ -1068,6 +1093,9 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       assertExactArity('string-downcase', args, 1);
       return makeRuntimeString(expectStringValue('string-downcase', args[0]!).toLowerCase());
     }),
+    builtin('string>?', (args) => compareStrings('string>?', args, (value) => value, (left, right) => left > right)),
+    builtin('string<=?', (args) => compareStrings('string<=?', args, (value) => value, (left, right) => left <= right)),
+    builtin('string>=?', (args) => compareStrings('string>=?', args, (value) => value, (left, right) => left >= right)),
     builtin('string<?', (args) => compareStrings('string<?', args, (value) => value, (left, right) => left < right)),
     builtin('string=?', (args) => compareStrings('string=?', args, (value) => value, (left, right) => left === right)),
     builtin('string-length', (args) => {
@@ -1118,6 +1146,17 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       return makeRuntimeString(expectSymbolValue('symbol->string', args[0]!).name);
     }),
     builtin('symbol?', (args) => unaryPredicate('symbol?', args, isSymbolValue)),
+    builtin('truncate', (args) => truncateBuiltin(args)),
+    builtin('set-car!', (args) => {
+      assertExactArity('set-car!', args, 2);
+      expectPair('set-car!', args[0]!).car = args[1]!;
+      return VOID;
+    }),
+    builtin('set-cdr!', (args) => {
+      assertExactArity('set-cdr!', args, 2);
+      expectPair('set-cdr!', args[0]!).cdr = args[1]!;
+      return VOID;
+    }),
     builtin('vector', (args) => ({ kind: 'vector', items: [...args] })),
     builtin('vector->list', (args) => {
       assertExactArity('vector->list', args, 1);
@@ -1298,6 +1337,8 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
         return evalLambda(items.slice(1), env);
       case 'let':
         return evalLet(items.slice(1), env, macroEnv);
+      case 'let*':
+        return evalLetStar(items.slice(1), env, macroEnv);
       case 'letrec':
         return evalLetRec(items.slice(1), env, macroEnv, false);
       case 'letrec*':
@@ -1587,6 +1628,20 @@ function evalLet(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
   });
 
   return evalSequenceTail(body, letEnv, macroEnv);
+}
+
+function evalLetStar(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+  assertAtLeastArity('let*', args, 2);
+
+  const bindings = parseBindings(args[0]!, 'let*');
+  const body = args.slice(1);
+  const letStarEnv = new Env(env);
+
+  for (const binding of bindings) {
+    letStarEnv.define(binding.name, evalExpr(binding.init, letStarEnv, macroEnv));
+  }
+
+  return evalSequenceTail(body, letStarEnv, macroEnv);
 }
 
 function evalLetRec(args: Expr[], env: Env, macroEnv: MacroEnv, sequential: boolean): EvalResult {
@@ -2143,8 +2198,13 @@ function expectRecordValue(name: string, value: Value, recordType?: RecordTypeDe
 function expectProperList(name: string, value: Value): Value[] {
   const items: Value[] = [];
   let current = value;
+  const seen = new Set<PairValue>();
 
   while (isPair(current)) {
+    if (seen.has(current)) {
+      throw new EvalError(`${name} expects a proper list`);
+    }
+    seen.add(current);
     items.push(current.car);
     current = current.cdr;
   }
@@ -2341,6 +2401,7 @@ function mapBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv)
   }
 
   const currentLists = args.slice(1);
+  const seenLists = currentLists.map(() => new Set<PairValue>());
   const results: Value[] = [];
 
   while (true) {
@@ -2371,12 +2432,125 @@ function mapBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv)
       if (!isPair(current)) {
         throw new EvalError('map expects proper list arguments');
       }
+      if (seenLists[index]!.has(current)) {
+        throw new EvalError('map expects proper list arguments');
+      }
+      seenLists[index]!.add(current);
       elementArgs.push(current.car);
       currentLists[index] = current.cdr;
     }
 
     results.push(resolveEvalResult(applyProcedure(proc, elementArgs, position, macroEnv), macroEnv));
   }
+}
+
+function forEachBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv): Value {
+  assertAtLeastArity('for-each', args, 2);
+
+  const proc = args[0]!;
+  if (!isProcedure(proc)) {
+    throw new EvalError('for-each expects a procedure');
+  }
+
+  const currentLists = args.slice(1);
+  const seenLists = currentLists.map(() => new Set<PairValue>());
+
+  while (true) {
+    let sawEmpty = false;
+    let sawPair = false;
+
+    for (const current of currentLists) {
+      if (isEmptyList(current)) {
+        sawEmpty = true;
+        continue;
+      }
+      if (!isPair(current)) {
+        throw new EvalError('for-each expects proper list arguments');
+      }
+      sawPair = true;
+    }
+
+    if (sawEmpty) {
+      if (sawPair) {
+        throw new EvalError('for-each expects lists of equal length');
+      }
+      return VOID;
+    }
+
+    const elementArgs: Value[] = [];
+    for (let index = 0; index < currentLists.length; index += 1) {
+      const current = currentLists[index]!;
+      if (!isPair(current)) {
+        throw new EvalError('for-each expects proper list arguments');
+      }
+      if (seenLists[index]!.has(current)) {
+        throw new EvalError('for-each expects proper list arguments');
+      }
+      seenLists[index]!.add(current);
+      elementArgs.push(current.car);
+      currentLists[index] = current.cdr;
+    }
+
+    resolveEvalResult(applyProcedure(proc, elementArgs, position, macroEnv), macroEnv);
+  }
+}
+
+function memberBuiltin(args: Value[]): Value {
+  assertExactArity('member', args, 2);
+
+  const key = args[0]!;
+  let current = args[1]!;
+  const seen = new Set<PairValue>();
+
+  while (isPair(current)) {
+    if (seen.has(current)) {
+      throw new EvalError('member expects a proper list');
+    }
+    seen.add(current);
+
+    if (equalValues(key, current.car)) {
+      return current;
+    }
+
+    current = current.cdr;
+  }
+
+  if (!isEmptyList(current)) {
+    throw new EvalError('member expects a proper list');
+  }
+
+  return false;
+}
+
+function assvBuiltin(args: Value[]): Value {
+  assertExactArity('assv', args, 2);
+
+  const key = args[0]!;
+  let current = args[1]!;
+  const seen = new Set<PairValue>();
+
+  while (isPair(current)) {
+    if (seen.has(current)) {
+      throw new EvalError('assv expects an association list');
+    }
+    seen.add(current);
+
+    const entry = current.car;
+    if (!isPair(entry)) {
+      throw new EvalError('assv expects an association list');
+    }
+    if (eqvValues(key, entry.car)) {
+      return entry;
+    }
+
+    current = current.cdr;
+  }
+
+  if (!isEmptyList(current)) {
+    throw new EvalError('assv expects an association list');
+  }
+
+  return false;
 }
 
 function assocBuiltin(args: Value[]): Value {
@@ -2403,15 +2577,153 @@ function assocBuiltin(args: Value[]): Value {
   return false;
 }
 
+function gcdBuiltin(args: Value[]): num.NumericValue {
+  const integers = args.map((arg) => expectIntegerValue('gcd', arg));
+  if (integers.length === 0) {
+    return makeExactIntegerValue(0n);
+  }
+
+  if (integers.every((value) => num.isExactNumeric(value))) {
+    let result = 0n;
+    for (const value of integers) {
+      result = gcdBigInt(result, absBigInt(integerNumericToBigInt(value)));
+    }
+    return makeExactIntegerValue(result);
+  }
+
+  let result = 0;
+  for (const value of integers) {
+    result = gcdNumber(result, Math.abs(Math.trunc(num.numericToNumber(value))));
+  }
+  return makeInexactNumberValue(result);
+}
+
+function lcmBuiltin(args: Value[]): num.NumericValue {
+  const integers = args.map((arg) => expectIntegerValue('lcm', arg));
+  if (integers.length === 0) {
+    return makeExactIntegerValue(1n);
+  }
+
+  if (integers.every((value) => num.isExactNumeric(value))) {
+    let result = 1n;
+    for (const value of integers) {
+      result = lcmBigInt(result, integerNumericToBigInt(value));
+    }
+    return makeExactIntegerValue(result);
+  }
+
+  let result = 1;
+  for (const value of integers) {
+    result = lcmNumber(result, Math.trunc(num.numericToNumber(value)));
+  }
+  return makeInexactNumberValue(result);
+}
+
+function truncateBuiltin(args: Value[]): num.NumericValue {
+  assertExactArity('truncate', args, 1);
+  return integerizingNumericResult(expectNumberValue('truncate', args[0]!), Math.trunc);
+}
+
+function roundBuiltin(args: Value[]): num.NumericValue {
+  assertExactArity('round', args, 1);
+  return integerizingNumericResult(expectNumberValue('round', args[0]!), Math.round);
+}
+
+function makeStringBuiltin(args: Value[]): string | MutableStringValue {
+  if (args.length !== 1 && args.length !== 2) {
+    throw new EvalError('make-string expects 1 or 2 argument(s)');
+  }
+
+  const length = expectIndex('make-string', args[0]!);
+  const fill = args[1] === undefined ? '\0' : expectCharValue('make-string', args[1]).value;
+  return makeRuntimeString(fill.repeat(length));
+}
+
+function stringBuiltin(args: Value[]): string | MutableStringValue {
+  return makeRuntimeString(args.map((arg) => expectCharValue('string', arg).value).join(''));
+}
+
+function integerizingNumericResult(
+  value: num.NumericValue,
+  transform: (value: number) => number,
+): num.NumericValue {
+  if (value.kind === 'exact-integer') {
+    return value;
+  }
+
+  const transformed = transform(num.numericToNumber(value));
+  return value.kind === 'inexact-number'
+    ? makeInexactNumberValue(transformed)
+    : makeExactIntegerValue(BigInt(transformed));
+}
+
+function integerNumericToBigInt(value: num.NumericValue): bigint {
+  return value.kind === 'exact-integer' ? value.value : BigInt(Math.trunc(num.numericToNumber(value)));
+}
+
+function makeExactIntegerValue(value: bigint): num.NumericValue {
+  return { kind: 'exact-integer', value };
+}
+
+function makeInexactNumberValue(value: number): num.NumericValue {
+  return { kind: 'inexact-number', value: Object.is(value, -0) ? 0 : value };
+}
+
+function absBigInt(value: bigint): bigint {
+  return value < 0n ? -value : value;
+}
+
+function gcdBigInt(left: bigint, right: bigint): bigint {
+  let a = absBigInt(left);
+  let b = absBigInt(right);
+
+  while (b !== 0n) {
+    const remainder = a % b;
+    a = b;
+    b = remainder;
+  }
+
+  return a;
+}
+
+function lcmBigInt(left: bigint, right: bigint): bigint {
+  if (left === 0n || right === 0n) {
+    return 0n;
+  }
+
+  return absBigInt((left / gcdBigInt(left, right)) * right);
+}
+
+function gcdNumber(left: number, right: number): number {
+  let a = Math.abs(left);
+  let b = Math.abs(right);
+
+  while (b !== 0) {
+    const remainder = a % b;
+    a = b;
+    b = remainder;
+  }
+
+  return a;
+}
+
+function lcmNumber(left: number, right: number): number {
+  if (left === 0 || right === 0) {
+    return 0;
+  }
+
+  return Math.abs((left / gcdNumber(left, right)) * right);
+}
+
 function formatValue(value: Value): string {
-  return formatValueWithMode(value, 'write');
+  return formatValueWithMode(value, 'write', { activePairs: new Set(), activeVectors: new Set() });
 }
 
 function formatDisplayValue(value: Value): string {
-  return formatValueWithMode(value, 'display');
+  return formatValueWithMode(value, 'display', { activePairs: new Set(), activeVectors: new Set() });
 }
 
-function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
+function formatValueWithMode(value: Value, mode: 'display' | 'write', state: FormatState): string {
   if (num.isNumericValue(value)) {
     return num.formatNumber(value);
   }
@@ -2437,9 +2749,9 @@ function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
     case 'empty-list':
       return '()';
     case 'pair':
-      return `(${formatPairContents(value, mode)})`;
+      return `(${formatPairContents(value, mode, state)})`;
     case 'vector':
-      return `#(${value.items.map((item) => formatValueWithMode(item, mode)).join(' ')})`;
+      return formatVectorValue(value, mode, state);
     case 'record':
       return `#<record:${value.recordType.name}>`;
     case 'void':
@@ -2453,20 +2765,40 @@ function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
   }
 }
 
-function formatPairContents(pair: PairValue, mode: 'display' | 'write'): string {
-  const parts: string[] = [];
-  let current: Value = pair;
-
-  while (isPair(current)) {
-    parts.push(formatValueWithMode(current.car, mode));
-    current = current.cdr;
+function formatPairContents(pair: PairValue, mode: 'display' | 'write', state: FormatState): string {
+  if (state.activePairs.has(pair)) {
+    return '#<circular>';
   }
 
-  if (isEmptyList(current)) {
-    return parts.join(' ');
+  state.activePairs.add(pair);
+  try {
+    const head = formatValueWithMode(pair.car, mode, state);
+
+    if (isEmptyList(pair.cdr)) {
+      return head;
+    }
+
+    if (isPair(pair.cdr)) {
+      return `${head} ${formatPairContents(pair.cdr, mode, state)}`;
+    }
+
+    return `${head} . ${formatValueWithMode(pair.cdr, mode, state)}`;
+  } finally {
+    state.activePairs.delete(pair);
+  }
+}
+
+function formatVectorValue(vector: VectorValue, mode: 'display' | 'write', state: FormatState): string {
+  if (state.activeVectors.has(vector)) {
+    return '#<circular>';
   }
 
-  return `${parts.join(' ')} . ${formatValueWithMode(current, mode)}`;
+  state.activeVectors.add(vector);
+  try {
+    return `#(${vector.items.map((item) => formatValueWithMode(item, mode, state)).join(' ')})`;
+  } finally {
+    state.activeVectors.delete(vector);
+  }
 }
 
 function formatCharLiteral(value: string): string {
@@ -2565,6 +2897,10 @@ function eqvValues(left: Value, right: Value): boolean {
 }
 
 function equalValues(left: Value, right: Value): boolean {
+  return equalValuesWithState(left, right, { seenPairs: new Map(), seenVectors: new Map() });
+}
+
+function equalValuesWithState(left: Value, right: Value, state: EqualityState): boolean {
   if (eqvValues(left, right)) {
     return true;
   }
@@ -2574,7 +2910,11 @@ function equalValues(left: Value, right: Value): boolean {
   }
 
   if (isPair(left) && isPair(right)) {
-    return equalValues(left.car, right.car) && equalValues(left.cdr, right.cdr);
+    if (rememberComparison(state.seenPairs, left, right)) {
+      return true;
+    }
+
+    return equalValuesWithState(left.car, right.car, state) && equalValuesWithState(left.cdr, right.cdr, state);
   }
 
   if (isVectorValue(left) && isVectorValue(right)) {
@@ -2582,8 +2922,12 @@ function equalValues(left: Value, right: Value): boolean {
       return false;
     }
 
+    if (rememberComparison(state.seenVectors, left, right)) {
+      return true;
+    }
+
     for (let index = 0; index < left.items.length; index += 1) {
-      if (!equalValues(left.items[index]!, right.items[index]!)) {
+      if (!equalValuesWithState(left.items[index]!, right.items[index]!, state)) {
         return false;
       }
     }
@@ -2591,6 +2935,19 @@ function equalValues(left: Value, right: Value): boolean {
     return true;
   }
 
+  return false;
+}
+
+function rememberComparison<T extends object>(seen: Map<T, Set<T>>, left: T, right: T): boolean {
+  let rights = seen.get(left);
+  if (rights === undefined) {
+    rights = new Set<T>();
+    seen.set(left, rights);
+  } else if (rights.has(right)) {
+    return true;
+  }
+
+  rights.add(right);
   return false;
 }
 
