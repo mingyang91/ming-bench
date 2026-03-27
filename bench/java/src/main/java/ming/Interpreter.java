@@ -137,6 +137,9 @@ final class Interpreter {
             if ("define-syntax".equals(symbolName)) {
                 return evalDefineSyntax(listExpr, env);
             }
+            if ("define-record-type".equals(symbolName)) {
+                return evalDefineRecordType(listExpr, env);
+            }
             if ("if".equals(symbolName)) {
                 return evalIf(listExpr, env);
             }
@@ -245,6 +248,85 @@ final class Interpreter {
                 env
         );
         env.defineMacro(nameSymbol.name(), definition);
+        return VOID;
+    }
+
+    private Value evalDefineRecordType(ListExpr listExpr, Environment env) throws EvalError {
+        ensureAtLeastExpressions("define-record-type", listExpr, 4);
+
+        String typeName = requireSymbolExpr(
+                listExpr.elements().get(1),
+                "define-record-type type name must be a symbol"
+        );
+
+        Expr constructorExpr = listExpr.elements().get(2);
+        if (!(constructorExpr instanceof ListExpr constructorList)
+                || constructorList.elements().isEmpty()) {
+            throw error(constructorExpr.loc(),
+                    "define-record-type constructor spec must be a non-empty list");
+        }
+
+        String constructorName = requireSymbolExpr(
+                constructorList.elements().getFirst(),
+                "define-record-type constructor name must be a symbol"
+        );
+        List<String> constructorFields = new ArrayList<>(Math.max(
+                constructorList.elements().size() - 1,
+                0
+        ));
+        for (int index = 1; index < constructorList.elements().size(); index++) {
+            constructorFields.add(requireSymbolExpr(
+                    constructorList.elements().get(index),
+                    "define-record-type constructor fields must be symbols"
+            ));
+        }
+
+        String predicateName = requireSymbolExpr(
+                listExpr.elements().get(3),
+                "define-record-type predicate name must be a symbol"
+        );
+
+        List<String> fieldNames = new ArrayList<>(Math.max(listExpr.elements().size() - 4, 0));
+        List<String> accessorNames = new ArrayList<>(fieldNames.size());
+        for (int index = 4; index < listExpr.elements().size(); index++) {
+            Expr fieldExpr = listExpr.elements().get(index);
+            if (!(fieldExpr instanceof ListExpr fieldList)) {
+                throw error(fieldExpr.loc(), "define-record-type field specs must be lists");
+            }
+            if (fieldList.elements().size() != 2) {
+                throw error(fieldExpr.loc(),
+                        "define-record-type field specs must contain a field name and accessor");
+            }
+
+            fieldNames.add(requireSymbolExpr(
+                    fieldList.elements().get(0),
+                    "define-record-type field names must be symbols"
+            ));
+            accessorNames.add(requireSymbolExpr(
+                    fieldList.elements().get(1),
+                    "define-record-type accessor names must be symbols"
+            ));
+        }
+
+        if (constructorFields.size() != fieldNames.size()) {
+            throw error(constructorExpr.loc(),
+                    "define-record-type constructor field count must match record fields");
+        }
+        if (!constructorFields.equals(fieldNames)) {
+            throw error(constructorExpr.loc(),
+                    "define-record-type constructor fields must match record fields");
+        }
+
+        RecordType recordType = new RecordType(typeName, fieldNames);
+        env.define(constructorName, new RecordConstructorProcedure(constructorName, recordType));
+        env.define(predicateName, new RecordPredicateProcedure(predicateName, recordType));
+        for (int index = 0; index < accessorNames.size(); index++) {
+            env.define(
+                    accessorNames.get(index),
+                    new RecordAccessorProcedure(accessorNames.get(index), recordType, index)
+            );
+        }
+
         return VOID;
     }
 
@@ -1214,6 +1296,13 @@ final class Interpreter {
         throw error(callLoc, procedureName + " expects a proper list");
     }
 
+    private String requireSymbolExpr(Expr expression, String message) throws EvalError {
+        if (expression instanceof SymbolExpr symbolExpr) {
+            return symbolExpr.name();
+        }
+        throw error(expression.loc(), message);
+    }
+
     private boolean isProperList(Value value) {
         Value current = value;
         while (current instanceof PairValue pairValue) {
@@ -1338,33 +1427,8 @@ final class Interpreter {
     }
 
     @FunctionalInterface
-    private interface BuiltinInvoker {
-        Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError;
-    }
-
-    @FunctionalInterface
     private interface NumberComparison {
         boolean test(SchemeNumber left, SchemeNumber right);
-    }
-
-    private static final class BuiltinProcedure implements Value, Procedure {
-        private final String name;
-        private final BuiltinInvoker invoker;
-
-        private BuiltinProcedure(String name, BuiltinInvoker invoker) {
-            this.name = name;
-            this.invoker = invoker;
-        }
-
-        @Override
-        public String render() {
-            return "#<procedure:" + name + ">";
-        }
-
-        @Override
-        public Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError {
-            return invoker.apply(arguments, callLoc);
-        }
     }
 
     private final class UserProcedure implements Value, Procedure {
