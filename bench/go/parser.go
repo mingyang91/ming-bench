@@ -24,6 +24,7 @@ const (
 	tokenLeftParen tokenKind = iota
 	tokenRightParen
 	tokenQuote
+	tokenSyntaxQuote
 	tokenAtom
 	tokenString
 )
@@ -93,6 +94,15 @@ func tokenize(input string) ([]token, error) {
 		}
 
 		pos := SourcePos{Line: line, Col: col}
+
+		if input[i] == '#' && i+1 < len(input) && input[i+1] == '\'' {
+			tokens = append(tokens, token{kind: tokenSyntaxQuote, value: "#'", pos: pos})
+			advance(input[i])
+			i++
+			advance(input[i])
+			i++
+			continue
+		}
 
 		switch input[i] {
 		case '(':
@@ -208,6 +218,18 @@ func (p *parser) parseExpr() (locatedExpr, error) {
 		return locatedExpr{
 			form: listExpr{
 				{form: symbolExpr("quote"), pos: tok.pos},
+				quoted,
+			},
+			pos: tok.pos,
+		}, nil
+	case tokenSyntaxQuote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return locatedExpr{}, err
+		}
+		return locatedExpr{
+			form: listExpr{
+				{form: symbolExpr("syntax"), pos: tok.pos},
 				quoted,
 			},
 			pos: tok.pos,

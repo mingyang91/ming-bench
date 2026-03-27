@@ -435,7 +435,11 @@ func (e *env) lookupBinding(name string) (*binding, bool) {
 }
 
 func (e *env) defineMacro(name string, transformer *syntaxRulesMacro) {
-	e.defineMacroBinding(name, &macroBinding{transformer: transformer})
+	e.defineMacroBinding(name, &macroBinding{
+		name:          name,
+		transformer:   transformer,
+		definitionEnv: transformer.env,
+	})
 }
 
 func (e *env) defineMacroBinding(name string, macro *macroBinding) {
@@ -497,6 +501,8 @@ func newGlobalEnv() *env {
 	global.define("symbol?", builtinProc{name: "symbol?", fn: evalSymbolPred})
 	global.define("char?", builtinProc{name: "char?", fn: evalCharPred})
 	global.define("procedure?", builtinProc{name: "procedure?", fn: evalProcedurePred})
+	global.define("syntax->datum", builtinProc{name: "syntax->datum", fn: evalSyntaxToDatum})
+	global.define("datum->syntax", builtinProc{name: "datum->syntax", fn: evalDatumToSyntax})
 	global.define("display", builtinProc{name: "display", fn: evalDisplay})
 	global.define("write", builtinProc{name: "write", fn: evalWrite})
 	global.define("newline", builtinProc{name: "newline", fn: evalNewline})
@@ -702,6 +708,12 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalDefineSyntax(items[1:], env)
 		case "define-record-type":
 			return evalDefineRecordType(items[1:], env)
+		case "syntax":
+			return evalSyntax(items[1:], env)
+		case "syntax-case":
+			return evalSyntaxCase(items[1:], env)
+		case "with-syntax":
+			return evalWithSyntax(items[1:], env)
 		case "set!":
 			return evalSet(items[1:], env)
 		case "quote":
@@ -784,6 +796,15 @@ func evalListExprTail(items listExpr, env *env) (value, *tailCall, error) {
 			return v, nil, err
 		case "define-record-type":
 			v, err := evalDefineRecordType(items[1:], env)
+			return v, nil, err
+		case "syntax":
+			v, err := evalSyntax(items[1:], env)
+			return v, nil, err
+		case "syntax-case":
+			v, err := evalSyntaxCase(items[1:], env)
+			return v, nil, err
+		case "with-syntax":
+			v, err := evalWithSyntax(items[1:], env)
 			return v, nil, err
 		case "set!":
 			v, err := evalSet(items[1:], env)

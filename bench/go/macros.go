@@ -9,7 +9,10 @@ type binding struct {
 }
 
 type macroBinding struct {
-	transformer *syntaxRulesMacro
+	name          string
+	transformer   *syntaxRulesMacro
+	proc          procedure
+	definitionEnv *env
 }
 
 type syntaxRulesMacro struct {
@@ -55,13 +58,46 @@ func evalDefineSyntax(parts []locatedExpr, env *env) (value, error) {
 		return nil, newEvalError(parts[0].pos, "'define-syntax' name must be a symbol")
 	}
 
-	transformer, err := parseSyntaxRules(parts[1], string(name), env)
+	if isSyntaxRulesExpr(parts[1]) {
+		transformer, err := parseSyntaxRules(parts[1], string(name), env)
+		if err != nil {
+			return nil, err
+		}
+
+		env.defineMacroBinding(string(name), &macroBinding{
+			name:          string(name),
+			transformer:   transformer,
+			definitionEnv: env,
+		})
+		return voidValue{}, nil
+	}
+
+	transformerValue, err := evalExpr(parts[1], env)
 	if err != nil {
 		return nil, err
 	}
 
-	env.defineMacro(string(name), transformer)
+	proc, ok := transformerValue.(procedure)
+	if !ok {
+		return nil, newEvalError(parts[1].pos, "'define-syntax' transformer must be a procedure")
+	}
+
+	env.defineMacroBinding(string(name), &macroBinding{
+		name:          string(name),
+		proc:          proc,
+		definitionEnv: env,
+	})
 	return voidValue{}, nil
+}
+
+func isSyntaxRulesExpr(expr locatedExpr) bool {
+	items, ok := expr.form.(listExpr)
+	if !ok || len(items) == 0 {
+		return false
+	}
+
+	head, ok := items[0].form.(symbolExpr)
+	return ok && string(head) == "syntax-rules"
 }
 
 func parseSyntaxRules(expr locatedExpr, name string, env *env) (*syntaxRulesMacro, error) {
@@ -116,30 +152,67 @@ func parseSyntaxRules(expr locatedExpr, name string, env *env) (*syntaxRulesMacr
 }
 
 func expandMacroCall(call listExpr, macro *macroBinding, callEnv *env) (locatedExpr, *env, error) {
-	transformer := macro.transformer
-	for _, rule := range transformer.rules {
-		match, ok, err := matchMacroPattern(rule.pattern, call, transformer.literals)
-		if err != nil {
-			return locatedExpr{}, nil, err
-		}
-		if !ok {
-			continue
+	if macro.transformer != nil {
+		transformer := macro.transformer
+		for _, rule := range transformer.rules {
+			match, ok, err := matchMacroPattern(rule.pattern, call, transformer.literals)
+			if err != nil {
+				return locatedExpr{}, nil, err
+			}
+			if !ok {
+				continue
+			}
+
+			instantiated, err := instantiateTemplate(rule.template, match, nil)
+			if err != nil {
+				return locatedExpr{}, nil, err
+			}
+
+			expansionEnv := callEnv
+			hygienic, err := hygienizeExpansion(instantiated, transformer.env, expansionEnv, nil)
+			if err != nil {
+				return locatedExpr{}, nil, err
+			}
+			return hygienic, expansionEnv, nil
 		}
 
-		instantiated, err := instantiateTemplate(rule.template, match, nil)
-		if err != nil {
-			return locatedExpr{}, nil, err
-		}
-
-		expansionEnv := newEnv(callEnv)
-		hygienic, err := hygienizeExpansion(instantiated, transformer.env, expansionEnv, nil)
-		if err != nil {
-			return locatedExpr{}, nil, err
-		}
-		return hygienic, expansionEnv, nil
+		return locatedExpr{}, nil, newEvalError(call[0].pos, "no matching syntax-rules clause for %s", transformer.name)
 	}
 
-	return locatedExpr{}, nil, newEvalError(call[0].pos, "no matching syntax-rules clause for %s", transformer.name)
+	if macro.proc != nil {
+		return expandProcedureMacroCall(call, macro, callEnv)
+	}
+
+	return locatedExpr{}, nil, newEvalError(call[0].pos, "invalid macro transformer for %s", macro.name)
+}
+
+func expandProcedureMacroCall(call listExpr, macro *macroBinding, callEnv *env) (locatedExpr, *env, error) {
+	if len(call) == 0 {
+		return locatedExpr{}, nil, newCurrentEvalError("cannot expand empty macro call")
+	}
+
+	result, err := applyProcedureWithContinuation(
+		macro.proc,
+		[]value{syntaxValueFromExpr(locatedExpr{form: call, pos: call[0].pos})},
+		call[0].pos,
+		nil,
+	)
+	if err != nil {
+		return locatedExpr{}, nil, err
+	}
+
+	syntaxResult, ok := result.(syntaxValue)
+	if !ok {
+		return locatedExpr{}, nil, newEvalError(call[0].pos, "macro transformer %s must return syntax", macro.name)
+	}
+
+	expansionEnv := callEnv
+	hygienic, err := hygienizeExpansion(syntaxResult.expr, macro.definitionEnv, expansionEnv, nil)
+	if err != nil {
+		return locatedExpr{}, nil, err
+	}
+
+	return hygienic, expansionEnv, nil
 }
 
 func matchMacroPattern(pattern listExpr, call listExpr, literals map[string]struct{}) (*macroMatch, bool, error) {
@@ -209,9 +282,12 @@ func matchPatternExpr(pattern locatedExpr, input locatedExpr, literals map[strin
 		if name == "..." {
 			return false, newEvalError(pattern.pos, "invalid use of ellipsis in syntax-rules pattern")
 		}
+		if name == "_" {
+			return true, nil
+		}
 		if _, isLiteral := literals[name]; isLiteral {
-			inputSymbol, ok := input.form.(symbolExpr)
-			return ok && string(inputSymbol) == name, nil
+			inputName, ok, _ := symbolLikeName(input.form)
+			return ok && inputName == name, nil
 		}
 		return match.bind(name, input, repeated), nil
 	case listExpr:
@@ -322,7 +398,7 @@ func repeatedPatternNames(pattern locatedExpr, literals map[string]struct{}, nam
 	switch expr := pattern.form.(type) {
 	case symbolExpr:
 		name := string(expr)
-		if name == "..." {
+		if name == "..." || name == "_" {
 			return names
 		}
 		if _, isLiteral := literals[name]; isLiteral {
@@ -393,7 +469,7 @@ func (state *hygieneState) hygienizeList(items listExpr, pos SourcePos, scope *h
 			return state.hygienizeDefine(items, pos, scope)
 		case "set!":
 			return state.hygienizeSet(items, pos, scope)
-		case "if", "begin", "and", "or", "cond", "define-syntax":
+		case "if", "begin", "and", "or", "cond", "define-syntax", "syntax", "syntax-case", "with-syntax":
 			newItems := make([]locatedExpr, 0, len(items))
 			newItems = append(newItems, locatedExpr{form: symbolExpr(operatorName), pos: items[0].pos})
 			for _, item := range items[1:] {
@@ -835,13 +911,12 @@ func cloneLocatedExpr(expr locatedExpr) locatedExpr {
 }
 
 func exprSyntaxEqual(left locatedExpr, right locatedExpr) bool {
+	if leftName, leftIsSymbol, _ := symbolLikeName(left.form); leftIsSymbol {
+		rightName, rightIsSymbol, _ := symbolLikeName(right.form)
+		return rightIsSymbol && leftName == rightName
+	}
+
 	switch leftExpr := left.form.(type) {
-	case symbolExpr:
-		rightExpr, ok := right.form.(symbolExpr)
-		return ok && leftExpr == rightExpr
-	case templateSymbolExpr:
-		rightExpr, ok := right.form.(templateSymbolExpr)
-		return ok && leftExpr == rightExpr
 	case listExpr:
 		rightExpr, ok := right.form.(listExpr)
 		if !ok || len(leftExpr) != len(rightExpr) {
@@ -923,7 +998,7 @@ func isEllipsisExpr(expr locatedExpr) bool {
 
 func isSyntaxKeyword(name string) bool {
 	switch name {
-	case "and", "begin", "case-lambda", "cond", "define", "define-syntax", "if", "lambda", "let", "or", "quote", "set!":
+	case "and", "begin", "case-lambda", "cond", "define", "define-syntax", "if", "lambda", "let", "or", "quote", "set!", "syntax", "syntax-case", "with-syntax":
 		return true
 	default:
 		return false

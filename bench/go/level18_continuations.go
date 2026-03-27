@@ -247,6 +247,27 @@ func (m *machine) evalList(items listExpr, env *env, cont continuation) error {
 			}
 			m.setValue(v, cont)
 			return nil
+		case "syntax":
+			v, err := evalSyntax(items[1:], env)
+			if err != nil {
+				return err
+			}
+			m.setValue(v, cont)
+			return nil
+		case "syntax-case":
+			v, err := evalSyntaxCase(items[1:], env)
+			if err != nil {
+				return err
+			}
+			m.setValue(v, cont)
+			return nil
+		case "with-syntax":
+			v, err := evalWithSyntax(items[1:], env)
+			if err != nil {
+				return err
+			}
+			m.setValue(v, cont)
+			return nil
 		case "set!":
 			return startSet(m, items[1:], env, cont)
 		case "quote":
