@@ -159,6 +159,8 @@ public class Evaluator {
         env.define("append", new BuiltinProcedure("append", this::builtinAppend));
         env.define("reverse", new BuiltinProcedure("reverse", this::builtinReverse));
         env.define("apply", new BuiltinProcedure("apply", this::builtinApply));
+        env.define("values", new BuiltinProcedure("values", this::builtinValues));
+        env.define("call-with-values", new BuiltinProcedure("call-with-values", this::builtinCallWithValues));
         env.define("dynamic-wind", new BuiltinProcedure("dynamic-wind", args -> {
             throw new EvalError("'dynamic-wind' requires continuation support");
         }));
@@ -1199,6 +1201,7 @@ public class Evaluator {
             throws EvalError {
         return switch (builtin.name()) {
             case "call/cc", "call-with-current-continuation" -> stepApplyCallCc(args, cont);
+            case "call-with-values" -> stepBuiltinCallWithValues(args, cont);
             case "dynamic-wind" -> stepBuiltinDynamicWind(args, cont);
             case "raise" -> stepBuiltinRaise(args);
             case "with-exception-handler" -> stepBuiltinWithExceptionHandler(args, cont);
@@ -1249,6 +1252,14 @@ public class Evaluator {
         requireArgCount(args.size(), 1, "call/cc");
         Value captured = new ContinuationProcedure(cont, List.copyOf(dynamicWindStack));
         return new ApplyStep(args.getFirst(), List.of(captured), cont);
+    }
+
+    private Step stepBuiltinCallWithValues(List<Value> args, Continuation cont) throws EvalError {
+        requireArgCount(args.size(), 2, "call-with-values");
+        return new ApplyStep(
+                args.getFirst(),
+                List.of(),
+                produced -> new ApplyStep(args.get(1), unpackValues(produced), cont));
     }
 
     private Step stepEnterDynamicWind(DynamicWindFrame frame, Value body, Continuation cont) {
@@ -2999,6 +3010,19 @@ public class Evaluator {
         return apply(args.getFirst(), appliedArgs);
     }
 
+    private Value builtinValues(List<Value> args) {
+        if (args.size() == 1) {
+            return args.getFirst();
+        }
+        return new MultiValue(args);
+    }
+
+    private Value builtinCallWithValues(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "call-with-values");
+        Value produced = apply(args.getFirst(), List.of());
+        return apply(args.get(1), unpackValues(produced));
+    }
+
     private Value builtinListRef(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 2, "list-ref");
         long index = requireInt(args.get(1));
@@ -3855,6 +3879,13 @@ public class Evaluator {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
     }
 
+    private List<Value> unpackValues(Value value) {
+        if (value instanceof MultiValue multiValue) {
+            return multiValue.values();
+        }
+        return List.of(value);
+    }
+
     private boolean isEqv(Value left, Value right) {
         if (isEq(left, right)) {
             return true;
@@ -4290,7 +4321,8 @@ public class Evaluator {
     }
 
     private sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue,
-            CharValue, EmptyListValue, PairValue, VectorValue, RecordValue, ProcedureValue, VoidValue {
+            CharValue, EmptyListValue, PairValue, VectorValue, RecordValue, ProcedureValue,
+            MultiValue, VoidValue {
         String toSchemeString();
 
         default String toDisplayString() {
@@ -4497,6 +4529,17 @@ public class Evaluator {
         @Override
         public String toSchemeString() {
             return "#<record:" + type.name() + ">";
+        }
+    }
+
+    private record MultiValue(List<Value> values) implements Value {
+        private MultiValue {
+            values = List.copyOf(values);
+        }
+
+        @Override
+        public String toSchemeString() {
+            return values.isEmpty() ? "" : "#<values>";
         }
     }
 
