@@ -20,6 +20,9 @@ type SchemeValBase =
   | { tag: 'continuation'; k: Cont; winders: Winder[] }
   | { tag: 'callcc' }
   | { tag: 'dynamicWind' }
+  | { tag: 'withExceptionHandler' }
+  | { tag: 'raiseProc' }
+  | { tag: 'guardExn'; val: SchemeVal }
   | { tag: 'case-closure'; clauses: { params: string[]; rest: string | null; body: SchemeVal[] }[]; closedEnv: Env };
 
 type Winder = { inThunk: SchemeVal; outThunk: SchemeVal };
@@ -54,6 +57,9 @@ type Cont =
   | { tag: 'dwAfterBodyK'; outThunk: SchemeVal; winder: Winder; next: Cont }
   | { tag: 'dwAfterOutK'; bodyVal: SchemeVal; next: Cont }
   | { tag: 'dwWindK'; setWindersTo: Winder[]; remaining: { thunk: SchemeVal; setWindersTo: Winder[] }[]; val: SchemeVal; targetK: Cont }
+  | { tag: 'wehK'; next: Cont }
+  | { tag: 'guardK'; varName: string; clauses: SchemeVal[]; env: Env; epos: string; next: Cont }
+  | { tag: 'raiseReturnK'; next: Cont }
   ;
 
 class ContinuationEscape { constructor(public k: Cont, public val: SchemeVal, public winders: Winder[]) {} }
@@ -65,6 +71,9 @@ const VOID: SchemeVal = { tag: 'void' };
 
 // ── dynamic-wind state ──────────────────────────────────────────────────
 let currentWinders: Winder[] = [];
+
+// ── exception handler state ─────────────────────────────────────────────
+let exceptionHandlers: SchemeVal[] = [];
 
 type WindAction = { thunk: SchemeVal; setWindersTo: Winder[] };
 
@@ -613,7 +622,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
 
   envSet(env, 'procedure?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('procedure? requires 1 argument');
-    return { tag: 'boolean', val: args[0].tag === 'procedure' || args[0].tag === 'closure' || args[0].tag === 'continuation' || args[0].tag === 'callcc' || args[0].tag === 'dynamicWind' || args[0].tag === 'case-closure' };
+    return { tag: 'boolean', val: args[0].tag === 'procedure' || args[0].tag === 'closure' || args[0].tag === 'continuation' || args[0].tag === 'callcc' || args[0].tag === 'dynamicWind' || args[0].tag === 'withExceptionHandler' || args[0].tag === 'raiseProc' || args[0].tag === 'case-closure' };
   }});
 
   // I/O
@@ -631,6 +640,9 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
       case 'continuation': return '#<procedure>';
       case 'callcc': return '#<procedure>';
       case 'dynamicWind': return '#<procedure>';
+      case 'withExceptionHandler': return '#<procedure>';
+      case 'raiseProc': return '#<procedure>';
+      case 'guardExn': return displayVal((v as any).val, seen);
       case 'case-closure': return '#<procedure>';
       case 'pair': {
         if (!seen) seen = new Set();
@@ -1194,6 +1206,10 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   // dynamic-wind
   envSet(env, 'dynamic-wind', { tag: 'dynamicWind' } as SchemeVal);
 
+  // exception handling
+  envSet(env, 'with-exception-handler', { tag: 'withExceptionHandler' } as SchemeVal);
+  envSet(env, 'raise', { tag: 'raiseProc' } as SchemeVal);
+
   // apply
   envSet(env, 'apply', { tag: 'procedure', val: (args) => {
     if (args.length < 2) throw new EvalError('apply requires at least 2 arguments');
@@ -1576,6 +1592,23 @@ function cekApply(proc: SchemeVal, args: SchemeVal[], epos: string, k: Cont): CE
     const cont: SchemeVal = { tag: 'continuation', k, winders: [...currentWinders] };
     return cekApply(args[0], [cont], epos, k);
   }
+  if (proc.tag === 'withExceptionHandler') {
+    if (args.length !== 2) throw new EvalError(`${epos}: with-exception-handler requires 2 arguments`);
+    const [handler, thunk] = args;
+    exceptionHandlers.push(handler);
+    const nextK: Cont = { tag: 'wehK', next: k };
+    return cekApply(thunk, [], epos, nextK);
+  }
+  if (proc.tag === 'raiseProc') {
+    if (args.length !== 1) throw new EvalError(`${epos}: raise requires 1 argument`);
+    const exnVal = args[0];
+    if (exceptionHandlers.length === 0) {
+      throw new EvalError(`unhandled exception: ${display(exnVal)}`);
+    }
+    const handler = exceptionHandlers.pop()!;
+    const afterK: Cont = { tag: 'raiseReturnK', next: k };
+    return cekApply(handler, [exnVal], epos, afterK);
+  }
   if (proc.tag === 'dynamicWind') {
     if (args.length !== 3) throw new EvalError(`${epos}: dynamic-wind requires 3 arguments`);
     const [inThunk, bodyThunk, outThunk] = args;
@@ -1851,6 +1884,43 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               if (elems.length !== 2) throw new EvalError(`${epos}: call/cc requires 1 argument`);
               k = { tag: 'callccK', next: k };
               c = elems[1]; continue;
+            }
+
+            if (name === 'guard') {
+              // (guard (var clause ...) body ...)
+              if (elems.length < 3) throw new EvalError(`${epos}: guard requires clauses and body`);
+              const spec = elems[1];
+              if (spec.tag !== 'list' || spec.val.length < 1 || spec.val[0].tag !== 'symbol')
+                throw new EvalError(`${epos}: invalid guard form`);
+              const varName = spec.val[0].val;
+              const clauses = spec.val.slice(1);
+              const body = elems.slice(2);
+
+              // guardK frame processes the result (normal vs exception)
+              k = { tag: 'guardK', varName, clauses, env: e, epos, next: k };
+
+              // Capture guard point for exception handler
+              const guardCont: Cont = k;
+              const guardWinders = [...currentWinders];
+
+              // Internal handler: on exception, jump back to guardK with wrapped value
+              const guardHandler: SchemeVal = {
+                tag: 'procedure',
+                val: (args: SchemeVal[]) => {
+                  const exn = args[0];
+                  const wrapped: SchemeVal = { tag: 'guardExn', val: exn } as SchemeVal;
+                  throw new ContinuationEscape(guardCont, wrapped, guardWinders);
+                }
+              };
+              exceptionHandlers.push(guardHandler);
+
+              // wehK pops handler on normal body completion
+              k = { tag: 'wehK', next: k };
+
+              // Evaluate body
+              if (body.length === 1) { c = body[0]; continue; }
+              k = { tag: 'seq', rest: body.slice(1), env: e, next: k };
+              c = body[0]; continue;
             }
 
             if (name === 'define-syntax') {
@@ -2144,6 +2214,47 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           continue;
         }
 
+        case 'wehK': {
+          const f = k;
+          exceptionHandlers.pop();
+          k = f.next;
+          continue;
+        }
+
+        case 'guardK': {
+          const f = k;
+          if ((c as any).tag === 'guardExn') {
+            const exnVal = (c as any).val;
+            const local = makeEnv(f.env);
+            envSet(local, f.varName, exnVal);
+            // Check if there's already an else clause
+            const hasElse = f.clauses.some((cl: SchemeVal) =>
+              cl.tag === 'list' && cl.val.length > 0 && cl.val[0].tag === 'symbol' && cl.val[0].val === 'else'
+            );
+            const condClauses = [...f.clauses];
+            if (!hasElse) {
+              condClauses.push({
+                tag: 'list', val: [
+                  { tag: 'symbol', val: 'else' } as SchemeVal,
+                  { tag: 'list', val: [{ tag: 'symbol', val: 'raise' } as SchemeVal, { tag: 'symbol', val: f.varName } as SchemeVal] } as SchemeVal
+                ]
+              } as SchemeVal);
+            }
+            const condExpr: SchemeVal = {
+              tag: 'list', val: [{ tag: 'symbol', val: 'cond' } as SchemeVal, ...condClauses]
+            };
+            c = condExpr; e = local; k = f.next; m = 0;
+            continue;
+          }
+          // Normal completion — pass through
+          k = f.next;
+          continue;
+        }
+
+        case 'raiseReturnK': {
+          throw new EvalError('exception handler returned from raise');
+        }
+
         default:
           throw new EvalError('unknown continuation frame');
       }
@@ -2198,6 +2309,9 @@ function display(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'continuation': return '#<procedure>';
     case 'callcc': return '#<procedure>';
     case 'dynamicWind': return '#<procedure>';
+    case 'withExceptionHandler': return '#<procedure>';
+    case 'raiseProc': return '#<procedure>';
+    case 'guardExn': return display((val as any).val, seen);
     case 'case-closure': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'record': return '#<record>';
@@ -2211,6 +2325,7 @@ export function evalStr(input: string): string {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   currentWinders = [];
+  exceptionHandlers = [];
   const env = makeGlobalEnv();
   // Evaluate all expressions in a single CEK run so continuations span forms
   const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
@@ -2223,6 +2338,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
   currentWinders = [];
+  exceptionHandlers = [];
   const outputBuf: string[] = [];
   const env = makeGlobalEnv(outputBuf);
   const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
