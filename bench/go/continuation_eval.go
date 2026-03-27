@@ -713,6 +713,12 @@ func (i *interpreter) stepContinuationExpr(expression expr, env *environment, st
 					return newExpressionControl(e.elements[1], env), stack, nil
 				case "cond":
 					return i.startCondControl(e.elements[1:], env, stack)
+				case "guard":
+					expanded, err := expandGuardForm(e.elements[1:], operator.pos)
+					if err != nil {
+						return continuationControl{}, nil, err
+					}
+					return newExpressionControl(expanded, env), stack, nil
 				case "case":
 					if len(e.elements) < 2 {
 						return continuationControl{}, nil, newEvalError(operator.pos, "case expects a key and at least 1 clause")
@@ -848,6 +854,12 @@ func (i *interpreter) resumeContinuationFrame(frame continuationFrame, value any
 		frame.slot.value = value
 		return newValueControl(voidValue{}), stack, nil
 
+	case withExceptionHandlerPopFrame:
+		if err := i.popCurrentHandler(frame.handler); err != nil {
+			return continuationControl{}, nil, err
+		}
+		return newValueControl(value), stack, nil
+
 	case dynamicWindAfterBeforeFrame:
 		i.currentWinds = append(i.currentWinds, frame.wind)
 		stack = append(stack, dynamicWindAfterBodyFrame{
@@ -872,6 +884,9 @@ func (i *interpreter) resumeContinuationFrame(frame continuationFrame, value any
 			i.currentWinds = append(i.currentWinds, frame.wind)
 		}
 		return i.advanceContinuationSwitch(frame.state)
+
+	case exceptionRaiseFrame:
+		return i.advanceExceptionRaise(frame.state)
 
 	case ifContinuationFrame:
 		if isTruthy(value) {
@@ -1222,6 +1237,16 @@ func (i *interpreter) applyContinuationProcedure(operator any, args []any, pos p
 				return continuationControl{}, nil, newEvalError(pos, "dynamic-wind expects exactly 3 arguments")
 			}
 			return i.startDynamicWind(args[0], args[1], args[2], pos, stack)
+		case "raise":
+			if len(args) != 1 {
+				return continuationControl{}, nil, newEvalError(pos, "raise expects exactly 1 argument")
+			}
+			return i.raiseContinuation(args[0], pos)
+		case "with-exception-handler":
+			if len(args) != 2 {
+				return continuationControl{}, nil, newEvalError(pos, "with-exception-handler expects exactly 2 arguments")
+			}
+			return i.startWithExceptionHandler(args[0], args[1], pos, stack)
 		case "call/cc", "call-with-current-continuation":
 			if len(args) != 1 {
 				return continuationControl{}, nil, newEvalError(pos, "call/cc expects exactly 1 argument")

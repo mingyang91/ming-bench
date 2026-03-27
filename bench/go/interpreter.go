@@ -351,6 +351,7 @@ type interpreter struct {
 	gensymCounter    int
 	immutableStrings bool
 	currentWinds     []*dynamicWind
+	currentHandlers  []*exceptionHandler
 }
 
 func newInterpreter() *interpreter {
@@ -388,13 +389,13 @@ func evalInput(input string) (string, string, error) {
 	if continuationsEnabledAtCurrentLevel() {
 		result, err = intp.evalProgramWithContinuations(parsed)
 		if err != nil {
-			return "", intp.output.String(), err
+			return "", intp.output.String(), normalizeInterpreterError(err)
 		}
 	} else {
 		for _, expression := range parsed {
 			result, err = intp.eval(expression, intp.global)
 			if err != nil {
-				return "", intp.output.String(), err
+				return "", intp.output.String(), normalizeInterpreterError(err)
 			}
 		}
 	}
@@ -423,7 +424,7 @@ func installBuiltins(env *environment) {
 		"cons", "car", "cdr", "set-car!", "set-cdr!", "null?", "list", "length", "append", "reverse",
 		"vector", "make-vector", "vector?", "vector-length", "vector-ref", "vector-set!", "vector->list", "list->vector",
 		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?", "procedure?",
-		"apply", "eqv?", "eq?", "equal?", "call/cc", "call-with-current-continuation", "dynamic-wind",
+		"apply", "eqv?", "eq?", "equal?", "call/cc", "call-with-current-continuation", "dynamic-wind", "raise", "with-exception-handler",
 		"display", "write", "newline", "error",
 		"string-append", "string-length", "substring", "make-string", "string",
 		"string->number", "number->string", "exact->inexact", "inexact->exact", "numerator", "denominator",
@@ -547,6 +548,12 @@ func (i *interpreter) evalList(list *listExpr, env *environment, tail bool) (any
 				return i.evalIf(list.elements[1:], operator.pos, env, tail)
 			case "cond":
 				return i.evalCond(list.elements[1:], operator.pos, env, tail)
+			case "guard":
+				expanded, err := expandGuardForm(list.elements[1:], operator.pos)
+				if err != nil {
+					return nil, err
+				}
+				return i.evalExpr(expanded, env, tail)
 			case "case":
 				return i.evalCase(list.elements[1:], operator.pos, env, tail)
 			case "do":
@@ -1451,6 +1458,32 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			return nil, err
 		}
 		return result, nil
+
+	case "raise":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		return nil, &raisedSignal{value: args[0], pos: pos}
+
+	case "with-exception-handler":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		if !isCallableValue(args[0]) || !isCallableValue(args[1]) {
+			return nil, newEvalError(pos, "attempt to call non-procedure")
+		}
+
+		result, err := applyProcedure(i, args[1], nil, pos, false)
+		if err == nil {
+			return result, nil
+		}
+
+		raised, ok := err.(*raisedSignal)
+		if !ok {
+			return nil, err
+		}
+
+		return applyProcedure(i, args[0], []any{raised.value}, pos, false)
 
 	case "eqv?":
 		if len(args) != 2 {
