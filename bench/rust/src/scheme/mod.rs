@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub mod error;
+mod machine;
 
 pub use error::EvalError;
 
@@ -91,6 +92,10 @@ enum Builtin {
     CharPred,
     Apply,
     Map,
+    Reverse,
+    CallCc,
+    CallWithCurrentContinuation,
+    DynamicWind,
 }
 
 impl Builtin {
@@ -133,6 +138,10 @@ impl Builtin {
             Self::CharPred => "char?",
             Self::Apply => "apply",
             Self::Map => "map",
+            Self::Reverse => "reverse",
+            Self::CallCc => "call/cc",
+            Self::CallWithCurrentContinuation => "call-with-current-continuation",
+            Self::DynamicWind => "dynamic-wind",
         }
     }
 }
@@ -149,6 +158,7 @@ enum Value {
     Void,
     Builtin(Builtin),
     Closure(Rc<Closure>),
+    Continuation(Rc<CapturedContinuation>),
     Record(Rc<Record>),
     RecordConstructor(Rc<RecordType>, String, Vec<usize>),
     RecordPredicate(Rc<RecordType>, String),
@@ -273,11 +283,124 @@ impl Environment {
 struct EvalState {
     output: String,
     next_hygiene_id: usize,
+    next_wind_id: usize,
 }
 
 enum EvalStep {
     Value(Value),
     Expr(Expr, Rc<Environment>),
+    Apply(Value, Vec<Value>, Position),
+}
+
+#[derive(Clone)]
+struct NamedLetState {
+    loop_name: String,
+    loop_key: String,
+    pos: Position,
+}
+
+#[derive(Clone)]
+struct DynamicWindFrame {
+    id: usize,
+    in_thunk: Value,
+    out_thunk: Value,
+}
+
+#[derive(Clone)]
+struct CapturedContinuation {
+    frames: Vec<MachineFrame>,
+    winds: Vec<DynamicWindFrame>,
+    name: Option<String>,
+}
+
+#[derive(Clone)]
+enum MachineFrame {
+    Sequence {
+        remaining: Vec<Expr>,
+        env: Rc<Environment>,
+    },
+    And {
+        remaining: Vec<Expr>,
+        env: Rc<Environment>,
+    },
+    Or {
+        remaining: Vec<Expr>,
+        env: Rc<Environment>,
+    },
+    If {
+        consequent: Expr,
+        alternate: Expr,
+        env: Rc<Environment>,
+    },
+    DefineValue {
+        name: String,
+        env: Rc<Environment>,
+    },
+    SetValue {
+        target: Expr,
+        env: Rc<Environment>,
+    },
+    ApplyOperator {
+        arguments: Vec<Expr>,
+        env: Rc<Environment>,
+        pos: Position,
+    },
+    ApplyArgument {
+        operator: Value,
+        evaluated: Vec<Value>,
+        remaining: Vec<Expr>,
+        env: Rc<Environment>,
+        pos: Position,
+    },
+    CondTest {
+        body: Vec<Expr>,
+        remaining_clauses: Vec<Expr>,
+        env: Rc<Environment>,
+    },
+    LetBinding {
+        bindings: Vec<Binding>,
+        next_index: usize,
+        values: Vec<Value>,
+        body: Vec<Expr>,
+        env: Rc<Environment>,
+        named: Option<NamedLetState>,
+    },
+    MapCall {
+        procedure: Value,
+        lists: Vec<Vec<Value>>,
+        index: usize,
+        results: Vec<Value>,
+        pos: Position,
+    },
+    DynamicWindAfterIn {
+        wind: DynamicWindFrame,
+        body_thunk: Value,
+        pos: Position,
+    },
+    DynamicWindAfterBody {
+        wind: DynamicWindFrame,
+        pos: Position,
+    },
+    DynamicWindAfterOut {
+        body_value: Value,
+    },
+    ContinuationTransferOut {
+        target: Rc<CapturedContinuation>,
+        value: Value,
+        common_prefix: usize,
+        pos: Position,
+    },
+    ContinuationTransferIn {
+        target: Rc<CapturedContinuation>,
+        value: Value,
+        next_index: usize,
+        pos: Position,
+    },
+}
+
+enum MachineControl {
+    Expr(Expr, Rc<Environment>),
+    Value(Value),
     Apply(Value, Vec<Value>, Position),
 }
 
@@ -382,6 +505,7 @@ struct FormalParameters {
     rest_param: Option<String>,
 }
 
+#[derive(Clone)]
 struct Binding {
     name: String,
     value_expr: Expr,
@@ -431,6 +555,10 @@ const BUILTINS: &[Builtin] = &[
     Builtin::CharPred,
     Builtin::Apply,
     Builtin::Map,
+    Builtin::Reverse,
+    Builtin::CallCc,
+    Builtin::CallWithCurrentContinuation,
+    Builtin::DynamicWind,
 ];
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -465,11 +593,7 @@ fn evaluate_input(input: &str) -> EvalResult<(String, String)> {
 
     let env = create_global_environment();
     let mut state = EvalState::default();
-    let mut result = Value::Void;
-
-    for expression in &expressions {
-        result = evaluate(expression, Rc::clone(&env), &mut state)?;
-    }
+    let result = machine::evaluate_program(&expressions, env, &mut state)?;
 
     Ok((format_value(&result), state.output))
 }
@@ -1317,6 +1441,12 @@ fn apply_builtin(
             expect_arity(builtin.name(), args, 1, pos)?;
             Ok(Value::Boolean(matches!(args[0], Value::Char(_))))
         }
+        Builtin::Reverse => {
+            expect_arity(builtin.name(), args, 1, pos)?;
+            let mut elements = list_to_vec(&args[0], builtin.name(), pos)?;
+            elements.reverse();
+            Ok(list_to_pairs(elements))
+        }
         Builtin::Apply => {
             expect_at_least_arity(builtin.name(), args, 2, pos)?;
             let procedure = args[0].clone();
@@ -1325,6 +1455,11 @@ fn apply_builtin(
             apply_procedure(procedure, flattened, pos, state)
         }
         Builtin::Map => apply_map(args, pos, state),
+        Builtin::CallCc
+        | Builtin::CallWithCurrentContinuation
+        | Builtin::DynamicWind => {
+            unreachable!("control builtins are handled by the machine evaluator")
+        }
     }
 }
 
@@ -2950,6 +3085,10 @@ fn format_value(value: &Value) -> String {
         Value::Void => "#<void>".into(),
         Value::Builtin(builtin) => format!("#<procedure:{}>", builtin.name()),
         Value::Closure(closure) => match &closure.name {
+            Some(name) => format!("#<procedure:{name}>"),
+            None => "#<procedure>".into(),
+        },
+        Value::Continuation(continuation) => match &continuation.name {
             Some(name) => format!("#<procedure:{name}>"),
             None => "#<procedure>".into(),
         },

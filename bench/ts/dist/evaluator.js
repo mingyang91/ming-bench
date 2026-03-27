@@ -5,7 +5,7 @@ const EXACT_ZERO = { kind: 'number', exact: true, numerator: 0n, denominator: 1n
 const EXACT_ONE = { kind: 'number', exact: true, numerator: 1n, denominator: 1n };
 const STRING_IMMUTABILITY_LEVEL = 15;
 const CURRENT_BENCH_LEVEL = parseBenchLevel();
-function createBuiltins(context) {
+function createBuiltins(context, runtime) {
     return new Map([
         ['+', builtin('+', (args, pos) => sum(args, EXACT_ZERO, pos))],
         ['-', builtin('-', (args, pos) => subtract(args, pos))],
@@ -484,11 +484,12 @@ function createBuiltins(context) {
                 return applyProcedureCps(procedure, [...prefixArgs, ...listArgs], pos, continuation);
             }),
         ],
-        ['call/cc', makeCallWithCurrentContinuationBuiltin('call/cc')],
+        ['call/cc', makeCallWithCurrentContinuationBuiltin('call/cc', runtime)],
         [
             'call-with-current-continuation',
-            makeCallWithCurrentContinuationBuiltin('call-with-current-continuation'),
+            makeCallWithCurrentContinuationBuiltin('call-with-current-continuation', runtime),
         ],
+        ['dynamic-wind', makeDynamicWindBuiltin(runtime)],
         [
             'string-append',
             builtin('string-append', (args, pos) => makeString(args.map((arg) => expectStringContent(arg, 'string-append', pos)).join(''))),
@@ -768,7 +769,7 @@ class Environment {
     runtime;
     constructor(parent) {
         this.parent = parent;
-        this.runtime = parent?.runtime ?? { nextHygieneId: 0 };
+        this.runtime = parent?.runtime ?? { nextHygieneId: 0, nextWindId: 0, dynamicWindStack: [] };
     }
     define(name, value) {
         this.bindings.set(name, value);
@@ -810,10 +811,13 @@ class Environment {
         this.runtime.nextHygieneId += 1;
         return `${name}#${this.runtime.nextHygieneId}`;
     }
+    runtimeState() {
+        return this.runtime;
+    }
 }
 function createGlobalEnvironment(context) {
     const env = new Environment();
-    for (const [name, value] of createBuiltins(context)) {
+    for (const [name, value] of createBuiltins(context, env.runtimeState())) {
         env.define(name, value);
     }
     return env;
@@ -1382,7 +1386,7 @@ function applyProcedureCps(value, args, pos, continuation) {
     }
     if (isContinuation(value)) {
         expectArity(value.name ?? 'continuation', args, 1, pos);
-        return continueWith(value.apply, args[0]);
+        return continueCapturedContinuationCps(value, args[0], pos);
     }
     if (isClosure(value)) {
         return applyProcedureClause(value, value.env, args, pos, value.name ?? 'lambda', continuation);
@@ -2169,11 +2173,80 @@ function builtin(name, apply) {
 function controlBuiltin(name, apply) {
     return { kind: 'builtin', name, apply };
 }
-function makeCallWithCurrentContinuationBuiltin(name) {
+function makeCallWithCurrentContinuationBuiltin(name, runtime) {
     return controlBuiltin(name, (args, pos, continuation) => {
         expectArity(name, args, 1, pos);
-        return applyProcedureCps(args[0], [{ kind: 'continuation', name: 'continuation', apply: continuation }], pos, continuation);
+        return applyProcedureCps(args[0], [
+            {
+                kind: 'continuation',
+                name: 'continuation',
+                continuation,
+                dynamicWindStack: runtime.dynamicWindStack.slice(),
+                runtime,
+            },
+        ], pos, continuation);
     });
+}
+function makeDynamicWindBuiltin(runtime) {
+    return controlBuiltin('dynamic-wind', (args, pos, continuation) => {
+        expectArity('dynamic-wind', args, 3, pos);
+        const [inThunk, bodyThunk, outThunk] = args;
+        const frame = {
+            id: runtime.nextWindId,
+            inThunk,
+            outThunk,
+        };
+        runtime.nextWindId += 1;
+        return applyProcedureCps(inThunk, [], pos, () => {
+            runtime.dynamicWindStack = [...runtime.dynamicWindStack, frame];
+            return applyProcedureCps(bodyThunk, [], pos, (bodyValue) => {
+                deactivateDynamicWindFrame(runtime, frame.id);
+                return applyProcedureCps(outThunk, [], pos, () => continueWith(continuation, bodyValue));
+            });
+        });
+    });
+}
+function continueCapturedContinuationCps(continuationValue, value, pos) {
+    const commonPrefix = commonDynamicWindPrefix(continuationValue.runtime.dynamicWindStack, continuationValue.dynamicWindStack);
+    return continueCapturedContinuationOutCps(continuationValue, value, commonPrefix, pos);
+}
+function continueCapturedContinuationOutCps(continuationValue, value, commonPrefix, pos) {
+    if (continuationValue.runtime.dynamicWindStack.length > commonPrefix) {
+        const frame = continuationValue.runtime.dynamicWindStack[continuationValue.runtime.dynamicWindStack.length - 1];
+        continuationValue.runtime.dynamicWindStack =
+            continuationValue.runtime.dynamicWindStack.slice(0, continuationValue.runtime.dynamicWindStack.length - 1);
+        return applyProcedureCps(frame.outThunk, [], pos, () => continueCapturedContinuationOutCps(continuationValue, value, commonPrefix, pos));
+    }
+    return continueCapturedContinuationInCps(continuationValue, value, commonPrefix, pos);
+}
+function continueCapturedContinuationInCps(continuationValue, value, nextIndex, pos) {
+    if (nextIndex < continuationValue.dynamicWindStack.length) {
+        const frame = continuationValue.dynamicWindStack[nextIndex];
+        return applyProcedureCps(frame.inThunk, [], pos, () => {
+            continuationValue.runtime.dynamicWindStack = [...continuationValue.runtime.dynamicWindStack, frame];
+            return continueCapturedContinuationInCps(continuationValue, value, nextIndex + 1, pos);
+        });
+    }
+    continuationValue.runtime.dynamicWindStack = continuationValue.dynamicWindStack.slice();
+    return continueWith(continuationValue.continuation, value);
+}
+function deactivateDynamicWindFrame(runtime, frameId) {
+    for (let index = runtime.dynamicWindStack.length - 1; index >= 0; index -= 1) {
+        if (runtime.dynamicWindStack[index].id === frameId) {
+            runtime.dynamicWindStack = [
+                ...runtime.dynamicWindStack.slice(0, index),
+                ...runtime.dynamicWindStack.slice(index + 1),
+            ];
+            return;
+        }
+    }
+}
+function commonDynamicWindPrefix(left, right) {
+    let index = 0;
+    while (index < left.length && index < right.length && left[index].id === right[index].id) {
+        index += 1;
+    }
+    return index;
 }
 function createPairAccessors() {
     const accessors = [];
