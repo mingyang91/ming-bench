@@ -9,8 +9,10 @@ public class Evaluator {
 
     // Top-level environment, persisted across evalStr calls
     private final Env globalEnv = createGlobalEnv();
+    private StringBuilder outputBuffer = new StringBuilder();
 
     public String evalStr(String input) throws EvalError {
+        outputBuffer.setLength(0);
         List<Object> exprs = parse(input);
         Object result = null;
         for (Object expr : exprs) {
@@ -20,7 +22,13 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        outputBuffer.setLength(0);
+        List<Object> exprs = parse(input);
+        Object result = null;
+        for (Object expr : exprs) {
+            result = eval(expr, globalEnv);
+        }
+        return new EvalResult(schemeToString(result), outputBuffer.toString());
     }
 
     // --- Environment ---
@@ -52,6 +60,8 @@ public class Evaluator {
 
     record SchemeString(String value) {}
 
+    record SchemeChar(char value) {}
+
     sealed interface SchemeList permits Pair, Empty {}
 
     record Pair(Object car, Object cdr) implements SchemeList {}
@@ -75,7 +85,12 @@ public class Evaluator {
         Env env = new Env(null);
         for (String name : List.of("+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
                 "cons", "car", "cdr", "null?", "list", "length",
-                "string?", "number?", "boolean?", "pair?", "symbol?", "append")) {
+                "string?", "number?", "boolean?", "pair?", "symbol?", "append",
+                "display", "write", "newline",
+                "string-append", "string-length", "substring",
+                "string->number", "number->string",
+                "symbol->string", "string->symbol",
+                "string-ref", "char?")) {
             env.define(name, "builtin:" + name);
         }
         return env;
@@ -87,25 +102,50 @@ public class Evaluator {
         if (val == VOID) return "#<void>";
         if (val instanceof Long n) return n.toString();
         if (val instanceof Boolean b) return b ? "#t" : "#f";
+        if (val instanceof SchemeChar c) return formatChar(c.value());
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val instanceof String sym) return sym;
         if (val == Empty.NIL) return "()";
-        if (val instanceof Pair p) {
-            StringBuilder sb = new StringBuilder("(");
-            sb.append(schemeToString(p.car()));
-            Object rest = p.cdr();
-            while (rest instanceof Pair pr) {
-                sb.append(" ").append(schemeToString(pr.car()));
-                rest = pr.cdr();
-            }
-            if (rest != Empty.NIL) {
-                sb.append(" . ").append(schemeToString(rest));
-            }
-            sb.append(")");
-            return sb.toString();
-        }
+        if (val instanceof Pair p) return pairToString(p, true);
         if (val instanceof Lambda) return "#<procedure>";
         return val.toString();
+    }
+
+    private String displayToString(Object val) {
+        if (val == VOID) return "#<void>";
+        if (val instanceof Long n) return n.toString();
+        if (val instanceof Boolean b) return b ? "#t" : "#f";
+        if (val instanceof SchemeChar c) return String.valueOf(c.value());
+        if (val instanceof SchemeString s) return s.value();
+        if (val instanceof String sym) return sym;
+        if (val == Empty.NIL) return "()";
+        if (val instanceof Pair p) return pairToString(p, false);
+        if (val instanceof Lambda) return "#<procedure>";
+        return val.toString();
+    }
+
+    private String pairToString(Pair p, boolean writeMode) {
+        StringBuilder sb = new StringBuilder("(");
+        sb.append(writeMode ? schemeToString(p.car()) : displayToString(p.car()));
+        Object rest = p.cdr();
+        while (rest instanceof Pair pr) {
+            sb.append(" ").append(writeMode ? schemeToString(pr.car()) : displayToString(pr.car()));
+            rest = pr.cdr();
+        }
+        if (rest != Empty.NIL) {
+            sb.append(" . ").append(writeMode ? schemeToString(rest) : displayToString(rest));
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    private String formatChar(char c) {
+        return switch (c) {
+            case ' ' -> "#\\space";
+            case '\n' -> "#\\newline";
+            case '\t' -> "#\\tab";
+            default -> "#\\" + c;
+        };
     }
 
     // --- Parser ---
@@ -240,7 +280,7 @@ public class Evaluator {
 
     @SuppressWarnings("unchecked")
     private Object eval(Object expr, Env env) throws EvalError {
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof LocatedSymbol ls) {
@@ -594,6 +634,73 @@ public class Evaluator {
                     }
                 }
                 yield result;
+            }
+            case "display" -> {
+                checkMinArgs(args, 1, "display");
+                outputBuffer.append(displayToString(args.get(0)));
+                yield VOID;
+            }
+            case "write" -> {
+                checkMinArgs(args, 1, "write");
+                outputBuffer.append(schemeToString(args.get(0)));
+                yield VOID;
+            }
+            case "newline" -> {
+                outputBuffer.append("\n");
+                yield VOID;
+            }
+            case "string-append" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object a : args) {
+                    if (!(a instanceof SchemeString s)) throw new EvalError("string-append: expected string");
+                    sb.append(s.value());
+                }
+                yield new SchemeString(sb.toString());
+            }
+            case "string-length" -> {
+                checkMinArgs(args, 1, "string-length");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-length: expected string");
+                yield (long) s.value().length();
+            }
+            case "substring" -> {
+                checkMinArgs(args, 3, "substring");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("substring: expected string");
+                long start = asLong(args.get(1), "substring");
+                long end = asLong(args.get(2), "substring");
+                yield new SchemeString(s.value().substring((int) start, (int) end));
+            }
+            case "string->number" -> {
+                checkMinArgs(args, 1, "string->number");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->number: expected string");
+                try {
+                    yield Long.parseLong(s.value());
+                } catch (NumberFormatException e) {
+                    yield Boolean.FALSE;
+                }
+            }
+            case "number->string" -> {
+                checkMinArgs(args, 1, "number->string");
+                yield new SchemeString(String.valueOf(asLong(args.get(0), "number->string")));
+            }
+            case "symbol->string" -> {
+                checkMinArgs(args, 1, "symbol->string");
+                if (!(args.get(0) instanceof String s)) throw new EvalError("symbol->string: expected symbol");
+                yield new SchemeString(s);
+            }
+            case "string->symbol" -> {
+                checkMinArgs(args, 1, "string->symbol");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->symbol: expected string");
+                yield s.value();
+            }
+            case "string-ref" -> {
+                checkMinArgs(args, 2, "string-ref");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-ref: expected string");
+                long idx = asLong(args.get(1), "string-ref");
+                yield new SchemeChar(s.value().charAt((int) idx));
+            }
+            case "char?" -> {
+                checkMinArgs(args, 1, "char?");
+                yield args.get(0) instanceof SchemeChar;
             }
             default -> throw new EvalError("unbound variable: " + name);
         };
