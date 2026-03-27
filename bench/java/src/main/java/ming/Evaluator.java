@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class Evaluator {
 
@@ -91,6 +92,28 @@ public class Evaluator {
     }
 
     private record BuiltinProc(String name, Builtin fn) {}
+
+    // --- Syntax Rules Macro ---
+
+    private static class SyntaxRulesMacro {
+        final String name;
+        final List<String> literals;
+        final List<Object[]> rules; // each: [pattern, template]
+        final Env defEnv;
+        SyntaxRulesMacro(String name, List<String> literals, List<Object[]> rules, Env defEnv) {
+            this.name = name;
+            this.literals = literals;
+            this.rules = rules;
+            this.defEnv = defEnv;
+        }
+    }
+
+    private static final Set<String> SPECIAL_FORMS = Set.of(
+        "if", "begin", "let", "set!", "define", "quote", "lambda",
+        "and", "or", "cond", "define-syntax", "syntax-rules"
+    );
+
+    private int gensymCounter = 0;
 
     // Output buffer for display/write/newline
     private StringBuilder outputBuffer;
@@ -956,6 +979,46 @@ public class Evaluator {
                             return evalBody(new ArrayList<>(list.subList(bindingsIdx + 1, list.size())), letEnv);
                         }
                     }
+                    case "define-syntax" -> {
+                        if (list.size() != 3) throw new EvalError("define-syntax: expected 2 arguments" + posStr);
+                        Object nameObj = list.get(1);
+                        if (nameObj instanceof Located loc) nameObj = loc.expr;
+                        if (!(nameObj instanceof String macroName))
+                            throw new EvalError("define-syntax: name must be symbol" + posStr);
+                        Object transformerExpr = list.get(2);
+                        if (transformerExpr instanceof Located loc) transformerExpr = loc.expr;
+                        if (!(transformerExpr instanceof List<?> transformer))
+                            throw new EvalError("define-syntax: expected syntax-rules" + posStr);
+                        Object srHead = transformer.get(0);
+                        if (srHead instanceof Located loc) srHead = loc.expr;
+                        if (!(srHead instanceof String srStr) || !srStr.equals("syntax-rules"))
+                            throw new EvalError("define-syntax: expected syntax-rules" + posStr);
+                        Object litsObj = transformer.get(1);
+                        if (litsObj instanceof Located loc) litsObj = loc.expr;
+                        List<String> macroLiterals = new ArrayList<>();
+                        if (litsObj instanceof List<?> litsList) {
+                            for (Object l : litsList) {
+                                if (l instanceof Located loc) l = loc.expr;
+                                if (l instanceof String s) macroLiterals.add(s);
+                            }
+                        }
+                        List<Object[]> macroRules = new ArrayList<>();
+                        for (int ri = 2; ri < transformer.size(); ri++) {
+                            Object ruleObj = transformer.get(ri);
+                            if (ruleObj instanceof Located loc) ruleObj = loc.expr;
+                            if (!(ruleObj instanceof List<?> rule) || rule.size() != 2)
+                                throw new EvalError("define-syntax: invalid rule" + posStr);
+                            macroRules.add(new Object[]{rule.get(0), rule.get(1)});
+                        }
+                        env.define(macroName, new SyntaxRulesMacro(macroName, macroLiterals, macroRules, env));
+                        return Boolean.FALSE;
+                    }
+                }
+                // Check for macro invocation
+                Object macroVal = null;
+                try { macroVal = env.lookup(op, new Pos(eLine, eCol)); } catch (EvalError ignored) {}
+                if (macroVal instanceof SyntaxRulesMacro macro) {
+                    return evalMacro(macro, list, env);
                 }
             }
 
@@ -1025,6 +1088,135 @@ public class Evaluator {
         return result;
     }
 
+    // --- Macro expansion ---
+
+    @SuppressWarnings("unchecked")
+    private Object evalMacro(SyntaxRulesMacro macro, List<?> form, Env useEnv) throws EvalError {
+        for (Object[] rule : macro.rules) {
+            Map<String, Object> bindings = matchPattern(rule[0], form, macro.literals);
+            if (bindings != null) {
+                Map<String, String> renameMap = new HashMap<>();
+                Object expanded = expandTemplate(rule[1], bindings, renameMap);
+                Env evalEnv = useEnv;
+                if (!renameMap.isEmpty()) {
+                    Map<String, Object> hygieneBindings = new HashMap<>();
+                    for (var entry : renameMap.entrySet()) {
+                        try {
+                            Object val = macro.defEnv.lookup(entry.getKey(), new Pos(0, 0));
+                            hygieneBindings.put(entry.getValue(), val);
+                        } catch (EvalError ignored) {}
+                    }
+                    if (!hygieneBindings.isEmpty()) {
+                        evalEnv = new Env(useEnv);
+                        for (var e : hygieneBindings.entrySet()) {
+                            evalEnv.define(e.getKey(), e.getValue());
+                        }
+                    }
+                }
+                return eval(expanded, evalEnv);
+            }
+        }
+        throw new EvalError("no matching pattern for macro " + macro.name);
+    }
+
+    private Map<String, Object> matchPattern(Object pattern, List<?> input, List<String> literals) {
+        if (pattern instanceof Located loc) pattern = loc.expr;
+        if (!(pattern instanceof List<?> patList)) return null;
+        Map<String, Object> bindings = new HashMap<>();
+        int pi = 1, ii = 1; // skip macro name
+        while (pi < patList.size()) {
+            Object patElem = patList.get(pi);
+            if (patElem instanceof Located loc) patElem = loc.expr;
+            boolean hasEllipsis = false;
+            if (pi + 1 < patList.size()) {
+                Object next = patList.get(pi + 1);
+                if (next instanceof Located loc) next = loc.expr;
+                if ("...".equals(next)) hasEllipsis = true;
+            }
+            if (hasEllipsis) {
+                if (!(patElem instanceof String varName)) return null;
+                List<Object> collected = new ArrayList<>();
+                while (ii < input.size()) {
+                    collected.add(input.get(ii));
+                    ii++;
+                }
+                bindings.put(varName, collected);
+                pi += 2;
+            } else if (patElem instanceof String s && literals.contains(s)) {
+                if (ii >= input.size()) return null;
+                Object inElem = input.get(ii);
+                if (inElem instanceof Located loc) inElem = loc.expr;
+                if (!s.equals(inElem)) return null;
+                pi++; ii++;
+            } else if (patElem instanceof String varName) {
+                if (ii >= input.size()) return null;
+                bindings.put(varName, input.get(ii));
+                pi++; ii++;
+            } else {
+                return null;
+            }
+        }
+        return ii == input.size() ? bindings : null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object expandTemplate(Object template, Map<String, Object> bindings,
+                                   Map<String, String> renameMap) {
+        if (template instanceof Located loc) template = loc.expr;
+        if (template instanceof String id) {
+            if (bindings.containsKey(id)) return bindings.get(id);
+            if ("...".equals(id) || SPECIAL_FORMS.contains(id)) return id;
+            if (!renameMap.containsKey(id)) {
+                renameMap.put(id, "__" + id + "_" + (gensymCounter++));
+            }
+            return renameMap.get(id);
+        }
+        if (template instanceof List<?> tmplList) {
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < tmplList.size(); i++) {
+                Object elem = tmplList.get(i);
+                Object rawElem = elem;
+                if (rawElem instanceof Located loc) rawElem = loc.expr;
+                boolean nextIsEllipsis = false;
+                if (i + 1 < tmplList.size()) {
+                    Object next = tmplList.get(i + 1);
+                    if (next instanceof Located loc) next = loc.expr;
+                    if ("...".equals(next)) nextIsEllipsis = true;
+                }
+                if (nextIsEllipsis) {
+                    String ellipsisVar = findEllipsisVar(elem, bindings);
+                    if (ellipsisVar != null) {
+                        List<Object> elements = (List<Object>) bindings.get(ellipsisVar);
+                        for (Object e : elements) {
+                            Map<String, Object> subBindings = new HashMap<>(bindings);
+                            subBindings.put(ellipsisVar, e);
+                            result.add(expandTemplate(elem, subBindings, renameMap));
+                        }
+                    }
+                    i++; // skip ...
+                } else if (rawElem instanceof String s && "...".equals(s)) {
+                    // skip, handled above
+                } else {
+                    result.add(expandTemplate(elem, bindings, renameMap));
+                }
+            }
+            return result;
+        }
+        return template;
+    }
+
+    private String findEllipsisVar(Object template, Map<String, Object> bindings) {
+        if (template instanceof Located loc) template = loc.expr;
+        if (template instanceof String s && bindings.get(s) instanceof List) return s;
+        if (template instanceof List<?> list) {
+            for (Object elem : list) {
+                String found = findEllipsisVar(elem, bindings);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
     private Object quoteValue(Object datum) {
         if (datum instanceof Located loc) datum = loc.expr;
         if (datum instanceof List<?> list) {
@@ -1087,6 +1279,7 @@ public class Evaluator {
         }
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
+        if (val instanceof SyntaxRulesMacro) return "#<macro>";
         if (val instanceof String s) return s;
         return val.toString();
     }
