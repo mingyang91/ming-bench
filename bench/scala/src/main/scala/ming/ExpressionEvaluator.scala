@@ -3,37 +3,46 @@ package ming
 private[ming] object ExpressionEvaluator:
 
   def eval(expr: Expr, env: Env, context: EvalContext): Value =
-    expr match
-      case Expr.IntLit(value, _)                       => Value.IntVal(value)
-      case Expr.RationalLit(numerator, denominator, _) => Value.RationalVal(numerator, denominator)
-      case Expr.InexactLit(value, _)                   => Value.InexactVal(value)
-      case Expr.BoolLit(value, _)                      => Value.BoolVal(value)
-      case Expr.StringLit(value, _)                    => Value.StringVal(MutableString.immutable(value))
-      case Expr.CharLit(value, _)                      => Value.CharVal(value)
-      case Expr.Symbol(name, pos) =>
-        env.lookup(name).getOrElse(throw EvalError.at(pos, s"unbound variable: $name"))
-      case Expr.ListExpr(items, pos) =>
-        SpecialFormEvaluator.evalList(items, env, pos, context)
+    run(EvalStep.EvalExpr(expr, env), context)
 
   def evalSequence(exprs: List[Expr], env: Env, context: EvalContext): Value =
-    exprs.foldLeft[Value](Value.Void) { (_, expr) =>
-      eval(expr, env, context)
-    }
+    run(EvalStep.EvalSequence(exprs, env), context)
 
-  @annotation.tailrec
-  def evalAnd(args: List[Expr], env: Env, lastValue: Value, context: EvalContext): Value =
-    args match
-      case Nil => lastValue
-      case head :: tail =>
-        val value = eval(head, env, context)
-        if ValueSemantics.isTruthy(value) then evalAnd(tail, env, value, context)
-        else value
+  private[ming] def run(step: EvalStep, context: EvalContext): Value =
+    var current = step
+    while true do
+      current match
+        case EvalStep.Done(value) =>
+          return value
+        case EvalStep.EvalExpr(expr, env) =>
+          current = evalExprStep(expr, env, context)
+        case EvalStep.EvalSequence(exprs, env) =>
+          current = evalSequenceStep(exprs, env, context)
+        case EvalStep.InvokeProcedure(procedure, evaluatedArgs, pos) =>
+          current = ProcedureInvoker.prepareProcedureCall(procedure, evaluatedArgs, pos, context)
 
-  @annotation.tailrec
-  def evalOr(args: List[Expr], env: Env, context: EvalContext): Value =
-    args match
-      case Nil => Value.BoolVal(false)
-      case head :: tail =>
-        val value = eval(head, env, context)
-        if ValueSemantics.isTruthy(value) then value
-        else evalOr(tail, env, context)
+    throw IllegalStateException("unreachable")
+
+  private def evalExprStep(expr: Expr, env: Env, context: EvalContext): EvalStep =
+    expr match
+      case Expr.IntLit(value, _)                       => EvalStep.Done(Value.IntVal(value))
+      case Expr.RationalLit(numerator, denominator, _) => EvalStep.Done(Value.RationalVal(numerator, denominator))
+      case Expr.InexactLit(value, _)                   => EvalStep.Done(Value.InexactVal(value))
+      case Expr.BoolLit(value, _)                      => EvalStep.Done(Value.BoolVal(value))
+      case Expr.StringLit(value, _)                    => EvalStep.Done(Value.StringVal(MutableString.immutable(value)))
+      case Expr.CharLit(value, _)                      => EvalStep.Done(Value.CharVal(value))
+      case Expr.Symbol(name, pos) =>
+        EvalStep.Done(env.lookup(name).getOrElse(throw EvalError.at(pos, s"unbound variable: $name")))
+      case Expr.ListExpr(items, pos) =>
+        SpecialFormEvaluator.evalListStep(items, env, pos, context)
+
+  private def evalSequenceStep(exprs: List[Expr], env: Env, context: EvalContext): EvalStep =
+    exprs match
+      case Nil =>
+        EvalStep.Done(Value.Void)
+      case _ =>
+        var remaining = exprs
+        while remaining.tail.nonEmpty do
+          eval(remaining.head, env, context)
+          remaining = remaining.tail
+        EvalStep.EvalExpr(remaining.head, env)

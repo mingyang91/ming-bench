@@ -20,24 +20,32 @@ private[ming] object ProcedureInvoker:
     pos: SourcePos,
     context: EvalContext
   ): Value =
+    ExpressionEvaluator.run(EvalStep.InvokeProcedure(procedure, evaluatedArgs, pos), context)
+
+  private[ming] def prepareProcedureCall(
+    procedure: Value,
+    evaluatedArgs: List[Value],
+    pos: SourcePos,
+    context: EvalContext
+  ): EvalStep =
     procedure match
       case Value.BuiltinProc("apply") =>
-        invokeApply(evaluatedArgs, pos, context)
+        prepareApply(evaluatedArgs, pos)
       case Value.BuiltinProc("map") =>
-        invokeMap(evaluatedArgs, pos, context)
+        EvalStep.Done(invokeMap(evaluatedArgs, pos, context))
       case Value.BuiltinProc(name) =>
-        Builtins.invoke(name, evaluatedArgs, pos, context)
+        EvalStep.Done(Builtins.invoke(name, evaluatedArgs, pos, context))
       case Value.RecordConstructor(recordType) =>
-        SchemeRecords.construct(recordType, evaluatedArgs, pos)
+        EvalStep.Done(SchemeRecords.construct(recordType, evaluatedArgs, pos))
       case Value.RecordPredicate(recordType) =>
-        SchemeRecords.test(recordType, evaluatedArgs, pos)
+        EvalStep.Done(SchemeRecords.test(recordType, evaluatedArgs, pos))
       case Value.RecordAccessor(recordType, fieldIndex, name) =>
-        SchemeRecords.access(recordType, fieldIndex, name, evaluatedArgs, pos)
+        EvalStep.Done(SchemeRecords.access(recordType, fieldIndex, name, evaluatedArgs, pos))
       case Value.Closure(name, params, restParam, body, closureEnv) =>
-        invokeUserProcedure(name, params, restParam, body, closureEnv, evaluatedArgs, pos, context)
+        prepareUserProcedure(name, params, restParam, body, closureEnv, evaluatedArgs, pos)
       case Value.CaseClosure(name, clauses, closureEnv) =>
         val clause = selectCaseLambdaClause(name, clauses, evaluatedArgs.length, pos)
-        invokeUserProcedure(name, clause.params, clause.restParam, clause.body, closureEnv, evaluatedArgs, pos, context)
+        prepareUserProcedure(name, clause.params, clause.restParam, clause.body, closureEnv, evaluatedArgs, pos)
       case _ =>
         throw EvalError.at(pos, "attempted to call a non-procedure")
 
@@ -52,14 +60,14 @@ private[ming] object ProcedureInvoker:
         throw EvalError.at(invalid.pos, "invalid case-lambda clause")
     }
 
-  private def invokeApply(args: List[Value], pos: SourcePos, context: EvalContext): Value =
+  private def prepareApply(args: List[Value], pos: SourcePos): EvalStep =
     if args.lengthCompare(2) < 0 then
       throw EvalError.at(pos, s"apply expects at least 2 argument(s), got ${args.length}")
 
     val procedure  = args.head
     val prefixArgs = args.slice(1, args.length - 1)
     val listArgs   = ValueSemantics.toProperList("apply", args.last, pos)
-    invokeProcedure(procedure, prefixArgs ++ listArgs, pos, context)
+    EvalStep.InvokeProcedure(procedure, prefixArgs ++ listArgs, pos)
 
   private def invokeMap(args: List[Value], pos: SourcePos, context: EvalContext): Value =
     if args.lengthCompare(2) < 0 then throw EvalError.at(pos, s"map expects at least 2 argument(s), got ${args.length}")
@@ -86,16 +94,15 @@ private[ming] object ProcedureInvoker:
       throw EvalError.at(pos, s"$procName has no matching clause for $actualArgCount argument(s)")
     }
 
-  private def invokeUserProcedure(
+  private def prepareUserProcedure(
     name: Option[String],
     params: List[String],
     restParam: Option[String],
     body: List[Expr],
     closureEnv: Env,
     evaluatedArgs: List[Value],
-    pos: SourcePos,
-    context: EvalContext
-  ): Value =
+    pos: SourcePos
+  ): EvalStep =
     validateArity(name, params.length, restParam, evaluatedArgs.length, pos)
 
     val callEnv = closureEnv.child()
@@ -105,7 +112,7 @@ private[ming] object ProcedureInvoker:
     restParam.foreach { param =>
       callEnv.define(param, ValueSemantics.listFrom(evaluatedArgs.drop(params.length)))
     }
-    ExpressionEvaluator.evalSequence(body, callEnv, context)
+    EvalStep.EvalSequence(body, callEnv)
 
   private def validateArity(
     name: Option[String],

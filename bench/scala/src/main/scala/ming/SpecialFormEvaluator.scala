@@ -4,48 +4,50 @@ import EvaluatorForms.*
 
 private[ming] object SpecialFormEvaluator:
 
-  def evalList(items: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
+  def evalListStep(items: List[Expr], env: Env, pos: SourcePos, context: EvalContext): EvalStep =
     items match
       case Nil => throw EvalError.at(pos, "cannot evaluate empty list")
       case Expr.Symbol("define-syntax", formPos) :: args =>
-        evalDefineSyntax(args, env, formPos)
+        EvalStep.Done(evalDefineSyntax(args, env, formPos))
       case Expr.Symbol("define-record-type", formPos) :: args =>
-        evalDefineRecordType(args, env, formPos)
+        EvalStep.Done(evalDefineRecordType(args, env, formPos))
       case Expr.Symbol("define", formPos) :: args =>
-        evalDefine(args, env, formPos, context)
+        EvalStep.Done(evalDefine(args, env, formPos, context))
       case Expr.Symbol("if", formPos) :: args =>
-        evalIf(args, env, formPos, context)
+        evalIfStep(args, env, formPos, context)
       case Expr.Symbol("quote", formPos) :: args =>
-        evalQuote(args, formPos)
+        EvalStep.Done(evalQuote(args, formPos))
       case Expr.Symbol("lambda", formPos) :: args =>
-        evalLambda(args, env, formPos)
+        EvalStep.Done(evalLambda(args, env, formPos))
       case Expr.Symbol("case-lambda", formPos) :: args =>
-        evalCaseLambda(args, env, formPos)
+        EvalStep.Done(evalCaseLambda(args, env, formPos))
       case Expr.Symbol("set!", formPos) :: args =>
-        evalSet(args, env, formPos, context)
+        EvalStep.Done(evalSet(args, env, formPos, context))
       case Expr.Symbol("begin", _) :: args =>
-        ExpressionEvaluator.evalSequence(args, env, context)
+        EvalStep.EvalSequence(args, env)
       case Expr.Symbol("let", formPos) :: args =>
-        evalLet(args, env, formPos, context)
+        evalLetStep(args, env, formPos, context)
       case Expr.Symbol("letrec", formPos) :: args =>
-        evalLetrec(args, env, formPos, context, sequential = false)
+        evalLetrecStep(args, env, formPos, context, sequential = false)
       case Expr.Symbol("letrec*", formPos) :: args =>
-        evalLetrec(args, env, formPos, context, sequential = true)
+        evalLetrecStep(args, env, formPos, context, sequential = true)
       case Expr.Symbol("cond", formPos) :: args =>
-        evalCond(args, env, formPos, context)
+        evalCondStep(args, env, formPos, context)
       case Expr.Symbol("case", formPos) :: args =>
-        evalCase(args, env, formPos, context)
+        evalCaseStep(args, env, formPos, context)
       case Expr.Symbol("do", formPos) :: args =>
-        evalDo(args, env, formPos, context)
+        EvalStep.Done(evalDo(args, env, formPos, context))
       case Expr.Symbol("and", _) :: args =>
-        ExpressionEvaluator.evalAnd(args, env, Value.BoolVal(true), context)
+        evalAndStep(args, env, context)
       case Expr.Symbol("or", _) :: args =>
-        ExpressionEvaluator.evalOr(args, env, context)
+        evalOrStep(args, env, context)
       case Expr.Symbol(name, _) :: _ if env.lookupSyntax(name).isDefined =>
         val expanded = env.lookupSyntax(name).get.expand(Expr.ListExpr(items, pos))
-        ExpressionEvaluator.eval(expanded, env, context)
+        EvalStep.EvalExpr(expanded, env)
       case head :: args =>
-        ProcedureInvoker.applyProcedure(ExpressionEvaluator.eval(head, env, context), args, env, head.pos, context)
+        val procedure     = ExpressionEvaluator.eval(head, env, context)
+        val evaluatedArgs = args.map(ExpressionEvaluator.eval(_, env, context))
+        EvalStep.InvokeProcedure(procedure, evaluatedArgs, head.pos)
 
   private def evalDefineSyntax(args: List[Expr], env: Env, pos: SourcePos): Value =
     args match
@@ -78,16 +80,16 @@ private[ming] object SpecialFormEvaluator:
       case _ =>
         throw EvalError.at(pos, "invalid define")
 
-  private def evalIf(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
+  private def evalIfStep(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): EvalStep =
     args match
       case conditionExpr :: thenExpr :: Nil =>
         if ValueSemantics.isTruthy(ExpressionEvaluator.eval(conditionExpr, env, context)) then
-          ExpressionEvaluator.eval(thenExpr, env, context)
-        else Value.Void
+          EvalStep.EvalExpr(thenExpr, env)
+        else EvalStep.Done(Value.Void)
       case conditionExpr :: thenExpr :: elseExpr :: Nil =>
         if ValueSemantics.isTruthy(ExpressionEvaluator.eval(conditionExpr, env, context)) then
-          ExpressionEvaluator.eval(thenExpr, env, context)
-        else ExpressionEvaluator.eval(elseExpr, env, context)
+          EvalStep.EvalExpr(thenExpr, env)
+        else EvalStep.EvalExpr(elseExpr, env)
       case _ =>
         throw EvalError.at(pos, "if expects 2 or 3 arguments")
 
@@ -116,12 +118,12 @@ private[ming] object SpecialFormEvaluator:
       case _ =>
         throw EvalError.at(pos, "invalid set!")
 
-  private def evalLet(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
+  private def evalLetStep(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): EvalStep =
     args match
       case Expr.ListExpr(bindings, _) :: body if body.nonEmpty =>
         val letEnv = env.child()
         bindLetValues(letEnv, parseLetBindings(bindings), env, context)
-        ExpressionEvaluator.evalSequence(body, letEnv, context)
+        EvalStep.EvalSequence(body, letEnv)
       case Expr.Symbol(name, _) :: Expr.ListExpr(bindings, _) :: body if body.nonEmpty =>
         val parsedBindings = parseLetBindings(bindings)
         val evaluatedArgs = parsedBindings.map { binding =>
@@ -137,7 +139,7 @@ private[ming] object SpecialFormEvaluator:
             env = letEnv
           )
         letEnv.define(name, closure)
-        ProcedureInvoker.invokeProcedure(closure, evaluatedArgs, pos, context)
+        EvalStep.InvokeProcedure(closure, evaluatedArgs, pos)
       case _ =>
         throw EvalError.at(pos, "invalid let")
 
@@ -146,13 +148,13 @@ private[ming] object SpecialFormEvaluator:
       targetEnv.define(binding.name, ExpressionEvaluator.eval(binding.valueExpr, evalEnv, context))
     }
 
-  private def evalLetrec(
+  private def evalLetrecStep(
     args: List[Expr],
     env: Env,
     pos: SourcePos,
     context: EvalContext,
     sequential: Boolean
-  ): Value =
+  ): EvalStep =
     args match
       case Expr.ListExpr(bindings, _) :: body if body.nonEmpty =>
         val recursiveEnv = env.child()
@@ -174,54 +176,54 @@ private[ming] object SpecialFormEvaluator:
             cell.value = value
           }
 
-        ExpressionEvaluator.evalSequence(body, recursiveEnv, context)
+        EvalStep.EvalSequence(body, recursiveEnv)
       case _ =>
         throw EvalError.at(pos, s"invalid ${if sequential then "letrec*" else "letrec"}")
 
-  private def evalCond(clauses: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
+  private def evalCondStep(clauses: List[Expr], env: Env, pos: SourcePos, context: EvalContext): EvalStep =
     clauses match
       case Nil =>
-        Value.Void
+        EvalStep.Done(Value.Void)
       case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: remaining =>
         if remaining.nonEmpty then throw EvalError.at(clausePos, "else clause must be last")
         if body.isEmpty then throw EvalError.at(clausePos, "else clause must have a body")
-        ExpressionEvaluator.evalSequence(body, env, context)
+        EvalStep.EvalSequence(body, env)
       case Expr.ListExpr(testExpr :: Nil, _) :: remaining =>
         val testValue = ExpressionEvaluator.eval(testExpr, env, context)
-        if ValueSemantics.isTruthy(testValue) then testValue
-        else evalCond(remaining, env, pos, context)
+        if ValueSemantics.isTruthy(testValue) then EvalStep.Done(testValue)
+        else evalCondStep(remaining, env, pos, context)
       case Expr.ListExpr(testExpr :: body, _) :: remaining =>
         val testValue = ExpressionEvaluator.eval(testExpr, env, context)
-        if ValueSemantics.isTruthy(testValue) then ExpressionEvaluator.evalSequence(body, env, context)
-        else evalCond(remaining, env, pos, context)
+        if ValueSemantics.isTruthy(testValue) then EvalStep.EvalSequence(body, env)
+        else evalCondStep(remaining, env, pos, context)
       case invalid :: _ =>
         throw EvalError.at(invalid.pos, "invalid cond clause")
 
-  private def evalCase(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
+  private def evalCaseStep(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): EvalStep =
     args match
       case keyExpr :: clauses =>
-        evalCaseClauses(ExpressionEvaluator.eval(keyExpr, env, context), clauses, env, pos, context)
+        evalCaseClausesStep(ExpressionEvaluator.eval(keyExpr, env, context), clauses, env, pos, context)
       case _ =>
         throw EvalError.at(pos, "case expects a key expression")
 
   @annotation.tailrec
-  private def evalCaseClauses(
+  private def evalCaseClausesStep(
     key: Value,
     clauses: List[Expr],
     env: Env,
     pos: SourcePos,
     context: EvalContext
-  ): Value =
+  ): EvalStep =
     clauses match
       case Nil =>
-        Value.Void
+        EvalStep.Done(Value.Void)
       case Expr.ListExpr(Expr.Symbol("else", _) :: body, clausePos) :: remaining =>
         if remaining.nonEmpty then throw EvalError.at(clausePos, "else clause must be last")
-        ExpressionEvaluator.evalSequence(body, env, context)
+        EvalStep.EvalSequence(body, env)
       case Expr.ListExpr(Expr.ListExpr(datums, _) :: body, _) :: remaining =>
         if datums.exists(datum => ValueSemantics.isEqv(key, ValueSemantics.quote(datum))) then
-          ExpressionEvaluator.evalSequence(body, env, context)
-        else evalCaseClauses(key, remaining, env, pos, context)
+          EvalStep.EvalSequence(body, env)
+        else evalCaseClausesStep(key, remaining, env, pos, context)
       case invalid :: _ =>
         throw EvalError.at(invalid.pos, "invalid case clause")
 
@@ -257,3 +259,27 @@ private[ming] object SpecialFormEvaluator:
         result
       case _ =>
         throw EvalError.at(pos, "invalid do")
+
+  private def evalAndStep(args: List[Expr], env: Env, context: EvalContext): EvalStep =
+    args match
+      case Nil =>
+        EvalStep.Done(Value.BoolVal(true))
+      case _ =>
+        var remaining = args
+        while remaining.tail.nonEmpty do
+          val value = ExpressionEvaluator.eval(remaining.head, env, context)
+          if !ValueSemantics.isTruthy(value) then return EvalStep.Done(value)
+          remaining = remaining.tail
+        EvalStep.EvalExpr(remaining.head, env)
+
+  private def evalOrStep(args: List[Expr], env: Env, context: EvalContext): EvalStep =
+    args match
+      case Nil =>
+        EvalStep.Done(Value.BoolVal(false))
+      case _ =>
+        var remaining = args
+        while remaining.tail.nonEmpty do
+          val value = ExpressionEvaluator.eval(remaining.head, env, context)
+          if ValueSemantics.isTruthy(value) then return EvalStep.Done(value)
+          remaining = remaining.tail
+        EvalStep.EvalExpr(remaining.head, env)
