@@ -464,6 +464,13 @@ fn expand_macro_list(
                     return Ok(expanded);
                 }
             }
+            if name == "case-lambda" {
+                if let Some(expanded) =
+                    expand_macro_case_lambda(items, context, scope, repetition_index)?
+                {
+                    return Ok(expanded);
+                }
+            }
         }
     }
 
@@ -611,6 +618,70 @@ fn expand_macro_lambda(
     }))
 }
 
+fn expand_macro_case_lambda(
+    items: &[Expr],
+    context: &mut MacroExpansionContext,
+    scope: &HashMap<String, String>,
+    repetition_index: Option<usize>,
+) -> Result<Option<Expr>, EvalError> {
+    let [head, clauses @ ..] = items else {
+        return Ok(None);
+    };
+
+    if clauses.is_empty() {
+        return Ok(None);
+    }
+
+    let mut expanded_items = vec![head.clone()];
+    for clause in clauses {
+        let Expr::List {
+            items: clause_items,
+            pos,
+        } = clause
+        else {
+            return Err(EvalError::ParseError {
+                message: "macro-generated case-lambda clauses must be lists".to_string(),
+            }
+            .with_position(clause.pos().line, clause.pos().col));
+        };
+
+        let Some((params_expr, body)) = clause_items.split_first() else {
+            return Err(EvalError::ParseError {
+                message: "macro-generated case-lambda clauses cannot be empty".to_string(),
+            }
+            .with_position(pos.line, pos.col));
+        };
+
+        if body.is_empty() {
+            return Err(EvalError::ParseError {
+                message: "macro-generated case-lambda clauses require a body".to_string(),
+            }
+            .with_position(pos.line, pos.col));
+        }
+
+        let (expanded_params, body_scope) = rename_macro_params(params_expr, scope)?;
+        let mut expanded_clause = vec![expanded_params];
+        for expr in body {
+            expanded_clause.push(expand_macro_template_at(
+                expr,
+                context,
+                &body_scope,
+                repetition_index,
+            )?);
+        }
+
+        expanded_items.push(Expr::List {
+            items: expanded_clause,
+            pos: *pos,
+        });
+    }
+
+    Ok(Some(Expr::List {
+        items: expanded_items,
+        pos: head.pos(),
+    }))
+}
+
 fn rename_macro_params(
     params_expr: &Expr,
     scope: &HashMap<String, String>,
@@ -721,6 +792,7 @@ fn is_special_form_keyword(name: &str) -> bool {
             | "cond"
             | "let"
             | "lambda"
+            | "case-lambda"
             | "define"
             | "define-syntax"
             | "set!"

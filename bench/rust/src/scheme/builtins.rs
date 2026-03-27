@@ -57,6 +57,7 @@ pub(super) fn default_env() -> EnvRef {
         ("boolean?", apply_boolean_pred as BuiltinFn),
         ("pair?", apply_pair_pred as BuiltinFn),
         ("symbol?", apply_symbol_pred as BuiltinFn),
+        ("procedure?", apply_procedure_pred as BuiltinFn),
         ("apply", apply_apply as BuiltinFn),
         ("display", apply_display as BuiltinFn),
         ("write", apply_write as BuiltinFn),
@@ -117,36 +118,28 @@ pub(super) fn apply_procedure(
     match procedure.as_ref() {
         Procedure::Builtin { func, .. } => func(args, output),
         Procedure::Lambda { params, body, env } => {
-            if args.len() < params.fixed_arity() {
-                return Err(EvalError::WrongArgCountAtLeast {
-                    name: "lambda",
-                    min: params.fixed_arity(),
-                    got: args.len(),
-                });
-            }
-
-            if !params.allows_rest() && args.len() != params.fixed_arity() {
+            apply_lambda_procedure("lambda", params, body, env, args, output)
+        }
+        Procedure::CaseLambda { clauses, env } => {
+            let Some(clause) = clauses
+                .iter()
+                .find(|clause| clause.params.matches_arity(args.len()))
+            else {
                 return Err(EvalError::WrongArgCount {
-                    name: "lambda",
-                    expected: "exact parameter count",
+                    name: "case-lambda",
+                    expected: "matching clause",
                     got: args.len(),
                 });
-            }
+            };
 
-            let call_env = Environment::new(Some(env.clone()));
-            for (name, arg) in params.fixed.iter().zip(args.iter()) {
-                call_env.define(name.clone(), arg.value.clone());
-            }
-
-            if let Some(name) = &params.rest {
-                let rest_items = args[params.fixed_arity()..]
-                    .iter()
-                    .map(|arg| arg.value.clone())
-                    .collect();
-                call_env.define(name.clone(), Value::List(rest_items));
-            }
-
-            eval_program(body, call_env, output)
+            apply_lambda_procedure(
+                "case-lambda",
+                &clause.params,
+                &clause.body,
+                env,
+                args,
+                output,
+            )
         }
         Procedure::RecordConstructor {
             record_type,
@@ -165,6 +158,46 @@ pub(super) fn apply_procedure(
             ..
         } => apply_record_mutator(record_type, *field_index, args),
     }
+}
+
+fn apply_lambda_procedure(
+    name: &'static str,
+    params: &super::LambdaParams,
+    body: &[Expr],
+    env: &EnvRef,
+    args: &[EvaluatedArg],
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    if args.len() < params.fixed_arity() {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name,
+            min: params.fixed_arity(),
+            got: args.len(),
+        });
+    }
+
+    if !params.matches_arity(args.len()) {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exact parameter count",
+            got: args.len(),
+        });
+    }
+
+    let call_env = Environment::new(Some(env.clone()));
+    for (binding_name, arg) in params.fixed.iter().zip(args.iter()) {
+        call_env.define(binding_name.clone(), arg.value.clone());
+    }
+
+    if let Some(rest_name) = &params.rest {
+        let rest_items = args[params.fixed_arity()..]
+            .iter()
+            .map(|arg| arg.value.clone())
+            .collect();
+        call_env.define(rest_name.clone(), Value::List(rest_items));
+    }
+
+    eval_program(body, call_env, output)
 }
 
 fn exact_int(value: i64) -> Value {
@@ -954,6 +987,18 @@ fn apply_symbol_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Valu
     };
 
     Ok(Value::Bool(matches!(&value.value, Value::Symbol(_))))
+}
+
+fn apply_procedure_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "procedure?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(&value.value, Value::Procedure(_))))
 }
 
 fn apply_zero_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {

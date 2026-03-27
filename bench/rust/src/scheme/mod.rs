@@ -62,6 +62,16 @@ impl LambdaParams {
     fn allows_rest(&self) -> bool {
         self.rest.is_some()
     }
+
+    fn matches_arity(&self, arity: usize) -> bool {
+        arity >= self.fixed_arity() && (self.allows_rest() || arity == self.fixed_arity())
+    }
+}
+
+#[derive(Clone)]
+struct CaseLambdaClause {
+    params: LambdaParams,
+    body: Vec<Expr>,
 }
 
 #[derive(Clone)]
@@ -161,6 +171,10 @@ enum Procedure {
         body: Vec<Expr>,
         env: EnvRef,
     },
+    CaseLambda {
+        clauses: Vec<CaseLambdaClause>,
+        env: EnvRef,
+    },
     RecordConstructor {
         name: String,
         record_type: Rc<RecordType>,
@@ -213,6 +227,7 @@ impl fmt::Debug for Procedure {
         match self {
             Self::Builtin { name, .. } => write!(f, "#<builtin:{name}>"),
             Self::Lambda { .. } => f.write_str("#<lambda>"),
+            Self::CaseLambda { .. } => f.write_str("#<case-lambda>"),
             Self::RecordConstructor { name, .. } => write!(f, "#<record-constructor:{name}>"),
             Self::RecordPredicate { name, .. } => write!(f, "#<record-predicate:{name}>"),
             Self::RecordAccessor { name, .. } => write!(f, "#<record-accessor:{name}>"),
@@ -584,6 +599,9 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
         Expr::Symbol { name, .. } if name == "lambda" => {
             with_position(eval_lambda(args, env), head_pos)
         }
+        Expr::Symbol { name, .. } if name == "case-lambda" => {
+            with_position(eval_case_lambda(args, env), head_pos)
+        }
         Expr::Symbol { name, .. } if name == "define" => {
             with_position(eval_define(args, env, output), head_pos)
         }
@@ -820,6 +838,50 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         body: body.to_vec(),
         env,
     })))
+}
+
+fn eval_case_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name: "case-lambda",
+            min: 1,
+            got: 0,
+        });
+    }
+
+    let clauses = args
+        .iter()
+        .map(parse_case_lambda_clause)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::Procedure(Rc::new(Procedure::CaseLambda {
+        clauses,
+        env,
+    })))
+}
+
+fn parse_case_lambda_clause(clause_expr: &Expr) -> Result<CaseLambdaClause, EvalError> {
+    let Expr::List { items, .. } = clause_expr else {
+        return Err(EvalError::ParseError {
+            message: "case-lambda clauses must be lists".to_string(),
+        });
+    };
+
+    let Some((params_expr, body)) = items.split_first() else {
+        return Err(EvalError::ParseError {
+            message: "case-lambda clauses cannot be empty".to_string(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::ParseError {
+            message: "case-lambda clauses require a body".to_string(),
+        });
+    }
+
+    Ok(CaseLambdaClause {
+        params: macros::parse_lambda_params(params_expr)?,
+        body: body.to_vec(),
+    })
 }
 
 fn eval_define(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
