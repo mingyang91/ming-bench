@@ -10,6 +10,12 @@ use std::rc::Rc;
 type Frame = Rc<RefCell<HashMap<String, Value>>>;
 type Env = Vec<Frame>;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct Span {
+    line: usize,
+    col: usize,
+}
+
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
@@ -42,7 +48,13 @@ impl fmt::Display for Value {
 }
 
 #[derive(Debug, Clone)]
-enum Expr {
+struct Expr {
+    kind: ExprKind,
+    span: Span,
+}
+
+#[derive(Debug, Clone)]
+enum ExprKind {
     Integer(i64),
     Boolean(bool),
     Str(String),
@@ -60,6 +72,20 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
         Self { input: input.as_bytes(), pos: 0 }
+    }
+
+    fn current_span(&self) -> Span {
+        let mut line = 1;
+        let mut col = 1;
+        for &b in &self.input[..self.pos] {
+            if b == b'\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        Span { line, col }
     }
 
     fn skip_whitespace_and_comments(&mut self) {
@@ -83,34 +109,38 @@ impl<'a> Parser<'a> {
 
     fn parse_expr(&mut self) -> Result<Expr, EvalError> {
         self.skip_whitespace_and_comments();
+        let span = self.current_span();
         match self.peek() {
             None => Err(EvalError::Parse("unexpected end of input".into())),
             Some(b'\'') => {
                 self.pos += 1;
                 let inner = self.parse_expr()?;
-                Ok(Expr::List(vec![Expr::Symbol("quote".into()), inner]))
+                Ok(Expr { kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("quote".into()), span },
+                    inner,
+                ]), span })
             }
-            Some(b'(') => self.parse_list(),
-            Some(b'"') => self.parse_string(),
-            Some(b'#') => self.parse_hash(),
-            _ => self.parse_atom(),
+            Some(b'(') => self.parse_list(span),
+            Some(b'"') => self.parse_string(span),
+            Some(b'#') => self.parse_hash(span),
+            _ => self.parse_atom(span),
         }
     }
 
-    fn parse_list(&mut self) -> Result<Expr, EvalError> {
+    fn parse_list(&mut self, span: Span) -> Result<Expr, EvalError> {
         self.pos += 1; // skip '('
         let mut items = Vec::new();
         loop {
             self.skip_whitespace_and_comments();
             match self.peek() {
                 None => return Err(EvalError::Parse("unterminated list".into())),
-                Some(b')') => { self.pos += 1; return Ok(Expr::List(items)); }
+                Some(b')') => { self.pos += 1; return Ok(Expr { kind: ExprKind::List(items), span }); }
                 _ => items.push(self.parse_expr()?),
             }
         }
     }
 
-    fn parse_string(&mut self) -> Result<Expr, EvalError> {
+    fn parse_string(&mut self, span: Span) -> Result<Expr, EvalError> {
         self.pos += 1; // skip opening "
         let mut s = String::new();
         loop {
@@ -118,7 +148,7 @@ impl<'a> Parser<'a> {
                 return Err(EvalError::Parse("unterminated string".into()));
             }
             let b = self.input[self.pos];
-            if b == b'"' { self.pos += 1; return Ok(Expr::Str(s)); }
+            if b == b'"' { self.pos += 1; return Ok(Expr { kind: ExprKind::Str(s), span }); }
             if b == b'\\' {
                 self.pos += 1;
                 if self.pos >= self.input.len() {
@@ -138,16 +168,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_hash(&mut self) -> Result<Expr, EvalError> {
+    fn parse_hash(&mut self, span: Span) -> Result<Expr, EvalError> {
         self.pos += 1; // skip '#'
         match self.peek() {
-            Some(b't') => { self.pos += 1; Ok(Expr::Boolean(true)) }
-            Some(b'f') => { self.pos += 1; Ok(Expr::Boolean(false)) }
+            Some(b't') => { self.pos += 1; Ok(Expr { kind: ExprKind::Boolean(true), span }) }
+            Some(b'f') => { self.pos += 1; Ok(Expr { kind: ExprKind::Boolean(false), span }) }
             _ => Err(EvalError::Parse("unexpected # literal".into())),
         }
     }
 
-    fn parse_atom(&mut self) -> Result<Expr, EvalError> {
+    fn parse_atom(&mut self, span: Span) -> Result<Expr, EvalError> {
         let start = self.pos;
         while self.pos < self.input.len() {
             let b = self.input[self.pos];
@@ -161,9 +191,9 @@ impl<'a> Parser<'a> {
         }
         let token = std::str::from_utf8(&self.input[start..self.pos]).expect("input is valid UTF-8");
         if let Ok(n) = token.parse::<i64>() {
-            return Ok(Expr::Integer(n));
+            return Ok(Expr { kind: ExprKind::Integer(n), span });
         }
-        Ok(Expr::Symbol(token.to_string()))
+        Ok(Expr { kind: ExprKind::Symbol(token.to_string()), span })
     }
 
     fn parse_all(&mut self) -> Result<Vec<Expr>, EvalError> {
@@ -199,18 +229,32 @@ fn env_define(env: &Env, name: String, val: Value) {
     env.last().expect("env must have at least one frame").borrow_mut().insert(name, val);
 }
 
+fn with_span(span: Span, err: EvalError) -> EvalError {
+    // Don't double-wrap errors that already have position info
+    let msg = err.to_string();
+    if msg.as_bytes().windows(2).any(|w| w[0].is_ascii_digit() && w[1] == b':') {
+        return err;
+    }
+    EvalError::Generic(format!("{}:{}: {}", span.line, span.col, msg))
+}
+
 fn eval(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Integer(n) => Ok(Value::Integer(*n)),
-        Expr::Boolean(b) => Ok(Value::Boolean(*b)),
-        Expr::Str(s) => Ok(Value::Str(s.clone())),
-        Expr::Symbol(name) => env_lookup(env, name),
-        Expr::List(items) => {
+    let span = expr.span;
+    eval_inner(expr, env).map_err(|e| with_span(span, e))
+}
+
+fn eval_inner(expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
+    match &expr.kind {
+        ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
+        ExprKind::Str(s) => Ok(Value::Str(s.clone())),
+        ExprKind::Symbol(name) => env_lookup(env, name),
+        ExprKind::List(items) => {
             if items.is_empty() {
                 return Err(EvalError::Parse("empty application".into()));
             }
             // Check for special forms
-            if let Expr::Symbol(op) = &items[0] {
+            if let ExprKind::Symbol(op) = &items[0].kind {
                 match op.as_str() {
                     "define" => return eval_define(&items[1..], env),
                     "if" => return eval_if(&items[1..], env),
@@ -276,9 +320,9 @@ fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("define requires at least 2 arguments".into()));
     }
-    match &args[0] {
+    match &args[0].kind {
         // (define x expr)
-        Expr::Symbol(name) => {
+        ExprKind::Symbol(name) => {
             if args.len() != 2 {
                 return Err(EvalError::Arity("define requires exactly 2 arguments".into()));
             }
@@ -287,21 +331,19 @@ fn eval_define(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             Ok(Value::Boolean(false))
         }
         // (define (f params...) body...) => (define f (lambda (params...) body...))
-        Expr::List(sig) => {
+        ExprKind::List(sig) => {
             if sig.is_empty() {
                 return Err(EvalError::Parse("define: empty signature".into()));
             }
-            let name = match &sig[0] {
-                Expr::Symbol(s) => s.clone(),
+            let name = match &sig[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
                 _ => return Err(EvalError::Type("define: expected symbol as function name".into())),
             };
-            let params: Vec<String> = sig[1..].iter().map(|e| match e {
-                Expr::Symbol(s) => Ok(s.clone()),
+            let params: Vec<String> = sig[1..].iter().map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
                 _ => Err(EvalError::Type("define: expected symbol as parameter".into())),
             }).collect::<Result<_, _>>()?;
             let body = args[1..].to_vec();
-            // Closure captures the env (shared frames via Rc), so when we define
-            // the name in the current frame, the closure can see itself via the shared Rc.
             let proc = Value::Procedure(params, body, env.clone());
             env_define(env, name, proc);
             Ok(Value::Boolean(false))
@@ -332,12 +374,12 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
 }
 
 fn expr_to_value(expr: &Expr) -> Value {
-    match expr {
-        Expr::Integer(n) => Value::Integer(*n),
-        Expr::Boolean(b) => Value::Boolean(*b),
-        Expr::Str(s) => Value::Str(s.clone()),
-        Expr::Symbol(s) => Value::Symbol(s.clone()),
-        Expr::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
+    match &expr.kind {
+        ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Boolean(b) => Value::Boolean(*b),
+        ExprKind::Str(s) => Value::Str(s.clone()),
+        ExprKind::Symbol(s) => Value::Symbol(s.clone()),
+        ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
     }
 }
 
@@ -345,10 +387,10 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("lambda requires at least 2 arguments".into()));
     }
-    let params = match &args[0] {
-        Expr::List(items) => {
-            items.iter().map(|e| match e {
-                Expr::Symbol(s) => Ok(s.clone()),
+    let params = match &args[0].kind {
+        ExprKind::List(items) => {
+            items.iter().map(|e| match &e.kind {
+                ExprKind::Symbol(s) => Ok(s.clone()),
                 _ => Err(EvalError::Type("lambda: expected symbol as parameter".into())),
             }).collect::<Result<Vec<_>, _>>()?
         }
@@ -466,7 +508,6 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                     Ok(Value::List(new_list))
                 }
                 _ => {
-                    // cons pair (dotted pair) - represent as 2-element list for now
                     Ok(Value::List(vec![args[0].clone(), args[1].clone()]))
                 }
             }
@@ -511,7 +552,6 @@ fn eval_builtin(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             let mut result = Vec::new();
             for (i, a) in args.iter().enumerate() {
                 if i == args.len() - 1 {
-                    // Last arg can be anything in full Scheme, but for lists:
                     match a {
                         Value::List(items) => result.extend(items.iter().cloned()),
                         _ => result.push(a.clone()),
@@ -554,20 +594,20 @@ fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
         return Err(EvalError::Arity("let requires bindings and body".into()));
     }
     // Named let: (let name ((var init) ...) body ...)
-    if let Expr::Symbol(name) = &args[0] {
+    if let ExprKind::Symbol(name) = &args[0].kind {
         if args.len() < 3 {
             return Err(EvalError::Arity("named let requires bindings and body".into()));
         }
-        let bindings = match &args[1] {
-            Expr::List(items) => items,
+        let bindings = match &args[1].kind {
+            ExprKind::List(items) => items,
             _ => return Err(EvalError::Type("let: expected bindings list".into())),
         };
         let mut params = Vec::new();
         let mut inits = Vec::new();
         for b in bindings {
-            match b {
-                Expr::List(pair) if pair.len() == 2 => {
-                    if let Expr::Symbol(s) = &pair[0] {
+            match &b.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    if let ExprKind::Symbol(s) = &pair[0].kind {
                         params.push(s.clone());
                         inits.push(eval(&pair[1], env)?);
                     } else {
@@ -578,26 +618,24 @@ fn eval_let(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
             }
         }
         let body = args[2..].to_vec();
-        // Create a recursive procedure for the named let
         let mut let_env = env.clone();
         let frame = new_frame();
         let_env.push(frame.clone());
         let proc = Value::Procedure(params.clone(), body, let_env.clone());
         frame.borrow_mut().insert(name.clone(), proc);
-        // Now call it with the initial values
         let func = env_lookup(&let_env, name)?;
         return apply_proc(&func, &inits);
     }
     // Regular let: (let ((var init) ...) body ...)
-    let bindings = match &args[0] {
-        Expr::List(items) => items,
+    let bindings = match &args[0].kind {
+        ExprKind::List(items) => items,
         _ => return Err(EvalError::Type("let: expected bindings list".into())),
     };
     let frame = new_frame();
     for b in bindings {
-        match b {
-            Expr::List(pair) if pair.len() == 2 => {
-                if let Expr::Symbol(s) = &pair[0] {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
                     let val = eval(&pair[1], env)?;
                     frame.borrow_mut().insert(s.clone(), val);
                 } else {
@@ -626,10 +664,9 @@ fn eval_begin(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
 
 fn eval_cond(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
     for clause in args {
-        match clause {
-            Expr::List(items) if !items.is_empty() => {
-                // Check for else clause
-                if let Expr::Symbol(s) = &items[0] {
+        match &clause.kind {
+            ExprKind::List(items) if !items.is_empty() => {
+                if let ExprKind::Symbol(s) = &items[0].kind {
                     if s == "else" {
                         let mut result = Value::Boolean(false);
                         for expr in &items[1..] {
