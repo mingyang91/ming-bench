@@ -269,6 +269,13 @@ function createBuiltins(context) {
             }),
         ],
         [
+            'procedure?',
+            builtin('procedure?', (args, pos) => {
+                expectArity('procedure?', args, 1, pos);
+                return isProcedureValue(args[0]);
+            }),
+        ],
+        [
             'symbol?',
             builtin('symbol?', (args, pos) => {
                 expectArity('symbol?', args, 1, pos);
@@ -669,6 +676,8 @@ function evaluateList(elements, env, pos) {
                 return evaluateQuote(argumentExprs, operatorExpr.pos);
             case 'lambda':
                 return evaluateLambda(argumentExprs, env, operatorExpr.pos);
+            case 'case-lambda':
+                return evaluateCaseLambda(argumentExprs, env, operatorExpr.pos);
             case 'begin':
                 return evaluateBegin(argumentExprs, env);
             case 'cond':
@@ -886,6 +895,16 @@ function evaluateLambda(expressions, env, pos) {
         env,
     };
 }
+function evaluateCaseLambda(expressions, env, pos) {
+    if (expressions.length === 0) {
+        throw new EvalError('case-lambda expected at least one clause', pos);
+    }
+    return {
+        kind: 'case-lambda',
+        clauses: expressions.map((expression) => parseCaseLambdaClause(expression)),
+        env,
+    };
+}
 function evaluateBegin(expressions, env) {
     return evaluateSequence(expressions, env);
 }
@@ -948,23 +967,36 @@ function applyProcedure(value, args, pos) {
     if (isBuiltin(value)) {
         return value.apply(args, pos);
     }
-    if (!isClosure(value)) {
-        throw new EvalError('attempted to call a non-procedure value', pos);
+    if (isClosure(value)) {
+        return applyProcedureClause(value, value.env, args, pos, value.name ?? 'lambda');
     }
-    if (value.restParam === undefined && args.length !== value.params.length) {
-        throw new EvalError(`${value.name ?? 'lambda'} expected ${value.params.length} argument(s), got ${args.length}`, pos);
+    if (isCaseLambda(value)) {
+        const clause = value.clauses.find((candidate) => matchesClauseArity(candidate, args.length));
+        if (clause === undefined) {
+            throw new EvalError(`case-lambda has no matching clause for ${args.length} argument(s)`, pos);
+        }
+        return applyProcedureClause(clause, value.env, args, pos, value.name ?? 'case-lambda');
     }
-    if (value.restParam !== undefined && args.length < value.params.length) {
-        throw new EvalError(`${value.name ?? 'lambda'} expected at least ${value.params.length} argument(s), got ${args.length}`, pos);
+    throw new EvalError('attempted to call a non-procedure value', pos);
+}
+function applyProcedureClause(clause, env, args, pos, name) {
+    if (clause.restParam === undefined && args.length !== clause.params.length) {
+        throw new EvalError(`${name} expected ${clause.params.length} argument(s), got ${args.length}`, pos);
     }
-    const callEnv = new Environment(value.env);
-    for (let index = 0; index < value.params.length; index += 1) {
-        callEnv.define(value.params[index], args[index]);
+    if (clause.restParam !== undefined && args.length < clause.params.length) {
+        throw new EvalError(`${name} expected at least ${clause.params.length} argument(s), got ${args.length}`, pos);
     }
-    if (value.restParam !== undefined) {
-        callEnv.define(value.restParam, listToPairs(args.slice(value.params.length)));
+    const callEnv = new Environment(env);
+    for (let index = 0; index < clause.params.length; index += 1) {
+        callEnv.define(clause.params[index], args[index]);
     }
-    return evaluateSequence(value.body, callEnv);
+    if (clause.restParam !== undefined) {
+        callEnv.define(clause.restParam, listToPairs(args.slice(clause.params.length)));
+    }
+    return evaluateSequence(clause.body, callEnv);
+}
+function matchesClauseArity(clause, argCount) {
+    return clause.restParam === undefined ? argCount === clause.params.length : argCount >= clause.params.length;
 }
 function parseSyntaxRules(keyword, expression, env) {
     if (expression.kind !== 'list' || expression.elements.length < 2) {
@@ -1738,6 +1770,12 @@ function isBuiltin(value) {
 function isClosure(value) {
     return typeof value === 'object' && value !== null && value.kind === 'closure';
 }
+function isCaseLambda(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'case-lambda';
+}
+function isProcedureValue(value) {
+    return isBuiltin(value) || isClosure(value) || isCaseLambda(value);
+}
 function isSymbolValue(value) {
     return typeof value === 'object' && value !== null && value.kind === 'symbol';
 }
@@ -1924,6 +1962,18 @@ function parseFormalParameters(parameterExprs, name) {
         params.push(expectParameterName(parameterExpr, name));
     }
     return { params };
+}
+function parseCaseLambdaClause(expression) {
+    if (expression.kind !== 'list' || expression.elements.length < 2) {
+        throw new EvalError('case-lambda expected clauses of the form (formals body ...)', expression.pos);
+    }
+    const [paramsExpr, ...body] = expression.elements;
+    const { params, restParam } = parseFormals(paramsExpr, 'case-lambda');
+    return {
+        params,
+        restParam,
+        body,
+    };
 }
 function parseBindings(bindingsExpr, name) {
     if (bindingsExpr.kind !== 'list') {
@@ -2416,6 +2466,9 @@ function formatValue(value) {
         return `#<procedure:${value.name}>`;
     }
     if (isClosure(value)) {
+        return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+    }
+    if (isCaseLambda(value)) {
         return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
     }
     if (isRecordValue(value)) {

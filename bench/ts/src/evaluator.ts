@@ -28,6 +28,19 @@ type ClosureValue = {
   name?: string;
 };
 
+type ProcedureClause = {
+  params: string[];
+  restParam?: string;
+  body: Expr[];
+};
+
+type CaseLambdaValue = {
+  kind: 'case-lambda';
+  clauses: ProcedureClause[];
+  env: Environment;
+  name?: string;
+};
+
 type SymbolValue = {
   kind: 'symbol';
   name: string;
@@ -94,7 +107,7 @@ type EvaluationContext = {
   output: string[];
 };
 
-type ProcedureValue = BuiltinValue | ClosureValue;
+type ProcedureValue = BuiltinValue | ClosureValue | CaseLambdaValue;
 
 type SchemeValue =
   | NumberValue
@@ -413,6 +426,13 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
       builtin('pair?', (args, pos) => {
         expectArity('pair?', args, 1, pos);
         return isPair(args[0]);
+      }),
+    ],
+    [
+      'procedure?',
+      builtin('procedure?', (args, pos) => {
+        expectArity('procedure?', args, 1, pos);
+        return isProcedureValue(args[0]);
       }),
     ],
     [
@@ -883,6 +903,8 @@ function evaluateList(elements: Expr[], env: Environment, pos: SourcePosition): 
         return evaluateQuote(argumentExprs, operatorExpr.pos);
       case 'lambda':
         return evaluateLambda(argumentExprs, env, operatorExpr.pos);
+      case 'case-lambda':
+        return evaluateCaseLambda(argumentExprs, env, operatorExpr.pos);
       case 'begin':
         return evaluateBegin(argumentExprs, env);
       case 'cond':
@@ -1171,6 +1193,18 @@ function evaluateLambda(expressions: Expr[], env: Environment, pos: SourcePositi
   };
 }
 
+function evaluateCaseLambda(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+  if (expressions.length === 0) {
+    throw new EvalError('case-lambda expected at least one clause', pos);
+  }
+
+  return {
+    kind: 'case-lambda',
+    clauses: expressions.map((expression) => parseCaseLambdaClause(expression)),
+    env,
+  };
+}
+
 function evaluateBegin(expressions: Expr[], env: Environment): SchemeValue {
   return evaluateSequence(expressions, env);
 }
@@ -1251,35 +1285,59 @@ function applyProcedure(value: SchemeValue, args: SchemeValue[], pos: SourcePosi
     return value.apply(args, pos);
   }
 
-  if (!isClosure(value)) {
-    throw new EvalError('attempted to call a non-procedure value', pos);
+  if (isClosure(value)) {
+    return applyProcedureClause(value, value.env, args, pos, value.name ?? 'lambda');
   }
 
-  if (value.restParam === undefined && args.length !== value.params.length) {
+  if (isCaseLambda(value)) {
+    const clause = value.clauses.find((candidate) => matchesClauseArity(candidate, args.length));
+
+    if (clause === undefined) {
+      throw new EvalError(`case-lambda has no matching clause for ${args.length} argument(s)`, pos);
+    }
+
+    return applyProcedureClause(clause, value.env, args, pos, value.name ?? 'case-lambda');
+  }
+
+  throw new EvalError('attempted to call a non-procedure value', pos);
+}
+
+function applyProcedureClause(
+  clause: ProcedureClause,
+  env: Environment,
+  args: SchemeValue[],
+  pos: SourcePosition,
+  name: string,
+): SchemeValue {
+  if (clause.restParam === undefined && args.length !== clause.params.length) {
     throw new EvalError(
-      `${value.name ?? 'lambda'} expected ${value.params.length} argument(s), got ${args.length}`,
+      `${name} expected ${clause.params.length} argument(s), got ${args.length}`,
       pos,
     );
   }
 
-  if (value.restParam !== undefined && args.length < value.params.length) {
+  if (clause.restParam !== undefined && args.length < clause.params.length) {
     throw new EvalError(
-      `${value.name ?? 'lambda'} expected at least ${value.params.length} argument(s), got ${args.length}`,
+      `${name} expected at least ${clause.params.length} argument(s), got ${args.length}`,
       pos,
     );
   }
 
-  const callEnv = new Environment(value.env);
+  const callEnv = new Environment(env);
 
-  for (let index = 0; index < value.params.length; index += 1) {
-    callEnv.define(value.params[index], args[index]);
+  for (let index = 0; index < clause.params.length; index += 1) {
+    callEnv.define(clause.params[index], args[index]);
   }
 
-  if (value.restParam !== undefined) {
-    callEnv.define(value.restParam, listToPairs(args.slice(value.params.length)));
+  if (clause.restParam !== undefined) {
+    callEnv.define(clause.restParam, listToPairs(args.slice(clause.params.length)));
   }
 
-  return evaluateSequence(value.body, callEnv);
+  return evaluateSequence(clause.body, callEnv);
+}
+
+function matchesClauseArity(clause: ProcedureClause, argCount: number): boolean {
+  return clause.restParam === undefined ? argCount === clause.params.length : argCount >= clause.params.length;
 }
 
 function parseSyntaxRules(keyword: string, expression: Expr, env: Environment): SyntaxTransformer {
@@ -2314,6 +2372,14 @@ function isClosure(value: SchemeValue): value is ClosureValue {
   return typeof value === 'object' && value !== null && value.kind === 'closure';
 }
 
+function isCaseLambda(value: SchemeValue): value is CaseLambdaValue {
+  return typeof value === 'object' && value !== null && value.kind === 'case-lambda';
+}
+
+function isProcedureValue(value: SchemeValue): value is ProcedureValue {
+  return isBuiltin(value) || isClosure(value) || isCaseLambda(value);
+}
+
 function isSymbolValue(value: SchemeValue): value is SymbolValue {
   return typeof value === 'object' && value !== null && value.kind === 'symbol';
 }
@@ -2576,6 +2642,20 @@ function parseFormalParameters(
   }
 
   return { params };
+}
+
+function parseCaseLambdaClause(expression: Expr): ProcedureClause {
+  if (expression.kind !== 'list' || expression.elements.length < 2) {
+    throw new EvalError('case-lambda expected clauses of the form (formals body ...)', expression.pos);
+  }
+
+  const [paramsExpr, ...body] = expression.elements;
+  const { params, restParam } = parseFormals(paramsExpr, 'case-lambda');
+  return {
+    params,
+    restParam,
+    body,
+  };
 }
 
 function parseBindings(bindingsExpr: Expr, name: string): Array<{ name: string; valueExpr: Expr }> {
@@ -3257,6 +3337,10 @@ function formatValue(value: SchemeValue): string {
   }
 
   if (isClosure(value)) {
+    return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+  }
+
+  if (isCaseLambda(value)) {
     return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
   }
 
