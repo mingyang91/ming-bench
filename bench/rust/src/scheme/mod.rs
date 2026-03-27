@@ -144,6 +144,7 @@ pub enum Value {
     Void,
     TailCall(Box<(Expr, Env)>),
     Continuation(Rc<ContinuationData>),
+    Values(Vec<Value>), // multiple return values
 }
 
 fn make_pair(car: Value, cdr: Value) -> Value {
@@ -307,6 +308,7 @@ fn format_value(val: &Value, seen: &mut HashSet<usize>) -> String {
         Value::Macro(_) => "#<macro>".to_string(),
         Value::Void => String::new(),
         Value::TailCall(_) => "#<tail-call>".to_string(),
+        Value::Values(_) => "#<values>".to_string(),
     }
 }
 
@@ -787,6 +789,27 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         let proc = eval(&items[1], env)?;
                         return eval_callcc_with_proc(&proc);
                     }
+                    "values" => {
+                        let vals: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env)).collect();
+                        let vals = vals?;
+                        if vals.len() == 1 {
+                            return Ok(vals.into_iter().next().unwrap());
+                        }
+                        return Ok(Value::Values(vals));
+                    }
+                    "call-with-values" => {
+                        if items.len() != 3 {
+                            return Err(EvalError::Arity("call-with-values requires 2 arguments".into()));
+                        }
+                        let producer = eval(&items[1], env)?;
+                        let consumer = eval(&items[2], env)?;
+                        let produced = apply(&producer, &[])?;
+                        let args = match produced {
+                            Value::Values(vals) => vals,
+                            single => vec![single],
+                        };
+                        return apply_tail(&consumer, &args);
+                    }
                     "guard" => {
                         // (guard (var clause ...) body ...)
                         // clause = (test expr ...) or (test => expr) or (else expr ...)
@@ -1049,6 +1072,23 @@ fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                     return Err(EvalError::Arity("call/cc requires exactly 1 argument".into()));
                 }
                 return eval_callcc_with_proc(&args[0]);
+            }
+            if name == "values" {
+                if args.len() == 1 {
+                    return Ok(args[0].clone());
+                }
+                return Ok(Value::Values(args.to_vec()));
+            }
+            if name == "call-with-values" {
+                if args.len() != 2 {
+                    return Err(EvalError::Arity("call-with-values requires 2 arguments".into()));
+                }
+                let produced = apply(&args[0], &[])?;
+                let consumer_args = match produced {
+                    Value::Values(vals) => vals,
+                    single => vec![single],
+                };
+                return apply_tail(&args[1], &consumer_args);
             }
             apply_builtin(name, args)
         }
@@ -3521,6 +3561,8 @@ fn seed_builtins(env: &Env) {
         "string->number", "string-ref", "substring", "string-copy",
         "string->list", "list->string", "char->integer", "integer->char",
         "procedure?",
+        // L21
+        "values", "call-with-values",
     ] {
         env.set(name.to_string(), Value::Builtin(name.to_string()));
     }
