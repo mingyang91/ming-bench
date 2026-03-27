@@ -90,6 +90,8 @@ public class Evaluator {
     }
     record Builtin(String name) {}
     record SyntaxRules(List<String> literals, List<Object> patterns, List<Object> templates, Env defEnv) {}
+    // Multiple return values from (values ...)
+    record MultipleValues(List<Object> vals) {}
     // Trampoline sentinel for tail call optimization
     record TailCall(Object expr, Env env) {}
 
@@ -194,7 +196,8 @@ public class Evaluator {
         "string>?", "string<=?", "string>=?",
         "call/cc", "call-with-current-continuation",
         "dynamic-wind",
-        "raise", "with-exception-handler"
+        "raise", "with-exception-handler",
+        "values", "call-with-values"
     };
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
@@ -1171,6 +1174,23 @@ public class Evaluator {
                 } catch (SchemeRaise sr) {
                     return resolve(apply(handler, List.of(sr.value)));
                 }
+            }
+            if (name.equals("values")) {
+                if (args.size() == 1) return args.get(0);
+                return new MultipleValues(args);
+            }
+            if (name.equals("call-with-values")) {
+                if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+                Object producer = args.get(0);
+                Object consumer = args.get(1);
+                Object produced = resolve(apply(producer, List.of()));
+                List<Object> consumerArgs;
+                if (produced instanceof MultipleValues mv) {
+                    consumerArgs = mv.vals();
+                } else {
+                    consumerArgs = List.of(produced);
+                }
+                return apply(consumer, consumerArgs);
             }
             return applyBuiltin(name, args);
         }
