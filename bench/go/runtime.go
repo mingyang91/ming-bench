@@ -434,6 +434,8 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalDefine(items[1:], env)
 		case "define-syntax":
 			return evalDefineSyntax(items[1:], env)
+		case "define-record-type":
+			return evalDefineRecordType(items[1:], env)
 		case "set!":
 			return evalSet(items[1:], env)
 		case "quote":
