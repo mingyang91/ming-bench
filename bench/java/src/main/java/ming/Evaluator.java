@@ -40,7 +40,7 @@ public class Evaluator {
 
     // --- Environment ---
 
-    private static class Env {
+    static class Env {
         final Map<String, Object> bindings = new HashMap<>();
         final Env parent;
 
@@ -86,6 +86,10 @@ public class Evaluator {
 
     private record Lambda(List<String> params, String restParam, List<Object> body, Env closureEnv) {}
 
+    // --- CaseLambda (multiple-arity closure) ---
+
+    private record CaseLambda(List<Lambda> clauses) {}
+
     // --- Builtin procedure ---
 
     @FunctionalInterface
@@ -95,43 +99,8 @@ public class Evaluator {
 
     private record BuiltinProc(String name, Builtin fn) {}
 
-    // --- Record Type ---
-
-    private static class RecordType {
-        final String name;
-        final List<String> fieldNames;
-        RecordType(String name, List<String> fieldNames) {
-            this.name = name;
-            this.fieldNames = fieldNames;
-        }
-    }
-
-    private static class SchemeRecord {
-        final RecordType type;
-        final Object[] fields;
-        SchemeRecord(RecordType type, Object[] fields) {
-            this.type = type;
-            this.fields = fields;
-        }
-    }
-
-    // --- Syntax Rules Macro ---
-
-    private static class SyntaxRulesMacro {
-        final String name;
-        final List<String> literals;
-        final List<Object[]> rules; // each: [pattern, template]
-        final Env defEnv;
-        SyntaxRulesMacro(String name, List<String> literals, List<Object[]> rules, Env defEnv) {
-            this.name = name;
-            this.literals = literals;
-            this.rules = rules;
-            this.defEnv = defEnv;
-        }
-    }
-
     private static final Set<String> SPECIAL_FORMS = Set.of(
-        "if", "begin", "let", "set!", "define", "quote", "lambda",
+        "if", "begin", "let", "set!", "define", "quote", "lambda", "case-lambda",
         "and", "or", "cond", "define-syntax", "syntax-rules", "define-record-type"
     );
 
@@ -265,6 +234,12 @@ public class Evaluator {
         env.define("symbol?", new BuiltinProc("symbol?", args -> {
             if (args.size() != 1) throw new EvalError("symbol?: expected 1 arg");
             return args.get(0) instanceof String ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("procedure?", new BuiltinProc("procedure?", args -> {
+            if (args.size() != 1) throw new EvalError("procedure?: expected 1 arg");
+            Object val = args.get(0);
+            return (val instanceof Lambda || val instanceof CaseLambda || val instanceof BuiltinProc)
+                    ? Boolean.TRUE : Boolean.FALSE;
         }));
     }
 
@@ -969,6 +944,41 @@ public class Evaluator {
                         List<Object> body = new ArrayList<>(list.subList(2, list.size()));
                         return new Lambda(params, restParam, body, env);
                     }
+                    case "case-lambda" -> {
+                        List<Lambda> clauses = new ArrayList<>();
+                        for (int ci = 1; ci < list.size(); ci++) {
+                            Object clauseObj = list.get(ci);
+                            if (clauseObj instanceof Located loc) clauseObj = loc.expr;
+                            if (!(clauseObj instanceof List<?> clause) || clause.size() < 2)
+                                throw new EvalError("case-lambda: bad clause" + posStr);
+                            Object paramSpec = clause.get(0);
+                            if (paramSpec instanceof Located loc) paramSpec = loc.expr;
+                            if (!(paramSpec instanceof List<?> paramList))
+                                throw new EvalError("case-lambda: params must be a list" + posStr);
+                            List<String> params = new ArrayList<>();
+                            String restParam = null;
+                            for (int pi = 0; pi < paramList.size(); pi++) {
+                                Object p = paramList.get(pi);
+                                if (p instanceof Located loc) p = loc.expr;
+                                if (p instanceof String pname && pname.equals(".")) {
+                                    if (pi + 1 >= paramList.size())
+                                        throw new EvalError("case-lambda: missing rest parameter after dot" + posStr);
+                                    Object rp = paramList.get(pi + 1);
+                                    if (rp instanceof Located loc) rp = loc.expr;
+                                    if (!(rp instanceof String rpname))
+                                        throw new EvalError("case-lambda: rest parameter must be symbol" + posStr);
+                                    restParam = rpname;
+                                    break;
+                                }
+                                if (!(p instanceof String pname))
+                                    throw new EvalError("case-lambda: parameter must be symbol" + posStr);
+                                params.add(pname);
+                            }
+                            List<Object> body = new ArrayList<>(clause.subList(1, clause.size()));
+                            clauses.add(new Lambda(params, restParam, body, env));
+                        }
+                        return new CaseLambda(clauses);
+                    }
                     case "and" -> {
                         Object result = Boolean.TRUE;
                         for (int i = 1; i < list.size(); i++) {
@@ -1062,38 +1072,7 @@ public class Evaluator {
                         }
                     }
                     case "define-syntax" -> {
-                        if (list.size() != 3) throw new EvalError("define-syntax: expected 2 arguments" + posStr);
-                        Object nameObj = list.get(1);
-                        if (nameObj instanceof Located loc) nameObj = loc.expr;
-                        if (!(nameObj instanceof String macroName))
-                            throw new EvalError("define-syntax: name must be symbol" + posStr);
-                        Object transformerExpr = list.get(2);
-                        if (transformerExpr instanceof Located loc) transformerExpr = loc.expr;
-                        if (!(transformerExpr instanceof List<?> transformer))
-                            throw new EvalError("define-syntax: expected syntax-rules" + posStr);
-                        Object srHead = transformer.get(0);
-                        if (srHead instanceof Located loc) srHead = loc.expr;
-                        if (!(srHead instanceof String srStr) || !srStr.equals("syntax-rules"))
-                            throw new EvalError("define-syntax: expected syntax-rules" + posStr);
-                        Object litsObj = transformer.get(1);
-                        if (litsObj instanceof Located loc) litsObj = loc.expr;
-                        List<String> macroLiterals = new ArrayList<>();
-                        if (litsObj instanceof List<?> litsList) {
-                            for (Object l : litsList) {
-                                if (l instanceof Located loc) l = loc.expr;
-                                if (l instanceof String s) macroLiterals.add(s);
-                            }
-                        }
-                        List<Object[]> macroRules = new ArrayList<>();
-                        for (int ri = 2; ri < transformer.size(); ri++) {
-                            Object ruleObj = transformer.get(ri);
-                            if (ruleObj instanceof Located loc) ruleObj = loc.expr;
-                            if (!(ruleObj instanceof List<?> rule) || rule.size() != 2)
-                                throw new EvalError("define-syntax: invalid rule" + posStr);
-                            macroRules.add(new Object[]{rule.get(0), rule.get(1)});
-                        }
-                        env.define(macroName, new SyntaxRulesMacro(macroName, macroLiterals, macroRules, env));
-                        return Boolean.FALSE;
+                        return evalDefineSyntax(list, env, posStr);
                     }
                     case "define-record-type" -> {
                         return evalDefineRecordType(list, env, posStr);
@@ -1152,6 +1131,20 @@ public class Evaluator {
                 callEnv.define(lambda.restParam, rest);
             }
             return evalBody(lambda.body, callEnv);
+        }
+        if (proc instanceof CaseLambda cl) {
+            for (Lambda clause : cl.clauses) {
+                if (clause.restParam != null) {
+                    if (args.size() >= clause.params.size()) {
+                        return applyProc(clause, args);
+                    }
+                } else {
+                    if (args.size() == clause.params.size()) {
+                        return applyProc(clause, args);
+                    }
+                }
+            }
+            throw new EvalError("case-lambda: no matching clause for " + args.size() + " arguments");
         }
         if (proc instanceof BuiltinProc bp) {
             return bp.fn.apply(args);
@@ -1221,6 +1214,41 @@ public class Evaluator {
                 return sr.fields[idx];
             }));
         }
+        return Boolean.FALSE;
+    }
+
+    private Object evalDefineSyntax(List<?> list, Env env, String posStr) throws EvalError {
+        if (list.size() != 3) throw new EvalError("define-syntax: expected 2 arguments" + posStr);
+        Object nameObj = list.get(1);
+        if (nameObj instanceof Located loc) nameObj = loc.expr;
+        if (!(nameObj instanceof String macroName))
+            throw new EvalError("define-syntax: name must be symbol" + posStr);
+        Object transformerExpr = list.get(2);
+        if (transformerExpr instanceof Located loc) transformerExpr = loc.expr;
+        if (!(transformerExpr instanceof List<?> transformer))
+            throw new EvalError("define-syntax: expected syntax-rules" + posStr);
+        Object srHead = transformer.get(0);
+        if (srHead instanceof Located loc) srHead = loc.expr;
+        if (!(srHead instanceof String srStr) || !srStr.equals("syntax-rules"))
+            throw new EvalError("define-syntax: expected syntax-rules" + posStr);
+        Object litsObj = transformer.get(1);
+        if (litsObj instanceof Located loc) litsObj = loc.expr;
+        List<String> macroLiterals = new ArrayList<>();
+        if (litsObj instanceof List<?> litsList) {
+            for (Object l : litsList) {
+                if (l instanceof Located loc) l = loc.expr;
+                if (l instanceof String s) macroLiterals.add(s);
+            }
+        }
+        List<Object[]> macroRules = new ArrayList<>();
+        for (int ri = 2; ri < transformer.size(); ri++) {
+            Object ruleObj = transformer.get(ri);
+            if (ruleObj instanceof Located loc) ruleObj = loc.expr;
+            if (!(ruleObj instanceof List<?> rule) || rule.size() != 2)
+                throw new EvalError("define-syntax: invalid rule" + posStr);
+            macroRules.add(new Object[]{rule.get(0), rule.get(1)});
+        }
+        env.define(macroName, new SyntaxRulesMacro(macroName, macroLiterals, macroRules, env));
         return Boolean.FALSE;
     }
 
@@ -1431,6 +1459,7 @@ public class Evaluator {
         }
         if (val instanceof SchemeRecord) return "#<record>";
         if (val instanceof Lambda) return "#<procedure>";
+        if (val instanceof CaseLambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         if (val instanceof SyntaxRulesMacro) return "#<macro>";
         if (val instanceof String s) return s;
@@ -1459,23 +1488,5 @@ public class Evaluator {
         }
         return schemeToString(val);
     }
-
-    // Internal type to distinguish Scheme strings from symbols (Java Strings)
-    static class SchemeString {
-        private char[] chars;
-        SchemeString(String value) { this.chars = value.toCharArray(); }
-        String value() { return new String(chars); }
-        char charAt(int i) { return chars[i]; }
-        int length() { return chars.length; }
-        void setChar(int i, char c) { chars[i] = c; }
-        SchemeString copy() { return new SchemeString(value()); }
-        @Override public boolean equals(Object o) {
-            return o instanceof SchemeString s && value().equals(s.value());
-        }
-        @Override public int hashCode() { return value().hashCode(); }
-    }
-
-    // Internal type for Scheme characters
-    record SchemeChar(char value) {}
 
 }
