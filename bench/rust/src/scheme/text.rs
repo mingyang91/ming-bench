@@ -47,10 +47,6 @@ impl SchemeString {
         self.0.chars.borrow()[start..end].iter().collect()
     }
 
-    pub(super) fn mutable_copy(&self) -> Self {
-        Self::from_chars(self.0.chars.borrow().clone(), true)
-    }
-
     pub(super) fn runtime_copy(&self) -> Self {
         Self::from_chars(self.0.chars.borrow().clone(), !runtime_strings_are_immutable())
     }
