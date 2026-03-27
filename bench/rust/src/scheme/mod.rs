@@ -20,6 +20,7 @@ fn gensym(prefix: &str) -> String {
 
 type Frame = Rc<RefCell<HashMap<String, Value>>>;
 type Env = Vec<Frame>;
+type CaseClause = (Vec<String>, Option<String>, Vec<Expr>, Env);
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Span {
@@ -49,6 +50,7 @@ enum Value {
         type_tag: String,
         fields: Vec<(String, Value)>,
     },
+    CaseLambda(Vec<CaseClause>),
 }
 
 fn num_gcd(mut a: i64, mut b: i64) -> i64 {
@@ -112,6 +114,7 @@ impl fmt::Display for Value {
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Record { type_tag, .. } => write!(f, "#<record:{type_tag}>"),
+            Value::CaseLambda(..) => write!(f, "#<procedure>"),
         }
     }
 }
@@ -405,6 +408,7 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
                     "if" => return eval_if(&items[1..], env, output),
                     "quote" => return eval_quote(&items[1..]),
                     "lambda" => return eval_lambda(&items[1..], env),
+                    "case-lambda" => return eval_case_lambda(&items[1..], env),
                     "and" => return eval_and(&items[1..], env, output),
                     "or" => return eval_or(&items[1..], env, output),
                     "let" => return eval_let(&items[1..], env, output),
@@ -459,6 +463,22 @@ fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value
                 result = eval(expr, &mut new_env, output)?;
             }
             Ok(result)
+        }
+        Value::CaseLambda(clauses) => {
+            for (params, rest, body, closure_env) in clauses {
+                let matches = if rest.is_some() {
+                    args.len() >= params.len()
+                } else {
+                    args.len() == params.len()
+                };
+                if matches {
+                    let proc = Value::Procedure(params.clone(), rest.clone(), body.clone(), closure_env.clone());
+                    return apply_proc(&proc, args, output);
+                }
+            }
+            Err(EvalError::Arity(format!(
+                "case-lambda: no matching clause for {} arguments", args.len()
+            )))
         }
         Value::Builtin(name) => eval_builtin(name, args, output),
         _ => Err(EvalError::Type("not a procedure".into())),
@@ -580,6 +600,25 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     Ok(Value::Procedure(params, rest, body, env.clone()))
 }
 
+fn eval_case_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut clauses = Vec::new();
+    for clause in args {
+        match &clause.kind {
+            ExprKind::List(items) if items.len() >= 2 => {
+                let (params, rest) = match &items[0].kind {
+                    ExprKind::List(param_items) => parse_params(param_items)?,
+                    ExprKind::Symbol(s) => (vec![], Some(s.clone())),
+                    _ => return Err(EvalError::Type("case-lambda: expected parameter list".into())),
+                };
+                let body = items[1..].to_vec();
+                clauses.push((params, rest, body, env.clone()));
+            }
+            _ => return Err(EvalError::Type("case-lambda: invalid clause".into())),
+        }
+    }
+    Ok(Value::CaseLambda(clauses))
+}
+
 fn eval_and(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     let mut result = Value::Boolean(true);
     for a in args {
@@ -622,7 +661,8 @@ fn is_builtin(op: &str) -> bool {
         | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
         | "char=?" | "char<?"
         | "string=?" | "string<?" | "string-ci=?"
-        | "string-upcase" | "string-downcase")
+        | "string-upcase" | "string-downcase"
+        | "procedure?")
 }
 
 fn display_value(v: &Value) -> String {
@@ -1084,7 +1124,7 @@ fn find_ellipsis_var(template: &Expr, bindings: &HashMap<String, MacroBinding>) 
 fn is_special_form(s: &str) -> bool {
     matches!(
         s,
-        "define" | "set!" | "if" | "quote" | "lambda" | "and" | "or" | "let" | "begin" | "cond"
+        "define" | "set!" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "begin" | "cond"
             | "define-syntax" | "syntax-rules" | "define-record-type"
     )
 }

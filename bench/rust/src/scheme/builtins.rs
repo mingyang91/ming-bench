@@ -15,7 +15,8 @@ pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Val
         "map" | "apply" => eval_higher_order(op, args, output),
 
         "not" | "eq?" | "equal?" | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
-        | "char?" | "integer?" | "rational?" | "exact?" | "inexact?" => eval_predicate(op, args),
+        | "char?" | "integer?" | "rational?" | "exact?" | "inexact?"
+        | "procedure?" => eval_predicate(op, args),
 
         "exact->inexact" | "inexact->exact" | "numerator" | "denominator" => {
             eval_number_conversion(op, args)
@@ -579,6 +580,15 @@ fn eval_predicate(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 return Err(EvalError::Arity("char? requires 1 argument".into()));
             }
             Ok(Value::Boolean(matches!(&args[0], Value::Char(_))))
+        }
+        "procedure?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("procedure? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::Procedure(..) | Value::Builtin(_) | Value::CaseLambda(_)
+            )))
         }
         _ => unreachable!(),
     }
