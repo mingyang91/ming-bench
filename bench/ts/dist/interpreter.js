@@ -5,6 +5,7 @@ const VOID = { kind: 'void' };
 const CORE_SYNTAX = new Set([
     'and',
     'begin',
+    'case-lambda',
     'cond',
     'define',
     'define-record-type',
@@ -739,6 +740,7 @@ function createBuiltins(output, macroEnv) {
         builtin('odd?', (args) => integerPredicate('odd?', args, (value) => num.numericIsOdd(value))),
         builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
         builtin('positive?', (args) => numberPredicate('positive?', args, (value) => num.numericIsPositive(value))),
+        builtin('procedure?', (args) => unaryPredicate('procedure?', args, isProcedure)),
         builtin('quotient', (args) => quotientNumbers(args)),
         builtin('rational?', (args) => unaryPredicate('rational?', args, (value) => num.isNumericValue(value))),
         builtin('remainder', (args) => remainderNumbers(args)),
@@ -884,6 +886,8 @@ function evalList(expr, env, macroEnv) {
                 return evalAnd(items.slice(1), env, macroEnv);
             case 'begin':
                 return evalSequence(items.slice(1), env, macroEnv);
+            case 'case-lambda':
+                return evalCaseLambda(items.slice(1), env);
             case 'cond':
                 return evalCond(items.slice(1), env, macroEnv);
             case 'define':
@@ -1065,6 +1069,14 @@ function evalIf(args, env, macroEnv) {
         ? evalExpr(thenExpr, env, macroEnv)
         : evalExpr(elseExpr, env, macroEnv);
 }
+function evalCaseLambda(args, env) {
+    assertAtLeastArity('case-lambda', args, 1);
+    return {
+        kind: 'case-lambda',
+        clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr)),
+        env,
+    };
+}
 function evalLambda(args, env) {
     assertAtLeastArity('lambda', args, 2);
     const paramsExpr = args[0];
@@ -1126,6 +1138,16 @@ function parseFormals(expr) {
         throw new EvalError('lambda expects a parameter list');
     }
     return parseParamItems(expr.items);
+}
+function parseCaseLambdaClause(expr) {
+    if (expr.kind !== 'list' || expr.items.length < 2) {
+        throw new EvalError('case-lambda clauses must be of the form (formals body ...)');
+    }
+    const [paramsExpr, ...body] = expr.items;
+    return {
+        params: parseFormals(paramsExpr),
+        body,
+    };
 }
 function parseParamItems(items) {
     const required = [];
@@ -1225,19 +1247,29 @@ function applyProcedure(proc, args, position, macroEnv) {
         if (proc.kind === 'builtin') {
             return proc.apply(args, position);
         }
-        assertProcedureArity(proc.name ?? 'lambda', args, proc.params);
-        const callEnv = new Env(proc.env);
-        proc.params.required.forEach((param, index) => {
-            callEnv.define(param, args[index]);
-        });
-        if (proc.params.rest !== undefined) {
-            callEnv.define(proc.params.rest, makeList(args.slice(proc.params.required.length)));
+        if (proc.kind === 'lambda') {
+            return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv);
         }
-        return evalSequence(proc.body, callEnv, macroEnv);
+        const clause = proc.clauses.find((candidate) => procedureArityMatches(args, candidate.params));
+        if (clause === undefined) {
+            throw new EvalError(`${proc.name ?? 'case-lambda'} has no matching clause for ${args.length} argument(s)`);
+        }
+        return applyProcedureClause(proc.name ?? 'case-lambda', proc.env, clause, args, macroEnv);
     }
     catch (error) {
         throw attachPosition(error, position);
     }
+}
+function applyProcedureClause(name, env, clause, args, macroEnv) {
+    assertProcedureArity(name, args, clause.params);
+    const callEnv = new Env(env);
+    clause.params.required.forEach((param, index) => {
+        callEnv.define(param, args[index]);
+    });
+    if (clause.params.rest !== undefined) {
+        callEnv.define(clause.params.rest, makeList(args.slice(clause.params.required.length)));
+    }
+    return evalSequence(clause.body, callEnv, macroEnv);
 }
 function builtin(name, apply) {
     return [name, { kind: 'builtin', name, apply }];
@@ -1479,6 +1511,12 @@ function assertProcedureArity(name, args, params) {
     }
     assertAtLeastArity(name, args, params.required.length);
 }
+function procedureArityMatches(args, params) {
+    if (params.rest === undefined) {
+        return args.length === params.required.length;
+    }
+    return args.length >= params.required.length;
+}
 function listRefBuiltin(args) {
     assertExactArity('list-ref', args, 2);
     const tail = listTailValue('list-ref', args[0], expectIndex('list-ref', args[1]));
@@ -1626,6 +1664,8 @@ function formatValueWithMode(value, mode) {
             return `#<procedure:${value.name}>`;
         case 'lambda':
             return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+        case 'case-lambda':
+            return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
     }
 }
 function formatPairContents(pair, mode) {
@@ -1716,7 +1756,9 @@ function isTruthy(value) {
     return value !== false;
 }
 function isProcedure(value) {
-    return typeof value === 'object' && value !== null && (value.kind === 'builtin' || value.kind === 'lambda');
+    return (typeof value === 'object' &&
+        value !== null &&
+        (value.kind === 'builtin' || value.kind === 'lambda' || value.kind === 'case-lambda'));
 }
 function isPair(value) {
     return typeof value === 'object' && value !== null && value.kind === 'pair';

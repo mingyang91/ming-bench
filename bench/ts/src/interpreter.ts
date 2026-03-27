@@ -42,11 +42,21 @@ type ParamSpec = {
   required: string[];
   rest?: string;
 };
+type ProcedureClause = {
+  params: ParamSpec;
+  body: Expr[];
+};
 type UserProc = {
   kind: 'lambda';
   name?: string;
   params: ParamSpec;
   body: Expr[];
+  env: Env;
+};
+type CaseLambdaProc = {
+  kind: 'case-lambda';
+  name?: string;
+  clauses: ProcedureClause[];
   env: Env;
 };
 type RecordFieldSpec = {
@@ -76,7 +86,8 @@ type Value =
   | RecordValue
   | VoidValue
   | BuiltinProc
-  | UserProc;
+  | UserProc
+  | CaseLambdaProc;
 
 type BindingSpec = { name: string; init: Expr };
 type Cell = { value: Value };
@@ -86,6 +97,7 @@ const VOID: VoidValue = { kind: 'void' };
 const CORE_SYNTAX = new Set([
   'and',
   'begin',
+  'case-lambda',
   'cond',
   'define',
   'define-record-type',
@@ -984,6 +996,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('odd?', (args) => integerPredicate('odd?', args, (value) => num.numericIsOdd(value))),
     builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
     builtin('positive?', (args) => numberPredicate('positive?', args, (value) => num.numericIsPositive(value))),
+    builtin('procedure?', (args) => unaryPredicate('procedure?', args, isProcedure)),
     builtin('quotient', (args) => quotientNumbers(args)),
     builtin('rational?', (args) => unaryPredicate('rational?', args, (value) => num.isNumericValue(value))),
     builtin('remainder', (args) => remainderNumbers(args)),
@@ -1146,6 +1159,8 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
         return evalAnd(items.slice(1), env, macroEnv);
       case 'begin':
         return evalSequence(items.slice(1), env, macroEnv);
+      case 'case-lambda':
+        return evalCaseLambda(items.slice(1), env);
       case 'cond':
         return evalCond(items.slice(1), env, macroEnv);
       case 'define':
@@ -1360,6 +1375,16 @@ function evalIf(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
     : evalExpr(elseExpr!, env, macroEnv);
 }
 
+function evalCaseLambda(args: Expr[], env: Env): Value {
+  assertAtLeastArity('case-lambda', args, 1);
+
+  return {
+    kind: 'case-lambda',
+    clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr)),
+    env,
+  };
+}
+
 function evalLambda(args: Expr[], env: Env): Value {
   assertAtLeastArity('lambda', args, 2);
 
@@ -1437,6 +1462,18 @@ function parseFormals(expr: Expr): ParamSpec {
   }
 
   return parseParamItems(expr.items);
+}
+
+function parseCaseLambdaClause(expr: Expr): ProcedureClause {
+  if (expr.kind !== 'list' || expr.items.length < 2) {
+    throw new EvalError('case-lambda clauses must be of the form (formals body ...)');
+  }
+
+  const [paramsExpr, ...body] = expr.items;
+  return {
+    params: parseFormals(paramsExpr!),
+    body,
+  };
 }
 
 function parseParamItems(items: Expr[]): ParamSpec {
@@ -1557,7 +1594,7 @@ function quoteExpr(expr: Expr): Value {
 }
 
 function applyProcedure(
-  proc: BuiltinProc | UserProc,
+  proc: BuiltinProc | UserProc | CaseLambdaProc,
   args: Value[],
   position: SourcePosition,
   macroEnv: MacroEnv,
@@ -1567,20 +1604,39 @@ function applyProcedure(
       return proc.apply(args, position);
     }
 
-    assertProcedureArity(proc.name ?? 'lambda', args, proc.params);
-
-    const callEnv = new Env(proc.env);
-    proc.params.required.forEach((param, index) => {
-      callEnv.define(param, args[index]!);
-    });
-    if (proc.params.rest !== undefined) {
-      callEnv.define(proc.params.rest, makeList(args.slice(proc.params.required.length)));
+    if (proc.kind === 'lambda') {
+      return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv);
     }
 
-    return evalSequence(proc.body, callEnv, macroEnv);
+    const clause = proc.clauses.find((candidate) => procedureArityMatches(args, candidate.params));
+    if (clause === undefined) {
+      throw new EvalError(`${proc.name ?? 'case-lambda'} has no matching clause for ${args.length} argument(s)`);
+    }
+
+    return applyProcedureClause(proc.name ?? 'case-lambda', proc.env, clause, args, macroEnv);
   } catch (error) {
     throw attachPosition(error, position);
   }
+}
+
+function applyProcedureClause(
+  name: string,
+  env: Env,
+  clause: ProcedureClause,
+  args: Value[],
+  macroEnv: MacroEnv,
+): Value {
+  assertProcedureArity(name, args, clause.params);
+
+  const callEnv = new Env(env);
+  clause.params.required.forEach((param, index) => {
+    callEnv.define(param, args[index]!);
+  });
+  if (clause.params.rest !== undefined) {
+    callEnv.define(clause.params.rest, makeList(args.slice(clause.params.required.length)));
+  }
+
+  return evalSequence(clause.body, callEnv, macroEnv);
 }
 
 function builtin(name: string, apply: (args: Value[], position: SourcePosition) => Value): [string, BuiltinProc] {
@@ -1915,6 +1971,14 @@ function assertProcedureArity(name: string, args: readonly unknown[], params: Pa
   assertAtLeastArity(name, args, params.required.length);
 }
 
+function procedureArityMatches(args: readonly unknown[], params: ParamSpec): boolean {
+  if (params.rest === undefined) {
+    return args.length === params.required.length;
+  }
+
+  return args.length >= params.required.length;
+}
+
 function listRefBuiltin(args: Value[]): Value {
   assertExactArity('list-ref', args, 2);
   const tail = listTailValue('list-ref', args[0]!, expectIndex('list-ref', args[1]!));
@@ -2093,6 +2157,8 @@ function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
       return `#<procedure:${value.name}>`;
     case 'lambda':
       return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+    case 'case-lambda':
+      return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
   }
 }
 
@@ -2208,8 +2274,12 @@ function isTruthy(value: Value): boolean {
   return value !== false;
 }
 
-function isProcedure(value: Value): value is BuiltinProc | UserProc {
-  return typeof value === 'object' && value !== null && (value.kind === 'builtin' || value.kind === 'lambda');
+function isProcedure(value: Value): value is BuiltinProc | UserProc | CaseLambdaProc {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value.kind === 'builtin' || value.kind === 'lambda' || value.kind === 'case-lambda')
+  );
 }
 
 function isPair(value: Value): value is PairValue {
