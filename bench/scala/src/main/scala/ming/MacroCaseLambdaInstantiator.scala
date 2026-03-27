@@ -84,20 +84,38 @@ private[ming] object MacroCaseLambdaInstantiator:
     instantiateTemplate: Instantiator
   ): (Expr, MacroInstantiationState) =
     clause match
-      case ListExpr(parameterSpec :: body, clausePosition) if body.nonEmpty =>
-        val (instantiatedParameterSpec, introducedBindings, afterParameters) =
-          MacroInstantiationSupport.instantiateBinderSpec(parameterSpec, context, state)
-        val (instantiatedBody, afterBody) =
-          MacroInstantiationSupport.instantiateExpressions(
-            body,
-            context.inScope(introducedBindings),
-            afterParameters,
-            instantiateTemplate
-          )
-        (
-          ListExpr(instantiatedParameterSpec :: instantiatedBody, clausePosition),
-          afterBody
-        )
+      case ListExpr(items, clausePosition) =>
+        val decoded =
+          ListExprSupport.decode(items, clausePosition, "macro expansion produced an invalid case-lambda clause")
+        decoded.items match
+          case parameterSpec :: body if body.nonEmpty || decoded.tail.nonEmpty =>
+            val (instantiatedParameterSpec, introducedBindings, afterParameters) =
+              MacroInstantiationSupport.instantiateBinderSpec(parameterSpec, context, state)
+            val (instantiatedBody, afterBody) =
+              MacroInstantiationSupport.instantiateProperListTemplate(
+                body,
+                decoded.tail,
+                clausePosition,
+                "macro expansion produced an invalid case-lambda body",
+                context.inScope(introducedBindings),
+                afterParameters,
+                instantiateTemplate
+              )
+            if instantiatedBody.isEmpty then
+              SchemeFailure.raise(
+                "macro expansion produced an invalid case-lambda clause",
+                clausePosition
+              )
+
+            (
+              ListExpr(instantiatedParameterSpec :: instantiatedBody, clausePosition),
+              afterBody
+            )
+          case _ =>
+            SchemeFailure.raise(
+              "macro expansion produced an invalid case-lambda clause",
+              clause.position
+            )
       case _ =>
         SchemeFailure.raise(
           "macro expansion produced an invalid case-lambda clause",

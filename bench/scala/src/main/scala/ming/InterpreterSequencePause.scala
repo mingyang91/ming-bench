@@ -20,6 +20,7 @@ private[ming] object InterpreterSequencePause:
     "letrec",
     "letrec*",
     "or",
+    "quasiquote",
     "quote",
     "set!",
     "syntax",

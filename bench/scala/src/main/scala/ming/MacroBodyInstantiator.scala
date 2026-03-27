@@ -22,6 +22,7 @@ private[ming] object MacroBodyInstantiator:
       List[Expr],
       Position,
       List[Expr],
+      Option[Expr],
       Position,
       MacroInstantiationContext,
       MacroInstantiationState
@@ -33,11 +34,30 @@ private[ming] object MacroBodyInstantiator:
     state: MacroInstantiationState,
     instantiateTemplate: TemplateInstantiator,
     instantiateValueDefine: ValueDefineInstantiator,
-    instantiateProcedureDefine: ProcedureDefineInstantiator
+    instantiateProcedureDefine: ProcedureDefineInstantiator,
+    tailExpression: Option[Expr] = None
   ): (List[Expr], MacroInstantiationState) =
     expressions match
       case Nil =>
-        (Nil, state)
+        tailExpression match
+          case Some(tailTemplate) =>
+            val (instantiatedTail, nextState) =
+              instantiateTemplate(tailTemplate, context, state)
+            val tailExpressions =
+              ListExprSupport.requireProperList(
+                instantiatedTail,
+                "macro expansion produced an invalid body"
+              )
+            instantiate(
+              tailExpressions,
+              context,
+              nextState,
+              instantiateTemplate,
+              instantiateValueDefine,
+              instantiateProcedureDefine
+            )
+          case None =>
+            (Nil, state)
       case expression :: rest =>
         val (instantiatedExpression, introducedBindings, nextState) =
           instantiateExpression(
@@ -55,7 +75,8 @@ private[ming] object MacroBodyInstantiator:
             nextState,
             instantiateTemplate,
             instantiateValueDefine,
-            instantiateProcedureDefine
+            instantiateProcedureDefine,
+            tailExpression
           )
         (instantiatedExpression :: instantiatedRest, finalState)
 
@@ -68,31 +89,36 @@ private[ming] object MacroBodyInstantiator:
     instantiateProcedureDefine: ProcedureDefineInstantiator
   ): (Expr, Map[String, String], MacroInstantiationState) =
     expression match
-      case ListExpr(
-            SymbolExpr("define", keywordPosition) ::
-            ListExpr(nameTemplate :: parameters, parameterPosition) ::
-            body,
-            position
-          ) if body.nonEmpty =>
-        instantiateProcedureDefine(
-          keywordPosition,
-          nameTemplate,
-          parameters,
-          parameterPosition,
-          body,
-          position,
-          context,
-          state
-        )
-      case ListExpr(SymbolExpr("define", keywordPosition) :: nameTemplate :: value :: Nil, position) =>
-        instantiateValueDefine(
-          keywordPosition,
-          nameTemplate,
-          value,
-          position,
-          context,
-          state
-        )
+      case ListExpr(items, position) =>
+        val decoded = ListExprSupport.decode(items, position, "macro expansion")
+        decoded.items match
+          case SymbolExpr("define", keywordPosition) ::
+              ListExpr(nameTemplate :: parameters, parameterPosition) ::
+              body if body.nonEmpty || decoded.tail.nonEmpty =>
+            instantiateProcedureDefine(
+              keywordPosition,
+              nameTemplate,
+              parameters,
+              parameterPosition,
+              body,
+              decoded.tail,
+              position,
+              context,
+              state
+            )
+          case SymbolExpr("define", keywordPosition) :: nameTemplate :: value :: Nil if decoded.tail.isEmpty =>
+            instantiateValueDefine(
+              keywordPosition,
+              nameTemplate,
+              value,
+              position,
+              context,
+              state
+            )
+          case _ =>
+            val (instantiatedExpression, nextState) =
+              instantiateTemplate(expression, context, state)
+            (instantiatedExpression, Map.empty, nextState)
       case _ =>
         val (instantiatedExpression, nextState) =
           instantiateTemplate(expression, context, state)

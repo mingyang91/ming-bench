@@ -1,5 +1,7 @@
 package ming
 
+import scala.collection.mutable
+
 private[ming] object SyntaxSupport:
 
   def parseLiteralIdentifiers(expression: Expr, position: Position): Set[String] =
@@ -48,9 +50,7 @@ private[ming] object SyntaxSupport:
       case EmptyListValue =>
         ListExpr(Nil, position)
       case pair: PairValue =>
-        val elements =
-          RuntimeSupport.expectProperList(pair, "datum->syntax", position)
-        ListExpr(elements.map(datumToExpr(_, position)), position)
+        pairToExpr(pair, position)
       case other =>
         SchemeFailure.raise(
           s"datum->syntax expected a datum, got ${RuntimeSupport.typeName(other)}",
@@ -100,19 +100,36 @@ private[ming] object SyntaxSupport:
                 (Map.empty, Nil)
           case None =>
             (Map.empty, Nil)
-      case ListExpr(items, _) =>
-        items.foldLeft((Map.empty[String, PatternBinding], List.empty[(String, BindingCell)])):
-          case ((collectedBindings, collectedAliases), item) =>
-            val (itemBindings, itemAliases) = collectTemplateBindings(item, env)
+      case ListExpr(items, position) =>
+        val decoded = ListExprSupport.decode(items, position, "syntax template")
+        val (collectedBindings, collectedAliases) =
+          decoded.items.foldLeft((Map.empty[String, PatternBinding], List.empty[(String, BindingCell)])):
+            case ((currentBindings, currentAliases), item) =>
+              val (itemBindings, itemAliases) = collectTemplateBindings(item, env)
+              (
+                mergeBindings(
+                  currentBindings,
+                  itemBindings,
+                  item.position,
+                  "syntax template"
+                ),
+                dedupeAliases(currentAliases ++ itemAliases)
+              )
+
+        decoded.tail match
+          case Some(tailExpression) =>
+            val (tailBindings, tailAliases) = collectTemplateBindings(tailExpression, env)
             (
               mergeBindings(
                 collectedBindings,
-                itemBindings,
-                item.position,
+                tailBindings,
+                tailExpression.position,
                 "syntax template"
               ),
-              dedupeAliases(collectedAliases ++ itemAliases)
+              dedupeAliases(collectedAliases ++ tailAliases)
             )
+          case None =>
+            (collectedBindings, collectedAliases)
       case _ =>
         (Map.empty, Nil)
 
@@ -183,3 +200,27 @@ private[ming] object SyntaxSupport:
     aliases.foldLeft(List.empty[(String, BindingCell)]):
       case (current, alias @ (name, _)) =>
         if current.exists(_._1 == name) then current else current :+ alias
+
+  private def pairToExpr(
+    pair: PairValue,
+    position: Position
+  ): Expr =
+    val elements = Vector.newBuilder[Expr]
+    val visited  = mutable.HashSet.empty[PairValue]
+
+    var current: Value = pair
+    while true do
+      current match
+        case currentPair: PairValue =>
+          if visited.contains(currentPair) then SchemeFailure.raise("datum->syntax expected a finite datum", position)
+
+          visited += currentPair
+          elements += datumToExpr(currentPair.car, position)
+          current = currentPair.cdr
+        case EmptyListValue =>
+          return ListExpr(elements.result().toList, position)
+        case other =>
+          val tailExpr = datumToExpr(other, position)
+          return ListExprSupport.build(elements.result().toList, Some(tailExpr), position, "datum->syntax")
+
+    throw new IllegalStateException("unreachable pair conversion")

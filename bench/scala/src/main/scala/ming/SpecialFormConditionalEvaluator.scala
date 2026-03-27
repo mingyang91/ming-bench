@@ -127,8 +127,26 @@ private[ming] object SpecialFormConditionalEvaluator:
     body match
       case Nil =>
         InterpreterEvaluator.done(testValue, continuation)
+      case SymbolExpr("=>", _) :: recipient :: Nil =>
+        evalCondRecipientClause(recipient, testValue, env, continuation)
+      case SymbolExpr("=>", arrowPosition) :: Nil =>
+        SchemeFailure.raise("cond => clause must have a recipient", arrowPosition)
+      case SymbolExpr("=>", _) :: _ =>
+        SchemeFailure.raise("cond => clause must have exactly one recipient", body.head.position)
       case _ =>
         InterpreterEvaluator.deferSequence(body, env, continuation)
+
+  private def evalCondRecipientClause(
+    recipient: Expr,
+    testValue: Value,
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
+    InterpreterEvaluator.deferExpr(
+      recipient,
+      env,
+      procedure => InterpreterEvaluator.deferApplication(procedure, List(testValue), recipient.position, continuation)
+    )
 
   private def evalCaseClauses(
     key: Value,

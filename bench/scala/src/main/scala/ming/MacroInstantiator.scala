@@ -2,6 +2,9 @@ package ming
 
 private[ming] object MacroInstantiator:
 
+  private lazy val defineInstantiator =
+    new MacroDefineInstantiator(instantiateTemplate)
+
   def instantiate(
     template: Expr,
     bindings: Map[String, PatternBinding],
@@ -37,9 +40,33 @@ private[ming] object MacroInstantiator:
     template match
       case quoted @ ListExpr(List(SymbolExpr("quote", _), _), _) =>
         (quoted, state)
-      case ListExpr(SymbolExpr("lambda", keywordPosition) :: parameterSpec :: body, position) if body.nonEmpty =>
-        instantiateLambda(keywordPosition, parameterSpec, body, position, context, state)
-      case ListExpr(SymbolExpr("case-lambda", keywordPosition) :: clauses, position) =>
+      case ListExpr(items, position) =>
+        instantiateListExpr(items, position, context, state)
+      case SymbolExpr(name, position) =>
+        MacroInstantiationHygiene.instantiateSymbol(name, position, context, state)
+      case _ =>
+        (template, state)
+
+  private def instantiateListExpr(
+    items: List[Expr],
+    position: Position,
+    context: MacroInstantiationContext,
+    state: MacroInstantiationState
+  ): (Expr, MacroInstantiationState) =
+    val decoded = ListExprSupport.decode(items, position, "macro template")
+
+    decoded.items match
+      case SymbolExpr("lambda", keywordPosition) :: parameterSpec :: body if body.nonEmpty || decoded.tail.nonEmpty =>
+        instantiateLambda(
+          keywordPosition,
+          parameterSpec,
+          body,
+          decoded.tail,
+          position,
+          context,
+          state
+        )
+      case SymbolExpr("case-lambda", keywordPosition) :: clauses if decoded.tail.isEmpty =>
         MacroCaseLambdaInstantiator.instantiate(
           keywordPosition,
           clauses,
@@ -48,45 +75,49 @@ private[ming] object MacroInstantiator:
           state,
           instantiateTemplate
         )
-      case ListExpr(
-            SymbolExpr("let", keywordPosition) ::
-            (nameTemplate @ SymbolExpr(_, _)) ::
-            bindingList ::
-            body,
-            position
-          ) if body.nonEmpty =>
+      case SymbolExpr("let", keywordPosition) ::
+          (nameTemplate @ SymbolExpr(_, _)) ::
+          bindingList ::
+          body if body.nonEmpty || decoded.tail.nonEmpty =>
         instantiateNamedLet(
           keywordPosition,
           nameTemplate,
           bindingList,
           body,
+          decoded.tail,
           position,
           context,
           state
         )
-      case ListExpr(SymbolExpr("let", keywordPosition) :: bindingList :: body, position) if body.nonEmpty =>
-        instantiateLet(keywordPosition, bindingList, body, position, context, state)
-      case ListExpr(
-            SymbolExpr("define", keywordPosition) ::
-            ListExpr(nameTemplate :: parameters, parameterPosition) ::
-            body,
-            position
-          ) if body.nonEmpty =>
+      case SymbolExpr("let", keywordPosition) :: bindingList :: body if body.nonEmpty || decoded.tail.nonEmpty =>
+        instantiateLet(
+          keywordPosition,
+          bindingList,
+          body,
+          decoded.tail,
+          position,
+          context,
+          state
+        )
+      case SymbolExpr("define", keywordPosition) ::
+          ListExpr(nameTemplate :: parameters, parameterPosition) ::
+          body if body.nonEmpty || decoded.tail.nonEmpty =>
         val (instantiatedDefine, _, nextState) =
-          instantiateProcedureDefine(
+          defineInstantiator.instantiateProcedure(
             keywordPosition,
             nameTemplate,
             parameters,
             parameterPosition,
             body,
+            decoded.tail,
             position,
             context,
             state
           )
         (instantiatedDefine, nextState)
-      case ListExpr(SymbolExpr("define", keywordPosition) :: nameTemplate :: value :: Nil, position) =>
+      case SymbolExpr("define", keywordPosition) :: nameTemplate :: value :: Nil if decoded.tail.isEmpty =>
         val (instantiatedDefine, _, nextState) =
-          instantiateValueDefine(
+          defineInstantiator.instantiateValue(
             keywordPosition,
             nameTemplate,
             value,
@@ -95,24 +126,22 @@ private[ming] object MacroInstantiator:
             state
           )
         (instantiatedDefine, nextState)
-      case ListExpr(items, position) =>
-        val (instantiatedItems, nextState) =
-          MacroInstantiationSupport.instantiateListItems(
-            items,
-            context,
-            state,
-            instantiateTemplate
-          )
-        (ListExpr(instantiatedItems, position), nextState)
-      case SymbolExpr(name, position) =>
-        MacroInstantiationHygiene.instantiateSymbol(name, position, context, state)
       case _ =>
-        (template, state)
+        MacroInstantiationSupport.instantiateListTemplate(
+          decoded.items,
+          decoded.tail,
+          position,
+          "macro expansion",
+          context,
+          state,
+          instantiateTemplate
+        )
 
   private def instantiateLambda(
     keywordPosition: Position,
     parameterSpec: Expr,
     body: List[Expr],
+    bodyTail: Option[Expr],
     position: Position,
     context: MacroInstantiationContext,
     state: MacroInstantiationState
@@ -125,9 +154,11 @@ private[ming] object MacroInstantiator:
         context.inScope(introducedBindings),
         afterParameters,
         instantiateTemplate,
-        instantiateValueDefine,
-        instantiateProcedureDefine
+        defineInstantiator.instantiateValue,
+        defineInstantiator.instantiateProcedure,
+        bodyTail
       )
+    if instantiatedBody.isEmpty then SchemeFailure.raise("macro expansion produced an invalid lambda form", position)
     (
       ListExpr(
         SymbolExpr("lambda", keywordPosition) :: instantiatedParameterSpec :: instantiatedBody,
@@ -141,6 +172,7 @@ private[ming] object MacroInstantiator:
     nameTemplate: Expr,
     bindingList: Expr,
     body: List[Expr],
+    bodyTail: Option[Expr],
     position: Position,
     context: MacroInstantiationContext,
     state: MacroInstantiationState
@@ -155,9 +187,11 @@ private[ming] object MacroInstantiator:
         context.inScope(nameBinding),
         afterBindings,
         instantiateTemplate,
-        instantiateValueDefine,
-        instantiateProcedureDefine
+        defineInstantiator.instantiateValue,
+        defineInstantiator.instantiateProcedure,
+        bodyTail
       )
+    if instantiatedBody.isEmpty then SchemeFailure.raise("macro expansion produced an invalid let form", position)
     (
       ListExpr(
         SymbolExpr("let", keywordPosition) ::
@@ -173,6 +207,7 @@ private[ming] object MacroInstantiator:
     keywordPosition: Position,
     bindingList: Expr,
     body: List[Expr],
+    bodyTail: Option[Expr],
     position: Position,
     context: MacroInstantiationContext,
     state: MacroInstantiationState
@@ -190,73 +225,15 @@ private[ming] object MacroInstantiator:
         context.inScope(introducedBindings),
         afterBindings,
         instantiateTemplate,
-        instantiateValueDefine,
-        instantiateProcedureDefine
+        defineInstantiator.instantiateValue,
+        defineInstantiator.instantiateProcedure,
+        bodyTail
       )
+    if instantiatedBody.isEmpty then SchemeFailure.raise("macro expansion produced an invalid let form", position)
     (
       ListExpr(
         SymbolExpr("let", keywordPosition) :: instantiatedBindingList :: instantiatedBody,
         position
       ),
-      afterBody
-    )
-
-  private def instantiateValueDefine(
-    keywordPosition: Position,
-    nameTemplate: Expr,
-    value: Expr,
-    position: Position,
-    context: MacroInstantiationContext,
-    state: MacroInstantiationState
-  ): (Expr, Map[String, String], MacroInstantiationState) =
-    val (instantiatedName, introducedBindings, afterName) =
-      MacroInstantiationSupport.instantiateBinder(nameTemplate, context, state)
-    val (instantiatedValue, afterValue) =
-      instantiateTemplate(value, context, afterName)
-    (
-      ListExpr(
-        List(
-          SymbolExpr("define", keywordPosition),
-          instantiatedName,
-          instantiatedValue
-        ),
-        position
-      ),
-      introducedBindings,
-      afterValue
-    )
-
-  private def instantiateProcedureDefine(
-    keywordPosition: Position,
-    nameTemplate: Expr,
-    parameters: List[Expr],
-    parameterPosition: Position,
-    body: List[Expr],
-    position: Position,
-    context: MacroInstantiationContext,
-    state: MacroInstantiationState
-  ): (Expr, Map[String, String], MacroInstantiationState) =
-    val (instantiatedName, nameBinding, afterName) =
-      MacroInstantiationSupport.instantiateBinder(nameTemplate, context, state)
-    val (instantiatedParameters, parameterBindings, afterParameters) =
-      MacroInstantiationSupport.instantiateBinderList(parameters, context, afterName)
-    val bodyContext = context.inScope(nameBinding ++ parameterBindings)
-    val (instantiatedBody, afterBody) =
-      MacroBodyInstantiator.instantiate(
-        body,
-        bodyContext,
-        afterParameters,
-        instantiateTemplate,
-        instantiateValueDefine,
-        instantiateProcedureDefine
-      )
-    (
-      ListExpr(
-        SymbolExpr("define", keywordPosition) ::
-          ListExpr(instantiatedName :: instantiatedParameters, parameterPosition) ::
-          instantiatedBody,
-        position
-      ),
-      nameBinding,
       afterBody
     )

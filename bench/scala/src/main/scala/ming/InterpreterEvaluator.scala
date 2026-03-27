@@ -164,6 +164,8 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalLetrec(rest, position, env, continuation)
       case SymbolExpr("letrec*", _) :: rest =>
         SpecialFormEvaluator.evalLetrecStar(rest, position, env, continuation)
+      case SymbolExpr("quasiquote", _) :: rest if env.lookupMacro("quasiquote").isEmpty =>
+        SpecialFormEvaluator.evalQuasiquote(rest, position, env, continuation)
       case SymbolExpr("quote", _) :: rest =>
         SpecialFormEvaluator.evalQuote(rest, position, continuation)
       case SymbolExpr("lambda", _) :: rest =>

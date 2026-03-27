@@ -97,6 +97,14 @@ private[ming] object SpecialFormEvaluator:
       continuation
     )
 
+  def evalQuasiquote(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
+    SpecialFormQuoteEvaluator.evalQuasiquote(arguments, position, env, continuation)
+
   def evalLambda(
     arguments: List[Expr],
     position: Position,

@@ -133,8 +133,15 @@ private[ming] object Level1ListBuiltins:
     IntValue(expectProperList(value, "length", position).length)
 
   private def append(arguments: List[Value], position: Position): Value =
-    val elements = arguments.flatMap(argument => expectProperList(argument, "append", position))
-    buildList(elements)
+    arguments match
+      case Nil =>
+        EmptyListValue
+      case last :: Nil =>
+        last
+      case _ =>
+        val prefixElements =
+          arguments.dropRight(1).flatMap(argument => expectProperList(argument, "append", position))
+        prefixElements.foldRight(arguments.last)(PairValue(_, _))
 
   private def reverse(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "reverse", position)

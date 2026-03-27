@@ -29,6 +29,11 @@ private[ming] object SchemeParser:
           SchemeFailure.raise("unexpected ')'", start)
         case '\'' =>
           parseQuote(advance(state), start)
+        case '`' =>
+          parseQuasiquote(advance(state), start)
+        case ',' =>
+          if state.nextChar.contains('@') then parseUnquoteSplicing(advance(advance(state)), start)
+          else parseUnquote(advance(state), start)
         case '"' =>
           parseString(advance(state), start)
         case _ =>
@@ -37,6 +42,21 @@ private[ming] object SchemeParser:
   private def parseQuote(state: State, start: Position): (State, Expr) =
     val (nextState, expression) = parseExpr(state)
     (nextState, ListExpr(List(SymbolExpr("quote", start), expression), start))
+
+  private def parseQuasiquote(state: State, start: Position): (State, Expr) =
+    val (nextState, expression) = parseExpr(state)
+    (nextState, ListExpr(List(SymbolExpr("quasiquote", start), expression), start))
+
+  private def parseUnquote(state: State, start: Position): (State, Expr) =
+    val (nextState, expression) = parseExpr(state)
+    (nextState, ListExpr(List(SymbolExpr("unquote", start), expression), start))
+
+  private def parseUnquoteSplicing(state: State, start: Position): (State, Expr) =
+    val (nextState, expression) = parseExpr(state)
+    (
+      nextState,
+      ListExpr(List(SymbolExpr("unquote-splicing", start), expression), start)
+    )
 
   private def parseSyntax(state: State, start: Position): (State, Expr) =
     val (nextState, expression) = parseExpr(state)

@@ -20,11 +20,14 @@ private[ming] object MacroInstantiationHygiene:
     "letrec",
     "letrec*",
     "or",
+    "quasiquote",
     "quote",
     "set!",
     "syntax",
     "syntax-case",
     "syntax-rules",
+    "unquote",
+    "unquote-splicing",
     "with-syntax"
   )
 
@@ -115,8 +118,13 @@ private[ming] object MacroInstantiationHygiene:
           if bindings.contains(name) &&
             remainingRepetitionCount(bindings(name), repetitionContext).nonEmpty =>
         Set(name)
-      case ListExpr(items, _) =>
-        items.filterNot(isEllipsis).flatMap(item => repeatedPatternVariables(item, bindings, repetitionContext)).toSet
+      case ListExpr(items, position) =>
+        val decoded = ListExprSupport.decode(items, position, "macro template")
+        decoded.items
+          .filterNot(isEllipsis)
+          .flatMap(item => repeatedPatternVariables(item, bindings, repetitionContext))
+          .toSet ++
+          decoded.tail.toSet.flatMap(item => repeatedPatternVariables(item, bindings, repetitionContext))
       case _ =>
         Set.empty
 

@@ -180,6 +180,58 @@ private[ming] object MacroInstantiationSupport:
           instantiateListItems(rest, context, afterItem, instantiateTemplate)
         (instantiatedItem :: remaining, nextState)
 
+  def instantiateListTemplate(
+    items: List[Expr],
+    tail: Option[Expr],
+    position: Position,
+    contextDescription: String,
+    context: MacroInstantiationContext,
+    state: MacroInstantiationState,
+    instantiateTemplate: Instantiator
+  ): (Expr, MacroInstantiationState) =
+    val (instantiatedItems, afterItems) =
+      instantiateListItems(items, context, state, instantiateTemplate)
+
+    tail match
+      case Some(tailTemplate) =>
+        val (instantiatedTail, afterTail) =
+          instantiateTemplate(tailTemplate, context, afterItems)
+        (
+          ListExprSupport.build(
+            instantiatedItems,
+            Some(instantiatedTail),
+            position,
+            contextDescription
+          ),
+          afterTail
+        )
+      case None =>
+        (ListExpr(instantiatedItems, position), afterItems)
+
+  def instantiateProperListTemplate(
+    items: List[Expr],
+    tail: Option[Expr],
+    position: Position,
+    contextDescription: String,
+    context: MacroInstantiationContext,
+    state: MacroInstantiationState,
+    instantiateTemplate: Instantiator
+  ): (List[Expr], MacroInstantiationState) =
+    val (instantiatedList, nextState) =
+      instantiateListTemplate(
+        items,
+        tail,
+        position,
+        contextDescription,
+        context,
+        state,
+        instantiateTemplate
+      )
+    (
+      ListExprSupport.requireProperList(instantiatedList, contextDescription),
+      nextState
+    )
+
   private def instantiateRepeatedTemplate(
     template: Expr,
     repetitions: Range,

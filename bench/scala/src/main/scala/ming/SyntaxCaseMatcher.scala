@@ -57,30 +57,65 @@ private[ming] object SyntaxCaseMatcher:
             Some(Map.empty)
           case _ =>
             None
-      case ListExpr(patternItems, _) =>
+      case ListExpr(patternItems, patternPosition) =>
         input match
-          case ListExpr(inputItems, _) =>
-            matchList(patternItems, inputItems, literalIdentifiers)
+          case ListExpr(inputItems, inputPosition) =>
+            val decodedPattern =
+              ListExprSupport.decode(patternItems, patternPosition, "syntax-case pattern")
+            val decodedInput =
+              ListExprSupport.decode(inputItems, inputPosition, "syntax-case input")
+            matchList(
+              decodedPattern.items,
+              decodedPattern.tail,
+              decodedInput.items,
+              decodedInput.tail,
+              inputPosition,
+              literalIdentifiers
+            )
           case _ =>
             None
 
   private def matchList(
     patternItems: List[Expr],
+    patternTail: Option[Expr],
     inputItems: List[Expr],
+    inputTail: Option[Expr],
+    inputPosition: Position,
     literalIdentifiers: Set[String]
   ): Option[Map[String, PatternBinding]] =
     patternItems match
       case Nil =>
-        Option.when(inputItems.isEmpty)(Map.empty)
+        patternTail match
+          case Some(tailPattern) =>
+            matchPattern(
+              tailPattern,
+              ListExprSupport.build(inputItems, inputTail, inputPosition, "syntax-case input"),
+              literalIdentifiers
+            )
+          case None =>
+            Option.when(inputItems.isEmpty && inputTail.isEmpty)(Map.empty)
       case pattern :: SymbolExpr("...", _) :: rest =>
-        matchRepeatedPattern(pattern, rest, inputItems, literalIdentifiers)
+        matchRepeatedPattern(
+          pattern,
+          rest,
+          patternTail,
+          inputItems,
+          inputTail,
+          inputPosition,
+          literalIdentifiers
+        )
       case pattern :: rest =>
         inputItems match
           case input :: remaining =>
             matchPattern(pattern, input, literalIdentifiers).flatMap(firstBindings =>
-              matchList(rest, remaining, literalIdentifiers).flatMap(remainingBindings =>
-                mergeBindings(firstBindings, remainingBindings)
-              )
+              matchList(
+                rest,
+                patternTail,
+                remaining,
+                inputTail,
+                inputPosition,
+                literalIdentifiers
+              ).flatMap(remainingBindings => mergeBindings(firstBindings, remainingBindings))
             )
           case Nil =>
             None
@@ -88,7 +123,10 @@ private[ming] object SyntaxCaseMatcher:
   private def matchRepeatedPattern(
     pattern: Expr,
     rest: List[Expr],
+    patternTail: Option[Expr],
     inputItems: List[Expr],
+    inputTail: Option[Expr],
+    inputPosition: Position,
     literalIdentifiers: Set[String]
   ): Option[Map[String, PatternBinding]] =
     val repeatedVariables = patternVariables(pattern, literalIdentifiers)
@@ -96,7 +134,15 @@ private[ming] object SyntaxCaseMatcher:
       .map(repetitionCount =>
         val (prefix, suffix) = inputItems.splitAt(repetitionCount)
         val repeatedMatches  = matchRepeatedInputs(pattern, prefix, literalIdentifiers)
-        val suffixBindings   = matchList(rest, suffix, literalIdentifiers)
+        val suffixBindings =
+          matchList(
+            rest,
+            patternTail,
+            suffix,
+            inputTail,
+            inputPosition,
+            literalIdentifiers
+          )
         repeatedMatches.flatMap(matches =>
           collectRepeatedBindings(repeatedVariables, matches)
             .flatMap(bindings => suffixBindings.flatMap(otherBindings => mergeBindings(bindings, otherBindings)))
@@ -201,8 +247,13 @@ private[ming] object SyntaxCaseMatcher:
         Set.empty
       case SymbolExpr(name, _) =>
         Set(name)
-      case ListExpr(items, _) =>
-        items.filterNot(isEllipsis).flatMap(item => patternVariables(item, literalIdentifiers)).toSet
+      case ListExpr(items, position) =>
+        val decoded = ListExprSupport.decode(items, position, "syntax-case pattern")
+        decoded.items
+          .filterNot(isEllipsis)
+          .flatMap(item => patternVariables(item, literalIdentifiers))
+          .toSet ++
+          decoded.tail.toSet.flatMap(item => patternVariables(item, literalIdentifiers))
       case _ =>
         Set.empty
 

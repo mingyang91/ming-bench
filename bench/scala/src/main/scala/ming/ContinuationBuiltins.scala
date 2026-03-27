@@ -13,6 +13,9 @@ private[ming] object ContinuationBuiltins:
   private val dynamicWindBuiltin =
     BuiltinValue("dynamic-wind", dynamicWind)
 
+  private val errorBuiltin =
+    BuiltinValue("error", error)
+
   private val raiseBuiltin =
     BuiltinValue("raise", raise)
 
@@ -27,6 +30,7 @@ private[ming] object ContinuationBuiltins:
     "call-with-values"               -> callWithValuesBuiltin,
     "call-with-current-continuation" -> callCcBuiltin,
     "dynamic-wind"                   -> dynamicWindBuiltin,
+    "error"                          -> errorBuiltin,
     "raise"                          -> raiseBuiltin,
     "values"                         -> valuesBuiltin,
     "with-exception-handler"         -> withExceptionHandlerBuiltin
@@ -104,6 +108,15 @@ private[ming] object ContinuationBuiltins:
   ): EvaluationStep =
     val value = expectSingleArgument(arguments, "raise", position)
     ExceptionRuntime.raiseValue(value, position)
+
+  private def error(
+    arguments: List[Value],
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
+    val allArguments = expectAtLeast(arguments, 1, "error", position)
+    val message      = allArguments.iterator.map(_.renderDisplay).mkString
+    ExceptionRuntime.raiseValue(StringValue(message), position)
 
   private def withExceptionHandler(
     arguments: List[Value],
