@@ -1,5 +1,7 @@
 package ming;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -84,6 +86,14 @@ public class Evaluator {
         env.define("map", new BuiltinProcedure("map", this::builtinMap));
         env.define("string?", new BuiltinProcedure("string?", this::builtinStringPredicate));
         env.define("number?", new BuiltinProcedure("number?", this::builtinNumberPredicate));
+        env.define("exact?", new BuiltinProcedure("exact?", this::builtinExactPredicate));
+        env.define("inexact?", new BuiltinProcedure("inexact?", this::builtinInexactPredicate));
+        env.define("integer?", new BuiltinProcedure("integer?", this::builtinIntegerPredicate));
+        env.define("rational?", new BuiltinProcedure("rational?", this::builtinRationalPredicate));
+        env.define("exact->inexact", new BuiltinProcedure("exact->inexact", this::builtinExactToInexact));
+        env.define("inexact->exact", new BuiltinProcedure("inexact->exact", this::builtinInexactToExact));
+        env.define("numerator", new BuiltinProcedure("numerator", this::builtinNumerator));
+        env.define("denominator", new BuiltinProcedure("denominator", this::builtinDenominator));
         env.define("boolean?", new BuiltinProcedure("boolean?", this::builtinBooleanPredicate));
         env.define("pair?", new BuiltinProcedure("pair?", this::builtinPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::builtinSymbolPredicate));
@@ -121,6 +131,9 @@ public class Evaluator {
         try {
             return switch (expr) {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
+                case RationalExpr rationalExpr -> exactFractionToValue(
+                        new ExactFraction(rationalExpr.numerator(), rationalExpr.denominator()));
+                case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
                 case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
                 case StringExpr stringExpr -> new StringValue(stringExpr.value());
                 case CharExpr charExpr -> new CharValue(charExpr.value());
@@ -572,6 +585,11 @@ public class Evaluator {
         return switch (pattern) {
             case IntExpr intExpr -> input instanceof IntExpr other
                     && intExpr.value() == other.value();
+            case RationalExpr rationalExpr -> input instanceof RationalExpr other
+                    && rationalExpr.numerator().equals(other.numerator())
+                    && rationalExpr.denominator().equals(other.denominator());
+            case InexactExpr inexactExpr -> input instanceof InexactExpr other
+                    && inexactExpr.value() == other.value();
             case BoolExpr boolExpr -> input instanceof BoolExpr other
                     && boolExpr.value() == other.value();
             case StringExpr stringExpr -> input instanceof StringExpr other
@@ -689,6 +707,8 @@ public class Evaluator {
             Integer repetitionIndex) throws EvalError {
         return switch (template) {
             case IntExpr ignored -> template;
+            case RationalExpr ignored -> template;
+            case InexactExpr ignored -> template;
             case BoolExpr ignored -> template;
             case StringExpr ignored -> template;
             case CharExpr ignored -> template;
@@ -979,6 +999,9 @@ public class Evaluator {
     private Value quoteToValue(Expr expr) throws EvalError {
         return switch (expr) {
             case IntExpr intExpr -> new IntValue(intExpr.value());
+            case RationalExpr rationalExpr -> exactFractionToValue(
+                    new ExactFraction(rationalExpr.numerator(), rationalExpr.denominator()));
+            case InexactExpr inexactExpr -> new InexactValue(inexactExpr.value());
             case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
             case CharExpr charExpr -> new CharValue(charExpr.value());
@@ -1029,11 +1052,19 @@ public class Evaluator {
     }
 
     private Value builtinAdd(List<Value> args) throws EvalError {
-        long sum = 0;
-        for (Value arg : args) {
-            sum += requireInt(arg);
+        if (containsInexact(args)) {
+            double sum = 0.0;
+            for (Value arg : args) {
+                sum += toInexactDouble(requireNumber(arg));
+            }
+            return new InexactValue(sum);
         }
-        return new IntValue(sum);
+
+        ExactFraction sum = ExactFraction.ZERO;
+        for (Value arg : args) {
+            sum = sum.add(toExactFraction(requireNumber(arg)));
+        }
+        return exactFractionToValue(sum);
     }
 
     private Value builtinSub(List<Value> args) throws EvalError {
@@ -1041,23 +1072,43 @@ public class Evaluator {
             throw new EvalError("'-' expects at least 1 argument");
         }
 
-        long result = requireInt(args.getFirst());
+        if (containsInexact(args)) {
+            double result = toInexactDouble(requireNumber(args.getFirst()));
+            if (args.size() == 1) {
+                return new InexactValue(-result);
+            }
+
+            for (int i = 1; i < args.size(); i++) {
+                result -= toInexactDouble(requireNumber(args.get(i)));
+            }
+            return new InexactValue(result);
+        }
+
+        ExactFraction result = toExactFraction(requireNumber(args.getFirst()));
         if (args.size() == 1) {
-            return new IntValue(-result);
+            return exactFractionToValue(result.negate());
         }
 
         for (int i = 1; i < args.size(); i++) {
-            result -= requireInt(args.get(i));
+            result = result.subtract(toExactFraction(requireNumber(args.get(i))));
         }
-        return new IntValue(result);
+        return exactFractionToValue(result);
     }
 
     private Value builtinMul(List<Value> args) throws EvalError {
-        long product = 1;
-        for (Value arg : args) {
-            product *= requireInt(arg);
+        if (containsInexact(args)) {
+            double product = 1.0;
+            for (Value arg : args) {
+                product *= toInexactDouble(requireNumber(arg));
+            }
+            return new InexactValue(product);
         }
-        return new IntValue(product);
+
+        ExactFraction product = ExactFraction.ONE;
+        for (Value arg : args) {
+            product = product.multiply(toExactFraction(requireNumber(arg)));
+        }
+        return exactFractionToValue(product);
     }
 
     private Value builtinDiv(List<Value> args) throws EvalError {
@@ -1065,20 +1116,36 @@ public class Evaluator {
             throw new EvalError("'/' expects at least 2 arguments");
         }
 
-        long result = requireInt(args.getFirst());
+        if (containsInexact(args)) {
+            double result = toInexactDouble(requireNumber(args.getFirst()));
+            for (int i = 1; i < args.size(); i++) {
+                double divisor = toInexactDouble(requireNumber(args.get(i)));
+                if (divisor == 0.0) {
+                    throw new EvalError("division by zero");
+                }
+                result /= divisor;
+            }
+            return new InexactValue(result);
+        }
+
+        ExactFraction result = toExactFraction(requireNumber(args.getFirst()));
         for (int i = 1; i < args.size(); i++) {
-            long divisor = requireInt(args.get(i));
-            if (divisor == 0) {
+            ExactFraction divisor = toExactFraction(requireNumber(args.get(i)));
+            if (divisor.isZero()) {
                 throw new EvalError("division by zero");
             }
-            result /= divisor;
+            result = result.divide(divisor);
         }
-        return new IntValue(result);
+        return exactFractionToValue(result);
     }
 
     private Value builtinAbs(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "abs");
-        return new IntValue(Math.abs(requireInt(args.getFirst())));
+        NumericValue value = requireNumber(args.getFirst());
+        if (value instanceof InexactValue inexactValue) {
+            return new InexactValue(Math.abs(inexactValue.value()));
+        }
+        return exactFractionToValue(toExactFraction(value).abs());
     }
 
     private Value builtinModulo(List<Value> args) throws EvalError {
@@ -1119,20 +1186,26 @@ public class Evaluator {
 
     private Value builtinMin(List<Value> args) throws EvalError {
         requireAtLeastArgCount(args.size(), 1, "min");
-        long result = requireInt(args.getFirst());
+        NumericValue result = requireNumber(args.getFirst());
         for (int i = 1; i < args.size(); i++) {
-            result = Math.min(result, requireInt(args.get(i)));
+            NumericValue current = requireNumber(args.get(i));
+            if (compareNumbers(current, result) < 0) {
+                result = current;
+            }
         }
-        return new IntValue(result);
+        return result;
     }
 
     private Value builtinMax(List<Value> args) throws EvalError {
         requireAtLeastArgCount(args.size(), 1, "max");
-        long result = requireInt(args.getFirst());
+        NumericValue result = requireNumber(args.getFirst());
         for (int i = 1; i < args.size(); i++) {
-            result = Math.max(result, requireInt(args.get(i)));
+            NumericValue current = requireNumber(args.get(i));
+            if (compareNumbers(current, result) > 0) {
+                result = current;
+            }
         }
-        return new IntValue(result);
+        return result;
     }
 
     private Value builtinExpt(List<Value> args) throws EvalError {
@@ -1162,10 +1235,10 @@ public class Evaluator {
             throw new EvalError("'" + name + "' expects at least 2 arguments");
         }
 
-        long previous = requireInt(args.getFirst());
+        NumericValue previous = requireNumber(args.getFirst());
         for (int i = 1; i < args.size(); i++) {
-            long current = requireInt(args.get(i));
-            if (!comparison.test(previous, current)) {
+            NumericValue current = requireNumber(args.get(i));
+            if (!comparison.test(compareNumbers(previous, current))) {
                 return BoolValue.FALSE;
             }
             previous = current;
@@ -1180,27 +1253,33 @@ public class Evaluator {
 
     private Value builtinZeroPredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "zero?");
-        return BoolValue.of(requireInt(args.getFirst()) == 0);
+        return BoolValue.of(isZero(requireNumber(args.getFirst())));
     }
 
     private Value builtinPositivePredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "positive?");
-        return BoolValue.of(requireInt(args.getFirst()) > 0);
+        return BoolValue.of(compareNumberToZero(requireNumber(args.getFirst())) > 0);
     }
 
     private Value builtinNegativePredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "negative?");
-        return BoolValue.of(requireInt(args.getFirst()) < 0);
+        return BoolValue.of(compareNumberToZero(requireNumber(args.getFirst())) < 0);
     }
 
     private Value builtinOddPredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "odd?");
-        return BoolValue.of((requireInt(args.getFirst()) & 1L) != 0);
+        return BoolValue.of(requireExactInteger(args.getFirst(), "odd?")
+                .abs()
+                .remainder(BigInteger.TWO)
+                .equals(BigInteger.ONE));
     }
 
     private Value builtinEvenPredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "even?");
-        return BoolValue.of((requireInt(args.getFirst()) & 1L) == 0);
+        return BoolValue.of(requireExactInteger(args.getFirst(), "even?")
+                .abs()
+                .remainder(BigInteger.TWO)
+                .equals(BigInteger.ZERO));
     }
 
     private Value builtinCons(List<Value> args) throws EvalError {
@@ -1337,7 +1416,52 @@ public class Evaluator {
 
     private Value builtinNumberPredicate(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "number?");
-        return BoolValue.of(args.getFirst() instanceof IntValue);
+        return BoolValue.of(args.getFirst() instanceof NumericValue);
+    }
+
+    private Value builtinExactPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "exact?");
+        return BoolValue.of(isExactNumber(args.getFirst()));
+    }
+
+    private Value builtinInexactPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "inexact?");
+        return BoolValue.of(args.getFirst() instanceof InexactValue);
+    }
+
+    private Value builtinIntegerPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "integer?");
+        Value value = args.getFirst();
+        return BoolValue.of(value instanceof NumericValue number && isIntegerValue(number));
+    }
+
+    private Value builtinRationalPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "rational?");
+        return BoolValue.of(valueIsRational(args.getFirst()));
+    }
+
+    private Value builtinExactToInexact(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "exact->inexact");
+        return new InexactValue(toInexactDouble(requireNumber(args.getFirst())));
+    }
+
+    private Value builtinInexactToExact(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "inexact->exact");
+        NumericValue value = requireNumber(args.getFirst());
+        if (value instanceof InexactValue inexactValue) {
+            return exactFractionToValue(ExactFraction.fromBigDecimal(BigDecimal.valueOf(inexactValue.value())));
+        }
+        return value;
+    }
+
+    private Value builtinNumerator(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "numerator");
+        return bigIntegerToExactValue(requireRational(args.getFirst(), "numerator").numerator());
+    }
+
+    private Value builtinDenominator(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "denominator");
+        return bigIntegerToExactValue(requireRational(args.getFirst(), "denominator").denominator());
     }
 
     private Value builtinBooleanPredicate(List<Value> args) throws EvalError {
@@ -1435,16 +1559,20 @@ public class Evaluator {
 
     private Value builtinStringToNumber(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "string->number");
-        Long parsed = parseIntegerLiteral(requireString(args.getFirst(), "string->number"));
-        if (parsed == null) {
+        try {
+            Value parsed = parseNumberLiteralValue(requireString(args.getFirst(), "string->number"));
+            if (parsed == null) {
+                return BoolValue.FALSE;
+            }
+            return parsed;
+        } catch (EvalError err) {
             return BoolValue.FALSE;
         }
-        return new IntValue(parsed);
     }
 
     private Value builtinNumberToString(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "number->string");
-        return new StringValue(Long.toString(requireInt(args.getFirst())));
+        return new StringValue(requireNumber(args.getFirst()).toSchemeString());
     }
 
     private Value builtinSymbolToString(List<Value> args) throws EvalError {
@@ -1508,10 +1636,10 @@ public class Evaluator {
     private Value builtinCharComparison(List<Value> args, Comparison comparison, String name)
             throws EvalError {
         requireAtLeastArgCount(args.size(), 2, name);
-        long previous = requireChar(args.getFirst(), name);
+        char previous = requireChar(args.getFirst(), name);
         for (int i = 1; i < args.size(); i++) {
-            long current = requireChar(args.get(i), name);
-            if (!comparison.test(previous, current)) {
+            char current = requireChar(args.get(i), name);
+            if (!comparison.test(Character.compare(previous, current))) {
                 return BoolValue.FALSE;
             }
             previous = current;
@@ -1542,10 +1670,144 @@ public class Evaluator {
     }
 
     private long requireInt(Value value) throws EvalError {
-        if (value instanceof IntValue intValue) {
-            return intValue.value();
+        try {
+            return requireExactInteger(value, null).longValueExact();
+        } catch (ArithmeticException ex) {
+            throw new EvalError("expected integer");
+        }
+    }
+
+    private NumericValue requireNumber(Value value) throws EvalError {
+        if (value instanceof NumericValue numberValue) {
+            return numberValue;
         }
         throw new EvalError("expected number");
+    }
+
+    private boolean containsInexact(List<Value> values) throws EvalError {
+        for (Value value : values) {
+            if (requireNumber(value) instanceof InexactValue) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isExactNumber(Value value) {
+        return value instanceof NumericValue && !(value instanceof InexactValue);
+    }
+
+    private boolean valueIsRational(Value value) {
+        return switch (value) {
+            case IntValue ignored -> true;
+            case RationalValue ignored -> true;
+            case InexactValue inexactValue -> Double.isFinite(inexactValue.value());
+            default -> false;
+        };
+    }
+
+    private boolean isIntegerValue(NumericValue value) {
+        return switch (value) {
+            case IntValue ignored -> true;
+            case RationalValue rationalValue -> rationalValue.denominator().equals(BigInteger.ONE);
+            case InexactValue inexactValue -> Double.isFinite(inexactValue.value())
+                    && inexactValue.value() == Math.rint(inexactValue.value());
+        };
+    }
+
+    private ExactFraction requireRational(Value value, String procedure) throws EvalError {
+        NumericValue number = requireNumber(value);
+        if (number instanceof InexactValue inexactValue) {
+            if (!Double.isFinite(inexactValue.value())) {
+                throw new EvalError("'" + procedure + "' expects a finite number");
+            }
+            return ExactFraction.fromBigDecimal(BigDecimal.valueOf(inexactValue.value()));
+        }
+        return toExactFraction(number);
+    }
+
+    private BigInteger requireExactInteger(Value value, String procedure) throws EvalError {
+        NumericValue number = requireNumber(value);
+        if (number instanceof InexactValue) {
+            if (procedure == null) {
+                throw new EvalError("expected integer");
+            }
+            throw new EvalError("'" + procedure + "' expects an exact integer");
+        }
+
+        ExactFraction exact = toExactFraction(number);
+        if (!exact.isInteger()) {
+            if (procedure == null) {
+                throw new EvalError("expected integer");
+            }
+            throw new EvalError("'" + procedure + "' expects an exact integer");
+        }
+        return exact.numerator();
+    }
+
+    private ExactFraction toExactFraction(NumericValue value) {
+        return switch (value) {
+            case IntValue intValue -> ExactFraction.of(BigInteger.valueOf(intValue.value()));
+            case RationalValue rationalValue ->
+                    new ExactFraction(rationalValue.numerator(), rationalValue.denominator());
+            case InexactValue ignored ->
+                    throw new IllegalStateException("cannot convert inexact value to exact fraction");
+        };
+    }
+
+    private double toInexactDouble(NumericValue value) {
+        return switch (value) {
+            case IntValue intValue -> intValue.value();
+            case RationalValue rationalValue ->
+                    rationalValue.numerator().doubleValue() / rationalValue.denominator().doubleValue();
+            case InexactValue inexactValue -> inexactValue.value();
+        };
+    }
+
+    private int compareNumbers(NumericValue left, NumericValue right) {
+        if (left instanceof InexactValue || right instanceof InexactValue) {
+            return compareInexact(toInexactDouble(left), toInexactDouble(right));
+        }
+        return toExactFraction(left).compareTo(toExactFraction(right));
+    }
+
+    private int compareInexact(double left, double right) {
+        if (left == right) {
+            return 0;
+        }
+        return left < right ? -1 : 1;
+    }
+
+    private int compareNumberToZero(NumericValue value) {
+        if (value instanceof InexactValue inexactValue) {
+            if (inexactValue.value() == 0.0) {
+                return 0;
+            }
+            return inexactValue.value() < 0.0 ? -1 : 1;
+        }
+        return toExactFraction(value).signum();
+    }
+
+    private boolean isZero(NumericValue value) {
+        if (value instanceof InexactValue inexactValue) {
+            return inexactValue.value() == 0.0;
+        }
+        return toExactFraction(value).isZero();
+    }
+
+    private static Value exactFractionToValue(ExactFraction fraction) {
+        if (fraction.isInteger()) {
+            return bigIntegerToExactValue(fraction.numerator());
+        }
+        return new RationalValue(fraction.numerator(), fraction.denominator());
+    }
+
+    private static Value bigIntegerToExactValue(BigInteger value) {
+        try {
+            return new IntValue(value.longValueExact());
+        } catch (ArithmeticException ex) {
+            return new RationalValue(value, BigInteger.ONE);
+        }
     }
 
     private String requireString(Value value, String procedure) throws EvalError {
@@ -1624,6 +1886,11 @@ public class Evaluator {
         return switch (left) {
             case IntValue intValue when right instanceof IntValue other ->
                     intValue.value() == other.value();
+            case RationalValue rationalValue when right instanceof RationalValue other ->
+                    rationalValue.numerator().equals(other.numerator())
+                            && rationalValue.denominator().equals(other.denominator());
+            case InexactValue inexactValue when right instanceof InexactValue other ->
+                    inexactValue.value() == other.value();
             case BoolValue boolValue when right instanceof BoolValue other ->
                     boolValue.value() == other.value();
             case CharValue charValue when right instanceof CharValue other ->
@@ -1638,6 +1905,10 @@ public class Evaluator {
     private boolean valuesEqual(Value left, Value right) {
         if (isEq(left, right)) {
             return true;
+        }
+
+        if (left instanceof NumericValue leftNumber && right instanceof NumericValue rightNumber) {
+            return compareNumbers(leftNumber, rightNumber) == 0;
         }
 
         return switch (left) {
@@ -1693,6 +1964,11 @@ public class Evaluator {
         return switch (left) {
             case IntExpr intExpr when right instanceof IntExpr other ->
                     intExpr.value() == other.value();
+            case RationalExpr rationalExpr when right instanceof RationalExpr other ->
+                    rationalExpr.numerator().equals(other.numerator())
+                            && rationalExpr.denominator().equals(other.denominator());
+            case InexactExpr inexactExpr when right instanceof InexactExpr other ->
+                    inexactExpr.value() == other.value();
             case BoolExpr boolExpr when right instanceof BoolExpr other ->
                     boolExpr.value() == other.value();
             case StringExpr stringExpr when right instanceof StringExpr other ->
@@ -1727,41 +2003,141 @@ public class Evaluator {
     private enum Comparison {
         LT {
             @Override
-            boolean test(long left, long right) {
-                return left < right;
+            boolean test(int ordering) {
+                return ordering < 0;
             }
         },
         GT {
             @Override
-            boolean test(long left, long right) {
-                return left > right;
+            boolean test(int ordering) {
+                return ordering > 0;
             }
         },
         EQ {
             @Override
-            boolean test(long left, long right) {
-                return left == right;
+            boolean test(int ordering) {
+                return ordering == 0;
             }
         },
         LE {
             @Override
-            boolean test(long left, long right) {
-                return left <= right;
+            boolean test(int ordering) {
+                return ordering <= 0;
             }
         };
 
-        abstract boolean test(long left, long right);
+        abstract boolean test(int ordering);
+    }
+
+    private record ExactFraction(BigInteger numerator, BigInteger denominator)
+            implements Comparable<ExactFraction> {
+        private static final ExactFraction ZERO =
+                new ExactFraction(BigInteger.ZERO, BigInteger.ONE);
+        private static final ExactFraction ONE =
+                new ExactFraction(BigInteger.ONE, BigInteger.ONE);
+
+        private ExactFraction {
+            if (denominator.signum() == 0) {
+                throw new IllegalArgumentException("rational denominator cannot be zero");
+            }
+
+            if (denominator.signum() < 0) {
+                numerator = numerator.negate();
+                denominator = denominator.negate();
+            }
+
+            BigInteger gcd = numerator.gcd(denominator);
+            if (!gcd.equals(BigInteger.ONE)) {
+                numerator = numerator.divide(gcd);
+                denominator = denominator.divide(gcd);
+            }
+        }
+
+        private static ExactFraction of(BigInteger integer) {
+            return new ExactFraction(integer, BigInteger.ONE);
+        }
+
+        private static ExactFraction fromBigDecimal(BigDecimal value) {
+            BigInteger unscaled = value.unscaledValue();
+            int scale = value.scale();
+            if (scale >= 0) {
+                return new ExactFraction(unscaled, BigInteger.TEN.pow(scale));
+            }
+            return new ExactFraction(unscaled.multiply(BigInteger.TEN.pow(-scale)), BigInteger.ONE);
+        }
+
+        private boolean isZero() {
+            return numerator.signum() == 0;
+        }
+
+        private boolean isInteger() {
+            return denominator.equals(BigInteger.ONE);
+        }
+
+        private int signum() {
+            return numerator.signum();
+        }
+
+        private ExactFraction add(ExactFraction other) {
+            return new ExactFraction(
+                    numerator.multiply(other.denominator)
+                            .add(other.numerator.multiply(denominator)),
+                    denominator.multiply(other.denominator));
+        }
+
+        private ExactFraction subtract(ExactFraction other) {
+            return new ExactFraction(
+                    numerator.multiply(other.denominator)
+                            .subtract(other.numerator.multiply(denominator)),
+                    denominator.multiply(other.denominator));
+        }
+
+        private ExactFraction multiply(ExactFraction other) {
+            return new ExactFraction(
+                    numerator.multiply(other.numerator),
+                    denominator.multiply(other.denominator));
+        }
+
+        private ExactFraction divide(ExactFraction other) {
+            return new ExactFraction(
+                    numerator.multiply(other.denominator),
+                    denominator.multiply(other.numerator));
+        }
+
+        private ExactFraction negate() {
+            return new ExactFraction(numerator.negate(), denominator);
+        }
+
+        private ExactFraction abs() {
+            if (numerator.signum() >= 0) {
+                return this;
+            }
+            return new ExactFraction(numerator.abs(), denominator);
+        }
+
+        @Override
+        public int compareTo(ExactFraction other) {
+            return numerator.multiply(other.denominator)
+                    .compareTo(other.numerator.multiply(denominator));
+        }
     }
 
     private record SourcePos(int line, int column) {
     }
 
-    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr,
-            CapturedSymbolExpr, ListExpr {
+    private sealed interface Expr permits IntExpr, RationalExpr, InexactExpr, BoolExpr, StringExpr,
+            CharExpr, SymbolExpr, CapturedSymbolExpr, ListExpr {
         SourcePos loc();
     }
 
     private record IntExpr(long value, SourcePos loc) implements Expr {
+    }
+
+    private record RationalExpr(BigInteger numerator, BigInteger denominator, SourcePos loc)
+            implements Expr {
+    }
+
+    private record InexactExpr(double value, SourcePos loc) implements Expr {
     }
 
     private record BoolExpr(boolean value, SourcePos loc) implements Expr {
@@ -1866,7 +2242,7 @@ public class Evaluator {
         }
     }
 
-    private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
+    private sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue,
             CharValue, ListValue, PairValue, ProcedureValue, VoidValue {
         String toSchemeString();
 
@@ -1875,13 +2251,39 @@ public class Evaluator {
         }
     }
 
+    private sealed interface NumericValue extends Value permits IntValue, RationalValue, InexactValue {
+    }
+
     private sealed interface ProcedureValue extends Value permits BuiltinProcedure, ClosureValue {
     }
 
-    private record IntValue(long value) implements Value {
+    private record IntValue(long value) implements NumericValue {
         @Override
         public String toSchemeString() {
             return Long.toString(value);
+        }
+    }
+
+    private record RationalValue(BigInteger numerator, BigInteger denominator) implements NumericValue {
+        private RationalValue {
+            ExactFraction normalized = new ExactFraction(numerator, denominator);
+            numerator = normalized.numerator();
+            denominator = normalized.denominator();
+        }
+
+        @Override
+        public String toSchemeString() {
+            if (denominator.equals(BigInteger.ONE)) {
+                return numerator.toString();
+            }
+            return numerator + "/" + denominator;
+        }
+    }
+
+    private record InexactValue(double value) implements NumericValue {
+        @Override
+        public String toSchemeString() {
+            return Double.toString(value);
         }
     }
 
@@ -2110,6 +2512,37 @@ public class Evaluator {
         };
     }
 
+    private static Value parseNumberLiteralValue(String text) throws EvalError {
+        ExactFraction rational = parseRationalLiteral(text);
+        if (rational != null) {
+            return exactFractionToValue(rational);
+        }
+
+        Double inexact = parseInexactLiteral(text);
+        if (inexact != null) {
+            return new InexactValue(inexact);
+        }
+
+        Long integer = parseIntegerLiteral(text);
+        if (integer != null) {
+            return new IntValue(integer);
+        }
+        if (isIntegerLiteral(text)) {
+            throw new EvalError("invalid integer literal: " + text);
+        }
+        return null;
+    }
+
+    private static Expr numberValueToExpr(Value value, SourcePos loc) {
+        return switch (value) {
+            case IntValue intValue -> new IntExpr(intValue.value(), loc);
+            case RationalValue rationalValue ->
+                    new RationalExpr(rationalValue.numerator(), rationalValue.denominator(), loc);
+            case InexactValue inexactValue -> new InexactExpr(inexactValue.value(), loc);
+            default -> throw new IllegalArgumentException("not a numeric value");
+        };
+    }
+
     private static Long parseIntegerLiteral(String text) {
         if (!isIntegerLiteral(text)) {
             return null;
@@ -2118,6 +2551,38 @@ public class Evaluator {
             return Long.parseLong(text);
         } catch (NumberFormatException ex) {
             return null;
+        }
+    }
+
+    private static ExactFraction parseRationalLiteral(String text) throws EvalError {
+        int slashIndex = text.indexOf('/');
+        if (slashIndex <= 0 || slashIndex != text.lastIndexOf('/') || slashIndex == text.length() - 1) {
+            return null;
+        }
+
+        String numeratorText = text.substring(0, slashIndex);
+        String denominatorText = text.substring(slashIndex + 1);
+        if (!isIntegerLiteral(numeratorText) || !isIntegerLiteral(denominatorText)) {
+            return null;
+        }
+
+        BigInteger numerator = new BigInteger(numeratorText);
+        BigInteger denominator = new BigInteger(denominatorText);
+        if (denominator.signum() == 0) {
+            throw new EvalError("invalid rational literal: " + text);
+        }
+        return new ExactFraction(numerator, denominator);
+    }
+
+    private static Double parseInexactLiteral(String text) throws EvalError {
+        if (!isInexactLiteral(text)) {
+            return null;
+        }
+
+        try {
+            return Double.parseDouble(text);
+        } catch (NumberFormatException ex) {
+            throw new EvalError("invalid inexact literal: " + text);
         }
     }
 
@@ -2135,6 +2600,36 @@ public class Evaluator {
             }
         }
         return true;
+    }
+
+    private static boolean isInexactLiteral(String text) {
+        if (text.isEmpty()) {
+            return false;
+        }
+
+        int start = (text.charAt(0) == '+' || text.charAt(0) == '-') ? 1 : 0;
+        if (start == text.length()) {
+            return false;
+        }
+
+        boolean sawDot = false;
+        boolean sawDigit = false;
+        for (int i = start; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch == '.') {
+                if (sawDot) {
+                    return false;
+                }
+                sawDot = true;
+                continue;
+            }
+            if (!Character.isDigit(ch)) {
+                return false;
+            }
+            sawDigit = true;
+        }
+
+        return sawDot && sawDigit;
     }
 
     private static Character parseCharacterLiteral(String text) {
@@ -2263,14 +2758,16 @@ public class Evaluator {
                 throw new EvalError("invalid character literal: " + atom,
                         start.line(), start.column());
             }
-            Long integerValue = parseIntegerLiteral(atom);
-            if (integerValue != null) {
-                return new IntExpr(integerValue, start);
+
+            try {
+                Value numericValue = parseNumberLiteralValue(atom);
+                if (numericValue != null) {
+                    return numberValueToExpr(numericValue, start);
+                }
+            } catch (EvalError err) {
+                throw new EvalError(err.getMessage(), start.line(), start.column());
             }
-            if (isIntegerLiteral(atom)) {
-                throw new EvalError("invalid integer literal: " + atom,
-                        start.line(), start.column());
-            }
+
             return new SymbolExpr(atom, start);
         }
 
