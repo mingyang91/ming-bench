@@ -55,6 +55,8 @@ const BUILTINS: &[&str] = &[
     "values", "call-with-values",
     // L22
     "syntax->datum", "datum->syntax",
+    // L26
+    "error",
     // cxr handled dynamically in apply_builtin
 ];
 

@@ -65,6 +65,22 @@ impl<'a> Parser<'a> {
                 let quoted = self.parse_expr()?;
                 Ok(Value::List(vec![Value::Symbol("quote".into()), quoted]))
             }
+            b'`' => {
+                self.pos += 1;
+                let expr = self.parse_expr()?;
+                Ok(Value::List(vec![Value::Symbol("quasiquote".into()), expr]))
+            }
+            b',' => {
+                self.pos += 1;
+                if self.pos < self.input.len() && self.input[self.pos] == b'@' {
+                    self.pos += 1;
+                    let expr = self.parse_expr()?;
+                    Ok(Value::List(vec![Value::Symbol("unquote-splicing".into()), expr]))
+                } else {
+                    let expr = self.parse_expr()?;
+                    Ok(Value::List(vec![Value::Symbol("unquote".into()), expr]))
+                }
+            }
             _ => self.parse_atom(),
         }
     }
@@ -80,6 +96,28 @@ impl<'a> Parser<'a> {
             if self.input[self.pos] == b')' {
                 self.pos += 1;
                 return Ok(Value::List(elems));
+            }
+            // Check for dotted pair: `. expr)` — but not `...` or `.symbol`
+            if self.input[self.pos] == b'.'
+                && self.pos + 1 < self.input.len()
+                && self.input[self.pos + 1] != b'.'
+            {
+                let next = self.input[self.pos + 1];
+                if matches!(next, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | b'(' | b')' | b'"' | b';') {
+                    self.pos += 1; // skip '.'
+                    let cdr = self.parse_expr()?;
+                    self.skip_whitespace_and_comments();
+                    if self.pos >= self.input.len() || self.input[self.pos] != b')' {
+                        return Err(EvalError::Parse("expected ) after dotted pair".into()));
+                    }
+                    self.pos += 1; // skip ')'
+                    // Build improper list: (a b . c) => Pair(a, Pair(b, c))
+                    let mut result = cdr;
+                    for e in elems.into_iter().rev() {
+                        result = Value::Pair(std::rc::Rc::new(std::cell::RefCell::new((e, result))));
+                    }
+                    return Ok(result);
+                }
             }
             elems.push(self.parse_expr()?);
         }
@@ -140,7 +178,7 @@ impl<'a> Parser<'a> {
                 let start = self.pos;
                 while self.pos < self.input.len() {
                     match self.input[self.pos] {
-                        b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'"' | b';' => break,
+                        b' ' | b'\t' | b'\n' | b'\r' | 0x0C | b'(' | b')' | b'"' | b';' => break,
                         _ => self.pos += 1,
                     }
                 }
@@ -160,6 +198,22 @@ impl<'a> Parser<'a> {
                 let expr = self.parse_expr()?;
                 Ok(Value::List(vec![Value::Symbol("syntax".into()), expr]))
             }
+            b'(' => {
+                self.pos += 1; // skip '('
+                let mut elems = Vec::new();
+                loop {
+                    self.skip_whitespace_and_comments();
+                    if self.pos >= self.input.len() {
+                        return Err(EvalError::Parse("unexpected end in vector literal".into()));
+                    }
+                    if self.input[self.pos] == b')' {
+                        self.pos += 1;
+                        break;
+                    }
+                    elems.push(self.parse_expr()?);
+                }
+                Ok(Value::Vector(std::rc::Rc::new(std::cell::RefCell::new(elems))))
+            }
             c => Err(EvalError::Parse(format!("unknown # literal: #{}", c as char))),
         }
     }
@@ -168,7 +222,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         while self.pos < self.input.len() {
             match self.input[self.pos] {
-                b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'"' | b';' => break,
+                b' ' | b'\t' | b'\n' | b'\r' | 0x0C | b'(' | b')' | b'"' | b';' => break,
                 _ => self.pos += 1,
             }
         }
@@ -201,7 +255,7 @@ impl<'a> Parser<'a> {
     fn skip_whitespace_and_comments(&mut self) {
         while self.pos < self.input.len() {
             match self.input[self.pos] {
-                b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
+                b' ' | b'\t' | b'\n' | b'\r' | 0x0C => self.pos += 1,
                 b';' => {
                     while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
                         self.pos += 1;

@@ -78,6 +78,11 @@ pub(crate) enum Cont {
         env: Rc<RefCell<Env>>,
         next: Rc<Cont>,
     },
+    CondArrow {
+        test_val: Value,
+        env: Rc<RefCell<Env>>,
+        next: Rc<Cont>,
+    },
     CaseKey {
         clauses: Vec<Value>,
         env: Rc<RefCell<Env>>,
@@ -526,6 +531,13 @@ fn cek_eval(
                                 if elems.len() != 2 { return Err(EvalError::Arity("quote requires 1 argument".into())); }
                                 break elems.swap_remove(1);
                             }
+                            "quasiquote" => {
+                                if elems.len() != 2 { return Err(EvalError::Arity("quasiquote requires 1 argument".into())); }
+                                let template = elems.swap_remove(1);
+                                let expanded = expand_quasiquote(&template, 1);
+                                ctrl = expanded;
+                                continue;
+                            }
                             "lambda" => break eval_lambda(&elems[1..], &env)?,
                             "case-lambda" => break eval_case_lambda(&elems[1..], &env)?,
                             "define-record-type" => break eval_define_record_type(&elems[1..], &env)?,
@@ -572,6 +584,13 @@ fn cek_eval(
                                             _ => return Err(EvalError::Type("define: expected symbol as name".into())),
                                         };
                                         let (params, rest_param) = parse_params(&sig[1..])?;
+                                        let body: Vec<Value> = elems.drain(1..).collect();
+                                        let lambda = Value::Lambda { params, rest_param, body, env: Rc::clone(&env) };
+                                        env.borrow_mut().set(name, lambda);
+                                        break Value::Void;
+                                    }
+                                    Value::Pair(_) => {
+                                        let (name, params, rest_param) = parse_pair_signature(&first)?;
                                         let body: Vec<Value> = elems.drain(1..).collect();
                                         let lambda = Value::Lambda { params, rest_param, body, env: Rc::clone(&env) };
                                         env.borrow_mut().set(name, lambda);
@@ -1033,6 +1052,22 @@ fn cek_eval(
                             kont = Rc::clone(next);
                             continue; // return test value
                         }
+                        // Check for => proc clause
+                        if body.len() == 2 {
+                            if let Value::Symbol(s) = &body[0] {
+                                if s == "=>" {
+                                    // Evaluate proc expression, then apply it to the test value
+                                    kont = Rc::new(Cont::CondArrow {
+                                        test_val: val.clone(),
+                                        env: Rc::clone(cenv),
+                                        next: Rc::clone(next),
+                                    });
+                                    ctrl = body[1].clone();
+                                    env = Rc::clone(cenv);
+                                    break;
+                                }
+                            }
+                        }
                         kont = Rc::clone(next);
                         if body.len() > 1 {
                             kont = Rc::new(Cont::Seq {
@@ -1070,6 +1105,21 @@ fn cek_eval(
                     }
                     kont = Rc::clone(next);
                     val = Value::Void;
+                    continue;
+                }
+
+                // --- CondArrow: proc evaluated, apply to test_val ---
+                Cont::CondArrow { test_val, env: aenv, next } => {
+                    // val is the proc; apply it to test_val
+                    let proc = val;
+                    kont = Rc::new(Cont::EvalArgs {
+                        evaluated: vec![proc],
+                        remaining: vec![],
+                        all_exprs: vec![],
+                        env: Rc::clone(aenv),
+                        next: Rc::clone(next),
+                    });
+                    val = test_val.clone();
                     continue;
                 }
 
@@ -1620,10 +1670,66 @@ fn eval_lambda(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalErro
     let (params, rest_param) = match &args[0] {
         Value::List(elems) => parse_params(elems)?,
         Value::Symbol(s) => (vec![], Some(s.clone())),
+        Value::Pair(_) => parse_pair_params(&args[0])?,
         _ => return Err(EvalError::Type("lambda: expected parameter list".into())),
     };
     let body = args[1..].to_vec();
     Ok(Value::Lambda { params, rest_param, body, env: Rc::clone(env) })
+}
+
+/// Parse a dotted-pair define signature like (name p1 p2 . rest)
+fn parse_pair_signature(sig: &Value) -> Result<(String, Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut cur = sig.clone();
+    let name;
+    // First element is the function name
+    match &cur {
+        Value::Pair(p) => {
+            let (car, cdr) = { let pair = p.borrow(); (pair.0.clone(), pair.1.clone()) };
+            name = match car {
+                Value::Symbol(s) => s,
+                _ => return Err(EvalError::Type("define: expected symbol as name".into())),
+            };
+            cur = cdr;
+        }
+        _ => return Err(EvalError::Type("define: expected pair signature".into())),
+    }
+    loop {
+        match &cur {
+            Value::Pair(p) => {
+                let (car, cdr) = { let pair = p.borrow(); (pair.0.clone(), pair.1.clone()) };
+                match car {
+                    Value::Symbol(s) => params.push(s),
+                    _ => return Err(EvalError::Type("expected symbol as parameter".into())),
+                }
+                cur = cdr;
+            }
+            Value::Symbol(s) => return Ok((name, params, Some(s.clone()))),
+            Value::List(l) if l.is_empty() => return Ok((name, params, None)),
+            _ => return Err(EvalError::Type("invalid parameter list".into())),
+        }
+    }
+}
+
+/// Parse params from a dotted-pair structure like (p1 p2 . rest)
+fn parse_pair_params(val: &Value) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut params = Vec::new();
+    let mut cur = val.clone();
+    loop {
+        match &cur {
+            Value::Pair(p) => {
+                let (car, cdr) = { let pair = p.borrow(); (pair.0.clone(), pair.1.clone()) };
+                match car {
+                    Value::Symbol(s) => params.push(s),
+                    _ => return Err(EvalError::Type("expected symbol as parameter".into())),
+                }
+                cur = cdr;
+            }
+            Value::Symbol(s) => return Ok((params, Some(s.clone()))),
+            Value::List(l) if l.is_empty() => return Ok((params, None)),
+            _ => return Err(EvalError::Type("invalid parameter list".into())),
+        }
+    }
 }
 
 fn parse_params(sig: &[Value]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -1663,6 +1769,7 @@ fn eval_case_lambda(clauses: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, 
         let (params, rest_param) = match &elems[0] {
             Value::List(p) => parse_params(p)?,
             Value::Symbol(s) => (vec![], Some(s.clone())),
+            Value::Pair(_) => parse_pair_params(&elems[0])?,
             _ => return Err(EvalError::Type("case-lambda: expected parameter list".into())),
         };
         let body = elems[1..].to_vec();
@@ -1812,6 +1919,14 @@ fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalEr
         "procedure?" => {
             if vals.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
             Ok(Value::Boolean(matches!(&vals[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::RecordProc { .. } | Value::Continuation(_) | Value::Builtin(_))))
+        }
+        "error" => {
+            let msg = if vals.is_empty() { "error".to_string() } else {
+                let mut s = vals[0].to_display_repr();
+                for v in &vals[1..] { s.push(' '); s.push_str(&v.to_display()); }
+                s
+            };
+            Err(EvalError::Raised(msg))
         }
         "display" => { if vals.len() != 1 { return Err(EvalError::Arity("display requires 1 argument".into())); } out.borrow_mut().push_str(&vals[0].to_display_repr()); Ok(Value::Void) }
         "write" => { if vals.len() != 1 { return Err(EvalError::Arity("write requires 1 argument".into())); } out.borrow_mut().push_str(&vals[0].to_display()); Ok(Value::Void) }
@@ -2654,5 +2769,140 @@ fn is_proper_list(val: &Value) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// Expand quasiquote template into executable Scheme code.
+fn expand_quasiquote(tmpl: &Value, depth: usize) -> Value {
+    match tmpl {
+        Value::List(elems) if elems.len() == 2 => {
+            if let Value::Symbol(s) = &elems[0] {
+                if s == "unquote" {
+                    if depth == 1 {
+                        return elems[1].clone();
+                    } else {
+                        let inner = expand_quasiquote(&elems[1], depth - 1);
+                        return Value::List(vec![
+                            Value::Symbol("list".into()),
+                            Value::List(vec![Value::Symbol("quote".into()), Value::Symbol("unquote".into())]),
+                            inner,
+                        ]);
+                    }
+                }
+                if s == "quasiquote" {
+                    let inner = expand_quasiquote(&elems[1], depth + 1);
+                    return Value::List(vec![
+                        Value::Symbol("list".into()),
+                        Value::List(vec![Value::Symbol("quote".into()), Value::Symbol("quasiquote".into())]),
+                        inner,
+                    ]);
+                }
+            }
+        }
+        _ => {}
+    }
+    match tmpl {
+        Value::List(elems) if !elems.is_empty() => {
+            qq_expand_list_elements(elems, depth)
+        }
+        Value::Pair(p) => {
+            let (car, cdr) = { let pair = p.borrow(); (pair.0.clone(), pair.1.clone()) };
+            if let Value::Symbol(s) = &car {
+                if s == "unquote" && depth == 1 {
+                    if let Value::Pair(cdr_p) = &cdr {
+                        return cdr_p.borrow().0.clone();
+                    }
+                    if let Value::List(cdr_elems) = &cdr {
+                        if cdr_elems.len() == 1 {
+                            return cdr_elems[0].clone();
+                        }
+                    }
+                }
+            }
+            let car_exp = expand_quasiquote_element(&car, depth);
+            let cdr_exp = expand_quasiquote(&cdr, depth);
+            match car_exp {
+                QQElement::Splice(expr) => Value::List(vec![
+                    Value::Symbol("append".into()),
+                    expr,
+                    cdr_exp,
+                ]),
+                QQElement::Expr(expr) => Value::List(vec![
+                    Value::Symbol("cons".into()),
+                    expr,
+                    cdr_exp,
+                ]),
+            }
+        }
+        Value::Vector(v) => {
+            let elems = v.borrow();
+            let list_expr = qq_expand_list_elements(&elems, depth);
+            Value::List(vec![
+                Value::Symbol("list->vector".into()),
+                list_expr,
+            ])
+        }
+        _ => Value::List(vec![Value::Symbol("quote".into()), tmpl.clone()]),
+    }
+}
+
+enum QQElement {
+    Expr(Value),
+    Splice(Value),
+}
+
+fn expand_quasiquote_element(elem: &Value, depth: usize) -> QQElement {
+    if let Value::List(parts) = elem {
+        if parts.len() == 2 {
+            if let Value::Symbol(s) = &parts[0] {
+                if s == "unquote-splicing" && depth == 1 {
+                    return QQElement::Splice(parts[1].clone());
+                }
+                if s == "unquote" && depth == 1 {
+                    return QQElement::Expr(parts[1].clone());
+                }
+            }
+        }
+    }
+    QQElement::Expr(expand_quasiquote(elem, depth))
+}
+
+fn qq_expand_list_elements(elems: &[Value], depth: usize) -> Value {
+    let mut parts: Vec<Value> = Vec::new();
+    let mut current_list: Vec<Value> = Vec::new();
+
+    for elem in elems {
+        match expand_quasiquote_element(elem, depth) {
+            QQElement::Splice(expr) => {
+                if !current_list.is_empty() {
+                    let mut list_call = vec![Value::Symbol("list".into())];
+                    list_call.append(&mut current_list);
+                    parts.push(Value::List(list_call));
+                }
+                parts.push(expr);
+            }
+            QQElement::Expr(expr) => {
+                current_list.push(expr);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        let mut list_call = vec![Value::Symbol("list".into())];
+        list_call.append(&mut current_list);
+        Value::List(list_call)
+    } else {
+        if !current_list.is_empty() {
+            let mut list_call = vec![Value::Symbol("list".into())];
+            list_call.append(&mut current_list);
+            parts.push(Value::List(list_call));
+        }
+        if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            let mut append_call = vec![Value::Symbol("append".into())];
+            append_call.append(&mut parts);
+            Value::List(append_call)
+        }
     }
 }
