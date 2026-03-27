@@ -12,7 +12,7 @@ sealed interface Expr permits NumberExpr, BooleanExpr, StringExpr, CharExpr, Sym
     SourceLoc loc();
 }
 
-record NumberExpr(SourceLoc loc, Rational value) implements Expr { }
+record NumberExpr(SourceLoc loc, SchemeNumber value) implements Expr { }
 
 record BooleanExpr(SourceLoc loc, boolean value) implements Expr { }
 

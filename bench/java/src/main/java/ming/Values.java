@@ -18,7 +18,7 @@ interface Value {
     }
 }
 
-record NumberValue(Rational value) implements Value {
+record NumberValue(SchemeNumber value) implements Value {
     @Override
     public String render() {
         return value.render();

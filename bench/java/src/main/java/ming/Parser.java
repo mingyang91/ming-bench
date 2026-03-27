@@ -1,6 +1,5 @@
 package ming;
 
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -126,8 +125,9 @@ final class Parser {
         if (token.startsWith("#\\")) {
             return new CharExpr(start, parseCharacterLiteral(token, start));
         }
-        if (Rational.isIntegerToken(token)) {
-            return new NumberExpr(start, Rational.integer(new BigInteger(token)));
+        SchemeNumber number = SchemeNumber.parse(token);
+        if (number != null) {
+            return new NumberExpr(start, number);
         }
         return new SymbolExpr(start, token);
     }

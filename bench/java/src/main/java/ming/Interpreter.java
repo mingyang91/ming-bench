@@ -68,6 +68,14 @@ final class Interpreter {
         env.define("char?", new BuiltinProcedure("char?", this::applyCharPredicate));
         env.define("string?", new BuiltinProcedure("string?", this::applyStringPredicate));
         env.define("number?", new BuiltinProcedure("number?", this::applyNumberPredicate));
+        env.define("exact?", new BuiltinProcedure("exact?", this::applyExactPredicate));
+        env.define("inexact?", new BuiltinProcedure("inexact?", this::applyInexactPredicate));
+        env.define("exact->inexact", new BuiltinProcedure("exact->inexact", this::applyExactToInexact));
+        env.define("inexact->exact", new BuiltinProcedure("inexact->exact", this::applyInexactToExact));
+        env.define("integer?", new BuiltinProcedure("integer?", this::applyIntegerPredicate));
+        env.define("rational?", new BuiltinProcedure("rational?", this::applyRationalPredicate));
+        env.define("numerator", new BuiltinProcedure("numerator", this::applyNumerator));
+        env.define("denominator", new BuiltinProcedure("denominator", this::applyDenominator));
         env.define("boolean?", new BuiltinProcedure("boolean?", this::applyBooleanPredicate));
         env.define("pair?", new BuiltinProcedure("pair?", this::applyPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::applySymbolPredicate));
@@ -389,7 +397,7 @@ final class Interpreter {
     }
 
     private Value applyAdd(List<Value> arguments, SourceLoc callLoc) throws EvalError {
-        Rational result = Rational.ZERO;
+        SchemeNumber result = SchemeNumber.EXACT_ZERO;
         for (Value argument : arguments) {
             result = result.add(requireNumber(argument, "+", callLoc));
         }
@@ -398,7 +406,7 @@ final class Interpreter {
 
     private Value applySubtract(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureAtLeast("-", arguments, 1, callLoc);
-        Rational result = requireNumber(arguments.getFirst(), "-", callLoc);
+        SchemeNumber result = requireNumber(arguments.getFirst(), "-", callLoc);
         if (arguments.size() == 1) {
             return new NumberValue(result.negate());
         }
@@ -410,7 +418,7 @@ final class Interpreter {
     }
 
     private Value applyMultiply(List<Value> arguments, SourceLoc callLoc) throws EvalError {
-        Rational result = Rational.ONE;
+        SchemeNumber result = SchemeNumber.EXACT_ONE;
         for (Value argument : arguments) {
             result = result.multiply(requireNumber(argument, "*", callLoc));
         }
@@ -419,12 +427,11 @@ final class Interpreter {
 
     private Value applyDivide(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureAtLeast("/", arguments, 1, callLoc);
-        Rational result = arguments.size() == 1
-                ? Rational.ONE.divide(requireNumber(arguments.getFirst(), "/", callLoc), callLoc)
+        SchemeNumber result = arguments.size() == 1
+                ? SchemeNumber.EXACT_ONE.divide(requireNumber(arguments.getFirst(), "/", callLoc), callLoc)
                 : requireNumber(arguments.getFirst(), "/", callLoc);
 
-        int startIndex = arguments.size() == 1 ? 1 : 1;
-        for (int index = startIndex; index < arguments.size(); index++) {
+        for (int index = 1; index < arguments.size(); index++) {
             result = result.divide(requireNumber(arguments.get(index), "/", callLoc), callLoc);
         }
         return new NumberValue(result);
@@ -439,7 +446,7 @@ final class Interpreter {
     }
 
     private Value applyNumericEquals(List<Value> arguments, SourceLoc callLoc) throws EvalError {
-        return applyComparison(arguments, callLoc, "=", Rational::equals);
+        return applyComparison(arguments, callLoc, "=", SchemeNumber::numericallyEquals);
     }
 
     private Value applyLessEqual(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -496,7 +503,9 @@ final class Interpreter {
     private Value applyLength(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("length", arguments, 1, callLoc);
         List<Value> elements = requireProperList(arguments.getFirst(), "length", callLoc);
-        return new NumberValue(Rational.integer(BigInteger.valueOf(elements.size())));
+        return new NumberValue(SchemeNumber.exact(
+                Rational.integer(BigInteger.valueOf(elements.size()))
+        ));
     }
 
     private Value applyAppend(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -546,7 +555,7 @@ final class Interpreter {
         ensureExactly("string-length", arguments, 1, callLoc);
         int length = requireString(arguments.getFirst(), "string-length", callLoc)
                 .codePointCount(0, requireString(arguments.getFirst(), "string-length", callLoc).length());
-        return new NumberValue(Rational.integer(BigInteger.valueOf(length)));
+        return new NumberValue(SchemeNumber.exact(Rational.integer(BigInteger.valueOf(length))));
     }
 
     private Value applySubstring(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -581,7 +590,7 @@ final class Interpreter {
     private Value applyStringToNumber(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("string->number", arguments, 1, callLoc);
         String value = requireString(arguments.getFirst(), "string->number", callLoc);
-        Rational parsed = Rational.parse(value);
+        SchemeNumber parsed = SchemeNumber.parse(value);
         if (parsed == null) {
             return FALSE;
         }
@@ -623,6 +632,56 @@ final class Interpreter {
     private Value applyNumberPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("number?", arguments, 1, callLoc);
         return arguments.getFirst() instanceof NumberValue ? TRUE : FALSE;
+    }
+
+    private Value applyExactPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("exact?", arguments, 1, callLoc);
+        return requireNumber(arguments.getFirst(), "exact?", callLoc).isExact() ? TRUE : FALSE;
+    }
+
+    private Value applyInexactPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("inexact?", arguments, 1, callLoc);
+        return requireNumber(arguments.getFirst(), "inexact?", callLoc).isInexact() ? TRUE : FALSE;
+    }
+
+    private Value applyExactToInexact(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("exact->inexact", arguments, 1, callLoc);
+        SchemeNumber number = requireNumber(arguments.getFirst(), "exact->inexact", callLoc);
+        if (number.isInexact()) {
+            return new NumberValue(number);
+        }
+        return new NumberValue(SchemeNumber.inexact(number.toDouble()));
+    }
+
+    private Value applyInexactToExact(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("inexact->exact", arguments, 1, callLoc);
+        SchemeNumber number = requireNumber(arguments.getFirst(), "inexact->exact", callLoc);
+        if (number.isExact()) {
+            return new NumberValue(number);
+        }
+        return new NumberValue(SchemeNumber.exact(number.toExact()));
+    }
+
+    private Value applyIntegerPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("integer?", arguments, 1, callLoc);
+        return requireNumber(arguments.getFirst(), "integer?", callLoc).isInteger() ? TRUE : FALSE;
+    }
+
+    private Value applyRationalPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("rational?", arguments, 1, callLoc);
+        return requireNumber(arguments.getFirst(), "rational?", callLoc).isRational() ? TRUE : FALSE;
+    }
+
+    private Value applyNumerator(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("numerator", arguments, 1, callLoc);
+        Rational exact = requireNumber(arguments.getFirst(), "numerator", callLoc).toExact();
+        return new NumberValue(SchemeNumber.exact(Rational.integer(exact.numerator())));
+    }
+
+    private Value applyDenominator(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("denominator", arguments, 1, callLoc);
+        Rational exact = requireNumber(arguments.getFirst(), "denominator", callLoc).toExact();
+        return new NumberValue(SchemeNumber.exact(Rational.integer(exact.denominator())));
     }
 
     private Value applyBooleanPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -688,8 +747,8 @@ final class Interpreter {
 
     private Value applyAbs(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("abs", arguments, 1, callLoc);
-        Rational value = requireNumber(arguments.getFirst(), "abs", callLoc);
-        return new NumberValue(value.compareTo(Rational.ZERO) < 0 ? value.negate() : value);
+        SchemeNumber value = requireNumber(arguments.getFirst(), "abs", callLoc);
+        return new NumberValue(value.signum() < 0 ? value.negate() : value);
     }
 
     private Value applyModulo(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -704,7 +763,7 @@ final class Interpreter {
         if (remainder.signum() != 0 && remainder.signum() != divisor.signum()) {
             remainder = remainder.add(divisor);
         }
-        return new NumberValue(Rational.integer(remainder));
+        return new NumberValue(SchemeNumber.exact(Rational.integer(remainder)));
     }
 
     private Value applyRemainder(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -714,7 +773,7 @@ final class Interpreter {
         if (divisor.signum() == 0) {
             throw error(callLoc, "division by zero");
         }
-        return new NumberValue(Rational.integer(dividend.remainder(divisor)));
+        return new NumberValue(SchemeNumber.exact(Rational.integer(dividend.remainder(divisor))));
     }
 
     private Value applyQuotient(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -724,14 +783,14 @@ final class Interpreter {
         if (divisor.signum() == 0) {
             throw error(callLoc, "division by zero");
         }
-        return new NumberValue(Rational.integer(dividend.divide(divisor)));
+        return new NumberValue(SchemeNumber.exact(Rational.integer(dividend.divide(divisor))));
     }
 
     private Value applyMin(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureAtLeast("min", arguments, 1, callLoc);
-        Rational result = requireNumber(arguments.getFirst(), "min", callLoc);
+        SchemeNumber result = requireNumber(arguments.getFirst(), "min", callLoc);
         for (int index = 1; index < arguments.size(); index++) {
-            Rational current = requireNumber(arguments.get(index), "min", callLoc);
+            SchemeNumber current = requireNumber(arguments.get(index), "min", callLoc);
             if (current.compareTo(result) < 0) {
                 result = current;
             }
@@ -741,9 +800,9 @@ final class Interpreter {
 
     private Value applyMax(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureAtLeast("max", arguments, 1, callLoc);
-        Rational result = requireNumber(arguments.getFirst(), "max", callLoc);
+        SchemeNumber result = requireNumber(arguments.getFirst(), "max", callLoc);
         for (int index = 1; index < arguments.size(); index++) {
-            Rational current = requireNumber(arguments.get(index), "max", callLoc);
+            SchemeNumber current = requireNumber(arguments.get(index), "max", callLoc);
             if (current.compareTo(result) > 0) {
                 result = current;
             }
@@ -753,30 +812,24 @@ final class Interpreter {
 
     private Value applyExpt(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("expt", arguments, 2, callLoc);
-        Rational base = requireNumber(arguments.get(0), "expt", callLoc);
+        SchemeNumber base = requireNumber(arguments.get(0), "expt", callLoc);
         BigInteger exponent = requireInteger(arguments.get(1), "expt", callLoc);
         return new NumberValue(pow(base, exponent, callLoc));
     }
 
     private Value applyZeroPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("zero?", arguments, 1, callLoc);
-        return requireNumber(arguments.getFirst(), "zero?", callLoc).compareTo(Rational.ZERO) == 0
-                ? TRUE
-                : FALSE;
+        return requireNumber(arguments.getFirst(), "zero?", callLoc).signum() == 0 ? TRUE : FALSE;
     }
 
     private Value applyPositivePredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("positive?", arguments, 1, callLoc);
-        return requireNumber(arguments.getFirst(), "positive?", callLoc).compareTo(Rational.ZERO) > 0
-                ? TRUE
-                : FALSE;
+        return requireNumber(arguments.getFirst(), "positive?", callLoc).signum() > 0 ? TRUE : FALSE;
     }
 
     private Value applyNegativePredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("negative?", arguments, 1, callLoc);
-        return requireNumber(arguments.getFirst(), "negative?", callLoc).compareTo(Rational.ZERO) < 0
-                ? TRUE
-                : FALSE;
+        return requireNumber(arguments.getFirst(), "negative?", callLoc).signum() < 0 ? TRUE : FALSE;
     }
 
     private Value applyOddPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -978,12 +1031,12 @@ final class Interpreter {
             List<Value> arguments,
             SourceLoc callLoc,
             String name,
-            RationalComparison comparison
+            NumberComparison comparison
     ) throws EvalError {
         ensureAtLeast(name, arguments, 2, callLoc);
-        Rational previous = requireNumber(arguments.getFirst(), name, callLoc);
+        SchemeNumber previous = requireNumber(arguments.getFirst(), name, callLoc);
         for (int index = 1; index < arguments.size(); index++) {
-            Rational current = requireNumber(arguments.get(index), name, callLoc);
+            SchemeNumber current = requireNumber(arguments.get(index), name, callLoc);
             if (!comparison.test(previous, current)) {
                 return FALSE;
             }
@@ -1077,7 +1130,7 @@ final class Interpreter {
         return new ParameterSpec(List.copyOf(parameters), restParameter);
     }
 
-    private Rational requireNumber(Value value, String procedureName, SourceLoc callLoc)
+    private SchemeNumber requireNumber(Value value, String procedureName, SourceLoc callLoc)
             throws EvalError {
         if (value instanceof NumberValue numberValue) {
             return numberValue.value();
@@ -1116,7 +1169,7 @@ final class Interpreter {
 
     private BigInteger requireInteger(Value value, String procedureName, SourceLoc callLoc)
             throws EvalError {
-        Rational number = requireNumber(value, procedureName, callLoc);
+        Rational number = requireNumber(value, procedureName, callLoc).toExact();
         if (!number.denominator().equals(BigInteger.ONE)) {
             throw error(callLoc, procedureName + " expects integer arguments");
         }
@@ -1125,7 +1178,7 @@ final class Interpreter {
 
     private int requireIndex(Value value, String procedureName, SourceLoc callLoc)
             throws EvalError {
-        Rational number = requireNumber(value, procedureName, callLoc);
+        Rational number = requireNumber(value, procedureName, callLoc).toExact();
         if (!number.denominator().equals(BigInteger.ONE)) {
             throw error(callLoc, procedureName + " expects a non-negative index");
         }
@@ -1174,7 +1227,7 @@ final class Interpreter {
             return true;
         }
         if (left instanceof NumberValue leftNumber && right instanceof NumberValue rightNumber) {
-            return leftNumber.value().equals(rightNumber.value());
+            return leftNumber.value().numericallyEquals(rightNumber.value());
         }
         if (left instanceof BooleanValue leftBoolean && right instanceof BooleanValue rightBoolean) {
             return leftBoolean.value() == rightBoolean.value();
@@ -1202,9 +1255,10 @@ final class Interpreter {
         return false;
     }
 
-    private Rational pow(Rational base, BigInteger exponent, SourceLoc callLoc) throws EvalError {
+    private SchemeNumber pow(SchemeNumber base, BigInteger exponent, SourceLoc callLoc)
+            throws EvalError {
         if (exponent.signum() == 0) {
-            return Rational.ONE;
+            return base.isExact() ? SchemeNumber.EXACT_ONE : SchemeNumber.inexact(1.0d);
         }
 
         BigInteger magnitude = exponent.signum() < 0 ? exponent.negate() : exponent;
@@ -1212,14 +1266,19 @@ final class Interpreter {
             throw error(callLoc, "expt exponent is too large");
         }
 
+        if (base.isInexact()) {
+            return SchemeNumber.inexact(Math.pow(base.toDouble(), exponent.doubleValue()));
+        }
+
+        Rational exactBase = base.toExact();
         Rational result = Rational.of(
-                base.numerator().pow(magnitude.intValueExact()),
-                base.denominator().pow(magnitude.intValueExact())
+                exactBase.numerator().pow(magnitude.intValueExact()),
+                exactBase.denominator().pow(magnitude.intValueExact())
         );
         if (exponent.signum() < 0) {
-            return Rational.ONE.divide(result, callLoc);
+            return SchemeNumber.exact(Rational.ONE.divide(result, callLoc));
         }
-        return result;
+        return SchemeNumber.exact(result);
     }
 
     private Value buildList(List<Value> elements) {
@@ -1284,8 +1343,8 @@ final class Interpreter {
     }
 
     @FunctionalInterface
-    private interface RationalComparison {
-        boolean test(Rational left, Rational right);
+    private interface NumberComparison {
+        boolean test(SchemeNumber left, SchemeNumber right);
     }
 
     private static final class BuiltinProcedure implements Value, Procedure {
