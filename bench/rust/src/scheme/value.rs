@@ -66,6 +66,8 @@ pub enum Value {
     Continuation(ContData),
     /// Multiple return values (internal; only consumed by call-with-values)
     Values(Vec<Value>),
+    /// Lambda-based macro transformer (from syntax-case define-syntax)
+    MacroTransformer(Box<Value>),
 }
 
 impl PartialEq for Value {
@@ -89,6 +91,7 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Continuation(_), Value::Continuation(_)) => false,
             (Value::Values(a), Value::Values(b)) => a == b,
+            (Value::MacroTransformer(_), Value::MacroTransformer(_)) => false,
             _ => false,
         }
     }
@@ -102,7 +105,7 @@ impl Value {
             | Value::Lambda { .. } | Value::Pair(_) | Value::SyntaxRules { .. }
             | Value::Record { .. } | Value::RecordProc { .. }
             | Value::CaseLambda { .. } | Value::Vector(_) | Value::Continuation(_)
-            | Value::Void | Value::Values(_)
+            | Value::Void | Value::Values(_) | Value::MacroTransformer(_)
         )
     }
 
@@ -157,6 +160,7 @@ impl Value {
             Value::Continuation(_) => "#<continuation>".into(),
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::SyntaxRules { .. } => "#<syntax>".into(),
+            Value::MacroTransformer(_) => "#<syntax>".into(),
             Value::Record { .. } => "#<record>".into(),
             Value::RecordProc { .. } => "#<procedure>".into(),
             Value::CaseLambda { .. } => "#<procedure>".into(),

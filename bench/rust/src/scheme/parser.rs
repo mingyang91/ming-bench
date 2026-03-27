@@ -155,6 +155,11 @@ impl<'a> Parser<'a> {
                 };
                 Ok(Value::Char(ch))
             }
+            b'\'' => {
+                self.pos += 1;
+                let expr = self.parse_expr()?;
+                Ok(Value::List(vec![Value::Symbol("syntax".into()), expr]))
+            }
             c => Err(EvalError::Parse(format!("unknown # literal: #{}", c as char))),
         }
     }

@@ -53,6 +53,8 @@ const BUILTINS: &[&str] = &[
     "call/cc", "call-with-current-continuation",
     // L21
     "values", "call-with-values",
+    // L22
+    "syntax->datum", "datum->syntax",
     // cxr handled dynamically in apply_builtin
 ];
 
