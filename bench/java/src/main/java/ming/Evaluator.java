@@ -162,6 +162,7 @@ public class Evaluator {
         registerCharOps(env);
         registerStringComparisons(env);
         registerHigherOrder(env);
+        registerRationals(env);
         return env;
     }
 
@@ -225,7 +226,7 @@ public class Evaluator {
     private void registerTypePredicates(Env env) {
         env.define("number?", new BuiltinProc("number?", args -> {
             if (args.size() != 1) throw new EvalError("number?: expected 1 arg");
-            return args.get(0) instanceof Long ? Boolean.TRUE : Boolean.FALSE;
+            return isNumber(args.get(0)) ? Boolean.TRUE : Boolean.FALSE;
         }));
         env.define("string?", new BuiltinProc("string?", args -> {
             if (args.size() != 1) throw new EvalError("string?: expected 1 arg");
@@ -247,38 +248,36 @@ public class Evaluator {
 
     private void registerArithmetic(Env env) {
         env.define("+", new BuiltinProc("+", args -> {
-            long result = 0;
-            for (Object a : args) result += asLong(a);
+            Object result = 0L;
+            for (Object a : args) { requireNumber(a, "+"); result = addNum(result, a); }
             return result;
         }));
         env.define("-", new BuiltinProc("-", args -> {
             if (args.isEmpty()) throw new EvalError("-: need at least 1 argument");
-            if (args.size() == 1) return -asLong(args.get(0));
-            long result = asLong(args.get(0));
-            for (int i = 1; i < args.size(); i++) result -= asLong(args.get(i));
+            requireNumber(args.get(0), "-");
+            if (args.size() == 1) return negateNum(args.get(0));
+            Object result = args.get(0);
+            for (int i = 1; i < args.size(); i++) { requireNumber(args.get(i), "-"); result = subNum(result, args.get(i)); }
             return result;
         }));
         env.define("*", new BuiltinProc("*", args -> {
-            long result = 1;
-            for (Object a : args) result *= asLong(a);
+            Object result = 1L;
+            for (Object a : args) { requireNumber(a, "*"); result = mulNum(result, a); }
             return result;
         }));
         env.define("/", new BuiltinProc("/", args -> {
             if (args.size() < 2) throw new EvalError("/: need at least 2 arguments");
-            long result = asLong(args.get(0));
-            for (int i = 1; i < args.size(); i++) {
-                long divisor = asLong(args.get(i));
-                if (divisor == 0) throw new EvalError("division by zero");
-                result /= divisor;
-            }
+            requireNumber(args.get(0), "/");
+            Object result = args.get(0);
+            for (int i = 1; i < args.size(); i++) { requireNumber(args.get(i), "/"); result = divNum(result, args.get(i)); }
             return result;
         }));
         for (String op : new String[]{"<", ">", "=", "<=", ">="}) {
             env.define(op, new BuiltinProc(op, args -> {
                 if (args.size() < 2) throw new EvalError(op + ": need at least 2 arguments");
-                long prev = asLong(args.get(0));
+                double prev = toDouble(args.get(0));
                 for (int i = 1; i < args.size(); i++) {
-                    long curr = asLong(args.get(i));
+                    double curr = toDouble(args.get(i));
                     boolean ok = switch (op) {
                         case "<" -> prev < curr;
                         case ">" -> prev > curr;
@@ -341,15 +340,12 @@ public class Evaluator {
         env.define("string->number", new BuiltinProc("string->number", args -> {
             if (args.size() != 1) throw new EvalError("string->number: expected 1 arg");
             if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->number: expected string");
-            try {
-                return Long.parseLong(s.value());
-            } catch (NumberFormatException e) {
-                return Boolean.FALSE;
-            }
+            Object n = parseNumber(s.value());
+            return n != null ? n : Boolean.FALSE;
         }));
         env.define("number->string", new BuiltinProc("number->string", args -> {
             if (args.size() != 1) throw new EvalError("number->string: expected 1 arg");
-            return new SchemeString(Long.toString(asLong(args.get(0))));
+            return new SchemeString(schemeToString(args.get(0)));
         }));
         env.define("symbol->string", new BuiltinProc("symbol->string", args -> {
             if (args.size() != 1) throw new EvalError("symbol->string: expected 1 arg");
@@ -609,6 +605,161 @@ public class Evaluator {
         }));
     }
 
+    private void registerRationals(Env env) {
+        env.define("exact?", new BuiltinProc("exact?", args -> {
+            if (args.size() != 1) throw new EvalError("exact?: expected 1 arg");
+            Object a = args.get(0);
+            return (a instanceof Long || a instanceof Rational) ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("inexact?", new BuiltinProc("inexact?", args -> {
+            if (args.size() != 1) throw new EvalError("inexact?: expected 1 arg");
+            return args.get(0) instanceof Double ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("exact->inexact", new BuiltinProc("exact->inexact", args -> {
+            if (args.size() != 1) throw new EvalError("exact->inexact: expected 1 arg");
+            return toDouble(args.get(0));
+        }));
+        env.define("inexact->exact", new BuiltinProc("inexact->exact", args -> {
+            if (args.size() != 1) throw new EvalError("inexact->exact: expected 1 arg");
+            Object a = args.get(0);
+            if (a instanceof Long || a instanceof Rational) return a;
+            if (a instanceof Double d) {
+                // Convert double to rational via continued fraction approximation
+                // For simple cases like 0.5 -> 1/2
+                long denom = 1;
+                double val = d;
+                while (val != Math.floor(val) && denom < 1000000000L) {
+                    val *= 10;
+                    denom *= 10;
+                }
+                long num = Math.round(d * denom);
+                Rational r = new Rational(num, denom);
+                return r.isInteger() ? r.toLong() : r;
+            }
+            throw new EvalError("inexact->exact: expected number");
+        }));
+        env.define("integer?", new BuiltinProc("integer?", args -> {
+            if (args.size() != 1) throw new EvalError("integer?: expected 1 arg");
+            Object a = args.get(0);
+            if (a instanceof Long) return Boolean.TRUE;
+            if (a instanceof Rational r) return r.isInteger() ? Boolean.TRUE : Boolean.FALSE;
+            if (a instanceof Double d) return (d == Math.floor(d) && !Double.isInfinite(d)) ? Boolean.TRUE : Boolean.FALSE;
+            return Boolean.FALSE;
+        }));
+        env.define("rational?", new BuiltinProc("rational?", args -> {
+            if (args.size() != 1) throw new EvalError("rational?: expected 1 arg");
+            Object a = args.get(0);
+            return (a instanceof Long || a instanceof Rational) ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("numerator", new BuiltinProc("numerator", args -> {
+            if (args.size() != 1) throw new EvalError("numerator: expected 1 arg");
+            Object a = args.get(0);
+            if (a instanceof Long l) return l;
+            if (a instanceof Rational r) return r.num;
+            throw new EvalError("numerator: expected rational");
+        }));
+        env.define("denominator", new BuiltinProc("denominator", args -> {
+            if (args.size() != 1) throw new EvalError("denominator: expected 1 arg");
+            Object a = args.get(0);
+            if (a instanceof Long) return 1L;
+            if (a instanceof Rational r) return r.den;
+            throw new EvalError("denominator: expected rational");
+        }));
+    }
+
+    // --- Number parsing and numeric tower ---
+
+    private static Object parseNumber(String tok) {
+        // Try integer
+        try { return Long.parseLong(tok); } catch (NumberFormatException ignored) {}
+        // Try rational a/b
+        int slash = tok.indexOf('/');
+        if (slash > 0 && slash < tok.length() - 1) {
+            try {
+                long num = Long.parseLong(tok.substring(0, slash));
+                long den = Long.parseLong(tok.substring(slash + 1));
+                if (den == 0) return null;
+                Rational r = new Rational(num, den);
+                return r.isInteger() ? r.toLong() : r;
+            } catch (NumberFormatException ignored) {}
+        }
+        // Try float
+        try {
+            if (tok.contains(".") || tok.contains("e") || tok.contains("E")) {
+                return Double.parseDouble(tok);
+            }
+        } catch (NumberFormatException ignored) {}
+        return null;
+    }
+
+    private static boolean isNumber(Object val) {
+        return val instanceof Long || val instanceof Rational || val instanceof Double;
+    }
+
+    private static double toDouble(Object val) throws EvalError {
+        if (val instanceof Long l) return l.doubleValue();
+        if (val instanceof Rational r) return r.toDouble();
+        if (val instanceof Double d) return d;
+        throw new EvalError("expected number, got: " + val);
+    }
+
+    // Arithmetic helpers that preserve exactness
+    private static Object addNum(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) + toDouble(b);
+        long an, ad, bn, bd;
+        if (a instanceof Long l) { an = l; ad = 1; } else { Rational r = (Rational) a; an = r.num; ad = r.den; }
+        if (b instanceof Long l) { bn = l; bd = 1; } else { Rational r = (Rational) b; bn = r.num; bd = r.den; }
+        Rational result = new Rational(an * bd + bn * ad, ad * bd);
+        return result.isInteger() ? result.toLong() : result;
+    }
+
+    private static Object subNum(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) - toDouble(b);
+        long an, ad, bn, bd;
+        if (a instanceof Long l) { an = l; ad = 1; } else { Rational r = (Rational) a; an = r.num; ad = r.den; }
+        if (b instanceof Long l) { bn = l; bd = 1; } else { Rational r = (Rational) b; bn = r.num; bd = r.den; }
+        Rational result = new Rational(an * bd - bn * ad, ad * bd);
+        return result.isInteger() ? result.toLong() : result;
+    }
+
+    private static Object mulNum(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) return toDouble(a) * toDouble(b);
+        long an, ad, bn, bd;
+        if (a instanceof Long l) { an = l; ad = 1; } else { Rational r = (Rational) a; an = r.num; ad = r.den; }
+        if (b instanceof Long l) { bn = l; bd = 1; } else { Rational r = (Rational) b; bn = r.num; bd = r.den; }
+        Rational result = new Rational(an * bn, ad * bd);
+        return result.isInteger() ? result.toLong() : result;
+    }
+
+    private static Object divNum(Object a, Object b) throws EvalError {
+        if (a instanceof Double || b instanceof Double) {
+            double dv = toDouble(b);
+            if (dv == 0) throw new EvalError("division by zero");
+            return toDouble(a) / dv;
+        }
+        long an, ad, bn, bd;
+        if (a instanceof Long l) { an = l; ad = 1; } else { Rational r = (Rational) a; an = r.num; ad = r.den; }
+        if (b instanceof Long l) { bn = l; bd = 1; } else { Rational r = (Rational) b; bn = r.num; bd = r.den; }
+        if (bn == 0) throw new EvalError("division by zero");
+        Rational result = new Rational(an * bd, ad * bn);
+        return result.isInteger() ? result.toLong() : result;
+    }
+
+    private static Object negateNum(Object a) throws EvalError {
+        if (a instanceof Long l) return -l;
+        if (a instanceof Double d) return -d;
+        if (a instanceof Rational r) return new Rational(-r.num, r.den);
+        throw new EvalError("expected number, got: " + a);
+    }
+
+    private static double numCompare(Object val) throws EvalError {
+        return toDouble(val);
+    }
+
+    private static void requireNumber(Object val, String context) throws EvalError {
+        if (!isNumber(val)) throw new EvalError(context + ": expected number, got: " + val);
+    }
+
     // --- Tokenizer ---
 
     private List<Token> tokenize(String input) throws EvalError {
@@ -711,9 +862,10 @@ public class Evaluator {
                     i++; col++;
                 }
                 String tok = sb.toString();
-                try {
-                    tokens.add(new Token(Long.parseLong(tok), line, startCol));
-                } catch (NumberFormatException e) {
+                Object parsed = parseNumber(tok);
+                if (parsed != null) {
+                    tokens.add(new Token(parsed, line, startCol));
+                } else {
                     tokens.add(new Token(tok, line, startCol)); // symbol
                 }
             }
@@ -771,7 +923,7 @@ public class Evaluator {
         }
         final String posStr = eLine > 0 ? " at " + eLine + ":" + eCol : "";
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
+        if (expr instanceof Long || expr instanceof Double || expr instanceof Rational || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String sym) {
@@ -1231,7 +1383,9 @@ public class Evaluator {
 
     private boolean schemeEqual(Object a, Object b) {
         if (a == b) return true;
-        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (isNumber(a) && isNumber(b)) {
+            try { return toDouble(a) == toDouble(b); } catch (EvalError e) { return false; }
+        }
         if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
         if (a instanceof String && b instanceof String) return a.equals(b);
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
@@ -1247,11 +1401,17 @@ public class Evaluator {
 
     private static long asLong(Object val) throws EvalError {
         if (val instanceof Long l) return l;
-        throw new EvalError("expected number, got: " + val);
+        if (val instanceof Rational r && r.isInteger()) return r.toLong();
+        throw new EvalError("expected integer, got: " + val);
     }
 
     private String schemeToString(Object val) {
         if (val instanceof Long l) return l.toString();
+        if (val instanceof Rational r) return r.toString();
+        if (val instanceof Double d) {
+            if (d == Math.floor(d) && !Double.isInfinite(d)) return String.format("%.1f", d);
+            return Double.toString(d);
+        }
         if (val instanceof Boolean b) return b ? "#t" : "#f";
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val == EMPTY_LIST) return "()";
@@ -1324,4 +1484,5 @@ public class Evaluator {
 
     // Internal type for Scheme characters
     record SchemeChar(char value) {}
+
 }
