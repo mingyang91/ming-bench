@@ -98,8 +98,17 @@ public class Evaluator {
         env.define("pair?", new BuiltinProcedure("pair?", this::builtinPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::builtinSymbolPredicate));
         env.define("procedure?", new BuiltinProcedure("procedure?", this::builtinProcedurePredicate));
+        env.define("eqv?", new BuiltinProcedure("eqv?", this::builtinEqv));
         env.define("eq?", new BuiltinProcedure("eq?", this::builtinEq));
         env.define("equal?", new BuiltinProcedure("equal?", this::builtinEqual));
+        env.define("vector", new BuiltinProcedure("vector", this::builtinVector));
+        env.define("make-vector", new BuiltinProcedure("make-vector", this::builtinMakeVector));
+        env.define("vector-ref", new BuiltinProcedure("vector-ref", this::builtinVectorRef));
+        env.define("vector-set!", new BuiltinProcedure("vector-set!", this::builtinVectorSet));
+        env.define("vector-length", new BuiltinProcedure("vector-length", this::builtinVectorLength));
+        env.define("vector?", new BuiltinProcedure("vector?", this::builtinVectorPredicate));
+        env.define("vector->list", new BuiltinProcedure("vector->list", this::builtinVectorToList));
+        env.define("list->vector", new BuiltinProcedure("list->vector", this::builtinListToVector));
         env.define("display", new BuiltinProcedure("display", this::builtinDisplay));
         env.define("write", new BuiltinProcedure("write", this::builtinWrite));
         env.define("newline", new BuiltinProcedure("newline", this::builtinNewline));
@@ -168,6 +177,10 @@ public class Evaluator {
                 case "case-lambda" -> evalCaseLambda(args, env);
                 case "begin" -> evalBegin(args, env);
                 case "let" -> evalLet(args, env);
+                case "letrec" -> evalLetrec(args, env, false);
+                case "letrec*" -> evalLetrec(args, env, true);
+                case "case" -> evalCase(args, env);
+                case "do" -> evalDo(args, env);
                 case "cond" -> evalCond(args, env);
                 case "and" -> evalAnd(args, env);
                 case "or" -> evalOr(args, env);
@@ -362,10 +375,15 @@ public class Evaluator {
     }
 
     private Value evalIf(List<Expr> args, Environment env) throws EvalError {
-        requireArgCount(args.size(), 3, "if");
+        if (args.size() != 2 && args.size() != 3) {
+            throw new EvalError("'if' expects exactly 2 or 3 arguments");
+        }
         Value condition = eval(args.get(0), env);
         if (isTruthy(condition)) {
             return eval(args.get(1), env);
+        }
+        if (args.size() == 2) {
+            return VoidValue.INSTANCE;
         }
         return eval(args.get(2), env);
     }
@@ -484,6 +502,141 @@ public class Evaluator {
         return List.copyOf(bindings);
     }
 
+    private Value evalLetrec(List<Expr> args, Environment env, boolean sequential) throws EvalError {
+        if (args.size() < 2) {
+            throw new EvalError("'" + (sequential ? "letrec*" : "letrec")
+                    + "' expects bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(args.getFirst());
+        Environment letrecEnv = new Environment(env);
+        for (Binding binding : bindings) {
+            letrecEnv.define(binding.name(), null);
+        }
+
+        if (sequential) {
+            for (Binding binding : bindings) {
+                letrecEnv.set(binding.name(), eval(binding.valueExpr(), letrecEnv));
+            }
+        } else {
+            List<Value> values = new ArrayList<>(bindings.size());
+            for (Binding binding : bindings) {
+                values.add(eval(binding.valueExpr(), letrecEnv));
+            }
+            for (int i = 0; i < bindings.size(); i++) {
+                letrecEnv.set(bindings.get(i).name(), values.get(i));
+            }
+        }
+
+        return evalSequence(args.subList(1, args.size()), letrecEnv);
+    }
+
+    private Value evalCase(List<Expr> args, Environment env) throws EvalError {
+        if (args.isEmpty()) {
+            throw new EvalError("'case' expects a key and clauses");
+        }
+
+        Value key = eval(args.getFirst(), env);
+        for (int i = 1; i < args.size(); i++) {
+            Expr clauseExpr = args.get(i);
+            if (!(clauseExpr instanceof ListExpr clause)) {
+                throw new EvalError("'case' clauses must be lists");
+            }
+
+            List<Expr> clauseElements = clause.elements();
+            if (clauseElements.isEmpty()) {
+                throw new EvalError("'case' clause cannot be empty");
+            }
+
+            Expr head = clauseElements.getFirst();
+            if (head instanceof SymbolExpr symbol && symbol.name().equals("else")) {
+                if (i != args.size() - 1) {
+                    throw new EvalError("'case' else clause must be last");
+                }
+                return evalSequenceOrVoid(clauseElements.subList(1, clauseElements.size()), env);
+            }
+
+            if (!(head instanceof ListExpr datums)) {
+                throw new EvalError("'case' clause datum list must be a list");
+            }
+
+            for (Expr datumExpr : datums.elements()) {
+                if (isEqv(key, quoteToValue(datumExpr))) {
+                    return evalSequenceOrVoid(clauseElements.subList(1, clauseElements.size()), env);
+                }
+            }
+        }
+
+        return VoidValue.INSTANCE;
+    }
+
+    private Value evalDo(List<Expr> args, Environment env) throws EvalError {
+        if (args.size() < 2) {
+            throw new EvalError("'do' expects variable bindings and a test clause");
+        }
+
+        List<DoBinding> bindings = parseDoBindings(args.getFirst());
+        if (!(args.get(1) instanceof ListExpr testClause) || testClause.elements().isEmpty()) {
+            throw new EvalError("'do' expects a non-empty test clause");
+        }
+
+        List<Value> initialValues = new ArrayList<>(bindings.size());
+        for (DoBinding binding : bindings) {
+            initialValues.add(eval(binding.initExpr(), env));
+        }
+
+        Environment loopEnv = new Environment(env);
+        for (int i = 0; i < bindings.size(); i++) {
+            loopEnv.define(bindings.get(i).name(), initialValues.get(i));
+        }
+
+        List<Expr> testElements = testClause.elements();
+        List<Expr> commands = args.subList(2, args.size());
+        while (true) {
+            if (isTruthy(eval(testElements.getFirst(), loopEnv))) {
+                return evalSequenceOrVoid(testElements.subList(1, testElements.size()), loopEnv);
+            }
+
+            evalSequence(commands, loopEnv);
+            List<Value> nextValues = new ArrayList<>(bindings.size());
+            for (DoBinding binding : bindings) {
+                if (binding.stepExpr() == null) {
+                    nextValues.add(loopEnv.lookup(binding.name()));
+                } else {
+                    nextValues.add(eval(binding.stepExpr(), loopEnv));
+                }
+            }
+            for (int i = 0; i < bindings.size(); i++) {
+                loopEnv.set(bindings.get(i).name(), nextValues.get(i));
+            }
+        }
+    }
+
+    private List<DoBinding> parseDoBindings(Expr bindingsExpr) throws EvalError {
+        if (!(bindingsExpr instanceof ListExpr bindingsList)) {
+            throw new EvalError("'do' expects a binding list");
+        }
+
+        List<DoBinding> bindings = new ArrayList<>(bindingsList.elements().size());
+        for (Expr bindingExpr : bindingsList.elements()) {
+            if (!(bindingExpr instanceof ListExpr bindingList)) {
+                throw new EvalError("'do' binding must be a list");
+            }
+
+            List<Expr> parts = bindingList.elements();
+            if (parts.size() < 2 || parts.size() > 3) {
+                throw new EvalError("'do' binding must contain 2 or 3 forms");
+            }
+            if (!(parts.getFirst() instanceof SymbolExpr name)) {
+                throw new EvalError("'do' binding name must be a symbol");
+            }
+
+            Expr stepExpr = parts.size() == 3 ? parts.get(2) : null;
+            bindings.add(new DoBinding(name.name(), parts.get(1), stepExpr));
+        }
+        return List.copyOf(bindings);
+    }
+
     private Value evalCond(List<Expr> args, Environment env) throws EvalError {
         for (int i = 0; i < args.size(); i++) {
             Expr clauseExpr = args.get(i);
@@ -513,6 +666,13 @@ public class Evaluator {
         }
 
         return VoidValue.INSTANCE;
+    }
+
+    private Value evalSequenceOrVoid(List<Expr> expressions, Environment env) throws EvalError {
+        if (expressions.isEmpty()) {
+            return VoidValue.INSTANCE;
+        }
+        return evalSequence(expressions, env);
     }
 
     private Value evalSequence(List<Expr> expressions, Environment env) throws EvalError {
@@ -1110,7 +1270,8 @@ public class Evaluator {
     private boolean isSyntaxKeyword(String name) {
         return switch (name) {
             case "define", "define-syntax", "define-record-type", "set!", "if", "quote",
-                    "lambda", "case-lambda", "begin", "let", "cond", "and", "or", "else", "." -> true;
+                    "lambda", "case-lambda", "begin", "let", "letrec", "letrec*", "case",
+                    "do", "cond", "and", "or", "else", "." -> true;
             default -> false;
         };
     }
@@ -1638,6 +1799,11 @@ public class Evaluator {
         return BoolValue.of(args.getFirst() instanceof ProcedureValue);
     }
 
+    private Value builtinEqv(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "eqv?");
+        return BoolValue.of(isEqv(args.getFirst(), args.get(1)));
+    }
+
     private Value builtinEq(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 2, "eq?");
         return BoolValue.of(isEq(args.getFirst(), args.get(1)));
@@ -1646,6 +1812,59 @@ public class Evaluator {
     private Value builtinEqual(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 2, "equal?");
         return BoolValue.of(valuesEqual(args.getFirst(), args.get(1)));
+    }
+
+    private Value builtinVector(List<Value> args) {
+        return new VectorValue(args);
+    }
+
+    private Value builtinMakeVector(List<Value> args) throws EvalError {
+        if (args.size() != 1 && args.size() != 2) {
+            throw new EvalError("'make-vector' expects exactly 1 or 2 arguments");
+        }
+
+        int size = requireSize(args.getFirst(), "make-vector");
+        Value fill = args.size() == 2 ? args.get(1) : VoidValue.INSTANCE;
+        List<Value> elements = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            elements.add(fill);
+        }
+        return new VectorValue(elements);
+    }
+
+    private Value builtinVectorRef(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "vector-ref");
+        VectorValue vector = requireVector(args.getFirst(), "vector-ref");
+        int index = requireElementIndex(args.get(1), vector.length(), "vector-ref");
+        return vector.get(index);
+    }
+
+    private Value builtinVectorSet(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 3, "vector-set!");
+        VectorValue vector = requireVector(args.getFirst(), "vector-set!");
+        int index = requireElementIndex(args.get(1), vector.length(), "vector-set!");
+        vector.set(index, args.get(2));
+        return VoidValue.INSTANCE;
+    }
+
+    private Value builtinVectorLength(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "vector-length");
+        return new IntValue(requireVector(args.getFirst(), "vector-length").length());
+    }
+
+    private Value builtinVectorPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "vector?");
+        return BoolValue.of(args.getFirst() instanceof VectorValue);
+    }
+
+    private Value builtinVectorToList(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "vector->list");
+        return new ListValue(List.copyOf(requireVector(args.getFirst(), "vector->list").elements()));
+    }
+
+    private Value builtinListToVector(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "list->vector");
+        return new VectorValue(requireList(args.getFirst(), "list->vector"));
     }
 
     private Value builtinDisplay(List<Value> args) throws EvalError {
@@ -1987,6 +2206,13 @@ public class Evaluator {
         throw new EvalError("'" + procedure + "' expects a mutable string");
     }
 
+    private VectorValue requireVector(Value value, String procedure) throws EvalError {
+        if (value instanceof VectorValue vectorValue) {
+            return vectorValue;
+        }
+        throw new EvalError("'" + procedure + "' expects a vector");
+    }
+
     private char requireChar(Value value, String procedure) throws EvalError {
         if (value instanceof CharValue charValue) {
             return charValue.value();
@@ -1999,6 +2225,14 @@ public class Evaluator {
             return listValue.elements();
         }
         throw new EvalError("'" + procedure + "' expects a list");
+    }
+
+    private int requireSize(Value value, String procedure) throws EvalError {
+        long size = requireInt(value);
+        if (size < 0) {
+            throw new EvalError("'" + procedure + "' expects a non-negative length");
+        }
+        return Math.toIntExact(size);
     }
 
     private int requireElementIndex(Value value, int size, String procedure) throws EvalError {
@@ -2045,6 +2279,15 @@ public class Evaluator {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
     }
 
+    private boolean isEqv(Value left, Value right) {
+        if (isEq(left, right)) {
+            return true;
+        }
+        return left instanceof NumericValue leftNumber
+                && right instanceof NumericValue rightNumber
+                && compareNumbers(leftNumber, rightNumber) == 0;
+    }
+
     private boolean isEq(Value left, Value right) {
         if (left == right) {
             return true;
@@ -2085,6 +2328,8 @@ public class Evaluator {
             case PairValue pairValue when right instanceof PairValue other ->
                     valuesEqual(pairValue.car(), other.car())
                             && valuesEqual(pairValue.cdr(), other.cdr());
+            case VectorValue vectorValue when right instanceof VectorValue other ->
+                    listElementsEqual(vectorValue.elements(), other.elements());
             default -> false;
         };
     }
@@ -2327,6 +2572,9 @@ public class Evaluator {
     private record Binding(String name, Expr valueExpr) {
     }
 
+    private record DoBinding(String name, Expr initExpr, Expr stepExpr) {
+    }
+
     private record FieldSpec(String fieldName, String accessorName) {
     }
 
@@ -2415,7 +2663,7 @@ public class Evaluator {
     }
 
     private sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue,
-            CharValue, ListValue, PairValue, RecordValue, ProcedureValue, VoidValue {
+            CharValue, ListValue, PairValue, VectorValue, RecordValue, ProcedureValue, VoidValue {
         String toSchemeString();
 
         default String toDisplayString() {
@@ -2568,6 +2816,44 @@ public class Evaluator {
         }
     }
 
+    private static final class VectorValue implements Value {
+        private final List<Value> elements;
+
+        private VectorValue(List<Value> elements) {
+            this.elements = new ArrayList<>(elements);
+        }
+
+        private int length() {
+            return elements.size();
+        }
+
+        private Value get(int index) {
+            return elements.get(index);
+        }
+
+        private void set(int index, Value value) {
+            elements.set(index, value);
+        }
+
+        private List<Value> elements() {
+            return elements;
+        }
+
+        @Override
+        public String toSchemeString() {
+            StringBuilder builder = new StringBuilder();
+            builder.append("#(");
+            for (int i = 0; i < elements.size(); i++) {
+                if (i > 0) {
+                    builder.append(' ');
+                }
+                builder.append(elements.get(i).toSchemeString());
+            }
+            builder.append(')');
+            return builder.toString();
+        }
+    }
+
     private static final class RecordType {
         private final String name;
 
@@ -2646,7 +2932,11 @@ public class Evaluator {
 
         private Value lookup(String name) throws EvalError {
             if (bindings.containsKey(name)) {
-                return bindings.get(name);
+                Value value = bindings.get(name);
+                if (value == null) {
+                    throw new EvalError("uninitialized variable: " + name);
+                }
+                return value;
             }
             if (parent != null) {
                 return parent.lookup(name);
