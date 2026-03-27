@@ -359,6 +359,7 @@ enum Builtin {
     IntegerPred,
     RationalPred,
     BooleanPred,
+    ProcedurePred,
     Display,
     Write,
     Newline,
@@ -412,6 +413,7 @@ enum Builtin {
 enum Procedure {
     Builtin(Builtin),
     Lambda(Lambda),
+    CaseLambda(CaseLambda),
     RecordConstructor(RecordConstructor),
     RecordPredicate(RecordPredicate),
     RecordAccessor(RecordAccessor),
@@ -423,6 +425,12 @@ struct Lambda {
     params: LambdaParams,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct CaseLambda {
+    name: Option<String>,
+    clauses: Vec<Lambda>,
 }
 
 #[derive(Clone)]
@@ -467,6 +475,24 @@ impl LambdaParams {
         match &self.rest {
             Some(_) => format!("at least {} arguments", self.fixed.len()),
             None => format!("exactly {} arguments", self.fixed.len()),
+        }
+    }
+
+    fn matches_arity(&self, count: usize) -> bool {
+        count >= self.fixed.len() && (self.rest.is_some() || count == self.fixed.len())
+    }
+}
+
+impl CaseLambda {
+    fn expected_args(&self) -> String {
+        if self.clauses.is_empty() {
+            "no supported arities".to_owned()
+        } else {
+            self.clauses
+                .iter()
+                .map(|clause| clause.params.expected_args())
+                .collect::<Vec<_>>()
+                .join(" or ")
         }
     }
 }
@@ -1020,6 +1046,7 @@ fn root_env() -> EnvRef {
         ("integer?", Builtin::IntegerPred),
         ("rational?", Builtin::RationalPred),
         ("boolean?", Builtin::BooleanPred),
+        ("procedure?", Builtin::ProcedurePred),
         ("display", Builtin::Display),
         ("write", Builtin::Write),
         ("newline", Builtin::Newline),
@@ -1100,6 +1127,7 @@ fn eval_list(items: &[Expr], list_pos: SourcePos, env: &EnvRef) -> Result<Value,
             "if" => return eval_if(args, env),
             "quote" => return eval_quote(args),
             "lambda" => return eval_lambda(args, env),
+            "case-lambda" => return eval_case_lambda(args, env),
             "begin" => return eval_begin(args, env),
             "cond" => return eval_cond(args, env),
             "let" => return eval_let(args, env),
@@ -1128,6 +1156,7 @@ fn apply_values(operator: Value, args: &[Value], env: &EnvRef) -> Result<Value, 
         Value::Procedure(procedure) => match procedure.as_ref() {
             Procedure::Builtin(builtin) => apply_builtin(*builtin, args, env),
             Procedure::Lambda(lambda) => apply_lambda(lambda, args),
+            Procedure::CaseLambda(case_lambda) => apply_case_lambda(case_lambda, args),
             Procedure::RecordConstructor(constructor) => {
                 apply_record_constructor(constructor, args)
             }
@@ -1170,6 +1199,7 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         Builtin::IntegerPred => eval_integer_type_pred(values),
         Builtin::RationalPred => eval_rational_pred(values),
         Builtin::BooleanPred => eval_boolean_pred(values),
+        Builtin::ProcedurePred => eval_procedure_pred(values),
         Builtin::Display => eval_display(values, env),
         Builtin::Write => eval_write(values, env),
         Builtin::Newline => eval_newline(values, env),
@@ -1226,9 +1256,7 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
 }
 
 fn apply_lambda(lambda: &Lambda, args: &[Value]) -> Result<Value, EvalError> {
-    if args.len() < lambda.params.fixed.len()
-        || (lambda.params.rest.is_none() && args.len() != lambda.params.fixed.len())
-    {
+    if !lambda.params.matches_arity(args.len()) {
         return Err(EvalError::WrongArgCount {
             name: lambda.name.clone().unwrap_or_else(|| "lambda".to_owned()),
             expected: lambda.params.expected_args(),
@@ -1256,6 +1284,25 @@ fn apply_lambda(lambda: &Lambda, args: &[Value]) -> Result<Value, EvalError> {
     }
 
     eval_sequence(&lambda.body, &call_env)
+}
+
+fn apply_case_lambda(case_lambda: &CaseLambda, args: &[Value]) -> Result<Value, EvalError> {
+    let Some(clause) = case_lambda
+        .clauses
+        .iter()
+        .find(|clause| clause.params.matches_arity(args.len()))
+    else {
+        return Err(EvalError::WrongArgCount {
+            name: case_lambda
+                .name
+                .clone()
+                .unwrap_or_else(|| "case-lambda".to_owned()),
+            expected: case_lambda.expected_args(),
+            got: args.len(),
+        });
+    };
+
+    apply_lambda(clause, args)
 }
 
 fn apply_record_constructor(
@@ -1878,6 +1925,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "if"
             | "quote"
             | "lambda"
+            | "case-lambda"
             | "begin"
             | "cond"
             | "let"
@@ -1974,14 +2022,7 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         return Err(EvalError::Parse("lambda requires a body".to_owned()));
     }
 
-    let params = match params_expr {
-        Expr::List(items, _) => parse_params(items, "lambda")?,
-        _ => {
-            return Err(EvalError::Parse(
-                "lambda parameters must be a list".to_owned(),
-            ));
-        }
-    };
+    let params = parse_formals_expr(params_expr, "lambda")?;
 
     Ok(Value::Procedure(Rc::new(Procedure::Lambda(Lambda {
         name: None,
@@ -1989,6 +2030,44 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         body: body.to_vec(),
         env: env.clone(),
     }))))
+}
+
+fn eval_case_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let mut clauses = Vec::with_capacity(args.len());
+
+    for clause in args {
+        let items = match clause {
+            Expr::List(items, _) => items,
+            _ => {
+                return Err(EvalError::Parse(
+                    "case-lambda clauses must be lists".to_owned(),
+                ))
+            }
+        };
+        let (params_expr, body) = items
+            .split_first()
+            .ok_or_else(|| EvalError::Parse("case-lambda clause cannot be empty".to_owned()))?;
+
+        if body.is_empty() {
+            return Err(EvalError::Parse(
+                "case-lambda clause requires a body".to_owned(),
+            ));
+        }
+
+        clauses.push(Lambda {
+            name: None,
+            params: parse_formals_expr(params_expr, "case-lambda")?,
+            body: body.to_vec(),
+            env: env.clone(),
+        });
+    }
+
+    Ok(Value::Procedure(Rc::new(Procedure::CaseLambda(
+        CaseLambda {
+            name: None,
+            clauses,
+        },
+    ))))
 }
 
 fn eval_begin(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
@@ -2132,6 +2211,19 @@ fn parse_params(params: &[Expr], form: &str) -> Result<LambdaParams, EvalError> 
     }
 
     Ok(LambdaParams { fixed, rest })
+}
+
+fn parse_formals_expr(params_expr: &Expr, form: &str) -> Result<LambdaParams, EvalError> {
+    match params_expr {
+        Expr::List(items, _) => parse_params(items, form),
+        Expr::Symbol(name, _) => Ok(LambdaParams {
+            fixed: Vec::new(),
+            rest: Some(name.clone()),
+        }),
+        _ => Err(EvalError::Parse(format!(
+            "{form} parameters must be a list or symbol"
+        ))),
+    }
 }
 
 fn parse_bindings(bindings: &[Expr], form: &str) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -2497,6 +2589,12 @@ fn eval_rational_pred(args: &[Value]) -> Result<Value, EvalError> {
 
 fn eval_boolean_pred(args: &[Value]) -> Result<Value, EvalError> {
     eval_type_predicate(args, "boolean?", |value| matches!(value, Value::Boolean(_)))
+}
+
+fn eval_procedure_pred(args: &[Value]) -> Result<Value, EvalError> {
+    eval_type_predicate(args, "procedure?", |value| {
+        matches!(value, Value::Procedure(_))
+    })
 }
 
 fn eval_display(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
