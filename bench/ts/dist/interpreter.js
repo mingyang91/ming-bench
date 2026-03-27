@@ -28,10 +28,13 @@ const CORE_SYNTAX = new Set([
     'letrec',
     'letrec*',
     'or',
+    'quasiquote',
     'quote',
     'set!',
     'syntax',
     'syntax-case',
+    'unquote',
+    'unquote-splicing',
     'with-syntax',
 ]);
 let macroIdentifierCounter = 0;
@@ -143,6 +146,26 @@ class Parser {
                 items: [{ kind: 'symbol', name: 'syntax', position }, this.parseExpr()],
             };
         }
+        if (ch === '#' && this.peekAt(1) === '(') {
+            return this.parseVector();
+        }
+        if (ch === '`') {
+            this.advance();
+            return {
+                kind: 'list',
+                position,
+                items: [{ kind: 'symbol', name: 'quasiquote', position }, this.parseExpr()],
+            };
+        }
+        if (ch === ',') {
+            this.advance();
+            const keyword = this.peekAt(0) === '@' ? (this.advance(), 'unquote-splicing') : 'unquote';
+            return {
+                kind: 'list',
+                position,
+                items: [{ kind: 'symbol', name: keyword, position }, this.parseExpr()],
+            };
+        }
         if (ch === '\'') {
             this.advance();
             return {
@@ -176,6 +199,22 @@ class Parser {
         }
         this.advance();
         return { kind: 'list', items, position };
+    }
+    parseVector() {
+        const position = this.currentPosition();
+        this.advance();
+        this.advance();
+        const items = [];
+        this.skipIgnored();
+        while (!this.isAtEnd() && this.peek() !== ')') {
+            items.push(this.parseExpr());
+            this.skipIgnored();
+        }
+        if (this.isAtEnd()) {
+            this.error('unterminated vector', position);
+        }
+        this.advance();
+        return { kind: 'vector', items, position };
     }
     parseString() {
         const position = this.currentPosition();
@@ -302,10 +341,15 @@ function cloneExpr(expr) {
             return { kind: 'symbol', name: expr.name, position: expr.position };
         case 'list':
             return { kind: 'list', items: expr.items.map((item) => cloneExpr(item)), position: expr.position };
+        case 'vector':
+            return { kind: 'vector', items: expr.items.map((item) => cloneExpr(item)), position: expr.position };
     }
 }
 function isEllipsisSymbol(expr) {
     return expr?.kind === 'symbol' && expr.name === '...';
+}
+function isDotSymbol(expr) {
+    return expr?.kind === 'symbol' && expr.name === '.';
 }
 function parseSyntaxRules(name, expr, env) {
     if (expr.kind !== 'list' || expr.items.length < 2) {
@@ -415,6 +459,10 @@ function matchPattern(pattern, expr, literals, captures, repeatedContext = false
             return expr.kind === 'list'
                 ? matchListPattern(pattern.items, expr.items, literals, captures, repeatedContext)
                 : false;
+        case 'vector':
+            return expr.kind === 'vector'
+                ? matchListPattern(pattern.items, expr.items, literals, captures, repeatedContext)
+                : false;
     }
 }
 function matchListPattern(patternItems, exprItems, literals, captures, repeatedContext) {
@@ -490,6 +538,13 @@ function ensureRepeatedCaptureSlots(pattern, literals, captures) {
                 }
             });
             return;
+        case 'vector':
+            pattern.items.forEach((item) => {
+                if (!isEllipsisSymbol(item)) {
+                    ensureRepeatedCaptureSlots(item, literals, captures);
+                }
+            });
+            return;
         default:
             return;
     }
@@ -513,6 +568,10 @@ function sameExpr(left, right) {
             return (right.kind === 'list' &&
                 left.items.length === right.items.length &&
                 left.items.every((item, index) => sameExpr(item, right.items[index])));
+        case 'vector':
+            return (right.kind === 'vector' &&
+                left.items.length === right.items.length &&
+                left.items.every((item, index) => sameExpr(item, right.items[index])));
     }
 }
 function expandTemplate(expr, ctx, repetitionIndex) {
@@ -526,6 +585,12 @@ function expandTemplate(expr, ctx, repetitionIndex) {
             return expandTemplateSymbol(expr, ctx, repetitionIndex);
         case 'list':
             return expandTemplateList(expr, ctx, repetitionIndex);
+        case 'vector':
+            return {
+                kind: 'vector',
+                items: expandTemplateSequence(expr.items, ctx, repetitionIndex),
+                position: expr.position,
+            };
     }
 }
 function expandTemplateSymbol(expr, ctx, repetitionIndex) {
@@ -677,6 +742,11 @@ function collectRepeatedCaptureNames(template, captures, names = new Set()) {
                 collectRepeatedCaptureNames(item, captures, names);
             });
             return names;
+        case 'vector':
+            template.items.forEach((item) => {
+                collectRepeatedCaptureNames(item, captures, names);
+            });
+            return names;
         default:
             return names;
     }
@@ -717,6 +787,7 @@ function createBuiltins(output, macroEnv) {
         builtin('apply', (args, position, k) => applyBuiltin(args, position, macroEnv, k)),
         builtin('append', (args) => appendValues(args)),
         builtin('assoc', (args) => assocBuiltin(args)),
+        builtin('assq', (args) => assqBuiltin(args)),
         builtin('assv', (args) => assvBuiltin(args)),
         builtin('boolean?', (args) => unaryPredicate('boolean?', args, (value) => typeof value === 'boolean')),
         builtin('car', (args) => {
@@ -779,6 +850,7 @@ function createBuiltins(output, macroEnv) {
             assertExactArity('equal?', args, 2);
             return equalValues(args[0], args[1]);
         }),
+        builtin('error', (args, position) => errorBuiltin(args, position)),
         builtin('denominator', (args) => {
             assertExactArity('denominator', args, 1);
             return num.denominatorOf(expectNumberValue('denominator', args[0]));
@@ -834,6 +906,8 @@ function createBuiltins(output, macroEnv) {
         builtin('map', (args, position, k) => mapBuiltin(args, position, macroEnv, k)),
         builtin('max', (args) => extremum('max', args, (left, right) => (num.numericCompare(left, right) >= 0 ? left : right))),
         builtin('member', (args) => memberBuiltin(args)),
+        builtin('memq', (args) => memqBuiltin(args)),
+        builtin('memv', (args) => memvBuiltin(args)),
         builtin('min', (args) => extremum('min', args, (left, right) => (num.numericCompare(left, right) <= 0 ? left : right))),
         builtin('modulo', (args) => moduloNumbers(args)),
         builtin('newline', (args) => {
@@ -1204,6 +1278,8 @@ function evalExprStep(expr, env, macroEnv, k) {
             return k(env.lookup(expr.name));
         case 'list':
             return evalListStep(expr, env, macroEnv, k);
+        case 'vector':
+            return k(quoteExpr(expr));
     }
 }
 function evalListStep(expr, env, macroEnv, k) {
@@ -1248,6 +1324,8 @@ function evalListStep(expr, env, macroEnv, k) {
                 return evalLetRecStep(items.slice(1), env, macroEnv, true, k);
             case 'or':
                 return evalOrStep(items.slice(1), env, macroEnv, k);
+            case 'quasiquote':
+                return evalQuasiquoteStep(items.slice(1), env, macroEnv, k);
             case 'quote':
                 return evalQuoteStep(items.slice(1), k);
             case 'set!':
@@ -1351,6 +1429,36 @@ function evalCondStep(clauses, env, macroEnv, k) {
             throw new EvalError('cond else clause must be last');
         }
         return evalSequenceStep(body, env, macroEnv, k);
+    }
+    const arrowExpr = body[0];
+    if (arrowExpr?.kind === 'symbol' && arrowExpr.name === '=>') {
+        if (body.length !== 2) {
+            throw new EvalError('cond => clause expects exactly one recipient expression');
+        }
+        const recipientExpr = body[1];
+        return {
+            kind: 'eval-step',
+            expr: testExpr,
+            env,
+            k: (result) => {
+                const testValue = expectSingleValueResult('cond', result);
+                if (!isTruthy(testValue)) {
+                    return evalCondStep(restClauses, env, macroEnv, k);
+                }
+                return {
+                    kind: 'eval-step',
+                    expr: recipientExpr,
+                    env,
+                    k: (recipientResult) => ({
+                        kind: 'apply-step',
+                        proc: expectProcedureValue('cond', expectSingleValueResult('cond', recipientResult)),
+                        args: [testValue],
+                        position: recipientExpr.position,
+                        k,
+                    }),
+                };
+            },
+        };
     }
     return {
         kind: 'eval-step',
@@ -1752,6 +1860,90 @@ function evalQuoteStep(args, k) {
     assertExactArity('quote', args, 1);
     return k(quoteExpr(args[0]));
 }
+function evalQuasiquoteStep(args, env, macroEnv, k) {
+    assertExactArity('quasiquote', args, 1);
+    return {
+        kind: 'eval-step',
+        expr: expandQuasiquoteExpr(args[0], 1),
+        env,
+        k,
+    };
+}
+function expandQuasiquoteExpr(template, depth) {
+    const unquoted = getQuasiquoteUnaryForm(template, 'unquote');
+    if (unquoted !== undefined) {
+        return depth === 1
+            ? cloneExpr(unquoted)
+            : makeQuasiquoteTaggedListExpr('unquote', expandQuasiquoteExpr(unquoted, depth - 1), template.position);
+    }
+    const spliced = getQuasiquoteUnaryForm(template, 'unquote-splicing');
+    if (spliced !== undefined) {
+        if (depth === 1) {
+            throw new EvalError('unquote-splicing must appear within a quasiquote list or vector', template.position);
+        }
+        return makeQuasiquoteTaggedListExpr('unquote-splicing', expandQuasiquoteExpr(spliced, depth - 1), template.position);
+    }
+    const nested = getQuasiquoteUnaryForm(template, 'quasiquote');
+    if (nested !== undefined) {
+        return makeQuasiquoteTaggedListExpr('quasiquote', expandQuasiquoteExpr(nested, depth + 1), template.position);
+    }
+    switch (template.kind) {
+        case 'number':
+        case 'boolean':
+        case 'char':
+        case 'string':
+        case 'symbol':
+            return makeQuotedExpr(template);
+        case 'list':
+            return expandQuasiquoteListExpr(template, depth);
+        case 'vector':
+            return makeCallExpr('list->vector', [buildQuasiquoteListExpr(template.items, undefined, depth, template.position)], template.position);
+    }
+}
+function expandQuasiquoteListExpr(expr, depth) {
+    const { prefix, tail } = splitImproperListItems(expr.items, expr.position, 'invalid dotted list');
+    return buildQuasiquoteListExpr(prefix, tail, depth, expr.position);
+}
+function buildQuasiquoteListExpr(items, tail, depth, position) {
+    let result = tail === undefined
+        ? makeQuotedExpr({ kind: 'list', items: [], position })
+        : expandQuasiquoteExpr(tail, depth);
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+        const item = items[index];
+        const spliced = depth === 1 ? getQuasiquoteUnaryForm(item, 'unquote-splicing') : undefined;
+        if (spliced !== undefined) {
+            result = makeCallExpr('append', [cloneExpr(spliced), result], item.position);
+            continue;
+        }
+        result = makeCallExpr('cons', [expandQuasiquoteExpr(item, depth), result], item.position);
+    }
+    return result;
+}
+function getQuasiquoteUnaryForm(expr, name) {
+    return expr.kind === 'list' &&
+        expr.items.length === 2 &&
+        expr.items[0]?.kind === 'symbol' &&
+        expr.items[0].name === name
+        ? expr.items[1]
+        : undefined;
+}
+function makeQuotedExpr(expr) {
+    return {
+        kind: 'list',
+        position: expr.position,
+        items: [{ kind: 'symbol', name: 'quote', position: expr.position }, cloneExpr(expr)],
+    };
+}
+function makeCallExpr(name, args, position) {
+    return {
+        kind: 'list',
+        position,
+        items: [{ kind: 'symbol', name, position }, ...args],
+    };
+}
+function makeQuasiquoteTaggedListExpr(name, operand, position) {
+    return makeCallExpr('list', [makeQuotedExpr({ kind: 'symbol', name, position }), operand], position);
+}
 function evalSyntaxStep(args, env, k) {
     assertExactArity('syntax', args, 1);
     if (currentProceduralMacroContexts.length === 0 && currentSyntaxFrames.length === 0) {
@@ -2015,8 +2207,34 @@ function quoteExpr(expr) {
         case 'symbol':
             return { kind: 'symbol-value', name: expr.name };
         case 'list':
-            return makeList(expr.items.map((item) => quoteExpr(item)));
+            return quoteListExpr(expr.items, expr.position);
+        case 'vector':
+            return { kind: 'vector', items: expr.items.map((item) => quoteExpr(item)) };
     }
+}
+function quoteListExpr(items, position) {
+    const { prefix, tail } = splitImproperListItems(items, position, 'invalid dotted list');
+    return tail === undefined
+        ? makeList(prefix.map((item) => quoteExpr(item)))
+        : makeImproperList(prefix.map((item) => quoteExpr(item)), quoteExpr(tail));
+}
+function splitImproperListItems(items, position, errorMessage) {
+    const dotIndices = [];
+    items.forEach((item, index) => {
+        if (isDotSymbol(item)) {
+            dotIndices.push(index);
+        }
+    });
+    if (dotIndices.length === 0) {
+        return { prefix: [...items] };
+    }
+    if (dotIndices.length !== 1 || dotIndices[0] === 0 || dotIndices[0] !== items.length - 2) {
+        throw new EvalError(errorMessage, position);
+    }
+    return {
+        prefix: items.slice(0, dotIndices[0]),
+        tail: items[dotIndices[0] + 1],
+    };
 }
 function isSyntaxRulesTransformerExpr(expr) {
     return expr.kind === 'list' && expr.items[0]?.kind === 'symbol' && expr.items[0].name === 'syntax-rules';
@@ -2129,9 +2347,11 @@ function datumValueToExpr(value, position) {
         case 'empty-list':
             return { kind: 'list', items: [], position };
         case 'pair':
+            return datumPairValueToExpr(value, position);
+        case 'vector':
             return {
-                kind: 'list',
-                items: expectProperList('datum->syntax', value).map((item) => datumValueToExpr(item, position)),
+                kind: 'vector',
+                items: value.items.map((item) => datumValueToExpr(item, position)),
                 position,
             };
         case 'syntax':
@@ -2139,6 +2359,24 @@ function datumValueToExpr(value, position) {
         default:
             throw new EvalError('datum->syntax expects a datum that can be converted to syntax');
     }
+}
+function datumPairValueToExpr(value, position) {
+    const items = [];
+    const seen = new Set();
+    let current = value;
+    while (isPair(current)) {
+        if (seen.has(current)) {
+            throw new EvalError('datum->syntax expects a finite list datum');
+        }
+        seen.add(current);
+        items.push(datumValueToExpr(current.car, position));
+        current = current.cdr;
+    }
+    if (!isEmptyList(current)) {
+        items.push({ kind: 'symbol', name: '.', position });
+        items.push(datumValueToExpr(current, position));
+    }
+    return { kind: 'list', items, position };
 }
 function applyProcedure(proc, args, position, macroEnv, k, allowVoidEscape = currentProcedureBoundaries[currentProcedureBoundaries.length - 1]?.allowVoidEscape ?? true) {
     if (proc.kind === 'builtin') {
@@ -2238,6 +2476,15 @@ function resumeContinuation(proc, value, macroEnv) {
 function raiseBuiltin(args, position) {
     assertExactArity('raise', args, 1);
     throw new SchemeExceptionSignal(args[0], position);
+}
+function errorBuiltin(args, position) {
+    assertAtLeastArity('error', args, 1);
+    const [message, ...irritants] = args;
+    const text = [
+        isStringValue(message) ? stringValueText(message) : formatDisplayValue(message),
+        ...irritants.map((value) => formatDisplayValue(value)),
+    ].join(' ');
+    throw new SchemeExceptionSignal(makeRuntimeString(text), position);
 }
 function withExceptionHandlerBuiltin(args, position, k) {
     assertExactArity('with-exception-handler', args, 2);
@@ -2457,6 +2704,17 @@ function appendList(list, tail) {
 }
 function makeList(items) {
     let result = EMPTY_LIST;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+        result = {
+            kind: 'pair',
+            car: items[index],
+            cdr: result,
+        };
+    }
+    return result;
+}
+function makeImproperList(items, tail) {
+    let result = tail;
     for (let index = items.length - 1; index >= 0; index -= 1) {
         result = {
             kind: 'pair',
@@ -2745,64 +3003,65 @@ function forEachLoopStep(proc, currentLists, seenLists, position, macroEnv, k) {
 }
 function memberBuiltin(args) {
     assertExactArity('member', args, 2);
-    const key = args[0];
-    let current = args[1];
+    return findMember('member', args[0], args[1], equalValues);
+}
+function memqBuiltin(args) {
+    assertExactArity('memq', args, 2);
+    return findMember('memq', args[0], args[1], eqValues);
+}
+function memvBuiltin(args) {
+    assertExactArity('memv', args, 2);
+    return findMember('memv', args[0], args[1], eqvValues);
+}
+function findMember(name, key, list, compare) {
+    let current = list;
     const seen = new Set();
     while (isPair(current)) {
         if (seen.has(current)) {
-            throw new EvalError('member expects a proper list');
+            throw new EvalError(`${name} expects a proper list`);
         }
         seen.add(current);
-        if (equalValues(key, current.car)) {
+        if (compare(key, current.car)) {
             return current;
         }
         current = current.cdr;
     }
     if (!isEmptyList(current)) {
-        throw new EvalError('member expects a proper list');
+        throw new EvalError(`${name} expects a proper list`);
     }
     return false;
 }
+function assqBuiltin(args) {
+    assertExactArity('assq', args, 2);
+    return findAssoc('assq', args[0], args[1], eqValues);
+}
 function assvBuiltin(args) {
     assertExactArity('assv', args, 2);
-    const key = args[0];
-    let current = args[1];
+    return findAssoc('assv', args[0], args[1], eqvValues);
+}
+function assocBuiltin(args) {
+    assertExactArity('assoc', args, 2);
+    return findAssoc('assoc', args[0], args[1], equalValues);
+}
+function findAssoc(name, key, list, compare) {
+    let current = list;
     const seen = new Set();
     while (isPair(current)) {
         if (seen.has(current)) {
-            throw new EvalError('assv expects an association list');
+            throw new EvalError(`${name} expects an association list`);
         }
         seen.add(current);
         const entry = current.car;
         if (!isPair(entry)) {
-            throw new EvalError('assv expects an association list');
+            throw new EvalError(`${name} expects an association list`);
         }
-        if (eqvValues(key, entry.car)) {
+        if (compare(key, entry.car)) {
             return entry;
         }
         current = current.cdr;
     }
     if (!isEmptyList(current)) {
-        throw new EvalError('assv expects an association list');
-    }
-    return false;
-}
-function assocBuiltin(args) {
-    assertExactArity('assoc', args, 2);
-    const key = args[0];
-    let current = args[1];
-    while (isPair(current)) {
-        const entry = current.car;
-        if (!isPair(entry)) {
-            throw new EvalError('assoc expects an association list');
-        }
-        if (equalValues(key, entry.car)) {
-            return entry;
-        }
-        current = current.cdr;
-    }
-    if (!isEmptyList(current)) {
-        throw new EvalError('assoc expects an association list');
+        throw new EvalError(`${name} expects an association list`);
     }
     return false;
 }
