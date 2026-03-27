@@ -5,7 +5,7 @@ import scala.annotation.tailrec
 private[ming] object SchemeParser:
 
   def parseProgram(input: String): List[Expr] =
-    val (_, expressions) = parseExpressions(skipIgnored(Cursor(input, 0)), Nil)
+    val (_, expressions) = parseExpressions(skipIgnored(Cursor(input, 0, 1, 1)), Nil)
     expressions.reverse
 
   @tailrec
@@ -18,45 +18,47 @@ private[ming] object SchemeParser:
 
   private def parseExpr(cursor: Cursor): (Cursor, Expr) =
     val current = skipIgnored(cursor)
-    if current.atEnd then fail("unexpected end of input")
+    if current.atEnd then fail(current, "unexpected end of input")
 
     current.currentChar match
       case '(' =>
-        parseList(current.advance())
+        parseList(current.advance(), current.position)
       case ')' =>
-        fail("unexpected ')'")
+        fail(current, "unexpected ')'")
       case '\'' =>
+        val quotePos     = current.position
         val (next, expr) = parseExpr(current.advance())
-        (next, Expr.ListExpr(List(Expr.Symbol("quote"), expr)))
+        (next, Expr.ListExpr(List(Expr.Symbol("quote", quotePos), expr), quotePos))
       case '"' =>
+        val stringPos     = current.position
         val (next, value) = parseString(current.advance())
-        (next, Expr.StringLit(value))
+        (next, Expr.StringLit(value, stringPos))
       case _ =>
         parseAtom(current)
 
   @tailrec
-  private def parseList(cursor: Cursor, acc: List[Expr] = Nil): (Cursor, Expr) =
+  private def parseList(cursor: Cursor, startPos: SourcePos, acc: List[Expr] = Nil): (Cursor, Expr) =
     val current = skipIgnored(cursor)
-    if current.atEnd then fail("unterminated list")
+    if current.atEnd then fail(current, "unterminated list")
 
     current.currentChar match
       case ')' =>
-        (current.advance(), Expr.ListExpr(acc.reverse))
+        (current.advance(), Expr.ListExpr(acc.reverse, startPos))
       case _ =>
         val (next, expr) = parseExpr(current)
-        parseList(next, expr :: acc)
+        parseList(next, startPos, expr :: acc)
 
   private def parseString(cursor: Cursor): (Cursor, String) =
     @tailrec
     def loop(current: Cursor, acc: List[Char]): (Cursor, String) =
-      if current.atEnd then fail("unterminated string literal")
+      if current.atEnd then fail(current, "unterminated string literal")
 
       current.currentChar match
         case '"' =>
           (current.advance(), acc.reverse.mkString)
         case '\\' =>
           val escaped = current.advance()
-          if escaped.atEnd then fail("unterminated escape sequence")
+          if escaped.atEnd then fail(escaped, "unterminated escape sequence")
           loop(escaped.advance(), decodeEscape(escaped.currentChar) :: acc)
         case ch =>
           loop(current.advance(), ch :: acc)
@@ -73,18 +75,19 @@ private[ming] object SchemeParser:
       case other => other
 
   private def parseAtom(cursor: Cursor): (Cursor, Expr) =
+    val pos   = cursor.position
     val next  = advanceWhile(cursor)(ch => !isDelimiter(ch))
     val token = cursor.input.substring(cursor.index, next.index)
     val expr =
       token match
-        case "#t" => Expr.BoolLit(true)
-        case "#f" => Expr.BoolLit(false)
+        case "#t" => Expr.BoolLit(true, pos)
+        case "#f" => Expr.BoolLit(false, pos)
         case _ if isIntegerToken(token) =>
-          Expr.IntLit(token.toInt)
+          Expr.IntLit(token.toInt, pos)
         case _ if token.nonEmpty =>
-          Expr.Symbol(token)
+          Expr.Symbol(token, pos)
         case _ =>
-          fail("expected expression")
+          fail(cursor, "expected expression")
 
     (next, expr)
 
@@ -122,10 +125,10 @@ private[ming] object SchemeParser:
           case _         => token
       digits.nonEmpty && digits.forall(_.isDigit)
 
-  private def fail(message: String): Nothing =
-    throw EvalError(message)
+  private def fail(cursor: Cursor, message: String): Nothing =
+    throw EvalError.at(cursor.position, message)
 
-  private case class Cursor(input: String, index: Int):
+  private case class Cursor(input: String, index: Int, line: Int, col: Int):
 
     def atEnd: Boolean =
       index >= input.length
@@ -133,5 +136,14 @@ private[ming] object SchemeParser:
     def currentChar: Char =
       input.charAt(index)
 
+    def position: SourcePos =
+      SourcePos(line, col)
+
     def advance(step: Int = 1): Cursor =
-      copy(index = index + step)
+      if step <= 0 || atEnd then this
+      else
+        val next =
+          currentChar match
+            case '\n' => copy(index = index + 1, line = line + 1, col = 1)
+            case _    => copy(index = index + 1, col = col + 1)
+        next.advance(step - 1)

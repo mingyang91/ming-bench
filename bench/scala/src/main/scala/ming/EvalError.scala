@@ -1,8 +1,18 @@
 package ming
 
-class EvalError(message: String) extends Exception(message)
+class EvalError private (
+  val detail: String,
+  val position: Option[SourcePos]
+) extends Exception(
+      position match
+        case Some(pos) => s"$pos: $detail"
+        case None      => detail
+    )
 
 object EvalError:
 
   def apply(message: String): EvalError =
-    new EvalError(message)
+    new EvalError(message, None)
+
+  def at(position: SourcePos, message: String): EvalError =
+    new EvalError(message, Some(position))

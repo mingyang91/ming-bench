@@ -21,11 +21,11 @@ private[ming] object ValueSemantics:
 
   def quote(expr: Expr): Value =
     expr match
-      case Expr.IntLit(value)    => Value.IntVal(value)
-      case Expr.BoolLit(value)   => Value.BoolVal(value)
-      case Expr.StringLit(value) => Value.StringVal(value)
-      case Expr.Symbol(name)     => Value.SymbolVal(name)
-      case Expr.ListExpr(items) =>
+      case Expr.IntLit(value, _)    => Value.IntVal(value)
+      case Expr.BoolLit(value, _)   => Value.BoolVal(value)
+      case Expr.StringLit(value, _) => Value.StringVal(value)
+      case Expr.Symbol(name, _)     => Value.SymbolVal(name)
+      case Expr.ListExpr(items, _) =>
         items.foldRight[Value](Value.EmptyList) { (item, acc) =>
           Value.PairVal(quote(item), acc)
         }
