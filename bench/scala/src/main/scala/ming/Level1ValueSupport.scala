@@ -4,7 +4,7 @@ import scala.annotation.tailrec
 
 private[ming] object Level1ValueSupport:
 
-  def eqValues(left: Value, right: Value): Boolean =
+  def eqvValues(left: Value, right: Value): Boolean =
     (left, right) match
       case (leftNumber: NumberValue, rightNumber: NumberValue) =>
         NumericSupport.equal(leftNumber, rightNumber)
@@ -16,12 +16,20 @@ private[ming] object Level1ValueSupport:
       case (EmptyListValue, EmptyListValue)                    => true
       case _                                                   => left eq right
 
+  def eqValues(left: Value, right: Value): Boolean =
+    eqvValues(left, right)
+
   def equalValues(left: Value, right: Value): Boolean =
     (left, right) match
       case (PairValue(leftCar, leftCdr), PairValue(rightCar, rightCdr)) =>
         equalValues(leftCar, rightCar) && equalValues(leftCdr, rightCdr)
+      case (leftVector: VectorValue, rightVector: VectorValue) =>
+        leftVector.length == rightVector.length &&
+        leftVector.toList
+          .zip(rightVector.toList)
+          .forall((leftElement, rightElement) => equalValues(leftElement, rightElement))
       case _ =>
-        eqValues(left, right)
+        eqvValues(left, right)
 
   def isString(value: Value): Boolean =
     value match
@@ -72,6 +80,11 @@ private[ming] object Level1ValueSupport:
     value match
       case CharValue(_) => true
       case _            => false
+
+  def isVector(value: Value): Boolean =
+    value match
+      case _: VectorValue => true
+      case _              => false
 
   @tailrec
   def isProperList(value: Value): Boolean =

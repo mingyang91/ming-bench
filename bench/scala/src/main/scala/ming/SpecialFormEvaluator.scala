@@ -1,6 +1,6 @@
 package ming
 
-import RuntimeSupport.{buildList, isTruthy}
+import RuntimeSupport.isTruthy
 
 import scala.annotation.tailrec
 
@@ -28,6 +28,7 @@ private[ming] object SpecialFormEvaluator:
         if isTruthy(result) then result
         else evalOr(rest, env)
 
+  @tailrec
   def evalCond(clauses: List[Expr], env: Environment): Value =
     clauses match
       case Nil =>
@@ -46,25 +47,14 @@ private[ming] object SpecialFormEvaluator:
     position: Position,
     env: Environment
   ): Value =
-    arguments match
-      case SymbolExpr(name, _) :: valueExpression :: Nil =>
-        evalValueDefine(name, valueExpression, env)
-      case ListExpr(SymbolExpr(name, _) :: parameters, _) :: body if body.nonEmpty =>
-        evalProcedureDefine(name, parameters, body, env, position)
-      case _ =>
-        SchemeFailure.raise(
-          "define expected (define name expr) or (define (name args) body ...)",
-          position
-        )
+    SpecialFormDefinitionEvaluator.evalDefine(arguments, position, env)
 
   def evalDefineSyntax(
     arguments: List[Expr],
     position: Position,
     env: Environment
   ): Value =
-    val (name, macroDefinition) = MacroExpander.parse(arguments, position, env)
-    env.defineMacro(name, macroDefinition)
-    VoidValue
+    SpecialFormDefinitionEvaluator.evalDefineSyntax(arguments, position, env)
 
   def evalIf(
     arguments: List[Expr],
@@ -75,59 +65,74 @@ private[ming] object SpecialFormEvaluator:
       case condition :: consequent :: alternate :: Nil =>
         if isTruthy(InterpreterEvaluator.eval(condition, env)) then InterpreterEvaluator.eval(consequent, env)
         else InterpreterEvaluator.eval(alternate, env)
+      case condition :: consequent :: Nil =>
+        if isTruthy(InterpreterEvaluator.eval(condition, env)) then InterpreterEvaluator.eval(consequent, env)
+        else VoidValue
       case _ =>
-        SchemeFailure.raise("if expected 3 argument(s)", position)
+        SchemeFailure.raise("if expected 2 or 3 argument(s)", position)
 
   def evalLet(
     arguments: List[Expr],
     position: Position,
     env: Environment
   ): Value =
-    arguments match
-      case SymbolExpr(name, _) :: bindingsExpression :: body if body.nonEmpty =>
-        evalNamedLet(name, bindingsExpression, body, position, env)
-      case bindingsExpression :: body if body.nonEmpty =>
-        evalUnnamedLet(bindingsExpression, body, position, env)
-      case _ =>
-        SchemeFailure.raise("let expected bindings and body", position)
+    SpecialFormBindingEvaluator.evalLet(arguments, position, env)
+
+  def evalLetrec(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): Value =
+    SpecialFormBindingEvaluator.evalLetrec(arguments, position, env)
+
+  def evalLetrecStar(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): Value =
+    SpecialFormBindingEvaluator.evalLetrecStar(arguments, position, env)
 
   def evalQuote(arguments: List[Expr], position: Position): Value =
-    arguments match
-      case expression :: Nil =>
-        quote(expression)
-      case _ =>
-        SchemeFailure.raise("quote expected 1 argument(s)", position)
+    SpecialFormQuoteEvaluator.evalQuote(arguments, position)
 
   def evalLambda(
     arguments: List[Expr],
     position: Position,
     env: Environment
   ): Value =
-    arguments match
-      case parametersExpression :: body if body.nonEmpty =>
-        buildClosure(parametersExpression, body, env, None, position)
-      case _ =>
-        SchemeFailure.raise("lambda expected a parameter list and body", position)
+    SpecialFormProcedureEvaluator.evalLambda(arguments, position, env)
 
   def evalCaseLambda(
     arguments: List[Expr],
-    _position: Position,
+    position: Position,
     env: Environment
   ): Value =
-    CaseLambdaValue(arguments.map(buildCaseLambdaClause(_, env)))
+    SpecialFormProcedureEvaluator.evalCaseLambda(arguments, position, env)
+
+  def evalCase(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): Value =
+    arguments match
+      case keyExpression :: clauses if clauses.nonEmpty =>
+        evalCaseClauses(InterpreterEvaluator.eval(keyExpression, env), clauses, env)
+      case _ =>
+        SchemeFailure.raise("case expected a key and at least one clause", position)
+
+  def evalDo(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): Value =
+    SpecialFormBindingEvaluator.evalDo(arguments, position, env)
 
   def evalSet(
     arguments: List[Expr],
     position: Position,
     env: Environment
   ): Value =
-    arguments match
-      case SymbolExpr(name, symbolPosition) :: valueExpression :: Nil =>
-        val value = InterpreterEvaluator.eval(valueExpression, env)
-        env.assign(name, value, symbolPosition)
-        VoidValue
-      case _ =>
-        SchemeFailure.raise("set! expected (set! name expr)", position)
+    SpecialFormDefinitionEvaluator.evalSet(arguments, position, env)
 
   private def evalCondElseClause(
     body: List[Expr],
@@ -143,153 +148,51 @@ private[ming] object SpecialFormEvaluator:
 
   private def evalCondBody(body: List[Expr], testValue: Value, env: Environment): Value =
     body match
-      case Nil => testValue
-      case _   => InterpreterEvaluator.evalSequence(body, env)
-
-  private def evalValueDefine(name: String, valueExpression: Expr, env: Environment): Value =
-    env.reserve(name)
-    val value = InterpreterEvaluator.eval(valueExpression, env)
-    env.define(name, value)
-    VoidValue
-
-  private def evalProcedureDefine(
-    name: String,
-    parameters: List[Expr],
-    body: List[Expr],
-    env: Environment,
-    position: Position
-  ): Value =
-    env.reserve(name)
-    val value = buildClosure(parameters, body, env, Some(name), position)
-    env.define(name, value)
-    VoidValue
-
-  private def evalUnnamedLet(
-    bindingsExpression: Expr,
-    body: List[Expr],
-    position: Position,
-    env: Environment
-  ): Value =
-    val bindings    = parseBindings(bindingsExpression, position, "let")
-    val boundValues = bindings.map { case (_, expression) => InterpreterEvaluator.eval(expression, env) }
-    val childEnv    = Environment.child(env, bindings.map(_._1).zip(boundValues))
-    InterpreterEvaluator.evalSequence(body, childEnv)
-
-  private def evalNamedLet(
-    name: String,
-    bindingsExpression: Expr,
-    body: List[Expr],
-    position: Position,
-    env: Environment
-  ): Value =
-    val bindings   = parseBindings(bindingsExpression, position, "let")
-    val arguments  = bindings.map { case (_, expression) => InterpreterEvaluator.eval(expression, env) }
-    val closureEnv = Environment.child(env)
-    val closure    = ClosureValue(bindings.map(_._1), None, body, closureEnv, Some(name))
-    closureEnv.define(name, closure)
-    InterpreterEvaluator.applyFunction(closure, arguments, position)
-
-  private def buildClosure(
-    parametersExpression: Expr,
-    body: List[Expr],
-    env: Environment,
-    name: Option[String],
-    position: Position
-  ): ClosureValue =
-    val (parameters, restParameter) = parameterSpec(parametersExpression, position)
-    ClosureValue(parameters, restParameter, body, env, name)
-
-  private def buildClosure(
-    parameterExpressions: List[Expr],
-    body: List[Expr],
-    env: Environment,
-    name: Option[String],
-    position: Position
-  ): ClosureValue =
-    val (parameters, restParameter) = parameterSpec(parameterExpressions, position)
-    ClosureValue(parameters, restParameter, body, env, name)
-
-  private def buildCaseLambdaClause(
-    clauseExpression: Expr,
-    env: Environment
-  ): ClosureValue =
-    clauseExpression match
-      case ListExpr(parameterSpec :: body, clausePosition) if body.nonEmpty =>
-        buildClosure(parameterSpec, body, env, None, clausePosition)
-      case ListExpr(_ :: Nil, clausePosition) =>
-        SchemeFailure.raise("case-lambda clause expected a body", clausePosition)
+      case Nil =>
+        testValue
       case _ =>
+        InterpreterEvaluator.evalSequence(body, env)
+
+  private def evalCaseClauses(
+    key: Value,
+    clauses: List[Expr],
+    env: Environment
+  ): Value =
+    clauses match
+      case Nil =>
+        VoidValue
+      case ListExpr(SymbolExpr("else", _) :: body, clausePosition) :: rest =>
+        evalCaseElseClause(body, rest, clausePosition, env)
+      case ListExpr(ListExpr(datumExpressions, _) :: body, clausePosition) :: rest =>
+        evalDatumCaseClause(key, datumExpressions, body, clausePosition, rest, env)
+      case clause :: _ =>
         SchemeFailure.raise(
-          "case-lambda expected clauses of the form ((args) body ...)",
-          clauseExpression.position
+          "case expected clauses of the form ((datum ...) body ...) or (else body ...)",
+          clause.position
         )
 
-  private def parameterSpec(
-    parametersExpression: Expr,
-    position: Position
-  ): (List[String], Option[String]) =
-    parametersExpression match
-      case SymbolExpr(name, _) =>
-        (Nil, Some(name))
-      case ListExpr(parameterExpressions, _) =>
-        parameterSpec(parameterExpressions, position)
-      case _ =>
-        SchemeFailure.raise("lambda expected a parameter list or symbol", position)
+  private def evalCaseElseClause(
+    body: List[Expr],
+    rest: List[Expr],
+    clausePosition: Position,
+    env: Environment
+  ): Value =
+    if rest.nonEmpty then SchemeFailure.raise("case else clause must be last", clausePosition)
 
-  private def parameterSpec(
-    parameterExpressions: List[Expr],
-    position: Position
-  ): (List[String], Option[String]) =
-    val dotIndex = parameterExpressions.indexWhere:
-      case SymbolExpr(".", _) => true
-      case _                  => false
+    if body.isEmpty then SchemeFailure.raise("case else clause must have a body", clausePosition)
 
-    if dotIndex < 0 then (parameterExpressions.map(parameterName(_, position)), None)
-    else
-      parameterExpressions.drop(dotIndex) match
-        case List(SymbolExpr(".", _), SymbolExpr(restName, _)) =>
-          (
-            parameterExpressions.take(dotIndex).map(parameterName(_, position)),
-            Some(restName)
-          )
-        case _ =>
-          SchemeFailure.raise("parameter list is malformed", position)
+    InterpreterEvaluator.evalSequence(body, env)
 
-  private def parameterName(expression: Expr, position: Position): String =
-    expression match
-      case SymbolExpr(name, _) => name
-      case _ =>
-        SchemeFailure.raise("parameters must be symbols", position)
+  private def evalDatumCaseClause(
+    key: Value,
+    datumExpressions: List[Expr],
+    body: List[Expr],
+    clausePosition: Position,
+    rest: List[Expr],
+    env: Environment
+  ): Value =
+    if body.isEmpty then SchemeFailure.raise("case clause must have a body", clausePosition)
 
-  private def parseBindings(
-    bindingsExpression: Expr,
-    position: Position,
-    formName: String
-  ): List[(String, Expr)] =
-    bindingsExpression match
-      case ListExpr(bindings, _) =>
-        bindings.map(binding => parseBinding(binding, formName))
-      case _ =>
-        SchemeFailure.raise(s"$formName expected a binding list", position)
-
-  private def parseBinding(binding: Expr, formName: String): (String, Expr) =
-    binding match
-      case ListExpr(List(SymbolExpr(name, _), valueExpression), _) =>
-        name -> valueExpression
-      case _ =>
-        SchemeFailure.raise(
-          s"$formName expected bindings of the form (name expr)",
-          binding.position
-        )
-
-  private def quote(expression: Expr): Value =
-    expression match
-      case IntExpr(value, _) => IntValue(value)
-      case RationalExpr(numerator, denominator, _) =>
-        NumericSupport.exactValue(numerator, denominator)
-      case InexactExpr(value, _) => InexactValue(value)
-      case BoolExpr(value, _)    => BoolValue(value)
-      case StringExpr(value, _)  => StringValue(value)
-      case CharExpr(value, _)    => CharValue(value)
-      case SymbolExpr(name, _)   => SymbolValue(name)
-      case ListExpr(items, _)    => buildList(items.map(quote))
+    if datumExpressions.exists(datum => Level1ValueSupport.eqvValues(key, SpecialFormQuoteEvaluator.quote(datum))) then
+      InterpreterEvaluator.evalSequence(body, env)
+    else evalCaseClauses(key, rest, env)

@@ -73,6 +73,24 @@ final private[ming] case class PairValue(car: Value, cdr: Value) extends Value:
       case other =>
         throw new IllegalStateException(s"expected pair while rendering pair, got ${other.render}")
 
+final private[ming] class VectorValue(initialElements: Iterable[Value]) extends Value:
+  private val elements: Array[Value] = initialElements.iterator.toArray
+
+  def length: Int =
+    elements.length
+
+  def element(index: Int): Value =
+    elements(index)
+
+  def update(index: Int, value: Value): Unit =
+    elements(index) = value
+
+  def toList: List[Value] =
+    elements.toList
+
+  override def render: String =
+    elements.iterator.map(_.render).mkString("#(", " ", ")")
+
 final private[ming] case class BuiltinValue(
   name: String,
   implementation: (List[Value], Position) => Value

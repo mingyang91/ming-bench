@@ -8,6 +8,7 @@ private[ming] object Level1PredicateBuiltins:
   val values: Map[String, Value] = Map(
     "not"       -> BuiltinValue("not", logicalNot),
     "eq?"       -> BuiltinValue("eq?", eqValue),
+    "eqv?"      -> BuiltinValue("eqv?", eqvValue),
     "equal?"    -> BuiltinValue("equal?", equalValue),
     "null?"     -> BuiltinValue("null?", unaryPredicate("null?")(_ == EmptyListValue)),
     "list?"     -> BuiltinValue("list?", unaryPredicate("list?")(isProperList)),
@@ -36,6 +37,10 @@ private[ming] object Level1PredicateBuiltins:
   private def eqValue(arguments: List[Value], position: Position): Value =
     val (left, right) = expectTwoArguments(arguments, "eq?", position)
     BoolValue(eqValues(left, right))
+
+  private def eqvValue(arguments: List[Value], position: Position): Value =
+    val (left, right) = expectTwoArguments(arguments, "eqv?", position)
+    BoolValue(eqvValues(left, right))
 
   private def equalValue(arguments: List[Value], position: Position): Value =
     val (left, right) = expectTwoArguments(arguments, "equal?", position)

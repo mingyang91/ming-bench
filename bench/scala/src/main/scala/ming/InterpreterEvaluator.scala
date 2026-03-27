@@ -42,8 +42,12 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalAnd(rest, env)
       case SymbolExpr("begin", _) :: rest =>
         evalSequence(rest, env)
+      case SymbolExpr("case", _) :: rest =>
+        SpecialFormEvaluator.evalCase(rest, position, env)
       case SymbolExpr("cond", _) :: rest =>
         SpecialFormEvaluator.evalCond(rest, env)
+      case SymbolExpr("do", _) :: rest =>
+        SpecialFormEvaluator.evalDo(rest, position, env)
       case SymbolExpr("or", _) :: rest =>
         SpecialFormEvaluator.evalOr(rest, env)
       case SymbolExpr("define", _) :: rest =>
@@ -58,6 +62,10 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalCaseLambda(rest, position, env)
       case SymbolExpr("let", _) :: rest =>
         SpecialFormEvaluator.evalLet(rest, position, env)
+      case SymbolExpr("letrec", _) :: rest =>
+        SpecialFormEvaluator.evalLetrec(rest, position, env)
+      case SymbolExpr("letrec*", _) :: rest =>
+        SpecialFormEvaluator.evalLetrecStar(rest, position, env)
       case SymbolExpr("quote", _) :: rest =>
         SpecialFormEvaluator.evalQuote(rest, position)
       case SymbolExpr("lambda", _) :: rest =>

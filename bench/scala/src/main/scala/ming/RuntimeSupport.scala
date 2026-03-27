@@ -93,6 +93,12 @@ private[ming] object RuntimeSupport:
       case other =>
         SchemeFailure.raise(s"$name expected a pair, got ${typeName(other)}", position)
 
+  def expectVector(value: Value, name: String, position: Position): VectorValue =
+    value match
+      case vectorValue: VectorValue => vectorValue
+      case other =>
+        SchemeFailure.raise(s"$name expected a vector, got ${typeName(other)}", position)
+
   def expectIndex(value: Value, name: String, position: Position): Int =
     val number = expectInteger(value, name, position)
     if number < 0 || !number.isValidInt then
@@ -129,6 +135,7 @@ private[ming] object RuntimeSupport:
       case CharValue(_)       => "char"
       case EmptyListValue     => "list"
       case PairValue(_, _)    => "pair"
+      case _: VectorValue     => "vector"
       case _: ProcedureValue =>
         "procedure"
       case _: RecordValue =>
