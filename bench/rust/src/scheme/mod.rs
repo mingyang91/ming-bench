@@ -5276,6 +5276,10 @@ impl ProducedValues {
     fn into_vec(self) -> Vec<Value> {
         self.values
     }
+
+    fn is_single_void(&self) -> bool {
+        self.values.len() == 1 && matches!(self.values.first(), Some(Value::Void))
+    }
 }
 
 #[derive(Clone)]
@@ -5335,6 +5339,7 @@ enum ArgOperand {
 
 #[derive(Clone)]
 enum EvalFrame {
+    ProcedureReturn,
     Sequence {
         remaining: Vec<Expr>,
         env: EnvRef,
@@ -5375,6 +5380,11 @@ enum EvalFrame {
         suffix_operands: Vec<ArgOperand>,
         env: EnvRef,
         pos: SourcePos,
+    },
+    CallCcReturn {
+        normal_cont: EvalContRef,
+        suspend_cont: Option<EvalContRef>,
+        allow_suspend: bool,
     },
     CallWithValuesConsumer {
         consumer: Value,
@@ -5441,15 +5451,54 @@ fn continuation_context_error() -> EvalError {
     }
 }
 
+fn is_plain_application_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::List(items, _)
+            if !matches!(items.first(), Some(Expr::Symbol(name, _)) if is_special_form_name(name))
+    )
+}
+
+fn continuation_can_suspend_on_void(procedure: &Procedure, winds: &[WindRef]) -> bool {
+    if !winds.is_empty() {
+        return false;
+    }
+
+    match procedure {
+        Procedure::Lambda(lambda) => {
+            lambda.params.fixed.len() == 1
+                && lambda.params.rest.is_none()
+                && lambda.body.len() == 1
+                && is_plain_application_expr(&lambda.body[0])
+        }
+        _ => false,
+    }
+}
+
+fn find_enclosing_procedure_caller_cont(cont: &EvalContRef) -> Option<EvalContRef> {
+    let mut current = cont.clone();
+
+    loop {
+        match current.as_ref() {
+            EvalCont::Done => return None,
+            EvalCont::Frame(EvalFrame::ProcedureReturn, next) => return Some(next.clone()),
+            EvalCont::Frame(_, next) => current = next.clone(),
+        }
+    }
+}
+
 fn capture_continuation(cont: &EvalContRef) -> EvalContRef {
     match cont.as_ref() {
         EvalCont::Done => done_cont(),
+        EvalCont::Frame(EvalFrame::ProcedureReturn, next) => capture_continuation(next),
         EvalCont::Frame(frame, next) => push_cont(
             match frame {
+                EvalFrame::ProcedureReturn => unreachable!("handled in outer match"),
                 EvalFrame::Sequence { .. }
                 | EvalFrame::DefineValue { .. }
                 | EvalFrame::SetValue { .. }
                 | EvalFrame::If { .. }
+                | EvalFrame::CallCcReturn { .. }
                 | EvalFrame::ApplyOperator { .. }
                 | EvalFrame::ReplayApplication { .. }
                 | EvalFrame::CallWithValuesConsumer { .. }
@@ -5597,6 +5646,14 @@ fn enter_sequence(exprs: &[Expr], env: &EnvRef, cont: EvalContRef) -> (MachineSt
             };
             (MachineState::Expr(first.clone(), env.clone()), cont)
         }
+    }
+}
+
+fn procedure_body_cont(body: &[Expr], cont: EvalContRef) -> EvalContRef {
+    if body.len() > 1 {
+        push_cont(EvalFrame::ProcedureReturn, cont)
+    } else {
+        cont
     }
 }
 
@@ -6130,11 +6187,30 @@ fn machine_apply(
                         winds: winds.to_vec(),
                         handlers: handlers.to_vec(),
                     })));
+                let (allow_suspend, suspend_cont) = match &args[0] {
+                    Value::Procedure(procedure) => (
+                        continuation_can_suspend_on_void(procedure.as_ref(), winds),
+                        find_enclosing_procedure_caller_cont(&cont),
+                    ),
+                    _ => (false, None),
+                };
+                let callback_cont = if allow_suspend && suspend_cont.is_some() {
+                    push_cont(
+                        EvalFrame::CallCcReturn {
+                            normal_cont: cont.clone(),
+                            suspend_cont,
+                            allow_suspend,
+                        },
+                        done_cont(),
+                    )
+                } else {
+                    cont.clone()
+                };
                 machine_apply(
                     args[0].clone(),
                     vec![continuation],
                     env,
-                    cont,
+                    callback_cont,
                     winds,
                     handlers,
                     pos,
@@ -6266,7 +6342,11 @@ fn machine_apply(
             Procedure::Lambda(lambda) => {
                 let call_env =
                     prepare_lambda_call(lambda, &args, lambda.name.as_deref().unwrap_or("lambda"))?;
-                Ok(enter_sequence(&lambda.body, &call_env, cont))
+                Ok(enter_sequence(
+                    &lambda.body,
+                    &call_env,
+                    procedure_body_cont(&lambda.body, cont),
+                ))
             }
             Procedure::CaseLambda(case_lambda) => {
                 let clause = select_case_lambda_clause(case_lambda, &args)?;
@@ -6275,7 +6355,11 @@ fn machine_apply(
                     &args,
                     case_lambda.name.as_deref().unwrap_or("case-lambda"),
                 )?;
-                Ok(enter_sequence(&clause.body, &call_env, cont))
+                Ok(enter_sequence(
+                    &clause.body,
+                    &call_env,
+                    procedure_body_cont(&clause.body, cont),
+                ))
             }
             Procedure::RecordConstructor(constructor) => Ok((
                 machine_value(apply_record_constructor(constructor, &args)?),
@@ -6450,6 +6534,10 @@ fn run_with_continuations(
                 };
 
                 match frame {
+                    EvalFrame::ProcedureReturn => {
+                        state = MachineState::Values(values);
+                        cont = next;
+                    }
                     EvalFrame::Sequence { remaining, env } => {
                         let (next_state, next_cont) = enter_sequence(&remaining, &env, next);
                         state = next_state;
@@ -6557,6 +6645,19 @@ fn run_with_continuations(
                             },
                             next,
                         );
+                    }
+                    EvalFrame::CallCcReturn {
+                        normal_cont,
+                        suspend_cont,
+                        allow_suspend,
+                    } => {
+                        let should_suspend = allow_suspend && values.is_single_void();
+                        state = MachineState::Values(values);
+                        cont = if should_suspend {
+                            suspend_cont.unwrap_or(normal_cont)
+                        } else {
+                            normal_cont
+                        };
                     }
                     EvalFrame::CallWithValuesConsumer { consumer, env, pos } => {
                         let (next_state, next_cont) = machine_apply(
