@@ -4,6 +4,10 @@
  */
 export declare function evalStr(input: string): string;
 /**
+ * Evaluate Scheme expressions with a maximum number of eval dispatches.
+ */
+export declare function evalStrWithLimit(input: string, maxSteps: number): string;
+/**
  * Evaluate Scheme expressions and return both the result string
  * and any captured output from display/write/newline.
  */

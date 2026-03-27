@@ -1,1 +1,1 @@
-export { evalStr, evalStrWithOutput } from './interpreter.js';
+export { evalStr, evalStrWithLimit, evalStrWithOutput } from './interpreter.js';

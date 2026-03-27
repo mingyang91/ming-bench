@@ -157,6 +157,7 @@ type EvalResult = Value | TailStep;
 type BindingSpec = { name: string; init: Expr };
 type DoBindingSpec = { name: string; init: Expr; step?: Expr };
 type Cell = { value: Value | typeof UNINITIALIZED };
+type StepBudget = { remaining: number };
 
 const EMPTY_LIST: EmptyList = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
@@ -167,6 +168,7 @@ let currentExceptionHandlers: ExceptionHandlerFrame[] = [];
 let currentProcedureBoundaries: ProcedureBoundary[] = [];
 let currentProceduralMacroContexts: ProceduralMacroContext[] = [];
 let currentSyntaxFrames: SyntaxFrame[] = [];
+let currentStepBudget: StepBudget | undefined;
 const procedureReturnContinuations = new WeakSet<ContinuationFn>();
 const CORE_SYNTAX = new Set([
   'and',
@@ -1433,7 +1435,14 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
  * representation of the last result.
  */
 export function evalStr(input: string): string {
-  return evalStrWithOutput(input).result;
+  return evaluateInput(input).result;
+}
+
+/**
+ * Evaluate Scheme expressions with a maximum number of eval dispatches.
+ */
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  return evaluateInput(input, maxSteps).result;
 }
 
 /**
@@ -1441,6 +1450,10 @@ export function evalStr(input: string): string {
  * and any captured output from display/write/newline.
  */
 export function evalStrWithOutput(input: string): { result: string; output: string } {
+  return evaluateInput(input);
+}
+
+function evaluateInput(input: string, maxSteps?: number): { result: string; output: string } {
   const program = new Parser(input).parseProgram();
   if (program.length === 0) {
     throw new EvalError('empty input', { line: 1, column: 1 });
@@ -1452,9 +1465,11 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const previousWindFrames = currentWindFrames;
   const previousExceptionHandlers = currentExceptionHandlers;
   const previousProcedureBoundaries = currentProcedureBoundaries;
+  const previousStepBudget = currentStepBudget;
   currentWindFrames = [];
   currentExceptionHandlers = [];
   currentProcedureBoundaries = [];
+  currentStepBudget = maxSteps === undefined ? undefined : createStepBudget(maxSteps);
 
   let lastValue: EvaluationResult;
   try {
@@ -1463,12 +1478,21 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
     currentWindFrames = previousWindFrames;
     currentExceptionHandlers = previousExceptionHandlers;
     currentProcedureBoundaries = previousProcedureBoundaries;
+    currentStepBudget = previousStepBudget;
   }
 
   return {
     result: formatEvaluationResult(lastValue),
     output: output.toString(),
   };
+}
+
+function createStepBudget(maxSteps: number): StepBudget {
+  if (!Number.isInteger(maxSteps) || maxSteps < 0) {
+    throw new EvalError('step limit must be a non-negative integer');
+  }
+
+  return { remaining: maxSteps };
 }
 
 function createGlobalEnv(output: OutputBuffer, macroEnv: MacroEnv): Env {
@@ -1525,6 +1549,7 @@ function runMachine(step: MachineStep, macroEnv: MacroEnv): EvaluationResult {
       case 'eval-step': {
         const evalStep = current;
         try {
+          consumeEvalStep(evalStep.expr);
           current = evalExprStep(evalStep.expr, evalStep.env, macroEnv, evalStep.k);
         } catch (error) {
           if (isSchemeExceptionSignal(error)) {
@@ -1568,6 +1593,18 @@ function runMachine(step: MachineStep, macroEnv: MacroEnv): EvaluationResult {
       }
     }
   }
+}
+
+function consumeEvalStep(expr: Expr): void {
+  if (currentStepBudget === undefined) {
+    return;
+  }
+
+  if (currentStepBudget.remaining <= 0) {
+    throw new EvalError('step limit exceeded', expr.position);
+  }
+
+  currentStepBudget.remaining -= 1;
 }
 
 function evalSequence(exprs: Expr[], env: Env, macroEnv: MacroEnv): EvaluationResult {
