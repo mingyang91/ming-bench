@@ -466,10 +466,20 @@ func (state *hygieneState) hygienizeList(items listExpr, pos SourcePos, scope *h
 		case "let":
 			return state.hygienizeLet(items, pos, scope)
 		case "define":
-			return state.hygienizeDefine(items, pos, scope)
+			expanded, _, err := state.hygienizeDefine(items, pos, scope)
+			return expanded, err
 		case "set!":
 			return state.hygienizeSet(items, pos, scope)
-		case "if", "begin", "and", "or", "cond", "define-syntax", "syntax", "syntax-case", "with-syntax":
+		case "begin":
+			newItems := make([]locatedExpr, 0, len(items))
+			newItems = append(newItems, locatedExpr{form: symbolExpr(operatorName), pos: items[0].pos})
+			bodyItems, err := state.hygienizeBody(items[1:], scope)
+			if err != nil {
+				return locatedExpr{}, err
+			}
+			newItems = append(newItems, bodyItems...)
+			return locatedExpr{form: listExpr(newItems), pos: pos}, nil
+		case "if", "and", "or", "cond", "define-syntax", "syntax", "syntax-case", "with-syntax":
 			newItems := make([]locatedExpr, 0, len(items))
 			newItems = append(newItems, locatedExpr{form: symbolExpr(operatorName), pos: items[0].pos})
 			for _, item := range items[1:] {
@@ -514,6 +524,36 @@ func (state *hygieneState) hygienizeQuote(items listExpr, pos SourcePos) (locate
 	return locatedExpr{form: listExpr(newItems), pos: pos}, nil
 }
 
+func (state *hygieneState) hygienizeBody(exprs []locatedExpr, scope *hygieneScope) ([]locatedExpr, error) {
+	if len(exprs) == 0 {
+		return nil, nil
+	}
+
+	currentScope := scope
+	items := make([]locatedExpr, 0, len(exprs))
+	for _, expr := range exprs {
+		if list, ok := expr.form.(listExpr); ok && len(list) > 0 {
+			if operatorName, operatorIsSymbol, _ := symbolLikeName(list[0].form); operatorIsSymbol && operatorName == "define" {
+				expanded, nextScope, err := state.hygienizeDefine(list, expr.pos, currentScope)
+				if err != nil {
+					return nil, err
+				}
+				items = append(items, expanded)
+				currentScope = nextScope
+				continue
+			}
+		}
+
+		expanded, err := state.hygienizeExpr(expr, currentScope)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, expanded)
+	}
+
+	return items, nil
+}
+
 func (state *hygieneState) hygienizeLambda(items listExpr, pos SourcePos, scope *hygieneScope) (locatedExpr, error) {
 	if len(items) < 3 {
 		return locatedExpr{}, newEvalError(pos, "'lambda' expects a parameter list and body")
@@ -528,13 +568,11 @@ func (state *hygieneState) hygienizeLambda(items listExpr, pos SourcePos, scope 
 		{form: symbolExpr("lambda"), pos: items[0].pos},
 		formals,
 	}
-	for _, bodyExpr := range items[2:] {
-		expanded, err := state.hygienizeExpr(bodyExpr, bodyScope)
-		if err != nil {
-			return locatedExpr{}, err
-		}
-		newItems = append(newItems, expanded)
+	bodyItems, err := state.hygienizeBody(items[2:], bodyScope)
+	if err != nil {
+		return locatedExpr{}, err
 	}
+	newItems = append(newItems, bodyItems...)
 	return locatedExpr{form: listExpr(newItems), pos: pos}, nil
 }
 
@@ -558,13 +596,11 @@ func (state *hygieneState) hygienizeCaseLambda(items listExpr, pos SourcePos, sc
 		}
 
 		newClause := []locatedExpr{formals}
-		for _, bodyExpr := range clause[1:] {
-			expanded, err := state.hygienizeExpr(bodyExpr, bodyScope)
-			if err != nil {
-				return locatedExpr{}, err
-			}
-			newClause = append(newClause, expanded)
+		bodyItems, err := state.hygienizeBody(clause[1:], bodyScope)
+		if err != nil {
+			return locatedExpr{}, err
 		}
+		newClause = append(newClause, bodyItems...)
 
 		newItems = append(newItems, locatedExpr{
 			form: listExpr(newClause),
@@ -610,13 +646,11 @@ func (state *hygieneState) hygienizeLet(items listExpr, pos SourcePos, scope *hy
 	}
 	newItems = append(newItems, bindings)
 
-	for _, bodyExpr := range items[bodyStart:] {
-		expanded, err := state.hygienizeExpr(bodyExpr, bindingScope)
-		if err != nil {
-			return locatedExpr{}, err
-		}
-		newItems = append(newItems, expanded)
+	bodyItems, err := state.hygienizeBody(items[bodyStart:], bindingScope)
+	if err != nil {
+		return locatedExpr{}, err
 	}
+	newItems = append(newItems, bodyItems...)
 
 	return locatedExpr{form: listExpr(newItems), pos: pos}, nil
 }
@@ -655,9 +689,9 @@ func (state *hygieneState) hygienizeLetBindings(bindingsExpr locatedExpr, scope 
 	return locatedExpr{form: listExpr(newBindings), pos: bindingsExpr.pos}, childScope, nil
 }
 
-func (state *hygieneState) hygienizeDefine(items listExpr, pos SourcePos, scope *hygieneScope) (locatedExpr, error) {
+func (state *hygieneState) hygienizeDefine(items listExpr, pos SourcePos, scope *hygieneScope) (locatedExpr, *hygieneScope, error) {
 	if len(items) < 3 {
-		return locatedExpr{}, newEvalError(pos, "'define' expects at least 2 arguments")
+		return locatedExpr{}, nil, newEvalError(pos, "'define' expects at least 2 arguments")
 	}
 
 	newItems := []locatedExpr{
@@ -666,24 +700,24 @@ func (state *hygieneState) hygienizeDefine(items listExpr, pos SourcePos, scope 
 
 	switch target := items[1].form.(type) {
 	case templateSymbolExpr, symbolExpr:
-		nameExpr, _, err := state.hygienizeBindingExpr(items[1], scope)
+		nameExpr, bodyScope, err := state.hygienizeBindingExpr(items[1], scope)
 		if err != nil {
-			return locatedExpr{}, err
+			return locatedExpr{}, nil, err
 		}
 		valueExpr, err := state.hygienizeExpr(items[2], scope)
 		if err != nil {
-			return locatedExpr{}, err
+			return locatedExpr{}, nil, err
 		}
 		newItems = append(newItems, nameExpr, valueExpr)
-		return locatedExpr{form: listExpr(newItems), pos: pos}, nil
+		return locatedExpr{form: listExpr(newItems), pos: pos}, bodyScope, nil
 	case listExpr:
 		if len(target) == 0 {
-			return locatedExpr{}, newEvalError(items[1].pos, "function name is required")
+			return locatedExpr{}, nil, newEvalError(items[1].pos, "function name is required")
 		}
 
 		functionName, bodyScope, err := state.hygienizeBindingExpr(target[0], scope)
 		if err != nil {
-			return locatedExpr{}, err
+			return locatedExpr{}, nil, err
 		}
 
 		formals, formalsScope, err := state.hygienizeFormals(locatedExpr{
@@ -691,7 +725,7 @@ func (state *hygieneState) hygienizeDefine(items listExpr, pos SourcePos, scope 
 			pos:  items[1].pos,
 		}, bodyScope)
 		if err != nil {
-			return locatedExpr{}, err
+			return locatedExpr{}, nil, err
 		}
 
 		targetItems := append([]locatedExpr{functionName}, formals.form.(listExpr)...)
@@ -700,16 +734,14 @@ func (state *hygieneState) hygienizeDefine(items listExpr, pos SourcePos, scope 
 			pos:  items[1].pos,
 		})
 
-		for _, bodyExpr := range items[2:] {
-			expanded, err := state.hygienizeExpr(bodyExpr, formalsScope)
-			if err != nil {
-				return locatedExpr{}, err
-			}
-			newItems = append(newItems, expanded)
+		bodyItems, err := state.hygienizeBody(items[2:], formalsScope)
+		if err != nil {
+			return locatedExpr{}, nil, err
 		}
-		return locatedExpr{form: listExpr(newItems), pos: pos}, nil
+		newItems = append(newItems, bodyItems...)
+		return locatedExpr{form: listExpr(newItems), pos: pos}, bodyScope, nil
 	default:
-		return locatedExpr{}, newEvalError(items[1].pos, "invalid define target")
+		return locatedExpr{}, nil, newEvalError(items[1].pos, "invalid define target")
 	}
 }
 

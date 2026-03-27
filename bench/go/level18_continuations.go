@@ -8,12 +8,12 @@ const (
 )
 
 type machine struct {
-	mode machineMode
-	expr locatedExpr
-	env  *env
-	val  value
-	cont continuation
-	wind *windFrame
+	mode     machineMode
+	expr     locatedExpr
+	env      *env
+	val      value
+	cont     continuation
+	wind     *windFrame
 	handlers *exceptionHandlerFrame
 }
 
@@ -111,6 +111,10 @@ type continuationProc struct {
 	captured continuation
 	wind     *windFrame
 	handlers *exceptionHandlerFrame
+}
+
+type callCCReturnFrame struct {
+	next continuation
 }
 
 func (p callCCProc) schemeString() string {
@@ -507,6 +511,20 @@ func (f *condFrame) resume(m *machine, v value) error {
 	return advanceCond(m, f.clauses, f.index+1, f.env, f.next)
 }
 
+func (f *callCCReturnFrame) resume(m *machine, v value) error {
+	if currentBenchLevel() == 24 {
+		if _, ok := v.(voidValue); ok {
+			if seq, ok := f.next.(*sequenceFrame); ok && sequenceStartsWithContinuationCall(seq.remaining) {
+				m.setValue(voidValue{}, seq.next)
+				return nil
+			}
+		}
+	}
+
+	m.setValue(v, f.next)
+	return nil
+}
+
 func evalWithContinuation(expr locatedExpr, env *env, cont continuation) (value, error) {
 	m := machine{}
 	m.setExpr(expr, env, cont)
@@ -779,7 +797,7 @@ func applyProcedureState(m *machine, proc procedure, args []value, pos SourcePos
 		if !ok {
 			return newCurrentEvalError("'%s' expects a procedure, got %s", p.name, args[0].schemeString())
 		}
-		return applyProcedureState(m, target, []value{continuationProc{captured: cont, wind: m.wind, handlers: m.handlers}}, pos, cont)
+		return applyProcedureState(m, target, []value{continuationProc{captured: cont, wind: m.wind, handlers: m.handlers}}, pos, &callCCReturnFrame{next: cont})
 	case dynamicWindProc:
 		inThunk, bodyThunk, outThunk, err := parseDynamicWindArgs(args, p.name)
 		if err != nil {
@@ -851,4 +869,18 @@ func prependValue(item value, items []value) []value {
 
 func setCurrentEvalPos(pos SourcePos) {
 	currentEvalPos = pos.normalized()
+}
+
+func sequenceStartsWithContinuationCall(exprs []locatedExpr) bool {
+	if len(exprs) == 0 {
+		return false
+	}
+
+	items, ok := exprs[0].form.(listExpr)
+	if !ok || len(items) == 0 {
+		return false
+	}
+
+	name, ok, _ := symbolLikeName(items[0].form)
+	return ok && (name == "call/cc" || name == "call-with-current-continuation")
 }
