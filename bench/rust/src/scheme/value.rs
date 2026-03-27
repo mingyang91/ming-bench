@@ -1,8 +1,19 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
+
+/// Type-erased continuation data, wrapping an `Rc<Cont>` from eval.rs.
+#[derive(Clone)]
+pub struct ContData(pub Rc<dyn Any>);
+
+impl fmt::Debug for ContData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<continuation>")
+    }
+}
 
 static RECORD_TYPE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -52,6 +63,7 @@ pub enum Value {
         clauses: Vec<(Vec<String>, Option<String>, Vec<Value>, Rc<RefCell<Env>>)>,
     },
     Vector(Rc<RefCell<Vec<Value>>>),
+    Continuation(ContData),
 }
 
 impl PartialEq for Value {
@@ -73,12 +85,24 @@ impl PartialEq for Value {
             (Value::RecordProc { .. }, Value::RecordProc { .. }) => false,
             (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+            (Value::Continuation(_), Value::Continuation(_)) => false,
             _ => false,
         }
     }
 }
 
 impl Value {
+    pub fn is_self_evaluating(&self) -> bool {
+        matches!(self,
+            Value::Integer(_) | Value::Rational(..) | Value::Float(_)
+            | Value::Boolean(_) | Value::String(..) | Value::Char(_)
+            | Value::Lambda { .. } | Value::Pair(_) | Value::SyntaxRules { .. }
+            | Value::Record { .. } | Value::RecordProc { .. }
+            | Value::CaseLambda { .. } | Value::Vector(_) | Value::Continuation(_)
+            | Value::Void
+        )
+    }
+
     pub fn new_pair(car: Value, cdr: Value) -> Value {
         Value::Pair(Rc::new(RefCell::new((car, cdr))))
     }
@@ -127,6 +151,7 @@ impl Value {
                 _ => format!("#\\{}", c),
             },
             Value::Pair(p) => display_pair_chain(p, false),
+            Value::Continuation(_) => "#<continuation>".into(),
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::SyntaxRules { .. } => "#<syntax>".into(),
             Value::Record { .. } => "#<record>".into(),

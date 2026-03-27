@@ -7,7 +7,7 @@ mod value;
 pub use error::EvalError;
 use env::Env;
 use parser::Parser;
-use eval::{eval, Output};
+use eval::{eval_sequence, Output};
 use value::Value;
 
 use std::cell::RefCell;
@@ -49,6 +49,8 @@ const BUILTINS: &[&str] = &[
     "make-string", "string",
     "string>?", "string<=?", "string>=?",
     "vector-set!", "string-set!",
+    // L18
+    "call/cc", "call-with-current-continuation",
     // cxr handled dynamically in apply_builtin
 ];
 
@@ -66,14 +68,19 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = Parser::new(input).parse_all()?;
     let env = make_env();
     let out: Output = Rc::new(RefCell::new(String::new()));
-    let mut result = Value::Boolean(false);
-    for (expr, line, col) in exprs {
-        result = eval(&expr, &env, &out).map_err(|e| EvalError::WithPosition {
-            error: Box::new(e),
-            line,
-            col,
-        })?;
+    if exprs.is_empty() {
+        return Ok(Value::Boolean(false).to_display());
     }
+    // Build position map: position of each top-level expression
+    let positions: Vec<(usize, usize)> = exprs.iter().map(|(_, l, c)| (*l, *c)).collect();
+    let all_exprs: Vec<Value> = exprs.into_iter().map(|(e, _, _)| e).collect();
+    // Use eval_sequence to keep all expressions in a single CEK pass
+    // (so call/cc continuations span across top-level expressions).
+    let result = eval_sequence(&all_exprs, &env, &out).map_err(|e| {
+        // Attach position from the last expression as a fallback
+        let (line, col) = positions.last().copied().unwrap_or((1, 1));
+        EvalError::WithPosition { error: Box::new(e), line, col }
+    })?;
     Ok(result.to_display())
 }
 
@@ -83,14 +90,15 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let exprs = Parser::new(input).parse_all()?;
     let env = make_env();
     let out: Output = Rc::new(RefCell::new(String::new()));
-    let mut result = Value::Boolean(false);
-    for (expr, line, col) in exprs {
-        result = eval(&expr, &env, &out).map_err(|e| EvalError::WithPosition {
-            error: Box::new(e),
-            line,
-            col,
-        })?;
+    if exprs.is_empty() {
+        return Ok((Value::Boolean(false).to_display(), String::new()));
     }
+    let positions: Vec<(usize, usize)> = exprs.iter().map(|(_, l, c)| (*l, *c)).collect();
+    let all_exprs: Vec<Value> = exprs.into_iter().map(|(e, _, _)| e).collect();
+    let result = eval_sequence(&all_exprs, &env, &out).map_err(|e| {
+        let (line, col) = positions.last().copied().unwrap_or((1, 1));
+        EvalError::WithPosition { error: Box::new(e), line, col }
+    })?;
     let output = out.borrow().clone();
     Ok((result.to_display(), output))
 }
