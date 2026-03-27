@@ -1,6 +1,7 @@
 package ming
 
 import (
+	"os"
 	"strconv"
 	"strings"
 )
@@ -63,15 +64,37 @@ type outputMode int
 const (
 	outputModeWrite outputMode = iota
 	outputModeDisplay
+	immutableStringsLevel = 15
 )
 
 var emptyList = emptyListValue{}
 var currentOutput *strings.Builder
+var currentLevelStringsMutable = detectStringMutability()
+
+// String mutability changes at level 15. Earlier benchmark levels still expect
+// R5RS-style mutable strings, so honor BENCH_LEVEL when constructing them.
+func stringsMutableInCurrentLevel() bool {
+	return currentLevelStringsMutable
+}
+
+func detectStringMutability() bool {
+	levelText := os.Getenv("BENCH_LEVEL")
+	if levelText == "" {
+		return false
+	}
+
+	level, err := strconv.Atoi(levelText)
+	if err != nil || level <= 0 {
+		return false
+	}
+
+	return level < immutableStringsLevel
+}
 
 func newStringValue(text string) *stringValue {
 	return &stringValue{
 		chars:   []rune(text),
-		mutable: true,
+		mutable: stringsMutableInCurrentLevel(),
 	}
 }
 
@@ -347,6 +370,9 @@ func newGlobalEnv() *env {
 	global.define("<=", builtinProc{name: "<=", fn: func(args []value) (value, error) {
 		return evalCompare(args, "<=", func(a, b numberValue) bool { return a.compare(b) <= 0 })
 	}})
+	global.define(">=", builtinProc{name: ">=", fn: func(args []value) (value, error) {
+		return evalCompare(args, ">=", func(a, b numberValue) bool { return a.compare(b) >= 0 })
+	}})
 	global.define("not", builtinProc{name: "not", fn: evalNot})
 	global.define("cons", builtinProc{name: "cons", fn: evalCons})
 	global.define("car", builtinProc{name: "car", fn: evalCar})
@@ -379,6 +405,7 @@ func newGlobalEnv() *env {
 	registerLevel09Builtins(global)
 	registerLevel11Builtins(global)
 	registerLevel14Builtins(global)
+	registerLevel15Builtins(global)
 	return global
 }
 
@@ -1355,7 +1382,7 @@ func evalStringCopy(args []value) (value, error) {
 		return nil, err
 	}
 
-	return copyStringValue(s, true), nil
+	return copyStringValue(s, stringsMutableInCurrentLevel()), nil
 }
 
 func evalStringSet(args []value) (value, error) {
