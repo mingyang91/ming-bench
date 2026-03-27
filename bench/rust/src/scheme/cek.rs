@@ -5,7 +5,7 @@ use super::error::EvalError;
 use super::macros::{eval_define_syntax, expand_macro_only, expand_transformer};
 use super::numeric::make_rational;
 use super::{
-    collect_list, env_define, env_lookup, env_set, eval_case, eval_case_lambda,
+    collect_list, env_define, env_lookup, env_set, eqv_match, eval_case_lambda,
     eval_define_record_type, eval_do, eval_lambda, expr_to_value, is_builtin, is_truthy,
     make_immutable_str, new_frame, parse_params, with_span, Env, Expr, ExprKind, Kont, Span,
     Value,
@@ -523,9 +523,11 @@ fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String, 
                     "letrec*" => cek_letrec_star(&items[1..], env, k),
                     "cond" => cek_cond(&items[1..], env, k),
                     "case" => {
-                        let mut env_mut = env;
-                        let val = eval_case(&items[1..], &mut env_mut, output)?;
-                        Ok((Ctrl::Val(val), k))
+                        if items.len() < 2 {
+                            return Err(EvalError::Arity("case requires at least 1 argument".into()));
+                        }
+                        Ok((Ctrl::Eval(items[1].clone(), env.clone()),
+                            Rc::new(Kont::CaseKey { clauses: items[2..].to_vec(), env, next: k })))
                     }
                     "do" => {
                         let mut env_mut = env;
@@ -816,6 +818,27 @@ fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec
         }
         Kont::CondArrow { test_val, next } => {
             Ok((Ctrl::Apply(val, vec![test_val.clone()]), next.clone()))
+        }
+        Kont::CaseKey { clauses, env, next } => {
+            for clause in clauses {
+                let ExprKind::List(items) = &clause.kind else {
+                    return Err(EvalError::Type("case: invalid clause".into()));
+                };
+                if items.is_empty() {
+                    return Err(EvalError::Type("case: invalid clause".into()));
+                }
+                if let ExprKind::Symbol(s) = &items[0].kind {
+                    if s == "else" {
+                        return cek_seq(&items[1..], env.clone(), next.clone());
+                    }
+                }
+                let ExprKind::List(datums) = &items[0].kind else { continue };
+                let matched = datums.iter().any(|d| eqv_match(&val, &expr_to_value(d)));
+                if matched {
+                    return cek_seq(&items[1..], env.clone(), next.clone());
+                }
+            }
+            Ok((Ctrl::Val(Value::Boolean(false)), next.clone()))
         }
     }
 }

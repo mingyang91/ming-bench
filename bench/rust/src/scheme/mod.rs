@@ -1205,7 +1205,7 @@ pub(crate) fn is_builtin(op: &str) -> bool {
         && op[1..op.len()-1].bytes().all(|b| b == b'a' || b == b'd'))
 }
 
-fn eqv_match(val: &Value, datum: &Value) -> bool {
+pub(crate) fn eqv_match(val: &Value, datum: &Value) -> bool {
     match (val, datum) {
         (Value::Integer(a), Value::Integer(b)) => a == b,
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
@@ -1396,6 +1396,7 @@ pub(crate) enum Kont {
     GuardBody { body: Vec<Expr>, env: Env, next: Rc<Kont> },
     Cwv { consumer: Value, next: Rc<Kont> },
     CondArrow { test_val: Value, next: Rc<Kont> },
+    CaseKey { clauses: Vec<Expr>, env: Env, next: Rc<Kont> },
 }
 
 impl fmt::Debug for Kont {
@@ -1428,7 +1429,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let env = vec![new_frame()];
     let mut output = String::new();
     let result = cek_run(exprs, env, &mut output)?;
-    Ok((result.to_string(), output))
+    Ok((display_value(&result), output))
 }
 
 pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
