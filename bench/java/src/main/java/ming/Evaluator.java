@@ -124,6 +124,15 @@ public class Evaluator {
         }
     }
 
+    // Thrown by (raise value)
+    static class SchemeRaise extends RuntimeException {
+        final Object value;
+        SchemeRaise(Object value) {
+            super(null, null, true, false);
+            this.value = value;
+        }
+    }
+
     // Resolve a TailCall chain to a final value
     private Object resolve(Object result) throws EvalError {
         while (result instanceof TailCall tc) {
@@ -184,13 +193,15 @@ public class Evaluator {
         "make-string", "string",
         "string>?", "string<=?", "string>=?",
         "call/cc", "call-with-current-continuation",
-        "dynamic-wind"
+        "dynamic-wind",
+        "raise", "with-exception-handler"
     };
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "define", "set!", "if", "quote", "lambda", "case-lambda", "and", "or", "begin", "let", "cond", "define-syntax", "define-record-type",
         "letrec", "letrec*", "case", "do", "let*", "when", "unless",
-        "call/cc", "call-with-current-continuation"
+        "call/cc", "call-with-current-continuation",
+        "guard"
     );
 
     record RecordType(String typeName, List<String> fields) {}
@@ -974,6 +985,45 @@ public class Evaluator {
                         }
                         return null;
                     }
+                    case "guard" -> {
+                        // (guard (var clause ...) body ...)
+                        Object guardSpecRaw = list.get(1);
+                        if (guardSpecRaw instanceof Located lg) guardSpecRaw = lg.expr();
+                        @SuppressWarnings("unchecked")
+                        List<Object> guardSpec = (List<Object>) guardSpecRaw;
+                        Object varRaw = guardSpec.getFirst();
+                        if (varRaw instanceof Located lv) varRaw = lv.expr();
+                        String var = (String) varRaw;
+                        try {
+                            Object bodyResult = null;
+                            for (int i = 2; i < list.size(); i++) {
+                                bodyResult = eval(list.get(i), env);
+                            }
+                            return bodyResult;
+                        } catch (SchemeRaise sr) {
+                            Env guardEnv = new Env(env);
+                            guardEnv.define(var, sr.value);
+                            for (int c = 1; c < guardSpec.size(); c++) {
+                                Object clauseRaw = guardSpec.get(c);
+                                if (clauseRaw instanceof Located lc) clauseRaw = lc.expr();
+                                List<?> clause = (List<?>) clauseRaw;
+                                Object test = clause.getFirst();
+                                Object rawTest = test;
+                                if (rawTest instanceof Located lt) rawTest = lt.expr();
+                                if (rawTest instanceof String st && st.equals("else")) {
+                                    for (int j = 1; j < clause.size() - 1; j++) eval(clause.get(j), guardEnv);
+                                    return new TailCall(clause.getLast(), guardEnv);
+                                }
+                                Object testVal = eval(test, guardEnv);
+                                if (!isFalse(testVal)) {
+                                    if (clause.size() == 1) return testVal;
+                                    for (int j = 1; j < clause.size() - 1; j++) eval(clause.get(j), guardEnv);
+                                    return new TailCall(clause.getLast(), guardEnv);
+                                }
+                            }
+                            throw sr; // no clause matched, re-raise
+                        }
+                    }
                     case "call/cc", "call-with-current-continuation" -> {
                         if (hasPendingCallccValue) {
                             Object v = pendingCallccValue;
@@ -1032,6 +1082,9 @@ public class Evaluator {
         } catch (ContinuationResume cr) {
             resolve(apply(outThunk, List.of()));
             throw cr;
+        } catch (SchemeRaise sr) {
+            resolve(apply(outThunk, List.of()));
+            throw sr;
         }
         resolve(apply(outThunk, List.of()));
         return result;
@@ -1104,6 +1157,20 @@ public class Evaluator {
             if (name.equals("dynamic-wind")) {
                 if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
                 return doDynamicWind(args.get(0), args.get(1), args.get(2));
+            }
+            if (name.equals("raise")) {
+                if (args.size() != 1) throw new EvalError("raise: expected 1 argument");
+                throw new SchemeRaise(args.get(0));
+            }
+            if (name.equals("with-exception-handler")) {
+                if (args.size() != 2) throw new EvalError("with-exception-handler: expected 2 arguments");
+                Object handler = args.get(0);
+                Object thunk = args.get(1);
+                try {
+                    return resolve(apply(thunk, List.of()));
+                } catch (SchemeRaise sr) {
+                    return resolve(apply(handler, List.of(sr.value)));
+                }
             }
             return applyBuiltin(name, args);
         }
