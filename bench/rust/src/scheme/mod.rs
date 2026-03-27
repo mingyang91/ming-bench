@@ -117,6 +117,7 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Pair(Rc<PairValue>),
+    Record(Rc<RecordValue>),
     Procedure(Rc<Procedure>),
     Void,
 }
@@ -125,6 +126,22 @@ enum Value {
 struct PairValue {
     head: Value,
     tail: Value,
+}
+
+struct RecordType {
+    name: String,
+}
+
+struct RecordValue {
+    record_type: Rc<RecordType>,
+    fields: RefCell<Vec<Value>>,
+}
+
+#[derive(Clone)]
+struct RecordFieldSpec {
+    field_name: String,
+    accessor_name: String,
+    mutator_name: Option<String>,
 }
 
 impl fmt::Debug for Value {
@@ -143,6 +160,25 @@ enum Procedure {
         params: LambdaParams,
         body: Vec<Expr>,
         env: EnvRef,
+    },
+    RecordConstructor {
+        name: String,
+        record_type: Rc<RecordType>,
+        field_count: usize,
+    },
+    RecordPredicate {
+        name: String,
+        record_type: Rc<RecordType>,
+    },
+    RecordAccessor {
+        name: String,
+        record_type: Rc<RecordType>,
+        field_index: usize,
+    },
+    RecordMutator {
+        name: String,
+        record_type: Rc<RecordType>,
+        field_index: usize,
     },
 }
 
@@ -177,6 +213,10 @@ impl fmt::Debug for Procedure {
         match self {
             Self::Builtin { name, .. } => write!(f, "#<builtin:{name}>"),
             Self::Lambda { .. } => f.write_str("#<lambda>"),
+            Self::RecordConstructor { name, .. } => write!(f, "#<record-constructor:{name}>"),
+            Self::RecordPredicate { name, .. } => write!(f, "#<record-predicate:{name}>"),
+            Self::RecordAccessor { name, .. } => write!(f, "#<record-accessor:{name}>"),
+            Self::RecordMutator { name, .. } => write!(f, "#<record-mutator:{name}>"),
         }
     }
 }
@@ -355,6 +395,7 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         Value::Symbol(value) => value.clone(),
         Value::List(items) => render_list(items, mode),
         Value::Pair(pair) => render_pair(pair, mode),
+        Value::Record(record) => format!("#<record:{}>", record.record_type.name),
         Value::Procedure(_) => "#<procedure>".to_string(),
         Value::Void => "#<void>".to_string(),
     }
@@ -404,6 +445,7 @@ fn values_eq(left: &Value, right: &Value) -> bool {
                 || (left.len() == right.len() && left.as_ptr() == right.as_ptr())
         }
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -431,6 +473,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Pair(left), Value::Pair(right)) => {
             values_equal(&left.head, &right.head) && values_equal(&left.tail, &right.tail)
         }
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -543,6 +586,9 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
         }
         Expr::Symbol { name, .. } if name == "define" => {
             with_position(eval_define(args, env, output), head_pos)
+        }
+        Expr::Symbol { name, .. } if name == "define-record-type" => {
+            with_position(eval_define_record_type(args, env), head_pos)
         }
         Expr::Symbol { name, .. } if name == "define-syntax" => {
             with_position(macros::define_syntax(args, env), head_pos)
@@ -813,6 +859,134 @@ fn eval_define(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value,
             message: "invalid define form".to_string(),
         }),
     }
+}
+
+fn eval_define_record_type(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let [type_name_expr, constructor_expr, predicate_expr, field_exprs @ ..] = args else {
+        return Err(EvalError::ParseError {
+            message: "invalid define-record-type form".to_string(),
+        });
+    };
+
+    let type_name = parse_symbol_name(type_name_expr, "record type name")?;
+    let (constructor_name, constructor_fields) = parse_record_constructor(constructor_expr)?;
+    let predicate_name = parse_symbol_name(predicate_expr, "record predicate name")?;
+    let field_specs = parse_record_field_specs(field_exprs)?;
+    let record_type = Rc::new(RecordType { name: type_name });
+
+    env.define(
+        constructor_name.clone(),
+        Value::Procedure(Rc::new(Procedure::RecordConstructor {
+            name: constructor_name,
+            record_type: record_type.clone(),
+            field_count: constructor_fields.len(),
+        })),
+    );
+    env.define(
+        predicate_name.clone(),
+        Value::Procedure(Rc::new(Procedure::RecordPredicate {
+            name: predicate_name,
+            record_type: record_type.clone(),
+        })),
+    );
+
+    for field_spec in field_specs {
+        let Some(field_index) = constructor_fields
+            .iter()
+            .position(|field_name| field_name == &field_spec.field_name)
+        else {
+            return Err(EvalError::ParseError {
+                message: format!(
+                    "record field {} is not declared by the constructor",
+                    field_spec.field_name
+                ),
+            });
+        };
+
+        env.define(
+            field_spec.accessor_name.clone(),
+            Value::Procedure(Rc::new(Procedure::RecordAccessor {
+                name: field_spec.accessor_name,
+                record_type: record_type.clone(),
+                field_index,
+            })),
+        );
+
+        if let Some(mutator_name) = field_spec.mutator_name {
+            env.define(
+                mutator_name.clone(),
+                Value::Procedure(Rc::new(Procedure::RecordMutator {
+                    name: mutator_name,
+                    record_type: record_type.clone(),
+                    field_index,
+                })),
+            );
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn parse_symbol_name(expr: &Expr, context: &str) -> Result<String, EvalError> {
+    let Expr::Symbol { name, .. } = expr else {
+        return Err(EvalError::ParseError {
+            message: format!("{context} must be a symbol"),
+        });
+    };
+    Ok(name.clone())
+}
+
+fn parse_record_constructor(expr: &Expr) -> Result<(String, Vec<String>), EvalError> {
+    let Expr::List { items, .. } = expr else {
+        return Err(EvalError::ParseError {
+            message: "record constructor spec must be a list".to_string(),
+        });
+    };
+
+    let Some((constructor_name, field_exprs)) = items.split_first() else {
+        return Err(EvalError::ParseError {
+            message: "record constructor spec cannot be empty".to_string(),
+        });
+    };
+
+    let constructor_name = parse_symbol_name(constructor_name, "record constructor name")?;
+    let field_names = field_exprs
+        .iter()
+        .map(|expr| parse_symbol_name(expr, "record constructor field"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((constructor_name, field_names))
+}
+
+fn parse_record_field_specs(field_exprs: &[Expr]) -> Result<Vec<RecordFieldSpec>, EvalError> {
+    field_exprs
+        .iter()
+        .map(|field_expr| {
+            let Expr::List { items, .. } = field_expr else {
+                return Err(EvalError::ParseError {
+                    message: "record field specs must be lists".to_string(),
+                });
+            };
+
+            match items.as_slice() {
+                [field_name, accessor_name] => Ok(RecordFieldSpec {
+                    field_name: parse_symbol_name(field_name, "record field name")?,
+                    accessor_name: parse_symbol_name(accessor_name, "record accessor name")?,
+                    mutator_name: None,
+                }),
+                [field_name, accessor_name, mutator_name] => Ok(RecordFieldSpec {
+                    field_name: parse_symbol_name(field_name, "record field name")?,
+                    accessor_name: parse_symbol_name(accessor_name, "record accessor name")?,
+                    mutator_name: Some(parse_symbol_name(mutator_name, "record mutator name")?),
+                }),
+                _ => Err(EvalError::ParseError {
+                    message:
+                        "record field specs must be (field accessor) or (field accessor mutator)"
+                            .to_string(),
+                }),
+            }
+        })
+        .collect()
 }
 
 fn eval_set(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {

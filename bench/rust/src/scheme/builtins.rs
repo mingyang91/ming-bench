@@ -2,9 +2,9 @@ use super::{
     eval_program,
     number::{parse_number_token, Number, Rational},
     values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg, Expr,
-    PairValue, Procedure, SchemeString, Value,
+    PairValue, Procedure, RecordType, RecordValue, SchemeString, Value,
 };
-use std::{cmp::Ordering, rc::Rc};
+use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub(super) fn default_env() -> EnvRef {
     let env = Environment::new(None);
@@ -148,6 +148,22 @@ pub(super) fn apply_procedure(
 
             eval_program(body, call_env, output)
         }
+        Procedure::RecordConstructor {
+            record_type,
+            field_count,
+            ..
+        } => apply_record_constructor(record_type.clone(), *field_count, args),
+        Procedure::RecordPredicate { record_type, .. } => apply_record_predicate(record_type, args),
+        Procedure::RecordAccessor {
+            record_type,
+            field_index,
+            ..
+        } => apply_record_accessor(record_type, *field_index, args),
+        Procedure::RecordMutator {
+            record_type,
+            field_index,
+            ..
+        } => apply_record_mutator(record_type, *field_index, args),
     }
 }
 
@@ -163,6 +179,105 @@ fn extract_rational(arg: &EvaluatedArg) -> Result<Rational, EvalError> {
         }
         .with_position(arg.pos.line, arg.pos.col)
     })
+}
+
+fn apply_record_constructor(
+    record_type: Rc<RecordType>,
+    field_count: usize,
+    args: &[EvaluatedArg],
+) -> Result<Value, EvalError> {
+    if args.len() != field_count {
+        return Err(EvalError::WrongArgCount {
+            name: "record constructor",
+            expected: "exact parameter count",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Record(Rc::new(RecordValue {
+        record_type,
+        fields: RefCell::new(args.iter().map(|arg| arg.value.clone()).collect()),
+    })))
+}
+
+fn apply_record_predicate(
+    record_type: &Rc<RecordType>,
+    args: &[EvaluatedArg],
+) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "record predicate",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(
+        &value.value,
+        Value::Record(record) if Rc::ptr_eq(&record.record_type, record_type)
+    )))
+}
+
+fn apply_record_accessor(
+    record_type: &Rc<RecordType>,
+    field_index: usize,
+    args: &[EvaluatedArg],
+) -> Result<Value, EvalError> {
+    let [record_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "record accessor",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let record = expect_record_instance(record_arg, record_type)?;
+    let value = {
+        let fields = record.fields.borrow();
+        fields[field_index].clone()
+    };
+    Ok(value)
+}
+
+fn apply_record_mutator(
+    record_type: &Rc<RecordType>,
+    field_index: usize,
+    args: &[EvaluatedArg],
+) -> Result<Value, EvalError> {
+    let [record_arg, value_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "record mutator",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    };
+
+    let record = expect_record_instance(record_arg, record_type)?;
+    record.fields.borrow_mut()[field_index] = value_arg.value.clone();
+    Ok(Value::Void)
+}
+
+fn expect_record_instance(
+    arg: &EvaluatedArg,
+    record_type: &Rc<RecordType>,
+) -> Result<Rc<RecordValue>, EvalError> {
+    let Value::Record(record) = &arg.value else {
+        return Err(EvalError::TypeMismatch {
+            expected: "record",
+            found: arg.value.render(),
+        }
+        .with_position(arg.pos.line, arg.pos.col));
+    };
+
+    if !Rc::ptr_eq(&record.record_type, record_type) {
+        return Err(EvalError::TypeMismatch {
+            expected: "record",
+            found: arg.value.render(),
+        }
+        .with_position(arg.pos.line, arg.pos.col));
+    }
+
+    Ok(record.clone())
 }
 
 fn apply_add(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -394,12 +509,9 @@ fn apply_comparison(
         .iter()
         .map(EvaluatedArg::as_number)
         .collect::<Result<Vec<_>, _>>()?;
-    let is_match = numbers.windows(2).all(|pair| {
-        pair[0]
-            .compare(pair[1])
-            .map(&predicate)
-            .unwrap_or(false)
-    });
+    let is_match = numbers
+        .windows(2)
+        .all(|pair| pair[0].compare(pair[1]).map(&predicate).unwrap_or(false));
     Ok(Value::Bool(is_match))
 }
 
