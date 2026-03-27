@@ -7,12 +7,46 @@ type Expr =
   | { kind: 'symbol'; name: string }
   | { kind: 'list'; items: Expr[] };
 
-type Value = number | boolean | string | BuiltinProc;
-
-interface BuiltinProc {
+type SchemeSymbol = { kind: 'symbol-value'; name: string };
+type SchemeList = { kind: 'list-value'; items: Value[] };
+type VoidValue = { kind: 'void' };
+type BuiltinProc = {
   kind: 'builtin';
   name: string;
   apply: (args: Value[]) => Value;
+};
+type UserProc = {
+  kind: 'lambda';
+  name?: string;
+  params: string[];
+  body: Expr[];
+  env: Env;
+};
+
+type Value = number | boolean | string | SchemeSymbol | SchemeList | VoidValue | BuiltinProc | UserProc;
+
+const VOID: VoidValue = { kind: 'void' };
+
+class Env {
+  private readonly bindings = new Map<string, Value>();
+
+  constructor(private readonly parent?: Env) {}
+
+  define(name: string, value: Value): void {
+    this.bindings.set(name, value);
+  }
+
+  lookup(name: string): Value {
+    if (this.bindings.has(name)) {
+      return this.bindings.get(name)!;
+    }
+
+    if (this.parent !== undefined) {
+      return this.parent.lookup(name);
+    }
+
+    throw new EvalError(`unbound symbol: ${name}`);
+  }
 }
 
 class Parser {
@@ -40,6 +74,17 @@ class Parser {
     }
 
     const ch = this.peek();
+
+    if (ch === '\'') {
+      this.advance();
+      return {
+        kind: 'list',
+        items: [
+          { kind: 'symbol', name: 'quote' },
+          this.parseExpr(),
+        ],
+      };
+    }
 
     if (ch === '(') {
       return this.parseList();
@@ -212,67 +257,78 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
     throw new EvalError('empty input');
   }
 
-  let lastValue: Value | undefined;
+  const env = createGlobalEnv();
+  let lastValue: Value = VOID;
   for (const expr of program) {
-    lastValue = evalExpr(expr);
+    lastValue = evalExpr(expr, env);
   }
 
   return {
-    result: formatValue(lastValue!),
+    result: formatValue(lastValue),
     output: '',
   };
 }
 
-function evalExpr(expr: Expr): Value {
+function createGlobalEnv(): Env {
+  const env = new Env();
+  for (const [name, value] of BUILTINS) {
+    env.define(name, value);
+  }
+  return env;
+}
+
+function evalExpr(expr: Expr, env: Env): Value {
   switch (expr.kind) {
     case 'number':
     case 'boolean':
     case 'string':
       return expr.value;
 
-    case 'symbol': {
-      const value = BUILTINS.get(expr.name);
-      if (value === undefined) {
-        throw new EvalError(`unbound symbol: ${expr.name}`);
-      }
-      return value;
-    }
+    case 'symbol':
+      return env.lookup(expr.name);
 
     case 'list':
-      return evalList(expr.items);
+      return evalList(expr.items, env);
   }
 }
 
-function evalList(items: Expr[]): Value {
+function evalList(items: Expr[], env: Env): Value {
   if (items.length === 0) {
     throw new EvalError('cannot evaluate empty list');
   }
 
   const first = items[0]!;
   if (first.kind === 'symbol') {
-    if (first.name === 'and') {
-      return evalAnd(items.slice(1));
-    }
-
-    if (first.name === 'or') {
-      return evalOr(items.slice(1));
+    switch (first.name) {
+      case 'and':
+        return evalAnd(items.slice(1), env);
+      case 'or':
+        return evalOr(items.slice(1), env);
+      case 'define':
+        return evalDefine(items.slice(1), env);
+      case 'if':
+        return evalIf(items.slice(1), env);
+      case 'lambda':
+        return evalLambda(items.slice(1), env);
+      case 'quote':
+        return evalQuote(items.slice(1));
     }
   }
 
-  const proc = evalExpr(first);
-  if (!isBuiltinProc(proc)) {
+  const proc = evalExpr(first, env);
+  if (!isProcedure(proc)) {
     throw new EvalError('attempted to call a non-procedure');
   }
 
-  const args = items.slice(1).map((item) => evalExpr(item));
-  return proc.apply(args);
+  const args = items.slice(1).map((item) => evalExpr(item, env));
+  return applyProcedure(proc, args);
 }
 
-function evalAnd(args: Expr[]): Value {
+function evalAnd(args: Expr[], env: Env): Value {
   let result: Value = true;
 
   for (const arg of args) {
-    result = evalExpr(arg);
+    result = evalExpr(arg, env);
     if (!isTruthy(result)) {
       return result;
     }
@@ -281,15 +337,124 @@ function evalAnd(args: Expr[]): Value {
   return result;
 }
 
-function evalOr(args: Expr[]): Value {
+function evalOr(args: Expr[], env: Env): Value {
   for (const arg of args) {
-    const value = evalExpr(arg);
+    const value = evalExpr(arg, env);
     if (isTruthy(value)) {
       return value;
     }
   }
 
   return false;
+}
+
+function evalDefine(args: Expr[], env: Env): Value {
+  assertAtLeastArity('define', args, 2);
+
+  const target = args[0]!;
+  const body = args.slice(1);
+
+  if (target.kind === 'symbol') {
+    assertExactArity('define', body, 1);
+    env.define(target.name, evalExpr(body[0]!, env));
+    return VOID;
+  }
+
+  if (target.kind === 'list' && target.items.length > 0) {
+    const nameExpr = target.items[0]!;
+    if (nameExpr.kind !== 'symbol') {
+      throw new EvalError('define expects a symbol name');
+    }
+
+    const params = parseParams(target.items.slice(1));
+    assertAtLeastArity('define', body, 1);
+    env.define(nameExpr.name, {
+      kind: 'lambda',
+      name: nameExpr.name,
+      params,
+      body,
+      env,
+    });
+    return VOID;
+  }
+
+  throw new EvalError('define expects a symbol name');
+}
+
+function evalIf(args: Expr[], env: Env): Value {
+  assertExactArity('if', args, 3);
+  const [conditionExpr, thenExpr, elseExpr] = args;
+  return isTruthy(evalExpr(conditionExpr!, env))
+    ? evalExpr(thenExpr!, env)
+    : evalExpr(elseExpr!, env);
+}
+
+function evalLambda(args: Expr[], env: Env): Value {
+  assertAtLeastArity('lambda', args, 2);
+
+  const paramsExpr = args[0]!;
+  if (paramsExpr.kind !== 'list') {
+    throw new EvalError('lambda expects a parameter list');
+  }
+
+  return {
+    kind: 'lambda',
+    params: parseParams(paramsExpr.items),
+    body: args.slice(1),
+    env,
+  };
+}
+
+function evalQuote(args: Expr[]): Value {
+  assertExactArity('quote', args, 1);
+  return quoteExpr(args[0]!);
+}
+
+function parseParams(items: Expr[]): string[] {
+  return items.map((item) => {
+    if (item.kind !== 'symbol') {
+      throw new EvalError('lambda parameters must be symbols');
+    }
+    return item.name;
+  });
+}
+
+function quoteExpr(expr: Expr): Value {
+  switch (expr.kind) {
+    case 'number':
+    case 'boolean':
+    case 'string':
+      return expr.value;
+
+    case 'symbol':
+      return { kind: 'symbol-value', name: expr.name };
+
+    case 'list':
+      return {
+        kind: 'list-value',
+        items: expr.items.map((item) => quoteExpr(item)),
+      };
+  }
+}
+
+function applyProcedure(proc: BuiltinProc | UserProc, args: Value[]): Value {
+  if (proc.kind === 'builtin') {
+    return proc.apply(args);
+  }
+
+  assertExactArity(proc.name ?? 'lambda', args, proc.params.length);
+
+  const callEnv = new Env(proc.env);
+  proc.params.forEach((param, index) => {
+    callEnv.define(param, args[index]!);
+  });
+
+  let result: Value = VOID;
+  for (const expr of proc.body) {
+    result = evalExpr(expr, callEnv);
+  }
+
+  return result;
 }
 
 function builtin(name: string, apply: (args: Value[]) => Value): [string, BuiltinProc] {
@@ -391,7 +556,18 @@ function formatValue(value: Value): string {
     return JSON.stringify(value);
   }
 
-  return `#<procedure:${value.name}>`;
+  switch (value.kind) {
+    case 'symbol-value':
+      return value.name;
+    case 'list-value':
+      return `(${value.items.map((item) => formatValue(item)).join(' ')})`;
+    case 'void':
+      return '';
+    case 'builtin':
+      return `#<procedure:${value.name}>`;
+    case 'lambda':
+      return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+  }
 }
 
 function formatNumber(value: number): string {
@@ -407,8 +583,8 @@ function isTruthy(value: Value): boolean {
   return value !== false;
 }
 
-function isBuiltinProc(value: Value): value is BuiltinProc {
-  return typeof value === 'object' && value !== null && value.kind === 'builtin';
+function isProcedure(value: Value): value is BuiltinProc | UserProc {
+  return typeof value === 'object' && value !== null && (value.kind === 'builtin' || value.kind === 'lambda');
 }
 
 function isWhitespace(ch: string): boolean {
@@ -416,5 +592,5 @@ function isWhitespace(ch: string): boolean {
 }
 
 function isDelimiter(ch: string): boolean {
-  return isWhitespace(ch) || ch === '(' || ch === ')' || ch === ';';
+  return isWhitespace(ch) || ch === '(' || ch === ')' || ch === ';' || ch === '\'';
 }
