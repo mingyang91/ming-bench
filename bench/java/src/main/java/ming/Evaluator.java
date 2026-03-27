@@ -74,7 +74,9 @@ public class Evaluator {
         env.define("number->string", new BuiltinProcedure("number->string", this::builtinNumberToString));
         env.define("symbol->string", new BuiltinProcedure("symbol->string", this::builtinSymbolToString));
         env.define("string->symbol", new BuiltinProcedure("string->symbol", this::builtinStringToSymbol));
+        env.define("string-copy", new BuiltinProcedure("string-copy", this::builtinStringCopy));
         env.define("string-ref", new BuiltinProcedure("string-ref", this::builtinStringRef));
+        env.define("string-set!", new BuiltinProcedure("string-set!", this::builtinStringSet));
         env.define("char?", new BuiltinProcedure("char?", this::builtinCharPredicate));
         return env;
     }
@@ -85,6 +87,7 @@ public class Evaluator {
                 case IntExpr intExpr -> new IntValue(intExpr.value());
                 case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
                 case StringExpr stringExpr -> new StringValue(stringExpr.value());
+                case CharExpr charExpr -> new CharValue(charExpr.value());
                 case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
                 case ListExpr listExpr -> evalList(listExpr, env);
             };
@@ -345,6 +348,7 @@ public class Evaluator {
             case IntExpr intExpr -> new IntValue(intExpr.value());
             case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case CharExpr charExpr -> new CharValue(charExpr.value());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
             case ListExpr listExpr -> {
                 List<Value> values = new ArrayList<>(listExpr.elements().size());
@@ -592,11 +596,24 @@ public class Evaluator {
         return new SymbolValue(requireString(args.getFirst(), "string->symbol"));
     }
 
+    private Value builtinStringCopy(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "string-copy");
+        return requireStringValue(args.getFirst(), "string-copy").mutableCopy();
+    }
+
     private Value builtinStringRef(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 2, "string-ref");
         String value = requireString(args.getFirst(), "string-ref");
         int index = requireElementIndex(args.get(1), value.length(), "string-ref");
         return new CharValue(value.charAt(index));
+    }
+
+    private Value builtinStringSet(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 3, "string-set!");
+        StringValue value = requireMutableString(args.getFirst(), "string-set!");
+        int index = requireElementIndex(args.get(1), value.length(), "string-set!");
+        value.set(index, requireChar(args.get(2), "string-set!"));
+        return VoidValue.INSTANCE;
     }
 
     private Value builtinCharPredicate(List<Value> args) throws EvalError {
@@ -626,10 +643,29 @@ public class Evaluator {
     }
 
     private String requireString(Value value, String procedure) throws EvalError {
+        return requireStringValue(value, procedure).value();
+    }
+
+    private StringValue requireStringValue(Value value, String procedure) throws EvalError {
         if (value instanceof StringValue stringValue) {
-            return stringValue.value();
+            return stringValue;
         }
         throw new EvalError("'" + procedure + "' expects a string");
+    }
+
+    private StringValue requireMutableString(Value value, String procedure) throws EvalError {
+        StringValue stringValue = requireStringValue(value, procedure);
+        if (stringValue.isMutable()) {
+            return stringValue;
+        }
+        throw new EvalError("'" + procedure + "' expects a mutable string");
+    }
+
+    private char requireChar(Value value, String procedure) throws EvalError {
+        if (value instanceof CharValue charValue) {
+            return charValue.value();
+        }
+        throw new EvalError("'" + procedure + "' expects a character");
     }
 
     private List<Value> requireList(Value value, String procedure) throws EvalError {
@@ -705,7 +741,7 @@ public class Evaluator {
     private record SourcePos(int line, int column) {
     }
 
-    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, SymbolExpr, ListExpr {
+    private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
         SourcePos loc();
     }
 
@@ -716,6 +752,9 @@ public class Evaluator {
     }
 
     private record StringExpr(String value, SourcePos loc) implements Expr {
+    }
+
+    private record CharExpr(char value, SourcePos loc) implements Expr {
     }
 
     private record SymbolExpr(String name, SourcePos loc) implements Expr {
@@ -760,15 +799,47 @@ public class Evaluator {
         }
     }
 
-    private record StringValue(String value) implements Value {
+    private static final class StringValue implements Value {
+        private final StringBuilder value;
+        private final boolean mutable;
+
+        private StringValue(String value) {
+            this(value, false);
+        }
+
+        private StringValue(String value, boolean mutable) {
+            this.value = new StringBuilder(value);
+            this.mutable = mutable;
+        }
+
+        private String value() {
+            return value.toString();
+        }
+
+        private int length() {
+            return value.length();
+        }
+
+        private boolean isMutable() {
+            return mutable;
+        }
+
+        private void set(int index, char ch) {
+            value.setCharAt(index, ch);
+        }
+
+        private StringValue mutableCopy() {
+            return new StringValue(value(), true);
+        }
+
         @Override
         public String toSchemeString() {
-            return quoteString(value);
+            return quoteString(value());
         }
 
         @Override
         public String toDisplayString() {
-            return value;
+            return value();
         }
     }
 
@@ -919,6 +990,19 @@ public class Evaluator {
         return true;
     }
 
+    private static Character parseCharacterLiteral(String text) {
+        if (!text.startsWith("#\\")) {
+            return null;
+        }
+
+        String literal = text.substring(2);
+        return switch (literal) {
+            case "space" -> ' ';
+            case "newline" -> '\n';
+            default -> literal.length() == 1 ? literal.charAt(0) : null;
+        };
+    }
+
     private static final class Parser {
         private final String input;
         private int index;
@@ -1023,6 +1107,14 @@ public class Evaluator {
             }
             if (atom.equals("#f")) {
                 return new BoolExpr(false, start);
+            }
+            Character charValue = parseCharacterLiteral(atom);
+            if (charValue != null) {
+                return new CharExpr(charValue, start);
+            }
+            if (atom.startsWith("#\\")) {
+                throw new EvalError("invalid character literal: " + atom,
+                        start.line(), start.column());
             }
             Long integerValue = parseIntegerLiteral(atom);
             if (integerValue != null) {
