@@ -2,6 +2,7 @@ package ming
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -22,6 +23,8 @@ type PairVal struct{ Car, Cdr Value }
 type NilVal struct{} // empty list
 type VoidVal struct{}
 type CharVal struct{ Val rune }
+type RatVal struct{ Num, Den int64 } // exact rational, Den > 0, gcd(|Num|,Den)==1
+type FloatVal struct{ Val float64 }  // inexact
 
 type LambdaVal struct {
 	Params   []string
@@ -58,6 +61,20 @@ func (v *SymbolVal) String() string  { return v.Name }
 func (v *NilVal) String() string     { return "()" }
 func (v *VoidVal) String() string    { return "" }
 func (v *CharVal) String() string     { return fmt.Sprintf("#\\%c", v.Val) }
+func (v *RatVal) String() string {
+	if v.Den == 1 {
+		return strconv.FormatInt(v.Num, 10)
+	}
+	return fmt.Sprintf("%d/%d", v.Num, v.Den)
+}
+func (v *FloatVal) String() string {
+	s := strconv.FormatFloat(v.Val, 'f', -1, 64)
+	// Ensure there's a decimal point for whole floats
+	if !strings.Contains(s, ".") {
+		s += ".0"
+	}
+	return s
+}
 func (v *LambdaVal) String() string  { return "#<procedure>" }
 func (v *BuiltinVal) String() string      { return "#<builtin:" + v.Name + ">" }
 func (v *SyntaxRulesVal) String() string   { return "#<syntax>" }
@@ -92,6 +109,170 @@ func (v *PairVal) String() string {
 	}
 	buf.WriteByte(')')
 	return buf.String()
+}
+
+// --------------- Numeric helpers ---------------
+
+func gcdInt(a, b int64) int64 {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func makeRat(num, den int64) Value {
+	if den == 0 {
+		panic("zero denominator in makeRat")
+	}
+	if den < 0 {
+		num, den = -num, -den
+	}
+	if num == 0 {
+		return &IntVal{Val: 0}
+	}
+	g := gcdInt(num, den)
+	num /= g
+	den /= g
+	if den == 1 {
+		return &IntVal{Val: num}
+	}
+	return &RatVal{Num: num, Den: den}
+}
+
+// toFloat64 extracts a float64 from any numeric Value
+func toFloat64(v Value) (float64, bool) {
+	switch n := v.(type) {
+	case *IntVal:
+		return float64(n.Val), true
+	case *RatVal:
+		return float64(n.Num) / float64(n.Den), true
+	case *FloatVal:
+		return n.Val, true
+	}
+	return 0, false
+}
+
+// isExact returns true for IntVal and RatVal
+func isExact(v Value) bool {
+	switch v.(type) {
+	case *IntVal, *RatVal:
+		return true
+	}
+	return false
+}
+
+// isNumber returns true for all numeric types
+func isNumber(v Value) bool {
+	switch v.(type) {
+	case *IntVal, *RatVal, *FloatVal:
+		return true
+	}
+	return false
+}
+
+// numAdd adds two numeric values
+func numAdd(a, b Value) Value {
+	if isExact(a) && isExact(b) {
+		an, ad := toRat(a)
+		bn, bd := toRat(b)
+		return makeRat(an*bd+bn*ad, ad*bd)
+	}
+	af, _ := toFloat64(a)
+	bf, _ := toFloat64(b)
+	return &FloatVal{Val: af + bf}
+}
+
+// numSub subtracts b from a
+func numSub(a, b Value) Value {
+	if isExact(a) && isExact(b) {
+		an, ad := toRat(a)
+		bn, bd := toRat(b)
+		return makeRat(an*bd-bn*ad, ad*bd)
+	}
+	af, _ := toFloat64(a)
+	bf, _ := toFloat64(b)
+	return &FloatVal{Val: af - bf}
+}
+
+// numMul multiplies two numeric values
+func numMul(a, b Value) Value {
+	if isExact(a) && isExact(b) {
+		an, ad := toRat(a)
+		bn, bd := toRat(b)
+		return makeRat(an*bn, ad*bd)
+	}
+	af, _ := toFloat64(a)
+	bf, _ := toFloat64(b)
+	return &FloatVal{Val: af * bf}
+}
+
+// numDiv divides a by b, returns (result, error)
+func numDiv(a, b Value) (Value, error) {
+	bf, _ := toFloat64(b)
+	if bf == 0 {
+		return nil, &EvalError{Message: "division by zero"}
+	}
+	if isExact(a) && isExact(b) {
+		an, ad := toRat(a)
+		bn, bd := toRat(b)
+		return makeRat(an*bd, ad*bn), nil
+	}
+	af, _ := toFloat64(a)
+	return &FloatVal{Val: af / bf}, nil
+}
+
+// numNeg negates a numeric value
+func numNeg(v Value) Value {
+	switch n := v.(type) {
+	case *IntVal:
+		return &IntVal{Val: -n.Val}
+	case *RatVal:
+		return &RatVal{Num: -n.Num, Den: n.Den}
+	case *FloatVal:
+		return &FloatVal{Val: -n.Val}
+	}
+	return v
+}
+
+// toRat converts exact numeric to num/den
+func toRat(v Value) (int64, int64) {
+	switch n := v.(type) {
+	case *IntVal:
+		return n.Val, 1
+	case *RatVal:
+		return n.Num, n.Den
+	}
+	return 0, 1
+}
+
+// numCmp compares two numbers, returns -1, 0, 1
+func numCmp(a, b Value) int {
+	if isExact(a) && isExact(b) {
+		an, ad := toRat(a)
+		bn, bd := toRat(b)
+		lhs := an * bd
+		rhs := bn * ad
+		if lhs < rhs {
+			return -1
+		} else if lhs > rhs {
+			return 1
+		}
+		return 0
+	}
+	af, _ := toFloat64(a)
+	bf, _ := toFloat64(b)
+	if af < bf {
+		return -1
+	} else if af > bf {
+		return 1
+	}
+	return 0
 }
 
 // --------------- Environment ---------------
@@ -347,6 +528,19 @@ func evalAtomInEnv(atom *AtomExpr, env *Env) (Value, error) {
 	}
 	if n, err := strconv.ParseInt(token, 10, 64); err == nil {
 		return &IntVal{Val: n}, nil
+	}
+	// Rational literal: digits/digits
+	if idx := strings.Index(token, "/"); idx > 0 && idx < len(token)-1 {
+		numStr, denStr := token[:idx], token[idx+1:]
+		if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+			if den, err := strconv.ParseInt(denStr, 10, 64); err == nil && den != 0 {
+				return makeRat(num, den), nil
+			}
+		}
+	}
+	// Float literal
+	if f, err := strconv.ParseFloat(token, 64); err == nil {
+		return &FloatVal{Val: f}, nil
 	}
 	// variable lookup
 	if v, ok := env.get(token); ok {
@@ -972,8 +1166,29 @@ func isSelfEvaluating(token string) bool {
 func valuesEqual(a, b Value) bool {
 	switch av := a.(type) {
 	case *IntVal:
-		bv, ok := b.(*IntVal)
-		return ok && av.Val == bv.Val
+		if bv, ok := b.(*IntVal); ok {
+			return av.Val == bv.Val
+		}
+		if isNumber(b) {
+			return numCmp(a, b) == 0
+		}
+		return false
+	case *RatVal:
+		if bv, ok := b.(*RatVal); ok {
+			return av.Num == bv.Num && av.Den == bv.Den
+		}
+		if isNumber(b) {
+			return numCmp(a, b) == 0
+		}
+		return false
+	case *FloatVal:
+		if bv, ok := b.(*FloatVal); ok {
+			return av.Val == bv.Val
+		}
+		if isNumber(b) {
+			return numCmp(a, b) == 0
+		}
+		return false
 	case *BoolVal:
 		bv, ok := b.(*BoolVal)
 		return ok && av.Val == bv.Val
@@ -1010,6 +1225,12 @@ func valuesEq(a, b Value) bool {
 		return ok && av.Val == bv.Val
 	case *IntVal:
 		bv, ok := b.(*IntVal)
+		return ok && av.Val == bv.Val
+	case *RatVal:
+		bv, ok := b.(*RatVal)
+		return ok && av.Num == bv.Num && av.Den == bv.Den
+	case *FloatVal:
+		bv, ok := b.(*FloatVal)
 		return ok && av.Val == bv.Val
 	case *NilVal:
 		_, ok := b.(*NilVal)
@@ -1105,92 +1326,78 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 	}
 
 	addBuiltin("+", func(args []Value) (Value, error) {
-		var sum int64
+		var result Value = &IntVal{Val: 0}
 		for _, a := range args {
-			n, ok := a.(*IntVal)
-			if !ok {
+			if !isNumber(a) {
 				return nil, &EvalError{Message: "expected number"}
 			}
-			sum += n.Val
+			result = numAdd(result, a)
 		}
-		return &IntVal{Val: sum}, nil
+		return result, nil
 	})
 
 	addBuiltin("-", func(args []Value) (Value, error) {
 		if len(args) == 0 {
 			return nil, &EvalError{Message: "- requires at least 1 argument"}
 		}
-		if len(args) == 1 {
-			n, ok := args[0].(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "expected number"}
-			}
-			return &IntVal{Val: -n.Val}, nil
-		}
-		first, ok := args[0].(*IntVal)
-		if !ok {
+		if !isNumber(args[0]) {
 			return nil, &EvalError{Message: "expected number"}
 		}
-		val := first.Val
+		if len(args) == 1 {
+			return numNeg(args[0]), nil
+		}
+		result := args[0]
 		for _, a := range args[1:] {
-			n, ok := a.(*IntVal)
-			if !ok {
+			if !isNumber(a) {
 				return nil, &EvalError{Message: "expected number"}
 			}
-			val -= n.Val
+			result = numSub(result, a)
 		}
-		return &IntVal{Val: val}, nil
+		return result, nil
 	})
 
 	addBuiltin("*", func(args []Value) (Value, error) {
-		var prod int64 = 1
+		var result Value = &IntVal{Val: 1}
 		for _, a := range args {
-			n, ok := a.(*IntVal)
-			if !ok {
+			if !isNumber(a) {
 				return nil, &EvalError{Message: "expected number"}
 			}
-			prod *= n.Val
+			result = numMul(result, a)
 		}
-		return &IntVal{Val: prod}, nil
+		return result, nil
 	})
 
 	addBuiltin("/", func(args []Value) (Value, error) {
 		if len(args) < 2 {
 			return nil, &EvalError{Message: "/ requires at least 2 arguments"}
 		}
-		first, ok := args[0].(*IntVal)
-		if !ok {
+		if !isNumber(args[0]) {
 			return nil, &EvalError{Message: "expected number"}
 		}
-		val := first.Val
+		result := args[0]
 		for _, a := range args[1:] {
-			n, ok := a.(*IntVal)
-			if !ok {
+			if !isNumber(a) {
 				return nil, &EvalError{Message: "expected number"}
 			}
-			if n.Val == 0 {
-				return nil, &EvalError{Message: "division by zero"}
+			var err error
+			result, err = numDiv(result, a)
+			if err != nil {
+				return nil, err
 			}
-			val /= n.Val
 		}
-		return &IntVal{Val: val}, nil
+		return result, nil
 	})
 
-	cmpBuiltin := func(name string, cmp func(int64, int64) bool) {
+	numCmpBuiltin := func(name string, test func(int) bool) {
 		addBuiltin(name, func(args []Value) (Value, error) {
 			if len(args) < 2 {
 				return nil, &EvalError{Message: name + " requires at least 2 arguments"}
 			}
 			for i := 0; i < len(args)-1; i++ {
-				a, ok := args[i].(*IntVal)
-				if !ok {
+				if !isNumber(args[i]) || !isNumber(args[i+1]) {
 					return nil, &EvalError{Message: "expected number"}
 				}
-				b, ok := args[i+1].(*IntVal)
-				if !ok {
-					return nil, &EvalError{Message: "expected number"}
-				}
-				if !cmp(a.Val, b.Val) {
+				if !test(numCmp(args[i], args[i+1])) {
 					return &BoolVal{Val: false}, nil
 				}
 			}
@@ -1198,11 +1405,11 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 		})
 	}
 
-	cmpBuiltin("=", func(a, b int64) bool { return a == b })
-	cmpBuiltin("<", func(a, b int64) bool { return a < b })
-	cmpBuiltin(">", func(a, b int64) bool { return a > b })
-	cmpBuiltin("<=", func(a, b int64) bool { return a <= b })
-	cmpBuiltin(">=", func(a, b int64) bool { return a >= b })
+	numCmpBuiltin("=", func(c int) bool { return c == 0 })
+	numCmpBuiltin("<", func(c int) bool { return c < 0 })
+	numCmpBuiltin(">", func(c int) bool { return c > 0 })
+	numCmpBuiltin("<=", func(c int) bool { return c <= 0 })
+	numCmpBuiltin(">=", func(c int) bool { return c >= 0 })
 
 	addBuiltin("not", func(args []Value) (Value, error) {
 		if len(args) != 1 {
@@ -1308,8 +1515,7 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 		if len(args) != 1 {
 			return nil, &EvalError{Message: "number? requires 1 argument"}
 		}
-		_, ok := args[0].(*IntVal)
-		return &BoolVal{Val: ok}, nil
+		return &BoolVal{Val: isNumber(args[0])}, nil
 	})
 
 	addBuiltin("string?", func(args []Value) (Value, error) {
@@ -2040,7 +2246,128 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 		return nil, &EvalError{Message: "apply: not a procedure"}
 	})
 
+	// L11: exact arithmetic & rationals
+	addBuiltin("exact?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "exact? requires 1 argument"}
+		}
+		return &BoolVal{Val: isExact(args[0])}, nil
+	})
+
+	addBuiltin("inexact?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "inexact? requires 1 argument"}
+		}
+		_, ok := args[0].(*FloatVal)
+		return &BoolVal{Val: ok}, nil
+	})
+
+	addBuiltin("integer?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "integer? requires 1 argument"}
+		}
+		switch n := args[0].(type) {
+		case *IntVal:
+			return &BoolVal{Val: true}, nil
+		case *RatVal:
+			return &BoolVal{Val: n.Den == 1}, nil
+		case *FloatVal:
+			return &BoolVal{Val: n.Val == math.Trunc(n.Val) && !math.IsInf(n.Val, 0) && !math.IsNaN(n.Val)}, nil
+		}
+		return &BoolVal{Val: false}, nil
+	})
+
+	addBuiltin("rational?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "rational? requires 1 argument"}
+		}
+		return &BoolVal{Val: isExact(args[0])}, nil
+	})
+
+	addBuiltin("exact->inexact", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "exact->inexact requires 1 argument"}
+		}
+		f, ok := toFloat64(args[0])
+		if !ok {
+			return nil, &EvalError{Message: "exact->inexact: expected number"}
+		}
+		return &FloatVal{Val: f}, nil
+	})
+
+	addBuiltin("inexact->exact", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "inexact->exact requires 1 argument"}
+		}
+		switch n := args[0].(type) {
+		case *IntVal:
+			return n, nil
+		case *RatVal:
+			return n, nil
+		case *FloatVal:
+			// Convert float to exact rational
+			if n.Val == math.Trunc(n.Val) && !math.IsInf(n.Val, 0) && !math.IsNaN(n.Val) {
+				return &IntVal{Val: int64(n.Val)}, nil
+			}
+			// Use continued fraction / multiply out denominator approach
+			// For 0.5 -> 1/2, etc.
+			num, den := floatToRat(n.Val)
+			return makeRat(num, den), nil
+		}
+		return nil, &EvalError{Message: "inexact->exact: expected number"}
+	})
+
+	addBuiltin("numerator", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "numerator requires 1 argument"}
+		}
+		switch n := args[0].(type) {
+		case *IntVal:
+			return n, nil
+		case *RatVal:
+			return &IntVal{Val: n.Num}, nil
+		}
+		return nil, &EvalError{Message: "numerator: expected rational"}
+	})
+
+	addBuiltin("denominator", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "denominator requires 1 argument"}
+		}
+		switch args[0].(type) {
+		case *IntVal:
+			return &IntVal{Val: 1}, nil
+		case *RatVal:
+			r := args[0].(*RatVal)
+			return &IntVal{Val: r.Den}, nil
+		}
+		return nil, &EvalError{Message: "denominator: expected rational"}
+	})
+
 	return env
+}
+
+// floatToRat converts a float64 to an exact rational num/den
+func floatToRat(f float64) (int64, int64) {
+	if f == 0 {
+		return 0, 1
+	}
+	neg := false
+	if f < 0 {
+		neg = true
+		f = -f
+	}
+	// Multiply by powers of 2 to find exact representation
+	den := int64(1)
+	for f != math.Trunc(f) && den < 1<<53 {
+		f *= 2
+		den *= 2
+	}
+	num := int64(f)
+	if neg {
+		num = -num
+	}
+	return num, den
 }
 
 // displayValue formats a value for `display` (no quotes on strings).
