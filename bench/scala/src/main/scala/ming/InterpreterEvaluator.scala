@@ -8,10 +8,13 @@ private[ming] object InterpreterEvaluator:
 
   def eval(expression: Expr, env: Environment): Value =
     expression match
-      case IntExpr(value, _)    => IntValue(value)
-      case BoolExpr(value, _)   => BoolValue(value)
-      case StringExpr(value, _) => StringValue(value)
-      case CharExpr(value, _)   => CharValue(value)
+      case IntExpr(value, _) => IntValue(value)
+      case RationalExpr(numerator, denominator, _) =>
+        NumericSupport.exactValue(numerator, denominator)
+      case InexactExpr(value, _) => InexactValue(value)
+      case BoolExpr(value, _)    => BoolValue(value)
+      case StringExpr(value, _)  => StringValue(value)
+      case CharExpr(value, _)    => CharValue(value)
       case SymbolExpr(name, position) =>
         env.lookup(name, position)
       case ListExpr(items, position) =>

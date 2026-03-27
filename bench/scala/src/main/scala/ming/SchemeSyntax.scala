@@ -7,6 +7,14 @@ sealed private[ming] trait Expr:
 
 final private[ming] case class IntExpr(value: BigInt, position: Position) extends Expr
 
+final private[ming] case class RationalExpr(
+  numerator: BigInt,
+  denominator: BigInt,
+  position: Position
+) extends Expr
+
+final private[ming] case class InexactExpr(value: Double, position: Position) extends Expr
+
 final private[ming] case class BoolExpr(value: Boolean, position: Position) extends Expr
 
 final private[ming] case class StringExpr(value: String, position: Position) extends Expr

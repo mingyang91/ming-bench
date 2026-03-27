@@ -44,11 +44,18 @@ private[ming] object RuntimeSupport:
       case _ =>
         throw new IllegalStateException("validated two-argument list")
 
-  def expectNumber(value: Value, name: String, position: Position): BigInt =
+  def expectNumber(value: Value, name: String, position: Position): NumberValue =
     value match
-      case IntValue(number) => number
+      case number: NumberValue => number
       case other =>
         SchemeFailure.raise(s"$name expected a number, got ${typeName(other)}", position)
+
+  def expectInteger(value: Value, name: String, position: Position): BigInt =
+    expectNumber(value, name, position) match
+      case IntValue(number) =>
+        number
+      case _ =>
+        SchemeFailure.raise(s"$name expected an exact integer", position)
 
   def expectString(value: Value, name: String, position: Position): String =
     value match
@@ -87,7 +94,7 @@ private[ming] object RuntimeSupport:
         SchemeFailure.raise(s"$name expected a pair, got ${typeName(other)}", position)
 
   def expectIndex(value: Value, name: String, position: Position): Int =
-    val number = expectNumber(value, name, position)
+    val number = expectInteger(value, name, position)
     if number < 0 || !number.isValidInt then
       SchemeFailure.raise(s"$name expected a non-negative integer index", position)
 
@@ -115,7 +122,7 @@ private[ming] object RuntimeSupport:
 
   def typeName(value: Value): String =
     value match
-      case IntValue(_)        => "number"
+      case _: NumberValue     => "number"
       case BoolValue(_)       => "boolean"
       case _: StringLikeValue => "string"
       case SymbolValue(_)     => "symbol"

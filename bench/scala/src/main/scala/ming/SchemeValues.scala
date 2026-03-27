@@ -4,8 +4,16 @@ sealed private[ming] trait Value:
   def render: String
   def renderDisplay: String = render
 
-final private[ming] case class IntValue(value: BigInt) extends Value:
+sealed private[ming] trait NumberValue extends Value
+
+final private[ming] case class IntValue(value: BigInt) extends NumberValue:
   override def render: String = value.toString
+
+final private[ming] case class RationalValue(numerator: BigInt, denominator: BigInt) extends NumberValue:
+  override def render: String = s"$numerator/$denominator"
+
+final private[ming] case class InexactValue(value: Double) extends NumberValue:
+  override def render: String = java.lang.Double.toString(value)
 
 final private[ming] case class BoolValue(value: Boolean) extends Value:
   override def render: String = if value then "#t" else "#f"

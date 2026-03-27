@@ -86,12 +86,13 @@ private[ming] object Level1StringBuiltins:
   private def stringToNumber(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "string->number", position)
     val text  = expectString(value, "string->number", position)
-    if text.matches("[+-]?\\d+") then IntValue(BigInt(text))
-    else BoolValue(false)
+    NumericSupport.parseNumberToken(text, position) match
+      case Some(number) => NumericSupport.valueForLiteral(number)
+      case None         => BoolValue(false)
 
   private def numberToString(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "number->string", position)
-    StringValue(expectNumber(value, "number->string", position).toString)
+    StringValue(expectNumber(value, "number->string", position).render)
 
   private def symbolToString(arguments: List[Value], position: Position): Value =
     val value = expectSingleArgument(arguments, "symbol->string", position)

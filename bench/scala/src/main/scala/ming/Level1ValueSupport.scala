@@ -6,8 +6,9 @@ private[ming] object Level1ValueSupport:
 
   def eqValues(left: Value, right: Value): Boolean =
     (left, right) match
-      case (IntValue(leftNumber), IntValue(rightNumber)) => leftNumber == rightNumber
-      case (BoolValue(leftBool), BoolValue(rightBool))   => leftBool == rightBool
+      case (leftNumber: NumberValue, rightNumber: NumberValue) =>
+        NumericSupport.equal(leftNumber, rightNumber)
+      case (BoolValue(leftBool), BoolValue(rightBool)) => leftBool == rightBool
       case (leftString: StringLikeValue, rightString: StringLikeValue) =>
         leftString.text == rightString.text
       case (CharValue(leftChar), CharValue(rightChar))         => leftChar == rightChar
@@ -29,8 +30,28 @@ private[ming] object Level1ValueSupport:
 
   def isNumber(value: Value): Boolean =
     value match
-      case IntValue(_) => true
-      case _           => false
+      case _: NumberValue => true
+      case _              => false
+
+  def isExactNumber(value: Value): Boolean =
+    value match
+      case number: NumberValue => NumericSupport.isExact(number)
+      case _                   => false
+
+  def isInexactNumber(value: Value): Boolean =
+    value match
+      case number: NumberValue => NumericSupport.isInexact(number)
+      case _                   => false
+
+  def isIntegerNumber(value: Value): Boolean =
+    value match
+      case number: NumberValue => NumericSupport.isInteger(number)
+      case _                   => false
+
+  def isRationalNumber(value: Value): Boolean =
+    value match
+      case number: NumberValue => NumericSupport.isRational(number)
+      case _                   => false
 
   def isBoolean(value: Value): Boolean =
     value match

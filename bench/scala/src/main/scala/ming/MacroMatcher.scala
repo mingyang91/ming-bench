@@ -40,6 +40,19 @@ private[ming] object MacroMatcher:
             Some(Map.empty)
           case _ =>
             None
+      case RationalExpr(numerator, denominator, _) =>
+        input match
+          case RationalExpr(inputNumerator, inputDenominator, _)
+              if inputNumerator == numerator && inputDenominator == denominator =>
+            Some(Map.empty)
+          case _ =>
+            None
+      case InexactExpr(value, _) =>
+        input match
+          case InexactExpr(inputValue, _) if java.lang.Double.compare(inputValue, value) == 0 =>
+            Some(Map.empty)
+          case _ =>
+            None
       case BoolExpr(value, _) =>
         input match
           case BoolExpr(inputValue, _) if inputValue == value =>
@@ -171,6 +184,13 @@ private[ming] object MacroMatcher:
     (left, right) match
       case (IntExpr(leftValue, _), IntExpr(rightValue, _)) =>
         leftValue == rightValue
+      case (
+            RationalExpr(leftNumerator, leftDenominator, _),
+            RationalExpr(rightNumerator, rightDenominator, _)
+          ) =>
+        leftNumerator == rightNumerator && leftDenominator == rightDenominator
+      case (InexactExpr(leftValue, _), InexactExpr(rightValue, _)) =>
+        java.lang.Double.compare(leftValue, rightValue) == 0
       case (BoolExpr(leftValue, _), BoolExpr(rightValue, _)) =>
         leftValue == rightValue
       case (StringExpr(leftValue, _), StringExpr(rightValue, _)) =>

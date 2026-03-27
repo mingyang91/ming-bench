@@ -94,10 +94,16 @@ private[ming] object SchemeParser:
         case "#f" => BoolExpr(false, start)
         case _ if token.startsWith("#\\") =>
           CharExpr(parseCharacterLiteral(token, start), start)
-        case _ if token.matches("[+-]?\\d+") =>
-          IntExpr(BigInt(token), start)
         case _ =>
-          SymbolExpr(token, start)
+          NumericSupport.parseNumberToken(token, start) match
+            case Some(NumericSupport.ParsedExactInteger(value)) =>
+              IntExpr(value, start)
+            case Some(NumericSupport.ParsedExactRational(numerator, denominator)) =>
+              RationalExpr(numerator, denominator, start)
+            case Some(NumericSupport.ParsedInexact(value)) =>
+              InexactExpr(value, start)
+            case None =>
+              SymbolExpr(token, start)
 
     (nextState, expression)
 

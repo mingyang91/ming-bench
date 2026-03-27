@@ -3,61 +3,123 @@ package ming
 import scala.annotation.tailrec
 
 private[ming] object Level1NumericBuiltins:
+
   import RuntimeSupport.*
+  import NumericSupport.ExactFraction
 
   val values: Map[String, Value] = Map(
-    "+"         -> BuiltinValue("+", add),
-    "-"         -> BuiltinValue("-", subtract),
-    "*"         -> BuiltinValue("*", multiply),
-    "/"         -> BuiltinValue("/", divide),
-    "<"         -> BuiltinValue("<", compareNumbers("<")(_ < _)),
-    ">"         -> BuiltinValue(">", compareNumbers(">")(_ > _)),
-    "="         -> BuiltinValue("=", compareNumbers("=")(_ == _)),
-    "<="        -> BuiltinValue("<=", compareNumbers("<=")(_ <= _)),
-    "abs"       -> BuiltinValue("abs", abs),
-    "modulo"    -> BuiltinValue("modulo", modulo),
-    "remainder" -> BuiltinValue("remainder", remainder),
-    "quotient"  -> BuiltinValue("quotient", quotient),
-    "min"       -> BuiltinValue("min", minValue),
-    "max"       -> BuiltinValue("max", maxValue),
-    "expt"      -> BuiltinValue("expt", expt),
-    "zero?"     -> BuiltinValue("zero?", unaryNumericPredicate("zero?")(_ == 0)),
-    "positive?" -> BuiltinValue("positive?", unaryNumericPredicate("positive?")(_ > 0)),
-    "negative?" -> BuiltinValue("negative?", unaryNumericPredicate("negative?")(_ < 0)),
-    "odd?"      -> BuiltinValue("odd?", unaryNumericPredicate("odd?")(_ % 2 != 0)),
-    "even?"     -> BuiltinValue("even?", unaryNumericPredicate("even?")(_ % 2 == 0))
+    "+"              -> BuiltinValue("+", add),
+    "-"              -> BuiltinValue("-", subtract),
+    "*"              -> BuiltinValue("*", multiply),
+    "/"              -> BuiltinValue("/", divide),
+    "<"              -> BuiltinValue("<", compareNumbers("<")(_ < 0)),
+    ">"              -> BuiltinValue(">", compareNumbers(">")(_ > 0)),
+    "="              -> BuiltinValue("=", compareNumbers("=")(_ == 0)),
+    "<="             -> BuiltinValue("<=", compareNumbers("<=")(_ <= 0)),
+    "abs"            -> BuiltinValue("abs", abs),
+    "modulo"         -> BuiltinValue("modulo", modulo),
+    "remainder"      -> BuiltinValue("remainder", remainder),
+    "quotient"       -> BuiltinValue("quotient", quotient),
+    "min"            -> BuiltinValue("min", minValue),
+    "max"            -> BuiltinValue("max", maxValue),
+    "expt"           -> BuiltinValue("expt", expt),
+    "exact->inexact" -> BuiltinValue("exact->inexact", exactToInexact),
+    "inexact->exact" -> BuiltinValue("inexact->exact", inexactToExact),
+    "numerator"      -> BuiltinValue("numerator", numerator),
+    "denominator"    -> BuiltinValue("denominator", denominator),
+    "zero?"          -> BuiltinValue("zero?", unaryNumberPredicate("zero?")(NumericSupport.isZero)),
+    "positive?" -> BuiltinValue(
+      "positive?",
+      unaryNumberPredicate("positive?")(number => NumericSupport.compare(number, IntValue(0)) > 0)
+    ),
+    "negative?" -> BuiltinValue(
+      "negative?",
+      unaryNumberPredicate("negative?")(number => NumericSupport.compare(number, IntValue(0)) < 0)
+    ),
+    "odd?"  -> BuiltinValue("odd?", unaryIntegerPredicate("odd?")(_ % 2 != 0)),
+    "even?" -> BuiltinValue("even?", unaryIntegerPredicate("even?")(_ % 2 == 0))
   )
 
   private def add(arguments: List[Value], position: Position): Value =
-    IntValue(numericArguments(arguments, "+", position).foldLeft(BigInt(0))(_ + _))
+    val numbers = numericArguments(arguments, "+", position)
+    if numbers.exists(NumericSupport.isInexact) then
+      InexactValue(numbers.foldLeft(0.0)((sum, number) => sum + NumericSupport.toDouble(number)))
+    else
+      NumericSupport.fromFraction(
+        numbers.foldLeft(ExactFraction(0, 1))((sum, number) => sum + NumericSupport.exactFraction(number))
+      )
 
   private def subtract(arguments: List[Value], position: Position): Value =
     val numbers = numericArgumentsAtLeast(arguments, 1, "-", position)
-    val result =
-      numbers match
-        case number :: Nil  => -number
-        case number :: rest => rest.foldLeft(number)(_ - _)
-        case Nil            => throw new IllegalStateException("validated non-empty argument list")
-    IntValue(result)
+    if numbers.exists(NumericSupport.isInexact) then
+      val result =
+        numbers match
+          case number :: Nil =>
+            -NumericSupport.toDouble(number)
+          case number :: rest =>
+            rest.foldLeft(NumericSupport.toDouble(number))((current, next) => current - NumericSupport.toDouble(next))
+          case Nil =>
+            throw new IllegalStateException("validated non-empty argument list")
+      InexactValue(result)
+    else
+      val result =
+        numbers match
+          case number :: Nil =>
+            -NumericSupport.exactFraction(number)
+          case number :: rest =>
+            rest.foldLeft(NumericSupport.exactFraction(number))((current, next) =>
+              current - NumericSupport.exactFraction(next)
+            )
+          case Nil =>
+            throw new IllegalStateException("validated non-empty argument list")
+      NumericSupport.fromFraction(result)
 
   private def multiply(arguments: List[Value], position: Position): Value =
-    IntValue(numericArguments(arguments, "*", position).foldLeft(BigInt(1))(_ * _))
+    val numbers = numericArguments(arguments, "*", position)
+    if numbers.exists(NumericSupport.isInexact) then
+      InexactValue(numbers.foldLeft(1.0)((product, number) => product * NumericSupport.toDouble(number)))
+    else
+      NumericSupport.fromFraction(
+        numbers.foldLeft(ExactFraction(1, 1))((product, number) => product * NumericSupport.exactFraction(number))
+      )
 
   private def divide(arguments: List[Value], position: Position): Value =
     val numbers = numericArgumentsAtLeast(arguments, 1, "/", position)
-    val result =
-      numbers match
-        case denominator :: Nil =>
-          divideExactly(BigInt(1), denominator, position)
-        case numerator :: rest =>
-          rest.foldLeft(numerator): (accumulator, denominator) =>
-            divideExactly(accumulator, denominator, position)
-        case Nil =>
-          throw new IllegalStateException("validated non-empty argument list")
-    IntValue(result)
+    if numbers.exists(NumericSupport.isInexact) then
+      val result =
+        numbers match
+          case denominator :: Nil =>
+            if NumericSupport.isZero(denominator) then SchemeFailure.raise("division by zero", position)
+            1.0 / NumericSupport.toDouble(denominator)
+          case numerator :: rest =>
+            rest.foldLeft(NumericSupport.toDouble(numerator))((current, denominator) =>
+              if NumericSupport.isZero(denominator) then SchemeFailure.raise("division by zero", position)
+              current / NumericSupport.toDouble(denominator)
+            )
+          case Nil =>
+            throw new IllegalStateException("validated non-empty argument list")
+      InexactValue(result)
+    else
+      val result =
+        numbers match
+          case denominator :: Nil =>
+            val divisor = NumericSupport.exactFraction(denominator)
+            if divisor.numerator == 0 then SchemeFailure.raise("division by zero", position)
+            ExactFraction(1, 1) / divisor
+          case numerator :: rest =>
+            rest.foldLeft(NumericSupport.exactFraction(numerator))((current, denominator) =>
+              val divisor = NumericSupport.exactFraction(denominator)
+              if divisor.numerator == 0 then SchemeFailure.raise("division by zero", position)
+              current / divisor
+            )
+          case Nil =>
+            throw new IllegalStateException("validated non-empty argument list")
+      NumericSupport.fromFraction(result)
 
   private def abs(arguments: List[Value], position: Position): Value =
-    IntValue(expectNumber(expectSingleArgument(arguments, "abs", position), "abs", position).abs)
+    val number = expectNumber(expectSingleArgument(arguments, "abs", position), "abs", position)
+    if NumericSupport.isInexact(number) then InexactValue(math.abs(NumericSupport.toDouble(number)))
+    else NumericSupport.fromFraction(NumericSupport.exactFraction(number).abs)
 
   private def modulo(arguments: List[Value], position: Position): Value =
     val (dividend, divisor) = expectTwoNumbers(arguments, "modulo", position)
@@ -73,11 +135,15 @@ private[ming] object Level1NumericBuiltins:
 
   private def minValue(arguments: List[Value], position: Position): Value =
     val numbers = numericArgumentsAtLeast(arguments, 1, "min", position)
-    IntValue(numbers.min)
+    numbers.reduceLeft((current: NumberValue, next: NumberValue) =>
+      if NumericSupport.compare(current, next) <= 0 then current else next
+    )
 
   private def maxValue(arguments: List[Value], position: Position): Value =
     val numbers = numericArgumentsAtLeast(arguments, 1, "max", position)
-    IntValue(numbers.max)
+    numbers.reduceLeft((current: NumberValue, next: NumberValue) =>
+      if NumericSupport.compare(current, next) >= 0 then current else next
+    )
 
   private def expt(arguments: List[Value], position: Position): Value =
     val (base, exponent) = expectTwoNumbers(arguments, "expt", position)
@@ -91,35 +157,46 @@ private[ming] object Level1NumericBuiltins:
 
     IntValue(loop(base, exponent, 1))
 
-  private def divideExactly(
-    numerator: BigInt,
-    denominator: BigInt,
-    position: Position
-  ): BigInt =
-    if denominator == 0 then SchemeFailure.raise("division by zero", position)
+  private def exactToInexact(arguments: List[Value], position: Position): Value =
+    val number = expectNumber(expectSingleArgument(arguments, "exact->inexact", position), "exact->inexact", position)
+    NumericSupport.toInexact(number)
 
-    if numerator % denominator != 0 then SchemeFailure.raise("division produced a non-integer result", position)
+  private def inexactToExact(arguments: List[Value], position: Position): Value =
+    val number = expectNumber(expectSingleArgument(arguments, "inexact->exact", position), "inexact->exact", position)
+    NumericSupport.toExact(number)
 
-    numerator / denominator
+  private def numerator(arguments: List[Value], position: Position): Value =
+    val number = expectNumber(expectSingleArgument(arguments, "numerator", position), "numerator", position)
+    IntValue(NumericSupport.exactFractionOnly(number, "numerator", position).numerator)
+
+  private def denominator(arguments: List[Value], position: Position): Value =
+    val number = expectNumber(expectSingleArgument(arguments, "denominator", position), "denominator", position)
+    IntValue(NumericSupport.exactFractionOnly(number, "denominator", position).denominator)
 
   private def compareNumbers(
     name: String
-  )(predicate: (BigInt, BigInt) => Boolean): (List[Value], Position) => Value =
+  )(predicate: Int => Boolean): (List[Value], Position) => Value =
     (arguments, position) =>
       val numbers = numericArgumentsAtLeast(arguments, 2, name, position)
-      BoolValue(numbers.zip(numbers.tail).forall((left, right) => predicate(left, right)))
+      BoolValue(numbers.zip(numbers.tail).forall((left, right) => predicate(NumericSupport.compare(left, right))))
 
-  private def unaryNumericPredicate(
+  private def unaryNumberPredicate(
+    name: String
+  )(predicate: NumberValue => Boolean): (List[Value], Position) => Value =
+    (arguments, position) =>
+      BoolValue(predicate(expectNumber(expectSingleArgument(arguments, name, position), name, position)))
+
+  private def unaryIntegerPredicate(
     name: String
   )(predicate: BigInt => Boolean): (List[Value], Position) => Value =
     (arguments, position) =>
-      BoolValue(predicate(expectNumber(expectSingleArgument(arguments, name, position), name, position)))
+      BoolValue(predicate(expectInteger(expectSingleArgument(arguments, name, position), name, position)))
 
   private def numericArguments(
     arguments: List[Value],
     name: String,
     position: Position
-  ): List[BigInt] =
+  ): List[NumberValue] =
     arguments.map(expectNumber(_, name, position))
 
   private def numericArgumentsAtLeast(
@@ -127,7 +204,7 @@ private[ming] object Level1NumericBuiltins:
     minimum: Int,
     name: String,
     position: Position
-  ): List[BigInt] =
+  ): List[NumberValue] =
     expectAtLeast(arguments, minimum, name, position).map(expectNumber(_, name, position))
 
   private def expectTwoNumbers(
@@ -136,7 +213,7 @@ private[ming] object Level1NumericBuiltins:
     position: Position
   ): (BigInt, BigInt) =
     val (left, right) = expectTwoArguments(arguments, name, position)
-    (expectNumber(left, name, position), expectNumber(right, name, position))
+    (expectInteger(left, name, position), expectInteger(right, name, position))
 
   private def quotientValue(
     dividend: BigInt,
