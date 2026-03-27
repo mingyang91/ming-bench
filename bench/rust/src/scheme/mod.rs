@@ -28,6 +28,7 @@ thread_local! {
     static EXCEPTION_HANDLERS: RefCell<Vec<Value>> = RefCell::new(Vec::new());
     static SYNTAX_CASE_BINDINGS: RefCell<Option<MacroBindings>> = RefCell::new(None);
     static MACRO_DEF_ENV: RefCell<Option<Env>> = RefCell::new(None);
+    static TAIL_FRAME: RefCell<Option<ContinuationFrame>> = RefCell::new(None);
 }
 
 #[derive(Debug, Clone)]
@@ -643,6 +644,8 @@ fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
         let (next_expr, next_env) = *tc;
         result = eval_inner(&next_expr, &next_env).map_err(|e| with_span(e, next_expr.span))?;
     }
+    // Clear any tail frame that wasn't consumed by a call/cc capture
+    TAIL_FRAME.with(|tf| *tf.borrow_mut() = None);
     Ok(result)
 }
 
@@ -843,7 +846,13 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         if items.len() != 2 {
                             return Err(EvalError::Arity("call/cc requires exactly 1 argument".into()));
                         }
+                        // Save tail frame before eval clears it
+                        let saved_tf = TAIL_FRAME.with(|tf| tf.borrow_mut().take());
                         let proc = eval(&items[1], env)?;
+                        // Restore tail frame for eval_callcc_with_proc
+                        if saved_tf.is_some() {
+                            TAIL_FRAME.with(|tf| *tf.borrow_mut() = saved_tf);
+                        }
                         return eval_callcc_with_proc(&proc);
                     }
                     "values" => {
@@ -1042,6 +1051,8 @@ fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             Err(EvalError::ContinuationEscape(data.id))
         }
         Value::Lambda(params, rest, body, closure_env) => {
+            // Clear any stale tail frame from a previous function call
+            TAIL_FRAME.with(|tf| *tf.borrow_mut() = None);
             if let Some(_rest_name) = rest {
                 if args.len() < params.len() {
                     return Err(EvalError::Arity(format!(
@@ -1092,6 +1103,14 @@ fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                     eval(expr, &call_env)?;
                 }
                 CONT_FRAMES.with(|f| f.borrow_mut().pop());
+                // Save tail frame so continuations captured during the tail
+                // expression know which specific expression to resume at.
+                TAIL_FRAME.with(|tf| {
+                    *tf.borrow_mut() = Some(ContinuationFrame {
+                        exprs: vec![body.last().unwrap().clone()],
+                        env: call_env.clone(),
+                    });
+                });
             }
             Ok(Value::TailCall(Box::new((body.last().unwrap().clone(), call_env))))
         }
@@ -3830,7 +3849,13 @@ fn seed_builtins(env: &Env) {
 
 fn eval_callcc_with_proc(proc: &Value) -> Result<Value, EvalError> {
     let id = CALLCC_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let frames = CONT_FRAMES.with(|f| f.borrow().clone());
+    let mut frames = CONT_FRAMES.with(|f| f.borrow().clone());
+    // If a tail frame was saved by apply_tail (the body frame was popped before
+    // the tail call to this call/cc), re-attach it so the continuation knows
+    // which specific call/cc expression to resume at.
+    if let Some(tf) = TAIL_FRAME.with(|tf| tf.borrow_mut().take()) {
+        frames.push(tf);
+    }
     let cont_data = Rc::new(ContinuationData { id, frames });
     let k = Value::Continuation(cont_data);
     let result = apply(proc, &[k]);
@@ -3874,6 +3899,7 @@ fn init_callcc_state() {
     RESUME_FRAMES.with(|rf| rf.borrow_mut().clear());
     CONTINUATION_VALUE.with(|v| *v.borrow_mut() = None);
     PENDING_CONTINUATION.with(|pc| *pc.borrow_mut() = None);
+    TAIL_FRAME.with(|tf| *tf.borrow_mut() = None);
 }
 
 fn eval_top_level_loop(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
