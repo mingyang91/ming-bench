@@ -485,6 +485,8 @@ enum Builtin {
     DynamicWind,
     Raise,
     WithExceptionHandler,
+    Values,
+    CallWithValues,
     Apply,
     Map,
     ForEach,
@@ -1265,6 +1267,8 @@ fn root_env() -> EnvRef {
         ("dynamic-wind", Builtin::DynamicWind),
         ("raise", Builtin::Raise),
         ("with-exception-handler", Builtin::WithExceptionHandler),
+        ("values", Builtin::Values),
+        ("call-with-values", Builtin::CallWithValues),
         ("apply", Builtin::Apply),
         ("map", Builtin::Map),
         ("for-each", Builtin::ForEach),
@@ -1691,7 +1695,14 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         }),
         Builtin::WithExceptionHandler => Err(EvalError::InvalidArgument {
             name: "with-exception-handler".to_owned(),
-            message: "internal exception handling requires continuation-aware evaluation".to_owned(),
+            message: "internal exception handling requires continuation-aware evaluation"
+                .to_owned(),
+        }),
+        Builtin::Values => eval_values_builtin(values),
+        Builtin::CallWithValues => Err(EvalError::InvalidArgument {
+            name: "call-with-values".to_owned(),
+            message: "internal multiple-value application requires continuation-aware evaluation"
+                .to_owned(),
         }),
         Builtin::Apply => eval_apply_builtin(values, env),
         Builtin::Map => eval_map_builtin(values, env),
@@ -3255,6 +3266,16 @@ fn eval_apply_builtin(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> 
     apply_values(operator, &applied_args, env)
 }
 
+fn eval_values_builtin(args: &[Value]) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(value.clone()),
+        _ => Err(EvalError::InvalidArgument {
+            name: "values".to_owned(),
+            message: "multiple values require continuation-aware evaluation".to_owned(),
+        }),
+    }
+}
+
 fn eval_add(args: &[Value]) -> Result<Value, EvalError> {
     let values = eval_number_args("+", args)?;
 
@@ -4810,9 +4831,41 @@ fn values_equal_inner(
 }
 
 #[derive(Clone)]
+struct ProducedValues {
+    values: Vec<Value>,
+}
+
+impl ProducedValues {
+    fn new(values: Vec<Value>) -> Self {
+        Self { values }
+    }
+
+    fn single(value: Value) -> Self {
+        Self {
+            values: vec![value],
+        }
+    }
+
+    fn into_single(self) -> Result<Value, EvalError> {
+        let mut values = self.values;
+        if values.len() == 1 {
+            Ok(values
+                .pop()
+                .expect("single-value result should contain one value"))
+        } else {
+            Err(EvalError::ExpectedSingleValue { got: values.len() })
+        }
+    }
+
+    fn into_vec(self) -> Vec<Value> {
+        self.values
+    }
+}
+
+#[derive(Clone)]
 enum MachineState {
     Expr(Expr, EnvRef),
-    Value(Value),
+    Values(ProducedValues),
     Raised {
         value: Value,
         env: EnvRef,
@@ -4907,6 +4960,11 @@ enum EvalFrame {
         env: EnvRef,
         pos: SourcePos,
     },
+    CallWithValuesConsumer {
+        consumer: Value,
+        env: EnvRef,
+        pos: Option<SourcePos>,
+    },
     DynamicWindBefore {
         wind: WindRef,
         body_thunk: Value,
@@ -4917,7 +4975,7 @@ enum EvalFrame {
         env: EnvRef,
     },
     DynamicWindAfterOut {
-        result: Value,
+        result: ProducedValues,
         wind: WindRef,
     },
     WithExceptionHandlerEnter {
@@ -4947,7 +5005,7 @@ enum EvalFrame {
         target_cont: EvalContRef,
         target_winds: Vec<WindRef>,
         target_handlers: Vec<HandlerRef>,
-        transfer_value: Value,
+        transfer_values: ProducedValues,
         env: EnvRef,
     },
 }
@@ -4978,6 +5036,7 @@ fn capture_continuation(cont: &EvalContRef) -> EvalContRef {
                 | EvalFrame::If { .. }
                 | EvalFrame::ApplyOperator { .. }
                 | EvalFrame::ReplayApplication { .. }
+                | EvalFrame::CallWithValuesConsumer { .. }
                 | EvalFrame::DynamicWindBefore { .. }
                 | EvalFrame::DynamicWindAfterBody { .. }
                 | EvalFrame::DynamicWindAfterOut { .. }
@@ -5040,14 +5099,14 @@ fn start_wind_transition(
     target_cont: EvalContRef,
     target_winds: Vec<WindRef>,
     target_handlers: Vec<HandlerRef>,
-    transfer_value: Value,
+    transfer_values: ProducedValues,
     env: &EnvRef,
     winds: &[WindRef],
     handlers: &[HandlerRef],
 ) -> Result<(MachineState, EvalContRef), EvalError> {
     let Some((current, remaining)) = actions.split_first() else {
         return Ok((
-            MachineState::Value(transfer_value),
+            MachineState::Values(transfer_values),
             push_cont(
                 EvalFrame::TransferState {
                     target_cont,
@@ -5067,7 +5126,7 @@ fn start_wind_transition(
             target_cont,
             target_winds,
             target_handlers,
-            transfer_value,
+            transfer_values,
             env: env.clone(),
         },
         done_cont(),
@@ -5104,7 +5163,10 @@ fn begin_expr(exprs: &[Expr], pos: SourcePos) -> Expr {
 
 fn enter_sequence(exprs: &[Expr], env: &EnvRef, cont: EvalContRef) -> (MachineState, EvalContRef) {
     match exprs.split_first() {
-        None => (MachineState::Value(Value::Void), cont),
+        None => (
+            MachineState::Values(ProducedValues::single(Value::Void)),
+            cont,
+        ),
         Some((first, rest)) => {
             let cont = if rest.is_empty() {
                 cont
@@ -5120,6 +5182,10 @@ fn enter_sequence(exprs: &[Expr], env: &EnvRef, cont: EvalContRef) -> (MachineSt
             (MachineState::Expr(first.clone(), env.clone()), cont)
         }
     }
+}
+
+fn machine_value(value: Value) -> MachineState {
+    MachineState::Values(ProducedValues::single(value))
 }
 
 fn expand_let_expr(args: &[Expr], pos: SourcePos) -> Result<Expr, EvalError> {
@@ -5396,7 +5462,7 @@ fn machine_start_define(
             })));
 
             env.define(name, procedure);
-            Ok((MachineState::Value(Value::Void), cont))
+            Ok((machine_value(Value::Void), cont))
         }
         _ => Err(EvalError::Parse(
             "define target must be a symbol".to_owned(),
@@ -5475,7 +5541,7 @@ fn machine_enter_list(
             }
             "define-record-type" => {
                 return Ok((
-                    MachineState::Value(
+                    machine_value(
                         eval_define_record_type(args, &env)
                             .map_err(|err| err.with_position(pos))?,
                     ),
@@ -5484,7 +5550,7 @@ fn machine_enter_list(
             }
             "define-syntax" => {
                 return Ok((
-                    MachineState::Value(
+                    machine_value(
                         eval_define_syntax(args, &env).map_err(|err| err.with_position(pos))?,
                     ),
                     cont,
@@ -5499,21 +5565,19 @@ fn machine_enter_list(
             }
             "quote" => {
                 return Ok((
-                    MachineState::Value(eval_quote(args).map_err(|err| err.with_position(pos))?),
+                    machine_value(eval_quote(args).map_err(|err| err.with_position(pos))?),
                     cont,
                 ))
             }
             "lambda" => {
                 return Ok((
-                    MachineState::Value(
-                        eval_lambda(args, &env).map_err(|err| err.with_position(pos))?,
-                    ),
+                    machine_value(eval_lambda(args, &env).map_err(|err| err.with_position(pos))?),
                     cont,
                 ))
             }
             "case-lambda" => {
                 return Ok((
-                    MachineState::Value(
+                    machine_value(
                         eval_case_lambda(args, &env).map_err(|err| err.with_position(pos))?,
                     ),
                     cont,
@@ -5536,31 +5600,25 @@ fn machine_enter_list(
             }
             "case" => {
                 return Ok((
-                    MachineState::Value(
-                        eval_case(args, &env).map_err(|err| err.with_position(pos))?,
-                    ),
+                    machine_value(eval_case(args, &env).map_err(|err| err.with_position(pos))?),
                     cont,
                 ))
             }
             "let*" => {
                 return Ok((
-                    MachineState::Value(
-                        eval_let_star(args, &env).map_err(|err| err.with_position(pos))?,
-                    ),
+                    machine_value(eval_let_star(args, &env).map_err(|err| err.with_position(pos))?),
                     cont,
                 ))
             }
             "letrec" => {
                 return Ok((
-                    MachineState::Value(
-                        eval_letrec(args, &env).map_err(|err| err.with_position(pos))?,
-                    ),
+                    machine_value(eval_letrec(args, &env).map_err(|err| err.with_position(pos))?),
                     cont,
                 ))
             }
             "letrec*" => {
                 return Ok((
-                    MachineState::Value(
+                    machine_value(
                         eval_letrec_star(args, &env).map_err(|err| err.with_position(pos))?,
                     ),
                     cont,
@@ -5568,21 +5626,19 @@ fn machine_enter_list(
             }
             "and" => {
                 return Ok((
-                    MachineState::Value(
-                        eval_and(args, &env).map_err(|err| err.with_position(pos))?,
-                    ),
+                    machine_value(eval_and(args, &env).map_err(|err| err.with_position(pos))?),
                     cont,
                 ))
             }
             "or" => {
                 return Ok((
-                    MachineState::Value(eval_or(args, &env).map_err(|err| err.with_position(pos))?),
+                    machine_value(eval_or(args, &env).map_err(|err| err.with_position(pos))?),
                     cont,
                 ))
             }
             "do" => {
                 return Ok((
-                    MachineState::Value(eval_do(args, &env).map_err(|err| err.with_position(pos))?),
+                    machine_value(eval_do(args, &env).map_err(|err| err.with_position(pos))?),
                     cont,
                 ))
             }
@@ -5711,7 +5767,7 @@ fn machine_apply(
                 });
 
                 Ok((
-                    MachineState::Value(Value::Void),
+                    machine_value(Value::Void),
                     push_cont(
                         EvalFrame::WithExceptionHandlerEnter {
                             handler,
@@ -5721,6 +5777,35 @@ fn machine_apply(
                         cont,
                     ),
                 ))
+            }
+            Procedure::Builtin(Builtin::Values) => {
+                Ok((MachineState::Values(ProducedValues::new(args)), cont))
+            }
+            Procedure::Builtin(Builtin::CallWithValues) => {
+                if args.len() != 2 {
+                    return Err(EvalError::WrongArgCount {
+                        name: "call-with-values".to_owned(),
+                        expected: "exactly 2 arguments".to_owned(),
+                        got: args.len(),
+                    });
+                }
+
+                machine_apply(
+                    args[0].clone(),
+                    Vec::new(),
+                    env,
+                    push_cont(
+                        EvalFrame::CallWithValuesConsumer {
+                            consumer: args[1].clone(),
+                            env: env.clone(),
+                            pos,
+                        },
+                        cont,
+                    ),
+                    winds,
+                    handlers,
+                    pos,
+                )
             }
             Procedure::Builtin(Builtin::Apply) => {
                 if args.len() < 2 {
@@ -5737,10 +5822,9 @@ fn machine_apply(
                 applied_args.extend(tail);
                 machine_apply(operator, applied_args, env, cont, winds, handlers, pos)
             }
-            Procedure::Builtin(builtin) => Ok((
-                MachineState::Value(apply_builtin(*builtin, &args, env)?),
-                cont,
-            )),
+            Procedure::Builtin(builtin) => {
+                Ok((machine_value(apply_builtin(*builtin, &args, env)?), cont))
+            }
             Procedure::Lambda(lambda) => {
                 let call_env =
                     prepare_lambda_call(lambda, &args, lambda.name.as_deref().unwrap_or("lambda"))?;
@@ -5756,32 +5840,23 @@ fn machine_apply(
                 Ok(enter_sequence(&clause.body, &call_env, cont))
             }
             Procedure::RecordConstructor(constructor) => Ok((
-                MachineState::Value(apply_record_constructor(constructor, &args)?),
+                machine_value(apply_record_constructor(constructor, &args)?),
                 cont,
             )),
             Procedure::RecordPredicate(predicate) => Ok((
-                MachineState::Value(apply_record_predicate(predicate, &args)?),
+                machine_value(apply_record_predicate(predicate, &args)?),
                 cont,
             )),
-            Procedure::RecordAccessor(accessor) => Ok((
-                MachineState::Value(apply_record_accessor(accessor, &args)?),
-                cont,
-            )),
+            Procedure::RecordAccessor(accessor) => {
+                Ok((machine_value(apply_record_accessor(accessor, &args)?), cont))
+            }
             Procedure::Continuation(captured) => {
-                if args.len() != 1 {
-                    return Err(EvalError::WrongArgCount {
-                        name: "continuation".to_owned(),
-                        expected: "exactly 1 argument".to_owned(),
-                        got: args.len(),
-                    });
-                }
-
-                let transfer_value = args[0].clone();
+                let transfer_values = ProducedValues::new(args);
                 let actions = build_wind_transition(winds, &captured.winds);
 
                 if actions.is_empty() {
                     Ok((
-                        MachineState::Value(transfer_value),
+                        MachineState::Values(transfer_values),
                         push_cont(
                             EvalFrame::TransferState {
                                 target_cont: captured.cont.clone(),
@@ -5797,7 +5872,7 @@ fn machine_apply(
                         captured.cont.clone(),
                         captured.winds.clone(),
                         captured.handlers.clone(),
-                        transfer_value,
+                        transfer_values,
                         env,
                         winds,
                         handlers,
@@ -5866,17 +5941,17 @@ fn run_with_continuations(
     loop {
         match state {
             MachineState::Expr(expr, env) => match expr {
-                Expr::Number(value, _) => state = MachineState::Value(Value::Number(value)),
-                Expr::Boolean(value, _) => state = MachineState::Value(Value::Boolean(value)),
+                Expr::Number(value, _) => state = machine_value(Value::Number(value)),
+                Expr::Boolean(value, _) => state = machine_value(Value::Boolean(value)),
                 Expr::String(value, _) => {
-                    state = MachineState::Value(Value::String(SchemeString::new(value)))
+                    state = machine_value(Value::String(SchemeString::new(value)))
                 }
-                Expr::Char(value, _) => state = MachineState::Value(Value::Char(value)),
+                Expr::Char(value, _) => state = machine_value(Value::Char(value)),
                 Expr::Symbol(name, pos) => {
                     let value = env
                         .lookup(&name)
                         .ok_or_else(|| EvalError::UnboundSymbol(name).with_position(pos))?;
-                    state = MachineState::Value(value);
+                    state = machine_value(value);
                 }
                 Expr::List(items, pos) => {
                     let (next_state, next_cont) = machine_enter_list(items, pos, env, cont)?;
@@ -5906,7 +5981,7 @@ fn run_with_continuations(
                 let actions = build_wind_transition(&winds, &handler_ctx.winds);
 
                 if actions.is_empty() {
-                    state = MachineState::Value(value);
+                    state = machine_value(value);
                     cont = push_cont(
                         EvalFrame::TransferState {
                             target_cont: handler_cont,
@@ -5921,7 +5996,7 @@ fn run_with_continuations(
                         handler_cont,
                         handler_ctx.winds.clone(),
                         handler_ctx.handlers.clone(),
-                        value,
+                        ProducedValues::single(value),
                         &env,
                         &winds,
                         &handlers,
@@ -5930,9 +6005,9 @@ fn run_with_continuations(
                     cont = next_cont;
                 }
             }
-            MachineState::Value(value) => {
+            MachineState::Values(values) => {
                 let (frame, next) = match cont.as_ref() {
-                    EvalCont::Done => return Ok(value),
+                    EvalCont::Done => return values.into_single(),
                     EvalCont::Frame(frame, next) => (frame.clone(), next.clone()),
                 };
 
@@ -5943,13 +6018,15 @@ fn run_with_continuations(
                         cont = next_cont;
                     }
                     EvalFrame::DefineValue { name, env } => {
+                        let value = values.into_single()?;
                         env.define(name, value);
-                        state = MachineState::Value(Value::Void);
+                        state = machine_value(Value::Void);
                         cont = next;
                     }
                     EvalFrame::SetValue { name, env, pos } => {
+                        let value = values.into_single()?;
                         if env.set(&name, value) {
-                            state = MachineState::Value(Value::Void);
+                            state = machine_value(Value::Void);
                             cont = next;
                         } else {
                             return Err(EvalError::UnboundSymbol(name).with_position(pos));
@@ -5960,6 +6037,7 @@ fn run_with_continuations(
                         alternate,
                         env,
                     } => {
+                        let value = values.into_single()?;
                         if value.is_truthy() {
                             state = MachineState::Expr(consequent, env);
                             cont = next;
@@ -5967,7 +6045,7 @@ fn run_with_continuations(
                             state = MachineState::Expr(alternate, env);
                             cont = next;
                         } else {
-                            state = MachineState::Value(Value::Void);
+                            state = machine_value(Value::Void);
                             cont = next;
                         }
                     }
@@ -5977,6 +6055,7 @@ fn run_with_continuations(
                         env,
                         pos,
                     } => {
+                        let value = values.into_single()?;
                         let (next_state, next_cont) = advance_apply_args(
                             value,
                             operator_expr,
@@ -6002,6 +6081,7 @@ fn run_with_continuations(
                         env,
                         pos,
                     } => {
+                        let value = values.into_single()?;
                         prefix_operands.push(ArgOperand::Expr(current_operand));
                         evaluated.push(value);
                         let (next_state, next_cont) = advance_apply_args(
@@ -6026,6 +6106,7 @@ fn run_with_continuations(
                         env,
                         pos,
                     } => {
+                        let value = values.into_single()?;
                         prefix_operands.push(ArgOperand::Value(value));
                         prefix_operands.extend(suffix_operands);
                         state = MachineState::Expr(operator_expr.clone(), env.clone());
@@ -6038,6 +6119,19 @@ fn run_with_continuations(
                             },
                             next,
                         );
+                    }
+                    EvalFrame::CallWithValuesConsumer { consumer, env, pos } => {
+                        let (next_state, next_cont) = machine_apply(
+                            consumer,
+                            values.into_vec(),
+                            &env,
+                            next,
+                            &winds,
+                            &handlers,
+                            pos,
+                        )?;
+                        state = next_state;
+                        cont = next_cont;
                     }
                     EvalFrame::DynamicWindBefore {
                         wind,
@@ -6064,7 +6158,7 @@ fn run_with_continuations(
                         cont = next_cont;
                     }
                     EvalFrame::DynamicWindAfterBody { wind, env } => {
-                        let body_result = value;
+                        let body_result = values;
                         let (next_state, next_cont) = machine_apply(
                             wind.out_thunk.clone(),
                             Vec::new(),
@@ -6088,10 +6182,14 @@ fn run_with_continuations(
                         debug_assert!(active
                             .as_ref()
                             .is_some_and(|current| Rc::ptr_eq(current, &wind)));
-                        state = MachineState::Value(result);
+                        state = MachineState::Values(result);
                         cont = next;
                     }
-                    EvalFrame::WithExceptionHandlerEnter { handler, thunk, env } => {
+                    EvalFrame::WithExceptionHandlerEnter {
+                        handler,
+                        thunk,
+                        env,
+                    } => {
                         let previous_handlers = handlers.clone();
                         handlers.push(handler);
                         let (next_state, next_cont) = machine_apply(
@@ -6111,10 +6209,11 @@ fn run_with_continuations(
                     }
                     EvalFrame::WithExceptionHandlerReturn { previous_handlers } => {
                         handlers = previous_handlers;
-                        state = MachineState::Value(value);
+                        state = MachineState::Values(values);
                         cont = next;
                     }
                     EvalFrame::EnterExceptionHandler { handler, env, pos } => {
+                        let value = values.into_single()?;
                         let (next_state, next_cont) = machine_apply(
                             handler,
                             vec![value],
@@ -6141,7 +6240,7 @@ fn run_with_continuations(
                     } => {
                         winds = target_winds;
                         handlers = target_handlers;
-                        state = MachineState::Value(value);
+                        state = MachineState::Values(values);
                         cont = target_cont;
                     }
                     EvalFrame::WindTransition {
@@ -6150,7 +6249,7 @@ fn run_with_continuations(
                         target_cont,
                         target_winds,
                         target_handlers,
-                        transfer_value,
+                        transfer_values,
                         env,
                     } => {
                         match current {
@@ -6166,7 +6265,7 @@ fn run_with_continuations(
                         if remaining.is_empty() {
                             winds = target_winds;
                             handlers = target_handlers;
-                            state = MachineState::Value(transfer_value);
+                            state = MachineState::Values(transfer_values);
                             cont = target_cont;
                         } else {
                             let (next_state, next_cont) = start_wind_transition(
@@ -6174,7 +6273,7 @@ fn run_with_continuations(
                                 target_cont,
                                 target_winds,
                                 target_handlers,
-                                transfer_value,
+                                transfer_values,
                                 &env,
                                 &winds,
                                 &handlers,

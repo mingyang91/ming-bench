@@ -67,6 +67,8 @@ pub enum EvalError {
     InvalidArgument { name: String, message: String },
     #[error("{name} invalid character code: {code}")]
     InvalidCharacterCode { name: String, code: i64 },
+    #[error("expected a single value, got {got}")]
+    ExpectedSingleValue { got: usize },
     #[error("division by zero")]
     DivisionByZero,
     #[error("uncaught exception: {value}")]
