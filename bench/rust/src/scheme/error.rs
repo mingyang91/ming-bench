@@ -70,6 +70,9 @@ pub enum EvalError {
     #[error("index out of bounds: index {index}, length {len}")]
     IndexOutOfBounds { index: usize, len: usize },
 
+    #[error("circular list")]
+    CircularList,
+
     #[error("{name} expected lists of equal length, got {expected} and {got}")]
     LengthMismatch {
         name: String,

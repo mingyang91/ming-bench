@@ -11,16 +11,11 @@ pub use error::{EvalError, SourcePos};
 use macros::{MacroEnvRef, MacroEnvironment};
 use number::Number;
 use parser::Parser;
-use record::{
-    define_record_type as eval_define_record_type, render_record, NativeProcedure, RecordRef,
-};
-use render::{
-    render_char, render_display_improper_list, render_display_list, render_improper_list,
-    render_list, render_string, render_vector,
-};
+use record::{define_record_type as eval_define_record_type, NativeProcedure, RecordRef};
+use render::{render_display_value, render_value};
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -51,6 +46,7 @@ impl Expr {
 type EnvRef = Rc<RefCell<Environment>>;
 type OutputRef = Rc<RefCell<String>>;
 type BindingRef = Rc<RefCell<Value>>;
+type PairRef = Rc<RefCell<PairCell>>;
 
 #[derive(Clone)]
 enum Value {
@@ -60,8 +56,8 @@ enum Value {
     MutableString(Rc<RefCell<Vec<char>>>),
     Symbol(String),
     Char(char),
+    Pair(PairRef),
     List(Vec<Value>),
-    ImproperList(Vec<Value>, Box<Value>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Procedure(Rc<Procedure>),
     NativeProcedure(Rc<NativeProcedure>),
@@ -69,6 +65,11 @@ enum Value {
     Record(RecordRef),
     Uninitialized,
     Void,
+}
+
+struct PairCell {
+    car: Value,
+    cdr: Value,
 }
 
 struct Procedure {
@@ -104,15 +105,20 @@ enum BuiltinKind {
     Cons,
     Car,
     Cdr,
+    ComposedCarCdr(&'static str),
+    SetCar,
+    SetCdr,
     NullPred,
     List,
     Length,
     Append,
+    Reverse,
     Apply,
     EqPred,
     EqvPred,
     EqualPred,
     Map,
+    ForEach,
     StringPred,
     NumberPred,
     IntegerPred,
@@ -126,6 +132,8 @@ enum BuiltinKind {
     Display,
     Write,
     Newline,
+    MakeString,
+    String,
     StringAppend,
     StringLength,
     Substring,
@@ -149,9 +157,13 @@ enum BuiltinKind {
     Modulo,
     Remainder,
     Quotient,
+    Gcd,
+    Lcm,
     Min,
     Max,
     Expt,
+    Truncate,
+    Round,
     ZeroPred,
     PositivePred,
     NegativePred,
@@ -160,7 +172,9 @@ enum BuiltinKind {
     ListRef,
     ListTail,
     ListPred,
+    Member,
     Assoc,
+    Assv,
     CharAlphabeticPred,
     CharNumericPred,
     CharUpcase,
@@ -169,6 +183,9 @@ enum BuiltinKind {
     CharLessThan,
     StringEqual,
     StringLessThan,
+    StringGreaterThan,
+    StringLessThanOrEqual,
+    StringGreaterThanOrEqual,
     StringCiEqual,
     StringUpcase,
     StringDowncase,
@@ -221,8 +238,8 @@ impl Value {
             Self::String(_) | Self::MutableString(_) => "string",
             Self::Symbol(_) => "symbol",
             Self::Char(_) => "character",
+            Self::Pair(_) => "pair",
             Self::List(_) => "list",
-            Self::ImproperList(_, _) => "pair",
             Self::Vector(_) => "vector",
             Self::Procedure(_) | Self::NativeProcedure(_) | Self::Builtin(_) => "procedure",
             Self::Record(_) => "record",
@@ -286,35 +303,99 @@ impl Value {
     }
 
     fn render(&self) -> String {
-        match self {
-            Self::Number(number) => number.render(),
-            Self::Boolean(true) => "#t".into(),
-            Self::Boolean(false) => "#f".into(),
-            Self::String(value) => render_string(value),
-            Self::MutableString(value) => render_string(&value.borrow().iter().collect::<String>()),
-            Self::Symbol(value) => value.clone(),
-            Self::Char(value) => render_char(*value),
-            Self::List(items) => render_list(items),
-            Self::ImproperList(items, tail) => render_improper_list(items, tail),
-            Self::Vector(items) => render_vector(&items.borrow()),
-            Self::Procedure(_) | Self::NativeProcedure(_) | Self::Builtin(_) => {
-                "#<procedure>".into()
-            }
-            Self::Record(record) => render_record(record),
-            Self::Uninitialized => "#<uninitialized>".into(),
-            Self::Void => "#<void>".into(),
-        }
+        render_value(self)
     }
 
     fn render_display(&self) -> String {
-        match self {
-            Self::String(value) => value.clone(),
-            Self::MutableString(value) => value.borrow().iter().collect(),
-            Self::Char(value) => value.to_string(),
-            Self::List(items) => render_display_list(items),
-            Self::ImproperList(items, tail) => render_display_improper_list(items, tail),
-            Self::Vector(items) => render_vector(&items.borrow()),
-            _ => self.render(),
+        render_display_value(self)
+    }
+}
+
+fn empty_list() -> Value {
+    Value::List(Vec::new())
+}
+
+fn is_empty_list(value: &Value) -> bool {
+    matches!(value, Value::List(items) if items.is_empty())
+}
+
+fn pair_ptr(pair: &PairRef) -> usize {
+    Rc::as_ptr(pair) as usize
+}
+
+fn list_from_vec(items: Vec<Value>) -> Value {
+    let mut list = empty_list();
+    for item in items.into_iter().rev() {
+        list = Value::Pair(Rc::new(RefCell::new(PairCell {
+            car: item,
+            cdr: list,
+        })));
+    }
+    list
+}
+
+fn pair_parts(value: &Value) -> Option<(Value, Value)> {
+    match value {
+        Value::Pair(pair) => {
+            let pair = pair.borrow();
+            Some((pair.car.clone(), pair.cdr.clone()))
+        }
+        Value::List(items) if !items.is_empty() => Some((
+            items[0].clone(),
+            if items.len() == 1 {
+                empty_list()
+            } else {
+                Value::List(items[1..].to_vec())
+            },
+        )),
+        _ => None,
+    }
+}
+
+fn collect_list_items(value: &Value) -> Result<Vec<Value>, EvalError> {
+    let mut items = Vec::new();
+    let mut current = value.clone();
+    let mut seen_pairs = HashSet::new();
+
+    loop {
+        match current {
+            Value::List(rest) => {
+                items.extend(rest);
+                return Ok(items);
+            }
+            Value::Pair(pair) => {
+                if !seen_pairs.insert(pair_ptr(&pair)) {
+                    return Err(EvalError::CircularList);
+                }
+
+                let pair = pair.borrow();
+                items.push(pair.car.clone());
+                current = pair.cdr.clone();
+            }
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "list",
+                    found: other.type_name().into(),
+                })
+            }
+        }
+    }
+}
+
+fn is_proper_list(value: &Value) -> bool {
+    let mut current = value.clone();
+    let mut seen_pairs = HashSet::new();
+
+    loop {
+        match current {
+            Value::List(_) => return true,
+            Value::Pair(pair) => {
+                if !seen_pairs.insert(pair_ptr(&pair)) {
+                    return false;
+                }
+                current = pair.borrow().cdr.clone();
+            }
+            _ => return false,
         }
     }
 }
@@ -345,15 +426,20 @@ impl BuiltinKind {
             Self::Cons => "cons",
             Self::Car => "car",
             Self::Cdr => "cdr",
+            Self::ComposedCarCdr(name) => name,
+            Self::SetCar => "set-car!",
+            Self::SetCdr => "set-cdr!",
             Self::NullPred => "null?",
             Self::List => "list",
             Self::Length => "length",
             Self::Append => "append",
+            Self::Reverse => "reverse",
             Self::Apply => "apply",
             Self::EqPred => "eq?",
             Self::EqvPred => "eqv?",
             Self::EqualPred => "equal?",
             Self::Map => "map",
+            Self::ForEach => "for-each",
             Self::StringPred => "string?",
             Self::NumberPred => "number?",
             Self::IntegerPred => "integer?",
@@ -367,6 +453,8 @@ impl BuiltinKind {
             Self::Display => "display",
             Self::Write => "write",
             Self::Newline => "newline",
+            Self::MakeString => "make-string",
+            Self::String => "string",
             Self::StringAppend => "string-append",
             Self::StringLength => "string-length",
             Self::Substring => "substring",
@@ -390,9 +478,13 @@ impl BuiltinKind {
             Self::Modulo => "modulo",
             Self::Remainder => "remainder",
             Self::Quotient => "quotient",
+            Self::Gcd => "gcd",
+            Self::Lcm => "lcm",
             Self::Min => "min",
             Self::Max => "max",
             Self::Expt => "expt",
+            Self::Truncate => "truncate",
+            Self::Round => "round",
             Self::ZeroPred => "zero?",
             Self::PositivePred => "positive?",
             Self::NegativePred => "negative?",
@@ -401,7 +493,9 @@ impl BuiltinKind {
             Self::ListRef => "list-ref",
             Self::ListTail => "list-tail",
             Self::ListPred => "list?",
+            Self::Member => "member",
             Self::Assoc => "assoc",
+            Self::Assv => "assv",
             Self::CharAlphabeticPred => "char-alphabetic?",
             Self::CharNumericPred => "char-numeric?",
             Self::CharUpcase => "char-upcase",
@@ -410,6 +504,9 @@ impl BuiltinKind {
             Self::CharLessThan => "char<?",
             Self::StringEqual => "string=?",
             Self::StringLessThan => "string<?",
+            Self::StringGreaterThan => "string>?",
+            Self::StringLessThanOrEqual => "string<=?",
+            Self::StringGreaterThanOrEqual => "string>=?",
             Self::StringCiEqual => "string-ci=?",
             Self::StringUpcase => "string-upcase",
             Self::StringDowncase => "string-downcase",
@@ -544,6 +641,7 @@ fn values_eq(lhs: &Value, rhs: &Value) -> bool {
         (Value::MutableString(lhs), Value::MutableString(rhs)) => *lhs.borrow() == *rhs.borrow(),
         (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
         (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+        (Value::Pair(lhs), Value::Pair(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Vector(lhs), Value::Vector(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::List(lhs), Value::List(rhs)) => {
             lhs.len() == rhs.len()
@@ -551,14 +649,6 @@ fn values_eq(lhs: &Value, rhs: &Value) -> bool {
                     .iter()
                     .zip(rhs.iter())
                     .all(|(lhs, rhs)| values_eq(lhs, rhs))
-        }
-        (Value::ImproperList(lhs_items, lhs_tail), Value::ImproperList(rhs_items, rhs_tail)) => {
-            lhs_items.len() == rhs_items.len()
-                && lhs_items
-                    .iter()
-                    .zip(rhs_items.iter())
-                    .all(|(lhs, rhs)| values_eq(lhs, rhs))
-                && values_eq(lhs_tail, rhs_tail)
         }
         (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Uninitialized, Value::Uninitialized) => true,
@@ -572,18 +662,71 @@ fn values_eqv(lhs: &Value, rhs: &Value) -> bool {
 }
 
 fn values_equal(lhs: &Value, rhs: &Value) -> bool {
-    match (lhs, rhs) {
-        (Value::Vector(lhs), Value::Vector(rhs)) => {
-            let lhs = lhs.borrow();
-            let rhs = rhs.borrow();
-            lhs.len() == rhs.len()
-                && lhs
-                    .iter()
-                    .zip(rhs.iter())
-                    .all(|(lhs, rhs)| values_equal(lhs, rhs))
+    fn values_equal_inner(
+        lhs: &Value,
+        rhs: &Value,
+        seen_pairs: &mut HashSet<(usize, usize)>,
+        seen_vectors: &mut HashSet<(usize, usize)>,
+    ) -> bool {
+        match (lhs, rhs) {
+            (Value::Number(lhs), Value::Number(rhs)) => lhs.equals(*rhs).unwrap_or(false),
+            (Value::Boolean(lhs), Value::Boolean(rhs)) => lhs == rhs,
+            (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
+            (Value::String(lhs), Value::MutableString(rhs))
+            | (Value::MutableString(rhs), Value::String(lhs)) => {
+                lhs.chars().eq(rhs.borrow().iter().copied())
+            }
+            (Value::MutableString(lhs), Value::MutableString(rhs)) => {
+                *lhs.borrow() == *rhs.borrow()
+            }
+            (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
+            (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+            (Value::List(lhs), Value::List(rhs)) => {
+                lhs.len() == rhs.len()
+                    && lhs
+                        .iter()
+                        .zip(rhs.iter())
+                        .all(|(lhs, rhs)| values_equal_inner(lhs, rhs, seen_pairs, seen_vectors))
+            }
+            (Value::Vector(lhs), Value::Vector(rhs)) => {
+                let key = (Rc::as_ptr(lhs) as usize, Rc::as_ptr(rhs) as usize);
+                if !seen_vectors.insert(key) {
+                    return true;
+                }
+
+                let lhs = lhs.borrow();
+                let rhs = rhs.borrow();
+                lhs.len() == rhs.len()
+                    && lhs
+                        .iter()
+                        .zip(rhs.iter())
+                        .all(|(lhs, rhs)| values_equal_inner(lhs, rhs, seen_pairs, seen_vectors))
+            }
+            (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
+            (Value::Uninitialized, Value::Uninitialized) => true,
+            (Value::Void, Value::Void) => true,
+            _ => {
+                let Some((lhs_car, lhs_cdr)) = pair_parts(lhs) else {
+                    return false;
+                };
+                let Some((rhs_car, rhs_cdr)) = pair_parts(rhs) else {
+                    return false;
+                };
+
+                if let (Value::Pair(lhs_pair), Value::Pair(rhs_pair)) = (lhs, rhs) {
+                    let key = (pair_ptr(lhs_pair), pair_ptr(rhs_pair));
+                    if !seen_pairs.insert(key) {
+                        return true;
+                    }
+                }
+
+                values_equal_inner(&lhs_car, &rhs_car, seen_pairs, seen_vectors)
+                    && values_equal_inner(&lhs_cdr, &rhs_cdr, seen_pairs, seen_vectors)
+            }
         }
-        _ => values_eq(lhs, rhs),
     }
+
+    values_equal_inner(lhs, rhs, &mut HashSet::new(), &mut HashSet::new())
 }
 
 fn env_define(env: &EnvRef, name: String, value: Value) {
@@ -789,10 +932,8 @@ fn eval_owned_expr_step<'a>(
                 Ok(EvalStep::Value(value))
             }
         }
-        Expr::List(items, position) => {
-            eval_owned_list_step(expr, items, *position, env, macro_env)
-                .map_err(|err| err.with_position(*position))
-        }
+        Expr::List(items, position) => eval_owned_list_step(expr, items, *position, env, macro_env)
+            .map_err(|err| err.with_position(*position)),
     }
 }
 
@@ -869,6 +1010,10 @@ fn eval_borrowed_list_step<'a>(
             }
             "let" => {
                 return special_forms::eval_let(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "let*" => {
+                return special_forms::eval_let_star(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "letrec" => {
@@ -988,6 +1133,10 @@ fn eval_owned_list_step<'a>(
             }
             "let" => {
                 return special_forms::eval_owned_let(expr, env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "let*" => {
+                return special_forms::eval_owned_let_star(expr, env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             "letrec" => {

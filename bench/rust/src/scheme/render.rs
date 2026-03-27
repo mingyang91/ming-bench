@@ -1,6 +1,129 @@
+use super::record::render_record;
 use super::Value;
 
-pub(super) fn render_string(value: &str) -> String {
+use std::collections::HashSet;
+use std::rc::Rc;
+
+pub(super) fn render_value(value: &Value) -> String {
+    RenderContext::new(RenderMode::Write).render(value)
+}
+
+pub(super) fn render_display_value(value: &Value) -> String {
+    RenderContext::new(RenderMode::Display).render(value)
+}
+
+struct RenderContext {
+    mode: RenderMode,
+    active_pairs: HashSet<usize>,
+    active_vectors: HashSet<usize>,
+}
+
+impl RenderContext {
+    fn new(mode: RenderMode) -> Self {
+        Self {
+            mode,
+            active_pairs: HashSet::new(),
+            active_vectors: HashSet::new(),
+        }
+    }
+
+    fn render(&mut self, value: &Value) -> String {
+        match value {
+            Value::Number(number) => number.render(),
+            Value::Boolean(true) => "#t".into(),
+            Value::Boolean(false) => "#f".into(),
+            Value::String(value) => match self.mode {
+                RenderMode::Write => render_string(value),
+                RenderMode::Display => value.clone(),
+            },
+            Value::MutableString(value) => {
+                let value = value.borrow().iter().collect::<String>();
+                match self.mode {
+                    RenderMode::Write => render_string(&value),
+                    RenderMode::Display => value,
+                }
+            }
+            Value::Symbol(value) => value.clone(),
+            Value::Char(value) => match self.mode {
+                RenderMode::Write => render_char(*value),
+                RenderMode::Display => value.to_string(),
+            },
+            Value::Pair(_) | Value::List(_) => self.render_list_like(value),
+            Value::Vector(items) => self.render_vector(items),
+            Value::Procedure(_) | Value::NativeProcedure(_) | Value::Builtin(_) => {
+                "#<procedure>".into()
+            }
+            Value::Record(record) => render_record(record),
+            Value::Uninitialized => "#<uninitialized>".into(),
+            Value::Void => "#<void>".into(),
+        }
+    }
+
+    fn render_list_like(&mut self, value: &Value) -> String {
+        let mut current = value.clone();
+        let mut rendered_items = Vec::new();
+        let mut inserted_pairs = Vec::new();
+
+        let tail = loop {
+            match current {
+                Value::List(items) => {
+                    for item in items {
+                        rendered_items.push(self.render(&item));
+                    }
+                    break None;
+                }
+                Value::Pair(pair) => {
+                    let ptr = Rc::as_ptr(&pair) as usize;
+                    if !self.active_pairs.insert(ptr) {
+                        break Some("#<circular>".into());
+                    }
+                    inserted_pairs.push(ptr);
+
+                    let pair = pair.borrow();
+                    rendered_items.push(self.render(&pair.car));
+                    current = pair.cdr.clone();
+                }
+                other => break Some(self.render(&other)),
+            }
+        };
+
+        for ptr in inserted_pairs {
+            self.active_pairs.remove(&ptr);
+        }
+
+        match tail {
+            Some(tail) if rendered_items.is_empty() => format!("({tail})"),
+            Some(tail) => format!("({} . {tail})", rendered_items.join(" ")),
+            None if rendered_items.is_empty() => "()".into(),
+            None => format!("({})", rendered_items.join(" ")),
+        }
+    }
+
+    fn render_vector(&mut self, items: &Rc<std::cell::RefCell<Vec<Value>>>) -> String {
+        let ptr = Rc::as_ptr(items) as usize;
+        if !self.active_vectors.insert(ptr) {
+            return "#<circular>".into();
+        }
+
+        let rendered_items = items
+            .borrow()
+            .iter()
+            .map(|item| self.render(item))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        self.active_vectors.remove(&ptr);
+        format!("#({rendered_items})")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RenderMode {
+    Write,
+    Display,
+}
+
+fn render_string(value: &str) -> String {
     let mut rendered = String::with_capacity(value.len() + 2);
     rendered.push('"');
     for ch in value.chars() {
@@ -17,84 +140,10 @@ pub(super) fn render_string(value: &str) -> String {
     rendered
 }
 
-pub(super) fn render_list(items: &[Value]) -> String {
-    if items.is_empty() {
-        return "()".into();
-    }
-
-    let rendered_items = items
-        .iter()
-        .map(Value::render)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("({rendered_items})")
-}
-
-pub(super) fn render_display_list(items: &[Value]) -> String {
-    if items.is_empty() {
-        return "()".into();
-    }
-
-    let rendered_items = items
-        .iter()
-        .map(Value::render_display)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("({rendered_items})")
-}
-
-pub(super) fn render_improper_list(items: &[Value], tail: &Value) -> String {
-    render_dotted_list(items, tail, RenderMode::Write)
-}
-
-pub(super) fn render_vector(items: &[Value]) -> String {
-    let rendered_items = items
-        .iter()
-        .map(Value::render)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("#({rendered_items})")
-}
-
-pub(super) fn render_display_improper_list(items: &[Value], tail: &Value) -> String {
-    render_dotted_list(items, tail, RenderMode::Display)
-}
-
-pub(super) fn render_char(value: char) -> String {
+fn render_char(value: char) -> String {
     match value {
         ' ' => "#\\space".into(),
         '\n' => "#\\newline".into(),
         other => format!("#\\{other}"),
-    }
-}
-
-#[derive(Clone, Copy)]
-enum RenderMode {
-    Write,
-    Display,
-}
-
-fn render_dotted_list(items: &[Value], tail: &Value, mode: RenderMode) -> String {
-    let mut rendered = String::from("(");
-
-    for (index, item) in items.iter().enumerate() {
-        if index > 0 {
-            rendered.push(' ');
-        }
-        rendered.push_str(&render_value(item, mode));
-    }
-
-    if !items.is_empty() {
-        rendered.push_str(" . ");
-    }
-    rendered.push_str(&render_value(tail, mode));
-    rendered.push(')');
-    rendered
-}
-
-fn render_value(value: &Value, mode: RenderMode) -> String {
-    match mode {
-        RenderMode::Write => value.render(),
-        RenderMode::Display => value.render_display(),
     }
 }

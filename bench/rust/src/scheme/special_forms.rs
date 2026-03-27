@@ -2,10 +2,10 @@ use std::rc::Rc;
 
 use super::macros::{MacroEnvRef, MacroEnvironment};
 use super::{
-    env_define, env_lookup, env_set, eval_expr, eval_sequence, eval_target, make_procedure,
-    single_clause_procedure, tail_borrowed_expr, tail_borrowed_sequence, tail_owned_expr,
-    values_eqv, EnvRef, Environment, EvalError, EvalStep, Expr, OwnedExprRef, Procedure,
-    ProcedureClause, Value,
+    env_define, env_lookup, env_set, eval_expr, eval_sequence, eval_target, list_from_vec,
+    make_procedure, single_clause_procedure, tail_borrowed_expr, tail_borrowed_sequence,
+    tail_owned_expr, values_eqv, EnvRef, Environment, EvalError, EvalStep, Expr, OwnedExprRef,
+    Procedure, ProcedureClause, Value,
 };
 
 pub(super) fn eval_define(
@@ -275,6 +275,39 @@ pub(super) fn eval_owned_let<'a>(
     }
 }
 
+pub(super) fn eval_owned_let_star<'a>(
+    expr: &OwnedExprRef,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<EvalStep<'a>, EvalError> {
+    let Expr::List(items, _) = expr.current() else {
+        unreachable!("owned let* helper requires a list");
+    };
+
+    let [_, Expr::List(bindings, _), body @ ..] = items.as_slice() else {
+        return Err(EvalError::SyntaxError {
+            message: "invalid let*".into(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "let* requires a body".into(),
+        });
+    }
+
+    let bindings = parse_binding_exprs(bindings, "let*")?;
+    let let_env = Environment::new(Some(Rc::clone(env)));
+    let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
+
+    for (name, value_expr) in bindings {
+        let value = eval_expr(value_expr, &let_env, &let_macro_env)?;
+        env_define(&let_env, name, value);
+    }
+
+    eval_owned_list_sequence(expr, 2, &let_env, &let_macro_env)
+}
+
 pub(super) fn eval_owned_letrec<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
@@ -491,7 +524,7 @@ fn quote_to_value(expr: &Expr) -> Result<Value, EvalError> {
             for item in items {
                 values.push(quote_to_value(item)?);
             }
-            Ok(Value::List(values))
+            Ok(list_from_vec(values))
         }
     }
 }
@@ -694,7 +727,7 @@ fn apply_procedure_result<'a>(
         env_define(
             &call_env,
             rest_param.clone(),
-            Value::List(args[required..].to_vec()),
+            list_from_vec(args[required..].to_vec()),
         );
     }
 
@@ -827,6 +860,35 @@ pub(super) fn eval_let<'a>(
             message: "invalid let".into(),
         }),
     }
+}
+
+pub(super) fn eval_let_star<'a>(
+    args: &'a [Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<EvalStep<'a>, EvalError> {
+    let [Expr::List(bindings, _), body @ ..] = args else {
+        return Err(EvalError::SyntaxError {
+            message: "invalid let*".into(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "let* requires a body".into(),
+        });
+    }
+
+    let bindings = parse_binding_exprs(bindings, "let*")?;
+    let let_env = Environment::new(Some(Rc::clone(env)));
+    let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
+
+    for (name, value_expr) in bindings {
+        let value = eval_expr(value_expr, &let_env, &let_macro_env)?;
+        env_define(&let_env, name, value);
+    }
+
+    Ok(tail_borrowed_sequence(body, &let_env, &let_macro_env))
 }
 
 pub(super) fn eval_letrec<'a>(
