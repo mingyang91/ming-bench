@@ -40,6 +40,10 @@ pub enum EvalError {
     ExpectedChar { name: String },
     #[error("{name} expects symbol arguments")]
     ExpectedSymbol { name: String },
+    #[error("{name} expects a procedure")]
+    ExpectedProcedure { name: String },
+    #[error("{name} expects a syntax object")]
+    ExpectedSyntax { name: String },
     #[error("{name} expects a list")]
     ExpectedList { name: String },
     #[error("{name} expects a non-empty list")]
