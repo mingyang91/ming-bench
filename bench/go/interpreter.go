@@ -405,6 +405,8 @@ type interpreter struct {
 	immutableStrings bool
 	currentWinds     []*dynamicWind
 	currentHandlers  []*exceptionHandler
+	stepLimitEnabled bool
+	remainingSteps   int
 }
 
 func newInterpreter() *interpreter {
@@ -431,12 +433,23 @@ func stringsAreImmutableAtCurrentLevel() bool {
 }
 
 func evalInput(input string) (string, string, error) {
+	return evalInputWithStepLimit(input, 0, false)
+}
+
+func evalInputWithLimit(input string, maxSteps int) (string, string, error) {
+	return evalInputWithStepLimit(input, maxSteps, true)
+}
+
+func evalInputWithStepLimit(input string, maxSteps int, useStepLimit bool) (string, string, error) {
 	parsed, err := parseProgram(input)
 	if err != nil {
 		return "", "", err
 	}
 
 	intp := newInterpreter()
+	if useStepLimit {
+		intp.setStepLimit(maxSteps)
+	}
 	result := any(voidValue{})
 
 	if continuationsEnabledAtCurrentLevel() && requiresContinuationEngine(parsed) {
@@ -454,6 +467,22 @@ func evalInput(input string) (string, string, error) {
 	}
 
 	return formatValue(result), intp.output.String(), nil
+}
+
+func (i *interpreter) setStepLimit(maxSteps int) {
+	i.stepLimitEnabled = true
+	i.remainingSteps = maxSteps
+}
+
+func (i *interpreter) consumeStep(pos position) error {
+	if !i.stepLimitEnabled {
+		return nil
+	}
+	if i.remainingSteps <= 0 {
+		return newEvalError(pos, "step limit exceeded")
+	}
+	i.remainingSteps--
+	return nil
 }
 
 func requiresContinuationEngine(expressions []expr) bool {
@@ -573,6 +602,10 @@ func (i *interpreter) eval(expression expr, env *environment) (any, error) {
 }
 
 func (i *interpreter) evalExpr(expression expr, env *environment, tail bool) (any, error) {
+	if err := i.consumeStep(expression.exprPos()); err != nil {
+		return nil, err
+	}
+
 	switch e := expression.(type) {
 	case *integerExpr:
 		return e.value, nil

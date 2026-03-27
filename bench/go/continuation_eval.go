@@ -715,6 +715,10 @@ func (i *interpreter) startDoStepsControl(bindings []doBinding, termination *lis
 }
 
 func (i *interpreter) stepContinuationExpr(expression expr, env *environment, stack []continuationFrame) (continuationControl, []continuationFrame, error) {
+	if err := i.consumeStep(expression.exprPos()); err != nil {
+		return continuationControl{}, nil, err
+	}
+
 	switch e := expression.(type) {
 	case *integerExpr:
 		return newValueControl(e.value), stack, nil
