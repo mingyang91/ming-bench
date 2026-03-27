@@ -154,6 +154,8 @@ func formatValue(v value, mode outputMode) string {
 		return formatChar(rune(value), mode)
 	case pairValue:
 		return formatPair(value, mode)
+	case *vectorValue:
+		return formatVector(value, mode)
 	default:
 		return v.schemeString()
 	}
@@ -376,6 +378,7 @@ func newGlobalEnv() *env {
 	global.define("string-set!", builtinProc{name: "string-set!", fn: evalStringSet})
 	registerLevel09Builtins(global)
 	registerLevel11Builtins(global)
+	registerLevel14Builtins(global)
 	return global
 }
 
@@ -430,11 +433,14 @@ func evalExpr(e locatedExpr, env *env) (value, error) {
 	case charExpr:
 		return charValue(expr), nil
 	case symbolExpr:
-		v, ok := env.lookup(string(expr))
+		binding, ok := env.lookupBinding(string(expr))
 		if !ok {
 			return nil, newCurrentEvalError("unbound variable: %s", string(expr))
 		}
-		return v, nil
+		if _, isUninitialized := binding.value.(uninitializedValue); isUninitialized {
+			return nil, newCurrentEvalError("uninitialized variable: %s", string(expr))
+		}
+		return binding.value, nil
 	case listExpr:
 		return evalList(expr, env)
 	default:
@@ -471,10 +477,18 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalQuote(items[1:])
 		case "let":
 			return evalLet(items[1:], env)
+		case "letrec":
+			return evalLetrec(items[1:], env)
+		case "letrec*":
+			return evalLetrecStar(items[1:], env)
 		case "lambda":
 			return evalLambda(items[1:], env)
 		case "case-lambda":
 			return evalCaseLambda(items[1:], env)
+		case "case":
+			return evalCase(items[1:], env)
+		case "do":
+			return evalDo(items[1:], env)
 		}
 
 		if macro, found := env.lookupMacro(string(operator)); found {

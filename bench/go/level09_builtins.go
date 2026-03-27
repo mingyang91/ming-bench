@@ -523,9 +523,24 @@ func schemeEq(a, b value) bool {
 	case *stringValue:
 		bv, ok := b.(*stringValue)
 		return ok && av == bv
+	case *vectorValue:
+		bv, ok := b.(*vectorValue)
+		return ok && av == bv
+	case *recordValue:
+		bv, ok := b.(*recordValue)
+		return ok && av == bv
 	case builtinProc:
 		bv, ok := b.(builtinProc)
 		return ok && av.name == bv.name
+	case recordConstructorProc:
+		bv, ok := b.(recordConstructorProc)
+		return ok && av.name == bv.name && av.recordType == bv.recordType
+	case recordPredicateProc:
+		bv, ok := b.(recordPredicateProc)
+		return ok && av.name == bv.name && av.recordType == bv.recordType
+	case recordAccessorProc:
+		bv, ok := b.(recordAccessorProc)
+		return ok && av.name == bv.name && av.recordType == bv.recordType && av.fieldIndex == bv.fieldIndex
 	case voidValue:
 		_, ok := b.(voidValue)
 		return ok
@@ -557,6 +572,17 @@ func schemeEqual(a, b value) bool {
 	case pairValue:
 		bv, ok := b.(pairValue)
 		return ok && schemeEqual(av.car, bv.car) && schemeEqual(av.cdr, bv.cdr)
+	case *vectorValue:
+		bv, ok := b.(*vectorValue)
+		if !ok || len(av.elems) != len(bv.elems) {
+			return false
+		}
+		for i := range av.elems {
+			if !schemeEqual(av.elems[i], bv.elems[i]) {
+				return false
+			}
+		}
+		return true
 	case builtinProc:
 		bv, ok := b.(builtinProc)
 		return ok && av.name == bv.name
