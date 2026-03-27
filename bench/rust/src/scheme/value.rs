@@ -64,6 +64,8 @@ pub enum Value {
     },
     Vector(Rc<RefCell<Vec<Value>>>),
     Continuation(ContData),
+    /// Multiple return values (internal; only consumed by call-with-values)
+    Values(Vec<Value>),
 }
 
 impl PartialEq for Value {
@@ -86,6 +88,7 @@ impl PartialEq for Value {
             (Value::CaseLambda { .. }, Value::CaseLambda { .. }) => false,
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Continuation(_), Value::Continuation(_)) => false,
+            (Value::Values(a), Value::Values(b)) => a == b,
             _ => false,
         }
     }
@@ -99,7 +102,7 @@ impl Value {
             | Value::Lambda { .. } | Value::Pair(_) | Value::SyntaxRules { .. }
             | Value::Record { .. } | Value::RecordProc { .. }
             | Value::CaseLambda { .. } | Value::Vector(_) | Value::Continuation(_)
-            | Value::Void
+            | Value::Void | Value::Values(_)
         )
     }
 
@@ -163,6 +166,10 @@ impl Value {
                 format!("#({})", inner.join(" "))
             }
             Value::Void => "".into(),
+            Value::Values(vs) => {
+                if vs.is_empty() { "".into() }
+                else { vs.last().unwrap().to_display() }
+            }
         }
     }
 

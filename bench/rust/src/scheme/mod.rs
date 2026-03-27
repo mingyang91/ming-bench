@@ -51,6 +51,8 @@ const BUILTINS: &[&str] = &[
     "vector-set!", "string-set!",
     // L18
     "call/cc", "call-with-current-continuation",
+    // L21
+    "values", "call-with-values",
     // cxr handled dynamically in apply_builtin
 ];
 

@@ -158,6 +158,11 @@ pub(crate) enum Cont {
     PopHandler {
         next: Rc<Cont>,
     },
+    /// call-with-values: producer returned, now apply consumer
+    CallWithValues {
+        consumer: Value,
+        next: Rc<Cont>,
+    },
 }
 
 enum CekAction {
@@ -766,6 +771,23 @@ fn cek_eval(
                                 }
                             }
 
+                            // ---- call-with-values ----
+                            "call-with-values" => {
+                                if elems.len() != 3 {
+                                    return Err(EvalError::Arity("call-with-values requires 2 arguments".into()));
+                                }
+                                let producer = eval(&elems[1], &env, out)?;
+                                let consumer = eval(&elems[2], &env, out)?;
+                                kont = Rc::new(Cont::CallWithValues {
+                                    consumer,
+                                    next: kont,
+                                });
+                                match apply_cek(&producer, &[], out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
+                                    CekAction::Value(v) => break v,
+                                    CekAction::Eval => continue,
+                                }
+                            }
+
                             // ---- macro / fall-through ----
                             _ => {
                                 let maybe_macro = env.borrow().get(op).ok();
@@ -1286,6 +1308,20 @@ fn cek_eval(
                     handlers.pop();
                     kont = Rc::clone(next);
                     continue;
+                }
+
+                // --- CallWithValues: producer returned, apply consumer ---
+                Cont::CallWithValues { consumer, next } => {
+                    let consumer = consumer.clone();
+                    kont = Rc::clone(next);
+                    let args = match val {
+                        Value::Values(vs) => vs,
+                        single => vec![single],
+                    };
+                    match apply_cek(&consumer, &args, out, &mut ctrl, &mut env, &mut kont, &mut winders, &mut handlers)? {
+                        CekAction::Value(v) => { val = v; continue; }
+                        CekAction::Eval => { break; }
+                    }
                 }
             }
         }
@@ -1933,6 +1969,13 @@ fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalEr
         "string-set!" => {
             if vals.len() != 3 { return Err(EvalError::Arity("string-set! requires 3 arguments".into())); }
             Err(EvalError::Type("string-set!: cannot mutate string via builtin call".into()))
+        }
+        "values" => {
+            if vals.len() == 1 {
+                Ok(vals[0].clone())
+            } else {
+                Ok(Value::Values(vals.to_vec()))
+            }
         }
         _ => {
             if op.starts_with('c') && op.ends_with('r') && op.len() >= 3 {
