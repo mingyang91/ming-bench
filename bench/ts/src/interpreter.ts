@@ -19,11 +19,13 @@ type PairValue = { kind: 'pair'; car: Value; cdr: Value };
 type VectorValue = { kind: 'vector'; items: Value[] };
 type VoidValue = { kind: 'void' };
 type TailStep = { kind: 'tail-step'; expr: Expr; env: Env };
-type ContinuationFn = (value: Value) => MachineStep;
+type MultipleValues = { kind: 'multiple-values'; values: Value[] };
+type EvaluationResult = Value | MultipleValues;
+type ContinuationFn = (value: EvaluationResult) => MachineStep;
 type BuiltinProc = {
   kind: 'builtin';
   name: string;
-  apply: (args: Value[], position: SourcePosition, k: ContinuationFn) => Value | MachineStep;
+  apply: (args: Value[], position: SourcePosition, k: ContinuationFn) => EvaluationResult | MachineStep;
 };
 type PatternCapture =
   | { kind: 'single'; expr: Expr }
@@ -121,7 +123,7 @@ type ProcedureValue = BuiltinProc | UserProc | CaseLambdaProc | ContinuationValu
 type MachineStep =
   | { kind: 'eval-step'; expr: Expr; env: Env; k: ContinuationFn }
   | { kind: 'apply-step'; proc: ProcedureValue; args: Value[]; position: SourcePosition; k: ContinuationFn }
-  | { kind: 'done-step'; value: Value };
+  | { kind: 'done-step'; value: EvaluationResult };
 type EvalResult = Value | TailStep;
 
 type BindingSpec = { name: string; init: Expr };
@@ -962,6 +964,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       return expectPair('cddr', expectPair('cddr', args[0]!).cdr).cdr;
     }),
     builtin('call-with-current-continuation', (args, position, k) => callCcBuiltin(args, position, k)),
+    builtin('call-with-values', (args, position, k) => callWithValuesBuiltin(args, position, macroEnv, k)),
     builtin('call/cc', (args, position, k) => callCcBuiltin(args, position, k)),
     builtin('char-alphabetic?', (args) => {
       assertExactArity('char-alphabetic?', args, 1);
@@ -1223,6 +1226,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       return VOID;
     }),
     builtin('vector?', (args) => unaryPredicate('vector?', args, isVectorValue)),
+    builtin('values', (args) => makeEvaluationResult(args)),
     builtin('write', (args) => {
       assertExactArity('write', args, 1);
       output.write(formatValue(args[0]!));
@@ -1259,7 +1263,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   currentWindFrames = [];
   currentExceptionHandlers = [];
 
-  let lastValue: Value;
+  let lastValue: EvaluationResult;
   try {
     lastValue = evalSequence(program, env, macroEnv);
   } finally {
@@ -1268,7 +1272,7 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   }
 
   return {
-    result: formatValue(lastValue),
+    result: formatEvaluationResult(lastValue),
     output: output.toString(),
   };
 }
@@ -1281,11 +1285,11 @@ function createGlobalEnv(output: OutputBuffer, macroEnv: MacroEnv): Env {
   return env;
 }
 
-function doneStep(value: Value): MachineStep {
+function doneStep(value: EvaluationResult): MachineStep {
   return { kind: 'done-step', value };
 }
 
-function isMachineStep(value: Value | MachineStep): value is MachineStep {
+function isMachineStep(value: EvaluationResult | MachineStep): value is MachineStep {
   return (
     typeof value === 'object' &&
     value !== null &&
@@ -1293,7 +1297,7 @@ function isMachineStep(value: Value | MachineStep): value is MachineStep {
   );
 }
 
-function runMachine(step: MachineStep, macroEnv: MacroEnv): Value {
+function runMachine(step: MachineStep, macroEnv: MacroEnv): EvaluationResult {
   let current = step;
 
   while (true) {
@@ -1332,12 +1336,33 @@ function runMachine(step: MachineStep, macroEnv: MacroEnv): Value {
   }
 }
 
-function evalSequence(exprs: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalSequence(exprs: Expr[], env: Env, macroEnv: MacroEnv): EvaluationResult {
   return runMachine(evalSequenceStep(exprs, env, macroEnv, doneStep), macroEnv);
 }
 
-function evalExpr(expr: Expr, env: Env, macroEnv: MacroEnv): Value {
+function evalExpr(expr: Expr, env: Env, macroEnv: MacroEnv): EvaluationResult {
   return runMachine({ kind: 'eval-step', expr, env, k: doneStep }, macroEnv);
+}
+
+function isMultipleValues(result: EvaluationResult): result is MultipleValues {
+  return typeof result === 'object' && result !== null && result.kind === 'multiple-values';
+}
+
+function makeEvaluationResult(values: readonly Value[]): EvaluationResult {
+  return values.length === 1 ? values[0]! : { kind: 'multiple-values', values: [...values] };
+}
+
+function expandEvaluationResult(result: EvaluationResult): Value[] {
+  return isMultipleValues(result) ? [...result.values] : [result];
+}
+
+function expectSingleValueResult(context: string, result: EvaluationResult): Value {
+  const values = expandEvaluationResult(result);
+  if (values.length !== 1) {
+    throw new EvalError(`${context} expected a single value, received ${values.length}`);
+  }
+
+  return values[0]!;
 }
 
 function evalSequenceStep(exprs: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
@@ -1374,7 +1399,7 @@ function evalExprsStep(
     kind: 'eval-step',
     expr: firstExpr!,
     env,
-    k: (value) => evalExprsStep(restExprs, env, macroEnv, k, [...values, value]),
+    k: (result) => evalExprsStep(restExprs, env, macroEnv, k, [...values, expectSingleValueResult('expression', result)]),
   };
 }
 
@@ -1395,7 +1420,11 @@ function evalCallArgsStep(
     kind: 'eval-step',
     expr: currentExpr,
     env,
-    k: (value) => evalCallArgsStep(exprs.slice(0, lastIndex), env, macroEnv, k, [value, ...values]),
+    k: (result) =>
+      evalCallArgsStep(exprs.slice(0, lastIndex), env, macroEnv, k, [
+        expectSingleValueResult('procedure call argument', result),
+        ...values,
+      ]),
   };
 }
 
@@ -1488,7 +1517,8 @@ function evalListStep(
     kind: 'eval-step',
     expr: first,
     env,
-    k: (proc) => {
+    k: (result) => {
+      const proc = expectSingleValueResult('procedure position', result);
       if (!isProcedure(proc)) {
         throw new EvalError('attempted to call a non-procedure');
       }
@@ -1518,7 +1548,10 @@ function evalAndStep(args: readonly Expr[], env: Env, macroEnv: MacroEnv, k: Con
     kind: 'eval-step',
     expr: firstExpr!,
     env,
-    k: (value) => (!isTruthy(value) ? k(value) : evalAndStep(restExprs, env, macroEnv, k)),
+    k: (result) => {
+      const value = expectSingleValueResult('and', result);
+      return !isTruthy(value) ? k(value) : evalAndStep(restExprs, env, macroEnv, k);
+    },
   };
 }
 
@@ -1529,7 +1562,7 @@ function evalCaseStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: Continuatio
     kind: 'eval-step',
     expr: args[0]!,
     env,
-    k: (key) => evalCaseClausesStep(key, args.slice(1), env, macroEnv, k),
+    k: (result) => evalCaseClausesStep(expectSingleValueResult('case', result), args.slice(1), env, macroEnv, k),
   };
 }
 
@@ -1588,12 +1621,14 @@ function evalCondStep(clauses: readonly Expr[], env: Env, macroEnv: MacroEnv, k:
     kind: 'eval-step',
     expr: testExpr!,
     env,
-    k: (testValue) =>
-      isTruthy(testValue)
+    k: (result) => {
+      const testValue = expectSingleValueResult('cond', result);
+      return isTruthy(testValue)
         ? body.length === 0
           ? k(testValue)
           : evalSequenceStep(body, env, macroEnv, k)
-        : evalCondStep(restClauses, env, macroEnv, k),
+        : evalCondStep(restClauses, env, macroEnv, k);
+    },
   };
 }
 
@@ -1611,7 +1646,10 @@ function evalOrStep(args: readonly Expr[], env: Env, macroEnv: MacroEnv, k: Cont
     kind: 'eval-step',
     expr: firstExpr!,
     env,
-    k: (value) => (isTruthy(value) ? k(value) : evalOrStep(restExprs, env, macroEnv, k)),
+    k: (result) => {
+      const value = expectSingleValueResult('or', result);
+      return isTruthy(value) ? k(value) : evalOrStep(restExprs, env, macroEnv, k);
+    },
   };
 }
 
@@ -1627,7 +1665,8 @@ function evalDefineStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: Continuat
       kind: 'eval-step',
       expr: body[0]!,
       env,
-      k: (value) => {
+      k: (result) => {
+        const value = expectSingleValueResult('define', result);
         env.define(target.name, value);
         return k(VOID);
       },
@@ -1753,12 +1792,14 @@ function evalIfStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationF
     kind: 'eval-step',
     expr: conditionExpr!,
     env,
-    k: (conditionValue) =>
-      isTruthy(conditionValue)
+    k: (result) => {
+      const conditionValue = expectSingleValueResult('if', result);
+      return isTruthy(conditionValue)
         ? { kind: 'eval-step', expr: thenExpr!, env, k }
         : elseExpr === undefined
           ? k(VOID)
-          : { kind: 'eval-step', expr: elseExpr, env, k },
+          : { kind: 'eval-step', expr: elseExpr, env, k };
+    },
   };
 }
 
@@ -1835,7 +1876,8 @@ function evalLetStarBindingsStep(
     kind: 'eval-step',
     expr: binding.init,
     env: letStarEnv,
-    k: (value) => {
+    k: (result) => {
+      const value = expectSingleValueResult('let*', result);
       letStarEnv.define(binding.name, value);
       return evalLetStarBindingsStep(bindings, index + 1, letStarEnv, body, macroEnv, k);
     },
@@ -1894,7 +1936,8 @@ function evalLetRecSequentialStep(
     kind: 'eval-step',
     expr: binding.init,
     env: letEnv,
-    k: (value) => {
+    k: (result) => {
+      const value = expectSingleValueResult('letrec*', result);
       letEnv.set(binding.name, value);
       return evalLetRecSequentialStep(bindings, index + 1, letEnv, body, macroEnv, k);
     },
@@ -2000,11 +2043,13 @@ function evalDoLoopStep(
     kind: 'eval-step',
     expr: testClause.test,
     env: doEnv,
-    k: (testValue) =>
-      isTruthy(testValue)
+    k: (result) => {
+      const testValue = expectSingleValueResult('do', result);
+      return isTruthy(testValue)
         ? evalSequenceStep(testClause.results, doEnv, macroEnv, k)
         : evalSequenceStep(body, doEnv, macroEnv, () =>
-            evalDoNextValuesStep(bindings, 0, [], doEnv, testClause, body, macroEnv, k)),
+            evalDoNextValuesStep(bindings, 0, [], doEnv, testClause, body, macroEnv, k));
+    },
   };
 }
 
@@ -2051,12 +2096,14 @@ function evalGuardClausesInEnvStep(
     kind: 'eval-step',
     expr: testExpr!,
     env,
-    k: (testValue) =>
-      isTruthy(testValue)
+    k: (result) => {
+      const testValue = expectSingleValueResult('guard', result);
+      return isTruthy(testValue)
         ? body.length === 0
           ? k(testValue)
           : evalSequenceStep(body, env, macroEnv, k)
-        : evalGuardClausesInEnvStep(exceptionValue, restClauses, env, macroEnv, position, k),
+        : evalGuardClausesInEnvStep(exceptionValue, restClauses, env, macroEnv, position, k);
+    },
   };
 }
 
@@ -2086,7 +2133,8 @@ function evalDoNextValuesStep(
     kind: 'eval-step',
     expr: binding.step,
     env: doEnv,
-    k: (value) => evalDoNextValuesStep(bindings, index + 1, [...values, value], doEnv, testClause, body, macroEnv, k),
+    k: (result) =>
+      evalDoNextValuesStep(bindings, index + 1, [...values, expectSingleValueResult('do', result)], doEnv, testClause, body, macroEnv, k),
   };
 }
 
@@ -2107,7 +2155,8 @@ function evalSetStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: Continuation
     kind: 'eval-step',
     expr: args[1]!,
     env,
-    k: (value) => {
+    k: (result) => {
+      const value = expectSingleValueResult('set!', result);
       env.set(target.name, value);
       return k(VOID);
     },
@@ -2341,7 +2390,7 @@ function applyProcedureClause(
 
 function builtin(
   name: string,
-  apply: (args: Value[], position: SourcePosition, k: ContinuationFn) => Value | MachineStep,
+  apply: (args: Value[], position: SourcePosition, k: ContinuationFn) => EvaluationResult | MachineStep,
 ): [string, BuiltinProc] {
   return [name, { kind: 'builtin', name, apply }];
 }
@@ -2368,6 +2417,22 @@ function callCcBuiltin(args: Value[], position: SourcePosition, k: ContinuationF
     position,
     k,
   };
+}
+
+function callWithValuesBuiltin(
+  args: Value[],
+  position: SourcePosition,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  assertExactArity('call-with-values', args, 2);
+
+  const producer = expectProcedureValue('call-with-values', args[0]!);
+  const consumer = expectProcedureValue('call-with-values', args[1]!);
+
+  return applyProcedure(producer, [], position, macroEnv, (result) =>
+    applyProcedure(consumer, expandEvaluationResult(result), position, macroEnv, k),
+  );
 }
 
 function dynamicWindBuiltin(
@@ -2408,7 +2473,7 @@ function invokeWindThunk(
   });
 }
 
-function resumeContinuation(proc: ContinuationValue, value: Value, macroEnv: MacroEnv): MachineStep {
+function resumeContinuation(proc: ContinuationValue, value: EvaluationResult, macroEnv: MacroEnv): MachineStep {
   return transitionWindFrames(proc.windStack, macroEnv, () => {
     currentExceptionHandlers = proc.handlerStack.slice();
     return proc.resume(value);
@@ -3032,8 +3097,16 @@ function mapLoopStep(
     nextLists[index] = current.cdr;
   }
 
-  return applyProcedure(proc, elementArgs, position, macroEnv, (value) =>
-    mapLoopStep(proc, nextLists, nextSeenLists, [...results, value], position, macroEnv, k));
+  return applyProcedure(proc, elementArgs, position, macroEnv, (result) =>
+    mapLoopStep(
+      proc,
+      nextLists,
+      nextSeenLists,
+      [...results, expectSingleValueResult('map', result)],
+      position,
+      macroEnv,
+      k,
+    ));
 }
 
 function forEachBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
@@ -3315,6 +3388,19 @@ function lcmNumber(left: number, right: number): number {
   }
 
   return Math.abs((left / gcdNumber(left, right)) * right);
+}
+
+function formatEvaluationResult(result: EvaluationResult): string {
+  const values = expandEvaluationResult(result);
+  if (values.length === 0) {
+    return '';
+  }
+
+  if (values.length === 1) {
+    return formatValue(values[0]!);
+  }
+
+  throw new EvalError(`top-level expression produced ${values.length} values`);
 }
 
 function formatValue(value: Value): string {
