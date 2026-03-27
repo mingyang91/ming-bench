@@ -142,6 +142,9 @@ class Parser {
         if (token === '#f') {
             return { kind: 'boolean', value: false, position };
         }
+        if (token.startsWith('#\\')) {
+            return parseCharToken(token, position);
+        }
         if (/^[+-]?\d+$/.test(token) && token !== '+' && token !== '-') {
             return { kind: 'number', value: Number.parseInt(token, 10), position };
         }
@@ -235,7 +238,7 @@ function createBuiltins(output) {
         builtin('null?', (args) => unaryPredicate('null?', args, isEmptyList)),
         builtin('number->string', (args) => {
             assertExactArity('number->string', args, 1);
-            return formatNumber(expectNumberValue('number->string', args[0]));
+            return makeMutableString(formatNumber(expectNumberValue('number->string', args[0])));
         }),
         builtin('number?', (args) => unaryPredicate('number?', args, (value) => typeof value === 'number')),
         builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
@@ -247,7 +250,11 @@ function createBuiltins(output) {
             assertExactArity('string->symbol', args, 1);
             return { kind: 'symbol-value', name: expectStringValue('string->symbol', args[0]) };
         }),
-        builtin('string-append', (args) => args.map((arg) => expectStringValue('string-append', arg)).join('')),
+        builtin('string-append', (args) => makeMutableString(args.map((arg) => expectStringValue('string-append', arg)).join(''))),
+        builtin('string-copy', (args) => {
+            assertExactArity('string-copy', args, 1);
+            return makeMutableString(expectStringValue('string-copy', args[0]));
+        }),
         builtin('string-length', (args) => {
             assertExactArity('string-length', args, 1);
             return stringChars(expectStringValue('string-length', args[0])).length;
@@ -261,7 +268,18 @@ function createBuiltins(output) {
             }
             return { kind: 'char', value: chars[index] };
         }),
-        builtin('string?', (args) => unaryPredicate('string?', args, (value) => typeof value === 'string')),
+        builtin('string-set!', (args) => {
+            assertExactArity('string-set!', args, 3);
+            const stringValue = expectMutableStringValue('string-set!', args[0]);
+            const index = expectIndex('string-set!', args[1]);
+            const charValue = expectCharValue('string-set!', args[2]);
+            if (index >= stringValue.chars.length) {
+                throw new EvalError('string-set! index out of bounds');
+            }
+            stringValue.chars[index] = charValue.value;
+            return VOID;
+        }),
+        builtin('string?', (args) => unaryPredicate('string?', args, isStringValue)),
         builtin('substring', (args) => {
             assertExactArity('substring', args, 3);
             const chars = stringChars(expectStringValue('substring', args[0]));
@@ -270,11 +288,11 @@ function createBuiltins(output) {
             if (start > end || end > chars.length) {
                 throw new EvalError('substring expects valid start/end indices');
             }
-            return chars.slice(start, end).join('');
+            return makeMutableString(chars.slice(start, end).join(''));
         }),
         builtin('symbol->string', (args) => {
             assertExactArity('symbol->string', args, 1);
-            return expectSymbolValue('symbol->string', args[0]).name;
+            return makeMutableString(expectSymbolValue('symbol->string', args[0]).name);
         }),
         builtin('symbol?', (args) => unaryPredicate('symbol?', args, isSymbolValue)),
         builtin('write', (args) => {
@@ -329,6 +347,8 @@ function evalExpr(expr, env) {
             case 'boolean':
             case 'string':
                 return expr.value;
+            case 'char':
+                return { kind: 'char', value: expr.value };
             case 'symbol':
                 return env.lookup(expr.name);
             case 'list':
@@ -524,6 +544,8 @@ function quoteExpr(expr) {
         case 'boolean':
         case 'string':
             return expr.value;
+        case 'char':
+            return { kind: 'char', value: expr.value };
         case 'symbol':
             return { kind: 'symbol-value', name: expr.name };
         case 'list':
@@ -664,8 +686,23 @@ function expectNumberValue(name, value) {
     return value;
 }
 function expectStringValue(name, value) {
-    if (typeof value !== 'string') {
-        throw new EvalError(`${name} expects a string`);
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (isMutableStringValue(value)) {
+        return value.chars.join('');
+    }
+    throw new EvalError(`${name} expects a string`);
+}
+function expectMutableStringValue(name, value) {
+    if (!isMutableStringValue(value)) {
+        throw new EvalError(`${name} expects a mutable string`);
+    }
+    return value;
+}
+function expectCharValue(name, value) {
+    if (!isCharValue(value)) {
+        throw new EvalError(`${name} expects a character`);
     }
     return value;
 }
@@ -707,6 +744,10 @@ function formatValueWithMode(value, mode) {
     }
     if (typeof value === 'string') {
         return mode === 'display' ? value : JSON.stringify(value);
+    }
+    if (isMutableStringValue(value)) {
+        const contents = value.chars.join('');
+        return mode === 'display' ? contents : JSON.stringify(contents);
     }
     switch (value.kind) {
         case 'char':
@@ -761,6 +802,26 @@ function parseStringNumber(value) {
 function stringChars(value) {
     return Array.from(value);
 }
+function makeMutableString(value) {
+    return { kind: 'mutable-string', chars: stringChars(value) };
+}
+function parseCharToken(token, position) {
+    const rawValue = token.slice(2);
+    if (rawValue.length === 0) {
+        throw new EvalError('invalid character literal', position);
+    }
+    switch (rawValue.toLowerCase()) {
+        case 'space':
+            return { kind: 'char', value: ' ', position };
+        case 'newline':
+            return { kind: 'char', value: '\n', position };
+    }
+    const chars = Array.from(rawValue);
+    if (chars.length !== 1) {
+        throw new EvalError('invalid character literal', position);
+    }
+    return { kind: 'char', value: chars[0], position };
+}
 function normalizeNumber(value) {
     return Object.is(value, -0) ? 0 : value;
 }
@@ -775,6 +836,12 @@ function isPair(value) {
 }
 function isCharValue(value) {
     return typeof value === 'object' && value !== null && value.kind === 'char';
+}
+function isMutableStringValue(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'mutable-string';
+}
+function isStringValue(value) {
+    return typeof value === 'string' || isMutableStringValue(value);
 }
 function isEmptyList(value) {
     return typeof value === 'object' && value !== null && value.kind === 'empty-list';

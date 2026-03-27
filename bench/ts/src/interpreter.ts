@@ -5,11 +5,13 @@ type ExprBase = { position: SourcePosition };
 type Expr =
   | (ExprBase & { kind: 'number'; value: number })
   | (ExprBase & { kind: 'boolean'; value: boolean })
+  | (ExprBase & { kind: 'char'; value: string })
   | (ExprBase & { kind: 'string'; value: string })
   | (ExprBase & { kind: 'symbol'; name: string })
   | (ExprBase & { kind: 'list'; items: Expr[] });
 
 type CharValue = { kind: 'char'; value: string };
+type MutableStringValue = { kind: 'mutable-string'; chars: string[] };
 type SchemeSymbol = { kind: 'symbol-value'; name: string };
 type EmptyList = { kind: 'empty-list' };
 type PairValue = { kind: 'pair'; car: Value; cdr: Value };
@@ -32,6 +34,7 @@ type Value =
   | boolean
   | string
   | CharValue
+  | MutableStringValue
   | SchemeSymbol
   | EmptyList
   | PairValue
@@ -216,6 +219,10 @@ class Parser {
       return { kind: 'boolean', value: false, position };
     }
 
+    if (token.startsWith('#\\')) {
+      return parseCharToken(token, position);
+    }
+
     if (/^[+-]?\d+$/.test(token) && token !== '+' && token !== '-') {
       return { kind: 'number', value: Number.parseInt(token, 10), position };
     }
@@ -321,7 +328,7 @@ function createBuiltins(output: OutputBuffer): Map<string, BuiltinProc> {
     builtin('null?', (args) => unaryPredicate('null?', args, isEmptyList)),
     builtin('number->string', (args) => {
       assertExactArity('number->string', args, 1);
-      return formatNumber(expectNumberValue('number->string', args[0]!));
+      return makeMutableString(formatNumber(expectNumberValue('number->string', args[0]!)));
     }),
     builtin('number?', (args) => unaryPredicate('number?', args, (value) => typeof value === 'number')),
     builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
@@ -334,8 +341,12 @@ function createBuiltins(output: OutputBuffer): Map<string, BuiltinProc> {
       return { kind: 'symbol-value', name: expectStringValue('string->symbol', args[0]!) };
     }),
     builtin('string-append', (args) =>
-      args.map((arg) => expectStringValue('string-append', arg)).join(''),
+      makeMutableString(args.map((arg) => expectStringValue('string-append', arg)).join('')),
     ),
+    builtin('string-copy', (args) => {
+      assertExactArity('string-copy', args, 1);
+      return makeMutableString(expectStringValue('string-copy', args[0]!));
+    }),
     builtin('string-length', (args) => {
       assertExactArity('string-length', args, 1);
       return stringChars(expectStringValue('string-length', args[0]!)).length;
@@ -349,7 +360,18 @@ function createBuiltins(output: OutputBuffer): Map<string, BuiltinProc> {
       }
       return { kind: 'char', value: chars[index]! };
     }),
-    builtin('string?', (args) => unaryPredicate('string?', args, (value) => typeof value === 'string')),
+    builtin('string-set!', (args) => {
+      assertExactArity('string-set!', args, 3);
+      const stringValue = expectMutableStringValue('string-set!', args[0]!);
+      const index = expectIndex('string-set!', args[1]!);
+      const charValue = expectCharValue('string-set!', args[2]!);
+      if (index >= stringValue.chars.length) {
+        throw new EvalError('string-set! index out of bounds');
+      }
+      stringValue.chars[index] = charValue.value;
+      return VOID;
+    }),
+    builtin('string?', (args) => unaryPredicate('string?', args, isStringValue)),
     builtin('substring', (args) => {
       assertExactArity('substring', args, 3);
       const chars = stringChars(expectStringValue('substring', args[0]!));
@@ -358,11 +380,11 @@ function createBuiltins(output: OutputBuffer): Map<string, BuiltinProc> {
       if (start > end || end > chars.length) {
         throw new EvalError('substring expects valid start/end indices');
       }
-      return chars.slice(start, end).join('');
+      return makeMutableString(chars.slice(start, end).join(''));
     }),
     builtin('symbol->string', (args) => {
       assertExactArity('symbol->string', args, 1);
-      return expectSymbolValue('symbol->string', args[0]!).name;
+      return makeMutableString(expectSymbolValue('symbol->string', args[0]!).name);
     }),
     builtin('symbol?', (args) => unaryPredicate('symbol?', args, isSymbolValue)),
     builtin('write', (args) => {
@@ -426,6 +448,9 @@ function evalExpr(expr: Expr, env: Env): Value {
       case 'boolean':
       case 'string':
         return expr.value;
+
+      case 'char':
+        return { kind: 'char', value: expr.value };
 
       case 'symbol':
         return env.lookup(expr.name);
@@ -660,6 +685,9 @@ function quoteExpr(expr: Expr): Value {
     case 'string':
       return expr.value;
 
+    case 'char':
+      return { kind: 'char', value: expr.value };
+
     case 'symbol':
       return { kind: 'symbol-value', name: expr.name };
 
@@ -842,8 +870,28 @@ function expectNumberValue(name: string, value: Value): number {
 }
 
 function expectStringValue(name: string, value: Value): string {
-  if (typeof value !== 'string') {
-    throw new EvalError(`${name} expects a string`);
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (isMutableStringValue(value)) {
+    return value.chars.join('');
+  }
+
+  throw new EvalError(`${name} expects a string`);
+}
+
+function expectMutableStringValue(name: string, value: Value): MutableStringValue {
+  if (!isMutableStringValue(value)) {
+    throw new EvalError(`${name} expects a mutable string`);
+  }
+
+  return value;
+}
+
+function expectCharValue(name: string, value: Value): CharValue {
+  if (!isCharValue(value)) {
+    throw new EvalError(`${name} expects a character`);
   }
 
   return value;
@@ -897,6 +945,11 @@ function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
 
   if (typeof value === 'string') {
     return mode === 'display' ? value : JSON.stringify(value);
+  }
+
+  if (isMutableStringValue(value)) {
+    const contents = value.chars.join('');
+    return mode === 'display' ? contents : JSON.stringify(contents);
   }
 
   switch (value.kind) {
@@ -962,6 +1015,31 @@ function stringChars(value: string): string[] {
   return Array.from(value);
 }
 
+function makeMutableString(value: string): MutableStringValue {
+  return { kind: 'mutable-string', chars: stringChars(value) };
+}
+
+function parseCharToken(token: string, position: SourcePosition): Expr {
+  const rawValue = token.slice(2);
+  if (rawValue.length === 0) {
+    throw new EvalError('invalid character literal', position);
+  }
+
+  switch (rawValue.toLowerCase()) {
+    case 'space':
+      return { kind: 'char', value: ' ', position };
+    case 'newline':
+      return { kind: 'char', value: '\n', position };
+  }
+
+  const chars = Array.from(rawValue);
+  if (chars.length !== 1) {
+    throw new EvalError('invalid character literal', position);
+  }
+
+  return { kind: 'char', value: chars[0]!, position };
+}
+
 function normalizeNumber(value: number): number {
   return Object.is(value, -0) ? 0 : value;
 }
@@ -980,6 +1058,14 @@ function isPair(value: Value): value is PairValue {
 
 function isCharValue(value: Value): value is CharValue {
   return typeof value === 'object' && value !== null && value.kind === 'char';
+}
+
+function isMutableStringValue(value: Value): value is MutableStringValue {
+  return typeof value === 'object' && value !== null && value.kind === 'mutable-string';
+}
+
+function isStringValue(value: Value): value is string | MutableStringValue {
+  return typeof value === 'string' || isMutableStringValue(value);
 }
 
 function isEmptyList(value: Value): value is EmptyList {
