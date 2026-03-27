@@ -20,21 +20,27 @@ private[ming] object SchemeParser:
     if state.atEnd then SchemeFailure.raise("unexpected end of input", state.position)
 
     val start = state.position
-    state.currentChar match
-      case '(' =>
-        parseList(advance(state), start)
-      case ')' =>
-        SchemeFailure.raise("unexpected ')'", start)
-      case '\'' =>
-        parseQuote(advance(state), start)
-      case '"' =>
-        parseString(advance(state), start)
-      case _ =>
-        parseAtom(state, start)
+    if state.currentChar == '#' && state.nextChar.contains('\'') then parseSyntax(advance(advance(state)), start)
+    else
+      state.currentChar match
+        case '(' =>
+          parseList(advance(state), start)
+        case ')' =>
+          SchemeFailure.raise("unexpected ')'", start)
+        case '\'' =>
+          parseQuote(advance(state), start)
+        case '"' =>
+          parseString(advance(state), start)
+        case _ =>
+          parseAtom(state, start)
 
   private def parseQuote(state: State, start: Position): (State, Expr) =
     val (nextState, expression) = parseExpr(state)
     (nextState, ListExpr(List(SymbolExpr("quote", start), expression), start))
+
+  private def parseSyntax(state: State, start: Position): (State, Expr) =
+    val (nextState, expression) = parseExpr(state)
+    (nextState, ListExpr(List(SymbolExpr("syntax", start), expression), start))
 
   private def parseList(state0: State, start: Position): (State, Expr) =
     @tailrec
@@ -151,6 +157,9 @@ private[ming] object SchemeParser:
     line: Int = 1,
     column: Int = 1
   ):
-    def atEnd: Boolean     = index >= input.length
-    def currentChar: Char  = input.charAt(index)
+    def atEnd: Boolean    = index >= input.length
+    def currentChar: Char = input.charAt(index)
+
+    def nextChar: Option[Char] =
+      Option.when(index + 1 < input.length)(input.charAt(index + 1))
     def position: Position = Position(line, column)

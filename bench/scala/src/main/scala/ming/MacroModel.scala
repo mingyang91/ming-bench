@@ -4,12 +4,22 @@ import java.util.UUID
 
 final private[ming] case class SyntaxRule(pattern: Expr, template: Expr)
 
+sealed private[ming] trait MacroDefinition:
+  def name: String
+  def definitionEnv: Environment
+
 final private[ming] case class SyntaxRulesMacro(
   name: String,
   literals: Set[String],
   rules: List[SyntaxRule],
   definitionEnv: Environment
-)
+) extends MacroDefinition
+
+final private[ming] case class ProcedureMacro(
+  name: String,
+  transformer: ProcedureValue,
+  definitionEnv: Environment
+) extends MacroDefinition
 
 final private[ming] case class MacroExpansion(
   expr: Expr,

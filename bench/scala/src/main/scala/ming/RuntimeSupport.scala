@@ -63,6 +63,12 @@ private[ming] object RuntimeSupport:
       case other =>
         SchemeFailure.raise(s"$name expected a number, got ${typeName(other)}", position)
 
+  def expectProcedure(value: Value, name: String, position: Position): ProcedureValue =
+    value match
+      case procedure: ProcedureValue => procedure
+      case other =>
+        SchemeFailure.raise(s"$name expected a procedure, got ${typeName(other)}", position)
+
   def expectInteger(value: Value, name: String, position: Position): BigInt =
     expectNumber(value, name, position) match
       case IntValue(number) =>
@@ -111,6 +117,16 @@ private[ming] object RuntimeSupport:
       case vectorValue: VectorValue => vectorValue
       case other =>
         SchemeFailure.raise(s"$name expected a vector, got ${typeName(other)}", position)
+
+  def expectSyntaxObject(
+    value: Value,
+    name: String,
+    position: Position
+  ): SyntaxObjectValue =
+    value match
+      case syntaxObject: SyntaxObjectValue => syntaxObject
+      case other =>
+        SchemeFailure.raise(s"$name expected a syntax object, got ${typeName(other)}", position)
 
   def expectIndex(value: Value, name: String, position: Position): Int =
     val number = expectInteger(value, name, position)
@@ -161,6 +177,8 @@ private[ming] object RuntimeSupport:
       case EmptyListValue     => "list"
       case PairValue(_, _)    => "pair"
       case _: VectorValue     => "vector"
+      case _: SyntaxRuntimeValue =>
+        "syntax"
       case _: ProcedureValue =>
         "procedure"
       case MultipleValuesValue(_) =>

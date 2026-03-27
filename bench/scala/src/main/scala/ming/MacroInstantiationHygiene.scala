@@ -21,7 +21,10 @@ private[ming] object MacroInstantiationHygiene:
     "or",
     "quote",
     "set!",
-    "syntax-rules"
+    "syntax",
+    "syntax-case",
+    "syntax-rules",
+    "with-syntax"
   )
 
   def instantiateSymbol(

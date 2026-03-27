@@ -10,6 +10,8 @@ sealed private[ming] trait NumberValue extends Value
 
 sealed private[ming] trait ProcedureValue extends Value
 
+sealed private[ming] trait SyntaxRuntimeValue extends Value
+
 final private[ming] case class IntValue(value: BigInt) extends NumberValue:
   override def render: String = value.toString
 
@@ -146,6 +148,14 @@ final private[ming] case class ContinuationValue(
   handlerFrames: List[ExceptionHandlerFrame] = Nil
 ) extends ProcedureValue:
   override def render: String = "#<procedure:continuation>"
+
+final private[ming] case class SyntaxObjectValue(expansion: MacroExpansion) extends SyntaxRuntimeValue:
+  def expr: Expr = expansion.expr
+
+  override def render: String = "#<syntax>"
+
+final private[ming] case class SyntaxListValue(values: Vector[SyntaxRuntimeValue]) extends SyntaxRuntimeValue:
+  override def render: String = "#<syntax-list>"
 
 final private[ming] case class MultipleValuesValue(values: List[Value]) extends Value:
   override def render: String = "#<values>"

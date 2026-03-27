@@ -22,11 +22,37 @@ private[ming] object SpecialFormDefinitionEvaluator:
   def evalDefineSyntax(
     arguments: List[Expr],
     position: Position,
-    env: Environment
-  ): Value =
-    val (name, macroDefinition) = MacroExpander.parse(arguments, position, env)
-    env.defineMacro(name, macroDefinition)
-    VoidValue
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
+    arguments match
+      case SymbolExpr(name, _) :: transformerExpression :: Nil =>
+        transformerExpression match
+          case ListExpr(SymbolExpr("syntax-rules", _) :: _, _) =>
+            env.defineMacro(
+              name,
+              MacroParser.parseSyntaxRules(name, transformerExpression, position, env)
+            )
+            InterpreterEvaluator.done(VoidValue, continuation)
+          case _ =>
+            InterpreterEvaluator.deferExpr(
+              transformerExpression,
+              env,
+              value =>
+                val transformer =
+                  RuntimeSupport.expectProcedure(
+                    RuntimeSupport.expectSingleValue(value, "define-syntax", transformerExpression.position),
+                    "define-syntax",
+                    transformerExpression.position
+                  )
+                env.defineMacro(name, ProcedureMacro(name, transformer, env))
+                InterpreterEvaluator.done(VoidValue, continuation)
+            )
+      case _ =>
+        SchemeFailure.raise(
+          "define-syntax expected (define-syntax name transformer)",
+          position
+        )
 
   def evalSet(
     arguments: List[Expr],

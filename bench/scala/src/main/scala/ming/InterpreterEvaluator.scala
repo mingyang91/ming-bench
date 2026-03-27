@@ -156,6 +156,12 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalLambda(rest, position, env, continuation)
       case SymbolExpr("set!", _) :: rest =>
         SpecialFormEvaluator.evalSet(rest, position, env, continuation)
+      case SymbolExpr("syntax", _) :: rest =>
+        SpecialFormEvaluator.evalSyntax(rest, position, env, continuation)
+      case SymbolExpr("syntax-case", _) :: rest =>
+        SpecialFormEvaluator.evalSyntaxCase(rest, position, env, continuation)
+      case SymbolExpr("with-syntax", _) :: rest =>
+        SpecialFormEvaluator.evalWithSyntax(rest, position, env, continuation)
       case (operator @ SymbolExpr(name, _)) :: arguments =>
         env.lookupMacro(name) match
           case Some(macroDefinition) =>
@@ -167,11 +173,29 @@ private[ming] object InterpreterEvaluator:
 
   private def evalMacroApplication(
     application: ListExpr,
-    macroDefinition: SyntaxRulesMacro,
+    macroDefinition: MacroDefinition,
     env: Environment,
     continuation: Continuation
   ): EvaluationStep =
-    val expansion = MacroExpander.expand(application, macroDefinition)
+    val expansion =
+      macroDefinition match
+        case syntaxRulesMacro: SyntaxRulesMacro =>
+          MacroExpander.expand(application, syntaxRulesMacro)
+        case ProcedureMacro(_, transformer, definitionEnv) =>
+          val result =
+            MacroRuntime.withDefinitionEnv(definitionEnv):
+              applyFunction(
+                transformer,
+                List(SyntaxObjectValue(MacroExpansion(application, Nil))),
+                application.position
+              )
+          RuntimeSupport
+            .expectSyntaxObject(
+              RuntimeSupport.expectSingleValue(result, "macro transformer", application.position),
+              "macro transformer",
+              application.position
+            )
+            .expansion
     expansion.aliases.foreach((alias, cell) => env.defineAlias(alias, cell))
     deferExpr(expansion.expr, env, continuation)
 

@@ -8,4 +8,5 @@ private[ming] object Level1Builtins:
       ContinuationBuiltins.values ++
       Level1VectorBuiltins.values ++
       Level1StringBuiltins.values ++
-      Level1PredicateBuiltins.values
+      Level1PredicateBuiltins.values ++
+      SyntaxBuiltins.values

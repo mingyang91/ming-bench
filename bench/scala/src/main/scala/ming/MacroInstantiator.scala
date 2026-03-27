@@ -12,6 +12,20 @@ private[ming] object MacroInstantiator:
       instantiateTemplate(template, context, MacroInstantiationState.initial())
     MacroExpansion(expanded, finalState.aliases.toList)
 
+  def instantiateSyntax(
+    template: Expr,
+    bindings: Map[String, PatternBinding],
+    definitionEnv: Environment,
+    inheritedAliases: List[(String, BindingCell)] = Nil
+  ): MacroExpansion =
+    val context = MacroInstantiationContext(
+      bindings,
+      SyntaxRulesMacro("<syntax>", Set.empty, Nil, definitionEnv)
+    )
+    val (expanded, finalState) =
+      instantiateTemplate(template, context, MacroInstantiationState.initial())
+    MacroExpansion(expanded, dedupeAliases(inheritedAliases ++ finalState.aliases.toList))
+
   private def instantiateTemplate(
     template: Expr,
     context: MacroInstantiationContext,
@@ -229,3 +243,10 @@ private[ming] object MacroInstantiator:
       ),
       afterBody
     )
+
+  private def dedupeAliases(
+    aliases: List[(String, BindingCell)]
+  ): List[(String, BindingCell)] =
+    aliases.foldLeft(List.empty[(String, BindingCell)]):
+      case (current, alias @ (name, _)) =>
+        if current.exists(_._1 == name) then current else current :+ alias

@@ -16,7 +16,7 @@ private[ming] object MacroParser:
           position
         )
 
-  private def parseSyntaxRules(
+  def parseSyntaxRules(
     name: String,
     expression: Expr,
     position: Position,

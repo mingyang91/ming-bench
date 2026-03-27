@@ -7,7 +7,7 @@ final private[ming] class BindingCell(var value: Value)
 final private[ming] class Environment private (
   val parent: Option[Environment],
   initialBindings: Iterable[(String, BindingCell)],
-  initialMacros: Iterable[(String, SyntaxRulesMacro)]
+  initialMacros: Iterable[(String, MacroDefinition)]
 ):
   private val bindings = mutable.LinkedHashMap.from(initialBindings)
   private val macros   = mutable.LinkedHashMap.from(initialMacros)
@@ -29,7 +29,7 @@ final private[ming] class Environment private (
   def defineAlias(name: String, cell: BindingCell): Unit =
     bindings.update(name, cell)
 
-  def defineMacro(name: String, macroDefinition: SyntaxRulesMacro): Unit =
+  def defineMacro(name: String, macroDefinition: MacroDefinition): Unit =
     macros.update(name, macroDefinition)
 
   def assign(name: String, value: Value, position: Position): Unit =
@@ -42,7 +42,7 @@ final private[ming] class Environment private (
       case value =>
         value
 
-  def lookupMacro(name: String): Option[SyntaxRulesMacro] =
+  def lookupMacro(name: String): Option[MacroDefinition] =
     macros.get(name) match
       case some @ Some(_) =>
         some
