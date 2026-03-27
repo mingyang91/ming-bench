@@ -701,6 +701,71 @@ func evalCond(clauses []Expr, env *Env) (Value, error) {
 	return &VoidVal{}, nil
 }
 
+// --------------- Value comparison helpers ---------------
+
+func valuesEqual(a, b Value) bool {
+	switch av := a.(type) {
+	case *IntVal:
+		bv, ok := b.(*IntVal)
+		return ok && av.Val == bv.Val
+	case *BoolVal:
+		bv, ok := b.(*BoolVal)
+		return ok && av.Val == bv.Val
+	case *StringVal:
+		bv, ok := b.(*StringVal)
+		return ok && av.Val == bv.Val
+	case *SymbolVal:
+		bv, ok := b.(*SymbolVal)
+		return ok && av.Name == bv.Name
+	case *CharVal:
+		bv, ok := b.(*CharVal)
+		return ok && av.Val == bv.Val
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return ok
+	case *PairVal:
+		bv, ok := b.(*PairVal)
+		if !ok {
+			return false
+		}
+		return valuesEqual(av.Car, bv.Car) && valuesEqual(av.Cdr, bv.Cdr)
+	default:
+		return a == b
+	}
+}
+
+func valuesEq(a, b Value) bool {
+	switch av := a.(type) {
+	case *SymbolVal:
+		bv, ok := b.(*SymbolVal)
+		return ok && av.Name == bv.Name
+	case *BoolVal:
+		bv, ok := b.(*BoolVal)
+		return ok && av.Val == bv.Val
+	case *IntVal:
+		bv, ok := b.(*IntVal)
+		return ok && av.Val == bv.Val
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return ok
+	case *CharVal:
+		bv, ok := b.(*CharVal)
+		return ok && av.Val == bv.Val
+	default:
+		return a == b
+	}
+}
+
+func applyProcSimple(proc Value, args []Value) (Value, error) {
+	switch fn := proc.(type) {
+	case *BuiltinVal:
+		return fn.Fn(args)
+	case *LambdaVal:
+		return applyLambda(fn, args)
+	}
+	return nil, &EvalError{Message: "not a procedure"}
+}
+
 // --------------- Procedure application ---------------
 
 func applyLambda(fn *LambdaVal, args []Value) (Value, error) {
@@ -1197,6 +1262,480 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 			return nil, &EvalError{Message: "string-ref: index out of range"}
 		}
 		return &CharVal{Val: rune(s.Val[idx.Val])}, nil
+	})
+
+	// L09: numeric utilities
+	addBuiltin("abs", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "abs requires 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "abs: expected number"}
+		}
+		v := n.Val
+		if v < 0 {
+			v = -v
+		}
+		return &IntVal{Val: v}, nil
+	})
+
+	addBuiltin("modulo", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "modulo requires 2 arguments"}
+		}
+		a, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "modulo: expected number"}
+		}
+		b, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "modulo: expected number"}
+		}
+		if b.Val == 0 {
+			return nil, &EvalError{Message: "modulo: division by zero"}
+		}
+		r := a.Val % b.Val
+		// modulo takes sign of divisor
+		if r != 0 && (r > 0) != (b.Val > 0) {
+			r += b.Val
+		}
+		return &IntVal{Val: r}, nil
+	})
+
+	addBuiltin("remainder", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "remainder requires 2 arguments"}
+		}
+		a, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "remainder: expected number"}
+		}
+		b, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "remainder: expected number"}
+		}
+		if b.Val == 0 {
+			return nil, &EvalError{Message: "remainder: division by zero"}
+		}
+		return &IntVal{Val: a.Val % b.Val}, nil
+	})
+
+	addBuiltin("quotient", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "quotient requires 2 arguments"}
+		}
+		a, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "quotient: expected number"}
+		}
+		b, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "quotient: expected number"}
+		}
+		if b.Val == 0 {
+			return nil, &EvalError{Message: "quotient: division by zero"}
+		}
+		return &IntVal{Val: a.Val / b.Val}, nil
+	})
+
+	addBuiltin("min", func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: "min requires at least 1 argument"}
+		}
+		best, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "min: expected number"}
+		}
+		for _, a := range args[1:] {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "min: expected number"}
+			}
+			if n.Val < best.Val {
+				best = n
+			}
+		}
+		return best, nil
+	})
+
+	addBuiltin("max", func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: "max requires at least 1 argument"}
+		}
+		best, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "max: expected number"}
+		}
+		for _, a := range args[1:] {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "max: expected number"}
+			}
+			if n.Val > best.Val {
+				best = n
+			}
+		}
+		return best, nil
+	})
+
+	addBuiltin("expt", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "expt requires 2 arguments"}
+		}
+		base, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "expt: expected number"}
+		}
+		exp, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "expt: expected number"}
+		}
+		var result int64 = 1
+		e := exp.Val
+		b := base.Val
+		for e > 0 {
+			result *= b
+			e--
+		}
+		return &IntVal{Val: result}, nil
+	})
+
+	addBuiltin("zero?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "zero? requires 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "zero?: expected number"}
+		}
+		return &BoolVal{Val: n.Val == 0}, nil
+	})
+
+	addBuiltin("positive?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "positive? requires 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "positive?: expected number"}
+		}
+		return &BoolVal{Val: n.Val > 0}, nil
+	})
+
+	addBuiltin("negative?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "negative? requires 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "negative?: expected number"}
+		}
+		return &BoolVal{Val: n.Val < 0}, nil
+	})
+
+	addBuiltin("odd?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "odd? requires 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "odd?: expected number"}
+		}
+		return &BoolVal{Val: n.Val%2 != 0}, nil
+	})
+
+	addBuiltin("even?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "even? requires 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "even?: expected number"}
+		}
+		return &BoolVal{Val: n.Val%2 == 0}, nil
+	})
+
+	// L09: list utilities
+	addBuiltin("list-ref", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "list-ref requires 2 arguments"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "list-ref: expected number"}
+		}
+		cur := args[0]
+		for i := int64(0); i < idx.Val; i++ {
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "list-ref: index out of range"}
+			}
+			cur = p.Cdr
+		}
+		p, ok := cur.(*PairVal)
+		if !ok {
+			return nil, &EvalError{Message: "list-ref: index out of range"}
+		}
+		return p.Car, nil
+	})
+
+	addBuiltin("list-tail", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "list-tail requires 2 arguments"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "list-tail: expected number"}
+		}
+		cur := args[0]
+		for i := int64(0); i < idx.Val; i++ {
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "list-tail: index out of range"}
+			}
+			cur = p.Cdr
+		}
+		return cur, nil
+	})
+
+	addBuiltin("list?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "list? requires 1 argument"}
+		}
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: true}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return &BoolVal{Val: false}, nil
+			}
+			cur = p.Cdr
+		}
+	})
+
+	addBuiltin("assoc", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "assoc requires 2 arguments"}
+		}
+		key := args[0]
+		cur := args[1]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				return &BoolVal{Val: false}, nil
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assoc: not a proper list"}
+			}
+			entry, ok := p.Car.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "assoc: entry is not a pair"}
+			}
+			if valuesEqual(key, entry.Car) {
+				return entry, nil
+			}
+			cur = p.Cdr
+		}
+	})
+
+	addBuiltin("equal?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "equal? requires 2 arguments"}
+		}
+		return &BoolVal{Val: valuesEqual(args[0], args[1])}, nil
+	})
+
+	addBuiltin("eq?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "eq? requires 2 arguments"}
+		}
+		return &BoolVal{Val: valuesEq(args[0], args[1])}, nil
+	})
+
+	// L09: built-in map (multi-list)
+	addBuiltin("map", func(args []Value) (Value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "map requires at least 2 arguments"}
+		}
+		proc := args[0]
+		lists := args[1:]
+		var result []Value
+		for {
+			// Check if any list is exhausted
+			callArgs := make([]Value, len(lists))
+			done := false
+			for i, lst := range lists {
+				if _, ok := lst.(*NilVal); ok {
+					done = true
+					break
+				}
+				p, ok := lst.(*PairVal)
+				if !ok {
+					return nil, &EvalError{Message: "map: not a proper list"}
+				}
+				callArgs[i] = p.Car
+				lists[i] = p.Cdr
+			}
+			if done {
+				break
+			}
+			val, err := applyProcSimple(proc, callArgs)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, val)
+		}
+		var out Value = &NilVal{}
+		for i := len(result) - 1; i >= 0; i-- {
+			out = &PairVal{Car: result[i], Cdr: out}
+		}
+		return out, nil
+	})
+
+	// L09: character utilities
+	addBuiltin("char-alphabetic?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char-alphabetic? requires 1 argument"}
+		}
+		c, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char-alphabetic?: expected char"}
+		}
+		return &BoolVal{Val: unicode.IsLetter(c.Val)}, nil
+	})
+
+	addBuiltin("char-numeric?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char-numeric? requires 1 argument"}
+		}
+		c, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char-numeric?: expected char"}
+		}
+		return &BoolVal{Val: unicode.IsDigit(c.Val)}, nil
+	})
+
+	addBuiltin("char-upcase", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char-upcase requires 1 argument"}
+		}
+		c, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char-upcase: expected char"}
+		}
+		return &CharVal{Val: unicode.ToUpper(c.Val)}, nil
+	})
+
+	addBuiltin("char-downcase", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char-downcase requires 1 argument"}
+		}
+		c, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char-downcase: expected char"}
+		}
+		return &CharVal{Val: unicode.ToLower(c.Val)}, nil
+	})
+
+	addBuiltin("char=?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "char=? requires 2 arguments"}
+		}
+		a, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char=?: expected char"}
+		}
+		b, ok := args[1].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char=?: expected char"}
+		}
+		return &BoolVal{Val: a.Val == b.Val}, nil
+	})
+
+	addBuiltin("char<?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "char<? requires 2 arguments"}
+		}
+		a, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char<?: expected char"}
+		}
+		b, ok := args[1].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char<?: expected char"}
+		}
+		return &BoolVal{Val: a.Val < b.Val}, nil
+	})
+
+	// L09: string comparison/case utilities
+	addBuiltin("string=?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string=? requires 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string=?: expected string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string=?: expected string"}
+		}
+		return &BoolVal{Val: a.Val == b.Val}, nil
+	})
+
+	addBuiltin("string<?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string<? requires 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string<?: expected string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string<?: expected string"}
+		}
+		return &BoolVal{Val: a.Val < b.Val}, nil
+	})
+
+	addBuiltin("string-ci=?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string-ci=? requires 2 arguments"}
+		}
+		a, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-ci=?: expected string"}
+		}
+		b, ok := args[1].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-ci=?: expected string"}
+		}
+		return &BoolVal{Val: strings.EqualFold(a.Val, b.Val)}, nil
+	})
+
+	addBuiltin("string-upcase", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-upcase requires 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-upcase: expected string"}
+		}
+		return &StringVal{Val: strings.ToUpper(s.Val)}, nil
+	})
+
+	addBuiltin("string-downcase", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-downcase requires 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-downcase: expected string"}
+		}
+		return &StringVal{Val: strings.ToLower(s.Val)}, nil
 	})
 
 	// L08: apply
