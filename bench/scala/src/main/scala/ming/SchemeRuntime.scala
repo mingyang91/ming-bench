@@ -17,12 +17,14 @@ final private[ming] class ExceptionHandlerContext(
 sealed private[ming] trait ContinuationFrame
 
 private[ming] object ContinuationFrame:
+  case object ProcedureBoundary                                               extends ContinuationFrame
   final case class Sequence(remaining: List[Expr], env: Env)                  extends ContinuationFrame
   final case class IfBranch(thenExpr: Expr, elseExpr: Option[Expr], env: Env) extends ContinuationFrame
   final case class DefineValue(name: String, env: Env)                        extends ContinuationFrame
   final case class SetValue(name: String, symbolPos: SourcePos, env: Env)     extends ContinuationFrame
   final case class CallHead(args: List[Expr], env: Env, pos: SourcePos)       extends ContinuationFrame
   final case class CallWithValuesConsumer(consumer: Value, pos: SourcePos)    extends ContinuationFrame
+  case object CallCcResult                                                    extends ContinuationFrame
 
   final case class CallArg(
     procedure: Value,
@@ -40,6 +42,7 @@ private[ming] object ContinuationFrame:
     env: Env,
     pos: SourcePos
   ) extends ContinuationFrame
+  final case class CondArrowRecipient(argument: Value, pos: SourcePos)    extends ContinuationFrame
   final case class CaseKey(clauses: List[Expr], env: Env, pos: SourcePos) extends ContinuationFrame
 
   final case class LetrecSequentialValue(

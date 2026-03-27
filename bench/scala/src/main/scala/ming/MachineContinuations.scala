@@ -6,6 +6,8 @@ private[ming] object MachineContinuations:
 
   def continueWith(machine: Machine, frame: ContinuationFrame, value: Value): Unit =
     frame match
+      case ProcedureBoundary =>
+        machine.setValue(value)
       case Sequence(remaining, env) =>
         MachineExpressions.startSequence(machine, remaining, env)
       case IfBranch(thenExpr, elseExpr, env) =>
@@ -19,6 +21,8 @@ private[ming] object MachineContinuations:
         continueCallHead(machine, args, env, pos, value)
       case CallWithValuesConsumer(consumer, pos) =>
         continueCallWithValuesConsumer(machine, consumer, pos, value)
+      case CallCcResult =>
+        continueCallCcResult(machine, value)
       case CallArg(procedure, evaluatedRev, remaining, env, pos) =>
         continueCallArg(machine, procedure, evaluatedRev, remaining, env, pos, value)
       case And(remaining, env) =>
@@ -27,6 +31,8 @@ private[ming] object MachineContinuations:
         continueOr(machine, remaining, env, value)
       case CondClause(body, remainingClauses, env, pos) =>
         continueCondClause(machine, body, remainingClauses, env, pos, value)
+      case CondArrowRecipient(argument, pos) =>
+        continueCondArrowRecipient(machine, argument, pos, value)
       case CaseKey(clauses, env, pos) =>
         MachineExpressions.startCaseClauses(machine, value, clauses, env, pos)
       case LetrecSequentialValue(currentCell, remaining, recursiveEnv, body) =>
@@ -100,6 +106,11 @@ private[ming] object MachineContinuations:
   ): Unit =
     machine.setInvoke(consumer, MultiValueSupport.unpack(value), pos)
 
+  private def continueCallCcResult(machine: Machine, value: Value): Unit =
+    if value == Value.Void && machine.winds.isEmpty && machine.handlers.isEmpty then
+      MachineProcedures.suspendCurrentProcedure(machine, value)
+    else machine.setValue(value)
+
   private def continueCallArg(
     machine: Machine,
     procedure: Value,
@@ -149,10 +160,27 @@ private[ming] object MachineContinuations:
     pos: SourcePos,
     value: Value
   ): Unit =
-    if ValueSemantics.isTruthy(value) then
-      if body.isEmpty then machine.setValue(value)
-      else MachineExpressions.startSequence(machine, body, env)
-    else MachineExpressions.startCond(machine, remainingClauses, env, pos)
+    if !ValueSemantics.isTruthy(value) then MachineExpressions.startCond(machine, remainingClauses, env, pos)
+    else
+      body match
+        case Nil =>
+          machine.setValue(value)
+        case Expr.Symbol("=>", arrowPos) :: recipientExpr :: Nil =>
+          machine.push(CondArrowRecipient(value, arrowPos))
+          machine.setExpr(recipientExpr, env)
+        case Expr.Symbol("=>", arrowPos) :: _ =>
+          throw EvalError.at(arrowPos, "cond => clause expects exactly 1 recipient")
+        case _ =>
+          MachineExpressions.startSequence(machine, body, env)
+
+  private def continueCondArrowRecipient(
+    machine: Machine,
+    argument: Value,
+    pos: SourcePos,
+    value: Value
+  ): Unit =
+    val procedure = MultiValueSupport.requireSingle(value, pos, "cond => recipient")
+    machine.setInvoke(procedure, List(argument), pos)
 
   private def continueLetrecSequentialValue(
     machine: Machine,

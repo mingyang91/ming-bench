@@ -5,7 +5,7 @@ import ContinuationFrame.*
 private[ming] object MachineExceptions:
 
   def raise(machine: Machine, exception: Value, pos: SourcePos): Unit =
-    machine.handlers.lastOption match
+    machine.handlers.headOption match
       case Some(handler) =>
         machine.handlers = handler.outerHandlers
 

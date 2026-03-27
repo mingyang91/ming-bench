@@ -39,7 +39,7 @@ private[ming] object MachineProcedures:
         val clause = selectCaseLambdaClause(name, clauses, args.length, pos)
         startClosureCall(machine, name, clause.params, clause.restParam, clause.body, closureEnv, args, pos)
       case continuation: Value.ContinuationVal =>
-        val capturedValue = requireSingleArg("continuation", args, pos)
+        val capturedValue = MultiValueSupport.pack(args)
         startContinuationTransfer(machine, continuation.snapshot, capturedValue)
       case _ =>
         throw EvalError.at(pos, "attempted to call a non-procedure")
@@ -63,11 +63,13 @@ private[ming] object MachineProcedures:
     restParam.foreach { param =>
       callEnv.define(param, ValueSemantics.listFrom(args.drop(params.length)))
     }
+    if machine.frames.headOption.forall(_ != ProcedureBoundary) then machine.push(ProcedureBoundary)
     MachineExpressions.startSequence(machine, body, callEnv)
 
   private def prepareCallCc(machine: Machine, name: String, args: List[Value], pos: SourcePos): Unit =
     val procedure = requireSingleArg(name, args, pos)
     val captured  = new Value.ContinuationVal(new ContinuationSnapshot(machine.frames, machine.winds, machine.handlers))
+    machine.push(CallCcResult)
     machine.setInvoke(procedure, List(captured), pos)
 
   private def prepareCallWithValues(machine: Machine, args: List[Value], pos: SourcePos): Unit =
@@ -227,3 +229,14 @@ private[ming] object MachineProcedures:
       case None =>
         val procName = name.getOrElse("lambda")
         throw EvalError.at(pos, s"$procName expects $fixedParamCount argument(s), got $actualArgCount")
+
+  private[ming] def suspendCurrentProcedure(machine: Machine, value: Value): Unit =
+    @annotation.tailrec
+    def dropToBoundary(frames: List[ContinuationFrame]): List[ContinuationFrame] =
+      frames match
+        case ProcedureBoundary :: tail => tail
+        case _ :: tail                 => dropToBoundary(tail)
+        case Nil                       => Nil
+
+    machine.frames = dropToBoundary(machine.frames)
+    machine.setValue(value)

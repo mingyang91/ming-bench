@@ -61,8 +61,11 @@ final private[ming] class Machine(private[ming] val context: EvalContext):
     else winds = winds.filterNot(existing => existing eq wind)
 
   private[ming] def activateHandler(handler: ExceptionHandlerContext): Unit =
-    handlers = handlers :+ handler
+    handlers = handler :: handlers
 
   private[ming] def deactivateHandler(handler: ExceptionHandlerContext): Unit =
-    if handlers.nonEmpty && (handlers.last eq handler) then handlers = handlers.init
-    else handlers = handlers.filterNot(existing => existing eq handler)
+    handlers match
+      case current :: rest if current.eq(handler) =>
+        handlers = rest
+      case _ =>
+        handlers = handlers.filterNot(existing => existing.eq(handler))

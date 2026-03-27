@@ -18,6 +18,7 @@ private[ming] object Builtins:
     "eq?",
     "eqv?",
     "equal?",
+    "error",
     "raise",
     "with-exception-handler",
     "map",
@@ -55,6 +56,8 @@ private[ming] object Builtins:
         Value.BoolVal(!ValueSemantics.isTruthy(requireSingleArg(name, args, pos)))
       case "eq?" | "eqv?" | "equal?" =>
         invokeEqualityBuiltin(name, args, pos)
+      case "error" =>
+        throw EvalError.at(pos, args.map(SchemeRenderer.render).mkString(" "))
       case "values" =>
         MultiValueSupport.pack(args)
       case builtin if NumericBuiltins.handlesUtility(builtin) =>
