@@ -14,6 +14,7 @@ type machine struct {
 	val  value
 	cont continuation
 	wind *windFrame
+	handlers *exceptionHandlerFrame
 }
 
 type continuation interface {
@@ -109,6 +110,7 @@ type callCCProc struct {
 type continuationProc struct {
 	captured continuation
 	wind     *windFrame
+	handlers *exceptionHandlerFrame
 }
 
 func (p callCCProc) schemeString() string {
@@ -150,7 +152,7 @@ func (p continuationProc) call(args []value) (value, error) {
 		return nil, newCurrentEvalError("continuation expects exactly 1 argument")
 	}
 
-	return evalValueWithWindTransition(args[0], nil, p.wind, p.captured)
+	return evalValueWithControlTransition(args[0], nil, p.wind, nil, p.handlers, p.captured)
 }
 
 func (m *machine) run() (value, error) {
@@ -223,6 +225,8 @@ func (m *machine) evalList(items listExpr, env *env, cont continuation) error {
 			return startIf(m, items[1:], env, cont)
 		case "cond":
 			return startCond(m, items[1:], env, cont)
+		case "guard":
+			return startGuard(m, items[1:], env, cont)
 		case "define":
 			return startDefine(m, items[1:], env, cont)
 		case "define-syntax":
@@ -750,18 +754,34 @@ func applyProcedureState(m *machine, proc procedure, args []value, pos SourcePos
 		if !ok {
 			return newCurrentEvalError("'%s' expects a procedure, got %s", p.name, args[0].schemeString())
 		}
-		return applyProcedureState(m, target, []value{continuationProc{captured: cont, wind: m.wind}}, pos, cont)
+		return applyProcedureState(m, target, []value{continuationProc{captured: cont, wind: m.wind, handlers: m.handlers}}, pos, cont)
 	case dynamicWindProc:
 		inThunk, bodyThunk, outThunk, err := parseDynamicWindArgs(args, p.name)
 		if err != nil {
 			return err
 		}
 		return startDynamicWind(m, inThunk, bodyThunk, outThunk, pos, cont)
+	case withExceptionHandlerProc:
+		handler, thunk, err := parseWithExceptionHandlerArgs(args, p.name)
+		if err != nil {
+			return err
+		}
+		return startWithExceptionHandler(m, handler, thunk, pos, cont)
+	case raiseProc:
+		if len(args) != 1 {
+			return newCurrentEvalError("'%s' expects exactly 1 argument", p.name)
+		}
+		return startRaise(m, args[0])
 	case continuationProc:
 		if len(args) != 1 {
 			return newCurrentEvalError("continuation expects exactly 1 argument")
 		}
-		return startWindTransition(m, p.wind, p.captured, args[0])
+		return startControlTransition(m, p.wind, p.handlers, p.captured, args[0])
+	case guardHandlerProc:
+		if len(args) != 1 {
+			return newCurrentEvalError("guard handler expects exactly 1 argument")
+		}
+		return startGuardHandler(m, p, args[0], cont)
 	case closureValue:
 		call, err := p.prepareTailCall(args)
 		if err != nil {

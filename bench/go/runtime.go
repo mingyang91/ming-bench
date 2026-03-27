@@ -457,6 +457,8 @@ func newGlobalEnv() *env {
 	global.define("-", builtinProc{name: "-", fn: evalSub})
 	global.define("*", builtinProc{name: "*", fn: evalMul})
 	global.define("/", builtinProc{name: "/", fn: evalDiv})
+	global.define("raise", raiseProc{name: "raise"})
+	global.define("with-exception-handler", withExceptionHandlerProc{name: "with-exception-handler"})
 	global.define("call/cc", callCCProc{name: "call/cc"})
 	global.define("call-with-current-continuation", callCCProc{name: "call-with-current-continuation"})
 	global.define("dynamic-wind", dynamicWindProc{name: "dynamic-wind"})
