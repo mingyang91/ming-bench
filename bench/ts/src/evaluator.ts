@@ -7,6 +7,7 @@ type SchemeValBase =
   | { tag: 'boolean'; val: boolean }
   | { tag: 'string'; val: string }
   | { tag: 'symbol'; val: string }
+  | { tag: 'char'; val: string }
   | { tag: 'list'; val: SchemeVal[] }
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
   | { tag: 'nil' }
@@ -147,7 +148,7 @@ function makeEnv(parent: Env | null): Env {
   return { bindings: new Map(), parent };
 }
 
-function makeGlobalEnv(): Env {
+function makeGlobalEnv(outputBuf?: string[]): Env {
   const env = makeEnv(null);
 
   const numBinop = (fn: (a: number, b: number) => number | boolean) =>
@@ -298,6 +299,105 @@ function makeGlobalEnv(): Env {
   envSet(env, 'symbol?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('symbol? requires 1 argument');
     return { tag: 'boolean', val: args[0].tag === 'symbol' };
+  }});
+
+  // I/O
+  const displayVal = (v: SchemeVal): string => {
+    switch (v.tag) {
+      case 'number': return String(v.val);
+      case 'boolean': return v.val ? '#t' : '#f';
+      case 'string': return v.val;
+      case 'symbol': return v.val;
+      case 'char': return v.val;
+      case 'nil': return '()';
+      case 'void': return '';
+      case 'procedure': return '#<procedure>';
+      case 'pair': {
+        let out = '(' + displayVal(v.car);
+        let cur: SchemeVal = v.cdr;
+        while (cur.tag === 'pair') { out += ' ' + displayVal(cur.car); cur = cur.cdr; }
+        if (cur.tag !== 'nil') out += ' . ' + displayVal(cur);
+        return out + ')';
+      }
+      case 'list': return `(${v.val.map(displayVal).join(' ')})`;
+    }
+  };
+
+  const writeVal = (v: SchemeVal): string => {
+    if (v.tag === 'string') return `"${v.val}"`;
+    if (v.tag === 'char') return `#\\${v.val}`;
+    return displayVal(v);
+  };
+
+  envSet(env, 'display', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('display requires 1 argument');
+    if (outputBuf) outputBuf.push(displayVal(args[0]));
+    return { tag: 'void' };
+  }});
+
+  envSet(env, 'write', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('write requires 1 argument');
+    if (outputBuf) outputBuf.push(writeVal(args[0]));
+    return { tag: 'void' };
+  }});
+
+  envSet(env, 'newline', { tag: 'procedure', val: (args) => {
+    if (outputBuf) outputBuf.push('\n');
+    return { tag: 'void' };
+  }});
+
+  // String operations
+  envSet(env, 'string-length', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-length: expected string');
+    return { tag: 'number', val: args[0].val.length };
+  }});
+
+  envSet(env, 'string-append', { tag: 'procedure', val: (args) => {
+    for (const a of args) if (a.tag !== 'string') throw new EvalError('string-append: expected string');
+    return { tag: 'string', val: args.map(a => (a as { tag: 'string'; val: string }).val).join('') };
+  }});
+
+  envSet(env, 'substring', { tag: 'procedure', val: (args) => {
+    if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'number')
+      throw new EvalError('substring: expected string, start, end');
+    return { tag: 'string', val: args[0].val.substring(args[1].val, args[2].val) };
+  }});
+
+  envSet(env, 'string->number', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string->number: expected string');
+    const n = Number(args[0].val);
+    if (isNaN(n)) return { tag: 'boolean', val: false };
+    return { tag: 'number', val: n };
+  }});
+
+  envSet(env, 'number->string', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('number->string: expected number');
+    return { tag: 'string', val: String(args[0].val) };
+  }});
+
+  envSet(env, 'string-ref', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'number')
+      throw new EvalError('string-ref: expected string and index');
+    const s = args[0].val;
+    const i = args[1].val;
+    if (i < 0 || i >= s.length) throw new EvalError('string-ref: index out of range');
+    return { tag: 'char', val: s[i] };
+  }});
+
+  envSet(env, 'char?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('char? requires 1 argument');
+    return { tag: 'boolean', val: args[0].tag === 'char' };
+  }});
+
+  // Symbol/string conversions
+  envSet(env, 'symbol->string', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'symbol') throw new EvalError('symbol->string: expected symbol');
+    return { tag: 'string', val: args[0].val };
+  }});
+
+  envSet(env, 'string->symbol', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string->symbol: expected string');
+    return { tag: 'symbol', val: args[0].val };
   }});
 
   return env;
@@ -512,6 +612,7 @@ function display(val: SchemeVal): string {
     case 'boolean': return val.val ? '#t' : '#f';
     case 'string': return `"${val.val}"`;
     case 'symbol': return val.val;
+    case 'char': return `#\\${val.val}`;
     case 'list': return `(${val.val.map(display).join(' ')})`;
     case 'nil': return '()';
     case 'pair': {
@@ -547,10 +648,11 @@ export function evalStr(input: string): string {
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
-  const env = makeGlobalEnv();
+  const outputBuf: string[] = [];
+  const env = makeGlobalEnv(outputBuf);
   let result: SchemeVal = { tag: 'void' };
   for (const expr of exprs) {
     result = evaluate(expr, env);
   }
-  return { result: display(result), output: '' };
+  return { result: display(result), output: outputBuf.join('') };
 }
