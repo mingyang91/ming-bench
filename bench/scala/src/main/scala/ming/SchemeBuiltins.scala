@@ -13,6 +13,7 @@ private[ming] object Builtins:
     ">",
     "=",
     "<=",
+    ">=",
     "not",
     "null?",
     "pair?",
@@ -63,7 +64,7 @@ private[ming] object Builtins:
     name match
       case "+" | "-" | "*" | "/" =>
         invokeArithmetic(name, args, pos)
-      case "<" | ">" | "=" | "<=" =>
+      case "<" | ">" | "=" | "<=" | ">=" =>
         invokeComparison(name, args, pos)
       case "not" =>
         Value.BoolVal(!ValueSemantics.isTruthy(requireSingleArg(name, args, pos)))
@@ -123,6 +124,8 @@ private[ming] object Builtins:
         compareNumbers(name, args, pos)(SchemeNumber.areEqual)
       case "<=" =>
         compareNumbers(name, args, pos)((left, right) => SchemeNumber.compare(left, right) <= 0)
+      case ">=" =>
+        compareNumbers(name, args, pos)((left, right) => SchemeNumber.compare(left, right) >= 0)
       case _ =>
         unknownProcedure(name, pos)
 

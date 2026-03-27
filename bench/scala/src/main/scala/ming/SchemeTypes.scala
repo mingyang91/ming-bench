@@ -39,7 +39,10 @@ private[ming] enum Value:
   )
   case Void
 
-final private[ming] class MutableString private (private val builder: java.lang.StringBuilder):
+final private[ming] class MutableString private (
+  private val builder: java.lang.StringBuilder,
+  val isMutable: Boolean
+):
 
   def length: Int =
     builder.length()
@@ -59,7 +62,10 @@ final private[ming] class MutableString private (private val builder: java.lang.
 object MutableString:
 
   def from(text: String): MutableString =
-    new MutableString(new java.lang.StringBuilder(text))
+    new MutableString(new java.lang.StringBuilder(text), isMutable = true)
+
+  def immutable(text: String): MutableString =
+    new MutableString(new java.lang.StringBuilder(text), isMutable = false)
 
 final private[ming] class VectorInstance(
   private val storage: Array[Value]

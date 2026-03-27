@@ -116,7 +116,7 @@ private[ming] object ValueSemantics:
       case Expr.InexactLit(value, _) => Value.InexactVal(value)
       case Expr.BoolLit(value, _)    => Value.BoolVal(value)
       case Expr.StringLit(value, _) =>
-        Value.StringVal(MutableString.from(value))
+        Value.StringVal(MutableString.immutable(value))
       case Expr.CharLit(value, _) => Value.CharVal(value)
       case Expr.Symbol(name, _)   => Value.SymbolVal(name)
       case Expr.ListExpr(items, _) =>
