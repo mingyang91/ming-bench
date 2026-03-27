@@ -14,19 +14,41 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse_all(&mut self) -> Result<Vec<Value>, EvalError> {
+    pub fn parse_all(&mut self) -> Result<Vec<(Value, usize, usize)>, EvalError> {
         let mut exprs = Vec::new();
         loop {
             self.skip_whitespace_and_comments();
             if self.pos >= self.input.len() {
                 break;
             }
-            exprs.push(self.parse_expr()?);
+            let (line, col) = self.line_col(self.pos);
+            let val = self.parse_expr().map_err(|e| {
+                EvalError::WithPosition {
+                    error: Box::new(e),
+                    line,
+                    col,
+                }
+            })?;
+            exprs.push((val, line, col));
         }
         if exprs.is_empty() {
             return Err(EvalError::Parse("empty input".into()));
         }
         Ok(exprs)
+    }
+
+    fn line_col(&self, byte_pos: usize) -> (usize, usize) {
+        let mut line = 1;
+        let mut col = 1;
+        for &b in &self.input[..byte_pos] {
+            if b == b'\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
     }
 
     fn parse_expr(&mut self) -> Result<Value, EvalError> {

@@ -14,4 +14,10 @@ pub enum EvalError {
     Arity(String),
     #[error("division by zero")]
     DivisionByZero,
+    #[error("{error} at {line}:{col}")]
+    WithPosition {
+        error: Box<EvalError>,
+        line: usize,
+        col: usize,
+    },
 }

@@ -28,8 +28,12 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
         env.borrow_mut().set(name.to_string(), Value::Symbol(name.to_string()));
     }
     let mut result = Value::Boolean(false);
-    for expr in exprs {
-        result = eval(&expr, &env)?;
+    for (expr, line, col) in exprs {
+        result = eval(&expr, &env).map_err(|e| EvalError::WithPosition {
+            error: Box::new(e),
+            line,
+            col,
+        })?;
     }
     Ok(result.to_display())
 }
