@@ -16,13 +16,14 @@ use self::sequence::{
 use super::{
     list_from_values,
     number::{parse_number_token, Number, Rational},
-    values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg, Procedure,
-    RecordType, RecordValue, SchemeString, SyntaxObject, Value,
+    values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg,
+    MacroTransformer, Procedure, RecordType, RecordValue, SchemeString, SyntaxObject, Value,
 };
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub(super) fn default_env() -> EnvRef {
     let env = Environment::new(None);
+    env.define_macro("quasiquote", Rc::new(MacroTransformer::BuiltinQuasiquote));
     env.define(
         "error",
         Value::Procedure(Rc::new(Procedure::Error { name: "error" })),

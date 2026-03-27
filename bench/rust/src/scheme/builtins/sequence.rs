@@ -1,6 +1,6 @@
 use super::super::{
-    list_from_values, values_eq, values_equal, EvalError, EvaluatedArg, PairValue, Value,
-    VectorValue,
+    list_from_values, list_from_values_with_tail, values_eq, values_equal, EvalError, EvaluatedArg,
+    PairValue, Value, VectorValue,
 };
 use super::{apply_procedure, exact_int, parse_index_arg, parse_index_bound, parse_length_arg};
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
@@ -367,11 +367,20 @@ pub(super) fn apply_append(
     args: &[EvaluatedArg],
     _output: &mut String,
 ) -> Result<Value, EvalError> {
+    let Some((tail, prefix)) = args.split_last() else {
+        return Ok(list_from_values(std::iter::empty::<Value>()));
+    };
+
     let mut items = Vec::new();
-    for value in args {
+    for value in prefix {
         items.extend(value.as_list()?);
     }
-    Ok(list_from_values(items))
+
+    if prefix.is_empty() {
+        Ok(tail.value.clone())
+    } else {
+        Ok(list_from_values_with_tail(items, tail.value.clone()))
+    }
 }
 
 pub(super) fn apply_reverse(

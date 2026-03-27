@@ -118,6 +118,10 @@ fn eval_machine(
             value: Value::String(SchemeString::immutable(&value)),
             cont,
         }),
+        Expr::Vector { items, pos } => Ok(MachineState::Return {
+            value: builtins::quote_expr(&Expr::Vector { items, pos }),
+            cont,
+        }),
         Expr::Symbol { name, pos } => Ok(MachineState::Return {
             value: eval_symbol(&name, pos, &env)?,
             cont,
@@ -1637,6 +1641,7 @@ fn eval_tail(expr: &Expr, env: EnvRef, output: &mut String) -> Result<TailEvalRe
         Expr::String { value, .. } => Ok(TailEvalResult::Value(Value::String(
             SchemeString::immutable(value),
         ))),
+        Expr::Vector { .. } => Ok(TailEvalResult::Value(builtins::quote_expr(expr))),
         Expr::Symbol { name, pos } => eval_symbol(name, *pos, &env).map(TailEvalResult::Value),
         Expr::List { items, pos } => eval_tail_list(items, *pos, env, output),
     }
@@ -2094,6 +2099,7 @@ fn eval(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalErro
         Expr::Number { value, .. } => Ok(Value::Number(*value)),
         Expr::Char { value, .. } => Ok(Value::Char(*value)),
         Expr::String { value, .. } => Ok(Value::String(SchemeString::immutable(value))),
+        Expr::Vector { .. } => Ok(builtins::quote_expr(expr)),
         Expr::Symbol { name, pos } => eval_symbol(name, *pos, &env),
         Expr::List { items, pos } => with_position(eval_list(items, env, output), *pos),
     }

@@ -2,12 +2,12 @@ use super::super::text::SchemeString;
 use super::super::{
     eval_program_tail, list_from_values, list_from_values_with_tail, pack_values, unpack_values,
     EnvRef, Environment, EvalError, EvaluatedArg, Expr, LambdaParams, Position, Procedure,
-    SyntaxContextRef, TailEvalResult, Value,
+    SyntaxContextRef, TailEvalResult, Value, VectorValue,
 };
 use super::{
     apply_record_accessor, apply_record_constructor, apply_record_mutator, apply_record_predicate,
 };
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
 pub(crate) fn quote_expr(expr: &Expr) -> Value {
     match expr {
@@ -17,6 +17,7 @@ pub(crate) fn quote_expr(expr: &Expr) -> Value {
         Expr::String { value, .. } => Value::String(SchemeString::immutable(value)),
         Expr::Symbol { name, .. } => Value::Symbol(name.clone()),
         Expr::List { items, .. } => quote_list_expr(items),
+        Expr::Vector { items, .. } => quote_vector_expr(items),
     }
 }
 
@@ -34,6 +35,7 @@ pub(crate) fn datum_to_expr(value: &Value, pos: Position) -> Result<Expr, EvalEr
             pos,
         }),
         Value::List(_) | Value::Pair(_) => datum_list_to_expr(value, pos),
+        Value::Vector(vector) => datum_vector_to_expr(vector, pos),
         Value::Syntax(syntax) => Ok(syntax.expr.clone()),
         _ => Err(EvalError::TypeMismatch {
             expected: "datum",
@@ -49,6 +51,12 @@ fn quote_list_expr(items: &[Expr]) -> Value {
         }
         None => list_from_values(items.iter().map(quote_expr)),
     }
+}
+
+fn quote_vector_expr(items: &[Expr]) -> Value {
+    Value::Vector(Rc::new(VectorValue {
+        elements: RefCell::new(items.iter().map(quote_expr).collect()),
+    }))
 }
 
 fn dotted_list_parts(items: &[Expr]) -> Option<(&[Expr], &Expr)> {
@@ -92,6 +100,16 @@ fn datum_list_to_expr(value: &Value, pos: Position) -> Result<Expr, EvalError> {
             }
         }
     }
+}
+
+fn datum_vector_to_expr(vector: &Rc<VectorValue>, pos: Position) -> Result<Expr, EvalError> {
+    let items = vector
+        .elements
+        .borrow()
+        .iter()
+        .map(|item| datum_to_expr(item, pos))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Expr::Vector { items, pos })
 }
 
 pub(crate) fn apply_procedure(

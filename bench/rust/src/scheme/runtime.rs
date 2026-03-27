@@ -21,6 +21,7 @@ pub(super) enum Expr {
     String { value: String, pos: Position },
     Symbol { name: String, pos: Position },
     List { items: Vec<Expr>, pos: Position },
+    Vector { items: Vec<Expr>, pos: Position },
 }
 
 impl Expr {
@@ -31,7 +32,8 @@ impl Expr {
             | Self::Char { pos, .. }
             | Self::String { pos, .. }
             | Self::Symbol { pos, .. }
-            | Self::List { pos, .. } => *pos,
+            | Self::List { pos, .. }
+            | Self::Vector { pos, .. } => *pos,
         }
     }
 }
@@ -376,6 +378,7 @@ pub(super) enum Procedure {
 
 #[derive(Clone)]
 pub(super) enum MacroTransformer {
+    BuiltinQuasiquote,
     SyntaxRules {
         literals: HashSet<String>,
         rules: Vec<MacroRule>,

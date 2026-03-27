@@ -57,22 +57,28 @@ impl<'a> Parser<'a> {
                 pos,
             });
         }
+        if self.input[self.pos..].starts_with("#(") {
+            return self.parse_vector();
+        }
 
         match self.peek_char() {
             Some('(') => self.parse_list(),
             Some('\'') => {
                 self.bump_char();
-                let quoted = self.parse_expr()?;
-                Ok(Expr::List {
-                    items: vec![
-                        Expr::Symbol {
-                            name: "quote".to_string(),
-                            pos,
-                        },
-                        quoted,
-                    ],
-                    pos,
-                })
+                self.parse_reader_abbreviation("quote", pos)
+            }
+            Some('`') => {
+                self.bump_char();
+                self.parse_reader_abbreviation("quasiquote", pos)
+            }
+            Some(',') => {
+                self.bump_char();
+                if self.peek_char() == Some('@') {
+                    self.bump_char();
+                    self.parse_reader_abbreviation("unquote-splicing", pos)
+                } else {
+                    self.parse_reader_abbreviation("unquote", pos)
+                }
             }
             Some('"') => self.parse_string(),
             Some(')') => Err(EvalError::ParseError {
@@ -82,6 +88,24 @@ impl<'a> Parser<'a> {
             Some(_) => self.parse_atom(),
             None => Err(EvalError::UnexpectedEof.with_position(pos.line, pos.col)),
         }
+    }
+
+    fn parse_reader_abbreviation(
+        &mut self,
+        symbol: &str,
+        pos: Position,
+    ) -> Result<Expr, EvalError> {
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List {
+            items: vec![
+                Expr::Symbol {
+                    name: symbol.to_string(),
+                    pos,
+                },
+                quoted,
+            ],
+            pos,
+        })
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
@@ -95,6 +119,25 @@ impl<'a> Parser<'a> {
                 Some(')') => {
                     self.bump_char();
                     return Ok(Expr::List { items, pos });
+                }
+                Some(_) => items.push(self.parse_expr()?),
+                None => return Err(self.error_here(EvalError::UnexpectedEof)),
+            }
+        }
+    }
+
+    fn parse_vector(&mut self) -> Result<Expr, EvalError> {
+        let pos = self.current_position();
+        self.bump_char();
+        self.bump_char();
+        let mut items = Vec::new();
+
+        loop {
+            self.skip_ignored();
+            match self.peek_char() {
+                Some(')') => {
+                    self.bump_char();
+                    return Ok(Expr::Vector { items, pos });
                 }
                 Some(_) => items.push(self.parse_expr()?),
                 None => return Err(self.error_here(EvalError::UnexpectedEof)),

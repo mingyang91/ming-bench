@@ -47,6 +47,7 @@ pub(super) fn expand_macro_call(
     transformer: MacroRef,
 ) -> Result<(Expr, EnvRef), EvalError> {
     match transformer.as_ref() {
+        MacroTransformer::BuiltinQuasiquote => expand_builtin_quasiquote_call(items, env),
         MacroTransformer::SyntaxRules {
             literals,
             rules,
@@ -56,6 +57,164 @@ pub(super) fn expand_macro_call(
             expand_procedure_macro_call(items, env, procedure, def_env)
         }
     }
+}
+
+fn expand_builtin_quasiquote_call(
+    items: &[Expr],
+    env: EnvRef,
+) -> Result<(Expr, EnvRef), EvalError> {
+    let [_, template] = items else {
+        return Err(EvalError::WrongArgCount {
+            name: "quasiquote",
+            expected: "exactly 1",
+            got: items.len().saturating_sub(1),
+        });
+    };
+
+    Ok((expand_builtin_quasiquote(template, 1)?, env))
+}
+
+fn expand_builtin_quasiquote(expr: &Expr, depth: usize) -> Result<Expr, EvalError> {
+    match expr {
+        Expr::Bool { .. } | Expr::Number { .. } | Expr::Char { .. } | Expr::String { .. } => {
+            Ok(expr.clone())
+        }
+        Expr::Symbol { .. } => Ok(make_quote(expr.clone(), expr.pos())),
+        Expr::List { items, pos } => expand_builtin_quasiquote_list(items, *pos, depth),
+        Expr::Vector { items, pos } => Ok(make_call(
+            "list->vector",
+            vec![expand_builtin_quasiquote_sequence(
+                items, None, *pos, depth,
+            )?],
+            *pos,
+        )),
+    }
+}
+
+fn expand_builtin_quasiquote_list(
+    items: &[Expr],
+    pos: Position,
+    depth: usize,
+) -> Result<Expr, EvalError> {
+    if let Some(arg) = special_form_arg(items, "unquote") {
+        return if depth == 1 {
+            Ok(arg.clone())
+        } else {
+            build_nested_quasiquote_symbol("unquote", arg, pos, depth - 1)
+        };
+    }
+
+    if let Some(arg) = special_form_arg(items, "unquote-splicing") {
+        return if depth == 1 {
+            Err(EvalError::ParseError {
+                message: "unquote-splicing must appear within a list or vector template"
+                    .to_string(),
+            }
+            .with_position(pos.line, pos.col))
+        } else {
+            build_nested_quasiquote_symbol("unquote-splicing", arg, pos, depth - 1)
+        };
+    }
+
+    if let Some(arg) = special_form_arg(items, "quasiquote") {
+        return build_nested_quasiquote_symbol("quasiquote", arg, pos, depth + 1);
+    }
+
+    expand_builtin_quasiquote_sequence(
+        items,
+        split_dotted_list_items(items).map(|(_, tail)| tail),
+        pos,
+        depth,
+    )
+}
+
+fn expand_builtin_quasiquote_sequence(
+    items: &[Expr],
+    dotted_tail: Option<&Expr>,
+    pos: Position,
+    depth: usize,
+) -> Result<Expr, EvalError> {
+    let prefix = split_dotted_list_items(items).map_or(items, |(prefix, _)| prefix);
+    let mut result = match dotted_tail {
+        Some(tail) => expand_builtin_quasiquote(tail, depth)?,
+        None => empty_list_expr(pos),
+    };
+
+    for item in prefix.iter().rev() {
+        if depth == 1 {
+            if let Some(spliced) = special_form_arg_expr(item, "unquote-splicing") {
+                result = make_call("append", vec![spliced.clone(), result], pos);
+                continue;
+            }
+        }
+
+        let head = expand_builtin_quasiquote(item, depth)?;
+        result = make_call("cons", vec![head, result], pos);
+    }
+
+    Ok(result)
+}
+
+fn build_nested_quasiquote_symbol(
+    symbol: &str,
+    arg: &Expr,
+    pos: Position,
+    depth: usize,
+) -> Result<Expr, EvalError> {
+    let quoted_symbol = make_quote(
+        Expr::Symbol {
+            name: symbol.to_string(),
+            pos,
+        },
+        pos,
+    );
+    let quoted_arg = expand_builtin_quasiquote(arg, depth)?;
+    Ok(make_call(
+        "cons",
+        vec![
+            quoted_symbol,
+            make_call("cons", vec![quoted_arg, empty_list_expr(pos)], pos),
+        ],
+        pos,
+    ))
+}
+
+fn special_form_arg<'a>(items: &'a [Expr], name: &str) -> Option<&'a Expr> {
+    match items {
+        [Expr::Symbol { name: symbol, .. }, arg] if symbol == name => Some(arg),
+        _ => None,
+    }
+}
+
+fn special_form_arg_expr<'a>(expr: &'a Expr, name: &str) -> Option<&'a Expr> {
+    match expr {
+        Expr::List { items, .. } => special_form_arg(items, name),
+        _ => None,
+    }
+}
+
+fn make_call(name: &str, args: Vec<Expr>, pos: Position) -> Expr {
+    let mut items = Vec::with_capacity(args.len() + 1);
+    items.push(Expr::Symbol {
+        name: name.to_string(),
+        pos,
+    });
+    items.extend(args);
+    Expr::List { items, pos }
+}
+
+fn make_quote(expr: Expr, pos: Position) -> Expr {
+    make_call("quote", vec![expr], pos)
+}
+
+fn empty_list_expr(pos: Position) -> Expr {
+    make_quote(
+        Expr::List {
+            items: Vec::new(),
+            pos,
+        },
+        pos,
+    )
 }
 
 pub(super) fn parse_lambda_params(expr: &Expr) -> Result<LambdaParams, EvalError> {
@@ -608,6 +767,15 @@ fn match_single_pattern(
             } => match_pattern_sequence(pattern_items, input_items, literals, bindings),
             _ => false,
         },
+        Expr::Vector {
+            items: pattern_items,
+            ..
+        } => match input {
+            Expr::Vector {
+                items: input_items, ..
+            } => match_pattern_sequence(pattern_items, input_items, literals, bindings),
+            _ => false,
+        },
     }
 }
 
@@ -656,6 +824,9 @@ fn expand_macro_template_at(
         }
         Expr::List { items, pos } => {
             expand_macro_list(items, *pos, context, scope, repetition_index)
+        }
+        Expr::Vector { items, pos } => {
+            expand_macro_vector(items, *pos, context, scope, repetition_index)
         }
     }
 }
@@ -867,6 +1038,44 @@ fn expand_macro_let(
     }))
 }
 
+fn expand_macro_vector(
+    items: &[Expr],
+    pos: Position,
+    context: &mut MacroExpansionContext,
+    scope: &HashMap<String, String>,
+    repetition_index: Option<usize>,
+) -> Result<Expr, EvalError> {
+    let mut expanded = Vec::new();
+    let mut index = 0;
+    while index < items.len() {
+        if index + 1 < items.len() && is_ellipsis(&items[index + 1]) {
+            let repeat_len = template_repeat_length(&items[index], context)?;
+            for repeat_index in 0..repeat_len {
+                expanded.push(expand_macro_template_at(
+                    &items[index],
+                    context,
+                    scope,
+                    Some(repeat_index),
+                )?);
+            }
+            index += 2;
+        } else {
+            expanded.push(expand_macro_template_at(
+                &items[index],
+                context,
+                scope,
+                repetition_index,
+            )?);
+            index += 1;
+        }
+    }
+
+    Ok(Expr::Vector {
+        items: expanded,
+        pos,
+    })
+}
+
 fn expand_macro_lambda(
     items: &[Expr],
     context: &mut MacroExpansionContext,
@@ -1051,6 +1260,11 @@ fn collect_template_repeat_length(
             }
         }
         Expr::List { items, .. } => {
+            for item in items {
+                collect_template_repeat_length(item, bindings, length)?;
+            }
+        }
+        Expr::Vector { items, .. } => {
             for item in items {
                 collect_template_repeat_length(item, bindings, length)?;
             }
