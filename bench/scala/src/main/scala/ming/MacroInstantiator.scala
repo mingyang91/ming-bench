@@ -24,7 +24,10 @@ private[ming] object MacroInstantiator:
     )
     val (expanded, finalState) =
       instantiateTemplate(template, context, MacroInstantiationState.initial())
-    MacroExpansion(expanded, dedupeAliases(inheritedAliases ++ finalState.aliases.toList))
+    MacroExpansion(
+      expanded,
+      MacroInstantiationSupport.dedupeAliases(inheritedAliases ++ finalState.aliases.toList)
+    )
 
   private def instantiateTemplate(
     template: Expr,
@@ -69,25 +72,29 @@ private[ming] object MacroInstantiator:
             body,
             position
           ) if body.nonEmpty =>
-        instantiateProcedureDefine(
-          keywordPosition,
-          nameTemplate,
-          parameters,
-          parameterPosition,
-          body,
-          position,
-          context,
-          state
-        )
+        val (instantiatedDefine, _, nextState) =
+          instantiateProcedureDefine(
+            keywordPosition,
+            nameTemplate,
+            parameters,
+            parameterPosition,
+            body,
+            position,
+            context,
+            state
+          )
+        (instantiatedDefine, nextState)
       case ListExpr(SymbolExpr("define", keywordPosition) :: nameTemplate :: value :: Nil, position) =>
-        instantiateValueDefine(
-          keywordPosition,
-          nameTemplate,
-          value,
-          position,
-          context,
-          state
-        )
+        val (instantiatedDefine, _, nextState) =
+          instantiateValueDefine(
+            keywordPosition,
+            nameTemplate,
+            value,
+            position,
+            context,
+            state
+          )
+        (instantiatedDefine, nextState)
       case ListExpr(items, position) =>
         val (instantiatedItems, nextState) =
           MacroInstantiationSupport.instantiateListItems(
@@ -113,11 +120,13 @@ private[ming] object MacroInstantiator:
     val (instantiatedParameterSpec, introducedBindings, afterParameters) =
       MacroInstantiationSupport.instantiateBinderSpec(parameterSpec, context, state)
     val (instantiatedBody, afterBody) =
-      MacroInstantiationSupport.instantiateExpressions(
+      MacroBodyInstantiator.instantiate(
         body,
         context.inScope(introducedBindings),
         afterParameters,
-        instantiateTemplate
+        instantiateTemplate,
+        instantiateValueDefine,
+        instantiateProcedureDefine
       )
     (
       ListExpr(
@@ -141,11 +150,13 @@ private[ming] object MacroInstantiator:
     val (instantiatedBindingList, afterBindings) =
       instantiateTemplate(bindingList, context, afterName)
     val (instantiatedBody, afterBody) =
-      MacroInstantiationSupport.instantiateExpressions(
+      MacroBodyInstantiator.instantiate(
         body,
         context.inScope(nameBinding),
         afterBindings,
-        instantiateTemplate
+        instantiateTemplate,
+        instantiateValueDefine,
+        instantiateProcedureDefine
       )
     (
       ListExpr(
@@ -174,11 +185,13 @@ private[ming] object MacroInstantiator:
         instantiateTemplate
       )
     val (instantiatedBody, afterBody) =
-      MacroInstantiationSupport.instantiateExpressions(
+      MacroBodyInstantiator.instantiate(
         body,
         context.inScope(introducedBindings),
         afterBindings,
-        instantiateTemplate
+        instantiateTemplate,
+        instantiateValueDefine,
+        instantiateProcedureDefine
       )
     (
       ListExpr(
@@ -195,8 +208,8 @@ private[ming] object MacroInstantiator:
     position: Position,
     context: MacroInstantiationContext,
     state: MacroInstantiationState
-  ): (Expr, MacroInstantiationState) =
-    val (instantiatedName, _, afterName) =
+  ): (Expr, Map[String, String], MacroInstantiationState) =
+    val (instantiatedName, introducedBindings, afterName) =
       MacroInstantiationSupport.instantiateBinder(nameTemplate, context, state)
     val (instantiatedValue, afterValue) =
       instantiateTemplate(value, context, afterName)
@@ -209,6 +222,7 @@ private[ming] object MacroInstantiator:
         ),
         position
       ),
+      introducedBindings,
       afterValue
     )
 
@@ -221,18 +235,20 @@ private[ming] object MacroInstantiator:
     position: Position,
     context: MacroInstantiationContext,
     state: MacroInstantiationState
-  ): (Expr, MacroInstantiationState) =
+  ): (Expr, Map[String, String], MacroInstantiationState) =
     val (instantiatedName, nameBinding, afterName) =
       MacroInstantiationSupport.instantiateBinder(nameTemplate, context, state)
     val (instantiatedParameters, parameterBindings, afterParameters) =
       MacroInstantiationSupport.instantiateBinderList(parameters, context, afterName)
     val bodyContext = context.inScope(nameBinding ++ parameterBindings)
     val (instantiatedBody, afterBody) =
-      MacroInstantiationSupport.instantiateExpressions(
+      MacroBodyInstantiator.instantiate(
         body,
         bodyContext,
         afterParameters,
-        instantiateTemplate
+        instantiateTemplate,
+        instantiateValueDefine,
+        instantiateProcedureDefine
       )
     (
       ListExpr(
@@ -241,12 +257,6 @@ private[ming] object MacroInstantiator:
           instantiatedBody,
         position
       ),
+      nameBinding,
       afterBody
     )
-
-  private def dedupeAliases(
-    aliases: List[(String, BindingCell)]
-  ): List[(String, BindingCell)] =
-    aliases.foldLeft(List.empty[(String, BindingCell)]):
-      case (current, alias @ (name, _)) =>
-        if current.exists(_._1 == name) then current else current :+ alias

@@ -19,6 +19,13 @@ private[ming] object MacroInstantiationSupport:
           (items :+ instantiatedExpression, updatedState)
     (instantiated.toList, nextState)
 
+  def dedupeAliases(
+    aliases: List[(String, BindingCell)]
+  ): List[(String, BindingCell)] =
+    aliases.foldLeft(List.empty[(String, BindingCell)]):
+      case (current, alias @ (name, _)) =>
+        if current.exists(_._1 == name) then current else current :+ alias
+
   def instantiateLetBindingList(
     template: Expr,
     context: MacroInstantiationContext,

@@ -99,7 +99,21 @@ private[ming] object InterpreterEvaluator:
       case expression :: Nil =>
         deferExpr(expression, env, continuation)
       case expression :: rest =>
-        deferExpr(expression, env, _ => deferSequence(rest, env, continuation))
+        deferExpr(
+          expression,
+          env,
+          value => continueSequence(expression, value, rest, env, continuation)
+        )
+
+  private def continueSequence(
+    expression: Expr,
+    value: Value,
+    rest: List[Expr],
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
+    if InterpreterSequencePause.shouldPauseAfter(expression, value) then done(value, continuation)
+    else deferSequence(rest, env, continuation)
 
   private def applyFunctionStep(
     function: Value,
