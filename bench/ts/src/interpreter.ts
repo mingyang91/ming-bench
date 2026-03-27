@@ -49,6 +49,20 @@ type UserProc = {
   body: Expr[];
   env: Env;
 };
+type RecordFieldSpec = {
+  name: string;
+  accessor: string;
+  mutator?: string;
+};
+type RecordTypeDescriptor = {
+  name: string;
+  fieldNames: string[];
+};
+type RecordValue = {
+  kind: 'record';
+  recordType: RecordTypeDescriptor;
+  fields: Value[];
+};
 
 type Value =
   | num.NumericValue
@@ -59,6 +73,7 @@ type Value =
   | SchemeSymbol
   | EmptyList
   | PairValue
+  | RecordValue
   | VoidValue
   | BuiltinProc
   | UserProc;
@@ -73,6 +88,7 @@ const CORE_SYNTAX = new Set([
   'begin',
   'cond',
   'define',
+  'define-record-type',
   'define-syntax',
   'if',
   'lambda',
@@ -1134,6 +1150,8 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
         return evalCond(items.slice(1), env, macroEnv);
       case 'define':
         return evalDefine(items.slice(1), env, macroEnv);
+      case 'define-record-type':
+        return evalDefineRecordType(items.slice(1), env);
       case 'define-syntax':
         return evalDefineSyntax(items.slice(1), env, macroEnv);
       case 'if':
@@ -1254,6 +1272,83 @@ function evalDefineSyntax(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
   }
 
   macroEnv.define(nameExpr.name, parseSyntaxRules(nameExpr.name, args[1]!, env));
+  return VOID;
+}
+
+function evalDefineRecordType(args: Expr[], env: Env): Value {
+  assertAtLeastArity('define-record-type', args, 3);
+
+  const recordTypeName = expectSymbolExprName('define-record-type', args[0]!, 'type name');
+  const constructorSpec = parseRecordConstructorSpec(args[1]!);
+  const predicateName = expectSymbolExprName('define-record-type', args[2]!, 'predicate name');
+  const fieldSpecs = args.slice(3).map((fieldExpr) => parseRecordFieldSpec(fieldExpr));
+  const fieldIndices = new Map<string, number>();
+
+  fieldSpecs.forEach((fieldSpec, index) => {
+    if (fieldIndices.has(fieldSpec.name)) {
+      throw new EvalError('define-record-type field names must be unique');
+    }
+    fieldIndices.set(fieldSpec.name, index);
+  });
+
+  const constructorFieldIndices = constructorSpec.fields.map((fieldName) => {
+    const fieldIndex = fieldIndices.get(fieldName);
+    if (fieldIndex === undefined) {
+      throw new EvalError(`define-record-type constructor field not found: ${fieldName}`);
+    }
+    return fieldIndex;
+  });
+
+  const recordType: RecordTypeDescriptor = {
+    name: recordTypeName,
+    fieldNames: fieldSpecs.map((fieldSpec) => fieldSpec.name),
+  };
+
+  env.define(constructorSpec.name, {
+    kind: 'builtin',
+    name: constructorSpec.name,
+    apply: (constructorArgs) => {
+      assertExactArity(constructorSpec.name, constructorArgs, constructorSpec.fields.length);
+      const fields = fieldSpecs.map(() => VOID as Value);
+      constructorFieldIndices.forEach((fieldIndex, argIndex) => {
+        fields[fieldIndex] = constructorArgs[argIndex]!;
+      });
+      return { kind: 'record', recordType, fields };
+    },
+  });
+
+  env.define(predicateName, {
+    kind: 'builtin',
+    name: predicateName,
+    apply: (predicateArgs) => {
+      assertExactArity(predicateName, predicateArgs, 1);
+      return isRecordValue(predicateArgs[0]!) && predicateArgs[0]!.recordType === recordType;
+    },
+  });
+
+  fieldSpecs.forEach((fieldSpec, index) => {
+    env.define(fieldSpec.accessor, {
+      kind: 'builtin',
+      name: fieldSpec.accessor,
+      apply: (accessorArgs) => {
+        assertExactArity(fieldSpec.accessor, accessorArgs, 1);
+        return expectRecordValue(fieldSpec.accessor, accessorArgs[0]!, recordType).fields[index]!;
+      },
+    });
+
+    if (fieldSpec.mutator !== undefined) {
+      env.define(fieldSpec.mutator, {
+        kind: 'builtin',
+        name: fieldSpec.mutator,
+        apply: (mutatorArgs) => {
+          assertExactArity(fieldSpec.mutator!, mutatorArgs, 2);
+          expectRecordValue(fieldSpec.mutator!, mutatorArgs[0]!, recordType).fields[index] = mutatorArgs[1]!;
+          return VOID;
+        },
+      });
+    }
+  });
+
   return VOID;
 }
 
@@ -1395,6 +1490,52 @@ function parseBindings(expr: Expr): BindingSpec[] {
       init: bindingExpr.items[1]!,
     };
   });
+}
+
+function parseRecordConstructorSpec(expr: Expr): { name: string; fields: string[] } {
+  if (expr.kind !== 'list' || expr.items.length === 0) {
+    throw new EvalError('define-record-type expects a constructor specification');
+  }
+
+  const name = expectSymbolExprName('define-record-type', expr.items[0]!, 'constructor name');
+  const fields = expr.items.slice(1).map((fieldExpr) => expectSymbolExprName('define-record-type', fieldExpr, 'constructor field'));
+
+  assertUniqueNames('define-record-type constructor fields', fields);
+  return { name, fields };
+}
+
+function parseRecordFieldSpec(expr: Expr): RecordFieldSpec {
+  if (expr.kind !== 'list' || (expr.items.length !== 2 && expr.items.length !== 3)) {
+    throw new EvalError('define-record-type expects field clauses of the form (field accessor) or (field accessor mutator)');
+  }
+
+  const [fieldExpr, accessorExpr, mutatorExpr] = expr.items;
+  return {
+    name: expectSymbolExprName('define-record-type', fieldExpr!, 'field name'),
+    accessor: expectSymbolExprName('define-record-type', accessorExpr!, 'field accessor'),
+    mutator:
+      mutatorExpr === undefined
+        ? undefined
+        : expectSymbolExprName('define-record-type', mutatorExpr, 'field mutator'),
+  };
+}
+
+function expectSymbolExprName(formName: string, expr: Expr, role: string): string {
+  if (expr.kind !== 'symbol') {
+    throw new EvalError(`${formName} expects ${role} to be a symbol`);
+  }
+
+  return expr.name;
+}
+
+function assertUniqueNames(context: string, names: string[]): void {
+  const seen = new Set<string>();
+  for (const name of names) {
+    if (seen.has(name)) {
+      throw new EvalError(`${context} must be unique`);
+    }
+    seen.add(name);
+  }
 }
 
 function quoteExpr(expr: Expr): Value {
@@ -1648,6 +1789,18 @@ function makeList(items: Value[]): Value {
 function expectPair(name: string, value: Value): PairValue {
   if (!isPair(value)) {
     throw new EvalError(`${name} expects a pair`);
+  }
+
+  return value;
+}
+
+function expectRecordValue(name: string, value: Value, recordType?: RecordTypeDescriptor): RecordValue {
+  if (!isRecordValue(value)) {
+    throw new EvalError(`${name} expects a record`);
+  }
+
+  if (recordType !== undefined && value.recordType !== recordType) {
+    throw new EvalError(`${name} expects a ${recordType.name} record`);
   }
 
   return value;
@@ -1932,6 +2085,8 @@ function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
       return '()';
     case 'pair':
       return `(${formatPairContents(value, mode)})`;
+    case 'record':
+      return `#<record:${value.recordType.name}>`;
     case 'void':
       return '';
     case 'builtin':
@@ -2059,6 +2214,10 @@ function isProcedure(value: Value): value is BuiltinProc | UserProc {
 
 function isPair(value: Value): value is PairValue {
   return typeof value === 'object' && value !== null && value.kind === 'pair';
+}
+
+function isRecordValue(value: Value): value is RecordValue {
+  return typeof value === 'object' && value !== null && value.kind === 'record';
 }
 
 function isCharValue(value: Value): value is CharValue {
