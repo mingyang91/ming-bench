@@ -166,7 +166,11 @@ func (m *machine) run() (value, error) {
 			if m.cont == nil {
 				return m.val, nil
 			}
-			if err := m.cont.resume(m, m.val); err != nil {
+			normalized, err := normalizeValueForContinuation(m.val, m.cont)
+			if err != nil {
+				return nil, err
+			}
+			if err := m.cont.resume(m, normalized); err != nil {
 				return nil, err
 			}
 		default:
@@ -767,6 +771,12 @@ func applyProcedureState(m *machine, proc procedure, args []value, pos SourcePos
 			return err
 		}
 		return startWithExceptionHandler(m, handler, thunk, pos, cont)
+	case callWithValuesProc:
+		producer, consumer, err := parseCallWithValuesArgs(args, p.name)
+		if err != nil {
+			return err
+		}
+		return startCallWithValues(m, producer, consumer, pos, cont)
 	case raiseProc:
 		if len(args) != 1 {
 			return newCurrentEvalError("'%s' expects exactly 1 argument", p.name)
