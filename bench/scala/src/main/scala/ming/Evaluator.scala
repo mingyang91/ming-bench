@@ -1,5 +1,7 @@
 package ming
 
+import EvaluatorForms.*
+
 /** Scheme interpreter entry point. Agents implement this object. */
 object Evaluator:
 
@@ -124,12 +126,12 @@ object Evaluator:
         evalSequence(body, letEnv, context)
       case Expr.Symbol(name, _) :: Expr.ListExpr(bindings, _) :: body if body.nonEmpty =>
         val parsedBindings = parseLetBindings(bindings)
-        val evaluatedArgs  = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env, context) }
+        val evaluatedArgs  = parsedBindings.map(binding => eval(binding.valueExpr, env, context))
         val letEnv         = env.child()
         val closure =
           Value.Closure(
             name = Some(name),
-            params = parsedBindings.map(_._1),
+            params = parsedBindings.map(_.name),
             restParam = None,
             body = body,
             env = letEnv
@@ -139,17 +141,9 @@ object Evaluator:
       case _ =>
         throw EvalError.at(pos, "invalid let")
 
-  private def bindLetValues(targetEnv: Env, bindings: List[(String, Expr)], evalEnv: Env, context: EvalContext): Unit =
-    bindings.foreach { case (name, valueExpr) =>
-      targetEnv.define(name, eval(valueExpr, evalEnv, context))
-    }
-
-  private def parseLetBindings(bindings: List[Expr]): List[(String, Expr)] =
-    bindings.map {
-      case Expr.ListExpr(Expr.Symbol(name, _) :: valueExpr :: Nil, _) =>
-        (name, valueExpr)
-      case invalid =>
-        throw EvalError.at(invalid.pos, "invalid let binding")
+  private def bindLetValues(targetEnv: Env, bindings: List[LetBinding], evalEnv: Env, context: EvalContext): Unit =
+    bindings.foreach { binding =>
+      targetEnv.define(binding.name, eval(binding.valueExpr, evalEnv, context))
     }
 
   private def evalCond(clauses: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
@@ -171,28 +165,6 @@ object Evaluator:
       case invalid :: _ =>
         throw EvalError.at(invalid.pos, "invalid cond clause")
 
-  private def parseParameterSpec(expr: Expr): ParameterSpec =
-    expr match
-      case Expr.ListExpr(params, _) => parseParameterSpec(params)
-      case Expr.Symbol(name, _)     => ParameterSpec(Nil, Some(name))
-      case other                    => throw EvalError.at(other.pos, "parameter list must be a list or symbol")
-
-  private def parseParameterSpec(params: List[Expr]): ParameterSpec =
-    def loop(remaining: List[Expr], fixed: List[String]): ParameterSpec =
-      remaining match
-        case Nil =>
-          ParameterSpec(fixed.reverse, None)
-        case Expr.Symbol(".", _) :: Expr.Symbol(name, _) :: Nil =>
-          ParameterSpec(fixed.reverse, Some(name))
-        case Expr.Symbol(".", dotPos) :: _ =>
-          throw EvalError.at(dotPos, "dot must appear before a single rest parameter")
-        case Expr.Symbol(name, _) :: tail =>
-          loop(tail, name :: fixed)
-        case other :: _ =>
-          throw EvalError.at(other.pos, "parameter names must be symbols")
-
-    loop(params, Nil)
-
   private def applyProcedure(
     procedure: Value,
     args: List[Expr],
@@ -212,6 +184,8 @@ object Evaluator:
     procedure match
       case Value.BuiltinProc("apply") =>
         invokeApply(evaluatedArgs, pos, context)
+      case Value.BuiltinProc("map") =>
+        invokeMap(evaluatedArgs, pos, context)
       case Value.BuiltinProc(name) =>
         Builtins.invoke(name, evaluatedArgs, pos, context)
       case Value.Closure(name, params, restParam, body, closureEnv) =>
@@ -236,6 +210,20 @@ object Evaluator:
     val prefixArgs = args.slice(1, args.length - 1)
     val listArgs   = ValueSemantics.toProperList("apply", args.last, pos)
     invokeProcedure(procedure, prefixArgs ++ listArgs, pos, context)
+
+  private def invokeMap(args: List[Value], pos: SourcePos, context: EvalContext): Value =
+    if args.lengthCompare(2) < 0 then throw EvalError.at(pos, s"map expects at least 2 argument(s), got ${args.length}")
+
+    val procedure = args.head
+    val lists     = args.tail.map(ValueSemantics.toProperList("map", _, pos))
+    val size      = lists.head.length
+    if lists.exists(_.lengthCompare(size) != 0) then throw EvalError.at(pos, "map expected lists of equal length")
+
+    val results =
+      if size == 0 then Nil
+      else lists.transpose.map(values => invokeProcedure(procedure, values, pos, context))
+
+    ValueSemantics.listFrom(results)
 
   private def validateArity(
     name: Option[String],
@@ -278,5 +266,3 @@ object Evaluator:
         val value = eval(head, env, context)
         if ValueSemantics.isTruthy(value) then value
         else evalOr(tail, env, context)
-
-  private case class ParameterSpec(params: List[String], restParam: Option[String])

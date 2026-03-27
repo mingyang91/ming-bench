@@ -1,5 +1,9 @@
 package ming
 
+import java.util.Locale
+
+import BuiltinSupport.*
+
 private[ming] object StringBuiltins:
 
   val names: Set[String] = Set(
@@ -12,7 +16,12 @@ private[ming] object StringBuiltins:
     "string->symbol",
     "string-ref",
     "string-copy",
-    "string-set!"
+    "string-set!",
+    "string=?",
+    "string<?",
+    "string-ci=?",
+    "string-upcase",
+    "string-downcase"
   )
 
   def handles(name: String): Boolean =
@@ -29,7 +38,7 @@ private[ming] object StringBuiltins:
       case "string->number" =>
         stringToNumber(name, args, pos)
       case "number->string" =>
-        Value.StringVal(MutableString.from(requireIndex(name, requireSingleArg(name, args, pos), pos).toString))
+        Value.StringVal(MutableString.from(requireNumber(name, requireSingleArg(name, args, pos), pos).toString))
       case "symbol->string" =>
         Value.StringVal(MutableString.from(requireSymbol(name, requireSingleArg(name, args, pos), pos)))
       case "string->symbol" =>
@@ -40,14 +49,28 @@ private[ming] object StringBuiltins:
         Value.StringVal(MutableString.from(requireString(name, requireSingleArg(name, args, pos), pos).text))
       case "string-set!" =>
         stringSet(name, args, pos)
+      case "string=?" =>
+        compareStrings(name, args, pos)(_ == _)
+      case "string<?" =>
+        compareStrings(name, args, pos)(_ < _)
+      case "string-ci=?" =>
+        compareStrings(name, args, pos)(_.equalsIgnoreCase(_))
+      case "string-upcase" =>
+        Value.StringVal(
+          MutableString.from(requireString(name, requireSingleArg(name, args, pos), pos).text.toUpperCase(Locale.ROOT))
+        )
+      case "string-downcase" =>
+        Value.StringVal(
+          MutableString.from(requireString(name, requireSingleArg(name, args, pos), pos).text.toLowerCase(Locale.ROOT))
+        )
       case _ =>
         unknownProcedure(name, pos)
 
   private def substring(name: String, args: List[Value], pos: SourcePos): Value =
     val values = requireArgCount(name, args, expected = 3, pos)
     val text   = requireString(name, values.head, pos)
-    val start  = requireIndex(name, values(1), pos)
-    val end    = requireIndex(name, values(2), pos)
+    val start  = requireNumber(name, values(1), pos)
+    val end    = requireNumber(name, values(2), pos)
     if start < 0 || end < start || end > text.length then throw EvalError.at(pos, s"$name indices out of range")
     Value.StringVal(MutableString.from(text.text.substring(start, end)))
 
@@ -62,50 +85,15 @@ private[ming] object StringBuiltins:
   private def stringRef(name: String, args: List[Value], pos: SourcePos): Value =
     val values = requireArgCount(name, args, expected = 2, pos)
     val text   = requireString(name, values.head, pos)
-    val index  = requireIndex(name, values(1), pos)
+    val index  = requireNumber(name, values(1), pos)
     if index < 0 || index >= text.length then throw EvalError.at(pos, s"$name index out of range")
     Value.CharVal(text.charAt(index))
 
   private def stringSet(name: String, args: List[Value], pos: SourcePos): Value =
     val values = requireArgCount(name, args, expected = 3, pos)
     val text   = requireString(name, values.head, pos)
-    val index  = requireIndex(name, values(1), pos)
+    val index  = requireNumber(name, values(1), pos)
     val ch     = requireChar(name, values(2), pos)
     if index < 0 || index >= text.length then throw EvalError.at(pos, s"$name index out of range")
     text.setCharAt(index, ch)
     Value.Void
-
-  private def requireString(name: String, value: Value, pos: SourcePos): MutableString =
-    value match
-      case Value.StringVal(text) => text
-      case other =>
-        throw EvalError.at(pos, s"$name expected a string, got ${ValueSemantics.typeName(other)}")
-
-  private def requireSymbol(name: String, value: Value, pos: SourcePos): String =
-    value match
-      case Value.SymbolVal(symbol) => symbol
-      case other =>
-        throw EvalError.at(pos, s"$name expected a symbol, got ${ValueSemantics.typeName(other)}")
-
-  private def requireIndex(name: String, value: Value, pos: SourcePos): Int =
-    value match
-      case Value.IntVal(number) => number
-      case other =>
-        throw EvalError.at(pos, s"$name expected a number, got ${ValueSemantics.typeName(other)}")
-
-  private def requireChar(name: String, value: Value, pos: SourcePos): Char =
-    value match
-      case Value.CharVal(ch) => ch
-      case other =>
-        throw EvalError.at(pos, s"$name expected a character, got ${ValueSemantics.typeName(other)}")
-
-  private def requireSingleArg(name: String, args: List[Value], pos: SourcePos): Value =
-    requireArgCount(name, args, expected = 1, pos).head
-
-  private def requireArgCount[T](name: String, args: List[T], expected: Int, pos: SourcePos): List[T] =
-    if args.lengthCompare(expected) != 0 then
-      throw EvalError.at(pos, s"$name expects $expected argument(s), got ${args.length}")
-    args
-
-  private def unknownProcedure(name: String, pos: SourcePos): Nothing =
-    throw EvalError.at(pos, s"unknown procedure: $name")

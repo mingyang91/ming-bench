@@ -1,6 +1,6 @@
 package ming
 
-import scala.annotation.tailrec
+import BuiltinSupport.*
 
 private[ming] object Builtins:
 
@@ -14,12 +14,6 @@ private[ming] object Builtins:
     "=",
     "<=",
     "not",
-    "cons",
-    "car",
-    "cdr",
-    "append",
-    "list",
-    "length",
     "null?",
     "pair?",
     "number?",
@@ -27,11 +21,29 @@ private[ming] object Builtins:
     "boolean?",
     "symbol?",
     "char?",
-    "apply",
-    "display",
-    "write",
-    "newline"
-  ) ++ StringBuiltins.names
+    "eq?",
+    "equal?",
+    "abs",
+    "modulo",
+    "remainder",
+    "quotient",
+    "min",
+    "max",
+    "expt",
+    "zero?",
+    "positive?",
+    "negative?",
+    "odd?",
+    "even?",
+    "map",
+    "char-alphabetic?",
+    "char-numeric?",
+    "char-upcase",
+    "char-downcase",
+    "char=?",
+    "char<?",
+    "apply"
+  ) ++ ListBuiltins.names ++ OutputBuiltins.names ++ StringBuiltins.names
 
   def resolve(name: String): Option[Value] =
     if builtinNames.contains(name) then Some(Value.BuiltinProc(name))
@@ -43,12 +55,24 @@ private[ming] object Builtins:
         invokeArithmetic(name, args, pos)
       case "<" | ">" | "=" | "<=" =>
         invokeComparison(name, args, pos)
-      case "not" | "cons" | "car" | "cdr" | "append" | "list" | "length" =>
-        invokeCoreBuiltin(name, args, pos)
+      case "not" =>
+        Value.BoolVal(!ValueSemantics.isTruthy(requireSingleArg(name, args, pos)))
+      case "eq?" | "equal?" =>
+        invokeEqualityBuiltin(name, args, pos)
+      case "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" =>
+        invokeNumericUtility(name, args, pos)
+      case "zero?" | "positive?" | "negative?" | "odd?" | "even?" =>
+        invokeNumericPredicate(name, args, pos)
+      case builtin if ListBuiltins.handlesCore(builtin) =>
+        ListBuiltins.invokeCore(builtin, args, pos)
+      case builtin if ListBuiltins.handlesUtility(builtin) =>
+        ListBuiltins.invokeUtility(builtin, args, pos)
+      case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
+        invokeCharBuiltin(name, args, pos)
       case "null?" | "pair?" | "number?" | "string?" | "boolean?" | "symbol?" | "char?" =>
         invokePredicateBuiltin(name, args, pos)
-      case "display" | "write" | "newline" =>
-        invokeOutputBuiltin(name, args, pos, context)
+      case builtin if OutputBuiltins.handles(builtin) =>
+        OutputBuiltins.invoke(builtin, args, pos, context)
       case builtin if StringBuiltins.handles(builtin) =>
         StringBuiltins.invoke(builtin, args, pos)
       case _ =>
@@ -98,26 +122,72 @@ private[ming] object Builtins:
       case _ =>
         unknownProcedure(name, pos)
 
-  private def invokeCoreBuiltin(name: String, args: List[Value], pos: SourcePos): Value =
+  private def invokeEqualityBuiltin(name: String, args: List[Value], pos: SourcePos): Value =
+    val values = requireArgCount(name, args, expected = 2, pos)
     name match
-      case "not" =>
-        Value.BoolVal(!ValueSemantics.isTruthy(requireSingleArg(name, args, pos)))
-      case "cons" =>
-        val values = requireArgCount(name, args, expected = 2, pos)
-        Value.PairVal(values.head, values(1))
-      case "car" =>
-        val (car, _) = requirePair(name, requireSingleArg(name, args, pos), pos)
-        car
-      case "cdr" =>
-        val (_, cdr) = requirePair(name, requireSingleArg(name, args, pos), pos)
-        cdr
-      case "append" =>
-        append(name, args, pos)
-      case "list" =>
-        ValueSemantics.listFrom(args)
-      case "length" =>
-        val value = requireSingleArg(name, args, pos)
-        Value.IntVal(ValueSemantics.toProperList(name, value, pos).length)
+      case "eq?" =>
+        Value.BoolVal(ValueSemantics.isEq(values.head, values(1)))
+      case "equal?" =>
+        Value.BoolVal(ValueSemantics.isEqual(values.head, values(1)))
+      case _ =>
+        unknownProcedure(name, pos)
+
+  private def invokeNumericUtility(name: String, args: List[Value], pos: SourcePos): Value =
+    name match
+      case "abs" =>
+        Value.IntVal(math.abs(requireNumber(name, requireSingleArg(name, args, pos), pos)))
+      case "modulo" =>
+        val (dividend, divisor) = requireBinaryNumbers(name, args, pos)
+        Value.IntVal(modulo(dividend, divisor, pos))
+      case "remainder" =>
+        val (dividend, divisor) = requireBinaryNumbers(name, args, pos)
+        if divisor == 0 then throw EvalError.at(pos, "division by zero")
+        Value.IntVal(dividend % divisor)
+      case "quotient" =>
+        val (dividend, divisor) = requireBinaryNumbers(name, args, pos)
+        if divisor == 0 then throw EvalError.at(pos, "division by zero")
+        Value.IntVal(dividend / divisor)
+      case "min" =>
+        Value.IntVal(requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos).min)
+      case "max" =>
+        Value.IntVal(requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos).max)
+      case "expt" =>
+        val (base, exponent) = requireBinaryNumbers(name, args, pos)
+        if exponent < 0 then throw EvalError.at(pos, s"$name expected a non-negative exponent")
+        Value.IntVal(expt(base, exponent))
+      case _ =>
+        unknownProcedure(name, pos)
+
+  private def invokeNumericPredicate(name: String, args: List[Value], pos: SourcePos): Value =
+    val number = requireNumber(name, requireSingleArg(name, args, pos), pos)
+    name match
+      case "zero?" =>
+        Value.BoolVal(number == 0)
+      case "positive?" =>
+        Value.BoolVal(number > 0)
+      case "negative?" =>
+        Value.BoolVal(number < 0)
+      case "odd?" =>
+        Value.BoolVal(number % 2 != 0)
+      case "even?" =>
+        Value.BoolVal(number % 2 == 0)
+      case _ =>
+        unknownProcedure(name, pos)
+
+  private def invokeCharBuiltin(name: String, args: List[Value], pos: SourcePos): Value =
+    name match
+      case "char-alphabetic?" =>
+        Value.BoolVal(Character.isLetter(requireChar(name, requireSingleArg(name, args, pos), pos)))
+      case "char-numeric?" =>
+        Value.BoolVal(Character.isDigit(requireChar(name, requireSingleArg(name, args, pos), pos)))
+      case "char-upcase" =>
+        Value.CharVal(Character.toUpperCase(requireChar(name, requireSingleArg(name, args, pos), pos)))
+      case "char-downcase" =>
+        Value.CharVal(Character.toLowerCase(requireChar(name, requireSingleArg(name, args, pos), pos)))
+      case "char=?" =>
+        compareChars(name, args, pos)(_ == _)
+      case "char<?" =>
+        compareChars(name, args, pos)(_ < _)
       case _ =>
         unknownProcedure(name, pos)
 
@@ -161,79 +231,17 @@ private[ming] object Builtins:
       case _ =>
         unknownProcedure(name, pos)
 
-  private def invokeOutputBuiltin(
-    name: String,
-    args: List[Value],
-    pos: SourcePos,
-    context: EvalContext
-  ): Value =
-    name match
-      case "display" =>
-        context.emit(SchemeRenderer.renderForDisplay(requireSingleArg(name, args, pos)))
-        Value.Void
-      case "write" =>
-        context.emit(SchemeRenderer.render(requireSingleArg(name, args, pos)))
-        Value.Void
-      case "newline" =>
-        requireArgCount(name, args, expected = 0, pos)
-        context.emit("\n")
-        Value.Void
-      case _ =>
-        unknownProcedure(name, pos)
+  private def modulo(dividend: Int, divisor: Int, pos: SourcePos): Int =
+    if divisor == 0 then throw EvalError.at(pos, "division by zero")
+    val remainder = dividend % divisor
+    if remainder == 0 || Integer.signum(remainder) == Integer.signum(divisor) then remainder
+    else remainder + divisor
 
-  private def requireSingleArg(name: String, args: List[Value], pos: SourcePos): Value =
-    requireArgCount(name, args, expected = 1, pos).head
+  private def expt(base: Int, exponent: Int): Int =
+    @annotation.tailrec
+    def loop(factor: Int, power: Int, acc: Int): Int =
+      if power == 0 then acc
+      else if (power & 1) == 1 then loop(factor * factor, power >>> 1, acc * factor)
+      else loop(factor * factor, power >>> 1, acc)
 
-  private def unknownProcedure(name: String, pos: SourcePos): Nothing =
-    throw EvalError.at(pos, s"unknown procedure: $name")
-
-  private def compareNumbers(
-    name: String,
-    args: List[Value],
-    pos: SourcePos
-  )(predicate: (Int, Int) => Boolean): Value =
-    val numbers = requireMinArgs(name, evalNumbers(name, args, pos), min = 2, pos)
-    Value.BoolVal(numbers.zip(numbers.tail).forall(predicate.tupled))
-
-  private def evalNumbers(name: String, args: List[Value], pos: SourcePos): List[Int] =
-    args.map {
-      case Value.IntVal(value) => value
-      case other =>
-        throw EvalError.at(pos, s"$name expected a number, got ${ValueSemantics.typeName(other)}")
-    }
-
-  private def unaryPredicate(name: String, args: List[Value], pos: SourcePos)(predicate: Value => Boolean): Value =
-    val values = requireArgCount(name, args, expected = 1, pos)
-    Value.BoolVal(predicate(values.head))
-
-  private def requirePair(name: String, value: Value, pos: SourcePos): (Value, Value) =
-    value match
-      case Value.PairVal(car, cdr) => (car, cdr)
-      case other =>
-        throw EvalError.at(pos, s"$name expected a pair, got ${ValueSemantics.typeName(other)}")
-
-  private def append(name: String, args: List[Value], pos: SourcePos): Value =
-    args match
-      case Nil =>
-        Value.EmptyList
-      case last :: Nil =>
-        ValueSemantics.toProperList(name, last, pos)
-        last
-      case _ =>
-        val last = args.last
-        ValueSemantics.toProperList(name, last, pos)
-        args.init.foldRight(last) { (listValue, acc) =>
-          ValueSemantics.toProperList(name, listValue, pos).foldRight(acc) { (item, tail) =>
-            Value.PairVal(item, tail)
-          }
-        }
-
-  private def requireArgCount[T](name: String, args: List[T], expected: Int, pos: SourcePos): List[T] =
-    if args.lengthCompare(expected) != 0 then
-      throw EvalError.at(pos, s"$name expects $expected argument(s), got ${args.length}")
-    args
-
-  private def requireMinArgs[T](name: String, args: List[T], min: Int, pos: SourcePos): List[T] =
-    if args.lengthCompare(min) < 0 then
-      throw EvalError.at(pos, s"$name expects at least $min argument(s), got ${args.length}")
-    args
+    loop(base, exponent, acc = 1)

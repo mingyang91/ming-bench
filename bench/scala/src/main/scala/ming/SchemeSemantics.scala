@@ -20,6 +20,44 @@ private[ming] object ValueSemantics:
         "procedure"
       case Value.Void => "void"
 
+  def isProperList(value: Value): Boolean =
+    @annotation.tailrec
+    def loop(current: Value): Boolean =
+      current match
+        case Value.EmptyList       => true
+        case Value.PairVal(_, cdr) => loop(cdr)
+        case _                     => false
+
+    loop(value)
+
+  def isEq(value1: Value, value2: Value): Boolean =
+    (value1, value2) match
+      case (Value.IntVal(left), Value.IntVal(right))       => left == right
+      case (Value.BoolVal(left), Value.BoolVal(right))     => left == right
+      case (Value.CharVal(left), Value.CharVal(right))     => left == right
+      case (Value.SymbolVal(left), Value.SymbolVal(right)) => left == right
+      case (Value.EmptyList, Value.EmptyList)              => true
+      case (Value.BuiltinProc(left), Value.BuiltinProc(right)) =>
+        left == right
+      case (Value.Void, Value.Void) => true
+      case (Value.StringVal(left), Value.StringVal(right)) =>
+        left eq right
+      case (leftPair @ Value.PairVal(_, _), rightPair @ Value.PairVal(_, _)) =>
+        leftPair eq rightPair
+      case (leftClosure @ Value.Closure(_, _, _, _, _), rightClosure @ Value.Closure(_, _, _, _, _)) =>
+        leftClosure eq rightClosure
+      case _ =>
+        false
+
+  def isEqual(value1: Value, value2: Value): Boolean =
+    (value1, value2) match
+      case (Value.StringVal(left), Value.StringVal(right)) =>
+        left.text == right.text
+      case (Value.PairVal(leftCar, leftCdr), Value.PairVal(rightCar, rightCdr)) =>
+        isEqual(leftCar, rightCar) && isEqual(leftCdr, rightCdr)
+      case _ =>
+        isEq(value1, value2)
+
   def quote(expr: Expr): Value =
     expr match
       case Expr.IntLit(value, _)    => Value.IntVal(value)
