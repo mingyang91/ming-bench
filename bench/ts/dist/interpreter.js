@@ -651,7 +651,7 @@ function createBuiltins(output, macroEnv) {
         builtin('<=', (args) => compareNumbers('<=', args, (left, right) => num.numericCompare(left, right) <= 0)),
         builtin('>=', (args) => compareNumbers('>=', args, (left, right) => num.numericCompare(left, right) >= 0)),
         builtin('abs', (args) => absoluteValue(args)),
-        builtin('apply', (args, position) => applyBuiltin(args, position, macroEnv)),
+        builtin('apply', (args, position, k) => applyBuiltin(args, position, macroEnv, k)),
         builtin('append', (args) => appendValues(args)),
         builtin('assoc', (args) => assocBuiltin(args)),
         builtin('assv', (args) => assvBuiltin(args)),
@@ -668,6 +668,8 @@ function createBuiltins(output, macroEnv) {
             assertExactArity('cddr', args, 1);
             return expectPair('cddr', expectPair('cddr', args[0]).cdr).cdr;
         }),
+        builtin('call-with-current-continuation', (args, position, k) => callCcBuiltin(args, position, k)),
+        builtin('call/cc', (args, position, k) => callCcBuiltin(args, position, k)),
         builtin('char-alphabetic?', (args) => {
             assertExactArity('char-alphabetic?', args, 1);
             return isAlphabeticChar(expectCharValue('char-alphabetic?', args[0]).value);
@@ -723,7 +725,7 @@ function createBuiltins(output, macroEnv) {
         }),
         builtin('exact?', (args) => unaryPredicate('exact?', args, (value) => num.isNumericValue(value) && num.isExactNumeric(value))),
         builtin('expt', (args) => exptNumbers(args)),
-        builtin('for-each', (args, position) => forEachBuiltin(args, position, macroEnv)),
+        builtin('for-each', (args, position, k) => forEachBuiltin(args, position, macroEnv, k)),
         builtin('gcd', (args) => gcdBuiltin(args)),
         builtin('inexact->exact', (args) => {
             assertExactArity('inexact->exact', args, 1);
@@ -759,7 +761,7 @@ function createBuiltins(output, macroEnv) {
         builtin('lcm', (args) => lcmBuiltin(args)),
         builtin('make-string', (args) => makeStringBuiltin(args)),
         builtin('make-vector', (args) => makeVectorBuiltin(args)),
-        builtin('map', (args, position) => mapBuiltin(args, position, macroEnv)),
+        builtin('map', (args, position, k) => mapBuiltin(args, position, macroEnv, k)),
         builtin('max', (args) => extremum('max', args, (left, right) => (num.numericCompare(left, right) >= 0 ? left : right))),
         builtin('member', (args) => memberBuiltin(args)),
         builtin('min', (args) => extremum('min', args, (left, right) => (num.numericCompare(left, right) <= 0 ? left : right))),
@@ -951,64 +953,105 @@ function createGlobalEnv(output, macroEnv) {
     }
     return env;
 }
+function doneStep(value) {
+    return { kind: 'done-step', value };
+}
+function isMachineStep(value) {
+    return (typeof value === 'object' &&
+        value !== null &&
+        (value.kind === 'eval-step' || value.kind === 'apply-step' || value.kind === 'done-step'));
+}
+function runMachine(step, macroEnv) {
+    let current = step;
+    while (true) {
+        switch (current.kind) {
+            case 'done-step':
+                return current.value;
+            case 'eval-step': {
+                const evalStep = current;
+                try {
+                    current = evalExprStep(evalStep.expr, evalStep.env, macroEnv, evalStep.k);
+                }
+                catch (error) {
+                    throw attachPosition(error, evalStep.expr.position);
+                }
+                break;
+            }
+            case 'apply-step': {
+                const applyStep = current;
+                try {
+                    current = applyProcedure(applyStep.proc, applyStep.args, applyStep.position, macroEnv, applyStep.k);
+                }
+                catch (error) {
+                    throw attachPosition(error, applyStep.position);
+                }
+                break;
+            }
+        }
+    }
+}
 function evalSequence(exprs, env, macroEnv) {
-    if (exprs.length === 0) {
-        return VOID;
-    }
-    for (const expr of exprs.slice(0, -1)) {
-        evalExpr(expr, env, macroEnv);
-    }
-    return evalExpr(exprs[exprs.length - 1], env, macroEnv);
-}
-function evalSequenceTail(exprs, env, macroEnv) {
-    if (exprs.length === 0) {
-        return VOID;
-    }
-    for (const expr of exprs.slice(0, -1)) {
-        evalExpr(expr, env, macroEnv);
-    }
-    return { kind: 'tail-step', expr: exprs[exprs.length - 1], env };
-}
-function isTailStep(result) {
-    return typeof result === 'object' && result !== null && result.kind === 'tail-step';
-}
-function resolveEvalResult(result, macroEnv) {
-    return isTailStep(result) ? evalExpr(result.expr, result.env, macroEnv) : result;
+    return runMachine(evalSequenceStep(exprs, env, macroEnv, doneStep), macroEnv);
 }
 function evalExpr(expr, env, macroEnv) {
-    let currentExpr = expr;
-    let currentEnv = env;
-    while (true) {
-        try {
-            const result = evalExprOnce(currentExpr, currentEnv, macroEnv);
-            if (isTailStep(result)) {
-                currentExpr = result.expr;
-                currentEnv = result.env;
-                continue;
-            }
-            return result;
-        }
-        catch (error) {
-            throw attachPosition(error, currentExpr.position);
-        }
-    }
+    return runMachine({ kind: 'eval-step', expr, env, k: doneStep }, macroEnv);
 }
-function evalExprOnce(expr, env, macroEnv) {
+function evalSequenceStep(exprs, env, macroEnv, k) {
+    if (exprs.length === 0) {
+        return k(VOID);
+    }
+    const [firstExpr, ...restExprs] = exprs;
+    if (restExprs.length === 0) {
+        return { kind: 'eval-step', expr: firstExpr, env, k };
+    }
+    return {
+        kind: 'eval-step',
+        expr: firstExpr,
+        env,
+        k: () => evalSequenceStep(restExprs, env, macroEnv, k),
+    };
+}
+function evalExprsStep(exprs, env, macroEnv, k, values = []) {
+    if (exprs.length === 0) {
+        return k([...values]);
+    }
+    const [firstExpr, ...restExprs] = exprs;
+    return {
+        kind: 'eval-step',
+        expr: firstExpr,
+        env,
+        k: (value) => evalExprsStep(restExprs, env, macroEnv, k, [...values, value]),
+    };
+}
+function evalCallArgsStep(exprs, env, macroEnv, k, values = []) {
+    if (exprs.length === 0) {
+        return k([...values]);
+    }
+    const lastIndex = exprs.length - 1;
+    const currentExpr = exprs[lastIndex];
+    return {
+        kind: 'eval-step',
+        expr: currentExpr,
+        env,
+        k: (value) => evalCallArgsStep(exprs.slice(0, lastIndex), env, macroEnv, k, [value, ...values]),
+    };
+}
+function evalExprStep(expr, env, macroEnv, k) {
     switch (expr.kind) {
         case 'number':
         case 'boolean':
-            return expr.value;
+            return k(expr.value);
         case 'string':
-            return makeRuntimeString(expr.value);
+            return k(makeRuntimeString(expr.value));
         case 'char':
-            return { kind: 'char', value: expr.value };
+            return k({ kind: 'char', value: expr.value });
         case 'symbol':
-            return env.lookup(expr.name);
+            return k(env.lookup(expr.name));
         case 'list':
-            return evalList(expr, env, macroEnv);
+            return evalListStep(expr, env, macroEnv, k);
     }
 }
-function evalList(expr, env, macroEnv) {
+function evalListStep(expr, env, macroEnv, k) {
     const { items } = expr;
     if (items.length === 0) {
         throw new EvalError('cannot evaluate empty list');
@@ -1017,70 +1060,95 @@ function evalList(expr, env, macroEnv) {
     if (first.kind === 'symbol') {
         switch (first.name) {
             case 'and':
-                return evalAnd(items.slice(1), env, macroEnv);
+                return evalAndStep(items.slice(1), env, macroEnv, k);
             case 'begin':
-                return evalSequenceTail(items.slice(1), env, macroEnv);
+                return evalSequenceStep(items.slice(1), env, macroEnv, k);
             case 'case':
-                return evalCase(items.slice(1), env, macroEnv);
+                return evalCaseStep(items.slice(1), env, macroEnv, k);
             case 'case-lambda':
-                return evalCaseLambda(items.slice(1), env);
+                return evalCaseLambdaStep(items.slice(1), env, k);
             case 'cond':
-                return evalCond(items.slice(1), env, macroEnv);
+                return evalCondStep(items.slice(1), env, macroEnv, k);
             case 'define':
-                return evalDefine(items.slice(1), env, macroEnv);
+                return evalDefineStep(items.slice(1), env, macroEnv, k);
             case 'define-record-type':
-                return evalDefineRecordType(items.slice(1), env);
+                return k(evalDefineRecordType(items.slice(1), env));
             case 'define-syntax':
-                return evalDefineSyntax(items.slice(1), env, macroEnv);
+                return evalDefineSyntaxStep(items.slice(1), env, macroEnv, k);
             case 'do':
-                return evalDo(items.slice(1), env, macroEnv);
+                return evalDoStep(items.slice(1), env, macroEnv, k);
             case 'if':
-                return evalIf(items.slice(1), env, macroEnv);
+                return evalIfStep(items.slice(1), env, macroEnv, k);
             case 'lambda':
-                return evalLambda(items.slice(1), env);
+                return evalLambdaStep(items.slice(1), env, k);
             case 'let':
-                return evalLet(items.slice(1), env, macroEnv);
+                return evalLetStep(items.slice(1), env, macroEnv, k);
             case 'let*':
-                return evalLetStar(items.slice(1), env, macroEnv);
+                return evalLetStarStep(items.slice(1), env, macroEnv, k);
             case 'letrec':
-                return evalLetRec(items.slice(1), env, macroEnv, false);
+                return evalLetRecStep(items.slice(1), env, macroEnv, false, k);
             case 'letrec*':
-                return evalLetRec(items.slice(1), env, macroEnv, true);
+                return evalLetRecStep(items.slice(1), env, macroEnv, true, k);
             case 'or':
-                return evalOr(items.slice(1), env, macroEnv);
+                return evalOrStep(items.slice(1), env, macroEnv, k);
             case 'quote':
-                return evalQuote(items.slice(1));
+                return evalQuoteStep(items.slice(1), k);
             case 'set!':
-                return evalSet(items.slice(1), env, macroEnv);
+                return evalSetStep(items.slice(1), env, macroEnv, k);
         }
         const macro = macroEnv.lookup(first.name);
         if (macro !== undefined) {
-            return { kind: 'tail-step', expr: expandMacroInvocation(macro, expr), env };
+            return {
+                kind: 'eval-step',
+                expr: expandMacroInvocation(macro, expr),
+                env,
+                k,
+            };
         }
     }
-    const proc = evalExpr(first, env, macroEnv);
-    if (!isProcedure(proc)) {
-        throw new EvalError('attempted to call a non-procedure');
-    }
-    const args = items.slice(1).map((item) => evalExpr(item, env, macroEnv));
-    return applyProcedure(proc, args, first.position, macroEnv);
+    return {
+        kind: 'eval-step',
+        expr: first,
+        env,
+        k: (proc) => {
+            if (!isProcedure(proc)) {
+                throw new EvalError('attempted to call a non-procedure');
+            }
+            return evalCallArgsStep(items.slice(1), env, macroEnv, (args) => ({
+                kind: 'apply-step',
+                proc,
+                args,
+                position: first.position,
+                k,
+            }));
+        },
+    };
 }
-function evalAnd(args, env, macroEnv) {
+function evalAndStep(args, env, macroEnv, k) {
     if (args.length === 0) {
-        return true;
+        return k(true);
     }
-    for (const arg of args.slice(0, -1)) {
-        const value = evalExpr(arg, env, macroEnv);
-        if (!isTruthy(value)) {
-            return value;
-        }
+    const [firstExpr, ...restExprs] = args;
+    if (restExprs.length === 0) {
+        return { kind: 'eval-step', expr: firstExpr, env, k };
     }
-    return { kind: 'tail-step', expr: args[args.length - 1], env };
+    return {
+        kind: 'eval-step',
+        expr: firstExpr,
+        env,
+        k: (value) => (!isTruthy(value) ? k(value) : evalAndStep(restExprs, env, macroEnv, k)),
+    };
 }
-function evalCase(args, env, macroEnv) {
+function evalCaseStep(args, env, macroEnv, k) {
     assertAtLeastArity('case', args, 1);
-    const key = evalExpr(args[0], env, macroEnv);
-    const clauses = args.slice(1);
+    return {
+        kind: 'eval-step',
+        expr: args[0],
+        env,
+        k: (key) => evalCaseClausesStep(key, args.slice(1), env, macroEnv, k),
+    };
+}
+function evalCaseClausesStep(key, clauses, env, macroEnv, k) {
     for (let index = 0; index < clauses.length; index += 1) {
         const clauseExpr = clauses[index];
         if (clauseExpr.kind !== 'list' || clauseExpr.items.length === 0) {
@@ -1091,57 +1159,73 @@ function evalCase(args, env, macroEnv) {
             if (index !== clauses.length - 1) {
                 throw new EvalError('case else clause must be last');
             }
-            return evalSequenceTail(body, env, macroEnv);
+            return evalSequenceStep(body, env, macroEnv, k);
         }
         if (headExpr.kind !== 'list') {
             throw new EvalError('case expects each clause datum list to be a list');
         }
         if (headExpr.items.some((datumExpr) => eqvValues(key, quoteExpr(datumExpr)))) {
-            return evalSequenceTail(body, env, macroEnv);
+            return evalSequenceStep(body, env, macroEnv, k);
         }
     }
-    return VOID;
+    return k(VOID);
 }
-function evalCond(clauses, env, macroEnv) {
-    for (let index = 0; index < clauses.length; index += 1) {
-        const clauseExpr = clauses[index];
-        if (clauseExpr.kind !== 'list' || clauseExpr.items.length === 0) {
-            throw new EvalError('cond expects non-empty clauses');
-        }
-        const [testExpr, ...body] = clauseExpr.items;
-        if (testExpr.kind === 'symbol' && testExpr.name === 'else') {
-            if (index !== clauses.length - 1) {
-                throw new EvalError('cond else clause must be last');
-            }
-            return evalSequenceTail(body, env, macroEnv);
-        }
-        const testValue = evalExpr(testExpr, env, macroEnv);
-        if (isTruthy(testValue)) {
-            return body.length === 0 ? testValue : evalSequenceTail(body, env, macroEnv);
-        }
+function evalCondStep(clauses, env, macroEnv, k) {
+    if (clauses.length === 0) {
+        return k(VOID);
     }
-    return VOID;
+    const [clauseExpr, ...restClauses] = clauses;
+    if (clauseExpr.kind !== 'list' || clauseExpr.items.length === 0) {
+        throw new EvalError('cond expects non-empty clauses');
+    }
+    const [testExpr, ...body] = clauseExpr.items;
+    if (testExpr.kind === 'symbol' && testExpr.name === 'else') {
+        if (restClauses.length !== 0) {
+            throw new EvalError('cond else clause must be last');
+        }
+        return evalSequenceStep(body, env, macroEnv, k);
+    }
+    return {
+        kind: 'eval-step',
+        expr: testExpr,
+        env,
+        k: (testValue) => isTruthy(testValue)
+            ? body.length === 0
+                ? k(testValue)
+                : evalSequenceStep(body, env, macroEnv, k)
+            : evalCondStep(restClauses, env, macroEnv, k),
+    };
 }
-function evalOr(args, env, macroEnv) {
+function evalOrStep(args, env, macroEnv, k) {
     if (args.length === 0) {
-        return false;
+        return k(false);
     }
-    for (const arg of args.slice(0, -1)) {
-        const value = evalExpr(arg, env, macroEnv);
-        if (isTruthy(value)) {
-            return value;
-        }
+    const [firstExpr, ...restExprs] = args;
+    if (restExprs.length === 0) {
+        return { kind: 'eval-step', expr: firstExpr, env, k };
     }
-    return { kind: 'tail-step', expr: args[args.length - 1], env };
+    return {
+        kind: 'eval-step',
+        expr: firstExpr,
+        env,
+        k: (value) => (isTruthy(value) ? k(value) : evalOrStep(restExprs, env, macroEnv, k)),
+    };
 }
-function evalDefine(args, env, macroEnv) {
+function evalDefineStep(args, env, macroEnv, k) {
     assertAtLeastArity('define', args, 2);
     const target = args[0];
     const body = args.slice(1);
     if (target.kind === 'symbol') {
         assertExactArity('define', body, 1);
-        env.define(target.name, evalExpr(body[0], env, macroEnv));
-        return VOID;
+        return {
+            kind: 'eval-step',
+            expr: body[0],
+            env,
+            k: (value) => {
+                env.define(target.name, value);
+                return k(VOID);
+            },
+        };
     }
     if (target.kind === 'list' && target.items.length > 0) {
         const nameExpr = target.items[0];
@@ -1156,18 +1240,18 @@ function evalDefine(args, env, macroEnv) {
             body,
             env,
         });
-        return VOID;
+        return k(VOID);
     }
     throw new EvalError('define expects a symbol name');
 }
-function evalDefineSyntax(args, env, macroEnv) {
+function evalDefineSyntaxStep(args, env, macroEnv, k) {
     assertExactArity('define-syntax', args, 2);
     const nameExpr = args[0];
     if (nameExpr.kind !== 'symbol') {
         throw new EvalError('define-syntax expects a symbol name');
     }
     macroEnv.define(nameExpr.name, parseSyntaxRules(nameExpr.name, args[1], env));
-    return VOID;
+    return k(VOID);
 }
 function evalDefineRecordType(args, env) {
     assertAtLeastArity('define-record-type', args, 3);
@@ -1236,62 +1320,80 @@ function evalDefineRecordType(args, env) {
     });
     return VOID;
 }
-function evalIf(args, env, macroEnv) {
+function evalIfStep(args, env, macroEnv, k) {
     if (args.length !== 2 && args.length !== 3) {
         throw new EvalError('if expects 2 or 3 argument(s)');
     }
     const [conditionExpr, thenExpr, elseExpr] = args;
-    return isTruthy(evalExpr(conditionExpr, env, macroEnv))
-        ? { kind: 'tail-step', expr: thenExpr, env }
-        : elseExpr === undefined
-            ? VOID
-            : { kind: 'tail-step', expr: elseExpr, env };
-}
-function evalCaseLambda(args, env) {
-    assertAtLeastArity('case-lambda', args, 1);
     return {
+        kind: 'eval-step',
+        expr: conditionExpr,
+        env,
+        k: (conditionValue) => isTruthy(conditionValue)
+            ? { kind: 'eval-step', expr: thenExpr, env, k }
+            : elseExpr === undefined
+                ? k(VOID)
+                : { kind: 'eval-step', expr: elseExpr, env, k },
+    };
+}
+function evalCaseLambdaStep(args, env, k) {
+    assertAtLeastArity('case-lambda', args, 1);
+    return k({
         kind: 'case-lambda',
         clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr)),
         env,
-    };
+    });
 }
-function evalLambda(args, env) {
+function evalLambdaStep(args, env, k) {
     assertAtLeastArity('lambda', args, 2);
     const paramsExpr = args[0];
-    return {
+    return k({
         kind: 'lambda',
         params: parseFormals(paramsExpr),
         body: args.slice(1),
         env,
-    };
+    });
 }
-function evalLet(args, env, macroEnv) {
+function evalLetStep(args, env, macroEnv, k) {
     assertAtLeastArity('let', args, 2);
     const firstArg = args[0];
     if (firstArg.kind === 'symbol') {
         assertAtLeastArity('let', args, 3);
-        return evalNamedLet(firstArg.name, args[1], args.slice(2), env, macroEnv);
+        return evalNamedLetStep(firstArg.name, args[1], args.slice(2), env, macroEnv, k);
     }
     const bindings = parseBindings(firstArg);
     const body = args.slice(1);
-    const values = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
-    const letEnv = new Env(env);
-    bindings.forEach((binding, index) => {
-        letEnv.define(binding.name, values[index]);
+    return evalExprsStep(bindings.map((binding) => binding.init), env, macroEnv, (values) => {
+        const letEnv = new Env(env);
+        bindings.forEach((binding, index) => {
+            letEnv.define(binding.name, values[index]);
+        });
+        return evalSequenceStep(body, letEnv, macroEnv, k);
     });
-    return evalSequenceTail(body, letEnv, macroEnv);
 }
-function evalLetStar(args, env, macroEnv) {
+function evalLetStarStep(args, env, macroEnv, k) {
     assertAtLeastArity('let*', args, 2);
     const bindings = parseBindings(args[0], 'let*');
     const body = args.slice(1);
     const letStarEnv = new Env(env);
-    for (const binding of bindings) {
-        letStarEnv.define(binding.name, evalExpr(binding.init, letStarEnv, macroEnv));
-    }
-    return evalSequenceTail(body, letStarEnv, macroEnv);
+    return evalLetStarBindingsStep(bindings, 0, letStarEnv, body, macroEnv, k);
 }
-function evalLetRec(args, env, macroEnv, sequential) {
+function evalLetStarBindingsStep(bindings, index, letStarEnv, body, macroEnv, k) {
+    if (index >= bindings.length) {
+        return evalSequenceStep(body, letStarEnv, macroEnv, k);
+    }
+    const binding = bindings[index];
+    return {
+        kind: 'eval-step',
+        expr: binding.init,
+        env: letStarEnv,
+        k: (value) => {
+            letStarEnv.define(binding.name, value);
+            return evalLetStarBindingsStep(bindings, index + 1, letStarEnv, body, macroEnv, k);
+        },
+    };
+}
+function evalLetRecStep(args, env, macroEnv, sequential, k) {
     const name = sequential ? 'letrec*' : 'letrec';
     assertAtLeastArity(name, args, 2);
     const bindings = parseBindings(args[0], name);
@@ -1301,65 +1403,111 @@ function evalLetRec(args, env, macroEnv, sequential) {
         letEnv.defineUninitialized(binding.name);
     });
     if (sequential) {
-        for (const binding of bindings) {
-            letEnv.set(binding.name, evalExpr(binding.init, letEnv, macroEnv));
-        }
+        return evalLetRecSequentialStep(bindings, 0, letEnv, body, macroEnv, k);
     }
-    else {
-        const values = bindings.map((binding) => evalExpr(binding.init, letEnv, macroEnv));
+    return evalExprsStep(bindings.map((binding) => binding.init), letEnv, macroEnv, (values) => {
         bindings.forEach((binding, index) => {
             letEnv.set(binding.name, values[index]);
         });
+        return evalSequenceStep(body, letEnv, macroEnv, k);
+    });
+}
+function evalLetRecSequentialStep(bindings, index, letEnv, body, macroEnv, k) {
+    if (index >= bindings.length) {
+        return evalSequenceStep(body, letEnv, macroEnv, k);
     }
-    return evalSequenceTail(body, letEnv, macroEnv);
-}
-function evalNamedLet(name, bindingsExpr, body, env, macroEnv) {
-    const bindings = parseBindings(bindingsExpr);
-    const values = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
-    const letEnv = new Env(env);
-    const proc = {
-        kind: 'lambda',
-        name,
-        params: { required: bindings.map((binding) => binding.name) },
-        body,
+    const binding = bindings[index];
+    return {
+        kind: 'eval-step',
+        expr: binding.init,
         env: letEnv,
+        k: (value) => {
+            letEnv.set(binding.name, value);
+            return evalLetRecSequentialStep(bindings, index + 1, letEnv, body, macroEnv, k);
+        },
     };
-    letEnv.define(name, proc);
-    return applyProcedure(proc, values, bindingsExpr.position, macroEnv);
 }
-function evalDo(args, env, macroEnv) {
+function evalNamedLetStep(name, bindingsExpr, body, env, macroEnv, k) {
+    const bindings = parseBindings(bindingsExpr);
+    return evalExprsStep(bindings.map((binding) => binding.init), env, macroEnv, (values) => {
+        const letEnv = new Env(env);
+        const proc = {
+            kind: 'lambda',
+            name,
+            params: { required: bindings.map((binding) => binding.name) },
+            body,
+            env: letEnv,
+        };
+        letEnv.define(name, proc);
+        return {
+            kind: 'apply-step',
+            proc,
+            args: values,
+            position: bindingsExpr.position,
+            k,
+        };
+    });
+}
+function evalDoStep(args, env, macroEnv, k) {
     assertAtLeastArity('do', args, 2);
     const bindings = parseDoBindings(args[0]);
     const testClause = parseDoTestClause(args[1]);
     const body = args.slice(2);
-    const initialValues = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
-    const doEnv = new Env(env);
-    bindings.forEach((binding, index) => {
-        doEnv.define(binding.name, initialValues[index]);
-    });
-    while (true) {
-        if (isTruthy(evalExpr(testClause.test, doEnv, macroEnv))) {
-            return evalSequenceTail(testClause.results, doEnv, macroEnv);
-        }
-        evalSequence(body, doEnv, macroEnv);
-        const nextValues = bindings.map((binding) => binding.step === undefined ? doEnv.lookup(binding.name) : evalExpr(binding.step, doEnv, macroEnv));
+    return evalExprsStep(bindings.map((binding) => binding.init), env, macroEnv, (initialValues) => {
+        const doEnv = new Env(env);
         bindings.forEach((binding, index) => {
-            doEnv.set(binding.name, nextValues[index]);
+            doEnv.define(binding.name, initialValues[index]);
         });
+        return evalDoLoopStep(bindings, testClause, body, doEnv, macroEnv, k);
+    });
+}
+function evalDoLoopStep(bindings, testClause, body, doEnv, macroEnv, k) {
+    return {
+        kind: 'eval-step',
+        expr: testClause.test,
+        env: doEnv,
+        k: (testValue) => isTruthy(testValue)
+            ? evalSequenceStep(testClause.results, doEnv, macroEnv, k)
+            : evalSequenceStep(body, doEnv, macroEnv, () => evalDoNextValuesStep(bindings, 0, [], doEnv, testClause, body, macroEnv, k)),
+    };
+}
+function evalDoNextValuesStep(bindings, index, values, doEnv, testClause, body, macroEnv, k) {
+    if (index >= bindings.length) {
+        bindings.forEach((binding, bindingIndex) => {
+            doEnv.set(binding.name, values[bindingIndex]);
+        });
+        return evalDoLoopStep(bindings, testClause, body, doEnv, macroEnv, k);
     }
+    const binding = bindings[index];
+    if (binding.step === undefined) {
+        return evalDoNextValuesStep(bindings, index + 1, [...values, doEnv.lookup(binding.name)], doEnv, testClause, body, macroEnv, k);
+    }
+    return {
+        kind: 'eval-step',
+        expr: binding.step,
+        env: doEnv,
+        k: (value) => evalDoNextValuesStep(bindings, index + 1, [...values, value], doEnv, testClause, body, macroEnv, k),
+    };
 }
-function evalQuote(args) {
+function evalQuoteStep(args, k) {
     assertExactArity('quote', args, 1);
-    return quoteExpr(args[0]);
+    return k(quoteExpr(args[0]));
 }
-function evalSet(args, env, macroEnv) {
+function evalSetStep(args, env, macroEnv, k) {
     assertExactArity('set!', args, 2);
     const target = args[0];
     if (target.kind !== 'symbol') {
         throw new EvalError('set! expects a symbol name');
     }
-    env.set(target.name, evalExpr(args[1], env, macroEnv));
-    return VOID;
+    return {
+        kind: 'eval-step',
+        expr: args[1],
+        env,
+        k: (value) => {
+            env.set(target.name, value);
+            return k(VOID);
+        },
+    };
 }
 function parseFormals(expr) {
     if (expr.kind === 'symbol') {
@@ -1500,25 +1648,25 @@ function quoteExpr(expr) {
             return makeList(expr.items.map((item) => quoteExpr(item)));
     }
 }
-function applyProcedure(proc, args, position, macroEnv) {
-    try {
-        if (proc.kind === 'builtin') {
-            return proc.apply(args, position);
-        }
-        if (proc.kind === 'lambda') {
-            return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv);
-        }
-        const clause = proc.clauses.find((candidate) => procedureArityMatches(args, candidate.params));
-        if (clause === undefined) {
-            throw new EvalError(`${proc.name ?? 'case-lambda'} has no matching clause for ${args.length} argument(s)`);
-        }
-        return applyProcedureClause(proc.name ?? 'case-lambda', proc.env, clause, args, macroEnv);
+function applyProcedure(proc, args, position, macroEnv, k) {
+    if (proc.kind === 'builtin') {
+        const result = proc.apply(args, position, k);
+        return isMachineStep(result) ? result : k(result);
     }
-    catch (error) {
-        throw attachPosition(error, position);
+    if (proc.kind === 'continuation') {
+        assertExactArity('continuation', args, 1);
+        return proc.resume(args[0]);
     }
+    if (proc.kind === 'lambda') {
+        return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv, k);
+    }
+    const clause = proc.clauses.find((candidate) => procedureArityMatches(args, candidate.params));
+    if (clause === undefined) {
+        throw new EvalError(`${proc.name ?? 'case-lambda'} has no matching clause for ${args.length} argument(s)`);
+    }
+    return applyProcedureClause(proc.name ?? 'case-lambda', proc.env, clause, args, macroEnv, k);
 }
-function applyProcedureClause(name, env, clause, args, macroEnv) {
+function applyProcedureClause(name, env, clause, args, macroEnv, k) {
     assertProcedureArity(name, args, clause.params);
     const callEnv = new Env(env);
     clause.params.required.forEach((param, index) => {
@@ -1527,12 +1675,26 @@ function applyProcedureClause(name, env, clause, args, macroEnv) {
     if (clause.params.rest !== undefined) {
         callEnv.define(clause.params.rest, makeList(args.slice(clause.params.required.length)));
     }
-    return evalSequenceTail(clause.body, callEnv, macroEnv);
+    return evalSequenceStep(clause.body, callEnv, macroEnv, k);
 }
 function builtin(name, apply) {
     return [name, { kind: 'builtin', name, apply }];
 }
-function applyBuiltin(args, position, macroEnv) {
+function callCcBuiltin(args, position, k) {
+    assertExactArity('call/cc', args, 1);
+    const proc = args[0];
+    if (!isProcedure(proc)) {
+        throw new EvalError('call/cc expects a procedure');
+    }
+    return {
+        kind: 'apply-step',
+        proc,
+        args: [{ kind: 'continuation', resume: k }],
+        position,
+        k,
+    };
+}
+function applyBuiltin(args, position, macroEnv, k) {
     assertAtLeastArity('apply', args, 2);
     const proc = args[0];
     if (!isProcedure(proc)) {
@@ -1540,7 +1702,7 @@ function applyBuiltin(args, position, macroEnv) {
     }
     const prefixArgs = args.slice(1, -1);
     const listArgs = expectProperList('apply', args[args.length - 1]);
-    return applyProcedure(proc, [...prefixArgs, ...listArgs], position, macroEnv);
+    return applyProcedure(proc, [...prefixArgs, ...listArgs], position, macroEnv, k);
 }
 function absoluteValue(args) {
     assertExactArity('abs', args, 1);
@@ -1854,92 +2016,93 @@ function isProperListValue(value) {
     }
     return isEmptyList(current);
 }
-function mapBuiltin(args, position, macroEnv) {
+function mapBuiltin(args, position, macroEnv, k) {
     assertAtLeastArity('map', args, 2);
     const proc = args[0];
     if (!isProcedure(proc)) {
         throw new EvalError('map expects a procedure');
     }
-    const currentLists = args.slice(1);
-    const seenLists = currentLists.map(() => new Set());
-    const results = [];
-    while (true) {
-        let sawEmpty = false;
-        let sawPair = false;
-        for (const current of currentLists) {
-            if (isEmptyList(current)) {
-                sawEmpty = true;
-                continue;
-            }
-            if (!isPair(current)) {
-                throw new EvalError('map expects proper list arguments');
-            }
-            sawPair = true;
-        }
-        if (sawEmpty) {
-            if (sawPair) {
-                throw new EvalError('map expects lists of equal length');
-            }
-            return makeList(results);
-        }
-        const elementArgs = [];
-        for (let index = 0; index < currentLists.length; index += 1) {
-            const current = currentLists[index];
-            if (!isPair(current)) {
-                throw new EvalError('map expects proper list arguments');
-            }
-            if (seenLists[index].has(current)) {
-                throw new EvalError('map expects proper list arguments');
-            }
-            seenLists[index].add(current);
-            elementArgs.push(current.car);
-            currentLists[index] = current.cdr;
-        }
-        results.push(resolveEvalResult(applyProcedure(proc, elementArgs, position, macroEnv), macroEnv));
-    }
+    return mapLoopStep(proc, args.slice(1), args.slice(1).map(() => new Set()), [], position, macroEnv, k);
 }
-function forEachBuiltin(args, position, macroEnv) {
+function mapLoopStep(proc, currentLists, seenLists, results, position, macroEnv, k) {
+    let sawEmpty = false;
+    let sawPair = false;
+    for (const current of currentLists) {
+        if (isEmptyList(current)) {
+            sawEmpty = true;
+            continue;
+        }
+        if (!isPair(current)) {
+            throw new EvalError('map expects proper list arguments');
+        }
+        sawPair = true;
+    }
+    if (sawEmpty) {
+        if (sawPair) {
+            throw new EvalError('map expects lists of equal length');
+        }
+        return k(makeList([...results]));
+    }
+    const elementArgs = [];
+    const nextLists = [...currentLists];
+    const nextSeenLists = seenLists.map((seen) => new Set(seen));
+    for (let index = 0; index < currentLists.length; index += 1) {
+        const current = currentLists[index];
+        if (!isPair(current)) {
+            throw new EvalError('map expects proper list arguments');
+        }
+        if (nextSeenLists[index].has(current)) {
+            throw new EvalError('map expects proper list arguments');
+        }
+        nextSeenLists[index].add(current);
+        elementArgs.push(current.car);
+        nextLists[index] = current.cdr;
+    }
+    return applyProcedure(proc, elementArgs, position, macroEnv, (value) => mapLoopStep(proc, nextLists, nextSeenLists, [...results, value], position, macroEnv, k));
+}
+function forEachBuiltin(args, position, macroEnv, k) {
     assertAtLeastArity('for-each', args, 2);
     const proc = args[0];
     if (!isProcedure(proc)) {
         throw new EvalError('for-each expects a procedure');
     }
-    const currentLists = args.slice(1);
-    const seenLists = currentLists.map(() => new Set());
-    while (true) {
-        let sawEmpty = false;
-        let sawPair = false;
-        for (const current of currentLists) {
-            if (isEmptyList(current)) {
-                sawEmpty = true;
-                continue;
-            }
-            if (!isPair(current)) {
-                throw new EvalError('for-each expects proper list arguments');
-            }
-            sawPair = true;
+    return forEachLoopStep(proc, args.slice(1), args.slice(1).map(() => new Set()), position, macroEnv, k);
+}
+function forEachLoopStep(proc, currentLists, seenLists, position, macroEnv, k) {
+    let sawEmpty = false;
+    let sawPair = false;
+    for (const current of currentLists) {
+        if (isEmptyList(current)) {
+            sawEmpty = true;
+            continue;
         }
-        if (sawEmpty) {
-            if (sawPair) {
-                throw new EvalError('for-each expects lists of equal length');
-            }
-            return VOID;
+        if (!isPair(current)) {
+            throw new EvalError('for-each expects proper list arguments');
         }
-        const elementArgs = [];
-        for (let index = 0; index < currentLists.length; index += 1) {
-            const current = currentLists[index];
-            if (!isPair(current)) {
-                throw new EvalError('for-each expects proper list arguments');
-            }
-            if (seenLists[index].has(current)) {
-                throw new EvalError('for-each expects proper list arguments');
-            }
-            seenLists[index].add(current);
-            elementArgs.push(current.car);
-            currentLists[index] = current.cdr;
-        }
-        resolveEvalResult(applyProcedure(proc, elementArgs, position, macroEnv), macroEnv);
+        sawPair = true;
     }
+    if (sawEmpty) {
+        if (sawPair) {
+            throw new EvalError('for-each expects lists of equal length');
+        }
+        return k(VOID);
+    }
+    const elementArgs = [];
+    const nextLists = [...currentLists];
+    const nextSeenLists = seenLists.map((seen) => new Set(seen));
+    for (let index = 0; index < currentLists.length; index += 1) {
+        const current = currentLists[index];
+        if (!isPair(current)) {
+            throw new EvalError('for-each expects proper list arguments');
+        }
+        if (nextSeenLists[index].has(current)) {
+            throw new EvalError('for-each expects proper list arguments');
+        }
+        nextSeenLists[index].add(current);
+        elementArgs.push(current.car);
+        nextLists[index] = current.cdr;
+    }
+    return applyProcedure(proc, elementArgs, position, macroEnv, () => forEachLoopStep(proc, nextLists, nextSeenLists, position, macroEnv, k));
 }
 function memberBuiltin(args) {
     assertExactArity('member', args, 2);
@@ -2153,6 +2316,8 @@ function formatValueWithMode(value, mode, state) {
             return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
         case 'case-lambda':
             return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+        case 'continuation':
+            return '#<procedure>';
     }
 }
 function formatPairContents(pair, mode, state) {
@@ -2317,7 +2482,7 @@ function isTruthy(value) {
 function isProcedure(value) {
     return (typeof value === 'object' &&
         value !== null &&
-        (value.kind === 'builtin' || value.kind === 'lambda' || value.kind === 'case-lambda'));
+        (value.kind === 'builtin' || value.kind === 'lambda' || value.kind === 'case-lambda' || value.kind === 'continuation'));
 }
 function isPair(value) {
     return typeof value === 'object' && value !== null && value.kind === 'pair';

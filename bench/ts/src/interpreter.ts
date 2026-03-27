@@ -19,10 +19,11 @@ type PairValue = { kind: 'pair'; car: Value; cdr: Value };
 type VectorValue = { kind: 'vector'; items: Value[] };
 type VoidValue = { kind: 'void' };
 type TailStep = { kind: 'tail-step'; expr: Expr; env: Env };
+type ContinuationFn = (value: Value) => MachineStep;
 type BuiltinProc = {
   kind: 'builtin';
   name: string;
-  apply: (args: Value[], position: SourcePosition) => EvalResult;
+  apply: (args: Value[], position: SourcePosition, k: ContinuationFn) => Value | MachineStep;
 };
 type PatternCapture =
   | { kind: 'single'; expr: Expr }
@@ -69,6 +70,10 @@ type CaseLambdaProc = {
   clauses: ProcedureClause[];
   env: Env;
 };
+type ContinuationValue = {
+  kind: 'continuation';
+  resume: ContinuationFn;
+};
 type RecordFieldSpec = {
   name: string;
   accessor: string;
@@ -98,7 +103,13 @@ type Value =
   | VoidValue
   | BuiltinProc
   | UserProc
-  | CaseLambdaProc;
+  | CaseLambdaProc
+  | ContinuationValue;
+type ProcedureValue = BuiltinProc | UserProc | CaseLambdaProc | ContinuationValue;
+type MachineStep =
+  | { kind: 'eval-step'; expr: Expr; env: Env; k: ContinuationFn }
+  | { kind: 'apply-step'; proc: ProcedureValue; args: Value[]; position: SourcePosition; k: ContinuationFn }
+  | { kind: 'done-step'; value: Value };
 type EvalResult = Value | TailStep;
 
 type BindingSpec = { name: string; init: Expr };
@@ -911,7 +922,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('<=', (args) => compareNumbers('<=', args, (left, right) => num.numericCompare(left, right) <= 0)),
     builtin('>=', (args) => compareNumbers('>=', args, (left, right) => num.numericCompare(left, right) >= 0)),
     builtin('abs', (args) => absoluteValue(args)),
-    builtin('apply', (args, position) => applyBuiltin(args, position, macroEnv)),
+    builtin('apply', (args, position, k) => applyBuiltin(args, position, macroEnv, k)),
     builtin('append', (args) => appendValues(args)),
     builtin('assoc', (args) => assocBuiltin(args)),
     builtin('assv', (args) => assvBuiltin(args)),
@@ -928,6 +939,8 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       assertExactArity('cddr', args, 1);
       return expectPair('cddr', expectPair('cddr', args[0]!).cdr).cdr;
     }),
+    builtin('call-with-current-continuation', (args, position, k) => callCcBuiltin(args, position, k)),
+    builtin('call/cc', (args, position, k) => callCcBuiltin(args, position, k)),
     builtin('char-alphabetic?', (args) => {
       assertExactArity('char-alphabetic?', args, 1);
       return isAlphabeticChar(expectCharValue('char-alphabetic?', args[0]!).value);
@@ -985,7 +998,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       unaryPredicate('exact?', args, (value) => num.isNumericValue(value) && num.isExactNumeric(value)),
     ),
     builtin('expt', (args) => exptNumbers(args)),
-    builtin('for-each', (args, position) => forEachBuiltin(args, position, macroEnv)),
+    builtin('for-each', (args, position, k) => forEachBuiltin(args, position, macroEnv, k)),
     builtin('gcd', (args) => gcdBuiltin(args)),
     builtin('inexact->exact', (args) => {
       assertExactArity('inexact->exact', args, 1);
@@ -1027,7 +1040,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('lcm', (args) => lcmBuiltin(args)),
     builtin('make-string', (args) => makeStringBuiltin(args)),
     builtin('make-vector', (args) => makeVectorBuiltin(args)),
-    builtin('map', (args, position) => mapBuiltin(args, position, macroEnv)),
+    builtin('map', (args, position, k) => mapBuiltin(args, position, macroEnv, k)),
     builtin('max', (args) =>
       extremum('max', args, (left, right) => (num.numericCompare(left, right) >= 0 ? left : right)),
     ),
@@ -1232,79 +1245,142 @@ function createGlobalEnv(output: OutputBuffer, macroEnv: MacroEnv): Env {
   return env;
 }
 
-function evalSequence(exprs: Expr[], env: Env, macroEnv: MacroEnv): Value {
-  if (exprs.length === 0) {
-    return VOID;
-  }
-
-  for (const expr of exprs.slice(0, -1)) {
-    evalExpr(expr, env, macroEnv);
-  }
-
-  return evalExpr(exprs[exprs.length - 1]!, env, macroEnv);
+function doneStep(value: Value): MachineStep {
+  return { kind: 'done-step', value };
 }
 
-function evalSequenceTail(exprs: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
-  if (exprs.length === 0) {
-    return VOID;
-  }
-
-  for (const expr of exprs.slice(0, -1)) {
-    evalExpr(expr, env, macroEnv);
-  }
-
-  return { kind: 'tail-step', expr: exprs[exprs.length - 1]!, env };
+function isMachineStep(value: Value | MachineStep): value is MachineStep {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value.kind === 'eval-step' || value.kind === 'apply-step' || value.kind === 'done-step')
+  );
 }
 
-function isTailStep(result: EvalResult): result is TailStep {
-  return typeof result === 'object' && result !== null && result.kind === 'tail-step';
-}
-
-function resolveEvalResult(result: EvalResult, macroEnv: MacroEnv): Value {
-  return isTailStep(result) ? evalExpr(result.expr, result.env, macroEnv) : result;
-}
-
-function evalExpr(expr: Expr, env: Env, macroEnv: MacroEnv): Value {
-  let currentExpr = expr;
-  let currentEnv = env;
+function runMachine(step: MachineStep, macroEnv: MacroEnv): Value {
+  let current = step;
 
   while (true) {
-    try {
-      const result = evalExprOnce(currentExpr, currentEnv, macroEnv);
-      if (isTailStep(result)) {
-        currentExpr = result.expr;
-        currentEnv = result.env;
-        continue;
+    switch (current.kind) {
+      case 'done-step':
+        return current.value;
+
+      case 'eval-step': {
+        const evalStep = current;
+        try {
+          current = evalExprStep(evalStep.expr, evalStep.env, macroEnv, evalStep.k);
+        } catch (error) {
+          throw attachPosition(error, evalStep.expr.position);
+        }
+        break;
       }
 
-      return result;
-    } catch (error) {
-      throw attachPosition(error, currentExpr.position);
+      case 'apply-step': {
+        const applyStep = current;
+        try {
+          current = applyProcedure(applyStep.proc, applyStep.args, applyStep.position, macroEnv, applyStep.k);
+        } catch (error) {
+          throw attachPosition(error, applyStep.position);
+        }
+        break;
+      }
     }
   }
 }
 
-function evalExprOnce(expr: Expr, env: Env, macroEnv: MacroEnv): EvalResult {
+function evalSequence(exprs: Expr[], env: Env, macroEnv: MacroEnv): Value {
+  return runMachine(evalSequenceStep(exprs, env, macroEnv, doneStep), macroEnv);
+}
+
+function evalExpr(expr: Expr, env: Env, macroEnv: MacroEnv): Value {
+  return runMachine({ kind: 'eval-step', expr, env, k: doneStep }, macroEnv);
+}
+
+function evalSequenceStep(exprs: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
+  if (exprs.length === 0) {
+    return k(VOID);
+  }
+
+  const [firstExpr, ...restExprs] = exprs;
+  if (restExprs.length === 0) {
+    return { kind: 'eval-step', expr: firstExpr!, env, k };
+  }
+
+  return {
+    kind: 'eval-step',
+    expr: firstExpr!,
+    env,
+    k: () => evalSequenceStep(restExprs, env, macroEnv, k),
+  };
+}
+
+function evalExprsStep(
+  exprs: readonly Expr[],
+  env: Env,
+  macroEnv: MacroEnv,
+  k: (values: Value[]) => MachineStep,
+  values: readonly Value[] = [],
+): MachineStep {
+  if (exprs.length === 0) {
+    return k([...values]);
+  }
+
+  const [firstExpr, ...restExprs] = exprs;
+  return {
+    kind: 'eval-step',
+    expr: firstExpr!,
+    env,
+    k: (value) => evalExprsStep(restExprs, env, macroEnv, k, [...values, value]),
+  };
+}
+
+function evalCallArgsStep(
+  exprs: readonly Expr[],
+  env: Env,
+  macroEnv: MacroEnv,
+  k: (values: Value[]) => MachineStep,
+  values: readonly Value[] = [],
+): MachineStep {
+  if (exprs.length === 0) {
+    return k([...values]);
+  }
+
+  const lastIndex = exprs.length - 1;
+  const currentExpr = exprs[lastIndex]!;
+  return {
+    kind: 'eval-step',
+    expr: currentExpr,
+    env,
+    k: (value) => evalCallArgsStep(exprs.slice(0, lastIndex), env, macroEnv, k, [value, ...values]),
+  };
+}
+
+function evalExprStep(expr: Expr, env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   switch (expr.kind) {
     case 'number':
     case 'boolean':
-      return expr.value;
+      return k(expr.value);
 
     case 'string':
-      return makeRuntimeString(expr.value);
+      return k(makeRuntimeString(expr.value));
 
     case 'char':
-      return { kind: 'char', value: expr.value };
+      return k({ kind: 'char', value: expr.value });
 
     case 'symbol':
-      return env.lookup(expr.name);
+      return k(env.lookup(expr.name));
 
     case 'list':
-      return evalList(expr, env, macroEnv);
+      return evalListStep(expr, env, macroEnv, k);
   }
 }
 
-function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, macroEnv: MacroEnv): EvalResult {
+function evalListStep(
+  expr: ExprBase & { kind: 'list'; items: Expr[] },
+  env: Env,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
   const { items } = expr;
   if (items.length === 0) {
     throw new EvalError('cannot evaluate empty list');
@@ -1314,79 +1390,110 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
   if (first.kind === 'symbol') {
     switch (first.name) {
       case 'and':
-        return evalAnd(items.slice(1), env, macroEnv);
+        return evalAndStep(items.slice(1), env, macroEnv, k);
       case 'begin':
-        return evalSequenceTail(items.slice(1), env, macroEnv);
+        return evalSequenceStep(items.slice(1), env, macroEnv, k);
       case 'case':
-        return evalCase(items.slice(1), env, macroEnv);
+        return evalCaseStep(items.slice(1), env, macroEnv, k);
       case 'case-lambda':
-        return evalCaseLambda(items.slice(1), env);
+        return evalCaseLambdaStep(items.slice(1), env, k);
       case 'cond':
-        return evalCond(items.slice(1), env, macroEnv);
+        return evalCondStep(items.slice(1), env, macroEnv, k);
       case 'define':
-        return evalDefine(items.slice(1), env, macroEnv);
+        return evalDefineStep(items.slice(1), env, macroEnv, k);
       case 'define-record-type':
-        return evalDefineRecordType(items.slice(1), env);
+        return k(evalDefineRecordType(items.slice(1), env));
       case 'define-syntax':
-        return evalDefineSyntax(items.slice(1), env, macroEnv);
+        return evalDefineSyntaxStep(items.slice(1), env, macroEnv, k);
       case 'do':
-        return evalDo(items.slice(1), env, macroEnv);
+        return evalDoStep(items.slice(1), env, macroEnv, k);
       case 'if':
-        return evalIf(items.slice(1), env, macroEnv);
+        return evalIfStep(items.slice(1), env, macroEnv, k);
       case 'lambda':
-        return evalLambda(items.slice(1), env);
+        return evalLambdaStep(items.slice(1), env, k);
       case 'let':
-        return evalLet(items.slice(1), env, macroEnv);
+        return evalLetStep(items.slice(1), env, macroEnv, k);
       case 'let*':
-        return evalLetStar(items.slice(1), env, macroEnv);
+        return evalLetStarStep(items.slice(1), env, macroEnv, k);
       case 'letrec':
-        return evalLetRec(items.slice(1), env, macroEnv, false);
+        return evalLetRecStep(items.slice(1), env, macroEnv, false, k);
       case 'letrec*':
-        return evalLetRec(items.slice(1), env, macroEnv, true);
+        return evalLetRecStep(items.slice(1), env, macroEnv, true, k);
       case 'or':
-        return evalOr(items.slice(1), env, macroEnv);
+        return evalOrStep(items.slice(1), env, macroEnv, k);
       case 'quote':
-        return evalQuote(items.slice(1));
+        return evalQuoteStep(items.slice(1), k);
       case 'set!':
-        return evalSet(items.slice(1), env, macroEnv);
+        return evalSetStep(items.slice(1), env, macroEnv, k);
     }
 
     const macro = macroEnv.lookup(first.name);
     if (macro !== undefined) {
-      return { kind: 'tail-step', expr: expandMacroInvocation(macro, expr), env };
+      return {
+        kind: 'eval-step',
+        expr: expandMacroInvocation(macro, expr),
+        env,
+        k,
+      };
     }
   }
 
-  const proc = evalExpr(first, env, macroEnv);
-  if (!isProcedure(proc)) {
-    throw new EvalError('attempted to call a non-procedure');
-  }
+  return {
+    kind: 'eval-step',
+    expr: first,
+    env,
+    k: (proc) => {
+      if (!isProcedure(proc)) {
+        throw new EvalError('attempted to call a non-procedure');
+      }
 
-  const args = items.slice(1).map((item) => evalExpr(item, env, macroEnv));
-  return applyProcedure(proc, args, first.position, macroEnv);
+      return evalCallArgsStep(items.slice(1), env, macroEnv, (args) => ({
+        kind: 'apply-step',
+        proc,
+        args,
+        position: first.position,
+        k,
+      }));
+    },
+  };
 }
 
-function evalAnd(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+function evalAndStep(args: readonly Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   if (args.length === 0) {
-    return true;
+    return k(true);
   }
 
-  for (const arg of args.slice(0, -1)) {
-    const value = evalExpr(arg, env, macroEnv);
-    if (!isTruthy(value)) {
-      return value;
-    }
+  const [firstExpr, ...restExprs] = args;
+  if (restExprs.length === 0) {
+    return { kind: 'eval-step', expr: firstExpr!, env, k };
   }
 
-  return { kind: 'tail-step', expr: args[args.length - 1]!, env };
+  return {
+    kind: 'eval-step',
+    expr: firstExpr!,
+    env,
+    k: (value) => (!isTruthy(value) ? k(value) : evalAndStep(restExprs, env, macroEnv, k)),
+  };
 }
 
-function evalCase(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+function evalCaseStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertAtLeastArity('case', args, 1);
 
-  const key = evalExpr(args[0]!, env, macroEnv);
-  const clauses = args.slice(1);
+  return {
+    kind: 'eval-step',
+    expr: args[0]!,
+    env,
+    k: (key) => evalCaseClausesStep(key, args.slice(1), env, macroEnv, k),
+  };
+}
 
+function evalCaseClausesStep(
+  key: Value,
+  clauses: readonly Expr[],
+  env: Env,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
   for (let index = 0; index < clauses.length; index += 1) {
     const clauseExpr = clauses[index]!;
     if (clauseExpr.kind !== 'list' || clauseExpr.items.length === 0) {
@@ -1398,7 +1505,7 @@ function evalCase(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
       if (index !== clauses.length - 1) {
         throw new EvalError('case else clause must be last');
       }
-      return evalSequenceTail(body, env, macroEnv);
+      return evalSequenceStep(body, env, macroEnv, k);
     }
 
     if (headExpr!.kind !== 'list') {
@@ -1406,53 +1513,63 @@ function evalCase(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
     }
 
     if (headExpr.items.some((datumExpr) => eqvValues(key, quoteExpr(datumExpr)))) {
-      return evalSequenceTail(body, env, macroEnv);
+      return evalSequenceStep(body, env, macroEnv, k);
     }
   }
 
-  return VOID;
+  return k(VOID);
 }
 
-function evalCond(clauses: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
-  for (let index = 0; index < clauses.length; index += 1) {
-    const clauseExpr = clauses[index]!;
-    if (clauseExpr.kind !== 'list' || clauseExpr.items.length === 0) {
-      throw new EvalError('cond expects non-empty clauses');
-    }
-
-    const [testExpr, ...body] = clauseExpr.items;
-    if (testExpr!.kind === 'symbol' && testExpr.name === 'else') {
-      if (index !== clauses.length - 1) {
-        throw new EvalError('cond else clause must be last');
-      }
-      return evalSequenceTail(body, env, macroEnv);
-    }
-
-    const testValue = evalExpr(testExpr!, env, macroEnv);
-    if (isTruthy(testValue)) {
-      return body.length === 0 ? testValue : evalSequenceTail(body, env, macroEnv);
-    }
+function evalCondStep(clauses: readonly Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
+  if (clauses.length === 0) {
+    return k(VOID);
   }
 
-  return VOID;
+  const [clauseExpr, ...restClauses] = clauses;
+  if (clauseExpr!.kind !== 'list' || clauseExpr.items.length === 0) {
+    throw new EvalError('cond expects non-empty clauses');
+  }
+
+  const [testExpr, ...body] = clauseExpr!.items;
+  if (testExpr!.kind === 'symbol' && testExpr.name === 'else') {
+    if (restClauses.length !== 0) {
+      throw new EvalError('cond else clause must be last');
+    }
+    return evalSequenceStep(body, env, macroEnv, k);
+  }
+
+  return {
+    kind: 'eval-step',
+    expr: testExpr!,
+    env,
+    k: (testValue) =>
+      isTruthy(testValue)
+        ? body.length === 0
+          ? k(testValue)
+          : evalSequenceStep(body, env, macroEnv, k)
+        : evalCondStep(restClauses, env, macroEnv, k),
+  };
 }
 
-function evalOr(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+function evalOrStep(args: readonly Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   if (args.length === 0) {
-    return false;
+    return k(false);
   }
 
-  for (const arg of args.slice(0, -1)) {
-    const value = evalExpr(arg, env, macroEnv);
-    if (isTruthy(value)) {
-      return value;
-    }
+  const [firstExpr, ...restExprs] = args;
+  if (restExprs.length === 0) {
+    return { kind: 'eval-step', expr: firstExpr!, env, k };
   }
 
-  return { kind: 'tail-step', expr: args[args.length - 1]!, env };
+  return {
+    kind: 'eval-step',
+    expr: firstExpr!,
+    env,
+    k: (value) => (isTruthy(value) ? k(value) : evalOrStep(restExprs, env, macroEnv, k)),
+  };
 }
 
-function evalDefine(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalDefineStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertAtLeastArity('define', args, 2);
 
   const target = args[0]!;
@@ -1460,8 +1577,15 @@ function evalDefine(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
 
   if (target.kind === 'symbol') {
     assertExactArity('define', body, 1);
-    env.define(target.name, evalExpr(body[0]!, env, macroEnv));
-    return VOID;
+    return {
+      kind: 'eval-step',
+      expr: body[0]!,
+      env,
+      k: (value) => {
+        env.define(target.name, value);
+        return k(VOID);
+      },
+    };
   }
 
   if (target.kind === 'list' && target.items.length > 0) {
@@ -1478,13 +1602,13 @@ function evalDefine(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
       body,
       env,
     });
-    return VOID;
+    return k(VOID);
   }
 
   throw new EvalError('define expects a symbol name');
 }
 
-function evalDefineSyntax(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalDefineSyntaxStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertExactArity('define-syntax', args, 2);
 
   const nameExpr = args[0]!;
@@ -1493,7 +1617,7 @@ function evalDefineSyntax(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
   }
 
   macroEnv.define(nameExpr.name, parseSyntaxRules(nameExpr.name, args[1]!, env));
-  return VOID;
+  return k(VOID);
 }
 
 function evalDefineRecordType(args: Expr[], env: Env): Value {
@@ -1573,78 +1697,112 @@ function evalDefineRecordType(args: Expr[], env: Env): Value {
   return VOID;
 }
 
-function evalIf(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+function evalIfStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   if (args.length !== 2 && args.length !== 3) {
     throw new EvalError('if expects 2 or 3 argument(s)');
   }
 
   const [conditionExpr, thenExpr, elseExpr] = args;
-  return isTruthy(evalExpr(conditionExpr!, env, macroEnv))
-    ? { kind: 'tail-step', expr: thenExpr!, env }
-    : elseExpr === undefined
-      ? VOID
-      : { kind: 'tail-step', expr: elseExpr, env };
-}
-
-function evalCaseLambda(args: Expr[], env: Env): Value {
-  assertAtLeastArity('case-lambda', args, 1);
-
   return {
-    kind: 'case-lambda',
-    clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr)),
+    kind: 'eval-step',
+    expr: conditionExpr!,
     env,
+    k: (conditionValue) =>
+      isTruthy(conditionValue)
+        ? { kind: 'eval-step', expr: thenExpr!, env, k }
+        : elseExpr === undefined
+          ? k(VOID)
+          : { kind: 'eval-step', expr: elseExpr, env, k },
   };
 }
 
-function evalLambda(args: Expr[], env: Env): Value {
+function evalCaseLambdaStep(args: Expr[], env: Env, k: ContinuationFn): MachineStep {
+  assertAtLeastArity('case-lambda', args, 1);
+
+  return k({
+    kind: 'case-lambda',
+    clauses: args.map((clauseExpr) => parseCaseLambdaClause(clauseExpr)),
+    env,
+  });
+}
+
+function evalLambdaStep(args: Expr[], env: Env, k: ContinuationFn): MachineStep {
   assertAtLeastArity('lambda', args, 2);
 
   const paramsExpr = args[0]!;
-
-  return {
+  return k({
     kind: 'lambda',
     params: parseFormals(paramsExpr),
     body: args.slice(1),
     env,
-  };
+  });
 }
 
-function evalLet(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+function evalLetStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertAtLeastArity('let', args, 2);
 
   const firstArg = args[0]!;
   if (firstArg.kind === 'symbol') {
     assertAtLeastArity('let', args, 3);
-    return evalNamedLet(firstArg.name, args[1]!, args.slice(2), env, macroEnv);
+    return evalNamedLetStep(firstArg.name, args[1]!, args.slice(2), env, macroEnv, k);
   }
 
   const bindings = parseBindings(firstArg);
   const body = args.slice(1);
-  const values = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
-  const letEnv = new Env(env);
-
-  bindings.forEach((binding, index) => {
-    letEnv.define(binding.name, values[index]!);
-  });
-
-  return evalSequenceTail(body, letEnv, macroEnv);
+  return evalExprsStep(
+    bindings.map((binding) => binding.init),
+    env,
+    macroEnv,
+    (values) => {
+      const letEnv = new Env(env);
+      bindings.forEach((binding, index) => {
+        letEnv.define(binding.name, values[index]!);
+      });
+      return evalSequenceStep(body, letEnv, macroEnv, k);
+    },
+  );
 }
 
-function evalLetStar(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+function evalLetStarStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertAtLeastArity('let*', args, 2);
 
   const bindings = parseBindings(args[0]!, 'let*');
   const body = args.slice(1);
   const letStarEnv = new Env(env);
-
-  for (const binding of bindings) {
-    letStarEnv.define(binding.name, evalExpr(binding.init, letStarEnv, macroEnv));
-  }
-
-  return evalSequenceTail(body, letStarEnv, macroEnv);
+  return evalLetStarBindingsStep(bindings, 0, letStarEnv, body, macroEnv, k);
 }
 
-function evalLetRec(args: Expr[], env: Env, macroEnv: MacroEnv, sequential: boolean): EvalResult {
+function evalLetStarBindingsStep(
+  bindings: readonly BindingSpec[],
+  index: number,
+  letStarEnv: Env,
+  body: Expr[],
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  if (index >= bindings.length) {
+    return evalSequenceStep(body, letStarEnv, macroEnv, k);
+  }
+
+  const binding = bindings[index]!;
+  return {
+    kind: 'eval-step',
+    expr: binding.init,
+    env: letStarEnv,
+    k: (value) => {
+      letStarEnv.define(binding.name, value);
+      return evalLetStarBindingsStep(bindings, index + 1, letStarEnv, body, macroEnv, k);
+    },
+  };
+}
+
+function evalLetRecStep(
+  args: Expr[],
+  env: Env,
+  macroEnv: MacroEnv,
+  sequential: boolean,
+  k: ContinuationFn,
+): MachineStep {
   const name = sequential ? 'letrec*' : 'letrec';
   assertAtLeastArity(name, args, 2);
 
@@ -1657,71 +1815,158 @@ function evalLetRec(args: Expr[], env: Env, macroEnv: MacroEnv, sequential: bool
   });
 
   if (sequential) {
-    for (const binding of bindings) {
-      letEnv.set(binding.name, evalExpr(binding.init, letEnv, macroEnv));
-    }
-  } else {
-    const values = bindings.map((binding) => evalExpr(binding.init, letEnv, macroEnv));
-    bindings.forEach((binding, index) => {
-      letEnv.set(binding.name, values[index]!);
-    });
+    return evalLetRecSequentialStep(bindings, 0, letEnv, body, macroEnv, k);
   }
 
-  return evalSequenceTail(body, letEnv, macroEnv);
+  return evalExprsStep(
+    bindings.map((binding) => binding.init),
+    letEnv,
+    macroEnv,
+    (values) => {
+      bindings.forEach((binding, index) => {
+        letEnv.set(binding.name, values[index]!);
+      });
+      return evalSequenceStep(body, letEnv, macroEnv, k);
+    },
+  );
 }
 
-function evalNamedLet(name: string, bindingsExpr: Expr, body: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
-  const bindings = parseBindings(bindingsExpr);
-  const values = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
-  const letEnv = new Env(env);
-  const proc: UserProc = {
-    kind: 'lambda',
-    name,
-    params: { required: bindings.map((binding) => binding.name) },
-    body,
+function evalLetRecSequentialStep(
+  bindings: readonly BindingSpec[],
+  index: number,
+  letEnv: Env,
+  body: Expr[],
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  if (index >= bindings.length) {
+    return evalSequenceStep(body, letEnv, macroEnv, k);
+  }
+
+  const binding = bindings[index]!;
+  return {
+    kind: 'eval-step',
+    expr: binding.init,
     env: letEnv,
+    k: (value) => {
+      letEnv.set(binding.name, value);
+      return evalLetRecSequentialStep(bindings, index + 1, letEnv, body, macroEnv, k);
+    },
   };
-
-  letEnv.define(name, proc);
-  return applyProcedure(proc, values, bindingsExpr.position, macroEnv);
 }
 
-function evalDo(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+function evalNamedLetStep(
+  name: string,
+  bindingsExpr: Expr,
+  body: Expr[],
+  env: Env,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  const bindings = parseBindings(bindingsExpr);
+  return evalExprsStep(
+    bindings.map((binding) => binding.init),
+    env,
+    macroEnv,
+    (values) => {
+      const letEnv = new Env(env);
+      const proc: UserProc = {
+        kind: 'lambda',
+        name,
+        params: { required: bindings.map((binding) => binding.name) },
+        body,
+        env: letEnv,
+      };
+
+      letEnv.define(name, proc);
+      return {
+        kind: 'apply-step',
+        proc,
+        args: values,
+        position: bindingsExpr.position,
+        k,
+      };
+    },
+  );
+}
+
+function evalDoStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertAtLeastArity('do', args, 2);
 
   const bindings = parseDoBindings(args[0]!);
   const testClause = parseDoTestClause(args[1]!);
   const body = args.slice(2);
-  const initialValues = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
-  const doEnv = new Env(env);
 
-  bindings.forEach((binding, index) => {
-    doEnv.define(binding.name, initialValues[index]!);
-  });
+  return evalExprsStep(
+    bindings.map((binding) => binding.init),
+    env,
+    macroEnv,
+    (initialValues) => {
+      const doEnv = new Env(env);
+      bindings.forEach((binding, index) => {
+        doEnv.define(binding.name, initialValues[index]!);
+      });
+      return evalDoLoopStep(bindings, testClause, body, doEnv, macroEnv, k);
+    },
+  );
+}
 
-  while (true) {
-    if (isTruthy(evalExpr(testClause.test, doEnv, macroEnv))) {
-      return evalSequenceTail(testClause.results, doEnv, macroEnv);
-    }
+function evalDoLoopStep(
+  bindings: readonly DoBindingSpec[],
+  testClause: { test: Expr; results: Expr[] },
+  body: Expr[],
+  doEnv: Env,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  return {
+    kind: 'eval-step',
+    expr: testClause.test,
+    env: doEnv,
+    k: (testValue) =>
+      isTruthy(testValue)
+        ? evalSequenceStep(testClause.results, doEnv, macroEnv, k)
+        : evalSequenceStep(body, doEnv, macroEnv, () =>
+            evalDoNextValuesStep(bindings, 0, [], doEnv, testClause, body, macroEnv, k)),
+  };
+}
 
-    evalSequence(body, doEnv, macroEnv);
-
-    const nextValues = bindings.map((binding) =>
-      binding.step === undefined ? doEnv.lookup(binding.name) : evalExpr(binding.step, doEnv, macroEnv),
-    );
-
-    bindings.forEach((binding, index) => {
-      doEnv.set(binding.name, nextValues[index]!);
+function evalDoNextValuesStep(
+  bindings: readonly DoBindingSpec[],
+  index: number,
+  values: readonly Value[],
+  doEnv: Env,
+  testClause: { test: Expr; results: Expr[] },
+  body: Expr[],
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  if (index >= bindings.length) {
+    bindings.forEach((binding, bindingIndex) => {
+      doEnv.set(binding.name, values[bindingIndex]!);
     });
+    return evalDoLoopStep(bindings, testClause, body, doEnv, macroEnv, k);
   }
+
+  const binding = bindings[index]!;
+  if (binding.step === undefined) {
+    return evalDoNextValuesStep(bindings, index + 1, [...values, doEnv.lookup(binding.name)], doEnv, testClause, body, macroEnv, k);
+  }
+
+  return {
+    kind: 'eval-step',
+    expr: binding.step,
+    env: doEnv,
+    k: (value) => evalDoNextValuesStep(bindings, index + 1, [...values, value], doEnv, testClause, body, macroEnv, k),
+  };
 }
 
-function evalQuote(args: Expr[]): Value {
+function evalQuoteStep(args: Expr[], k: ContinuationFn): MachineStep {
   assertExactArity('quote', args, 1);
-  return quoteExpr(args[0]!);
+  return k(quoteExpr(args[0]!));
 }
 
-function evalSet(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalSetStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertExactArity('set!', args, 2);
 
   const target = args[0]!;
@@ -1729,8 +1974,15 @@ function evalSet(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
     throw new EvalError('set! expects a symbol name');
   }
 
-  env.set(target.name, evalExpr(args[1]!, env, macroEnv));
-  return VOID;
+  return {
+    kind: 'eval-step',
+    expr: args[1]!,
+    env,
+    k: (value) => {
+      env.set(target.name, value);
+      return k(VOID);
+    },
+  };
 }
 
 function parseFormals(expr: Expr): ParamSpec {
@@ -1909,29 +2161,32 @@ function quoteExpr(expr: Expr): Value {
 }
 
 function applyProcedure(
-  proc: BuiltinProc | UserProc | CaseLambdaProc,
+  proc: ProcedureValue,
   args: Value[],
   position: SourcePosition,
   macroEnv: MacroEnv,
-): EvalResult {
-  try {
-    if (proc.kind === 'builtin') {
-      return proc.apply(args, position);
-    }
-
-    if (proc.kind === 'lambda') {
-      return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv);
-    }
-
-    const clause = proc.clauses.find((candidate) => procedureArityMatches(args, candidate.params));
-    if (clause === undefined) {
-      throw new EvalError(`${proc.name ?? 'case-lambda'} has no matching clause for ${args.length} argument(s)`);
-    }
-
-    return applyProcedureClause(proc.name ?? 'case-lambda', proc.env, clause, args, macroEnv);
-  } catch (error) {
-    throw attachPosition(error, position);
+  k: ContinuationFn,
+): MachineStep {
+  if (proc.kind === 'builtin') {
+    const result = proc.apply(args, position, k);
+    return isMachineStep(result) ? result : k(result);
   }
+
+  if (proc.kind === 'continuation') {
+    assertExactArity('continuation', args, 1);
+    return proc.resume(args[0]!);
+  }
+
+  if (proc.kind === 'lambda') {
+    return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv, k);
+  }
+
+  const clause = proc.clauses.find((candidate) => procedureArityMatches(args, candidate.params));
+  if (clause === undefined) {
+    throw new EvalError(`${proc.name ?? 'case-lambda'} has no matching clause for ${args.length} argument(s)`);
+  }
+
+  return applyProcedureClause(proc.name ?? 'case-lambda', proc.env, clause, args, macroEnv, k);
 }
 
 function applyProcedureClause(
@@ -1940,7 +2195,8 @@ function applyProcedureClause(
   clause: ProcedureClause,
   args: Value[],
   macroEnv: MacroEnv,
-): EvalResult {
+  k: ContinuationFn,
+): MachineStep {
   assertProcedureArity(name, args, clause.params);
 
   const callEnv = new Env(env);
@@ -1951,14 +2207,34 @@ function applyProcedureClause(
     callEnv.define(clause.params.rest, makeList(args.slice(clause.params.required.length)));
   }
 
-  return evalSequenceTail(clause.body, callEnv, macroEnv);
+  return evalSequenceStep(clause.body, callEnv, macroEnv, k);
 }
 
-function builtin(name: string, apply: (args: Value[], position: SourcePosition) => EvalResult): [string, BuiltinProc] {
+function builtin(
+  name: string,
+  apply: (args: Value[], position: SourcePosition, k: ContinuationFn) => Value | MachineStep,
+): [string, BuiltinProc] {
   return [name, { kind: 'builtin', name, apply }];
 }
 
-function applyBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv): EvalResult {
+function callCcBuiltin(args: Value[], position: SourcePosition, k: ContinuationFn): MachineStep {
+  assertExactArity('call/cc', args, 1);
+
+  const proc = args[0]!;
+  if (!isProcedure(proc)) {
+    throw new EvalError('call/cc expects a procedure');
+  }
+
+  return {
+    kind: 'apply-step',
+    proc,
+    args: [{ kind: 'continuation', resume: k }],
+    position,
+    k,
+  };
+}
+
+function applyBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertAtLeastArity('apply', args, 2);
 
   const proc = args[0]!;
@@ -1968,7 +2244,7 @@ function applyBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEn
 
   const prefixArgs = args.slice(1, -1);
   const listArgs = expectProperList('apply', args[args.length - 1]!);
-  return applyProcedure(proc, [...prefixArgs, ...listArgs], position, macroEnv);
+  return applyProcedure(proc, [...prefixArgs, ...listArgs], position, macroEnv, k);
 }
 
 function absoluteValue(args: Value[]): num.NumericValue {
@@ -2392,7 +2668,7 @@ function isProperListValue(value: Value): boolean {
   return isEmptyList(current);
 }
 
-function mapBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv): Value {
+function mapBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertAtLeastArity('map', args, 2);
 
   const proc = args[0]!;
@@ -2400,51 +2676,61 @@ function mapBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv)
     throw new EvalError('map expects a procedure');
   }
 
-  const currentLists = args.slice(1);
-  const seenLists = currentLists.map(() => new Set<PairValue>());
-  const results: Value[] = [];
-
-  while (true) {
-    let sawEmpty = false;
-    let sawPair = false;
-
-    for (const current of currentLists) {
-      if (isEmptyList(current)) {
-        sawEmpty = true;
-        continue;
-      }
-      if (!isPair(current)) {
-        throw new EvalError('map expects proper list arguments');
-      }
-      sawPair = true;
-    }
-
-    if (sawEmpty) {
-      if (sawPair) {
-        throw new EvalError('map expects lists of equal length');
-      }
-      return makeList(results);
-    }
-
-    const elementArgs: Value[] = [];
-    for (let index = 0; index < currentLists.length; index += 1) {
-      const current = currentLists[index]!;
-      if (!isPair(current)) {
-        throw new EvalError('map expects proper list arguments');
-      }
-      if (seenLists[index]!.has(current)) {
-        throw new EvalError('map expects proper list arguments');
-      }
-      seenLists[index]!.add(current);
-      elementArgs.push(current.car);
-      currentLists[index] = current.cdr;
-    }
-
-    results.push(resolveEvalResult(applyProcedure(proc, elementArgs, position, macroEnv), macroEnv));
-  }
+  return mapLoopStep(proc, args.slice(1), args.slice(1).map(() => new Set<PairValue>()), [], position, macroEnv, k);
 }
 
-function forEachBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv): Value {
+function mapLoopStep(
+  proc: ProcedureValue,
+  currentLists: readonly Value[],
+  seenLists: readonly Set<PairValue>[],
+  results: readonly Value[],
+  position: SourcePosition,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  let sawEmpty = false;
+  let sawPair = false;
+
+  for (const current of currentLists) {
+    if (isEmptyList(current)) {
+      sawEmpty = true;
+      continue;
+    }
+    if (!isPair(current)) {
+      throw new EvalError('map expects proper list arguments');
+    }
+    sawPair = true;
+  }
+
+  if (sawEmpty) {
+    if (sawPair) {
+      throw new EvalError('map expects lists of equal length');
+    }
+    return k(makeList([...results]));
+  }
+
+  const elementArgs: Value[] = [];
+  const nextLists = [...currentLists];
+  const nextSeenLists = seenLists.map((seen) => new Set(seen));
+
+  for (let index = 0; index < currentLists.length; index += 1) {
+    const current = currentLists[index]!;
+    if (!isPair(current)) {
+      throw new EvalError('map expects proper list arguments');
+    }
+    if (nextSeenLists[index]!.has(current)) {
+      throw new EvalError('map expects proper list arguments');
+    }
+    nextSeenLists[index]!.add(current);
+    elementArgs.push(current.car);
+    nextLists[index] = current.cdr;
+  }
+
+  return applyProcedure(proc, elementArgs, position, macroEnv, (value) =>
+    mapLoopStep(proc, nextLists, nextSeenLists, [...results, value], position, macroEnv, k));
+}
+
+function forEachBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertAtLeastArity('for-each', args, 2);
 
   const proc = args[0]!;
@@ -2452,47 +2738,57 @@ function forEachBuiltin(args: Value[], position: SourcePosition, macroEnv: Macro
     throw new EvalError('for-each expects a procedure');
   }
 
-  const currentLists = args.slice(1);
-  const seenLists = currentLists.map(() => new Set<PairValue>());
+  return forEachLoopStep(proc, args.slice(1), args.slice(1).map(() => new Set<PairValue>()), position, macroEnv, k);
+}
 
-  while (true) {
-    let sawEmpty = false;
-    let sawPair = false;
+function forEachLoopStep(
+  proc: ProcedureValue,
+  currentLists: readonly Value[],
+  seenLists: readonly Set<PairValue>[],
+  position: SourcePosition,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  let sawEmpty = false;
+  let sawPair = false;
 
-    for (const current of currentLists) {
-      if (isEmptyList(current)) {
-        sawEmpty = true;
-        continue;
-      }
-      if (!isPair(current)) {
-        throw new EvalError('for-each expects proper list arguments');
-      }
-      sawPair = true;
+  for (const current of currentLists) {
+    if (isEmptyList(current)) {
+      sawEmpty = true;
+      continue;
     }
-
-    if (sawEmpty) {
-      if (sawPair) {
-        throw new EvalError('for-each expects lists of equal length');
-      }
-      return VOID;
+    if (!isPair(current)) {
+      throw new EvalError('for-each expects proper list arguments');
     }
-
-    const elementArgs: Value[] = [];
-    for (let index = 0; index < currentLists.length; index += 1) {
-      const current = currentLists[index]!;
-      if (!isPair(current)) {
-        throw new EvalError('for-each expects proper list arguments');
-      }
-      if (seenLists[index]!.has(current)) {
-        throw new EvalError('for-each expects proper list arguments');
-      }
-      seenLists[index]!.add(current);
-      elementArgs.push(current.car);
-      currentLists[index] = current.cdr;
-    }
-
-    resolveEvalResult(applyProcedure(proc, elementArgs, position, macroEnv), macroEnv);
+    sawPair = true;
   }
+
+  if (sawEmpty) {
+    if (sawPair) {
+      throw new EvalError('for-each expects lists of equal length');
+    }
+    return k(VOID);
+  }
+
+  const elementArgs: Value[] = [];
+  const nextLists = [...currentLists];
+  const nextSeenLists = seenLists.map((seen) => new Set(seen));
+
+  for (let index = 0; index < currentLists.length; index += 1) {
+    const current = currentLists[index]!;
+    if (!isPair(current)) {
+      throw new EvalError('for-each expects proper list arguments');
+    }
+    if (nextSeenLists[index]!.has(current)) {
+      throw new EvalError('for-each expects proper list arguments');
+    }
+    nextSeenLists[index]!.add(current);
+    elementArgs.push(current.car);
+    nextLists[index] = current.cdr;
+  }
+
+  return applyProcedure(proc, elementArgs, position, macroEnv, () =>
+    forEachLoopStep(proc, nextLists, nextSeenLists, position, macroEnv, k));
 }
 
 function memberBuiltin(args: Value[]): Value {
@@ -2762,6 +3058,8 @@ function formatValueWithMode(value: Value, mode: 'display' | 'write', state: For
       return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
     case 'case-lambda':
       return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+    case 'continuation':
+      return '#<procedure>';
   }
 }
 
@@ -2963,11 +3261,11 @@ function isTruthy(value: Value): boolean {
   return value !== false;
 }
 
-function isProcedure(value: Value): value is BuiltinProc | UserProc | CaseLambdaProc {
+function isProcedure(value: Value): value is ProcedureValue {
   return (
     typeof value === 'object' &&
     value !== null &&
-    (value.kind === 'builtin' || value.kind === 'lambda' || value.kind === 'case-lambda')
+    (value.kind === 'builtin' || value.kind === 'lambda' || value.kind === 'case-lambda' || value.kind === 'continuation')
   );
 }
 
