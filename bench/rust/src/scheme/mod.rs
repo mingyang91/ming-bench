@@ -2,6 +2,11 @@ pub mod error;
 
 pub use error::EvalError;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fmt;
+use std::rc::Rc;
+
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
     Bool(bool),
@@ -11,11 +16,72 @@ enum Expr {
     List(Vec<Expr>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+type EnvRef = Rc<Environment>;
+type BuiltinFn = fn(&[Value]) -> Result<Value, EvalError>;
+
+#[derive(Clone)]
 enum Value {
     Bool(bool),
     Int(i64),
     String(String),
+    Symbol(String),
+    List(Vec<Value>),
+    Procedure(Rc<Procedure>),
+    Void,
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.render())
+    }
+}
+
+#[derive(Clone)]
+enum Procedure {
+    Builtin {
+        name: &'static str,
+        func: BuiltinFn,
+    },
+    Lambda {
+        params: Vec<String>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    },
+}
+
+impl fmt::Debug for Procedure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Builtin { name, .. } => write!(f, "#<builtin:{name}>"),
+            Self::Lambda { .. } => f.write_str("#<lambda>"),
+        }
+    }
+}
+
+struct Environment {
+    parent: Option<EnvRef>,
+    bindings: RefCell<HashMap<String, Value>>,
+}
+
+impl Environment {
+    fn new(parent: Option<EnvRef>) -> EnvRef {
+        Rc::new(Self {
+            parent,
+            bindings: RefCell::new(HashMap::new()),
+        })
+    }
+
+    fn define(&self, name: impl Into<String>, value: Value) {
+        self.bindings.borrow_mut().insert(name.into(), value);
+    }
+
+    fn lookup(&self, name: &str) -> Option<Value> {
+        if let Some(value) = self.bindings.borrow().get(name).cloned() {
+            return Some(value);
+        }
+
+        self.parent.as_ref().and_then(|parent| parent.lookup(name))
+    }
 }
 
 impl Value {
@@ -39,6 +105,17 @@ impl Value {
             Self::Bool(false) => "#f".to_string(),
             Self::Int(value) => value.to_string(),
             Self::String(value) => format!("\"{}\"", escape_string(value)),
+            Self::Symbol(value) => value.clone(),
+            Self::List(items) => {
+                let rendered = items
+                    .iter()
+                    .map(Value::render)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("({rendered})")
+            }
+            Self::Procedure(_) => "#<procedure>".to_string(),
+            Self::Void => "#<void>".to_string(),
         }
     }
 }
@@ -205,7 +282,7 @@ impl<'a> Parser<'a> {
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_program()?;
-    let value = eval_program(&exprs)?;
+    let value = eval_program(&exprs, default_env())?;
     Ok(value.render())
 }
 
@@ -218,25 +295,48 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 #[cfg(test)]
 mod tests;
 
-fn eval_program(exprs: &[Expr]) -> Result<Value, EvalError> {
-    let mut last = None;
-    for expr in exprs {
-        last = Some(eval(expr)?);
+fn default_env() -> EnvRef {
+    let env = Environment::new(None);
+    for (name, func) in [
+        ("+", apply_add as BuiltinFn),
+        ("-", apply_sub as BuiltinFn),
+        ("*", apply_mul as BuiltinFn),
+        ("/", apply_div as BuiltinFn),
+        ("<", apply_lt as BuiltinFn),
+        (">", apply_gt as BuiltinFn),
+        ("=", apply_eq as BuiltinFn),
+        ("<=", apply_lte as BuiltinFn),
+        ("not", apply_not as BuiltinFn),
+    ] {
+        env.define(
+            name,
+            Value::Procedure(Rc::new(Procedure::Builtin { name, func })),
+        );
     }
-    last.ok_or(EvalError::EmptyProgram)
+    env
 }
 
-fn eval(expr: &Expr) -> Result<Value, EvalError> {
+fn eval_program(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let mut last = Value::Void;
+    for expr in exprs {
+        last = eval(expr, env.clone())?;
+    }
+    Ok(last)
+}
+
+fn eval(expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
     match expr {
         Expr::Bool(value) => Ok(Value::Bool(*value)),
         Expr::Int(value) => Ok(Value::Int(*value)),
         Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => Err(EvalError::UnboundSymbol { name: name.clone() }),
-        Expr::List(items) => eval_list(items),
+        Expr::Symbol(name) => env
+            .lookup(name)
+            .ok_or_else(|| EvalError::UnboundSymbol { name: name.clone() }),
+        Expr::List(items) => eval_list(items, env),
     }
 }
 
-fn eval_list(items: &[Expr]) -> Result<Value, EvalError> {
+fn eval_list(items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     let Some((head, args)) = items.split_first() else {
         return Err(EvalError::ParseError {
             message: "cannot evaluate empty list".to_string(),
@@ -244,22 +344,27 @@ fn eval_list(items: &[Expr]) -> Result<Value, EvalError> {
     };
 
     match head {
-        Expr::Symbol(name) if name == "and" => eval_and(args),
-        Expr::Symbol(name) if name == "or" => eval_or(args),
-        Expr::Symbol(name) => {
-            let values = args.iter().map(eval).collect::<Result<Vec<_>, _>>()?;
-            apply_builtin(name, &values)
+        Expr::Symbol(name) if name == "and" => eval_and(args, env),
+        Expr::Symbol(name) if name == "or" => eval_or(args, env),
+        Expr::Symbol(name) if name == "if" => eval_if(args, env),
+        Expr::Symbol(name) if name == "quote" => eval_quote(args),
+        Expr::Symbol(name) if name == "lambda" => eval_lambda(args, env),
+        Expr::Symbol(name) if name == "define" => eval_define(args, env),
+        _ => {
+            let procedure = eval(head, env.clone())?;
+            let values = args
+                .iter()
+                .map(|expr| eval(expr, env.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+            apply_procedure(procedure, &values)
         }
-        _ => Err(EvalError::NotAProcedure {
-            found: render_expr(head),
-        }),
     }
 }
 
-fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_and(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     let mut last = Value::Bool(true);
     for expr in args {
-        last = eval(expr)?;
+        last = eval(expr, env.clone())?;
         if !last.is_truthy() {
             return Ok(last);
         }
@@ -267,10 +372,10 @@ fn eval_and(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(last)
 }
 
-fn eval_or(args: &[Expr]) -> Result<Value, EvalError> {
+fn eval_or(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     let mut last = Value::Bool(false);
     for expr in args {
-        let value = eval(expr)?;
+        let value = eval(expr, env.clone())?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -279,20 +384,152 @@ fn eval_or(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(last)
 }
 
-fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
-    match name {
-        "+" => apply_add(args),
-        "-" => apply_sub(args),
-        "*" => apply_mul(args),
-        "/" => apply_div(args),
-        "<" => apply_comparison("<", args, |left, right| left < right),
-        ">" => apply_comparison(">", args, |left, right| left > right),
-        "=" => apply_comparison("=", args, |left, right| left == right),
-        "<=" => apply_comparison("<=", args, |left, right| left <= right),
-        "not" => apply_not(args),
-        _ => Err(EvalError::UnboundSymbol {
-            name: name.to_string(),
+fn eval_if(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let [condition, consequent, alternate] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "if",
+            expected: "exactly 3",
+            got: args.len(),
+        });
+    };
+
+    if eval(condition, env.clone())?.is_truthy() {
+        eval(consequent, env)
+    } else {
+        eval(alternate, env)
+    }
+}
+
+fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
+    let [quoted] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "quote",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(quote_expr(quoted))
+}
+
+fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let Some((params_expr, body)) = args.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "lambda",
+            expected: "at least 2",
+            got: 0,
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "lambda",
+            expected: "at least 2",
+            got: 1,
+        });
+    }
+
+    let params = parse_param_list(params_expr)?;
+    Ok(Value::Procedure(Rc::new(Procedure::Lambda {
+        params,
+        body: body.to_vec(),
+        env,
+    })))
+}
+
+fn eval_define(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    match args {
+        [Expr::Symbol(name), value_expr] => {
+            let value = eval(value_expr, env.clone())?;
+            env.define(name.clone(), value);
+            Ok(Value::Void)
+        }
+        [Expr::List(signature), body @ ..] => {
+            if body.is_empty() {
+                return Err(EvalError::ParseError {
+                    message: "define requires a function body".to_string(),
+                });
+            }
+
+            let Some((Expr::Symbol(name), params)) = signature.split_first() else {
+                return Err(EvalError::ParseError {
+                    message: "define requires a function name".to_string(),
+                });
+            };
+
+            let params = parse_param_names(params)?;
+            env.define(
+                name.clone(),
+                Value::Procedure(Rc::new(Procedure::Lambda {
+                    params,
+                    body: body.to_vec(),
+                    env: env.clone(),
+                })),
+            );
+            Ok(Value::Void)
+        }
+        _ => Err(EvalError::ParseError {
+            message: "invalid define form".to_string(),
         }),
+    }
+}
+
+fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
+    match expr {
+        Expr::List(items) => parse_param_names(items),
+        _ => Err(EvalError::ParseError {
+            message: "lambda parameters must be a list".to_string(),
+        }),
+    }
+}
+
+fn parse_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> {
+    items
+        .iter()
+        .map(|expr| match expr {
+            Expr::Symbol(name) => Ok(name.clone()),
+            _ => Err(EvalError::ParseError {
+                message: "parameter names must be symbols".to_string(),
+            }),
+        })
+        .collect()
+}
+
+fn quote_expr(expr: &Expr) -> Value {
+    match expr {
+        Expr::Bool(value) => Value::Bool(*value),
+        Expr::Int(value) => Value::Int(*value),
+        Expr::String(value) => Value::String(value.clone()),
+        Expr::Symbol(value) => Value::Symbol(value.clone()),
+        Expr::List(items) => Value::List(items.iter().map(quote_expr).collect()),
+    }
+}
+
+fn apply_procedure(value: Value, args: &[Value]) -> Result<Value, EvalError> {
+    let Value::Procedure(procedure) = value else {
+        return Err(EvalError::NotAProcedure {
+            found: value.render(),
+        });
+    };
+
+    match procedure.as_ref() {
+        Procedure::Builtin { func, .. } => func(args),
+        Procedure::Lambda { params, body, env } => {
+            if args.len() != params.len() {
+                return Err(EvalError::WrongArgCount {
+                    name: "lambda",
+                    expected: "exact parameter count",
+                    got: args.len(),
+                });
+            }
+
+            let call_env = Environment::new(Some(env.clone()));
+            for (name, value) in params.iter().zip(args.iter()) {
+                call_env.define(name.clone(), value.clone());
+            }
+
+            eval_program(body, call_env)
+        }
     }
 }
 
@@ -358,6 +595,22 @@ fn apply_div(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Int(result))
 }
 
+fn apply_lt(args: &[Value]) -> Result<Value, EvalError> {
+    apply_comparison("<", args, |left, right| left < right)
+}
+
+fn apply_gt(args: &[Value]) -> Result<Value, EvalError> {
+    apply_comparison(">", args, |left, right| left > right)
+}
+
+fn apply_eq(args: &[Value]) -> Result<Value, EvalError> {
+    apply_comparison("=", args, |left, right| left == right)
+}
+
+fn apply_lte(args: &[Value]) -> Result<Value, EvalError> {
+    apply_comparison("<=", args, |left, right| left <= right)
+}
+
 fn apply_comparison(
     name: &'static str,
     args: &[Value],
@@ -413,18 +666,4 @@ fn escape_string(input: &str) -> String {
         }
     }
     escaped
-}
-
-fn render_expr(expr: &Expr) -> String {
-    match expr {
-        Expr::Bool(true) => "#t".to_string(),
-        Expr::Bool(false) => "#f".to_string(),
-        Expr::Int(value) => value.to_string(),
-        Expr::String(value) => format!("\"{}\"", escape_string(value)),
-        Expr::Symbol(value) => value.clone(),
-        Expr::List(items) => {
-            let rendered = items.iter().map(render_expr).collect::<Vec<_>>().join(" ");
-            format!("({rendered})")
-        }
-    }
 }
