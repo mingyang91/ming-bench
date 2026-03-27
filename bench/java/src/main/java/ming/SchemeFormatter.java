@@ -55,6 +55,8 @@ class SchemeFormatter {
         if (val instanceof Evaluator.Lambda) return "#<procedure>";
         if (val instanceof Evaluator.CaseLambda) return "#<procedure>";
         if (val instanceof Evaluator.BuiltinProc) return "#<procedure>";
+        if (val instanceof Evaluator.Continuation) return "#<continuation>";
+        if (val == Evaluator.CALLCC_PROC) return "#<procedure>";
         if (val instanceof SyntaxRulesMacro) return "#<macro>";
         if (val instanceof String s) return s;
         return val.toString();
