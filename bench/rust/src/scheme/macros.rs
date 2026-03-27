@@ -183,10 +183,11 @@ fn find_ellipsis_var(template: &Expr, bindings: &HashMap<String, MacroBinding>) 
 fn is_special_form(s: &str) -> bool {
     matches!(
         s,
-        "define" | "set!" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "begin" | "cond"
+        "define" | "set!" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "let*" | "begin" | "cond"
             | "define-syntax" | "syntax-rules" | "define-record-type"
             | "letrec" | "letrec*" | "case" | "do"
             | "call/cc" | "call-with-current-continuation"
+            | "guard" | "dynamic-wind"
             | "syntax-case" | "syntax" | "with-syntax"
     )
 }

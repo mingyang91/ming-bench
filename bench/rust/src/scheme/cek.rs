@@ -553,7 +553,8 @@ fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String, 
                         if let Ok(macro_val @ Value::Macro { .. }) = env_lookup(&env, op) {
                             let (expanded, hygiene_frame) = expand_macro_only(&macro_val, items, &env)?;
                             let mut new_env = env;
-                            new_env.push(hygiene_frame);
+                            let idx = new_env.len().saturating_sub(1);
+                            new_env.insert(idx, hygiene_frame);
                             Ok((Ctrl::Eval(expanded, new_env), k))
                         } else if let Ok(Value::TransformerMacro(proc)) = env_lookup(&env, op) {
                             let (expanded, hygiene_frame) = expand_transformer(&proc, items, output)?;
@@ -896,10 +897,11 @@ fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut Strin
             }
         }
         Value::Continuation(saved_k, saved_winders) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation expects 1 argument".into()));
-            }
-            let val = args[0].clone();
+            let val = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Value::Values(args)
+            };
             // Find common prefix of current and saved winders
             let common_len = winders.iter().zip(saved_winders.iter())
                 .take_while(|(a, b)| Rc::ptr_eq(a, b))
