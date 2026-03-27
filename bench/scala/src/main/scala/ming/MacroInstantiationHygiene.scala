@@ -7,6 +7,7 @@ private[ming] object MacroInstantiationHygiene:
   private val SyntaxKeywords = Set(
     "and",
     "begin",
+    "case-lambda",
     "cond",
     "define",
     "define-syntax",

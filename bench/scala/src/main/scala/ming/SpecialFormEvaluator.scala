@@ -109,6 +109,13 @@ private[ming] object SpecialFormEvaluator:
       case _ =>
         SchemeFailure.raise("lambda expected a parameter list and body", position)
 
+  def evalCaseLambda(
+    arguments: List[Expr],
+    _position: Position,
+    env: Environment
+  ): Value =
+    CaseLambdaValue(arguments.map(buildCaseLambdaClause(_, env)))
+
   def evalSet(
     arguments: List[Expr],
     position: Position,
@@ -201,6 +208,21 @@ private[ming] object SpecialFormEvaluator:
   ): ClosureValue =
     val (parameters, restParameter) = parameterSpec(parameterExpressions, position)
     ClosureValue(parameters, restParameter, body, env, name)
+
+  private def buildCaseLambdaClause(
+    clauseExpression: Expr,
+    env: Environment
+  ): ClosureValue =
+    clauseExpression match
+      case ListExpr(parameterSpec :: body, clausePosition) if body.nonEmpty =>
+        buildClosure(parameterSpec, body, env, None, clausePosition)
+      case ListExpr(_ :: Nil, clausePosition) =>
+        SchemeFailure.raise("case-lambda clause expected a body", clausePosition)
+      case _ =>
+        SchemeFailure.raise(
+          "case-lambda expected clauses of the form ((args) body ...)",
+          clauseExpression.position
+        )
 
   private def parameterSpec(
     parametersExpression: Expr,

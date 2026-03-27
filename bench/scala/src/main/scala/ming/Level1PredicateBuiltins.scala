@@ -20,7 +20,13 @@ private[ming] object Level1PredicateBuiltins:
     "boolean?"  -> BuiltinValue("boolean?", unaryPredicate("boolean?")(isBoolean)),
     "pair?"     -> BuiltinValue("pair?", unaryPredicate("pair?")(isPair)),
     "symbol?"   -> BuiltinValue("symbol?", unaryPredicate("symbol?")(isSymbol)),
-    "char?"     -> BuiltinValue("char?", unaryPredicate("char?")(isChar))
+    "char?"     -> BuiltinValue("char?", unaryPredicate("char?")(isChar)),
+    "procedure?" -> BuiltinValue(
+      "procedure?",
+      unaryPredicate("procedure?"):
+        case _: ProcedureValue => true
+        case _                 => false
+    )
   )
 
   private def logicalNot(arguments: List[Value], position: Position): Value =

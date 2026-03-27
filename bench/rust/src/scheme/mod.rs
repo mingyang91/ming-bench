@@ -61,6 +61,13 @@ struct RecordInstance {
     fields: Vec<Value>,
 }
 
+#[derive(Clone)]
+struct ProcedureClause {
+    params: Vec<String>,
+    rest_param: Option<String>,
+    body: Vec<Expr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
     Int(i128, Position),
@@ -100,7 +107,13 @@ enum Value {
     },
     Closure {
         params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Expr>,
+        env: EnvRef,
+        name: Option<String>,
+    },
+    CaseClosure {
+        clauses: Vec<ProcedureClause>,
         env: EnvRef,
         name: Option<String>,
     },
@@ -149,6 +162,7 @@ impl Value {
             Self::Record(_) => "record",
             Self::Builtin { .. }
             | Self::Closure { .. }
+            | Self::CaseClosure { .. }
             | Self::RecordConstructor { .. }
             | Self::RecordPredicate { .. }
             | Self::RecordAccessor { .. } => "procedure",
@@ -469,6 +483,7 @@ fn eval_list(
     match head {
         Expr::Symbol(name, _) if name == "and" => eval_and(rest, env, context),
         Expr::Symbol(name, _) if name == "begin" => eval_sequence(rest, env, context),
+        Expr::Symbol(name, _) if name == "case-lambda" => eval_case_lambda(rest, position, env),
         Expr::Symbol(name, _) if name == "cond" => eval_cond(rest, env, context),
         Expr::Symbol(name, _) if name == "or" => eval_or(rest, env, context),
         Expr::Symbol(name, _) if name == "define" => eval_define(rest, position, env, context),
@@ -565,6 +580,26 @@ fn eval_cond(clauses: &[Expr], env: EnvRef, context: &mut EvalContext) -> EvalRe
     Ok(Value::Void)
 }
 
+fn eval_case_lambda(arguments: &[Expr], position: Position, env: EnvRef) -> EvalResult<Value> {
+    if arguments.is_empty() {
+        return Err(error_at(
+            "case-lambda expected at least one clause",
+            position,
+        ));
+    }
+
+    let clauses = arguments
+        .iter()
+        .map(|clause| parse_case_lambda_clause(clause, position))
+        .collect::<EvalResult<Vec<_>>>()?;
+
+    Ok(Value::CaseClosure {
+        clauses,
+        env,
+        name: None,
+    })
+}
+
 fn eval_define(
     arguments: &[Expr],
     position: Position,
@@ -611,7 +646,7 @@ fn eval_procedure_define(
     position: Position,
 ) -> EvalResult<Value> {
     env.reserve(name);
-    let value = build_closure(
+    let value = build_closure_from_list(
         parameters,
         body,
         env.clone(),
@@ -748,6 +783,7 @@ fn eval_named_let(
     let closure_env = Environment::child(env, Vec::new());
     let closure = Value::Closure {
         params: bindings.iter().map(|(name, _)| name.clone()).collect(),
+        rest_param: None,
         body: body.to_vec(),
         env: closure_env.clone(),
         name: Some(name.to_string()),
@@ -765,8 +801,8 @@ fn eval_quote(arguments: &[Expr], position: Position) -> EvalResult<Value> {
 
 fn eval_lambda(arguments: &[Expr], position: Position, env: EnvRef) -> EvalResult<Value> {
     match arguments {
-        [Expr::List(parameters, _), body @ ..] if !body.is_empty() => {
-            build_closure(parameters, body, env, None, position)
+        [parameters_expression, body @ ..] if !body.is_empty() => {
+            build_closure_from_expr(parameters_expression, body, env, None, position)
         }
         _ => Err(error_at(
             "lambda expected a parameter list and body",
@@ -775,27 +811,121 @@ fn eval_lambda(arguments: &[Expr], position: Position, env: EnvRef) -> EvalResul
     }
 }
 
-fn build_closure(
+fn build_closure_from_expr(
+    parameters_expression: &Expr,
+    body: &[Expr],
+    env: EnvRef,
+    name: Option<String>,
+    position: Position,
+) -> EvalResult<Value> {
+    let (params, rest_param) = parse_parameter_spec_expression(parameters_expression, position)?;
+    Ok(Value::Closure {
+        params,
+        rest_param,
+        body: body.to_vec(),
+        env,
+        name,
+    })
+}
+
+fn build_closure_from_list(
     parameter_expressions: &[Expr],
     body: &[Expr],
     env: EnvRef,
     name: Option<String>,
     position: Position,
 ) -> EvalResult<Value> {
-    let mut parameters = Vec::with_capacity(parameter_expressions.len());
-    for expression in parameter_expressions {
-        match expression {
-            Expr::Symbol(name, _) => parameters.push(name.clone()),
-            _ => return Err(error_at("lambda parameters must be symbols", position)),
-        }
-    }
-
+    let (params, rest_param) = parse_parameter_spec_list(parameter_expressions, position)?;
     Ok(Value::Closure {
-        params: parameters,
+        params,
+        rest_param,
         body: body.to_vec(),
         env,
         name,
     })
+}
+
+fn parse_case_lambda_clause(clause: &Expr, position: Position) -> EvalResult<ProcedureClause> {
+    let Expr::List(items, clause_position) = clause else {
+        return Err(error_at(
+            "case-lambda expected clauses of the form (formals body ...)",
+            position,
+        ));
+    };
+
+    let Some((parameters_expression, body)) = items.split_first() else {
+        return Err(error_at(
+            "case-lambda expected clauses of the form (formals body ...)",
+            *clause_position,
+        ));
+    };
+
+    if body.is_empty() {
+        return Err(error_at(
+            "case-lambda clauses must have a body",
+            *clause_position,
+        ));
+    }
+
+    let (params, rest_param) =
+        parse_parameter_spec_expression(parameters_expression, *clause_position)?;
+    Ok(ProcedureClause {
+        params,
+        rest_param,
+        body: body.to_vec(),
+    })
+}
+
+fn parse_parameter_spec_expression(
+    parameters_expression: &Expr,
+    position: Position,
+) -> EvalResult<(Vec<String>, Option<String>)> {
+    match parameters_expression {
+        Expr::Symbol(name, _) => Ok((Vec::new(), Some(name.clone()))),
+        Expr::List(parameter_expressions, _) => {
+            parse_parameter_spec_list(parameter_expressions, position)
+        }
+        _ => Err(error_at(
+            "lambda expected a parameter list or symbol",
+            position,
+        )),
+    }
+}
+
+fn parse_parameter_spec_list(
+    parameter_expressions: &[Expr],
+    position: Position,
+) -> EvalResult<(Vec<String>, Option<String>)> {
+    let dot_index = parameter_expressions
+        .iter()
+        .position(|expression| matches!(expression, Expr::Symbol(name, _) if name == "."));
+
+    match dot_index {
+        None => Ok((
+            parameter_expressions
+                .iter()
+                .map(|expression| parse_parameter_name(expression, position))
+                .collect::<EvalResult<Vec<_>>>()?,
+            None,
+        )),
+        Some(index) => match &parameter_expressions[index..] {
+            [Expr::Symbol(dot, _), Expr::Symbol(rest_name, _)] if dot == "." => Ok((
+                parameter_expressions[..index]
+                    .iter()
+                    .map(|expression| parse_parameter_name(expression, position))
+                    .collect::<EvalResult<Vec<_>>>()?,
+                Some(rest_name.clone()),
+            )),
+            _ => Err(error_at("parameter list is malformed", position)),
+        },
+    }
+}
+
+fn parse_parameter_name(expression: &Expr, position: Position) -> EvalResult<String> {
+    match expression {
+        Expr::Symbol(name, _) => Ok(name.clone()),
+        _ => Err(error_at("lambda parameters must be symbols", position)),
+    }
 }
 
 fn parse_bindings(
@@ -1011,10 +1141,24 @@ fn apply(
         Value::Builtin { function, .. } => function(&arguments, position, context),
         Value::Closure {
             params,
+            rest_param,
             body,
             env,
             name: _,
-        } => apply_closure(&params, &body, env, arguments, position, context),
+        } => apply_closure(
+            &params,
+            rest_param.as_deref(),
+            &body,
+            env,
+            arguments,
+            position,
+            context,
+        ),
+        Value::CaseClosure {
+            clauses,
+            env,
+            name: _,
+        } => apply_case_closure(&clauses, env, arguments, position, context),
         Value::RecordConstructor {
             name,
             record_type,
@@ -1040,28 +1184,83 @@ fn apply(
 
 fn apply_closure(
     parameters: &[String],
+    rest_param: Option<&str>,
     body: &[Expr],
     closure_env: EnvRef,
     arguments: Vec<Value>,
     position: Position,
     context: &mut EvalContext,
 ) -> EvalResult<Value> {
-    if arguments.len() != parameters.len() {
-        return Err(error_at(
-            format!(
-                "procedure expected {} argument(s), got {}",
-                parameters.len(),
-                arguments.len()
-            ),
-            position,
-        ));
+    match rest_param {
+        Some(_) if arguments.len() < parameters.len() => {
+            return Err(error_at(
+                format!(
+                    "procedure expected at least {} argument(s), got {}",
+                    parameters.len(),
+                    arguments.len()
+                ),
+                position,
+            ));
+        }
+        None if arguments.len() != parameters.len() => {
+            return Err(error_at(
+                format!(
+                    "procedure expected {} argument(s), got {}",
+                    parameters.len(),
+                    arguments.len()
+                ),
+                position,
+            ));
+        }
+        _ => {}
     }
 
-    let call_env = Environment::child(
-        closure_env,
-        parameters.iter().cloned().zip(arguments).collect(),
-    );
+    let mut bindings = parameters
+        .iter()
+        .cloned()
+        .zip(arguments.iter().take(parameters.len()).cloned())
+        .collect::<Vec<_>>();
+
+    if let Some(rest_name) = rest_param {
+        let rest_arguments = arguments.into_iter().skip(parameters.len()).collect();
+        bindings.push((rest_name.to_string(), build_list(rest_arguments)));
+    }
+
+    let call_env = Environment::child(closure_env, bindings);
     eval_sequence(body, call_env, context)
+}
+
+fn apply_case_closure(
+    clauses: &[ProcedureClause],
+    closure_env: EnvRef,
+    arguments: Vec<Value>,
+    position: Position,
+    context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let argument_count = arguments.len();
+
+    for clause in clauses {
+        let matches = match clause.rest_param {
+            Some(_) => argument_count >= clause.params.len(),
+            None => argument_count == clause.params.len(),
+        };
+        if matches {
+            return apply_closure(
+                &clause.params,
+                clause.rest_param.as_deref(),
+                &clause.body,
+                closure_env.clone(),
+                arguments,
+                position,
+                context,
+            );
+        }
+    }
+
+    Err(error_at(
+        format!("case-lambda expected a matching clause for {argument_count} argument(s)"),
+        position,
+    ))
 }
 
 fn apply_record_constructor(
@@ -1123,6 +1322,7 @@ fn root_bindings() -> Vec<(String, Value)> {
         builtin("cons", cons),
         builtin("car", car),
         builtin("cdr", cdr),
+        builtin("apply", apply_builtin),
         builtin("null?", is_null),
         builtin("list", list),
         builtin("length", length),
@@ -1131,6 +1331,7 @@ fn root_bindings() -> Vec<(String, Value)> {
         builtin("number?", is_number),
         builtin("boolean?", is_boolean),
         builtin("pair?", is_pair),
+        builtin("procedure?", is_procedure),
         builtin("symbol?", is_symbol),
         builtin("display", display),
         builtin("write", write),
@@ -1311,6 +1512,24 @@ fn cdr(arguments: &[Value], position: Position, _context: &mut EvalContext) -> E
     Ok(cdr.clone())
 }
 
+fn apply_builtin(
+    arguments: &[Value],
+    position: Position,
+    context: &mut EvalContext,
+) -> EvalResult<Value> {
+    expect_at_least(arguments, 2, "apply", position)?;
+
+    let function = arguments[0].clone();
+    let mut applied_arguments = arguments[1..arguments.len() - 1].to_vec();
+    applied_arguments.extend(expect_proper_list(
+        &arguments[arguments.len() - 1],
+        "apply",
+        position,
+    )?);
+
+    apply(function, applied_arguments, position, context)
+}
+
 fn is_null(
     arguments: &[Value],
     position: Position,
@@ -1385,6 +1604,14 @@ fn is_pair(
     unary_predicate(arguments, "pair?", position, |value| {
         matches!(value, Value::Pair(_, _))
     })
+}
+
+fn is_procedure(
+    arguments: &[Value],
+    position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    unary_predicate(arguments, "procedure?", position, is_callable_value)
 }
 
 fn is_symbol(
@@ -2260,6 +2487,18 @@ fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Bool(false))
 }
 
+fn is_callable_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Builtin { .. }
+            | Value::Closure { .. }
+            | Value::CaseClosure { .. }
+            | Value::RecordConstructor { .. }
+            | Value::RecordPredicate { .. }
+            | Value::RecordAccessor { .. }
+    )
+}
+
 fn render_value(value: &Value, display_mode: bool) -> String {
     match value {
         Value::Int(number) => number.to_string(),
@@ -2289,6 +2528,10 @@ fn render_value(value: &Value, display_mode: bool) -> String {
         Value::Pair(_, _) => format!("({})", render_pair_contents(value, display_mode)),
         Value::Builtin { name, .. } => format!("#<procedure:{name}>"),
         Value::Closure { name, .. } => match name {
+            Some(name) => format!("#<procedure:{name}>"),
+            None => "#<procedure:lambda>".to_string(),
+        },
+        Value::CaseClosure { name, .. } => match name {
             Some(name) => format!("#<procedure:{name}>"),
             None => "#<procedure:lambda>".to_string(),
         },

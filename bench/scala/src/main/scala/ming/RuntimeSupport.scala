@@ -129,8 +129,7 @@ private[ming] object RuntimeSupport:
       case CharValue(_)       => "char"
       case EmptyListValue     => "list"
       case PairValue(_, _)    => "pair"
-      case BuiltinValue(_, _) => "procedure"
-      case ClosureValue(_, _, _, _, _) =>
+      case _: ProcedureValue =>
         "procedure"
       case _: RecordValue =>
         "record"

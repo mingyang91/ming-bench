@@ -22,6 +22,15 @@ private[ming] object MacroInstantiator:
         (quoted, state)
       case ListExpr(SymbolExpr("lambda", keywordPosition) :: parameterSpec :: body, position) if body.nonEmpty =>
         instantiateLambda(keywordPosition, parameterSpec, body, position, context, state)
+      case ListExpr(SymbolExpr("case-lambda", keywordPosition) :: clauses, position) =>
+        MacroCaseLambdaInstantiator.instantiate(
+          keywordPosition,
+          clauses,
+          position,
+          context,
+          state,
+          instantiateTemplate
+        )
       case ListExpr(
             SymbolExpr("let", keywordPosition) ::
             (nameTemplate @ SymbolExpr(_, _)) ::

@@ -6,6 +6,8 @@ sealed private[ming] trait Value:
 
 sealed private[ming] trait NumberValue extends Value
 
+sealed private[ming] trait ProcedureValue extends Value
+
 final private[ming] case class IntValue(value: BigInt) extends NumberValue:
   override def render: String = value.toString
 
@@ -74,7 +76,7 @@ final private[ming] case class PairValue(car: Value, cdr: Value) extends Value:
 final private[ming] case class BuiltinValue(
   name: String,
   implementation: (List[Value], Position) => Value
-) extends Value:
+) extends ProcedureValue:
   override def render: String = s"#<procedure:$name>"
 
 final private[ming] case class ClosureValue(
@@ -83,12 +85,22 @@ final private[ming] case class ClosureValue(
   body: List[Expr],
   env: Environment,
   name: Option[String] = None
-) extends Value:
+) extends ProcedureValue:
 
   override def render: String =
     name match
       case Some(procedureName) => s"#<procedure:$procedureName>"
       case None                => "#<procedure:lambda>"
+
+final private[ming] case class CaseLambdaValue(
+  clauses: List[ClosureValue],
+  name: Option[String] = None
+) extends ProcedureValue:
+
+  override def render: String =
+    name match
+      case Some(procedureName) => s"#<procedure:$procedureName>"
+      case None                => "#<procedure:case-lambda>"
 
 final private[ming] class RecordTypeDescriptor(
   val name: String,

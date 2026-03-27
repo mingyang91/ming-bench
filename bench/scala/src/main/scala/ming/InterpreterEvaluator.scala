@@ -26,6 +26,8 @@ private[ming] object InterpreterEvaluator:
         implementation(arguments, position)
       case ClosureValue(parameters, restParameter, body, closureEnv, _) =>
         applyClosure(parameters, restParameter, body, closureEnv, arguments, position)
+      case CaseLambdaValue(clauses, _) =>
+        applyCaseLambda(clauses, arguments, position)
       case other =>
         SchemeFailure.raise(
           s"attempted to call a non-procedure value: ${other.render}",
@@ -52,6 +54,8 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalDefineSyntax(rest, position, env)
       case SymbolExpr("if", _) :: rest =>
         SpecialFormEvaluator.evalIf(rest, position, env)
+      case SymbolExpr("case-lambda", _) :: rest =>
+        SpecialFormEvaluator.evalCaseLambda(rest, position, env)
       case SymbolExpr("let", _) :: rest =>
         SpecialFormEvaluator.evalLet(rest, position, env)
       case SymbolExpr("quote", _) :: rest =>
@@ -88,6 +92,20 @@ private[ming] object InterpreterEvaluator:
     val evaluatedArguments = arguments.map(argument => eval(argument, env))
     applyFunction(function, evaluatedArguments, position)
 
+  private def applyCaseLambda(
+    clauses: List[ClosureValue],
+    arguments: List[Value],
+    position: Position
+  ): Value =
+    clauses.find(clauseMatches(_, arguments.length)) match
+      case Some(ClosureValue(parameters, restParameter, body, closureEnv, _)) =>
+        applyClosure(parameters, restParameter, body, closureEnv, arguments, position)
+      case None =>
+        SchemeFailure.raise(
+          s"case-lambda did not match ${arguments.length} argument(s)",
+          position
+        )
+
   private def applyClosure(
     parameters: List[String],
     restParameter: Option[String],
@@ -120,3 +138,8 @@ private[ming] object InterpreterEvaluator:
           fixedBindings
     val callEnv = Environment.child(closureEnv, bindings)
     evalSequence(body, callEnv)
+
+  private def clauseMatches(clause: ClosureValue, argumentCount: Int): Boolean =
+    clause.restParameter match
+      case Some(_) => argumentCount >= clause.parameters.length
+      case None    => argumentCount == clause.parameters.length
