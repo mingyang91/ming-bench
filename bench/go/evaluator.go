@@ -42,6 +42,10 @@ type CaseLambdaVal struct {
 	Clauses []*LambdaVal
 }
 
+type VectorVal struct {
+	Items []Value
+}
+
 type SyntaxRulesVal struct {
 	Literals []string
 	Rules    []syntaxRule
@@ -83,6 +87,18 @@ func (v *LambdaVal) String() string  { return "#<procedure>" }
 func (v *BuiltinVal) String() string      { return "#<builtin:" + v.Name + ">" }
 func (v *CaseLambdaVal) String() string    { return "#<procedure>" }
 func (v *SyntaxRulesVal) String() string   { return "#<syntax>" }
+func (v *VectorVal) String() string {
+	var buf strings.Builder
+	buf.WriteString("#(")
+	for i, item := range v.Items {
+		if i > 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteString(item.String())
+	}
+	buf.WriteByte(')')
+	return buf.String()
+}
 
 // Record types
 type RecordTypeDesc struct {
@@ -366,7 +382,11 @@ func tokenize(input string) []Token {
 			col++
 		} else if ch == '#' {
 			startCol := col
-			if i+1 < len(input) && input[i+1] == '\\' {
+			if i+1 < len(input) && input[i+1] == '(' {
+				tokens = append(tokens, Token{"#(", line, startCol})
+				i += 2
+				col += 2
+			} else if i+1 < len(input) && input[i+1] == '\\' {
 				// Character literal: #\a, #\space, #\newline, etc.
 				j := i + 2
 				c := col + 2
@@ -452,6 +472,28 @@ func parse(tokens []Token) (Expr, []Token, error) {
 			return nil, nil, err
 		}
 		return &ListExpr{Items: []Expr{&AtomExpr{Token: "quote", Line: tok.Line, Col: tok.Col}, inner}, Line: tok.Line, Col: tok.Col}, rest2, nil
+	}
+	if tok.Val == "#(" {
+		// Vector literal: #(items...)
+		var items []Expr
+		for len(rest) > 0 && rest[0].Val != ")" {
+			var item Expr
+			var err error
+			item, rest, err = parse(rest)
+			if err != nil {
+				return nil, nil, err
+			}
+			items = append(items, item)
+		}
+		if len(rest) == 0 {
+			return nil, nil, &EvalError{Message: "missing closing paren in vector literal", Line: tok.Line, Col: tok.Col}
+		}
+		rest = rest[1:]
+		// Represent as (##vector-literal items...)
+		allItems := make([]Expr, len(items)+1)
+		allItems[0] = &AtomExpr{Token: "##vector-literal", Line: tok.Line, Col: tok.Col}
+		copy(allItems[1:], items)
+		return &ListExpr{Items: allItems, Line: tok.Line, Col: tok.Col}, rest, nil
 	}
 	if tok.Val == "(" {
 		var items []Expr
@@ -604,6 +646,24 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 			return evalDefineRecordType(list, env)
 		case "case-lambda":
 			return evalCaseLambda(list, env)
+		case "letrec":
+			return evalLetrec(list, env)
+		case "letrec*":
+			return evalLetrecStar(list, env)
+		case "case":
+			return evalCase(list, env)
+		case "do":
+			return evalDo(list, env)
+		case "##vector-literal":
+			items := make([]Value, len(list.Items)-1)
+			for i, item := range list.Items[1:] {
+				v, err := evalInEnv(item, env)
+				if err != nil {
+					return nil, err
+				}
+				items[i] = v
+			}
+			return &VectorVal{Items: items}, nil
 		}
 	}
 
@@ -659,6 +719,18 @@ func exprToValue(expr Expr) (Value, error) {
 	case *ListExpr:
 		if len(e.Items) == 0 {
 			return &NilVal{}, nil
+		}
+		// Check for vector literal in quote context
+		if atom, ok := e.Items[0].(*AtomExpr); ok && atom.Token == "##vector-literal" {
+			items := make([]Value, len(e.Items)-1)
+			for i, item := range e.Items[1:] {
+				v, err := exprToValue(item)
+				if err != nil {
+					return nil, err
+				}
+				items[i] = v
+			}
+			return &VectorVal{Items: items}, nil
 		}
 		// Check for dot notation: (a b . c)
 		dotIdx := -1
@@ -998,6 +1070,263 @@ func evalCond(clauses []Expr, env *Env) (Value, error) {
 	return &VoidVal{}, nil
 }
 
+// --------------- L14: letrec, letrec*, case, do ---------------
+
+func evalLetrec(list *ListExpr, env *Env) (Value, error) {
+	args := list.Items[1:]
+	if len(args) < 2 {
+		return nil, errAt(list, "letrec requires bindings and body")
+	}
+	bindList, ok := args[0].(*ListExpr)
+	if !ok {
+		return nil, errAt(list, "letrec: expected binding list")
+	}
+	letEnv := newEnv(env)
+	// First pass: bind all names to undefined
+	names := make([]string, len(bindList.Items))
+	initExprs := make([]Expr, len(bindList.Items))
+	for i, item := range bindList.Items {
+		pair, ok := item.(*ListExpr)
+		if !ok || len(pair.Items) != 2 {
+			return nil, errAt(list, "letrec: bad binding")
+		}
+		nameAtom, ok := pair.Items[0].(*AtomExpr)
+		if !ok {
+			return nil, errAt(list, "letrec: expected symbol in binding")
+		}
+		names[i] = nameAtom.Token
+		initExprs[i] = pair.Items[1]
+		letEnv.set(nameAtom.Token, &VoidVal{})
+	}
+	// Second pass: evaluate init expressions in letEnv (all names visible)
+	for i, initExpr := range initExprs {
+		v, err := evalInEnv(initExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.set(names[i], v)
+	}
+	// Evaluate body
+	var result Value
+	var err error
+	for _, bodyExpr := range args[1:] {
+		result, err = evalInEnv(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalLetrecStar(list *ListExpr, env *Env) (Value, error) {
+	args := list.Items[1:]
+	if len(args) < 2 {
+		return nil, errAt(list, "letrec* requires bindings and body")
+	}
+	bindList, ok := args[0].(*ListExpr)
+	if !ok {
+		return nil, errAt(list, "letrec*: expected binding list")
+	}
+	letEnv := newEnv(env)
+	for _, item := range bindList.Items {
+		pair, ok := item.(*ListExpr)
+		if !ok || len(pair.Items) != 2 {
+			return nil, errAt(list, "letrec*: bad binding")
+		}
+		nameAtom, ok := pair.Items[0].(*AtomExpr)
+		if !ok {
+			return nil, errAt(list, "letrec*: expected symbol in binding")
+		}
+		v, err := evalInEnv(pair.Items[1], letEnv)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.set(nameAtom.Token, v)
+	}
+	var result Value
+	var err error
+	for _, bodyExpr := range args[1:] {
+		result, err = evalInEnv(bodyExpr, letEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func evalCase(list *ListExpr, env *Env) (Value, error) {
+	if len(list.Items) < 3 {
+		return nil, errAt(list, "case requires key and at least one clause")
+	}
+	key, err := evalInEnv(list.Items[1], env)
+	if err != nil {
+		return nil, err
+	}
+	for _, clauseExpr := range list.Items[2:] {
+		clause, ok := clauseExpr.(*ListExpr)
+		if !ok || len(clause.Items) < 2 {
+			return nil, errAt(list, "case: bad clause")
+		}
+		// Check for else
+		if atom, ok := clause.Items[0].(*AtomExpr); ok && atom.Token == "else" {
+			var result Value = &VoidVal{}
+			for _, e := range clause.Items[1:] {
+				result, err = evalInEnv(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+		// Datum list
+		datumList, ok := clause.Items[0].(*ListExpr)
+		if !ok {
+			return nil, errAt(list, "case: expected datum list")
+		}
+		matched := false
+		for _, datumExpr := range datumList.Items {
+			datum, err := exprToValue(datumExpr)
+			if err != nil {
+				return nil, err
+			}
+			if valuesEqv(key, datum) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			var result Value = &VoidVal{}
+			for _, e := range clause.Items[1:] {
+				result, err = evalInEnv(e, env)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		}
+	}
+	// No match, no else => void
+	return &VoidVal{}, nil
+}
+
+func valuesEqv(a, b Value) bool {
+	switch av := a.(type) {
+	case *IntVal:
+		bv, ok := b.(*IntVal)
+		return ok && av.Val == bv.Val
+	case *RatVal:
+		bv, ok := b.(*RatVal)
+		return ok && av.Num == bv.Num && av.Den == bv.Den
+	case *FloatVal:
+		bv, ok := b.(*FloatVal)
+		return ok && av.Val == bv.Val
+	case *BoolVal:
+		bv, ok := b.(*BoolVal)
+		return ok && av.Val == bv.Val
+	case *SymbolVal:
+		bv, ok := b.(*SymbolVal)
+		return ok && av.Name == bv.Name
+	case *CharVal:
+		bv, ok := b.(*CharVal)
+		return ok && av.Val == bv.Val
+	case *NilVal:
+		_, ok := b.(*NilVal)
+		return ok
+	default:
+		return a == b
+	}
+}
+
+func evalDo(list *ListExpr, env *Env) (Value, error) {
+	// (do ((var init step) ...) (test expr ...) body ...)
+	if len(list.Items) < 3 {
+		return nil, errAt(list, "do requires variable list and test clause")
+	}
+	varList, ok := list.Items[1].(*ListExpr)
+	if !ok {
+		return nil, errAt(list, "do: expected variable list")
+	}
+	testClause, ok := list.Items[2].(*ListExpr)
+	if !ok || len(testClause.Items) == 0 {
+		return nil, errAt(list, "do: expected test clause")
+	}
+	bodyExprs := list.Items[3:]
+
+	type doVar struct {
+		name string
+		step Expr // nil if no step
+	}
+	vars := make([]doVar, len(varList.Items))
+	doEnv := newEnv(env)
+
+	// Initialize variables
+	for i, item := range varList.Items {
+		vl, ok := item.(*ListExpr)
+		if !ok || len(vl.Items) < 2 || len(vl.Items) > 3 {
+			return nil, errAt(list, "do: bad variable spec")
+		}
+		nameAtom, ok := vl.Items[0].(*AtomExpr)
+		if !ok {
+			return nil, errAt(list, "do: expected variable name")
+		}
+		initVal, err := evalInEnv(vl.Items[1], env)
+		if err != nil {
+			return nil, err
+		}
+		vars[i] = doVar{name: nameAtom.Token}
+		if len(vl.Items) == 3 {
+			vars[i].step = vl.Items[2]
+		}
+		doEnv.set(nameAtom.Token, initVal)
+	}
+
+	// Iteration loop
+	for {
+		// Test
+		testVal, err := evalInEnv(testClause.Items[0], doEnv)
+		if err != nil {
+			return nil, err
+		}
+		if isTruthy(testVal) {
+			// Evaluate result expressions
+			if len(testClause.Items) > 1 {
+				var result Value
+				for _, e := range testClause.Items[1:] {
+					result, err = evalInEnv(e, doEnv)
+					if err != nil {
+						return nil, err
+					}
+				}
+				return result, nil
+			}
+			return &VoidVal{}, nil
+		}
+		// Evaluate body
+		for _, bodyExpr := range bodyExprs {
+			_, err = evalInEnv(bodyExpr, doEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Compute step values (parallel update)
+		newVals := make([]Value, len(vars))
+		for i, v := range vars {
+			if v.step != nil {
+				newVals[i], err = evalInEnv(v.step, doEnv)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				newVals[i], _ = doEnv.get(v.name)
+			}
+		}
+		// Update all at once
+		for i, v := range vars {
+			doEnv.set(v.name, newVals[i])
+		}
+	}
+}
+
 // --------------- Macros (syntax-rules) ---------------
 
 func evalDefineSyntax(list *ListExpr, env *Env) (Value, error) {
@@ -1314,7 +1643,7 @@ func collectEllipsisVars(tmpl Expr, bindings *patternBindings) []string {
 
 func isSpecialForm(name string) bool {
 	switch name {
-	case "if", "let", "begin", "set!", "define", "lambda", "and", "or", "cond", "quote", "define-syntax", "syntax-rules", "define-record-type":
+	case "if", "let", "begin", "set!", "define", "lambda", "and", "or", "cond", "quote", "define-syntax", "syntax-rules", "define-record-type", "letrec", "letrec*", "case", "do", "case-lambda":
 		return true
 	}
 	return false
@@ -1385,6 +1714,17 @@ func valuesEqual(a, b Value) bool {
 			return false
 		}
 		return valuesEqual(av.Car, bv.Car) && valuesEqual(av.Cdr, bv.Cdr)
+	case *VectorVal:
+		bv, ok := b.(*VectorVal)
+		if !ok || len(av.Items) != len(bv.Items) {
+			return false
+		}
+		for i := range av.Items {
+			if !valuesEqual(av.Items[i], bv.Items[i]) {
+				return false
+			}
+		}
+		return true
 	default:
 		return a == b
 	}
@@ -2215,6 +2555,130 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 		return &BoolVal{Val: valuesEq(args[0], args[1])}, nil
 	})
 
+	addBuiltin("eqv?", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "eqv? requires 2 arguments"}
+		}
+		return &BoolVal{Val: valuesEqv(args[0], args[1])}, nil
+	})
+
+	// L14: vector operations
+	addBuiltin("vector", func(args []Value) (Value, error) {
+		items := make([]Value, len(args))
+		copy(items, args)
+		return &VectorVal{Items: items}, nil
+	})
+
+	addBuiltin("make-vector", func(args []Value) (Value, error) {
+		if len(args) < 1 || len(args) > 2 {
+			return nil, &EvalError{Message: "make-vector requires 1 or 2 arguments"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "make-vector: expected integer"}
+		}
+		var fill Value = &IntVal{Val: 0}
+		if len(args) == 2 {
+			fill = args[1]
+		}
+		items := make([]Value, n.Val)
+		for i := range items {
+			items[i] = fill
+		}
+		return &VectorVal{Items: items}, nil
+	})
+
+	addBuiltin("vector-ref", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "vector-ref requires 2 arguments"}
+		}
+		v, ok := args[0].(*VectorVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-ref: expected vector"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-ref: expected integer index"}
+		}
+		if idx.Val < 0 || idx.Val >= int64(len(v.Items)) {
+			return nil, &EvalError{Message: "vector-ref: index out of range"}
+		}
+		return v.Items[idx.Val], nil
+	})
+
+	addBuiltin("vector-set!", func(args []Value) (Value, error) {
+		if len(args) != 3 {
+			return nil, &EvalError{Message: "vector-set! requires 3 arguments"}
+		}
+		v, ok := args[0].(*VectorVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-set!: expected vector"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-set!: expected integer index"}
+		}
+		if idx.Val < 0 || idx.Val >= int64(len(v.Items)) {
+			return nil, &EvalError{Message: "vector-set!: index out of range"}
+		}
+		v.Items[idx.Val] = args[2]
+		return &VoidVal{}, nil
+	})
+
+	addBuiltin("vector-length", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "vector-length requires 1 argument"}
+		}
+		v, ok := args[0].(*VectorVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector-length: expected vector"}
+		}
+		return &IntVal{Val: int64(len(v.Items))}, nil
+	})
+
+	addBuiltin("vector?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "vector? requires 1 argument"}
+		}
+		_, ok := args[0].(*VectorVal)
+		return &BoolVal{Val: ok}, nil
+	})
+
+	addBuiltin("vector->list", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "vector->list requires 1 argument"}
+		}
+		v, ok := args[0].(*VectorVal)
+		if !ok {
+			return nil, &EvalError{Message: "vector->list: expected vector"}
+		}
+		var result Value = &NilVal{}
+		for i := len(v.Items) - 1; i >= 0; i-- {
+			result = &PairVal{Car: v.Items[i], Cdr: result}
+		}
+		return result, nil
+	})
+
+	addBuiltin("list->vector", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "list->vector requires 1 argument"}
+		}
+		var items []Value
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				break
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "list->vector: not a proper list"}
+			}
+			items = append(items, p.Car)
+			cur = p.Cdr
+		}
+		return &VectorVal{Items: items}, nil
+	})
+
 	// L09: built-in map (multi-list)
 	addBuiltin("map", func(args []Value) (Value, error) {
 		if len(args) < 2 {
@@ -2599,6 +3063,17 @@ func displayValue(v Value) string {
 		if _, ok := cur.(*NilVal); !ok {
 			buf.WriteString(" . ")
 			buf.WriteString(displayValue(cur))
+		}
+		buf.WriteByte(')')
+		return buf.String()
+	case *VectorVal:
+		var buf strings.Builder
+		buf.WriteString("#(")
+		for i, item := range val.Items {
+			if i > 0 {
+				buf.WriteByte(' ')
+			}
+			buf.WriteString(displayValue(item))
 		}
 		buf.WriteByte(')')
 		return buf.String()
