@@ -172,6 +172,22 @@ impl<'a> Parser<'a> {
 
         if let Ok(n) = token.parse::<i64>() {
             Ok(Value::Integer(n))
+        } else if let Some(idx) = token.find('/') {
+            // Try rational: num/den
+            if idx > 0 && idx < token.len() - 1 {
+                if let (Ok(num), Ok(den)) = (token[..idx].parse::<i64>(), token[idx+1..].parse::<i64>()) {
+                    if den != 0 {
+                        return Ok(Value::make_rational(num, den));
+                    }
+                }
+            }
+            Ok(Value::Symbol(token.into()))
+        } else if token.contains('.') {
+            if let Ok(f) = token.parse::<f64>() {
+                Ok(Value::Float(f))
+            } else {
+                Ok(Value::Symbol(token.into()))
+            }
         } else {
             Ok(Value::Symbol(token.into()))
         }

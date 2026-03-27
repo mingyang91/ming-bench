@@ -29,6 +29,9 @@ const BUILTINS: &[&str] = &[
     "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
     "char=?", "char<?",
     "string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+    // L11
+    "exact?", "inexact?", "exact->inexact", "inexact->exact",
+    "numerator", "denominator", "integer?", "rational?",
 ];
 
 fn make_env() -> Rc<RefCell<Env>> {

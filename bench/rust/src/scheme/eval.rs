@@ -9,7 +9,8 @@ pub type Output = Rc<RefCell<String>>;
 
 pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     match expr {
-        Value::Integer(_) | Value::Boolean(_) | Value::String(_)
+        Value::Integer(_) | Value::Rational(_, _) | Value::Float(_)
+        | Value::Boolean(_) | Value::String(_)
         | Value::Char(_) | Value::Lambda { .. } | Value::Pair(_, _)
         | Value::SyntaxRules { .. } => {
             Ok(expr.clone())
@@ -228,45 +229,41 @@ fn builtin_apply(args: &[Value], out: &Output) -> Result<Value, EvalError> {
 fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalError> {
     match op {
         "+" => {
-            let mut sum: i64 = 0;
+            let mut acc = Num::Exact(0, 1);
             for v in vals {
-                sum += expect_int(v)?;
+                acc = num_add(acc, to_num(v)?);
             }
-            Ok(Value::Integer(sum))
+            Ok(num_to_value(acc))
         }
         "-" => {
             if vals.is_empty() {
                 return Err(EvalError::Arity("- requires at least 1 argument".into()));
             }
             if vals.len() == 1 {
-                return Ok(Value::Integer(-expect_int(&vals[0])?));
+                return Ok(num_to_value(num_neg(to_num(&vals[0])?)));
             }
-            let mut result = expect_int(&vals[0])?;
+            let mut acc = to_num(&vals[0])?;
             for v in &vals[1..] {
-                result -= expect_int(v)?;
+                acc = num_sub(acc, to_num(v)?);
             }
-            Ok(Value::Integer(result))
+            Ok(num_to_value(acc))
         }
         "*" => {
-            let mut product: i64 = 1;
+            let mut acc = Num::Exact(1, 1);
             for v in vals {
-                product *= expect_int(v)?;
+                acc = num_mul(acc, to_num(v)?);
             }
-            Ok(Value::Integer(product))
+            Ok(num_to_value(acc))
         }
         "/" => {
             if vals.len() < 2 {
                 return Err(EvalError::Arity("/ requires at least 2 arguments".into()));
             }
-            let mut result = expect_int(&vals[0])?;
+            let mut acc = to_num(&vals[0])?;
             for v in &vals[1..] {
-                let d = expect_int(v)?;
-                if d == 0 {
-                    return Err(EvalError::DivisionByZero);
-                }
-                result /= d;
+                acc = num_div(acc, to_num(v)?)?;
             }
-            Ok(Value::Integer(result))
+            Ok(num_to_value(acc))
         }
         "<" => compare_nums(vals, |a, b| a < b),
         ">" => compare_nums(vals, |a, b| a > b),
@@ -349,7 +346,62 @@ fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalEr
         }
         "number?" => {
             if vals.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Integer(_) | Value::Rational(_, _) | Value::Float(_))))
+        }
+        "integer?" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("integer? requires 1 argument".into())); }
             Ok(Value::Boolean(matches!(&vals[0], Value::Integer(_))))
+        }
+        "rational?" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("rational? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Integer(_) | Value::Rational(_, _))))
+        }
+        "exact?" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("exact? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Integer(_) | Value::Rational(_, _))))
+        }
+        "inexact?" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("inexact? requires 1 argument".into())); }
+            Ok(Value::Boolean(matches!(&vals[0], Value::Float(_))))
+        }
+        "exact->inexact" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("exact->inexact requires 1 argument".into())); }
+            match &vals[0] {
+                Value::Integer(n) => Ok(Value::Float(*n as f64)),
+                Value::Rational(n, d) => Ok(Value::Float(*n as f64 / *d as f64)),
+                Value::Float(f) => Ok(Value::Float(*f)),
+                _ => Err(EvalError::Type("exact->inexact: expected number".into())),
+            }
+        }
+        "inexact->exact" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("inexact->exact requires 1 argument".into())); }
+            match &vals[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, d) => Ok(Value::Rational(*n, *d)),
+                Value::Float(f) => {
+                    // Convert float to rational via continued fraction / simple approach
+                    // For 0.5 => 1/2, etc.
+                    let (num, den) = float_to_rational(*f);
+                    Ok(Value::make_rational(num, den))
+                }
+                _ => Err(EvalError::Type("inexact->exact: expected number".into())),
+            }
+        }
+        "numerator" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("numerator requires 1 argument".into())); }
+            match &vals[0] {
+                Value::Integer(n) => Ok(Value::Integer(*n)),
+                Value::Rational(n, _) => Ok(Value::Integer(*n)),
+                _ => Err(EvalError::Type("numerator: expected rational".into())),
+            }
+        }
+        "denominator" => {
+            if vals.len() != 1 { return Err(EvalError::Arity("denominator requires 1 argument".into())); }
+            match &vals[0] {
+                Value::Integer(_) => Ok(Value::Integer(1)),
+                Value::Rational(_, d) => Ok(Value::Integer(*d)),
+                _ => Err(EvalError::Type("denominator: expected rational".into())),
+            }
         }
         "boolean?" => {
             if vals.len() != 1 { return Err(EvalError::Arity("boolean? requires 1 argument".into())); }
@@ -441,8 +493,7 @@ fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalEr
             if vals.len() != 1 {
                 return Err(EvalError::Arity("number->string requires 1 argument".into()));
             }
-            let n = expect_int(&vals[0])?;
-            Ok(Value::String(n.to_string()))
+            Ok(Value::String(vals[0].to_display()))
         }
         "symbol->string" => {
             if vals.len() != 1 {
@@ -856,8 +907,119 @@ fn eval_or(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value
 fn expect_int(v: &Value) -> Result<i64, EvalError> {
     match v {
         Value::Integer(n) => Ok(*n),
+        _ => Err(EvalError::Type(format!("expected integer, got {}", v))),
+    }
+}
+
+/// Extract a number as (numerator, denominator) for exact, or f64 for inexact
+enum Num {
+    Exact(i64, i64), // num, den
+    Inexact(f64),
+}
+
+fn to_num(v: &Value) -> Result<Num, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(Num::Exact(*n, 1)),
+        Value::Rational(n, d) => Ok(Num::Exact(*n, *d)),
+        Value::Float(f) => Ok(Num::Inexact(*f)),
         _ => Err(EvalError::Type(format!("expected number, got {}", v))),
     }
+}
+
+fn num_to_value(n: Num) -> Value {
+    match n {
+        Num::Exact(num, den) => Value::make_rational(num, den),
+        Num::Inexact(f) => Value::Float(f),
+    }
+}
+
+fn num_add(a: Num, b: Num) -> Num {
+    match (a, b) {
+        (Num::Exact(an, ad), Num::Exact(bn, bd)) => Num::Exact(an * bd + bn * ad, ad * bd),
+        (Num::Inexact(a), Num::Inexact(b)) => Num::Inexact(a + b),
+        (Num::Exact(n, d), Num::Inexact(f)) | (Num::Inexact(f), Num::Exact(n, d)) => {
+            Num::Inexact(n as f64 / d as f64 + f)
+        }
+    }
+}
+
+fn num_sub(a: Num, b: Num) -> Num {
+    match (a, b) {
+        (Num::Exact(an, ad), Num::Exact(bn, bd)) => Num::Exact(an * bd - bn * ad, ad * bd),
+        (Num::Inexact(a), Num::Inexact(b)) => Num::Inexact(a - b),
+        (Num::Exact(n, d), Num::Inexact(f)) => Num::Inexact(n as f64 / d as f64 - f),
+        (Num::Inexact(f), Num::Exact(n, d)) => Num::Inexact(f - n as f64 / d as f64),
+    }
+}
+
+fn num_mul(a: Num, b: Num) -> Num {
+    match (a, b) {
+        (Num::Exact(an, ad), Num::Exact(bn, bd)) => Num::Exact(an * bn, ad * bd),
+        (Num::Inexact(a), Num::Inexact(b)) => Num::Inexact(a * b),
+        (Num::Exact(n, d), Num::Inexact(f)) | (Num::Inexact(f), Num::Exact(n, d)) => {
+            Num::Inexact(n as f64 / d as f64 * f)
+        }
+    }
+}
+
+fn num_div(a: Num, b: Num) -> Result<Num, EvalError> {
+    match (a, b) {
+        (Num::Exact(an, ad), Num::Exact(bn, bd)) => {
+            if bn == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Num::Exact(an * bd, ad * bn))
+        }
+        (Num::Inexact(a), Num::Inexact(b)) => {
+            if b == 0.0 { return Err(EvalError::DivisionByZero); }
+            Ok(Num::Inexact(a / b))
+        }
+        (Num::Exact(n, d), Num::Inexact(f)) => {
+            if f == 0.0 { return Err(EvalError::DivisionByZero); }
+            Ok(Num::Inexact(n as f64 / d as f64 / f))
+        }
+        (Num::Inexact(f), Num::Exact(n, d)) => {
+            if n == 0 { return Err(EvalError::DivisionByZero); }
+            Ok(Num::Inexact(f / (n as f64 / d as f64)))
+        }
+    }
+}
+
+fn num_to_f64(n: &Num) -> f64 {
+    match n {
+        Num::Exact(num, den) => *num as f64 / *den as f64,
+        Num::Inexact(f) => *f,
+    }
+}
+
+fn num_neg(a: Num) -> Num {
+    match a {
+        Num::Exact(n, d) => Num::Exact(-n, d),
+        Num::Inexact(f) => Num::Inexact(-f),
+    }
+}
+
+fn float_to_rational(f: f64) -> (i64, i64) {
+    if f == 0.0 {
+        return (0, 1);
+    }
+    // Use the fact that f64 has limited precision - multiply by power of 2
+    // Simple approach: scale to integer
+    let sign = if f < 0.0 { -1i64 } else { 1 };
+    let f = f.abs();
+    // Find a denominator that makes this exact
+    // Try powers of 10 first for common decimal fractions
+    let mut den = 1i64;
+    let mut approx = f;
+    for _ in 0..15 {
+        if (approx - approx.round()).abs() < 1e-10 {
+            return (sign * approx.round() as i64, den);
+        }
+        den *= 10;
+        approx = f * den as f64;
+    }
+    // Fallback
+    let den = 1_000_000_000i64;
+    let num = (f * den as f64).round() as i64;
+    (sign * num, den)
 }
 
 // --- Macro support (L10) ---
@@ -1127,15 +1289,15 @@ fn collect_ellipsis_vars(template: &Value, bindings: &HashMap<String, MacroBindi
     vars
 }
 
-fn compare_nums(vals: &[Value], pred: fn(i64, i64) -> bool) -> Result<Value, EvalError> {
+fn compare_nums(vals: &[Value], pred: fn(f64, f64) -> bool) -> Result<Value, EvalError> {
     if vals.len() < 2 {
         return Err(EvalError::Arity(
             "comparison requires at least 2 arguments".into(),
         ));
     }
-    let mut prev = expect_int(&vals[0])?;
+    let mut prev = num_to_f64(&to_num(&vals[0])?);
     for v in &vals[1..] {
-        let curr = expect_int(v)?;
+        let curr = num_to_f64(&to_num(v)?);
         if !pred(prev, curr) {
             return Ok(Value::Boolean(false));
         }
