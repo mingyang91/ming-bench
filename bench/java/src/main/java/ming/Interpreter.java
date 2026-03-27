@@ -45,6 +45,9 @@ final class Interpreter {
         env.define("=", new BuiltinProcedure("=", this::applyNumericEquals));
         env.define("<=", new BuiltinProcedure("<=", this::applyLessEqual));
         env.define("not", new BuiltinProcedure("not", this::applyNot));
+        env.define("display", new BuiltinProcedure("display", this::applyDisplay));
+        env.define("write", new BuiltinProcedure("write", this::applyWrite));
+        env.define("newline", new BuiltinProcedure("newline", this::applyNewline));
         env.define("cons", new BuiltinProcedure("cons", this::applyCons));
         env.define("car", new BuiltinProcedure("car", this::applyCar));
         env.define("cdr", new BuiltinProcedure("cdr", this::applyCdr));
@@ -52,6 +55,15 @@ final class Interpreter {
         env.define("list", new BuiltinProcedure("list", this::applyList));
         env.define("length", new BuiltinProcedure("length", this::applyLength));
         env.define("append", new BuiltinProcedure("append", this::applyAppend));
+        env.define("string-append", new BuiltinProcedure("string-append", this::applyStringAppend));
+        env.define("string-length", new BuiltinProcedure("string-length", this::applyStringLength));
+        env.define("substring", new BuiltinProcedure("substring", this::applySubstring));
+        env.define("string->number", new BuiltinProcedure("string->number", this::applyStringToNumber));
+        env.define("number->string", new BuiltinProcedure("number->string", this::applyNumberToString));
+        env.define("symbol->string", new BuiltinProcedure("symbol->string", this::applySymbolToString));
+        env.define("string->symbol", new BuiltinProcedure("string->symbol", this::applyStringToSymbol));
+        env.define("string-ref", new BuiltinProcedure("string-ref", this::applyStringRef));
+        env.define("char?", new BuiltinProcedure("char?", this::applyCharPredicate));
         env.define("string?", new BuiltinProcedure("string?", this::applyStringPredicate));
         env.define("number?", new BuiltinProcedure("number?", this::applyNumberPredicate));
         env.define("boolean?", new BuiltinProcedure("boolean?", this::applyBooleanPredicate));
@@ -346,6 +358,24 @@ final class Interpreter {
         return arguments.getFirst().isTruthy() ? FALSE : TRUE;
     }
 
+    private Value applyDisplay(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("display", arguments, 1, callLoc);
+        output.append(arguments.getFirst().displayRender());
+        return VOID;
+    }
+
+    private Value applyWrite(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("write", arguments, 1, callLoc);
+        output.append(arguments.getFirst().render());
+        return VOID;
+    }
+
+    private Value applyNewline(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("newline", arguments, 0, callLoc);
+        output.append('\n');
+        return VOID;
+    }
+
     private Value applyCons(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("cons", arguments, 2, callLoc);
         return new PairValue(arguments.get(0), arguments.get(1));
@@ -391,6 +421,73 @@ final class Interpreter {
         return result;
     }
 
+    private Value applyStringAppend(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (Value argument : arguments) {
+            builder.append(requireString(argument, "string-append", callLoc));
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private Value applyStringLength(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string-length", arguments, 1, callLoc);
+        int length = requireString(arguments.getFirst(), "string-length", callLoc)
+                .codePointCount(0, requireString(arguments.getFirst(), "string-length", callLoc).length());
+        return new NumberValue(Rational.integer(BigInteger.valueOf(length)));
+    }
+
+    private Value applySubstring(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("substring", arguments, 3, callLoc);
+        String value = requireString(arguments.get(0), "substring", callLoc);
+        int start = requireIndex(arguments.get(1), "substring", callLoc);
+        int end = requireIndex(arguments.get(2), "substring", callLoc);
+        int length = value.codePointCount(0, value.length());
+        if (start > end || end > length) {
+            throw error(callLoc, "substring indices are out of bounds");
+        }
+
+        int startOffset = value.offsetByCodePoints(0, start);
+        int endOffset = value.offsetByCodePoints(0, end);
+        return new StringValue(value.substring(startOffset, endOffset));
+    }
+
+    private Value applyStringToNumber(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string->number", arguments, 1, callLoc);
+        String value = requireString(arguments.getFirst(), "string->number", callLoc);
+        Rational parsed = parseNumberLiteral(value);
+        if (parsed == null) {
+            return FALSE;
+        }
+        return new NumberValue(parsed);
+    }
+
+    private Value applyNumberToString(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("number->string", arguments, 1, callLoc);
+        return new StringValue(requireNumber(arguments.getFirst(), "number->string", callLoc).render());
+    }
+
+    private Value applySymbolToString(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("symbol->string", arguments, 1, callLoc);
+        return new StringValue(requireSymbol(arguments.getFirst(), "symbol->string", callLoc));
+    }
+
+    private Value applyStringToSymbol(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string->symbol", arguments, 1, callLoc);
+        return new SymbolValue(requireString(arguments.getFirst(), "string->symbol", callLoc));
+    }
+
+    private Value applyStringRef(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string-ref", arguments, 2, callLoc);
+        String value = requireString(arguments.get(0), "string-ref", callLoc);
+        int index = requireIndex(arguments.get(1), "string-ref", callLoc);
+        int codePointLength = value.codePointCount(0, value.length());
+        if (index >= codePointLength) {
+            throw error(callLoc, "string-ref index is out of bounds");
+        }
+        int charOffset = value.offsetByCodePoints(0, index);
+        return new CharValue(value.codePointAt(charOffset));
+    }
+
     private Value applyStringPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("string?", arguments, 1, callLoc);
         return arguments.getFirst() instanceof StringValue ? TRUE : FALSE;
@@ -414,6 +511,11 @@ final class Interpreter {
     private Value applySymbolPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("symbol?", arguments, 1, callLoc);
         return arguments.getFirst() instanceof SymbolValue ? TRUE : FALSE;
+    }
+
+    private Value applyCharPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("char?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof CharValue ? TRUE : FALSE;
     }
 
     private Value applyComparison(
@@ -506,6 +608,38 @@ final class Interpreter {
             return numberValue.value();
         }
         throw error(callLoc, procedureName + " expects numeric arguments");
+    }
+
+    private String requireString(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        if (value instanceof StringValue stringValue) {
+            return stringValue.value();
+        }
+        throw error(callLoc, procedureName + " expects string arguments");
+    }
+
+    private String requireSymbol(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        if (value instanceof SymbolValue symbolValue) {
+            return symbolValue.name();
+        }
+        throw error(callLoc, procedureName + " expects symbol arguments");
+    }
+
+    private int requireIndex(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        Rational number = requireNumber(value, procedureName, callLoc);
+        if (!number.denominator().equals(BigInteger.ONE)) {
+            throw error(callLoc, procedureName + " expects a non-negative index");
+        }
+        BigInteger integer = number.numerator();
+        if (integer.signum() < 0) {
+            throw error(callLoc, procedureName + " expects a non-negative index");
+        }
+        if (integer.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {
+            throw error(callLoc, procedureName + " index is too large");
+        }
+        return integer.intValueExact();
     }
 
     private PairValue requirePair(Value value, String procedureName, SourceLoc callLoc)
@@ -607,6 +741,7 @@ final class Interpreter {
     private sealed interface Value permits NumberValue,
             BooleanValue,
             StringValue,
+            CharValue,
             SymbolValue,
             PairValue,
             EmptyListValue,
@@ -614,6 +749,10 @@ final class Interpreter {
             UserProcedure,
             VoidValue {
         String render();
+
+        default String displayRender() {
+            return render();
+        }
 
         default boolean isTruthy() {
             return true;
@@ -665,6 +804,23 @@ final class Interpreter {
         public String render() {
             return renderString(value);
         }
+
+        @Override
+        public String displayRender() {
+            return value;
+        }
+    }
+
+    private record CharValue(int codePoint) implements Value {
+        @Override
+        public String render() {
+            return renderChar(codePoint);
+        }
+
+        @Override
+        public String displayRender() {
+            return new String(Character.toChars(codePoint));
+        }
     }
 
     private record SymbolValue(String name) implements Value {
@@ -677,25 +833,34 @@ final class Interpreter {
     private record PairValue(Value car, Value cdr) implements Value {
         @Override
         public String render() {
+            return renderContents(false);
+        }
+
+        @Override
+        public String displayRender() {
+            return renderContents(true);
+        }
+
+        private String renderContents(boolean displayMode) {
             StringBuilder builder = new StringBuilder();
             builder.append('(');
-            appendPairContents(builder, this);
+            appendPairContents(builder, this, displayMode);
             builder.append(')');
             return builder.toString();
         }
 
-        private static void appendPairContents(StringBuilder builder, PairValue pair) {
-            builder.append(pair.car.render());
+        private static void appendPairContents(StringBuilder builder, PairValue pair, boolean displayMode) {
+            builder.append(displayMode ? pair.car.displayRender() : pair.car.render());
             if (pair.cdr instanceof EmptyListValue) {
                 return;
             }
             if (pair.cdr instanceof PairValue nextPair) {
                 builder.append(' ');
-                appendPairContents(builder, nextPair);
+                appendPairContents(builder, nextPair, displayMode);
                 return;
             }
             builder.append(" . ");
-            builder.append(pair.cdr.render());
+            builder.append(displayMode ? pair.cdr.displayRender() : pair.cdr.render());
         }
     }
 
@@ -1075,6 +1240,29 @@ final class Interpreter {
         }
     }
 
+    private Rational parseNumberLiteral(String token) {
+        if (isIntegerToken(token)) {
+            return Rational.integer(new BigInteger(token));
+        }
+
+        int slashIndex = token.indexOf('/');
+        if (slashIndex <= 0 || slashIndex != token.lastIndexOf('/')) {
+            return null;
+        }
+
+        String numeratorToken = token.substring(0, slashIndex);
+        String denominatorToken = token.substring(slashIndex + 1);
+        if (!isIntegerToken(numeratorToken) || !isIntegerToken(denominatorToken)) {
+            return null;
+        }
+
+        BigInteger denominator = new BigInteger(denominatorToken);
+        if (denominator.signum() == 0) {
+            return null;
+        }
+        return Rational.of(new BigInteger(numeratorToken), denominator);
+    }
+
     private static String renderString(String value) {
         StringBuilder builder = new StringBuilder();
         builder.append('"');
@@ -1091,5 +1279,37 @@ final class Interpreter {
         }
         builder.append('"');
         return builder.toString();
+    }
+
+    private static String renderChar(int codePoint) {
+        if (codePoint == ' ') {
+            return "#\\space";
+        }
+        if (codePoint == '\n') {
+            return "#\\newline";
+        }
+        return "#\\" + new String(Character.toChars(codePoint));
+    }
+
+    private static boolean isIntegerToken(String token) {
+        if (token.isEmpty()) {
+            return false;
+        }
+
+        int start = 0;
+        char first = token.charAt(0);
+        if (first == '+' || first == '-') {
+            if (token.length() == 1) {
+                return false;
+            }
+            start = 1;
+        }
+
+        for (int index = start; index < token.length(); index++) {
+            if (!Character.isDigit(token.charAt(index))) {
+                return false;
+            }
+        }
+        return true;
     }
 }

@@ -10,7 +10,7 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### render_value (src/scheme/mod.rs:660) — Render Scheme values in write or display mode, including recursive list formatting
 
 ## Python Helpers (scripts/)
 

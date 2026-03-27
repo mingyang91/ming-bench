@@ -33,15 +33,18 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     }
 
     let env = default_env();
+    let output = Rc::new(RefCell::new(String::new()));
     let mut last = Value::Void;
     for expression in &expressions {
-        last = eval(expression, &env)?;
+        last = eval(expression, &env, &output)?;
     }
 
-    Ok((last, String::new()))
+    let captured_output = output.borrow().clone();
+    Ok((last, captured_output))
 }
 
 type EnvRef = Rc<RefCell<Environment>>;
+type OutputRef = Rc<RefCell<String>>;
 
 #[derive(Clone, Debug)]
 enum Expr {
@@ -57,10 +60,17 @@ enum Value {
     Number(i128),
     Bool(bool),
     String(String),
+    Char(char),
     Symbol(String),
     List(Vec<Value>),
     Procedure(Rc<Procedure>),
     Void,
+}
+
+#[derive(Clone, Copy)]
+enum RenderMode {
+    Write,
+    Display,
 }
 
 #[derive(Clone)]
@@ -72,7 +82,7 @@ enum Procedure {
 #[derive(Clone, Copy)]
 struct BuiltinProcedure {
     name: &'static str,
-    func: fn(&[Value]) -> Result<Value, EvalError>,
+    func: fn(&[Value], &OutputRef) -> Result<Value, EvalError>,
 }
 
 #[derive(Clone)]
@@ -103,7 +113,10 @@ impl Environment {
     fn lookup(env: &EnvRef, name: &str) -> Result<Value, EvalError> {
         let (value, parent) = {
             let borrowed = env.borrow();
-            (borrowed.bindings.get(name).cloned(), borrowed.parent.clone())
+            (
+                borrowed.bindings.get(name).cloned(),
+                borrowed.parent.clone(),
+            )
         };
 
         if let Some(value) = value {
@@ -120,16 +133,11 @@ impl Environment {
 
 impl Value {
     fn render(&self) -> String {
-        match self {
-            Self::Number(number) => number.to_string(),
-            Self::Bool(true) => "#t".to_string(),
-            Self::Bool(false) => "#f".to_string(),
-            Self::String(value) => render_string(value),
-            Self::Symbol(name) => name.clone(),
-            Self::List(values) => render_list(values),
-            Self::Procedure(procedure) => procedure.render(),
-            Self::Void => "#<void>".to_string(),
-        }
+        render_value(self, RenderMode::Write)
+    }
+
+    fn display_repr(&self) -> String {
+        render_value(self, RenderMode::Display)
     }
 
     fn is_truthy(&self) -> bool {
@@ -143,6 +151,36 @@ impl Value {
                 "{procedure_name} expects numeric arguments"
             ))),
         }
+    }
+
+    fn as_string<'a>(&'a self, procedure_name: &str) -> Result<&'a str, EvalError> {
+        match self {
+            Self::String(value) => Ok(value),
+            _ => Err(EvalError::msg(format!(
+                "{procedure_name} expects string arguments"
+            ))),
+        }
+    }
+
+    fn as_symbol<'a>(&'a self, procedure_name: &str) -> Result<&'a str, EvalError> {
+        match self {
+            Self::Symbol(name) => Ok(name),
+            _ => Err(EvalError::msg(format!(
+                "{procedure_name} expects symbol arguments"
+            ))),
+        }
+    }
+
+    fn as_index(&self, procedure_name: &str) -> Result<usize, EvalError> {
+        let number = self.as_number(procedure_name)?;
+        if number < 0 {
+            return Err(EvalError::msg(format!(
+                "{procedure_name} expects a non-negative index"
+            )));
+        }
+
+        usize::try_from(number)
+            .map_err(|_| EvalError::msg(format!("{procedure_name} index is too large")))
     }
 }
 
@@ -169,13 +207,25 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "=", builtin_numeric_equals);
     define_builtin(&env, "<=", builtin_less_equal);
     define_builtin(&env, "not", builtin_not);
+    define_builtin(&env, "display", builtin_display);
+    define_builtin(&env, "write", builtin_write);
+    define_builtin(&env, "newline", builtin_newline);
+    define_builtin(&env, "string-append", builtin_string_append);
+    define_builtin(&env, "string-length", builtin_string_length);
+    define_builtin(&env, "substring", builtin_substring);
+    define_builtin(&env, "string->number", builtin_string_to_number);
+    define_builtin(&env, "number->string", builtin_number_to_string);
+    define_builtin(&env, "symbol->string", builtin_symbol_to_string);
+    define_builtin(&env, "string->symbol", builtin_string_to_symbol);
+    define_builtin(&env, "string-ref", builtin_string_ref);
+    define_builtin(&env, "char?", builtin_char_predicate);
     env
 }
 
 fn define_builtin(
     env: &EnvRef,
     name: &'static str,
-    func: fn(&[Value]) -> Result<Value, EvalError>,
+    func: fn(&[Value], &OutputRef) -> Result<Value, EvalError>,
 ) {
     Environment::define(
         env,
@@ -184,42 +234,43 @@ fn define_builtin(
     );
 }
 
-fn eval(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
+fn eval(expr: &Expr, env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
     match expr {
         Expr::Number(number) => Ok(Value::Number(*number)),
         Expr::Bool(value) => Ok(Value::Bool(*value)),
         Expr::String(value) => Ok(Value::String(value.clone())),
         Expr::Symbol(name) => Environment::lookup(env, name),
-        Expr::List(items) => eval_list(items, env),
+        Expr::List(items) => eval_list(items, env, output),
     }
 }
 
-fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_list(items: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
     let Some((head, tail)) = items.split_first() else {
         return Err(EvalError::msg("cannot evaluate empty list"));
     };
 
     if let Expr::Symbol(name) = head {
         match name.as_str() {
-            "and" => return eval_and(tail, env),
-            "or" => return eval_or(tail, env),
-            "define" => return eval_define(tail, env),
-            "if" => return eval_if(tail, env),
+            "and" => return eval_and(tail, env, output),
+            "or" => return eval_or(tail, env, output),
+            "begin" => return eval_begin(tail, env, output),
+            "define" => return eval_define(tail, env, output),
+            "if" => return eval_if(tail, env, output),
             "quote" => return eval_quote(tail),
             "lambda" => return eval_lambda(tail, env),
             _ => {}
         }
     }
 
-    let procedure = eval(head, env)?;
+    let procedure = eval(head, env, output)?;
     let mut arguments = Vec::with_capacity(tail.len());
     for expression in tail {
-        arguments.push(eval(expression, env)?);
+        arguments.push(eval(expression, env, output)?);
     }
-    apply(procedure, arguments)
+    apply(procedure, arguments, output)
 }
 
-fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_define(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::msg("define requires a target and value"));
     }
@@ -232,7 +283,7 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
                 ));
             }
 
-            let value = eval(&args[1], env)?;
+            let value = eval(&args[1], env, output)?;
             Environment::define(env, name.clone(), value);
             Ok(Value::Void)
         }
@@ -245,12 +296,7 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
                 return Err(EvalError::msg("function name must be a symbol"));
             };
 
-            let lambda = build_lambda(
-                params,
-                &args[1..],
-                env,
-                Some(name.clone()),
-            )?;
+            let lambda = build_lambda(params, &args[1..], env, Some(name.clone()))?;
             Environment::define(env, name.clone(), lambda);
             Ok(Value::Void)
         }
@@ -260,17 +306,17 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     }
 }
 
-fn eval_if(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_if(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::msg(
             "if requires condition, then branch, and else branch",
         ));
     }
 
-    if eval(&args[0], env)?.is_truthy() {
-        eval(&args[1], env)
+    if eval(&args[0], env, output)?.is_truthy() {
+        eval(&args[1], env, output)
     } else {
-        eval(&args[2], env)
+        eval(&args[2], env, output)
     }
 }
 
@@ -301,7 +347,9 @@ fn build_lambda(
     name: Option<String>,
 ) -> Result<Value, EvalError> {
     if body.is_empty() {
-        return Err(EvalError::msg("lambda requires at least one body expression"));
+        return Err(EvalError::msg(
+            "lambda requires at least one body expression",
+        ));
     }
 
     let mut param_names = Vec::with_capacity(params.len());
@@ -312,18 +360,24 @@ fn build_lambda(
         param_names.push(name.clone());
     }
 
-    Ok(Value::Procedure(Rc::new(Procedure::Lambda(LambdaProcedure {
-        name,
-        params: param_names,
-        body: body.to_vec(),
-        env: Rc::clone(env),
-    }))))
+    Ok(Value::Procedure(Rc::new(Procedure::Lambda(
+        LambdaProcedure {
+            name,
+            params: param_names,
+            body: body.to_vec(),
+            env: Rc::clone(env),
+        },
+    ))))
 }
 
-fn eval_sequence(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_sequence(
+    expressions: &[Expr],
+    env: &EnvRef,
+    output: &OutputRef,
+) -> Result<Value, EvalError> {
     let mut last = Value::Void;
     for expression in expressions {
-        last = eval(expression, env)?;
+        last = eval(expression, env, output)?;
     }
     Ok(last)
 }
@@ -338,10 +392,10 @@ fn quote_expr(expr: &Expr) -> Value {
     }
 }
 
-fn eval_and(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_and(expressions: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
     let mut last = Value::Bool(true);
     for expression in expressions {
-        let value = eval(expression, env)?;
+        let value = eval(expression, env, output)?;
         if !value.is_truthy() {
             return Ok(value);
         }
@@ -350,9 +404,9 @@ fn eval_and(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(last)
 }
 
-fn eval_or(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_or(expressions: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
     for expression in expressions {
-        let value = eval(expression, env)?;
+        let value = eval(expression, env, output)?;
         if value.is_truthy() {
             return Ok(value);
         }
@@ -360,18 +414,26 @@ fn eval_or(expressions: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     Ok(Value::Bool(false))
 }
 
-fn apply(procedure: Value, arguments: Vec<Value>) -> Result<Value, EvalError> {
+fn eval_begin(expressions: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
+    eval_sequence(expressions, env, output)
+}
+
+fn apply(procedure: Value, arguments: Vec<Value>, output: &OutputRef) -> Result<Value, EvalError> {
     let Value::Procedure(procedure) = procedure else {
         return Err(EvalError::msg("attempted to call a non-procedure"));
     };
 
     match procedure.as_ref() {
-        Procedure::Builtin(builtin) => (builtin.func)(&arguments),
-        Procedure::Lambda(lambda) => apply_lambda(lambda, arguments),
+        Procedure::Builtin(builtin) => (builtin.func)(&arguments, output),
+        Procedure::Lambda(lambda) => apply_lambda(lambda, arguments, output),
     }
 }
 
-fn apply_lambda(lambda: &LambdaProcedure, arguments: Vec<Value>) -> Result<Value, EvalError> {
+fn apply_lambda(
+    lambda: &LambdaProcedure,
+    arguments: Vec<Value>,
+    output: &OutputRef,
+) -> Result<Value, EvalError> {
     ensure_exactly(
         lambda.name.as_deref().unwrap_or("lambda"),
         arguments.len(),
@@ -383,10 +445,10 @@ fn apply_lambda(lambda: &LambdaProcedure, arguments: Vec<Value>) -> Result<Value
         Environment::define(&call_env, name.clone(), value);
     }
 
-    eval_sequence(&lambda.body, &call_env)
+    eval_sequence(&lambda.body, &call_env, output)
 }
 
-fn builtin_add(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_add(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     let mut total = 0_i128;
     for argument in arguments {
         total += argument.as_number("+")?;
@@ -394,7 +456,7 @@ fn builtin_add(arguments: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Number(total))
 }
 
-fn builtin_subtract(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_subtract(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     ensure_at_least("-", arguments.len(), 1)?;
     let first = arguments[0].as_number("-")?;
 
@@ -409,7 +471,7 @@ fn builtin_subtract(arguments: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Number(total))
 }
 
-fn builtin_multiply(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_multiply(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     let mut total = 1_i128;
     for argument in arguments {
         total *= argument.as_number("*")?;
@@ -417,7 +479,7 @@ fn builtin_multiply(arguments: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Number(total))
 }
 
-fn builtin_divide(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_divide(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     ensure_at_least("/", arguments.len(), 1)?;
 
     let mut total = if arguments.len() == 1 {
@@ -443,25 +505,117 @@ fn builtin_divide(arguments: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Number(total))
 }
 
-fn builtin_less_than(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_less_than(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     compare_numbers(arguments, "<", |left, right| left < right)
 }
 
-fn builtin_greater_than(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_greater_than(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     compare_numbers(arguments, ">", |left, right| left > right)
 }
 
-fn builtin_numeric_equals(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_numeric_equals(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     compare_numbers(arguments, "=", |left, right| left == right)
 }
 
-fn builtin_less_equal(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_less_equal(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     compare_numbers(arguments, "<=", |left, right| left <= right)
 }
 
-fn builtin_not(arguments: &[Value]) -> Result<Value, EvalError> {
+fn builtin_not(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     ensure_exactly("not", arguments.len(), 1)?;
     Ok(Value::Bool(!arguments[0].is_truthy()))
+}
+
+fn builtin_display(arguments: &[Value], output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("display", arguments.len(), 1)?;
+    output.borrow_mut().push_str(&arguments[0].display_repr());
+    Ok(Value::Void)
+}
+
+fn builtin_write(arguments: &[Value], output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("write", arguments.len(), 1)?;
+    output.borrow_mut().push_str(&arguments[0].render());
+    Ok(Value::Void)
+}
+
+fn builtin_newline(arguments: &[Value], output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("newline", arguments.len(), 0)?;
+    output.borrow_mut().push('\n');
+    Ok(Value::Void)
+}
+
+fn builtin_string_append(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    let mut result = String::new();
+    for argument in arguments {
+        result.push_str(argument.as_string("string-append")?);
+    }
+    Ok(Value::String(result))
+}
+
+fn builtin_string_length(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("string-length", arguments.len(), 1)?;
+    let length = arguments[0].as_string("string-length")?.chars().count();
+    Ok(Value::Number(length as i128))
+}
+
+fn builtin_substring(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("substring", arguments.len(), 3)?;
+    let value = arguments[0].as_string("substring")?;
+    let start = arguments[1].as_index("substring")?;
+    let end = arguments[2].as_index("substring")?;
+    let chars: Vec<char> = value.chars().collect();
+
+    if start > end || end > chars.len() {
+        return Err(EvalError::msg("substring indices are out of bounds"));
+    }
+
+    Ok(Value::String(chars[start..end].iter().collect()))
+}
+
+fn builtin_string_to_number(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("string->number", arguments.len(), 1)?;
+    let value = arguments[0].as_string("string->number")?;
+    match value.parse::<i128>() {
+        Ok(number) => Ok(Value::Number(number)),
+        Err(_) => Ok(Value::Bool(false)),
+    }
+}
+
+fn builtin_number_to_string(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("number->string", arguments.len(), 1)?;
+    let number = arguments[0].as_number("number->string")?;
+    Ok(Value::String(number.to_string()))
+}
+
+fn builtin_symbol_to_string(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("symbol->string", arguments.len(), 1)?;
+    Ok(Value::String(
+        arguments[0].as_symbol("symbol->string")?.to_string(),
+    ))
+}
+
+fn builtin_string_to_symbol(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("string->symbol", arguments.len(), 1)?;
+    Ok(Value::Symbol(
+        arguments[0].as_string("string->symbol")?.to_string(),
+    ))
+}
+
+fn builtin_string_ref(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("string-ref", arguments.len(), 2)?;
+    let value = arguments[0].as_string("string-ref")?;
+    let index = arguments[1].as_index("string-ref")?;
+    let chars: Vec<char> = value.chars().collect();
+    let Some(ch) = chars.get(index) else {
+        return Err(EvalError::msg("string-ref index is out of bounds"));
+    };
+
+    Ok(Value::Char(*ch))
+}
+
+fn builtin_char_predicate(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("char?", arguments.len(), 1)?;
+    Ok(Value::Bool(matches!(arguments[0], Value::Char(_))))
 }
 
 fn compare_numbers(
@@ -503,16 +657,44 @@ fn ensure_at_least(name: &str, actual: usize, minimum: usize) -> Result<(), Eval
     }
 }
 
-fn render_list(values: &[Value]) -> String {
+fn render_value(value: &Value, mode: RenderMode) -> String {
+    match value {
+        Value::Number(number) => number.to_string(),
+        Value::Bool(true) => "#t".to_string(),
+        Value::Bool(false) => "#f".to_string(),
+        Value::String(value) => match mode {
+            RenderMode::Write => render_string(value),
+            RenderMode::Display => value.clone(),
+        },
+        Value::Char(ch) => match mode {
+            RenderMode::Write => render_char(*ch),
+            RenderMode::Display => ch.to_string(),
+        },
+        Value::Symbol(name) => name.clone(),
+        Value::List(values) => render_list(values, mode),
+        Value::Procedure(procedure) => procedure.render(),
+        Value::Void => "#<void>".to_string(),
+    }
+}
+
+fn render_list(values: &[Value], mode: RenderMode) -> String {
     let mut rendered = String::from("(");
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             rendered.push(' ');
         }
-        rendered.push_str(&value.render());
+        rendered.push_str(&render_value(value, mode));
     }
     rendered.push(')');
     rendered
+}
+
+fn render_char(value: char) -> String {
+    match value {
+        ' ' => "#\\space".to_string(),
+        '\n' => "#\\newline".to_string(),
+        other => format!("#\\{other}"),
+    }
 }
 
 fn render_string(value: &str) -> String {
@@ -561,10 +743,19 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some('(') => self.parse_list(),
             Some(')') => Err(EvalError::msg("unexpected ')'")),
+            Some('\'') => self.parse_quote_shorthand(),
             Some('"') => self.parse_string(),
             Some(_) => self.parse_atom(),
             None => Err(EvalError::msg("unexpected end of input")),
         }
+    }
+
+    fn parse_quote_shorthand(&mut self) -> Result<Expr, EvalError> {
+        self.advance();
+        Ok(Expr::List(vec![
+            Expr::Symbol("quote".to_string()),
+            self.parse_expr()?,
+        ]))
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
