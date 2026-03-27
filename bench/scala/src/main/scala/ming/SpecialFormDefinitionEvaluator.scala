@@ -40,7 +40,11 @@ private[ming] object SpecialFormDefinitionEvaluator:
           valueExpression,
           env,
           value =>
-            env.assign(name, value, symbolPosition)
+            env.assign(
+              name,
+              RuntimeSupport.expectSingleValue(value, "set!", valueExpression.position),
+              symbolPosition
+            )
             InterpreterEvaluator.done(VoidValue, continuation)
         )
       case _ =>
@@ -57,7 +61,7 @@ private[ming] object SpecialFormDefinitionEvaluator:
       valueExpression,
       env,
       value =>
-        env.define(name, value)
+        env.define(name, RuntimeSupport.expectSingleValue(value, "define", valueExpression.position))
         InterpreterEvaluator.done(VoidValue, continuation)
     )
 

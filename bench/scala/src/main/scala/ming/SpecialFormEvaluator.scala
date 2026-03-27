@@ -202,7 +202,7 @@ private[ming] object SpecialFormEvaluator:
     env: Environment,
     continuation: Continuation
   ): EvaluationStep =
-    SpecialFormBindingEvaluator.evalDo(arguments, position, env, continuation)
+    DoEvaluator.eval(arguments, position, env, continuation)
 
   def evalSet(
     arguments: List[Expr],

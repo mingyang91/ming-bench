@@ -26,7 +26,13 @@ pub fn eval_str_with_output(_input: &str) -> Result<(String, String), EvalError>
 
     let env = Environment::root(root_bindings());
     let mut context = EvalContext::default();
-    let value = eval_sequence(&expressions, env, &mut context)?;
+    let value = expect_single_value_result(
+        eval_sequence(&expressions, env, &mut context)?,
+        expressions
+            .last()
+            .expect("non-empty program must have a last expression")
+            .position(),
+    )?;
     Ok((value.render(), context.output))
 }
 
@@ -131,6 +137,7 @@ enum Value {
         record_type: Rc<RecordType>,
         field_index: usize,
     },
+    Values(Vec<Value>),
     Void,
     Uninitialized,
 }
@@ -166,6 +173,7 @@ impl Value {
             | Self::RecordConstructor { .. }
             | Self::RecordPredicate { .. }
             | Self::RecordAccessor { .. } => "procedure",
+            Self::Values(_) => "values",
             Self::Void => "void",
             Self::Uninitialized => "uninitialized",
         }
@@ -505,10 +513,14 @@ fn eval_application(
     env: EnvRef,
     context: &mut EvalContext,
 ) -> EvalResult<Value> {
-    let function = eval(operator, env.clone(), context)?;
+    let function =
+        expect_single_value_result(eval(operator, env.clone(), context)?, operator.position())?;
     let mut evaluated_arguments = Vec::with_capacity(arguments.len());
     for argument in arguments {
-        evaluated_arguments.push(eval(argument, env.clone(), context)?);
+        evaluated_arguments.push(expect_single_value_result(
+            eval(argument, env.clone(), context)?,
+            argument.position(),
+        )?);
     }
     apply(function, evaluated_arguments, position, context)
 }
@@ -519,7 +531,10 @@ fn eval_and(expressions: &[Expr], env: EnvRef, context: &mut EvalContext) -> Eva
     }
 
     for expression in &expressions[..expressions.len() - 1] {
-        let value = eval(expression, env.clone(), context)?;
+        let value = expect_single_value_result(
+            eval(expression, env.clone(), context)?,
+            expression.position(),
+        )?;
         if !is_truthy(&value) {
             return Ok(value);
         }
@@ -533,14 +548,17 @@ fn eval_or(expressions: &[Expr], env: EnvRef, context: &mut EvalContext) -> Eval
         return Ok(Value::Bool(false));
     }
 
-    for expression in expressions {
-        let value = eval(expression, env.clone(), context)?;
+    for expression in &expressions[..expressions.len() - 1] {
+        let value = expect_single_value_result(
+            eval(expression, env.clone(), context)?,
+            expression.position(),
+        )?;
         if is_truthy(&value) {
             return Ok(value);
         }
     }
 
-    Ok(Value::Bool(false))
+    eval(&expressions[expressions.len() - 1], env, context)
 }
 
 fn eval_cond(clauses: &[Expr], env: EnvRef, context: &mut EvalContext) -> EvalResult<Value> {
@@ -560,7 +578,10 @@ fn eval_cond(clauses: &[Expr], env: EnvRef, context: &mut EvalContext) -> EvalRe
                     return eval_sequence(&items[1..], env, context);
                 }
 
-                let test_value = eval(&items[0], env.clone(), context)?;
+                let test_value = expect_single_value_result(
+                    eval(&items[0], env.clone(), context)?,
+                    items[0].position(),
+                )?;
                 if is_truthy(&test_value) {
                     if items.len() == 1 {
                         return Ok(test_value);
@@ -633,7 +654,10 @@ fn eval_value_define(
     context: &mut EvalContext,
 ) -> EvalResult<Value> {
     env.reserve(name);
-    let value = eval(value_expression, env.clone(), context)?;
+    let value = expect_single_value_result(
+        eval(value_expression, env.clone(), context)?,
+        value_expression.position(),
+    )?;
     env.define(name, value);
     Ok(Value::Void)
 }
@@ -716,7 +740,11 @@ fn eval_if(
 ) -> EvalResult<Value> {
     match arguments {
         [condition, consequent, alternate] => {
-            if is_truthy(&eval(condition, env.clone(), context)?) {
+            let condition_value = expect_single_value_result(
+                eval(condition, env.clone(), context)?,
+                condition.position(),
+            )?;
+            if is_truthy(&condition_value) {
                 eval(consequent, env, context)
             } else {
                 eval(alternate, env, context)
@@ -753,7 +781,10 @@ fn eval_unnamed_let(
     let bindings = parse_bindings(bindings_expression, position, "let")?;
     let mut bound_values = Vec::with_capacity(bindings.len());
     for (_, expression) in &bindings {
-        bound_values.push(eval(expression, env.clone(), context)?);
+        bound_values.push(expect_single_value_result(
+            eval(expression, env.clone(), context)?,
+            expression.position(),
+        )?);
     }
     let child_env = Environment::child(
         env,
@@ -777,7 +808,10 @@ fn eval_named_let(
     let bindings = parse_bindings(bindings_expression, position, "let")?;
     let mut arguments = Vec::with_capacity(bindings.len());
     for (_, expression) in &bindings {
-        arguments.push(eval(expression, env.clone(), context)?);
+        arguments.push(expect_single_value_result(
+            eval(expression, env.clone(), context)?,
+            expression.position(),
+        )?);
     }
 
     let closure_env = Environment::child(env, Vec::new());
@@ -1323,6 +1357,8 @@ fn root_bindings() -> Vec<(String, Value)> {
         builtin("car", car),
         builtin("cdr", cdr),
         builtin("apply", apply_builtin),
+        builtin("values", values),
+        builtin("call-with-values", call_with_values),
         builtin("null?", is_null),
         builtin("list", list),
         builtin("length", length),
@@ -1528,6 +1564,28 @@ fn apply_builtin(
     )?);
 
     apply(function, applied_arguments, position, context)
+}
+
+fn values(
+    arguments: &[Value],
+    _position: Position,
+    _context: &mut EvalContext,
+) -> EvalResult<Value> {
+    Ok(match arguments {
+        [] => Value::Values(Vec::new()),
+        [value] => value.clone(),
+        _ => Value::Values(arguments.to_vec()),
+    })
+}
+
+fn call_with_values(
+    arguments: &[Value],
+    position: Position,
+    context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let (producer, consumer) = expect_two_arguments(arguments, "call-with-values", position)?;
+    let produced = apply(producer.clone(), Vec::new(), position, context)?;
+    apply(consumer.clone(), unpack_values_result(produced), position, context)
 }
 
 fn is_null(
@@ -1997,10 +2055,32 @@ fn map(arguments: &[Value], position: Position, context: &mut EvalContext) -> Ev
             .iter()
             .map(|list| list[index].clone())
             .collect::<Vec<_>>();
-        results.push(apply(procedure.clone(), call_arguments, position, context)?);
+        results.push(expect_single_value_result(
+            apply(procedure.clone(), call_arguments, position, context)?,
+            position,
+        )?);
     }
 
     Ok(build_list(results))
+}
+
+fn expect_single_value_result(value: Value, position: Position) -> EvalResult<Value> {
+    match value {
+        Value::Values(mut values) => match values.len() {
+            1 => Ok(values
+                .pop()
+                .expect("single values result must contain exactly one item")),
+            count => Err(error_at(format!("expected 1 value(s), got {count}"), position)),
+        },
+        other => Ok(other),
+    }
+}
+
+fn unpack_values_result(value: Value) -> Vec<Value> {
+    match value {
+        Value::Values(values) => values,
+        other => vec![other],
+    }
 }
 
 fn is_char_alphabetic(
@@ -2411,6 +2491,13 @@ fn eq_values(left: &Value, right: &Value) -> bool {
         (Value::EmptyList, Value::EmptyList) => true,
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Builtin { name: left, .. }, Value::Builtin { name: right, .. }) => left == right,
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| eq_values(left, right))
+        }
         (
             Value::RecordConstructor {
                 name: left_name,
@@ -2468,6 +2555,13 @@ fn equal_values(left: &Value, right: &Value) -> bool {
         (Value::EmptyList, Value::EmptyList) => true,
         (Value::Pair(left_head, left_tail), Value::Pair(right_head, right_tail)) => {
             equal_values(left_head, right_head) && equal_values(left_tail, right_tail)
+        }
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| equal_values(left, right))
         }
         (Value::Builtin { name: left, .. }, Value::Builtin { name: right, .. }) => left == right,
         (Value::Void, Value::Void) => true,
@@ -2539,6 +2633,7 @@ fn render_value(value: &Value, display_mode: bool) -> String {
         Value::RecordConstructor { name, .. }
         | Value::RecordPredicate { name, .. }
         | Value::RecordAccessor { name, .. } => format!("#<procedure:{name}>"),
+        Value::Values(_) => "#<values>".to_string(),
         Value::Void => "#<void>".to_string(),
         Value::Uninitialized => "#<uninitialized>".to_string(),
     }

@@ -8,6 +8,18 @@ private[ming] object RuntimeSupport:
   def buildList(values: List[Value]): Value =
     values.foldRight[Value](EmptyListValue)(PairValue(_, _))
 
+  def unpackValues(value: Value): List[Value] =
+    value match
+      case MultipleValuesValue(values) => values
+      case singleValue                 => List(singleValue)
+
+  def expectSingleValue(value: Value, context: String, position: Position): Value =
+    value match
+      case MultipleValuesValue(values) =>
+        SchemeFailure.raise(s"$context expected a single value, got ${values.length} value(s)", position)
+      case singleValue =>
+        singleValue
+
   def expectExact(
     arguments: List[Value],
     expected: Int,
@@ -151,6 +163,8 @@ private[ming] object RuntimeSupport:
       case _: VectorValue     => "vector"
       case _: ProcedureValue =>
         "procedure"
+      case MultipleValuesValue(_) =>
+        "values"
       case _: RecordValue =>
         "record"
       case VoidValue =>

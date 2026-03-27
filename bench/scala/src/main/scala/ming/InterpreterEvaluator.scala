@@ -107,32 +107,7 @@ private[ming] object InterpreterEvaluator:
     position: Position,
     continuation: Continuation
   ): EvaluationStep =
-    function match
-      case BuiltinValue(_, implementation) =>
-        implementation(arguments, position, continuation)
-      case ClosureValue(parameters, restParameter, body, closureEnv, _) =>
-        applyClosure(parameters, restParameter, body, closureEnv, arguments, position, continuation)
-      case CaseLambdaValue(clauses, _) =>
-        applyCaseLambda(clauses, arguments, position, continuation)
-      case ContinuationValue(savedContinuation, savedWindFrames, savedHandlerFrames) =>
-        arguments match
-          case value :: Nil =>
-            DynamicWindRuntime.transferToContinuation(
-              value,
-              savedContinuation,
-              savedWindFrames,
-              () => ExceptionRuntime.restoreHandlerFrames(savedHandlerFrames)
-            )
-          case _ =>
-            SchemeFailure.raise(
-              s"continuation expected 1 argument(s), got ${arguments.length}",
-              position
-            )
-      case other =>
-        SchemeFailure.raise(
-          s"attempted to call a non-procedure value: ${other.render}",
-          position
-        )
+    ProcedureApplicationEvaluator.apply(function, arguments, position, continuation)
 
   private def evalListStep(
     items: List[Expr],
@@ -210,7 +185,14 @@ private[ming] object InterpreterEvaluator:
     deferExpr(
       operator,
       env,
-      function => evalArgumentExpressions(function, arguments.reverse, env, position, continuation)
+      function =>
+        evalArgumentExpressions(
+          RuntimeSupport.expectSingleValue(function, "procedure application", operator.position),
+          arguments.reverse,
+          env,
+          position,
+          continuation
+        )
     )
 
   private def evalArgumentExpressions(
@@ -235,60 +217,6 @@ private[ming] object InterpreterEvaluator:
               env,
               position,
               continuation,
-              value :: evaluatedArguments
+              RuntimeSupport.expectSingleValue(value, "procedure application", argument.position) :: evaluatedArguments
             )
         )
-
-  private def applyCaseLambda(
-    clauses: List[ClosureValue],
-    arguments: List[Value],
-    position: Position,
-    continuation: Continuation
-  ): EvaluationStep =
-    clauses.find(clauseMatches(_, arguments.length)) match
-      case Some(ClosureValue(parameters, restParameter, body, closureEnv, _)) =>
-        applyClosure(parameters, restParameter, body, closureEnv, arguments, position, continuation)
-      case None =>
-        SchemeFailure.raise(
-          s"case-lambda did not match ${arguments.length} argument(s)",
-          position
-        )
-
-  private def applyClosure(
-    parameters: List[String],
-    restParameter: Option[String],
-    body: List[Expr],
-    closureEnv: Environment,
-    arguments: List[Value],
-    position: Position,
-    continuation: Continuation
-  ): EvaluationStep =
-    restParameter match
-      case None =>
-        if arguments.length != parameters.length then
-          SchemeFailure.raise(
-            s"procedure expected ${parameters.length} argument(s), got ${arguments.length}",
-            position
-          )
-
-      case Some(_) =>
-        if arguments.length < parameters.length then
-          SchemeFailure.raise(
-            s"procedure expected at least ${parameters.length} argument(s), got ${arguments.length}",
-            position
-          )
-
-    val fixedBindings = parameters.zip(arguments.take(parameters.length))
-    val bindings =
-      restParameter match
-        case Some(restName) =>
-          fixedBindings ++ List(restName -> RuntimeSupport.buildList(arguments.drop(parameters.length)))
-        case None =>
-          fixedBindings
-    val callEnv = Environment.child(closureEnv, bindings)
-    deferSequence(body, callEnv, continuation)
-
-  private def clauseMatches(clause: ClosureValue, argumentCount: Int): Boolean =
-    clause.restParameter match
-      case Some(_) => argumentCount >= clause.parameters.length
-      case None    => argumentCount == clause.parameters.length

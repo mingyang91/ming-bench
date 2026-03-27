@@ -147,6 +147,9 @@ final private[ming] case class ContinuationValue(
 ) extends ProcedureValue:
   override def render: String = "#<procedure:continuation>"
 
+final private[ming] case class MultipleValuesValue(values: List[Value]) extends Value:
+  override def render: String = "#<values>"
+
 final private[ming] class RecordTypeDescriptor(
   val name: String,
   val fieldNames: List[String]

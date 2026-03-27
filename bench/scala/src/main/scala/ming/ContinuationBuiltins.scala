@@ -7,20 +7,28 @@ private[ming] object ContinuationBuiltins:
   private val callCcBuiltin =
     BuiltinValue("call/cc", callWithCurrentContinuation)
 
+  private val callWithValuesBuiltin =
+    BuiltinValue("call-with-values", callWithValues)
+
   private val dynamicWindBuiltin =
     BuiltinValue("dynamic-wind", dynamicWind)
 
   private val raiseBuiltin =
     BuiltinValue("raise", raise)
 
+  private val valuesBuiltin =
+    BuiltinValue("values", valuesProcedure)
+
   private val withExceptionHandlerBuiltin =
     BuiltinValue("with-exception-handler", withExceptionHandler)
 
   val values: Map[String, Value] = Map(
     "call/cc"                        -> callCcBuiltin,
+    "call-with-values"               -> callWithValuesBuiltin,
     "call-with-current-continuation" -> callCcBuiltin,
     "dynamic-wind"                   -> dynamicWindBuiltin,
     "raise"                          -> raiseBuiltin,
+    "values"                         -> valuesBuiltin,
     "with-exception-handler"         -> withExceptionHandlerBuiltin
   )
 
@@ -59,6 +67,35 @@ private[ming] object ContinuationBuiltins:
         )
       case _ =>
         throw new IllegalStateException("validated dynamic-wind argument list")
+
+  private def valuesProcedure(arguments: List[Value], position: Position): Value =
+    arguments match
+      case value :: Nil =>
+        value
+      case _ =>
+        MultipleValuesValue(arguments)
+
+  private def callWithValues(
+    arguments: List[Value],
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
+    expectExact(arguments, 2, "call-with-values", position) match
+      case producer :: consumer :: Nil =>
+        InterpreterEvaluator.deferApplication(
+          producer,
+          Nil,
+          position,
+          produced =>
+            InterpreterEvaluator.deferApplication(
+              consumer,
+              unpackValues(produced),
+              position,
+              continuation
+            )
+        )
+      case _ =>
+        throw new IllegalStateException("validated call-with-values argument list")
 
   private def raise(
     arguments: List[Value],
