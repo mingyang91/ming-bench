@@ -4,84 +4,119 @@ import scala.annotation.tailrec
 
 private[ming] object InterpreterEvaluator:
 
+  private val halt: Continuation = value => FinalStep(value)
+
   def evalSequence(expressions: List[Expr], env: Environment): Value =
-    run(EvalSequenceControl(expressions, env))
+    run(deferSequence(expressions, env, halt))
 
   def eval(expression: Expr, env: Environment): Value =
-    run(EvalExprControl(expression, env))
+    run(deferExpr(expression, env, halt))
 
   def applyFunction(function: Value, arguments: List[Value], position: Position): Value =
-    run(ApplyControl(function, arguments, position))
+    run(deferApplication(function, arguments, position, halt))
 
-  def done(value: Value): EvaluationStep =
-    ReturnStep(value)
+  def done(value: Value, continuation: Continuation): EvaluationStep =
+    ReturnStep(value, continuation)
 
-  def deferExpr(expression: Expr, env: Environment): EvaluationStep =
-    ContinueStep(EvalExprControl(expression, env))
+  def deferExpr(
+    expression: Expr,
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
+    ContinueStep(EvalExprControl(expression, env, continuation))
 
-  def deferSequence(expressions: List[Expr], env: Environment): EvaluationStep =
-    ContinueStep(EvalSequenceControl(expressions, env))
+  def deferSequence(
+    expressions: List[Expr],
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
+    ContinueStep(EvalSequenceControl(expressions, env, continuation))
 
-  def deferApplication(function: Value, arguments: List[Value], position: Position): EvaluationStep =
-    ContinueStep(ApplyControl(function, arguments, position))
+  def deferApplication(
+    function: Value,
+    arguments: List[Value],
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
+    ContinueStep(ApplyControl(function, arguments, position, continuation))
 
   @tailrec
-  private def run(control: EvaluationControl): Value =
-    step(control) match
-      case ReturnStep(value)     => value
-      case ContinueStep(nextJob) => run(nextJob)
+  private def run(step: EvaluationStep): Value =
+    step match
+      case FinalStep(value) =>
+        value
+      case ReturnStep(value, continuation) =>
+        run(continuation(value))
+      case ContinueStep(control) =>
+        run(stepControl(control))
 
-  private def step(control: EvaluationControl): EvaluationStep =
+  private def stepControl(control: EvaluationControl): EvaluationStep =
     control match
-      case EvalExprControl(expression, env) =>
-        evalStep(expression, env)
-      case EvalSequenceControl(expressions, env) =>
-        evalSequenceStep(expressions, env)
-      case ApplyControl(function, arguments, position) =>
-        applyFunctionStep(function, arguments, position)
+      case EvalExprControl(expression, env, continuation) =>
+        evalStep(expression, env, continuation)
+      case EvalSequenceControl(expressions, env, continuation) =>
+        evalSequenceStep(expressions, env, continuation)
+      case ApplyControl(function, arguments, position, continuation) =>
+        applyFunctionStep(function, arguments, position, continuation)
 
-  private def evalStep(expression: Expr, env: Environment): EvaluationStep =
+  private def evalStep(
+    expression: Expr,
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     expression match
       case IntExpr(value, _) =>
-        done(IntValue(value))
+        done(IntValue(value), continuation)
       case RationalExpr(numerator, denominator, _) =>
-        done(NumericSupport.exactValue(numerator, denominator))
+        done(NumericSupport.exactValue(numerator, denominator), continuation)
       case InexactExpr(value, _) =>
-        done(InexactValue(value))
+        done(InexactValue(value), continuation)
       case BoolExpr(value, _) =>
-        done(BoolValue(value))
+        done(BoolValue(value), continuation)
       case StringExpr(value, _) =>
-        done(StringValue(value))
+        done(StringValue(value), continuation)
       case CharExpr(value, _) =>
-        done(CharValue(value))
+        done(CharValue(value), continuation)
       case SymbolExpr(name, position) =>
-        done(env.lookup(name, position))
+        done(env.lookup(name, position), continuation)
       case ListExpr(items, position) =>
-        evalListStep(items, position, env)
+        evalListStep(items, position, env, continuation)
 
-  @tailrec
-  private def evalSequenceStep(expressions: List[Expr], env: Environment): EvaluationStep =
+  private def evalSequenceStep(
+    expressions: List[Expr],
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     expressions match
       case Nil =>
-        done(VoidValue)
+        done(VoidValue, continuation)
       case expression :: Nil =>
-        deferExpr(expression, env)
+        deferExpr(expression, env, continuation)
       case expression :: rest =>
-        eval(expression, env)
-        evalSequenceStep(rest, env)
+        deferExpr(expression, env, _ => deferSequence(rest, env, continuation))
 
   private def applyFunctionStep(
     function: Value,
     arguments: List[Value],
-    position: Position
+    position: Position,
+    continuation: Continuation
   ): EvaluationStep =
     function match
       case BuiltinValue(_, implementation) =>
-        done(implementation(arguments, position))
+        implementation(arguments, position, continuation)
       case ClosureValue(parameters, restParameter, body, closureEnv, _) =>
-        applyClosure(parameters, restParameter, body, closureEnv, arguments, position)
+        applyClosure(parameters, restParameter, body, closureEnv, arguments, position, continuation)
       case CaseLambdaValue(clauses, _) =>
-        applyCaseLambda(clauses, arguments, position)
+        applyCaseLambda(clauses, arguments, position, continuation)
+      case ContinuationValue(savedContinuation) =>
+        arguments match
+          case value :: Nil =>
+            done(value, savedContinuation)
+          case _ =>
+            SchemeFailure.raise(
+              s"continuation expected 1 argument(s), got ${arguments.length}",
+              position
+            )
       case other =>
         SchemeFailure.raise(
           s"attempted to call a non-procedure value: ${other.render}",
@@ -91,83 +126,115 @@ private[ming] object InterpreterEvaluator:
   private def evalListStep(
     items: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     items match
       case Nil =>
         SchemeFailure.raise("cannot evaluate an empty list", position)
       case SymbolExpr("and", _) :: rest =>
-        SpecialFormEvaluator.evalAnd(rest, env)
+        SpecialFormEvaluator.evalAnd(rest, env, continuation)
       case SymbolExpr("begin", _) :: rest =>
-        deferSequence(rest, env)
+        deferSequence(rest, env, continuation)
       case SymbolExpr("case", _) :: rest =>
-        SpecialFormEvaluator.evalCase(rest, position, env)
+        SpecialFormEvaluator.evalCase(rest, position, env, continuation)
       case SymbolExpr("cond", _) :: rest =>
-        SpecialFormEvaluator.evalCond(rest, env)
+        SpecialFormEvaluator.evalCond(rest, env, continuation)
       case SymbolExpr("do", _) :: rest =>
-        SpecialFormEvaluator.evalDo(rest, position, env)
+        SpecialFormEvaluator.evalDo(rest, position, env, continuation)
       case SymbolExpr("or", _) :: rest =>
-        SpecialFormEvaluator.evalOr(rest, env)
+        SpecialFormEvaluator.evalOr(rest, env, continuation)
       case SymbolExpr("define", _) :: rest =>
-        SpecialFormEvaluator.evalDefine(rest, position, env)
+        SpecialFormEvaluator.evalDefine(rest, position, env, continuation)
       case SymbolExpr("define-record-type", _) :: rest =>
-        done(RecordTypeEvaluator.evalDefineRecordType(rest, position, env))
+        done(RecordTypeEvaluator.evalDefineRecordType(rest, position, env), continuation)
       case SymbolExpr("define-syntax", _) :: rest =>
-        SpecialFormEvaluator.evalDefineSyntax(rest, position, env)
+        SpecialFormEvaluator.evalDefineSyntax(rest, position, env, continuation)
       case SymbolExpr("if", _) :: rest =>
-        SpecialFormEvaluator.evalIf(rest, position, env)
+        SpecialFormEvaluator.evalIf(rest, position, env, continuation)
       case SymbolExpr("case-lambda", _) :: rest =>
-        SpecialFormEvaluator.evalCaseLambda(rest, position, env)
+        SpecialFormEvaluator.evalCaseLambda(rest, position, env, continuation)
       case SymbolExpr("let", _) :: rest =>
-        SpecialFormEvaluator.evalLet(rest, position, env)
+        SpecialFormEvaluator.evalLet(rest, position, env, continuation)
       case SymbolExpr("let*", _) :: rest =>
-        SpecialFormEvaluator.evalLetStar(rest, position, env)
+        SpecialFormEvaluator.evalLetStar(rest, position, env, continuation)
       case SymbolExpr("letrec", _) :: rest =>
-        SpecialFormEvaluator.evalLetrec(rest, position, env)
+        SpecialFormEvaluator.evalLetrec(rest, position, env, continuation)
       case SymbolExpr("letrec*", _) :: rest =>
-        SpecialFormEvaluator.evalLetrecStar(rest, position, env)
+        SpecialFormEvaluator.evalLetrecStar(rest, position, env, continuation)
       case SymbolExpr("quote", _) :: rest =>
-        SpecialFormEvaluator.evalQuote(rest, position)
+        SpecialFormEvaluator.evalQuote(rest, position, continuation)
       case SymbolExpr("lambda", _) :: rest =>
-        SpecialFormEvaluator.evalLambda(rest, position, env)
+        SpecialFormEvaluator.evalLambda(rest, position, env, continuation)
       case SymbolExpr("set!", _) :: rest =>
-        SpecialFormEvaluator.evalSet(rest, position, env)
+        SpecialFormEvaluator.evalSet(rest, position, env, continuation)
       case (operator @ SymbolExpr(name, _)) :: arguments =>
         env.lookupMacro(name) match
           case Some(macroDefinition) =>
-            evalMacroApplication(ListExpr(operator :: arguments, position), macroDefinition, env)
+            evalMacroApplication(ListExpr(operator :: arguments, position), macroDefinition, env, continuation)
           case None =>
-            evalApplicationStep(operator, arguments, position, env)
+            evalApplicationStep(operator, arguments, position, env, continuation)
       case operator :: arguments =>
-        evalApplicationStep(operator, arguments, position, env)
+        evalApplicationStep(operator, arguments, position, env, continuation)
 
   private def evalMacroApplication(
     application: ListExpr,
     macroDefinition: SyntaxRulesMacro,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     val expansion = MacroExpander.expand(application, macroDefinition)
     expansion.aliases.foreach((alias, cell) => env.defineAlias(alias, cell))
-    deferExpr(expansion.expr, env)
+    deferExpr(expansion.expr, env, continuation)
 
   private def evalApplicationStep(
     operator: Expr,
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    val function           = eval(operator, env)
-    val evaluatedArguments = arguments.map(argument => eval(argument, env))
-    deferApplication(function, evaluatedArguments, position)
+    deferExpr(
+      operator,
+      env,
+      function => evalArgumentExpressions(function, arguments.reverse, env, position, continuation)
+    )
+
+  private def evalArgumentExpressions(
+    function: Value,
+    arguments: List[Expr],
+    env: Environment,
+    position: Position,
+    continuation: Continuation,
+    evaluatedArguments: List[Value] = Nil
+  ): EvaluationStep =
+    arguments match
+      case Nil =>
+        deferApplication(function, evaluatedArguments, position, continuation)
+      case argument :: rest =>
+        deferExpr(
+          argument,
+          env,
+          value =>
+            evalArgumentExpressions(
+              function,
+              rest,
+              env,
+              position,
+              continuation,
+              value :: evaluatedArguments
+            )
+        )
 
   private def applyCaseLambda(
     clauses: List[ClosureValue],
     arguments: List[Value],
-    position: Position
+    position: Position,
+    continuation: Continuation
   ): EvaluationStep =
     clauses.find(clauseMatches(_, arguments.length)) match
       case Some(ClosureValue(parameters, restParameter, body, closureEnv, _)) =>
-        applyClosure(parameters, restParameter, body, closureEnv, arguments, position)
+        applyClosure(parameters, restParameter, body, closureEnv, arguments, position, continuation)
       case None =>
         SchemeFailure.raise(
           s"case-lambda did not match ${arguments.length} argument(s)",
@@ -180,7 +247,8 @@ private[ming] object InterpreterEvaluator:
     body: List[Expr],
     closureEnv: Environment,
     arguments: List[Value],
-    position: Position
+    position: Position,
+    continuation: Continuation
   ): EvaluationStep =
     restParameter match
       case None =>
@@ -205,7 +273,7 @@ private[ming] object InterpreterEvaluator:
         case None =>
           fixedBindings
     val callEnv = Environment.child(closureEnv, bindings)
-    deferSequence(body, callEnv)
+    deferSequence(body, callEnv, continuation)
 
   private def clauseMatches(clause: ClosureValue, argumentCount: Int): Boolean =
     clause.restParameter match

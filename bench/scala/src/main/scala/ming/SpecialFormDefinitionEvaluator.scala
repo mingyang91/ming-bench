@@ -5,13 +5,14 @@ private[ming] object SpecialFormDefinitionEvaluator:
   def evalDefine(
     arguments: List[Expr],
     position: Position,
-    env: Environment
-  ): Value =
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     arguments match
       case SymbolExpr(name, _) :: valueExpression :: Nil =>
-        evalValueDefine(name, valueExpression, env)
+        evalValueDefine(name, valueExpression, env, continuation)
       case ListExpr(SymbolExpr(name, _) :: parameters, _) :: body if body.nonEmpty =>
-        evalProcedureDefine(name, parameters, body, env, position)
+        evalProcedureDefine(name, parameters, body, env, position, continuation)
       case _ =>
         SchemeFailure.raise(
           "define expected (define name expr) or (define (name args) body ...)",
@@ -30,30 +31,45 @@ private[ming] object SpecialFormDefinitionEvaluator:
   def evalSet(
     arguments: List[Expr],
     position: Position,
-    env: Environment
-  ): Value =
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     arguments match
       case SymbolExpr(name, symbolPosition) :: valueExpression :: Nil =>
-        val value = InterpreterEvaluator.eval(valueExpression, env)
-        env.assign(name, value, symbolPosition)
-        VoidValue
+        InterpreterEvaluator.deferExpr(
+          valueExpression,
+          env,
+          value =>
+            env.assign(name, value, symbolPosition)
+            InterpreterEvaluator.done(VoidValue, continuation)
+        )
       case _ =>
         SchemeFailure.raise("set! expected (set! name expr)", position)
 
-  private def evalValueDefine(name: String, valueExpression: Expr, env: Environment): Value =
+  private def evalValueDefine(
+    name: String,
+    valueExpression: Expr,
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     env.reserve(name)
-    val value = InterpreterEvaluator.eval(valueExpression, env)
-    env.define(name, value)
-    VoidValue
+    InterpreterEvaluator.deferExpr(
+      valueExpression,
+      env,
+      value =>
+        env.define(name, value)
+        InterpreterEvaluator.done(VoidValue, continuation)
+    )
 
   private def evalProcedureDefine(
     name: String,
     parameters: List[Expr],
     body: List[Expr],
     env: Environment,
-    position: Position
-  ): Value =
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
     env.reserve(name)
     val value = SpecialFormProcedureEvaluator.buildClosure(parameters, body, env, Some(name), position)
     env.define(name, value)
-    VoidValue
+    InterpreterEvaluator.done(VoidValue, continuation)

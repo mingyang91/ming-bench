@@ -2,190 +2,246 @@ package ming
 
 import RuntimeSupport.isTruthy
 
-import scala.annotation.tailrec
-
 private[ming] object SpecialFormEvaluator:
 
-  @tailrec
-  def evalAnd(expressions: List[Expr], env: Environment): EvaluationStep =
+  def evalAnd(
+    expressions: List[Expr],
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     expressions match
       case Nil =>
-        InterpreterEvaluator.done(BoolValue(true))
+        InterpreterEvaluator.done(BoolValue(true), continuation)
       case expression :: Nil =>
-        InterpreterEvaluator.deferExpr(expression, env)
+        InterpreterEvaluator.deferExpr(expression, env, continuation)
       case expression :: rest =>
-        val result = InterpreterEvaluator.eval(expression, env)
-        if isTruthy(result) then evalAnd(rest, env)
-        else InterpreterEvaluator.done(result)
+        InterpreterEvaluator.deferExpr(
+          expression,
+          env,
+          result =>
+            if isTruthy(result) then evalAnd(rest, env, continuation)
+            else InterpreterEvaluator.done(result, continuation)
+        )
 
-  @tailrec
-  def evalOr(expressions: List[Expr], env: Environment): EvaluationStep =
+  def evalOr(
+    expressions: List[Expr],
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     expressions match
       case Nil =>
-        InterpreterEvaluator.done(BoolValue(false))
+        InterpreterEvaluator.done(BoolValue(false), continuation)
       case expression :: Nil =>
-        InterpreterEvaluator.deferExpr(expression, env)
+        InterpreterEvaluator.deferExpr(expression, env, continuation)
       case expression :: rest =>
-        val result = InterpreterEvaluator.eval(expression, env)
-        if isTruthy(result) then InterpreterEvaluator.done(result)
-        else evalOr(rest, env)
+        InterpreterEvaluator.deferExpr(
+          expression,
+          env,
+          result =>
+            if isTruthy(result) then InterpreterEvaluator.done(result, continuation)
+            else evalOr(rest, env, continuation)
+        )
 
-  @tailrec
-  def evalCond(clauses: List[Expr], env: Environment): EvaluationStep =
+  def evalCond(
+    clauses: List[Expr],
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     clauses match
       case Nil =>
-        InterpreterEvaluator.done(VoidValue)
+        InterpreterEvaluator.done(VoidValue, continuation)
       case ListExpr(SymbolExpr("else", _) :: body, clausePosition) :: rest =>
-        evalCondElseClause(body, rest, clausePosition, env)
+        evalCondElseClause(body, rest, clausePosition, env, continuation)
       case ListExpr(test :: body, _) :: rest =>
-        val testValue = InterpreterEvaluator.eval(test, env)
-        if isTruthy(testValue) then evalCondBody(body, testValue, env)
-        else evalCond(rest, env)
+        InterpreterEvaluator.deferExpr(
+          test,
+          env,
+          testValue =>
+            if isTruthy(testValue) then evalCondBody(body, testValue, env, continuation)
+            else evalCond(rest, env, continuation)
+        )
       case clause :: _ =>
         SchemeFailure.raise("cond expected non-empty list clauses", clause.position)
 
   def evalDefine(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    InterpreterEvaluator.done(
-      SpecialFormDefinitionEvaluator.evalDefine(arguments, position, env)
-    )
+    SpecialFormDefinitionEvaluator.evalDefine(arguments, position, env, continuation)
 
   def evalDefineSyntax(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     InterpreterEvaluator.done(
-      SpecialFormDefinitionEvaluator.evalDefineSyntax(arguments, position, env)
+      SpecialFormDefinitionEvaluator.evalDefineSyntax(arguments, position, env),
+      continuation
     )
 
   def evalIf(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     arguments match
       case condition :: consequent :: alternate :: Nil =>
-        if isTruthy(InterpreterEvaluator.eval(condition, env)) then InterpreterEvaluator.deferExpr(consequent, env)
-        else InterpreterEvaluator.deferExpr(alternate, env)
+        InterpreterEvaluator.deferExpr(
+          condition,
+          env,
+          value =>
+            if isTruthy(value) then InterpreterEvaluator.deferExpr(consequent, env, continuation)
+            else InterpreterEvaluator.deferExpr(alternate, env, continuation)
+        )
       case condition :: consequent :: Nil =>
-        if isTruthy(InterpreterEvaluator.eval(condition, env)) then InterpreterEvaluator.deferExpr(consequent, env)
-        else InterpreterEvaluator.done(VoidValue)
+        InterpreterEvaluator.deferExpr(
+          condition,
+          env,
+          value =>
+            if isTruthy(value) then InterpreterEvaluator.deferExpr(consequent, env, continuation)
+            else InterpreterEvaluator.done(VoidValue, continuation)
+        )
       case _ =>
         SchemeFailure.raise("if expected 2 or 3 argument(s)", position)
 
   def evalLet(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    SpecialFormBindingEvaluator.evalLet(arguments, position, env)
+    SpecialFormBindingEvaluator.evalLet(arguments, position, env, continuation)
 
   def evalLetrec(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    SpecialFormBindingEvaluator.evalLetrec(arguments, position, env)
+    SpecialFormBindingEvaluator.evalLetrec(arguments, position, env, continuation)
 
   def evalLetrecStar(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    SpecialFormBindingEvaluator.evalLetrecStar(arguments, position, env)
+    SpecialFormBindingEvaluator.evalLetrecStar(arguments, position, env, continuation)
 
   def evalLetStar(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    SpecialFormBindingEvaluator.evalLetStar(arguments, position, env)
+    SpecialFormBindingEvaluator.evalLetStar(arguments, position, env, continuation)
 
-  def evalQuote(arguments: List[Expr], position: Position): EvaluationStep =
+  def evalQuote(
+    arguments: List[Expr],
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
     InterpreterEvaluator.done(
-      SpecialFormQuoteEvaluator.evalQuote(arguments, position)
+      SpecialFormQuoteEvaluator.evalQuote(arguments, position),
+      continuation
     )
 
   def evalLambda(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     InterpreterEvaluator.done(
-      SpecialFormProcedureEvaluator.evalLambda(arguments, position, env)
+      SpecialFormProcedureEvaluator.evalLambda(arguments, position, env),
+      continuation
     )
 
   def evalCaseLambda(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     InterpreterEvaluator.done(
-      SpecialFormProcedureEvaluator.evalCaseLambda(arguments, position, env)
+      SpecialFormProcedureEvaluator.evalCaseLambda(arguments, position, env),
+      continuation
     )
 
   def evalCase(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     arguments match
       case keyExpression :: clauses if clauses.nonEmpty =>
-        evalCaseClauses(InterpreterEvaluator.eval(keyExpression, env), clauses, env)
+        InterpreterEvaluator.deferExpr(
+          keyExpression,
+          env,
+          key => evalCaseClauses(key, clauses, env, continuation)
+        )
       case _ =>
         SchemeFailure.raise("case expected a key and at least one clause", position)
 
   def evalDo(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    SpecialFormBindingEvaluator.evalDo(arguments, position, env)
+    SpecialFormBindingEvaluator.evalDo(arguments, position, env, continuation)
 
   def evalSet(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    InterpreterEvaluator.done(
-      SpecialFormDefinitionEvaluator.evalSet(arguments, position, env)
-    )
+    SpecialFormDefinitionEvaluator.evalSet(arguments, position, env, continuation)
 
   private def evalCondElseClause(
     body: List[Expr],
     rest: List[Expr],
     clausePosition: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     if rest.nonEmpty then SchemeFailure.raise("cond else clause must be last", clausePosition)
 
     if body.isEmpty then SchemeFailure.raise("cond else clause must have a body", clausePosition)
 
-    InterpreterEvaluator.deferSequence(body, env)
+    InterpreterEvaluator.deferSequence(body, env, continuation)
 
-  private def evalCondBody(body: List[Expr], testValue: Value, env: Environment): EvaluationStep =
+  private def evalCondBody(
+    body: List[Expr],
+    testValue: Value,
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
     body match
       case Nil =>
-        InterpreterEvaluator.done(testValue)
+        InterpreterEvaluator.done(testValue, continuation)
       case _ =>
-        InterpreterEvaluator.deferSequence(body, env)
+        InterpreterEvaluator.deferSequence(body, env, continuation)
 
   private def evalCaseClauses(
     key: Value,
     clauses: List[Expr],
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     clauses match
       case Nil =>
-        InterpreterEvaluator.done(VoidValue)
+        InterpreterEvaluator.done(VoidValue, continuation)
       case ListExpr(SymbolExpr("else", _) :: body, clausePosition) :: rest =>
-        evalCaseElseClause(body, rest, clausePosition, env)
+        evalCaseElseClause(body, rest, clausePosition, env, continuation)
       case ListExpr(ListExpr(datumExpressions, _) :: body, clausePosition) :: rest =>
-        evalDatumCaseClause(key, datumExpressions, body, clausePosition, rest, env)
+        evalDatumCaseClause(key, datumExpressions, body, clausePosition, rest, env, continuation)
       case clause :: _ =>
         SchemeFailure.raise(
           "case expected clauses of the form ((datum ...) body ...) or (else body ...)",
@@ -196,13 +252,14 @@ private[ming] object SpecialFormEvaluator:
     body: List[Expr],
     rest: List[Expr],
     clausePosition: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     if rest.nonEmpty then SchemeFailure.raise("case else clause must be last", clausePosition)
 
     if body.isEmpty then SchemeFailure.raise("case else clause must have a body", clausePosition)
 
-    InterpreterEvaluator.deferSequence(body, env)
+    InterpreterEvaluator.deferSequence(body, env, continuation)
 
   private def evalDatumCaseClause(
     key: Value,
@@ -210,10 +267,11 @@ private[ming] object SpecialFormEvaluator:
     body: List[Expr],
     clausePosition: Position,
     rest: List[Expr],
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     if body.isEmpty then SchemeFailure.raise("case clause must have a body", clausePosition)
 
     if datumExpressions.exists(datum => Level1ValueSupport.eqvValues(key, SpecialFormQuoteEvaluator.quote(datum))) then
-      InterpreterEvaluator.deferSequence(body, env)
-    else evalCaseClauses(key, rest, env)
+      InterpreterEvaluator.deferSequence(body, env, continuation)
+    else evalCaseClauses(key, rest, env, continuation)

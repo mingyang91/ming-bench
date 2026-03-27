@@ -101,9 +101,21 @@ final private[ming] class VectorValue(initialElements: Iterable[Value]) extends 
 
 final private[ming] case class BuiltinValue(
   name: String,
-  implementation: (List[Value], Position) => Value
+  implementation: (List[Value], Position, Continuation) => EvaluationStep
 ) extends ProcedureValue:
   override def render: String = s"#<procedure:$name>"
+
+private[ming] object BuiltinValue:
+
+  def apply(
+    name: String,
+    implementation: (List[Value], Position) => Value
+  ): BuiltinValue =
+    new BuiltinValue(
+      name,
+      (arguments, position, continuation) =>
+        InterpreterEvaluator.done(implementation(arguments, position), continuation)
+    )
 
 final private[ming] case class ClosureValue(
   parameters: List[String],
@@ -127,6 +139,11 @@ final private[ming] case class CaseLambdaValue(
     name match
       case Some(procedureName) => s"#<procedure:$procedureName>"
       case None                => "#<procedure:case-lambda>"
+
+final private[ming] case class ContinuationValue(
+  continuation: Continuation
+) extends ProcedureValue:
+  override def render: String = "#<procedure:continuation>"
 
 final private[ming] class RecordTypeDescriptor(
   val name: String,

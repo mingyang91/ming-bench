@@ -1,12 +1,12 @@
 package ming
 
-import scala.collection.mutable
 import scala.annotation.tailrec
 
 private[ming] object Level1ListBuiltins:
 
   import RuntimeSupport.*
   import Level1ValueSupport.*
+  import Level1ListSearchSupport.*
 
   val values: Map[String, Value] = Map(
     "cons"      -> BuiltinValue("cons", cons),
@@ -71,31 +71,47 @@ private[ming] object Level1ListBuiltins:
     expectPair(pairValue, "set-cdr!", position).updateCdr(replacement)
     VoidValue
 
-  private def applyProcedure(arguments: List[Value], position: Position): Value =
+  private def applyProcedure(
+    arguments: List[Value],
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
     expectAtLeast(arguments, 2, "apply", position) match
       case function :: rest =>
         val prefixArguments = rest.dropRight(1)
         val listArguments   = expectProperList(rest.last, "apply", position)
-        InterpreterEvaluator.applyFunction(function, prefixArguments ++ listArguments, position)
+        InterpreterEvaluator.deferApplication(
+          function,
+          prefixArguments ++ listArguments,
+          position,
+          continuation
+        )
       case _ =>
         throw new IllegalStateException("validated apply argument list")
 
-  private def mapValues(arguments: List[Value], position: Position): Value =
+  private def mapValues(
+    arguments: List[Value],
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
     expectAtLeast(arguments, 2, "map", position) match
       case function :: listArguments =>
         val lists = listArguments.map(expectProperList(_, "map", position))
         ensureEqualLengths(lists, position)
-        mapAcrossLists(function, lists, position)
+        mapAcrossLists(function, lists, position, continuation)
       case _ =>
         throw new IllegalStateException("validated map argument list")
 
-  private def forEachValues(arguments: List[Value], position: Position): Value =
+  private def forEachValues(
+    arguments: List[Value],
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
     expectAtLeast(arguments, 2, "for-each", position) match
       case function :: listArguments =>
         val lists = listArguments.map(expectProperList(_, "for-each", position))
         ensureEqualLengths(lists, position)
-        forEachAcrossLists(function, lists, position)
-        VoidValue
+        forEachAcrossLists(function, lists, position, continuation)
       case _ =>
         throw new IllegalStateException("validated for-each argument list")
 
@@ -146,17 +162,22 @@ private[ming] object Level1ListBuiltins:
     function: Value,
     lists: List[List[Value]],
     position: Position,
+    continuation: Continuation,
     reversedResult: List[Value] = Nil
-  ): Value =
+  ): EvaluationStep =
     lists match
       case Nil =>
         throw new IllegalStateException("validated map argument list")
       case first :: _ if first.isEmpty =>
-        buildList(reversedResult.reverse)
+        InterpreterEvaluator.done(buildList(reversedResult.reverse), continuation)
       case _ =>
         val (heads, tails) = collectHeadsAndTails(lists)
-        val mappedValue    = InterpreterEvaluator.applyFunction(function, heads, position)
-        mapAcrossLists(function, tails, position, mappedValue :: reversedResult)
+        InterpreterEvaluator.deferApplication(
+          function,
+          heads,
+          position,
+          mappedValue => mapAcrossLists(function, tails, position, continuation, mappedValue :: reversedResult)
+        )
 
   private def collectHeadsAndTails(lists: List[List[Value]]): (List[Value], List[List[Value]]) =
     lists.foldRight((List.empty[Value], List.empty[List[Value]])):
@@ -165,21 +186,25 @@ private[ming] object Level1ListBuiltins:
       case (Nil, _) =>
         throw new IllegalStateException("validated equal non-empty lists")
 
-  @tailrec
   private def forEachAcrossLists(
     function: Value,
     lists: List[List[Value]],
-    position: Position
-  ): Unit =
+    position: Position,
+    continuation: Continuation
+  ): EvaluationStep =
     lists match
       case Nil =>
         throw new IllegalStateException("validated for-each argument list")
       case first :: _ if first.isEmpty =>
-        ()
+        InterpreterEvaluator.done(VoidValue, continuation)
       case _ =>
         val (heads, tails) = collectHeadsAndTails(lists)
-        InterpreterEvaluator.applyFunction(function, heads, position)
-        forEachAcrossLists(function, tails, position)
+        InterpreterEvaluator.deferApplication(
+          function,
+          heads,
+          position,
+          _ => forEachAcrossLists(function, tails, position, continuation)
+        )
 
   private def ensureEqualLengths(lists: List[List[Value]], position: Position): Unit =
     if lists.map(_.length).distinct.length > 1 then
@@ -224,60 +249,3 @@ private[ming] object Level1ListBuiltins:
         else SchemeFailure.raise(s"$name index out of bounds", position)
       case other =>
         SchemeFailure.raise(s"$name expected a list, got ${typeName(other)}", position)
-
-  private def membershipValue(
-    key: Value,
-    value: Value,
-    name: String,
-    position: Position
-  )(matches: (Value, Value) => Boolean): Value =
-    val visited = mutable.HashSet.empty[PairValue]
-    var current = value
-
-    while true do
-      current match
-        case EmptyListValue =>
-          return BoolValue(false)
-        case pair: PairValue =>
-          if visited.contains(pair) then
-            SchemeFailure.raise(s"$name expected a proper list, got circular list", position)
-
-          visited += pair
-          if matches(key, pair.car) then return pair
-          current = pair.cdr
-        case other =>
-          SchemeFailure.raise(s"$name expected a proper list, got ${typeName(other)}", position)
-
-    throw new IllegalStateException("unreachable membership traversal")
-
-  private def associationValue(
-    key: Value,
-    value: Value,
-    name: String,
-    position: Position
-  )(matches: (Value, Value) => Boolean): Value =
-    val visited = mutable.HashSet.empty[PairValue]
-    var current = value
-
-    while true do
-      current match
-        case EmptyListValue =>
-          return BoolValue(false)
-        case pair: PairValue =>
-          if visited.contains(pair) then
-            SchemeFailure.raise(s"$name expected a proper list, got circular list", position)
-
-          visited += pair
-          pair.car match
-            case entry: PairValue =>
-              if matches(key, entry.car) then return entry
-              current = pair.cdr
-            case other =>
-              SchemeFailure.raise(
-                s"$name expected pairs in its association list, got ${typeName(other)}",
-                position
-              )
-        case other =>
-          SchemeFailure.raise(s"$name expected a proper list, got ${typeName(other)}", position)
-
-    throw new IllegalStateException("unreachable association traversal")

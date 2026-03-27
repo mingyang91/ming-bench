@@ -1,83 +1,71 @@
 package ming
 
 import RuntimeSupport.isTruthy
-
-import scala.annotation.tailrec
+import SpecialFormBindingSyntax.*
 
 private[ming] object SpecialFormBindingEvaluator:
-
-  final private case class Binding(name: String, valueExpression: Expr)
-
-  final private case class DoBinding(
-    name: String,
-    initExpression: Expr,
-    stepExpression: Option[Expr],
-    position: Position
-  )
-
-  final private case class DoTestClause(
-    testExpression: Expr,
-    finalExpressions: List[Expr]
-  )
-
-  private enum RecursiveLetMode:
-    case Parallel
-    case Sequential
 
   def evalLet(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     arguments match
       case SymbolExpr(name, _) :: bindingsExpression :: body if body.nonEmpty =>
-        evalNamedLet(name, bindingsExpression, body, position, env)
+        evalNamedLet(name, bindingsExpression, body, position, env, continuation)
       case bindingsExpression :: body if body.nonEmpty =>
-        evalUnnamedLet(bindingsExpression, body, position, env)
+        evalUnnamedLet(bindingsExpression, body, position, env, continuation)
       case _ =>
         SchemeFailure.raise("let expected bindings and body", position)
 
   def evalLetrec(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    evalRecursiveLet(arguments, position, env, "letrec", RecursiveLetMode.Parallel)
+    evalRecursiveLet(arguments, position, env, "letrec", RecursiveLetMode.Parallel, continuation)
 
   def evalLetrecStar(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    evalRecursiveLet(arguments, position, env, "letrec*", RecursiveLetMode.Sequential)
+    evalRecursiveLet(arguments, position, env, "letrec*", RecursiveLetMode.Sequential, continuation)
 
   def evalLetStar(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     arguments match
       case bindingsExpression :: body if body.nonEmpty =>
         val bindings = parseBindings(bindingsExpression, position, "let*")
         val childEnv = Environment.child(env)
-        bindings.foreach: binding =>
-          childEnv.define(binding.name, InterpreterEvaluator.eval(binding.valueExpression, childEnv))
-        InterpreterEvaluator.deferSequence(body, childEnv)
+        evalLetStarBindings(bindings, childEnv, body, continuation)
       case _ =>
         SchemeFailure.raise("let* expected bindings and body", position)
 
   def evalDo(
     arguments: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     arguments match
       case bindingsExpression :: testClauseExpression :: body =>
-        val bindings      = parseDoBindings(bindingsExpression, position)
-        val doTestClause  = parseDoTestClause(testClauseExpression)
-        val initialValues = bindings.map(binding => InterpreterEvaluator.eval(binding.initExpression, env))
-        val loopEnv       = Environment.child(env, bindings.map(_.name).zip(initialValues))
-        evalDoLoop(bindings, doTestClause, body, loopEnv)
+        val bindings     = parseDoBindings(bindingsExpression, position)
+        val doTestClause = parseDoTestClause(testClauseExpression)
+        evalExpressionList(
+          bindings.map(_.initExpression),
+          env,
+          initialValues =>
+            val loopEnv = Environment.child(env, bindings.map(_.name).zip(initialValues))
+            evalDoLoop(bindings, doTestClause, body, loopEnv, continuation)
+        )
       case _ =>
         SchemeFailure.raise("do expected bindings and a test clause", position)
 
@@ -85,41 +73,57 @@ private[ming] object SpecialFormBindingEvaluator:
     bindingsExpression: Expr,
     body: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    val bindings    = parseBindings(bindingsExpression, position, "let")
-    val boundValues = bindings.map(binding => InterpreterEvaluator.eval(binding.valueExpression, env))
-    val childEnv    = Environment.child(env, bindings.map(_.name).zip(boundValues))
-    InterpreterEvaluator.deferSequence(body, childEnv)
+    val bindings = parseBindings(bindingsExpression, position, "let")
+    evalExpressionList(
+      bindings.map(_.valueExpression),
+      env,
+      boundValues =>
+        val childEnv = Environment.child(env, bindings.map(_.name).zip(boundValues))
+        InterpreterEvaluator.deferSequence(body, childEnv, continuation)
+    )
 
   private def evalNamedLet(
     name: String,
     bindingsExpression: Expr,
     body: List[Expr],
     position: Position,
-    env: Environment
+    env: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    val bindings   = parseBindings(bindingsExpression, position, "let")
-    val arguments  = bindings.map(binding => InterpreterEvaluator.eval(binding.valueExpression, env))
-    val closureEnv = Environment.child(env)
-    val closure    = ClosureValue(bindings.map(_.name), None, body, closureEnv, Some(name))
-    closureEnv.define(name, closure)
-    InterpreterEvaluator.deferApplication(closure, arguments, position)
+    val bindings = parseBindings(bindingsExpression, position, "let")
+    evalExpressionList(
+      bindings.map(_.valueExpression),
+      env,
+      arguments =>
+        val closureEnv = Environment.child(env)
+        val closure    = ClosureValue(bindings.map(_.name), None, body, closureEnv, Some(name))
+        closureEnv.define(name, closure)
+        InterpreterEvaluator.deferApplication(closure, arguments, position, continuation)
+    )
 
   private def evalRecursiveLet(
     arguments: List[Expr],
     position: Position,
     env: Environment,
     formName: String,
-    mode: RecursiveLetMode
+    mode: RecursiveLetMode,
+    continuation: Continuation
   ): EvaluationStep =
     arguments match
       case bindingsExpression :: body if body.nonEmpty =>
         val bindings = parseBindings(bindingsExpression, position, formName)
         val childEnv = Environment.child(env)
         reserveBindings(bindings, childEnv)
-        initializeRecursiveBindings(bindings, childEnv, position, mode)
-        InterpreterEvaluator.deferSequence(body, childEnv)
+        initializeRecursiveBindings(
+          bindings,
+          childEnv,
+          position,
+          mode,
+          () => InterpreterEvaluator.deferSequence(body, childEnv, continuation)
+        )
       case _ =>
         SchemeFailure.raise(s"$formName expected bindings and body", position)
 
@@ -130,110 +134,152 @@ private[ming] object SpecialFormBindingEvaluator:
     bindings: List[Binding],
     env: Environment,
     position: Position,
-    mode: RecursiveLetMode
-  ): Unit =
+    mode: RecursiveLetMode,
+    finish: () => EvaluationStep
+  ): EvaluationStep =
     mode match
       case RecursiveLetMode.Sequential =>
-        bindings.foreach: binding =>
-          val value = InterpreterEvaluator.eval(binding.valueExpression, env)
-          env.assign(binding.name, value, position)
+        initializeRecursiveBindingsSequential(bindings, env, position, finish)
       case RecursiveLetMode.Parallel =>
-        val values = bindings.map(binding => InterpreterEvaluator.eval(binding.valueExpression, env))
-        bindings
-          .zip(values)
-          .foreach: (binding, value) =>
-            env.assign(binding.name, value, position)
+        evalExpressionList(
+          bindings.map(_.valueExpression),
+          env,
+          values =>
+            bindings
+              .zip(values)
+              .foreach: (binding, value) =>
+                env.assign(binding.name, value, position)
+            finish()
+        )
 
-  @tailrec
+  private def initializeRecursiveBindingsSequential(
+    bindings: List[Binding],
+    env: Environment,
+    position: Position,
+    finish: () => EvaluationStep
+  ): EvaluationStep =
+    bindings match
+      case Nil =>
+        finish()
+      case binding :: rest =>
+        InterpreterEvaluator.deferExpr(
+          binding.valueExpression,
+          env,
+          value =>
+            env.assign(binding.name, value, position)
+            initializeRecursiveBindingsSequential(rest, env, position, finish)
+        )
+
+  private def evalLetStarBindings(
+    bindings: List[Binding],
+    childEnv: Environment,
+    body: List[Expr],
+    continuation: Continuation
+  ): EvaluationStep =
+    bindings match
+      case Nil =>
+        InterpreterEvaluator.deferSequence(body, childEnv, continuation)
+      case binding :: rest =>
+        InterpreterEvaluator.deferExpr(
+          binding.valueExpression,
+          childEnv,
+          value =>
+            childEnv.define(binding.name, value)
+            evalLetStarBindings(rest, childEnv, body, continuation)
+        )
+
   private def evalDoLoop(
     bindings: List[DoBinding],
     testClause: DoTestClause,
     body: List[Expr],
-    loopEnv: Environment
+    loopEnv: Environment,
+    continuation: Continuation
   ): EvaluationStep =
-    if isTruthy(InterpreterEvaluator.eval(testClause.testExpression, loopEnv)) then
-      evalDoFinalExpressions(testClause.finalExpressions, loopEnv)
-    else
-      evalDoBody(body, loopEnv)
-      advanceDoBindings(bindings, loopEnv)
-      evalDoLoop(bindings, testClause, body, loopEnv)
+    InterpreterEvaluator.deferExpr(
+      testClause.testExpression,
+      loopEnv,
+      testValue =>
+        if isTruthy(testValue) then evalDoFinalExpressions(testClause.finalExpressions, loopEnv, continuation)
+        else evalDoBodyAndAdvance(bindings, testClause, body, loopEnv, continuation)
+    )
 
   private def evalDoFinalExpressions(
     finalExpressions: List[Expr],
-    loopEnv: Environment
+    loopEnv: Environment,
+    continuation: Continuation
   ): EvaluationStep =
     finalExpressions match
       case Nil =>
-        InterpreterEvaluator.done(VoidValue)
+        InterpreterEvaluator.done(VoidValue, continuation)
       case _ =>
-        InterpreterEvaluator.deferSequence(finalExpressions, loopEnv)
+        InterpreterEvaluator.deferSequence(finalExpressions, loopEnv, continuation)
 
-  private def evalDoBody(body: List[Expr], loopEnv: Environment): Unit =
-    if body.nonEmpty then InterpreterEvaluator.evalSequence(body, loopEnv)
+  private def evalDoBodyAndAdvance(
+    bindings: List[DoBinding],
+    testClause: DoTestClause,
+    body: List[Expr],
+    loopEnv: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
+    val finish = () =>
+      advanceDoBindings(bindings, loopEnv, () => evalDoLoop(bindings, testClause, body, loopEnv, continuation))
 
-  private def advanceDoBindings(bindings: List[DoBinding], loopEnv: Environment): Unit =
-    val nextValues = bindings.map(nextDoValue(_, loopEnv))
-    bindings
-      .zip(nextValues)
-      .foreach: (binding, value) =>
-        loopEnv.assign(binding.name, value, binding.position)
+    if body.nonEmpty then InterpreterEvaluator.deferSequence(body, loopEnv, _ => finish())
+    else finish()
 
-  private def nextDoValue(binding: DoBinding, loopEnv: Environment): Value =
-    binding.stepExpression match
-      case Some(stepExpression) =>
-        InterpreterEvaluator.eval(stepExpression, loopEnv)
-      case None =>
-        loopEnv.lookup(binding.name, binding.position)
+  private def advanceDoBindings(
+    bindings: List[DoBinding],
+    loopEnv: Environment,
+    finish: () => EvaluationStep
+  ): EvaluationStep =
+    evalDoNextValues(
+      bindings,
+      loopEnv,
+      nextValues =>
+        bindings
+          .zip(nextValues)
+          .foreach: (binding, value) =>
+            loopEnv.assign(binding.name, value, binding.position)
+        finish()
+    )
 
-  private def parseBindings(
-    bindingsExpression: Expr,
-    position: Position,
-    formName: String
-  ): List[Binding] =
-    bindingsExpression match
-      case ListExpr(bindings, _) =>
-        bindings.map(parseBinding(_, formName))
-      case _ =>
-        SchemeFailure.raise(s"$formName expected a binding list", position)
+  private def evalDoNextValues(
+    bindings: List[DoBinding],
+    loopEnv: Environment,
+    finish: List[Value] => EvaluationStep,
+    reversedValues: List[Value] = Nil
+  ): EvaluationStep =
+    bindings match
+      case Nil =>
+        finish(reversedValues.reverse)
+      case binding :: rest =>
+        binding.stepExpression match
+          case Some(stepExpression) =>
+            InterpreterEvaluator.deferExpr(
+              stepExpression,
+              loopEnv,
+              value => evalDoNextValues(rest, loopEnv, finish, value :: reversedValues)
+            )
+          case None =>
+            evalDoNextValues(
+              rest,
+              loopEnv,
+              finish,
+              loopEnv.lookup(binding.name, binding.position) :: reversedValues
+            )
 
-  private def parseBinding(binding: Expr, formName: String): Binding =
-    binding match
-      case ListExpr(List(SymbolExpr(name, _), valueExpression), _) =>
-        Binding(name, valueExpression)
-      case _ =>
-        SchemeFailure.raise(
-          s"$formName expected bindings of the form (name expr)",
-          binding.position
-        )
-
-  private def parseDoBindings(
-    bindingsExpression: Expr,
-    position: Position
-  ): List[DoBinding] =
-    bindingsExpression match
-      case ListExpr(bindings, _) =>
-        bindings.map(parseDoBinding)
-      case _ =>
-        SchemeFailure.raise("do expected a binding list", position)
-
-  private def parseDoBinding(binding: Expr): DoBinding =
-    binding match
-      case ListExpr(List(SymbolExpr(name, _), initExpression), bindingPosition) =>
-        DoBinding(name, initExpression, None, bindingPosition)
-      case ListExpr(List(SymbolExpr(name, _), initExpression, stepExpression), bindingPosition) =>
-        DoBinding(name, initExpression, Some(stepExpression), bindingPosition)
-      case _ =>
-        SchemeFailure.raise(
-          "do expected bindings of the form (name init) or (name init step)",
-          binding.position
-        )
-
-  private def parseDoTestClause(testClauseExpression: Expr): DoTestClause =
-    testClauseExpression match
-      case ListExpr(testExpression :: finalExpressions, _) =>
-        DoTestClause(testExpression, finalExpressions)
-      case _ =>
-        SchemeFailure.raise(
-          "do expected a test clause of the form (test expr ...)",
-          testClauseExpression.position
+  private def evalExpressionList(
+    expressions: List[Expr],
+    env: Environment,
+    finish: List[Value] => EvaluationStep,
+    reversedValues: List[Value] = Nil
+  ): EvaluationStep =
+    expressions match
+      case Nil =>
+        finish(reversedValues.reverse)
+      case expression :: rest =>
+        InterpreterEvaluator.deferExpr(
+          expression,
+          env,
+          value => evalExpressionList(rest, env, finish, value :: reversedValues)
         )
