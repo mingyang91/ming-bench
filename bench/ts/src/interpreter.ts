@@ -18,6 +18,7 @@ type EmptyList = { kind: 'empty-list' };
 type PairValue = { kind: 'pair'; car: Value; cdr: Value };
 type VectorValue = { kind: 'vector'; items: Value[] };
 type VoidValue = { kind: 'void' };
+type SyntaxValue = { kind: 'syntax'; expr: Expr };
 type TailStep = { kind: 'tail-step'; expr: Expr; env: Env };
 type MultipleValues = { kind: 'multiple-values'; values: Value[] };
 type EvaluationResult = Value | MultipleValues;
@@ -31,10 +32,19 @@ type PatternCapture =
   | { kind: 'single'; expr: Expr }
   | { kind: 'repeat'; exprs: Expr[] };
 type MacroRule = { pattern: Expr; template: Expr };
-type MacroTransformer = {
+type TemplateMacroContext = {
   name: string;
   literals: Set<string>;
+  definitionEnv?: Env;
+};
+type SyntaxRulesTransformer = TemplateMacroContext & {
+  kind: 'syntax-rules';
   rules: MacroRule[];
+};
+type ProcedureMacroTransformer = {
+  kind: 'procedure-macro';
+  name: string;
+  proc: ProcedureValue;
   definitionEnv: Env;
 };
 type EqualityState = {
@@ -46,10 +56,18 @@ type FormatState = {
   activeVectors: Set<VectorValue>;
 };
 type TemplateContext = {
-  macro: MacroTransformer;
+  macro: TemplateMacroContext;
   captures: Map<string, PatternCapture>;
   renameMap: Map<string, string>;
   capturedFreeNames: Map<string, string>;
+};
+type SyntaxFrame = {
+  captures: Map<string, PatternCapture>;
+  literals: Set<string>;
+};
+type ProceduralMacroContext = {
+  name: string;
+  definitionEnv: Env;
 };
 type ParamSpec = {
   required: string[];
@@ -115,10 +133,12 @@ type Value =
   | VectorValue
   | RecordValue
   | VoidValue
+  | SyntaxValue
   | BuiltinProc
   | UserProc
   | CaseLambdaProc
   | ContinuationValue;
+type MacroTransformer = SyntaxRulesTransformer | ProcedureMacroTransformer;
 type ProcedureValue = BuiltinProc | UserProc | CaseLambdaProc | ContinuationValue;
 type MachineStep =
   | { kind: 'eval-step'; expr: Expr; env: Env; k: ContinuationFn }
@@ -136,6 +156,8 @@ const UNINITIALIZED = Symbol('uninitialized');
 const STRING_IMMUTABILITY_LEVEL = 15;
 let currentWindFrames: WindFrame[] = [];
 let currentExceptionHandlers: ExceptionHandlerFrame[] = [];
+let currentProceduralMacroContexts: ProceduralMacroContext[] = [];
+let currentSyntaxFrames: SyntaxFrame[] = [];
 const CORE_SYNTAX = new Set([
   'and',
   'begin',
@@ -156,6 +178,9 @@ const CORE_SYNTAX = new Set([
   'or',
   'quote',
   'set!',
+  'syntax',
+  'syntax-case',
+  'with-syntax',
 ]);
 
 let macroIdentifierCounter = 0;
@@ -275,6 +300,16 @@ class Parser {
 
     const position = this.currentPosition();
     const ch = this.peek();
+
+    if (ch === '#' && this.peekAt(1) === '\'') {
+      this.advance();
+      this.advance();
+      return {
+        kind: 'list',
+        position,
+        items: [{ kind: 'symbol', name: 'syntax', position }, this.parseExpr()],
+      };
+    }
 
     if (ch === '\'') {
       this.advance();
@@ -424,6 +459,10 @@ class Parser {
     return this.input[this.index]!;
   }
 
+  private peekAt(offset: number): string | undefined {
+    return this.input[this.index + offset];
+  }
+
   private advance(): string {
     const ch = this.input[this.index]!;
     this.index += 1;
@@ -473,7 +512,7 @@ function isEllipsisSymbol(expr: Expr | undefined): expr is ExprBase & { kind: 's
   return expr?.kind === 'symbol' && expr.name === '...';
 }
 
-function parseSyntaxRules(name: string, expr: Expr, env: Env): MacroTransformer {
+function parseSyntaxRules(name: string, expr: Expr, env: Env): SyntaxRulesTransformer {
   if (expr.kind !== 'list' || expr.items.length < 2) {
     throw new EvalError('define-syntax expects a syntax-rules transformer');
   }
@@ -511,6 +550,7 @@ function parseSyntaxRules(name: string, expr: Expr, env: Env): MacroTransformer 
   });
 
   return {
+    kind: 'syntax-rules',
     name,
     literals,
     rules,
@@ -520,6 +560,18 @@ function parseSyntaxRules(name: string, expr: Expr, env: Env): MacroTransformer 
 
 function expandMacroInvocation(
   transformer: MacroTransformer,
+  invocation: ExprBase & { kind: 'list'; items: Expr[] },
+  macroEnv: MacroEnv,
+): Expr {
+  if (transformer.kind === 'procedure-macro') {
+    return expandProcedureMacroInvocation(transformer, invocation, macroEnv);
+  }
+
+  return expandSyntaxRulesInvocation(transformer, invocation);
+}
+
+function expandSyntaxRulesInvocation(
+  transformer: SyntaxRulesTransformer,
   invocation: ExprBase & { kind: 'list'; items: Expr[] },
 ): Expr {
   const literals = new Set(transformer.literals);
@@ -540,6 +592,36 @@ function expandMacroInvocation(
   }
 
   throw new EvalError(`no matching syntax-rules pattern for ${transformer.name}`);
+}
+
+function expandProcedureMacroInvocation(
+  transformer: ProcedureMacroTransformer,
+  invocation: ExprBase & { kind: 'list'; items: Expr[] },
+  macroEnv: MacroEnv,
+): Expr {
+  const priorMacroDepth = currentProceduralMacroContexts.length;
+  const priorSyntaxDepth = currentSyntaxFrames.length;
+  currentProceduralMacroContexts.push({
+    name: transformer.name,
+    definitionEnv: transformer.definitionEnv,
+  });
+
+  try {
+    const result = runMachine(
+      {
+        kind: 'apply-step',
+        proc: transformer.proc,
+        args: [makeSyntaxValue(invocation)],
+        position: invocation.position,
+        k: doneStep,
+      },
+      macroEnv,
+    );
+    return syntaxResultToExpr(transformer.name, expectSingleValueResult('macro transformer', result));
+  } finally {
+    currentProceduralMacroContexts.length = priorMacroDepth;
+    currentSyntaxFrames.length = priorSyntaxDepth;
+  }
 }
 
 function matchPattern(
@@ -923,13 +1005,18 @@ function captureDefinitionIdentifier(name: string, ctx: TemplateContext): string
     return cached;
   }
 
-  const cell = ctx.macro.definitionEnv.lookupCell(name);
+  const definitionEnv = ctx.macro.definitionEnv;
+  if (definitionEnv === undefined) {
+    return undefined;
+  }
+
+  const cell = definitionEnv.lookupCell(name);
   if (cell === undefined) {
     return undefined;
   }
 
   const alias = freshMacroIdentifier(name);
-  ctx.macro.definitionEnv.defineAlias(alias, cell);
+  definitionEnv.defineAlias(alias, cell);
   ctx.capturedFreeNames.set(name, alias);
   return alias;
 }
@@ -1015,6 +1102,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       assertExactArity('denominator', args, 1);
       return num.denominatorOf(expectNumberValue('denominator', args[0]!));
     }),
+    builtin('datum->syntax', (args, position) => datumToSyntaxBuiltin(args, position)),
     builtin('even?', (args) => integerPredicate('even?', args, (value) => num.numericIsEven(value))),
     builtin('exact->inexact', (args) => {
       assertExactArity('exact->inexact', args, 1);
@@ -1026,6 +1114,10 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('expt', (args) => exptNumbers(args)),
     builtin('for-each', (args, position, k) => forEachBuiltin(args, position, macroEnv, k)),
     builtin('gcd', (args) => gcdBuiltin(args)),
+    builtin('identifier?', (args) => {
+      assertExactArity('identifier?', args, 1);
+      return expectSyntaxValue('identifier?', args[0]!).expr.kind === 'symbol';
+    }),
     builtin('inexact->exact', (args) => {
       assertExactArity('inexact->exact', args, 1);
       return num.inexactToExact(expectNumberValue('inexact->exact', args[0]!));
@@ -1186,6 +1278,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       return makeRuntimeString(expectSymbolValue('symbol->string', args[0]!).name);
     }),
     builtin('symbol?', (args) => unaryPredicate('symbol?', args, isSymbolValue)),
+    builtin('syntax->datum', (args) => syntaxToDatumBuiltin(args)),
     builtin('truncate', (args) => truncateBuiltin(args)),
     builtin('set-car!', (args) => {
       assertExactArity('set-car!', args, 2);
@@ -1500,13 +1593,19 @@ function evalListStep(
         return evalQuoteStep(items.slice(1), k);
       case 'set!':
         return evalSetStep(items.slice(1), env, macroEnv, k);
+      case 'syntax':
+        return evalSyntaxStep(items.slice(1), env, k);
+      case 'syntax-case':
+        return evalSyntaxCaseStep(items.slice(1), env, macroEnv, k);
+      case 'with-syntax':
+        return evalWithSyntaxStep(items.slice(1), env, macroEnv, k);
     }
 
     const macro = macroEnv.lookup(first.name);
     if (macro !== undefined) {
       return {
         kind: 'eval-step',
-        expr: expandMacroInvocation(macro, expr),
+        expr: expandMacroInvocation(macro, expr, macroEnv),
         env,
         k,
       };
@@ -1701,8 +1800,25 @@ function evalDefineSyntaxStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: Con
     throw new EvalError('define-syntax expects a symbol name');
   }
 
-  macroEnv.define(nameExpr.name, parseSyntaxRules(nameExpr.name, args[1]!, env));
-  return k(VOID);
+  if (isSyntaxRulesTransformerExpr(args[1]!)) {
+    macroEnv.define(nameExpr.name, parseSyntaxRules(nameExpr.name, args[1]!, env));
+    return k(VOID);
+  }
+
+  return {
+    kind: 'eval-step',
+    expr: args[1]!,
+    env,
+    k: (result) => {
+      macroEnv.define(nameExpr.name, {
+        kind: 'procedure-macro',
+        name: nameExpr.name,
+        proc: expectProcedureValue('define-syntax', expectSingleValueResult('define-syntax', result)),
+        definitionEnv: env,
+      });
+      return k(VOID);
+    },
+  };
 }
 
 function evalDefineRecordType(args: Expr[], env: Env): Value {
@@ -2143,6 +2259,161 @@ function evalQuoteStep(args: Expr[], k: ContinuationFn): MachineStep {
   return k(quoteExpr(args[0]!));
 }
 
+function evalSyntaxStep(args: Expr[], env: Env, k: ContinuationFn): MachineStep {
+  assertExactArity('syntax', args, 1);
+
+  if (currentProceduralMacroContexts.length === 0 && currentSyntaxFrames.length === 0) {
+    return k(makeSyntaxValue(args[0]!));
+  }
+
+  return k(
+    makeSyntaxValue(
+      expandTemplate(args[0]!, {
+        macro: {
+          name: currentProceduralMacroContexts[currentProceduralMacroContexts.length - 1]?.name ?? 'syntax',
+          literals: currentSyntaxFrames[currentSyntaxFrames.length - 1]?.literals ?? new Set<string>(),
+          definitionEnv: currentProceduralMacroContexts[currentProceduralMacroContexts.length - 1]?.definitionEnv,
+        },
+        captures: collectActiveSyntaxCaptures(),
+        renameMap: new Map<string, string>(),
+        capturedFreeNames: new Map<string, string>(),
+      }),
+    ),
+  );
+}
+
+function evalSyntaxCaseStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
+  assertAtLeastArity('syntax-case', args, 3);
+  const literals = parseSyntaxLiteralIdentifiers(args[1]!);
+
+  return {
+    kind: 'eval-step',
+    expr: args[0]!,
+    env,
+    k: (result) =>
+      evalSyntaxCaseClausesStep(
+        expectSyntaxValue('syntax-case', expectSingleValueResult('syntax-case', result)),
+        literals,
+        args.slice(2),
+        0,
+        env,
+        macroEnv,
+        k,
+      ),
+  };
+}
+
+function evalSyntaxCaseClausesStep(
+  syntaxValue: SyntaxValue,
+  literals: Set<string>,
+  clauses: Expr[],
+  clauseIndex: number,
+  env: Env,
+  macroEnv: MacroEnv,
+  k: ContinuationFn,
+): MachineStep {
+  if (clauseIndex >= clauses.length) {
+    throw new EvalError('syntax-case: no matching clause');
+  }
+
+  const clauseExpr = clauses[clauseIndex]!;
+  if (clauseExpr.kind !== 'list' || clauseExpr.items.length < 2) {
+    throw new EvalError('syntax-case expects clauses of the form (pattern expr ...)');
+  }
+
+  const [patternExpr, ...restExprs] = clauseExpr.items;
+  const captures = new Map<string, PatternCapture>();
+  if (!matchPattern(patternExpr!, syntaxValue.expr, literals, captures)) {
+    return evalSyntaxCaseClausesStep(syntaxValue, literals, clauses, clauseIndex + 1, env, macroEnv, k);
+  }
+
+  let fender: Expr | undefined;
+  let body: Expr[];
+  if (restExprs.length === 1) {
+    body = restExprs;
+  } else {
+    [fender, ...body] = restExprs;
+  }
+
+  if (body.length === 0) {
+    throw new EvalError('syntax-case clause requires a result expression');
+  }
+
+  const clauseEnv = new Env(env);
+  bindSyntaxCaptures(clauseEnv, captures);
+  const previousFrames = currentSyntaxFrames;
+  currentSyntaxFrames = [...previousFrames, { captures, literals }];
+  const restore = (result: EvaluationResult) => {
+    currentSyntaxFrames = previousFrames;
+    return k(result);
+  };
+
+  if (fender === undefined) {
+    return evalSequenceStep(body, clauseEnv, macroEnv, restore);
+  }
+
+  return {
+    kind: 'eval-step',
+    expr: fender,
+    env: clauseEnv,
+    k: (result) => {
+      const passed = expectSingleValueResult('syntax-case', result);
+      if (!isTruthy(passed)) {
+        currentSyntaxFrames = previousFrames;
+        return evalSyntaxCaseClausesStep(syntaxValue, literals, clauses, clauseIndex + 1, env, macroEnv, k);
+      }
+
+      return evalSequenceStep(body, clauseEnv, macroEnv, restore);
+    },
+  };
+}
+
+function evalWithSyntaxStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
+  assertAtLeastArity('with-syntax', args, 2);
+  return evalWithSyntaxBindingsStep(parseWithSyntaxBindings(args[0]!), 0, env, macroEnv, new Map<string, PatternCapture>(), args.slice(1), k);
+}
+
+function evalWithSyntaxBindingsStep(
+  bindings: Array<{ pattern: Expr; expr: Expr }>,
+  index: number,
+  env: Env,
+  macroEnv: MacroEnv,
+  captures: Map<string, PatternCapture>,
+  body: Expr[],
+  k: ContinuationFn,
+): MachineStep {
+  if (index >= bindings.length) {
+    const withEnv = new Env(env);
+    bindSyntaxCaptures(withEnv, captures);
+    const previousFrames = currentSyntaxFrames;
+    currentSyntaxFrames = [
+      ...previousFrames,
+      {
+        captures,
+        literals: new Set(previousFrames[previousFrames.length - 1]?.literals ?? []),
+      },
+    ];
+    return evalSequenceStep(body, withEnv, macroEnv, (result) => {
+      currentSyntaxFrames = previousFrames;
+      return k(result);
+    });
+  }
+
+  const binding = bindings[index]!;
+  return {
+    kind: 'eval-step',
+    expr: binding.expr,
+    env,
+    k: (result) => {
+      const syntaxValue = expectSyntaxValue('with-syntax', expectSingleValueResult('with-syntax', result));
+      if (!matchPattern(binding.pattern, syntaxValue.expr, new Set<string>(), captures)) {
+        throw new EvalError('with-syntax pattern did not match');
+      }
+      return evalWithSyntaxBindingsStep(bindings, index + 1, env, macroEnv, captures, body, k);
+    },
+  };
+}
+
 function evalSetStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
   assertExactArity('set!', args, 2);
 
@@ -2335,6 +2606,159 @@ function quoteExpr(expr: Expr): Value {
 
     case 'list':
       return makeList(expr.items.map((item) => quoteExpr(item)));
+  }
+}
+
+function isSyntaxRulesTransformerExpr(expr: Expr): boolean {
+  return expr.kind === 'list' && expr.items[0]?.kind === 'symbol' && expr.items[0].name === 'syntax-rules';
+}
+
+function makeSyntaxValue(expr: Expr): SyntaxValue {
+  return { kind: 'syntax', expr: cloneExpr(expr) };
+}
+
+function syntaxResultToExpr(name: string, value: Value): Expr {
+  return cloneExpr(expectSyntaxValue(name, value).expr);
+}
+
+function parseSyntaxLiteralIdentifiers(expr: Expr): Set<string> {
+  if (expr.kind !== 'list') {
+    throw new EvalError('syntax-case expects a literal identifier list');
+  }
+
+  const literals = new Set<string>();
+  for (const literalExpr of expr.items) {
+    if (literalExpr.kind !== 'symbol') {
+      throw new EvalError('syntax-case literals must be identifiers');
+    }
+    literals.add(literalExpr.name);
+  }
+  return literals;
+}
+
+function parseWithSyntaxBindings(expr: Expr): Array<{ pattern: Expr; expr: Expr }> {
+  if (expr.kind !== 'list') {
+    throw new EvalError('with-syntax expects a binding list');
+  }
+
+  return expr.items.map((bindingExpr) => {
+    if (bindingExpr.kind !== 'list' || bindingExpr.items.length !== 2) {
+      throw new EvalError('with-syntax bindings must be pairs');
+    }
+
+    return {
+      pattern: bindingExpr.items[0]!,
+      expr: bindingExpr.items[1]!,
+    };
+  });
+}
+
+function bindSyntaxCaptures(env: Env, captures: Map<string, PatternCapture>): void {
+  for (const [name, capture] of captures) {
+    if (capture.kind === 'single') {
+      env.define(name, makeSyntaxValue(capture.expr));
+      continue;
+    }
+
+    env.define(
+      name,
+      makeList(capture.exprs.map((expr) => makeSyntaxValue(expr))),
+    );
+  }
+}
+
+function collectActiveSyntaxCaptures(): Map<string, PatternCapture> {
+  const captures = new Map<string, PatternCapture>();
+
+  for (const frame of currentSyntaxFrames) {
+    for (const [name, capture] of frame.captures) {
+      captures.set(
+        name,
+        capture.kind === 'single'
+          ? { kind: 'single', expr: capture.expr }
+          : { kind: 'repeat', exprs: [...capture.exprs] },
+      );
+    }
+  }
+
+  return captures;
+}
+
+function syntaxToDatumBuiltin(args: Value[]): Value {
+  assertExactArity('syntax->datum', args, 1);
+  return syntaxToDatumValue(args[0]!);
+}
+
+function syntaxToDatumValue(value: Value): Value {
+  if (isSyntaxValue(value)) {
+    return quoteExpr(value.expr);
+  }
+
+  if (isPair(value)) {
+    return {
+      kind: 'pair',
+      car: syntaxToDatumValue(value.car),
+      cdr: syntaxToDatumValue(value.cdr),
+    };
+  }
+
+  if (isVectorValue(value)) {
+    return {
+      kind: 'vector',
+      items: value.items.map((item) => syntaxToDatumValue(item)),
+    };
+  }
+
+  if (isEmptyList(value)) {
+    return value;
+  }
+
+  throw new EvalError('syntax->datum expects a syntax object');
+}
+
+function datumToSyntaxBuiltin(args: Value[], position: SourcePosition): SyntaxValue {
+  assertExactArity('datum->syntax', args, 2);
+  const sourceSyntax = expectSyntaxValue('datum->syntax', args[0]!);
+  return {
+    kind: 'syntax',
+    expr: datumValueToExpr(args[1]!, sourceSyntax.expr.position ?? position),
+  };
+}
+
+function datumValueToExpr(value: Value, position: SourcePosition): Expr {
+  if (num.isNumericValue(value)) {
+    return { kind: 'number', value, position };
+  }
+
+  if (typeof value === 'boolean') {
+    return { kind: 'boolean', value, position };
+  }
+
+  if (typeof value === 'string') {
+    return { kind: 'string', value, position };
+  }
+
+  if (isMutableStringValue(value)) {
+    return { kind: 'string', value: value.chars.join(''), position };
+  }
+
+  switch (value.kind) {
+    case 'char':
+      return { kind: 'char', value: value.value, position };
+    case 'symbol-value':
+      return { kind: 'symbol', name: value.name, position };
+    case 'empty-list':
+      return { kind: 'list', items: [], position };
+    case 'pair':
+      return {
+        kind: 'list',
+        items: expectProperList('datum->syntax', value).map((item) => datumValueToExpr(item, position)),
+        position,
+      };
+    case 'syntax':
+      return cloneExpr(value.expr);
+    default:
+      throw new EvalError('datum->syntax expects a datum that can be converted to syntax');
   }
 }
 
@@ -2925,6 +3349,14 @@ function expectSymbolValue(name: string, value: Value): SchemeSymbol {
   return value;
 }
 
+function expectSyntaxValue(name: string, value: Value): SyntaxValue {
+  if (!isSyntaxValue(value)) {
+    throw new EvalError(`${name} expects a syntax object`);
+  }
+
+  return value;
+}
+
 function expectIndex(name: string, value: Value): number {
   const index = expectIntegerValue(name, value);
   const indexValue = num.numericToNumber(index);
@@ -3444,6 +3876,8 @@ function formatValueWithMode(value: Value, mode: 'display' | 'write', state: For
       return `#<record:${value.recordType.name}>`;
     case 'void':
       return '';
+    case 'syntax':
+      return '#<syntax>';
     case 'builtin':
       return `#<procedure:${value.name}>`;
     case 'lambda':
@@ -3683,6 +4117,10 @@ function isMutableStringValue(value: Value): value is MutableStringValue {
 
 function isStringValue(value: Value): value is string | MutableStringValue {
   return typeof value === 'string' || isMutableStringValue(value);
+}
+
+function isSyntaxValue(value: Value): value is SyntaxValue {
+  return typeof value === 'object' && value !== null && value.kind === 'syntax';
 }
 
 function isEmptyList(value: Value): value is EmptyList {
