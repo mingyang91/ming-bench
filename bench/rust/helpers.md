@@ -10,7 +10,12 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-(none yet)
+### eval_sequence (src/scheme/mod.rs:515) — Evaluate a sequence of expressions in one environment and return the last value
+### proper_list_length (src/scheme/mod.rs:577) — Validate a proper list and count its elements for list primitives
+### append_lists (src/scheme/mod.rs:593) — Implement Scheme `append` over zero or more list arguments
+### parse_bindings (src/scheme/mod.rs:633) — Validate `let` binding syntax and extract name/expression pairs
+### eval_binding_values (src/scheme/mod.rs:650) — Evaluate `let` binding expressions in the outer environment
+### make_proper_list (src/scheme/mod.rs:667) — Build a Scheme list value from an iterator of already-evaluated items
 
 ## Python Helpers (scripts/)
 

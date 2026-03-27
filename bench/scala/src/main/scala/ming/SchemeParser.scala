@@ -25,6 +25,9 @@ private[ming] object SchemeParser:
         parseList(current.advance())
       case ')' =>
         fail("unexpected ')'")
+      case '\'' =>
+        val (next, expr) = parseExpr(current.advance())
+        (next, Expr.ListExpr(List(Expr.Symbol("quote"), expr)))
       case '"' =>
         val (next, value) = parseString(current.advance())
         (next, Expr.StringLit(value))

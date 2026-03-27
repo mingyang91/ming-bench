@@ -39,6 +39,12 @@ object Evaluator:
         evalQuote(args)
       case Expr.Symbol("lambda") :: args =>
         evalLambda(args, env)
+      case Expr.Symbol("begin") :: args =>
+        evalBegin(args, env)
+      case Expr.Symbol("let") :: args =>
+        evalLet(args, env)
+      case Expr.Symbol("cond") :: args =>
+        evalCond(args, env)
       case Expr.Symbol("and") :: args =>
         evalAnd(args, env, Value.BoolVal(true))
       case Expr.Symbol("or") :: args =>
@@ -84,6 +90,63 @@ object Evaluator:
       case _ =>
         throw EvalError("lambda expects parameters and at least one body expression")
 
+  private def evalBegin(args: List[Expr], env: Env): Value =
+    evalSequence(args, env)
+
+  private def evalLet(args: List[Expr], env: Env): Value =
+    args match
+      case Expr.ListExpr(bindings) :: body if body.nonEmpty =>
+        val letEnv = env.child()
+        bindLetValues(letEnv, parseLetBindings(bindings), env)
+        evalSequence(body, letEnv)
+      case Expr.Symbol(name) :: Expr.ListExpr(bindings) :: body if body.nonEmpty =>
+        val parsedBindings = parseLetBindings(bindings)
+        val evaluatedArgs  = parsedBindings.map { case (_, valueExpr) => eval(valueExpr, env) }
+        val letEnv         = env.child()
+        val closure =
+          Value.Closure(
+            name = Some(name),
+            params = parsedBindings.map(_._1),
+            body = body,
+            env = letEnv
+          )
+        letEnv.define(name, closure)
+        invokeProcedure(closure, evaluatedArgs)
+      case _ =>
+        throw EvalError("invalid let")
+
+  private def bindLetValues(targetEnv: Env, bindings: List[(String, Expr)], evalEnv: Env): Unit =
+    bindings.foreach { case (name, valueExpr) =>
+      targetEnv.define(name, eval(valueExpr, evalEnv))
+    }
+
+  private def parseLetBindings(bindings: List[Expr]): List[(String, Expr)] =
+    bindings.map {
+      case Expr.ListExpr(Expr.Symbol(name) :: valueExpr :: Nil) =>
+        (name, valueExpr)
+      case _ =>
+        throw EvalError("invalid let binding")
+    }
+
+  private def evalCond(clauses: List[Expr], env: Env): Value =
+    clauses match
+      case Nil =>
+        Value.Void
+      case Expr.ListExpr(Expr.Symbol("else") :: body) :: remaining =>
+        if remaining.nonEmpty then throw EvalError("else clause must be last")
+        if body.isEmpty then throw EvalError("else clause must have a body")
+        evalSequence(body, env)
+      case Expr.ListExpr(testExpr :: Nil) :: remaining =>
+        val testValue = eval(testExpr, env)
+        if ValueSemantics.isTruthy(testValue) then testValue
+        else evalCond(remaining, env)
+      case Expr.ListExpr(testExpr :: body) :: remaining =>
+        val testValue = eval(testExpr, env)
+        if ValueSemantics.isTruthy(testValue) then evalSequence(body, env)
+        else evalCond(remaining, env)
+      case _ =>
+        throw EvalError("invalid cond clause")
+
   private def parseParameterNames(expr: Expr): List[String] =
     expr match
       case Expr.ListExpr(params) => parseParameterNames(params)
@@ -97,6 +160,9 @@ object Evaluator:
 
   private def applyProcedure(procedure: Value, args: List[Expr], env: Env): Value =
     val evaluatedArgs = args.map(eval(_, env))
+    invokeProcedure(procedure, evaluatedArgs)
+
+  private def invokeProcedure(procedure: Value, evaluatedArgs: List[Value]): Value =
     procedure match
       case Value.BuiltinProc(name) =>
         Builtins.invoke(name, evaluatedArgs)
