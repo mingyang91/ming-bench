@@ -3104,6 +3104,11 @@ function display(val, seen) {
         case 'vector': return '#(' + val.val.map(v => display(v, seen)).join(' ') + ')';
     }
 }
+function displayScheme(val, seen) {
+    if (val.tag === 'string')
+        return val.val;
+    return display(val, seen);
+}
 // ── Public API ─────────────────────────────────────────────────────────
 export function evalStr(input) {
     const exprs = parseAll(input);
@@ -3141,5 +3146,5 @@ export function evalStrWithOutput(input) {
     const beginExpr = exprs.length === 1 ? exprs[0]
         : { tag: 'list', val: [{ tag: 'symbol', val: 'begin' }, ...exprs] };
     const result = evaluate(beginExpr, env);
-    return { result: display(result), output: outputBuf.join('') };
+    return { result: displayScheme(result), output: outputBuf.join('') };
 }

@@ -2777,6 +2777,11 @@ function display(val: SchemeVal, seen?: Set<SchemeVal>): string {
   }
 }
 
+function displayScheme(val: SchemeVal, seen?: Set<SchemeVal>): string {
+  if (val.tag === 'string') return val.val;
+  return display(val, seen);
+}
+
 // ── Public API ─────────────────────────────────────────────────────────
 
 export function evalStr(input: string): string {
@@ -2814,5 +2819,5 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
     : { tag: 'list', val: [{ tag: 'symbol', val: 'begin' } as SchemeVal, ...exprs] };
   const result = evaluate(beginExpr, env);
-  return { result: display(result), output: outputBuf.join('') };
+  return { result: displayScheme(result), output: outputBuf.join('') };
 }
