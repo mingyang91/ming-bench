@@ -11,6 +11,7 @@ type EvalResult = Result<Value, EvalError>;
 type ContRef = Rc<dyn Fn(Value) -> Action>;
 type ValuesContRef = Rc<dyn Fn(Vec<Value>) -> Action>;
 type WindFrameRef = Rc<DynamicWindFrame>;
+type ExceptionHandlerRef = Rc<ExceptionHandlerFrame>;
 
 enum Action {
     EvalExpr(Expr, EnvRef, ContRef),
@@ -41,6 +42,13 @@ enum Action {
         results: Vec<Value>,
         cont: ContRef,
     },
+    EvalGuardClauses {
+        clauses: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        exception: Value,
+        cont: ContRef,
+    },
     EnterDynamicWind {
         frame: WindFrameRef,
         body: Value,
@@ -58,6 +66,16 @@ enum Action {
     ReenterDynamicWind {
         frame: WindFrameRef,
         continuation: CapturedContinuation,
+        value: Value,
+    },
+    ExitExceptionHandler {
+        frame: ExceptionHandlerRef,
+        value: Value,
+        cont: ContRef,
+    },
+    Raise(Value),
+    HandleException {
+        frame: ExceptionHandlerRef,
         value: Value,
     },
     Continue(ContRef, Value),
@@ -113,6 +131,7 @@ fn return_cont() -> ContRef {
 struct Interpreter {
     output: String,
     dynamic_wind_stack: Vec<WindFrameRef>,
+    exception_handler_stack: Vec<ExceptionHandlerRef>,
 }
 
 impl Interpreter {
@@ -155,6 +174,13 @@ impl Interpreter {
                     results,
                     cont,
                 } => self.step_builtin_map_iter(procedure, lists, index, results, cont),
+                Action::EvalGuardClauses {
+                    clauses,
+                    index,
+                    env,
+                    exception,
+                    cont,
+                } => self.step_eval_guard_clauses(clauses, index, env, exception, cont),
                 Action::EnterDynamicWind { frame, body, cont } => {
                     self.step_enter_dynamic_wind(frame, body, cont)
                 }
@@ -170,6 +196,13 @@ impl Interpreter {
                     continuation,
                     value,
                 } => self.step_reenter_dynamic_wind(frame, continuation, value),
+                Action::ExitExceptionHandler { frame, value, cont } => {
+                    self.step_exit_exception_handler(frame, value, cont)
+                }
+                Action::Raise(value) => self.step_raise(value),
+                Action::HandleException { frame, value } => {
+                    self.step_handle_exception(frame, value)
+                }
                 Action::Continue(cont, value) => cont(value),
                 Action::Done(result) => return result,
             };
@@ -216,6 +249,7 @@ impl Interpreter {
                 }
                 "cond" => return Action::EvalCond(Rc::new(items[1..].to_vec()), 0, env, cont),
                 "set!" => return self.step_eval_set(&items[1..], env, cont),
+                "guard" => return self.step_eval_guard(&items[1..], env, cont),
                 _ => {}
             }
         }
@@ -575,6 +609,54 @@ impl Interpreter {
         )
     }
 
+    fn step_eval_guard(&mut self, args: &[Expr], env: EnvRef, cont: ContRef) -> Action {
+        if args.len() < 2 {
+            return Action::Done(Err(EvalError::InvalidForm(
+                "guard expects a clause list and at least one body expression".to_string(),
+            )));
+        }
+
+        let header = match &args[0] {
+            Expr::List(items) if !items.is_empty() => items,
+            _ => {
+                return Action::Done(Err(EvalError::InvalidForm(
+                    "guard expects (variable clause ...) as its first argument".to_string(),
+                )));
+            }
+        };
+
+        let variable = match &header[0] {
+            Expr::Symbol(name) => name.clone(),
+            _ => {
+                return Action::Done(Err(EvalError::InvalidForm(
+                    "guard variable must be a symbol".to_string(),
+                )));
+            }
+        };
+
+        let frame = Rc::new(ExceptionHandlerFrame {
+            kind: ExceptionHandlerKind::Guard {
+                variable,
+                clauses: Rc::new(header[1..].to_vec()),
+                env: env.clone(),
+                cont: cont.clone(),
+            },
+            wind_stack: self.dynamic_wind_stack.clone(),
+        });
+        self.exception_handler_stack.push(frame.clone());
+
+        Action::EvalSequence(
+            Rc::new(args[1..].to_vec()),
+            0,
+            env,
+            Rc::new(move |value| Action::ExitExceptionHandler {
+                frame: frame.clone(),
+                value,
+                cont: cont.clone(),
+            }),
+        )
+    }
+
     fn step_eval_sequence(
         &mut self,
         expressions: Rc<Vec<Expr>>,
@@ -595,6 +677,59 @@ impl Interpreter {
             env.clone(),
             Rc::new(move |_| {
                 Action::EvalSequence(expressions.clone(), index + 1, env.clone(), cont.clone())
+            }),
+        )
+    }
+
+    fn step_eval_guard_clauses(
+        &mut self,
+        clauses: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        exception: Value,
+        cont: ContRef,
+    ) -> Action {
+        if index >= clauses.len() {
+            return Action::Raise(exception);
+        }
+
+        let clause = match &clauses[index] {
+            Expr::List(items) if !items.is_empty() => items.clone(),
+            _ => {
+                return Action::Done(Err(EvalError::InvalidForm(
+                    "guard clauses must be non-empty lists".to_string(),
+                )));
+            }
+        };
+
+        if matches!(&clause[0], Expr::Symbol(name) if name == "else") {
+            if clause.len() == 1 {
+                return Action::Continue(cont, Value::Void);
+            }
+            return Action::EvalSequence(Rc::new(clause[1..].to_vec()), 0, env, cont);
+        }
+
+        let test_expr = clause[0].clone();
+        let body = clause[1..].to_vec();
+        Action::EvalExpr(
+            test_expr,
+            env.clone(),
+            Rc::new(move |test_value| {
+                if is_truthy(&test_value) {
+                    if body.is_empty() {
+                        Action::Continue(cont.clone(), test_value)
+                    } else {
+                        Action::EvalSequence(Rc::new(body.clone()), 0, env.clone(), cont.clone())
+                    }
+                } else {
+                    Action::EvalGuardClauses {
+                        clauses: clauses.clone(),
+                        index: index + 1,
+                        env: env.clone(),
+                        exception: exception.clone(),
+                        cont: cont.clone(),
+                    }
+                }
             }),
         )
     }
@@ -858,6 +993,16 @@ impl Interpreter {
                     Err(err) => Action::Done(Err(err)),
                 }
             }
+            Builtin::StringAppend => {
+                let mut combined = String::new();
+                for arg in &args {
+                    match expect_string(arg, builtin.name()) {
+                        Ok(value) => combined.push_str(value),
+                        Err(err) => return Action::Done(Err(err)),
+                    }
+                }
+                Action::Continue(cont, Value::String(combined))
+            }
             Builtin::Display => {
                 if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
                     return Action::Done(Err(err));
@@ -896,6 +1041,58 @@ impl Interpreter {
                     )
                 }
             }
+            Builtin::NumberPredicate => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(cont, Value::Bool(matches!(&args[0], Value::Int(_))))
+                }
+            }
+            Builtin::BooleanPredicate => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(cont, Value::Bool(matches!(&args[0], Value::Bool(_))))
+                }
+            }
+            Builtin::StringPredicate => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(cont, Value::Bool(matches!(&args[0], Value::String(_))))
+                }
+            }
+            Builtin::SymbolPredicate => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(cont, Value::Bool(matches!(&args[0], Value::Symbol(_))))
+                }
+            }
+            Builtin::PairPredicate => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(
+                        cont,
+                        Value::Bool(matches!(&args[0], Value::List(items) if !items.is_empty())),
+                    )
+                }
+            }
+            Builtin::ListPredicate => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(cont, Value::Bool(matches!(&args[0], Value::List(_))))
+                }
+            }
+            Builtin::CharPredicate => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(cont, Value::Bool(matches!(&args[0], Value::Char(_))))
+                }
+            }
             Builtin::Car => {
                 if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
                     return Action::Done(Err(err));
@@ -927,6 +1124,43 @@ impl Interpreter {
                     Action::Continue(cont, Value::List(items[1..].to_vec()))
                 }
             }
+            Builtin::Raise => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Raise(args[0].clone())
+                }
+            }
+            Builtin::WithExceptionHandler => {
+                if let Err(err) = require_exact_arity(args.len(), 2, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                if let Err(err) = expect_procedure_value(&args[0], builtin.name(), "handler") {
+                    return Action::Done(Err(err));
+                }
+                if let Err(err) = expect_procedure_value(&args[1], builtin.name(), "thunk") {
+                    return Action::Done(Err(err));
+                }
+
+                let frame = Rc::new(ExceptionHandlerFrame {
+                    kind: ExceptionHandlerKind::Procedure {
+                        handler: args[0].clone(),
+                        cont: cont.clone(),
+                    },
+                    wind_stack: self.dynamic_wind_stack.clone(),
+                });
+                self.exception_handler_stack.push(frame.clone());
+
+                Action::Apply(
+                    args[1].clone(),
+                    vec![],
+                    Rc::new(move |value| Action::ExitExceptionHandler {
+                        frame: frame.clone(),
+                        value,
+                        cont: cont.clone(),
+                    }),
+                )
+            }
             Builtin::DynamicWind => {
                 if let Err(err) = require_exact_arity(args.len(), 3, builtin.name()) {
                     return Action::Done(Err(err));
@@ -956,6 +1190,7 @@ impl Interpreter {
                 let captured = Value::Procedure(Procedure::Continuation(CapturedContinuation {
                     cont: cont.clone(),
                     wind_stack: self.dynamic_wind_stack.clone(),
+                    handler_stack: self.exception_handler_stack.clone(),
                 }));
                 Action::Apply(args[0].clone(), vec![captured], cont)
             }
@@ -1094,6 +1329,7 @@ impl Interpreter {
             );
         }
 
+        self.exception_handler_stack = continuation.handler_stack.clone();
         Action::Continue(continuation.cont, value)
     }
 
@@ -1107,6 +1343,70 @@ impl Interpreter {
         Action::SwitchContinuation {
             continuation,
             value,
+        }
+    }
+
+    fn step_exit_exception_handler(
+        &mut self,
+        frame: ExceptionHandlerRef,
+        value: Value,
+        cont: ContRef,
+    ) -> Action {
+        self.remove_exception_handler(&frame);
+        Action::Continue(cont, value)
+    }
+
+    fn step_raise(&mut self, value: Value) -> Action {
+        let Some(frame) = self.exception_handler_stack.pop() else {
+            return Action::Done(Err(EvalError::Message(format!(
+                "uncaught exception: {}",
+                value.to_scheme_string()
+            ))));
+        };
+
+        Action::HandleException { frame, value }
+    }
+
+    fn step_handle_exception(&mut self, frame: ExceptionHandlerRef, value: Value) -> Action {
+        let shared = common_dynamic_wind_prefix_len(&self.dynamic_wind_stack, &frame.wind_stack);
+
+        if self.dynamic_wind_stack.len() > shared {
+            let active = self
+                .dynamic_wind_stack
+                .pop()
+                .expect("active dynamic-wind frame");
+            return Action::Apply(
+                active.after.clone(),
+                vec![],
+                Rc::new(move |_| Action::HandleException {
+                    frame: frame.clone(),
+                    value: value.clone(),
+                }),
+            );
+        }
+
+        match &frame.kind {
+            ExceptionHandlerKind::Procedure { handler, cont } => {
+                Action::Apply(handler.clone(), vec![value], cont.clone())
+            }
+            ExceptionHandlerKind::Guard {
+                variable,
+                clauses,
+                env,
+                cont,
+            } => {
+                let handler_env = Environment::child(env.clone());
+                handler_env
+                    .borrow_mut()
+                    .define(variable.clone(), value.clone());
+                Action::EvalGuardClauses {
+                    clauses: clauses.clone(),
+                    index: 0,
+                    env: handler_env,
+                    exception: value,
+                    cont: cont.clone(),
+                }
+            }
         }
     }
 
@@ -1124,6 +1424,23 @@ impl Interpreter {
             .rposition(|active| Rc::ptr_eq(active, frame))
         {
             self.dynamic_wind_stack.remove(index);
+        }
+    }
+
+    fn remove_exception_handler(&mut self, frame: &ExceptionHandlerRef) {
+        if let Some(active) = self.exception_handler_stack.last() {
+            if Rc::ptr_eq(active, frame) {
+                self.exception_handler_stack.pop();
+                return;
+            }
+        }
+
+        if let Some(index) = self
+            .exception_handler_stack
+            .iter()
+            .rposition(|active| Rc::ptr_eq(active, frame))
+        {
+            self.exception_handler_stack.remove(index);
         }
     }
 }
@@ -1204,11 +1521,31 @@ enum Procedure {
 struct CapturedContinuation {
     cont: ContRef,
     wind_stack: Vec<WindFrameRef>,
+    handler_stack: Vec<ExceptionHandlerRef>,
 }
 
 struct DynamicWindFrame {
     before: Value,
     after: Value,
+}
+
+#[derive(Clone)]
+enum ExceptionHandlerKind {
+    Procedure {
+        handler: Value,
+        cont: ContRef,
+    },
+    Guard {
+        variable: String,
+        clauses: Rc<Vec<Expr>>,
+        env: EnvRef,
+        cont: ContRef,
+    },
+}
+
+struct ExceptionHandlerFrame {
+    kind: ExceptionHandlerKind,
+    wind_stack: Vec<WindFrameRef>,
 }
 
 #[derive(Clone)]
@@ -1242,10 +1579,20 @@ enum Builtin {
     Display,
     Write,
     Newline,
+    StringAppend,
     Not,
     Null,
+    NumberPredicate,
+    BooleanPredicate,
+    StringPredicate,
+    SymbolPredicate,
+    PairPredicate,
+    ListPredicate,
+    CharPredicate,
     Car,
     Cdr,
+    Raise,
+    WithExceptionHandler,
     DynamicWind,
     CallCc,
 }
@@ -1274,10 +1621,20 @@ impl Builtin {
             Builtin::Display => "display",
             Builtin::Write => "write",
             Builtin::Newline => "newline",
+            Builtin::StringAppend => "string-append",
             Builtin::Not => "not",
             Builtin::Null => "null?",
+            Builtin::NumberPredicate => "number?",
+            Builtin::BooleanPredicate => "boolean?",
+            Builtin::StringPredicate => "string?",
+            Builtin::SymbolPredicate => "symbol?",
+            Builtin::PairPredicate => "pair?",
+            Builtin::ListPredicate => "list?",
+            Builtin::CharPredicate => "char?",
             Builtin::Car => "car",
             Builtin::Cdr => "cdr",
+            Builtin::Raise => "raise",
+            Builtin::WithExceptionHandler => "with-exception-handler",
             Builtin::DynamicWind => "dynamic-wind",
             Builtin::CallCc => "call/cc",
         }
@@ -1349,10 +1706,20 @@ fn global_env() -> EnvRef {
         ("display", Builtin::Display),
         ("write", Builtin::Write),
         ("newline", Builtin::Newline),
+        ("string-append", Builtin::StringAppend),
         ("not", Builtin::Not),
         ("null?", Builtin::Null),
+        ("number?", Builtin::NumberPredicate),
+        ("boolean?", Builtin::BooleanPredicate),
+        ("string?", Builtin::StringPredicate),
+        ("symbol?", Builtin::SymbolPredicate),
+        ("pair?", Builtin::PairPredicate),
+        ("list?", Builtin::ListPredicate),
+        ("char?", Builtin::CharPredicate),
         ("car", Builtin::Car),
         ("cdr", Builtin::Cdr),
+        ("raise", Builtin::Raise),
+        ("with-exception-handler", Builtin::WithExceptionHandler),
         ("dynamic-wind", Builtin::DynamicWind),
         ("call/cc", Builtin::CallCc),
         ("call-with-current-continuation", Builtin::CallCc),
@@ -1468,6 +1835,16 @@ fn expect_list<'a>(value: &'a Value, procedure: &str) -> Result<&'a [Value], Eva
         Value::List(items) => Ok(items),
         _ => Err(EvalError::Type(format!(
             "{procedure} expects a list, got {}",
+            value.type_name()
+        ))),
+    }
+}
+
+fn expect_procedure_value(value: &Value, procedure: &str, role: &str) -> Result<(), EvalError> {
+    match value {
+        Value::Procedure(_) => Ok(()),
+        _ => Err(EvalError::Type(format!(
+            "{procedure} expects {role} to be a procedure, got {}",
             value.type_name()
         ))),
     }
