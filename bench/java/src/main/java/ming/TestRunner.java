@@ -27,6 +27,7 @@ public class TestRunner {
                 System.exit(2);
             }
         }
+        System.setProperty("bench.level", Integer.toString(benchLevel));
 
         String testsJsonPath = System.getenv("TESTS_JSON");
         if (testsJsonPath == null || testsJsonPath.isEmpty()) {

@@ -19,11 +19,17 @@ interface EquivalenceChecker {
     boolean test(Value left, Value right);
 }
 
+@FunctionalInterface
+interface StringFactory {
+    StringValue create(String value);
+}
+
 record SpecialFormRuntime(
         ExpressionEvaluator expressionEvaluator,
         ParameterSpecParser parameterSpecParser,
         EquivalenceChecker equivalenceChecker,
-        ProcedureRuntime procedureRuntime
+        ProcedureRuntime procedureRuntime,
+        StringFactory stringFactory
 ) {
     Value eval(Expr expression, Environment env) throws EvalError {
         return expressionEvaluator.eval(expression, env);
@@ -43,6 +49,10 @@ record SpecialFormRuntime(
 
     Value buildList(List<Value> values) {
         return procedureRuntime.buildList(values);
+    }
+
+    StringValue createString(String value) {
+        return stringFactory.create(value);
     }
 
     EvalError error(SourceLoc loc, String message) {
@@ -430,7 +440,7 @@ final class SpecialFormEvaluator {
         return switch (expression) {
             case NumberExpr numberExpr -> new NumberValue(numberExpr.value());
             case BooleanExpr booleanExpr -> booleanExpr.value() ? TRUE : FALSE;
-            case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case StringExpr stringExpr -> runtime.createString(stringExpr.value());
             case CharExpr charExpr -> new CharValue(charExpr.codePoint());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
             case ListExpr listExpr -> quoteList(listExpr.elements());

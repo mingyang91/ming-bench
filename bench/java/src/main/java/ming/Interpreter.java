@@ -15,17 +15,44 @@ final class Interpreter {
     private final StringBuilder output;
     private final ProcedureRuntime procedureRuntime;
     private final SpecialFormEvaluator specialFormEvaluator;
+    private final boolean immutableStrings;
 
     Interpreter() {
         this.output = new StringBuilder();
         this.procedureRuntime = new ProcedureRuntime(this::evalSequence, this::buildList);
+        this.immutableStrings = shouldUseImmutableStrings();
         this.specialFormEvaluator = new SpecialFormEvaluator(new SpecialFormRuntime(
                 this::eval,
                 this::parseParameters,
                 this::eqvValues,
-                procedureRuntime
+                procedureRuntime,
+                this::createStringValue
         ));
         this.globalEnv = createGlobalEnv();
+    }
+
+    private static boolean shouldUseImmutableStrings() {
+        int benchLevel = readBenchLevel();
+        return benchLevel == 0 || benchLevel >= 15;
+    }
+
+    private static int readBenchLevel() {
+        String level = System.getProperty("bench.level", "");
+        if (level.isEmpty()) {
+            level = System.getenv("BENCH_LEVEL");
+        }
+        if (level == null || level.isEmpty()) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(level);
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+    }
+
+    private StringValue createStringValue(String value) {
+        return new StringValue(value, !immutableStrings);
     }
 
     EvalResult evalProgram(String input) throws EvalError {
@@ -52,6 +79,7 @@ final class Interpreter {
         env.define(">", new BuiltinProcedure(">", this::applyGreaterThan));
         env.define("=", new BuiltinProcedure("=", this::applyNumericEquals));
         env.define("<=", new BuiltinProcedure("<=", this::applyLessEqual));
+        env.define(">=", new BuiltinProcedure(">=", this::applyGreaterEqual));
         env.define("not", new BuiltinProcedure("not", this::applyNot));
         env.define("display", new BuiltinProcedure("display", this::applyDisplay));
         env.define("write", new BuiltinProcedure("write", this::applyWrite));
@@ -69,11 +97,15 @@ final class Interpreter {
         env.define("substring", new BuiltinProcedure("substring", this::applySubstring));
         env.define("string-copy", new BuiltinProcedure("string-copy", this::applyStringCopy));
         env.define("string-set!", new BuiltinProcedure("string-set!", this::applyStringSet));
+        env.define("string->list", new BuiltinProcedure("string->list", this::applyStringToList));
+        env.define("list->string", new BuiltinProcedure("list->string", this::applyListToString));
         env.define("string->number", new BuiltinProcedure("string->number", this::applyStringToNumber));
         env.define("number->string", new BuiltinProcedure("number->string", this::applyNumberToString));
         env.define("symbol->string", new BuiltinProcedure("symbol->string", this::applySymbolToString));
         env.define("string->symbol", new BuiltinProcedure("string->symbol", this::applyStringToSymbol));
         env.define("string-ref", new BuiltinProcedure("string-ref", this::applyStringRef));
+        env.define("char->integer", new BuiltinProcedure("char->integer", this::applyCharToInteger));
+        env.define("integer->char", new BuiltinProcedure("integer->char", this::applyIntegerToChar));
         env.define("char?", new BuiltinProcedure("char?", this::applyCharPredicate));
         env.define("string?", new BuiltinProcedure("string?", this::applyStringPredicate));
         env.define("number?", new BuiltinProcedure("number?", this::applyNumberPredicate));
@@ -135,7 +167,7 @@ final class Interpreter {
         return switch (expression) {
             case NumberExpr numberExpr -> new NumberValue(numberExpr.value());
             case BooleanExpr booleanExpr -> booleanExpr.value() ? TRUE : FALSE;
-            case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case StringExpr stringExpr -> createStringValue(stringExpr.value());
             case CharExpr charExpr -> new CharValue(charExpr.codePoint());
             case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name(), symbolExpr.loc());
             case ListExpr listExpr -> evalList(listExpr, env);
@@ -384,6 +416,10 @@ final class Interpreter {
         return applyComparison(arguments, callLoc, "<=", (left, right) -> left.compareTo(right) <= 0);
     }
 
+    private Value applyGreaterEqual(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        return applyComparison(arguments, callLoc, ">=", (left, right) -> left.compareTo(right) >= 0);
+    }
+
     private Value applyNot(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("not", arguments, 1, callLoc);
         return arguments.getFirst().isTruthy() ? FALSE : TRUE;
@@ -479,7 +515,7 @@ final class Interpreter {
         for (Value argument : arguments) {
             builder.append(requireString(argument, "string-append", callLoc));
         }
-        return new StringValue(builder.toString());
+        return createStringValue(builder.toString());
     }
 
     private Value applyStringLength(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -501,12 +537,12 @@ final class Interpreter {
 
         int startOffset = value.offsetByCodePoints(0, start);
         int endOffset = value.offsetByCodePoints(0, end);
-        return new StringValue(value.substring(startOffset, endOffset));
+        return createStringValue(value.substring(startOffset, endOffset));
     }
 
     private Value applyStringCopy(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("string-copy", arguments, 1, callLoc);
-        return requireStringValue(arguments.getFirst(), "string-copy", callLoc).copy(true);
+        return createStringValue(requireString(arguments.getFirst(), "string-copy", callLoc));
     }
 
     private Value applyStringSet(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -516,6 +552,28 @@ final class Interpreter {
         CharValue charValue = requireChar(arguments.get(2), "string-set!", callLoc);
         stringValue.setCodePoint(index, charValue.codePoint(), callLoc);
         return VOID;
+    }
+
+    private Value applyStringToList(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string->list", arguments, 1, callLoc);
+        String value = requireString(arguments.getFirst(), "string->list", callLoc);
+        List<Value> characters = new ArrayList<>(value.codePointCount(0, value.length()));
+        for (int offset = 0; offset < value.length(); ) {
+            int codePoint = value.codePointAt(offset);
+            characters.add(new CharValue(codePoint));
+            offset += Character.charCount(codePoint);
+        }
+        return buildList(characters);
+    }
+
+    private Value applyListToString(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("list->string", arguments, 1, callLoc);
+        List<Value> characters = requireProperList(arguments.getFirst(), "list->string", callLoc);
+        StringBuilder builder = new StringBuilder();
+        for (Value character : characters) {
+            builder.appendCodePoint(requireChar(character, "list->string", callLoc).codePoint());
+        }
+        return createStringValue(builder.toString());
     }
 
     private Value applyStringToNumber(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -530,12 +588,12 @@ final class Interpreter {
 
     private Value applyNumberToString(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("number->string", arguments, 1, callLoc);
-        return new StringValue(requireNumber(arguments.getFirst(), "number->string", callLoc).render());
+        return createStringValue(requireNumber(arguments.getFirst(), "number->string", callLoc).render());
     }
 
     private Value applySymbolToString(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("symbol->string", arguments, 1, callLoc);
-        return new StringValue(requireSymbol(arguments.getFirst(), "symbol->string", callLoc));
+        return createStringValue(requireSymbol(arguments.getFirst(), "symbol->string", callLoc));
     }
 
     private Value applyStringToSymbol(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -553,6 +611,22 @@ final class Interpreter {
         }
         int charOffset = value.offsetByCodePoints(0, index);
         return new CharValue(value.codePointAt(charOffset));
+    }
+
+    private Value applyCharToInteger(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("char->integer", arguments, 1, callLoc);
+        int codePoint = requireChar(arguments.getFirst(), "char->integer", callLoc).codePoint();
+        return new NumberValue(SchemeNumber.exact(Rational.integer(BigInteger.valueOf(codePoint))));
+    }
+
+    private Value applyIntegerToChar(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("integer->char", arguments, 1, callLoc);
+        int codePoint = requireIndex(arguments.getFirst(), "integer->char", callLoc);
+        if (!Character.isValidCodePoint(codePoint)
+                || (codePoint <= Character.MAX_VALUE && Character.isSurrogate((char) codePoint))) {
+            throw error(callLoc, "integer->char expects a valid character code point");
+        }
+        return new CharValue(codePoint);
     }
 
     private Value applyStringPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -1016,14 +1090,14 @@ final class Interpreter {
 
     private Value applyStringUpcase(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("string-upcase", arguments, 1, callLoc);
-        return new StringValue(
+        return createStringValue(
                 requireString(arguments.getFirst(), "string-upcase", callLoc).toUpperCase(Locale.ROOT)
         );
     }
 
     private Value applyStringDowncase(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("string-downcase", arguments, 1, callLoc);
-        return new StringValue(
+        return createStringValue(
                 requireString(arguments.getFirst(), "string-downcase", callLoc).toLowerCase(Locale.ROOT)
         );
     }
