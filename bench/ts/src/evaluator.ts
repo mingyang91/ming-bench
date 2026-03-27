@@ -431,6 +431,17 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return { tag: 'boolean', val: args[0].tag === 'char' };
   }});
 
+  // apply
+  envSet(env, 'apply', { tag: 'procedure', val: (args) => {
+    if (args.length < 2) throw new EvalError('apply requires at least 2 arguments');
+    const fn = args[0];
+    if (fn.tag !== 'procedure') throw new EvalError('apply: first argument must be a procedure');
+    const lastArg = args[args.length - 1];
+    const tailArgs = listToArray(lastArg);
+    const prefixArgs = args.slice(1, -1);
+    return fn.val([...prefixArgs, ...tailArgs]);
+  }});
+
   // Symbol/string conversions
   envSet(env, 'symbol->string', { tag: 'procedure', val: (args) => {
     if (args.length !== 1 || args[0].tag !== 'symbol') throw new EvalError('symbol->string: expected symbol');
@@ -443,6 +454,43 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   }});
 
   return env;
+}
+
+function listToArray(v: SchemeVal): SchemeVal[] {
+  const arr: SchemeVal[] = [];
+  let cur = v;
+  while (cur.tag === 'pair') { arr.push(cur.car); cur = cur.cdr; }
+  return arr;
+}
+
+function parseParams(paramList: SchemeVal[], pos: string): { fixed: string[]; rest: string | null } {
+  const dotIdx = paramList.findIndex(p => p.tag === 'symbol' && p.val === '.');
+  if (dotIdx === -1) {
+    return { fixed: paramList.map(p => {
+      if (p.tag !== 'symbol') throw new EvalError(`${pos}: parameter must be a symbol`);
+      return p.val;
+    }), rest: null };
+  }
+  if (dotIdx !== paramList.length - 2) throw new EvalError(`${pos}: invalid dot notation`);
+  const restParam = paramList[paramList.length - 1];
+  if (restParam.tag !== 'symbol') throw new EvalError(`${pos}: rest parameter must be a symbol`);
+  const fixed = paramList.slice(0, dotIdx).map(p => {
+    if (p.tag !== 'symbol') throw new EvalError(`${pos}: parameter must be a symbol`);
+    return p.val;
+  });
+  return { fixed, rest: restParam.val };
+}
+
+function makeVariadicClosure(fixed: string[], rest: string, body: SchemeVal[], closedEnv: Env, pos: string): SchemeVal {
+  return { tag: 'procedure', val: (args: SchemeVal[]) => {
+    if (args.length < fixed.length) throw new EvalError(`${pos}: expected at least ${fixed.length} args, got ${args.length}`);
+    const local = makeEnv(closedEnv);
+    for (let i = 0; i < fixed.length; i++) envSet(local, fixed[i], args[i]);
+    envSet(local, rest, arrayToList(args.slice(fixed.length)));
+    let result: SchemeVal = { tag: 'void' };
+    for (const expr of body) result = evaluate(expr, local);
+    return result;
+  }};
 }
 
 function isFalsy(v: SchemeVal): boolean {
@@ -568,21 +616,23 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             return { tag: 'void' };
           }
           if (elems[1].tag === 'list' && elems[1].val.length > 0 && elems[1].val[0].tag === 'symbol') {
-            // (define (f params...) body...)
+            // (define (f params...) body...) or (define (f x . rest) body...)
             const fname = elems[1].val[0].val;
-            const params = elems[1].val.slice(1).map(p => {
-              if (p.tag !== 'symbol') throw new EvalError(`${epos}: parameter must be a symbol`);
-              return p.val;
-            });
+            const { fixed: params, rest } = parseParams(elems[1].val.slice(1), epos);
             const body = elems.slice(2);
-            const closure: SchemeVal = { tag: 'procedure', val: (args: SchemeVal[]) => {
-              if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
-              const local = makeEnv(env);
-              for (let i = 0; i < params.length; i++) envSet(local, params[i], args[i]);
-              let result: SchemeVal = { tag: 'void' };
-              for (const expr of body) result = evaluate(expr, local);
-              return result;
-            }};
+            let closure: SchemeVal;
+            if (rest !== null) {
+              closure = makeVariadicClosure(params, rest, body, env, epos);
+            } else {
+              closure = { tag: 'procedure', val: (args: SchemeVal[]) => {
+                if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
+                const local = makeEnv(env);
+                for (let i = 0; i < params.length; i++) envSet(local, params[i], args[i]);
+                let result: SchemeVal = { tag: 'void' };
+                for (const expr of body) result = evaluate(expr, local);
+                return result;
+              }};
+            }
             envSet(env, fname, closure);
             return { tag: 'void' };
           }
@@ -600,13 +650,20 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         if (name === 'lambda') {
           if (elems.length < 3) throw new EvalError(`${epos}: lambda requires params and body`);
           const paramList = elems[1];
-          if (paramList.tag !== 'list') throw new EvalError(`${epos}: lambda params must be a list`);
-          const params = paramList.val.map(p => {
-            if (p.tag !== 'symbol') throw new EvalError(`${epos}: parameter must be a symbol`);
-            return p.val;
-          });
+          if (paramList.tag === 'symbol') {
+            // (lambda args body...) — all args collected into one param
+            const restName = paramList.val;
+            const body = elems.slice(2);
+            const closedEnv = env;
+            return makeVariadicClosure([], restName, body, closedEnv, epos);
+          }
+          if (paramList.tag !== 'list') throw new EvalError(`${epos}: lambda params must be a list or symbol`);
+          const { fixed: params, rest } = parseParams(paramList.val, epos);
           const body = elems.slice(2);
           const closedEnv = env;
+          if (rest !== null) {
+            return makeVariadicClosure(params, rest, body, closedEnv, epos);
+          }
           return { tag: 'procedure', val: (args: SchemeVal[]) => {
             if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
             const local = makeEnv(closedEnv);
