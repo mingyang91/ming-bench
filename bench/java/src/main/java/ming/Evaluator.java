@@ -75,8 +75,8 @@ public class Evaluator {
 
     enum Empty implements SchemeList { NIL }
 
-    // Lambda (closure)
-    record Lambda(List<String> params, List<Object> body, Env env) {}
+    // Lambda (closure) — restParam is non-null for variadic (dot notation)
+    record Lambda(List<String> params, String restParam, List<Object> body, Env env) {}
 
     // Source position-aware types
     record LocatedSymbol(String name, int line, int col) {}
@@ -98,7 +98,8 @@ public class Evaluator {
                 "string->number", "number->string",
                 "symbol->string", "string->symbol",
                 "string-ref", "char?",
-                "string-copy", "string-set!")) {
+                "string-copy", "string-set!",
+                "apply")) {
             env.define(name, "builtin:" + name);
         }
         return env;
@@ -346,20 +347,29 @@ public class Evaluator {
                             // (define x expr)
                             env.define(targetName, eval(list.get(2), env));
                         } else if (target instanceof List<?> sig) {
-                            // (define (f params...) body...)
+                            // (define (f params... . rest) body...)
                             String fname = symName(sig.isEmpty() ? null : sig.get(0));
                             if (sig.isEmpty() || fname == null)
                                 throw errAt(eline, ecol, "define: bad syntax");
                             List<String> params = new ArrayList<>();
+                            String restParam = null;
                             for (int i = 1; i < sig.size(); i++) {
                                 String pname = symName(sig.get(i));
                                 if (pname == null)
                                     throw errAt(eline, ecol, "define: parameter must be a symbol");
+                                if (".".equals(pname)) {
+                                    if (i + 2 != sig.size())
+                                        throw errAt(eline, ecol, "define: bad dot syntax");
+                                    restParam = symName(sig.get(i + 1));
+                                    if (restParam == null)
+                                        throw errAt(eline, ecol, "define: parameter must be a symbol");
+                                    break;
+                                }
                                 params.add(pname);
                             }
                             List<Object> body = new ArrayList<>();
                             for (int i = 2; i < list.size(); i++) body.add(list.get(i));
-                            env.define(fname, new Lambda(params, body, env));
+                            env.define(fname, new Lambda(params, restParam, body, env));
                         } else {
                             throw errAt(eline, ecol, "define: bad syntax");
                         }
@@ -370,15 +380,24 @@ public class Evaluator {
                         if (!(list.get(1) instanceof List<?> paramList))
                             throw errAt(eline, ecol, "lambda: bad syntax");
                         List<String> params = new ArrayList<>();
-                        for (Object p : paramList) {
-                            String pname = symName(p);
+                        String restParam = null;
+                        for (int i = 0; i < paramList.size(); i++) {
+                            String pname = symName(paramList.get(i));
                             if (pname == null)
                                 throw errAt(eline, ecol, "lambda: parameter must be a symbol");
+                            if (".".equals(pname)) {
+                                if (i + 2 != paramList.size())
+                                    throw errAt(eline, ecol, "lambda: bad dot syntax");
+                                restParam = symName(paramList.get(i + 1));
+                                if (restParam == null)
+                                    throw errAt(eline, ecol, "lambda: parameter must be a symbol");
+                                break;
+                            }
                             params.add(pname);
                         }
                         List<Object> body = new ArrayList<>();
                         for (int i = 2; i < list.size(); i++) body.add(list.get(i));
-                        return new Lambda(params, body, env);
+                        return new Lambda(params, restParam, body, env);
                     }
                     case "and" -> {
                         Object result = Boolean.TRUE;
@@ -416,7 +435,7 @@ public class Evaluator {
                             List<Object> body = new ArrayList<>();
                             for (int i = 3; i < list.size(); i++) body.add(list.get(i));
                             Env letEnv = new Env(env);
-                            Lambda loopLam = new Lambda(params, body, letEnv);
+                            Lambda loopLam = new Lambda(params, null, body, letEnv);
                             letEnv.define(secondName, loopLam);
                             List<Object> args = new ArrayList<>(inits);
                             return apply(loopLam, args);
@@ -533,11 +552,23 @@ public class Evaluator {
             return applyBuiltin(sym.substring(8), args);
         }
         if (proc instanceof Lambda lam) {
-            if (args.size() != lam.params().size())
-                throw new EvalError("wrong number of arguments: expected " + lam.params().size() + ", got " + args.size());
+            if (lam.restParam() != null) {
+                if (args.size() < lam.params().size())
+                    throw new EvalError("wrong number of arguments: expected at least " + lam.params().size() + ", got " + args.size());
+            } else {
+                if (args.size() != lam.params().size())
+                    throw new EvalError("wrong number of arguments: expected " + lam.params().size() + ", got " + args.size());
+            }
             Env callEnv = new Env(lam.env());
             for (int i = 0; i < lam.params().size(); i++) {
                 callEnv.define(lam.params().get(i), args.get(i));
+            }
+            if (lam.restParam() != null) {
+                Object rest = Empty.NIL;
+                for (int i = args.size() - 1; i >= lam.params().size(); i--) {
+                    rest = new Pair(args.get(i), rest);
+                }
+                callEnv.define(lam.restParam(), rest);
             }
             Object result = VOID;
             for (Object bodyExpr : lam.body()) {
@@ -744,6 +775,23 @@ public class Evaluator {
                 checkMinArgs(args, 1, "string-copy");
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: expected string");
                 yield new SchemeString(s.value());
+            }
+            case "apply" -> {
+                if (args.size() < 2) throw new EvalError("apply: expected at least 2 arguments");
+                Object fn = args.get(0);
+                // Last arg must be a list; prefix args are prepended
+                Object lastArg = args.get(args.size() - 1);
+                List<Object> allArgs = new ArrayList<>();
+                for (int i = 1; i < args.size() - 1; i++) {
+                    allArgs.add(args.get(i));
+                }
+                // Unpack the last argument (a list)
+                Object lst = lastArg;
+                while (lst instanceof Pair p) {
+                    allArgs.add(p.car());
+                    lst = p.cdr();
+                }
+                yield apply(fn, allArgs);
             }
             case "string-set!" -> {
                 checkMinArgs(args, 3, "string-set!");
