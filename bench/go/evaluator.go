@@ -38,6 +38,10 @@ type BuiltinVal struct {
 	Fn   func([]Value) (Value, error)
 }
 
+type CaseLambdaVal struct {
+	Clauses []*LambdaVal
+}
+
 type SyntaxRulesVal struct {
 	Literals []string
 	Rules    []syntaxRule
@@ -77,6 +81,7 @@ func (v *FloatVal) String() string {
 }
 func (v *LambdaVal) String() string  { return "#<procedure>" }
 func (v *BuiltinVal) String() string      { return "#<builtin:" + v.Name + ">" }
+func (v *CaseLambdaVal) String() string    { return "#<procedure>" }
 func (v *SyntaxRulesVal) String() string   { return "#<syntax>" }
 
 // Record types
@@ -597,6 +602,8 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 			return evalDefineSyntax(list, env)
 		case "define-record-type":
 			return evalDefineRecordType(list, env)
+		case "case-lambda":
+			return evalCaseLambda(list, env)
 		}
 	}
 
@@ -806,6 +813,53 @@ func evalLambda(list *ListExpr, env *Env) (Value, error) {
 		return nil, err
 	}
 	return &LambdaVal{Params: params, Rest: rest, Body: args[1:], Env: env}, nil
+}
+
+func evalCaseLambda(list *ListExpr, env *Env) (Value, error) {
+	clauses := list.Items[1:]
+	if len(clauses) == 0 {
+		return nil, errAt(list, "case-lambda requires at least one clause")
+	}
+	var lambdas []*LambdaVal
+	for _, c := range clauses {
+		cl, ok := c.(*ListExpr)
+		if !ok || len(cl.Items) < 2 {
+			return nil, errAt(list, "case-lambda: bad clause")
+		}
+		// Parse formals
+		paramExpr := cl.Items[0]
+		body := cl.Items[1:]
+		if atom, ok := paramExpr.(*AtomExpr); ok {
+			// (rest-arg body...) — variadic catching all args
+			lambdas = append(lambdas, &LambdaVal{Rest: atom.Token, Body: body, Env: env})
+			continue
+		}
+		paramList, ok := paramExpr.(*ListExpr)
+		if !ok {
+			return nil, errAt(list, "case-lambda: expected parameter list")
+		}
+		params, rest, err := parseDotParams(paramList.Items, list)
+		if err != nil {
+			return nil, err
+		}
+		lambdas = append(lambdas, &LambdaVal{Params: params, Rest: rest, Body: body, Env: env})
+	}
+	return &CaseLambdaVal{Clauses: lambdas}, nil
+}
+
+func applyCaseLambda(cl *CaseLambdaVal, args []Value) (Value, error) {
+	for _, lam := range cl.Clauses {
+		if lam.Rest != "" {
+			if len(args) >= len(lam.Params) {
+				return applyLambda(lam, args)
+			}
+		} else {
+			if len(args) == len(lam.Params) {
+				return applyLambda(lam, args)
+			}
+		}
+	}
+	return nil, &EvalError{Message: fmt.Sprintf("case-lambda: no matching clause for %d arguments", len(args))}
 }
 
 func evalAnd(exprs []Expr, env *Env) (Value, error) {
@@ -1370,6 +1424,8 @@ func applyProcSimple(proc Value, args []Value) (Value, error) {
 		return fn.Fn(args)
 	case *LambdaVal:
 		return applyLambda(fn, args)
+	case *CaseLambdaVal:
+		return applyCaseLambda(fn, args)
 	}
 	return nil, &EvalError{Message: "not a procedure"}
 }
@@ -1424,6 +1480,17 @@ func applyProcAt(op Value, args []Value, callSite Expr) (Value, error) {
 		return val, nil
 	case *LambdaVal:
 		val, err := applyLambda(fn, args)
+		if err != nil {
+			if ee, ok := err.(*EvalError); ok && ee.Line == 0 {
+				l, c := callSite.Pos()
+				ee.Line = l
+				ee.Col = c
+			}
+			return nil, err
+		}
+		return val, nil
+	case *CaseLambdaVal:
+		val, err := applyCaseLambda(fn, args)
 		if err != nil {
 			if ee, ok := err.(*EvalError); ok && ee.Line == 0 {
 				l, c := callSite.Pos()
@@ -2363,6 +2430,8 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 			return fn.Fn(finalArgs)
 		case *LambdaVal:
 			return applyLambda(fn, finalArgs)
+		case *CaseLambdaVal:
+			return applyCaseLambda(fn, finalArgs)
 		}
 		return nil, &EvalError{Message: "apply: not a procedure"}
 	})
@@ -2463,6 +2532,18 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 			return &IntVal{Val: r.Den}, nil
 		}
 		return nil, &EvalError{Message: "denominator: expected rational"}
+	})
+
+	// L13: case-lambda & procedure?
+	addBuiltin("procedure?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "procedure? requires 1 argument"}
+		}
+		switch args[0].(type) {
+		case *LambdaVal, *BuiltinVal, *CaseLambdaVal:
+			return &BoolVal{Val: true}, nil
+		}
+		return &BoolVal{Val: false}, nil
 	})
 
 	return env
