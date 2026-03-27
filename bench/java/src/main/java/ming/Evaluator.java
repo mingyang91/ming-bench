@@ -223,6 +223,9 @@ public class Evaluator {
         @Override public String toString() { return "#<procedure>"; }
     };
 
+    // Multiple values wrapper
+    record SchemeValues(List<Object> values) {}
+
     // --- Global environment ---
 
     private Env createGlobalEnv() {
@@ -260,7 +263,8 @@ public class Evaluator {
                 "caaar", "caadr", "cadar", "cdaar", "cdadr", "cddar",
                 "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
                 "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
-                "raise")) {
+                "raise",
+                "values", "call-with-values")) {
             env.define(name, "builtin:" + name);
         }
         env.define("call/cc", CALLCC_PROC);
@@ -1386,6 +1390,24 @@ public class Evaluator {
             if ("raise".equals(name)) {
                 if (args.size() != 1) throw new EvalError("raise: expected 1 argument");
                 throw new SchemeRaisedException(args.get(0));
+            }
+            if ("values".equals(name)) {
+                if (args.size() == 1) return k.apply(args.get(0));
+                return k.apply(new SchemeValues(args));
+            }
+            if ("call-with-values".equals(name)) {
+                if (args.size() != 2) throw new EvalError("call-with-values: expected 2 arguments");
+                Object producer = args.get(0);
+                Object consumer = args.get(1);
+                return applyK(producer, List.of(), eline, ecol, produced -> {
+                    List<Object> consumerArgs;
+                    if (produced instanceof SchemeValues sv) {
+                        consumerArgs = sv.values();
+                    } else {
+                        consumerArgs = List.of(produced);
+                    }
+                    return applyK(consumer, consumerArgs, eline, ecol, k);
+                });
             }
             Object result = applyBuiltin(name, args);
             return k.apply(result);
