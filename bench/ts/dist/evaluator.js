@@ -490,6 +490,8 @@ function createBuiltins(context, runtime) {
             makeCallWithCurrentContinuationBuiltin('call-with-current-continuation', runtime),
         ],
         ['dynamic-wind', makeDynamicWindBuiltin(runtime)],
+        ['raise', makeRaiseBuiltin(runtime)],
+        ['with-exception-handler', makeWithExceptionHandlerBuiltin(runtime)],
         [
             'string-append',
             builtin('string-append', (args, pos) => makeString(args.map((arg) => expectStringContent(arg, 'string-append', pos)).join(''))),
@@ -769,7 +771,14 @@ class Environment {
     runtime;
     constructor(parent) {
         this.parent = parent;
-        this.runtime = parent?.runtime ?? { nextHygieneId: 0, nextWindId: 0, dynamicWindStack: [] };
+        this.runtime =
+            parent?.runtime ?? {
+                nextHygieneId: 0,
+                nextWindId: 0,
+                nextExceptionHandlerId: 0,
+                dynamicWindStack: [],
+                exceptionHandlerStack: [],
+            };
     }
     define(name, value) {
         this.bindings.set(name, value);
@@ -970,6 +979,8 @@ function evaluateListCps(elements, env, pos, continuation) {
                 return evaluateDo(argumentExprs, env, operatorExpr.pos, continuation);
             case 'set!':
                 return evaluateSet(argumentExprs, env, operatorExpr.pos, continuation);
+            case 'guard':
+                return evaluateGuard(argumentExprs, env, operatorExpr.pos, continuation);
         }
         const transformer = lookupSyntax(operatorExpr, env);
         if (transformer !== undefined) {
@@ -1190,6 +1201,59 @@ function evaluateCaseLambda(expressions, env, pos, continuation) {
 }
 function evaluateBegin(expressions, env, continuation) {
     return evaluateSequenceCps(expressions, env, continuation);
+}
+function evaluateGuard(expressions, env, pos, continuation) {
+    if (expressions.length < 2) {
+        throw new EvalError(`guard expected at least 2 argument(s), got ${expressions.length}`, pos);
+    }
+    const [specExpr, ...bodyExprs] = expressions;
+    if (specExpr.kind !== 'list' || specExpr.elements.length === 0) {
+        throw new EvalError('guard expected a handler specification', specExpr.pos);
+    }
+    const [exceptionExpr, ...clauses] = specExpr.elements;
+    const exceptionName = bindingName(exceptionExpr, 'guard');
+    const runtime = env.runtimeState();
+    const frame = {
+        id: runtime.nextExceptionHandlerId,
+        dynamicWindStack: runtime.dynamicWindStack.slice(),
+        handle: (raisedValue, raisedPos) => {
+            const guardEnv = new Environment(env);
+            guardEnv.define(exceptionName, raisedValue);
+            return evaluateGuardClauses(clauses, guardEnv, raisedPos, continuation, raisedValue);
+        },
+    };
+    runtime.nextExceptionHandlerId += 1;
+    runtime.exceptionHandlerStack = [...runtime.exceptionHandlerStack, frame];
+    return evaluateSequenceCps(bodyExprs, env, (value) => {
+        deactivateExceptionHandlerFrame(runtime, frame.id);
+        return continueWith(continuation, value);
+    });
+}
+function evaluateGuardClauses(clauses, env, raisedPos, continuation, raisedValue, index = 0) {
+    if (index >= clauses.length) {
+        return raiseExceptionCps(env.runtimeState(), raisedValue, raisedPos);
+    }
+    const clause = clauses[index];
+    if (clause.kind !== 'list' || clause.elements.length === 0) {
+        throw new EvalError('guard expected a non-empty clause', clause.pos);
+    }
+    const [testExpr, ...bodyExprs] = clause.elements;
+    const isElseClause = symbolName(testExpr) === 'else';
+    if (isElseClause) {
+        if (index !== clauses.length - 1) {
+            throw new EvalError('guard else clause must be last', clause.pos);
+        }
+        return evaluateSequenceCps(bodyExprs, env, continuation);
+    }
+    return evaluateCps(testExpr, env, (testValue) => {
+        if (isFalse(testValue)) {
+            return evaluateGuardClauses(clauses, env, raisedPos, continuation, raisedValue, index + 1);
+        }
+        if (bodyExprs.length === 0) {
+            return continueWith(continuation, testValue);
+        }
+        return evaluateSequenceCps(bodyExprs, env, continuation);
+    });
 }
 function evaluateCond(clauses, env, pos, continuation, index = 0) {
     if (index >= clauses.length) {
@@ -2182,6 +2246,7 @@ function makeCallWithCurrentContinuationBuiltin(name, runtime) {
                 name: 'continuation',
                 continuation,
                 dynamicWindStack: runtime.dynamicWindStack.slice(),
+                exceptionHandlerStack: runtime.exceptionHandlerStack.slice(),
                 runtime,
             },
         ], pos, continuation);
@@ -2206,29 +2271,67 @@ function makeDynamicWindBuiltin(runtime) {
         });
     });
 }
-function continueCapturedContinuationCps(continuationValue, value, pos) {
-    const commonPrefix = commonDynamicWindPrefix(continuationValue.runtime.dynamicWindStack, continuationValue.dynamicWindStack);
-    return continueCapturedContinuationOutCps(continuationValue, value, commonPrefix, pos);
+function makeRaiseBuiltin(runtime) {
+    return controlBuiltin('raise', (args, pos) => {
+        expectArity('raise', args, 1, pos);
+        return raiseExceptionCps(runtime, args[0], pos);
+    });
 }
-function continueCapturedContinuationOutCps(continuationValue, value, commonPrefix, pos) {
-    if (continuationValue.runtime.dynamicWindStack.length > commonPrefix) {
-        const frame = continuationValue.runtime.dynamicWindStack[continuationValue.runtime.dynamicWindStack.length - 1];
-        continuationValue.runtime.dynamicWindStack =
-            continuationValue.runtime.dynamicWindStack.slice(0, continuationValue.runtime.dynamicWindStack.length - 1);
-        return applyProcedureCps(frame.outThunk, [], pos, () => continueCapturedContinuationOutCps(continuationValue, value, commonPrefix, pos));
+function makeWithExceptionHandlerBuiltin(runtime) {
+    return controlBuiltin('with-exception-handler', (args, pos, continuation) => {
+        expectArity('with-exception-handler', args, 2, pos);
+        const [handler, thunk] = args;
+        const frame = {
+            id: runtime.nextExceptionHandlerId,
+            dynamicWindStack: runtime.dynamicWindStack.slice(),
+            handle: (raisedValue, raisedPos) => applyProcedureCps(handler, [raisedValue], raisedPos, () => {
+                throw new EvalError('raise handler returned', raisedPos);
+            }),
+        };
+        runtime.nextExceptionHandlerId += 1;
+        runtime.exceptionHandlerStack = [...runtime.exceptionHandlerStack, frame];
+        return applyProcedureCps(thunk, [], pos, (value) => {
+            deactivateExceptionHandlerFrame(runtime, frame.id);
+            return continueWith(continuation, value);
+        });
+    });
+}
+function raiseExceptionCps(runtime, value, pos) {
+    if (runtime.exceptionHandlerStack.length === 0) {
+        throw new EvalError(`uncaught exception: ${formatValue(value)}`, pos);
     }
-    return continueCapturedContinuationInCps(continuationValue, value, commonPrefix, pos);
+    const frame = runtime.exceptionHandlerStack[runtime.exceptionHandlerStack.length - 1];
+    runtime.exceptionHandlerStack = runtime.exceptionHandlerStack.slice(0, runtime.exceptionHandlerStack.length - 1);
+    return transferDynamicWindCps(runtime, frame.dynamicWindStack, pos, () => frame.handle(value, pos));
 }
-function continueCapturedContinuationInCps(continuationValue, value, nextIndex, pos) {
-    if (nextIndex < continuationValue.dynamicWindStack.length) {
-        const frame = continuationValue.dynamicWindStack[nextIndex];
+function continueCapturedContinuationCps(continuationValue, value, pos) {
+    return transferDynamicWindCps(continuationValue.runtime, continuationValue.dynamicWindStack, pos, () => {
+        continuationValue.runtime.exceptionHandlerStack = continuationValue.exceptionHandlerStack.slice();
+        return continueWith(continuationValue.continuation, value);
+    });
+}
+function transferDynamicWindCps(runtime, targetStack, pos, continuation) {
+    const commonPrefix = commonDynamicWindPrefix(runtime.dynamicWindStack, targetStack);
+    return transferDynamicWindOutCps(runtime, targetStack, commonPrefix, pos, continuation);
+}
+function transferDynamicWindOutCps(runtime, targetStack, commonPrefix, pos, continuation) {
+    if (runtime.dynamicWindStack.length > commonPrefix) {
+        const frame = runtime.dynamicWindStack[runtime.dynamicWindStack.length - 1];
+        runtime.dynamicWindStack = runtime.dynamicWindStack.slice(0, runtime.dynamicWindStack.length - 1);
+        return applyProcedureCps(frame.outThunk, [], pos, () => transferDynamicWindOutCps(runtime, targetStack, commonPrefix, pos, continuation));
+    }
+    return transferDynamicWindInCps(runtime, targetStack, commonPrefix, pos, continuation);
+}
+function transferDynamicWindInCps(runtime, targetStack, nextIndex, pos, continuation) {
+    if (nextIndex < targetStack.length) {
+        const frame = targetStack[nextIndex];
         return applyProcedureCps(frame.inThunk, [], pos, () => {
-            continuationValue.runtime.dynamicWindStack = [...continuationValue.runtime.dynamicWindStack, frame];
-            return continueCapturedContinuationInCps(continuationValue, value, nextIndex + 1, pos);
+            runtime.dynamicWindStack = [...runtime.dynamicWindStack, frame];
+            return transferDynamicWindInCps(runtime, targetStack, nextIndex + 1, pos, continuation);
         });
     }
-    continuationValue.runtime.dynamicWindStack = continuationValue.dynamicWindStack.slice();
-    return continueWith(continuationValue.continuation, value);
+    runtime.dynamicWindStack = targetStack.slice();
+    return bounce(continuation);
 }
 function deactivateDynamicWindFrame(runtime, frameId) {
     for (let index = runtime.dynamicWindStack.length - 1; index >= 0; index -= 1) {
@@ -2236,6 +2339,17 @@ function deactivateDynamicWindFrame(runtime, frameId) {
             runtime.dynamicWindStack = [
                 ...runtime.dynamicWindStack.slice(0, index),
                 ...runtime.dynamicWindStack.slice(index + 1),
+            ];
+            return;
+        }
+    }
+}
+function deactivateExceptionHandlerFrame(runtime, frameId) {
+    for (let index = runtime.exceptionHandlerStack.length - 1; index >= 0; index -= 1) {
+        if (runtime.exceptionHandlerStack[index].id === frameId) {
+            runtime.exceptionHandlerStack = [
+                ...runtime.exceptionHandlerStack.slice(0, index),
+                ...runtime.exceptionHandlerStack.slice(index + 1),
             ];
             return;
         }
