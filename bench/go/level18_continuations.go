@@ -190,6 +190,9 @@ func (m *machine) run() (value, error) {
 }
 
 func (m *machine) stepExpr() error {
+	if err := consumeEvalStep(m.expr.pos); err != nil {
+		return err
+	}
 	setCurrentEvalPos(m.expr.pos)
 
 	switch expr := m.expr.form.(type) {

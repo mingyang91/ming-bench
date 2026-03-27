@@ -555,6 +555,18 @@ func registerCxrBuiltins(global *env, maxDepth int) {
 }
 
 func evalInput(input string) (result string, output string, err error) {
+	return evalInputWithOptionalLimit(input, nil)
+}
+
+func evalInputWithStepLimit(input string, maxSteps int) (result string, output string, err error) {
+	return evalInputWithOptionalLimit(input, &maxSteps)
+}
+
+func evalInputWithOptionalLimit(input string, maxSteps *int) (result string, output string, err error) {
+	if maxSteps != nil && *maxSteps < 0 {
+		return "", "", newEvalError(defaultSourcePos(), "step limit must be non-negative")
+	}
+
 	exprs, err := parseProgram(input)
 	if err != nil {
 		return "", "", err
@@ -566,6 +578,10 @@ func evalInput(input string) (result string, output string, err error) {
 	defer restoreOutput()
 	restore := pushEvalPos(defaultSourcePos())
 	defer restore()
+	if maxSteps != nil {
+		restoreBudget := pushStepBudget(*maxSteps)
+		defer restoreBudget()
+	}
 	last, err := evalSequence(exprs, env)
 	if err != nil {
 		return "", "", err
@@ -613,6 +629,9 @@ func evalSequence(exprs []locatedExpr, env *env) (value, error) {
 
 func evalExpr(e locatedExpr, env *env) (value, error) {
 	if useLegacyEvaluator() {
+		if err := consumeEvalStep(e.pos); err != nil {
+			return nil, err
+		}
 		restore := pushEvalPos(e.pos)
 		defer restore()
 
@@ -658,6 +677,9 @@ func evalSequenceTail(exprs []locatedExpr, env *env) (value, *tailCall, error) {
 }
 
 func evalExprTail(e locatedExpr, env *env) (value, *tailCall, error) {
+	if err := consumeEvalStep(e.pos); err != nil {
+		return nil, nil, err
+	}
 	restore := pushEvalPos(e.pos)
 	defer restore()
 
