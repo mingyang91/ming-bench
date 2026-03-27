@@ -249,6 +249,16 @@ func (e *env) define(name string, v value) {
 	e.vars[name] = v
 }
 
+func (e *env) set(name string, v value) bool {
+	for current := e; current != nil; current = current.parent {
+		if _, ok := current.vars[name]; ok {
+			current.vars[name] = v
+			return true
+		}
+	}
+	return false
+}
+
 func (e *env) lookup(name string) (value, bool) {
 	for current := e; current != nil; current = current.parent {
 		if v, ok := current.vars[name]; ok {
@@ -388,6 +398,8 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalCond(items[1:], env)
 		case "define":
 			return evalDefine(items[1:], env)
+		case "set!":
+			return evalSet(items[1:], env)
 		case "quote":
 			return evalQuote(items[1:])
 		case "let":
@@ -514,6 +526,28 @@ func evalDefine(parts []locatedExpr, env *env) (value, error) {
 	default:
 		return nil, newCurrentEvalError("invalid define target")
 	}
+}
+
+func evalSet(parts []locatedExpr, env *env) (value, error) {
+	if len(parts) != 2 {
+		return nil, newCurrentEvalError("'set!' expects exactly 2 arguments")
+	}
+
+	name, ok := parts[0].form.(symbolExpr)
+	if !ok {
+		return nil, newEvalError(parts[0].pos, "'set!' target must be a symbol")
+	}
+
+	v, err := evalExpr(parts[1], env)
+	if err != nil {
+		return nil, err
+	}
+
+	if !env.set(string(name), v) {
+		return nil, newEvalError(parts[0].pos, "unbound variable: %s", string(name))
+	}
+
+	return voidValue{}, nil
 }
 
 func evalQuote(parts []locatedExpr) (value, error) {
