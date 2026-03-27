@@ -128,6 +128,10 @@ type EvaluationContext = {
   output: string[];
 };
 
+type EvaluationOptions = {
+  maxSteps?: number;
+};
+
 type Continuation = (value: SchemeValue) => Bounce;
 
 type DynamicWindFrame = {
@@ -233,6 +237,9 @@ type RuntimeState = {
   latestContinuations: Map<number, ContinuationValue>;
   dynamicWindStack: DynamicWindFrame[];
   exceptionHandlerStack: ExceptionHandlerFrame[];
+  stepBudget?: {
+    remaining: number;
+  };
 };
 
 type EnvironmentOptions = {
@@ -1075,11 +1082,15 @@ export function evalStr(input: string): string {
   return evaluateInput(input).result;
 }
 
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  return evaluateInput(input, { maxSteps: validateMaxSteps(maxSteps) }).result;
+}
+
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   return evaluateInput(input);
 }
 
-function evaluateInput(input: string): { result: string; output: string } {
+function evaluateInput(input: string, options: EvaluationOptions = {}): { result: string; output: string } {
   const parser = new Parser(tokenize(input));
   const expressions = parser.parseProgram();
 
@@ -1089,6 +1100,12 @@ function evaluateInput(input: string): { result: string; output: string } {
 
   const context: EvaluationContext = { output: [] };
   const env = createGlobalEnvironment(context);
+  const maxSteps = options.maxSteps;
+
+  if (maxSteps !== undefined) {
+    env.runtimeState().stepBudget = { remaining: maxSteps };
+  }
+
   const result = runBounce(evaluateSequenceCps(expressions, env, done));
 
   return {
@@ -1117,6 +1134,7 @@ class Environment {
         latestContinuations: new Map<number, ContinuationValue>(),
         dynamicWindStack: [],
         exceptionHandlerStack: [],
+        stepBudget: undefined,
       };
     this.syntaxContext = options?.syntaxContext ?? parent?.syntaxContext;
     this.transformerDefinitionEnv =
@@ -1289,6 +1307,8 @@ function evaluate(expression: Expr, env: Environment): SchemeValue {
 function evaluateCps(expression: Expr, env: Environment, continuation: Continuation): Bounce {
   return bounce(() => {
     try {
+      consumeEvalStep(env.runtimeState());
+
       switch (expression.kind) {
         case 'number':
         case 'boolean':
@@ -5679,6 +5699,27 @@ function parseBenchLevel(): number | undefined {
 
   const parsedLevel = Number.parseInt(rawBenchLevel, 10);
   return Number.isNaN(parsedLevel) ? undefined : parsedLevel;
+}
+
+function validateMaxSteps(maxSteps: number): number {
+  if (!Number.isSafeInteger(maxSteps) || maxSteps < 0) {
+    throw new EvalError('maxSteps must be a non-negative safe integer');
+  }
+
+  return maxSteps;
+}
+
+function consumeEvalStep(runtime: RuntimeState): void {
+  const budget = runtime.stepBudget;
+  if (budget === undefined) {
+    return;
+  }
+
+  if (budget.remaining <= 0) {
+    throw new EvalError('step limit exceeded');
+  }
+
+  budget.remaining -= 1;
 }
 
 function stringsAreImmutable(): boolean {

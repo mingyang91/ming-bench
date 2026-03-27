@@ -771,10 +771,13 @@ function createBuiltins(context, runtime) {
 export function evalStr(input) {
     return evaluateInput(input).result;
 }
+export function evalStrWithLimit(input, maxSteps) {
+    return evaluateInput(input, { maxSteps: validateMaxSteps(maxSteps) }).result;
+}
 export function evalStrWithOutput(input) {
     return evaluateInput(input);
 }
-function evaluateInput(input) {
+function evaluateInput(input, options = {}) {
     const parser = new Parser(tokenize(input));
     const expressions = parser.parseProgram();
     if (expressions.length === 0) {
@@ -782,6 +785,10 @@ function evaluateInput(input) {
     }
     const context = { output: [] };
     const env = createGlobalEnvironment(context);
+    const maxSteps = options.maxSteps;
+    if (maxSteps !== undefined) {
+        env.runtimeState().stepBudget = { remaining: maxSteps };
+    }
     const result = runBounce(evaluateSequenceCps(expressions, env, done));
     return {
         result: formatValue(result),
@@ -807,6 +814,7 @@ class Environment {
                 latestContinuations: new Map(),
                 dynamicWindStack: [],
                 exceptionHandlerStack: [],
+                stepBudget: undefined,
             };
         this.syntaxContext = options?.syntaxContext ?? parent?.syntaxContext;
         this.transformerDefinitionEnv =
@@ -940,6 +948,7 @@ function evaluate(expression, env) {
 function evaluateCps(expression, env, continuation) {
     return bounce(() => {
         try {
+            consumeEvalStep(env.runtimeState());
             switch (expression.kind) {
                 case 'number':
                 case 'boolean':
@@ -3930,6 +3939,22 @@ function parseBenchLevel() {
     }
     const parsedLevel = Number.parseInt(rawBenchLevel, 10);
     return Number.isNaN(parsedLevel) ? undefined : parsedLevel;
+}
+function validateMaxSteps(maxSteps) {
+    if (!Number.isSafeInteger(maxSteps) || maxSteps < 0) {
+        throw new EvalError('maxSteps must be a non-negative safe integer');
+    }
+    return maxSteps;
+}
+function consumeEvalStep(runtime) {
+    const budget = runtime.stepBudget;
+    if (budget === undefined) {
+        return;
+    }
+    if (budget.remaining <= 0) {
+        throw new EvalError('step limit exceeded');
+    }
+    budget.remaining -= 1;
 }
 function stringsAreImmutable() {
     return CURRENT_BENCH_LEVEL === undefined || CURRENT_BENCH_LEVEL >= STRING_IMMUTABILITY_LEVEL;
