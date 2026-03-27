@@ -1,8 +1,10 @@
 pub mod error;
 mod builtins;
+mod cek;
 mod display;
 mod macros;
 mod numeric;
+mod records;
 
 pub use error::EvalError;
 
@@ -58,6 +60,7 @@ pub(crate) enum Value {
     },
     CaseLambda(Vec<CaseClause>),
     Vector(Rc<RefCell<Vec<Value>>>),
+    Continuation(Rc<Kont>),
 }
 
 
@@ -65,7 +68,7 @@ fn make_str(s: String) -> Value {
     Value::Str(Rc::new(RefCell::new(s)), true)
 }
 
-fn make_immutable_str(s: String) -> Value {
+pub(crate) fn make_immutable_str(s: String) -> Value {
     Value::Str(Rc::new(RefCell::new(s)), false)
 }
 
@@ -183,6 +186,7 @@ impl fmt::Display for Value {
             Value::Macro { .. } => write!(f, "#<macro>"),
             Value::Record { type_tag, .. } => write!(f, "#<record:{type_tag}>"),
             Value::CaseLambda(..) => write!(f, "#<procedure>"),
+            Value::Continuation(_) => write!(f, "#<continuation>"),
             Value::Vector(v) => {
                 write!(f, "#(")?;
                 let items = v.borrow();
@@ -441,7 +445,7 @@ pub(crate) fn env_define(env: &Env, name: String, val: Value) {
     env.last().expect("env must have at least one frame").borrow_mut().insert(name, val);
 }
 
-fn env_set(env: &Env, name: &str, val: Value) -> Result<(), EvalError> {
+pub(crate) fn env_set(env: &Env, name: &str, val: Value) -> Result<(), EvalError> {
     for frame in env.iter().rev() {
         let mut f = frame.borrow_mut();
         if f.contains_key(name) {
@@ -452,7 +456,7 @@ fn env_set(env: &Env, name: &str, val: Value) -> Result<(), EvalError> {
     Err(EvalError::UnboundVariable(name.to_string()))
 }
 
-fn with_span(span: Span, err: EvalError) -> EvalError {
+pub(crate) fn with_span(span: Span, err: EvalError) -> EvalError {
     let msg = err.to_string();
     if msg.as_bytes().windows(2).any(|w| w[0].is_ascii_digit() && w[1] == b':') {
         return err;
@@ -515,6 +519,9 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
                     "letrec*" => return eval_letrec_star(&items[1..], env, output),
                     "case" => return eval_case(&items[1..], env, output),
                     "do" => return eval_do(&items[1..], env, output),
+                    "call/cc" | "call-with-current-continuation" => {
+                        return Err(EvalError::Generic("call/cc: not available in recursive eval context".into()));
+                    }
                     _ => {}
                 }
                 // Check for macro invocation
@@ -559,7 +566,8 @@ fn eval_tail_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Ta
                     "letrec" => return eval_letrec_tail(&items[1..], env, output),
                     "letrec*" => return eval_letrec_star_tail(&items[1..], env, output),
                     "define" | "set!" | "quote" | "lambda" | "case-lambda" |
-                    "define-syntax" | "define-record-type" | "case" | "do" | "let*" => {
+                    "define-syntax" | "define-record-type" | "case" | "do" | "let*" |
+                    "call/cc" | "call-with-current-continuation" => {
                         return Ok(TailResult::Done(eval(expr, env, output)?));
                     }
                     _ => {}
@@ -857,12 +865,13 @@ fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value
                 }
             }
             Value::Builtin(ref name) => return eval_builtin(name, &cur_args, output),
+            Value::Continuation(_) => return Err(EvalError::Generic("cannot invoke continuation from recursive eval".into())),
             _ => return Err(EvalError::Type("not a procedure".into())),
         }
     }
 }
 
-fn is_truthy(v: &Value) -> bool {
+pub(crate) fn is_truthy(v: &Value) -> bool {
     !matches!(v, Value::Boolean(false))
 }
 
@@ -873,7 +882,7 @@ fn expect_integer(v: &Value, context: &str) -> Result<i64, EvalError> {
     }
 }
 
-fn parse_params(items: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+pub(crate) fn parse_params(items: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
     let mut params = Vec::new();
     let mut rest = None;
     let mut i = 0;
@@ -951,7 +960,7 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     Ok(expr_to_value(&args[0]))
 }
 
-fn expr_to_value(expr: &Expr) -> Value {
+pub(crate) fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
         ExprKind::Rational(n, d) => make_rational(*n, *d),
@@ -964,7 +973,7 @@ fn expr_to_value(expr: &Expr) -> Value {
     }
 }
 
-fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+pub(crate) fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::Arity("lambda requires at least 2 arguments".into()));
     }
@@ -977,7 +986,7 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     Ok(Value::Procedure(params, rest, body, env.clone()))
 }
 
-fn eval_case_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+pub(crate) fn eval_case_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     let mut clauses = Vec::new();
     for clause in args {
         match &clause.kind {
@@ -1240,7 +1249,7 @@ fn eval_body(body: &[Expr], env: &mut Env, output: &mut String) -> Result<Value,
     Ok(result)
 }
 
-fn eval_case(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+pub(crate) fn eval_case(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("case requires at least 1 argument".into()));
     }
@@ -1269,7 +1278,7 @@ fn eval_case(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value,
     Ok(Value::Boolean(false))
 }
 
-fn eval_do(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+pub(crate) fn eval_do(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     // (do ((var init step) ...) (test expr ...) body ...)
     if args.len() < 2 {
         return Err(EvalError::Arity("do requires variable specs and test clause".into()));
@@ -1378,108 +1387,47 @@ fn eval_cond(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value,
 
 // ── Records (define-record-type) ──
 
-fn eval_define_record_type(args: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
-    // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
-    if args.len() < 3 {
-        return Err(EvalError::Arity("define-record-type requires at least 3 arguments".into()));
-    }
-    // Type name (used for unique tag)
-    let type_name = match &args[0].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Type("define-record-type: expected type name symbol".into())),
-    };
-    let type_tag = gensym(&type_name);
+use records::eval_define_record_type;
 
-    // Constructor: (make-foo field1 field2 ...)
-    let (constructor_name, constructor_fields) = match &args[1].kind {
-        ExprKind::List(items) if !items.is_empty() => {
-            let name = match &items[0].kind {
-                ExprKind::Symbol(s) => s.clone(),
-                _ => return Err(EvalError::Type("define-record-type: constructor name must be symbol".into())),
-            };
-            let fields: Vec<String> = items[1..].iter().map(|e| match &e.kind {
-                ExprKind::Symbol(s) => Ok(s.clone()),
-                _ => Err(EvalError::Type("define-record-type: field name must be symbol".into())),
-            }).collect::<Result<_, _>>()?;
-            (name, fields)
-        }
-        _ => return Err(EvalError::Type("define-record-type: expected constructor spec".into())),
-    };
 
-    // Predicate name
-    let predicate_name = match &args[2].kind {
-        ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Type("define-record-type: expected predicate name".into())),
-    };
+// ── CEK Machine (for call/cc support) ──
 
-    // Field accessors: (field accessor) ...
-    let mut field_accessors: Vec<(String, String)> = Vec::new();
-    for arg in &args[3..] {
-        match &arg.kind {
-            ExprKind::List(items) if items.len() == 2 => {
-                let field = match &items[0].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => return Err(EvalError::Type("define-record-type: field name must be symbol".into())),
-                };
-                let accessor = match &items[1].kind {
-                    ExprKind::Symbol(s) => s.clone(),
-                    _ => return Err(EvalError::Type("define-record-type: accessor name must be symbol".into())),
-                };
-                field_accessors.push((field, accessor));
-            }
-            _ => return Err(EvalError::Type("define-record-type: invalid field spec".into())),
-        }
-    }
-
-    // Define constructor as a builtin-like procedure
-    let tag = type_tag.clone();
-    let fields = constructor_fields.clone();
-    let constructor_tag = tag.clone();
-    let constructor_fields_clone = fields.clone();
-
-    // We'll use special procedure values that carry record metadata.
-    // Constructor: a procedure that creates Record values
-    // We encode these as special Builtin names that we handle in apply.
-
-    // Register constructor
-    let ctor_id = format!("##record-ctor##{}", constructor_tag);
-    // Store metadata: type_tag and field names in the environment
-    let meta_key = format!("##record-meta##{}", constructor_tag);
-    env_define(env, meta_key, Value::List(
-        constructor_fields_clone.iter().map(|f| Value::Symbol(f.clone())).collect()
-    ));
-    env_define(env, constructor_name, Value::Builtin(ctor_id));
-
-    // Register predicate
-    let pred_id = format!("##record-pred##{}", tag);
-    env_define(env, predicate_name, Value::Builtin(pred_id));
-
-    // Register accessors
-    for (field_name, accessor_name) in &field_accessors {
-        // Find the index of this field in the constructor fields
-        let idx = constructor_fields.iter().position(|f| f == field_name)
-            .ok_or_else(|| EvalError::Generic(format!(
-                "define-record-type: field {} not in constructor", field_name
-            )))?;
-        let acc_id = format!("##record-acc##{}##{}", tag, idx);
-        env_define(env, accessor_name.clone(), Value::Builtin(acc_id));
-    }
-
-    Ok(Value::Boolean(false))
+#[derive(Clone)]
+pub(crate) enum Kont {
+    Halt,
+    Seq { rest: Vec<Expr>, env: Env, next: Rc<Kont> },
+    Def { name: String, env: Env, next: Rc<Kont> },
+    Set { name: String, env: Env, next: Rc<Kont> },
+    If { then_e: Expr, else_e: Option<Expr>, env: Env, next: Rc<Kont> },
+    Ev1 { args: Vec<Expr>, env: Env, next: Rc<Kont> },
+    EvN { func: Value, done: Vec<Value>, rest: Vec<Expr>, env: Env, next: Rc<Kont> },
+    CallCC { next: Rc<Kont> },
+    And { rest: Vec<Expr>, env: Env, next: Rc<Kont> },
+    Or { rest: Vec<Expr>, env: Env, next: Rc<Kont> },
+    LetInit { var: String, rem: Vec<(String, Expr)>, frame: Frame, body: Vec<Expr>, eval_env: Env, next: Rc<Kont> },
+    SeqBind { var: String, rem: Vec<(String, Expr)>, body: Vec<Expr>, env: Env, next: Rc<Kont>, use_set: bool },
+    CondK { body: Vec<Expr>, rest: Vec<Expr>, env: Env, next: Rc<Kont> },
 }
 
+impl fmt::Debug for Kont {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Kont::Halt => write!(f, "Halt"),
+            _ => write!(f, "Kont(..)"),
+        }
+    }
+}
+
+use cek::cek_run;
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
-    let mut env = vec![new_frame()];
+    let env = vec![new_frame()];
     let mut output = String::new();
-    let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &mut env, &mut output)?;
-    }
+    let result = cek_run(exprs, env, &mut output)?;
     Ok(result.to_string())
 }
 
@@ -1488,12 +1436,9 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_all()?;
-    let mut env = vec![new_frame()];
+    let env = vec![new_frame()];
     let mut output = String::new();
-    let mut result = Value::Boolean(false);
-    for expr in &exprs {
-        result = eval(expr, &mut env, &mut output)?;
-    }
+    let result = cek_run(exprs, env, &mut output)?;
     Ok((result.to_string(), output))
 }
 

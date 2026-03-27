@@ -11,7 +11,7 @@ enum MacroBinding {
     Repeated(Vec<Expr>),
 }
 
-pub(super) fn eval_define_syntax(
+pub(crate) fn eval_define_syntax(
     args: &[Expr],
     env: &mut Env,
 ) -> Result<Value, EvalError> {
@@ -167,6 +167,7 @@ fn is_special_form(s: &str) -> bool {
         "define" | "set!" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "begin" | "cond"
             | "define-syntax" | "syntax-rules" | "define-record-type"
             | "letrec" | "letrec*" | "case" | "do"
+            | "call/cc" | "call-with-current-continuation"
     )
 }
 
@@ -246,6 +247,33 @@ fn expand_template(
         }
         _ => template.clone(),
     }
+}
+
+pub(crate) fn expand_macro_only(
+    macro_val: &Value,
+    items: &[Expr],
+    _env: &Env,
+) -> Result<(Expr, super::Frame), EvalError> {
+    let (literals, rules, def_env) = match macro_val {
+        Value::Macro { literals, rules, def_env } => (literals, rules, def_env),
+        _ => unreachable!(),
+    };
+    for (pattern, template) in rules {
+        let mut bindings = HashMap::new();
+        if match_pattern(&pattern[1..], &items[1..], &mut bindings, literals) {
+            let pattern_vars: HashSet<String> = bindings.keys().cloned().collect();
+            let mut renames = HashMap::new();
+            let expanded = expand_template(template, &bindings, &pattern_vars, &mut renames);
+            let frame = new_frame();
+            for (original, gensym_name) in &renames {
+                if let Ok(val) = env_lookup(def_env, original) {
+                    frame.borrow_mut().insert(gensym_name.clone(), val);
+                }
+            }
+            return Ok((expanded, frame));
+        }
+    }
+    Err(EvalError::Generic("no matching syntax-rules pattern".into()))
 }
 
 pub(super) fn expand_and_eval_macro(

@@ -878,7 +878,7 @@ fn eval_predicate(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::Boolean(matches!(
                 &args[0],
-                Value::Procedure(..) | Value::Builtin(_) | Value::CaseLambda(_)
+                Value::Procedure(..) | Value::Builtin(_) | Value::CaseLambda(_) | Value::Continuation(_)
             )))
         }
         "vector?" => {
