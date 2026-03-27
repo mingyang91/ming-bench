@@ -9,6 +9,10 @@ private[ming] object MachineProcedures:
     procedure match
       case Value.BuiltinProc("dynamic-wind") =>
         prepareDynamicWind(machine, args, pos)
+      case Value.BuiltinProc("raise") =>
+        prepareRaise(machine, args, pos)
+      case Value.BuiltinProc("with-exception-handler") =>
+        prepareWithExceptionHandler(machine, args, pos)
       case Value.BuiltinProc("call/cc") =>
         prepareCallCc(machine, "call/cc", args, pos)
       case Value.BuiltinProc("call-with-current-continuation") =>
@@ -61,7 +65,7 @@ private[ming] object MachineProcedures:
 
   private def prepareCallCc(machine: Machine, name: String, args: List[Value], pos: SourcePos): Unit =
     val procedure = requireSingleArg(name, args, pos)
-    val captured  = new Value.ContinuationVal(new ContinuationSnapshot(machine.frames, machine.winds))
+    val captured  = new Value.ContinuationVal(new ContinuationSnapshot(machine.frames, machine.winds, machine.handlers))
     machine.setInvoke(procedure, List(captured), pos)
 
   private def prepareDynamicWind(machine: Machine, args: List[Value], pos: SourcePos): Unit =
@@ -69,6 +73,17 @@ private[ming] object MachineProcedures:
     val wind                               = new DynamicWindContext(inThunk, outThunk, pos)
     machine.push(DynamicWindEntered(bodyThunk, wind))
     machine.setInvoke(inThunk, Nil, pos)
+
+  private def prepareRaise(machine: Machine, args: List[Value], pos: SourcePos): Unit =
+    MachineExceptions.raise(machine, requireSingleArg("raise", args, pos), pos)
+
+  private def prepareWithExceptionHandler(machine: Machine, args: List[Value], pos: SourcePos): Unit =
+    val List(handler, thunk) = requireArgCount("with-exception-handler", args, expected = 2, pos)
+    val handlerContext =
+      new ExceptionHandlerContext(handler, machine.frames, machine.winds, machine.handlers, pos)
+    machine.push(WithExceptionHandlerResult(handlerContext))
+    machine.activateHandler(handlerContext)
+    machine.setInvoke(thunk, Nil, pos)
 
   private[ming] def continueDynamicWindBody(machine: Machine, wind: DynamicWindContext, bodyResult: Value): Unit =
     machine.deactivateWind(wind)
@@ -113,6 +128,7 @@ private[ming] object MachineProcedures:
       case Nil =>
         machine.frames = snapshot.frames
         machine.winds = snapshot.winds
+        machine.handlers = snapshot.handlers
         machine.setValue(capturedValue)
 
   @annotation.tailrec

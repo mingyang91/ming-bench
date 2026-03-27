@@ -82,6 +82,76 @@ private[ming] object SpecialFormTransforms:
       case _ =>
         throw EvalError.at(pos, "invalid do")
 
+  def desugarGuard(args: List[Expr], pos: SourcePos): Expr =
+    args match
+      case Expr.ListExpr(Expr.Symbol(name, namePos) :: clauses, _) :: body if body.nonEmpty =>
+        val returnName    = MacroSyntax.freshIdentifier("guard_return")
+        val exceptionName = MacroSyntax.freshIdentifier("guard_exception")
+        val condClauses =
+          if clauses.exists(isElseClause) then clauses
+          else clauses :+ reRaiseGuardClause(name, namePos, pos)
+
+        val condExpr =
+          Expr.ListExpr(Expr.Symbol("cond", pos) :: condClauses, pos)
+        val bindingExpr =
+          Expr.ListExpr(List(Expr.Symbol(name, namePos), Expr.Symbol(exceptionName, pos)), pos)
+        val letExpr =
+          Expr.ListExpr(
+            List(
+              Expr.Symbol("let", pos),
+              Expr.ListExpr(List(bindingExpr), pos),
+              condExpr
+            ),
+            pos
+          )
+        val handlerExpr =
+          Expr.ListExpr(List(Expr.Symbol(returnName, pos), letExpr), pos)
+        val handlerLambda =
+          Expr.ListExpr(
+            List(
+              Expr.Symbol("lambda", pos),
+              Expr.ListExpr(List(Expr.Symbol(exceptionName, pos)), pos),
+              handlerExpr
+            ),
+            pos
+          )
+        val thunkLambda =
+          Expr.ListExpr(
+            List(
+              Expr.Symbol("lambda", pos),
+              Expr.ListExpr(Nil, pos)
+            ) ++ body,
+            pos
+          )
+        val withExceptionHandlerExpr =
+          Expr.ListExpr(
+            List(
+              Expr.Symbol("with-exception-handler", pos),
+              handlerLambda,
+              thunkLambda
+            ),
+            pos
+          )
+        val outerLambda =
+          Expr.ListExpr(
+            List(
+              Expr.Symbol("lambda", pos),
+              Expr.ListExpr(List(Expr.Symbol(returnName, pos)), pos),
+              withExceptionHandlerExpr
+            ),
+            pos
+          )
+
+        Expr.ListExpr(
+          List(
+            Expr.Symbol("call/cc", pos),
+            outerLambda
+          ),
+          pos
+        )
+      case _ =>
+        throw EvalError.at(pos, "invalid guard")
+
   private def makeLetApplication(bindings: List[LetBinding], body: List[Expr], pos: SourcePos): Expr =
     val paramsExpr = Expr.ListExpr(bindings.map(binding => Expr.Symbol(binding.name, pos)), pos)
     val lambdaExpr =
@@ -115,3 +185,23 @@ private[ming] object SpecialFormTransforms:
 
   private def beginExpr(body: List[Expr], pos: SourcePos): Expr =
     Expr.ListExpr(Expr.Symbol("begin", pos) :: body, pos)
+
+  private def isElseClause(expr: Expr): Boolean =
+    expr match
+      case Expr.ListExpr(Expr.Symbol("else", _) :: _, _) => true
+      case _                                             => false
+
+  private def reRaiseGuardClause(name: String, namePos: SourcePos, pos: SourcePos): Expr =
+    Expr.ListExpr(
+      List(
+        Expr.Symbol("else", pos),
+        Expr.ListExpr(
+          List(
+            Expr.Symbol("raise", pos),
+            Expr.Symbol(name, namePos)
+          ),
+          pos
+        )
+      ),
+      pos
+    )

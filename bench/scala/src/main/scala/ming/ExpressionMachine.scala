@@ -7,9 +7,10 @@ private[ming] enum MachineState:
 
 final private[ming] class Machine(private[ming] val context: EvalContext):
 
-  private[ming] var state: MachineState             = MachineState.ApplyValue(Value.Void)
-  private[ming] var frames: List[ContinuationFrame] = Nil
-  private[ming] var winds: List[DynamicWindContext] = Nil
+  private[ming] var state: MachineState                     = MachineState.ApplyValue(Value.Void)
+  private[ming] var frames: List[ContinuationFrame]         = Nil
+  private[ming] var winds: List[DynamicWindContext]         = Nil
+  private[ming] var handlers: List[ExceptionHandlerContext] = Nil
 
   def runExpr(expr: Expr, env: Env): Value =
     state = MachineState.EvalExpr(expr, env)
@@ -58,3 +59,10 @@ final private[ming] class Machine(private[ming] val context: EvalContext):
   private[ming] def deactivateWind(wind: DynamicWindContext): Unit =
     if winds.nonEmpty && (winds.last eq wind) then winds = winds.init
     else winds = winds.filterNot(existing => existing eq wind)
+
+  private[ming] def activateHandler(handler: ExceptionHandlerContext): Unit =
+    handlers = handlers :+ handler
+
+  private[ming] def deactivateHandler(handler: ExceptionHandlerContext): Unit =
+    if handlers.nonEmpty && (handlers.last eq handler) then handlers = handlers.init
+    else handlers = handlers.filterNot(existing => existing eq handler)

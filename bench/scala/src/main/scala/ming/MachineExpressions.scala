@@ -96,6 +96,8 @@ private[ming] object MachineExpressions:
         startLetrec(machine, args, env, formPos, sequential = true)
       case Expr.Symbol("cond", formPos) :: args =>
         startCond(machine, args, env, formPos)
+      case Expr.Symbol("guard", formPos) :: args =>
+        machine.setExpr(SpecialFormTransforms.desugarGuard(args, formPos), env)
       case Expr.Symbol("case", formPos) :: args =>
         startCase(machine, args, env, formPos)
       case Expr.Symbol("do", formPos) :: args =>

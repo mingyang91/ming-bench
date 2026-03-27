@@ -6,6 +6,14 @@ final private[ming] class DynamicWindContext(
   val pos: SourcePos
 )
 
+final private[ming] class ExceptionHandlerContext(
+  val handler: Value,
+  val outerFrames: List[ContinuationFrame],
+  val outerWinds: List[DynamicWindContext],
+  val outerHandlers: List[ExceptionHandlerContext],
+  val pos: SourcePos
+)
+
 sealed private[ming] trait ContinuationFrame
 
 private[ming] object ContinuationFrame:
@@ -64,6 +72,24 @@ private[ming] object ContinuationFrame:
   final case class DynamicWindEntered(bodyThunk: Value, wind: DynamicWindContext) extends ContinuationFrame
   final case class DynamicWindBodyResult(wind: DynamicWindContext)                extends ContinuationFrame
   final case class DynamicWindOutResult(bodyResult: Value)                        extends ContinuationFrame
+  final case class WithExceptionHandlerResult(handler: ExceptionHandlerContext)   extends ContinuationFrame
+  final case class ExceptionHandlerReturned(raisePos: SourcePos)                  extends ContinuationFrame
+
+  final case class ExceptionWindExit(
+    remaining: List[DynamicWindContext],
+    entering: List[DynamicWindContext],
+    handler: ExceptionHandlerContext,
+    exception: Value,
+    raisePos: SourcePos
+  ) extends ContinuationFrame
+
+  final case class ExceptionWindEnter(
+    current: DynamicWindContext,
+    remaining: List[DynamicWindContext],
+    handler: ExceptionHandlerContext,
+    exception: Value,
+    raisePos: SourcePos
+  ) extends ContinuationFrame
 
   final case class ContinuationWindExit(
     remaining: List[DynamicWindContext],
@@ -81,7 +107,8 @@ private[ming] object ContinuationFrame:
 
 final private[ming] class ContinuationSnapshot(
   val frames: List[ContinuationFrame],
-  val winds: List[DynamicWindContext]
+  val winds: List[DynamicWindContext],
+  val handlers: List[ExceptionHandlerContext]
 )
 
 final private[ming] class EvalContext:

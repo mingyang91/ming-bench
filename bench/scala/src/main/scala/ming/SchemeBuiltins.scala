@@ -18,6 +18,8 @@ private[ming] object Builtins:
     "eq?",
     "eqv?",
     "equal?",
+    "raise",
+    "with-exception-handler",
     "map",
     "for-each",
     "apply",

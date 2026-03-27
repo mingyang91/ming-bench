@@ -41,6 +41,15 @@ private[ming] object MachineContinuations:
         MachineProcedures.continueDynamicWindBody(machine, wind, value)
       case DynamicWindOutResult(bodyResult) =>
         machine.setValue(bodyResult)
+      case WithExceptionHandlerResult(handler) =>
+        machine.deactivateHandler(handler)
+        machine.setValue(value)
+      case ExceptionHandlerReturned(raisePos) =>
+        throw EvalError.at(raisePos, "raise handler returned")
+      case ExceptionWindExit(remaining, entering, handler, exception, raisePos) =>
+        MachineExceptions.continueRaiseAfterExit(machine, remaining, entering, handler, exception, raisePos)
+      case ExceptionWindEnter(current, remaining, handler, exception, raisePos) =>
+        continueExceptionWindEnter(machine, current, remaining, handler, exception, raisePos)
       case ContinuationWindExit(remaining, entering, snapshot, capturedValue) =>
         MachineProcedures.continueContinuationTransferAfterExit(machine, remaining, entering, snapshot, capturedValue)
       case ContinuationWindEnter(current, remaining, snapshot, capturedValue) =>
@@ -202,6 +211,17 @@ private[ming] object MachineContinuations:
     machine.activateWind(wind)
     machine.push(DynamicWindBodyResult(wind))
     machine.setInvoke(bodyThunk, Nil, wind.pos)
+
+  private def continueExceptionWindEnter(
+    machine: Machine,
+    current: DynamicWindContext,
+    remaining: List[DynamicWindContext],
+    handler: ExceptionHandlerContext,
+    exception: Value,
+    raisePos: SourcePos
+  ): Unit =
+    machine.activateWind(current)
+    MachineExceptions.continueRaiseAfterEnter(machine, remaining, handler, exception, raisePos)
 
   private def continueContinuationWindEnter(
     machine: Machine,

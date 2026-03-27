@@ -10,6 +10,7 @@ private[ming] object MacroSyntax:
     "cond",
     "define",
     "define-syntax",
+    "guard",
     "if",
     "lambda",
     "let",
