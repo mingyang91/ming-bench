@@ -58,6 +58,8 @@ final class Interpreter {
         env.define("string-append", new BuiltinProcedure("string-append", this::applyStringAppend));
         env.define("string-length", new BuiltinProcedure("string-length", this::applyStringLength));
         env.define("substring", new BuiltinProcedure("substring", this::applySubstring));
+        env.define("string-copy", new BuiltinProcedure("string-copy", this::applyStringCopy));
+        env.define("string-set!", new BuiltinProcedure("string-set!", this::applyStringSet));
         env.define("string->number", new BuiltinProcedure("string->number", this::applyStringToNumber));
         env.define("number->string", new BuiltinProcedure("number->string", this::applyNumberToString));
         env.define("symbol->string", new BuiltinProcedure("symbol->string", this::applySymbolToString));
@@ -77,6 +79,7 @@ final class Interpreter {
             case NumberExpr numberExpr -> new NumberValue(numberExpr.value());
             case BooleanExpr booleanExpr -> booleanExpr.value() ? TRUE : FALSE;
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case CharExpr charExpr -> new CharValue(charExpr.codePoint());
             case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name(), symbolExpr.loc());
             case ListExpr listExpr -> evalList(listExpr, env);
         };
@@ -451,6 +454,20 @@ final class Interpreter {
         return new StringValue(value.substring(startOffset, endOffset));
     }
 
+    private Value applyStringCopy(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string-copy", arguments, 1, callLoc);
+        return requireStringValue(arguments.getFirst(), "string-copy", callLoc).copy(true);
+    }
+
+    private Value applyStringSet(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string-set!", arguments, 3, callLoc);
+        StringValue stringValue = requireStringValue(arguments.get(0), "string-set!", callLoc);
+        int index = requireIndex(arguments.get(1), "string-set!", callLoc);
+        CharValue charValue = requireChar(arguments.get(2), "string-set!", callLoc);
+        stringValue.setCodePoint(index, charValue.codePoint(), callLoc);
+        return VOID;
+    }
+
     private Value applyStringToNumber(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("string->number", arguments, 1, callLoc);
         String value = requireString(arguments.getFirst(), "string->number", callLoc);
@@ -553,6 +570,7 @@ final class Interpreter {
             case NumberExpr numberExpr -> new NumberValue(numberExpr.value());
             case BooleanExpr booleanExpr -> booleanExpr.value() ? TRUE : FALSE;
             case StringExpr stringExpr -> new StringValue(stringExpr.value());
+            case CharExpr charExpr -> new CharValue(charExpr.codePoint());
             case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
             case ListExpr listExpr -> quoteList(listExpr.elements());
         };
@@ -612,8 +630,13 @@ final class Interpreter {
 
     private String requireString(Value value, String procedureName, SourceLoc callLoc)
             throws EvalError {
+        return requireStringValue(value, procedureName, callLoc).text();
+    }
+
+    private StringValue requireStringValue(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
         if (value instanceof StringValue stringValue) {
-            return stringValue.value();
+            return stringValue;
         }
         throw error(callLoc, procedureName + " expects string arguments");
     }
@@ -624,6 +647,14 @@ final class Interpreter {
             return symbolValue.name();
         }
         throw error(callLoc, procedureName + " expects symbol arguments");
+    }
+
+    private CharValue requireChar(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        if (value instanceof CharValue charValue) {
+            return charValue;
+        }
+        throw error(callLoc, procedureName + " expects character arguments");
     }
 
     private int requireIndex(Value value, String procedureName, SourceLoc callLoc)
@@ -734,7 +765,7 @@ final class Interpreter {
         Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError;
     }
 
-    private sealed interface Expr permits NumberExpr, BooleanExpr, StringExpr, SymbolExpr, ListExpr {
+    private sealed interface Expr permits NumberExpr, BooleanExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
         SourceLoc loc();
     }
 
@@ -774,6 +805,9 @@ final class Interpreter {
     private record StringExpr(SourceLoc loc, String value) implements Expr {
     }
 
+    private record CharExpr(SourceLoc loc, int codePoint) implements Expr {
+    }
+
     private record SymbolExpr(SourceLoc loc, String name) implements Expr {
     }
 
@@ -799,15 +833,50 @@ final class Interpreter {
         }
     }
 
-    private record StringValue(String value) implements Value {
+    private static final class StringValue implements Value {
+        private final StringBuilder contents;
+        private final boolean mutable;
+
+        private StringValue(String value) {
+            this(value, false);
+        }
+
+        private StringValue(String value, boolean mutable) {
+            this.contents = new StringBuilder(value);
+            this.mutable = mutable;
+        }
+
         @Override
         public String render() {
-            return renderString(value);
+            return renderString(text());
         }
 
         @Override
         public String displayRender() {
-            return value;
+            return text();
+        }
+
+        private String text() {
+            return contents.toString();
+        }
+
+        private StringValue copy(boolean mutableCopy) {
+            return new StringValue(text(), mutableCopy);
+        }
+
+        private void setCodePoint(int index, int codePoint, SourceLoc callLoc) throws EvalError {
+            if (!mutable) {
+                throw error(callLoc, "string-set! expects a mutable string");
+            }
+
+            int length = contents.codePointCount(0, contents.length());
+            if (index >= length) {
+                throw error(callLoc, "string-set! index is out of bounds");
+            }
+
+            int startOffset = contents.offsetByCodePoints(0, index);
+            int endOffset = contents.offsetByCodePoints(startOffset, 1);
+            contents.replace(startOffset, endOffset, new String(Character.toChars(codePoint)));
         }
     }
 
@@ -1072,7 +1141,7 @@ final class Interpreter {
             };
         }
 
-        private Expr parseAtom() {
+        private Expr parseAtom() throws EvalError {
             SourceLoc start = currentLoc();
             StringBuilder builder = new StringBuilder();
             while (!isAtEnd() && !isDelimiter(peek())) {
@@ -1085,6 +1154,9 @@ final class Interpreter {
             }
             if ("#f".equals(token)) {
                 return new BooleanExpr(start, false);
+            }
+            if (token.startsWith("#\\")) {
+                return new CharExpr(start, parseCharacterLiteral(token, start));
             }
             if (isIntegerToken(token)) {
                 return new NumberExpr(start, Rational.integer(new BigInteger(token)));
@@ -1161,6 +1233,20 @@ final class Interpreter {
                 }
             }
             return true;
+        }
+
+        private int parseCharacterLiteral(String token, SourceLoc loc) throws EvalError {
+            String literal = token.substring(2);
+            return switch (literal) {
+                case "space" -> ' ';
+                case "newline" -> '\n';
+                default -> {
+                    if (literal.codePointCount(0, literal.length()) != 1) {
+                        throw error(loc, "invalid character literal");
+                    }
+                    yield literal.codePointAt(0);
+                }
+            };
         }
     }
 
