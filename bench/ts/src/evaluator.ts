@@ -113,6 +113,11 @@ type UninitializedValue = {
   name: string;
 };
 
+type MultipleValuesValue = {
+  kind: 'multiple-values';
+  values: SchemeValue[];
+};
+
 type EvaluationContext = {
   output: string[];
 };
@@ -154,6 +159,7 @@ type SchemeValue =
   | EmptyListValue
   | VoidValue
   | UninitializedValue
+  | MultipleValuesValue
   | ProcedureValue;
 
 type Token =
@@ -697,6 +703,17 @@ function createBuiltins(context: EvaluationContext, runtime: RuntimeState): Map<
         const listArgs = listToArray(listArg, 'apply', pos);
 
         return applyProcedureCps(procedure, [...prefixArgs, ...listArgs], pos, continuation);
+      }),
+    ],
+    ['values', builtin('values', (args) => packValues(args))],
+    [
+      'call-with-values',
+      controlBuiltin('call-with-values', (args, pos, continuation) => {
+        expectArity('call-with-values', args, 2, pos);
+        const [producer, consumer] = args;
+        return applyProcedureCps(producer, [], pos, (producedValue) =>
+          applyProcedureCps(consumer, unpackValues(producedValue), pos, continuation),
+        );
       }),
     ],
     ['call/cc', makeCallWithCurrentContinuationBuiltin('call/cc', runtime)],
@@ -3423,6 +3440,25 @@ function isRecordValue(value: SchemeValue): value is RecordValue {
   return typeof value === 'object' && value !== null && value.kind === 'record';
 }
 
+function isMultipleValues(value: SchemeValue): value is MultipleValuesValue {
+  return typeof value === 'object' && value !== null && value.kind === 'multiple-values';
+}
+
+function packValues(values: SchemeValue[]): SchemeValue {
+  if (values.length === 1) {
+    return values[0];
+  }
+
+  return {
+    kind: 'multiple-values',
+    values: [...values],
+  };
+}
+
+function unpackValues(value: SchemeValue): SchemeValue[] {
+  return isMultipleValues(value) ? value.values : [value];
+}
+
 function sameNumberLiteral(left: NumberValue, right: NumberValue): boolean {
   if (left.exact && right.exact) {
     return left.numerator === right.numerator && left.denominator === right.denominator;
@@ -4658,6 +4694,10 @@ function formatValueInternal(value: SchemeValue, display: boolean, path: Set<obj
 
   if (isChar(value)) {
     return display ? value.value : formatCharLiteral(value.value);
+  }
+
+  if (isMultipleValues(value)) {
+    return '#<values>';
   }
 
   if (isBuiltin(value)) {

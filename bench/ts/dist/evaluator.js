@@ -484,6 +484,15 @@ function createBuiltins(context, runtime) {
                 return applyProcedureCps(procedure, [...prefixArgs, ...listArgs], pos, continuation);
             }),
         ],
+        ['values', builtin('values', (args) => packValues(args))],
+        [
+            'call-with-values',
+            controlBuiltin('call-with-values', (args, pos, continuation) => {
+                expectArity('call-with-values', args, 2, pos);
+                const [producer, consumer] = args;
+                return applyProcedureCps(producer, [], pos, (producedValue) => applyProcedureCps(consumer, unpackValues(producedValue), pos, continuation));
+            }),
+        ],
         ['call/cc', makeCallWithCurrentContinuationBuiltin('call/cc', runtime)],
         [
             'call-with-current-continuation',
@@ -2439,6 +2448,21 @@ function isEmptyList(value) {
 function isRecordValue(value) {
     return typeof value === 'object' && value !== null && value.kind === 'record';
 }
+function isMultipleValues(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'multiple-values';
+}
+function packValues(values) {
+    if (values.length === 1) {
+        return values[0];
+    }
+    return {
+        kind: 'multiple-values',
+        values: [...values],
+    };
+}
+function unpackValues(value) {
+    return isMultipleValues(value) ? value.values : [value];
+}
 function sameNumberLiteral(left, right) {
     if (left.exact && right.exact) {
         return left.numerator === right.numerator && left.denominator === right.denominator;
@@ -3290,6 +3314,9 @@ function formatValueInternal(value, display, path) {
     }
     if (isChar(value)) {
         return display ? value.value : formatCharLiteral(value.value);
+    }
+    if (isMultipleValues(value)) {
+        return '#<values>';
     }
     if (isBuiltin(value)) {
         return `#<procedure:${value.name}>`;
