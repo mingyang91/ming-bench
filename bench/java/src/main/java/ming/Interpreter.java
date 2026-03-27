@@ -55,6 +55,7 @@ final class Interpreter {
         env.define("list", new BuiltinProcedure("list", this::applyList));
         env.define("length", new BuiltinProcedure("length", this::applyLength));
         env.define("append", new BuiltinProcedure("append", this::applyAppend));
+        env.define("apply", new BuiltinProcedure("apply", this::applyApply));
         env.define("string-append", new BuiltinProcedure("string-append", this::applyStringAppend));
         env.define("string-length", new BuiltinProcedure("string-length", this::applyStringLength));
         env.define("substring", new BuiltinProcedure("substring", this::applySubstring));
@@ -160,12 +161,18 @@ final class Interpreter {
                 throw error(nameExpr.loc(), "define requires a function name");
             }
 
-            List<String> parameters = parseParameters(
+            ParameterSpec parameters = parseParameters(
                     signature.elements().subList(1, signature.elements().size()),
                     "define"
             );
             List<Expr> body = List.copyOf(listExpr.elements().subList(2, listExpr.elements().size()));
-            UserProcedure procedure = new UserProcedure(nameSymbol.name(), parameters, body, env);
+            UserProcedure procedure = new UserProcedure(
+                    nameSymbol.name(),
+                    parameters.requiredParameters(),
+                    parameters.restParameter(),
+                    body,
+                    env
+            );
             env.define(nameSymbol.name(), procedure);
             return VOID;
         }
@@ -192,9 +199,15 @@ final class Interpreter {
             throw error(parametersExpr.loc(), "lambda requires a parameter list");
         }
 
-        List<String> parameters = parseParameters(parametersList.elements(), "lambda");
+        ParameterSpec parameters = parseParameters(parametersList.elements(), "lambda");
         List<Expr> body = List.copyOf(listExpr.elements().subList(2, listExpr.elements().size()));
-        return new UserProcedure("lambda", parameters, body, env);
+        return new UserProcedure(
+                "lambda",
+                parameters.requiredParameters(),
+                parameters.restParameter(),
+                body,
+                env
+        );
     }
 
     private Value evalSet(ListExpr listExpr, Environment env) throws EvalError {
@@ -237,6 +250,7 @@ final class Interpreter {
             UserProcedure procedure = new UserProcedure(
                     nameSymbol.name(),
                     bindings.names(),
+                    null,
                     body,
                     namedLetEnv
             );
@@ -440,6 +454,26 @@ final class Interpreter {
         return result;
     }
 
+    private Value applyApply(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("apply", arguments, 2, callLoc);
+
+        Value procedureValue = arguments.getFirst();
+        if (!(procedureValue instanceof Procedure procedure)) {
+            throw error(callLoc, "apply expects a procedure as its first argument");
+        }
+
+        List<Value> appliedArguments = new ArrayList<>();
+        for (int index = 1; index < arguments.size() - 1; index++) {
+            appliedArguments.add(arguments.get(index));
+        }
+        appliedArguments.addAll(requireProperList(
+                arguments.get(arguments.size() - 1),
+                "apply",
+                callLoc
+        ));
+        return procedure.apply(appliedArguments, callLoc);
+    }
+
     private Value applyStringAppend(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         StringBuilder builder = new StringBuilder();
         for (Value argument : arguments) {
@@ -624,16 +658,34 @@ final class Interpreter {
         return new BindingParseResult(List.copyOf(names), List.copyOf(values));
     }
 
-    private List<String> parseParameters(List<Expr> parameterExprs, String formName)
+    private ParameterSpec parseParameters(List<Expr> parameterExprs, String formName)
             throws EvalError {
         List<String> parameters = new ArrayList<>(parameterExprs.size());
-        for (Expr parameterExpr : parameterExprs) {
+        String restParameter = null;
+
+        for (int index = 0; index < parameterExprs.size(); index++) {
+            Expr parameterExpr = parameterExprs.get(index);
             if (!(parameterExpr instanceof SymbolExpr symbolExpr)) {
                 throw error(parameterExpr.loc(), formName + " parameters must be symbols");
             }
+
+            if (".".equals(symbolExpr.name())) {
+                if (restParameter != null || index != parameterExprs.size() - 2) {
+                    throw error(symbolExpr.loc(), formName + " has invalid dotted parameter list");
+                }
+
+                Expr restExpr = parameterExprs.get(index + 1);
+                if (!(restExpr instanceof SymbolExpr restSymbol)
+                        || ".".equals(restSymbol.name())) {
+                    throw error(restExpr.loc(), formName + " has invalid dotted parameter list");
+                }
+                restParameter = restSymbol.name();
+                break;
+            }
+
             parameters.add(symbolExpr.name());
         }
-        return List.copyOf(parameters);
+        return new ParameterSpec(List.copyOf(parameters), restParameter);
     }
 
     private Rational requireNumber(Value value, String procedureName, SourceLoc callLoc)
@@ -806,29 +858,23 @@ final class Interpreter {
         }
     }
 
-    private record SourceLoc(int line, int column) {
-    }
+    private record SourceLoc(int line, int column) { }
 
-    private record BindingParseResult(List<String> names, List<Value> values) {
-    }
+    private record BindingParseResult(List<String> names, List<Value> values) { }
 
-    private record NumberExpr(SourceLoc loc, Rational value) implements Expr {
-    }
+    private record ParameterSpec(List<String> requiredParameters, String restParameter) { }
 
-    private record BooleanExpr(SourceLoc loc, boolean value) implements Expr {
-    }
+    private record NumberExpr(SourceLoc loc, Rational value) implements Expr { }
 
-    private record StringExpr(SourceLoc loc, String value) implements Expr {
-    }
+    private record BooleanExpr(SourceLoc loc, boolean value) implements Expr { }
 
-    private record CharExpr(SourceLoc loc, int codePoint) implements Expr {
-    }
+    private record StringExpr(SourceLoc loc, String value) implements Expr { }
 
-    private record SymbolExpr(SourceLoc loc, String name) implements Expr {
-    }
+    private record CharExpr(SourceLoc loc, int codePoint) implements Expr { }
 
-    private record ListExpr(SourceLoc loc, List<Expr> elements) implements Expr {
-    }
+    private record SymbolExpr(SourceLoc loc, String name) implements Expr { }
+
+    private record ListExpr(SourceLoc loc, List<Expr> elements) implements Expr { }
 
     private record NumberValue(Rational value) implements Value {
         @Override
@@ -990,12 +1036,20 @@ final class Interpreter {
     private final class UserProcedure implements Value, Procedure {
         private final String name;
         private final List<String> parameters;
+        private final String restParameter;
         private final List<Expr> body;
         private final Environment closureEnv;
 
-        private UserProcedure(String name, List<String> parameters, List<Expr> body, Environment closureEnv) {
+        private UserProcedure(
+                String name,
+                List<String> parameters,
+                String restParameter,
+                List<Expr> body,
+                Environment closureEnv
+        ) {
             this.name = name;
             this.parameters = parameters;
+            this.restParameter = restParameter;
             this.body = body;
             this.closureEnv = closureEnv;
         }
@@ -1007,15 +1061,30 @@ final class Interpreter {
 
         @Override
         public Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError {
-            if (arguments.size() != parameters.size()) {
-                throw error(callLoc,
+            if (restParameter == null && arguments.size() != parameters.size()) {
+                throw error(
+                        callLoc,
                         name + " expected " + parameters.size() + " arguments but got "
-                                + arguments.size());
+                                + arguments.size()
+                );
+            }
+            if (restParameter != null && arguments.size() < parameters.size()) {
+                throw error(
+                        callLoc,
+                        name + " expected at least " + parameters.size() + " arguments but got "
+                                + arguments.size()
+                );
             }
 
             Environment callEnv = new Environment(closureEnv);
             for (int index = 0; index < parameters.size(); index++) {
                 callEnv.define(parameters.get(index), arguments.get(index));
+            }
+            if (restParameter != null) {
+                callEnv.define(
+                        restParameter,
+                        buildList(arguments.subList(parameters.size(), arguments.size()))
+                );
             }
             return evalSequence(body, callEnv);
         }

@@ -89,6 +89,7 @@ struct BuiltinProcedure {
 struct LambdaProcedure {
     name: Option<String>,
     params: Vec<String>,
+    rest: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
 }
@@ -207,6 +208,10 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "=", builtin_numeric_equals);
     define_builtin(&env, "<=", builtin_less_equal);
     define_builtin(&env, "not", builtin_not);
+    define_builtin(&env, "null?", builtin_null_predicate);
+    define_builtin(&env, "car", builtin_car);
+    define_builtin(&env, "cdr", builtin_cdr);
+    define_builtin(&env, "apply", builtin_apply);
     define_builtin(&env, "display", builtin_display);
     define_builtin(&env, "write", builtin_write);
     define_builtin(&env, "newline", builtin_newline);
@@ -352,22 +357,53 @@ fn build_lambda(
         ));
     }
 
-    let mut param_names = Vec::with_capacity(params.len());
-    for param in params {
-        let Expr::Symbol(name) = param else {
-            return Err(EvalError::msg("lambda parameters must be symbols"));
-        };
-        param_names.push(name.clone());
-    }
+    let (param_names, rest_param) = parse_parameter_list(params)?;
 
     Ok(Value::Procedure(Rc::new(Procedure::Lambda(
         LambdaProcedure {
             name,
             params: param_names,
+            rest: rest_param,
             body: body.to_vec(),
             env: Rc::clone(env),
         },
     ))))
+}
+
+fn parse_parameter_list(params: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
+    let mut param_names = Vec::with_capacity(params.len());
+    let mut saw_dot = false;
+    let mut rest_param = None;
+
+    for (index, param) in params.iter().enumerate() {
+        let Expr::Symbol(name) = param else {
+            return Err(EvalError::msg("lambda parameters must be symbols"));
+        };
+
+        if name == "." {
+            if saw_dot || index + 1 >= params.len() {
+                return Err(EvalError::msg("invalid dotted parameter list"));
+            }
+            saw_dot = true;
+            continue;
+        }
+
+        if saw_dot {
+            if index + 1 != params.len() {
+                return Err(EvalError::msg("invalid dotted parameter list"));
+            }
+            rest_param = Some(name.clone());
+            break;
+        }
+
+        param_names.push(name.clone());
+    }
+
+    if saw_dot && rest_param.is_none() {
+        return Err(EvalError::msg("invalid dotted parameter list"));
+    }
+
+    Ok((param_names, rest_param))
 }
 
 fn eval_sequence(
@@ -434,15 +470,28 @@ fn apply_lambda(
     arguments: Vec<Value>,
     output: &OutputRef,
 ) -> Result<Value, EvalError> {
-    ensure_exactly(
-        lambda.name.as_deref().unwrap_or("lambda"),
-        arguments.len(),
-        lambda.params.len(),
-    )?;
+    let procedure_name = lambda.name.as_deref().unwrap_or("lambda");
+    if lambda.rest.is_some() {
+        ensure_at_least(procedure_name, arguments.len(), lambda.params.len())?;
+    } else {
+        ensure_exactly(procedure_name, arguments.len(), lambda.params.len())?;
+    }
 
     let call_env = Environment::new(Some(Rc::clone(&lambda.env)));
-    for (name, value) in lambda.params.iter().zip(arguments.into_iter()) {
+    let mut arguments = arguments.into_iter();
+    for name in &lambda.params {
+        let value = arguments
+            .next()
+            .expect("arity check ensures enough arguments for fixed parameters");
         Environment::define(&call_env, name.clone(), value);
+    }
+
+    if let Some(rest_name) = &lambda.rest {
+        Environment::define(
+            &call_env,
+            rest_name.clone(),
+            Value::List(arguments.collect()),
+        );
     }
 
     eval_sequence(&lambda.body, &call_env, output)
@@ -524,6 +573,49 @@ fn builtin_less_equal(arguments: &[Value], _output: &OutputRef) -> Result<Value,
 fn builtin_not(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     ensure_exactly("not", arguments.len(), 1)?;
     Ok(Value::Bool(!arguments[0].is_truthy()))
+}
+
+fn builtin_null_predicate(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("null?", arguments.len(), 1)?;
+    Ok(Value::Bool(matches!(
+        &arguments[0],
+        Value::List(values) if values.is_empty()
+    )))
+}
+
+fn builtin_car(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("car", arguments.len(), 1)?;
+    match &arguments[0] {
+        Value::List(values) if !values.is_empty() => Ok(values[0].clone()),
+        Value::List(_) => Err(EvalError::msg("car expects a non-empty list")),
+        _ => Err(EvalError::msg("car expects a list")),
+    }
+}
+
+fn builtin_cdr(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("cdr", arguments.len(), 1)?;
+    match &arguments[0] {
+        Value::List(values) if !values.is_empty() => Ok(Value::List(values[1..].to_vec())),
+        Value::List(_) => Err(EvalError::msg("cdr expects a non-empty list")),
+        _ => Err(EvalError::msg("cdr expects a list")),
+    }
+}
+
+fn builtin_apply(arguments: &[Value], output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_at_least("apply", arguments.len(), 2)?;
+
+    let trailing_args = match arguments.last() {
+        Some(Value::List(values)) => values.clone(),
+        Some(_) => return Err(EvalError::msg("apply expects a list as its last argument")),
+        None => unreachable!("arity check guarantees at least two arguments"),
+    };
+
+    let mut applied_args =
+        Vec::with_capacity(arguments.len().saturating_sub(1) + trailing_args.len());
+    applied_args.extend(arguments[1..arguments.len() - 1].iter().cloned());
+    applied_args.extend(trailing_args);
+
+    apply(arguments[0].clone(), applied_args, output)
 }
 
 fn builtin_display(arguments: &[Value], output: &OutputRef) -> Result<Value, EvalError> {
