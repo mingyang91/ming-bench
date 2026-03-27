@@ -6,6 +6,7 @@ use super::continuation::{
     current_continuation_value, Continuation, ContinuationRef, EvalResult, EvalSignal,
     RaisedException,
 };
+use super::macros::{datum_from_syntax_value, datum_to_syntax_value};
 use super::number::{parse_number_string, Number};
 use super::value_ops::{
     collect_list_items, is_empty_list, is_proper_list, list_from_vec, pair_parts, values_eq,
@@ -128,6 +129,8 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::VectorPred,
         BuiltinKind::VectorToList,
         BuiltinKind::ListToVector,
+        BuiltinKind::SyntaxToDatum,
+        BuiltinKind::DatumToSyntax,
     ] {
         env_define(
             &env,
@@ -370,6 +373,8 @@ fn apply_builtin_without_context(
         }
         BuiltinKind::VectorToList => eval_vector_to_list(args),
         BuiltinKind::ListToVector => eval_list_to_vector(args),
+        BuiltinKind::SyntaxToDatum => eval_syntax_to_datum(args),
+        BuiltinKind::DatumToSyntax => eval_datum_to_syntax(args),
     }
 }
 
@@ -1062,6 +1067,30 @@ fn eval_string_to_symbol(args: &[Value]) -> Result<Value, EvalError> {
     };
 
     Ok(Value::Symbol(value.as_string()?.to_string()))
+}
+
+fn eval_syntax_to_datum(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "syntax->datum".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    datum_from_syntax_value(value)
+}
+
+fn eval_datum_to_syntax(args: &[Value]) -> Result<Value, EvalError> {
+    let [context, datum] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "datum->syntax".into(),
+            expected: "exactly 2 arguments".into(),
+            got: args.len(),
+        });
+    };
+
+    datum_to_syntax_value(context, datum)
 }
 
 fn eval_string_ref(args: &[Value]) -> Result<Value, EvalError> {

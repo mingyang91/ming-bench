@@ -48,6 +48,7 @@ pub(super) fn pair_parts(value: &Value) -> Option<(Value, Value)> {
         | Value::MutableString(_)
         | Value::Symbol(_)
         | Value::Char(_)
+        | Value::Syntax(_)
         | Value::Vector(_)
         | Value::Procedure(_)
         | Value::NativeProcedure(_)
@@ -109,6 +110,7 @@ pub(super) fn is_proper_list(value: &Value) -> bool {
             | Value::MutableString(_)
             | Value::Symbol(_)
             | Value::Char(_)
+            | Value::Syntax(_)
             | Value::Vector(_)
             | Value::Procedure(_)
             | Value::NativeProcedure(_)
@@ -134,6 +136,7 @@ pub(super) fn values_eq(lhs: &Value, rhs: &Value) -> bool {
         (Value::MutableString(lhs), Value::MutableString(rhs)) => *lhs.borrow() == *rhs.borrow(),
         (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
         (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+        (Value::Syntax(lhs), Value::Syntax(rhs)) => super::macros::match_values_equal(lhs, rhs),
         (Value::Pair(lhs), Value::Pair(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Vector(lhs), Value::Vector(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
@@ -182,6 +185,7 @@ pub(super) fn values_equal(lhs: &Value, rhs: &Value) -> bool {
             }
             (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
             (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+            (Value::Syntax(lhs), Value::Syntax(rhs)) => super::macros::match_values_equal(lhs, rhs),
             (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
             (Value::Values(lhs), Value::Values(rhs)) => {
                 lhs.len() == rhs.len()

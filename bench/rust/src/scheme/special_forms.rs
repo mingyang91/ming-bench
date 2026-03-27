@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::continuation::{
@@ -5,13 +6,13 @@ use super::continuation::{
     push_wind_frame, sequence_continuation, set_captured_continuation, set_symbol_continuation,
     Continuation, ContinuationRef, EvalResult, EvalSignal, RaisedException,
 };
-use super::macros::{MacroEnvRef, MacroEnvironment};
+use super::macros::{expand_syntax_template, match_syntax_pattern, MacroEnvRef, MacroEnvironment};
 use super::value_ops::{list_from_vec, values_eqv};
 use super::{
     env_define, env_lookup, env_set, eval_expr, eval_sequence, eval_target, make_procedure,
     run_expr_in_cont, single_clause_procedure, tail_borrowed_expr, tail_borrowed_sequence,
     tail_owned_expr, EnvRef, Environment, EvalError, EvalStep, Expr, OwnedExprRef, Procedure,
-    ProcedureClause, Value,
+    ProcedureClause, SourcePos, Value,
 };
 
 pub(super) fn eval_define(
@@ -515,14 +516,29 @@ fn eval_owned_plain_let<'a>(
         .into());
     }
 
-    let bindings = parse_let_bindings(bindings, env, macro_env, continuation)?;
-    let let_env = Environment::new(Some(Rc::clone(env)));
-    for (name, value) in bindings {
-        env_define(&let_env, name, value);
-    }
+    let bindings = parse_binding_exprs(bindings, "let")?;
+    let params = bindings
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let arg_exprs = bindings
+        .iter()
+        .map(|(_, expr)| (*expr).clone())
+        .collect::<Vec<_>>();
+    let procedure =
+        single_clause_procedure(params, None, items[body_start..].to_vec(), env, macro_env);
 
-    let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
-    eval_owned_list_sequence(expr, body_start, &let_env, &let_macro_env, continuation)
+    eval_callable_with_expr_args(
+        procedure,
+        &arg_exprs,
+        env,
+        macro_env,
+        bindings
+            .first()
+            .map(|(_, expr)| expr.position())
+            .unwrap_or_else(|| items[body_start].position()),
+        continuation,
+    )
 }
 
 fn eval_owned_named_let<'a>(
@@ -545,14 +561,14 @@ fn eval_owned_named_let<'a>(
         .into());
     }
 
-    let bindings = parse_let_bindings(bindings, env, macro_env, continuation)?;
+    let bindings = parse_binding_exprs(bindings, "let")?;
     let params = bindings
         .iter()
         .map(|(param, _)| param.clone())
         .collect::<Vec<_>>();
-    let args = bindings
-        .into_iter()
-        .map(|(_, value)| value)
+    let arg_exprs = bindings
+        .iter()
+        .map(|(_, expr)| (*expr).clone())
         .collect::<Vec<_>>();
 
     let let_env = Environment::new(Some(Rc::clone(env)));
@@ -565,7 +581,17 @@ fn eval_owned_named_let<'a>(
     );
     env_define(&let_env, name.to_string(), procedure.clone());
 
-    apply_callable_result(procedure, &args, continuation)
+    eval_callable_with_expr_args(
+        procedure,
+        &arg_exprs,
+        env,
+        macro_env,
+        bindings
+            .first()
+            .map(|(_, expr)| expr.position())
+            .unwrap_or_else(|| items[body_start].position()),
+        continuation,
+    )
 }
 
 pub(super) fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
@@ -577,6 +603,165 @@ pub(super) fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
             got: args.len(),
         }),
     }
+}
+
+pub(super) fn eval_syntax(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    match args {
+        [template] => expand_syntax_template(template, env),
+        _ => Err(EvalError::WrongArgCount {
+            name: "syntax".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        }),
+    }
+}
+
+pub(super) fn eval_syntax_case(
+    args: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    let Some((input_expr, rest)) = args.split_first() else {
+        return Err(EvalError::SyntaxError {
+            message: "syntax-case requires an input, literals, and at least one clause".into(),
+        }
+        .into());
+    };
+
+    let Some((literal_list, clause_exprs)) = rest.split_first() else {
+        return Err(EvalError::SyntaxError {
+            message: "syntax-case requires a literal list and at least one clause".into(),
+        }
+        .into());
+    };
+
+    if clause_exprs.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "syntax-case requires at least one clause".into(),
+        }
+        .into());
+    }
+
+    let Expr::List(literal_items, _) = literal_list else {
+        return Err(EvalError::SyntaxError {
+            message: "syntax-case literal list must be a list".into(),
+        }
+        .into());
+    };
+
+    let literals = literal_items
+        .iter()
+        .map(|literal| match literal {
+            Expr::Symbol(name, _) if name != "..." => Ok(name.clone()),
+            _ => Err(EvalError::SyntaxError {
+                message: "syntax-case literals must be symbols".into(),
+            }),
+        })
+        .collect::<Result<HashSet<_>, _>>()?;
+
+    let input = eval_expr(input_expr, env, macro_env, continuation)?;
+
+    for clause in clause_exprs {
+        let Expr::List(items, _) = clause else {
+            return Err(EvalError::SyntaxError {
+                message: "syntax-case clauses must be lists".into(),
+            }
+            .into());
+        };
+
+        let (pattern, fender, template) = match items.as_slice() {
+            [pattern, template] => (pattern, None, template),
+            [pattern, fender, template] => (pattern, Some(fender), template),
+            _ => return Err(EvalError::SyntaxError {
+                message:
+                    "syntax-case clauses must be (pattern template) or (pattern fender template)"
+                        .into(),
+            }
+            .into()),
+        };
+
+        let Some(bindings) = match_syntax_pattern(pattern, &input, &literals)? else {
+            continue;
+        };
+
+        let clause_env = Environment::new(Some(Rc::clone(env)));
+        for (name, binding) in bindings {
+            env_define(&clause_env, name, Value::Syntax(binding));
+        }
+
+        if let Some(fender) = fender {
+            if !eval_expr(fender, &clause_env, macro_env, continuation)?.is_truthy() {
+                continue;
+            }
+        }
+
+        return eval_expr(template, &clause_env, macro_env, continuation);
+    }
+
+    Err(EvalError::SyntaxError {
+        message: "no matching syntax-case clause".into(),
+    }
+    .into())
+}
+
+pub(super) fn eval_with_syntax(
+    args: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    let Some((bindings_expr, body)) = args.split_first() else {
+        return Err(EvalError::SyntaxError {
+            message: "with-syntax requires bindings and a body".into(),
+        }
+        .into());
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "with-syntax requires a body".into(),
+        }
+        .into());
+    }
+
+    let Expr::List(bindings, _) = bindings_expr else {
+        return Err(EvalError::SyntaxError {
+            message: "with-syntax bindings must be a list".into(),
+        }
+        .into());
+    };
+
+    let syntax_env = Environment::new(Some(Rc::clone(env)));
+    for binding in bindings {
+        let Expr::List(items, _) = binding else {
+            return Err(EvalError::SyntaxError {
+                message: "with-syntax bindings must be (name expr) pairs".into(),
+            }
+            .into());
+        };
+
+        let [Expr::Symbol(name, _), value_expr] = items.as_slice() else {
+            return Err(EvalError::SyntaxError {
+                message: "with-syntax bindings must be (name expr) pairs".into(),
+            }
+            .into());
+        };
+
+        let value = eval_expr(value_expr, env, macro_env, continuation)?;
+        match value {
+            Value::Syntax(_) => env_define(&syntax_env, name.clone(), value),
+            other => {
+                return Err(EvalError::TypeMismatch {
+                    expected: "syntax",
+                    found: other.type_name().into(),
+                }
+                .into())
+            }
+        }
+    }
+
+    eval_sequence(body, &syntax_env, macro_env, continuation)
 }
 
 fn quote_to_value(expr: &Expr) -> Result<Value, EvalError> {
@@ -785,9 +970,10 @@ pub(super) fn apply_callable_result<'a>(
             .map(EvalStep::Value)
             .map_err(Into::into),
         Value::Builtin(builtin) => builtin.apply(args, continuation).map(EvalStep::Value),
-        Value::Continuation(continuation) => {
-            Err(invoke_continuation(continuation, Value::from_values(args.to_vec())))
-        }
+        Value::Continuation(continuation) => Err(invoke_continuation(
+            continuation,
+            Value::from_values(args.to_vec()),
+        )),
         other => Err(EvalError::NotCallable {
             found: other.type_name().into(),
         }
@@ -1362,14 +1548,28 @@ fn eval_plain_let<'a>(
         .into());
     }
 
-    let bindings = parse_let_bindings(bindings, env, macro_env, continuation)?;
-    let let_env = Environment::new(Some(Rc::clone(env)));
-    for (name, value) in bindings {
-        env_define(&let_env, name, value);
-    }
+    let bindings = parse_binding_exprs(bindings, "let")?;
+    let params = bindings
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let arg_exprs = bindings
+        .iter()
+        .map(|(_, expr)| (*expr).clone())
+        .collect::<Vec<_>>();
+    let procedure = single_clause_procedure(params, None, body.to_vec(), env, macro_env);
 
-    let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
-    Ok(tail_borrowed_sequence(body, &let_env, &let_macro_env))
+    eval_callable_with_expr_args(
+        procedure,
+        &arg_exprs,
+        env,
+        macro_env,
+        bindings
+            .first()
+            .map(|(_, expr)| expr.position())
+            .unwrap_or_else(|| body[0].position()),
+        continuation,
+    )
 }
 
 fn eval_named_let<'a>(
@@ -1387,53 +1587,63 @@ fn eval_named_let<'a>(
         .into());
     }
 
-    let bindings = parse_let_bindings(bindings, env, macro_env, continuation)?;
+    let bindings = parse_binding_exprs(bindings, "let")?;
     let params = bindings
         .iter()
         .map(|(param, _)| param.clone())
         .collect::<Vec<_>>();
-    let args = bindings
-        .into_iter()
-        .map(|(_, value)| value)
+    let arg_exprs = bindings
+        .iter()
+        .map(|(_, expr)| (*expr).clone())
         .collect::<Vec<_>>();
 
     let let_env = Environment::new(Some(Rc::clone(env)));
     let procedure = single_clause_procedure(params, None, body.to_vec(), &let_env, macro_env);
     env_define(&let_env, name.to_string(), procedure.clone());
 
-    apply_callable_result(procedure, &args, continuation)
+    eval_callable_with_expr_args(
+        procedure,
+        &arg_exprs,
+        env,
+        macro_env,
+        bindings
+            .first()
+            .map(|(_, expr)| expr.position())
+            .unwrap_or_else(|| body[0].position()),
+        continuation,
+    )
 }
 
-fn parse_let_bindings(
-    bindings: &[Expr],
+fn eval_callable_with_expr_args<'a>(
+    callable: Value,
+    arg_exprs: &[Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
+    head_position: SourcePos,
     continuation: &ContinuationRef,
-) -> EvalResult<Vec<(String, Value)>> {
-    let mut parsed = Vec::with_capacity(bindings.len());
+) -> EvalResult<EvalStep<'a>> {
+    let mut args = Vec::with_capacity(arg_exprs.len());
 
-    for binding in bindings {
-        let Expr::List(items, _) = binding else {
-            return Err(EvalError::SyntaxError {
-                message: "let bindings must be lists".into(),
-            }
-            .into());
-        };
-
-        let [Expr::Symbol(name, _), value_expr] = items.as_slice() else {
-            return Err(EvalError::SyntaxError {
-                message: "let bindings must be (name value) pairs".into(),
-            }
-            .into());
-        };
-
-        parsed.push((
-            name.clone(),
-            eval_expr(value_expr, env, macro_env, continuation)?,
-        ));
+    for index in (0..arg_exprs.len()).rev() {
+        let arg = run_expr_in_cont(
+            &arg_exprs[index],
+            env,
+            macro_env,
+            Rc::new(Continuation::Application {
+                callable: callable.clone(),
+                pending_args: arg_exprs[..index].to_vec(),
+                evaluated_suffix: args.clone(),
+                env: Rc::clone(env),
+                macro_env: Rc::clone(macro_env),
+                head_position,
+                next: Rc::clone(continuation),
+            }),
+        )?;
+        args.insert(0, arg);
     }
 
-    Ok(parsed)
+    apply_callable_result(callable, &args, continuation)
+        .map_err(|signal| signal.with_position(head_position))
 }
 
 fn parse_binding_exprs<'a>(

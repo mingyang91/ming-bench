@@ -48,6 +48,7 @@ impl RenderContext {
                 RenderMode::Write => render_char(*value),
                 RenderMode::Display => value.to_string(),
             },
+            Value::Syntax(_) => "#<syntax>".into(),
             Value::Pair(_) | Value::List(_) => self.render_list_like(value),
             Value::Vector(items) => self.render_vector(items),
             Value::Procedure(_)

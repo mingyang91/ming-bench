@@ -15,7 +15,7 @@ use continuation::{
     ContinuationRef, EvalResult, EvalSignal, RaisedException,
 };
 pub use error::{EvalError, SourcePos};
-use macros::{MacroEnvRef, MacroEnvironment};
+use macros::{MacroEnvRef, MacroEnvironment, MatchValue};
 use number::Number;
 use parser::Parser;
 use record::{define_record_type as eval_define_record_type, NativeProcedure, RecordRef};
@@ -63,6 +63,7 @@ enum Value {
     MutableString(Rc<RefCell<Vec<char>>>),
     Symbol(String),
     Char(char),
+    Syntax(MatchValue),
     Pair(PairRef),
     List(Vec<Value>),
     Vector(Rc<RefCell<Vec<Value>>>),
@@ -211,6 +212,8 @@ enum BuiltinKind {
     VectorPred,
     VectorToList,
     ListToVector,
+    SyntaxToDatum,
+    DatumToSyntax,
 }
 
 struct Environment {
@@ -252,6 +255,7 @@ impl Value {
             Self::String(_) | Self::MutableString(_) => "string",
             Self::Symbol(_) => "symbol",
             Self::Char(_) => "character",
+            Self::Syntax(_) => "syntax",
             Self::Pair(_) => "pair",
             Self::List(_) => "list",
             Self::Vector(_) => "vector",
@@ -330,7 +334,9 @@ impl Value {
 
     fn from_values(mut values: Vec<Value>) -> Self {
         if values.len() == 1 {
-            values.pop().expect("single-value vector must contain a value")
+            values
+                .pop()
+                .expect("single-value vector must contain a value")
         } else {
             Self::Values(values)
         }
@@ -467,6 +473,8 @@ impl BuiltinKind {
             Self::VectorPred => "vector?",
             Self::VectorToList => "vector->list",
             Self::ListToVector => "list->vector",
+            Self::SyntaxToDatum => "syntax->datum",
+            Self::DatumToSyntax => "datum->syntax",
         }
     }
 }
@@ -1132,10 +1140,25 @@ fn eval_borrowed_list_step<'a>(
             "define-syntax" => {
                 return macros::eval_define_syntax(&items[1..], env, macro_env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position).into())
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "if" => {
                 return special_forms::eval_if(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
+            }
+            "syntax" => {
+                return special_forms::eval_syntax(&items[1..], env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position).into())
+            }
+            "syntax-case" => {
+                return special_forms::eval_syntax_case(&items[1..], env, macro_env, continuation)
+                    .map(EvalStep::Value)
+                    .map_err(|signal| signal.with_position(head_position))
+            }
+            "with-syntax" => {
+                return special_forms::eval_with_syntax(&items[1..], env, macro_env, continuation)
+                    .map(EvalStep::Value)
                     .map_err(|signal| signal.with_position(head_position))
             }
             "quote" => {
@@ -1221,7 +1244,11 @@ fn eval_borrowed_list_step<'a>(
     if let Some(expanded) = macros::expand_macro_call(items, position, macro_env)
         .map_err(|err| err.with_position(head_position))?
     {
-        return eval_expr(&expanded, env, macro_env, continuation).map(EvalStep::Value);
+        return Ok(tail_owned_expr(
+            OwnedExprRef::new(Rc::new(expanded)),
+            env,
+            macro_env,
+        ));
     }
 
     let callable = match head {
@@ -1268,10 +1295,25 @@ fn eval_owned_list_step<'a>(
             "define-syntax" => {
                 return macros::eval_define_syntax(&items[1..], env, macro_env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position).into())
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "if" => {
                 return special_forms::eval_owned_if(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
+            }
+            "syntax" => {
+                return special_forms::eval_syntax(&items[1..], env)
+                    .map(EvalStep::Value)
+                    .map_err(|err| err.with_position(head_position).into())
+            }
+            "syntax-case" => {
+                return special_forms::eval_syntax_case(&items[1..], env, macro_env, continuation)
+                    .map(EvalStep::Value)
+                    .map_err(|signal| signal.with_position(head_position))
+            }
+            "with-syntax" => {
+                return special_forms::eval_with_syntax(&items[1..], env, macro_env, continuation)
+                    .map(EvalStep::Value)
                     .map_err(|signal| signal.with_position(head_position))
             }
             "quote" => {
@@ -1357,7 +1399,11 @@ fn eval_owned_list_step<'a>(
     if let Some(expanded) = macros::expand_macro_call(items, position, macro_env)
         .map_err(|err| err.with_position(head_position))?
     {
-        return eval_expr(&expanded, env, macro_env, continuation).map(EvalStep::Value);
+        return Ok(tail_owned_expr(
+            OwnedExprRef::new(Rc::new(expanded)),
+            env,
+            macro_env,
+        ));
     }
 
     let callable = match head {

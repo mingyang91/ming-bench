@@ -40,6 +40,7 @@ impl<'a> Parser<'a> {
         match self.peek_char() {
             Some('(') => self.parse_list(position),
             Some('\'') => self.parse_quote(position),
+            Some('#') if self.peek_prefixed_quote() => self.parse_syntax(position),
             Some('"') => self.parse_string(position),
             Some(')') => Err(EvalError::SyntaxError {
                 message: "unexpected ')'".into(),
@@ -72,6 +73,16 @@ impl<'a> Parser<'a> {
         let quoted = self.parse_expr()?;
         Ok(Expr::List(
             vec![Expr::Symbol("quote".into(), position), quoted],
+            position,
+        ))
+    }
+
+    fn parse_syntax(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
+        self.expect_char('#', position)?;
+        self.expect_char('\'', position)?;
+        let datum = self.parse_expr()?;
+        Ok(Expr::List(
+            vec![Expr::Symbol("syntax".into(), position), datum],
             position,
         ))
     }
@@ -185,6 +196,10 @@ impl<'a> Parser<'a> {
 
     fn peek_char(&self) -> Option<char> {
         self.input[self.pos..].chars().next()
+    }
+
+    fn peek_prefixed_quote(&self) -> bool {
+        self.input[self.pos..].starts_with("#'")
     }
 
     fn advance_char(&mut self) -> Option<char> {
