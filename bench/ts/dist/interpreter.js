@@ -214,8 +214,10 @@ function createBuiltins(output) {
         builtin('>', (args) => compareNumbers('>', args, (left, right) => left > right)),
         builtin('=', (args) => compareNumbers('=', args, (left, right) => left === right)),
         builtin('<=', (args) => compareNumbers('<=', args, (left, right) => left <= right)),
+        builtin('abs', (args) => absoluteValue(args)),
         builtin('apply', (args, position) => applyBuiltin(args, position)),
         builtin('append', (args) => appendValues(args)),
+        builtin('assoc', (args) => assocBuiltin(args)),
         builtin('boolean?', (args) => unaryPredicate('boolean?', args, (value) => typeof value === 'boolean')),
         builtin('car', (args) => {
             assertExactArity('car', args, 1);
@@ -224,6 +226,24 @@ function createBuiltins(output) {
         builtin('cdr', (args) => {
             assertExactArity('cdr', args, 1);
             return expectPair('cdr', args[0]).cdr;
+        }),
+        builtin('char-alphabetic?', (args) => {
+            assertExactArity('char-alphabetic?', args, 1);
+            return isAlphabeticChar(expectCharValue('char-alphabetic?', args[0]).value);
+        }),
+        builtin('char-downcase', (args) => {
+            assertExactArity('char-downcase', args, 1);
+            return { kind: 'char', value: expectCharValue('char-downcase', args[0]).value.toLowerCase() };
+        }),
+        builtin('char-numeric?', (args) => {
+            assertExactArity('char-numeric?', args, 1);
+            return isNumericChar(expectCharValue('char-numeric?', args[0]).value);
+        }),
+        builtin('char<?', (args) => compareChars('char<?', args, (left, right) => left < right)),
+        builtin('char=?', (args) => compareChars('char=?', args, (left, right) => left === right)),
+        builtin('char-upcase', (args) => {
+            assertExactArity('char-upcase', args, 1);
+            return { kind: 'char', value: expectCharValue('char-upcase', args[0]).value.toUpperCase() };
         }),
         builtin('char?', (args) => unaryPredicate('char?', args, isCharValue)),
         builtin('cons', (args) => {
@@ -235,16 +255,37 @@ function createBuiltins(output) {
             output.write(formatDisplayValue(args[0]));
             return VOID;
         }),
+        builtin('eq?', (args) => {
+            assertExactArity('eq?', args, 2);
+            return eqValues(args[0], args[1]);
+        }),
+        builtin('equal?', (args) => {
+            assertExactArity('equal?', args, 2);
+            return equalValues(args[0], args[1]);
+        }),
+        builtin('even?', (args) => integerPredicate('even?', args, (value) => value % 2 === 0)),
+        builtin('expt', (args) => exptNumbers(args)),
         builtin('length', (args) => {
             assertExactArity('length', args, 1);
             return expectProperList('length', args[0]).length;
         }),
         builtin('list', (args) => makeList(args)),
+        builtin('list-ref', (args) => listRefBuiltin(args)),
+        builtin('list-tail', (args) => listTailBuiltin(args)),
+        builtin('list?', (args) => {
+            assertExactArity('list?', args, 1);
+            return isProperListValue(args[0]);
+        }),
+        builtin('map', (args, position) => mapBuiltin(args, position)),
+        builtin('max', (args) => extremum('max', args, (left, right) => (left >= right ? left : right))),
+        builtin('min', (args) => extremum('min', args, (left, right) => (left <= right ? left : right))),
+        builtin('modulo', (args) => moduloNumbers(args)),
         builtin('newline', (args) => {
             assertExactArity('newline', args, 0);
             output.write('\n');
             return VOID;
         }),
+        builtin('negative?', (args) => numberPredicate('negative?', args, (value) => value < 0)),
         builtin('not', (args) => {
             assertExactArity('not', args, 1);
             return !isTruthy(args[0]);
@@ -255,7 +296,11 @@ function createBuiltins(output) {
             return makeMutableString(formatNumber(expectNumberValue('number->string', args[0])));
         }),
         builtin('number?', (args) => unaryPredicate('number?', args, (value) => typeof value === 'number')),
+        builtin('odd?', (args) => integerPredicate('odd?', args, (value) => Math.abs(value % 2) === 1)),
         builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
+        builtin('positive?', (args) => numberPredicate('positive?', args, (value) => value > 0)),
+        builtin('quotient', (args) => quotientNumbers(args)),
+        builtin('remainder', (args) => remainderNumbers(args)),
         builtin('string->number', (args) => {
             assertExactArity('string->number', args, 1);
             return parseStringNumber(expectStringValue('string->number', args[0]));
@@ -269,6 +314,13 @@ function createBuiltins(output) {
             assertExactArity('string-copy', args, 1);
             return makeMutableString(expectStringValue('string-copy', args[0]));
         }),
+        builtin('string-ci=?', (args) => compareStrings('string-ci=?', args, (value) => value.toLowerCase(), (left, right) => left === right)),
+        builtin('string-downcase', (args) => {
+            assertExactArity('string-downcase', args, 1);
+            return makeMutableString(expectStringValue('string-downcase', args[0]).toLowerCase());
+        }),
+        builtin('string<?', (args) => compareStrings('string<?', args, (value) => value, (left, right) => left < right)),
+        builtin('string=?', (args) => compareStrings('string=?', args, (value) => value, (left, right) => left === right)),
         builtin('string-length', (args) => {
             assertExactArity('string-length', args, 1);
             return stringChars(expectStringValue('string-length', args[0])).length;
@@ -294,6 +346,10 @@ function createBuiltins(output) {
             return VOID;
         }),
         builtin('string?', (args) => unaryPredicate('string?', args, isStringValue)),
+        builtin('string-upcase', (args) => {
+            assertExactArity('string-upcase', args, 1);
+            return makeMutableString(expectStringValue('string-upcase', args[0]).toUpperCase());
+        }),
         builtin('substring', (args) => {
             assertExactArity('substring', args, 3);
             const chars = stringChars(expectStringValue('substring', args[0]));
@@ -314,6 +370,7 @@ function createBuiltins(output) {
             output.write(formatValue(args[0]));
             return VOID;
         }),
+        builtin('zero?', (args) => numberPredicate('zero?', args, (value) => value === 0)),
     ]);
 }
 /**
@@ -631,9 +688,47 @@ function applyBuiltin(args, position) {
     const listArgs = expectProperList('apply', args[args.length - 1]);
     return applyProcedure(proc, [...prefixArgs, ...listArgs], position);
 }
+function absoluteValue(args) {
+    assertExactArity('abs', args, 1);
+    return normalizeNumber(Math.abs(expectNumberValue('abs', args[0])));
+}
 function unaryPredicate(name, args, predicate) {
     assertExactArity(name, args, 1);
     return predicate(args[0]);
+}
+function numberPredicate(name, args, predicate) {
+    assertExactArity(name, args, 1);
+    return predicate(expectNumberValue(name, args[0]));
+}
+function integerPredicate(name, args, predicate) {
+    assertExactArity(name, args, 1);
+    return predicate(expectIntegerValue(name, args[0]));
+}
+function compareChars(name, args, compare) {
+    assertAtLeastArity(name, args, 2);
+    const codePoints = args.map((arg) => {
+        const value = expectCharValue(name, arg).value.codePointAt(0);
+        if (value === undefined) {
+            throw new EvalError(`${name} expects valid characters`);
+        }
+        return value;
+    });
+    for (let index = 1; index < codePoints.length; index += 1) {
+        if (!compare(codePoints[index - 1], codePoints[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+function compareStrings(name, args, normalize, compare) {
+    assertAtLeastArity(name, args, 2);
+    const values = args.map((arg) => normalize(expectStringValue(name, arg)));
+    for (let index = 1; index < values.length; index += 1) {
+        if (!compare(values[index - 1], values[index])) {
+            return false;
+        }
+    }
+    return true;
 }
 function sumNumbers(name, args, initial) {
     const numbers = expectNumbers(name, args);
@@ -678,6 +773,52 @@ function compareNumbers(name, args, compare) {
         }
     }
     return true;
+}
+function quotientNumbers(args) {
+    assertExactArity('quotient', args, 2);
+    const dividend = expectIntegerValue('quotient', args[0]);
+    const divisor = expectIntegerValue('quotient', args[1]);
+    if (divisor === 0) {
+        throw new EvalError('division by zero');
+    }
+    return normalizeNumber(Math.trunc(dividend / divisor));
+}
+function remainderNumbers(args) {
+    assertExactArity('remainder', args, 2);
+    const dividend = expectIntegerValue('remainder', args[0]);
+    const divisor = expectIntegerValue('remainder', args[1]);
+    if (divisor === 0) {
+        throw new EvalError('division by zero');
+    }
+    return normalizeNumber(dividend % divisor);
+}
+function moduloNumbers(args) {
+    assertExactArity('modulo', args, 2);
+    const dividend = expectIntegerValue('modulo', args[0]);
+    const divisor = expectIntegerValue('modulo', args[1]);
+    if (divisor === 0) {
+        throw new EvalError('division by zero');
+    }
+    const remainder = dividend % divisor;
+    if (remainder === 0) {
+        return 0;
+    }
+    return normalizeNumber(Math.sign(remainder) === Math.sign(divisor) ? remainder : remainder + divisor);
+}
+function extremum(name, args, select) {
+    const numbers = expectNumbers(name, args);
+    assertAtLeastArity(name, numbers, 1);
+    let result = numbers[0];
+    for (const value of numbers.slice(1)) {
+        result = select(result, value);
+    }
+    return normalizeNumber(result);
+}
+function exptNumbers(args) {
+    assertExactArity('expt', args, 2);
+    const base = expectNumberValue('expt', args[0]);
+    const exponent = expectIntegerValue('expt', args[1]);
+    return normalizeNumber(Math.pow(base, exponent));
 }
 function appendValues(args) {
     if (args.length === 0) {
@@ -745,6 +886,13 @@ function expectNumberValue(name, value) {
     }
     return value;
 }
+function expectIntegerValue(name, value) {
+    const number = expectNumberValue(name, value);
+    if (!Number.isInteger(number)) {
+        throw new EvalError(`${name} expects an integer`);
+    }
+    return number;
+}
 function expectStringValue(name, value) {
     if (typeof value === 'string') {
         return value;
@@ -795,6 +943,116 @@ function assertProcedureArity(name, args, params) {
         return;
     }
     assertAtLeastArity(name, args, params.required.length);
+}
+function listRefBuiltin(args) {
+    assertExactArity('list-ref', args, 2);
+    const tail = listTailValue('list-ref', args[0], expectIndex('list-ref', args[1]));
+    if (!isPair(tail)) {
+        throw new EvalError('list-ref index out of bounds');
+    }
+    return tail.car;
+}
+function listTailBuiltin(args) {
+    assertExactArity('list-tail', args, 2);
+    return listTailValue('list-tail', args[0], expectIndex('list-tail', args[1]));
+}
+function listTailValue(name, list, index) {
+    let current = list;
+    for (let offset = 0; offset < index; offset += 1) {
+        if (isEmptyList(current)) {
+            throw new EvalError(`${name} index out of bounds`);
+        }
+        if (!isPair(current)) {
+            throw new EvalError(`${name} expects a proper list`);
+        }
+        current = current.cdr;
+    }
+    ensureProperList(name, current);
+    return current;
+}
+function ensureProperList(name, value) {
+    let current = value;
+    const seen = new Set();
+    while (isPair(current)) {
+        if (seen.has(current)) {
+            throw new EvalError(`${name} expects a proper list`);
+        }
+        seen.add(current);
+        current = current.cdr;
+    }
+    if (!isEmptyList(current)) {
+        throw new EvalError(`${name} expects a proper list`);
+    }
+}
+function isProperListValue(value) {
+    let current = value;
+    const seen = new Set();
+    while (isPair(current)) {
+        if (seen.has(current)) {
+            return false;
+        }
+        seen.add(current);
+        current = current.cdr;
+    }
+    return isEmptyList(current);
+}
+function mapBuiltin(args, position) {
+    assertAtLeastArity('map', args, 2);
+    const proc = args[0];
+    if (!isProcedure(proc)) {
+        throw new EvalError('map expects a procedure');
+    }
+    const currentLists = args.slice(1);
+    const results = [];
+    while (true) {
+        let sawEmpty = false;
+        let sawPair = false;
+        for (const current of currentLists) {
+            if (isEmptyList(current)) {
+                sawEmpty = true;
+                continue;
+            }
+            if (!isPair(current)) {
+                throw new EvalError('map expects proper list arguments');
+            }
+            sawPair = true;
+        }
+        if (sawEmpty) {
+            if (sawPair) {
+                throw new EvalError('map expects lists of equal length');
+            }
+            return makeList(results);
+        }
+        const elementArgs = [];
+        for (let index = 0; index < currentLists.length; index += 1) {
+            const current = currentLists[index];
+            if (!isPair(current)) {
+                throw new EvalError('map expects proper list arguments');
+            }
+            elementArgs.push(current.car);
+            currentLists[index] = current.cdr;
+        }
+        results.push(applyProcedure(proc, elementArgs, position));
+    }
+}
+function assocBuiltin(args) {
+    assertExactArity('assoc', args, 2);
+    const key = args[0];
+    let current = args[1];
+    while (isPair(current)) {
+        const entry = current.car;
+        if (!isPair(entry)) {
+            throw new EvalError('assoc expects an association list');
+        }
+        if (equalValues(key, entry.car)) {
+            return entry;
+        }
+        current = current.cdr;
+    }
+    if (!isEmptyList(current)) {
+        throw new EvalError('assoc expects an association list');
+    }
+    return false;
 }
 function formatValue(value) {
     return formatValueWithMode(value, 'write');
@@ -872,6 +1130,9 @@ function stringChars(value) {
 function makeMutableString(value) {
     return { kind: 'mutable-string', chars: stringChars(value) };
 }
+function stringValueText(value) {
+    return typeof value === 'string' ? value : value.chars.join('');
+}
 function parseCharToken(token, position) {
     const rawValue = token.slice(2);
     if (rawValue.length === 0) {
@@ -891,6 +1152,39 @@ function parseCharToken(token, position) {
 }
 function normalizeNumber(value) {
     return Object.is(value, -0) ? 0 : value;
+}
+function eqValues(left, right) {
+    if (typeof left === 'number' || typeof left === 'boolean' || typeof left === 'string') {
+        return typeof right === typeof left && left === right;
+    }
+    if (isCharValue(left) && isCharValue(right)) {
+        return left.value === right.value;
+    }
+    if (isSymbolValue(left) && isSymbolValue(right)) {
+        return left.name === right.name;
+    }
+    if (isEmptyList(left) || isEmptyList(right)) {
+        return isEmptyList(left) && isEmptyList(right);
+    }
+    return left === right;
+}
+function equalValues(left, right) {
+    if (eqValues(left, right)) {
+        return true;
+    }
+    if (isStringValue(left) && isStringValue(right)) {
+        return stringValueText(left) === stringValueText(right);
+    }
+    if (isPair(left) && isPair(right)) {
+        return equalValues(left.car, right.car) && equalValues(left.cdr, right.cdr);
+    }
+    return false;
+}
+function isAlphabeticChar(value) {
+    return value.toLowerCase() !== value.toUpperCase();
+}
+function isNumericChar(value) {
+    return /^[0-9]$/u.test(value);
 }
 function isTruthy(value) {
     return value !== false;
