@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type value interface {
@@ -79,6 +80,7 @@ const (
 var emptyList = emptyListValue{}
 var currentOutput *strings.Builder
 var currentLevelStringsMutable = detectStringMutability()
+var evalMu sync.Mutex
 
 type formatState struct {
 	activePairs   map[*pairCell]struct{}
@@ -563,6 +565,12 @@ func evalInputWithStepLimit(input string, maxSteps int) (result string, output s
 }
 
 func evalInputWithOptionalLimit(input string, maxSteps *int) (result string, output string, err error) {
+	// Independent EvalStr/EvalStrWithOutput calls must not interleave because the
+	// evaluator still uses process-wide bookkeeping for source positions, output
+	// capture, macro hygiene names, and step budgeting.
+	evalMu.Lock()
+	defer evalMu.Unlock()
+
 	if maxSteps != nil && *maxSteps < 0 {
 		return "", "", newEvalError(defaultSourcePos(), "step limit must be non-negative")
 	}
