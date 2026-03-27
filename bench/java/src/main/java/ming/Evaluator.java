@@ -217,7 +217,7 @@ public class Evaluator {
             List<Object> bf = new ArrayList<>(); bf.add("begin"); bf.addAll(forms);
             result = eval(bf, env);
         }
-        return new EvalResult(schemeToString(result), outputBuffer.toString());
+        return new EvalResult(displayString(result), outputBuffer.toString());
     }
 
     private Env createGlobalEnv() {

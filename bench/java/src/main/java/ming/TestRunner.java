@@ -151,6 +151,9 @@ public class TestRunner {
         if (benchLevel == 0 || benchLevel >= 27) {
             extraFailed |= runStandaloneTests("ming.L27Tests");
         }
+        if (benchLevel == 0 || benchLevel >= 28) {
+            extraFailed |= runStandaloneTests("ming.L28Tests");
+        }
 
         System.exit((failed > 0 || extraFailed) ? 1 : 0);
     }
@@ -158,16 +161,27 @@ public class TestRunner {
     private static boolean runStandaloneTests(String className) {
         try {
             Class<?> cls = Class.forName(className);
-            // Reset the class's passed/failed counters and run main
-            // L27Tests.main calls System.exit — we install a SecurityManager workaround
-            // Instead, just invoke main and let it exit. If tests fail, exit(1) propagates.
-            // If tests pass, exit(0) kills the JVM which is fine.
-            cls.getMethod("main", String[].class).invoke(null, (Object) new String[0]);
+            // Reset pass/fail counters
+            var passedField = cls.getDeclaredField("passed");
+            var failedField = cls.getDeclaredField("failed");
+            passedField.setInt(null, 0);
+            failedField.setInt(null, 0);
+            // Invoke each test method (static void testXxx) directly, bypassing main/System.exit
+            for (var m : cls.getDeclaredMethods()) {
+                if (m.getName().startsWith("test") && m.getParameterCount() == 0) {
+                    m.setAccessible(true);
+                    m.invoke(null);
+                }
+            }
+            int p = passedField.getInt(null);
+            int f = failedField.getInt(null);
+            System.out.println(p + " passed, " + f + " failed out of " + (p + f) + " tests");
+            return f > 0;
         } catch (ClassNotFoundException e) {
             return false; // not present — skip
         } catch (Exception e) {
+            System.out.println("FAIL " + className + ": " + e);
             return true; // failure
         }
-        return false;
     }
 }
