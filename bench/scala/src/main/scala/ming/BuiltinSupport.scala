@@ -12,6 +12,11 @@ private[ming] object BuiltinSupport:
       throw EvalError.at(pos, s"$name expects at least $min argument(s), got ${args.length}")
     args
 
+  def requireArgCountRange[T](name: String, args: List[T], min: Int, max: Int, pos: SourcePos): List[T] =
+    if args.lengthCompare(min) < 0 || args.lengthCompare(max) > 0 then
+      throw EvalError.at(pos, s"$name expects between $min and $max argument(s), got ${args.length}")
+    args
+
   def requireSingleArg(name: String, args: List[Value], pos: SourcePos): Value =
     requireArgCount(name, args, expected = 1, pos).head
 
@@ -48,11 +53,15 @@ private[ming] object BuiltinSupport:
       case other =>
         throw EvalError.at(pos, s"$name expected a symbol, got ${ValueSemantics.typeName(other)}")
 
-  def requirePair(name: String, value: Value, pos: SourcePos): (Value, Value) =
+  def requirePairValue(name: String, value: Value, pos: SourcePos): Value.PairVal =
     value match
-      case Value.PairVal(car, cdr) => (car, cdr)
+      case pair: Value.PairVal => pair
       case other =>
         throw EvalError.at(pos, s"$name expected a pair, got ${ValueSemantics.typeName(other)}")
+
+  def requirePair(name: String, value: Value, pos: SourcePos): (Value, Value) =
+    val pair = requirePairValue(name, value, pos)
+    (pair.car, pair.cdr)
 
   def requireVector(name: String, value: Value, pos: SourcePos): VectorInstance =
     value match

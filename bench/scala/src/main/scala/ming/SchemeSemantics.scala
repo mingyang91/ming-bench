@@ -1,5 +1,7 @@
 package ming
 
+import scala.collection.mutable
+
 private[ming] object ValueSemantics:
 
   def isTruthy(value: Value): Boolean =
@@ -19,13 +21,13 @@ private[ming] object ValueSemantics:
     value match
       case Value.IntVal(_) | Value.RationalVal(_, _) | Value.InexactVal(_) =>
         "number"
-      case Value.BoolVal(_)    => "boolean"
-      case Value.StringVal(_)  => "string"
-      case Value.CharVal(_)    => "character"
-      case Value.SymbolVal(_)  => "symbol"
-      case Value.EmptyList     => "null"
-      case Value.PairVal(_, _) => "pair"
-      case Value.VectorVal(_)  => "vector"
+      case Value.BoolVal(_)   => "boolean"
+      case Value.StringVal(_) => "string"
+      case Value.CharVal(_)   => "character"
+      case Value.SymbolVal(_) => "symbol"
+      case Value.EmptyList    => "null"
+      case _: Value.PairVal   => "pair"
+      case Value.VectorVal(_) => "vector"
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
           Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
         "procedure"
@@ -33,12 +35,20 @@ private[ming] object ValueSemantics:
       case Value.Void         => "void"
 
   def isProperList(value: Value): Boolean =
+    val seen = mutable.HashSet.empty[Value.PairVal]
+
     @annotation.tailrec
     def loop(current: Value): Boolean =
       current match
-        case Value.EmptyList       => true
-        case Value.PairVal(_, cdr) => loop(cdr)
-        case _                     => false
+        case Value.EmptyList =>
+          true
+        case pair: Value.PairVal =>
+          if seen.contains(pair) then false
+          else
+            seen += pair
+            loop(pair.cdr)
+        case _ =>
+          false
 
     loop(value)
 
@@ -95,18 +105,30 @@ private[ming] object ValueSemantics:
     isEq(value1, value2)
 
   def isEqual(value1: Value, value2: Value): Boolean =
-    (value1, value2) match
-      case (Value.StringVal(left), Value.StringVal(right)) =>
-        left.text == right.text
-      case (Value.PairVal(leftCar, leftCdr), Value.PairVal(rightCar, rightCdr)) =>
-        isEqual(leftCar, rightCar) && isEqual(leftCdr, rightCdr)
-      case (Value.VectorVal(left), Value.VectorVal(right)) =>
-        left.length == right.length &&
-        left.elements.zip(right.elements).forall { case (leftValue, rightValue) =>
-          isEqual(leftValue, rightValue)
-        }
-      case _ =>
-        isEq(value1, value2)
+    val seen = mutable.HashSet.empty[(AnyRef, AnyRef)]
+
+    def loop(left: Value, right: Value): Boolean =
+      (left, right) match
+        case (Value.StringVal(leftText), Value.StringVal(rightText)) =>
+          leftText.text == rightText.text
+        case (leftPair: Value.PairVal, rightPair: Value.PairVal) =>
+          val key = (leftPair: AnyRef, rightPair: AnyRef)
+          if seen.contains(key) then true
+          else
+            seen += key
+            loop(leftPair.car, rightPair.car) && loop(leftPair.cdr, rightPair.cdr)
+        case (Value.VectorVal(leftVector), Value.VectorVal(rightVector)) =>
+          if leftVector.length != rightVector.length then false
+          else
+            val key = (leftVector: AnyRef, rightVector: AnyRef)
+            if seen.contains(key) then true
+            else
+              seen += key
+              leftVector.elements.zip(rightVector.elements).forall(loop.tupled)
+        case _ =>
+          isEq(left, right)
+
+    loop(value1, value2)
 
   def quote(expr: Expr): Value =
     expr match
@@ -130,13 +152,17 @@ private[ming] object ValueSemantics:
     }
 
   def toProperList(name: String, value: Value, pos: SourcePos): List[Value] =
+    val seen = mutable.HashSet.empty[Value.PairVal]
+
     @annotation.tailrec
     def loop(current: Value, acc: List[Value]): List[Value] =
       current match
         case Value.EmptyList =>
           acc.reverse
-        case Value.PairVal(car, cdr) =>
-          loop(cdr, car :: acc)
+        case pair: Value.PairVal =>
+          if seen.contains(pair) then throw EvalError.at(pos, s"$name expected a proper list, got circular list")
+          seen += pair
+          loop(pair.cdr, pair.car :: acc)
         case other =>
           throw EvalError.at(pos, s"$name expected a list, got ${typeName(other)}")
 

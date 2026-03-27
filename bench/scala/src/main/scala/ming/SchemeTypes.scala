@@ -12,32 +12,62 @@ private[ming] enum Expr:
   case Symbol(name: String, pos: SourcePos)                            extends Expr
   case ListExpr(items: List[Expr], pos: SourcePos)                     extends Expr
 
-private[ming] enum Value:
-  case IntVal(value: Long)
-  case RationalVal(numerator: Long, denominator: Long)
-  case InexactVal(value: Double)
-  case BoolVal(value: Boolean)
-  case StringVal(value: MutableString)
-  case CharVal(value: Char)
-  case SymbolVal(name: String)
-  case EmptyList
-  case PairVal(car: Value, cdr: Value)
-  case VectorVal(instance: VectorInstance)
-  case BuiltinProc(name: String)
-  case RecordConstructor(recordType: RecordType)
-  case RecordPredicate(recordType: RecordType)
-  case RecordAccessor(recordType: RecordType, fieldIndex: Int, name: String)
-  case RecordVal(instance: RecordInstance)
-  case CaseClosure(name: Option[String], clauses: List[CaseLambdaClause], env: Env)
+sealed private[ming] trait Value
 
-  case Closure(
+private[ming] object Value:
+  final case class IntVal(value: Long)                             extends Value
+  final case class RationalVal(numerator: Long, denominator: Long) extends Value
+  final case class InexactVal(value: Double)                       extends Value
+  final case class BoolVal(value: Boolean)                         extends Value
+  final case class StringVal(value: MutableString)                 extends Value
+  final case class CharVal(value: Char)                            extends Value
+  final case class SymbolVal(name: String)                         extends Value
+  case object EmptyList                                            extends Value
+
+  final class PairVal private (
+    private var currentCar: Value,
+    private var currentCdr: Value
+  ) extends Value:
+
+    def car: Value =
+      currentCar
+
+    def cdr: Value =
+      currentCdr
+
+    def setCar(value: Value): Unit =
+      currentCar = value
+
+    def setCdr(value: Value): Unit =
+      currentCdr = value
+
+  object PairVal:
+
+    def apply(car: Value, cdr: Value): PairVal =
+      new PairVal(car, cdr)
+
+    def unapply(value: Value): Option[(Value, Value)] =
+      value match
+        case pair: PairVal => Some((pair.car, pair.cdr))
+        case _             => None
+
+  final case class VectorVal(instance: VectorInstance)                                          extends Value
+  final case class BuiltinProc(name: String)                                                    extends Value
+  final case class RecordConstructor(recordType: RecordType)                                    extends Value
+  final case class RecordPredicate(recordType: RecordType)                                      extends Value
+  final case class RecordAccessor(recordType: RecordType, fieldIndex: Int, name: String)        extends Value
+  final case class RecordVal(instance: RecordInstance)                                          extends Value
+  final case class CaseClosure(name: Option[String], clauses: List[CaseLambdaClause], env: Env) extends Value
+
+  final case class Closure(
     name: Option[String],
     params: List[String],
     restParam: Option[String],
     body: List[Expr],
     env: Env
-  )
-  case Void
+  ) extends Value
+
+  case object Void extends Value
 
 final private[ming] class MutableString private (
   private val builder: java.lang.StringBuilder,

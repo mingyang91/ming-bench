@@ -8,6 +8,8 @@ private[ming] object ListBuiltins:
     "cons",
     "car",
     "cdr",
+    "set-car!",
+    "set-cdr!",
     "append",
     "list",
     "length"
@@ -17,7 +19,13 @@ private[ming] object ListBuiltins:
     "list-ref",
     "list-tail",
     "list?",
-    "assoc"
+    "assoc",
+    "assq",
+    "assv",
+    "member",
+    "memq",
+    "memv",
+    "reverse"
   )
 
   val names: Set[String] = coreNames ++ utilityNames
@@ -39,6 +47,10 @@ private[ming] object ListBuiltins:
       case "cdr" =>
         val (_, cdr) = requirePair(name, requireSingleArg(name, args, pos), pos)
         cdr
+      case "set-car!" =>
+        mutatePair(name, args, pos)(_.setCar(_))
+      case "set-cdr!" =>
+        mutatePair(name, args, pos)(_.setCdr(_))
       case "append" =>
         append(name, args, pos)
       case "list" =>
@@ -58,7 +70,19 @@ private[ming] object ListBuiltins:
       case "list?" =>
         Value.BoolVal(ValueSemantics.isProperList(requireSingleArg(name, args, pos)))
       case "assoc" =>
-        assoc(name, args, pos)
+        assoc(name, args, pos, ValueSemantics.isEqual)
+      case "assq" =>
+        assoc(name, args, pos, ValueSemantics.isEq)
+      case "assv" =>
+        assoc(name, args, pos, ValueSemantics.isEqv)
+      case "member" =>
+        member(name, args, pos, ValueSemantics.isEqual)
+      case "memq" =>
+        member(name, args, pos, ValueSemantics.isEq)
+      case "memv" =>
+        member(name, args, pos, ValueSemantics.isEqv)
+      case "reverse" =>
+        ValueSemantics.listFrom(ValueSemantics.toProperList(name, requireSingleArg(name, args, pos), pos).reverse)
       case _ =>
         unknownProcedure(name, pos)
 
@@ -96,7 +120,12 @@ private[ming] object ListBuiltins:
 
     loop(values.head, index)
 
-  private def assoc(name: String, args: List[Value], pos: SourcePos): Value =
+  private def assoc(
+    name: String,
+    args: List[Value],
+    pos: SourcePos,
+    predicate: (Value, Value) => Boolean
+  ): Value =
     val values = requireArgCount(name, args, expected = 2, pos)
     val key    = values.head
     val alist  = ValueSemantics.toProperList(name, values(1), pos)
@@ -107,17 +136,53 @@ private[ming] object ListBuiltins:
         case Nil =>
           Value.BoolVal(false)
         case (entry @ Value.PairVal(car, _)) :: rest =>
-          if ValueSemantics.isEqual(key, car) then entry
+          if predicate(key, car) then entry
           else loop(rest)
         case other :: _ =>
           throw EvalError.at(pos, s"$name expected an association list, got ${ValueSemantics.typeName(other)}")
 
     loop(alist)
 
+  private def member(
+    name: String,
+    args: List[Value],
+    pos: SourcePos,
+    predicate: (Value, Value) => Boolean
+  ): Value =
+    val values = requireArgCount(name, args, expected = 2, pos)
+    val key    = values.head
+    val seen   = scala.collection.mutable.HashSet.empty[Value.PairVal]
+
+    @annotation.tailrec
+    def loop(current: Value): Value =
+      current match
+        case Value.EmptyList =>
+          Value.BoolVal(false)
+        case pair: Value.PairVal =>
+          if predicate(key, pair.car) then current
+          else if seen.contains(pair) then throw EvalError.at(pos, s"$name expected a proper list, got circular list")
+          else
+            seen += pair
+            loop(pair.cdr)
+        case other =>
+          throw EvalError.at(pos, s"$name expected a list, got ${ValueSemantics.typeName(other)}")
+
+    loop(values(1))
+
   private def requireNonNegativeIndex(name: String, value: Value, pos: SourcePos): Int =
     val index = requireIndex(name, value, pos)
     if index < 0 then throw EvalError.at(pos, s"$name expected a non-negative index")
     index
+
+  private def mutatePair(
+    name: String,
+    args: List[Value],
+    pos: SourcePos
+  )(update: (Value.PairVal, Value) => Unit): Value =
+    val values = requireArgCount(name, args, expected = 2, pos)
+    val pair   = requirePairValue(name, values.head, pos)
+    update(pair, values(1))
+    Value.Void
 
   private def append(name: String, args: List[Value], pos: SourcePos): Value =
     args match

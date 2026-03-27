@@ -7,6 +7,8 @@ import BuiltinSupport.*
 private[ming] object StringBuiltins:
 
   val names: Set[String] = Set(
+    "make-string",
+    "string",
     "string-append",
     "string-length",
     "substring",
@@ -23,6 +25,9 @@ private[ming] object StringBuiltins:
     "integer->char",
     "string=?",
     "string<?",
+    "string>?",
+    "string<=?",
+    "string>=?",
     "string-ci=?",
     "string-upcase",
     "string-downcase"
@@ -33,6 +38,10 @@ private[ming] object StringBuiltins:
 
   def invoke(name: String, args: List[Value], pos: SourcePos): Value =
     name match
+      case "make-string" =>
+        makeString(name, args, pos)
+      case "string" =>
+        Value.StringVal(MutableString.immutable(args.map(arg => requireChar(name, arg, pos)).mkString))
       case "string-append" =>
         Value.StringVal(MutableString.from(args.map(arg => requireString(name, arg, pos).text).mkString))
       case "string-length" =>
@@ -67,6 +76,12 @@ private[ming] object StringBuiltins:
         compareStrings(name, args, pos)(_ == _)
       case "string<?" =>
         compareStrings(name, args, pos)(_ < _)
+      case "string>?" =>
+        compareStrings(name, args, pos)(_ > _)
+      case "string<=?" =>
+        compareStrings(name, args, pos)(_ <= _)
+      case "string>=?" =>
+        compareStrings(name, args, pos)(_ >= _)
       case "string-ci=?" =>
         compareStrings(name, args, pos)(_.equalsIgnoreCase(_))
       case "string-upcase" =>
@@ -79,6 +94,15 @@ private[ming] object StringBuiltins:
         )
       case _ =>
         unknownProcedure(name, pos)
+
+  private def makeString(name: String, args: List[Value], pos: SourcePos): Value =
+    val values = requireArgCountRange(name, args, min = 1, max = 2, pos)
+    val length = requireIndex(name, values.head, pos)
+    if length < 0 then throw EvalError.at(pos, s"$name expected a non-negative length")
+    val fill = values.lift(1) match
+      case Some(value) => requireChar(name, value, pos)
+      case None        => ' '
+    Value.StringVal(MutableString.immutable(fill.toString.repeat(length)))
 
   private def substring(name: String, args: List[Value], pos: SourcePos): Value =
     val values = requireArgCount(name, args, expected = 3, pos)

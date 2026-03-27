@@ -1,14 +1,21 @@
 package ming
 
+import scala.collection.mutable
+
 private[ming] object SchemeRenderer:
 
   def render(value: Value): String =
-    renderWithMode(value, displayStrings = false, displayChars = false)
+    renderWithMode(value, displayStrings = false, displayChars = false, mutable.HashSet.empty[AnyRef])
 
   def renderForDisplay(value: Value): String =
-    renderWithMode(value, displayStrings = true, displayChars = true)
+    renderWithMode(value, displayStrings = true, displayChars = true, mutable.HashSet.empty[AnyRef])
 
-  private def renderWithMode(value: Value, displayStrings: Boolean, displayChars: Boolean): String =
+  private def renderWithMode(
+    value: Value,
+    displayStrings: Boolean,
+    displayChars: Boolean,
+    path: mutable.HashSet[AnyRef]
+  ): String =
     value match
       case Value.IntVal(number)                      => number.toString
       case Value.RationalVal(numerator, denominator) => s"$numerator/$denominator"
@@ -23,10 +30,10 @@ private[ming] object SchemeRenderer:
         else renderChar(ch)
       case Value.SymbolVal(name) => name
       case Value.EmptyList       => "()"
-      case pair @ Value.PairVal(_, _) =>
-        renderPair(pair, displayStrings, displayChars)
+      case pair: Value.PairVal =>
+        renderPair(pair, displayStrings, displayChars, path)
       case Value.VectorVal(instance) =>
-        renderVector(instance, displayStrings, displayChars)
+        renderVector(instance, displayStrings, displayChars, path)
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
           Value.RecordAccessor(_, _, _) | Value.CaseClosure(_, _, _) | Value.Closure(_, _, _, _, _) =>
         "#<procedure>"
@@ -34,32 +41,70 @@ private[ming] object SchemeRenderer:
         s"#<record ${instance.recordType.typeName}>"
       case Value.Void => ""
 
-  private def renderPair(value: Value, displayStrings: Boolean, displayChars: Boolean): String =
-    val builder = new StringBuilder("(")
+  private def renderPair(
+    value: Value.PairVal,
+    displayStrings: Boolean,
+    displayChars: Boolean,
+    path: mutable.HashSet[AnyRef]
+  ): String =
+    if path.contains(value) then "#<circular>"
+    else
+      val builder = new StringBuilder("(")
+      val added   = mutable.ArrayBuffer.empty[AnyRef]
 
-    def appendList(current: Value, first: Boolean): Unit =
-      current match
-        case Value.PairVal(car, cdr) =>
-          if !first then builder.append(' ')
-          builder.append(renderWithMode(car, displayStrings, displayChars))
-          cdr match
-            case Value.EmptyList => ()
-            case next @ Value.PairVal(_, _) =>
-              appendList(next, first = false)
-            case other =>
-              builder.append(" . ")
-              builder.append(renderWithMode(other, displayStrings, displayChars))
-        case _ =>
-          ()
+      try
+        renderPairContents(value, builder, added, displayStrings, displayChars, path, isFirstElement = true)
+        builder.append(')')
+        builder.toString
+      finally added.reverseIterator.foreach(path -= _)
 
-    appendList(value, first = true)
-    builder.append(')')
-    builder.toString
+  @annotation.tailrec
+  private def renderPairContents(
+    current: Value,
+    builder: StringBuilder,
+    added: mutable.ArrayBuffer[AnyRef],
+    displayStrings: Boolean,
+    displayChars: Boolean,
+    path: mutable.HashSet[AnyRef],
+    isFirstElement: Boolean
+  ): Unit =
+    current match
+      case pair: Value.PairVal if path.contains(pair) =>
+        appendDottedSeparator(builder, isFirstElement)
+        builder.append("#<circular>")
+      case pair: Value.PairVal =>
+        path += pair
+        added += pair
+        appendElementSeparator(builder, isFirstElement)
+        builder.append(renderWithMode(pair.car, displayStrings, displayChars, path))
+        renderPairContents(pair.cdr, builder, added, displayStrings, displayChars, path, isFirstElement = false)
+      case Value.EmptyList =>
+        ()
+      case other =>
+        appendDottedSeparator(builder, isFirstElement)
+        builder.append(renderWithMode(other, displayStrings, displayChars, path))
 
-  private def renderVector(instance: VectorInstance, displayStrings: Boolean, displayChars: Boolean): String =
-    instance.elements
-      .map(renderWithMode(_, displayStrings, displayChars))
-      .mkString("#(", " ", ")")
+  private def renderVector(
+    instance: VectorInstance,
+    displayStrings: Boolean,
+    displayChars: Boolean,
+    path: mutable.HashSet[AnyRef]
+  ): String =
+    if path.contains(instance) then "#<circular>"
+    else
+      path += instance
+      try
+        instance.elements
+          .map(renderWithMode(_, displayStrings, displayChars, path))
+          .mkString("#(", " ", ")")
+      finally
+        path -= instance
+
+  private def appendElementSeparator(builder: StringBuilder, isFirstElement: Boolean): Unit =
+    if !isFirstElement then builder.append(' ')
+
+  private def appendDottedSeparator(builder: StringBuilder, isFirstElement: Boolean): Unit =
+    if !isFirstElement then builder.append(" . ")
 
   private def renderChar(ch: Char): String =
     ch match

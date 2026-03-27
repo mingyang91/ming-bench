@@ -27,6 +27,8 @@ private[ming] object SpecialFormEvaluator:
         EvalStep.EvalSequence(args, env)
       case Expr.Symbol("let", formPos) :: args =>
         evalLetStep(args, env, formPos, context)
+      case Expr.Symbol("let*", formPos) :: args =>
+        evalLetStarStep(args, env, formPos, context)
       case Expr.Symbol("letrec", formPos) :: args =>
         evalLetrecStep(args, env, formPos, context, sequential = false)
       case Expr.Symbol("letrec*", formPos) :: args =>
@@ -147,6 +149,17 @@ private[ming] object SpecialFormEvaluator:
     bindings.foreach { binding =>
       targetEnv.define(binding.name, ExpressionEvaluator.eval(binding.valueExpr, evalEnv, context))
     }
+
+  private def evalLetStarStep(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): EvalStep =
+    args match
+      case Expr.ListExpr(bindings, _) :: body if body.nonEmpty =>
+        val letEnv = env.child()
+        parseLetBindings(bindings).foreach { binding =>
+          letEnv.define(binding.name, ExpressionEvaluator.eval(binding.valueExpr, letEnv, context))
+        }
+        EvalStep.EvalSequence(body, letEnv)
+      case _ =>
+        throw EvalError.at(pos, "invalid let*")
 
   private def evalLetrecStep(
     args: List[Expr],

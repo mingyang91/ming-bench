@@ -33,6 +33,8 @@ private[ming] object ProcedureInvoker:
         prepareApply(evaluatedArgs, pos)
       case Value.BuiltinProc("map") =>
         EvalStep.Done(invokeMap(evaluatedArgs, pos, context))
+      case Value.BuiltinProc("for-each") =>
+        EvalStep.Done(invokeForEach(evaluatedArgs, pos, context))
       case Value.BuiltinProc(name) =>
         EvalStep.Done(Builtins.invoke(name, evaluatedArgs, pos, context))
       case Value.RecordConstructor(recordType) =>
@@ -82,6 +84,19 @@ private[ming] object ProcedureInvoker:
       else lists.transpose.map(values => invokeProcedure(procedure, values, pos, context))
 
     ValueSemantics.listFrom(results)
+
+  private def invokeForEach(args: List[Value], pos: SourcePos, context: EvalContext): Value =
+    if args.lengthCompare(2) < 0 then
+      throw EvalError.at(pos, s"for-each expects at least 2 argument(s), got ${args.length}")
+
+    val procedure = args.head
+    val lists     = args.tail.map(ValueSemantics.toProperList("for-each", _, pos))
+    val size      = lists.head.length
+    if lists.exists(_.lengthCompare(size) != 0) then throw EvalError.at(pos, "for-each expected lists of equal length")
+
+    if size != 0 then lists.transpose.foreach(values => invokeProcedure(procedure, values, pos, context))
+
+    Value.Void
 
   private def selectCaseLambdaClause(
     name: Option[String],
