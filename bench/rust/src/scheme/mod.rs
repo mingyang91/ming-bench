@@ -1,6 +1,8 @@
 pub mod error;
+mod text;
 
 pub use error::EvalError;
+use text::{escape_string, parse_char_literal, render_char, SchemeString};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,6 +19,7 @@ struct Position {
 enum Expr {
     Bool { value: bool, pos: Position },
     Int { value: i64, pos: Position },
+    Char { value: char, pos: Position },
     String { value: String, pos: Position },
     Symbol { name: String, pos: Position },
     List { items: Vec<Expr>, pos: Position },
@@ -27,6 +30,7 @@ impl Expr {
         match self {
             Self::Bool { pos, .. }
             | Self::Int { pos, .. }
+            | Self::Char { pos, .. }
             | Self::String { pos, .. }
             | Self::Symbol { pos, .. }
             | Self::List { pos, .. } => *pos,
@@ -56,7 +60,7 @@ impl EvaluatedArg {
             .map_err(|error| error.with_position(self.pos.line, self.pos.col))
     }
 
-    fn as_string(&self) -> Result<&str, EvalError> {
+    fn as_string(&self) -> Result<SchemeString, EvalError> {
         self.value
             .as_string()
             .map_err(|error| error.with_position(self.pos.line, self.pos.col))
@@ -67,6 +71,12 @@ impl EvaluatedArg {
             .as_symbol()
             .map_err(|error| error.with_position(self.pos.line, self.pos.col))
     }
+
+    fn as_char(&self) -> Result<char, EvalError> {
+        self.value
+            .as_char()
+            .map_err(|error| error.with_position(self.pos.line, self.pos.col))
+    }
 }
 
 #[derive(Clone)]
@@ -74,7 +84,7 @@ enum Value {
     Bool(bool),
     Int(i64),
     Char(char),
-    String(String),
+    String(SchemeString),
     Symbol(String),
     List(Vec<Value>),
     Procedure(Rc<Procedure>),
@@ -160,9 +170,9 @@ impl Value {
         }
     }
 
-    fn as_string(&self) -> Result<&str, EvalError> {
+    fn as_string(&self) -> Result<SchemeString, EvalError> {
         match self {
-            Self::String(value) => Ok(value),
+            Self::String(value) => Ok(value.clone()),
             _ => Err(EvalError::TypeMismatch {
                 expected: "string",
                 found: self.render(),
@@ -180,13 +190,23 @@ impl Value {
         }
     }
 
+    fn as_char(&self) -> Result<char, EvalError> {
+        match self {
+            Self::Char(value) => Ok(*value),
+            _ => Err(EvalError::TypeMismatch {
+                expected: "char",
+                found: self.render(),
+            }),
+        }
+    }
+
     fn render(&self) -> String {
         match self {
             Self::Bool(true) => "#t".to_string(),
             Self::Bool(false) => "#f".to_string(),
             Self::Int(value) => value.to_string(),
             Self::Char(value) => render_char(*value),
-            Self::String(value) => format!("\"{}\"", escape_string(value)),
+            Self::String(value) => format!("\"{}\"", escape_string(&value.to_plain_string())),
             Self::Symbol(value) => value.clone(),
             Self::List(items) => {
                 let rendered = items
@@ -203,7 +223,7 @@ impl Value {
 
     fn display(&self) -> String {
         match self {
-            Self::String(value) => value.clone(),
+            Self::String(value) => value.to_plain_string(),
             Self::Char(value) => value.to_string(),
             Self::List(items) => {
                 let rendered = items
@@ -354,6 +374,17 @@ impl<'a> Parser<'a> {
         if token == "#f" {
             return Ok(Expr::Bool { value: false, pos });
         }
+        if let Some(literal) = token.strip_prefix("#\\") {
+            let Some(value) = parse_char_literal(literal) else {
+                return Err(self.error_at(
+                    pos,
+                    EvalError::ParseError {
+                        message: format!("invalid character literal: {token}"),
+                    },
+                ));
+            };
+            return Ok(Expr::Char { value, pos });
+        }
         if is_integer_token(token) {
             return token
                 .parse::<i64>()
@@ -490,6 +521,7 @@ fn default_env() -> EnvRef {
         ("write", apply_write as BuiltinFn),
         ("newline", apply_newline as BuiltinFn),
         ("string-append", apply_string_append as BuiltinFn),
+        ("string-copy", apply_string_copy as BuiltinFn),
         ("string-length", apply_string_length as BuiltinFn),
         ("substring", apply_substring as BuiltinFn),
         ("string->number", apply_string_to_number as BuiltinFn),
@@ -497,6 +529,7 @@ fn default_env() -> EnvRef {
         ("symbol->string", apply_symbol_to_string as BuiltinFn),
         ("string->symbol", apply_string_to_symbol as BuiltinFn),
         ("string-ref", apply_string_ref as BuiltinFn),
+        ("string-set!", apply_string_set as BuiltinFn),
         ("char?", apply_char_pred as BuiltinFn),
     ] {
         env.define(
@@ -519,7 +552,8 @@ fn eval(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalErro
     match expr {
         Expr::Bool { value, .. } => Ok(Value::Bool(*value)),
         Expr::Int { value, .. } => Ok(Value::Int(*value)),
-        Expr::String { value, .. } => Ok(Value::String(value.clone())),
+        Expr::Char { value, .. } => Ok(Value::Char(*value)),
+        Expr::String { value, .. } => Ok(Value::String(SchemeString::immutable(value))),
         Expr::Symbol { name, pos } => env
             .lookup(name)
             .ok_or_else(|| EvalError::UnboundSymbol { name: name.clone() })
@@ -849,7 +883,8 @@ fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Bool { value, .. } => Value::Bool(*value),
         Expr::Int { value, .. } => Value::Int(*value),
-        Expr::String { value, .. } => Value::String(value.clone()),
+        Expr::Char { value, .. } => Value::Char(*value),
+        Expr::String { value, .. } => Value::String(SchemeString::immutable(value)),
         Expr::Symbol { name, .. } => Value::Symbol(name.clone()),
         Expr::List { items, .. } => Value::List(items.iter().map(quote_expr).collect()),
     }
@@ -1198,9 +1233,22 @@ fn apply_newline(args: &[EvaluatedArg], output: &mut String) -> Result<Value, Ev
 fn apply_string_append(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     let mut combined = String::new();
     for arg in args {
-        combined.push_str(arg.as_string()?);
+        let value = arg.as_string()?;
+        combined.push_str(&value.to_plain_string());
     }
-    Ok(Value::String(combined))
+    Ok(Value::String(SchemeString::immutable(combined)))
+}
+
+fn apply_string_copy(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "string-copy",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::String(value.as_string()?.mutable_copy()))
 }
 
 fn apply_string_length(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1212,7 +1260,7 @@ fn apply_string_length(args: &[EvaluatedArg], _output: &mut String) -> Result<Va
         });
     };
 
-    Ok(Value::Int(value.as_string()?.chars().count() as i64))
+    Ok(Value::Int(value.as_string()?.len() as i64))
 }
 
 fn apply_substring(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1225,8 +1273,7 @@ fn apply_substring(args: &[EvaluatedArg], _output: &mut String) -> Result<Value,
     };
 
     let source = value.as_string()?;
-    let chars = source.chars().collect::<Vec<_>>();
-    let len = chars.len();
+    let len = source.len();
     let start_index = parse_index_bound(start, len, true)?;
     let end_index = parse_index_bound(end, len, true)?;
 
@@ -1239,9 +1286,9 @@ fn apply_substring(args: &[EvaluatedArg], _output: &mut String) -> Result<Value,
         .with_position(end.pos.line, end.pos.col));
     }
 
-    Ok(Value::String(
-        chars[start_index..end_index].iter().collect(),
-    ))
+    Ok(Value::String(SchemeString::immutable(
+        source.substring(start_index, end_index),
+    )))
 }
 
 fn apply_string_to_number(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1253,7 +1300,9 @@ fn apply_string_to_number(args: &[EvaluatedArg], _output: &mut String) -> Result
         });
     };
 
-    let candidate = value.as_string()?.trim();
+    let source = value.as_string()?;
+    let owned = source.to_plain_string();
+    let candidate = owned.trim();
     if is_integer_token(candidate) {
         if let Ok(parsed) = candidate.parse::<i64>() {
             return Ok(Value::Int(parsed));
@@ -1272,7 +1321,9 @@ fn apply_number_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result
         });
     };
 
-    Ok(Value::String(value.as_int()?.to_string()))
+    Ok(Value::String(SchemeString::immutable(
+        value.as_int()?.to_string(),
+    )))
 }
 
 fn apply_symbol_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1284,7 +1335,7 @@ fn apply_symbol_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result
         });
     };
 
-    Ok(Value::String(value.as_symbol()?.to_string()))
+    Ok(Value::String(SchemeString::immutable(value.as_symbol()?)))
 }
 
 fn apply_string_to_symbol(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1296,7 +1347,7 @@ fn apply_string_to_symbol(args: &[EvaluatedArg], _output: &mut String) -> Result
         });
     };
 
-    Ok(Value::Symbol(value.as_string()?.to_string()))
+    Ok(Value::Symbol(value.as_string()?.to_plain_string()))
 }
 
 fn apply_string_ref(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1309,9 +1360,29 @@ fn apply_string_ref(args: &[EvaluatedArg], _output: &mut String) -> Result<Value
     };
 
     let source = value.as_string()?;
-    let chars = source.chars().collect::<Vec<_>>();
-    let char_index = parse_index_arg(index, chars.len())?;
-    Ok(Value::Char(chars[char_index]))
+    let char_index = parse_index_arg(index, source.len())?;
+    Ok(Value::Char(
+        source
+            .char_at(char_index)
+            .expect("validated string-ref index must exist"),
+    ))
+}
+
+fn apply_string_set(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [target, index, value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "string-set!",
+            expected: "exactly 3",
+            got: args.len(),
+        });
+    };
+
+    let string = target.as_string()?;
+    let char_index = parse_index_arg(index, string.len())?;
+    string
+        .set_char(char_index, value.as_char()?)
+        .map_err(|error| error.with_position(target.pos.line, target.pos.col))?;
+    Ok(Value::Void)
 }
 
 fn apply_char_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1357,27 +1428,4 @@ fn is_integer_token(token: &str) -> bool {
         .unwrap_or(token);
 
     !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn escape_string(input: &str) -> String {
-    let mut escaped = String::new();
-    for ch in input.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
-}
-
-fn render_char(ch: char) -> String {
-    match ch {
-        ' ' => "#\\space".to_string(),
-        '\n' => "#\\newline".to_string(),
-        other => format!("#\\{other}"),
-    }
 }
