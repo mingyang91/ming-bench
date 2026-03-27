@@ -29,6 +29,13 @@ type tailCallVal struct {
 	expr Expr
 	env  *Env
 }
+
+type ContinuationVal struct {
+	replayFn func(Value) (Value, error)
+	active   bool
+}
+
+type CallCCVal struct{}
 type CharVal struct{ Val rune }
 type RatVal struct{ Num, Den int64 } // exact rational, Den > 0, gcd(|Num|,Den)==1
 type FloatVal struct{ Val float64 }  // inexact
@@ -74,9 +81,11 @@ func (v *BoolVal) String() string {
 func (v *StringVal) String() string  { return fmt.Sprintf("%q", v.Val) }
 func (v *SymbolVal) String() string  { return v.Name }
 func (v *NilVal) String() string     { return "()" }
-func (v *VoidVal) String() string     { return "" }
-func (v *tailCallVal) String() string { return "" }
-func (v *CharVal) String() string     { return fmt.Sprintf("#\\%c", v.Val) }
+func (v *VoidVal) String() string         { return "" }
+func (v *tailCallVal) String() string     { return "" }
+func (v *ContinuationVal) String() string { return "#<continuation>" }
+func (v *CallCCVal) String() string       { return "#<builtin:call/cc>" }
+func (v *CharVal) String() string         { return fmt.Sprintf("#\\%c", v.Val) }
 func (v *RatVal) String() string {
 	if v.Den == 1 {
 		return strconv.FormatInt(v.Num, 10)
@@ -126,6 +135,139 @@ var gensymCounter int
 func gensym(base string) string {
 	gensymCounter++
 	return fmt.Sprintf("##%s~%d", base, gensymCounter)
+}
+
+// --------------- Continuation support ---------------
+
+type continuationJump struct {
+	cont *ContinuationVal
+	val  Value
+}
+
+type bodyCtx struct {
+	exprs []Expr
+	env   *Env
+}
+
+var currentBodyCtx *bodyCtx
+var contReplayValues = map[Expr]Value{}
+
+type contJumpError struct {
+	cont *ContinuationVal
+	val  Value
+}
+
+func (e *contJumpError) Error() string { return "continuation jump" }
+
+func evalBodyExprs(body []Expr, env *Env) (Value, error) {
+	if len(body) == 0 {
+		return &VoidVal{}, nil
+	}
+	for i, expr := range body[:len(body)-1] {
+		saved := currentBodyCtx
+		currentBodyCtx = &bodyCtx{exprs: body[i:], env: env}
+		_, err := evalInEnv(expr, env)
+		currentBodyCtx = saved
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &tailCallVal{expr: body[len(body)-1], env: env}, nil
+}
+
+func evalCallCC(proc Value, callSite Expr) (Value, error) {
+	if callSite != nil {
+		if val, found := contReplayValues[callSite]; found {
+			delete(contReplayValues, callSite)
+			return val, nil
+		}
+	}
+
+	capturedCtx := currentBodyCtx
+
+	cont := &ContinuationVal{active: true}
+	cont.replayFn = func(val Value) (Value, error) {
+		if capturedCtx == nil {
+			return val, nil
+		}
+		if callSite != nil {
+			contReplayValues[callSite] = val
+			defer delete(contReplayValues, callSite)
+		}
+		var result Value
+		var err error
+		for _, expr := range capturedCtx.exprs {
+			result, err = evalInEnv(expr, capturedCtx.env)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+
+	result, err, jumped, jumpVal := runWithContCatch(proc, cont)
+	cont.active = false
+
+	if jumped {
+		return jumpVal, nil
+	}
+	return result, err
+}
+
+func runWithContCatch(proc Value, cont *ContinuationVal) (result Value, err error, jumped bool, jumpVal Value) {
+	defer func() {
+		if r := recover(); r != nil {
+			if j, ok := r.(continuationJump); ok && j.cont == cont {
+				jumped = true
+				jumpVal = j.val
+			} else {
+				panic(r)
+			}
+		}
+	}()
+	result, err = applyProcSimple(proc, []Value{cont})
+	return
+}
+
+func evalWithContJump(fn func() (Value, error)) (result Value, retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if j, ok := r.(continuationJump); ok {
+				retErr = &contJumpError{cont: j.cont, val: j.val}
+			} else {
+				panic(r)
+			}
+		}
+	}()
+	return fn()
+}
+
+func evalTopLevel(exprs []Expr, env *Env) (Value, error) {
+	result, err := evalWithContJump(func() (Value, error) {
+		var result Value
+		for i, expr := range exprs {
+			currentBodyCtx = &bodyCtx{exprs: exprs[i:], env: env}
+			var e error
+			result, e = evalInEnv(expr, env)
+			if e != nil {
+				return nil, e
+			}
+		}
+		currentBodyCtx = nil
+		return result, nil
+	})
+
+	for err != nil {
+		je, ok := err.(*contJumpError)
+		if !ok {
+			return nil, err
+		}
+		result, err = evalWithContJump(func() (Value, error) {
+			return je.cont.replayFn(je.val)
+		})
+	}
+
+	return result, nil
 }
 
 func (v *PairVal) String() string {
@@ -348,15 +490,18 @@ type Env struct {
 }
 
 func newEnv(parent *Env) *Env {
-	return &Env{bindings: make(map[string]Value), parent: parent}
+	return &Env{bindings: make(map[string]Value, 4), parent: parent}
+}
+
+func newEnvSized(parent *Env, size int) *Env {
+	return &Env{bindings: make(map[string]Value, size), parent: parent}
 }
 
 func (e *Env) get(name string) (Value, bool) {
-	if v, ok := e.bindings[name]; ok {
-		return v, true
-	}
-	if e.parent != nil {
-		return e.parent.get(name)
+	for cur := e; cur != nil; cur = cur.parent {
+		if v, ok := cur.bindings[name]; ok {
+			return v, true
+		}
 	}
 	return nil, false
 }
@@ -366,12 +511,11 @@ func (e *Env) set(name string, val Value) {
 }
 
 func (e *Env) setExisting(name string, val Value) bool {
-	if _, ok := e.bindings[name]; ok {
-		e.bindings[name] = val
-		return true
-	}
-	if e.parent != nil {
-		return e.parent.setExisting(name, val)
+	for cur := e; cur != nil; cur = cur.parent {
+		if _, ok := cur.bindings[name]; ok {
+			cur.bindings[name] = val
+			return true
+		}
 	}
 	return false
 }
@@ -1060,16 +1204,7 @@ func evalLet(list *ListExpr, env *Env) (Value, error) {
 		lambda := &LambdaVal{Params: names, Body: body, Env: letEnv}
 		letEnv.set(loopName, lambda)
 	}
-	if len(body) == 0 {
-		return &VoidVal{}, nil
-	}
-	for _, bodyExpr := range body[:len(body)-1] {
-		_, err := evalInEnv(bodyExpr, letEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &tailCallVal{expr: body[len(body)-1], env: letEnv}, nil
+	return evalBodyExprs(body, letEnv)
 }
 
 func evalLetStar(list *ListExpr, env *Env) (Value, error) {
@@ -1097,30 +1232,11 @@ func evalLetStar(list *ListExpr, env *Env) (Value, error) {
 		}
 		letEnv.set(nameAtom.Token, v)
 	}
-	body := args[1:]
-	if len(body) == 0 {
-		return &VoidVal{}, nil
-	}
-	for _, bodyExpr := range body[:len(body)-1] {
-		_, err := evalInEnv(bodyExpr, letEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &tailCallVal{expr: body[len(body)-1], env: letEnv}, nil
+	return evalBodyExprs(args[1:], letEnv)
 }
 
 func evalBegin(args []Expr, env *Env) (Value, error) {
-	if len(args) == 0 {
-		return &VoidVal{}, nil
-	}
-	for _, e := range args[:len(args)-1] {
-		_, err := evalInEnv(e, env)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &tailCallVal{expr: args[len(args)-1], env: env}, nil
+	return evalBodyExprs(args, env)
 }
 
 func evalCond(clauses []Expr, env *Env) (Value, error) {
@@ -1201,17 +1317,7 @@ func evalLetrec(list *ListExpr, env *Env) (Value, error) {
 		letEnv.set(names[i], v)
 	}
 	// Evaluate body
-	body := args[1:]
-	if len(body) == 0 {
-		return &VoidVal{}, nil
-	}
-	for _, bodyExpr := range body[:len(body)-1] {
-		_, err := evalInEnv(bodyExpr, letEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &tailCallVal{expr: body[len(body)-1], env: letEnv}, nil
+	return evalBodyExprs(args[1:], letEnv)
 }
 
 func evalLetrecStar(list *ListExpr, env *Env) (Value, error) {
@@ -1239,17 +1345,7 @@ func evalLetrecStar(list *ListExpr, env *Env) (Value, error) {
 		}
 		letEnv.set(nameAtom.Token, v)
 	}
-	body := args[1:]
-	if len(body) == 0 {
-		return &VoidVal{}, nil
-	}
-	for _, bodyExpr := range body[:len(body)-1] {
-		_, err := evalInEnv(bodyExpr, letEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &tailCallVal{expr: body[len(body)-1], env: letEnv}, nil
+	return evalBodyExprs(args[1:], letEnv)
 }
 
 func evalCase(list *ListExpr, env *Env) (Value, error) {
@@ -1883,6 +1979,16 @@ func applyProcSimple(proc Value, args []Value) (Value, error) {
 		return resolveTC(applyLambda(fn, args))
 	case *CaseLambdaVal:
 		return resolveTC(applyCaseLambda(fn, args))
+	case *CallCCVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "call/cc requires 1 argument"}
+		}
+		return evalCallCC(args[0], nil)
+	case *ContinuationVal:
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "continuation requires 1 argument"}
+		}
+		panic(continuationJump{cont: fn, val: args[0]})
 	}
 	return nil, &EvalError{Message: "not a procedure"}
 }
@@ -1899,7 +2005,11 @@ func applyLambda(fn *LambdaVal, args []Value) (Value, error) {
 			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
 		}
 	}
-	callEnv := newEnv(fn.Env)
+	sz := len(fn.Params)
+	if fn.Rest != "" {
+		sz++
+	}
+	callEnv := newEnvSized(fn.Env, sz)
 	for i, p := range fn.Params {
 		callEnv.set(p, args[i])
 	}
@@ -1910,16 +2020,7 @@ func applyLambda(fn *LambdaVal, args []Value) (Value, error) {
 		}
 		callEnv.set(fn.Rest, restList)
 	}
-	if len(fn.Body) == 0 {
-		return &VoidVal{}, nil
-	}
-	for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
-		_, err := evalInEnv(bodyExpr, callEnv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &tailCallVal{expr: fn.Body[len(fn.Body)-1], env: callEnv}, nil
+	return evalBodyExprs(fn.Body, callEnv)
 }
 
 func applyProcAt(op Value, args []Value, callSite Expr) (Value, error) {
@@ -1958,6 +2059,16 @@ func applyProcAt(op Value, args []Value, callSite Expr) (Value, error) {
 			return nil, err
 		}
 		return val, nil
+	case *CallCCVal:
+		if len(args) != 1 {
+			return nil, errAt(callSite, "call/cc requires 1 argument")
+		}
+		return evalCallCC(args[0], callSite)
+	case *ContinuationVal:
+		if len(args) != 1 {
+			return nil, errAt(callSite, "continuation requires 1 argument")
+		}
+		panic(continuationJump{cont: fn, val: args[0]})
 	}
 	return nil, errAt(callSite, "not a procedure")
 }
@@ -3089,6 +3200,16 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 			return applyLambda(fn, finalArgs)
 		case *CaseLambdaVal:
 			return applyCaseLambda(fn, finalArgs)
+		case *CallCCVal:
+			if len(finalArgs) != 1 {
+				return nil, &EvalError{Message: "call/cc requires 1 argument"}
+			}
+			return evalCallCC(finalArgs[0], nil)
+		case *ContinuationVal:
+			if len(finalArgs) != 1 {
+				return nil, &EvalError{Message: "continuation requires 1 argument"}
+			}
+			panic(continuationJump{cont: fn, val: finalArgs[0]})
 		}
 		return nil, &EvalError{Message: "apply: not a procedure"}
 	})
@@ -3197,11 +3318,15 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 			return nil, &EvalError{Message: "procedure? requires 1 argument"}
 		}
 		switch args[0].(type) {
-		case *LambdaVal, *BuiltinVal, *CaseLambdaVal:
+		case *LambdaVal, *BuiltinVal, *CaseLambdaVal, *ContinuationVal, *CallCCVal:
 			return &BoolVal{Val: true}, nil
 		}
 		return &BoolVal{Val: false}, nil
 	})
+
+	// L18: call/cc
+	env.set("call/cc", &CallCCVal{})
+	env.set("call-with-current-continuation", &CallCCVal{})
 
 	// L17: cxr compositions
 	addBuiltin("caar", func(args []Value) (Value, error) {
@@ -3690,12 +3815,9 @@ func EvalStr(input string) (string, error) {
 		return "", err
 	}
 	env := makeBuiltinEnv(nil)
-	var result Value
-	for _, expr := range exprs {
-		result, err = evalInEnv(expr, env)
-		if err != nil {
-			return "", err
-		}
+	result, err := evalTopLevel(exprs, env)
+	if err != nil {
+		return "", err
 	}
 	if _, ok := result.(*VoidVal); ok {
 		return "", nil
@@ -3714,12 +3836,9 @@ func EvalStrWithOutput(input string) (result string, output string, err error) {
 	}
 	var outBuf strings.Builder
 	env := makeBuiltinEnv(&outBuf)
-	var res Value
-	for _, expr := range exprs {
-		res, err = evalInEnv(expr, env)
-		if err != nil {
-			return "", "", err
-		}
+	res, evalErr := evalTopLevel(exprs, env)
+	if evalErr != nil {
+		return "", "", evalErr
 	}
 	var r string
 	if _, ok := res.(*VoidVal); !ok {
