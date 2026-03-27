@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static CALLCC_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn gensym(base: &str) -> String {
     let n = GENSYM_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -18,6 +19,23 @@ fn gensym(base: &str) -> String {
 
 thread_local! {
     static OUTPUT_BUFFER: RefCell<String> = RefCell::new(String::new());
+    static CALLCC_RETURN: RefCell<Option<Value>> = RefCell::new(None);
+    static CONT_FRAMES: RefCell<Vec<ContinuationFrame>> = RefCell::new(Vec::new());
+    static RESUME_FRAMES: RefCell<Vec<ContinuationFrame>> = RefCell::new(Vec::new());
+    static CONTINUATION_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static PENDING_CONTINUATION: RefCell<Option<Rc<ContinuationData>>> = RefCell::new(None);
+}
+
+#[derive(Debug, Clone)]
+struct ContinuationFrame {
+    exprs: Vec<Expr>,
+    env: Env,
+}
+
+#[derive(Debug, Clone)]
+struct ContinuationData {
+    id: usize,
+    frames: Vec<ContinuationFrame>,
 }
 
 fn output_write(s: &str) {
@@ -123,6 +141,7 @@ pub enum Value {
     Vector(Rc<RefCell<Vec<Value>>>),
     Void,
     TailCall(Box<(Expr, Env)>),
+    Continuation(Rc<ContinuationData>),
 }
 
 fn make_pair(car: Value, cdr: Value) -> Value {
@@ -220,6 +239,7 @@ impl PartialEq for Value {
             (Value::Record(id1, f1), Value::Record(id2, f2)) => id1 == id2 && f1 == f2,
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Void, Value::Void) => true,
+            (Value::Continuation(a), Value::Continuation(b)) => a.id == b.id,
             (Value::Macro(_), Value::Macro(_)) => false,
             (Value::TailCall(_), _) | (_, Value::TailCall(_)) => false,
             _ => false,
@@ -270,7 +290,7 @@ fn format_value(val: &Value, seen: &mut HashSet<usize>) -> String {
             s.push(')');
             s
         }
-        Value::Lambda(..) | Value::CaseLambda(..) | Value::Builtin(..) => "#<procedure>".to_string(),
+        Value::Lambda(..) | Value::CaseLambda(..) | Value::Builtin(..) | Value::Continuation(..) => "#<procedure>".to_string(),
         Value::Record(_, _) => "#<record>".to_string(),
         Value::Vector(items) => {
             let items = items.borrow();
@@ -566,6 +586,9 @@ fn expr_to_value(expr: &Expr) -> Value {
 
 /// Wrap an error with span info if it doesn't already have position info.
 fn with_span(err: EvalError, span: Span) -> EvalError {
+    if matches!(&err, EvalError::ContinuationEscape(_)) {
+        return err;
+    }
     let msg = err.to_string();
     // Don't double-annotate — check for pattern like "at N:N"
     if msg.contains(&format!("at {}", span)) {
@@ -649,7 +672,7 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                             return Err(EvalError::Arity("procedure? requires exactly 1 argument".into()));
                         }
                         let val = eval(&items[1], env)?;
-                        return Ok(Value::Boolean(matches!(val, Value::Lambda(..) | Value::CaseLambda(..) | Value::Builtin(..))));
+                        return Ok(Value::Boolean(matches!(val, Value::Lambda(..) | Value::CaseLambda(..) | Value::Builtin(..) | Value::Continuation(..))));
                     }
                     "+" => return eval_add(&items[1..], env),
                     "-" => return eval_sub(&items[1..], env),
@@ -714,6 +737,17 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                             }
                         }).collect();
                         return Err(EvalError::Generic(format!("error: {}", msg.join(" "))));
+                    }
+                    "call/cc" | "call-with-current-continuation" => {
+                        let override_val = CALLCC_RETURN.with(|r| r.borrow_mut().take());
+                        if let Some(val) = override_val {
+                            return Ok(val);
+                        }
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity("call/cc requires exactly 1 argument".into()));
+                        }
+                        let proc = eval(&items[1], env)?;
+                        return eval_callcc_with_proc(&proc);
                     }
                     "set-car!" | "set-cdr!" => {
                         if items.len() != 3 {
@@ -801,6 +835,14 @@ fn parse_params(exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalErr
 
 fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     match func {
+        Value::Continuation(data) => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("continuation requires exactly 1 argument".into()));
+            }
+            CONTINUATION_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+            PENDING_CONTINUATION.with(|pc| *pc.borrow_mut() = Some(data.clone()));
+            Err(EvalError::ContinuationEscape(data.id))
+        }
         Value::Lambda(params, rest, body, closure_env) => {
             if let Some(_rest_name) = rest {
                 if args.len() < params.len() {
@@ -813,6 +855,18 @@ fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                     "expected {} args, got {}", params.len(), args.len()
                 )));
             }
+            // Check for resume frame
+            let resume = RESUME_FRAMES.with(|rf| {
+                let mut frames = rf.borrow_mut();
+                if !frames.is_empty() {
+                    Some(frames.remove(0))
+                } else {
+                    None
+                }
+            });
+            if let Some(frame) = resume {
+                return eval_body_with_frames(&frame.exprs, &frame.env);
+            }
             let call_env = Env::with_parent(closure_env);
             for (p, a) in params.iter().zip(args) {
                 call_env.set(p.clone(), a.clone());
@@ -824,8 +878,22 @@ fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             if body.is_empty() {
                 return Ok(Value::Void);
             }
-            for expr in &body[..body.len()-1] {
-                eval(expr, &call_env)?;
+            if body.len() > 1 {
+                CONT_FRAMES.with(|f| {
+                    f.borrow_mut().push(ContinuationFrame {
+                        exprs: body.clone(),
+                        env: call_env.clone(),
+                    });
+                });
+                for (i, expr) in body[..body.len()-1].iter().enumerate() {
+                    CONT_FRAMES.with(|f| {
+                        if let Some(frame) = f.borrow_mut().last_mut() {
+                            frame.exprs = body[i..].to_vec();
+                        }
+                    });
+                    eval(expr, &call_env)?;
+                }
+                CONT_FRAMES.with(|f| f.borrow_mut().pop());
             }
             Ok(Value::TailCall(Box::new((body.last().unwrap().clone(), call_env))))
         }
@@ -856,7 +924,19 @@ fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
             }
             Err(EvalError::Arity(format!("no matching case-lambda clause for {} args", args.len())))
         }
-        Value::Builtin(name) => apply_builtin(name, args),
+        Value::Builtin(name) => {
+            if name == "call/cc" || name == "call-with-current-continuation" {
+                let override_val = CALLCC_RETURN.with(|r| r.borrow_mut().take());
+                if let Some(val) = override_val {
+                    return Ok(val);
+                }
+                if args.len() != 1 {
+                    return Err(EvalError::Arity("call/cc requires exactly 1 argument".into()));
+                }
+                return eval_callcc_with_proc(&args[0]);
+            }
+            apply_builtin(name, args)
+        }
         other => Err(EvalError::Type(format!("not a procedure: {}", other))),
     }
 }
@@ -1569,7 +1649,7 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         }
         "procedure?" => {
             if args.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
-            Ok(Value::Boolean(matches!(&args[0], Value::Lambda(..) | Value::CaseLambda(..) | Value::Builtin(..))))
+            Ok(Value::Boolean(matches!(&args[0], Value::Lambda(..) | Value::CaseLambda(..) | Value::Builtin(..) | Value::Continuation(..))))
         }
         // ── L09: char operations ──
         "char-alphabetic?" => {
@@ -2122,8 +2202,33 @@ fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Ok(Value::Void);
     }
-    for a in &args[..args.len()-1] {
-        eval(a, env)?;
+    let resume = RESUME_FRAMES.with(|rf| {
+        let mut frames = rf.borrow_mut();
+        if !frames.is_empty() {
+            Some(frames.remove(0))
+        } else {
+            None
+        }
+    });
+    if let Some(frame) = resume {
+        return eval_body_with_frames(&frame.exprs, &frame.env);
+    }
+    if args.len() > 1 {
+        CONT_FRAMES.with(|f| {
+            f.borrow_mut().push(ContinuationFrame {
+                exprs: args.to_vec(),
+                env: env.clone(),
+            });
+        });
+        for (i, a) in args[..args.len()-1].iter().enumerate() {
+            CONT_FRAMES.with(|f| {
+                if let Some(frame) = f.borrow_mut().last_mut() {
+                    frame.exprs = args[i..].to_vec();
+                }
+            });
+            eval(a, env)?;
+        }
+        CONT_FRAMES.with(|f| f.borrow_mut().pop());
     }
     Ok(Value::TailCall(Box::new((args.last().unwrap().clone(), env.clone()))))
 }
@@ -2163,6 +2268,18 @@ fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
 fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::Arity("let requires bindings and body".into()));
+    }
+    // Check for resume frame BEFORE creating bindings
+    let resume = RESUME_FRAMES.with(|rf| {
+        let mut frames = rf.borrow_mut();
+        if !frames.is_empty() {
+            Some(frames.remove(0))
+        } else {
+            None
+        }
+    });
+    if let Some(frame) = resume {
+        return eval_body_with_frames(&frame.exprs, &frame.env);
     }
     // Named let: (let name ((var init) ...) body ...)
     if let ExprKind::Symbol(name) = &args[0].kind {
@@ -2220,8 +2337,23 @@ fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if body.is_empty() {
         return Ok(Value::Void);
     }
-    for expr in &body[..body.len()-1] {
-        eval(expr, &let_env)?;
+    if body.len() > 1 {
+        let body_vec: Vec<Expr> = body.to_vec();
+        CONT_FRAMES.with(|f| {
+            f.borrow_mut().push(ContinuationFrame {
+                exprs: body_vec.clone(),
+                env: let_env.clone(),
+            });
+        });
+        for (i, expr) in body[..body.len()-1].iter().enumerate() {
+            CONT_FRAMES.with(|f| {
+                if let Some(frame) = f.borrow_mut().last_mut() {
+                    frame.exprs = body_vec[i..].to_vec();
+                }
+            });
+            eval(expr, &let_env)?;
+        }
+        CONT_FRAMES.with(|f| f.borrow_mut().pop());
     }
     Ok(Value::TailCall(Box::new((body.last().unwrap().clone(), let_env))))
 }
@@ -3187,6 +3319,8 @@ fn seed_builtins(env: &Env) {
         "eqv?",
         "vector", "make-vector", "vector-ref", "vector-set!", "vector-length",
         "vector?", "vector->list", "list->vector",
+        // L18
+        "call/cc", "call-with-current-continuation",
         // L17
         "set-car!", "set-cdr!",
         "caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr", "caddar",
@@ -3205,6 +3339,107 @@ fn seed_builtins(env: &Env) {
     }
 }
 
+// ── Continuations ───────────────────────────────────────────────────
+
+fn eval_callcc_with_proc(proc: &Value) -> Result<Value, EvalError> {
+    let id = CALLCC_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let frames = CONT_FRAMES.with(|f| f.borrow().clone());
+    let cont_data = Rc::new(ContinuationData { id, frames });
+    let k = Value::Continuation(cont_data);
+    let result = apply(proc, &[k]);
+    match result {
+        Ok(v) => Ok(v),
+        Err(EvalError::ContinuationEscape(ret_id)) if ret_id == id => {
+            let val = CONTINUATION_VALUE.with(|v| v.borrow_mut().take()).unwrap();
+            PENDING_CONTINUATION.with(|pc| *pc.borrow_mut() = None);
+            Ok(val)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn eval_body_with_frames(body: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if body.is_empty() {
+        return Ok(Value::Void);
+    }
+    CONT_FRAMES.with(|f| {
+        f.borrow_mut().push(ContinuationFrame {
+            exprs: body.to_vec(),
+            env: env.clone(),
+        });
+    });
+    let mut last = Value::Void;
+    for (i, expr) in body.iter().enumerate() {
+        CONT_FRAMES.with(|f| {
+            if let Some(frame) = f.borrow_mut().last_mut() {
+                frame.exprs = body[i..].to_vec();
+            }
+        });
+        last = eval(expr, env)?;
+    }
+    CONT_FRAMES.with(|f| f.borrow_mut().pop());
+    Ok(last)
+}
+
+fn init_callcc_state() {
+    CALLCC_RETURN.with(|r| *r.borrow_mut() = None);
+    CONT_FRAMES.with(|f| f.borrow_mut().clear());
+    RESUME_FRAMES.with(|rf| rf.borrow_mut().clear());
+    CONTINUATION_VALUE.with(|v| *v.borrow_mut() = None);
+    PENDING_CONTINUATION.with(|pc| *pc.borrow_mut() = None);
+}
+
+fn eval_top_level_loop(exprs: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    let mut current_exprs: Vec<Expr> = exprs.to_vec();
+    let mut current_env = env.clone();
+
+    loop {
+        CONT_FRAMES.with(|f| {
+            f.borrow_mut().clear();
+            f.borrow_mut().push(ContinuationFrame {
+                exprs: current_exprs.clone(),
+                env: current_env.clone(),
+            });
+        });
+
+        let mut last = Value::Void;
+        let mut error = None;
+
+        for (i, expr) in current_exprs.iter().enumerate() {
+            CONT_FRAMES.with(|f| {
+                if let Some(frame) = f.borrow_mut().last_mut() {
+                    frame.exprs = current_exprs[i..].to_vec();
+                }
+            });
+            match eval(expr, &current_env) {
+                Ok(v) => last = v,
+                Err(e) => { error = Some(e); break; }
+            }
+        }
+
+        CONT_FRAMES.with(|f| f.borrow_mut().pop());
+
+        match error {
+            None => return Ok(last),
+            Some(EvalError::ContinuationEscape(_id)) => {
+                let val = CONTINUATION_VALUE.with(|v| v.borrow_mut().take()).unwrap();
+                let cont_data = PENDING_CONTINUATION.with(|pc| pc.borrow_mut().take()).unwrap();
+                CALLCC_RETURN.with(|r| *r.borrow_mut() = Some(val));
+                RESUME_FRAMES.with(|rf| {
+                    rf.borrow_mut().clear();
+                    if cont_data.frames.len() > 1 {
+                        *rf.borrow_mut() = cont_data.frames[1..].to_vec();
+                    }
+                });
+                current_exprs = cont_data.frames[0].exprs.clone();
+                current_env = cont_data.frames[0].env.clone();
+                continue;
+            }
+            Some(e) => return Err(e),
+        }
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────
 
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
@@ -3216,10 +3451,8 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     }
     let env = Env::new();
     seed_builtins(&env);
-    let mut last = Value::Void;
-    for expr in &exprs {
-        last = eval(expr, &env)?;
-    }
+    init_callcc_state();
+    let last = eval_top_level_loop(&exprs, &env)?;
     let output = OUTPUT_BUFFER.with(|buf| buf.borrow().clone());
     Ok((last.to_string(), output))
 }
@@ -3232,10 +3465,8 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     }
     let env = Env::new();
     seed_builtins(&env);
-    let mut last = Value::Void;
-    for expr in &exprs {
-        last = eval(expr, &env)?;
-    }
+    init_callcc_state();
+    let last = eval_top_level_loop(&exprs, &env)?;
     Ok(last.to_string())
 }
 

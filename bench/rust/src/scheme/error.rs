@@ -18,4 +18,7 @@ pub enum EvalError {
 
     #[error("{0}")]
     Generic(String),
+
+    #[error("continuation escape")]
+    ContinuationEscape(usize),
 }
