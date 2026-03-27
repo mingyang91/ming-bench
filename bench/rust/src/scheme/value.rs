@@ -1,19 +1,18 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::scheme::env::Env;
 
-static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static RECORD_TYPE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn next_record_type_id() -> usize {
-    RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    RECORD_TYPE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecordProcKind {
-    Constructor { field_names: Vec<std::string::String> },
+    Constructor { field_names: Vec<String> },
     Predicate,
     Accessor { field_index: usize },
 }
@@ -24,20 +23,20 @@ pub enum Value {
     Rational(i64, i64), // numerator, denominator (always simplified, den > 0)
     Float(f64),
     Boolean(bool),
-    String(std::string::String, bool), // (content, mutable)
-    Symbol(std::string::String),
+    String(String, bool), // (content, mutable)
+    Symbol(String),
     List(Vec<Value>),
     Lambda {
-        params: Vec<std::string::String>,
-        rest_param: Option<std::string::String>,
+        params: Vec<String>,
+        rest_param: Option<String>,
         body: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },
     Char(char),
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<(Value, Value)>>),
     Void,
     SyntaxRules {
-        literals: Vec<std::string::String>,
+        literals: Vec<String>,
         rules: Vec<(Value, Value)>,
         def_env: Rc<RefCell<Env>>,
     },
@@ -50,7 +49,7 @@ pub enum Value {
         kind: RecordProcKind,
     },
     CaseLambda {
-        clauses: Vec<(Vec<std::string::String>, Option<std::string::String>, Vec<Value>, Rc<RefCell<Env>>)>,
+        clauses: Vec<(Vec<String>, Option<String>, Vec<Value>, Rc<RefCell<Env>>)>,
     },
     Vector(Rc<RefCell<Vec<Value>>>),
 }
@@ -66,7 +65,7 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
-            (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
+            (Value::Pair(a), Value::Pair(b)) => Rc::ptr_eq(a, b),
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
@@ -80,6 +79,10 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    pub fn new_pair(car: Value, cdr: Value) -> Value {
+        Value::Pair(Rc::new(RefCell::new((car, cdr))))
+    }
+
     pub fn make_rational(num: i64, den: i64) -> Value {
         if den == 0 {
             panic!("rational with zero denominator");
@@ -97,7 +100,7 @@ impl Value {
         }
     }
 
-    pub fn to_display(&self) -> std::string::String {
+    pub fn to_display(&self) -> String {
         match self {
             Value::Integer(n) => n.to_string(),
             Value::Rational(n, d) => format!("{}/{}", n, d),
@@ -113,7 +116,7 @@ impl Value {
             Value::String(s, _) => format!("\"{}\"", s),
             Value::Symbol(s) => s.clone(),
             Value::List(elems) => {
-                let inner: Vec<std::string::String> =
+                let inner: Vec<String> =
                     elems.iter().map(|v| v.to_display()).collect();
                 format!("({})", inner.join(" "))
             }
@@ -123,7 +126,7 @@ impl Value {
                 '\t' => "#\\tab".into(),
                 _ => format!("#\\{}", c),
             },
-            Value::Pair(a, b) => format!("({} . {})", a.to_display(), b.to_display()),
+            Value::Pair(p) => display_pair_chain(p, false),
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::SyntaxRules { .. } => "#<syntax>".into(),
             Value::Record { .. } => "#<record>".into(),
@@ -131,7 +134,7 @@ impl Value {
             Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Vector(v) => {
                 let elems = v.borrow();
-                let inner: Vec<std::string::String> = elems.iter().map(|v| v.to_display()).collect();
+                let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
                 format!("#({})", inner.join(" "))
             }
             Value::Void => "".into(),
@@ -148,21 +151,21 @@ impl Value {
     }
 
     /// Display representation (no quotes on strings, chars as raw)
-    pub fn to_display_repr(&self) -> std::string::String {
+    pub fn to_display_repr(&self) -> String {
         match self {
             Value::String(s, _) => s.clone(),
             Value::Char(c) => c.to_string(),
             Value::Rational(_, _) | Value::Float(_) => self.to_display(),
             Value::List(elems) => {
-                let inner: Vec<std::string::String> =
+                let inner: Vec<String> =
                     elems.iter().map(|v| v.to_display_repr()).collect();
                 format!("({})", inner.join(" "))
             }
-            Value::Pair(a, b) => format!("({} . {})", a.to_display_repr(), b.to_display_repr()),
+            Value::Pair(p) => display_pair_chain(p, true),
             Value::CaseLambda { .. } => "#<procedure>".into(),
             Value::Vector(v) => {
                 let elems = v.borrow();
-                let inner: Vec<std::string::String> = elems.iter().map(|v| v.to_display_repr()).collect();
+                let inner: Vec<String> = elems.iter().map(|v| v.to_display_repr()).collect();
                 format!("#({})", inner.join(" "))
             }
             _ => self.to_display(),
@@ -172,6 +175,63 @@ impl Value {
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Boolean(false))
     }
+}
+
+/// Display a pair chain as a proper or improper list.
+/// Handles cycles by tracking visited Rc pointers.
+fn display_pair_chain(p: &Rc<RefCell<(Value, Value)>>, display_mode: bool) -> String {
+    let mut parts = Vec::new();
+    let mut cur_rc = Rc::clone(p);
+    let mut seen: Vec<*const RefCell<(Value, Value)>> = Vec::new();
+
+    loop {
+        let ptr = Rc::as_ptr(&cur_rc);
+        if seen.iter().any(|s| std::ptr::eq(*s, ptr)) {
+            break; // cycle detected
+        }
+        seen.push(ptr);
+
+        let (car_val, cdr_val) = {
+            let pair = cur_rc.borrow();
+            (pair.0.clone(), pair.1.clone())
+        };
+
+        if display_mode {
+            parts.push(car_val.to_display_repr());
+        } else {
+            parts.push(car_val.to_display());
+        }
+
+        match cdr_val {
+            Value::Pair(next) => {
+                cur_rc = next;
+            }
+            Value::List(ref elems) if elems.is_empty() => {
+                return format!("({})", parts.join(" "));
+            }
+            Value::List(ref elems) => {
+                // Non-empty List as cdr: append its elements
+                for elem in elems {
+                    if display_mode {
+                        parts.push(elem.to_display_repr());
+                    } else {
+                        parts.push(elem.to_display());
+                    }
+                }
+                return format!("({})", parts.join(" "));
+            }
+            other => {
+                let tail = if display_mode {
+                    other.to_display_repr()
+                } else {
+                    other.to_display()
+                };
+                return format!("({} . {})", parts.join(" "), tail);
+            }
+        }
+    }
+
+    format!("({})", parts.join(" "))
 }
 
 impl fmt::Display for Value {

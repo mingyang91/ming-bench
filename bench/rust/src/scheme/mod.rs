@@ -40,6 +40,16 @@ const BUILTINS: &[&str] = &[
     "for-each",
     // L15
     "string->list", "list->string", "char->integer", "integer->char",
+    // L17
+    "set-car!", "set-cdr!",
+    "caar", "cadr", "cdar", "cddr",
+    "caaar", "caadr", "caddr", "cdddr", "caddar",
+    "reverse", "assq", "assv", "memq", "memv", "member",
+    "gcd", "lcm", "truncate", "round", "floor", "ceiling",
+    "make-string", "string",
+    "string>?", "string<=?", "string>=?",
+    "vector-set!", "string-set!",
+    // cxr handled dynamically in apply_builtin
 ];
 
 fn make_env() -> Rc<RefCell<Env>> {
