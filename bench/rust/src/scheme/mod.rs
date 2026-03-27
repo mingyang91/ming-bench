@@ -122,6 +122,7 @@ pub enum Value {
     Record(usize, Vec<Value>), // type_id, field values
     Vector(Rc<RefCell<Vec<Value>>>),
     Void,
+    TailCall(Box<(Expr, Env)>),
 }
 
 fn gcd(a: i64, b: i64) -> i64 {
@@ -161,6 +162,7 @@ impl PartialEq for Value {
             (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
             (Value::Void, Value::Void) => true,
             (Value::Macro(_), Value::Macro(_)) => false,
+            (Value::TailCall(_), _) | (_, Value::TailCall(_)) => false,
             _ => false,
         }
     }
@@ -212,6 +214,7 @@ impl fmt::Display for Value {
             }
             Value::Macro(_) => write!(f, "#<macro>"),
             Value::Void => Ok(()),
+            Value::TailCall(_) => write!(f, "#<tail-call>"),
         }
     }
 }
@@ -469,7 +472,12 @@ fn with_span(err: EvalError, span: Span) -> EvalError {
 }
 
 fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
-    eval_inner(expr, env).map_err(|e| with_span(e, expr.span))
+    let mut result = eval_inner(expr, env).map_err(|e| with_span(e, expr.span))?;
+    while let Value::TailCall(tc) = result {
+        let (next_expr, next_env) = *tc;
+        result = eval_inner(&next_expr, &next_env).map_err(|e| with_span(e, next_expr.span))?;
+    }
+    Ok(result)
 }
 
 fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
@@ -626,11 +634,11 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     return expand_and_eval_macro(&mac, items, env);
                 }
             }
-            // Function application
+            // Function application (tail position — may return TailCall)
             let func = eval(&items[0], env)?;
             let args: Result<Vec<Value>, _> = items[1..].iter().map(|a| eval(a, env)).collect();
             let args = args?;
-            apply(&func, &args)
+            apply_tail(&func, &args)
         }
     }
 }
@@ -659,10 +667,10 @@ fn parse_params(exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalErr
     }
 }
 
-fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     match func {
         Value::Lambda(params, rest, body, closure_env) => {
-            if let Some(rest_name) = rest {
+            if let Some(_rest_name) = rest {
                 if args.len() < params.len() {
                     return Err(EvalError::Arity(format!(
                         "expected at least {} args, got {}", params.len(), args.len()
@@ -681,11 +689,13 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                 let rest_args = args[params.len()..].to_vec();
                 call_env.set(rest_name.clone(), Value::List(rest_args));
             }
-            let mut result = Value::Void;
-            for expr in body {
-                result = eval(expr, &call_env)?;
+            if body.is_empty() {
+                return Ok(Value::Void);
             }
-            Ok(result)
+            for expr in &body[..body.len()-1] {
+                eval(expr, &call_env)?;
+            }
+            Ok(Value::TailCall(Box::new((body.last().unwrap().clone(), call_env))))
         }
         Value::CaseLambda(clauses) => {
             for (params, rest, body, closure_env) in clauses {
@@ -703,17 +713,30 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
                         let rest_args = args[params.len()..].to_vec();
                         call_env.set(rest_name.clone(), Value::List(rest_args));
                     }
-                    let mut result = Value::Void;
-                    for expr in body {
-                        result = eval(expr, &call_env)?;
+                    if body.is_empty() {
+                        return Ok(Value::Void);
                     }
-                    return Ok(result);
+                    for expr in &body[..body.len()-1] {
+                        eval(expr, &call_env)?;
+                    }
+                    return Ok(Value::TailCall(Box::new((body.last().unwrap().clone(), call_env))));
                 }
             }
             Err(EvalError::Arity(format!("no matching case-lambda clause for {} args", args.len())))
         }
         Value::Builtin(name) => apply_builtin(name, args),
         other => Err(EvalError::Type(format!("not a procedure: {}", other))),
+    }
+}
+
+fn apply(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
+    let result = apply_tail(func, args)?;
+    match result {
+        Value::TailCall(tc) => {
+            let (expr, env) = *tc;
+            eval(&expr, &env)
+        }
+        v => Ok(v),
     }
 }
 
@@ -857,7 +880,7 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             };
             let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
             all_args.extend(tail);
-            apply(proc, &all_args)
+            apply_tail(proc, &all_args)
         }
         "number?" => { if args.len() != 1 { return Err(EvalError::Arity("number? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Integer(_) | Value::Rational(_, _) | Value::Float(_)))) }
         "string?" => { if args.len() != 1 { return Err(EvalError::Arity("string? requires 1 argument".into())); } Ok(Value::Boolean(matches!(args[0], Value::Str(_)))) }
@@ -1298,9 +1321,9 @@ fn eval_if(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     }
     let cond = eval(&args[0], env)?;
     if is_truthy(&cond) {
-        eval(&args[1], env)
+        Ok(Value::TailCall(Box::new((args[1].clone(), env.clone()))))
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        Ok(Value::TailCall(Box::new((args[2].clone(), env.clone()))))
     } else {
         Ok(Value::Void)
     }
@@ -1569,33 +1592,39 @@ fn eval_not(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
 }
 
 fn eval_and(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(true);
-    for a in args {
-        result = eval(a, env)?;
+    if args.is_empty() {
+        return Ok(Value::Boolean(true));
+    }
+    for a in &args[..args.len()-1] {
+        let result = eval(a, env)?;
         if !is_truthy(&result) {
             return Ok(result);
         }
     }
-    Ok(result)
+    Ok(Value::TailCall(Box::new((args.last().unwrap().clone(), env.clone()))))
 }
 
 fn eval_or(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Boolean(false);
-    for a in args {
-        result = eval(a, env)?;
+    if args.is_empty() {
+        return Ok(Value::Boolean(false));
+    }
+    for a in &args[..args.len()-1] {
+        let result = eval(a, env)?;
         if is_truthy(&result) {
             return Ok(result);
         }
     }
-    Ok(result)
+    Ok(Value::TailCall(Box::new((args.last().unwrap().clone(), env.clone()))))
 }
 
 fn eval_begin(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
-    let mut result = Value::Void;
-    for a in args {
-        result = eval(a, env)?;
+    if args.is_empty() {
+        return Ok(Value::Void);
     }
-    Ok(result)
+    for a in &args[..args.len()-1] {
+        eval(a, env)?;
+    }
+    Ok(Value::TailCall(Box::new((args.last().unwrap().clone(), env.clone()))))
 }
 
 fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
@@ -1604,20 +1633,24 @@ fn eval_cond(clauses: &[Expr], env: &Env) -> Result<Value, EvalError> {
             ExprKind::List(parts) if !parts.is_empty() => {
                 if let ExprKind::Symbol(s) = &parts[0].kind {
                     if s == "else" {
-                        let mut result = Value::Void;
-                        for expr in &parts[1..] {
-                            result = eval(expr, env)?;
+                        if parts.len() <= 1 {
+                            return Ok(Value::Void);
                         }
-                        return Ok(result);
+                        for expr in &parts[1..parts.len()-1] {
+                            eval(expr, env)?;
+                        }
+                        return Ok(Value::TailCall(Box::new((parts.last().unwrap().clone(), env.clone()))));
                     }
                 }
                 let test = eval(&parts[0], env)?;
                 if is_truthy(&test) {
-                    let mut result = test;
-                    for expr in &parts[1..] {
-                        result = eval(expr, env)?;
+                    if parts.len() <= 1 {
+                        return Ok(test);
                     }
-                    return Ok(result);
+                    for expr in &parts[1..parts.len()-1] {
+                        eval(expr, env)?;
+                    }
+                    return Ok(Value::TailCall(Box::new((parts.last().unwrap().clone(), env.clone()))));
                 }
             }
             _ => return Err(EvalError::Parse("cond: invalid clause".into())),
@@ -1662,7 +1695,7 @@ fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         let lambda2 = Value::Lambda(params, None, body2, let_env.clone());
         let_env.set(name.clone(), lambda2.clone());
         let init_vals: Result<Vec<Value>, _> = inits.iter().map(|e| eval(e, env)).collect();
-        return apply(&lambda2, &init_vals?);
+        return apply_tail(&lambda2, &init_vals?);
     }
     let bindings = match &args[0].kind {
         ExprKind::List(b) => b,
@@ -1682,11 +1715,14 @@ fn eval_let(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
             _ => return Err(EvalError::Parse("let: invalid binding".into())),
         }
     }
-    let mut result = Value::Void;
-    for expr in &args[1..] {
-        result = eval(expr, &let_env)?;
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Value::Void);
     }
-    Ok(result)
+    for expr in &body[..body.len()-1] {
+        eval(expr, &let_env)?;
+    }
+    Ok(Value::TailCall(Box::new((body.last().unwrap().clone(), let_env))))
 }
 
 fn eval_let_star(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
@@ -2567,7 +2603,7 @@ fn expand_and_eval_macro(mac: &SyntaxRulesMacro, input: &[Expr], use_env: &Env) 
                 }
             }
 
-            return eval(&expanded, use_env);
+            return Ok(Value::TailCall(Box::new((expanded, use_env.clone()))));
         }
     }
     Err(EvalError::Generic("no matching syntax-rules pattern".into()))
