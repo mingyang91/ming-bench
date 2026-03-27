@@ -38,9 +38,9 @@ public class Evaluator {
     public EvalResult evalStrWithOutput(String input) throws EvalError {
         outputBuffer.setLength(0);
         List<Object> exprs = parse(input);
-        if (exprs.isEmpty()) return new EvalResult(schemeToString(VOID), outputBuffer.toString());
+        if (exprs.isEmpty()) return new EvalResult(displayToString(VOID), outputBuffer.toString());
         Object result = trampoline(evalSeqK(exprs, 0, globalEnv, BounceValue::new));
-        return new EvalResult(schemeToString(result), outputBuffer.toString());
+        return new EvalResult(displayToString(result), outputBuffer.toString());
     }
 
     // --- Trampoline ---
