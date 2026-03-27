@@ -34,6 +34,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
                     "let" => return eval_let(&elems[1..], env, out),
                     "begin" => return eval_begin(&elems[1..], env, out),
                     "cond" => return eval_cond(&elems[1..], env, out),
+                    "set!" => return eval_set_bang(&elems[1..], env, out),
                     "string-set!" => return eval_string_set(&elems[1..], env, out),
                     _ => {}
                 }
@@ -47,6 +48,19 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
         }
         Value::Void => Ok(Value::Void),
     }
+}
+
+fn eval_set_bang(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("set! requires 2 arguments".into()));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("set!: first argument must be a symbol".into())),
+    };
+    let val = eval(&args[1], env, out)?;
+    Env::set_existing(env, &name, val)?;
+    Ok(Value::Void)
 }
 
 fn eval_define(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {

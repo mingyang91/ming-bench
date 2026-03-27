@@ -39,4 +39,25 @@ impl Env {
     pub fn set(&mut self, name: String, val: Value) {
         self.bindings.insert(name, val);
     }
+
+    pub fn set_existing(env: &Rc<RefCell<Env>>, name: &str, val: Value) -> Result<(), EvalError> {
+        let mut cur = Rc::clone(env);
+        loop {
+            {
+                let mut e = cur.borrow_mut();
+                if e.bindings.contains_key(name) {
+                    e.bindings.insert(name.to_string(), val);
+                    return Ok(());
+                }
+            }
+            let next = {
+                let e = cur.borrow();
+                match e.parent {
+                    Some(ref p) => Rc::clone(p),
+                    None => return Err(EvalError::UnboundVariable(name.into())),
+                }
+            };
+            cur = next;
+        }
+    }
 }
