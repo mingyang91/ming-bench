@@ -20,6 +20,7 @@ const (
 	tokenLParen tokenKind = iota
 	tokenRParen
 	tokenQuote
+	tokenSyntaxQuote
 	tokenAtom
 	tokenString
 )
@@ -80,7 +81,7 @@ type symbolExpr struct {
 	value   string
 	pos     position
 	binding *binding
-	macro   *syntaxRuleMacro
+	macro   *macroExpander
 }
 
 func (e *symbolExpr) exprPos() position { return e.pos }
@@ -288,16 +289,24 @@ type binding struct {
 }
 
 type environment struct {
-	parent *environment
-	values map[string]*binding
-	macros map[string]*syntaxRuleMacro
+	parent         *environment
+	values         map[string]*binding
+	macros         map[string]*macroExpander
+	syntaxBindings map[string]syntaxCapture
+	syntaxCtx      *syntaxContext
 }
 
 func newEnvironment(parent *environment) *environment {
+	var syntaxCtx *syntaxContext
+	if parent != nil {
+		syntaxCtx = parent.syntaxCtx
+	}
 	return &environment{
-		parent: parent,
-		values: map[string]*binding{},
-		macros: map[string]*syntaxRuleMacro{},
+		parent:         parent,
+		values:         map[string]*binding{},
+		macros:         map[string]*macroExpander{},
+		syntaxBindings: map[string]syntaxCapture{},
+		syntaxCtx:      syntaxCtx,
 	}
 }
 
@@ -326,17 +335,54 @@ func (e *environment) lookup(name string) (any, bool) {
 	return binding.value, true
 }
 
-func (e *environment) defineMacro(name string, macro *syntaxRuleMacro) {
+func (e *environment) defineMacro(name string, macro *macroExpander) {
 	e.macros[name] = macro
 }
 
-func (e *environment) lookupMacro(name string) (*syntaxRuleMacro, bool) {
+func (e *environment) lookupMacro(name string) (*macroExpander, bool) {
 	for current := e; current != nil; current = current.parent {
 		if macro, ok := current.macros[name]; ok {
 			return macro, true
 		}
 	}
 	return nil, false
+}
+
+func (e *environment) defineSyntaxBinding(name string, capture syntaxCapture) {
+	cloned := cloneSyntaxCapture(capture)
+	e.syntaxBindings[name] = cloned
+	e.defineBinding(name, &binding{value: syntaxRuntimeValue(cloned)})
+}
+
+func (e *environment) lookupSyntaxBinding(name string) (syntaxCapture, bool) {
+	for current := e; current != nil; current = current.parent {
+		if capture, ok := current.syntaxBindings[name]; ok {
+			return cloneSyntaxCapture(capture), true
+		}
+	}
+	return syntaxCapture{}, false
+}
+
+func (e *environment) collectSyntaxBindings() map[string]syntaxCapture {
+	merged := map[string]syntaxCapture{}
+	for current := e; current != nil; current = current.parent {
+		for name, capture := range current.syntaxBindings {
+			if _, exists := merged[name]; exists {
+				continue
+			}
+			merged[name] = cloneSyntaxCapture(capture)
+		}
+	}
+	return merged
+}
+
+func (e *environment) syntaxDefinitionEnv() *environment {
+	for current := e; current != nil; current = current.parent {
+		if current.syntaxCtx != nil && current.syntaxCtx.defEnv != nil {
+			return current.syntaxCtx.defEnv
+		}
+	}
+	return nil
 }
 
 func (e *environment) assign(name string, value any) bool {
@@ -431,7 +477,7 @@ func installBuiltins(env *environment) {
 		"display", "write", "newline", "error",
 		"string-append", "string-length", "substring", "make-string", "string",
 		"string->number", "number->string", "exact->inexact", "inexact->exact", "numerator", "denominator",
-		"symbol->string", "string->symbol",
+		"symbol->string", "string->symbol", "syntax->datum", "datum->syntax",
 		"string-ref", "string-copy", "string-set!", "string->list", "list->string", "char?", "char->integer", "integer->char",
 		"abs", "modulo", "remainder", "quotient", "min", "max", "expt", "gcd", "lcm", "truncate", "round",
 		"zero?", "positive?", "negative?", "odd?", "even?",
@@ -575,6 +621,12 @@ func (i *interpreter) evalList(list *listExpr, env *environment, tail bool) (any
 				return i.evalLetRec(list.elements[1:], operator.pos, env, true, "letrec*", tail)
 			case "quote":
 				return i.evalQuote(list.elements[1:], operator.pos)
+			case "syntax":
+				return i.evalSyntax(list.elements[1:], operator.pos, env)
+			case "syntax-case":
+				return i.evalSyntaxCase(list.elements[1:], operator.pos, env)
+			case "with-syntax":
+				return i.evalWithSyntax(list.elements[1:], operator.pos, env)
 			case "lambda":
 				return i.evalLambda(list.elements[1:], operator.pos, env)
 			case "case-lambda":
@@ -1106,7 +1158,7 @@ func (i *interpreter) evalDefineSyntax(args []expr, pos position, env *environme
 		return nil, newEvalError(args[0].exprPos(), "define-syntax requires a symbol name")
 	}
 
-	macro, err := parseSyntaxRuleMacro(name.value, args[1], env)
+	macro, err := i.parseMacroDefinition(name.value, args[1], env)
 	if err != nil {
 		return nil, err
 	}
@@ -2503,6 +2555,25 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return symbolValue(text), nil
 
+	case "syntax->datum":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		return datumFromSyntaxValue(args[0], pos)
+
+	case "datum->syntax":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		if _, err := captureFromSyntaxValue(args[0], pos); err != nil {
+			return nil, err
+		}
+		converted, err := exprFromDatum(args[1], syntaxSourcePos(args[0], pos))
+		if err != nil {
+			return nil, err
+		}
+		return &syntaxObject{expr: converted}, nil
+
 	case "string-ref":
 		if len(args) != 2 {
 			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
@@ -3214,6 +3285,18 @@ func formatValueWithState(value any, state *formatState) string {
 		return fmt.Sprintf("#<record %s>", v.recordType.name)
 	case *multiValueResult:
 		return "#<values>"
+	case *syntaxObject:
+		datum, err := datumFromExpr(v.expr)
+		if err != nil {
+			return "#<syntax>"
+		}
+		return "#<syntax " + formatValueWithState(datum, state) + ">"
+	case *syntaxSequenceValue:
+		datum, err := datumFromSyntaxValue(v, position{})
+		if err != nil {
+			return "#<syntax>"
+		}
+		return "#<syntax " + formatValueWithState(datum, state) + ">"
 	case *continuationProcedure:
 		return "#<procedure>"
 	case callable:
@@ -3354,6 +3437,13 @@ func lex(input string) ([]token, error) {
 
 		pos := position{line: line, column: column}
 
+		if ch == '#' && index+1 < len(input) && input[index+1] == '\'' {
+			tokens = append(tokens, token{kind: tokenSyntaxQuote, text: "#'", pos: pos})
+			index += 2
+			column += 2
+			continue
+		}
+
 		switch ch {
 		case '(':
 			tokens = append(tokens, token{kind: tokenLParen, text: "(", pos: pos})
@@ -3470,6 +3560,18 @@ func (p *tokenParser) parseExpr() (expr, error) {
 		return &listExpr{
 			elements: []expr{
 				&symbolExpr{value: "quote", pos: current.pos},
+				quoted,
+			},
+			pos: current.pos,
+		}, nil
+	case tokenSyntaxQuote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &listExpr{
+			elements: []expr{
+				&symbolExpr{value: "syntax", pos: current.pos},
 				quoted,
 			},
 			pos: current.pos,

@@ -5,6 +5,18 @@ import (
 	"strings"
 )
 
+type macroImplementation interface {
+	expand(*interpreter, *listExpr) (expr, error)
+}
+
+type macroExpander struct {
+	impl macroImplementation
+}
+
+func (m *macroExpander) expand(i *interpreter, invocation *listExpr) (expr, error) {
+	return m.impl.expand(i, invocation)
+}
+
 type syntaxRuleMacro struct {
 	name     string
 	literals map[string]struct{}
@@ -94,7 +106,7 @@ func (m *syntaxRuleMacro) expand(i *interpreter, invocation *listExpr) (expr, er
 
 		state := templateState{
 			intp:           i,
-			macro:          m,
+			defEnv:         m.defEnv,
 			patternVars:    rule.patternVars,
 			captures:       captures,
 			freeIntroduced: map[string]string{},
@@ -108,7 +120,7 @@ func (m *syntaxRuleMacro) expand(i *interpreter, invocation *listExpr) (expr, er
 func collectPatternVars(pattern expr, literals map[string]struct{}, vars map[string]struct{}) {
 	switch p := pattern.(type) {
 	case *symbolExpr:
-		if p.value == "..." {
+		if p.value == "..." || p.value == "_" {
 			return
 		}
 		if _, ok := literals[p.value]; ok {
@@ -127,6 +139,9 @@ func matchSyntaxPattern(pattern expr, input expr, literals map[string]struct{}) 
 	case *symbolExpr:
 		if p.value == "..." {
 			return nil, false
+		}
+		if p.value == "_" {
+			return map[string]syntaxCapture{}, true
 		}
 		if _, ok := literals[p.value]; ok {
 			symbol, ok := input.(*symbolExpr)
@@ -320,7 +335,7 @@ func exprEqual(left expr, right expr) bool {
 
 type templateState struct {
 	intp           *interpreter
-	macro          *syntaxRuleMacro
+	defEnv         *environment
 	patternVars    map[string]struct{}
 	captures       map[string]syntaxCapture
 	freeIntroduced map[string]string
@@ -367,12 +382,12 @@ func (s *templateState) expandSymbol(symbol *symbolExpr, path []int, renames map
 	}
 
 	var binding *binding
-	if resolved, ok := s.macro.defEnv.lookupBinding(symbol.value); ok {
+	if resolved, ok := s.defEnv.lookupBinding(symbol.value); ok {
 		binding = resolved
 	}
 
-	var macro *syntaxRuleMacro
-	if resolved, ok := s.macro.defEnv.lookupMacro(symbol.value); ok {
+	var macro *macroExpander
+	if resolved, ok := s.defEnv.lookupMacro(symbol.value); ok {
 		macro = resolved
 	}
 
@@ -790,7 +805,7 @@ func isEllipsisExpr(expression expr) bool {
 
 func isCoreSyntaxKeyword(name string) bool {
 	switch name {
-	case "and", "or", "begin", "if", "cond", "define", "set!", "let", "quote", "lambda", "define-syntax", "syntax-rules":
+	case "and", "or", "begin", "if", "cond", "define", "set!", "let", "quote", "lambda", "define-syntax", "syntax-rules", "syntax", "syntax-case", "with-syntax":
 		return true
 	default:
 		return false
