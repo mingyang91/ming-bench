@@ -35,10 +35,7 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
 
     let env = default_env();
     let output = Rc::new(RefCell::new(String::new()));
-    let mut last = Value::Void;
-    for expression in &expressions {
-        last = eval(expression, &env, &output)?;
-    }
+    let last = eval_sequence_machine(&expressions, &env, &output)?;
 
     let captured_output = output.borrow().clone();
     Ok((last, captured_output))
@@ -49,6 +46,7 @@ type CellRef = Rc<RefCell<Value>>;
 type OutputRef = Rc<RefCell<String>>;
 
 static MACRO_GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static WIND_FRAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, PartialEq)]
 enum Expr {
@@ -80,14 +78,29 @@ enum RenderMode {
 #[derive(Clone)]
 enum Procedure {
     Builtin(BuiltinProcedure),
+    Special(SpecialProcedure),
     Lambda(LambdaProcedure),
     CaseLambda(CaseLambdaProcedure),
+    Continuation(Rc<ContinuationProcedure>),
 }
 
 #[derive(Clone, Copy)]
 struct BuiltinProcedure {
     name: &'static str,
     func: fn(&[Value], &OutputRef) -> Result<Value, EvalError>,
+}
+
+#[derive(Clone, Copy)]
+struct SpecialProcedure {
+    name: &'static str,
+    kind: SpecialProcedureKind,
+}
+
+#[derive(Clone, Copy)]
+enum SpecialProcedureKind {
+    Apply,
+    CallCc,
+    DynamicWind,
 }
 
 #[derive(Clone)]
@@ -128,6 +141,105 @@ enum PatternBinding {
 enum TailResult {
     Value(Value),
     Call(Value, Vec<Value>),
+}
+
+#[derive(Clone)]
+struct ContinuationProcedure {
+    continuation: Vec<Frame>,
+    wind_stack: Vec<WindFrame>,
+}
+
+#[derive(Clone)]
+struct WindFrame {
+    id: usize,
+    in_thunk: Value,
+    out_thunk: Value,
+}
+
+#[derive(Clone)]
+enum WindTransitionStep {
+    Out(WindFrame),
+    In(WindFrame),
+}
+
+enum MachineState {
+    Expr(Expr, EnvRef),
+    Value(Value),
+    Apply(Value, Vec<Value>),
+}
+
+#[derive(Clone)]
+enum Frame {
+    Sequence {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    If {
+        then_expr: Expr,
+        else_expr: Option<Expr>,
+        env: EnvRef,
+    },
+    DefineValue {
+        name: String,
+        env: EnvRef,
+    },
+    SetValue {
+        name: String,
+        env: EnvRef,
+    },
+    And {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    Or {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    Cond {
+        body: Vec<Expr>,
+        remaining_clauses: Vec<Expr>,
+        env: EnvRef,
+    },
+    CallOperator {
+        arguments: Vec<Expr>,
+        env: EnvRef,
+    },
+    CallArgument {
+        procedure: Value,
+        evaluated: Vec<Value>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    Let {
+        names: Vec<String>,
+        remaining_exprs: Vec<Expr>,
+        evaluated: Vec<Value>,
+        body: Vec<Expr>,
+        env: EnvRef,
+    },
+    NamedLet {
+        procedure: Value,
+        remaining_exprs: Vec<Expr>,
+        evaluated: Vec<Value>,
+        env: EnvRef,
+    },
+    DynamicWindAfterIn {
+        frame: WindFrame,
+        body_thunk: Value,
+    },
+    DynamicWindAfterBody {
+        frame: WindFrame,
+    },
+    DynamicWindAfterOut {
+        result: Value,
+    },
+    WindTransition {
+        pending_push: Option<WindFrame>,
+        remaining: Vec<WindTransitionStep>,
+        target_continuation: Vec<Frame>,
+        target_wind_stack: Vec<WindFrame>,
+        value: Value,
+    },
 }
 
 struct Environment {
@@ -261,6 +373,7 @@ impl Procedure {
     fn render(&self) -> String {
         match self {
             Self::Builtin(builtin) => format!("#<procedure:{}>", builtin.name),
+            Self::Special(special) => format!("#<procedure:{}>", special.name),
             Self::Lambda(lambda) => match &lambda.name {
                 Some(name) => format!("#<procedure:{name}>"),
                 None => "#<procedure>".to_string(),
@@ -269,6 +382,17 @@ impl Procedure {
                 Some(name) => format!("#<procedure:{name}>"),
                 None => "#<procedure>".to_string(),
             },
+            Self::Continuation(_) => "#<continuation>".to_string(),
+        }
+    }
+}
+
+impl WindFrame {
+    fn new(in_thunk: Value, out_thunk: Value) -> Self {
+        Self {
+            id: WIND_FRAME_COUNTER.fetch_add(1, Ordering::Relaxed),
+            in_thunk,
+            out_thunk,
         }
     }
 }
@@ -291,7 +415,16 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "procedure?", builtin_procedure_predicate);
     define_builtin(&env, "car", builtin_car);
     define_builtin(&env, "cdr", builtin_cdr);
-    define_builtin(&env, "apply", builtin_apply);
+    define_builtin(&env, "length", builtin_length);
+    define_builtin(&env, "reverse", builtin_reverse);
+    define_special(&env, "apply", SpecialProcedureKind::Apply);
+    define_special(&env, "call/cc", SpecialProcedureKind::CallCc);
+    define_special(
+        &env,
+        "call-with-current-continuation",
+        SpecialProcedureKind::CallCc,
+    );
+    define_special(&env, "dynamic-wind", SpecialProcedureKind::DynamicWind);
     define_builtin(&env, "display", builtin_display);
     define_builtin(&env, "write", builtin_write);
     define_builtin(&env, "newline", builtin_newline);
@@ -319,14 +452,783 @@ fn define_builtin(
     );
 }
 
+fn define_special(env: &EnvRef, name: &'static str, kind: SpecialProcedureKind) {
+    Environment::define(
+        env,
+        name,
+        Value::Procedure(Rc::new(Procedure::Special(SpecialProcedure { name, kind }))),
+    );
+}
+
 fn eval(expr: &Expr, env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
-    match expr {
-        Expr::Number(number) => Ok(Value::Number(*number)),
-        Expr::Bool(value) => Ok(Value::Bool(*value)),
-        Expr::String(value) => Ok(Value::String(value.clone())),
-        Expr::Symbol(name) => Environment::lookup(env, name),
-        Expr::List(items) => eval_list(items, env, output),
+    run_machine(
+        MachineState::Expr(expr.clone(), Rc::clone(env)),
+        Vec::new(),
+        Vec::new(),
+        output,
+    )
+}
+
+fn eval_sequence_machine(
+    expressions: &[Expr],
+    env: &EnvRef,
+    output: &OutputRef,
+) -> Result<Value, EvalError> {
+    let mut state = MachineState::Value(Value::Void);
+    let mut continuation = Vec::new();
+    start_sequence(expressions, env, &mut state, &mut continuation);
+    run_machine(state, continuation, Vec::new(), output)
+}
+
+fn run_machine(
+    mut state: MachineState,
+    mut continuation: Vec<Frame>,
+    mut wind_stack: Vec<WindFrame>,
+    output: &OutputRef,
+) -> Result<Value, EvalError> {
+    loop {
+        let current_state = std::mem::replace(&mut state, MachineState::Value(Value::Void));
+        match current_state {
+            MachineState::Expr(expr, env) => match expr {
+                Expr::Number(number) => state = MachineState::Value(Value::Number(number)),
+                Expr::Bool(value) => state = MachineState::Value(Value::Bool(value)),
+                Expr::String(value) => state = MachineState::Value(Value::String(value)),
+                Expr::Symbol(name) => {
+                    state = MachineState::Value(Environment::lookup(&env, &name)?);
+                }
+                Expr::List(items) => {
+                    eval_machine_list(&items, &env, &mut state, &mut continuation)?;
+                }
+            },
+            MachineState::Value(value) => {
+                let Some(frame) = continuation.pop() else {
+                    return Ok(value);
+                };
+                handle_frame(
+                    frame,
+                    value,
+                    &mut state,
+                    &mut continuation,
+                    &mut wind_stack,
+                    output,
+                )?;
+            }
+            MachineState::Apply(procedure, arguments) => {
+                handle_apply(
+                    procedure,
+                    arguments,
+                    &mut state,
+                    &mut continuation,
+                    &mut wind_stack,
+                    output,
+                )?;
+            }
+        }
     }
+}
+
+fn eval_machine_list(
+    items: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) -> Result<(), EvalError> {
+    let Some((head, tail)) = items.split_first() else {
+        return Err(EvalError::msg("cannot evaluate empty list"));
+    };
+
+    if let Expr::Symbol(name) = head {
+        match name.as_str() {
+            "and" => {
+                start_and(tail, env, state, continuation);
+                return Ok(());
+            }
+            "or" => {
+                start_or(tail, env, state, continuation);
+                return Ok(());
+            }
+            "begin" => {
+                start_sequence(tail, env, state, continuation);
+                return Ok(());
+            }
+            "cond" => return start_cond(tail, env, state, continuation),
+            "define" => return start_define(tail, env, state, continuation),
+            "define-syntax" => {
+                *state = MachineState::Value(eval_define_syntax(tail, env)?);
+                return Ok(());
+            }
+            "if" => return start_if(tail, env, state, continuation),
+            "let" => return start_let_form(tail, env, state, continuation),
+            "quote" => {
+                *state = MachineState::Value(eval_quote(tail)?);
+                return Ok(());
+            }
+            "set!" => return start_set(tail, env, state, continuation),
+            "case-lambda" => {
+                *state = MachineState::Value(eval_case_lambda(tail, env)?);
+                return Ok(());
+            }
+            "lambda" => {
+                *state = MachineState::Value(eval_lambda(tail, env)?);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        if let Some(definition) = Environment::lookup_macro(env, name) {
+            let (expanded, expanded_env) = expand_macro_call(definition.as_ref(), tail, env)?;
+            *state = MachineState::Expr(expanded, expanded_env);
+            return Ok(());
+        }
+    }
+
+    continuation.push(Frame::CallOperator {
+        arguments: tail.to_vec(),
+        env: Rc::clone(env),
+    });
+    *state = MachineState::Expr(head.clone(), Rc::clone(env));
+    Ok(())
+}
+
+fn start_sequence(
+    expressions: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) {
+    let Some((first, rest)) = expressions.split_first() else {
+        *state = MachineState::Value(Value::Void);
+        return;
+    };
+
+    if !rest.is_empty() {
+        continuation.push(Frame::Sequence {
+            remaining: rest.to_vec(),
+            env: Rc::clone(env),
+        });
+    }
+    *state = MachineState::Expr(first.clone(), Rc::clone(env));
+}
+
+fn start_and(
+    expressions: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) {
+    let Some((first, rest)) = expressions.split_first() else {
+        *state = MachineState::Value(Value::Bool(true));
+        return;
+    };
+
+    if !rest.is_empty() {
+        continuation.push(Frame::And {
+            remaining: rest.to_vec(),
+            env: Rc::clone(env),
+        });
+    }
+    *state = MachineState::Expr(first.clone(), Rc::clone(env));
+}
+
+fn start_or(
+    expressions: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) {
+    let Some((first, rest)) = expressions.split_first() else {
+        *state = MachineState::Value(Value::Bool(false));
+        return;
+    };
+
+    if !rest.is_empty() {
+        continuation.push(Frame::Or {
+            remaining: rest.to_vec(),
+            env: Rc::clone(env),
+        });
+    }
+    *state = MachineState::Expr(first.clone(), Rc::clone(env));
+}
+
+fn start_cond(
+    clauses: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) -> Result<(), EvalError> {
+    let Some((clause, rest)) = clauses.split_first() else {
+        *state = MachineState::Value(Value::Void);
+        return Ok(());
+    };
+
+    let Expr::List(items) = clause else {
+        return Err(EvalError::msg("cond clauses must be lists"));
+    };
+    let Some((test, body)) = items.split_first() else {
+        return Err(EvalError::msg("cond clauses cannot be empty"));
+    };
+
+    if matches!(test, Expr::Symbol(name) if name == "else") {
+        if !rest.is_empty() {
+            return Err(EvalError::msg("cond else clause must be last"));
+        }
+        start_sequence(body, env, state, continuation);
+        return Ok(());
+    }
+
+    continuation.push(Frame::Cond {
+        body: body.to_vec(),
+        remaining_clauses: rest.to_vec(),
+        env: Rc::clone(env),
+    });
+    *state = MachineState::Expr(test.clone(), Rc::clone(env));
+    Ok(())
+}
+
+fn start_define(
+    args: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) -> Result<(), EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::msg("define requires a target and value"));
+    }
+
+    match &args[0] {
+        Expr::Symbol(name) => {
+            if args.len() != 2 {
+                return Err(EvalError::msg(
+                    "define variable form requires exactly one value",
+                ));
+            }
+
+            continuation.push(Frame::DefineValue {
+                name: name.clone(),
+                env: Rc::clone(env),
+            });
+            *state = MachineState::Expr(args[1].clone(), Rc::clone(env));
+            Ok(())
+        }
+        Expr::List(signature) => {
+            let Some((name_expr, params)) = signature.split_first() else {
+                return Err(EvalError::msg("define function form requires a name"));
+            };
+
+            let Expr::Symbol(name) = name_expr else {
+                return Err(EvalError::msg("function name must be a symbol"));
+            };
+
+            let formals = Expr::List(params.to_vec());
+            let lambda = build_lambda(&formals, &args[1..], env, Some(name.clone()))?;
+            Environment::define(env, name.clone(), lambda);
+            *state = MachineState::Value(Value::Void);
+            Ok(())
+        }
+        _ => Err(EvalError::msg(
+            "define target must be a symbol or parameter list",
+        )),
+    }
+}
+
+fn start_if(
+    args: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) -> Result<(), EvalError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(EvalError::msg(
+            "if requires a condition, then branch, and optional else branch",
+        ));
+    }
+
+    continuation.push(Frame::If {
+        then_expr: args[1].clone(),
+        else_expr: args.get(2).cloned(),
+        env: Rc::clone(env),
+    });
+    *state = MachineState::Expr(args[0].clone(), Rc::clone(env));
+    Ok(())
+}
+
+fn start_set(
+    args: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) -> Result<(), EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::msg("set! requires a target and value"));
+    }
+
+    let Expr::Symbol(name) = &args[0] else {
+        return Err(EvalError::msg("set! target must be a symbol"));
+    };
+
+    continuation.push(Frame::SetValue {
+        name: name.clone(),
+        env: Rc::clone(env),
+    });
+    *state = MachineState::Expr(args[1].clone(), Rc::clone(env));
+    Ok(())
+}
+
+fn start_let_form(
+    args: &[Expr],
+    env: &EnvRef,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+) -> Result<(), EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::msg("let requires bindings and body"));
+    }
+
+    if let Expr::Symbol(name) = &args[0] {
+        if args.len() < 3 {
+            return Err(EvalError::msg("let requires bindings and body"));
+        }
+
+        let Expr::List(bindings) = &args[1] else {
+            return Err(EvalError::msg("let bindings must be a list"));
+        };
+
+        let (params, value_exprs) = parse_let_binding_exprs(bindings)?;
+        let named_env = Environment::new(Some(Rc::clone(env)));
+        let procedure = Value::Procedure(Rc::new(Procedure::Lambda(LambdaProcedure {
+            name: Some(name.clone()),
+            params,
+            rest: None,
+            body: args[2..].to_vec(),
+            env: Rc::clone(&named_env),
+        })));
+        Environment::define(&named_env, name.clone(), procedure.clone());
+
+        if let Some((first, rest)) = value_exprs.split_first() {
+            continuation.push(Frame::NamedLet {
+                procedure,
+                remaining_exprs: rest.to_vec(),
+                evaluated: Vec::new(),
+                env: Rc::clone(env),
+            });
+            *state = MachineState::Expr(first.clone(), Rc::clone(env));
+        } else {
+            *state = MachineState::Apply(procedure, Vec::new());
+        }
+        return Ok(());
+    }
+
+    let Expr::List(bindings) = &args[0] else {
+        return Err(EvalError::msg("let bindings must be a list"));
+    };
+
+    let (names, value_exprs) = parse_let_binding_exprs(bindings)?;
+    if let Some((first, rest)) = value_exprs.split_first() {
+        continuation.push(Frame::Let {
+            names,
+            remaining_exprs: rest.to_vec(),
+            evaluated: Vec::new(),
+            body: args[1..].to_vec(),
+            env: Rc::clone(env),
+        });
+        *state = MachineState::Expr(first.clone(), Rc::clone(env));
+    } else {
+        let let_env = Environment::new(Some(Rc::clone(env)));
+        start_sequence(&args[1..], &let_env, state, continuation);
+    }
+    Ok(())
+}
+
+fn parse_let_binding_exprs(bindings: &[Expr]) -> Result<(Vec<String>, Vec<Expr>), EvalError> {
+    let mut names = Vec::with_capacity(bindings.len());
+    let mut values = Vec::with_capacity(bindings.len());
+
+    for binding in bindings {
+        let Expr::List(parts) = binding else {
+            return Err(EvalError::msg("let bindings must be pairs"));
+        };
+        if parts.len() != 2 {
+            return Err(EvalError::msg("let bindings must be pairs"));
+        }
+
+        let Expr::Symbol(name) = &parts[0] else {
+            return Err(EvalError::msg("let binding names must be symbols"));
+        };
+
+        names.push(name.clone());
+        values.push(parts[1].clone());
+    }
+
+    Ok((names, values))
+}
+
+fn handle_frame(
+    frame: Frame,
+    value: Value,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+    wind_stack: &mut Vec<WindFrame>,
+    _output: &OutputRef,
+) -> Result<(), EvalError> {
+    match frame {
+        Frame::Sequence { remaining, env } => {
+            start_sequence(&remaining, &env, state, continuation);
+        }
+        Frame::If {
+            then_expr,
+            else_expr,
+            env,
+        } => {
+            let next = if value.is_truthy() {
+                then_expr
+            } else if let Some(else_expr) = else_expr {
+                else_expr
+            } else {
+                *state = MachineState::Value(Value::Void);
+                return Ok(());
+            };
+            *state = MachineState::Expr(next, env);
+        }
+        Frame::DefineValue { name, env } => {
+            Environment::define(&env, name, value);
+            *state = MachineState::Value(Value::Void);
+        }
+        Frame::SetValue { name, env } => {
+            Environment::set(&env, &name, value)?;
+            *state = MachineState::Value(Value::Void);
+        }
+        Frame::And { remaining, env } => {
+            if !value.is_truthy() {
+                *state = MachineState::Value(value);
+            } else if let Some((next, rest)) = remaining.split_first() {
+                if !rest.is_empty() {
+                    continuation.push(Frame::And {
+                        remaining: rest.to_vec(),
+                        env: Rc::clone(&env),
+                    });
+                }
+                *state = MachineState::Expr(next.clone(), env);
+            } else {
+                *state = MachineState::Value(value);
+            }
+        }
+        Frame::Or { remaining, env } => {
+            if value.is_truthy() {
+                *state = MachineState::Value(value);
+            } else if let Some((next, rest)) = remaining.split_first() {
+                if !rest.is_empty() {
+                    continuation.push(Frame::Or {
+                        remaining: rest.to_vec(),
+                        env: Rc::clone(&env),
+                    });
+                }
+                *state = MachineState::Expr(next.clone(), env);
+            } else {
+                *state = MachineState::Value(value);
+            }
+        }
+        Frame::Cond {
+            body,
+            remaining_clauses,
+            env,
+        } => {
+            if value.is_truthy() {
+                if body.is_empty() {
+                    *state = MachineState::Value(value);
+                } else {
+                    start_sequence(&body, &env, state, continuation);
+                }
+            } else {
+                start_cond(&remaining_clauses, &env, state, continuation)?;
+            }
+        }
+        Frame::CallOperator { arguments, env } => {
+            if let Some((next, rest)) = arguments.split_first() {
+                continuation.push(Frame::CallArgument {
+                    procedure: value,
+                    evaluated: Vec::new(),
+                    remaining: rest.to_vec(),
+                    env: Rc::clone(&env),
+                });
+                *state = MachineState::Expr(next.clone(), env);
+            } else {
+                *state = MachineState::Apply(value, Vec::new());
+            }
+        }
+        Frame::CallArgument {
+            procedure,
+            mut evaluated,
+            remaining,
+            env,
+        } => {
+            evaluated.push(value);
+            if let Some((next, rest)) = remaining.split_first() {
+                continuation.push(Frame::CallArgument {
+                    procedure,
+                    evaluated,
+                    remaining: rest.to_vec(),
+                    env: Rc::clone(&env),
+                });
+                *state = MachineState::Expr(next.clone(), env);
+            } else {
+                *state = MachineState::Apply(procedure, evaluated);
+            }
+        }
+        Frame::Let {
+            names,
+            remaining_exprs,
+            mut evaluated,
+            body,
+            env,
+        } => {
+            evaluated.push(value);
+            if let Some((next, rest)) = remaining_exprs.split_first() {
+                continuation.push(Frame::Let {
+                    names,
+                    remaining_exprs: rest.to_vec(),
+                    evaluated,
+                    body,
+                    env: Rc::clone(&env),
+                });
+                *state = MachineState::Expr(next.clone(), env);
+            } else {
+                let let_env = Environment::new(Some(Rc::clone(&env)));
+                for (name, value) in names.into_iter().zip(evaluated) {
+                    Environment::define(&let_env, name, value);
+                }
+                start_sequence(&body, &let_env, state, continuation);
+            }
+        }
+        Frame::NamedLet {
+            procedure,
+            remaining_exprs,
+            mut evaluated,
+            env,
+        } => {
+            evaluated.push(value);
+            if let Some((next, rest)) = remaining_exprs.split_first() {
+                continuation.push(Frame::NamedLet {
+                    procedure,
+                    remaining_exprs: rest.to_vec(),
+                    evaluated,
+                    env: Rc::clone(&env),
+                });
+                *state = MachineState::Expr(next.clone(), env);
+            } else {
+                *state = MachineState::Apply(procedure, evaluated);
+            }
+        }
+        Frame::DynamicWindAfterIn { frame, body_thunk } => {
+            wind_stack.push(frame.clone());
+            continuation.push(Frame::DynamicWindAfterBody { frame });
+            *state = MachineState::Apply(body_thunk, Vec::new());
+        }
+        Frame::DynamicWindAfterBody { frame } => {
+            let popped = wind_stack
+                .pop()
+                .ok_or_else(|| EvalError::msg("dynamic-wind stack underflow"))?;
+            if popped.id != frame.id {
+                return Err(EvalError::msg("dynamic-wind stack mismatch"));
+            }
+            continuation.push(Frame::DynamicWindAfterOut { result: value });
+            *state = MachineState::Apply(frame.out_thunk.clone(), Vec::new());
+        }
+        Frame::DynamicWindAfterOut { result } => {
+            *state = MachineState::Value(result);
+        }
+        Frame::WindTransition {
+            pending_push,
+            remaining,
+            target_continuation,
+            target_wind_stack,
+            value: jump_value,
+        } => {
+            if let Some(frame) = pending_push {
+                wind_stack.push(frame);
+            }
+            continue_wind_transition(
+                remaining,
+                target_continuation,
+                target_wind_stack,
+                jump_value,
+                state,
+                continuation,
+                wind_stack,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_apply(
+    procedure: Value,
+    arguments: Vec<Value>,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+    wind_stack: &mut Vec<WindFrame>,
+    output: &OutputRef,
+) -> Result<(), EvalError> {
+    let procedure = into_procedure(procedure)?;
+    match procedure.as_ref() {
+        Procedure::Builtin(builtin) => {
+            *state = MachineState::Value((builtin.func)(&arguments, output)?);
+        }
+        Procedure::Special(special) => {
+            handle_special_apply(
+                *special,
+                arguments,
+                state,
+                continuation,
+                wind_stack,
+                output,
+            )?;
+        }
+        Procedure::Lambda(lambda) => {
+            let call_env = bind_lambda_call(lambda, arguments)?;
+            start_sequence(&lambda.body, &call_env, state, continuation);
+        }
+        Procedure::CaseLambda(case_lambda) => {
+            let clause = select_case_lambda_clause(case_lambda, arguments.len())?;
+            let call_env = bind_lambda_call(clause, arguments)?;
+            start_sequence(&clause.body, &call_env, state, continuation);
+        }
+        Procedure::Continuation(captured) => {
+            ensure_exactly("continuation", arguments.len(), 1)?;
+            continuation.clear();
+            let jump_value = arguments
+                .into_iter()
+                .next()
+                .expect("arity check ensures a single continuation argument");
+            let steps = compute_wind_transition_steps(wind_stack, &captured.wind_stack);
+            continue_wind_transition(
+                steps,
+                captured.continuation.clone(),
+                captured.wind_stack.clone(),
+                jump_value,
+                state,
+                continuation,
+                wind_stack,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_special_apply(
+    special: SpecialProcedure,
+    arguments: Vec<Value>,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+    wind_stack: &mut Vec<WindFrame>,
+    _output: &OutputRef,
+) -> Result<(), EvalError> {
+    match special.kind {
+        SpecialProcedureKind::Apply => {
+            ensure_at_least("apply", arguments.len(), 2)?;
+            let trailing_args = match arguments.last() {
+                Some(Value::List(values)) => values.clone(),
+                Some(_) => {
+                    return Err(EvalError::msg("apply expects a list as its last argument"));
+                }
+                None => unreachable!("arity check guarantees at least two arguments"),
+            };
+
+            let mut applied_args =
+                Vec::with_capacity(arguments.len().saturating_sub(1) + trailing_args.len());
+            applied_args.extend(arguments[1..arguments.len() - 1].iter().cloned());
+            applied_args.extend(trailing_args);
+            *state = MachineState::Apply(arguments[0].clone(), applied_args);
+        }
+        SpecialProcedureKind::CallCc => {
+            ensure_exactly(special.name, arguments.len(), 1)?;
+            let captured = Value::Procedure(Rc::new(Procedure::Continuation(Rc::new(
+                ContinuationProcedure {
+                    continuation: continuation.clone(),
+                    wind_stack: wind_stack.clone(),
+                },
+            ))));
+            *state = MachineState::Apply(arguments[0].clone(), vec![captured]);
+        }
+        SpecialProcedureKind::DynamicWind => {
+            ensure_exactly("dynamic-wind", arguments.len(), 3)?;
+            let frame = WindFrame::new(arguments[0].clone(), arguments[2].clone());
+            continuation.push(Frame::DynamicWindAfterIn {
+                frame,
+                body_thunk: arguments[1].clone(),
+            });
+            *state = MachineState::Apply(arguments[0].clone(), Vec::new());
+        }
+    }
+    Ok(())
+}
+
+fn compute_wind_transition_steps(
+    current: &[WindFrame],
+    target: &[WindFrame],
+) -> Vec<WindTransitionStep> {
+    let mut shared = 0;
+    while shared < current.len() && shared < target.len() && current[shared].id == target[shared].id
+    {
+        shared += 1;
+    }
+
+    let mut steps = Vec::with_capacity((current.len() - shared) + (target.len() - shared));
+    for frame in current[shared..].iter().rev() {
+        steps.push(WindTransitionStep::Out(frame.clone()));
+    }
+    for frame in &target[shared..] {
+        steps.push(WindTransitionStep::In(frame.clone()));
+    }
+    steps
+}
+
+fn continue_wind_transition(
+    steps: Vec<WindTransitionStep>,
+    target_continuation: Vec<Frame>,
+    target_wind_stack: Vec<WindFrame>,
+    value: Value,
+    state: &mut MachineState,
+    continuation: &mut Vec<Frame>,
+    wind_stack: &mut Vec<WindFrame>,
+) -> Result<(), EvalError> {
+    let Some((first, rest)) = steps.split_first() else {
+        *continuation = target_continuation;
+        *wind_stack = target_wind_stack;
+        *state = MachineState::Value(value);
+        return Ok(());
+    };
+
+    match first {
+        WindTransitionStep::Out(frame) => {
+            let popped = wind_stack
+                .pop()
+                .ok_or_else(|| EvalError::msg("dynamic-wind stack underflow"))?;
+            if popped.id != frame.id {
+                return Err(EvalError::msg("dynamic-wind stack mismatch"));
+            }
+            continuation.push(Frame::WindTransition {
+                pending_push: None,
+                remaining: rest.to_vec(),
+                target_continuation,
+                target_wind_stack,
+                value,
+            });
+            *state = MachineState::Apply(frame.out_thunk.clone(), Vec::new());
+        }
+        WindTransitionStep::In(frame) => {
+            continuation.push(Frame::WindTransition {
+                pending_push: Some(frame.clone()),
+                remaining: rest.to_vec(),
+                target_continuation,
+                target_wind_stack,
+                value,
+            });
+            *state = MachineState::Apply(frame.in_thunk.clone(), Vec::new());
+        }
+    }
+
+    Ok(())
 }
 
 fn eval_list(items: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
@@ -403,16 +1305,18 @@ fn eval_define(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value,
 }
 
 fn eval_if(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
-    if args.len() != 3 {
+    if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::msg(
-            "if requires condition, then branch, and else branch",
+            "if requires a condition, then branch, and optional else branch",
         ));
     }
 
     if eval(&args[0], env, output)?.is_truthy() {
         eval(&args[1], env, output)
-    } else {
+    } else if args.len() == 3 {
         eval(&args[2], env, output)
+    } else {
+        Ok(Value::Void)
     }
 }
 
@@ -1121,16 +2025,18 @@ fn eval_tail_sequence(
 }
 
 fn eval_tail_if(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<TailResult, EvalError> {
-    if args.len() != 3 {
+    if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::msg(
-            "if requires condition, then branch, and else branch",
+            "if requires a condition, then branch, and optional else branch",
         ));
     }
 
     if eval(&args[0], env, output)?.is_truthy() {
         eval_tail_expression(&args[1], env, output)
-    } else {
+    } else if args.len() == 3 {
         eval_tail_expression(&args[2], env, output)
+    } else {
+        Ok(TailResult::Value(Value::Void))
     }
 }
 
@@ -1285,28 +2191,12 @@ fn eval_tail_begin(
 }
 
 fn apply(procedure: Value, arguments: Vec<Value>, output: &OutputRef) -> Result<Value, EvalError> {
-    let mut procedure = into_procedure(procedure)?;
-    let mut arguments = arguments;
-
-    loop {
-        let current_arguments = arguments;
-        let lambda = match procedure.as_ref() {
-            Procedure::Builtin(builtin) => return (builtin.func)(&current_arguments, output),
-            Procedure::Lambda(lambda) => lambda,
-            Procedure::CaseLambda(case_lambda) => {
-                select_case_lambda_clause(case_lambda, current_arguments.len())?
-            }
-        };
-
-        let call_env = bind_lambda_call(lambda, current_arguments)?;
-        match eval_tail_sequence(&lambda.body, &call_env, output)? {
-            TailResult::Value(value) => return Ok(value),
-            TailResult::Call(next_procedure, next_arguments) => {
-                procedure = into_procedure(next_procedure)?;
-                arguments = next_arguments;
-            }
-        }
-    }
+    run_machine(
+        MachineState::Apply(procedure, arguments),
+        Vec::new(),
+        Vec::new(),
+        output,
+    )
 }
 
 fn into_procedure(value: Value) -> Result<Rc<Procedure>, EvalError> {
@@ -1501,6 +2391,26 @@ fn builtin_cdr(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalEr
         Value::List(values) if !values.is_empty() => Ok(Value::List(values[1..].to_vec())),
         Value::List(_) => Err(EvalError::msg("cdr expects a non-empty list")),
         _ => Err(EvalError::msg("cdr expects a list")),
+    }
+}
+
+fn builtin_length(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("length", arguments.len(), 1)?;
+    match &arguments[0] {
+        Value::List(values) => Ok(Value::Number(values.len() as i128)),
+        _ => Err(EvalError::msg("length expects a list")),
+    }
+}
+
+fn builtin_reverse(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("reverse", arguments.len(), 1)?;
+    match &arguments[0] {
+        Value::List(values) => {
+            let mut reversed = values.clone();
+            reversed.reverse();
+            Ok(Value::List(reversed))
+        }
+        _ => Err(EvalError::msg("reverse expects a list")),
     }
 }
 
