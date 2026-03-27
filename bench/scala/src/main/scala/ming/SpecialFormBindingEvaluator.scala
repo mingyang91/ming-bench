@@ -28,7 +28,7 @@ private[ming] object SpecialFormBindingEvaluator:
     arguments: List[Expr],
     position: Position,
     env: Environment
-  ): Value =
+  ): EvaluationStep =
     arguments match
       case SymbolExpr(name, _) :: bindingsExpression :: body if body.nonEmpty =>
         evalNamedLet(name, bindingsExpression, body, position, env)
@@ -41,21 +41,21 @@ private[ming] object SpecialFormBindingEvaluator:
     arguments: List[Expr],
     position: Position,
     env: Environment
-  ): Value =
+  ): EvaluationStep =
     evalRecursiveLet(arguments, position, env, "letrec", RecursiveLetMode.Parallel)
 
   def evalLetrecStar(
     arguments: List[Expr],
     position: Position,
     env: Environment
-  ): Value =
+  ): EvaluationStep =
     evalRecursiveLet(arguments, position, env, "letrec*", RecursiveLetMode.Sequential)
 
   def evalDo(
     arguments: List[Expr],
     position: Position,
     env: Environment
-  ): Value =
+  ): EvaluationStep =
     arguments match
       case bindingsExpression :: testClauseExpression :: body =>
         val bindings      = parseDoBindings(bindingsExpression, position)
@@ -71,11 +71,11 @@ private[ming] object SpecialFormBindingEvaluator:
     body: List[Expr],
     position: Position,
     env: Environment
-  ): Value =
+  ): EvaluationStep =
     val bindings    = parseBindings(bindingsExpression, position, "let")
     val boundValues = bindings.map(binding => InterpreterEvaluator.eval(binding.valueExpression, env))
     val childEnv    = Environment.child(env, bindings.map(_.name).zip(boundValues))
-    InterpreterEvaluator.evalSequence(body, childEnv)
+    InterpreterEvaluator.deferSequence(body, childEnv)
 
   private def evalNamedLet(
     name: String,
@@ -83,13 +83,13 @@ private[ming] object SpecialFormBindingEvaluator:
     body: List[Expr],
     position: Position,
     env: Environment
-  ): Value =
+  ): EvaluationStep =
     val bindings   = parseBindings(bindingsExpression, position, "let")
     val arguments  = bindings.map(binding => InterpreterEvaluator.eval(binding.valueExpression, env))
     val closureEnv = Environment.child(env)
     val closure    = ClosureValue(bindings.map(_.name), None, body, closureEnv, Some(name))
     closureEnv.define(name, closure)
-    InterpreterEvaluator.applyFunction(closure, arguments, position)
+    InterpreterEvaluator.deferApplication(closure, arguments, position)
 
   private def evalRecursiveLet(
     arguments: List[Expr],
@@ -97,14 +97,14 @@ private[ming] object SpecialFormBindingEvaluator:
     env: Environment,
     formName: String,
     mode: RecursiveLetMode
-  ): Value =
+  ): EvaluationStep =
     arguments match
       case bindingsExpression :: body if body.nonEmpty =>
         val bindings = parseBindings(bindingsExpression, position, formName)
         val childEnv = Environment.child(env)
         reserveBindings(bindings, childEnv)
         initializeRecursiveBindings(bindings, childEnv, position, mode)
-        InterpreterEvaluator.evalSequence(body, childEnv)
+        InterpreterEvaluator.deferSequence(body, childEnv)
       case _ =>
         SchemeFailure.raise(s"$formName expected bindings and body", position)
 
@@ -135,7 +135,7 @@ private[ming] object SpecialFormBindingEvaluator:
     testClause: DoTestClause,
     body: List[Expr],
     loopEnv: Environment
-  ): Value =
+  ): EvaluationStep =
     if isTruthy(InterpreterEvaluator.eval(testClause.testExpression, loopEnv)) then
       evalDoFinalExpressions(testClause.finalExpressions, loopEnv)
     else
@@ -146,12 +146,12 @@ private[ming] object SpecialFormBindingEvaluator:
   private def evalDoFinalExpressions(
     finalExpressions: List[Expr],
     loopEnv: Environment
-  ): Value =
+  ): EvaluationStep =
     finalExpressions match
       case Nil =>
-        VoidValue
+        InterpreterEvaluator.done(VoidValue)
       case _ =>
-        InterpreterEvaluator.evalSequence(finalExpressions, loopEnv)
+        InterpreterEvaluator.deferSequence(finalExpressions, loopEnv)
 
   private def evalDoBody(body: List[Expr], loopEnv: Environment): Unit =
     if body.nonEmpty then InterpreterEvaluator.evalSequence(body, loopEnv)
