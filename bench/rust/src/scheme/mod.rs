@@ -1,11 +1,13 @@
 pub mod error;
 mod builtins;
 mod macros;
+mod numeric;
 
 pub use error::EvalError;
 
 use builtins::eval_builtin;
 use macros::{eval_define_syntax, expand_and_eval_macro};
+use numeric::{f64_to_exact, is_number, make_rational, nums_equal, nums_less, value_to_f64, values_equal};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -56,31 +58,6 @@ pub(crate) enum Value {
     Vector(Rc<RefCell<Vec<Value>>>),
 }
 
-fn num_gcd(mut a: i64, mut b: i64) -> i64 {
-    a = a.abs();
-    b = b.abs();
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
-}
-
-fn make_rational(num: i64, den: i64) -> Value {
-    assert!(den != 0, "division by zero in make_rational");
-    let sign = if den < 0 { -1 } else { 1 };
-    let num = num * sign;
-    let den = den.abs();
-    let g = num_gcd(num.abs(), den);
-    let num = num / g;
-    let den = den / g;
-    if den == 1 {
-        Value::Integer(num)
-    } else {
-        Value::Rational(num, den)
-    }
-}
 
 fn make_str(s: String) -> Value {
     Value::Str(Rc::new(RefCell::new(s)), true)
@@ -471,54 +448,332 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
     }
 }
 
+// ── Tail Call Optimization (Trampoline) ──
+
+enum TailResult {
+    Done(Value),
+    TailCall(Value, Vec<Value>),
+}
+
+fn eval_tail(expr: &Expr, env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    let span = expr.span;
+    eval_tail_inner(expr, env, output).map_err(|e| with_span(span, e))
+}
+
+fn eval_tail_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    match &expr.kind {
+        ExprKind::List(items) if !items.is_empty() => {
+            if let ExprKind::Symbol(op) = &items[0].kind {
+                match op.as_str() {
+                    "if" => return eval_if_tail(&items[1..], env, output),
+                    "begin" => return eval_begin_tail(&items[1..], env, output),
+                    "cond" => return eval_cond_tail(&items[1..], env, output),
+                    "and" => return eval_and_tail(&items[1..], env, output),
+                    "or" => return eval_or_tail(&items[1..], env, output),
+                    "let" => return eval_let_tail(&items[1..], env, output),
+                    "letrec" => return eval_letrec_tail(&items[1..], env, output),
+                    "letrec*" => return eval_letrec_star_tail(&items[1..], env, output),
+                    "define" | "set!" | "quote" | "lambda" | "case-lambda" |
+                    "define-syntax" | "define-record-type" | "case" | "do" => {
+                        return Ok(TailResult::Done(eval(expr, env, output)?));
+                    }
+                    _ => {}
+                }
+                if let Ok(macro_val @ Value::Macro { .. }) = env_lookup(env, op) {
+                    return Ok(TailResult::Done(expand_and_eval_macro(&macro_val, items, env, output)?));
+                }
+                if is_builtin(op) {
+                    let args: Vec<Value> = items[1..].iter()
+                        .map(|a| eval(a, env, output))
+                        .collect::<Result<_, _>>()?;
+                    return Ok(TailResult::Done(eval_builtin(op, &args, output)?));
+                }
+            }
+            // Function call in tail position
+            let func = eval(&items[0], env, output)?;
+            let args: Vec<Value> = items[1..].iter()
+                .map(|a| eval(a, env, output))
+                .collect::<Result<_, _>>()?;
+            match &func {
+                Value::Procedure(..) | Value::CaseLambda(..) => {
+                    Ok(TailResult::TailCall(func, args))
+                }
+                _ => Ok(TailResult::Done(apply_proc(&func, &args, output)?)),
+            }
+        }
+        _ => Ok(TailResult::Done(eval(expr, env, output)?)),
+    }
+}
+
+fn eval_if_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(EvalError::Arity("if requires 2 or 3 arguments".into()));
+    }
+    let cond = eval(&args[0], env, output)?;
+    if is_truthy(&cond) {
+        eval_tail(&args[1], env, output)
+    } else if args.len() == 3 {
+        eval_tail(&args[2], env, output)
+    } else {
+        Ok(TailResult::Done(Value::Boolean(false)))
+    }
+}
+
+fn eval_body_tail(body: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    if body.is_empty() {
+        return Ok(TailResult::Done(Value::Boolean(false)));
+    }
+    for expr in &body[..body.len() - 1] {
+        eval(expr, env, output)?;
+    }
+    eval_tail(&body[body.len() - 1], env, output)
+}
+
+fn eval_begin_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    eval_body_tail(args, env, output)
+}
+
+fn eval_cond_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    for clause in args {
+        match &clause.kind {
+            ExprKind::List(items) if !items.is_empty() => {
+                if let ExprKind::Symbol(s) = &items[0].kind {
+                    if s == "else" {
+                        return eval_body_tail(&items[1..], env, output);
+                    }
+                }
+                let test = eval(&items[0], env, output)?;
+                if is_truthy(&test) {
+                    if items.len() == 1 {
+                        return Ok(TailResult::Done(test));
+                    }
+                    return eval_body_tail(&items[1..], env, output);
+                }
+            }
+            _ => return Err(EvalError::Type("cond: invalid clause".into())),
+        }
+    }
+    Ok(TailResult::Done(Value::Boolean(false)))
+}
+
+fn eval_and_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    if args.is_empty() {
+        return Ok(TailResult::Done(Value::Boolean(true)));
+    }
+    for a in &args[..args.len() - 1] {
+        let result = eval(a, env, output)?;
+        if !is_truthy(&result) {
+            return Ok(TailResult::Done(result));
+        }
+    }
+    eval_tail(&args[args.len() - 1], env, output)
+}
+
+fn eval_or_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    if args.is_empty() {
+        return Ok(TailResult::Done(Value::Boolean(false)));
+    }
+    for a in &args[..args.len() - 1] {
+        let result = eval(a, env, output)?;
+        if is_truthy(&result) {
+            return Ok(TailResult::Done(result));
+        }
+    }
+    eval_tail(&args[args.len() - 1], env, output)
+}
+
+fn eval_let_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("let requires bindings and body".into()));
+    }
+    // Named let: (let name ((var init) ...) body ...)
+    if let ExprKind::Symbol(name) = &args[0].kind {
+        if args.len() < 3 {
+            return Err(EvalError::Arity("named let requires bindings and body".into()));
+        }
+        let bindings = match &args[1].kind {
+            ExprKind::List(items) => items,
+            _ => return Err(EvalError::Type("let: expected bindings list".into())),
+        };
+        let mut params = Vec::new();
+        let mut inits = Vec::new();
+        for b in bindings {
+            match &b.kind {
+                ExprKind::List(pair) if pair.len() == 2 => {
+                    if let ExprKind::Symbol(s) = &pair[0].kind {
+                        params.push(s.clone());
+                        inits.push(eval(&pair[1], env, output)?);
+                    } else {
+                        return Err(EvalError::Type("let: binding name must be symbol".into()));
+                    }
+                }
+                _ => return Err(EvalError::Type("let: invalid binding".into())),
+            }
+        }
+        let body = args[2..].to_vec();
+        let mut let_env = env.clone();
+        let frame = new_frame();
+        let_env.push(frame.clone());
+        let proc = Value::Procedure(params, None, body, let_env.clone());
+        frame.borrow_mut().insert(name.clone(), proc.clone());
+        return Ok(TailResult::TailCall(proc, inits));
+    }
+    // Regular let
+    let bindings = match &args[0].kind {
+        ExprKind::List(items) => items,
+        _ => return Err(EvalError::Type("let: expected bindings list".into())),
+    };
+    let frame = new_frame();
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], env, output)?;
+                    frame.borrow_mut().insert(s.clone(), val);
+                } else {
+                    return Err(EvalError::Type("let: binding name must be symbol".into()));
+                }
+            }
+            _ => return Err(EvalError::Type("let: invalid binding".into())),
+        }
+    }
+    env.push(frame);
+    let result = eval_body_tail(&args[1..], env, output);
+    env.pop();
+    result
+}
+
+fn eval_letrec_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("letrec requires bindings and body".into()));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(items) => items,
+        _ => return Err(EvalError::Type("letrec: expected bindings list".into())),
+    };
+    let frame = new_frame();
+    env.push(frame);
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    env_define(env, s.clone(), Value::Boolean(false));
+                } else {
+                    return Err(EvalError::Type("letrec: binding name must be symbol".into()));
+                }
+            }
+            _ => return Err(EvalError::Type("letrec: invalid binding".into())),
+        }
+    }
+    for b in bindings {
+        if let ExprKind::List(pair) = &b.kind {
+            if let ExprKind::Symbol(s) = &pair[0].kind {
+                let val = eval(&pair[1], env, output)?;
+                env_set(env, s, val)?;
+            }
+        }
+    }
+    let result = eval_body_tail(&args[1..], env, output);
+    env.pop();
+    result
+}
+
+fn eval_letrec_star_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<TailResult, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("letrec* requires bindings and body".into()));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(items) => items,
+        _ => return Err(EvalError::Type("letrec*: expected bindings list".into())),
+    };
+    let frame = new_frame();
+    env.push(frame);
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], env, output)?;
+                    env_define(env, s.clone(), val);
+                } else {
+                    return Err(EvalError::Type("letrec*: binding name must be symbol".into()));
+                }
+            }
+            _ => return Err(EvalError::Type("letrec*: invalid binding".into())),
+        }
+    }
+    let result = eval_body_tail(&args[1..], env, output);
+    env.pop();
+    result
+}
+
 fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
-    match func {
-        Value::Procedure(params, rest, body, closure_env) => {
-            if let Some(_rest_name) = rest {
-                if args.len() < params.len() {
+    let mut cur_func = func.clone();
+    let mut cur_args = args.to_vec();
+
+    loop {
+        match cur_func {
+            Value::Procedure(ref params, ref rest, ref body, ref closure_env) => {
+                if rest.is_some() {
+                    if cur_args.len() < params.len() {
+                        return Err(EvalError::Arity(format!(
+                            "expected at least {} arguments, got {}", params.len(), cur_args.len()
+                        )));
+                    }
+                } else if cur_args.len() != params.len() {
                     return Err(EvalError::Arity(format!(
-                        "expected at least {} arguments, got {}", params.len(), args.len()
+                        "expected {} arguments, got {}", params.len(), cur_args.len()
                     )));
                 }
-            } else if args.len() != params.len() {
-                return Err(EvalError::Arity(format!(
-                    "expected {} arguments, got {}", params.len(), args.len()
-                )));
-            }
-            let mut new_env = closure_env.clone();
-            let frame = new_frame();
-            for (p, a) in params.iter().zip(args.iter()) {
-                frame.borrow_mut().insert(p.clone(), a.clone());
-            }
-            if let Some(rest_name) = rest {
-                let rest_args = args[params.len()..].to_vec();
-                frame.borrow_mut().insert(rest_name.clone(), Value::List(rest_args));
-            }
-            new_env.push(frame);
-            let mut result = Value::Boolean(false);
-            for expr in body {
-                result = eval(expr, &mut new_env, output)?;
-            }
-            Ok(result)
-        }
-        Value::CaseLambda(clauses) => {
-            for (params, rest, body, closure_env) in clauses {
-                let matches = if rest.is_some() {
-                    args.len() >= params.len()
-                } else {
-                    args.len() == params.len()
-                };
-                if matches {
-                    let proc = Value::Procedure(params.clone(), rest.clone(), body.clone(), closure_env.clone());
-                    return apply_proc(&proc, args, output);
+                let mut new_env = closure_env.clone();
+                let frame = new_frame();
+                for (p, a) in params.iter().zip(cur_args.iter()) {
+                    frame.borrow_mut().insert(p.clone(), a.clone());
+                }
+                if let Some(rest_name) = rest {
+                    let rest_args = cur_args[params.len()..].to_vec();
+                    frame.borrow_mut().insert(rest_name.clone(), Value::List(rest_args));
+                }
+                new_env.push(frame);
+
+                if body.is_empty() {
+                    return Ok(Value::Boolean(false));
+                }
+                // Evaluate all but last body expression
+                for expr in &body[..body.len() - 1] {
+                    eval(expr, &mut new_env, output)?;
+                }
+                // Last body expression in tail position
+                match eval_tail(&body[body.len() - 1], &mut new_env, output)? {
+                    TailResult::Done(v) => return Ok(v),
+                    TailResult::TailCall(f, a) => {
+                        cur_func = f;
+                        cur_args = a;
+                    }
                 }
             }
-            Err(EvalError::Arity(format!(
-                "case-lambda: no matching clause for {} arguments", args.len()
-            )))
+            Value::CaseLambda(ref clauses) => {
+                let mut found = false;
+                for (params, rest, body, closure_env) in clauses {
+                    let matches = if rest.is_some() {
+                        cur_args.len() >= params.len()
+                    } else {
+                        cur_args.len() == params.len()
+                    };
+                    if matches {
+                        cur_func = Value::Procedure(params.clone(), rest.clone(), body.clone(), closure_env.clone());
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Err(EvalError::Arity(format!(
+                        "case-lambda: no matching clause for {} arguments", cur_args.len()
+                    )));
+                }
+            }
+            Value::Builtin(ref name) => return eval_builtin(name, &cur_args, output),
+            _ => return Err(EvalError::Type("not a procedure".into())),
         }
-        Value::Builtin(name) => eval_builtin(name, args, output),
-        _ => Err(EvalError::Type("not a procedure".into())),
     }
 }
 
@@ -734,96 +989,6 @@ fn display_value(v: &Value) -> String {
         other => other.to_string(),
     }
 }
-
-fn value_to_f64(v: &Value) -> Result<f64, EvalError> {
-    match v {
-        Value::Integer(n) => Ok(*n as f64),
-        Value::Rational(n, d) => Ok(*n as f64 / *d as f64),
-        Value::Float(f) => Ok(*f),
-        _ => Err(EvalError::Type(format!("expected number, got {v}"))),
-    }
-}
-
-fn f64_to_exact(f: f64) -> Value {
-    if f == f.floor() && f.abs() < i64::MAX as f64 {
-        return Value::Integer(f as i64);
-    }
-    // Decompose IEEE 754 double to exact rational
-    let bits = f.to_bits();
-    let sign: i64 = if bits >> 63 == 1 { -1 } else { 1 };
-    let raw_exp = ((bits >> 52) & 0x7FF) as i64;
-    let mantissa = if raw_exp == 0 {
-        (bits & 0x000F_FFFF_FFFF_FFFF) as i64
-    } else {
-        (bits & 0x000F_FFFF_FFFF_FFFF | 0x0010_0000_0000_0000) as i64
-    };
-    let exp = raw_exp - 1023 - 52;
-    if exp >= 0 {
-        Value::Integer(sign * mantissa * (1i64 << exp as u32))
-    } else {
-        let den = 1i64 << ((-exp) as u32);
-        make_rational(sign * mantissa, den)
-    }
-}
-
-fn is_number(v: &Value) -> bool {
-    matches!(v, Value::Integer(_) | Value::Rational(_, _) | Value::Float(_))
-}
-
-fn values_equal(a: &Value, b: &Value) -> bool {
-    if is_number(a) && is_number(b) {
-        return nums_equal(a, b);
-    }
-    match (a, b) {
-        (Value::Boolean(a), Value::Boolean(b)) => a == b,
-        (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::Str(a, _), Value::Str(b, _)) => *a.borrow() == *b.borrow(),
-        (Value::Symbol(a), Value::Symbol(b)) => a == b,
-        (Value::List(a), Value::List(b)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
-        }
-        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
-            values_equal(a1, b1) && values_equal(a2, b2)
-        }
-        (Value::Vector(a), Value::Vector(b)) => {
-            let a = a.borrow();
-            let b = b.borrow();
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
-        }
-        _ => false,
-    }
-}
-
-fn nums_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Integer(a), Value::Integer(b)) => a == b,
-        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
-        (Value::Float(a), Value::Float(b)) => a == b,
-        _ => {
-            // Cross-tower: convert to f64
-            if let (Ok(a), Ok(b)) = (value_to_f64(a), value_to_f64(b)) {
-                a == b
-            } else {
-                false
-            }
-        }
-    }
-}
-
-fn nums_less(a: &Value, b: &Value) -> Result<bool, EvalError> {
-    match (a, b) {
-        (Value::Integer(a), Value::Integer(b)) => Ok(a < b),
-        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => Ok(n1 * d2 < n2 * d1),
-        (Value::Integer(a), Value::Rational(n, d)) => Ok(*a * d < *n),
-        (Value::Rational(n, d), Value::Integer(b)) => Ok(*n < *b * d),
-        _ => {
-            let a = value_to_f64(a)?;
-            let b = value_to_f64(b)?;
-            Ok(a < b)
-        }
-    }
-}
-
 
 fn eval_let(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     if args.len() < 2 {
