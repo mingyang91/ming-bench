@@ -43,6 +43,10 @@ type closureValue struct {
 	env       *env
 }
 
+type caseClosureValue struct {
+	clauses []closureValue
+}
+
 type letBinding struct {
 	name string
 	init locatedExpr
@@ -219,12 +223,18 @@ func (closureValue) isTruthy() bool {
 	return true
 }
 
-func (p closureValue) call(args []value) (value, error) {
+func (p closureValue) acceptsArgCount(argCount int) bool {
 	if p.hasRest {
-		if len(args) < len(p.params) {
+		return argCount >= len(p.params)
+	}
+	return argCount == len(p.params)
+}
+
+func (p closureValue) call(args []value) (value, error) {
+	if !p.acceptsArgCount(len(args)) {
+		if p.hasRest {
 			return nil, newCurrentEvalError("expected at least %d arguments, got %d", len(p.params), len(args))
 		}
-	} else if len(args) != len(p.params) {
 		return nil, newCurrentEvalError("expected %d arguments, got %d", len(p.params), len(args))
 	}
 
@@ -237,6 +247,24 @@ func (p closureValue) call(args []value) (value, error) {
 	}
 
 	return evalSequence(p.body, callEnv)
+}
+
+func (caseClosureValue) schemeString() string {
+	return "#<procedure>"
+}
+
+func (caseClosureValue) isTruthy() bool {
+	return true
+}
+
+func (p caseClosureValue) call(args []value) (value, error) {
+	for _, clause := range p.clauses {
+		if clause.acceptsArgCount(len(args)) {
+			return clause.call(args)
+		}
+	}
+
+	return nil, newCurrentEvalError("no matching case-lambda clause for %d arguments", len(args))
 }
 
 func newEnv(parent *env) *env {
@@ -331,6 +359,7 @@ func newGlobalEnv() *env {
 	global.define("pair?", builtinProc{name: "pair?", fn: evalPairPred})
 	global.define("symbol?", builtinProc{name: "symbol?", fn: evalSymbolPred})
 	global.define("char?", builtinProc{name: "char?", fn: evalCharPred})
+	global.define("procedure?", builtinProc{name: "procedure?", fn: evalProcedurePred})
 	global.define("display", builtinProc{name: "display", fn: evalDisplay})
 	global.define("write", builtinProc{name: "write", fn: evalWrite})
 	global.define("newline", builtinProc{name: "newline", fn: evalNewline})
@@ -444,6 +473,8 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalLet(items[1:], env)
 		case "lambda":
 			return evalLambda(items[1:], env)
+		case "case-lambda":
+			return evalCaseLambda(items[1:], env)
 		}
 
 		if macro, found := env.lookupMacro(string(operator)); found {
@@ -622,6 +653,35 @@ func evalLambda(parts []locatedExpr, env *env) (value, error) {
 		body:      parts[1:],
 		env:       env,
 	}, nil
+}
+
+func evalCaseLambda(parts []locatedExpr, env *env) (value, error) {
+	if len(parts) == 0 {
+		return nil, newCurrentEvalError("'case-lambda' expects at least 1 clause")
+	}
+
+	clauses := make([]closureValue, 0, len(parts))
+	for _, clauseExpr := range parts {
+		clause, ok := clauseExpr.form.(listExpr)
+		if !ok || len(clause) < 2 {
+			return nil, newEvalError(clauseExpr.pos, "'case-lambda' clauses must have a parameter list and body")
+		}
+
+		formals, err := parseFormalsExpr(clause[0])
+		if err != nil {
+			return nil, err
+		}
+
+		clauses = append(clauses, closureValue{
+			params:    formals.params,
+			restParam: formals.restParam,
+			hasRest:   formals.hasRest,
+			body:      clause[1:],
+			env:       env,
+		})
+	}
+
+	return caseClosureValue{clauses: clauses}, nil
 }
 
 func evalCond(clauses []locatedExpr, env *env) (value, error) {
@@ -1082,6 +1142,13 @@ func evalSymbolPred(args []value) (value, error) {
 func evalCharPred(args []value) (value, error) {
 	return evalTypePredicate(args, "char?", func(v value) bool {
 		_, ok := v.(charValue)
+		return ok
+	})
+}
+
+func evalProcedurePred(args []value) (value, error) {
+	return evalTypePredicate(args, "procedure?", func(v value) bool {
+		_, ok := v.(procedure)
 		return ok
 	})
 }

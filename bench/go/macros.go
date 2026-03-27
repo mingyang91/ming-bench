@@ -385,6 +385,8 @@ func (state *hygieneState) hygienizeList(items listExpr, pos SourcePos, scope *h
 			return state.hygienizeQuote(items, pos)
 		case "lambda":
 			return state.hygienizeLambda(items, pos, scope)
+		case "case-lambda":
+			return state.hygienizeCaseLambda(items, pos, scope)
 		case "let":
 			return state.hygienizeLet(items, pos, scope)
 		case "define":
@@ -457,6 +459,43 @@ func (state *hygieneState) hygienizeLambda(items listExpr, pos SourcePos, scope 
 		}
 		newItems = append(newItems, expanded)
 	}
+	return locatedExpr{form: listExpr(newItems), pos: pos}, nil
+}
+
+func (state *hygieneState) hygienizeCaseLambda(items listExpr, pos SourcePos, scope *hygieneScope) (locatedExpr, error) {
+	if len(items) < 2 {
+		return locatedExpr{}, newEvalError(pos, "'case-lambda' expects at least 1 clause")
+	}
+
+	newItems := []locatedExpr{
+		{form: symbolExpr("case-lambda"), pos: items[0].pos},
+	}
+	for _, clauseExpr := range items[1:] {
+		clause, ok := clauseExpr.form.(listExpr)
+		if !ok || len(clause) < 2 {
+			return locatedExpr{}, newEvalError(clauseExpr.pos, "'case-lambda' clauses must have a parameter list and body")
+		}
+
+		formals, bodyScope, err := state.hygienizeFormals(clause[0], scope)
+		if err != nil {
+			return locatedExpr{}, err
+		}
+
+		newClause := []locatedExpr{formals}
+		for _, bodyExpr := range clause[1:] {
+			expanded, err := state.hygienizeExpr(bodyExpr, bodyScope)
+			if err != nil {
+				return locatedExpr{}, err
+			}
+			newClause = append(newClause, expanded)
+		}
+
+		newItems = append(newItems, locatedExpr{
+			form: listExpr(newClause),
+			pos:  clauseExpr.pos,
+		})
+	}
+
 	return locatedExpr{form: listExpr(newItems), pos: pos}, nil
 }
 
@@ -884,7 +923,7 @@ func isEllipsisExpr(expr locatedExpr) bool {
 
 func isSyntaxKeyword(name string) bool {
 	switch name {
-	case "and", "begin", "cond", "define", "define-syntax", "if", "lambda", "let", "or", "quote", "set!":
+	case "and", "begin", "case-lambda", "cond", "define", "define-syntax", "if", "lambda", "let", "or", "quote", "set!":
 		return true
 	default:
 		return false
