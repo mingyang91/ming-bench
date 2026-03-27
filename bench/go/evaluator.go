@@ -25,6 +25,10 @@ type SymbolVal struct{ Name string }
 type PairVal struct{ Car, Cdr Value }
 type NilVal struct{} // empty list
 type VoidVal struct{}
+type tailCallVal struct {
+	expr Expr
+	env  *Env
+}
 type CharVal struct{ Val rune }
 type RatVal struct{ Num, Den int64 } // exact rational, Den > 0, gcd(|Num|,Den)==1
 type FloatVal struct{ Val float64 }  // inexact
@@ -70,7 +74,8 @@ func (v *BoolVal) String() string {
 func (v *StringVal) String() string  { return fmt.Sprintf("%q", v.Val) }
 func (v *SymbolVal) String() string  { return v.Name }
 func (v *NilVal) String() string     { return "()" }
-func (v *VoidVal) String() string    { return "" }
+func (v *VoidVal) String() string     { return "" }
+func (v *tailCallVal) String() string { return "" }
 func (v *CharVal) String() string     { return fmt.Sprintf("#\\%c", v.Val) }
 func (v *RatVal) String() string {
 	if v.Den == 1 {
@@ -549,13 +554,27 @@ func errAt(expr Expr, msg string) error {
 }
 
 func evalInEnv(expr Expr, env *Env) (Value, error) {
-	switch e := expr.(type) {
-	case *AtomExpr:
-		return evalAtomInEnv(e, env)
-	case *ListExpr:
-		return evalListInEnv(e, env)
+	for {
+		var val Value
+		var err error
+		switch e := expr.(type) {
+		case *AtomExpr:
+			val, err = evalAtomInEnv(e, env)
+		case *ListExpr:
+			val, err = evalListInEnv(e, env)
+		default:
+			return nil, errAt(expr, "unknown expression")
+		}
+		if err != nil {
+			return nil, err
+		}
+		if tc, ok := val.(*tailCallVal); ok {
+			expr = tc.expr
+			env = tc.env
+			continue
+		}
+		return val, nil
 	}
-	return nil, errAt(expr, "unknown expression")
 }
 
 func evalAtomInEnv(atom *AtomExpr, env *Env) (Value, error) {
@@ -784,10 +803,10 @@ func evalIf(list *ListExpr, env *Env) (Value, error) {
 		return nil, err
 	}
 	if isTruthy(cond) {
-		return evalInEnv(args[1], env)
+		return &tailCallVal{expr: args[1], env: env}, nil
 	}
 	if len(args) == 3 {
-		return evalInEnv(args[2], env)
+		return &tailCallVal{expr: args[2], env: env}, nil
 	}
 	return &VoidVal{}, nil
 }
@@ -938,8 +957,10 @@ func applyCaseLambda(cl *CaseLambdaVal, args []Value) (Value, error) {
 }
 
 func evalAnd(exprs []Expr, env *Env) (Value, error) {
-	var result Value = &BoolVal{Val: true}
-	for _, e := range exprs {
+	if len(exprs) == 0 {
+		return &BoolVal{Val: true}, nil
+	}
+	for _, e := range exprs[:len(exprs)-1] {
 		v, err := evalInEnv(e, env)
 		if err != nil {
 			return nil, err
@@ -947,14 +968,15 @@ func evalAnd(exprs []Expr, env *Env) (Value, error) {
 		if !isTruthy(v) {
 			return v, nil
 		}
-		result = v
 	}
-	return result, nil
+	return &tailCallVal{expr: exprs[len(exprs)-1], env: env}, nil
 }
 
 func evalOr(exprs []Expr, env *Env) (Value, error) {
-	var result Value = &BoolVal{Val: false}
-	for _, e := range exprs {
+	if len(exprs) == 0 {
+		return &BoolVal{Val: false}, nil
+	}
+	for _, e := range exprs[:len(exprs)-1] {
 		v, err := evalInEnv(e, env)
 		if err != nil {
 			return nil, err
@@ -962,9 +984,8 @@ func evalOr(exprs []Expr, env *Env) (Value, error) {
 		if isTruthy(v) {
 			return v, nil
 		}
-		result = v
 	}
-	return result, nil
+	return &tailCallVal{expr: exprs[len(exprs)-1], env: env}, nil
 }
 
 func evalLet(list *ListExpr, env *Env) (Value, error) {
@@ -1014,27 +1035,29 @@ func evalLet(list *ListExpr, env *Env) (Value, error) {
 		lambda := &LambdaVal{Params: names, Body: body, Env: letEnv}
 		letEnv.set(loopName, lambda)
 	}
-	var result Value
-	var err error
-	for _, bodyExpr := range body {
-		result, err = evalInEnv(bodyExpr, letEnv)
+	if len(body) == 0 {
+		return &VoidVal{}, nil
+	}
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := evalInEnv(bodyExpr, letEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCallVal{expr: body[len(body)-1], env: letEnv}, nil
 }
 
 func evalBegin(args []Expr, env *Env) (Value, error) {
-	var result Value = &VoidVal{}
-	var err error
-	for _, e := range args {
-		result, err = evalInEnv(e, env)
+	if len(args) == 0 {
+		return &VoidVal{}, nil
+	}
+	for _, e := range args[:len(args)-1] {
+		_, err := evalInEnv(e, env)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCallVal{expr: args[len(args)-1], env: env}, nil
 }
 
 func evalCond(clauses []Expr, env *Env) (Value, error) {
@@ -1045,29 +1068,34 @@ func evalCond(clauses []Expr, env *Env) (Value, error) {
 		}
 		// Check for else
 		if atom, ok := cl.Items[0].(*AtomExpr); ok && atom.Token == "else" {
-			var result Value = &VoidVal{}
-			var err error
-			for _, e := range cl.Items[1:] {
-				result, err = evalInEnv(e, env)
+			body := cl.Items[1:]
+			if len(body) == 0 {
+				return &VoidVal{}, nil
+			}
+			for _, e := range body[:len(body)-1] {
+				_, err := evalInEnv(e, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return &tailCallVal{expr: body[len(body)-1], env: env}, nil
 		}
 		test, err := evalInEnv(cl.Items[0], env)
 		if err != nil {
 			return nil, err
 		}
 		if isTruthy(test) {
-			var result Value = test
-			for _, e := range cl.Items[1:] {
-				result, err = evalInEnv(e, env)
+			body := cl.Items[1:]
+			if len(body) == 0 {
+				return test, nil
+			}
+			for _, e := range body[:len(body)-1] {
+				_, err := evalInEnv(e, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return &tailCallVal{expr: body[len(body)-1], env: env}, nil
 		}
 	}
 	return &VoidVal{}, nil
@@ -1110,15 +1138,17 @@ func evalLetrec(list *ListExpr, env *Env) (Value, error) {
 		letEnv.set(names[i], v)
 	}
 	// Evaluate body
-	var result Value
-	var err error
-	for _, bodyExpr := range args[1:] {
-		result, err = evalInEnv(bodyExpr, letEnv)
+	body := args[1:]
+	if len(body) == 0 {
+		return &VoidVal{}, nil
+	}
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := evalInEnv(bodyExpr, letEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCallVal{expr: body[len(body)-1], env: letEnv}, nil
 }
 
 func evalLetrecStar(list *ListExpr, env *Env) (Value, error) {
@@ -1146,15 +1176,17 @@ func evalLetrecStar(list *ListExpr, env *Env) (Value, error) {
 		}
 		letEnv.set(nameAtom.Token, v)
 	}
-	var result Value
-	var err error
-	for _, bodyExpr := range args[1:] {
-		result, err = evalInEnv(bodyExpr, letEnv)
+	body := args[1:]
+	if len(body) == 0 {
+		return &VoidVal{}, nil
+	}
+	for _, bodyExpr := range body[:len(body)-1] {
+		_, err := evalInEnv(bodyExpr, letEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCallVal{expr: body[len(body)-1], env: letEnv}, nil
 }
 
 func evalCase(list *ListExpr, env *Env) (Value, error) {
@@ -1172,14 +1204,17 @@ func evalCase(list *ListExpr, env *Env) (Value, error) {
 		}
 		// Check for else
 		if atom, ok := clause.Items[0].(*AtomExpr); ok && atom.Token == "else" {
-			var result Value = &VoidVal{}
-			for _, e := range clause.Items[1:] {
-				result, err = evalInEnv(e, env)
+			body := clause.Items[1:]
+			if len(body) == 0 {
+				return &VoidVal{}, nil
+			}
+			for _, e := range body[:len(body)-1] {
+				_, err = evalInEnv(e, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return &tailCallVal{expr: body[len(body)-1], env: env}, nil
 		}
 		// Datum list
 		datumList, ok := clause.Items[0].(*ListExpr)
@@ -1198,14 +1233,17 @@ func evalCase(list *ListExpr, env *Env) (Value, error) {
 			}
 		}
 		if matched {
-			var result Value = &VoidVal{}
-			for _, e := range clause.Items[1:] {
-				result, err = evalInEnv(e, env)
+			body := clause.Items[1:]
+			if len(body) == 0 {
+				return &VoidVal{}, nil
+			}
+			for _, e := range body[:len(body)-1] {
+				_, err = evalInEnv(e, env)
 				if err != nil {
 					return nil, err
 				}
 			}
-			return result, nil
+			return &tailCallVal{expr: body[len(body)-1], env: env}, nil
 		}
 	}
 	// No match, no else => void
@@ -1292,17 +1330,17 @@ func evalDo(list *ListExpr, env *Env) (Value, error) {
 		}
 		if isTruthy(testVal) {
 			// Evaluate result expressions
-			if len(testClause.Items) > 1 {
-				var result Value
-				for _, e := range testClause.Items[1:] {
-					result, err = evalInEnv(e, doEnv)
-					if err != nil {
-						return nil, err
-					}
-				}
-				return result, nil
+			resultExprs := testClause.Items[1:]
+			if len(resultExprs) == 0 {
+				return &VoidVal{}, nil
 			}
-			return &VoidVal{}, nil
+			for _, e := range resultExprs[:len(resultExprs)-1] {
+				_, err = evalInEnv(e, doEnv)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return &tailCallVal{expr: resultExprs[len(resultExprs)-1], env: doEnv}, nil
 		}
 		// Evaluate body
 		for _, bodyExpr := range bodyExprs {
@@ -1761,14 +1799,24 @@ func valuesEq(a, b Value) bool {
 	}
 }
 
+func resolveTC(val Value, err error) (Value, error) {
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := val.(*tailCallVal); ok {
+		return evalInEnv(tc.expr, tc.env)
+	}
+	return val, nil
+}
+
 func applyProcSimple(proc Value, args []Value) (Value, error) {
 	switch fn := proc.(type) {
 	case *BuiltinVal:
 		return fn.Fn(args)
 	case *LambdaVal:
-		return applyLambda(fn, args)
+		return resolveTC(applyLambda(fn, args))
 	case *CaseLambdaVal:
-		return applyCaseLambda(fn, args)
+		return resolveTC(applyCaseLambda(fn, args))
 	}
 	return nil, &EvalError{Message: "not a procedure"}
 }
@@ -1796,15 +1844,16 @@ func applyLambda(fn *LambdaVal, args []Value) (Value, error) {
 		}
 		callEnv.set(fn.Rest, restList)
 	}
-	var result Value
-	var err error
-	for _, bodyExpr := range fn.Body {
-		result, err = evalInEnv(bodyExpr, callEnv)
+	if len(fn.Body) == 0 {
+		return &VoidVal{}, nil
+	}
+	for _, bodyExpr := range fn.Body[:len(fn.Body)-1] {
+		_, err := evalInEnv(bodyExpr, callEnv)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return result, nil
+	return &tailCallVal{expr: fn.Body[len(fn.Body)-1], env: callEnv}, nil
 }
 
 func applyProcAt(op Value, args []Value, callSite Expr) (Value, error) {
