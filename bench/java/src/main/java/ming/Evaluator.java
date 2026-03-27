@@ -462,6 +462,24 @@ public class Evaluator {
                         }
                         return VOID;
                     }
+                    case "set!" -> {
+                        if (list.size() != 3) throw errAt(eline, ecol, "set!: bad syntax");
+                        Object target = list.get(1);
+                        String tname = symName(target);
+                        if (tname == null) throw errAt(eline, ecol, "set!: expected symbol");
+                        int tline = eline, tcol = ecol;
+                        if (target instanceof LocatedSymbol ls) { tline = ls.line(); tcol = ls.col(); }
+                        // Find the env that owns this binding
+                        Env e = env;
+                        while (e != null) {
+                            if (e.bindings.containsKey(tname)) {
+                                e.bindings.put(tname, eval(list.get(2), env));
+                                return VOID;
+                            }
+                            e = e.parent;
+                        }
+                        throw errAt(tline, tcol, "set!: unbound variable: " + tname);
+                    }
                     case "or" -> {
                         Object result = Boolean.FALSE;
                         for (int i = 1; i < list.size(); i++) {
