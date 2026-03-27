@@ -97,6 +97,8 @@ public class Evaluator {
     record SyntaxCaseTransformer(Object proc, Env defEnv) {}
     // Trampoline sentinel for tail call optimization
     record TailCall(Object expr, Env env) {}
+    // Guard setup sentinel — returned by guard case to the trampoline
+    record GuardSetup(String var, List<?> guardSpec, Env env, Object bodyExpr, Env bodyEnv) {}
 
     // First-class continuation captured by call/cc
     static class Continuation {
@@ -487,6 +489,9 @@ public class Evaluator {
     }
 
     private Object eval(Object expr, Env env) throws EvalError {
+        // Guard handler stack for TCO-compatible exception handling
+        java.util.ArrayDeque<GuardSetup> guardStack = null;
+
         while (true) {
             // Unwrap Located to get position info
             int eLine = 0, eCol = 0;
@@ -503,7 +508,29 @@ public class Evaluator {
                     env = tc.env();
                     continue;
                 }
+                if (result instanceof GuardSetup gs) {
+                    // Guard body is next to evaluate; push handler
+                    if (guardStack == null) guardStack = new java.util.ArrayDeque<>();
+                    guardStack.push(gs);
+                    expr = gs.bodyExpr();
+                    env = gs.bodyEnv();
+                    continue;
+                }
+                // Normal return — clear guard stack
                 return result;
+            } catch (SchemeRaise sr) {
+                if (guardStack != null && !guardStack.isEmpty()) {
+                    GuardSetup gs = guardStack.pop();
+                    Object clauseResult = evalGuardClauses(gs, sr.value);
+                    if (clauseResult instanceof TailCall tc) {
+                        expr = tc.expr();
+                        env = tc.env();
+                        continue;
+                    }
+                    if (clauseResult != null) return clauseResult;
+                    // null means no clause matched — re-raise
+                }
+                throw sr;
             } catch (EvalError e) {
                 String msg = e.getMessage();
                 if (eLine > 0 && !msg.matches(".*\\d+:\\d+.*")) {
@@ -512,6 +539,32 @@ public class Evaluator {
                 throw e;
             }
         }
+    }
+
+    // Evaluate guard clauses against a raised value. Returns TailCall, a value, or null (no match).
+    private Object evalGuardClauses(GuardSetup gs, Object raisedValue) throws EvalError {
+        Env guardEnv = new Env(gs.env());
+        guardEnv.define(gs.var(), raisedValue);
+        List<?> guardSpec = gs.guardSpec();
+        for (int c = 1; c < guardSpec.size(); c++) {
+            Object clauseRaw = guardSpec.get(c);
+            if (clauseRaw instanceof Located lc) clauseRaw = lc.expr();
+            List<?> clause = (List<?>) clauseRaw;
+            Object test = clause.getFirst();
+            Object rawTest = test;
+            if (rawTest instanceof Located lt) rawTest = lt.expr();
+            if (rawTest instanceof String st && st.equals("else")) {
+                for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), guardEnv));
+                return new TailCall(clause.getLast(), guardEnv);
+            }
+            Object testVal = eval(test, guardEnv);
+            if (!isFalse(testVal)) {
+                if (clause.size() == 1) return testVal;
+                for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), guardEnv));
+                return new TailCall(clause.getLast(), guardEnv);
+            }
+        }
+        return null; // no clause matched
     }
 
     private Object evalInner(Object expr, Env env, int posLine, int posCol) throws EvalError {
@@ -1028,6 +1081,10 @@ public class Evaluator {
                     }
                     case "guard" -> {
                         // (guard (var clause ...) body ...)
+                        // Uses trampoline-based exception handling for TCO support.
+                        // Non-last body exprs are evaluated fully here; last body expr
+                        // is returned as TailCall with a GuardSetup pushed onto the
+                        // trampoline's guard stack in eval().
                         Object guardSpecRaw = list.get(1);
                         if (guardSpecRaw instanceof Located lg) guardSpecRaw = lg.expr();
                         @SuppressWarnings("unchecked")
@@ -1035,35 +1092,17 @@ public class Evaluator {
                         Object varRaw = guardSpec.getFirst();
                         if (varRaw instanceof Located lv) varRaw = lv.expr();
                         String var = (String) varRaw;
-                        try {
-                            Object bodyResult = null;
-                            for (int i = 2; i < list.size(); i++) {
-                                bodyResult = eval(list.get(i), env);
+                        // Evaluate non-last body expressions fully
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            try {
+                                resolve(eval(list.get(i), env));
+                            } catch (SchemeRaise sr) {
+                                return evalGuardClauses(new GuardSetup(var, guardSpec, env, null, null), sr.value);
                             }
-                            return bodyResult;
-                        } catch (SchemeRaise sr) {
-                            Env guardEnv = new Env(env);
-                            guardEnv.define(var, sr.value);
-                            for (int c = 1; c < guardSpec.size(); c++) {
-                                Object clauseRaw = guardSpec.get(c);
-                                if (clauseRaw instanceof Located lc) clauseRaw = lc.expr();
-                                List<?> clause = (List<?>) clauseRaw;
-                                Object test = clause.getFirst();
-                                Object rawTest = test;
-                                if (rawTest instanceof Located lt) rawTest = lt.expr();
-                                if (rawTest instanceof String st && st.equals("else")) {
-                                    for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), guardEnv));
-                                    return new TailCall(clause.getLast(), guardEnv);
-                                }
-                                Object testVal = eval(test, guardEnv);
-                                if (!isFalse(testVal)) {
-                                    if (clause.size() == 1) return testVal;
-                                    for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), guardEnv));
-                                    return new TailCall(clause.getLast(), guardEnv);
-                                }
-                            }
-                            throw sr; // no clause matched, re-raise
                         }
+                        // Last body expression: set up guard handler and return as TailCall
+                        // so the eval trampoline handles it iteratively
+                        return new GuardSetup(var, guardSpec, env, list.getLast(), env);
                     }
                     case "call/cc", "call-with-current-continuation" -> {
                         if (hasPendingCallccValue) {
@@ -1321,8 +1360,12 @@ public class Evaluator {
 
     private Object apply(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof Continuation cont) {
-            if (args.size() != 1) throw new EvalError("continuation: expected 1 argument");
-            Object value = args.get(0);
+            Object value;
+            if (args.size() == 1) {
+                value = args.get(0);
+            } else {
+                value = new MultipleValues(new ArrayList<>(args));
+            }
             if (cont.inExtent) {
                 throw new ContinuationEscape(cont, value);
             } else {
@@ -2364,20 +2407,19 @@ public class Evaluator {
                 // Expand template
                 Object expanded = expandTemplate(template, bindings, ellipsisVars, renameMap);
 
-                // Create wrapper env with hygienic bindings
-                Env wrapperEnv = new Env(useEnv);
+                // Inject hygienic bindings directly into useEnv (gensyms won't clash)
                 for (Map.Entry<String, String> entry : renameMap.entrySet()) {
                     String origName = entry.getKey();
                     String gensymName = entry.getValue();
                     try {
                         Object val = sr.defEnv().lookup(origName);
-                        wrapperEnv.define(gensymName, val);
+                        useEnv.define(gensymName, val);
                     } catch (EvalError e) {
                         // Not in def env (macro-introduced binding) - let/lambda will bind it
                     }
                 }
 
-                return eval(expanded, wrapperEnv);
+                return eval(expanded, useEnv);
             }
         }
         throw new EvalError("no matching syntax-rules pattern");
