@@ -1,8 +1,22 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::scheme::env::Env;
+
+static RECORD_TYPE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn next_record_type_id() -> usize {
+    RECORD_TYPE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordProcKind {
+    Constructor { field_names: Vec<std::string::String> },
+    Predicate,
+    Accessor { field_index: usize },
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -27,6 +41,14 @@ pub enum Value {
         rules: Vec<(Value, Value)>,
         def_env: Rc<RefCell<Env>>,
     },
+    Record {
+        type_id: usize,
+        fields: Vec<Value>,
+    },
+    RecordProc {
+        type_id: usize,
+        kind: RecordProcKind,
+    },
 }
 
 impl PartialEq for Value {
@@ -44,6 +66,8 @@ impl PartialEq for Value {
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
             (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
+            (Value::Record { type_id: a, fields: af }, Value::Record { type_id: b, fields: bf }) => a == b && af == bf,
+            (Value::RecordProc { .. }, Value::RecordProc { .. }) => false,
             _ => false,
         }
     }
@@ -96,6 +120,8 @@ impl Value {
             Value::Pair(a, b) => format!("({} . {})", a.to_display(), b.to_display()),
             Value::Lambda { .. } => "#<procedure>".into(),
             Value::SyntaxRules { .. } => "#<syntax>".into(),
+            Value::Record { .. } => "#<record>".into(),
+            Value::RecordProc { .. } => "#<procedure>".into(),
             Value::Void => "".into(),
         }
     }

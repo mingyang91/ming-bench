@@ -12,7 +12,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
         Value::Integer(_) | Value::Rational(_, _) | Value::Float(_)
         | Value::Boolean(_) | Value::String(_)
         | Value::Char(_) | Value::Lambda { .. } | Value::Pair(_, _)
-        | Value::SyntaxRules { .. } => {
+        | Value::SyntaxRules { .. } | Value::Record { .. } | Value::RecordProc { .. } => {
             Ok(expr.clone())
         }
         Value::Symbol(name) => env.borrow().get(name),
@@ -39,6 +39,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
                     "set!" => return eval_set_bang(&elems[1..], env, out),
                     "string-set!" => return eval_string_set(&elems[1..], env, out),
                     "define-syntax" => return eval_define_syntax(&elems[1..], env, out),
+                    "define-record-type" => return eval_define_record_type(&elems[1..], env),
                     _ => {
                         // Check if symbol is bound to a macro
                         // Clone to release borrow before eval
@@ -200,6 +201,37 @@ fn apply(func: &Value, args: &[Value], out: &Output) -> Result<Value, EvalError>
                 result = eval(expr, &local_env, out)?;
             }
             Ok(result)
+        }
+        Value::RecordProc { type_id, kind } => {
+            use crate::scheme::value::RecordProcKind;
+            match kind {
+                RecordProcKind::Constructor { field_names } => {
+                    if args.len() != field_names.len() {
+                        return Err(EvalError::Arity(format!(
+                            "record constructor expected {} arguments, got {}",
+                            field_names.len(), args.len()
+                        )));
+                    }
+                    Ok(Value::Record { type_id: *type_id, fields: args.to_vec() })
+                }
+                RecordProcKind::Predicate => {
+                    if args.len() != 1 {
+                        return Err(EvalError::Arity("record predicate requires 1 argument".into()));
+                    }
+                    Ok(Value::Boolean(matches!(&args[0], Value::Record { type_id: tid, .. } if tid == type_id)))
+                }
+                RecordProcKind::Accessor { field_index } => {
+                    if args.len() != 1 {
+                        return Err(EvalError::Arity("record accessor requires 1 argument".into()));
+                    }
+                    match &args[0] {
+                        Value::Record { type_id: tid, fields } if tid == type_id => {
+                            Ok(fields[*field_index].clone())
+                        }
+                        _ => Err(EvalError::Type("record accessor: wrong record type".into())),
+                    }
+                }
+            }
         }
         Value::Symbol(op) => {
             if op == "apply" {
@@ -1020,6 +1052,78 @@ fn float_to_rational(f: f64) -> (i64, i64) {
     let den = 1_000_000_000i64;
     let num = (f * den as f64).round() as i64;
     (sign * num, den)
+}
+
+// --- Record types (L12) ---
+
+fn eval_define_record_type(args: &[Value], env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    // (define-record-type <name> (constructor field ...) predicate (field accessor) ...)
+    if args.len() < 3 {
+        return Err(EvalError::Arity("define-record-type requires at least 3 arguments".into()));
+    }
+    let type_id = crate::scheme::value::next_record_type_id();
+
+    // Parse constructor: (ctor-name field1 field2 ...)
+    let ctor_elems = match &args[1] {
+        Value::List(e) => e,
+        _ => return Err(EvalError::Type("define-record-type: expected constructor spec".into())),
+    };
+    if ctor_elems.is_empty() {
+        return Err(EvalError::Parse("define-record-type: empty constructor".into()));
+    }
+    let ctor_name = match &ctor_elems[0] {
+        Value::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("define-record-type: expected constructor name".into())),
+    };
+    let ctor_fields: Vec<String> = ctor_elems[1..].iter().map(|v| match v {
+        Value::Symbol(s) => Ok(s.clone()),
+        _ => Err(EvalError::Type("define-record-type: expected field name".into())),
+    }).collect::<Result<_, _>>()?;
+
+    // Parse predicate
+    let pred_name = match &args[2] {
+        Value::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("define-record-type: expected predicate name".into())),
+    };
+
+    // Define constructor
+    env.borrow_mut().set(ctor_name, Value::RecordProc {
+        type_id,
+        kind: crate::scheme::value::RecordProcKind::Constructor { field_names: ctor_fields.clone() },
+    });
+
+    // Define predicate
+    env.borrow_mut().set(pred_name, Value::RecordProc {
+        type_id,
+        kind: crate::scheme::value::RecordProcKind::Predicate,
+    });
+
+    // Parse field specs: (field-name accessor-name)
+    for field_spec in &args[3..] {
+        let parts = match field_spec {
+            Value::List(e) => e,
+            _ => return Err(EvalError::Type("define-record-type: expected field spec".into())),
+        };
+        if parts.len() < 2 {
+            return Err(EvalError::Arity("define-record-type: field spec needs name and accessor".into()));
+        }
+        let field_name = match &parts[0] {
+            Value::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Type("define-record-type: expected field name".into())),
+        };
+        let accessor_name = match &parts[1] {
+            Value::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Type("define-record-type: expected accessor name".into())),
+        };
+        let field_index = ctor_fields.iter().position(|f| f == &field_name)
+            .ok_or_else(|| EvalError::Type(format!("define-record-type: unknown field {}", field_name)))?;
+        env.borrow_mut().set(accessor_name, Value::RecordProc {
+            type_id,
+            kind: crate::scheme::value::RecordProcKind::Accessor { field_index },
+        });
+    }
+
+    Ok(Value::Void)
 }
 
 // --- Macro support (L10) ---
