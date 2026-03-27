@@ -106,7 +106,7 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
         EvalError::WithPosition { error: Box::new(e), line, col }
     })?;
     let output = out.borrow().clone();
-    Ok((result.to_display(), output))
+    Ok((result.to_display_repr(), output))
 }
 
 /// Evaluate Scheme expressions with a step budget.
