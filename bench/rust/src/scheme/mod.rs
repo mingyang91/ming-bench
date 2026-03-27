@@ -2,6 +2,7 @@ pub mod error;
 mod builtins;
 mod cek;
 mod display;
+mod let_forms;
 mod macros;
 mod numeric;
 mod records;
@@ -9,7 +10,11 @@ mod records;
 pub use error::EvalError;
 
 use builtins::eval_builtin;
-use macros::{eval_define_syntax, expand_and_eval_macro};
+use let_forms::{eval_let, eval_let_star, eval_letrec, eval_letrec_star};
+use macros::{
+    eval_define_syntax, eval_syntax_case, eval_syntax_form, eval_with_syntax,
+    expand_and_eval_macro, expand_transformer,
+};
 use display::display_value;
 use numeric::{f64_to_exact, is_number, make_rational, nums_equal, nums_less, value_to_f64, values_equal};
 
@@ -62,6 +67,8 @@ pub(crate) enum Value {
     Vector(Rc<RefCell<Vec<Value>>>),
     Continuation(Rc<Kont>, Vec<Rc<(Value, Value)>>),
     Values(Vec<Value>),
+    Syntax(Expr, Frame),
+    TransformerMacro(Box<Value>),
 }
 
 
@@ -204,6 +211,8 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Syntax(..) => write!(f, "#<syntax>"),
+            Value::TransformerMacro(_) => write!(f, "#<transformer>"),
         }
     }
 }
@@ -286,7 +295,18 @@ impl<'a> Parser<'a> {
             }
             Some(b'(') => self.parse_list(span),
             Some(b'"') => self.parse_string(span),
-            Some(b'#') => self.parse_hash(span),
+            Some(b'#') => {
+                // Check for #' (syntax shorthand)
+                if self.pos + 1 < self.input.len() && self.input[self.pos + 1] == b'\'' {
+                    self.pos += 2; // skip #'
+                    let inner = self.parse_expr()?;
+                    return Ok(Expr { kind: ExprKind::List(vec![
+                        Expr { kind: ExprKind::Symbol("syntax".into()), span },
+                        inner,
+                    ]), span });
+                }
+                self.parse_hash(span)
+            }
             _ => self.parse_atom(span),
         }
     }
@@ -530,11 +550,24 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
                     "call/cc" | "call-with-current-continuation" => {
                         return Err(EvalError::Generic("call/cc: not available in recursive eval context".into()));
                     }
+                    "syntax-case" => return eval_syntax_case(&items[1..], env, output),
+                    "syntax" => return eval_syntax_form(&items[1..], env),
+                    "with-syntax" => return eval_with_syntax(&items[1..], env, output),
                     _ => {}
                 }
                 // Check for macro invocation
                 if let Ok(macro_val @ Value::Macro { .. }) = env_lookup(env, op) {
                     return expand_and_eval_macro(&macro_val, items, env, output);
+                }
+                // Check for transformer macro (syntax-case based)
+                if let Ok(Value::TransformerMacro(proc)) = env_lookup(env, op) {
+                    let (expanded, hygiene_frame) = expand_transformer(&proc, items, output)?;
+                    // Insert hygiene frame below the top so define still works in caller's frame
+                    let idx = env.len().saturating_sub(1);
+                    env.insert(idx, hygiene_frame);
+                    let result = eval(&expanded, env, output);
+                    env.remove(idx);
+                    return result;
                 }
                 if is_builtin(op) {
                     let args: Vec<Value> = items[1..].iter().map(|a| eval(a, env, output)).collect::<Result<_, _>>()?;
@@ -575,13 +608,22 @@ fn eval_tail_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Ta
                     "letrec*" => return eval_letrec_star_tail(&items[1..], env, output),
                     "define" | "set!" | "quote" | "lambda" | "case-lambda" |
                     "define-syntax" | "define-record-type" | "case" | "do" | "let*" |
-                    "call/cc" | "call-with-current-continuation" => {
+                    "call/cc" | "call-with-current-continuation" |
+                    "syntax-case" | "syntax" | "with-syntax" => {
                         return Ok(TailResult::Done(eval(expr, env, output)?));
                     }
                     _ => {}
                 }
                 if let Ok(macro_val @ Value::Macro { .. }) = env_lookup(env, op) {
                     return Ok(TailResult::Done(expand_and_eval_macro(&macro_val, items, env, output)?));
+                }
+                if let Ok(Value::TransformerMacro(proc)) = env_lookup(env, op) {
+                    let (expanded, hygiene_frame) = expand_transformer(&proc, items, output)?;
+                    let idx = env.len().saturating_sub(1);
+                    env.insert(idx, hygiene_frame);
+                    let result = eval(&expanded, env, output);
+                    env.remove(idx);
+                    return Ok(TailResult::Done(result?));
                 }
                 if is_builtin(op) {
                     let args: Vec<Value> = items[1..].iter()
@@ -807,7 +849,7 @@ fn eval_letrec_star_tail(args: &[Expr], env: &mut Env, output: &mut String) -> R
     result
 }
 
-fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
+pub(crate) fn apply_proc(func: &Value, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
     let mut cur_func = func.clone();
     let mut cur_args = args.to_vec();
 
@@ -1068,177 +1110,10 @@ pub(crate) fn is_builtin(op: &str) -> bool {
         | "error"
         | "dynamic-wind"
         | "raise" | "with-exception-handler"
-        | "values" | "call-with-values")
+        | "values" | "call-with-values"
+        | "syntax->datum" | "datum->syntax")
     || (op.len() > 2 && op.starts_with('c') && op.ends_with('r')
         && op[1..op.len()-1].bytes().all(|b| b == b'a' || b == b'd'))
-}
-
-
-fn eval_let(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity("let requires bindings and body".into()));
-    }
-    // Named let: (let name ((var init) ...) body ...)
-    if let ExprKind::Symbol(name) = &args[0].kind {
-        if args.len() < 3 {
-            return Err(EvalError::Arity("named let requires bindings and body".into()));
-        }
-        let bindings = match &args[1].kind {
-            ExprKind::List(items) => items,
-            _ => return Err(EvalError::Type("let: expected bindings list".into())),
-        };
-        let mut params = Vec::new();
-        let mut inits = Vec::new();
-        for b in bindings {
-            match &b.kind {
-                ExprKind::List(pair) if pair.len() == 2 => {
-                    if let ExprKind::Symbol(s) = &pair[0].kind {
-                        params.push(s.clone());
-                        inits.push(eval(&pair[1], env, output)?);
-                    } else {
-                        return Err(EvalError::Type("let: binding name must be symbol".into()));
-                    }
-                }
-                _ => return Err(EvalError::Type("let: invalid binding".into())),
-            }
-        }
-        let body = args[2..].to_vec();
-        let mut let_env = env.clone();
-        let frame = new_frame();
-        let_env.push(frame.clone());
-        let proc = Value::Procedure(params.clone(), None, body, let_env.clone());
-        frame.borrow_mut().insert(name.clone(), proc);
-        let func = env_lookup(&let_env, name)?;
-        return apply_proc(&func, &inits, output);
-    }
-    // Regular let: (let ((var init) ...) body ...)
-    let bindings = match &args[0].kind {
-        ExprKind::List(items) => items,
-        _ => return Err(EvalError::Type("let: expected bindings list".into())),
-    };
-    let frame = new_frame();
-    for b in bindings {
-        match &b.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                if let ExprKind::Symbol(s) = &pair[0].kind {
-                    let val = eval(&pair[1], env, output)?;
-                    frame.borrow_mut().insert(s.clone(), val);
-                } else {
-                    return Err(EvalError::Type("let: binding name must be symbol".into()));
-                }
-            }
-            _ => return Err(EvalError::Type("let: invalid binding".into())),
-        }
-    }
-    env.push(frame);
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, env, output)?;
-    }
-    env.pop();
-    Ok(result)
-}
-
-fn eval_let_star(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity("let* requires bindings and body".into()));
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(items) => items,
-        _ => return Err(EvalError::Type("let*: expected bindings list".into())),
-    };
-    let frame = new_frame();
-    env.push(frame);
-    for b in bindings {
-        match &b.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                if let ExprKind::Symbol(s) = &pair[0].kind {
-                    let val = eval(&pair[1], env, output)?;
-                    env_define(env, s.clone(), val);
-                } else {
-                    return Err(EvalError::Type("let*: binding name must be symbol".into()));
-                }
-            }
-            _ => return Err(EvalError::Type("let*: invalid binding".into())),
-        }
-    }
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, env, output)?;
-    }
-    env.pop();
-    Ok(result)
-}
-
-fn eval_letrec(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity("letrec requires bindings and body".into()));
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(items) => items,
-        _ => return Err(EvalError::Type("letrec: expected bindings list".into())),
-    };
-    let frame = new_frame();
-    env.push(frame);
-    // First pass: bind all names to undefined (we use #f as placeholder)
-    for b in bindings {
-        match &b.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                if let ExprKind::Symbol(s) = &pair[0].kind {
-                    env_define(env, s.clone(), Value::Boolean(false));
-                } else {
-                    return Err(EvalError::Type("letrec: binding name must be symbol".into()));
-                }
-            }
-            _ => return Err(EvalError::Type("letrec: invalid binding".into())),
-        }
-    }
-    // Second pass: evaluate inits and set!
-    for b in bindings {
-        if let ExprKind::List(pair) = &b.kind {
-            if let ExprKind::Symbol(s) = &pair[0].kind {
-                let val = eval(&pair[1], env, output)?;
-                env_set(env, s, val)?;
-            }
-        }
-    }
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, env, output)?;
-    }
-    env.pop();
-    Ok(result)
-}
-
-fn eval_letrec_star(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
-    if args.len() < 2 {
-        return Err(EvalError::Arity("letrec* requires bindings and body".into()));
-    }
-    let bindings = match &args[0].kind {
-        ExprKind::List(items) => items,
-        _ => return Err(EvalError::Type("letrec*: expected bindings list".into())),
-    };
-    let frame = new_frame();
-    env.push(frame);
-    for b in bindings {
-        match &b.kind {
-            ExprKind::List(pair) if pair.len() == 2 => {
-                if let ExprKind::Symbol(s) = &pair[0].kind {
-                    let val = eval(&pair[1], env, output)?;
-                    env_define(env, s.clone(), val);
-                } else {
-                    return Err(EvalError::Type("letrec*: binding name must be symbol".into()));
-                }
-            }
-            _ => return Err(EvalError::Type("letrec*: invalid binding".into())),
-        }
-    }
-    let mut result = Value::Boolean(false);
-    for expr in &args[1..] {
-        result = eval(expr, env, output)?;
-    }
-    env.pop();
-    Ok(result)
 }
 
 fn eqv_match(val: &Value, datum: &Value) -> bool {

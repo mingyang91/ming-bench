@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use super::builtins::eval_builtin;
 use super::error::EvalError;
-use super::macros::{eval_define_syntax, expand_macro_only};
+use super::macros::{eval_define_syntax, expand_macro_only, expand_transformer};
 use super::numeric::make_rational;
 use super::{
     collect_list, env_define, env_lookup, env_set, eval_case, eval_case_lambda,
@@ -544,11 +544,22 @@ fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String, 
                         });
                         cek_seq(&body, env, Rc::new(Kont::PopHandler { next: guard_k }))
                     }
+                    "syntax-case" | "syntax" | "with-syntax" => {
+                        let mut env_mut = env;
+                        let val = super::eval(&super::Expr { kind: ExprKind::List(items.to_vec()), span: items[0].span }, &mut env_mut, output)?;
+                        Ok((Ctrl::Val(val), k))
+                    }
                     _ => {
                         if let Ok(macro_val @ Value::Macro { .. }) = env_lookup(&env, op) {
                             let (expanded, hygiene_frame) = expand_macro_only(&macro_val, items, &env)?;
                             let mut new_env = env;
                             new_env.push(hygiene_frame);
+                            Ok((Ctrl::Eval(expanded, new_env), k))
+                        } else if let Ok(Value::TransformerMacro(proc)) = env_lookup(&env, op) {
+                            let (expanded, hygiene_frame) = expand_transformer(&proc, items, output)?;
+                            let mut new_env = env;
+                            let idx = new_env.len().saturating_sub(1);
+                            new_env.insert(idx, hygiene_frame);
                             Ok((Ctrl::Eval(expanded, new_env), k))
                         } else if let Some(result) = try_fast_call(items, &env, k.clone(), output) {
                             result

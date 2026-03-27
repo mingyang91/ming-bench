@@ -3,6 +3,7 @@ use super::{
     list_from_vec, make_pair, make_rational, make_str, nums_equal, nums_less, value_to_f64,
     values_equal, EvalError, Value,
 };
+use super::macros::{syntax_to_datum, datum_to_syntax};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -141,6 +142,9 @@ pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Val
                 _ => Err(EvalError::Type(format!("expected record of type {tag}"))),
             }
         }
+        "syntax->datum" => syntax_to_datum(args),
+        "datum->syntax" => datum_to_syntax(args),
+
         _ => Err(EvalError::UnboundVariable(op.to_string())),
     }
 }
