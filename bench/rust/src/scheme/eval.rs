@@ -265,7 +265,7 @@ fn apply(func: &Value, args: &[Value], out: &Output) -> Result<Value, EvalError>
         Value::RecordProc { type_id, kind } => {
             apply_record_proc(*type_id, kind, args)
         }
-        Value::Symbol(op) => {
+        Value::Symbol(op) | Value::Builtin(op) => {
             if op == "apply" {
                 return builtin_apply(args, out);
             }
@@ -415,7 +415,7 @@ fn apply_cek(
                 apply_cek(&first, &[], out, ctrl, env, kont, winders, handlers)
             }
         }
-        Value::Symbol(op) => {
+        Value::Symbol(op) | Value::Builtin(op) => {
             if op == "apply" {
                 if args.len() < 2 {
                     return Err(EvalError::Arity("apply requires at least 2 arguments".into()));
@@ -856,7 +856,7 @@ fn cek_eval(
                                 env = local_env;
                                 continue;
                             }
-                            Value::Symbol(ref op) if op != "apply" && op != "call/cc" && op != "call-with-current-continuation" => {
+                            Value::Symbol(ref op) | Value::Builtin(ref op) if op != "apply" && op != "call/cc" && op != "call-with-current-continuation" => {
                                 break apply_builtin(op, &args, out)?;
                             }
                             other => {
@@ -1787,7 +1787,7 @@ fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalEr
         "char?" => { if vals.len() != 1 { return Err(EvalError::Arity("char? requires 1 argument".into())); } Ok(Value::Boolean(matches!(&vals[0], Value::Char(_)))) }
         "procedure?" => {
             if vals.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
-            Ok(Value::Boolean(matches!(&vals[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::RecordProc { .. } | Value::Continuation(_))))
+            Ok(Value::Boolean(matches!(&vals[0], Value::Lambda { .. } | Value::CaseLambda { .. } | Value::RecordProc { .. } | Value::Continuation(_) | Value::Builtin(_))))
         }
         "display" => { if vals.len() != 1 { return Err(EvalError::Arity("display requires 1 argument".into())); } out.borrow_mut().push_str(&vals[0].to_display_repr()); Ok(Value::Void) }
         "write" => { if vals.len() != 1 { return Err(EvalError::Arity("write requires 1 argument".into())); } out.borrow_mut().push_str(&vals[0].to_display()); Ok(Value::Void) }
@@ -2530,6 +2530,7 @@ fn eqv(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Float(y)) => x == y,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Builtin(x), Value::Builtin(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::List(a), Value::List(b)) if a.is_empty() && b.is_empty() => true,
         (Value::Pair(x), Value::Pair(y)) => Rc::ptr_eq(x, y),
@@ -2546,6 +2547,7 @@ fn deep_equal(a: &Value, b: &Value) -> bool {
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::String(x, _), Value::String(y, _)) => x == y,
         (Value::Symbol(x), Value::Symbol(y)) => x == y,
+        (Value::Builtin(x), Value::Builtin(y)) => x == y,
         (Value::Char(x), Value::Char(y)) => x == y,
         (Value::List(al), Value::List(bl)) => al.len() == bl.len() && al.iter().zip(bl.iter()).all(|(x, y)| deep_equal(x, y)),
         (Value::Pair(a_rc), Value::Pair(b_rc)) => {

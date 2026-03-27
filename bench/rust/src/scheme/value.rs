@@ -68,6 +68,8 @@ pub enum Value {
     Values(Vec<Value>),
     /// Lambda-based macro transformer (from syntax-case define-syntax)
     MacroTransformer(Box<Value>),
+    /// Built-in procedure (named)
+    Builtin(String),
 }
 
 impl PartialEq for Value {
@@ -92,6 +94,7 @@ impl PartialEq for Value {
             (Value::Continuation(_), Value::Continuation(_)) => false,
             (Value::Values(a), Value::Values(b)) => a == b,
             (Value::MacroTransformer(_), Value::MacroTransformer(_)) => false,
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
             _ => false,
         }
     }
@@ -105,7 +108,7 @@ impl Value {
             | Value::Lambda { .. } | Value::Pair(_) | Value::SyntaxRules { .. }
             | Value::Record { .. } | Value::RecordProc { .. }
             | Value::CaseLambda { .. } | Value::Vector(_) | Value::Continuation(_)
-            | Value::Void | Value::Values(_) | Value::MacroTransformer(_)
+            | Value::Void | Value::Values(_) | Value::MacroTransformer(_) | Value::Builtin(_)
         )
     }
 
@@ -169,6 +172,7 @@ impl Value {
                 let inner: Vec<String> = elems.iter().map(|v| v.to_display()).collect();
                 format!("#({})", inner.join(" "))
             }
+            Value::Builtin(_) => "#<procedure>".into(),
             Value::Void => "".into(),
             Value::Values(vs) => {
                 if vs.is_empty() { "".into() }

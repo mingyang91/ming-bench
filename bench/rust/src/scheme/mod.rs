@@ -61,7 +61,7 @@ const BUILTINS: &[&str] = &[
 fn make_env() -> Rc<RefCell<Env>> {
     let env = Env::new();
     for name in BUILTINS {
-        env.borrow_mut().set(name.to_string(), Value::Symbol(name.to_string()));
+        env.borrow_mut().set(name.to_string(), Value::Builtin(name.to_string()));
     }
     env
 }
