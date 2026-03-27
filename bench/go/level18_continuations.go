@@ -13,6 +13,7 @@ type machine struct {
 	env  *env
 	val  value
 	cont continuation
+	wind *windFrame
 }
 
 type continuation interface {
@@ -107,6 +108,7 @@ type callCCProc struct {
 
 type continuationProc struct {
 	captured continuation
+	wind     *windFrame
 }
 
 func (p callCCProc) schemeString() string {
@@ -148,7 +150,7 @@ func (p continuationProc) call(args []value) (value, error) {
 		return nil, newCurrentEvalError("continuation expects exactly 1 argument")
 	}
 
-	return evalValueWithContinuation(args[0], p.captured)
+	return evalValueWithWindTransition(args[0], nil, p.wind, p.captured)
 }
 
 func (m *machine) run() (value, error) {
@@ -748,13 +750,18 @@ func applyProcedureState(m *machine, proc procedure, args []value, pos SourcePos
 		if !ok {
 			return newCurrentEvalError("'%s' expects a procedure, got %s", p.name, args[0].schemeString())
 		}
-		return applyProcedureState(m, target, []value{continuationProc{captured: cont}}, pos, cont)
+		return applyProcedureState(m, target, []value{continuationProc{captured: cont, wind: m.wind}}, pos, cont)
+	case dynamicWindProc:
+		inThunk, bodyThunk, outThunk, err := parseDynamicWindArgs(args, p.name)
+		if err != nil {
+			return err
+		}
+		return startDynamicWind(m, inThunk, bodyThunk, outThunk, pos, cont)
 	case continuationProc:
 		if len(args) != 1 {
 			return newCurrentEvalError("continuation expects exactly 1 argument")
 		}
-		m.setValue(args[0], p.captured)
-		return nil
+		return startWindTransition(m, p.wind, p.captured, args[0])
 	case closureValue:
 		call, err := p.prepareTailCall(args)
 		if err != nil {

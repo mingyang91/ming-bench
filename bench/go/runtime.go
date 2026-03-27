@@ -91,17 +91,32 @@ func stringsMutableInCurrentLevel() bool {
 	return currentLevelStringsMutable
 }
 
-func detectStringMutability() bool {
+func currentBenchLevel() int {
 	levelText := os.Getenv("BENCH_LEVEL")
 	if levelText == "" {
-		return false
+		return 0
 	}
 
 	level, err := strconv.Atoi(levelText)
 	if err != nil || level <= 0 {
-		return false
+		return 0
 	}
 
+	return level
+}
+
+// Pre-call/cc levels don't need the continuation machine and are much faster
+// on the older trampoline evaluator for the large TCO fixtures.
+func useLegacyEvaluator() bool {
+	level := currentBenchLevel()
+	return level > 0 && level < 18
+}
+
+func detectStringMutability() bool {
+	level := currentBenchLevel()
+	if level == 0 {
+		return false
+	}
 	return level < immutableStringsLevel
 }
 
@@ -444,6 +459,7 @@ func newGlobalEnv() *env {
 	global.define("/", builtinProc{name: "/", fn: evalDiv})
 	global.define("call/cc", callCCProc{name: "call/cc"})
 	global.define("call-with-current-continuation", callCCProc{name: "call-with-current-continuation"})
+	global.define("dynamic-wind", dynamicWindProc{name: "dynamic-wind"})
 	global.define("<", builtinProc{name: "<", fn: func(args []value) (value, error) {
 		return evalCompare(args, "<", func(a, b numberValue) bool { return a.compare(b) < 0 })
 	}})
@@ -539,7 +555,7 @@ func evalInput(input string) (result string, output string, err error) {
 	defer restoreOutput()
 	restore := pushEvalPos(defaultSourcePos())
 	defer restore()
-	last, err := evalSequenceWithContinuation(exprs, env, nil)
+	last, err := evalSequence(exprs, env)
 	if err != nil {
 		return "", "", err
 	}
@@ -551,14 +567,68 @@ func runTailCall(call *tailCall) (value, error) {
 	if call == nil {
 		return voidValue{}, nil
 	}
-	return evalSequenceWithContinuation(call.body, call.env, nil)
+
+	if !useLegacyEvaluator() {
+		return evalSequenceWithContinuation(call.body, call.env, nil)
+	}
+
+	for current := call; current != nil; {
+		nextValue, nextCall, err := evalSequenceTail(current.body, current.env)
+		if err != nil {
+			return nil, err
+		}
+		if nextCall == nil {
+			return nextValue, nil
+		}
+		current = nextCall
+	}
+
+	return voidValue{}, nil
 }
 
 func evalSequence(exprs []locatedExpr, env *env) (value, error) {
+	if useLegacyEvaluator() {
+		result, tail, err := evalSequenceTail(exprs, env)
+		if err != nil {
+			return nil, err
+		}
+		if tail != nil {
+			return runTailCall(tail)
+		}
+		return result, nil
+	}
 	return evalSequenceWithContinuation(exprs, env, nil)
 }
 
 func evalExpr(e locatedExpr, env *env) (value, error) {
+	if useLegacyEvaluator() {
+		restore := pushEvalPos(e.pos)
+		defer restore()
+
+		switch expr := e.form.(type) {
+		case numberExpr:
+			return expr, nil
+		case boolExpr:
+			return boolValue(expr), nil
+		case stringExpr:
+			return newStringValue(string(expr)), nil
+		case charExpr:
+			return charValue(expr), nil
+		case symbolExpr:
+			binding, ok := env.lookupBinding(string(expr))
+			if !ok {
+				return nil, newCurrentEvalError("unbound variable: %s", string(expr))
+			}
+			if _, isUninitialized := binding.value.(uninitializedValue); isUninitialized {
+				return nil, newCurrentEvalError("uninitialized variable: %s", string(expr))
+			}
+			return binding.value, nil
+		case listExpr:
+			return evalList(expr, env)
+		default:
+			return nil, newCurrentEvalError("unknown expression")
+		}
+	}
 	return evalWithContinuation(e, env, nil)
 }
 
