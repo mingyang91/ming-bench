@@ -71,10 +71,17 @@ function tokenize(input: string): Token[] {
       tokens.push({ text: s, pos: startPos });
       continue;
     }
-    // #t, #f
+    // #t, #f, #\char
     if (ch === '#' && i + 1 < input.length) {
       if (input[i + 1] === 't') { tokens.push({ text: '#t', pos: startPos }); advance(); advance(); continue; }
       if (input[i + 1] === 'f') { tokens.push({ text: '#f', pos: startPos }); advance(); advance(); continue; }
+      if (input[i + 1] === '\\') {
+        advance(); advance(); // skip # and backslash
+        let charName = '';
+        while (i < input.length && !/[\s()";]/.test(input[i])) { charName += input[i]; advance(); }
+        tokens.push({ text: '#\\' + charName, pos: startPos });
+        continue;
+      }
     }
     // atom
     let atom = '';
@@ -110,6 +117,14 @@ function parse(tokens: Token[], pos: { i: number }): SchemeVal {
 function parseAtom(tok: Token): SchemeVal {
   if (tok.text === '#t') return { tag: 'boolean', val: true, pos: tok.pos };
   if (tok.text === '#f') return { tag: 'boolean', val: false, pos: tok.pos };
+  if (tok.text.startsWith('#\\')) {
+    const name = tok.text.slice(2);
+    if (name === 'space') return { tag: 'char', val: ' ', pos: tok.pos };
+    if (name === 'newline') return { tag: 'char', val: '\n', pos: tok.pos };
+    if (name === 'tab') return { tag: 'char', val: '\t', pos: tok.pos };
+    if (name.length === 1) return { tag: 'char', val: name, pos: tok.pos };
+    throw new EvalError(`${tok.pos}: unknown character name: ${name}`);
+  }
   if (tok.text.startsWith('"')) return { tag: 'string', val: tok.text.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\'), pos: tok.pos };
   const n = Number(tok.text);
   if (!isNaN(n) && tok.text !== '') return { tag: 'number', val: n, pos: tok.pos };
@@ -384,6 +399,21 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return { tag: 'char', val: s[i] };
   }});
 
+  envSet(env, 'string-copy', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-copy: expected string');
+    return { tag: 'string', val: args[0].val };
+  }});
+
+  envSet(env, 'string-set!', { tag: 'procedure', val: (args) => {
+    if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'char')
+      throw new EvalError('string-set!: expected string, index, char');
+    const s = args[0];
+    const i = args[1].val;
+    if (i < 0 || i >= s.val.length) throw new EvalError('string-set!: index out of range');
+    s.val = s.val.substring(0, i) + args[2].val + s.val.substring(i + 1);
+    return { tag: 'void' };
+  }});
+
   envSet(env, 'char?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('char? requires 1 argument');
     return { tag: 'boolean', val: args[0].tag === 'char' };
@@ -416,6 +446,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     case 'number':
     case 'boolean':
     case 'string':
+    case 'char':
     case 'nil':
     case 'pair':
       return expr;
