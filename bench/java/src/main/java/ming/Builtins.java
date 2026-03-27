@@ -20,6 +20,7 @@ final class Builtins {
 
     static void registerAll(Evaluator.Env env, StringBuilder outputBuffer, ProcApplier applier) {
         registerListOps(env);
+        registerCxrAndReverse(env);
         registerTypePredicates(env);
         registerArithmetic(env);
         registerIOOps(env, outputBuffer);
@@ -31,6 +32,7 @@ final class Builtins {
         registerHigherOrder(env, applier);
         registerRationals(env);
         registerVectors(env);
+        registerMutation(env, applier);
     }
 
     private static void registerListOps(Evaluator.Env env) {
@@ -85,6 +87,53 @@ final class Builtins {
             Object result = b;
             for (int i = elems.size() - 1; i >= 0; i--) {
                 result = new Evaluator.Pair(elems.get(i), result);
+            }
+            return result;
+        }));
+    }
+
+    private static void registerCxrAndReverse(Evaluator.Env env) {
+        env.define("caar", new Evaluator.BuiltinProc("caar", args -> {
+            if (args.size() != 1) throw new EvalError("caar: expected 1 arg");
+            if (!(args.get(0) instanceof Evaluator.Pair p)) throw new EvalError("caar: not a pair");
+            if (!(p.car instanceof Evaluator.Pair pp)) throw new EvalError("caar: car is not a pair");
+            return pp.car;
+        }));
+        env.define("cadr", new Evaluator.BuiltinProc("cadr", args -> {
+            if (args.size() != 1) throw new EvalError("cadr: expected 1 arg");
+            if (!(args.get(0) instanceof Evaluator.Pair p)) throw new EvalError("cadr: not a pair");
+            if (!(p.cdr instanceof Evaluator.Pair pp)) throw new EvalError("cadr: cdr is not a pair");
+            return pp.car;
+        }));
+        env.define("cdar", new Evaluator.BuiltinProc("cdar", args -> {
+            if (args.size() != 1) throw new EvalError("cdar: expected 1 arg");
+            if (!(args.get(0) instanceof Evaluator.Pair p)) throw new EvalError("cdar: not a pair");
+            if (!(p.car instanceof Evaluator.Pair pp)) throw new EvalError("cdar: car is not a pair");
+            return pp.cdr;
+        }));
+        env.define("cddr", new Evaluator.BuiltinProc("cddr", args -> {
+            if (args.size() != 1) throw new EvalError("cddr: expected 1 arg");
+            if (!(args.get(0) instanceof Evaluator.Pair p)) throw new EvalError("cddr: not a pair");
+            if (!(p.cdr instanceof Evaluator.Pair pp)) throw new EvalError("cddr: cdr is not a pair");
+            return pp.cdr;
+        }));
+        env.define("member", new Evaluator.BuiltinProc("member", args -> {
+            if (args.size() != 2) throw new EvalError("member: expected 2 args");
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Evaluator.Pair p) {
+                if (Evaluator.schemeEqual(key, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+        env.define("reverse", new Evaluator.BuiltinProc("reverse", args -> {
+            if (args.size() != 1) throw new EvalError("reverse: expected 1 arg");
+            Object result = Evaluator.EMPTY_LIST;
+            Object lst = args.get(0);
+            while (lst instanceof Evaluator.Pair p) {
+                result = new Evaluator.Pair(p.car, result);
+                lst = p.cdr;
             }
             return result;
         }));
@@ -370,9 +419,15 @@ final class Builtins {
         }));
         env.define("list?", new Evaluator.BuiltinProc("list?", args -> {
             if (args.size() != 1) throw new EvalError("list?: expected 1 arg");
-            Object obj = args.get(0);
-            while (obj instanceof Evaluator.Pair p) obj = p.cdr;
-            return obj == Evaluator.EMPTY_LIST ? Boolean.TRUE : Boolean.FALSE;
+            Object slow = args.get(0), fast = args.get(0);
+            while (true) {
+                if (!(fast instanceof Evaluator.Pair fp)) return fast == Evaluator.EMPTY_LIST ? Boolean.TRUE : Boolean.FALSE;
+                fast = fp.cdr;
+                if (!(fast instanceof Evaluator.Pair fp2)) return fast == Evaluator.EMPTY_LIST ? Boolean.TRUE : Boolean.FALSE;
+                fast = fp2.cdr;
+                slow = ((Evaluator.Pair) slow).cdr;
+                if (slow == fast) return Boolean.FALSE; // cycle detected
+            }
         }));
         env.define("assoc", new Evaluator.BuiltinProc("assoc", args -> {
             if (args.size() != 2) throw new EvalError("assoc: expected 2 args");
@@ -577,6 +632,173 @@ final class Builtins {
             if (a instanceof Long) return 1L;
             if (a instanceof Rational r) return r.den;
             throw new EvalError("denominator: expected rational");
+        }));
+    }
+
+    private static void registerMutation(Evaluator.Env env, ProcApplier applier) {
+        env.define("set-car!", new Evaluator.BuiltinProc("set-car!", args -> {
+            if (args.size() != 2) throw new EvalError("set-car!: expected 2 args");
+            if (!(args.get(0) instanceof Evaluator.Pair p)) throw new EvalError("set-car!: not a pair");
+            p.car = args.get(1);
+            return Boolean.FALSE;
+        }));
+        env.define("set-cdr!", new Evaluator.BuiltinProc("set-cdr!", args -> {
+            if (args.size() != 2) throw new EvalError("set-cdr!: expected 2 args");
+            if (!(args.get(0) instanceof Evaluator.Pair p)) throw new EvalError("set-cdr!: not a pair");
+            p.cdr = args.get(1);
+            return Boolean.FALSE;
+        }));
+        env.define("for-each", new Evaluator.BuiltinProc("for-each", args -> {
+            if (args.size() < 2) throw new EvalError("for-each: expected at least 2 args");
+            Object proc = args.get(0);
+            int numLists = args.size() - 1;
+            Object[] currents = new Object[numLists];
+            for (int i = 0; i < numLists; i++) currents[i] = args.get(i + 1);
+            while (true) {
+                boolean allPairs = true;
+                for (Object c : currents) {
+                    if (!(c instanceof Evaluator.Pair)) { allPairs = false; break; }
+                }
+                if (!allPairs) break;
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 0; i < numLists; i++) {
+                    callArgs.add(((Evaluator.Pair) currents[i]).car);
+                    currents[i] = ((Evaluator.Pair) currents[i]).cdr;
+                }
+                applier.apply(proc, callArgs);
+            }
+            return Boolean.FALSE;
+        }));
+        env.define("error", new Evaluator.BuiltinProc("error", args -> {
+            if (args.isEmpty()) throw new EvalError("error");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < args.size(); i++) {
+                if (i > 0) sb.append(" ");
+                sb.append(SchemeFormatter.displayString(args.get(i)));
+            }
+            throw new EvalError(sb.toString());
+        }));
+        env.define("memq", new Evaluator.BuiltinProc("memq", args -> {
+            if (args.size() != 2) throw new EvalError("memq: expected 2 args");
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Evaluator.Pair p) {
+                if (key == p.car || (key instanceof Long && key.equals(p.car))
+                    || (key instanceof Boolean && key.equals(p.car))
+                    || (key instanceof SchemeChar && key.equals(p.car))
+                    || (key instanceof String && key.equals(p.car))) return lst;
+                lst = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+        env.define("memv", new Evaluator.BuiltinProc("memv", args -> {
+            if (args.size() != 2) throw new EvalError("memv: expected 2 args");
+            Object key = args.get(0);
+            Object lst = args.get(1);
+            while (lst instanceof Evaluator.Pair p) {
+                if (Evaluator.schemeEqvStatic(key, p.car)) return lst;
+                lst = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+        env.define("assq", new Evaluator.BuiltinProc("assq", args -> {
+            if (args.size() != 2) throw new EvalError("assq: expected 2 args");
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Evaluator.Pair p) {
+                if (p.car instanceof Evaluator.Pair entry) {
+                    if (key == entry.car || (key instanceof Long && key.equals(entry.car))
+                        || (key instanceof Boolean && key.equals(entry.car))
+                        || (key instanceof SchemeChar && key.equals(entry.car))
+                        || (key instanceof String && key.equals(entry.car))) return entry;
+                }
+                alist = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+        env.define("assv", new Evaluator.BuiltinProc("assv", args -> {
+            if (args.size() != 2) throw new EvalError("assv: expected 2 args");
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Evaluator.Pair p) {
+                if (p.car instanceof Evaluator.Pair entry) {
+                    if (Evaluator.schemeEqvStatic(key, entry.car)) return entry;
+                }
+                alist = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+        env.define("gcd", new Evaluator.BuiltinProc("gcd", args -> {
+            if (args.size() == 0) return 0L;
+            long result = Math.abs(asLong(args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                long b = Math.abs(asLong(args.get(i)));
+                while (b != 0) { long t = b; b = result % b; result = t; }
+            }
+            return result;
+        }));
+        env.define("lcm", new Evaluator.BuiltinProc("lcm", args -> {
+            if (args.size() == 0) return 1L;
+            long result = Math.abs(asLong(args.get(0)));
+            for (int i = 1; i < args.size(); i++) {
+                long b = Math.abs(asLong(args.get(i)));
+                if (result == 0 && b == 0) { result = 0; } else {
+                    long g = result; long t = b;
+                    while (t != 0) { long tmp = t; t = g % t; g = tmp; }
+                    result = (result / g) * b;
+                }
+            }
+            return result;
+        }));
+        env.define("truncate", new Evaluator.BuiltinProc("truncate", args -> {
+            if (args.size() != 1) throw new EvalError("truncate: expected 1 arg");
+            Object a = args.get(0);
+            if (a instanceof Long) return a;
+            if (a instanceof Double d) return (long) d.doubleValue();
+            if (a instanceof Rational r) return r.toLong();
+            throw new EvalError("truncate: expected number");
+        }));
+        env.define("round", new Evaluator.BuiltinProc("round", args -> {
+            if (args.size() != 1) throw new EvalError("round: expected 1 arg");
+            Object a = args.get(0);
+            if (a instanceof Long) return a;
+            if (a instanceof Double d) return Math.round(d);
+            if (a instanceof Rational r) return Math.round(r.toDouble());
+            throw new EvalError("round: expected number");
+        }));
+        env.define("make-string", new Evaluator.BuiltinProc("make-string", args -> {
+            if (args.size() < 1 || args.size() > 2) throw new EvalError("make-string: expected 1-2 args");
+            int len = (int) asLong(args.get(0));
+            char fill = args.size() == 2 && args.get(1) instanceof SchemeChar c ? c.value() : '\0';
+            char[] chars = new char[len];
+            java.util.Arrays.fill(chars, fill);
+            return new SchemeString(new String(chars));
+        }));
+        env.define("string", new Evaluator.BuiltinProc("string", args -> {
+            char[] chars = new char[args.size()];
+            for (int i = 0; i < args.size(); i++) {
+                if (!(args.get(i) instanceof SchemeChar c)) throw new EvalError("string: expected char");
+                chars[i] = c.value();
+            }
+            return new SchemeString(new String(chars));
+        }));
+        env.define("string>?", new Evaluator.BuiltinProc("string>?", args -> {
+            if (args.size() != 2) throw new EvalError("string>?: expected 2 args");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string>?: expected strings");
+            return a.value().compareTo(b.value()) > 0 ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("string<=?", new Evaluator.BuiltinProc("string<=?", args -> {
+            if (args.size() != 2) throw new EvalError("string<=?: expected 2 args");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string<=?: expected strings");
+            return a.value().compareTo(b.value()) <= 0 ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("string>=?", new Evaluator.BuiltinProc("string>=?", args -> {
+            if (args.size() != 2) throw new EvalError("string>=?: expected 2 args");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string>=?: expected strings");
+            return a.value().compareTo(b.value()) >= 0 ? Boolean.TRUE : Boolean.FALSE;
         }));
     }
 

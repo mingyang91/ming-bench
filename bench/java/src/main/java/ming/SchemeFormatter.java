@@ -3,6 +3,10 @@ package ming;
 class SchemeFormatter {
 
     static String schemeToString(Object val) {
+        return schemeToStringRec(val, new java.util.IdentityHashMap<>());
+    }
+
+    private static String schemeToStringRec(Object val, java.util.IdentityHashMap<Object, Boolean> seen) {
         if (val instanceof Long l) return l.toString();
         if (val instanceof Rational r) return r.toString();
         if (val instanceof Double d) {
@@ -13,17 +17,21 @@ class SchemeFormatter {
         if (val instanceof SchemeString s) return "\"" + s.value() + "\"";
         if (val == Evaluator.EMPTY_LIST) return "()";
         if (val instanceof Evaluator.Pair p) {
+            if (seen.containsKey(p)) return "...";
+            seen.put(p, Boolean.TRUE);
             StringBuilder sb = new StringBuilder("(");
-            sb.append(schemeToString(p.car));
+            sb.append(schemeToStringRec(p.car, seen));
             Object rest = p.cdr;
             while (rest instanceof Evaluator.Pair rp) {
+                if (seen.containsKey(rp)) { sb.append(" ..."); break; }
+                seen.put(rp, Boolean.TRUE);
                 sb.append(" ");
-                sb.append(schemeToString(rp.car));
+                sb.append(schemeToStringRec(rp.car, seen));
                 rest = rp.cdr;
             }
-            if (rest != Evaluator.EMPTY_LIST) {
+            if (!(rest instanceof Evaluator.Pair) && rest != Evaluator.EMPTY_LIST) {
                 sb.append(" . ");
-                sb.append(schemeToString(rest));
+                sb.append(schemeToStringRec(rest, seen));
             }
             sb.append(")");
             return sb.toString();
@@ -38,7 +46,7 @@ class SchemeFormatter {
             StringBuilder sb = new StringBuilder("#(");
             for (int i = 0; i < v.length(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(schemeToString(v.ref(i)));
+                sb.append(schemeToStringRec(v.ref(i), seen));
             }
             sb.append(")");
             return sb.toString();
@@ -53,21 +61,29 @@ class SchemeFormatter {
     }
 
     static String displayString(Object val) {
+        return displayStringRec(val, new java.util.IdentityHashMap<>());
+    }
+
+    private static String displayStringRec(Object val, java.util.IdentityHashMap<Object, Boolean> seen) {
         if (val instanceof SchemeString s) return s.value();
         if (val instanceof SchemeChar c) return String.valueOf(c.value());
         if (val == Evaluator.EMPTY_LIST) return "()";
         if (val instanceof Evaluator.Pair p) {
+            if (seen.containsKey(p)) return "...";
+            seen.put(p, Boolean.TRUE);
             StringBuilder sb = new StringBuilder("(");
-            sb.append(displayString(p.car));
+            sb.append(displayStringRec(p.car, seen));
             Object rest = p.cdr;
             while (rest instanceof Evaluator.Pair rp) {
+                if (seen.containsKey(rp)) { sb.append(" ..."); break; }
+                seen.put(rp, Boolean.TRUE);
                 sb.append(" ");
-                sb.append(displayString(rp.car));
+                sb.append(displayStringRec(rp.car, seen));
                 rest = rp.cdr;
             }
-            if (rest != Evaluator.EMPTY_LIST) {
+            if (!(rest instanceof Evaluator.Pair) && rest != Evaluator.EMPTY_LIST) {
                 sb.append(" . ");
-                sb.append(displayString(rest));
+                sb.append(displayStringRec(rest, seen));
             }
             sb.append(")");
             return sb.toString();
@@ -76,11 +92,11 @@ class SchemeFormatter {
             StringBuilder sb = new StringBuilder("#(");
             for (int i = 0; i < v.length(); i++) {
                 if (i > 0) sb.append(" ");
-                sb.append(displayString(v.ref(i)));
+                sb.append(displayStringRec(v.ref(i), seen));
             }
             sb.append(")");
             return sb.toString();
         }
-        return schemeToString(val);
+        return schemeToStringRec(val, seen);
     }
 }

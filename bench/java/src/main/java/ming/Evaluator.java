@@ -951,6 +951,10 @@ public class Evaluator {
     }
 
     static boolean schemeEqual(Object a, Object b) {
+        return schemeEqualRec(a, b, new java.util.IdentityHashMap<>());
+    }
+
+    private static boolean schemeEqualRec(Object a, Object b, java.util.IdentityHashMap<Object, Object> seen) {
         if (a == b) return true;
         if (isNumber(a) && isNumber(b)) {
             try { return toDouble(a) == toDouble(b); } catch (EvalError e) { return false; }
@@ -960,14 +964,29 @@ public class Evaluator {
         if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
         if (a == EMPTY_LIST && b == EMPTY_LIST) return true;
-        if (a instanceof Pair pa && b instanceof Pair pb) return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        if (a instanceof Pair pa && b instanceof Pair pb) {
+            if (seen.containsKey(pa)) return true; // assume equal for cycles
+            seen.put(pa, pb);
+            return schemeEqualRec(pa.car, pb.car, seen) && schemeEqualRec(pa.cdr, pb.cdr, seen);
+        }
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.length() != vb.length()) return false;
             for (int i = 0; i < va.length(); i++) {
-                if (!schemeEqual(va.ref(i), vb.ref(i))) return false;
+                if (!schemeEqualRec(va.ref(i), vb.ref(i), seen)) return false;
             }
             return true;
         }
+        return false;
+    }
+
+    static boolean schemeEqvStatic(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Double && b instanceof Double) return a.equals(b);
+        if (a instanceof Rational && b instanceof Rational) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof SchemeChar && b instanceof SchemeChar) return a.equals(b);
+        if (a instanceof String && b instanceof String) return a.equals(b);
         return false;
     }
 
