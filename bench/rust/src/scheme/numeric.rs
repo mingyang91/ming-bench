@@ -1,4 +1,5 @@
-use super::{EvalError, Value};
+use super::{collect_list, EvalError, Value};
+use std::rc::Rc;
 
 pub(crate) fn num_gcd(mut a: i64, mut b: i64) -> i64 {
     a = a.abs();
@@ -62,6 +63,11 @@ pub(crate) fn is_number(v: &Value) -> bool {
 }
 
 pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
+    values_equal_depth(a, b, 0)
+}
+
+fn values_equal_depth(a: &Value, b: &Value, depth: usize) -> bool {
+    if depth > 100_000 { return false; }
     if is_number(a) && is_number(b) {
         return nums_equal(a, b);
     }
@@ -70,16 +76,42 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Str(a, _), Value::Str(b, _)) => *a.borrow() == *b.borrow(),
         (Value::Symbol(a), Value::Symbol(b)) => a == b,
-        (Value::List(a), Value::List(b)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
+        (Value::Pair(a), Value::Pair(b)) if Rc::ptr_eq(a, b) => true,
+        (Value::Pair(a_cell), Value::Pair(b_cell)) => {
+            let (a_car, a_cdr) = {
+                let a = a_cell.borrow();
+                (a.0.clone(), a.1.clone())
+            };
+            let (b_car, b_cdr) = {
+                let b = b_cell.borrow();
+                (b.0.clone(), b.1.clone())
+            };
+            values_equal_depth(&a_car, &b_car, depth + 1)
+                && values_equal_depth(&a_cdr, &b_cdr, depth + 1)
         }
-        (Value::Pair(a1, a2), Value::Pair(b1, b2)) => {
-            values_equal(a1, b1) && values_equal(a2, b2)
+        (Value::List(a), Value::List(b)) => {
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|(x, y)| values_equal_depth(x, y, depth + 1))
+        }
+        // Cross-type: List vs Pair chain
+        (Value::List(_), Value::Pair(_)) | (Value::Pair(_), Value::List(_)) => {
+            let a_items = collect_list(a);
+            let b_items = collect_list(b);
+            match (a_items, b_items) {
+                (Some(a), Some(b)) => {
+                    a.len() == b.len()
+                        && a.iter().zip(b.iter())
+                            .all(|(x, y)| values_equal_depth(x, y, depth + 1))
+                }
+                _ => false,
+            }
         }
         (Value::Vector(a), Value::Vector(b)) => {
+            if Rc::ptr_eq(a, b) { return true; }
             let a = a.borrow();
             let b = b.borrow();
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|(x, y)| values_equal_depth(x, y, depth + 1))
         }
         _ => false,
     }

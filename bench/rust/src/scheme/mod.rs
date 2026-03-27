@@ -1,5 +1,6 @@
 pub mod error;
 mod builtins;
+mod display;
 mod macros;
 mod numeric;
 
@@ -7,6 +8,7 @@ pub use error::EvalError;
 
 use builtins::eval_builtin;
 use macros::{eval_define_syntax, expand_and_eval_macro};
+use display::display_value;
 use numeric::{f64_to_exact, is_number, make_rational, nums_equal, nums_less, value_to_f64, values_equal};
 
 use std::cell::RefCell;
@@ -42,7 +44,7 @@ pub(crate) enum Value {
     Str(Rc<RefCell<String>>, bool), // (data, mutable)
     Symbol(String),
     List(Vec<Value>),
-    Pair(Box<Value>, Box<Value>),
+    Pair(Rc<RefCell<(Value, Value)>>),
     Procedure(Vec<String>, Option<String>, Vec<Expr>, Env),
     Builtin(String),
     Macro {
@@ -65,6 +67,50 @@ fn make_str(s: String) -> Value {
 
 fn make_immutable_str(s: String) -> Value {
     Value::Str(Rc::new(RefCell::new(s)), false)
+}
+
+pub(crate) fn make_pair(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(RefCell::new((car, cdr))))
+}
+
+pub(crate) fn list_from_vec(items: &[Value]) -> Value {
+    let mut result = Value::List(vec![]);
+    for item in items.iter().rev() {
+        result = make_pair(item.clone(), result);
+    }
+    result
+}
+
+pub(crate) fn collect_list(v: &Value) -> Option<Vec<Value>> {
+    match v {
+        Value::List(items) => Some(items.clone()),
+        Value::Pair(_) => {
+            let mut result = Vec::new();
+            let mut current = v.clone();
+            loop {
+                match current {
+                    Value::List(ref items) if items.is_empty() => return Some(result),
+                    Value::List(ref items) => {
+                        result.extend(items.iter().cloned());
+                        return Some(result);
+                    }
+                    Value::Pair(ref cell) => {
+                        let (car, cdr) = {
+                            let b = cell.borrow();
+                            (b.0.clone(), b.1.clone())
+                        };
+                        result.push(car);
+                        current = cdr;
+                        if result.len() > 10_000_000 {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 impl fmt::Display for Value {
@@ -93,7 +139,45 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            Value::Pair(a, b) => write!(f, "({a} . {b})"),
+            Value::Pair(cell) => {
+                write!(f, "(")?;
+                let (car, cdr) = {
+                    let b = cell.borrow();
+                    (b.0.clone(), b.1.clone())
+                };
+                write!(f, "{}", car)?;
+                let mut current = cdr;
+                let mut depth = 0usize;
+                loop {
+                    match current {
+                        Value::List(ref items) if items.is_empty() => break,
+                        Value::List(ref items) => {
+                            for item in items {
+                                write!(f, " {}", item)?;
+                            }
+                            break;
+                        }
+                        Value::Pair(ref next) => {
+                            depth += 1;
+                            if depth > 100_000 {
+                                write!(f, " ...")?;
+                                break;
+                            }
+                            let (car, cdr2) = {
+                                let b = next.borrow();
+                                (b.0.clone(), b.1.clone())
+                            };
+                            write!(f, " {}", car)?;
+                            current = cdr2;
+                        }
+                        _ => {
+                            write!(f, " . {}", current)?;
+                            break;
+                        }
+                    }
+                }
+                write!(f, ")")
+            }
             Value::Procedure(..) => write!(f, "#<procedure>"),
             Value::Builtin(name) => write!(f, "#<procedure:{name}>"),
             Value::Macro { .. } => write!(f, "#<macro>"),
@@ -426,6 +510,7 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
                     "cond" => return eval_cond(&items[1..], env, output),
                     "define-syntax" => return eval_define_syntax(&items[1..], env),
                     "define-record-type" => return eval_define_record_type(&items[1..], env),
+                    "let*" => return eval_let_star(&items[1..], env, output),
                     "letrec" => return eval_letrec(&items[1..], env, output),
                     "letrec*" => return eval_letrec_star(&items[1..], env, output),
                     "case" => return eval_case(&items[1..], env, output),
@@ -474,7 +559,7 @@ fn eval_tail_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Ta
                     "letrec" => return eval_letrec_tail(&items[1..], env, output),
                     "letrec*" => return eval_letrec_star_tail(&items[1..], env, output),
                     "define" | "set!" | "quote" | "lambda" | "case-lambda" |
-                    "define-syntax" | "define-record-type" | "case" | "do" => {
+                    "define-syntax" | "define-record-type" | "case" | "do" | "let*" => {
                         return Ok(TailResult::Done(eval(expr, env, output)?));
                     }
                     _ => {}
@@ -936,6 +1021,7 @@ fn eval_or(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, E
 pub(crate) fn is_builtin(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
         | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
+        | "set-car!" | "set-cdr!"
         | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
         | "integer?" | "rational?" | "exact?" | "inexact?"
         | "exact->inexact" | "inexact->exact"
@@ -949,46 +1035,24 @@ pub(crate) fn is_builtin(op: &str) -> bool {
         | "eq?" | "equal?"
         | "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt"
         | "zero?" | "positive?" | "negative?" | "odd?" | "even?"
-        | "list-ref" | "list-tail" | "list?" | "assoc" | "map"
+        | "list-ref" | "list-tail" | "list?" | "assoc" | "assq" | "assv"
+        | "member" | "memq" | "memv"
+        | "map" | "for-each" | "reverse"
         | "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase"
         | "char=?" | "char<?" | "char->integer" | "integer->char"
-        | "string=?" | "string<?" | "string-ci=?"
+        | "string=?" | "string<?" | "string>?" | "string<=?" | "string>=?" | "string-ci=?"
         | "string-upcase" | "string-downcase"
+        | "make-string" | "string"
+        | "gcd" | "lcm" | "truncate" | "round"
         | "procedure?"
         | "eqv?"
         | "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
-        | "vector?" | "vector->list" | "list->vector")
+        | "vector?" | "vector->list" | "list->vector"
+        | "error")
+    || (op.len() > 2 && op.starts_with('c') && op.ends_with('r')
+        && op[1..op.len()-1].bytes().all(|b| b == b'a' || b == b'd'))
 }
 
-fn display_value(v: &Value) -> String {
-    match v {
-        Value::Str(s, _) => s.borrow().clone(),
-        Value::Char(c) => c.to_string(),
-        Value::List(items) => {
-            let mut s = String::from("(");
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 { s.push(' '); }
-                s.push_str(&display_value(item));
-            }
-            s.push(')');
-            s
-        }
-        Value::Pair(a, b) => format!("({} . {})", display_value(a), display_value(b)),
-        Value::Builtin(name) => format!("#<procedure:{name}>"),
-        Value::Record { type_tag, .. } => format!("#<record:{type_tag}>"),
-        Value::Vector(v) => {
-            let items = v.borrow();
-            let mut s = String::from("#(");
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 { s.push(' '); }
-                s.push_str(&display_value(item));
-            }
-            s.push(')');
-            s
-        }
-        other => other.to_string(),
-    }
-}
 
 fn eval_let(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     if args.len() < 2 {
@@ -1047,6 +1111,37 @@ fn eval_let(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, 
         }
     }
     env.push(frame);
+    let mut result = Value::Boolean(false);
+    for expr in &args[1..] {
+        result = eval(expr, env, output)?;
+    }
+    env.pop();
+    Ok(result)
+}
+
+fn eval_let_star(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::Arity("let* requires bindings and body".into()));
+    }
+    let bindings = match &args[0].kind {
+        ExprKind::List(items) => items,
+        _ => return Err(EvalError::Type("let*: expected bindings list".into())),
+    };
+    let frame = new_frame();
+    env.push(frame);
+    for b in bindings {
+        match &b.kind {
+            ExprKind::List(pair) if pair.len() == 2 => {
+                if let ExprKind::Symbol(s) = &pair[0].kind {
+                    let val = eval(&pair[1], env, output)?;
+                    env_define(env, s.clone(), val);
+                } else {
+                    return Err(EvalError::Type("let*: binding name must be symbol".into()));
+                }
+            }
+            _ => return Err(EvalError::Type("let*: invalid binding".into())),
+        }
+    }
     let mut result = Value::Boolean(false);
     for expr in &args[1..] {
         result = eval(expr, env, output)?;
