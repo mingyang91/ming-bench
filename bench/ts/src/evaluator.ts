@@ -30,6 +30,15 @@ type Token = { text: string; pos: string };
 
 const NIL: SchemeVal = { tag: 'nil' };
 
+// Unique identity for cycle detection
+let _nextId = 0;
+const _idMap = new WeakMap<object, number>();
+function idOf(obj: SchemeVal): number {
+  let id = _idMap.get(obj);
+  if (id === undefined) { id = _nextId++; _idMap.set(obj, id); }
+  return id;
+}
+
 function arrayToList(arr: SchemeVal[]): SchemeVal {
   let result: SchemeVal = NIL;
   for (let i = arr.length - 1; i >= 0; i--) {
@@ -396,6 +405,30 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return args[0].cdr;
   }});
 
+  // cxr compositions
+  const pairCar = (v: SchemeVal, name: string): SchemeVal => {
+    if (v.tag !== 'pair') throw new EvalError(`${name}: not a pair`);
+    return v.car;
+  };
+  const pairCdr = (v: SchemeVal, name: string): SchemeVal => {
+    if (v.tag !== 'pair') throw new EvalError(`${name}: not a pair`);
+    return v.cdr;
+  };
+  envSet(env, 'caar', { tag: 'procedure', val: (a) => pairCar(pairCar(a[0], 'caar'), 'caar') });
+  envSet(env, 'cadr', { tag: 'procedure', val: (a) => pairCar(pairCdr(a[0], 'cadr'), 'cadr') });
+  envSet(env, 'cdar', { tag: 'procedure', val: (a) => pairCdr(pairCar(a[0], 'cdar'), 'cdar') });
+  envSet(env, 'cddr', { tag: 'procedure', val: (a) => pairCdr(pairCdr(a[0], 'cddr'), 'cddr') });
+  envSet(env, 'caaar', { tag: 'procedure', val: (a) => pairCar(pairCar(pairCar(a[0], 'caaar'), 'caaar'), 'caaar') });
+  envSet(env, 'caadr', { tag: 'procedure', val: (a) => pairCar(pairCar(pairCdr(a[0], 'caadr'), 'caadr'), 'caadr') });
+  envSet(env, 'caddr', { tag: 'procedure', val: (a) => pairCar(pairCdr(pairCdr(a[0], 'caddr'), 'caddr'), 'caddr') });
+  envSet(env, 'cdddr', { tag: 'procedure', val: (a) => pairCdr(pairCdr(pairCdr(a[0], 'cdddr'), 'cdddr'), 'cdddr') });
+  envSet(env, 'cdaar', { tag: 'procedure', val: (a) => pairCdr(pairCar(pairCar(a[0], 'cdaar'), 'cdaar'), 'cdaar') });
+  envSet(env, 'cdadr', { tag: 'procedure', val: (a) => pairCdr(pairCar(pairCdr(a[0], 'cdadr'), 'cdadr'), 'cdadr') });
+  envSet(env, 'cddar', { tag: 'procedure', val: (a) => pairCdr(pairCdr(pairCar(a[0], 'cddar'), 'cddar'), 'cddar') });
+  envSet(env, 'cadar', { tag: 'procedure', val: (a) => pairCar(pairCdr(pairCar(a[0], 'cadar'), 'cadar'), 'cadar') });
+  envSet(env, 'caddar', { tag: 'procedure', val: (a) => pairCar(pairCdr(pairCdr(pairCar(a[0], 'caddar'), 'caddar'), 'caddar'), 'caddar') });
+  envSet(env, 'cadddr', { tag: 'procedure', val: (a) => pairCar(pairCdr(pairCdr(pairCdr(a[0], 'cadddr'), 'cadddr'), 'cadddr'), 'cadddr') });
+
   envSet(env, 'null?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('null? requires 1 argument');
     return { tag: 'boolean', val: args[0].tag === 'nil' };
@@ -443,6 +476,50 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return arrayToList(results);
   }});
 
+  envSet(env, 'for-each', { tag: 'procedure', val: (args) => {
+    if (args.length < 2) throw new EvalError('for-each requires at least 2 arguments');
+    const fn = args[0];
+    if (fn.tag !== 'procedure' && fn.tag !== 'closure') throw new EvalError('for-each: first argument must be a procedure');
+    const lists = args.slice(1);
+    const cursors = lists.map(l => l);
+    while (true) {
+      const fnArgs: SchemeVal[] = [];
+      let done = false;
+      for (let i = 0; i < cursors.length; i++) {
+        if (cursors[i].tag !== 'pair') { done = true; break; }
+        fnArgs.push((cursors[i] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).car);
+      }
+      if (done) break;
+      callAny(fn, fnArgs);
+      for (let i = 0; i < cursors.length; i++) {
+        cursors[i] = (cursors[i] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).cdr;
+      }
+    }
+    return { tag: 'void' };
+  }});
+
+  envSet(env, 'reverse', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('reverse requires 1 argument');
+    let cur = args[0];
+    let result: SchemeVal = NIL;
+    while (cur.tag === 'pair') {
+      result = { tag: 'pair', car: cur.car, cdr: result };
+      cur = cur.cdr;
+    }
+    return result;
+  }});
+
+  envSet(env, 'member', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2) throw new EvalError('member requires 2 arguments');
+    const key = args[0];
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (schemeEqual(cur.car, key)) return cur;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', val: false };
+  }});
+
   envSet(env, 'length', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('length requires 1 argument');
     let cur = args[0];
@@ -484,7 +561,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   }});
 
   // I/O
-  const displayVal = (v: SchemeVal): string => {
+  const displayVal = (v: SchemeVal, seen?: Set<SchemeVal>): string => {
     switch (v.tag) {
       case 'number': return displayNumber(v);
       case 'boolean': return v.val ? '#t' : '#f';
@@ -496,24 +573,47 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
       case 'procedure': return '#<procedure>';
       case 'closure': return '#<procedure>';
       case 'pair': {
-        let out = '(' + displayVal(v.car);
+        if (!seen) seen = new Set();
+        if (seen.has(v)) return '(...)';
+        seen.add(v);
+        let out = '(' + displayVal(v.car, seen);
         let cur: SchemeVal = v.cdr;
-        while (cur.tag === 'pair') { out += ' ' + displayVal(cur.car); cur = cur.cdr; }
-        if (cur.tag !== 'nil') out += ' . ' + displayVal(cur);
+        while (cur.tag === 'pair') {
+          if (seen.has(cur)) { out += ' ...'; break; }
+          seen.add(cur);
+          out += ' ' + displayVal(cur.car, seen);
+          cur = cur.cdr;
+        }
+        if (cur.tag !== 'nil' && cur.tag !== 'pair') out += ' . ' + displayVal(cur, seen);
         return out + ')';
       }
-      case 'list': return `(${v.val.map(displayVal).join(' ')})`;
+      case 'list': return `(${v.val.map(x => displayVal(x, seen)).join(' ')})`;
       case 'macro': return '#<macro>';
       case 'record': return '#<record>';
-      case 'vector': return '#(' + v.val.map(displayVal).join(' ') + ')';
+      case 'vector': return '#(' + v.val.map(x => displayVal(x, seen)).join(' ') + ')';
     }
   };
 
-  const writeVal = (v: SchemeVal): string => {
+  const writeVal = (v: SchemeVal, seen?: Set<SchemeVal>): string => {
     if (v.tag === 'string') return `"${v.val}"`;
     if (v.tag === 'char') return `#\\${v.val}`;
-    if (v.tag === 'vector') return '#(' + v.val.map(writeVal).join(' ') + ')';
-    return displayVal(v);
+    if (v.tag === 'vector') return '#(' + v.val.map(x => writeVal(x, seen)).join(' ') + ')';
+    if (v.tag === 'pair') {
+      if (!seen) seen = new Set();
+      if (seen.has(v)) return '(...)';
+      seen.add(v);
+      let out = '(' + writeVal(v.car, seen);
+      let cur: SchemeVal = v.cdr;
+      while (cur.tag === 'pair') {
+        if (seen.has(cur)) { out += ' ...'; break; }
+        seen.add(cur);
+        out += ' ' + writeVal(cur.car, seen);
+        cur = cur.cdr;
+      }
+      if (cur.tag !== 'nil' && cur.tag !== 'pair') out += ' . ' + writeVal(cur, seen);
+      return out + ')';
+    }
+    return displayVal(v, seen);
   };
 
   envSet(env, 'display', { tag: 'procedure', val: (args) => {
@@ -641,7 +741,9 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return { tag: 'boolean', val: a === b };
   }});
 
+  const equalSeen = new Set<string>();
   const schemeEqual = (a: SchemeVal, b: SchemeVal): boolean => {
+    if (a === b) return true;
     if (a.tag !== b.tag) return false;
     if (a.tag === 'nil') return true;
     if (a.tag === 'boolean') return a.val === (b as typeof a).val;
@@ -649,7 +751,15 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     if (a.tag === 'string') return a.val === (b as typeof a).val;
     if (a.tag === 'symbol') return a.val === (b as typeof a).val;
     if (a.tag === 'char') return a.val === (b as typeof a).val;
-    if (a.tag === 'pair' && b.tag === 'pair') return schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+    if (a.tag === 'pair' && b.tag === 'pair') {
+      // Use object identity to detect cycles
+      const key = `${idOf(a)},${idOf(b)}`;
+      if (equalSeen.has(key)) return true; // assume equal if we've seen this pair before
+      equalSeen.add(key);
+      const result = schemeEqual(a.car, b.car) && schemeEqual(a.cdr, b.cdr);
+      equalSeen.delete(key);
+      return result;
+    }
     if (a.tag === 'vector' && b.tag === 'vector') {
       if (a.val.length !== b.val.length) return false;
       for (let i = 0; i < a.val.length; i++) {
@@ -739,6 +849,82 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     return { tag: 'boolean', val: args[0].val % 2 === 0 };
   }});
 
+  envSet(env, 'gcd', { tag: 'procedure', val: (args) => {
+    for (const a of args) if (a.tag !== 'number') throw new EvalError('gcd: expected number');
+    const nums = args as (SchemeVal & { tag: 'number' })[];
+    if (nums.length === 0) return makeExactInt(0);
+    let result = Math.abs(nums[0].val);
+    for (let i = 1; i < nums.length; i++) result = gcd(result, Math.abs(nums[i].val));
+    return makeExactInt(result);
+  }});
+
+  envSet(env, 'lcm', { tag: 'procedure', val: (args) => {
+    for (const a of args) if (a.tag !== 'number') throw new EvalError('lcm: expected number');
+    const nums = args as (SchemeVal & { tag: 'number' })[];
+    if (nums.length === 0) return makeExactInt(1);
+    let result = Math.abs(nums[0].val);
+    for (let i = 1; i < nums.length; i++) {
+      const b = Math.abs(nums[i].val);
+      result = result === 0 && b === 0 ? 0 : (result / gcd(result, b)) * b;
+    }
+    return makeExactInt(result);
+  }});
+
+  envSet(env, 'truncate', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('truncate: expected number');
+    return makeExactInt(Math.trunc(args[0].val));
+  }});
+
+  envSet(env, 'round', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('round: expected number');
+    return makeExactInt(Math.round(args[0].val));
+  }});
+
+  envSet(env, 'floor', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('floor: expected number');
+    return makeExactInt(Math.floor(args[0].val));
+  }});
+
+  envSet(env, 'ceiling', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('ceiling: expected number');
+    return makeExactInt(Math.ceil(args[0].val));
+  }});
+
+  envSet(env, 'make-string', { tag: 'procedure', val: (args) => {
+    if (args.length < 1 || args[0].tag !== 'number') throw new EvalError('make-string: expected number');
+    const ch = args.length >= 2 && args[1].tag === 'char' ? args[1].val : '\0';
+    const chars = Array(args[0].val).fill(ch);
+    return { tag: 'string', val: chars.join(''), mutable: true, chars };
+  }});
+
+  envSet(env, 'string', { tag: 'procedure', val: (args) => {
+    for (const a of args) if (a.tag !== 'char') throw new EvalError('string: expected chars');
+    const chars = args.map(a => (a as { tag: 'char'; val: string }).val);
+    return { tag: 'string', val: chars.join('') };
+  }});
+
+  envSet(env, 'memq', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2) throw new EvalError('memq requires 2 arguments');
+    const key = args[0];
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (schemeEqv(cur.car, key)) return cur;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', val: false };
+  }});
+
+  envSet(env, 'assq', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2) throw new EvalError('assq requires 2 arguments');
+    const key = args[0];
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (cur.car.tag === 'pair' && schemeEqv(cur.car.car, key)) return cur.car;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', val: false };
+  }});
+
   // Exact/rational predicates and conversions (L11)
   envSet(env, 'exact?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('exact?: expected number');
@@ -809,9 +995,31 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
 
   envSet(env, 'list?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('list? requires 1 argument');
-    let cur = args[0];
-    while (cur.tag === 'pair') cur = cur.cdr;
-    return { tag: 'boolean', val: cur.tag === 'nil' };
+    // Floyd's cycle detection
+    let slow = args[0];
+    let fast = args[0];
+    while (fast.tag === 'pair') {
+      slow = (slow as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).cdr;
+      fast = fast.cdr;
+      if (fast.tag !== 'pair') break;
+      fast = fast.cdr;
+      if (slow === fast) return { tag: 'boolean', val: false }; // cycle detected
+    }
+    return { tag: 'boolean', val: fast.tag === 'nil' };
+  }});
+
+  envSet(env, 'set-car!', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2) throw new EvalError('set-car! requires 2 arguments');
+    if (args[0].tag !== 'pair') throw new EvalError('set-car!: not a pair');
+    (args[0] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).car = args[1];
+    return { tag: 'void' };
+  }});
+
+  envSet(env, 'set-cdr!', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2) throw new EvalError('set-cdr! requires 2 arguments');
+    if (args[0].tag !== 'pair') throw new EvalError('set-cdr!: not a pair');
+    (args[0] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).cdr = args[1];
+    return { tag: 'void' };
   }});
 
   envSet(env, 'assoc', { tag: 'procedure', val: (args) => {
@@ -820,6 +1028,28 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
     let cur = args[1];
     while (cur.tag === 'pair') {
       if (cur.car.tag === 'pair' && schemeEqual(cur.car.car, key)) return cur.car;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', val: false };
+  }});
+
+  envSet(env, 'assv', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2) throw new EvalError('assv requires 2 arguments');
+    const key = args[0];
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (cur.car.tag === 'pair' && schemeEqv(cur.car.car, key)) return cur.car;
+      cur = cur.cdr;
+    }
+    return { tag: 'boolean', val: false };
+  }});
+
+  envSet(env, 'memv', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2) throw new EvalError('memv requires 2 arguments');
+    const key = args[0];
+    let cur = args[1];
+    while (cur.tag === 'pair') {
+      if (schemeEqv(cur.car, key)) return cur;
       cur = cur.cdr;
     }
     return { tag: 'boolean', val: false };
@@ -865,6 +1095,21 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   envSet(env, 'string<?', { tag: 'procedure', val: (args) => {
     if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string<?: expected 2 strings');
     return { tag: 'boolean', val: args[0].val < args[1].val };
+  }});
+
+  envSet(env, 'string>?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string>?: expected 2 strings');
+    return { tag: 'boolean', val: args[0].val > args[1].val };
+  }});
+
+  envSet(env, 'string<=?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string<=?: expected 2 strings');
+    return { tag: 'boolean', val: args[0].val <= args[1].val };
+  }});
+
+  envSet(env, 'string>=?', { tag: 'procedure', val: (args) => {
+    if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'string') throw new EvalError('string>=?: expected 2 strings');
+    return { tag: 'boolean', val: args[0].val >= args[1].val };
   }});
 
   envSet(env, 'string-ci=?', { tag: 'procedure', val: (args) => {
@@ -1385,13 +1630,18 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         if (name === 'cond') {
           for (let i = 1; i < elems.length; i++) {
             const clause = elems[i];
-            if (clause.tag !== 'list' || clause.val.length < 2) throw new EvalError(`${epos}: invalid cond clause`);
+            if (clause.tag !== 'list' || clause.val.length < 1) throw new EvalError(`${epos}: invalid cond clause`);
             if (clause.val[0].tag === 'symbol' && clause.val[0].val === 'else') {
               for (let j = 1; j < clause.val.length - 1; j++) evaluate(clause.val[j], env);
               expr = clause.val[clause.val.length - 1]; continue trampoline; // TCO
             }
             const test = evaluate(clause.val[0], env);
             if (isTruthy(test)) {
+              if (clause.val.length === 1) return test; // (cond (test)) => test value
+              if (clause.val.length >= 3 && clause.val[1].tag === 'symbol' && clause.val[1].val === '=>') {
+                const proc = evaluate(clause.val[2], env);
+                return callAny(proc, [test]);
+              }
               for (let j = 1; j < clause.val.length - 1; j++) evaluate(clause.val[j], env);
               expr = clause.val[clause.val.length - 1]; continue trampoline; // TCO
             }
@@ -1643,24 +1893,29 @@ function displayNumber(val: SchemeVal & { tag: 'number' }): string {
   return s;
 }
 
-function display(val: SchemeVal): string {
+function display(val: SchemeVal, seen?: Set<SchemeVal>): string {
   switch (val.tag) {
     case 'number': return displayNumber(val);
     case 'boolean': return val.val ? '#t' : '#f';
     case 'string': return `"${val.val}"`;
     case 'symbol': return val.val;
     case 'char': return `#\\${val.val}`;
-    case 'list': return `(${val.val.map(display).join(' ')})`;
+    case 'list': return `(${val.val.map(v => display(v, seen)).join(' ')})`;
     case 'nil': return '()';
     case 'pair': {
-      let out = '(' + display(val.car);
+      if (!seen) seen = new Set();
+      if (seen.has(val)) return '(...)';
+      seen.add(val);
+      let out = '(' + display(val.car, seen);
       let cur: SchemeVal = val.cdr;
       while (cur.tag === 'pair') {
-        out += ' ' + display(cur.car);
+        if (seen.has(cur)) { out += ' ...'; break; }
+        seen.add(cur);
+        out += ' ' + display(cur.car, seen);
         cur = cur.cdr;
       }
-      if (cur.tag !== 'nil') {
-        out += ' . ' + display(cur);
+      if (cur.tag !== 'nil' && cur.tag !== 'pair') {
+        out += ' . ' + display(cur, seen);
       }
       return out + ')';
     }
@@ -1669,7 +1924,7 @@ function display(val: SchemeVal): string {
     case 'closure': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'record': return '#<record>';
-    case 'vector': return '#(' + val.val.map(display).join(' ') + ')';
+    case 'vector': return '#(' + val.val.map(v => display(v, seen)).join(' ') + ')';
   }
 }
 
