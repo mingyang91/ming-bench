@@ -17,6 +17,13 @@ type exceptionHandler struct {
 	pos      position
 }
 
+type guardHandlerProcedure struct {
+	name    string
+	namePos position
+	clauses []expr
+	env     *environment
+}
+
 type withExceptionHandlerPopFrame struct {
 	handler *exceptionHandler
 }
@@ -43,24 +50,34 @@ func normalizeInterpreterError(err error) error {
 	return err
 }
 
-func expandGuardForm(args []expr, pos position) (expr, error) {
+func parseGuardHandler(args []expr, pos position, env *environment) (*guardHandlerProcedure, []expr, error) {
 	if len(args) < 2 {
-		return nil, newEvalError(pos, "guard expects a clause list and a body")
+		return nil, nil, newEvalError(pos, "guard expects a clause list and a body")
 	}
 
 	spec, ok := args[0].(*listExpr)
 	if !ok || len(spec.elements) == 0 {
-		return nil, newEvalError(args[0].exprPos(), "guard requires a condition variable and clauses")
+		return nil, nil, newEvalError(args[0].exprPos(), "guard requires a condition variable and clauses")
 	}
 
 	name, ok := spec.elements[0].(*symbolExpr)
 	if !ok {
-		return nil, newEvalError(spec.elements[0].exprPos(), "guard requires a symbol condition variable")
+		return nil, nil, newEvalError(spec.elements[0].exprPos(), "guard requires a symbol condition variable")
 	}
 
-	clauses := append([]expr(nil), spec.elements[1:]...)
-	if !guardHasElseClause(clauses) {
-		clauses = append(clauses, &listExpr{
+	handler := &guardHandlerProcedure{
+		name:    name.value,
+		namePos: name.pos,
+		clauses: append([]expr(nil), spec.elements[1:]...),
+		env:     env,
+	}
+	return handler, args[1:], nil
+}
+
+func buildGuardHandlerExpr(name string, namePos, pos position, clauses []expr) expr {
+	condClauses := append([]expr(nil), clauses...)
+	if !guardHasElseClause(condClauses) {
+		condClauses = append(condClauses, &listExpr{
 			pos: pos,
 			elements: []expr{
 				&symbolExpr{value: "else", pos: pos},
@@ -68,37 +85,45 @@ func expandGuardForm(args []expr, pos position) (expr, error) {
 					pos: pos,
 					elements: []expr{
 						&symbolExpr{value: "raise", pos: pos},
-						&symbolExpr{value: name.value, pos: name.pos},
+						&symbolExpr{value: name, pos: namePos},
 					},
 				},
 			},
 		})
 	}
 
-	condElements := make([]expr, 0, len(clauses)+1)
+	condElements := make([]expr, 0, len(condClauses)+1)
 	condElements = append(condElements, &symbolExpr{value: "cond", pos: pos})
-	condElements = append(condElements, clauses...)
+	condElements = append(condElements, condClauses...)
+	return &listExpr{pos: pos, elements: condElements}
+}
+
+func expandGuardForm(args []expr, pos position) (expr, error) {
+	handler, body, err := parseGuardHandler(args, pos, nil)
+	if err != nil {
+		return nil, err
+	}
 
 	handlerLambda := &listExpr{
 		pos: pos,
 		elements: []expr{
 			&symbolExpr{value: "lambda", pos: pos},
 			&listExpr{
-				pos: name.pos,
+				pos: handler.namePos,
 				elements: []expr{
-					&symbolExpr{value: name.value, pos: name.pos},
+					&symbolExpr{value: handler.name, pos: handler.namePos},
 				},
 			},
-			&listExpr{pos: pos, elements: condElements},
+			buildGuardHandlerExpr(handler.name, handler.namePos, pos, handler.clauses),
 		},
 	}
 
-	thunkElements := make([]expr, 0, len(args)+1)
+	thunkElements := make([]expr, 0, len(body)+2)
 	thunkElements = append(thunkElements,
 		&symbolExpr{value: "lambda", pos: pos},
 		&listExpr{pos: pos},
 	)
-	thunkElements = append(thunkElements, args[1:]...)
+	thunkElements = append(thunkElements, body...)
 
 	return &listExpr{
 		pos: pos,
@@ -147,6 +172,26 @@ func (i *interpreter) startWithExceptionHandler(handler any, thunk any, pos posi
 	i.currentHandlers = append(i.currentHandlers, entry)
 	stack = append(stack, withExceptionHandlerPopFrame{handler: entry})
 	return i.applyContinuationProcedure(thunk, nil, pos, stack)
+}
+
+func (i *interpreter) startGuardControl(args []expr, pos position, env *environment, stack []continuationFrame) (continuationControl, []continuationFrame, error) {
+	handler, body, err := parseGuardHandler(args, pos, env)
+	if err != nil {
+		return continuationControl{}, nil, err
+	}
+
+	entry := &exceptionHandler{
+		handler:  handler,
+		stack:    cloneContinuationStack(stack),
+		winds:    cloneDynamicWinds(i.currentWinds),
+		handlers: cloneExceptionHandlers(i.currentHandlers),
+		pos:      pos,
+	}
+
+	i.currentHandlers = append(i.currentHandlers, entry)
+	stack = append(stack, withExceptionHandlerPopFrame{handler: entry})
+	control, nextStack := i.startSequenceControl(body, env, stack)
+	return control, nextStack, nil
 }
 
 func (i *interpreter) raiseContinuation(value any, pos position) (continuationControl, []continuationFrame, error) {

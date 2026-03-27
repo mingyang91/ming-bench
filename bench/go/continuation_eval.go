@@ -777,11 +777,7 @@ func (i *interpreter) stepContinuationExpr(expression expr, env *environment, st
 				case "cond":
 					return i.startCondControl(e.elements[1:], env, stack)
 				case "guard":
-					expanded, err := expandGuardForm(e.elements[1:], operator.pos)
-					if err != nil {
-						return continuationControl{}, nil, err
-					}
-					return newExpressionControl(expanded, env), stack, nil
+					return i.startGuardControl(e.elements[1:], operator.pos, env, stack)
 				case "case":
 					if len(e.elements) < 2 {
 						return continuationControl{}, nil, newEvalError(operator.pos, "case expects a key and at least 1 clause")
@@ -1279,10 +1275,15 @@ func (i *interpreter) resumeContinuationFrame(frame continuationFrame, value any
 func (i *interpreter) applyContinuationProcedure(operator any, args []any, pos position, stack []continuationFrame) (continuationControl, []continuationFrame, error) {
 	switch procedure := operator.(type) {
 	case *continuationProcedure:
+		return i.startContinuationSwitch(procedure, packValuesResult(args))
+
+	case *guardHandlerProcedure:
 		if len(args) != 1 {
-			return continuationControl{}, nil, newEvalError(pos, "continuation expects exactly 1 argument")
+			return continuationControl{}, nil, newEvalError(pos, "guard handler expects exactly 1 argument")
 		}
-		return i.startContinuationSwitch(procedure, args[0])
+		guardEnv := newEnvironment(procedure.env)
+		guardEnv.define(procedure.name, args[0])
+		return newExpressionControl(buildGuardHandlerExpr(procedure.name, procedure.namePos, pos, procedure.clauses), guardEnv), stack, nil
 
 	case *lambdaProcedure:
 		if !procedure.matchesArity(len(args)) && !procedure.hasRest {

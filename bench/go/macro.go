@@ -75,8 +75,8 @@ func parseSyntaxRuleMacro(name string, transformer expr, env *environment) (*syn
 		}
 
 		head, ok := patternList.elements[0].(*symbolExpr)
-		if !ok || head.value != name {
-			return nil, newEvalError(patternList.elements[0].exprPos(), "syntax-rules pattern must start with the macro name")
+		if !ok || (head.value != name && head.value != "_") {
+			return nil, newEvalError(patternList.elements[0].exprPos(), "syntax-rules pattern must start with the macro name or _")
 		}
 
 		patternVars := map[string]struct{}{}
@@ -805,7 +805,11 @@ func isEllipsisExpr(expression expr) bool {
 
 func isCoreSyntaxKeyword(name string) bool {
 	switch name {
-	case "and", "or", "begin", "if", "cond", "define", "set!", "let", "quote", "lambda", "define-syntax", "syntax-rules", "syntax", "syntax-case", "with-syntax":
+	case "and", "or", "begin", "if", "cond", "guard", "case", "do",
+		"define", "set!", "let", "let*", "letrec", "letrec*",
+		"quote", "lambda", "case-lambda", "define-record-type",
+		"define-syntax", "syntax-rules", "syntax", "syntax-case", "with-syntax",
+		"else":
 		return true
 	default:
 		return false

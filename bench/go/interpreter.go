@@ -435,7 +435,7 @@ func evalInput(input string) (string, string, error) {
 	intp := newInterpreter()
 	result := any(voidValue{})
 
-	if continuationsEnabledAtCurrentLevel() {
+	if continuationsEnabledAtCurrentLevel() && requiresContinuationEngine(parsed) {
 		result, err = intp.evalProgramWithContinuations(parsed)
 		if err != nil {
 			return "", intp.output.String(), normalizeInterpreterError(err)
@@ -450,6 +450,43 @@ func evalInput(input string) (string, string, error) {
 	}
 
 	return formatValue(result), intp.output.String(), nil
+}
+
+func requiresContinuationEngine(expressions []expr) bool {
+	for _, expression := range expressions {
+		if exprRequiresContinuationEngine(expression) {
+			return true
+		}
+	}
+	return false
+}
+
+func exprRequiresContinuationEngine(expression expr) bool {
+	switch e := expression.(type) {
+	case *listExpr:
+		if len(e.elements) == 0 {
+			return false
+		}
+		if symbol, ok := e.elements[0].(*symbolExpr); ok {
+			switch symbol.value {
+			case "quote", "syntax":
+				return false
+			case "call/cc", "call-with-current-continuation", "dynamic-wind":
+				return true
+			}
+		}
+		for _, element := range e.elements {
+			if exprRequiresContinuationEngine(element) {
+				return true
+			}
+		}
+	case *symbolExpr:
+		switch e.value {
+		case "call/cc", "call-with-current-continuation", "dynamic-wind":
+			return true
+		}
+	}
+	return false
 }
 
 func (i *interpreter) resolveTailResult(result any) (any, error) {
@@ -598,11 +635,7 @@ func (i *interpreter) evalList(list *listExpr, env *environment, tail bool) (any
 			case "cond":
 				return i.evalCond(list.elements[1:], operator.pos, env, tail)
 			case "guard":
-				expanded, err := expandGuardForm(list.elements[1:], operator.pos)
-				if err != nil {
-					return nil, err
-				}
-				return i.evalExpr(expanded, env, tail)
+				return i.evalGuard(list.elements[1:], operator.pos, env, tail)
 			case "case":
 				return i.evalCase(list.elements[1:], operator.pos, env, tail)
 			case "do":
@@ -768,6 +801,27 @@ func (i *interpreter) evalCond(args []expr, pos position, env *environment, tail
 	}
 
 	return voidValue{}, nil
+}
+
+func (i *interpreter) evalGuard(args []expr, pos position, env *environment, tail bool) (any, error) {
+	handler, body, err := parseGuardHandler(args, pos, env)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := i.evalSequence(body, env, tail)
+	if err == nil {
+		return result, nil
+	}
+
+	raised, ok := err.(*raisedSignal)
+	if !ok {
+		return nil, err
+	}
+
+	guardEnv := newEnvironment(handler.env)
+	guardEnv.define(handler.name, raised.value)
+	return i.evalExpr(buildGuardHandlerExpr(handler.name, handler.namePos, raised.pos, handler.clauses), guardEnv, tail)
 }
 
 func (i *interpreter) evalCase(args []expr, pos position, env *environment, tail bool) (any, error) {
