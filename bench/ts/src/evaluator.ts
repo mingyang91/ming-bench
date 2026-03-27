@@ -159,6 +159,18 @@ function envSet(env: Env, name: string, val: SchemeVal): void {
   env.bindings.set(name, val);
 }
 
+function envMutate(env: Env, name: string, val: SchemeVal, pos?: string): void {
+  let cur: Env | null = env;
+  while (cur) {
+    if (cur.bindings.has(name)) {
+      cur.bindings.set(name, val);
+      return;
+    }
+    cur = cur.parent;
+  }
+  throw new EvalError(`${pos ?? '?'}: unbound variable: ${name}`);
+}
+
 function makeEnv(parent: Env | null): Env {
   return { bindings: new Map(), parent };
 }
@@ -575,6 +587,14 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             return { tag: 'void' };
           }
           throw new EvalError(`${epos}: invalid define`);
+        }
+
+        if (name === 'set!') {
+          if (elems.length !== 3) throw new EvalError(`${epos}: set! requires 2 arguments`);
+          if (elems[1].tag !== 'symbol') throw new EvalError(`${epos}: set! target must be a symbol`);
+          const val = evaluate(elems[2], env);
+          envMutate(env, elems[1].val, val, epos);
+          return { tag: 'void' };
         }
 
         if (name === 'lambda') {
