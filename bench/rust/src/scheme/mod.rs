@@ -22,7 +22,9 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = Parser::new(input).parse_all()?;
     let env = Env::new();
     // Pre-populate builtins as symbols
-    for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not"] {
+    for name in &["+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+                   "cons", "car", "cdr", "list", "length", "null?", "append",
+                   "number?", "boolean?", "string?", "symbol?", "pair?"] {
         env.borrow_mut().set(name.to_string(), Value::Symbol(name.to_string()));
     }
     let mut result = Value::Boolean(false);
