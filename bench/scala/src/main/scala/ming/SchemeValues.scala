@@ -90,6 +90,25 @@ final private[ming] case class ClosureValue(
       case Some(procedureName) => s"#<procedure:$procedureName>"
       case None                => "#<procedure:lambda>"
 
+final private[ming] class RecordTypeDescriptor(
+  val name: String,
+  val fieldNames: List[String]
+)
+
+final private[ming] class RecordValue(
+  val recordType: RecordTypeDescriptor,
+  initialFields: List[Value]
+) extends Value:
+  private val fields: Array[Value] = initialFields.toArray
+
+  def field(index: Int): Value =
+    fields(index)
+
+  def updateField(index: Int, value: Value): Unit =
+    fields(index) = value
+
+  override def render: String = s"#<record:${recordType.name}>"
+
 private[ming] case object VoidValue extends Value:
   override def render: String = "#<void>"
 

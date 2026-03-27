@@ -132,6 +132,8 @@ private[ming] object RuntimeSupport:
       case BuiltinValue(_, _) => "procedure"
       case ClosureValue(_, _, _, _, _) =>
         "procedure"
+      case _: RecordValue =>
+        "record"
       case VoidValue =>
         "void"
       case UninitializedValue =>

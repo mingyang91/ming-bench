@@ -46,6 +46,8 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalOr(rest, env)
       case SymbolExpr("define", _) :: rest =>
         SpecialFormEvaluator.evalDefine(rest, position, env)
+      case SymbolExpr("define-record-type", _) :: rest =>
+        RecordTypeEvaluator.evalDefineRecordType(rest, position, env)
       case SymbolExpr("define-syntax", _) :: rest =>
         SpecialFormEvaluator.evalDefineSyntax(rest, position, env)
       case SymbolExpr("if", _) :: rest =>
