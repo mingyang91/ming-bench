@@ -54,7 +54,7 @@ private[ming] object SpecialFormEvaluator:
   private def evalDefineSyntax(args: List[Expr], env: Env, pos: SourcePos): Value =
     args match
       case Expr.Symbol(name, _) :: transformerExpr :: Nil =>
-        env.defineSyntax(name, SchemeMacros.parseSyntaxRules(name, transformerExpr, env, pos))
+        env.defineSyntax(name, SchemeMacros.parseTransformer(name, transformerExpr, env, pos))
         Value.Void
       case _ =>
         throw EvalError.at(pos, "invalid define-syntax")

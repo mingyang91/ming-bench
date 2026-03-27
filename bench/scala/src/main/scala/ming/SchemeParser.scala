@@ -21,6 +21,10 @@ private[ming] object SchemeParser:
     if current.atEnd then fail(current, "unexpected end of input")
 
     current.currentChar match
+      case '#' if current.peekChar().contains('\'') =>
+        val syntaxPos    = current.position
+        val (next, expr) = parseExpr(current.advance(2))
+        (next, Expr.ListExpr(List(Expr.Symbol("syntax", syntaxPos), expr), syntaxPos))
       case '(' =>
         parseList(current.advance(), current.position)
       case ')' =>
@@ -146,6 +150,10 @@ private[ming] object SchemeParser:
 
     def position: SourcePos =
       SourcePos(line, col)
+
+    def peekChar(offset: Int = 1): Option[Char] =
+      val targetIndex = index + offset
+      Option.when(targetIndex < input.length)(input.charAt(targetIndex))
 
     def advance(step: Int = 1): Cursor =
       if step <= 0 || atEnd then this

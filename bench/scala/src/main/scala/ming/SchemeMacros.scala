@@ -5,7 +5,7 @@ private[ming] trait SyntaxTransformer:
 
 private[ming] object SchemeMacros:
 
-  def parseSyntaxRules(
+  def parseTransformer(
     name: String,
     transformerExpr: Expr,
     definitionEnv: Env,
@@ -19,8 +19,13 @@ private[ming] object SchemeMacros:
         val literalNames = literalExprs.map(parseLiteralName)
         val parsedRules  = rules.map(parseRule(name, _, pos))
         SyntaxRulesTransformer(name, literalNames.toSet, parsedRules, definitionEnv)
+      case Expr.ListExpr(
+            Expr.Symbol("lambda", _) :: Expr.ListExpr(Expr.Symbol(parameter, _) :: Nil, _) :: body,
+            _
+          ) if body.nonEmpty =>
+        SyntaxCaseTransformer(name, parameter, body, definitionEnv)
       case _ =>
-        throw EvalError.at(pos, "define-syntax expects a syntax-rules transformer")
+        throw EvalError.at(pos, "define-syntax expects a syntax-rules form or transformer lambda")
 
   private def parseLiteralName(expr: Expr): String =
     expr match
