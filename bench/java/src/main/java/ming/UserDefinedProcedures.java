@@ -39,7 +39,7 @@ record CaseLambdaClause(
     }
 }
 
-final class CaseLambdaProcedure implements Value, Procedure {
+final class CaseLambdaProcedure implements Value, Procedure, TailCallable {
     private final List<CaseLambdaClause> clauses;
     private final Environment closureEnv;
     private final ProcedureRuntime runtime;
@@ -61,11 +61,18 @@ final class CaseLambdaProcedure implements Value, Procedure {
 
     @Override
     public Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        SequenceTask task = prepareTailCall(arguments, callLoc);
+        return runtime.evalSequence(task.expressions(), task.env());
+    }
+
+    @Override
+    public SequenceTask prepareTailCall(List<Value> arguments, SourceLoc callLoc)
+            throws EvalError {
         for (CaseLambdaClause clause : clauses) {
             if (!clause.matches(arguments.size())) {
                 continue;
             }
-            return applyClause(clause, arguments);
+            return prepareClause(clause, arguments);
         }
 
         throw runtime.error(
@@ -74,11 +81,11 @@ final class CaseLambdaProcedure implements Value, Procedure {
         );
     }
 
-    private Value applyClause(CaseLambdaClause clause, List<Value> arguments) throws EvalError {
+    private SequenceTask prepareClause(CaseLambdaClause clause, List<Value> arguments) {
         Environment callEnv = new Environment(closureEnv);
         bindRequiredParameters(callEnv, clause.parameters(), arguments);
         bindRestParameter(callEnv, clause.parameters().size(), clause.restParameter(), arguments);
-        return runtime.evalSequence(clause.body(), callEnv);
+        return new SequenceTask(clause.body(), callEnv);
     }
 
     private void bindRequiredParameters(
@@ -107,7 +114,7 @@ final class CaseLambdaProcedure implements Value, Procedure {
     }
 }
 
-final class UserProcedure implements Value, Procedure {
+final class UserProcedure implements Value, Procedure, TailCallable {
     private final String name;
     private final List<String> parameters;
     private final String restParameter;
@@ -138,12 +145,19 @@ final class UserProcedure implements Value, Procedure {
 
     @Override
     public Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        SequenceTask task = prepareTailCall(arguments, callLoc);
+        return runtime.evalSequence(task.expressions(), task.env());
+    }
+
+    @Override
+    public SequenceTask prepareTailCall(List<Value> arguments, SourceLoc callLoc)
+            throws EvalError {
         ensureArity(arguments.size(), callLoc);
 
         Environment callEnv = new Environment(closureEnv);
         bindRequiredParameters(callEnv, arguments);
         bindRestParameter(callEnv, arguments);
-        return runtime.evalSequence(body, callEnv);
+        return new SequenceTask(body, callEnv);
     }
 
     private void ensureArity(int argumentCount, SourceLoc callLoc) throws EvalError {

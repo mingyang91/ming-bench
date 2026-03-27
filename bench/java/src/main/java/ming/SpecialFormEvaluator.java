@@ -71,27 +71,41 @@ final class SpecialFormEvaluator {
         this.runtime = runtime;
     }
 
-    Optional<Value> tryEval(String symbolName, ListExpr listExpr, Environment env) throws EvalError {
+    Optional<Value> tryEval(
+            String symbolName,
+            ListExpr listExpr,
+            Environment env,
+            boolean tailPosition
+    ) throws EvalError {
         return switch (symbolName) {
-            case "if" -> Optional.of(evalIf(listExpr, env));
+            case "if" -> Optional.of(evalIf(listExpr, env, tailPosition));
             case "quote" -> Optional.of(evalQuote(listExpr));
             case "lambda" -> Optional.of(evalLambda(listExpr, env));
             case "case-lambda" -> Optional.of(evalCaseLambda(listExpr, env));
             case "set!" -> Optional.of(evalSet(listExpr, env));
-            case "begin" -> Optional.of(evalBegin(listExpr, env));
-            case "let" -> Optional.of(evalLet(listExpr, env));
-            case "letrec" -> Optional.of(evalLetrec(listExpr, env, false));
-            case "letrec*" -> Optional.of(evalLetrec(listExpr, env, true));
-            case "cond" -> Optional.of(evalCond(listExpr, env));
-            case "case" -> Optional.of(evalCase(listExpr, env));
-            case "and" -> Optional.of(evalAnd(listExpr.elements().subList(1, listExpr.elements().size()), env));
-            case "or" -> Optional.of(evalOr(listExpr.elements().subList(1, listExpr.elements().size()), env));
-            case "do" -> Optional.of(evalDo(listExpr, env));
+            case "begin" -> Optional.of(evalBegin(listExpr, env, tailPosition));
+            case "let" -> Optional.of(evalLet(listExpr, env, tailPosition));
+            case "letrec" -> Optional.of(evalLetrec(listExpr, env, false, tailPosition));
+            case "letrec*" -> Optional.of(evalLetrec(listExpr, env, true, tailPosition));
+            case "cond" -> Optional.of(evalCond(listExpr, env, tailPosition));
+            case "case" -> Optional.of(evalCase(listExpr, env, tailPosition));
+            case "and" -> Optional.of(evalAnd(
+                    listExpr.elements().subList(1, listExpr.elements().size()),
+                    env,
+                    tailPosition
+            ));
+            case "or" -> Optional.of(evalOr(
+                    listExpr.elements().subList(1, listExpr.elements().size()),
+                    env,
+                    tailPosition
+            ));
+            case "do" -> Optional.of(evalDo(listExpr, env, tailPosition));
             default -> Optional.empty();
         };
     }
 
-    private Value evalIf(ListExpr listExpr, Environment env) throws EvalError {
+    private Value evalIf(ListExpr listExpr, Environment env, boolean tailPosition)
+            throws EvalError {
         if (listExpr.elements().size() != 3 && listExpr.elements().size() != 4) {
             throw runtime.error(
                     listExpr.loc(),
@@ -101,10 +115,10 @@ final class SpecialFormEvaluator {
 
         Value condition = runtime.eval(listExpr.elements().get(1), env);
         if (condition.isTruthy()) {
-            return runtime.eval(listExpr.elements().get(2), env);
+            return evalResultExpression(listExpr.elements().get(2), env, tailPosition);
         }
         if (listExpr.elements().size() == 4) {
-            return runtime.eval(listExpr.elements().get(3), env);
+            return evalResultExpression(listExpr.elements().get(3), env, tailPosition);
         }
         return VOID;
     }
@@ -186,16 +200,22 @@ final class SpecialFormEvaluator {
         return VOID;
     }
 
-    private Value evalBegin(ListExpr listExpr, Environment env) throws EvalError {
-        return runtime.evalSequence(listExpr.elements().subList(1, listExpr.elements().size()), env);
+    private Value evalBegin(ListExpr listExpr, Environment env, boolean tailPosition)
+            throws EvalError {
+        return evalResultSequence(
+                listExpr.elements().subList(1, listExpr.elements().size()),
+                env,
+                tailPosition
+        );
     }
 
-    private Value evalLet(ListExpr listExpr, Environment env) throws EvalError {
+    private Value evalLet(ListExpr listExpr, Environment env, boolean tailPosition)
+            throws EvalError {
         ensureAtLeastExpressions("let", listExpr, 3);
 
         Expr secondExpr = listExpr.elements().get(1);
         if (secondExpr instanceof SymbolExpr nameSymbol) {
-            return evalNamedLet(listExpr, env, nameSymbol);
+            return evalNamedLet(listExpr, env, nameSymbol, tailPosition);
         }
         if (!(secondExpr instanceof ListExpr bindingList)) {
             throw runtime.error(secondExpr.loc(), "let requires a binding list");
@@ -206,11 +226,19 @@ final class SpecialFormEvaluator {
         for (int index = 0; index < bindings.names().size(); index++) {
             letEnv.define(bindings.names().get(index), bindings.values().get(index));
         }
-        return runtime.evalSequence(listExpr.elements().subList(2, listExpr.elements().size()), letEnv);
+        return evalResultSequence(
+                listExpr.elements().subList(2, listExpr.elements().size()),
+                letEnv,
+                tailPosition
+        );
     }
 
-    private Value evalNamedLet(ListExpr listExpr, Environment env, SymbolExpr nameSymbol)
-            throws EvalError {
+    private Value evalNamedLet(
+            ListExpr listExpr,
+            Environment env,
+            SymbolExpr nameSymbol,
+            boolean tailPosition
+    ) throws EvalError {
         if (listExpr.elements().size() < 4) {
             throw runtime.error(
                     listExpr.loc(),
@@ -236,11 +264,15 @@ final class SpecialFormEvaluator {
                 runtime.procedureRuntime()
         );
         namedLetEnv.define(nameSymbol.name(), procedure);
-        return procedure.apply(bindings.values(), listExpr.loc());
+        return applyResultProcedure(procedure, bindings.values(), listExpr.loc(), tailPosition);
     }
 
-    private Value evalLetrec(ListExpr listExpr, Environment env, boolean sequential)
-            throws EvalError {
+    private Value evalLetrec(
+            ListExpr listExpr,
+            Environment env,
+            boolean sequential,
+            boolean tailPosition
+    ) throws EvalError {
         String formName = sequential ? "letrec*" : "letrec";
         ensureAtLeastExpressions(formName, listExpr, 3);
 
@@ -272,10 +304,15 @@ final class SpecialFormEvaluator {
             }
         }
 
-        return runtime.evalSequence(listExpr.elements().subList(2, listExpr.elements().size()), letrecEnv);
+        return evalResultSequence(
+                listExpr.elements().subList(2, listExpr.elements().size()),
+                letrecEnv,
+                tailPosition
+        );
     }
 
-    private Value evalCond(ListExpr listExpr, Environment env) throws EvalError {
+    private Value evalCond(ListExpr listExpr, Environment env, boolean tailPosition)
+            throws EvalError {
         ensureAtLeastExpressions("cond", listExpr, 2);
 
         List<Expr> clauses = listExpr.elements().subList(1, listExpr.elements().size());
@@ -295,9 +332,10 @@ final class SpecialFormEvaluator {
                 if (clauseIndex != clauses.size() - 1) {
                     throw runtime.error(testExpr.loc(), "cond else clause must be last");
                 }
-                return runtime.evalSequence(
+                return evalResultSequence(
                         clauseList.elements().subList(1, clauseList.elements().size()),
-                        env
+                        env,
+                        tailPosition
                 );
             }
 
@@ -308,16 +346,18 @@ final class SpecialFormEvaluator {
             if (clauseList.elements().size() == 1) {
                 return testValue;
             }
-            return runtime.evalSequence(
+            return evalResultSequence(
                     clauseList.elements().subList(1, clauseList.elements().size()),
-                    env
+                    env,
+                    tailPosition
             );
         }
 
         return VOID;
     }
 
-    private Value evalCase(ListExpr listExpr, Environment env) throws EvalError {
+    private Value evalCase(ListExpr listExpr, Environment env, boolean tailPosition)
+            throws EvalError {
         ensureAtLeastExpressions("case", listExpr, 2);
 
         Value key = runtime.eval(listExpr.elements().get(1), env);
@@ -338,9 +378,10 @@ final class SpecialFormEvaluator {
                 if (clauseIndex != clauses.size() - 1) {
                     throw runtime.error(firstExpr.loc(), "case else clause must be last");
                 }
-                return runtime.evalSequence(
+                return evalResultSequence(
                         clauseList.elements().subList(1, clauseList.elements().size()),
-                        env
+                        env,
+                        tailPosition
                 );
             }
 
@@ -350,9 +391,10 @@ final class SpecialFormEvaluator {
 
             for (Expr datumExpr : datumList.elements()) {
                 if (runtime.eqv(key, quoteToValue(datumExpr))) {
-                    return runtime.evalSequence(
+                    return evalResultSequence(
                             clauseList.elements().subList(1, clauseList.elements().size()),
-                            env
+                            env,
+                            tailPosition
                     );
                 }
             }
@@ -361,29 +403,38 @@ final class SpecialFormEvaluator {
         return VOID;
     }
 
-    private Value evalAnd(List<Expr> expressions, Environment env) throws EvalError {
-        Value lastValue = TRUE;
-        for (Expr expression : expressions) {
-            Value value = runtime.eval(expression, env);
+    private Value evalAnd(List<Expr> expressions, Environment env, boolean tailPosition)
+            throws EvalError {
+        if (expressions.isEmpty()) {
+            return TRUE;
+        }
+
+        for (int index = 0; index < expressions.size() - 1; index++) {
+            Value value = runtime.eval(expressions.get(index), env);
             if (!value.isTruthy()) {
                 return value;
             }
-            lastValue = value;
         }
-        return lastValue;
+        return evalResultExpression(expressions.getLast(), env, tailPosition);
     }
 
-    private Value evalOr(List<Expr> expressions, Environment env) throws EvalError {
-        for (Expr expression : expressions) {
-            Value value = runtime.eval(expression, env);
+    private Value evalOr(List<Expr> expressions, Environment env, boolean tailPosition)
+            throws EvalError {
+        if (expressions.isEmpty()) {
+            return FALSE;
+        }
+
+        for (int index = 0; index < expressions.size() - 1; index++) {
+            Value value = runtime.eval(expressions.get(index), env);
             if (value.isTruthy()) {
                 return value;
             }
         }
-        return FALSE;
+        return evalResultExpression(expressions.getLast(), env, tailPosition);
     }
 
-    private Value evalDo(ListExpr listExpr, Environment env) throws EvalError {
+    private Value evalDo(ListExpr listExpr, Environment env, boolean tailPosition)
+            throws EvalError {
         ensureAtLeastExpressions("do", listExpr, 3);
 
         Expr bindingsExpr = listExpr.elements().get(1);
@@ -413,9 +464,10 @@ final class SpecialFormEvaluator {
         while (true) {
             Value testValue = runtime.eval(testClause.elements().getFirst(), loopEnv);
             if (testValue.isTruthy()) {
-                return runtime.evalSequence(
+                return evalResultSequence(
                         testClause.elements().subList(1, testClause.elements().size()),
-                        loopEnv
+                        loopEnv,
+                        tailPosition
                 );
             }
 
@@ -434,6 +486,37 @@ final class SpecialFormEvaluator {
                 cells.get(index).set(nextValues.get(index));
             }
         }
+    }
+
+    private Value evalResultExpression(Expr expression, Environment env, boolean tailPosition)
+            throws EvalError {
+        if (tailPosition) {
+            throw new TailCall(new ExpressionTask(expression, env));
+        }
+        return runtime.eval(expression, env);
+    }
+
+    private Value evalResultSequence(
+            List<Expr> expressions,
+            Environment env,
+            boolean tailPosition
+    ) throws EvalError {
+        if (tailPosition) {
+            throw new TailCall(new SequenceTask(expressions, env));
+        }
+        return runtime.evalSequence(expressions, env);
+    }
+
+    private Value applyResultProcedure(
+            UserProcedure procedure,
+            List<Value> arguments,
+            SourceLoc callLoc,
+            boolean tailPosition
+    ) throws EvalError {
+        if (tailPosition) {
+            throw new TailCall(procedure.prepareTailCall(arguments, callLoc));
+        }
+        return procedure.apply(arguments, callLoc);
     }
 
     private Value quoteToValue(Expr expression) throws EvalError {

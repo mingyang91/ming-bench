@@ -164,17 +164,39 @@ final class Interpreter {
     }
 
     private Value eval(Expr expression, Environment env) throws EvalError {
+        return executeTask(new ExpressionTask(expression, env));
+    }
+
+    private Value executeTask(EvaluationTask task) throws EvalError {
+        EvaluationTask currentTask = task;
+        while (true) {
+            try {
+                return switch (currentTask) {
+                    case ExpressionTask expressionTask ->
+                            evalInternal(expressionTask.expression(), expressionTask.env(), true);
+                    case SequenceTask sequenceTask ->
+                            evalSequenceInternal(sequenceTask.expressions(), sequenceTask.env());
+                };
+            } catch (TailCall tailCall) {
+                currentTask = tailCall.task();
+            }
+        }
+    }
+
+    private Value evalInternal(Expr expression, Environment env, boolean tailPosition)
+            throws EvalError {
         return switch (expression) {
             case NumberExpr numberExpr -> new NumberValue(numberExpr.value());
             case BooleanExpr booleanExpr -> booleanExpr.value() ? TRUE : FALSE;
             case StringExpr stringExpr -> createStringValue(stringExpr.value());
             case CharExpr charExpr -> new CharValue(charExpr.codePoint());
             case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name(), symbolExpr.loc());
-            case ListExpr listExpr -> evalList(listExpr, env);
+            case ListExpr listExpr -> evalList(listExpr, env, tailPosition);
         };
     }
 
-    private Value evalList(ListExpr listExpr, Environment env) throws EvalError {
+    private Value evalList(ListExpr listExpr, Environment env, boolean tailPosition)
+            throws EvalError {
         if (listExpr.elements().isEmpty()) {
             throw error(listExpr.loc(), "cannot evaluate empty list");
         }
@@ -191,7 +213,12 @@ final class Interpreter {
             if ("define-record-type".equals(symbolName)) {
                 return evalDefineRecordType(listExpr, env);
             }
-            var specialFormValue = specialFormEvaluator.tryEval(symbolName, listExpr, env);
+            var specialFormValue = specialFormEvaluator.tryEval(
+                    symbolName,
+                    listExpr,
+                    env,
+                    tailPosition
+            );
             if (specialFormValue.isPresent()) {
                 return specialFormValue.get();
             }
@@ -204,6 +231,12 @@ final class Interpreter {
                         env,
                         listExpr.loc()
                 );
+                if (tailPosition) {
+                    throw new TailCall(new ExpressionTask(
+                            expansion.expression(),
+                            expansion.environment()
+                    ));
+                }
                 return eval(expansion.expression(), expansion.environment());
             }
         }
@@ -216,6 +249,9 @@ final class Interpreter {
         List<Value> arguments = new ArrayList<>();
         for (int index = 1; index < listExpr.elements().size(); index++) {
             arguments.add(eval(listExpr.elements().get(index), env));
+        }
+        if (tailPosition && procedureValue instanceof TailCallable tailCallable) {
+            throw new TailCall(tailCallable.prepareTailCall(arguments, listExpr.loc()));
         }
         return procedure.apply(arguments, listExpr.loc());
     }
@@ -1121,15 +1157,18 @@ final class Interpreter {
     }
 
     private Value evalSequence(List<Expr> expressions, Environment env) throws EvalError {
+        return executeTask(new SequenceTask(expressions, env));
+    }
+
+    private Value evalSequenceInternal(List<Expr> expressions, Environment env) throws EvalError {
         if (expressions.isEmpty()) {
             return VOID;
         }
 
-        Value lastValue = VOID;
-        for (Expr expression : expressions) {
-            lastValue = eval(expression, env);
+        for (int index = 0; index < expressions.size() - 1; index++) {
+            eval(expressions.get(index), env);
         }
-        return lastValue;
+        return evalInternal(expressions.getLast(), env, true);
     }
     private ParameterSpec parseParameters(List<Expr> parameterExprs, String formName)
             throws EvalError {
