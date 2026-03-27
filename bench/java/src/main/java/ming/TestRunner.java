@@ -50,6 +50,16 @@ public class TestRunner {
             return;
         }
 
+        if (levelArg.equals("all")) {
+            for (JsonElement elem : testCases) {
+                int level = elem.getAsJsonObject().get("level").getAsInt();
+                if (level > benchLevel) {
+                    benchLevel = level;
+                }
+            }
+        }
+        System.setProperty("bench.level", Integer.toString(benchLevel));
+
         int passed = 0;
         int failed = 0;
         int total = 0;

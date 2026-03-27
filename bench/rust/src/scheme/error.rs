@@ -4,7 +4,31 @@
 /// error type is not possible — the `eval_str` signature requires this type.
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum EvalError {
-    // Add variants as needed, e.g.:
-    // #[error("unbound variable: {name}")]
-    // UnboundVariable { name: String },
+    #[error("empty input")]
+    EmptyInput,
+
+    #[error("parse error: {0}")]
+    Parse(String),
+
+    #[error("unbound variable: {0}")]
+    UnboundVariable(String),
+
+    #[error("invalid form: {0}")]
+    InvalidForm(String),
+
+    #[error("wrong arity for {name}: expected {expected}, got {got}")]
+    WrongArity {
+        name: String,
+        expected: String,
+        got: usize,
+    },
+
+    #[error("type error: {0}")]
+    Type(String),
+
+    #[error("attempted to mutate an immutable string")]
+    ImmutableString,
+
+    #[error("{0}")]
+    Message(String),
 }

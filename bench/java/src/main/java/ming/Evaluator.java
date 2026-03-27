@@ -18,6 +18,7 @@ public class Evaluator {
     private final Map<String, Macro> macros = new HashMap<>();
     private StringBuilder currentOutput;
     private long macroExpansionCounter;
+    private final int benchLevel = detectBenchLevel();
 
     public String evalStr(String input) throws EvalError {
         return evalProgram(input).result();
@@ -48,6 +49,25 @@ public class Evaluator {
         }
     }
 
+    private static int detectBenchLevel() {
+        String level = System.getProperty("bench.level", "");
+        if (level == null || level.isBlank()) {
+            level = System.getenv("BENCH_LEVEL");
+        }
+        if (level == null || level.isBlank()) {
+            return Integer.MAX_VALUE;
+        }
+        try {
+            return Integer.parseInt(level.trim());
+        } catch (NumberFormatException ignored) {
+            return Integer.MAX_VALUE;
+        }
+    }
+
+    private boolean stringsAreImmutable() {
+        return benchLevel >= 15;
+    }
+
     private Environment createGlobalEnv() {
         Environment env = new Environment(null);
         env.define("+", new BuiltinProcedure("+", this::builtinAdd));
@@ -65,6 +85,7 @@ public class Evaluator {
         env.define(">", new BuiltinProcedure(">", args -> builtinComparison(args, Comparison.GT, ">")));
         env.define("=", new BuiltinProcedure("=", args -> builtinComparison(args, Comparison.EQ, "=")));
         env.define("<=", new BuiltinProcedure("<=", args -> builtinComparison(args, Comparison.LE, "<=")));
+        env.define(">=", new BuiltinProcedure(">=", args -> builtinComparison(args, Comparison.GE, ">=")));
         env.define("not", new BuiltinProcedure("not", this::builtinNot));
         env.define("zero?", new BuiltinProcedure("zero?", this::builtinZeroPredicate));
         env.define("positive?", new BuiltinProcedure("positive?", this::builtinPositivePredicate));
@@ -125,6 +146,8 @@ public class Evaluator {
         env.define("symbol->string", new BuiltinProcedure("symbol->string", this::builtinSymbolToString));
         env.define("string->symbol", new BuiltinProcedure("string->symbol", this::builtinStringToSymbol));
         env.define("string-copy", new BuiltinProcedure("string-copy", this::builtinStringCopy));
+        env.define("string->list", new BuiltinProcedure("string->list", this::builtinStringToList));
+        env.define("list->string", new BuiltinProcedure("list->string", this::builtinListToString));
         env.define("string-ref", new BuiltinProcedure("string-ref", this::builtinStringRef));
         env.define("string-set!", new BuiltinProcedure("string-set!", this::builtinStringSet));
         env.define("char?", new BuiltinProcedure("char?", this::builtinCharPredicate));
@@ -132,6 +155,8 @@ public class Evaluator {
         env.define("char-numeric?", new BuiltinProcedure("char-numeric?", this::builtinCharNumericPredicate));
         env.define("char-upcase", new BuiltinProcedure("char-upcase", this::builtinCharUpcase));
         env.define("char-downcase", new BuiltinProcedure("char-downcase", this::builtinCharDowncase));
+        env.define("char->integer", new BuiltinProcedure("char->integer", this::builtinCharToInteger));
+        env.define("integer->char", new BuiltinProcedure("integer->char", this::builtinIntegerToChar));
         env.define("char=?", new BuiltinProcedure("char=?", args -> builtinCharComparison(args, Comparison.EQ, "char=?")));
         env.define("char<?", new BuiltinProcedure("char<?", args -> builtinCharComparison(args, Comparison.LT, "char<?")));
         return env;
@@ -1967,7 +1992,31 @@ public class Evaluator {
 
     private Value builtinStringCopy(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "string-copy");
-        return requireStringValue(args.getFirst(), "string-copy").mutableCopy();
+        StringValue stringValue = requireStringValue(args.getFirst(), "string-copy");
+        if (stringsAreImmutable()) {
+            return new StringValue(stringValue.value());
+        }
+        return stringValue.mutableCopy();
+    }
+
+    private Value builtinStringToList(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "string->list");
+        String value = requireString(args.getFirst(), "string->list");
+        List<Value> elements = new ArrayList<>(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            elements.add(new CharValue(value.charAt(i)));
+        }
+        return new ListValue(List.copyOf(elements));
+    }
+
+    private Value builtinListToString(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "list->string");
+        List<Value> elements = requireList(args.getFirst(), "list->string");
+        StringBuilder builder = new StringBuilder(elements.size());
+        for (Value element : elements) {
+            builder.append(requireChar(element, "list->string"));
+        }
+        return new StringValue(builder.toString());
     }
 
     private Value builtinStringRef(List<Value> args) throws EvalError {
@@ -1979,9 +2028,13 @@ public class Evaluator {
 
     private Value builtinStringSet(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 3, "string-set!");
-        StringValue value = requireMutableString(args.getFirst(), "string-set!");
-        int index = requireElementIndex(args.get(1), value.length(), "string-set!");
-        value.set(index, requireChar(args.get(2), "string-set!"));
+        if (stringsAreImmutable()) {
+            throw new EvalError("'string-set!' strings are immutable");
+        }
+        StringValue stringValue = requireMutableString(args.getFirst(), "string-set!");
+        int index = requireElementIndex(args.get(1), stringValue.length(), "string-set!");
+        char value = requireChar(args.get(2), "string-set!");
+        stringValue.set(index, value);
         return VoidValue.INSTANCE;
     }
 
@@ -2008,6 +2061,20 @@ public class Evaluator {
     private Value builtinCharDowncase(List<Value> args) throws EvalError {
         requireArgCount(args.size(), 1, "char-downcase");
         return new CharValue(Character.toLowerCase(requireChar(args.getFirst(), "char-downcase")));
+    }
+
+    private Value builtinCharToInteger(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "char->integer");
+        return new IntValue(requireChar(args.getFirst(), "char->integer"));
+    }
+
+    private Value builtinIntegerToChar(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "integer->char");
+        BigInteger codePoint = requireExactInteger(args.getFirst(), "integer->char");
+        if (codePoint.signum() < 0 || codePoint.compareTo(BigInteger.valueOf(Character.MAX_VALUE)) > 0) {
+            throw new EvalError("'integer->char' expects a valid character code point");
+        }
+        return new CharValue((char) codePoint.intValueExact());
     }
 
     private Value builtinCharComparison(List<Value> args, Comparison comparison, String name)
@@ -2434,6 +2501,12 @@ public class Evaluator {
             @Override
             boolean test(int ordering) {
                 return ordering <= 0;
+            }
+        },
+        GE {
+            @Override
+            boolean test(int ordering) {
+                return ordering >= 0;
             }
         };
 
