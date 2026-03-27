@@ -27,6 +27,7 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::Append,
         BuiltinKind::Apply,
         BuiltinKind::EqPred,
+        BuiltinKind::EqvPred,
         BuiltinKind::EqualPred,
         BuiltinKind::Map,
         BuiltinKind::StringPred,
@@ -84,6 +85,14 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::StringCiEqual,
         BuiltinKind::StringUpcase,
         BuiltinKind::StringDowncase,
+        BuiltinKind::Vector,
+        BuiltinKind::MakeVector,
+        BuiltinKind::VectorRef,
+        BuiltinKind::VectorSet,
+        BuiltinKind::VectorLength,
+        BuiltinKind::VectorPred,
+        BuiltinKind::VectorToList,
+        BuiltinKind::ListToVector,
     ] {
         env_define(
             &env,
@@ -126,7 +135,8 @@ pub(super) fn apply_builtin(
         BuiltinKind::Length => eval_length(args),
         BuiltinKind::Append => eval_append(args),
         BuiltinKind::Apply => eval_apply(args),
-        BuiltinKind::EqPred => eval_equality("eq?", args),
+        BuiltinKind::EqPred => eval_eq_like("eq?", args, super::values_eq),
+        BuiltinKind::EqvPred => eval_eq_like("eqv?", args, super::values_eqv),
         BuiltinKind::EqualPred => eval_equality("equal?", args),
         BuiltinKind::Map => eval_map(args),
         BuiltinKind::StringPred => eval_predicate("string?", args, |value| {
@@ -237,6 +247,16 @@ pub(super) fn apply_builtin(
         BuiltinKind::StringDowncase => {
             eval_string_transform("string-downcase", args, |value| value.to_lowercase())
         }
+        BuiltinKind::Vector => eval_vector(args),
+        BuiltinKind::MakeVector => eval_make_vector(args),
+        BuiltinKind::VectorRef => eval_vector_ref(args),
+        BuiltinKind::VectorSet => eval_vector_set(args),
+        BuiltinKind::VectorLength => eval_vector_length(args),
+        BuiltinKind::VectorPred => {
+            eval_predicate("vector?", args, |value| matches!(value, Value::Vector(_)))
+        }
+        BuiltinKind::VectorToList => eval_vector_to_list(args),
+        BuiltinKind::ListToVector => eval_list_to_vector(args),
     }
 }
 
@@ -505,7 +525,10 @@ fn eval_apply(args: &[Value]) -> Result<Value, EvalError> {
     super::apply_callable(callable, &applied_args)
 }
 
-fn eval_equality(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn eval_eq_like<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
+where
+    F: FnOnce(&Value, &Value) -> bool,
+{
     let [lhs, rhs] = args else {
         return Err(EvalError::WrongArgCount {
             name: name.into(),
@@ -514,7 +537,11 @@ fn eval_equality(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         });
     };
 
-    Ok(Value::Boolean(super::values_equal(lhs, rhs)))
+    Ok(Value::Boolean(compare(lhs, rhs)))
+}
+
+fn eval_equality(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    eval_eq_like(name, args, super::values_equal)
 }
 
 fn eval_map(args: &[Value]) -> Result<Value, EvalError> {
@@ -812,6 +839,109 @@ fn eval_string_set(args: &[Value]) -> Result<Value, EvalError> {
     Ok(Value::Void)
 }
 
+fn eval_vector(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+}
+
+fn eval_make_vector(args: &[Value]) -> Result<Value, EvalError> {
+    let (len, fill) = match args {
+        [len] => (non_negative_index(len)?, Value::Void),
+        [len, fill] => (non_negative_index(len)?, fill.clone()),
+        _ => {
+            return Err(EvalError::WrongArgCount {
+                name: "make-vector".into(),
+                expected: "1 or 2 arguments".into(),
+                got: args.len(),
+            });
+        }
+    };
+
+    Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+}
+
+fn eval_vector_ref(args: &[Value]) -> Result<Value, EvalError> {
+    let [vector, index] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-ref".into(),
+            expected: "exactly 2 arguments".into(),
+            got: args.len(),
+        });
+    };
+
+    let vector = vector_items(vector)?;
+    let index = non_negative_index(index)?;
+    let vector = vector.borrow();
+
+    vector
+        .get(index)
+        .cloned()
+        .ok_or(EvalError::IndexOutOfBounds {
+            index,
+            len: vector.len(),
+        })
+}
+
+fn eval_vector_set(args: &[Value]) -> Result<Value, EvalError> {
+    let [vector, index, value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-set!".into(),
+            expected: "exactly 3 arguments".into(),
+            got: args.len(),
+        });
+    };
+
+    let vector = vector_items(vector)?;
+    let index = non_negative_index(index)?;
+    let mut vector = vector.borrow_mut();
+    if index >= vector.len() {
+        return Err(EvalError::IndexOutOfBounds {
+            index,
+            len: vector.len(),
+        });
+    }
+
+    vector[index] = value.clone();
+    Ok(Value::Void)
+}
+
+fn eval_vector_length(args: &[Value]) -> Result<Value, EvalError> {
+    let [vector] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-length".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(integer_value(vector_items(vector)?.borrow().len() as i64))
+}
+
+fn eval_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    let [vector] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector->list".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::List(vector_items(vector)?.borrow().clone()))
+}
+
+fn eval_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
+    let [list] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "list->vector".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Vector(Rc::new(RefCell::new(
+        list_items(list)?.to_vec(),
+    ))))
+}
+
 fn eval_abs(args: &[Value]) -> Result<Value, EvalError> {
     let [value] = args else {
         return Err(EvalError::WrongArgCount {
@@ -1088,6 +1218,16 @@ fn list_items(value: &Value) -> Result<&[Value], EvalError> {
         Value::List(items) => Ok(items),
         _ => Err(EvalError::TypeMismatch {
             expected: "list",
+            found: value.type_name().into(),
+        }),
+    }
+}
+
+fn vector_items(value: &Value) -> Result<&Rc<RefCell<Vec<Value>>>, EvalError> {
+    match value {
+        Value::Vector(items) => Ok(items),
+        _ => Err(EvalError::TypeMismatch {
+            expected: "vector",
             found: value.type_name().into(),
         }),
     }

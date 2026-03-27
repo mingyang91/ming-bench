@@ -90,6 +90,9 @@ pub enum EvalError {
     #[error("expected {expected} record, got {found}")]
     RecordTypeMismatch { expected: String, found: String },
 
+    #[error("uninitialized binding: {name}")]
+    UninitializedBinding { name: String },
+
     #[error("{inner} at {position}")]
     WithPosition {
         inner: Box<EvalError>,

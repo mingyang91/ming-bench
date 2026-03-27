@@ -2,13 +2,20 @@ mod builtins;
 pub mod error;
 mod macros;
 mod number;
+mod parser;
 mod record;
+mod render;
 
 pub use error::{EvalError, SourcePos};
 use macros::{MacroEnvRef, MacroEnvironment};
-use number::{parse_number_token, Number};
+use number::Number;
+use parser::Parser;
 use record::{
     define_record_type as eval_define_record_type, render_record, NativeProcedure, RecordRef,
+};
+use render::{
+    render_char, render_display_improper_list, render_display_list, render_improper_list,
+    render_list, render_string, render_vector,
 };
 
 use std::cell::RefCell;
@@ -54,10 +61,12 @@ enum Value {
     Char(char),
     List(Vec<Value>),
     ImproperList(Vec<Value>, Box<Value>),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Procedure(Rc<Procedure>),
     NativeProcedure(Rc<NativeProcedure>),
     Builtin(Builtin),
     Record(RecordRef),
+    Uninitialized,
     Void,
 }
 
@@ -99,6 +108,7 @@ enum BuiltinKind {
     Append,
     Apply,
     EqPred,
+    EqvPred,
     EqualPred,
     Map,
     StringPred,
@@ -156,6 +166,14 @@ enum BuiltinKind {
     StringCiEqual,
     StringUpcase,
     StringDowncase,
+    Vector,
+    MakeVector,
+    VectorRef,
+    VectorSet,
+    VectorLength,
+    VectorPred,
+    VectorToList,
+    ListToVector,
 }
 
 struct Environment {
@@ -178,8 +196,10 @@ impl Value {
             Self::Char(_) => "character",
             Self::List(_) => "list",
             Self::ImproperList(_, _) => "pair",
+            Self::Vector(_) => "vector",
             Self::Procedure(_) | Self::NativeProcedure(_) | Self::Builtin(_) => "procedure",
             Self::Record(_) => "record",
+            Self::Uninitialized => "uninitialized",
             Self::Void => "void",
         }
     }
@@ -249,10 +269,12 @@ impl Value {
             Self::Char(value) => render_char(*value),
             Self::List(items) => render_list(items),
             Self::ImproperList(items, tail) => render_improper_list(items, tail),
+            Self::Vector(items) => render_vector(&items.borrow()),
             Self::Procedure(_) | Self::NativeProcedure(_) | Self::Builtin(_) => {
                 "#<procedure>".into()
             }
             Self::Record(record) => render_record(record),
+            Self::Uninitialized => "#<uninitialized>".into(),
             Self::Void => "#<void>".into(),
         }
     }
@@ -264,6 +286,7 @@ impl Value {
             Self::Char(value) => value.to_string(),
             Self::List(items) => render_display_list(items),
             Self::ImproperList(items, tail) => render_display_improper_list(items, tail),
+            Self::Vector(items) => render_vector(&items.borrow()),
             _ => self.render(),
         }
     }
@@ -300,6 +323,7 @@ impl BuiltinKind {
             Self::Append => "append",
             Self::Apply => "apply",
             Self::EqPred => "eq?",
+            Self::EqvPred => "eqv?",
             Self::EqualPred => "equal?",
             Self::Map => "map",
             Self::StringPred => "string?",
@@ -357,6 +381,14 @@ impl BuiltinKind {
             Self::StringCiEqual => "string-ci=?",
             Self::StringUpcase => "string-upcase",
             Self::StringDowncase => "string-downcase",
+            Self::Vector => "vector",
+            Self::MakeVector => "make-vector",
+            Self::VectorRef => "vector-ref",
+            Self::VectorSet => "vector-set!",
+            Self::VectorLength => "vector-length",
+            Self::VectorPred => "vector?",
+            Self::VectorToList => "vector->list",
+            Self::ListToVector => "list->vector",
         }
     }
 }
@@ -393,307 +425,6 @@ impl Environment {
     }
 }
 
-struct Parser<'a> {
-    input: &'a str,
-    pos: usize,
-    line: usize,
-    col: usize,
-}
-
-impl<'a> Parser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
-            input,
-            pos: 0,
-            line: 1,
-            col: 1,
-        }
-    }
-
-    fn parse_program(&mut self) -> Result<Vec<Expr>, EvalError> {
-        let mut exprs = Vec::new();
-        self.skip_ignored();
-
-        while !self.is_eof() {
-            exprs.push(self.parse_expr()?);
-            self.skip_ignored();
-        }
-
-        if exprs.is_empty() {
-            return Err(EvalError::EmptyInput);
-        }
-
-        Ok(exprs)
-    }
-
-    fn parse_expr(&mut self) -> Result<Expr, EvalError> {
-        self.skip_ignored();
-        let position = self.current_position();
-        match self.peek_char() {
-            Some('(') => self.parse_list(position),
-            Some('\'') => self.parse_quote(position),
-            Some('"') => self.parse_string(position),
-            Some(')') => Err(EvalError::SyntaxError {
-                message: "unexpected ')'".into(),
-            }
-            .with_position(position)),
-            Some(_) => self.parse_atom(position),
-            None => Err(EvalError::UnexpectedEof.with_position(position)),
-        }
-    }
-
-    fn parse_list(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
-        self.expect_char('(', position)?;
-        let mut items = Vec::new();
-
-        loop {
-            self.skip_ignored();
-            match self.peek_char() {
-                Some(')') => {
-                    self.advance_char();
-                    return Ok(Expr::List(items, position));
-                }
-                Some(_) => items.push(self.parse_expr()?),
-                None => return Err(EvalError::UnexpectedEof.with_position(self.current_position())),
-            }
-        }
-    }
-
-    fn parse_quote(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
-        self.expect_char('\'', position)?;
-        let quoted = self.parse_expr()?;
-        Ok(Expr::List(
-            vec![Expr::Symbol("quote".into(), position), quoted],
-            position,
-        ))
-    }
-
-    fn parse_string(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
-        self.expect_char('"', position)?;
-        let mut value = String::new();
-
-        while let Some(ch) = self.advance_char() {
-            match ch {
-                '"' => return Ok(Expr::String(value, position)),
-                '\\' => {
-                    let escaped = self
-                        .advance_char()
-                        .ok_or_else(|| EvalError::UnexpectedEof.with_position(position))?;
-                    match escaped {
-                        '"' => value.push('"'),
-                        '\\' => value.push('\\'),
-                        'n' => value.push('\n'),
-                        'r' => value.push('\r'),
-                        't' => value.push('\t'),
-                        other => value.push(other),
-                    }
-                }
-                other => value.push(other),
-            }
-        }
-
-        Err(EvalError::UnexpectedEof.with_position(position))
-    }
-
-    fn parse_atom(&mut self, position: SourcePos) -> Result<Expr, EvalError> {
-        let token = self.read_token();
-        if token.is_empty() {
-            return Err(EvalError::UnexpectedEof.with_position(position));
-        }
-
-        match token {
-            "#t" => Ok(Expr::Boolean(true, position)),
-            "#f" => Ok(Expr::Boolean(false, position)),
-            _ if token.starts_with("#\\") => {
-                let value = parse_char_literal(token).ok_or_else(|| {
-                    EvalError::SyntaxError {
-                        message: format!("invalid character literal: {token}"),
-                    }
-                    .with_position(position)
-                })?;
-                Ok(Expr::Char(value, position))
-            }
-            _ => match parse_number_token(token) {
-                Some(Ok(number)) => Ok(Expr::Number(number, position)),
-                Some(Err(error)) => Err(EvalError::SyntaxError {
-                    message: error.message(),
-                }
-                .with_position(position)),
-                None => Ok(Expr::Symbol(token.to_string(), position)),
-            },
-        }
-    }
-
-    fn skip_ignored(&mut self) {
-        loop {
-            while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
-                self.advance_char();
-            }
-
-            if self.peek_char() == Some(';') {
-                while let Some(ch) = self.advance_char() {
-                    if ch == '\n' {
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            break;
-        }
-    }
-
-    fn read_token(&mut self) -> &'a str {
-        let start = self.pos;
-
-        while let Some(ch) = self.peek_char() {
-            if ch.is_whitespace() || matches!(ch, '(' | ')' | ';') {
-                break;
-            }
-            self.advance_char();
-        }
-
-        &self.input[start..self.pos]
-    }
-
-    fn expect_char(&mut self, expected: char, position: SourcePos) -> Result<(), EvalError> {
-        match self.advance_char() {
-            Some(actual) if actual == expected => Ok(()),
-            Some(actual) => Err(EvalError::SyntaxError {
-                message: format!("expected '{expected}', found '{actual}'"),
-            }
-            .with_position(position)),
-            None => Err(EvalError::UnexpectedEof.with_position(position)),
-        }
-    }
-
-    fn current_position(&self) -> SourcePos {
-        SourcePos::new(self.line, self.col)
-    }
-
-    fn is_eof(&self) -> bool {
-        self.pos >= self.input.len()
-    }
-
-    fn peek_char(&self) -> Option<char> {
-        self.input[self.pos..].chars().next()
-    }
-
-    fn advance_char(&mut self) -> Option<char> {
-        let ch = self.peek_char()?;
-        self.pos += ch.len_utf8();
-        if ch == '\n' {
-            self.line += 1;
-            self.col = 1;
-        } else {
-            self.col += 1;
-        }
-        Some(ch)
-    }
-}
-
-fn parse_char_literal(token: &str) -> Option<char> {
-    let suffix = token.strip_prefix("#\\")?;
-    match suffix {
-        "space" => Some(' '),
-        "newline" => Some('\n'),
-        _ => {
-            let mut chars = suffix.chars();
-            let ch = chars.next()?;
-            if chars.next().is_none() {
-                Some(ch)
-            } else {
-                None
-            }
-        }
-    }
-}
-
-fn render_string(value: &str) -> String {
-    let mut rendered = String::with_capacity(value.len() + 2);
-    rendered.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => rendered.push_str("\\\""),
-            '\\' => rendered.push_str("\\\\"),
-            '\n' => rendered.push_str("\\n"),
-            '\r' => rendered.push_str("\\r"),
-            '\t' => rendered.push_str("\\t"),
-            other => rendered.push(other),
-        }
-    }
-    rendered.push('"');
-    rendered
-}
-
-fn render_list(items: &[Value]) -> String {
-    if items.is_empty() {
-        return "()".into();
-    }
-
-    let rendered_items = items
-        .iter()
-        .map(Value::render)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("({rendered_items})")
-}
-
-fn render_display_list(items: &[Value]) -> String {
-    if items.is_empty() {
-        return "()".into();
-    }
-
-    let rendered_items = items
-        .iter()
-        .map(Value::render_display)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("({rendered_items})")
-}
-
-fn render_improper_list(items: &[Value], tail: &Value) -> String {
-    render_dotted_list(items, tail, false)
-}
-
-fn render_display_improper_list(items: &[Value], tail: &Value) -> String {
-    render_dotted_list(items, tail, true)
-}
-
-fn render_dotted_list(items: &[Value], tail: &Value, display: bool) -> String {
-    let mut rendered = String::from("(");
-
-    for (index, item) in items.iter().enumerate() {
-        if index > 0 {
-            rendered.push(' ');
-        }
-        rendered.push_str(&render_value(item, display));
-    }
-
-    if !items.is_empty() {
-        rendered.push_str(" . ");
-    }
-    rendered.push_str(&render_value(tail, display));
-    rendered.push(')');
-    rendered
-}
-
-fn render_value(value: &Value, display: bool) -> String {
-    if display {
-        value.render_display()
-    } else {
-        value.render()
-    }
-}
-
-fn render_char(value: char) -> String {
-    match value {
-        ' ' => "#\\space".into(),
-        '\n' => "#\\newline".into(),
-        other => format!("#\\{other}"),
-    }
-}
-
 fn make_procedure(clauses: Vec<ProcedureClause>, env: &EnvRef, macro_env: &MacroEnvRef) -> Value {
     Value::Procedure(Rc::new(Procedure {
         clauses,
@@ -716,7 +447,7 @@ fn single_clause_procedure(
     )
 }
 
-fn values_equal(lhs: &Value, rhs: &Value) -> bool {
+fn values_eq(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Number(lhs), Value::Number(rhs)) => lhs.equals(*rhs).unwrap_or(false),
         (Value::Boolean(lhs), Value::Boolean(rhs)) => lhs == rhs,
@@ -728,24 +459,45 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
         (Value::MutableString(lhs), Value::MutableString(rhs)) => *lhs.borrow() == *rhs.borrow(),
         (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
         (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+        (Value::Vector(lhs), Value::Vector(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::List(lhs), Value::List(rhs)) => {
             lhs.len() == rhs.len()
                 && lhs
                     .iter()
                     .zip(rhs.iter())
-                    .all(|(lhs, rhs)| values_equal(lhs, rhs))
+                    .all(|(lhs, rhs)| values_eq(lhs, rhs))
         }
         (Value::ImproperList(lhs_items, lhs_tail), Value::ImproperList(rhs_items, rhs_tail)) => {
             lhs_items.len() == rhs_items.len()
                 && lhs_items
                     .iter()
                     .zip(rhs_items.iter())
-                    .all(|(lhs, rhs)| values_equal(lhs, rhs))
-                && values_equal(lhs_tail, rhs_tail)
+                    .all(|(lhs, rhs)| values_eq(lhs, rhs))
+                && values_eq(lhs_tail, rhs_tail)
         }
         (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
+        (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,
+    }
+}
+
+fn values_eqv(lhs: &Value, rhs: &Value) -> bool {
+    values_eq(lhs, rhs)
+}
+
+fn values_equal(lhs: &Value, rhs: &Value) -> bool {
+    match (lhs, rhs) {
+        (Value::Vector(lhs), Value::Vector(rhs)) => {
+            let lhs = lhs.borrow();
+            let rhs = rhs.borrow();
+            lhs.len() == rhs.len()
+                && lhs
+                    .iter()
+                    .zip(rhs.iter())
+                    .all(|(lhs, rhs)| values_equal(lhs, rhs))
+        }
+        _ => values_eq(lhs, rhs),
     }
 }
 
@@ -820,10 +572,24 @@ fn eval_expr(expr: &Expr, env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value
         Expr::Boolean(value, _) => Ok(Value::Boolean(*value)),
         Expr::String(value, _) => Ok(Value::String(value.clone())),
         Expr::Char(value, _) => Ok(Value::Char(*value)),
-        Expr::Symbol(name, position) => env_lookup(env, name).ok_or_else(|| {
-            EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
-        }),
-        Expr::CapturedSymbol(_, binding, _) => Ok(binding.borrow().clone()),
+        Expr::Symbol(name, position) => {
+            let value = env_lookup(env, name).ok_or_else(|| {
+                EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
+            })?;
+            if matches!(value, Value::Uninitialized) {
+                Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
+            } else {
+                Ok(value)
+            }
+        }
+        Expr::CapturedSymbol(name, binding, position) => {
+            let value = binding.borrow().clone();
+            if matches!(value, Value::Uninitialized) {
+                Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
+            } else {
+                Ok(value)
+            }
+        }
         Expr::List(items, position) => {
             eval_list(items, *position, env, macro_env).map_err(|err| err.with_position(*position))
         }
@@ -895,6 +661,22 @@ fn eval_list(
             }
             "let" => {
                 return eval_let(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "letrec" => {
+                return eval_letrec(&items[1..], env, macro_env, false)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "letrec*" => {
+                return eval_letrec(&items[1..], env, macro_env, true)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "case" => {
+                return eval_case(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "do" => {
+                return eval_do(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
             _ => {}
@@ -1295,6 +1077,171 @@ fn eval_let(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Valu
     }
 }
 
+fn eval_letrec(
+    args: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    let [Expr::List(bindings, _), body @ ..] = args else {
+        return Err(EvalError::SyntaxError {
+            message: if sequential {
+                "invalid letrec*".into()
+            } else {
+                "invalid letrec".into()
+            },
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: if sequential {
+                "letrec* requires a body".into()
+            } else {
+                "letrec requires a body".into()
+            },
+        });
+    }
+
+    let bindings = parse_binding_exprs(bindings, if sequential { "letrec*" } else { "letrec" })?;
+    let let_env = Environment::new(Some(Rc::clone(env)));
+    let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
+
+    for (name, _) in &bindings {
+        env_define(&let_env, name.clone(), Value::Uninitialized);
+    }
+
+    if sequential {
+        for (name, value_expr) in &bindings {
+            let value = eval_expr(value_expr, &let_env, &let_macro_env)?;
+            env_set(&let_env, name, value);
+        }
+    } else {
+        let mut values = Vec::with_capacity(bindings.len());
+        for (_, value_expr) in &bindings {
+            values.push(eval_expr(value_expr, &let_env, &let_macro_env)?);
+        }
+
+        for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
+            env_set(&let_env, name, value);
+        }
+    }
+
+    eval_sequence(body, &let_env, &let_macro_env)
+}
+
+fn eval_case(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
+    let Some((key_expr, clauses)) = args.split_first() else {
+        return Err(EvalError::WrongArgCount {
+            name: "case".into(),
+            expected: "at least 1 argument".into(),
+            got: 0,
+        });
+    };
+
+    let key = eval_expr(key_expr, env, macro_env)?;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items, _) = clause else {
+            return Err(EvalError::SyntaxError {
+                message: "case clauses must be lists".into(),
+            });
+        };
+
+        let Some((datums, body)) = items.split_first() else {
+            return Err(EvalError::SyntaxError {
+                message: "case clause cannot be empty".into(),
+            });
+        };
+
+        if matches!(datums, Expr::Symbol(symbol, _) if symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::SyntaxError {
+                    message: "else clause must be last".into(),
+                });
+            }
+
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(body, env, macro_env)
+            };
+        }
+
+        let Expr::List(datums, _) = datums else {
+            return Err(EvalError::SyntaxError {
+                message: "case clause datums must be in a list".into(),
+            });
+        };
+
+        for datum in datums {
+            let datum = quote_to_value(datum)?;
+            if values_eqv(&key, &datum) {
+                return if body.is_empty() {
+                    Ok(Value::Void)
+                } else {
+                    eval_sequence(body, env, macro_env)
+                };
+            }
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_do(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
+    let [Expr::List(bindings, _), Expr::List(test_clause, _), body @ ..] = args else {
+        return Err(EvalError::SyntaxError {
+            message: "invalid do".into(),
+        });
+    };
+
+    let Some((test_expr, result_exprs)) = test_clause.split_first() else {
+        return Err(EvalError::SyntaxError {
+            message: "do test clause cannot be empty".into(),
+        });
+    };
+
+    let bindings = parse_do_bindings(bindings)?;
+    let do_env = Environment::new(Some(Rc::clone(env)));
+    let do_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
+
+    for binding in &bindings {
+        let value = eval_expr(binding.init_expr, env, macro_env)?;
+        env_define(&do_env, binding.name.clone(), value);
+    }
+
+    loop {
+        if eval_expr(test_expr, &do_env, &do_macro_env)?.is_truthy() {
+            return if result_exprs.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(result_exprs, &do_env, &do_macro_env)
+            };
+        }
+
+        if !body.is_empty() {
+            eval_sequence(body, &do_env, &do_macro_env)?;
+        }
+
+        let mut updates = Vec::with_capacity(bindings.len());
+        for binding in &bindings {
+            let value = if let Some(step_expr) = binding.step_expr {
+                eval_expr(step_expr, &do_env, &do_macro_env)?
+            } else {
+                env_lookup(&do_env, &binding.name).ok_or_else(|| EvalError::UnboundVariable {
+                    name: binding.name.clone(),
+                })?
+            };
+            updates.push((binding.name.clone(), value));
+        }
+
+        for (name, value) in updates {
+            env_set(&do_env, &name, value);
+        }
+    }
+}
+
 fn eval_plain_let(
     bindings: &[Expr],
     body: &[Expr],
@@ -1368,6 +1315,69 @@ fn parse_let_bindings(
         };
 
         parsed.push((name.clone(), eval_expr(value_expr, env, macro_env)?));
+    }
+
+    Ok(parsed)
+}
+
+fn parse_binding_exprs<'a>(
+    bindings: &'a [Expr],
+    form_name: &str,
+) -> Result<Vec<(String, &'a Expr)>, EvalError> {
+    let mut parsed = Vec::with_capacity(bindings.len());
+
+    for binding in bindings {
+        let Expr::List(items, _) = binding else {
+            return Err(EvalError::SyntaxError {
+                message: format!("{form_name} bindings must be lists"),
+            });
+        };
+
+        let [Expr::Symbol(name, _), value_expr] = items.as_slice() else {
+            return Err(EvalError::SyntaxError {
+                message: format!("{form_name} bindings must be (name value) pairs"),
+            });
+        };
+
+        parsed.push((name.clone(), value_expr));
+    }
+
+    Ok(parsed)
+}
+
+struct DoBinding<'a> {
+    name: String,
+    init_expr: &'a Expr,
+    step_expr: Option<&'a Expr>,
+}
+
+fn parse_do_bindings(bindings: &[Expr]) -> Result<Vec<DoBinding<'_>>, EvalError> {
+    let mut parsed = Vec::with_capacity(bindings.len());
+
+    for binding in bindings {
+        let Expr::List(items, _) = binding else {
+            return Err(EvalError::SyntaxError {
+                message: "do bindings must be lists".into(),
+            });
+        };
+
+        match items.as_slice() {
+            [Expr::Symbol(name, _), init_expr] => parsed.push(DoBinding {
+                name: name.clone(),
+                init_expr,
+                step_expr: None,
+            }),
+            [Expr::Symbol(name, _), init_expr, step_expr] => parsed.push(DoBinding {
+                name: name.clone(),
+                init_expr,
+                step_expr: Some(step_expr),
+            }),
+            _ => {
+                return Err(EvalError::SyntaxError {
+                    message: "do bindings must be (name init [step])".into(),
+                });
+            }
+        }
     }
 
     Ok(parsed)
