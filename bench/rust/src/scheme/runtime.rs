@@ -73,6 +73,62 @@ pub(super) struct EvaluatedArg {
     pub(super) pos: Position,
 }
 
+pub(super) type ContinuationRef = Option<Rc<Continuation>>;
+
+#[derive(Clone)]
+pub(super) struct Continuation {
+    pub(super) frame: Frame,
+    pub(super) next: ContinuationRef,
+}
+
+#[derive(Clone)]
+pub(super) enum Frame {
+    Sequence {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    And {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    Or {
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    If {
+        consequent: Expr,
+        alternate: Option<Expr>,
+        env: EnvRef,
+    },
+    CondClause {
+        body: Vec<Expr>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+    },
+    ApplyHead {
+        args: Vec<Expr>,
+        env: EnvRef,
+        pos: Position,
+    },
+    ApplyArgs {
+        procedure: Value,
+        evaluated: Vec<EvaluatedArg>,
+        remaining: Vec<Expr>,
+        env: EnvRef,
+        pos: Position,
+        current_arg_pos: Position,
+    },
+    DefineValue {
+        name: String,
+        env: EnvRef,
+    },
+    SetValue {
+        name: String,
+        pos: Position,
+        env: EnvRef,
+    },
+}
+
 pub(super) enum TailEvalResult {
     Value(Value),
     Call {
@@ -179,6 +235,12 @@ pub(super) enum Procedure {
         name: &'static str,
         func: BuiltinFn,
     },
+    ContinuationCapture {
+        name: &'static str,
+    },
+    Continuation {
+        cont: ContinuationRef,
+    },
     Lambda {
         params: LambdaParams,
         body: Vec<Expr>,
@@ -239,6 +301,8 @@ impl fmt::Debug for Procedure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Builtin { name, .. } => write!(f, "#<builtin:{name}>"),
+            Self::ContinuationCapture { name } => write!(f, "#<builtin:{name}>"),
+            Self::Continuation { .. } => f.write_str("#<continuation>"),
             Self::Lambda { .. } => f.write_str("#<lambda>"),
             Self::CaseLambda { .. } => f.write_str("#<case-lambda>"),
             Self::RecordConstructor { name, .. } => write!(f, "#<record-constructor:{name}>"),

@@ -24,7 +24,7 @@ use std::rc::Rc;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse_program(input)?;
     let mut output = String::new();
-    let value = eval_program(&exprs, builtins::default_env(), &mut output)?;
+    let value = eval_program_machine(&exprs, builtins::default_env(), &mut output)?;
     Ok(value.render())
 }
 
@@ -33,12 +33,942 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let exprs = parser::parse_program(input)?;
     let mut output = String::new();
-    let value = eval_program(&exprs, builtins::default_env(), &mut output)?;
+    let value = eval_program_machine(&exprs, builtins::default_env(), &mut output)?;
     Ok((value.render(), output))
 }
 
 #[cfg(test)]
 mod tests;
+
+enum MachineState {
+    Eval {
+        expr: Expr,
+        env: EnvRef,
+        cont: ContinuationRef,
+    },
+    Apply {
+        procedure: Value,
+        args: Vec<EvaluatedArg>,
+        pos: Position,
+        cont: ContinuationRef,
+    },
+    Return {
+        value: Value,
+        cont: ContinuationRef,
+    },
+}
+
+fn eval_program_machine(
+    exprs: &[Expr],
+    env: EnvRef,
+    output: &mut String,
+) -> Result<Value, EvalError> {
+    let mut state = schedule_program_machine(exprs, env, None);
+
+    loop {
+        state = match state {
+            MachineState::Eval { expr, env, cont } => eval_machine(expr, env, cont, output)?,
+            MachineState::Apply {
+                procedure,
+                args,
+                pos,
+                cont,
+            } => apply_machine(procedure, args, pos, cont, output)?,
+            MachineState::Return { value, cont } => match cont {
+                None => return Ok(value),
+                Some(continuation) => resume_machine(continuation, value, output)?,
+            },
+        };
+    }
+}
+
+fn eval_machine(
+    expr: Expr,
+    env: EnvRef,
+    cont: ContinuationRef,
+    output: &mut String,
+) -> Result<MachineState, EvalError> {
+    match expr {
+        Expr::Bool { value, .. } => Ok(MachineState::Return {
+            value: Value::Bool(value),
+            cont,
+        }),
+        Expr::Number { value, .. } => Ok(MachineState::Return {
+            value: Value::Number(value),
+            cont,
+        }),
+        Expr::Char { value, .. } => Ok(MachineState::Return {
+            value: Value::Char(value),
+            cont,
+        }),
+        Expr::String { value, .. } => Ok(MachineState::Return {
+            value: Value::String(SchemeString::immutable(&value)),
+            cont,
+        }),
+        Expr::Symbol { name, pos } => Ok(MachineState::Return {
+            value: eval_symbol(&name, pos, &env)?,
+            cont,
+        }),
+        Expr::List { items, pos } => eval_list_machine(items, pos, env, cont, output),
+    }
+}
+
+fn eval_list_machine(
+    items: Vec<Expr>,
+    pos: Position,
+    env: EnvRef,
+    cont: ContinuationRef,
+    output: &mut String,
+) -> Result<MachineState, EvalError> {
+    let Some((head, args)) = items.split_first() else {
+        return Err(EvalError::ParseError {
+            message: "cannot evaluate empty list".to_string(),
+        }
+        .with_position(pos.line, pos.col));
+    };
+
+    let head_pos = head.pos();
+    if let Expr::Symbol { name, .. } = head {
+        return match name.as_str() {
+            "and" => Ok(schedule_and_machine(args, env, cont)),
+            "or" => Ok(schedule_or_machine(args, env, cont)),
+            "if" => eval_if_machine(args, head_pos, env, cont),
+            "quote" => Ok(MachineState::Return {
+                value: with_position(eval_quote(args), head_pos)?,
+                cont,
+            }),
+            "begin" => Ok(schedule_program_machine(args, env, cont)),
+            "cond" => schedule_cond_machine(args, head_pos, env, cont),
+            "let" => eval_let_machine(args, head_pos, env, cont),
+            "lambda" => Ok(MachineState::Return {
+                value: with_position(eval_lambda(args, env), head_pos)?,
+                cont,
+            }),
+            "case-lambda" => Ok(MachineState::Return {
+                value: with_position(eval_case_lambda(args, env), head_pos)?,
+                cont,
+            }),
+            "define" => eval_define_machine(args, head_pos, env, cont),
+            "define-record-type" => Ok(MachineState::Return {
+                value: with_position(eval_define_record_type(args, env), head_pos)?,
+                cont,
+            }),
+            "define-syntax" => Ok(MachineState::Return {
+                value: with_position(macros::define_syntax(args, env), head_pos)?,
+                cont,
+            }),
+            "set!" => eval_set_machine(args, head_pos, env, cont),
+            "case" | "let*" | "letrec" | "letrec*" | "do" => Ok(MachineState::Return {
+                value: with_position(eval_list(&items, env, output), pos)?,
+                cont,
+            }),
+            _ => {
+                if let Some(transformer) = env.lookup_macro(name) {
+                    let (expanded, macro_env) = with_position(
+                        macros::expand_macro_call(&items, env.clone(), transformer),
+                        head_pos,
+                    )?;
+                    Ok(MachineState::Eval {
+                        expr: expanded,
+                        env: macro_env,
+                        cont,
+                    })
+                } else {
+                    let procedure = eval_symbol(name, head_pos, &env)?;
+                    Ok(schedule_call_machine(procedure, args, env, head_pos, cont))
+                }
+            }
+        };
+    }
+
+    Ok(MachineState::Eval {
+        expr: head.clone(),
+        env: env.clone(),
+        cont: push_frame(
+            Frame::ApplyHead {
+                args: args.to_vec(),
+                env,
+                pos: head_pos,
+            },
+            cont,
+        ),
+    })
+}
+
+fn apply_machine(
+    procedure: Value,
+    args: Vec<EvaluatedArg>,
+    pos: Position,
+    cont: ContinuationRef,
+    output: &mut String,
+) -> Result<MachineState, EvalError> {
+    let Value::Procedure(procedure) = procedure else {
+        return Err(EvalError::NotAProcedure {
+            found: procedure.render(),
+        }
+        .with_position(pos.line, pos.col));
+    };
+
+    match procedure.as_ref() {
+        Procedure::Builtin { func, .. } => Ok(MachineState::Return {
+            value: with_position(func(&args, output), pos)?,
+            cont,
+        }),
+        Procedure::ContinuationCapture { name } => {
+            let [procedure_arg] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    name,
+                    expected: "exactly 1",
+                    got: args.len(),
+                }
+                .with_position(pos.line, pos.col));
+            };
+
+            Ok(MachineState::Apply {
+                procedure: procedure_arg.value.clone(),
+                args: vec![EvaluatedArg {
+                    value: Value::Procedure(Rc::new(Procedure::Continuation {
+                        cont: cont.clone(),
+                    })),
+                    pos,
+                }],
+                pos,
+                cont,
+            })
+        }
+        Procedure::Continuation { cont: saved_cont } => {
+            let [value_arg] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    name: "continuation",
+                    expected: "exactly 1",
+                    got: args.len(),
+                }
+                .with_position(pos.line, pos.col));
+            };
+
+            Ok(MachineState::Return {
+                value: value_arg.value.clone(),
+                cont: saved_cont.clone(),
+            })
+        }
+        Procedure::Lambda { params, body, env } => {
+            let call_env = with_position(
+                prepare_lambda_call_env_machine("lambda", params, env, &args),
+                pos,
+            )?;
+            Ok(schedule_program_machine(body, call_env, cont))
+        }
+        Procedure::CaseLambda { clauses, env } => {
+            let clause = with_position(
+                clauses
+                    .iter()
+                    .find(|clause| clause.params.matches_arity(args.len()))
+                    .ok_or(EvalError::WrongArgCount {
+                        name: "case-lambda",
+                        expected: "matching clause",
+                        got: args.len(),
+                    }),
+                pos,
+            )?;
+
+            let call_env = with_position(
+                prepare_lambda_call_env_machine("case-lambda", &clause.params, env, &args),
+                pos,
+            )?;
+            Ok(schedule_program_machine(&clause.body, call_env, cont))
+        }
+        Procedure::RecordConstructor {
+            record_type,
+            field_count,
+            ..
+        } => Ok(MachineState::Return {
+            value: with_position(
+                apply_record_constructor_machine(record_type.clone(), *field_count, &args),
+                pos,
+            )?,
+            cont,
+        }),
+        Procedure::RecordPredicate { record_type, .. } => Ok(MachineState::Return {
+            value: with_position(apply_record_predicate_machine(record_type, &args), pos)?,
+            cont,
+        }),
+        Procedure::RecordAccessor {
+            record_type,
+            field_index,
+            ..
+        } => Ok(MachineState::Return {
+            value: with_position(
+                apply_record_accessor_machine(record_type, *field_index, &args),
+                pos,
+            )?,
+            cont,
+        }),
+        Procedure::RecordMutator {
+            record_type,
+            field_index,
+            ..
+        } => Ok(MachineState::Return {
+            value: with_position(
+                apply_record_mutator_machine(record_type, *field_index, &args),
+                pos,
+            )?,
+            cont,
+        }),
+    }
+}
+
+fn resume_machine(
+    continuation: Rc<Continuation>,
+    value: Value,
+    _output: &mut String,
+) -> Result<MachineState, EvalError> {
+    let next = continuation.next.clone();
+    match &continuation.frame {
+        Frame::Sequence { remaining, env } => Ok(schedule_program_machine(remaining, env.clone(), next)),
+        Frame::And { remaining, env } => handle_and_value_machine(value, remaining, env.clone(), next),
+        Frame::Or { remaining, env } => handle_or_value_machine(value, remaining, env.clone(), next),
+        Frame::If {
+            consequent,
+            alternate,
+            env,
+        } => {
+            if value.is_truthy() {
+                Ok(MachineState::Eval {
+                    expr: consequent.clone(),
+                    env: env.clone(),
+                    cont: next,
+                })
+            } else if let Some(alternate) = alternate {
+                Ok(MachineState::Eval {
+                    expr: alternate.clone(),
+                    env: env.clone(),
+                    cont: next,
+                })
+            } else {
+                Ok(MachineState::Return {
+                    value: Value::Void,
+                    cont: next,
+                })
+            }
+        }
+        Frame::CondClause {
+            body,
+            remaining,
+            env,
+        } => {
+            if value.is_truthy() {
+                if body.is_empty() {
+                    Ok(MachineState::Return { value, cont: next })
+                } else {
+                    Ok(schedule_program_machine(body, env.clone(), next))
+                }
+            } else {
+                schedule_cond_machine(remaining, Position { line: 0, col: 0 }, env.clone(), next)
+            }
+        }
+        Frame::ApplyHead { args, env, pos } => Ok(schedule_call_machine(value, args, env.clone(), *pos, next)),
+        Frame::ApplyArgs {
+            procedure,
+            evaluated,
+            remaining,
+            env,
+            pos,
+            current_arg_pos,
+        } => {
+            let mut applied_args = evaluated.clone();
+            applied_args.insert(
+                0,
+                EvaluatedArg {
+                    value,
+                    pos: *current_arg_pos,
+                },
+            );
+
+            if let Some((next_arg, rest)) = remaining.split_last() {
+                Ok(MachineState::Eval {
+                    expr: next_arg.clone(),
+                    env: env.clone(),
+                    cont: push_frame(
+                        Frame::ApplyArgs {
+                            procedure: procedure.clone(),
+                            evaluated: applied_args,
+                            remaining: rest.to_vec(),
+                            env: env.clone(),
+                            pos: *pos,
+                            current_arg_pos: next_arg.pos(),
+                        },
+                        next,
+                    ),
+                })
+            } else {
+                Ok(MachineState::Apply {
+                    procedure: procedure.clone(),
+                    args: applied_args,
+                    pos: *pos,
+                    cont: next,
+                })
+            }
+        }
+        Frame::DefineValue { name, env } => {
+            env.define(name.clone(), value);
+            Ok(MachineState::Return {
+                value: Value::Void,
+                cont: next,
+            })
+        }
+        Frame::SetValue { name, pos, env } => {
+            env.set(name, value)
+                .map_err(|error| error.with_position(pos.line, pos.col))?;
+            Ok(MachineState::Return {
+                value: Value::Void,
+                cont: next,
+            })
+        }
+    }
+}
+
+fn schedule_program_machine(exprs: &[Expr], env: EnvRef, cont: ContinuationRef) -> MachineState {
+    let Some((first, remaining)) = exprs.split_first() else {
+        return MachineState::Return {
+            value: Value::Void,
+            cont,
+        };
+    };
+
+    if remaining.is_empty() {
+        MachineState::Eval {
+            expr: first.clone(),
+            env,
+            cont,
+        }
+    } else {
+        MachineState::Eval {
+            expr: first.clone(),
+            env: env.clone(),
+            cont: push_frame(
+                Frame::Sequence {
+                    remaining: remaining.to_vec(),
+                    env,
+                },
+                cont,
+            ),
+        }
+    }
+}
+
+fn schedule_and_machine(args: &[Expr], env: EnvRef, cont: ContinuationRef) -> MachineState {
+    let Some((first, remaining)) = args.split_first() else {
+        return MachineState::Return {
+            value: Value::Bool(true),
+            cont,
+        };
+    };
+
+    if remaining.is_empty() {
+        MachineState::Eval {
+            expr: first.clone(),
+            env,
+            cont,
+        }
+    } else {
+        MachineState::Eval {
+            expr: first.clone(),
+            env: env.clone(),
+            cont: push_frame(
+                Frame::And {
+                    remaining: remaining.to_vec(),
+                    env,
+                },
+                cont,
+            ),
+        }
+    }
+}
+
+fn handle_and_value_machine(
+    value: Value,
+    remaining: &[Expr],
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    if !value.is_truthy() {
+        return Ok(MachineState::Return { value, cont });
+    }
+
+    Ok(schedule_and_machine(remaining, env, cont))
+}
+
+fn schedule_or_machine(args: &[Expr], env: EnvRef, cont: ContinuationRef) -> MachineState {
+    let Some((first, remaining)) = args.split_first() else {
+        return MachineState::Return {
+            value: Value::Bool(false),
+            cont,
+        };
+    };
+
+    if remaining.is_empty() {
+        MachineState::Eval {
+            expr: first.clone(),
+            env,
+            cont,
+        }
+    } else {
+        MachineState::Eval {
+            expr: first.clone(),
+            env: env.clone(),
+            cont: push_frame(
+                Frame::Or {
+                    remaining: remaining.to_vec(),
+                    env,
+                },
+                cont,
+            ),
+        }
+    }
+}
+
+fn handle_or_value_machine(
+    value: Value,
+    remaining: &[Expr],
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    if value.is_truthy() {
+        return Ok(MachineState::Return { value, cont });
+    }
+
+    Ok(schedule_or_machine(remaining, env, cont))
+}
+
+fn eval_if_machine(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    match args {
+        [condition, consequent] => Ok(MachineState::Eval {
+            expr: condition.clone(),
+            env: env.clone(),
+            cont: push_frame(
+                Frame::If {
+                    consequent: consequent.clone(),
+                    alternate: None,
+                    env,
+                },
+                cont,
+            ),
+        }),
+        [condition, consequent, alternate] => Ok(MachineState::Eval {
+            expr: condition.clone(),
+            env: env.clone(),
+            cont: push_frame(
+                Frame::If {
+                    consequent: consequent.clone(),
+                    alternate: Some(alternate.clone()),
+                    env,
+                },
+                cont,
+            ),
+        }),
+        _ => Err(EvalError::WrongArgCount {
+            name: "if",
+            expected: "2 or 3",
+            got: args.len(),
+        }
+        .with_position(head_pos.line, head_pos.col)),
+    }
+}
+
+fn schedule_cond_machine(
+    clauses: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    let Some((clause, remaining)) = clauses.split_first() else {
+        return Ok(MachineState::Return {
+            value: Value::Void,
+            cont,
+        });
+    };
+
+    let Expr::List { items, pos } = clause else {
+        return Err(EvalError::ParseError {
+            message: "cond clauses must be lists".to_string(),
+        }
+        .with_position(head_pos.line, head_pos.col));
+    };
+
+    let Some((test, body)) = items.split_first() else {
+        return Err(EvalError::ParseError {
+            message: "cond clauses cannot be empty".to_string(),
+        }
+        .with_position(pos.line, pos.col));
+    };
+
+    if matches!(test, Expr::Symbol { name, .. } if name == "else") {
+        return Ok(if body.is_empty() {
+            MachineState::Return {
+                value: Value::Void,
+                cont,
+            }
+        } else {
+            schedule_program_machine(body, env, cont)
+        });
+    }
+
+    Ok(MachineState::Eval {
+        expr: test.clone(),
+        env: env.clone(),
+        cont: push_frame(
+            Frame::CondClause {
+                body: body.to_vec(),
+                remaining: remaining.to_vec(),
+                env,
+            },
+            cont,
+        ),
+    })
+}
+
+fn eval_let_machine(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    match args {
+        [Expr::Symbol { name, .. }, bindings_expr, body @ ..] => {
+            if body.is_empty() {
+                return Err(EvalError::WrongArgCount {
+                    name: "let",
+                    expected: "at least 3",
+                    got: 2,
+                }
+                .with_position(head_pos.line, head_pos.col));
+            }
+
+            let bindings = with_position(macros::parse_let_bindings(bindings_expr), head_pos)?;
+            let params = bindings
+                .iter()
+                .map(|(param, _)| param.clone())
+                .collect::<Vec<_>>();
+            let values = bindings
+                .iter()
+                .map(|(_, expr)| expr.clone())
+                .collect::<Vec<_>>();
+
+            let closure_env = Environment::new(Some(env.clone()));
+            let procedure = Value::Procedure(Rc::new(Procedure::Lambda {
+                params: LambdaParams {
+                    fixed: params,
+                    rest: None,
+                },
+                body: body.to_vec(),
+                env: closure_env.clone(),
+            }));
+            closure_env.define(name.clone(), procedure.clone());
+            Ok(schedule_call_machine(procedure, &values, env, head_pos, cont))
+        }
+        [bindings_expr, body @ ..] => {
+            if body.is_empty() {
+                return Err(EvalError::WrongArgCount {
+                    name: "let",
+                    expected: "at least 2",
+                    got: 1,
+                }
+                .with_position(head_pos.line, head_pos.col));
+            }
+
+            let bindings = with_position(macros::parse_let_bindings(bindings_expr), head_pos)?;
+            let params = bindings
+                .iter()
+                .map(|(param, _)| param.clone())
+                .collect::<Vec<_>>();
+            let values = bindings
+                .iter()
+                .map(|(_, expr)| expr.clone())
+                .collect::<Vec<_>>();
+            let procedure_env = env.clone();
+            let procedure = Value::Procedure(Rc::new(Procedure::Lambda {
+                params: LambdaParams {
+                    fixed: params,
+                    rest: None,
+                },
+                body: body.to_vec(),
+                env: procedure_env,
+            }));
+            Ok(schedule_call_machine(procedure, &values, env, head_pos, cont))
+        }
+        [] => Err(EvalError::WrongArgCount {
+            name: "let",
+            expected: "at least 2",
+            got: 0,
+        }
+        .with_position(head_pos.line, head_pos.col)),
+    }
+}
+
+fn eval_define_machine(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    match args {
+        [Expr::Symbol { name, .. }, value_expr] => Ok(MachineState::Eval {
+            expr: value_expr.clone(),
+            env: env.clone(),
+            cont: push_frame(
+                Frame::DefineValue {
+                    name: name.clone(),
+                    env,
+                },
+                cont,
+            ),
+        }),
+        [Expr::List { items: signature, .. }, body @ ..] => {
+            if body.is_empty() {
+                return Err(EvalError::ParseError {
+                    message: "define requires a function body".to_string(),
+                }
+                .with_position(head_pos.line, head_pos.col));
+            }
+
+            let Some((Expr::Symbol { name, .. }, params)) = signature.split_first() else {
+                return Err(EvalError::ParseError {
+                    message: "define requires a function name".to_string(),
+                }
+                .with_position(head_pos.line, head_pos.col));
+            };
+
+            let params = with_position(macros::parse_lambda_param_items(params), head_pos)?;
+            env.define(
+                name.clone(),
+                Value::Procedure(Rc::new(Procedure::Lambda {
+                    params,
+                    body: body.to_vec(),
+                    env: env.clone(),
+                })),
+            );
+            Ok(MachineState::Return {
+                value: Value::Void,
+                cont,
+            })
+        }
+        _ => Err(EvalError::ParseError {
+            message: "invalid define form".to_string(),
+        }
+        .with_position(head_pos.line, head_pos.col)),
+    }
+}
+
+fn eval_set_machine(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    cont: ContinuationRef,
+) -> Result<MachineState, EvalError> {
+    match args {
+        [Expr::Symbol { name, pos }, value_expr] => Ok(MachineState::Eval {
+            expr: value_expr.clone(),
+            env: env.clone(),
+            cont: push_frame(
+                Frame::SetValue {
+                    name: name.clone(),
+                    pos: *pos,
+                    env,
+                },
+                cont,
+            ),
+        }),
+        [_, _] => Err(EvalError::ParseError {
+            message: "set! target must be a symbol".to_string(),
+        }
+        .with_position(head_pos.line, head_pos.col)),
+        _ => Err(EvalError::WrongArgCount {
+            name: "set!",
+            expected: "exactly 2",
+            got: args.len(),
+        }
+        .with_position(head_pos.line, head_pos.col)),
+    }
+}
+
+fn schedule_call_machine(
+    procedure: Value,
+    args: &[Expr],
+    env: EnvRef,
+    pos: Position,
+    cont: ContinuationRef,
+) -> MachineState {
+    let Some((last, remaining)) = args.split_last() else {
+        return MachineState::Apply {
+            procedure,
+            args: Vec::new(),
+            pos,
+            cont,
+        };
+    };
+
+    MachineState::Eval {
+        expr: last.clone(),
+        env: env.clone(),
+        cont: push_frame(
+            Frame::ApplyArgs {
+                procedure,
+                evaluated: Vec::new(),
+                remaining: remaining.to_vec(),
+                env,
+                pos,
+                current_arg_pos: last.pos(),
+            },
+            cont,
+        ),
+    }
+}
+
+fn push_frame(frame: Frame, next: ContinuationRef) -> ContinuationRef {
+    Some(Rc::new(Continuation { frame, next }))
+}
+
+fn prepare_lambda_call_env_machine(
+    name: &'static str,
+    params: &LambdaParams,
+    env: &EnvRef,
+    args: &[EvaluatedArg],
+) -> Result<EnvRef, EvalError> {
+    if args.len() < params.fixed_arity() {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name,
+            min: params.fixed_arity(),
+            got: args.len(),
+        });
+    }
+
+    if !params.matches_arity(args.len()) {
+        return Err(EvalError::WrongArgCount {
+            name,
+            expected: "exact parameter count",
+            got: args.len(),
+        });
+    }
+
+    let call_env = Environment::new(Some(env.clone()));
+    for (binding_name, arg) in params.fixed.iter().zip(args.iter()) {
+        call_env.define(binding_name.clone(), arg.value.clone());
+    }
+
+    if let Some(rest_name) = &params.rest {
+        let rest_items: Vec<_> = args[params.fixed_arity()..]
+            .iter()
+            .map(|arg| arg.value.clone())
+            .collect();
+        call_env.define(rest_name.clone(), list_from_values(rest_items));
+    }
+
+    Ok(call_env)
+}
+
+fn apply_record_constructor_machine(
+    record_type: Rc<RecordType>,
+    field_count: usize,
+    args: &[EvaluatedArg],
+) -> Result<Value, EvalError> {
+    if args.len() != field_count {
+        return Err(EvalError::WrongArgCount {
+            name: "record constructor",
+            expected: "exact parameter count",
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Record(Rc::new(RecordValue {
+        record_type,
+        fields: RefCell::new(args.iter().map(|arg| arg.value.clone()).collect()),
+    })))
+}
+
+fn apply_record_predicate_machine(
+    record_type: &Rc<RecordType>,
+    args: &[EvaluatedArg],
+) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "record predicate",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(
+        &value.value,
+        Value::Record(record) if Rc::ptr_eq(&record.record_type, record_type)
+    )))
+}
+
+fn apply_record_accessor_machine(
+    record_type: &Rc<RecordType>,
+    field_index: usize,
+    args: &[EvaluatedArg],
+) -> Result<Value, EvalError> {
+    let [record_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "record accessor",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let record = expect_record_instance_machine(record_arg, record_type)?;
+    let value = {
+        let fields = record.fields.borrow();
+        fields[field_index].clone()
+    };
+    Ok(value)
+}
+
+fn apply_record_mutator_machine(
+    record_type: &Rc<RecordType>,
+    field_index: usize,
+    args: &[EvaluatedArg],
+) -> Result<Value, EvalError> {
+    let [record_arg, value_arg] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "record mutator",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    };
+
+    let record = expect_record_instance_machine(record_arg, record_type)?;
+    record.fields.borrow_mut()[field_index] = value_arg.value.clone();
+    Ok(Value::Void)
+}
+
+fn expect_record_instance_machine(
+    arg: &EvaluatedArg,
+    record_type: &Rc<RecordType>,
+) -> Result<Rc<RecordValue>, EvalError> {
+    let Value::Record(record) = &arg.value else {
+        return Err(EvalError::TypeMismatch {
+            expected: "record",
+            found: arg.value.render(),
+        }
+        .with_position(arg.pos.line, arg.pos.col));
+    };
+
+    if !Rc::ptr_eq(&record.record_type, record_type) {
+        return Err(EvalError::TypeMismatch {
+            expected: "record",
+            found: arg.value.render(),
+        }
+        .with_position(arg.pos.line, arg.pos.col));
+    }
+
+    Ok(record.clone())
+}
 
 fn eval_program(exprs: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
     match eval_program_tail(exprs, env, output)? {

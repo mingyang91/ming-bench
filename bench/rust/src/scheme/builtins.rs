@@ -19,6 +19,12 @@ use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub(super) fn default_env() -> EnvRef {
     let env = Environment::new(None);
+    for name in ["call/cc", "call-with-current-continuation"] {
+        env.define(
+            name,
+            Value::Procedure(Rc::new(Procedure::ContinuationCapture { name })),
+        );
+    }
     for (name, func) in [
         ("+", apply_add as BuiltinFn),
         ("-", apply_sub as BuiltinFn),

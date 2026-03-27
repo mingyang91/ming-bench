@@ -6,6 +6,7 @@ use super::super::{
 use super::{
     apply_record_accessor, apply_record_constructor, apply_record_mutator, apply_record_predicate,
 };
+use std::rc::Rc;
 
 pub(crate) fn quote_expr(expr: &Expr) -> Value {
     match expr {
@@ -43,6 +44,38 @@ pub(crate) fn apply_procedure(
         match procedure.as_ref() {
             Procedure::Builtin { func, .. } => {
                 return with_call_position(func(&current_args, output), call_pos);
+            }
+            Procedure::ContinuationCapture { name } => {
+                let [procedure_arg] = current_args.as_slice() else {
+                    return with_call_position(
+                        Err(EvalError::WrongArgCount {
+                            name,
+                            expected: "exactly 1",
+                            got: current_args.len(),
+                        }),
+                        call_pos,
+                    );
+                };
+
+                current_value = procedure_arg.value.clone();
+                current_args = vec![EvaluatedArg {
+                    value: Value::Procedure(Rc::new(Procedure::Continuation { cont: None })),
+                    pos: procedure_arg.pos,
+                }];
+            }
+            Procedure::Continuation { .. } => {
+                let [value_arg] = current_args.as_slice() else {
+                    return with_call_position(
+                        Err(EvalError::WrongArgCount {
+                            name: "continuation",
+                            expected: "exactly 1",
+                            got: current_args.len(),
+                        }),
+                        call_pos,
+                    );
+                };
+
+                return Ok(value_arg.value.clone());
             }
             Procedure::Lambda { params, body, env } => {
                 let call_env = with_call_position(
