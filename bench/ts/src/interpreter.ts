@@ -16,6 +16,7 @@ type MutableStringValue = { kind: 'mutable-string'; chars: string[] };
 type SchemeSymbol = { kind: 'symbol-value'; name: string };
 type EmptyList = { kind: 'empty-list' };
 type PairValue = { kind: 'pair'; car: Value; cdr: Value };
+type VectorValue = { kind: 'vector'; items: Value[] };
 type VoidValue = { kind: 'void' };
 type BuiltinProc = {
   kind: 'builtin';
@@ -83,6 +84,7 @@ type Value =
   | SchemeSymbol
   | EmptyList
   | PairValue
+  | VectorValue
   | RecordValue
   | VoidValue
   | BuiltinProc
@@ -90,21 +92,27 @@ type Value =
   | CaseLambdaProc;
 
 type BindingSpec = { name: string; init: Expr };
-type Cell = { value: Value };
+type DoBindingSpec = { name: string; init: Expr; step?: Expr };
+type Cell = { value: Value | typeof UNINITIALIZED };
 
 const EMPTY_LIST: EmptyList = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
+const UNINITIALIZED = Symbol('uninitialized');
 const CORE_SYNTAX = new Set([
   'and',
   'begin',
+  'case',
   'case-lambda',
   'cond',
   'define',
   'define-record-type',
   'define-syntax',
+  'do',
   'if',
   'lambda',
   'let',
+  'letrec',
+  'letrec*',
   'or',
   'quote',
   'set!',
@@ -133,6 +141,10 @@ class Env {
     this.bindings.set(name, { value });
   }
 
+  defineUninitialized(name: string): void {
+    this.bindings.set(name, { value: UNINITIALIZED });
+  }
+
   defineAlias(name: string, cell: Cell): void {
     this.bindings.set(name, cell);
   }
@@ -149,6 +161,9 @@ class Env {
   lookup(name: string): Value {
     const cell = this.lookupCell(name);
     if (cell !== undefined) {
+      if (cell.value === UNINITIALIZED) {
+        throw new EvalError(`uninitialized binding: ${name}`);
+      }
       return cell.value;
     }
 
@@ -927,6 +942,10 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       assertExactArity('eq?', args, 2);
       return eqValues(args[0]!, args[1]!);
     }),
+    builtin('eqv?', (args) => {
+      assertExactArity('eqv?', args, 2);
+      return eqvValues(args[0]!, args[1]!);
+    }),
     builtin('equal?', (args) => {
       assertExactArity('equal?', args, 2);
       return equalValues(args[0]!, args[1]!);
@@ -961,10 +980,15 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('list', (args) => makeList(args)),
     builtin('list-ref', (args) => listRefBuiltin(args)),
     builtin('list-tail', (args) => listTailBuiltin(args)),
+    builtin('list->vector', (args) => {
+      assertExactArity('list->vector', args, 1);
+      return { kind: 'vector', items: expectProperList('list->vector', args[0]!) };
+    }),
     builtin('list?', (args) => {
       assertExactArity('list?', args, 1);
       return isProperListValue(args[0]!);
     }),
+    builtin('make-vector', (args) => makeVectorBuiltin(args)),
     builtin('map', (args, position) => mapBuiltin(args, position, macroEnv)),
     builtin('max', (args) =>
       extremum('max', args, (left, right) => (num.numericCompare(left, right) >= 0 ? left : right)),
@@ -1068,6 +1092,35 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       return makeMutableString(expectSymbolValue('symbol->string', args[0]!).name);
     }),
     builtin('symbol?', (args) => unaryPredicate('symbol?', args, isSymbolValue)),
+    builtin('vector', (args) => ({ kind: 'vector', items: [...args] })),
+    builtin('vector->list', (args) => {
+      assertExactArity('vector->list', args, 1);
+      return makeList(expectVectorValue('vector->list', args[0]!).items);
+    }),
+    builtin('vector-length', (args) => {
+      assertExactArity('vector-length', args, 1);
+      return num.exactIntegerFromNumber(expectVectorValue('vector-length', args[0]!).items.length);
+    }),
+    builtin('vector-ref', (args) => {
+      assertExactArity('vector-ref', args, 2);
+      const vector = expectVectorValue('vector-ref', args[0]!);
+      const index = expectIndex('vector-ref', args[1]!);
+      if (index >= vector.items.length) {
+        throw new EvalError('vector-ref index out of bounds');
+      }
+      return vector.items[index]!;
+    }),
+    builtin('vector-set!', (args) => {
+      assertExactArity('vector-set!', args, 3);
+      const vector = expectVectorValue('vector-set!', args[0]!);
+      const index = expectIndex('vector-set!', args[1]!);
+      if (index >= vector.items.length) {
+        throw new EvalError('vector-set! index out of bounds');
+      }
+      vector.items[index] = args[2]!;
+      return VOID;
+    }),
+    builtin('vector?', (args) => unaryPredicate('vector?', args, isVectorValue)),
     builtin('write', (args) => {
       assertExactArity('write', args, 1);
       output.write(formatValue(args[0]!));
@@ -1159,6 +1212,8 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
         return evalAnd(items.slice(1), env, macroEnv);
       case 'begin':
         return evalSequence(items.slice(1), env, macroEnv);
+      case 'case':
+        return evalCase(items.slice(1), env, macroEnv);
       case 'case-lambda':
         return evalCaseLambda(items.slice(1), env);
       case 'cond':
@@ -1169,12 +1224,18 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
         return evalDefineRecordType(items.slice(1), env);
       case 'define-syntax':
         return evalDefineSyntax(items.slice(1), env, macroEnv);
+      case 'do':
+        return evalDo(items.slice(1), env, macroEnv);
       case 'if':
         return evalIf(items.slice(1), env, macroEnv);
       case 'lambda':
         return evalLambda(items.slice(1), env);
       case 'let':
         return evalLet(items.slice(1), env, macroEnv);
+      case 'letrec':
+        return evalLetRec(items.slice(1), env, macroEnv, false);
+      case 'letrec*':
+        return evalLetRec(items.slice(1), env, macroEnv, true);
       case 'or':
         return evalOr(items.slice(1), env, macroEnv);
       case 'quote':
@@ -1209,6 +1270,38 @@ function evalAnd(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
   }
 
   return result;
+}
+
+function evalCase(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+  assertAtLeastArity('case', args, 1);
+
+  const key = evalExpr(args[0]!, env, macroEnv);
+  const clauses = args.slice(1);
+
+  for (let index = 0; index < clauses.length; index += 1) {
+    const clauseExpr = clauses[index]!;
+    if (clauseExpr.kind !== 'list' || clauseExpr.items.length === 0) {
+      throw new EvalError('case expects non-empty clauses');
+    }
+
+    const [headExpr, ...body] = clauseExpr.items;
+    if (headExpr!.kind === 'symbol' && headExpr.name === 'else') {
+      if (index !== clauses.length - 1) {
+        throw new EvalError('case else clause must be last');
+      }
+      return body.length === 0 ? VOID : evalSequence(body, env, macroEnv);
+    }
+
+    if (headExpr!.kind !== 'list') {
+      throw new EvalError('case expects each clause datum list to be a list');
+    }
+
+    if (headExpr.items.some((datumExpr) => eqvValues(key, quoteExpr(datumExpr)))) {
+      return body.length === 0 ? VOID : evalSequence(body, env, macroEnv);
+    }
+  }
+
+  return VOID;
 }
 
 function evalCond(clauses: Expr[], env: Env, macroEnv: MacroEnv): Value {
@@ -1368,11 +1461,16 @@ function evalDefineRecordType(args: Expr[], env: Env): Value {
 }
 
 function evalIf(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
-  assertExactArity('if', args, 3);
+  if (args.length !== 2 && args.length !== 3) {
+    throw new EvalError('if expects 2 or 3 argument(s)');
+  }
+
   const [conditionExpr, thenExpr, elseExpr] = args;
   return isTruthy(evalExpr(conditionExpr!, env, macroEnv))
     ? evalExpr(thenExpr!, env, macroEnv)
-    : evalExpr(elseExpr!, env, macroEnv);
+    : elseExpr === undefined
+      ? VOID
+      : evalExpr(elseExpr, env, macroEnv);
 }
 
 function evalCaseLambda(args: Expr[], env: Env): Value {
@@ -1419,6 +1517,32 @@ function evalLet(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
   return evalSequence(body, letEnv, macroEnv);
 }
 
+function evalLetRec(args: Expr[], env: Env, macroEnv: MacroEnv, sequential: boolean): Value {
+  const name = sequential ? 'letrec*' : 'letrec';
+  assertAtLeastArity(name, args, 2);
+
+  const bindings = parseBindings(args[0]!, name);
+  const body = args.slice(1);
+  const letEnv = new Env(env);
+
+  bindings.forEach((binding) => {
+    letEnv.defineUninitialized(binding.name);
+  });
+
+  if (sequential) {
+    for (const binding of bindings) {
+      letEnv.set(binding.name, evalExpr(binding.init, letEnv, macroEnv));
+    }
+  } else {
+    const values = bindings.map((binding) => evalExpr(binding.init, letEnv, macroEnv));
+    bindings.forEach((binding, index) => {
+      letEnv.set(binding.name, values[index]!);
+    });
+  }
+
+  return evalSequence(body, letEnv, macroEnv);
+}
+
 function evalNamedLet(name: string, bindingsExpr: Expr, body: Expr[], env: Env, macroEnv: MacroEnv): Value {
   const bindings = parseBindings(bindingsExpr);
   const values = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
@@ -1433,6 +1557,36 @@ function evalNamedLet(name: string, bindingsExpr: Expr, body: Expr[], env: Env, 
 
   letEnv.define(name, proc);
   return applyProcedure(proc, values, bindingsExpr.position, macroEnv);
+}
+
+function evalDo(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+  assertAtLeastArity('do', args, 2);
+
+  const bindings = parseDoBindings(args[0]!);
+  const testClause = parseDoTestClause(args[1]!);
+  const body = args.slice(2);
+  const initialValues = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
+  const doEnv = new Env(env);
+
+  bindings.forEach((binding, index) => {
+    doEnv.define(binding.name, initialValues[index]!);
+  });
+
+  while (true) {
+    if (isTruthy(evalExpr(testClause.test, doEnv, macroEnv))) {
+      return testClause.results.length === 0 ? VOID : evalSequence(testClause.results, doEnv, macroEnv);
+    }
+
+    evalSequence(body, doEnv, macroEnv);
+
+    const nextValues = bindings.map((binding) =>
+      binding.step === undefined ? doEnv.lookup(binding.name) : evalExpr(binding.step, doEnv, macroEnv),
+    );
+
+    bindings.forEach((binding, index) => {
+      doEnv.set(binding.name, nextValues[index]!);
+    });
+  }
 }
 
 function evalQuote(args: Expr[]): Value {
@@ -1507,19 +1661,19 @@ function parseParamItems(items: Expr[]): ParamSpec {
   return { required };
 }
 
-function parseBindings(expr: Expr): BindingSpec[] {
+function parseBindings(expr: Expr, formName = 'let'): BindingSpec[] {
   if (expr.kind !== 'list') {
-    throw new EvalError('let expects a binding list');
+    throw new EvalError(`${formName} expects a binding list`);
   }
 
   return expr.items.map((bindingExpr) => {
     if (bindingExpr.kind !== 'list' || bindingExpr.items.length !== 2) {
-      throw new EvalError('let bindings must be pairs');
+      throw new EvalError(`${formName} bindings must be pairs`);
     }
 
     const nameExpr = bindingExpr.items[0]!;
     if (nameExpr.kind !== 'symbol') {
-      throw new EvalError('let bindings must start with a symbol');
+      throw new EvalError(`${formName} bindings must start with a symbol`);
     }
 
     return {
@@ -1527,6 +1681,38 @@ function parseBindings(expr: Expr): BindingSpec[] {
       init: bindingExpr.items[1]!,
     };
   });
+}
+
+function parseDoBindings(expr: Expr): DoBindingSpec[] {
+  if (expr.kind !== 'list') {
+    throw new EvalError('do expects a binding list');
+  }
+
+  return expr.items.map((bindingExpr) => {
+    if (bindingExpr.kind !== 'list' || (bindingExpr.items.length !== 2 && bindingExpr.items.length !== 3)) {
+      throw new EvalError('do bindings must be of the form (name init) or (name init step)');
+    }
+
+    const [nameExpr, initExpr, stepExpr] = bindingExpr.items;
+    if (nameExpr!.kind !== 'symbol') {
+      throw new EvalError('do bindings must start with a symbol');
+    }
+
+    return {
+      name: nameExpr.name,
+      init: initExpr!,
+      step: stepExpr,
+    };
+  });
+}
+
+function parseDoTestClause(expr: Expr): { test: Expr; results: Expr[] } {
+  if (expr.kind !== 'list' || expr.items.length === 0) {
+    throw new EvalError('do expects a termination clause');
+  }
+
+  const [test, ...results] = expr.items;
+  return { test: test!, results };
 }
 
 function parseRecordConstructorSpec(expr: Expr): { name: string; fields: string[] } {
@@ -1799,6 +1985,16 @@ function exptNumbers(args: Value[]): num.NumericValue {
   return num.exptNumeric(expectNumberValue('expt', args[0]!), expectIntegerValue('expt', args[1]!));
 }
 
+function makeVectorBuiltin(args: Value[]): VectorValue {
+  if (args.length !== 1 && args.length !== 2) {
+    throw new EvalError('make-vector expects 1 or 2 argument(s)');
+  }
+
+  const length = expectIndex('make-vector', args[0]!);
+  const fill = args.length === 2 ? args[1]! : VOID;
+  return { kind: 'vector', items: Array.from({ length }, () => fill) };
+}
+
 function appendValues(args: Value[]): Value {
   if (args.length === 0) {
     return EMPTY_LIST;
@@ -1845,6 +2041,14 @@ function makeList(items: Value[]): Value {
 function expectPair(name: string, value: Value): PairValue {
   if (!isPair(value)) {
     throw new EvalError(`${name} expects a pair`);
+  }
+
+  return value;
+}
+
+function expectVectorValue(name: string, value: Value): VectorValue {
+  if (!isVectorValue(value)) {
+    throw new EvalError(`${name} expects a vector`);
   }
 
   return value;
@@ -2149,6 +2353,8 @@ function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
       return '()';
     case 'pair':
       return `(${formatPairContents(value, mode)})`;
+    case 'vector':
+      return `#(${value.items.map((item) => formatValueWithMode(item, mode)).join(' ')})`;
     case 'record':
       return `#<record:${value.recordType.name}>`;
     case 'void':
@@ -2246,8 +2452,12 @@ function eqValues(left: Value, right: Value): boolean {
   return left === right;
 }
 
+function eqvValues(left: Value, right: Value): boolean {
+  return eqValues(left, right);
+}
+
 function equalValues(left: Value, right: Value): boolean {
-  if (eqValues(left, right)) {
+  if (eqvValues(left, right)) {
     return true;
   }
 
@@ -2257,6 +2467,20 @@ function equalValues(left: Value, right: Value): boolean {
 
   if (isPair(left) && isPair(right)) {
     return equalValues(left.car, right.car) && equalValues(left.cdr, right.cdr);
+  }
+
+  if (isVectorValue(left) && isVectorValue(right)) {
+    if (left.items.length !== right.items.length) {
+      return false;
+    }
+
+    for (let index = 0; index < left.items.length; index += 1) {
+      if (!equalValues(left.items[index]!, right.items[index]!)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   return false;
@@ -2288,6 +2512,10 @@ function isPair(value: Value): value is PairValue {
 
 function isRecordValue(value: Value): value is RecordValue {
   return typeof value === 'object' && value !== null && value.kind === 'record';
+}
+
+function isVectorValue(value: Value): value is VectorValue {
+  return typeof value === 'object' && value !== null && value.kind === 'vector';
 }
 
 function isCharValue(value: Value): value is CharValue {
