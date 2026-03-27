@@ -19,6 +19,7 @@ type numberValue int
 type boolValue bool
 type stringValue string
 type symbolValue string
+type charValue rune
 type voidValue struct{}
 type emptyListValue struct{}
 
@@ -48,7 +49,15 @@ type env struct {
 	vars   map[string]value
 }
 
+type outputMode int
+
+const (
+	outputModeWrite outputMode = iota
+	outputModeDisplay
+)
+
 var emptyList = emptyListValue{}
+var currentOutput *strings.Builder
 
 func (n numberValue) schemeString() string {
 	return strconv.Itoa(int(n))
@@ -85,6 +94,14 @@ func (symbolValue) isTruthy() bool {
 	return true
 }
 
+func (c charValue) schemeString() string {
+	return formatChar(rune(c), outputModeWrite)
+}
+
+func (charValue) isTruthy() bool {
+	return true
+}
+
 func (voidValue) schemeString() string {
 	return ""
 }
@@ -102,26 +119,62 @@ func (emptyListValue) isTruthy() bool {
 }
 
 func (p pairValue) schemeString() string {
+	return formatPair(p, outputModeWrite)
+}
+
+func formatValue(v value, mode outputMode) string {
+	switch value := v.(type) {
+	case stringValue:
+		if mode == outputModeDisplay {
+			return string(value)
+		}
+		return strconv.Quote(string(value))
+	case charValue:
+		return formatChar(rune(value), mode)
+	case pairValue:
+		return formatPair(value, mode)
+	default:
+		return v.schemeString()
+	}
+}
+
+func formatPair(p pairValue, mode outputMode) string {
 	var builder strings.Builder
 	builder.WriteByte('(')
 
-	current := p
+	current := value(p)
 	for {
-		builder.WriteString(current.car.schemeString())
-
-		switch next := current.cdr.(type) {
+		switch next := current.(type) {
+		case pairValue:
+			builder.WriteString(formatValue(next.car, mode))
+			current = next.cdr
+			if _, ok := current.(pairValue); ok {
+				builder.WriteByte(' ')
+			}
 		case emptyListValue:
 			builder.WriteByte(')')
 			return builder.String()
-		case pairValue:
-			builder.WriteByte(' ')
-			current = next
 		default:
 			builder.WriteString(" . ")
-			builder.WriteString(next.schemeString())
+			builder.WriteString(formatValue(next, mode))
 			builder.WriteByte(')')
 			return builder.String()
 		}
+	}
+}
+
+func formatChar(ch rune, mode outputMode) string {
+	if mode == outputModeDisplay {
+		return string(ch)
+	}
+
+	switch ch {
+	case ' ':
+		return "#\\space"
+	case '\n':
+		return "#\\newline"
+	default:
+		return "#\\" + string(ch)
 	}
 }
 
@@ -213,6 +266,18 @@ func newGlobalEnv() *env {
 	global.define("string?", builtinProc{name: "string?", fn: evalStringPred})
 	global.define("pair?", builtinProc{name: "pair?", fn: evalPairPred})
 	global.define("symbol?", builtinProc{name: "symbol?", fn: evalSymbolPred})
+	global.define("char?", builtinProc{name: "char?", fn: evalCharPred})
+	global.define("display", builtinProc{name: "display", fn: evalDisplay})
+	global.define("write", builtinProc{name: "write", fn: evalWrite})
+	global.define("newline", builtinProc{name: "newline", fn: evalNewline})
+	global.define("string-append", builtinProc{name: "string-append", fn: evalStringAppend})
+	global.define("string-length", builtinProc{name: "string-length", fn: evalStringLength})
+	global.define("substring", builtinProc{name: "substring", fn: evalSubstring})
+	global.define("string->number", builtinProc{name: "string->number", fn: evalStringToNumber})
+	global.define("number->string", builtinProc{name: "number->string", fn: evalNumberToString})
+	global.define("symbol->string", builtinProc{name: "symbol->string", fn: evalSymbolToString})
+	global.define("string->symbol", builtinProc{name: "string->symbol", fn: evalStringToSymbol})
+	global.define("string-ref", builtinProc{name: "string-ref", fn: evalStringRef})
 	return global
 }
 
@@ -223,6 +288,9 @@ func evalInput(input string) (result string, output string, err error) {
 	}
 
 	env := newGlobalEnv()
+	var outputBuilder strings.Builder
+	restoreOutput := pushOutputBuffer(&outputBuilder)
+	defer restoreOutput()
 	restore := pushEvalPos(defaultSourcePos())
 	defer restore()
 
@@ -235,7 +303,7 @@ func evalInput(input string) (result string, output string, err error) {
 		}
 	}
 
-	return last.schemeString(), "", nil
+	return last.schemeString(), outputBuilder.String(), nil
 }
 
 func evalSequence(exprs []locatedExpr, env *env) (value, error) {
@@ -853,11 +921,188 @@ func evalSymbolPred(args []value) (value, error) {
 	})
 }
 
+func evalCharPred(args []value) (value, error) {
+	return evalTypePredicate(args, "char?", func(v value) bool {
+		_, ok := v.(charValue)
+		return ok
+	})
+}
+
+func evalDisplay(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'display' expects exactly 1 argument")
+	}
+	appendOutput(formatValue(args[0], outputModeDisplay))
+	return voidValue{}, nil
+}
+
+func evalWrite(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'write' expects exactly 1 argument")
+	}
+	appendOutput(formatValue(args[0], outputModeWrite))
+	return voidValue{}, nil
+}
+
+func evalNewline(args []value) (value, error) {
+	if len(args) != 0 {
+		return nil, newCurrentEvalError("'newline' expects exactly 0 arguments")
+	}
+	appendOutput("\n")
+	return voidValue{}, nil
+}
+
+func evalStringAppend(args []value) (value, error) {
+	var builder strings.Builder
+	for _, arg := range args {
+		s, err := expectString(arg)
+		if err != nil {
+			return nil, err
+		}
+		builder.WriteString(s)
+	}
+	return stringValue(builder.String()), nil
+}
+
+func evalStringLength(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'string-length' expects exactly 1 argument")
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return numberValue(len([]rune(s))), nil
+}
+
+func evalSubstring(args []value) (value, error) {
+	if len(args) != 3 {
+		return nil, newCurrentEvalError("'substring' expects exactly 3 arguments")
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	start, err := expectNumber(args[1])
+	if err != nil {
+		return nil, err
+	}
+	end, err := expectNumber(args[2])
+	if err != nil {
+		return nil, err
+	}
+
+	runes := []rune(s)
+	if start < 0 || end < 0 || start > end || end > len(runes) {
+		return nil, newCurrentEvalError("'substring' indices out of range")
+	}
+
+	return stringValue(string(runes[start:end])), nil
+}
+
+func evalStringToNumber(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'string->number' expects exactly 1 argument")
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	n, convErr := strconv.Atoi(s)
+	if convErr != nil {
+		return boolValue(false), nil
+	}
+
+	return numberValue(n), nil
+}
+
+func evalNumberToString(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'number->string' expects exactly 1 argument")
+	}
+
+	n, err := expectNumber(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return stringValue(strconv.Itoa(n)), nil
+}
+
+func evalSymbolToString(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'symbol->string' expects exactly 1 argument")
+	}
+
+	symbol, err := expectSymbol(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return stringValue(symbol), nil
+}
+
+func evalStringToSymbol(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'string->symbol' expects exactly 1 argument")
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return symbolValue(s), nil
+}
+
+func evalStringRef(args []value) (value, error) {
+	if len(args) != 2 {
+		return nil, newCurrentEvalError("'string-ref' expects exactly 2 arguments")
+	}
+
+	s, err := expectString(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	index, err := expectNumber(args[1])
+	if err != nil {
+		return nil, err
+	}
+
+	runes := []rune(s)
+	if index < 0 || index >= len(runes) {
+		return nil, newCurrentEvalError("'string-ref' index out of range")
+	}
+
+	return charValue(runes[index]), nil
+}
+
 func evalTypePredicate(args []value, name string, pred func(value) bool) (value, error) {
 	if len(args) != 1 {
 		return nil, newCurrentEvalError("'%s' expects exactly 1 argument", name)
 	}
 	return boolValue(pred(args[0])), nil
+}
+
+func pushOutputBuffer(builder *strings.Builder) func() {
+	prev := currentOutput
+	currentOutput = builder
+	return func() {
+		currentOutput = prev
+	}
+}
+
+func appendOutput(text string) {
+	if currentOutput != nil {
+		currentOutput.WriteString(text)
+	}
 }
 
 func properListElements(v value) ([]value, error) {
@@ -891,4 +1136,20 @@ func expectNumber(v value) (int, error) {
 		return 0, newCurrentEvalError("expected number, got %s", v.schemeString())
 	}
 	return int(n), nil
+}
+
+func expectString(v value) (string, error) {
+	s, ok := v.(stringValue)
+	if !ok {
+		return "", newCurrentEvalError("expected string, got %s", v.schemeString())
+	}
+	return string(s), nil
+}
+
+func expectSymbol(v value) (string, error) {
+	s, ok := v.(symbolValue)
+	if !ok {
+		return "", newCurrentEvalError("expected symbol, got %s", v.schemeString())
+	}
+	return string(s), nil
 }
