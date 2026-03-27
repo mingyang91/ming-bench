@@ -39,6 +39,11 @@ type closureValue struct {
 	env    *env
 }
 
+type letBinding struct {
+	name string
+	init expr
+}
+
 type env struct {
 	parent *env
 	vars   map[string]value
@@ -197,6 +202,18 @@ func newGlobalEnv() *env {
 		return evalCompare(args, "<=", func(a, b int) bool { return a <= b })
 	}})
 	global.define("not", builtinProc{name: "not", fn: evalNot})
+	global.define("cons", builtinProc{name: "cons", fn: evalCons})
+	global.define("car", builtinProc{name: "car", fn: evalCar})
+	global.define("cdr", builtinProc{name: "cdr", fn: evalCdr})
+	global.define("append", builtinProc{name: "append", fn: evalAppend})
+	global.define("list", builtinProc{name: "list", fn: evalListBuiltin})
+	global.define("length", builtinProc{name: "length", fn: evalLength})
+	global.define("null?", builtinProc{name: "null?", fn: evalNullPred})
+	global.define("number?", builtinProc{name: "number?", fn: evalNumberPred})
+	global.define("boolean?", builtinProc{name: "boolean?", fn: evalBooleanPred})
+	global.define("string?", builtinProc{name: "string?", fn: evalStringPred})
+	global.define("pair?", builtinProc{name: "pair?", fn: evalPairPred})
+	global.define("symbol?", builtinProc{name: "symbol?", fn: evalSymbolPred})
 	return global
 }
 
@@ -263,12 +280,18 @@ func evalList(items listExpr, env *env) (value, error) {
 			return evalAnd(items[1:], env)
 		case "or":
 			return evalOr(items[1:], env)
+		case "begin":
+			return evalSequence(items[1:], env)
 		case "if":
 			return evalIf(items[1:], env)
+		case "cond":
+			return evalCond(items[1:], env)
 		case "define":
 			return evalDefine(items[1:], env)
 		case "quote":
 			return evalQuote(items[1:])
+		case "let":
+			return evalLet(items[1:], env)
 		case "lambda":
 			return evalLambda(items[1:], env)
 		}
@@ -418,6 +441,101 @@ func evalLambda(parts []expr, env *env) (value, error) {
 	}, nil
 }
 
+func evalCond(clauses []expr, env *env) (value, error) {
+	for i, clauseExpr := range clauses {
+		clause, ok := clauseExpr.(listExpr)
+		if !ok || len(clause) == 0 {
+			return nil, &EvalError{Message: "'cond' clauses must be non-empty lists"}
+		}
+
+		if keyword, ok := clause[0].(symbolExpr); ok && string(keyword) == "else" {
+			if i != len(clauses)-1 {
+				return nil, &EvalError{Message: "'cond' else clause must be last"}
+			}
+			if len(clause) == 1 {
+				return voidValue{}, nil
+			}
+			return evalSequence(clause[1:], env)
+		}
+
+		test, err := evalExpr(clause[0], env)
+		if err != nil {
+			return nil, err
+		}
+		if test.isTruthy() {
+			if len(clause) == 1 {
+				return test, nil
+			}
+			return evalSequence(clause[1:], env)
+		}
+	}
+
+	return voidValue{}, nil
+}
+
+func evalLet(parts []expr, env *env) (value, error) {
+	if len(parts) < 2 {
+		return nil, &EvalError{Message: "'let' expects bindings and a body"}
+	}
+
+	if name, ok := parts[0].(symbolExpr); ok {
+		if len(parts) < 3 {
+			return nil, &EvalError{Message: "named 'let' expects bindings and a body"}
+		}
+
+		bindingExprs, ok := parts[1].(listExpr)
+		if !ok {
+			return nil, &EvalError{Message: "'let' bindings must be a list"}
+		}
+
+		bindings, err := parseLetBindings(bindingExprs)
+		if err != nil {
+			return nil, err
+		}
+
+		args := make([]value, 0, len(bindings))
+		params := make([]string, 0, len(bindings))
+		for _, binding := range bindings {
+			arg, err := evalExpr(binding.init, env)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, arg)
+			params = append(params, binding.name)
+		}
+
+		letEnv := newEnv(env)
+		proc := closureValue{
+			params: params,
+			body:   parts[2:],
+			env:    letEnv,
+		}
+		letEnv.define(string(name), proc)
+		return proc.call(args)
+	}
+
+	bindingExprs, ok := parts[0].(listExpr)
+	if !ok {
+		return nil, &EvalError{Message: "'let' bindings must be a list"}
+	}
+
+	bindings, err := parseLetBindings(bindingExprs)
+	if err != nil {
+		return nil, err
+	}
+
+	letEnv := newEnv(env)
+	for _, binding := range bindings {
+		v, err := evalExpr(binding.init, env)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.define(binding.name, v)
+	}
+
+	return evalSequence(parts[1:], letEnv)
+}
+
 func parseParams(items []expr) ([]string, error) {
 	params := make([]string, 0, len(items))
 	seen := make(map[string]struct{}, len(items))
@@ -433,6 +551,35 @@ func parseParams(items []expr) ([]string, error) {
 		params = append(params, string(name))
 	}
 	return params, nil
+}
+
+func parseLetBindings(items listExpr) ([]letBinding, error) {
+	bindings := make([]letBinding, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+
+	for _, item := range items {
+		binding, ok := item.(listExpr)
+		if !ok || len(binding) != 2 {
+			return nil, &EvalError{Message: "'let' bindings must be (name value) pairs"}
+		}
+
+		name, ok := binding[0].(symbolExpr)
+		if !ok {
+			return nil, &EvalError{Message: "'let' binding names must be symbols"}
+		}
+
+		if _, exists := seen[string(name)]; exists {
+			return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", string(name))}
+		}
+		seen[string(name)] = struct{}{}
+
+		bindings = append(bindings, letBinding{
+			name: string(name),
+			init: binding[1],
+		})
+	}
+
+	return bindings, nil
 }
 
 func quoteExpr(e expr) (value, error) {
@@ -568,6 +715,165 @@ func evalNot(args []value) (value, error) {
 		return nil, &EvalError{Message: "'not' expects exactly 1 argument"}
 	}
 	return boolValue(!args[0].isTruthy()), nil
+}
+
+func evalCons(args []value) (value, error) {
+	if len(args) != 2 {
+		return nil, &EvalError{Message: "'cons' expects exactly 2 arguments"}
+	}
+	return pairValue{car: args[0], cdr: args[1]}, nil
+}
+
+func evalCar(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "'car' expects exactly 1 argument"}
+	}
+
+	pair, ok := args[0].(pairValue)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("'car' expects a pair, got %s", args[0].schemeString())}
+	}
+
+	return pair.car, nil
+}
+
+func evalCdr(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "'cdr' expects exactly 1 argument"}
+	}
+
+	pair, ok := args[0].(pairValue)
+	if !ok {
+		return nil, &EvalError{Message: fmt.Sprintf("'cdr' expects a pair, got %s", args[0].schemeString())}
+	}
+
+	return pair.cdr, nil
+}
+
+func evalAppend(args []value) (value, error) {
+	if len(args) == 0 {
+		return emptyList, nil
+	}
+	if len(args) == 1 {
+		return args[0], nil
+	}
+
+	var elems []value
+	for _, arg := range args[:len(args)-1] {
+		listElems, err := properListElements(arg)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, listElems...)
+	}
+
+	result := args[len(args)-1]
+	for i := len(elems) - 1; i >= 0; i-- {
+		result = pairValue{
+			car: elems[i],
+			cdr: result,
+		}
+	}
+
+	return result, nil
+}
+
+func evalListBuiltin(args []value) (value, error) {
+	result := value(emptyList)
+	for i := len(args) - 1; i >= 0; i-- {
+		result = pairValue{
+			car: args[i],
+			cdr: result,
+		}
+	}
+	return result, nil
+}
+
+func evalLength(args []value) (value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: "'length' expects exactly 1 argument"}
+	}
+
+	length, err := properListLength(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return numberValue(length), nil
+}
+
+func evalNullPred(args []value) (value, error) {
+	return evalTypePredicate(args, "null?", func(v value) bool {
+		_, ok := v.(emptyListValue)
+		return ok
+	})
+}
+
+func evalNumberPred(args []value) (value, error) {
+	return evalTypePredicate(args, "number?", func(v value) bool {
+		_, ok := v.(numberValue)
+		return ok
+	})
+}
+
+func evalBooleanPred(args []value) (value, error) {
+	return evalTypePredicate(args, "boolean?", func(v value) bool {
+		_, ok := v.(boolValue)
+		return ok
+	})
+}
+
+func evalStringPred(args []value) (value, error) {
+	return evalTypePredicate(args, "string?", func(v value) bool {
+		_, ok := v.(stringValue)
+		return ok
+	})
+}
+
+func evalPairPred(args []value) (value, error) {
+	return evalTypePredicate(args, "pair?", func(v value) bool {
+		_, ok := v.(pairValue)
+		return ok
+	})
+}
+
+func evalSymbolPred(args []value) (value, error) {
+	return evalTypePredicate(args, "symbol?", func(v value) bool {
+		_, ok := v.(symbolValue)
+		return ok
+	})
+}
+
+func evalTypePredicate(args []value, name string, pred func(value) bool) (value, error) {
+	if len(args) != 1 {
+		return nil, &EvalError{Message: fmt.Sprintf("'%s' expects exactly 1 argument", name)}
+	}
+	return boolValue(pred(args[0])), nil
+}
+
+func properListElements(v value) ([]value, error) {
+	var elems []value
+	current := v
+
+	for {
+		switch list := current.(type) {
+		case emptyListValue:
+			return elems, nil
+		case pairValue:
+			elems = append(elems, list.car)
+			current = list.cdr
+		default:
+			return nil, &EvalError{Message: fmt.Sprintf("expected list, got %s", v.schemeString())}
+		}
+	}
+}
+
+func properListLength(v value) (int, error) {
+	elems, err := properListElements(v)
+	if err != nil {
+		return 0, err
+	}
+	return len(elems), nil
 }
 
 func expectNumber(v value) (int, error) {

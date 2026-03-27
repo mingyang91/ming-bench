@@ -20,6 +20,7 @@ type tokenKind int
 const (
 	tokenLeftParen tokenKind = iota
 	tokenRightParen
+	tokenQuote
 	tokenAtom
 	tokenString
 )
@@ -80,6 +81,9 @@ func tokenize(input string) ([]token, error) {
 			i++
 		case ')':
 			tokens = append(tokens, token{kind: tokenRightParen, value: ")"})
+			i++
+		case '\'':
+			tokens = append(tokens, token{kind: tokenQuote, value: "'"})
 			i++
 		case '"':
 			value, next, err := readStringToken(input, i)
@@ -146,6 +150,12 @@ func (p *parser) parseExpr() (expr, error) {
 		return p.parseList()
 	case tokenRightParen:
 		return nil, &EvalError{Message: "unexpected ')'"}
+	case tokenQuote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return listExpr{symbolExpr("quote"), quoted}, nil
 	case tokenString:
 		return stringExpr(tok.value), nil
 	case tokenAtom:
