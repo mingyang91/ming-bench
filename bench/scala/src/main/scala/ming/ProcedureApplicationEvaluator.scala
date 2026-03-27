@@ -36,19 +36,17 @@ private[ming] object ProcedureApplicationEvaluator:
     savedWindFrames: List[WindFrame],
     savedHandlerFrames: List[ExceptionHandlerFrame]
   ): EvaluationStep =
-    arguments match
-      case value :: Nil =>
-        DynamicWindRuntime.transferToContinuation(
-          value,
-          savedContinuation,
-          savedWindFrames,
-          () => ExceptionRuntime.restoreHandlerFrames(savedHandlerFrames)
-        )
-      case _ =>
-        SchemeFailure.raise(
-          s"continuation expected 1 argument(s), got ${arguments.length}",
-          position
-        )
+    val resumedValue =
+      arguments match
+        case value :: Nil => value
+        case _            => MultipleValuesValue(arguments)
+
+    DynamicWindRuntime.transferToContinuation(
+      resumedValue,
+      savedContinuation,
+      savedWindFrames,
+      () => ExceptionRuntime.restoreHandlerFrames(savedHandlerFrames)
+    )
 
   private def applyCaseLambda(
     clauses: List[ClosureValue],

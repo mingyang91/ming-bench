@@ -13,6 +13,7 @@ private[ming] object MacroInstantiationHygiene:
     "define",
     "define-syntax",
     "do",
+    "guard",
     "if",
     "lambda",
     "let",
