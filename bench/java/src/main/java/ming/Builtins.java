@@ -17,6 +17,7 @@ final class Builtins {
     private final Function<String, StringValue> stringFactory;
     private final StringBuilder output;
     private final ValueEquality equality;
+    private final HigherOrderBuiltins higherOrderBuiltins;
 
     Builtins(
             Function<String, StringValue> stringFactory,
@@ -26,6 +27,7 @@ final class Builtins {
         this.stringFactory = stringFactory;
         this.output = output;
         this.equality = equality;
+        this.higherOrderBuiltins = new HigherOrderBuiltins(this);
     }
 
     Environment createGlobalEnvironment() {
@@ -55,7 +57,12 @@ final class Builtins {
         defineBuiltin(env, "length", this::applyLength);
         defineBuiltin(env, "append", this::applyAppend);
         defineBuiltin(env, "reverse", this::applyReverse);
-        defineBuiltin(env, "apply", this::applyApply);
+        defineBuiltin(env, "apply", this::applyApply, higherOrderBuiltins::invokeApply);
+        defineBuiltin(env, "call/cc", higherOrderBuiltins::applyCallWithCurrentContinuation,
+                higherOrderBuiltins::invokeCallWithCurrentContinuation);
+        defineBuiltin(env, "call-with-current-continuation",
+                higherOrderBuiltins::applyCallWithCurrentContinuation,
+                higherOrderBuiltins::invokeCallWithCurrentContinuation);
         defineBuiltin(env, "string-append", this::applyStringAppend);
         defineBuiltin(env, "make-string", this::applyMakeString);
         defineBuiltin(env, "string", this::applyString);
@@ -98,8 +105,8 @@ final class Builtins {
         defineBuiltin(env, "vector?", this::applyVectorPredicate);
         defineBuiltin(env, "vector->list", this::applyVectorToList);
         defineBuiltin(env, "list->vector", this::applyListToVector);
-        defineBuiltin(env, "map", this::applyMap);
-        defineBuiltin(env, "for-each", this::applyForEach);
+        defineBuiltin(env, "map", this::applyMap, higherOrderBuiltins::invokeMap);
+        defineBuiltin(env, "for-each", this::applyForEach, higherOrderBuiltins::invokeForEach);
         defineBuiltin(env, "abs", this::applyAbs);
         defineBuiltin(env, "modulo", this::applyModulo);
         defineBuiltin(env, "remainder", this::applyRemainder);
@@ -141,6 +148,15 @@ final class Builtins {
 
     private void defineBuiltin(Environment env, String name, BuiltinInvoker invoker) {
         env.define(name, new BuiltinProcedure(name, invoker));
+    }
+
+    private void defineBuiltin(
+            Environment env,
+            String name,
+            BuiltinInvoker invoker,
+            MachineBuiltinInvoker machineInvoker
+    ) {
+        env.define(name, new BuiltinProcedure(name, invoker, machineInvoker));
     }
 
     private StringValue createStringValue(String value) {
@@ -1181,6 +1197,19 @@ final class Builtins {
             return vectorValue;
         }
         throw error(callLoc, procedureName + " expects a vector");
+    }
+
+    List<Value> requireProperListValue(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        return requireProperList(value, procedureName, callLoc);
+    }
+
+    Value buildListValue(List<Value> elements) {
+        return buildList(elements);
+    }
+
+    EvalError errorAt(SourceLoc loc, String message) {
+        return error(loc, message);
     }
 
     private List<Value> requireProperList(Value value, String procedureName, SourceLoc callLoc)

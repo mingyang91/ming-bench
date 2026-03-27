@@ -65,6 +65,12 @@ final class CaseLambdaProcedure implements Value, Procedure, TailCallable {
         return runtime.evalSequence(task.expressions(), task.env());
     }
 
+    MachineState invoke(List<Value> arguments, SourceLoc callLoc, Continuation cont)
+            throws EvalError {
+        SequenceTask task = prepareTailCall(arguments, callLoc);
+        return new SequenceState(task.expressions(), task.env(), cont);
+    }
+
     @Override
     public SequenceTask prepareTailCall(List<Value> arguments, SourceLoc callLoc)
             throws EvalError {
@@ -149,6 +155,12 @@ final class UserProcedure implements Value, Procedure, TailCallable {
         return runtime.evalSequence(task.expressions(), task.env());
     }
 
+    MachineState invoke(List<Value> arguments, SourceLoc callLoc, Continuation cont)
+            throws EvalError {
+        SequenceTask task = prepareTailCall(arguments, callLoc);
+        return new SequenceState(task.expressions(), task.env(), cont);
+    }
+
     @Override
     public SequenceTask prepareTailCall(List<Value> arguments, SourceLoc callLoc)
             throws EvalError {
@@ -189,7 +201,40 @@ final class UserProcedure implements Value, Procedure, TailCallable {
         }
         callEnv.define(
                 restParameter,
-                runtime.buildList(arguments.subList(parameters.size(), arguments.size()))
+            runtime.buildList(arguments.subList(parameters.size(), arguments.size()))
         );
+    }
+}
+
+final class ContinuationProcedure implements Value, Procedure {
+    private final Continuation continuation;
+
+    ContinuationProcedure(Continuation continuation) {
+        this.continuation = continuation;
+    }
+
+    @Override
+    public String render() {
+        return "#<procedure:continuation>";
+    }
+
+    @Override
+    public Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactlyOne(arguments, callLoc);
+        return arguments.getFirst();
+    }
+
+    MachineState invoke(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactlyOne(arguments, callLoc);
+        return new ReturnState(arguments.getFirst(), continuation);
+    }
+
+    private void ensureExactlyOne(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        if (arguments.size() != 1) {
+            throw SchemeErrors.at(
+                    callLoc,
+                    "continuation expected 1 argument but got " + arguments.size()
+            );
+        }
     }
 }
