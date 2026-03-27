@@ -13,9 +13,11 @@ final class Interpreter {
 
     private final Environment globalEnv;
     private final StringBuilder output;
+    private final ProcedureRuntime procedureRuntime;
 
     Interpreter() {
         this.output = new StringBuilder();
+        this.procedureRuntime = new ProcedureRuntime(this::evalSequence, this::buildList);
         this.globalEnv = createGlobalEnv();
     }
 
@@ -77,6 +79,7 @@ final class Interpreter {
         env.define("numerator", new BuiltinProcedure("numerator", this::applyNumerator));
         env.define("denominator", new BuiltinProcedure("denominator", this::applyDenominator));
         env.define("boolean?", new BuiltinProcedure("boolean?", this::applyBooleanPredicate));
+        env.define("procedure?", new BuiltinProcedure("procedure?", this::applyProcedurePredicate));
         env.define("pair?", new BuiltinProcedure("pair?", this::applyPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::applySymbolPredicate));
         env.define("eq?", new BuiltinProcedure("eq?", this::applyEq));
@@ -148,6 +151,9 @@ final class Interpreter {
             }
             if ("lambda".equals(symbolName)) {
                 return evalLambda(listExpr, env);
+            }
+            if ("case-lambda".equals(symbolName)) {
+                return evalCaseLambda(listExpr, env);
             }
             if ("set!".equals(symbolName)) {
                 return evalSet(listExpr, env);
@@ -225,7 +231,8 @@ final class Interpreter {
                     parameters.requiredParameters(),
                     parameters.restParameter(),
                     body,
-                    env
+                    env,
+                    procedureRuntime
             );
             env.define(nameSymbol.name(), procedure);
             return VOID;
@@ -356,8 +363,43 @@ final class Interpreter {
                 parameters.requiredParameters(),
                 parameters.restParameter(),
                 body,
-                env
+                env,
+                procedureRuntime
         );
+    }
+
+    private Value evalCaseLambda(ListExpr listExpr, Environment env) throws EvalError {
+        ensureAtLeastExpressions("case-lambda", listExpr, 2);
+
+        List<CaseLambdaClause> clauses = new ArrayList<>(listExpr.elements().size() - 1);
+        for (int index = 1; index < listExpr.elements().size(); index++) {
+            Expr clauseExpr = listExpr.elements().get(index);
+            if (!(clauseExpr instanceof ListExpr clauseList)) {
+                throw error(clauseExpr.loc(), "case-lambda clauses must be lists");
+            }
+            if (clauseList.elements().isEmpty()) {
+                throw error(clauseExpr.loc(), "case-lambda clauses cannot be empty");
+            }
+
+            Expr parametersExpr = clauseList.elements().getFirst();
+            if (!(parametersExpr instanceof ListExpr parametersList)) {
+                throw error(parametersExpr.loc(), "case-lambda clauses require a parameter list");
+            }
+
+            ParameterSpec parameters = parseParameters(parametersList.elements(), "case-lambda");
+            List<Expr> body = List.copyOf(clauseList.elements().subList(1, clauseList.elements().size()));
+            if (body.isEmpty()) {
+                throw error(clauseExpr.loc(), "case-lambda clauses must have a body");
+            }
+
+            clauses.add(new CaseLambdaClause(
+                    parameters.requiredParameters(),
+                    parameters.restParameter(),
+                    body
+            ));
+        }
+
+        return new CaseLambdaProcedure(clauses, env, procedureRuntime);
     }
 
     private Value evalSet(ListExpr listExpr, Environment env) throws EvalError {
@@ -402,7 +444,8 @@ final class Interpreter {
                     bindings.names(),
                     null,
                     body,
-                    namedLetEnv
+                    namedLetEnv,
+                    procedureRuntime
             );
             namedLetEnv.define(nameSymbol.name(), procedure);
             return procedure.apply(bindings.values(), listExpr.loc());
@@ -769,6 +812,11 @@ final class Interpreter {
     private Value applyBooleanPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("boolean?", arguments, 1, callLoc);
         return arguments.getFirst() instanceof BooleanValue ? TRUE : FALSE;
+    }
+
+    private Value applyProcedurePredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("procedure?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof Procedure ? TRUE : FALSE;
     }
 
     private Value applyPairPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -1429,62 +1477,5 @@ final class Interpreter {
     @FunctionalInterface
     private interface NumberComparison {
         boolean test(SchemeNumber left, SchemeNumber right);
-    }
-
-    private final class UserProcedure implements Value, Procedure {
-        private final String name;
-        private final List<String> parameters;
-        private final String restParameter;
-        private final List<Expr> body;
-        private final Environment closureEnv;
-
-        private UserProcedure(
-                String name,
-                List<String> parameters,
-                String restParameter,
-                List<Expr> body,
-                Environment closureEnv
-        ) {
-            this.name = name;
-            this.parameters = parameters;
-            this.restParameter = restParameter;
-            this.body = body;
-            this.closureEnv = closureEnv;
-        }
-
-        @Override
-        public String render() {
-            return "#<procedure:" + name + ">";
-        }
-
-        @Override
-        public Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError {
-            if (restParameter == null && arguments.size() != parameters.size()) {
-                throw error(
-                        callLoc,
-                        name + " expected " + parameters.size() + " arguments but got "
-                                + arguments.size()
-                );
-            }
-            if (restParameter != null && arguments.size() < parameters.size()) {
-                throw error(
-                        callLoc,
-                        name + " expected at least " + parameters.size() + " arguments but got "
-                                + arguments.size()
-                );
-            }
-
-            Environment callEnv = new Environment(closureEnv);
-            for (int index = 0; index < parameters.size(); index++) {
-                callEnv.define(parameters.get(index), arguments.get(index));
-            }
-            if (restParameter != null) {
-                callEnv.define(
-                        restParameter,
-                        buildList(arguments.subList(parameters.size(), arguments.size()))
-                );
-            }
-            return evalSequence(body, callEnv);
-        }
     }
 }

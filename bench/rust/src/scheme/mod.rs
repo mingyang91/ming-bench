@@ -81,6 +81,7 @@ enum RenderMode {
 enum Procedure {
     Builtin(BuiltinProcedure),
     Lambda(LambdaProcedure),
+    CaseLambda(CaseLambdaProcedure),
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +97,12 @@ struct LambdaProcedure {
     rest: Option<String>,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct CaseLambdaProcedure {
+    name: Option<String>,
+    clauses: Vec<LambdaProcedure>,
 }
 
 #[derive(Clone)]
@@ -250,6 +257,10 @@ impl Procedure {
                 Some(name) => format!("#<procedure:{name}>"),
                 None => "#<procedure>".to_string(),
             },
+            Self::CaseLambda(case_lambda) => match &case_lambda.name {
+                Some(name) => format!("#<procedure:{name}>"),
+                None => "#<procedure>".to_string(),
+            },
         }
     }
 }
@@ -263,11 +274,13 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "<", builtin_less_than);
     define_builtin(&env, ">", builtin_greater_than);
     define_builtin(&env, "=", builtin_numeric_equals);
+    define_builtin(&env, "equal?", builtin_equal);
     define_builtin(&env, "<=", builtin_less_equal);
     define_builtin(&env, "not", builtin_not);
     define_builtin(&env, "cons", builtin_cons);
     define_builtin(&env, "list", builtin_list);
     define_builtin(&env, "null?", builtin_null_predicate);
+    define_builtin(&env, "procedure?", builtin_procedure_predicate);
     define_builtin(&env, "car", builtin_car);
     define_builtin(&env, "cdr", builtin_cdr);
     define_builtin(&env, "apply", builtin_apply);
@@ -324,6 +337,7 @@ fn eval_list(items: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, 
             "let" => return eval_let(tail, env, output),
             "quote" => return eval_quote(tail),
             "set!" => return eval_set(tail, env, output),
+            "case-lambda" => return eval_case_lambda(tail, env),
             "lambda" => return eval_lambda(tail, env),
             _ => {}
         }
@@ -368,7 +382,8 @@ fn eval_define(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value,
                 return Err(EvalError::msg("function name must be a symbol"));
             };
 
-            let lambda = build_lambda(params, &args[1..], env, Some(name.clone()))?;
+            let formals = Expr::List(params.to_vec());
+            let lambda = build_lambda(&formals, &args[1..], env, Some(name.clone()))?;
             Environment::define(env, name.clone(), lambda);
             Ok(Value::Void)
         }
@@ -448,11 +463,11 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         return Err(EvalError::msg("lambda requires a parameter list and body"));
     }
 
-    let Expr::List(params) = &args[0] else {
-        return Err(EvalError::msg("lambda parameters must be a list"));
-    };
+    build_lambda(&args[0], &args[1..], env, None)
+}
 
-    build_lambda(params, &args[1..], env, None)
+fn eval_case_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    build_case_lambda(args, env, None)
 }
 
 fn eval_define_syntax(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
@@ -470,28 +485,76 @@ fn eval_define_syntax(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 }
 
 fn build_lambda(
-    params: &[Expr],
+    formals: &Expr,
     body: &[Expr],
     env: &EnvRef,
     name: Option<String>,
 ) -> Result<Value, EvalError> {
+    let lambda = build_lambda_procedure(formals, body, env, name)?;
+    Ok(Value::Procedure(Rc::new(Procedure::Lambda(lambda))))
+}
+
+fn build_case_lambda(
+    clauses: &[Expr],
+    env: &EnvRef,
+    name: Option<String>,
+) -> Result<Value, EvalError> {
+    if clauses.is_empty() {
+        return Err(EvalError::msg("case-lambda requires at least one clause"));
+    }
+
+    let mut parsed_clauses = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::msg("case-lambda clauses must be lists"));
+        };
+
+        let Some((formals, body)) = items.split_first() else {
+            return Err(EvalError::msg(
+                "case-lambda clauses require parameters and body",
+            ));
+        };
+
+        parsed_clauses.push(build_lambda_procedure(formals, body, env, name.clone())?);
+    }
+
+    Ok(Value::Procedure(Rc::new(Procedure::CaseLambda(
+        CaseLambdaProcedure {
+            name,
+            clauses: parsed_clauses,
+        },
+    ))))
+}
+
+fn build_lambda_procedure(
+    formals: &Expr,
+    body: &[Expr],
+    env: &EnvRef,
+    name: Option<String>,
+) -> Result<LambdaProcedure, EvalError> {
     if body.is_empty() {
         return Err(EvalError::msg(
             "lambda requires at least one body expression",
         ));
     }
 
-    let (param_names, rest_param) = parse_parameter_list(params)?;
+    let (param_names, rest_param) = parse_formals(formals)?;
 
-    Ok(Value::Procedure(Rc::new(Procedure::Lambda(
-        LambdaProcedure {
-            name,
-            params: param_names,
-            rest: rest_param,
-            body: body.to_vec(),
-            env: Rc::clone(env),
-        },
-    ))))
+    Ok(LambdaProcedure {
+        name,
+        params: param_names,
+        rest: rest_param,
+        body: body.to_vec(),
+        env: Rc::clone(env),
+    })
+}
+
+fn parse_formals(formals: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
+    match formals {
+        Expr::List(params) => parse_parameter_list(params),
+        Expr::Symbol(name) => Ok((Vec::new(), Some(name.clone()))),
+        _ => Err(EvalError::msg("lambda parameters must be a list or symbol")),
+    }
 }
 
 fn parse_parameter_list(params: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalError> {
@@ -833,6 +896,7 @@ fn is_core_syntax(name: &str) -> bool {
         "and"
             | "or"
             | "begin"
+            | "case-lambda"
             | "define"
             | "define-syntax"
             | "if"
@@ -914,6 +978,7 @@ fn apply(procedure: Value, arguments: Vec<Value>, output: &OutputRef) -> Result<
     match procedure.as_ref() {
         Procedure::Builtin(builtin) => (builtin.func)(&arguments, output),
         Procedure::Lambda(lambda) => apply_lambda(lambda, arguments, output),
+        Procedure::CaseLambda(case_lambda) => apply_case_lambda(case_lambda, arguments, output),
     }
 }
 
@@ -947,6 +1012,34 @@ fn apply_lambda(
     }
 
     eval_sequence(&lambda.body, &call_env, output)
+}
+
+fn apply_case_lambda(
+    case_lambda: &CaseLambdaProcedure,
+    arguments: Vec<Value>,
+    output: &OutputRef,
+) -> Result<Value, EvalError> {
+    let argument_count = arguments.len();
+    let Some(clause) = case_lambda
+        .clauses
+        .iter()
+        .find(|clause| lambda_accepts_arity(clause, argument_count))
+    else {
+        let procedure_name = case_lambda.name.as_deref().unwrap_or("case-lambda");
+        return Err(EvalError::msg(format!(
+            "{procedure_name} has no matching clause for {argument_count} arguments"
+        )));
+    };
+
+    apply_lambda(clause, arguments, output)
+}
+
+fn lambda_accepts_arity(lambda: &LambdaProcedure, argument_count: usize) -> bool {
+    if lambda.rest.is_some() {
+        argument_count >= lambda.params.len()
+    } else {
+        argument_count == lambda.params.len()
+    }
 }
 
 fn builtin_add(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
@@ -1018,6 +1111,11 @@ fn builtin_numeric_equals(arguments: &[Value], _output: &OutputRef) -> Result<Va
     compare_numbers(arguments, "=", |left, right| left == right)
 }
 
+fn builtin_equal(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("equal?", arguments.len(), 2)?;
+    Ok(Value::Bool(values_equal(&arguments[0], &arguments[1])))
+}
+
 fn builtin_less_equal(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     compare_numbers(arguments, "<=", |left, right| left <= right)
 }
@@ -1050,6 +1148,14 @@ fn builtin_null_predicate(arguments: &[Value], _output: &OutputRef) -> Result<Va
         &arguments[0],
         Value::List(values) if values.is_empty()
     )))
+}
+
+fn builtin_procedure_predicate(
+    arguments: &[Value],
+    _output: &OutputRef,
+) -> Result<Value, EvalError> {
+    ensure_exactly("procedure?", arguments.len(), 1)?;
+    Ok(Value::Bool(matches!(arguments[0], Value::Procedure(_))))
 }
 
 fn builtin_car(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
@@ -1196,6 +1302,26 @@ fn compare_numbers(
     }
 
     Ok(Value::Bool(true))
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left == right,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::List(left), Value::List(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| values_equal(left, right))
+        }
+        (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
 }
 
 fn ensure_exactly(name: &str, actual: usize, expected: usize) -> Result<(), EvalError> {
