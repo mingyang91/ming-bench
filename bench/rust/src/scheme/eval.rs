@@ -10,7 +10,8 @@ pub type Output = Rc<RefCell<String>>;
 pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     match expr {
         Value::Integer(_) | Value::Boolean(_) | Value::String(_)
-        | Value::Char(_) | Value::Lambda { .. } | Value::Pair(_, _) => {
+        | Value::Char(_) | Value::Lambda { .. } | Value::Pair(_, _)
+        | Value::SyntaxRules { .. } => {
             Ok(expr.clone())
         }
         Value::Symbol(name) => env.borrow().get(name),
@@ -36,7 +37,16 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
                     "cond" => return eval_cond(&elems[1..], env, out),
                     "set!" => return eval_set_bang(&elems[1..], env, out),
                     "string-set!" => return eval_string_set(&elems[1..], env, out),
-                    _ => {}
+                    "define-syntax" => return eval_define_syntax(&elems[1..], env, out),
+                    _ => {
+                        // Check if symbol is bound to a macro
+                        // Clone to release borrow before eval
+                        let maybe_macro = env.borrow().get(op).ok();
+                        if let Some(Value::SyntaxRules { ref literals, ref rules, ref def_env }) = maybe_macro {
+                            let expanded = expand_macro(literals, rules, def_env, elems)?;
+                            return eval(&expanded, env, out);
+                        }
+                    }
                 }
             }
             let func = eval(&elems[0], env, out)?;
@@ -848,6 +858,273 @@ fn expect_int(v: &Value) -> Result<i64, EvalError> {
         Value::Integer(n) => Ok(*n),
         _ => Err(EvalError::Type(format!("expected number, got {}", v))),
     }
+}
+
+// --- Macro support (L10) ---
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+enum MacroBinding {
+    Single(Value),
+    Ellipsis(Vec<Value>),
+}
+
+fn eval_define_syntax(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Arity("define-syntax requires 2 arguments".into()));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("define-syntax: expected symbol".into())),
+    };
+    let transformer = eval_syntax_rules(&args[1], env)?;
+    env.borrow_mut().set(name, transformer);
+    let _ = out; // unused but kept for consistency
+    Ok(Value::Void)
+}
+
+fn eval_syntax_rules(expr: &Value, env: &Rc<RefCell<Env>>) -> Result<Value, EvalError> {
+    let elems = match expr {
+        Value::List(e) => e,
+        _ => return Err(EvalError::Type("syntax-rules: expected list".into())),
+    };
+    if elems.len() < 3 {
+        return Err(EvalError::Arity("syntax-rules requires literals and rules".into()));
+    }
+    if !matches!(&elems[0], Value::Symbol(s) if s == "syntax-rules") {
+        return Err(EvalError::Type("expected syntax-rules".into()));
+    }
+    let literals = match &elems[1] {
+        Value::List(lits) => {
+            let mut result = Vec::new();
+            for lit in lits {
+                match lit {
+                    Value::Symbol(s) => result.push(s.clone()),
+                    _ => return Err(EvalError::Type("syntax-rules: literals must be symbols".into())),
+                }
+            }
+            result
+        }
+        _ => return Err(EvalError::Type("syntax-rules: expected literals list".into())),
+    };
+    let mut rules = Vec::new();
+    for rule in &elems[2..] {
+        match rule {
+            Value::List(parts) if parts.len() == 2 => {
+                rules.push((parts[0].clone(), parts[1].clone()));
+            }
+            _ => return Err(EvalError::Type("syntax-rules: each rule must be (pattern template)".into())),
+        }
+    }
+    Ok(Value::SyntaxRules {
+        literals,
+        rules,
+        def_env: Rc::clone(env),
+    })
+}
+
+fn expand_macro(
+    literals: &[String],
+    rules: &[(Value, Value)],
+    def_env: &Rc<RefCell<Env>>,
+    input: &[Value],
+) -> Result<Value, EvalError> {
+    let input_list = Value::List(input.to_vec());
+    for (pattern, template) in rules {
+        let mut bindings = HashMap::new();
+        if match_syntax_rule(pattern, &input_list, literals, &mut bindings) {
+            return instantiate_template(template, &bindings, def_env);
+        }
+    }
+    Err(EvalError::Type("no matching syntax-rules pattern".into()))
+}
+
+fn match_syntax_rule(
+    pattern: &Value,
+    input: &Value,
+    literals: &[String],
+    bindings: &mut HashMap<String, MacroBinding>,
+) -> bool {
+    match (pattern, input) {
+        (Value::List(pat_elems), Value::List(inp_elems)) => {
+            if pat_elems.is_empty() {
+                return inp_elems.is_empty();
+            }
+            // Skip the macro name (first element of pattern)
+            match_elements(&pat_elems[1..], &inp_elems[1..], literals, bindings)
+        }
+        _ => false,
+    }
+}
+
+fn match_elements(
+    patterns: &[Value],
+    inputs: &[Value],
+    literals: &[String],
+    bindings: &mut HashMap<String, MacroBinding>,
+) -> bool {
+    let mut pi = 0;
+    let mut ii = 0;
+
+    while pi < patterns.len() {
+        let has_ellipsis = pi + 1 < patterns.len()
+            && matches!(&patterns[pi + 1], Value::Symbol(s) if s == "...");
+
+        if has_ellipsis {
+            let pat = &patterns[pi];
+            let mut matches = Vec::new();
+            // Ellipsis greedily matches remaining elements (minus what's needed for remaining patterns)
+            let remaining_fixed = count_fixed_patterns(&patterns[pi + 2..]);
+            let available = if inputs.len() >= ii + remaining_fixed {
+                inputs.len() - remaining_fixed
+            } else {
+                ii
+            };
+            while ii < available {
+                let mut sub_bindings = HashMap::new();
+                if match_single(pat, &inputs[ii], literals, &mut sub_bindings) {
+                    matches.push(inputs[ii].clone());
+                    ii += 1;
+                } else {
+                    break;
+                }
+            }
+            if let Value::Symbol(s) = pat {
+                if !literals.contains(s) {
+                    bindings.insert(s.clone(), MacroBinding::Ellipsis(matches));
+                }
+            }
+            pi += 2; // skip pattern and ellipsis
+        } else {
+            if ii >= inputs.len() {
+                return false;
+            }
+            if !match_single(&patterns[pi], &inputs[ii], literals, bindings) {
+                return false;
+            }
+            pi += 1;
+            ii += 1;
+        }
+    }
+    ii == inputs.len()
+}
+
+fn count_fixed_patterns(patterns: &[Value]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < patterns.len() {
+        let has_ellipsis = i + 1 < patterns.len()
+            && matches!(&patterns[i + 1], Value::Symbol(s) if s == "...");
+        if has_ellipsis {
+            i += 2;
+        } else {
+            count += 1;
+            i += 1;
+        }
+    }
+    count
+}
+
+fn match_single(
+    pattern: &Value,
+    input: &Value,
+    literals: &[String],
+    bindings: &mut HashMap<String, MacroBinding>,
+) -> bool {
+    match pattern {
+        Value::Symbol(s) if s == "_" => true,
+        Value::Symbol(s) if literals.contains(s) => {
+            matches!(input, Value::Symbol(t) if t == s)
+        }
+        Value::Symbol(s) => {
+            bindings.insert(s.clone(), MacroBinding::Single(input.clone()));
+            true
+        }
+        Value::List(pat_elems) => {
+            if let Value::List(inp_elems) = input {
+                match_elements(pat_elems, inp_elems, literals, bindings)
+            } else {
+                false
+            }
+        }
+        _ => pattern == input,
+    }
+}
+
+fn instantiate_template(
+    template: &Value,
+    bindings: &HashMap<String, MacroBinding>,
+    def_env: &Rc<RefCell<Env>>,
+) -> Result<Value, EvalError> {
+    match template {
+        Value::Symbol(s) => {
+            if let Some(binding) = bindings.get(s) {
+                match binding {
+                    MacroBinding::Single(v) => Ok(v.clone()),
+                    MacroBinding::Ellipsis(_) => Ok(template.clone()),
+                }
+            } else {
+                // Hygiene: for free variables, check definition-site env
+                // Only inline self-evaluating values (Integer, Boolean, String, Char)
+                if let Ok(val) = def_env.borrow().get(s) {
+                    match &val {
+                        Value::Integer(_) | Value::Boolean(_)
+                        | Value::String(_) | Value::Char(_) => Ok(val),
+                        _ => Ok(template.clone()),
+                    }
+                } else {
+                    Ok(template.clone())
+                }
+            }
+        }
+        Value::List(elems) => {
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < elems.len() {
+                let has_ellipsis = i + 1 < elems.len()
+                    && matches!(&elems[i + 1], Value::Symbol(s) if s == "...");
+
+                if has_ellipsis {
+                    let ellipsis_vars = collect_ellipsis_vars(&elems[i], bindings);
+                    if let Some(var_name) = ellipsis_vars.first() {
+                        if let Some(MacroBinding::Ellipsis(vals)) = bindings.get(var_name) {
+                            for val in vals {
+                                let mut local_bindings = bindings.clone();
+                                // Override all ellipsis vars for this iteration
+                                local_bindings.insert(var_name.clone(), MacroBinding::Single(val.clone()));
+                                result.push(instantiate_template(&elems[i], &local_bindings, def_env)?);
+                            }
+                        }
+                    }
+                    i += 2;
+                } else {
+                    result.push(instantiate_template(&elems[i], bindings, def_env)?);
+                    i += 1;
+                }
+            }
+            Ok(Value::List(result))
+        }
+        _ => Ok(template.clone()),
+    }
+}
+
+fn collect_ellipsis_vars(template: &Value, bindings: &HashMap<String, MacroBinding>) -> Vec<String> {
+    let mut vars = Vec::new();
+    match template {
+        Value::Symbol(s) => {
+            if let Some(MacroBinding::Ellipsis(_)) = bindings.get(s) {
+                vars.push(s.clone());
+            }
+        }
+        Value::List(elems) => {
+            for e in elems {
+                vars.extend(collect_ellipsis_vars(e, bindings));
+            }
+        }
+        _ => {}
+    }
+    vars
 }
 
 fn compare_nums(vals: &[Value], pred: fn(i64, i64) -> bool) -> Result<Value, EvalError> {

@@ -20,6 +20,11 @@ pub enum Value {
     Char(char),
     Pair(Box<Value>, Box<Value>),
     Void,
+    SyntaxRules {
+        literals: Vec<std::string::String>,
+        rules: Vec<(Value, Value)>,
+        def_env: Rc<RefCell<Env>>,
+    },
 }
 
 impl PartialEq for Value {
@@ -34,6 +39,7 @@ impl PartialEq for Value {
             (Value::Pair(a1, a2), Value::Pair(b1, b2)) => a1 == b1 && a2 == b2,
             (Value::Void, Value::Void) => true,
             (Value::Lambda { .. }, Value::Lambda { .. }) => false,
+            (Value::SyntaxRules { .. }, Value::SyntaxRules { .. }) => false,
             _ => false,
         }
     }
@@ -60,6 +66,7 @@ impl Value {
             },
             Value::Pair(a, b) => format!("({} . {})", a.to_display(), b.to_display()),
             Value::Lambda { .. } => "#<procedure>".into(),
+            Value::SyntaxRules { .. } => "#<syntax>".into(),
             Value::Void => "".into(),
         }
     }
