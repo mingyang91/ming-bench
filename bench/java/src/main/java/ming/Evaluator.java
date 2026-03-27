@@ -10,24 +10,35 @@ import java.util.Map;
  */
 public class Evaluator {
     private final Environment globalEnv = createGlobalEnv();
+    private StringBuilder currentOutput;
 
     public String evalStr(String input) throws EvalError {
+        return evalProgram(input).result();
+    }
+
+    public EvalResult evalStrWithOutput(String input) throws EvalError {
+        return evalProgram(input);
+    }
+
+    private EvalResult evalProgram(String input) throws EvalError {
         Parser parser = new Parser(input);
         List<Expr> program = parser.parseProgram();
         if (program.isEmpty()) {
             throw new EvalError("empty input", 1, 1);
         }
 
-        Value last = VoidValue.INSTANCE;
-        for (Expr expr : program) {
-            last = eval(expr, globalEnv);
+        StringBuilder previousOutput = currentOutput;
+        currentOutput = new StringBuilder();
+        try {
+            Value last = VoidValue.INSTANCE;
+            for (Expr expr : program) {
+                last = eval(expr, globalEnv);
+            }
+
+            return new EvalResult(last.toSchemeString(), currentOutput.toString());
+        } finally {
+            currentOutput = previousOutput;
         }
-
-        return last.toSchemeString();
-    }
-
-    public EvalResult evalStrWithOutput(String input) throws EvalError {
-        return new EvalResult(evalStr(input), "");
     }
 
     private Environment createGlobalEnv() {
@@ -53,6 +64,18 @@ public class Evaluator {
         env.define("boolean?", new BuiltinProcedure("boolean?", this::builtinBooleanPredicate));
         env.define("pair?", new BuiltinProcedure("pair?", this::builtinPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::builtinSymbolPredicate));
+        env.define("display", new BuiltinProcedure("display", this::builtinDisplay));
+        env.define("write", new BuiltinProcedure("write", this::builtinWrite));
+        env.define("newline", new BuiltinProcedure("newline", this::builtinNewline));
+        env.define("string-append", new BuiltinProcedure("string-append", this::builtinStringAppend));
+        env.define("string-length", new BuiltinProcedure("string-length", this::builtinStringLength));
+        env.define("substring", new BuiltinProcedure("substring", this::builtinSubstring));
+        env.define("string->number", new BuiltinProcedure("string->number", this::builtinStringToNumber));
+        env.define("number->string", new BuiltinProcedure("number->string", this::builtinNumberToString));
+        env.define("symbol->string", new BuiltinProcedure("symbol->string", this::builtinSymbolToString));
+        env.define("string->symbol", new BuiltinProcedure("string->symbol", this::builtinStringToSymbol));
+        env.define("string-ref", new BuiltinProcedure("string-ref", this::builtinStringRef));
+        env.define("char?", new BuiltinProcedure("char?", this::builtinCharPredicate));
         return env;
     }
 
@@ -500,6 +523,87 @@ public class Evaluator {
         return BoolValue.of(args.getFirst() instanceof SymbolValue);
     }
 
+    private Value builtinDisplay(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "display");
+        appendOutput(args.getFirst().toDisplayString());
+        return VoidValue.INSTANCE;
+    }
+
+    private Value builtinWrite(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "write");
+        appendOutput(args.getFirst().toSchemeString());
+        return VoidValue.INSTANCE;
+    }
+
+    private Value builtinNewline(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 0, "newline");
+        appendOutput("\n");
+        return VoidValue.INSTANCE;
+    }
+
+    private Value builtinStringAppend(List<Value> args) throws EvalError {
+        StringBuilder builder = new StringBuilder();
+        for (Value arg : args) {
+            builder.append(requireString(arg, "string-append"));
+        }
+        return new StringValue(builder.toString());
+    }
+
+    private Value builtinStringLength(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "string-length");
+        return new IntValue(requireString(args.getFirst(), "string-length").length());
+    }
+
+    private Value builtinSubstring(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 3, "substring");
+        String value = requireString(args.getFirst(), "substring");
+        int start = requireSubstringIndex(args.get(1), value.length(), "substring");
+        int end = requireSubstringIndex(args.get(2), value.length(), "substring");
+        if (end < start) {
+            throw new EvalError("'substring' expects start <= end");
+        }
+        return new StringValue(value.substring(start, end));
+    }
+
+    private Value builtinStringToNumber(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "string->number");
+        Long parsed = parseIntegerLiteral(requireString(args.getFirst(), "string->number"));
+        if (parsed == null) {
+            return BoolValue.FALSE;
+        }
+        return new IntValue(parsed);
+    }
+
+    private Value builtinNumberToString(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "number->string");
+        return new StringValue(Long.toString(requireInt(args.getFirst())));
+    }
+
+    private Value builtinSymbolToString(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "symbol->string");
+        if (args.getFirst() instanceof SymbolValue symbolValue) {
+            return new StringValue(symbolValue.name());
+        }
+        throw new EvalError("'symbol->string' expects a symbol");
+    }
+
+    private Value builtinStringToSymbol(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "string->symbol");
+        return new SymbolValue(requireString(args.getFirst(), "string->symbol"));
+    }
+
+    private Value builtinStringRef(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 2, "string-ref");
+        String value = requireString(args.getFirst(), "string-ref");
+        int index = requireElementIndex(args.get(1), value.length(), "string-ref");
+        return new CharValue(value.charAt(index));
+    }
+
+    private Value builtinCharPredicate(List<Value> args) throws EvalError {
+        requireArgCount(args.size(), 1, "char?");
+        return BoolValue.of(args.getFirst() instanceof CharValue);
+    }
+
     private EvalError attachPosition(EvalError err, Expr expr) {
         if (err.hasPosition()) {
             return err;
@@ -521,11 +625,34 @@ public class Evaluator {
         throw new EvalError("expected number");
     }
 
+    private String requireString(Value value, String procedure) throws EvalError {
+        if (value instanceof StringValue stringValue) {
+            return stringValue.value();
+        }
+        throw new EvalError("'" + procedure + "' expects a string");
+    }
+
     private List<Value> requireList(Value value, String procedure) throws EvalError {
         if (value instanceof ListValue listValue) {
             return listValue.elements();
         }
         throw new EvalError("'" + procedure + "' expects a list");
+    }
+
+    private int requireElementIndex(Value value, int size, String procedure) throws EvalError {
+        long index = requireInt(value);
+        if (index < 0 || index >= size) {
+            throw new EvalError("'" + procedure + "' index out of range");
+        }
+        return Math.toIntExact(index);
+    }
+
+    private int requireSubstringIndex(Value value, int size, String procedure) throws EvalError {
+        long index = requireInt(value);
+        if (index < 0 || index > size) {
+            throw new EvalError("'" + procedure + "' index out of range");
+        }
+        return Math.toIntExact(index);
     }
 
     private List<Value> requireNonEmptyList(Value value, String procedure) throws EvalError {
@@ -538,6 +665,12 @@ public class Evaluator {
 
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
+    }
+
+    private void appendOutput(String text) {
+        if (currentOutput != null) {
+            currentOutput.append(text);
+        }
     }
 
     private enum Comparison {
@@ -595,8 +728,12 @@ public class Evaluator {
     }
 
     private sealed interface Value permits IntValue, BoolValue, StringValue, SymbolValue,
-            ListValue, ProcedureValue, VoidValue {
+            CharValue, ListValue, ProcedureValue, VoidValue {
         String toSchemeString();
+
+        default String toDisplayString() {
+            return toSchemeString();
+        }
     }
 
     private sealed interface ProcedureValue extends Value permits BuiltinProcedure, ClosureValue {
@@ -628,12 +765,29 @@ public class Evaluator {
         public String toSchemeString() {
             return quoteString(value);
         }
+
+        @Override
+        public String toDisplayString() {
+            return value;
+        }
     }
 
     private record SymbolValue(String name) implements Value {
         @Override
         public String toSchemeString() {
             return name;
+        }
+    }
+
+    private record CharValue(char value) implements Value {
+        @Override
+        public String toSchemeString() {
+            return charToSchemeString(value);
+        }
+
+        @Override
+        public String toDisplayString() {
+            return Character.toString(value);
         }
     }
 
@@ -728,6 +882,41 @@ public class Evaluator {
         }
         builder.append('"');
         return builder.toString();
+    }
+
+    private static String charToSchemeString(char value) {
+        return switch (value) {
+            case ' ' -> "#\\space";
+            case '\n' -> "#\\newline";
+            default -> "#\\" + value;
+        };
+    }
+
+    private static Long parseIntegerLiteral(String text) {
+        if (!isIntegerLiteral(text)) {
+            return null;
+        }
+        try {
+            return Long.parseLong(text);
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
+
+    private static boolean isIntegerLiteral(String text) {
+        if (text.isEmpty()) {
+            return false;
+        }
+        int start = (text.charAt(0) == '+' || text.charAt(0) == '-') ? 1 : 0;
+        if (start == text.length()) {
+            return false;
+        }
+        for (int i = start; i < text.length(); i++) {
+            if (!Character.isDigit(text.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static final class Parser {
@@ -835,31 +1024,15 @@ public class Evaluator {
             if (atom.equals("#f")) {
                 return new BoolExpr(false, start);
             }
-            if (isInteger(atom)) {
-                try {
-                    return new IntExpr(Long.parseLong(atom), start);
-                } catch (NumberFormatException ex) {
-                    throw new EvalError("invalid integer literal: " + atom,
-                            start.line(), start.column());
-                }
+            Long integerValue = parseIntegerLiteral(atom);
+            if (integerValue != null) {
+                return new IntExpr(integerValue, start);
+            }
+            if (isIntegerLiteral(atom)) {
+                throw new EvalError("invalid integer literal: " + atom,
+                        start.line(), start.column());
             }
             return new SymbolExpr(atom, start);
-        }
-
-        private boolean isInteger(String text) {
-            if (text.isEmpty()) {
-                return false;
-            }
-            int start = (text.charAt(0) == '+' || text.charAt(0) == '-') ? 1 : 0;
-            if (start == text.length()) {
-                return false;
-            }
-            for (int i = start; i < text.length(); i++) {
-                if (!Character.isDigit(text.charAt(i))) {
-                    return false;
-                }
-            }
-            return true;
         }
 
         private void skipIgnored() {
