@@ -673,7 +673,7 @@ public class Evaluator {
                     case "begin" -> {
                         if (list.size() == 1) return null;
                         for (int i = 1; i < list.size() - 1; i++) {
-                            eval(list.get(i), env);
+                            resolve(eval(list.get(i), env));
                         }
                         return new TailCall(list.getLast(), env);
                     }
@@ -718,7 +718,12 @@ public class Evaluator {
                         }
                         boolean contCapturedInLet = false;
                         for (int i = 2; i < list.size() - 1; i++) {
-                            eval(list.get(i), letEnv);
+                            try {
+                                resolve(eval(list.get(i), letEnv));
+                            } catch (ContinuationResume cr) {
+                                // Continuation invoked during non-tail expression; abandon and proceed to tail
+                                break;
+                            }
                             if (lastCapturedCont != null && lastCapturedCont.capturedBody == null) {
                                 lastCapturedCont.capturedBody = list;
                                 lastCapturedCont.capturedBodyIndex = i;
@@ -735,7 +740,11 @@ public class Evaluator {
                                         hasPendingCallccValue = true;
                                         pendingCallccValue = cr.value;
                                         for (int j = cr.cont.capturedBodyIndex; j < list.size() - 1; j++) {
-                                            eval(list.get(j), letEnv);
+                                            try {
+                                                resolve(eval(list.get(j), letEnv));
+                                            } catch (ContinuationResume cr2) {
+                                                break;
+                                            }
                                         }
                                         continue;
                                     }
@@ -754,13 +763,13 @@ public class Evaluator {
                             Object rawTest = test;
                             if (rawTest instanceof Located lt) rawTest = lt.expr();
                             if (rawTest instanceof String st && st.equals("else")) {
-                                for (int j = 1; j < clause.size() - 1; j++) eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), env));
                                 return new TailCall(clause.getLast(), env);
                             }
                             Object testVal = eval(test, env);
                             if (!isFalse(testVal)) {
                                 if (clause.size() == 1) return testVal;
-                                for (int j = 1; j < clause.size() - 1; j++) eval(clause.get(j), env);
+                                for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), env));
                                 return new TailCall(clause.getLast(), env);
                             }
                         }
@@ -826,7 +835,7 @@ public class Evaluator {
                         for (int i = 0; i < names.size(); i++) {
                             letrecEnv.define(names.get(i), eval(initExprs.get(i), letrecEnv));
                         }
-                        for (int i = 2; i < list.size() - 1; i++) eval(list.get(i), letrecEnv);
+                        for (int i = 2; i < list.size() - 1; i++) resolve(eval(list.get(i), letrecEnv));
                         return new TailCall(list.getLast(), letrecEnv);
                     }
                     case "letrec*" -> {
@@ -854,17 +863,15 @@ public class Evaluator {
                             Object datumsRaw = clause.get(0);
                             if (datumsRaw instanceof Located ld) datumsRaw = ld.expr();
                             if (datumsRaw instanceof String ds && ds.equals("else")) {
-                                Object r = null;
-                                for (int j = 1; j < clause.size(); j++) r = eval(clause.get(j), env);
-                                return r;
+                                for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), env));
+                                return clause.size() > 1 ? eval(clause.getLast(), env) : null;
                             }
                             List<?> datums = (List<?>) datumsRaw;
                             for (Object d : datums) {
                                 Object datum = quote(d);
                                 if (schemeEqv(key, datum)) {
-                                    Object r = null;
-                                    for (int j = 1; j < clause.size(); j++) r = eval(clause.get(j), env);
-                                    return r;
+                                    for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), env));
+                                    return clause.size() > 1 ? eval(clause.getLast(), env) : null;
                                 }
                             }
                         }
@@ -901,14 +908,13 @@ public class Evaluator {
                             if (!isFalse(testVal)) {
                                 // Test passed - evaluate result exprs
                                 if (testClause.size() > 1) {
-                                    Object r = null;
-                                    for (int j = 1; j < testClause.size(); j++) r = eval(testClause.get(j), doEnv);
-                                    return r;
+                                    for (int j = 1; j < testClause.size() - 1; j++) resolve(eval(testClause.get(j), doEnv));
+                                    return eval(testClause.getLast(), doEnv);
                                 }
                                 return null;
                             }
                             // Evaluate body
-                            for (int i = 3; i < list.size(); i++) eval(list.get(i), doEnv);
+                            for (int i = 3; i < list.size(); i++) resolve(eval(list.get(i), doEnv));
                             // Parallel step: evaluate all step exprs with current values
                             Object[] newVals = new Object[varNames.size()];
                             for (int i = 0; i < varNames.size(); i++) {
@@ -941,7 +947,7 @@ public class Evaluator {
                             letEnv = nextEnv;
                         }
                         for (int i = 2; i < list.size() - 1; i++) {
-                            eval(list.get(i), letEnv);
+                            resolve(eval(list.get(i), letEnv));
                         }
                         return new TailCall(list.getLast(), letEnv);
                     }
@@ -949,7 +955,7 @@ public class Evaluator {
                         if (list.size() < 3) throw new EvalError("when: bad syntax");
                         Object testVal = eval(list.get(1), env);
                         if (!isFalse(testVal)) {
-                            for (int i = 2; i < list.size() - 1; i++) eval(list.get(i), env);
+                            for (int i = 2; i < list.size() - 1; i++) resolve(eval(list.get(i), env));
                             return new TailCall(list.getLast(), env);
                         }
                         return null;
@@ -958,7 +964,7 @@ public class Evaluator {
                         if (list.size() < 3) throw new EvalError("unless: bad syntax");
                         Object testVal = eval(list.get(1), env);
                         if (isFalse(testVal)) {
-                            for (int i = 2; i < list.size() - 1; i++) eval(list.get(i), env);
+                            for (int i = 2; i < list.size() - 1; i++) resolve(eval(list.get(i), env));
                             return new TailCall(list.getLast(), env);
                         }
                         return null;
@@ -1046,13 +1052,13 @@ public class Evaluator {
                                 Object rawTest = test;
                                 if (rawTest instanceof Located lt) rawTest = lt.expr();
                                 if (rawTest instanceof String st && st.equals("else")) {
-                                    for (int j = 1; j < clause.size() - 1; j++) eval(clause.get(j), guardEnv);
+                                    for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), guardEnv));
                                     return new TailCall(clause.getLast(), guardEnv);
                                 }
                                 Object testVal = eval(test, guardEnv);
                                 if (!isFalse(testVal)) {
                                     if (clause.size() == 1) return testVal;
-                                    for (int j = 1; j < clause.size() - 1; j++) eval(clause.get(j), guardEnv);
+                                    for (int j = 1; j < clause.size() - 1; j++) resolve(eval(clause.get(j), guardEnv));
                                     return new TailCall(clause.getLast(), guardEnv);
                                 }
                             }
@@ -1346,7 +1352,7 @@ public class Evaluator {
                 callEnv.define(lambda.restParam(), rest);
             }
             for (int i = 0; i < lambda.body().size() - 1; i++) {
-                eval(lambda.body().get(i), callEnv);
+                resolve(eval(lambda.body().get(i), callEnv));
                 if (lastCapturedCont != null && lastCapturedCont.capturedBody == null) {
                     lastCapturedCont.capturedBody = lambda.body();
                     lastCapturedCont.capturedBodyIndex = i;
