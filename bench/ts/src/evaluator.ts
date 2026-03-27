@@ -130,6 +130,7 @@ type EvaluationContext = {
 
 type EvaluationOptions = {
   maxSteps?: number;
+  outputApiResult?: boolean;
 };
 
 type Continuation = (value: SchemeValue) => Bounce;
@@ -1087,7 +1088,7 @@ export function evalStrWithLimit(input: string, maxSteps: number): string {
 }
 
 export function evalStrWithOutput(input: string): { result: string; output: string } {
-  return evaluateInput(input);
+  return evaluateInput(input, { outputApiResult: true });
 }
 
 function evaluateInput(input: string, options: EvaluationOptions = {}): { result: string; output: string } {
@@ -1109,9 +1110,13 @@ function evaluateInput(input: string, options: EvaluationOptions = {}): { result
   const result = runBounce(evaluateSequenceCps(expressions, env, done));
 
   return {
-    result: formatValue(result),
+    result: options.outputApiResult ? formatOutputApiResult(result) : formatValue(result),
     output: context.output.join(''),
   };
+}
+
+function formatOutputApiResult(value: SchemeValue): string {
+  return isStringValue(value) ? value.chars.join('') : formatValue(value);
 }
 
 class Environment {

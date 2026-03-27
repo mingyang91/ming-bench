@@ -775,7 +775,7 @@ export function evalStrWithLimit(input, maxSteps) {
     return evaluateInput(input, { maxSteps: validateMaxSteps(maxSteps) }).result;
 }
 export function evalStrWithOutput(input) {
-    return evaluateInput(input);
+    return evaluateInput(input, { outputApiResult: true });
 }
 function evaluateInput(input, options = {}) {
     const parser = new Parser(tokenize(input));
@@ -791,9 +791,12 @@ function evaluateInput(input, options = {}) {
     }
     const result = runBounce(evaluateSequenceCps(expressions, env, done));
     return {
-        result: formatValue(result),
+        result: options.outputApiResult ? formatOutputApiResult(result) : formatValue(result),
         output: context.output.join(''),
     };
+}
+function formatOutputApiResult(value) {
+    return isStringValue(value) ? value.chars.join('') : formatValue(value);
 }
 class Environment {
     bindings = new Map();
