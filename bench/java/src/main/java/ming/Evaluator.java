@@ -99,7 +99,15 @@ public class Evaluator {
                 "symbol->string", "string->symbol",
                 "string-ref", "char?",
                 "string-copy", "string-set!",
-                "apply")) {
+                "apply",
+                "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+                "zero?", "positive?", "negative?", "odd?", "even?",
+                "list-ref", "list-tail", "list?", "assoc", "map",
+                "equal?", "eq?",
+                "char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase",
+                "char=?", "char<?",
+                "string=?", "string<?", "string-ci=?",
+                "string-upcase", "string-downcase")) {
             env.define(name, "builtin:" + name);
         }
         return env;
@@ -547,6 +555,20 @@ public class Evaluator {
         return val instanceof Boolean b && !b;
     }
 
+    private boolean schemeEqual(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof String && b instanceof String) return a.equals(b);
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        if (a == Empty.NIL && b == Empty.NIL) return true;
+        if (a instanceof Pair pa && b instanceof Pair pb) {
+            return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+        }
+        return false;
+    }
+
     private Object apply(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof String sym && sym.startsWith("builtin:")) {
             return applyBuiltin(sym.substring(8), args);
@@ -800,6 +822,216 @@ public class Evaluator {
                 if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: expected char");
                 s.setChar((int) idx, c.value());
                 yield VOID;
+            }
+            case "abs" -> {
+                checkMinArgs(args, 1, "abs");
+                yield Math.abs(asLong(args.get(0), "abs"));
+            }
+            case "modulo" -> {
+                checkMinArgs(args, 2, "modulo");
+                long a = asLong(args.get(0), "modulo");
+                long b = asLong(args.get(1), "modulo");
+                yield Math.floorMod(a, b);
+            }
+            case "remainder" -> {
+                checkMinArgs(args, 2, "remainder");
+                long a = asLong(args.get(0), "remainder");
+                long b = asLong(args.get(1), "remainder");
+                yield a % b;
+            }
+            case "quotient" -> {
+                checkMinArgs(args, 2, "quotient");
+                long a = asLong(args.get(0), "quotient");
+                long b = asLong(args.get(1), "quotient");
+                yield a / b;
+            }
+            case "min" -> {
+                checkMinArgs(args, 1, "min");
+                long result = asLong(args.get(0), "min");
+                for (int i = 1; i < args.size(); i++) {
+                    long v = asLong(args.get(i), "min");
+                    if (v < result) result = v;
+                }
+                yield result;
+            }
+            case "max" -> {
+                checkMinArgs(args, 1, "max");
+                long result = asLong(args.get(0), "max");
+                for (int i = 1; i < args.size(); i++) {
+                    long v = asLong(args.get(i), "max");
+                    if (v > result) result = v;
+                }
+                yield result;
+            }
+            case "expt" -> {
+                checkMinArgs(args, 2, "expt");
+                long base = asLong(args.get(0), "expt");
+                long exp = asLong(args.get(1), "expt");
+                long result = 1;
+                for (long i = 0; i < exp; i++) result *= base;
+                yield result;
+            }
+            case "zero?" -> {
+                checkMinArgs(args, 1, "zero?");
+                yield asLong(args.get(0), "zero?") == 0;
+            }
+            case "positive?" -> {
+                checkMinArgs(args, 1, "positive?");
+                yield asLong(args.get(0), "positive?") > 0;
+            }
+            case "negative?" -> {
+                checkMinArgs(args, 1, "negative?");
+                yield asLong(args.get(0), "negative?") < 0;
+            }
+            case "odd?" -> {
+                checkMinArgs(args, 1, "odd?");
+                yield asLong(args.get(0), "odd?") % 2 != 0;
+            }
+            case "even?" -> {
+                checkMinArgs(args, 1, "even?");
+                yield asLong(args.get(0), "even?") % 2 == 0;
+            }
+            case "list-ref" -> {
+                checkMinArgs(args, 2, "list-ref");
+                Object lst = args.get(0);
+                long idx = asLong(args.get(1), "list-ref");
+                for (long i = 0; i < idx; i++) {
+                    if (!(lst instanceof Pair p)) throw new EvalError("list-ref: index out of range");
+                    lst = p.cdr();
+                }
+                if (!(lst instanceof Pair p)) throw new EvalError("list-ref: index out of range");
+                yield p.car();
+            }
+            case "list-tail" -> {
+                checkMinArgs(args, 2, "list-tail");
+                Object lst = args.get(0);
+                long idx = asLong(args.get(1), "list-tail");
+                for (long i = 0; i < idx; i++) {
+                    if (!(lst instanceof Pair p)) throw new EvalError("list-tail: index out of range");
+                    lst = p.cdr();
+                }
+                yield lst;
+            }
+            case "list?" -> {
+                checkMinArgs(args, 1, "list?");
+                Object lst = args.get(0);
+                while (lst instanceof Pair p) {
+                    lst = p.cdr();
+                }
+                yield lst == Empty.NIL;
+            }
+            case "assoc" -> {
+                checkMinArgs(args, 2, "assoc");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (p.car() instanceof Pair entry) {
+                        if (schemeEqual(key, entry.car())) yield entry;
+                    }
+                    lst = p.cdr();
+                }
+                yield Boolean.FALSE;
+            }
+            case "map" -> {
+                checkMinArgs(args, 2, "map");
+                Object fn = args.get(0);
+                // Collect all input lists
+                List<Object> lists = new ArrayList<>();
+                for (int i = 1; i < args.size(); i++) lists.add(args.get(i));
+                List<Object> results = new ArrayList<>();
+                while (true) {
+                    // Check if any list is exhausted
+                    boolean done = false;
+                    for (Object l : lists) {
+                        if (!(l instanceof Pair)) { done = true; break; }
+                    }
+                    if (done) break;
+                    // Collect car of each list
+                    List<Object> mapArgs = new ArrayList<>();
+                    List<Object> nextLists = new ArrayList<>();
+                    for (Object l : lists) {
+                        Pair p = (Pair) l;
+                        mapArgs.add(p.car());
+                        nextLists.add(p.cdr());
+                    }
+                    results.add(apply(fn, mapArgs));
+                    lists = nextLists;
+                }
+                // Build result list
+                Object result = Empty.NIL;
+                for (int i = results.size() - 1; i >= 0; i--) {
+                    result = new Pair(results.get(i), result);
+                }
+                yield result;
+            }
+            case "equal?" -> {
+                checkMinArgs(args, 2, "equal?");
+                yield schemeEqual(args.get(0), args.get(1));
+            }
+            case "eq?" -> {
+                checkMinArgs(args, 2, "eq?");
+                Object a = args.get(0), b = args.get(1);
+                yield a == b || a.equals(b);
+            }
+            case "char-alphabetic?" -> {
+                checkMinArgs(args, 1, "char-alphabetic?");
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-alphabetic?: expected char");
+                yield Character.isLetter(c.value());
+            }
+            case "char-numeric?" -> {
+                checkMinArgs(args, 1, "char-numeric?");
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-numeric?: expected char");
+                yield Character.isDigit(c.value());
+            }
+            case "char-upcase" -> {
+                checkMinArgs(args, 1, "char-upcase");
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-upcase: expected char");
+                yield new SchemeChar(Character.toUpperCase(c.value()));
+            }
+            case "char-downcase" -> {
+                checkMinArgs(args, 1, "char-downcase");
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-downcase: expected char");
+                yield new SchemeChar(Character.toLowerCase(c.value()));
+            }
+            case "char=?" -> {
+                checkMinArgs(args, 2, "char=?");
+                if (!(args.get(0) instanceof SchemeChar a)) throw new EvalError("char=?: expected char");
+                if (!(args.get(1) instanceof SchemeChar b)) throw new EvalError("char=?: expected char");
+                yield a.value() == b.value();
+            }
+            case "char<?" -> {
+                checkMinArgs(args, 2, "char<?");
+                if (!(args.get(0) instanceof SchemeChar a)) throw new EvalError("char<?: expected char");
+                if (!(args.get(1) instanceof SchemeChar b)) throw new EvalError("char<?: expected char");
+                yield a.value() < b.value();
+            }
+            case "string=?" -> {
+                checkMinArgs(args, 2, "string=?");
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string=?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string=?: expected string");
+                yield a.value().equals(b.value());
+            }
+            case "string<?" -> {
+                checkMinArgs(args, 2, "string<?");
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string<?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string<?: expected string");
+                yield a.value().compareTo(b.value()) < 0;
+            }
+            case "string-ci=?" -> {
+                checkMinArgs(args, 2, "string-ci=?");
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string-ci=?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string-ci=?: expected string");
+                yield a.value().equalsIgnoreCase(b.value());
+            }
+            case "string-upcase" -> {
+                checkMinArgs(args, 1, "string-upcase");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-upcase: expected string");
+                yield new SchemeString(s.value().toUpperCase());
+            }
+            case "string-downcase" -> {
+                checkMinArgs(args, 1, "string-downcase");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-downcase: expected string");
+                yield new SchemeString(s.value().toLowerCase());
             }
             default -> throw new EvalError("unbound variable: " + name);
         };
