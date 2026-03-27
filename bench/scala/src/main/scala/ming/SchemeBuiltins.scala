@@ -27,6 +27,7 @@ private[ming] object Builtins:
     "boolean?",
     "symbol?",
     "char?",
+    "apply",
     "display",
     "write",
     "newline"
@@ -113,10 +114,10 @@ private[ming] object Builtins:
       case "append" =>
         append(name, args, pos)
       case "list" =>
-        buildList(args)
+        ValueSemantics.listFrom(args)
       case "length" =>
         val value = requireSingleArg(name, args, pos)
-        Value.IntVal(toProperList(name, value, pos).length)
+        Value.IntVal(ValueSemantics.toProperList(name, value, pos).length)
       case _ =>
         unknownProcedure(name, pos)
 
@@ -216,34 +217,16 @@ private[ming] object Builtins:
       case Nil =>
         Value.EmptyList
       case last :: Nil =>
-        toProperList(name, last, pos)
+        ValueSemantics.toProperList(name, last, pos)
         last
       case _ =>
         val last = args.last
-        toProperList(name, last, pos)
+        ValueSemantics.toProperList(name, last, pos)
         args.init.foldRight(last) { (listValue, acc) =>
-          toProperList(name, listValue, pos).foldRight(acc) { (item, tail) =>
+          ValueSemantics.toProperList(name, listValue, pos).foldRight(acc) { (item, tail) =>
             Value.PairVal(item, tail)
           }
         }
-
-  private def buildList(values: List[Value]): Value =
-    values.foldRight[Value](Value.EmptyList) { (value, acc) =>
-      Value.PairVal(value, acc)
-    }
-
-  private def toProperList(name: String, value: Value, pos: SourcePos): List[Value] =
-    @tailrec
-    def loop(current: Value, acc: List[Value]): List[Value] =
-      current match
-        case Value.EmptyList =>
-          acc.reverse
-        case Value.PairVal(car, cdr) =>
-          loop(cdr, car :: acc)
-        case other =>
-          throw EvalError.at(pos, s"$name expected a list, got ${ValueSemantics.typeName(other)}")
-
-    loop(value, Nil)
 
   private def requireArgCount[T](name: String, args: List[T], expected: Int, pos: SourcePos): List[T] =
     if args.lengthCompare(expected) != 0 then

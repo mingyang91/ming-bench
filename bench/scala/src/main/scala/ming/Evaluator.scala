@@ -69,10 +69,12 @@ object Evaluator:
         env.define(name, eval(valueExpr, env, context))
         Value.Void
       case Expr.ListExpr(Expr.Symbol(name, _) :: params, _) :: body if body.nonEmpty =>
+        val formals = parseParameterSpec(params)
         val closure =
           Value.Closure(
             name = Some(name),
-            params = parseParameterNames(params),
+            params = formals.params,
+            restParam = formals.restParam,
             body = body,
             env = env
           )
@@ -97,7 +99,8 @@ object Evaluator:
   private def evalLambda(args: List[Expr], env: Env, pos: SourcePos): Value =
     args match
       case paramsExpr :: body if body.nonEmpty =>
-        Value.Closure(name = None, params = parseParameterNames(paramsExpr), body = body, env = env)
+        val formals = parseParameterSpec(paramsExpr)
+        Value.Closure(name = None, params = formals.params, restParam = formals.restParam, body = body, env = env)
       case _ =>
         throw EvalError.at(pos, "lambda expects parameters and at least one body expression")
 
@@ -127,6 +130,7 @@ object Evaluator:
           Value.Closure(
             name = Some(name),
             params = parsedBindings.map(_._1),
+            restParam = None,
             body = body,
             env = letEnv
           )
@@ -167,16 +171,27 @@ object Evaluator:
       case invalid :: _ =>
         throw EvalError.at(invalid.pos, "invalid cond clause")
 
-  private def parseParameterNames(expr: Expr): List[String] =
+  private def parseParameterSpec(expr: Expr): ParameterSpec =
     expr match
-      case Expr.ListExpr(params, _) => parseParameterNames(params)
-      case other                    => throw EvalError.at(other.pos, "parameter list must be a list")
+      case Expr.ListExpr(params, _) => parseParameterSpec(params)
+      case Expr.Symbol(name, _)     => ParameterSpec(Nil, Some(name))
+      case other                    => throw EvalError.at(other.pos, "parameter list must be a list or symbol")
 
-  private def parseParameterNames(params: List[Expr]): List[String] =
-    params.map {
-      case Expr.Symbol(name, _) => name
-      case other                => throw EvalError.at(other.pos, "parameter names must be symbols")
-    }
+  private def parseParameterSpec(params: List[Expr]): ParameterSpec =
+    def loop(remaining: List[Expr], fixed: List[String]): ParameterSpec =
+      remaining match
+        case Nil =>
+          ParameterSpec(fixed.reverse, None)
+        case Expr.Symbol(".", _) :: Expr.Symbol(name, _) :: Nil =>
+          ParameterSpec(fixed.reverse, Some(name))
+        case Expr.Symbol(".", dotPos) :: _ =>
+          throw EvalError.at(dotPos, "dot must appear before a single rest parameter")
+        case Expr.Symbol(name, _) :: tail =>
+          loop(tail, name :: fixed)
+        case other :: _ =>
+          throw EvalError.at(other.pos, "parameter names must be symbols")
+
+    loop(params, Nil)
 
   private def applyProcedure(
     procedure: Value,
@@ -195,20 +210,51 @@ object Evaluator:
     context: EvalContext
   ): Value =
     procedure match
+      case Value.BuiltinProc("apply") =>
+        invokeApply(evaluatedArgs, pos, context)
       case Value.BuiltinProc(name) =>
         Builtins.invoke(name, evaluatedArgs, pos, context)
-      case Value.Closure(name, params, body, closureEnv) =>
-        if evaluatedArgs.lengthCompare(params.length) != 0 then
-          val procName = name.getOrElse("lambda")
-          throw EvalError.at(pos, s"$procName expects ${params.length} argument(s), got ${evaluatedArgs.length}")
+      case Value.Closure(name, params, restParam, body, closureEnv) =>
+        validateArity(name, params.length, restParam, evaluatedArgs.length, pos)
 
         val callEnv = closureEnv.child()
         params.zip(evaluatedArgs).foreach { case (param, value) =>
           callEnv.define(param, value)
         }
+        restParam.foreach { param =>
+          callEnv.define(param, ValueSemantics.listFrom(evaluatedArgs.drop(params.length)))
+        }
         evalSequence(body, callEnv, context)
       case _ =>
         throw EvalError.at(pos, "attempted to call a non-procedure")
+
+  private def invokeApply(args: List[Value], pos: SourcePos, context: EvalContext): Value =
+    if args.lengthCompare(2) < 0 then
+      throw EvalError.at(pos, s"apply expects at least 2 argument(s), got ${args.length}")
+
+    val procedure  = args.head
+    val prefixArgs = args.slice(1, args.length - 1)
+    val listArgs   = ValueSemantics.toProperList("apply", args.last, pos)
+    invokeProcedure(procedure, prefixArgs ++ listArgs, pos, context)
+
+  private def validateArity(
+    name: Option[String],
+    fixedParamCount: Int,
+    restParam: Option[String],
+    actualArgCount: Int,
+    pos: SourcePos
+  ): Unit =
+    restParam match
+      case Some(_) if actualArgCount >= fixedParamCount =>
+        ()
+      case Some(_) =>
+        val procName = name.getOrElse("lambda")
+        throw EvalError.at(pos, s"$procName expects at least $fixedParamCount argument(s), got $actualArgCount")
+      case None if actualArgCount == fixedParamCount =>
+        ()
+      case None =>
+        val procName = name.getOrElse("lambda")
+        throw EvalError.at(pos, s"$procName expects $fixedParamCount argument(s), got $actualArgCount")
 
   private def evalSequence(exprs: List[Expr], env: Env, context: EvalContext): Value =
     exprs.foldLeft[Value](Value.Void) { (_, expr) =>
@@ -232,3 +278,5 @@ object Evaluator:
         val value = eval(head, env, context)
         if ValueSemantics.isTruthy(value) then value
         else evalOr(tail, env, context)
+
+  private case class ParameterSpec(params: List[String], restParam: Option[String])

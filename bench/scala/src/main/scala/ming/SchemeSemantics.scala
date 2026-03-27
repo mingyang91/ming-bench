@@ -16,7 +16,7 @@ private[ming] object ValueSemantics:
       case Value.SymbolVal(_)  => "symbol"
       case Value.EmptyList     => "null"
       case Value.PairVal(_, _) => "pair"
-      case Value.BuiltinProc(_) | Value.Closure(_, _, _, _) =>
+      case Value.BuiltinProc(_) | Value.Closure(_, _, _, _, _) =>
         "procedure"
       case Value.Void => "void"
 
@@ -31,3 +31,21 @@ private[ming] object ValueSemantics:
         items.foldRight[Value](Value.EmptyList) { (item, acc) =>
           Value.PairVal(quote(item), acc)
         }
+
+  def listFrom(values: List[Value]): Value =
+    values.foldRight[Value](Value.EmptyList) { (value, acc) =>
+      Value.PairVal(value, acc)
+    }
+
+  def toProperList(name: String, value: Value, pos: SourcePos): List[Value] =
+    @annotation.tailrec
+    def loop(current: Value, acc: List[Value]): List[Value] =
+      current match
+        case Value.EmptyList =>
+          acc.reverse
+        case Value.PairVal(car, cdr) =>
+          loop(cdr, car :: acc)
+        case other =>
+          throw EvalError.at(pos, s"$name expected a list, got ${typeName(other)}")
+
+    loop(value, Nil)

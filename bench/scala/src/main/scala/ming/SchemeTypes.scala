@@ -19,7 +19,14 @@ private[ming] enum Value:
   case EmptyList
   case PairVal(car: Value, cdr: Value)
   case BuiltinProc(name: String)
-  case Closure(name: Option[String], params: List[String], body: List[Expr], env: Env)
+
+  case Closure(
+    name: Option[String],
+    params: List[String],
+    restParam: Option[String],
+    body: List[Expr],
+    env: Env
+  )
   case Void
 
 final private[ming] class MutableString private (private val builder: java.lang.StringBuilder):
