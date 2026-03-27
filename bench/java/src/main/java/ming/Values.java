@@ -1,7 +1,9 @@
 package ming;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 interface Procedure {
     Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError;
@@ -113,16 +115,7 @@ final class VectorValue implements Value {
 
     @Override
     public String render() {
-        StringBuilder builder = new StringBuilder();
-        builder.append("#(");
-        for (int index = 0; index < elements.size(); index++) {
-            if (index > 0) {
-                builder.append(' ');
-            }
-            builder.append(elements.get(index).render());
-        }
-        builder.append(')');
-        return builder.toString();
+        return ValuePrinter.renderValue(this);
     }
 }
 
@@ -145,41 +138,39 @@ record SymbolValue(String name) implements Value {
     }
 }
 
-record PairValue(Value car, Value cdr) implements Value {
+final class PairValue implements Value {
+    private Value car;
+    private Value cdr;
+
+    PairValue(Value car, Value cdr) {
+        this.car = car;
+        this.cdr = cdr;
+    }
+
+    Value car() {
+        return car;
+    }
+
+    Value cdr() {
+        return cdr;
+    }
+
+    void setCar(Value value) {
+        this.car = value;
+    }
+
+    void setCdr(Value value) {
+        this.cdr = value;
+    }
+
     @Override
     public String render() {
-        return renderContents(false);
+        return ValuePrinter.renderValue(this);
     }
 
     @Override
     public String displayRender() {
-        return renderContents(true);
-    }
-
-    private String renderContents(boolean displayMode) {
-        StringBuilder builder = new StringBuilder();
-        builder.append('(');
-        appendPairContents(builder, this, displayMode);
-        builder.append(')');
-        return builder.toString();
-    }
-
-    private static void appendPairContents(
-            StringBuilder builder,
-            PairValue pair,
-            boolean displayMode
-    ) {
-        builder.append(displayMode ? pair.car.displayRender() : pair.car.render());
-        if (pair.cdr instanceof EmptyListValue) {
-            return;
-        }
-        if (pair.cdr instanceof PairValue nextPair) {
-            builder.append(' ');
-            appendPairContents(builder, nextPair, displayMode);
-            return;
-        }
-        builder.append(" . ");
-        builder.append(displayMode ? pair.cdr.displayRender() : pair.cdr.render());
+        return ValuePrinter.displayValue(this);
     }
 }
 
@@ -203,6 +194,14 @@ enum VoidValue implements Value {
 
 final class ValuePrinter {
     private ValuePrinter() {
+    }
+
+    static String renderValue(Value value) {
+        return renderValue(value, false, new HashSet<>());
+    }
+
+    static String displayValue(Value value) {
+        return renderValue(value, true, new HashSet<>());
     }
 
     static String renderString(String value) {
@@ -231,5 +230,88 @@ final class ValuePrinter {
             return "#\\newline";
         }
         return "#\\" + new String(Character.toChars(codePoint));
+    }
+
+    private static String renderValue(Value value, boolean displayMode, Set<PairValue> activePairs) {
+        if (value instanceof PairValue pairValue) {
+            return renderPair(pairValue, displayMode, activePairs);
+        }
+        if (value instanceof VectorValue vectorValue) {
+            return renderVector(vectorValue, activePairs);
+        }
+        if (value instanceof StringValue stringValue) {
+            return displayMode ? stringValue.text() : renderString(stringValue.text());
+        }
+        if (value instanceof CharValue charValue) {
+            return displayMode
+                    ? new String(Character.toChars(charValue.codePoint()))
+                    : renderChar(charValue.codePoint());
+        }
+        return displayMode ? value.displayRender() : value.render();
+    }
+
+    private static String renderVector(VectorValue vector, Set<PairValue> activePairs) {
+        StringBuilder builder = new StringBuilder();
+        builder.append("#(");
+        for (int index = 0; index < vector.size(); index++) {
+            if (index > 0) {
+                builder.append(' ');
+            }
+            builder.append(renderValue(vector.element(index), false, activePairs));
+        }
+        builder.append(')');
+        return builder.toString();
+    }
+
+    private static String renderPair(
+            PairValue pair,
+            boolean displayMode,
+            Set<PairValue> activePairs
+    ) {
+        if (!activePairs.add(pair)) {
+            return "#<circular>";
+        }
+
+        try {
+            StringBuilder builder = new StringBuilder();
+            builder.append('(');
+            appendPairContents(builder, pair, displayMode, activePairs);
+            builder.append(')');
+            return builder.toString();
+        } finally {
+            activePairs.remove(pair);
+        }
+    }
+
+    private static void appendPairContents(
+            StringBuilder builder,
+            PairValue pair,
+            boolean displayMode,
+            Set<PairValue> activePairs
+    ) {
+        builder.append(renderValue(pair.car(), displayMode, activePairs));
+
+        Value tail = pair.cdr();
+        if (tail instanceof EmptyListValue) {
+            return;
+        }
+        if (tail instanceof PairValue nextPair) {
+            if (activePairs.contains(nextPair)) {
+                builder.append(" . #<circular>");
+                return;
+            }
+
+            builder.append(' ');
+            activePairs.add(nextPair);
+            try {
+                appendPairContents(builder, nextPair, displayMode, activePairs);
+            } finally {
+                activePairs.remove(nextPair);
+            }
+            return;
+        }
+
+        builder.append(" . ");
+        builder.append(renderValue(tail, displayMode, activePairs));
     }
 }

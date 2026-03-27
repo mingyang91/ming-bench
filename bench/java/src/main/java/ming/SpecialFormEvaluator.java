@@ -85,6 +85,7 @@ final class SpecialFormEvaluator {
             case "set!" -> Optional.of(evalSet(listExpr, env));
             case "begin" -> Optional.of(evalBegin(listExpr, env, tailPosition));
             case "let" -> Optional.of(evalLet(listExpr, env, tailPosition));
+            case "let*" -> Optional.of(evalLetStar(listExpr, env, tailPosition));
             case "letrec" -> Optional.of(evalLetrec(listExpr, env, false, tailPosition));
             case "letrec*" -> Optional.of(evalLetrec(listExpr, env, true, tailPosition));
             case "cond" -> Optional.of(evalCond(listExpr, env, tailPosition));
@@ -265,6 +266,27 @@ final class SpecialFormEvaluator {
         );
         namedLetEnv.define(nameSymbol.name(), procedure);
         return applyResultProcedure(procedure, bindings.values(), listExpr.loc(), tailPosition);
+    }
+
+    private Value evalLetStar(ListExpr listExpr, Environment env, boolean tailPosition)
+            throws EvalError {
+        ensureAtLeastExpressions("let*", listExpr, 3);
+
+        Expr bindingsExpr = listExpr.elements().get(1);
+        if (!(bindingsExpr instanceof ListExpr bindingsList)) {
+            throw runtime.error(bindingsExpr.loc(), "let* requires a binding list");
+        }
+
+        Environment letStarEnv = new Environment(env);
+        for (BindingSpec binding : parseBindingSpecs(bindingsList, "let*")) {
+            letStarEnv.define(binding.name(), runtime.eval(binding.valueExpr(), letStarEnv));
+        }
+
+        return evalResultSequence(
+                listExpr.elements().subList(2, listExpr.elements().size()),
+                letStarEnv,
+                tailPosition
+        );
     }
 
     private Value evalLetrec(
