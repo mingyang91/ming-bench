@@ -24,9 +24,10 @@ type VoidVal struct{}
 type CharVal struct{ Val rune }
 
 type LambdaVal struct {
-	Params []string
-	Body   []Expr
-	Env    *Env
+	Params   []string
+	Rest     string // rest parameter name (dot notation), empty if none
+	Body     []Expr
+	Env      *Env
 }
 
 type BuiltinVal struct {
@@ -409,7 +410,32 @@ func exprToValue(expr Expr) (Value, error) {
 		if len(e.Items) == 0 {
 			return &NilVal{}, nil
 		}
-		// Build list from items
+		// Check for dot notation: (a b . c)
+		dotIdx := -1
+		for i, item := range e.Items {
+			if a, ok := item.(*AtomExpr); ok && a.Token == "." {
+				dotIdx = i
+				break
+			}
+		}
+		if dotIdx >= 0 {
+			if dotIdx != len(e.Items)-2 {
+				return nil, &EvalError{Message: "bad dot syntax"}
+			}
+			cdr, err := exprToValue(e.Items[len(e.Items)-1])
+			if err != nil {
+				return nil, err
+			}
+			for i := dotIdx - 1; i >= 0; i-- {
+				car, err := exprToValue(e.Items[i])
+				if err != nil {
+					return nil, err
+				}
+				cdr = &PairVal{Car: car, Cdr: cdr}
+			}
+			return cdr, nil
+		}
+		// Build proper list from items
 		var result Value = &NilVal{}
 		for i := len(e.Items) - 1; i >= 0; i-- {
 			car, err := exprToValue(e.Items[i])
@@ -455,15 +481,11 @@ func evalDefine(list *ListExpr, env *Env) (Value, error) {
 		if !ok {
 			return nil, errAt(list, "define: expected symbol")
 		}
-		params := make([]string, len(plist.Items)-1)
-		for i, item := range plist.Items[1:] {
-			p, ok := item.(*AtomExpr)
-			if !ok {
-				return nil, errAt(list, "define: expected parameter name")
-			}
-			params[i] = p.Token
+		params, rest, err := parseDotParams(plist.Items[1:], list)
+		if err != nil {
+			return nil, err
 		}
-		lambda := &LambdaVal{Params: params, Body: args[1:], Env: env}
+		lambda := &LambdaVal{Params: params, Rest: rest, Body: args[1:], Env: env}
 		env.set(nameAtom.Token, lambda)
 		return &VoidVal{}, nil
 	}
@@ -499,24 +521,48 @@ func evalSetBang(list *ListExpr, env *Env) (Value, error) {
 	return &VoidVal{}, nil
 }
 
+func parseDotParams(items []Expr, errExpr Expr) ([]string, string, error) {
+	var params []string
+	var rest string
+	for i, item := range items {
+		a, ok := item.(*AtomExpr)
+		if !ok {
+			return nil, "", errAt(errExpr, "expected parameter name")
+		}
+		if a.Token == "." {
+			if i != len(items)-2 {
+				return nil, "", errAt(errExpr, "malformed dot parameter list")
+			}
+			restAtom, ok := items[i+1].(*AtomExpr)
+			if !ok {
+				return nil, "", errAt(errExpr, "expected rest parameter name")
+			}
+			rest = restAtom.Token
+			break
+		}
+		params = append(params, a.Token)
+	}
+	return params, rest, nil
+}
+
 func evalLambda(list *ListExpr, env *Env) (Value, error) {
 	args := list.Items[1:]
 	if len(args) < 2 {
 		return nil, errAt(list, "lambda requires params and body")
 	}
+	// (lambda args body) — single symbol captures all args
+	if atom, ok := args[0].(*AtomExpr); ok {
+		return &LambdaVal{Rest: atom.Token, Body: args[1:], Env: env}, nil
+	}
 	paramList, ok := args[0].(*ListExpr)
 	if !ok {
 		return nil, errAt(list, "lambda: expected parameter list")
 	}
-	params := make([]string, len(paramList.Items))
-	for i, item := range paramList.Items {
-		p, ok := item.(*AtomExpr)
-		if !ok {
-			return nil, errAt(list, "lambda: expected parameter name")
-		}
-		params[i] = p.Token
+	params, rest, err := parseDotParams(paramList.Items, list)
+	if err != nil {
+		return nil, err
 	}
-	return &LambdaVal{Params: params, Body: args[1:], Env: env}, nil
+	return &LambdaVal{Params: params, Rest: rest, Body: args[1:], Env: env}, nil
 }
 
 func evalAnd(exprs []Expr, env *Env) (Value, error) {
@@ -657,6 +703,38 @@ func evalCond(clauses []Expr, env *Env) (Value, error) {
 
 // --------------- Procedure application ---------------
 
+func applyLambda(fn *LambdaVal, args []Value) (Value, error) {
+	if fn.Rest != "" {
+		if len(args) < len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected at least %d arguments, got %d", len(fn.Params), len(args))}
+		}
+	} else {
+		if len(args) != len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
+		}
+	}
+	callEnv := newEnv(fn.Env)
+	for i, p := range fn.Params {
+		callEnv.set(p, args[i])
+	}
+	if fn.Rest != "" {
+		var restList Value = &NilVal{}
+		for i := len(args) - 1; i >= len(fn.Params); i-- {
+			restList = &PairVal{Car: args[i], Cdr: restList}
+		}
+		callEnv.set(fn.Rest, restList)
+	}
+	var result Value
+	var err error
+	for _, bodyExpr := range fn.Body {
+		result, err = evalInEnv(bodyExpr, callEnv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
 func applyProcAt(op Value, args []Value, callSite Expr) (Value, error) {
 	switch fn := op.(type) {
 	case *BuiltinVal:
@@ -672,22 +750,16 @@ func applyProcAt(op Value, args []Value, callSite Expr) (Value, error) {
 		}
 		return val, nil
 	case *LambdaVal:
-		if len(args) != len(fn.Params) {
-			return nil, errAt(callSite, fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args)))
-		}
-		callEnv := newEnv(fn.Env)
-		for i, p := range fn.Params {
-			callEnv.set(p, args[i])
-		}
-		var result Value
-		var err error
-		for _, bodyExpr := range fn.Body {
-			result, err = evalInEnv(bodyExpr, callEnv)
-			if err != nil {
-				return nil, err
+		val, err := applyLambda(fn, args)
+		if err != nil {
+			if ee, ok := err.(*EvalError); ok && ee.Line == 0 {
+				l, c := callSite.Pos()
+				ee.Line = l
+				ee.Col = c
 			}
+			return nil, err
 		}
-		return result, nil
+		return val, nil
 	}
 	return nil, errAt(callSite, "not a procedure")
 }
@@ -1125,6 +1197,42 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 			return nil, &EvalError{Message: "string-ref: index out of range"}
 		}
 		return &CharVal{Val: rune(s.Val[idx.Val])}, nil
+	})
+
+	// L08: apply
+	addBuiltin("apply", func(args []Value) (Value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "apply requires at least 2 arguments"}
+		}
+		proc := args[0]
+		// Last argument must be a list; prefix args are prepended
+		last := args[len(args)-1]
+		var finalArgs []Value
+		// Collect prefix args (between proc and last)
+		for _, a := range args[1 : len(args)-1] {
+			finalArgs = append(finalArgs, a)
+		}
+		// Unpack last argument (must be a proper list)
+		cur := last
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				break
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "apply: last argument must be a list"}
+			}
+			finalArgs = append(finalArgs, p.Car)
+			cur = p.Cdr
+		}
+		// Apply using applyLambda or builtin call
+		switch fn := proc.(type) {
+		case *BuiltinVal:
+			return fn.Fn(finalArgs)
+		case *LambdaVal:
+			return applyLambda(fn, finalArgs)
+		}
+		return nil, &EvalError{Message: "apply: not a procedure"}
 	})
 
 	return env
