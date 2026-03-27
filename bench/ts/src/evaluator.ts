@@ -1871,14 +1871,18 @@ function cekApply(proc: SchemeVal, args: SchemeVal[], epos: string, k: Cont): CE
   throw new EvalError(`${epos}: not a procedure`);
 }
 
-function evaluate(expr: SchemeVal, env: Env): SchemeVal {
+function evaluate(expr: SchemeVal, env: Env, maxSteps?: number): SchemeVal {
   let m: 0 | 1 = 0;
   let c: SchemeVal = expr;
   let e: Env = env;
   let k: Cont = { tag: 'halt' };
+  let steps = 0;
 
   mainLoop: while (true) {
     if (m === 0) {
+      if (maxSteps !== undefined && ++steps > maxSteps) {
+        throw new EvalError('step limit exceeded');
+      }
       // ── EVAL ──
       switch (c.tag) {
         case 'number': case 'boolean': case 'string': case 'char':
@@ -2785,6 +2789,18 @@ export function evalStr(input: string): string {
   const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
     : { tag: 'list', val: [{ tag: 'symbol', val: 'begin' } as SchemeVal, ...exprs] };
   const result = evaluate(beginExpr, env);
+  return display(result);
+}
+
+export function evalStrWithLimit(input: string, maxSteps: number): string {
+  const exprs = parseAll(input);
+  if (exprs.length === 0) throw new EvalError('no expressions');
+  currentWinders = [];
+  exceptionHandlers = [];
+  const env = makeGlobalEnv();
+  const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
+    : { tag: 'list', val: [{ tag: 'symbol', val: 'begin' } as SchemeVal, ...exprs] };
+  const result = evaluate(beginExpr, env, maxSteps);
   return display(result);
 }
 
