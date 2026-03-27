@@ -6735,25 +6735,32 @@ fn needs_continuation_machine(exprs: &[Expr]) -> bool {
     exprs.iter().any(expr_needs_continuation_machine)
 }
 
+fn continuation_builtin_requires_machine(name: &str) -> bool {
+    matches!(
+        name,
+        "call/cc"
+            | "call-with-current-continuation"
+            | "dynamic-wind"
+            | "raise"
+            | "with-exception-handler"
+            | "values"
+            | "call-with-values"
+    )
+}
+
 fn expr_needs_continuation_machine(expr: &Expr) -> bool {
     match expr {
         Expr::Number(_, _)
         | Expr::Boolean(_, _)
         | Expr::String(_, _)
-        | Expr::Char(_, _)
-        | Expr::Symbol(_, _) => false,
+        | Expr::Char(_, _) => false,
+        Expr::Symbol(name, _) => continuation_builtin_requires_machine(name),
         Expr::List(items, _) => {
             if let Some(Expr::Symbol(name, _)) = items.first() {
                 match name.as_str() {
                     "quote" | "syntax" => return false,
-                    "call/cc"
-                    | "call-with-current-continuation"
-                    | "dynamic-wind"
-                    | "raise"
-                    | "with-exception-handler"
-                    | "guard"
-                    | "values"
-                    | "call-with-values" => return true,
+                    "guard" => return true,
+                    _ if continuation_builtin_requires_machine(name) => return true,
                     _ => {}
                 }
             }
