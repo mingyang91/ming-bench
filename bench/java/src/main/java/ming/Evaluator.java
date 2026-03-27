@@ -58,7 +58,14 @@ public class Evaluator {
         @Override public String toString() { return "#<void>"; }
     };
 
-    record SchemeString(String value) {}
+    static class SchemeString {
+        private char[] chars;
+        SchemeString(String value) { this.chars = value.toCharArray(); }
+        String value() { return new String(chars); }
+        char charAt(int i) { return chars[i]; }
+        void setChar(int i, char c) { chars[i] = c; }
+        int length() { return chars.length; }
+    }
 
     record SchemeChar(char value) {}
 
@@ -90,7 +97,8 @@ public class Evaluator {
                 "string-append", "string-length", "substring",
                 "string->number", "number->string",
                 "symbol->string", "string->symbol",
-                "string-ref", "char?")) {
+                "string-ref", "char?",
+                "string-copy", "string-set!")) {
             env.define(name, "builtin:" + name);
         }
         return env;
@@ -252,6 +260,18 @@ public class Evaluator {
     private Object parseAtom(String s, int line, int col) {
         if (s.equals("#t")) return Boolean.TRUE;
         if (s.equals("#f")) return Boolean.FALSE;
+        if (s.startsWith("#\\")) {
+            String charName = s.substring(2);
+            return switch (charName) {
+                case "space" -> new SchemeChar(' ');
+                case "newline" -> new SchemeChar('\n');
+                case "tab" -> new SchemeChar('\t');
+                default -> {
+                    if (charName.length() == 1) yield new SchemeChar(charName.charAt(0));
+                    yield new LocatedSymbol(s, line, col);
+                }
+            };
+        }
         try {
             return Long.parseLong(s);
         } catch (NumberFormatException e) {
@@ -701,6 +721,19 @@ public class Evaluator {
             case "char?" -> {
                 checkMinArgs(args, 1, "char?");
                 yield args.get(0) instanceof SchemeChar;
+            }
+            case "string-copy" -> {
+                checkMinArgs(args, 1, "string-copy");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: expected string");
+                yield new SchemeString(s.value());
+            }
+            case "string-set!" -> {
+                checkMinArgs(args, 3, "string-set!");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: expected string");
+                long idx = asLong(args.get(1), "string-set!");
+                if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: expected char");
+                s.setChar((int) idx, c.value());
+                yield VOID;
             }
             default -> throw new EvalError("unbound variable: " + name);
         };
