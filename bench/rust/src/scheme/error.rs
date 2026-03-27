@@ -43,6 +43,9 @@ pub enum EvalError {
         got: usize,
     },
 
+    #[error("wrong value count: expected {expected}, got {got}")]
+    WrongValueCount { expected: &'static str, got: usize },
+
     #[error("type mismatch: expected {expected}, got {found}")]
     TypeMismatch {
         expected: &'static str,

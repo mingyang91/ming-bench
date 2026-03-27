@@ -42,6 +42,12 @@ pub(super) fn default_env() -> EnvRef {
             name: "dynamic-wind",
         })),
     );
+    env.define(
+        "call-with-values",
+        Value::Procedure(Rc::new(Procedure::CallWithValues {
+            name: "call-with-values",
+        })),
+    );
     for (name, func) in [
         ("+", apply_add as BuiltinFn),
         ("-", apply_sub as BuiltinFn),
@@ -114,6 +120,7 @@ pub(super) fn default_env() -> EnvRef {
         ("symbol?", apply_symbol_pred as BuiltinFn),
         ("procedure?", apply_procedure_pred as BuiltinFn),
         ("apply", apply_apply as BuiltinFn),
+        ("values", apply_values as BuiltinFn),
         ("display", apply_display as BuiltinFn),
         ("write", apply_write as BuiltinFn),
         ("newline", apply_newline as BuiltinFn),
@@ -820,6 +827,15 @@ fn apply_procedure_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<V
     };
 
     Ok(Value::Bool(matches!(&value.value, Value::Procedure(_))))
+}
+
+fn apply_values(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    match args {
+        [value] => Ok(value.value.clone()),
+        _ => Ok(Value::Values(
+            args.iter().map(|arg| arg.value.clone()).collect(),
+        )),
+    }
 }
 
 fn apply_zero_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {

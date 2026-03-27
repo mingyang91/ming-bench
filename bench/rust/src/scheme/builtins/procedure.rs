@@ -1,7 +1,7 @@
 use super::super::text::SchemeString;
 use super::super::{
-    eval_program_tail, list_from_values, EnvRef, Environment, EvalError, EvaluatedArg, Expr,
-    LambdaParams, Position, Procedure, TailEvalResult, Value,
+    eval_program_tail, list_from_values, unpack_values, EnvRef, Environment, EvalError,
+    EvaluatedArg, Expr, LambdaParams, Position, Procedure, TailEvalResult, Value,
 };
 use super::{
     apply_record_accessor, apply_record_constructor, apply_record_mutator, apply_record_predicate,
@@ -124,6 +124,31 @@ pub(crate) fn apply_procedure(
                     call_pos,
                 )?;
                 return Ok(body_value);
+            }
+            Procedure::CallWithValues { name } => {
+                let [producer_arg, consumer_arg] = current_args.as_slice() else {
+                    return with_call_position(
+                        Err(EvalError::WrongArgCount {
+                            name,
+                            expected: "exactly 2",
+                            got: current_args.len(),
+                        }),
+                        call_pos,
+                    );
+                };
+
+                let produced = with_call_position(
+                    apply_procedure(producer_arg.value.clone(), &[], output),
+                    call_pos,
+                )?;
+                current_value = consumer_arg.value.clone();
+                current_args = unpack_values(produced)
+                    .into_iter()
+                    .map(|value| EvaluatedArg {
+                        value,
+                        pos: producer_arg.pos,
+                    })
+                    .collect();
             }
             Procedure::Continuation { .. } => {
                 let [value_arg] = current_args.as_slice() else {

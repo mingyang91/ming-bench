@@ -132,6 +132,10 @@ pub(super) enum Frame {
         pos: Position,
         current_arg_pos: Position,
     },
+    CallWithValues {
+        consumer: Value,
+        pos: Position,
+    },
     DefineValue {
         name: String,
         env: EnvRef,
@@ -243,6 +247,7 @@ pub(super) enum Value {
     Vector(Rc<VectorValue>),
     Record(Rc<RecordValue>),
     Procedure(Rc<Procedure>),
+    Values(Vec<Value>),
     Uninitialized,
     Void,
 }
@@ -294,6 +299,9 @@ pub(super) enum Procedure {
         name: &'static str,
     },
     DynamicWind {
+        name: &'static str,
+    },
+    CallWithValues {
         name: &'static str,
     },
     Continuation {
@@ -368,6 +376,7 @@ impl fmt::Debug for Procedure {
             Self::WithExceptionHandler { name } => write!(f, "#<builtin:{name}>"),
             Self::ContinuationCapture { name } => write!(f, "#<builtin:{name}>"),
             Self::DynamicWind { name } => write!(f, "#<builtin:{name}>"),
+            Self::CallWithValues { name } => write!(f, "#<builtin:{name}>"),
             Self::Continuation { .. } => f.write_str("#<continuation>"),
             Self::GuardHandler { .. } => f.write_str("#<guard-handler>"),
             Self::Lambda { .. } => f.write_str("#<lambda>"),
@@ -539,6 +548,13 @@ impl Value {
     }
 }
 
+pub(super) fn unpack_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Values(values) => values,
+        value => vec![value],
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RenderMode {
     Write,
@@ -593,6 +609,7 @@ fn render_value_with_state(
         }
         Value::Record(record) => format!("#<record:{}>", record.record_type.name),
         Value::Procedure(_) => "#<procedure>".to_string(),
+        Value::Values(_) => "#<values>".to_string(),
         Value::Uninitialized => "#<uninitialized>".to_string(),
         Value::Void => "#<void>".to_string(),
     }
@@ -698,6 +715,13 @@ pub(super) fn values_eq(left: &Value, right: &Value) -> bool {
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| values_eq(left, right))
+        }
         (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,
@@ -769,6 +793,12 @@ fn values_equal_with_state(
                     .all(|(left, right)| {
                         values_equal_with_state(left, right, seen_pairs, seen_vectors)
                     })
+        }
+        (Value::Values(left), Value::Values(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right.iter()).all(|(left, right)| {
+                    values_equal_with_state(left, right, seen_pairs, seen_vectors)
+                })
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),

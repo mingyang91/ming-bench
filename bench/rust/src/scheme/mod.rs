@@ -24,7 +24,10 @@ use std::rc::Rc;
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let exprs = parser::parse_program(input)?;
     let mut output = String::new();
-    let value = eval_program_machine(&exprs, builtins::default_env(), &mut output)?;
+    let value = finalize_top_level_value(
+        eval_program_machine(&exprs, builtins::default_env(), &mut output)?,
+        exprs.last().map(Expr::pos),
+    )?;
     Ok(value.render())
 }
 
@@ -33,7 +36,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
     let exprs = parser::parse_program(input)?;
     let mut output = String::new();
-    let value = eval_program_machine(&exprs, builtins::default_env(), &mut output)?;
+    let value = finalize_top_level_value(
+        eval_program_machine(&exprs, builtins::default_env(), &mut output)?,
+        exprs.last().map(Expr::pos),
+    )?;
     Ok((value.render(), output))
 }
 
@@ -308,6 +314,28 @@ fn apply_machine(
                 ),
             ))
         }
+        Procedure::CallWithValues { name } => {
+            let [producer_arg, consumer_arg] = args.as_slice() else {
+                return Err(EvalError::WrongArgCount {
+                    name,
+                    expected: "exactly 2",
+                    got: args.len(),
+                }
+                .with_position(pos.line, pos.col));
+            };
+
+            Ok(call_thunk_machine(
+                producer_arg.value.clone(),
+                pos,
+                push_frame(
+                    Frame::CallWithValues {
+                        consumer: consumer_arg.value.clone(),
+                        pos,
+                    },
+                    cont,
+                ),
+            ))
+        }
         Procedure::Continuation { cont: saved_cont } => {
             let [value_arg] = args.as_slice() else {
                 return Err(EvalError::WrongArgCount {
@@ -469,9 +497,13 @@ fn resume_machine(
                 schedule_cond_machine(remaining, Position { line: 0, col: 0 }, env.clone(), next)
             }
         }
-        Frame::ApplyHead { args, env, pos } => {
-            Ok(schedule_call_machine(value, args, env.clone(), *pos, next))
-        }
+        Frame::ApplyHead { args, env, pos } => Ok(schedule_call_machine(
+            expect_single_value_at(value, *pos)?,
+            args,
+            env.clone(),
+            *pos,
+            next,
+        )),
         Frame::ApplyArgs {
             procedure,
             evaluated,
@@ -480,6 +512,7 @@ fn resume_machine(
             pos,
             current_arg_pos,
         } => {
+            let value = expect_single_value_at(value, *current_arg_pos)?;
             let mut applied_args = evaluated.clone();
             applied_args.insert(
                 0,
@@ -514,6 +547,12 @@ fn resume_machine(
                 })
             }
         }
+        Frame::CallWithValues { consumer, pos } => Ok(MachineState::Apply {
+            procedure: consumer.clone(),
+            args: values_to_args(value, *pos),
+            pos: *pos,
+            cont: next,
+        }),
         Frame::DefineValue { name, env } => {
             env.define(name.clone(), value);
             Ok(MachineState::Return {
@@ -1121,6 +1160,31 @@ fn call_thunk_machine(procedure: Value, pos: Position, cont: ContinuationRef) ->
     }
 }
 
+fn values_to_args(value: Value, pos: Position) -> Vec<EvaluatedArg> {
+    unpack_values(value)
+        .into_iter()
+        .map(|value| EvaluatedArg { value, pos })
+        .collect()
+}
+
+fn expect_single_value_at(value: Value, pos: Position) -> Result<Value, EvalError> {
+    match value {
+        Value::Values(values) => Err(EvalError::WrongValueCount {
+            expected: "exactly 1",
+            got: values.len(),
+        }
+        .with_position(pos.line, pos.col)),
+        value => Ok(value),
+    }
+}
+
+fn finalize_top_level_value(value: Value, pos: Option<Position>) -> Result<Value, EvalError> {
+    match pos {
+        Some(pos) => expect_single_value_at(value, pos),
+        None => Ok(value),
+    }
+}
+
 fn raise_machine(
     value: Value,
     pos: Position,
@@ -1408,7 +1472,7 @@ fn eval_program_tail(
     };
 
     for expr in prefix {
-        let _ = eval(expr, env.clone(), output)?;
+        let _ = eval_single(expr, env.clone(), output)?;
     }
 
     eval_tail(last, env, output)
@@ -1421,7 +1485,7 @@ fn eval_args(
 ) -> Result<Vec<EvaluatedArg>, EvalError> {
     args.iter()
         .map(|expr| {
-            eval(expr, env.clone(), output).map(|value| EvaluatedArg {
+            eval_single(expr, env.clone(), output).map(|value| EvaluatedArg {
                 value,
                 pos: expr.pos(),
             })
@@ -1535,7 +1599,7 @@ fn eval_tail_application(
     env: EnvRef,
     output: &mut String,
 ) -> Result<TailEvalResult, EvalError> {
-    let procedure = eval(head, env.clone(), output)?;
+    let procedure = eval_single(head, env.clone(), output)?;
     eval_tail_call(procedure, args, head_pos, env, output)
 }
 
@@ -1912,6 +1976,10 @@ fn eval(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalErro
     }
 }
 
+fn eval_single(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    expect_single_value_at(eval(expr, env, output)?, expr.pos())
+}
+
 fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
     let Some((head, args)) = items.split_first() else {
         return Err(EvalError::ParseError {
@@ -1984,7 +2052,7 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
                 )?;
                 eval(&expanded, macro_env, output)
             } else {
-                let procedure = eval(head, env.clone(), output)?;
+                let procedure = eval_single(head, env.clone(), output)?;
                 let values = eval_args(args, env.clone(), output)?;
                 with_position(
                     builtins::apply_procedure(procedure, &values, output),
@@ -1993,7 +2061,7 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
             }
         }
         _ => {
-            let procedure = eval(head, env.clone(), output)?;
+            let procedure = eval_single(head, env.clone(), output)?;
             let values = eval_args(args, env.clone(), output)?;
             with_position(
                 builtins::apply_procedure(procedure, &values, output),
@@ -2532,7 +2600,7 @@ fn parse_do_end_clause(expr: &Expr) -> Result<(Expr, Vec<Expr>), EvalError> {
 fn eval_define(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol { name, .. }, value_expr] => {
-            let value = eval(value_expr, env.clone(), output)?;
+            let value = eval_single(value_expr, env.clone(), output)?;
             env.define(name.clone(), value);
             Ok(Value::Void)
         }
@@ -2699,7 +2767,7 @@ fn parse_record_field_specs(field_exprs: &[Expr]) -> Result<Vec<RecordFieldSpec>
 fn eval_set(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
     match args {
         [Expr::Symbol { name, pos }, value_expr] => {
-            let value = eval(value_expr, env.clone(), output)?;
+            let value = eval_single(value_expr, env.clone(), output)?;
             env.set(name, value)
                 .map_err(|error| error.with_position(pos.line, pos.col))?;
             Ok(Value::Void)
