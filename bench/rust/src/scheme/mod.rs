@@ -62,11 +62,15 @@ enum Value {
 }
 
 struct Procedure {
+    clauses: Vec<ProcedureClause>,
+    env: EnvRef,
+    macro_env: MacroEnvRef,
+}
+
+struct ProcedureClause {
     params: Vec<String>,
     rest_param: Option<String>,
     body: Vec<Expr>,
-    env: EnvRef,
-    macro_env: MacroEnvRef,
 }
 
 #[derive(Clone)]
@@ -106,6 +110,7 @@ enum BuiltinKind {
     BooleanPred,
     PairPred,
     SymbolPred,
+    ProcedurePred,
     Display,
     Write,
     Newline,
@@ -306,6 +311,7 @@ impl BuiltinKind {
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
+            Self::ProcedurePred => "procedure?",
             Self::Display => "display",
             Self::Write => "write",
             Self::Newline => "newline",
@@ -351,6 +357,29 @@ impl BuiltinKind {
             Self::StringCiEqual => "string-ci=?",
             Self::StringUpcase => "string-upcase",
             Self::StringDowncase => "string-downcase",
+        }
+    }
+}
+
+impl ProcedureClause {
+    fn new(params: Vec<String>, rest_param: Option<String>, body: Vec<Expr>) -> Self {
+        Self {
+            params,
+            rest_param,
+            body,
+        }
+    }
+
+    fn matches_arity(&self, arg_count: usize) -> bool {
+        arg_count >= self.params.len()
+            && (self.rest_param.is_some() || arg_count == self.params.len())
+    }
+
+    fn expected_arity(&self) -> String {
+        if self.rest_param.is_some() {
+            format!("at least {} argument(s)", self.params.len())
+        } else {
+            format!("exactly {} argument(s)", self.params.len())
         }
     }
 }
@@ -665,6 +694,28 @@ fn render_char(value: char) -> String {
     }
 }
 
+fn make_procedure(clauses: Vec<ProcedureClause>, env: &EnvRef, macro_env: &MacroEnvRef) -> Value {
+    Value::Procedure(Rc::new(Procedure {
+        clauses,
+        env: Rc::clone(env),
+        macro_env: Rc::clone(macro_env),
+    }))
+}
+
+fn single_clause_procedure(
+    params: Vec<String>,
+    rest_param: Option<String>,
+    body: Vec<Expr>,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Value {
+    make_procedure(
+        vec![ProcedureClause::new(params, rest_param, body)],
+        env,
+        macro_env,
+    )
+}
+
 fn values_equal(lhs: &Value, rhs: &Value) -> bool {
     match (lhs, rhs) {
         (Value::Number(lhs), Value::Number(rhs)) => lhs.equals(*rhs).unwrap_or(false),
@@ -814,6 +865,10 @@ fn eval_list(
                 return eval_lambda(&items[1..], env, macro_env)
                     .map_err(|err| err.with_position(head_position))
             }
+            "case-lambda" => {
+                return eval_case_lambda(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
             "define-record-type" => {
                 return eval_define_record_type(&items[1..], env)
                     .map_err(|err| err.with_position(head_position))
@@ -888,13 +943,7 @@ fn eval_define(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<V
         }
 
         let (params, rest_param) = parse_param_list_items(params)?;
-        let procedure = Value::Procedure(Rc::new(Procedure {
-            params,
-            rest_param,
-            body: body.to_vec(),
-            env: Rc::clone(env),
-            macro_env: Rc::clone(macro_env),
-        }));
+        let procedure = single_clause_procedure(params, rest_param, body.to_vec(), env, macro_env);
 
         env_define(env, name.clone(), procedure);
         return Ok(Value::Void);
@@ -972,13 +1021,51 @@ fn eval_lambda(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<V
     }
 
     let (params, rest_param) = parse_param_list(params_expr)?;
-    Ok(Value::Procedure(Rc::new(Procedure {
+    Ok(single_clause_procedure(
         params,
         rest_param,
-        body: body.to_vec(),
-        env: Rc::clone(env),
-        macro_env: Rc::clone(macro_env),
-    })))
+        body.to_vec(),
+        env,
+        macro_env,
+    ))
+}
+
+fn eval_case_lambda(
+    args: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "case-lambda requires at least one clause".into(),
+        });
+    }
+
+    let mut clauses = Vec::with_capacity(args.len());
+    for clause in args {
+        let Expr::List(items, _) = clause else {
+            return Err(EvalError::SyntaxError {
+                message: "case-lambda clauses must be lists".into(),
+            });
+        };
+
+        let Some((params_expr, body)) = items.split_first() else {
+            return Err(EvalError::SyntaxError {
+                message: "case-lambda clause cannot be empty".into(),
+            });
+        };
+
+        if body.is_empty() {
+            return Err(EvalError::SyntaxError {
+                message: "case-lambda clause requires a body".into(),
+            });
+        }
+
+        let (params, rest_param) = parse_param_list(params_expr)?;
+        clauses.push(ProcedureClause::new(params, rest_param, body.to_vec()));
+    }
+
+    Ok(make_procedure(clauses, env, macro_env))
 }
 
 fn eval_set(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
@@ -1010,8 +1097,9 @@ fn eval_set(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Valu
 fn parse_param_list(params_expr: &Expr) -> Result<(Vec<String>, Option<String>), EvalError> {
     match params_expr {
         Expr::List(items, _) => parse_param_list_items(items),
+        Expr::Symbol(name, _) if name != "." => Ok((Vec::new(), Some(name.clone()))),
         _ => Err(EvalError::SyntaxError {
-            message: "parameter list must be a list of symbols".into(),
+            message: "parameter list must be a symbol or list of symbols".into(),
         }),
     }
 }
@@ -1069,24 +1157,51 @@ fn apply_callable(callable: Value, args: &[Value]) -> Result<Value, EvalError> {
 }
 
 fn apply_procedure(procedure: &Procedure, args: &[Value]) -> Result<Value, EvalError> {
-    let required = procedure.params.len();
-    if args.len() < required || (procedure.rest_param.is_none() && args.len() != required) {
-        return Err(EvalError::WrongArgCount {
-            name: "lambda".into(),
-            expected: if procedure.rest_param.is_some() {
-                format!("at least {required} argument(s)")
+    let clause = procedure
+        .clauses
+        .iter()
+        .find(|clause| clause.matches_arity(args.len()))
+        .ok_or_else(|| EvalError::WrongArgCount {
+            name: if procedure.clauses.len() > 1 {
+                "case-lambda".into()
             } else {
-                format!("exactly {required} argument(s)")
+                "lambda".into()
             },
+            expected: procedure_expected_arity(procedure),
             got: args.len(),
-        });
+        })?;
+
+    apply_procedure_clause(clause, &procedure.env, &procedure.macro_env, args)
+}
+
+fn procedure_expected_arity(procedure: &Procedure) -> String {
+    if let [clause] = procedure.clauses.as_slice() {
+        return clause.expected_arity();
     }
 
-    let call_env = Environment::new(Some(Rc::clone(&procedure.env)));
-    for (param, arg) in procedure.params.iter().zip(args.iter().take(required)) {
+    let mut arities = Vec::with_capacity(procedure.clauses.len());
+    for clause in &procedure.clauses {
+        let expected = clause.expected_arity();
+        if !arities.contains(&expected) {
+            arities.push(expected);
+        }
+    }
+
+    format!("one of {}", arities.join(", "))
+}
+
+fn apply_procedure_clause(
+    clause: &ProcedureClause,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    args: &[Value],
+) -> Result<Value, EvalError> {
+    let required = clause.params.len();
+    let call_env = Environment::new(Some(Rc::clone(env)));
+    for (param, arg) in clause.params.iter().zip(args.iter().take(required)) {
         env_define(&call_env, param.clone(), arg.clone());
     }
-    if let Some(rest_param) = &procedure.rest_param {
+    if let Some(rest_param) = &clause.rest_param {
         env_define(
             &call_env,
             rest_param.clone(),
@@ -1094,8 +1209,8 @@ fn apply_procedure(procedure: &Procedure, args: &[Value]) -> Result<Value, EvalE
         );
     }
 
-    let call_macro_env = MacroEnvironment::new(Some(Rc::clone(&procedure.macro_env)));
-    eval_sequence(&procedure.body, &call_env, &call_macro_env)
+    let call_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
+    eval_sequence(&clause.body, &call_env, &call_macro_env)
 }
 
 fn eval_and(args: &[Expr], env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
@@ -1226,13 +1341,7 @@ fn eval_named_let(
         .collect::<Vec<_>>();
 
     let let_env = Environment::new(Some(Rc::clone(env)));
-    let procedure = Value::Procedure(Rc::new(Procedure {
-        params,
-        rest_param: None,
-        body: body.to_vec(),
-        env: Rc::clone(&let_env),
-        macro_env: Rc::clone(macro_env),
-    }));
+    let procedure = single_clause_procedure(params, None, body.to_vec(), &let_env, macro_env);
     env_define(&let_env, name.to_string(), procedure.clone());
 
     apply_callable(procedure, &args)

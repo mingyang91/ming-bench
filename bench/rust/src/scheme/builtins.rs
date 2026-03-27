@@ -38,6 +38,7 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::BooleanPred,
         BuiltinKind::PairPred,
         BuiltinKind::SymbolPred,
+        BuiltinKind::ProcedurePred,
         BuiltinKind::Display,
         BuiltinKind::Write,
         BuiltinKind::Newline,
@@ -161,6 +162,12 @@ pub(super) fn apply_builtin(
         BuiltinKind::SymbolPred => {
             eval_predicate("symbol?", args, |value| matches!(value, Value::Symbol(_)))
         }
+        BuiltinKind::ProcedurePred => eval_predicate("procedure?", args, |value| {
+            matches!(
+                value,
+                Value::Procedure(_) | Value::NativeProcedure(_) | Value::Builtin(_)
+            )
+        }),
         BuiltinKind::Display => eval_display(args, output),
         BuiltinKind::Write => eval_write(args, output),
         BuiltinKind::Newline => eval_newline(args, output),
