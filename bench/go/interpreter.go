@@ -111,6 +111,13 @@ func (s *mutableString) String() string {
 	return string(s.runes)
 }
 
+func newRuntimeString(text string, immutable bool) any {
+	if immutable {
+		return stringValue(text)
+	}
+	return newMutableString(text)
+}
+
 type vectorValue struct {
 	elements []any
 }
@@ -122,6 +129,21 @@ func newVectorValue(elements []any) *vectorValue {
 type pairValue struct {
 	car any
 	cdr any
+}
+
+type pairComparison struct {
+	left  *pairValue
+	right *pairValue
+}
+
+type vectorComparison struct {
+	left  *vectorValue
+	right *vectorValue
+}
+
+type formatState struct {
+	pairs   map[*pairValue]struct{}
+	vectors map[*vectorValue]struct{}
 }
 
 type callable interface {
@@ -390,20 +412,35 @@ func (i *interpreter) resolveTailResult(result any) (any, error) {
 func installBuiltins(env *environment) {
 	for _, name := range []string{
 		"+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
-		"cons", "car", "cdr", "null?", "list", "length", "append",
-		"vector", "make-vector", "vector?", "vector-length", "vector-ref", "vector-set!", "vector->list",
+		"cons", "car", "cdr", "set-car!", "set-cdr!", "null?", "list", "length", "append", "reverse",
+		"vector", "make-vector", "vector?", "vector-length", "vector-ref", "vector-set!", "vector->list", "list->vector",
 		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?", "procedure?",
-		"apply", "eq?", "equal?",
-		"display", "write", "newline",
-		"string-append", "string-length", "substring",
+		"apply", "eqv?", "eq?", "equal?",
+		"display", "write", "newline", "error",
+		"string-append", "string-length", "substring", "make-string", "string",
 		"string->number", "number->string", "exact->inexact", "inexact->exact", "numerator", "denominator",
 		"symbol->string", "string->symbol",
 		"string-ref", "string-copy", "string-set!", "string->list", "list->string", "char?", "char->integer", "integer->char",
-		"abs", "modulo", "remainder", "quotient", "min", "max", "expt",
+		"abs", "modulo", "remainder", "quotient", "min", "max", "expt", "gcd", "lcm", "truncate", "round",
 		"zero?", "positive?", "negative?", "odd?", "even?",
-		"list-ref", "list-tail", "list?", "assoc", "map",
+		"list-ref", "list-tail", "list?", "assoc", "assv", "member", "map", "for-each",
 		"char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase", "char=?", "char<?",
-		"string=?", "string<?", "string-ci=?", "string-upcase", "string-downcase",
+		"string=?", "string<?", "string>?", "string<=?", "string>=?", "string-ci=?", "string-upcase", "string-downcase",
+	} {
+		name := name
+		env.define(name, &builtinProcedure{
+			name: name,
+			fn: func(i *interpreter, args []any, pos position) (any, error) {
+				return applyBuiltin(i, name, args, pos)
+			},
+		})
+	}
+
+	for _, name := range []string{
+		"caar", "cadr", "cdar", "cddr",
+		"caaar", "caadr", "cadar", "caddr", "cdaar", "cdadr", "cddar", "cdddr",
+		"caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "caddar", "cadddr",
+		"cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
 	} {
 		name := name
 		env.define(name, &builtinProcedure{
@@ -512,6 +549,8 @@ func (i *interpreter) evalList(list *listExpr, env *environment, tail bool) (any
 				return i.evalSet(list.elements[1:], operator.pos, env)
 			case "let":
 				return i.evalLet(list.elements[1:], operator.pos, env, tail)
+			case "let*":
+				return i.evalLetStar(list.elements[1:], operator.pos, env, tail)
 			case "letrec":
 				return i.evalLetRec(list.elements[1:], operator.pos, env, false, "letrec", tail)
 			case "letrec*":
@@ -917,6 +956,28 @@ func (i *interpreter) evalPlainLet(args []expr, _ position, env *environment, ta
 	letEnv := newEnvironment(env)
 	for _, binding := range bindings {
 		value, err := i.eval(binding.valueExpr, env)
+		if err != nil {
+			return nil, err
+		}
+		letEnv.define(binding.name, value)
+	}
+
+	return i.evalSequence(args[1:], letEnv, tail)
+}
+
+func (i *interpreter) evalLetStar(args []expr, pos position, env *environment, tail bool) (any, error) {
+	if len(args) < 2 {
+		return nil, newEvalError(pos, "let* expects bindings and a body")
+	}
+
+	bindings, err := parseLetBindings(args[0])
+	if err != nil {
+		return nil, err
+	}
+
+	letEnv := newEnvironment(env)
+	for _, binding := range bindings {
+		value, err := i.eval(binding.valueExpr, letEnv)
 		if err != nil {
 			return nil, err
 		}
@@ -1344,6 +1405,10 @@ func applyProcedure(i *interpreter, operator any, args []any, pos position, tail
 }
 
 func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, error) {
+	if isCxrProcedureName(name) {
+		return applyCxr(name, args, pos)
+	}
+
 	switch name {
 	case "apply":
 		callArgs, err := expandApplyArgs(args, pos, name)
@@ -1351,6 +1416,12 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			return nil, err
 		}
 		return applyProcedure(i, args[0], callArgs, pos, false)
+
+	case "eqv?":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		return eqValues(args[0], args[1]), nil
 
 	case "eq?":
 		if len(args) != 2 {
@@ -1568,6 +1639,63 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return result, nil
 
+	case "gcd":
+		result := 0
+		for _, arg := range args {
+			value, err := expectInt(arg, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			result = gcd(result, value)
+		}
+		return absInt(result), nil
+
+	case "lcm":
+		result := 1
+		if len(args) == 0 {
+			return result, nil
+		}
+		for _, arg := range args {
+			value, err := expectInt(arg, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			value = absInt(value)
+			if result == 0 || value == 0 {
+				result = 0
+				continue
+			}
+			result = absInt(result/gcd(result, value) * value)
+		}
+		return result, nil
+
+	case "truncate":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		numeric, ok := numericFromValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects a number", name)
+		}
+		if numeric.exact {
+			return numeric.numerator / numeric.denominator, nil
+		}
+		return inexactValue(normalizeInexactFloat(math.Trunc(numeric.inexact))), nil
+
+	case "round":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		numeric, ok := numericFromValue(args[0])
+		if !ok {
+			return nil, newEvalError(pos, "%s expects a number", name)
+		}
+		rounded := math.Round(numeric.asFloat64())
+		if numeric.exact {
+			return int(rounded), nil
+		}
+		return inexactValue(normalizeInexactFloat(rounded)), nil
+
 	case "<":
 		return numericCompare(name, args, pos, func(cmp int) bool { return cmp < 0 })
 	case ">":
@@ -1660,6 +1788,28 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return pair.cdr, nil
 
+	case "set-car!":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		pair, err := expectPair(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		pair.car = args[1]
+		return voidValue{}, nil
+
+	case "set-cdr!":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		pair, err := expectPair(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		pair.cdr = args[1]
+		return voidValue{}, nil
+
 	case "null?":
 		if len(args) != 1 {
 			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
@@ -1697,6 +1847,20 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			for elementIndex := len(elements) - 1; elementIndex >= 0; elementIndex-- {
 				result = &pairValue{car: elements[elementIndex], cdr: result}
 			}
+		}
+		return result, nil
+
+	case "reverse":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		elements, err := listElements(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		result := any(emptyList{})
+		for _, element := range elements {
+			result = &pairValue{car: element, cdr: result}
 		}
 		return result, nil
 
@@ -1753,6 +1917,56 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return false, nil
 
+	case "assv":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		seen := map[*pairValue]struct{}{}
+		for current := args[1]; ; {
+			switch list := current.(type) {
+			case emptyList:
+				return false, nil
+			case *pairValue:
+				if _, ok := seen[list]; ok {
+					return nil, newEvalError(pos, "%s expects a proper list", name)
+				}
+				seen[list] = struct{}{}
+				entry, ok := list.car.(*pairValue)
+				if !ok {
+					return nil, newEvalError(pos, "%s expects an association list", name)
+				}
+				if eqValues(args[0], entry.car) {
+					return list.car, nil
+				}
+				current = list.cdr
+			default:
+				return nil, newEvalError(pos, "%s expects a proper list", name)
+			}
+		}
+
+	case "member":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		seen := map[*pairValue]struct{}{}
+		for current := args[1]; ; {
+			switch list := current.(type) {
+			case emptyList:
+				return false, nil
+			case *pairValue:
+				if _, ok := seen[list]; ok {
+					return nil, newEvalError(pos, "%s expects a proper list", name)
+				}
+				seen[list] = struct{}{}
+				if equalValues(args[0], list.car) {
+					return list, nil
+				}
+				current = list.cdr
+			default:
+				return nil, newEvalError(pos, "%s expects a proper list", name)
+			}
+		}
+
 	case "map":
 		if len(args) < 2 {
 			return nil, newEvalError(pos, "%s expects at least 2 arguments", name)
@@ -1784,6 +1998,35 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			results = append(results, result)
 		}
 		return buildList(results), nil
+
+	case "for-each":
+		if len(args) < 2 {
+			return nil, newEvalError(pos, "%s expects at least 2 arguments", name)
+		}
+		lists := make([][]any, len(args)-1)
+		expectedLen := -1
+		for index, arg := range args[1:] {
+			elements, err := listElements(arg, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			if expectedLen == -1 {
+				expectedLen = len(elements)
+			} else if len(elements) != expectedLen {
+				return nil, newEvalError(pos, "%s expects lists of equal length", name)
+			}
+			lists[index] = elements
+		}
+		callArgs := make([]any, len(lists))
+		for index := 0; index < expectedLen; index++ {
+			for listIndex := range lists {
+				callArgs[listIndex] = lists[listIndex][index]
+			}
+			if _, err := applyProcedure(i, args[0], callArgs, pos, false); err != nil {
+				return nil, err
+			}
+		}
+		return voidValue{}, nil
 
 	case "vector":
 		return newVectorValue(args), nil
@@ -1870,6 +2113,16 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			return nil, err
 		}
 		return buildList(vector.elements), nil
+
+	case "list->vector":
+		if len(args) != 1 {
+			return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+		}
+		elements, err := listElements(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		return newVectorValue(elements), nil
 
 	case "string?":
 		if len(args) != 1 {
@@ -2006,6 +2259,23 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		i.output.WriteByte('\n')
 		return voidValue{}, nil
 
+	case "error":
+		if len(args) == 0 {
+			return nil, newEvalError(pos, "%s expects at least 1 argument", name)
+		}
+		parts := make([]string, 0, len(args))
+		for _, arg := range args {
+			switch value := arg.(type) {
+			case stringValue:
+				parts = append(parts, string(value))
+			case *mutableString:
+				parts = append(parts, value.String())
+			default:
+				parts = append(parts, formatValue(arg))
+			}
+		}
+		return nil, newEvalError(pos, strings.Join(parts, " "))
+
 	case "string-append":
 		var builder strings.Builder
 		for _, arg := range args {
@@ -2016,6 +2286,42 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			builder.WriteString(text)
 		}
 		return stringValue(builder.String()), nil
+
+	case "make-string":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, newEvalError(pos, "%s expects 1 or 2 arguments", name)
+		}
+		length, err := expectInt(args[0], pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if length < 0 {
+			return nil, newEvalError(pos, "%s expects a non-negative length", name)
+		}
+		fill := rune(' ')
+		if len(args) == 2 {
+			ch, err := expectChar(args[1], pos, name)
+			if err != nil {
+				return nil, err
+			}
+			fill = rune(ch)
+		}
+		runes := make([]rune, length)
+		for index := range runes {
+			runes[index] = fill
+		}
+		return newRuntimeString(string(runes), i.immutableStrings), nil
+
+	case "string":
+		runes := make([]rune, len(args))
+		for index, arg := range args {
+			ch, err := expectChar(arg, pos, name)
+			if err != nil {
+				return nil, err
+			}
+			runes[index] = rune(ch)
+		}
+		return newRuntimeString(string(runes), i.immutableStrings), nil
 
 	case "string-length":
 		if len(args) != 1 {
@@ -2119,10 +2425,7 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		if err != nil {
 			return nil, err
 		}
-		if i.immutableStrings {
-			return stringValue(text), nil
-		}
-		return newMutableString(text), nil
+		return newRuntimeString(text, i.immutableStrings), nil
 
 	case "string->list":
 		if len(args) != 1 {
@@ -2162,6 +2465,15 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 
 	case "string<?":
 		return stringCompare(name, args, pos, func(a, b string) bool { return compareStrings(a, b) < 0 })
+
+	case "string>?":
+		return stringCompare(name, args, pos, func(a, b string) bool { return compareStrings(a, b) > 0 })
+
+	case "string<=?":
+		return stringCompare(name, args, pos, func(a, b string) bool { return compareStrings(a, b) <= 0 })
+
+	case "string>=?":
+		return stringCompare(name, args, pos, func(a, b string) bool { return compareStrings(a, b) >= 0 })
 
 	case "string-ci=?":
 		return stringCompare(name, args, pos, func(a, b string) bool { return strings.EqualFold(a, b) })
@@ -2396,6 +2708,38 @@ func compareStrings(left, right string) int {
 	}
 }
 
+func isCxrProcedureName(name string) bool {
+	if len(name) < 4 || len(name) > 6 || name[0] != 'c' || name[len(name)-1] != 'r' {
+		return false
+	}
+	for index := 1; index < len(name)-1; index++ {
+		if name[index] != 'a' && name[index] != 'd' {
+			return false
+		}
+	}
+	return true
+}
+
+func applyCxr(name string, args []any, pos position) (any, error) {
+	if len(args) != 1 {
+		return nil, newEvalError(pos, "%s expects exactly 1 argument", name)
+	}
+
+	current := args[0]
+	for index := len(name) - 2; index >= 1; index-- {
+		pair, err := expectPair(current, pos, name)
+		if err != nil {
+			return nil, err
+		}
+		if name[index] == 'a' {
+			current = pair.car
+		} else {
+			current = pair.cdr
+		}
+	}
+	return current, nil
+}
+
 func transformString(text string, transform func(rune) rune) string {
 	runes := []rune(text)
 	for index, value := range runes {
@@ -2430,13 +2774,34 @@ func listTailAt(value any, index int, pos position, procedure string) (any, erro
 }
 
 func isProperList(value any) bool {
+	slow := value
+	fast := value
+
 	for {
-		switch current := value.(type) {
+		switch current := fast.(type) {
 		case emptyList:
 			return true
 		case *pairValue:
-			value = current.cdr
+			fast = current.cdr
 		default:
+			return false
+		}
+
+		switch current := fast.(type) {
+		case emptyList:
+			return true
+		case *pairValue:
+			fast = current.cdr
+		default:
+			return false
+		}
+
+		slowPair, ok := slow.(*pairValue)
+		if !ok {
+			return false
+		}
+		slow = slowPair.cdr
+		if slow == fast {
 			return false
 		}
 	}
@@ -2497,6 +2862,15 @@ func eqValues(left, right any) bool {
 }
 
 func equalValues(left, right any) bool {
+	return equalValuesSeen(
+		left,
+		right,
+		map[pairComparison]struct{}{},
+		map[vectorComparison]struct{}{},
+	)
+}
+
+func equalValuesSeen(left, right any, seenPairs map[pairComparison]struct{}, seenVectors map[vectorComparison]struct{}) bool {
 	if leftNumeric, ok := numericFromValue(left); ok {
 		rightNumeric, ok := numericFromValue(right)
 		return ok && compareNumericValues(leftNumeric, rightNumeric) == 0
@@ -2541,14 +2915,28 @@ func equalValues(left, right any) bool {
 		return ok
 	case *pairValue:
 		r, ok := right.(*pairValue)
-		return ok && equalValues(l.car, r.car) && equalValues(l.cdr, r.cdr)
+		if !ok {
+			return false
+		}
+		key := pairComparison{left: l, right: r}
+		if _, ok := seenPairs[key]; ok {
+			return true
+		}
+		seenPairs[key] = struct{}{}
+		return equalValuesSeen(l.car, r.car, seenPairs, seenVectors) &&
+			equalValuesSeen(l.cdr, r.cdr, seenPairs, seenVectors)
 	case *vectorValue:
 		r, ok := right.(*vectorValue)
 		if !ok || len(l.elements) != len(r.elements) {
 			return false
 		}
+		key := vectorComparison{left: l, right: r}
+		if _, ok := seenVectors[key]; ok {
+			return true
+		}
+		seenVectors[key] = struct{}{}
 		for index := range l.elements {
-			if !equalValues(l.elements[index], r.elements[index]) {
+			if !equalValuesSeen(l.elements[index], r.elements[index], seenPairs, seenVectors) {
 				return false
 			}
 		}
@@ -2631,11 +3019,16 @@ func expectVector(value any, pos position, procedure string) (*vectorValue, erro
 
 func listElements(value any, pos position, procedure string) ([]any, error) {
 	elements := []any{}
+	seen := map[*pairValue]struct{}{}
 	for {
 		switch current := value.(type) {
 		case emptyList:
 			return elements, nil
 		case *pairValue:
+			if _, ok := seen[current]; ok {
+				return nil, newEvalError(pos, "%s expects a proper list", procedure)
+			}
+			seen[current] = struct{}{}
 			elements = append(elements, current.car)
 			value = current.cdr
 		default:
@@ -2658,6 +3051,13 @@ func isTruthy(value any) bool {
 }
 
 func formatValue(value any) string {
+	return formatValueWithState(value, &formatState{
+		pairs:   map[*pairValue]struct{}{},
+		vectors: map[*vectorValue]struct{}{},
+	})
+}
+
+func formatValueWithState(value any, state *formatState) string {
 	if text, ok := formatNumericValue(value); ok {
 		return text
 	}
@@ -2683,9 +3083,9 @@ func formatValue(value any) string {
 	case emptyList:
 		return "()"
 	case *vectorValue:
-		return formatVector(v)
+		return formatVectorWithState(v, state)
 	case *pairValue:
-		return formatPair(v)
+		return formatPairWithState(v, state)
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", v.recordType.name)
 	case callable:
@@ -2720,30 +3120,61 @@ func formatCharLiteral(value rune) string {
 }
 
 func formatPair(pair *pairValue) string {
+	return formatPairWithState(pair, &formatState{
+		pairs:   map[*pairValue]struct{}{},
+		vectors: map[*vectorValue]struct{}{},
+	})
+}
+
+func formatPairWithState(pair *pairValue, state *formatState) string {
+	if _, ok := state.pairs[pair]; ok {
+		return "#<circular>"
+	}
+	state.pairs[pair] = struct{}{}
+	defer delete(state.pairs, pair)
+
 	var builder strings.Builder
 	builder.WriteByte('(')
+	formatPairElements(pair, &builder, state)
+	builder.WriteByte(')')
+	return builder.String()
+}
 
-	current := pair
-	for {
-		builder.WriteString(formatValue(current.car))
+func formatPairElements(pair *pairValue, builder *strings.Builder, state *formatState) {
+	builder.WriteString(formatValueWithState(pair.car, state))
 
-		switch next := current.cdr.(type) {
-		case emptyList:
-			builder.WriteByte(')')
-			return builder.String()
-		case *pairValue:
-			builder.WriteByte(' ')
-			current = next
-		default:
-			builder.WriteString(" . ")
-			builder.WriteString(formatValue(next))
-			builder.WriteByte(')')
-			return builder.String()
+	switch next := pair.cdr.(type) {
+	case emptyList:
+		return
+	case *pairValue:
+		if _, ok := state.pairs[next]; ok {
+			builder.WriteString(" . #<circular>")
+			return
 		}
+		state.pairs[next] = struct{}{}
+		builder.WriteByte(' ')
+		formatPairElements(next, builder, state)
+		delete(state.pairs, next)
+	default:
+		builder.WriteString(" . ")
+		builder.WriteString(formatValueWithState(next, state))
 	}
 }
 
 func formatVector(vector *vectorValue) string {
+	return formatVectorWithState(vector, &formatState{
+		pairs:   map[*pairValue]struct{}{},
+		vectors: map[*vectorValue]struct{}{},
+	})
+}
+
+func formatVectorWithState(vector *vectorValue, state *formatState) string {
+	if _, ok := state.vectors[vector]; ok {
+		return "#<circular>"
+	}
+	state.vectors[vector] = struct{}{}
+	defer delete(state.vectors, vector)
+
 	var builder strings.Builder
 	builder.WriteString("#(")
 
@@ -2751,7 +3182,7 @@ func formatVector(vector *vectorValue) string {
 		if index > 0 {
 			builder.WriteByte(' ')
 		}
-		builder.WriteString(formatValue(element))
+		builder.WriteString(formatValueWithState(element, state))
 	}
 
 	builder.WriteByte(')')
