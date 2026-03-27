@@ -17,6 +17,7 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::GreaterThan,
         BuiltinKind::Equal,
         BuiltinKind::LessThanOrEqual,
+        BuiltinKind::GreaterThanOrEqual,
         BuiltinKind::Not,
         BuiltinKind::Cons,
         BuiltinKind::Car,
@@ -57,7 +58,11 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::StringRef,
         BuiltinKind::StringCopy,
         BuiltinKind::StringSet,
+        BuiltinKind::StringToList,
+        BuiltinKind::ListToString,
         BuiltinKind::CharPred,
+        BuiltinKind::CharToInteger,
+        BuiltinKind::IntegerToChar,
         BuiltinKind::Abs,
         BuiltinKind::Modulo,
         BuiltinKind::Remainder,
@@ -125,6 +130,9 @@ pub(super) fn apply_builtin(
         }
         BuiltinKind::LessThanOrEqual => {
             eval_compare(kind.name(), args, |ordering| ordering != Ordering::Greater)
+        }
+        BuiltinKind::GreaterThanOrEqual => {
+            eval_compare(kind.name(), args, |ordering| ordering != Ordering::Less)
         }
         BuiltinKind::Not => eval_not(args),
         BuiltinKind::Cons => eval_cons(args),
@@ -195,9 +203,13 @@ pub(super) fn apply_builtin(
         BuiltinKind::StringRef => eval_string_ref(args),
         BuiltinKind::StringCopy => eval_string_copy(args),
         BuiltinKind::StringSet => eval_string_set(args),
+        BuiltinKind::StringToList => eval_string_to_list(args),
+        BuiltinKind::ListToString => eval_list_to_string(args),
         BuiltinKind::CharPred => {
             eval_predicate("char?", args, |value| matches!(value, Value::Char(_)))
         }
+        BuiltinKind::CharToInteger => eval_char_to_integer(args),
+        BuiltinKind::IntegerToChar => eval_integer_to_char(args),
         BuiltinKind::Abs => eval_abs(args),
         BuiltinKind::Modulo => eval_modulo(args),
         BuiltinKind::Remainder => eval_remainder(args),
@@ -837,6 +849,65 @@ fn eval_string_set(args: &[Value]) -> Result<Value, EvalError> {
 
     chars[index] = ch;
     Ok(Value::Void)
+}
+
+fn eval_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "string->list".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::List(
+        value.as_string()?.chars().map(Value::Char).collect(),
+    ))
+}
+
+fn eval_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    let [list] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "list->string".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    let result = list_items(list)?
+        .iter()
+        .map(Value::as_char)
+        .collect::<Result<String, _>>()?;
+    Ok(Value::String(result))
+}
+
+fn eval_char_to_integer(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "char->integer".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    Ok(integer_value(value.as_char()? as u32 as i64))
+}
+
+fn eval_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "integer->char".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        });
+    };
+
+    let code_point = value.as_integer()?;
+    let Some(ch) = char::from_u32(code_point as u32) else {
+        return Err(EvalError::InvalidCodePoint { value: code_point });
+    };
+
+    Ok(Value::Char(ch))
 }
 
 fn eval_vector(args: &[Value]) -> Result<Value, EvalError> {

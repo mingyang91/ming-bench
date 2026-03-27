@@ -87,6 +87,9 @@ pub enum EvalError {
     #[error("string is immutable")]
     ImmutableString,
 
+    #[error("invalid character code point: {value}")]
+    InvalidCodePoint { value: i64 },
+
     #[error("expected {expected} record, got {found}")]
     RecordTypeMismatch { expected: String, found: String },
 
