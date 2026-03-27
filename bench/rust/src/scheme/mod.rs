@@ -31,7 +31,10 @@ pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, Eval
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
-    Ok((eval_str(input)?, String::new()))
+    let _output_scope = OutputCaptureScope::enter();
+    let result = eval_str_internal(input, true)?;
+    let output = drain_output_buffer();
+    Ok((result, output))
 }
 
 fn eval_str_internal(input: &str, allow_level26_fast_path: bool) -> Result<String, EvalError> {
@@ -101,6 +104,7 @@ impl StepBudget {
 
 thread_local! {
     static STEP_BUDGET: RefCell<Option<StepBudget>> = const { RefCell::new(None) };
+    static OUTPUT_BUFFER: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 struct StepBudgetScope {
@@ -126,6 +130,43 @@ impl Drop for StepBudgetScope {
             slot.replace(previous);
         });
     }
+}
+
+struct OutputCaptureScope {
+    previous: Option<Option<String>>,
+}
+
+impl OutputCaptureScope {
+    fn enter() -> Self {
+        let previous = OUTPUT_BUFFER.with(|slot| slot.replace(Some(String::new())));
+        Self {
+            previous: Some(previous),
+        }
+    }
+}
+
+impl Drop for OutputCaptureScope {
+    fn drop(&mut self) {
+        let previous = self
+            .previous
+            .take()
+            .expect("output capture scope should only be dropped once");
+        OUTPUT_BUFFER.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+fn append_output(text: &str) {
+    OUTPUT_BUFFER.with(|slot| {
+        if let Some(buffer) = slot.borrow_mut().as_mut() {
+            buffer.push_str(text);
+        }
+    });
+}
+
+fn drain_output_buffer() -> String {
+    OUTPUT_BUFFER.with(|slot| slot.borrow_mut().take().unwrap_or_default())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -168,10 +209,14 @@ enum Builtin {
     Remainder,
     StringPred,
     StringAppend,
+    StringLength,
     NumberToString,
     StringToSymbol,
     SymbolToString,
     StringRef,
+    Display,
+    Write,
+    Newline,
     NumberPred,
     BooleanPred,
     PairPred,
@@ -217,10 +262,14 @@ impl Builtin {
             "remainder" => Some(Self::Remainder),
             "string?" => Some(Self::StringPred),
             "string-append" => Some(Self::StringAppend),
+            "string-length" => Some(Self::StringLength),
             "number->string" => Some(Self::NumberToString),
             "string->symbol" => Some(Self::StringToSymbol),
             "symbol->string" => Some(Self::SymbolToString),
             "string-ref" => Some(Self::StringRef),
+            "display" => Some(Self::Display),
+            "write" => Some(Self::Write),
+            "newline" => Some(Self::Newline),
             "number?" => Some(Self::NumberPred),
             "boolean?" => Some(Self::BooleanPred),
             "pair?" => Some(Self::PairPred),
@@ -267,10 +316,14 @@ impl Builtin {
             Self::Remainder => "remainder",
             Self::StringPred => "string?",
             Self::StringAppend => "string-append",
+            Self::StringLength => "string-length",
             Self::NumberToString => "number->string",
             Self::StringToSymbol => "string->symbol",
             Self::SymbolToString => "symbol->string",
             Self::StringRef => "string-ref",
+            Self::Display => "display",
+            Self::Write => "write",
+            Self::Newline => "newline",
             Self::NumberPred => "number?",
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
@@ -299,6 +352,7 @@ enum SpecialForm {
     Let,
     Begin,
     Cond,
+    Case,
     Set,
     Letrec,
     Guard,
@@ -319,6 +373,7 @@ impl SpecialForm {
             "let" => Some(Self::Let),
             "begin" => Some(Self::Begin),
             "cond" => Some(Self::Cond),
+            "case" => Some(Self::Case),
             "set!" => Some(Self::Set),
             "letrec" => Some(Self::Letrec),
             "guard" => Some(Self::Guard),
@@ -693,6 +748,7 @@ fn eval_special_form(
         SpecialForm::Letrec => eval_letrec(args, env),
         SpecialForm::Begin => eval_sequence(args, env),
         SpecialForm::Cond => eval_cond(args, env),
+        SpecialForm::Case => eval(&desugar_case(args)?, env),
         SpecialForm::Set => eval_set(args, env),
         SpecialForm::Guard => eval(&desugar_guard(args)?, env),
         SpecialForm::Do => eval(&desugar_do(args)?, env),
@@ -1501,6 +1557,12 @@ fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
             }
             Ok(Value::String(result))
         }
+        Builtin::StringLength => {
+            let [value] = require_exact_args(builtin.name(), args, 1)? else {
+                unreachable!();
+            };
+            Ok(Value::Int(expect_string(builtin.name(), value)?.chars().count() as i64))
+        }
         Builtin::NumberToString => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
                 unreachable!();
@@ -1538,6 +1600,25 @@ fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
                 )));
             };
             Ok(Value::Char(ch))
+        }
+        Builtin::Display => {
+            let [value] = require_exact_args(builtin.name(), args, 1)? else {
+                unreachable!();
+            };
+            append_output(&render_display(value));
+            Ok(Value::Void)
+        }
+        Builtin::Write => {
+            let [value] = require_exact_args(builtin.name(), args, 1)? else {
+                unreachable!();
+            };
+            append_output(&render(value));
+            Ok(Value::Void)
+        }
+        Builtin::Newline => {
+            require_exact_args(builtin.name(), args, 0)?;
+            append_output("\n");
+            Ok(Value::Void)
         }
         Builtin::NumberPred => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
@@ -2021,6 +2102,11 @@ fn handle_special_form_machine(
         }),
         SpecialForm::Begin => Ok(start_sequence_machine(args, env, frames)),
         SpecialForm::Cond => eval_cond_machine(args, env, frames),
+        SpecialForm::Case => Ok(MachineState::Eval {
+            expr: desugar_case(&args)?,
+            env,
+            frames,
+        }),
         SpecialForm::Set => match args.as_slice() {
             [Expr::Symbol(name), value_expr] => {
                 frames.push(MachineFrame::SetValue {
@@ -3086,6 +3172,63 @@ fn desugar_guard(args: &[Expr]) -> Result<Expr, EvalError> {
     ]))
 }
 
+fn desugar_case(args: &[Expr]) -> Result<Expr, EvalError> {
+    let [key_expr, clauses @ ..] = args else {
+        return Err(EvalError::message(
+            "case expects a key and at least one clause",
+        ));
+    };
+    if clauses.is_empty() {
+        return Err(EvalError::message(
+            "case expects a key and at least one clause",
+        ));
+    }
+
+    let key_name = fresh_symbol("case_key");
+    let mut cond_clauses = Vec::with_capacity(clauses.len());
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::message("case clauses must be lists"));
+        };
+        let Some((head, body)) = items.split_first() else {
+            return Err(EvalError::message("case clauses cannot be empty"));
+        };
+        if body.is_empty() {
+            return Err(EvalError::message("case clauses require a body"));
+        }
+
+        if matches!(head, Expr::Symbol(symbol) if symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::message("case else clause must be last"));
+            }
+            cond_clauses.push(clause.clone());
+            continue;
+        }
+
+        let Expr::List(datums) = head else {
+            return Err(EvalError::message("case clause datums must be a list"));
+        };
+
+        let mut cond_clause = Vec::with_capacity(body.len() + 1);
+        cond_clause.push(case_clause_test(&key_name, datums));
+        cond_clause.extend(body.iter().cloned());
+        cond_clauses.push(Expr::List(cond_clause));
+    }
+
+    let mut cond_items = vec![Expr::Symbol("cond".into())];
+    cond_items.extend(cond_clauses);
+
+    Ok(Expr::List(vec![
+        Expr::Symbol("let".into()),
+        Expr::List(vec![Expr::List(vec![
+            Expr::Symbol(key_name.clone()),
+            key_expr.clone(),
+        ])]),
+        Expr::List(cond_items),
+    ]))
+}
+
 fn desugar_do(args: &[Expr]) -> Result<Expr, EvalError> {
     let [bindings_expr, Expr::List(test_items), body @ ..] = args else {
         return Err(EvalError::message("invalid do"));
@@ -3144,6 +3287,30 @@ fn begin_expr(exprs: Vec<Expr>) -> Expr {
     let mut items = vec![Expr::Symbol("begin".into())];
     items.extend(exprs);
     Expr::List(items)
+}
+
+fn case_clause_test(key_name: &str, datums: &[Expr]) -> Expr {
+    match datums {
+        [] => Expr::Bool(false),
+        [datum] => case_match_expr(key_name, datum),
+        _ => {
+            let mut items = vec![Expr::Symbol("or".into())];
+            items.extend(datums.iter().map(|datum| case_match_expr(key_name, datum)));
+            Expr::List(items)
+        }
+    }
+}
+
+fn case_match_expr(key_name: &str, datum: &Expr) -> Expr {
+    Expr::List(vec![
+        Expr::Symbol("eq?".into()),
+        Expr::Symbol(key_name.to_string()),
+        quote_expr(datum.clone()),
+    ])
+}
+
+fn quote_expr(expr: Expr) -> Expr {
+    Expr::List(vec![Expr::Symbol("quote".into()), expr])
 }
 
 fn is_else_clause(expr: &Expr) -> bool {
@@ -3305,6 +3472,14 @@ fn render(value: &Value) -> String {
         Value::Multi(_) => "#<values>".into(),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Void => String::new(),
+    }
+}
+
+fn render_display(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Char(ch) => ch.to_string(),
+        _ => render(value),
     }
 }
 
