@@ -13,6 +13,7 @@ pub enum Value {
     List(Vec<Value>),
     Lambda {
         params: Vec<std::string::String>,
+        rest_param: Option<std::string::String>,
         body: Vec<Value>,
         env: Rc<RefCell<Env>>,
     },

@@ -21,6 +21,7 @@ const BUILTINS: &[&str] = &[
     "string-append", "string-length", "substring",
     "string->number", "number->string",
     "symbol->string", "string->symbol", "string-ref", "string-copy",
+    "apply",
 ];
 
 fn make_env() -> Rc<RefCell<Env>> {
