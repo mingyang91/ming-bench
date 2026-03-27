@@ -1,5 +1,11 @@
 package ming
 
+final private[ming] class DynamicWindContext(
+  val inThunk: Value,
+  val outThunk: Value,
+  val pos: SourcePos
+)
+
 sealed private[ming] trait ContinuationFrame
 
 private[ming] object ContinuationFrame:
@@ -55,8 +61,27 @@ private[ming] object ContinuationFrame:
     pos: SourcePos
   ) extends ContinuationFrame
 
+  final case class DynamicWindEntered(bodyThunk: Value, wind: DynamicWindContext) extends ContinuationFrame
+  final case class DynamicWindBodyResult(wind: DynamicWindContext)                extends ContinuationFrame
+  final case class DynamicWindOutResult(bodyResult: Value)                        extends ContinuationFrame
+
+  final case class ContinuationWindExit(
+    remaining: List[DynamicWindContext],
+    entering: List[DynamicWindContext],
+    snapshot: ContinuationSnapshot,
+    value: Value
+  ) extends ContinuationFrame
+
+  final case class ContinuationWindEnter(
+    current: DynamicWindContext,
+    remaining: List[DynamicWindContext],
+    snapshot: ContinuationSnapshot,
+    value: Value
+  ) extends ContinuationFrame
+
 final private[ming] class ContinuationSnapshot(
-  val frames: List[ContinuationFrame]
+  val frames: List[ContinuationFrame],
+  val winds: List[DynamicWindContext]
 )
 
 final private[ming] class EvalContext:

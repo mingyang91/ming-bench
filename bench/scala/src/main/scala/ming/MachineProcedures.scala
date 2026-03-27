@@ -1,11 +1,14 @@
 package ming
 
 import BuiltinSupport.*
+import ContinuationFrame.*
 
 private[ming] object MachineProcedures:
 
   def invokeProcedure(machine: Machine, procedure: Value, args: List[Value], pos: SourcePos): Unit =
     procedure match
+      case Value.BuiltinProc("dynamic-wind") =>
+        prepareDynamicWind(machine, args, pos)
       case Value.BuiltinProc("call/cc") =>
         prepareCallCc(machine, "call/cc", args, pos)
       case Value.BuiltinProc("call-with-current-continuation") =>
@@ -31,8 +34,7 @@ private[ming] object MachineProcedures:
         startClosureCall(machine, name, clause.params, clause.restParam, clause.body, closureEnv, args, pos)
       case continuation: Value.ContinuationVal =>
         val capturedValue = requireSingleArg("continuation", args, pos)
-        machine.frames = continuation.snapshot.frames
-        machine.setValue(capturedValue)
+        startContinuationTransfer(machine, continuation.snapshot, capturedValue)
       case _ =>
         throw EvalError.at(pos, "attempted to call a non-procedure")
 
@@ -59,8 +61,71 @@ private[ming] object MachineProcedures:
 
   private def prepareCallCc(machine: Machine, name: String, args: List[Value], pos: SourcePos): Unit =
     val procedure = requireSingleArg(name, args, pos)
-    val captured  = new Value.ContinuationVal(new ContinuationSnapshot(machine.frames))
+    val captured  = new Value.ContinuationVal(new ContinuationSnapshot(machine.frames, machine.winds))
     machine.setInvoke(procedure, List(captured), pos)
+
+  private def prepareDynamicWind(machine: Machine, args: List[Value], pos: SourcePos): Unit =
+    val List(inThunk, bodyThunk, outThunk) = requireArgCount("dynamic-wind", args, expected = 3, pos)
+    val wind                               = new DynamicWindContext(inThunk, outThunk, pos)
+    machine.push(DynamicWindEntered(bodyThunk, wind))
+    machine.setInvoke(inThunk, Nil, pos)
+
+  private[ming] def continueDynamicWindBody(machine: Machine, wind: DynamicWindContext, bodyResult: Value): Unit =
+    machine.deactivateWind(wind)
+    machine.push(DynamicWindOutResult(bodyResult))
+    machine.setInvoke(wind.outThunk, Nil, wind.pos)
+
+  private[ming] def startContinuationTransfer(
+    machine: Machine,
+    snapshot: ContinuationSnapshot,
+    capturedValue: Value
+  ): Unit =
+    val sharedPrefix = sharedWindPrefix(machine.winds, snapshot.winds)
+    val exiting      = machine.winds.drop(sharedPrefix).reverse
+    val entering     = snapshot.winds.drop(sharedPrefix)
+    continueContinuationTransferAfterExit(machine, exiting, entering, snapshot, capturedValue)
+
+  private[ming] def continueContinuationTransferAfterExit(
+    machine: Machine,
+    remaining: List[DynamicWindContext],
+    entering: List[DynamicWindContext],
+    snapshot: ContinuationSnapshot,
+    capturedValue: Value
+  ): Unit =
+    remaining match
+      case wind :: tail =>
+        machine.deactivateWind(wind)
+        machine.push(ContinuationWindExit(tail, entering, snapshot, capturedValue))
+        machine.setInvoke(wind.outThunk, Nil, wind.pos)
+      case Nil =>
+        continueContinuationTransferAfterEnter(machine, entering, snapshot, capturedValue)
+
+  private[ming] def continueContinuationTransferAfterEnter(
+    machine: Machine,
+    remaining: List[DynamicWindContext],
+    snapshot: ContinuationSnapshot,
+    capturedValue: Value
+  ): Unit =
+    remaining match
+      case wind :: tail =>
+        machine.push(ContinuationWindEnter(wind, tail, snapshot, capturedValue))
+        machine.setInvoke(wind.inThunk, Nil, wind.pos)
+      case Nil =>
+        machine.frames = snapshot.frames
+        machine.winds = snapshot.winds
+        machine.setValue(capturedValue)
+
+  @annotation.tailrec
+  private def sharedWindPrefix(
+    current: List[DynamicWindContext],
+    target: List[DynamicWindContext],
+    shared: Int = 0
+  ): Int =
+    (current, target) match
+      case (currentHead :: currentTail, targetHead :: targetTail) if currentHead.eq(targetHead) =>
+        sharedWindPrefix(currentTail, targetTail, shared + 1)
+      case _ =>
+        shared
 
   private def prepareApply(machine: Machine, args: List[Value], pos: SourcePos): Unit =
     if args.lengthCompare(2) < 0 then

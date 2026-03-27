@@ -21,6 +21,7 @@ private[ming] object Builtins:
     "map",
     "for-each",
     "apply",
+    "dynamic-wind",
     "call/cc",
     "call-with-current-continuation"
   )

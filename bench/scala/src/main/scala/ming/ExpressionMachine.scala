@@ -9,6 +9,7 @@ final private[ming] class Machine(private[ming] val context: EvalContext):
 
   private[ming] var state: MachineState             = MachineState.ApplyValue(Value.Void)
   private[ming] var frames: List[ContinuationFrame] = Nil
+  private[ming] var winds: List[DynamicWindContext] = Nil
 
   def runExpr(expr: Expr, env: Env): Value =
     state = MachineState.EvalExpr(expr, env)
@@ -50,3 +51,10 @@ final private[ming] class Machine(private[ming] val context: EvalContext):
 
   private[ming] def push(frame: ContinuationFrame): Unit =
     frames = frame :: frames
+
+  private[ming] def activateWind(wind: DynamicWindContext): Unit =
+    winds = winds :+ wind
+
+  private[ming] def deactivateWind(wind: DynamicWindContext): Unit =
+    if winds.nonEmpty && (winds.last eq wind) then winds = winds.init
+    else winds = winds.filterNot(existing => existing eq wind)
