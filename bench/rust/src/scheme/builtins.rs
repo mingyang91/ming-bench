@@ -2,6 +2,8 @@ use super::{
     apply_proc, display_value, expect_integer, f64_to_exact, is_number, is_truthy, make_rational,
     make_str, nums_equal, nums_less, value_to_f64, values_equal, EvalError, Value,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
     match op {
@@ -14,9 +16,12 @@ pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Val
 
         "map" | "apply" => eval_higher_order(op, args, output),
 
-        "not" | "eq?" | "equal?" | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
+        "not" | "eq?" | "eqv?" | "equal?" | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
         | "char?" | "integer?" | "rational?" | "exact?" | "inexact?"
-        | "procedure?" => eval_predicate(op, args),
+        | "procedure?" | "vector?" => eval_predicate(op, args),
+
+        "vector" | "make-vector" | "vector-ref" | "vector-set!" | "vector-length"
+        | "vector->list" | "list->vector" => eval_vector(op, args),
 
         "exact->inexact" | "inexact->exact" | "numerator" | "denominator" => {
             eval_number_conversion(op, args)
@@ -496,6 +501,24 @@ fn eval_predicate(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 (Value::Char(a), Value::Char(b)) => a == b,
                 (Value::Symbol(a), Value::Symbol(b)) => a == b,
                 (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
+                (Value::Vector(a), Value::Vector(b)) => Rc::ptr_eq(a, b),
+                (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b),
+                _ => false,
+            };
+            Ok(Value::Boolean(result))
+        }
+        "eqv?" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("eqv? requires 2 arguments".into()));
+            }
+            let result = match (&args[0], &args[1]) {
+                (Value::Integer(a), Value::Integer(b)) => a == b,
+                (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+                (Value::Float(a), Value::Float(b)) => a == b,
+                (Value::Boolean(a), Value::Boolean(b)) => a == b,
+                (Value::Char(a), Value::Char(b)) => a == b,
+                (Value::Symbol(a), Value::Symbol(b)) => a == b,
+                (Value::List(a), Value::List(b)) => a.is_empty() && b.is_empty(),
                 _ => false,
             };
             Ok(Value::Boolean(result))
@@ -589,6 +612,12 @@ fn eval_predicate(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 &args[0],
                 Value::Procedure(..) | Value::Builtin(_) | Value::CaseLambda(_)
             )))
+        }
+        "vector?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("vector? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Vector(_))))
         }
         _ => unreachable!(),
     }
@@ -877,6 +906,80 @@ fn eval_char(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             match (&args[0], &args[1]) {
                 (Value::Char(a), Value::Char(b)) => Ok(Value::Boolean(a < b)),
                 _ => Err(EvalError::Type("char<?: expected chars".into())),
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn eval_vector(op: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match op {
+        "vector" => {
+            Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec()))))
+        }
+        "make-vector" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EvalError::Arity("make-vector requires 1 or 2 arguments".into()));
+            }
+            let len = expect_integer(&args[0], "make-vector")? as usize;
+            let fill = if args.len() == 2 { args[1].clone() } else { Value::Integer(0) };
+            Ok(Value::Vector(Rc::new(RefCell::new(vec![fill; len]))))
+        }
+        "vector-ref" => {
+            if args.len() != 2 {
+                return Err(EvalError::Arity("vector-ref requires 2 arguments".into()));
+            }
+            let v = match &args[0] {
+                Value::Vector(v) => v.borrow(),
+                _ => return Err(EvalError::Type("vector-ref: expected vector".into())),
+            };
+            let idx = expect_integer(&args[1], "vector-ref")? as usize;
+            if idx >= v.len() {
+                return Err(EvalError::Generic("vector-ref: index out of range".into()));
+            }
+            Ok(v[idx].clone())
+        }
+        "vector-set!" => {
+            if args.len() != 3 {
+                return Err(EvalError::Arity("vector-set! requires 3 arguments".into()));
+            }
+            let v = match &args[0] {
+                Value::Vector(v) => v.clone(),
+                _ => return Err(EvalError::Type("vector-set!: expected vector".into())),
+            };
+            let idx = expect_integer(&args[1], "vector-set!")? as usize;
+            let mut borrowed = v.borrow_mut();
+            if idx >= borrowed.len() {
+                return Err(EvalError::Generic("vector-set!: index out of range".into()));
+            }
+            borrowed[idx] = args[2].clone();
+            Ok(Value::Boolean(false))
+        }
+        "vector-length" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("vector-length requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::Integer(v.borrow().len() as i64)),
+                _ => Err(EvalError::Type("vector-length: expected vector".into())),
+            }
+        }
+        "vector->list" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("vector->list requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Vector(v) => Ok(Value::List(v.borrow().clone())),
+                _ => Err(EvalError::Type("vector->list: expected vector".into())),
+            }
+        }
+        "list->vector" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("list->vector requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::List(items) => Ok(Value::Vector(Rc::new(RefCell::new(items.clone())))),
+                _ => Err(EvalError::Type("list->vector: expected list".into())),
             }
         }
         _ => unreachable!(),
