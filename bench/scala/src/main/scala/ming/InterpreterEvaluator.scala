@@ -43,6 +43,8 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalOr(rest, env)
       case SymbolExpr("define", _) :: rest =>
         SpecialFormEvaluator.evalDefine(rest, position, env)
+      case SymbolExpr("define-syntax", _) :: rest =>
+        SpecialFormEvaluator.evalDefineSyntax(rest, position, env)
       case SymbolExpr("if", _) :: rest =>
         SpecialFormEvaluator.evalIf(rest, position, env)
       case SymbolExpr("let", _) :: rest =>
@@ -53,8 +55,23 @@ private[ming] object InterpreterEvaluator:
         SpecialFormEvaluator.evalLambda(rest, position, env)
       case SymbolExpr("set!", _) :: rest =>
         SpecialFormEvaluator.evalSet(rest, position, env)
+      case (operator @ SymbolExpr(name, _)) :: arguments =>
+        env.lookupMacro(name) match
+          case Some(macroDefinition) =>
+            evalMacroApplication(ListExpr(operator :: arguments, position), macroDefinition, env)
+          case None =>
+            evalApplication(operator, arguments, position, env)
       case operator :: arguments =>
         evalApplication(operator, arguments, position, env)
+
+  private def evalMacroApplication(
+    application: ListExpr,
+    macroDefinition: SyntaxRulesMacro,
+    env: Environment
+  ): Value =
+    val expansion = MacroExpander.expand(application, macroDefinition)
+    expansion.aliases.foreach((alias, cell) => env.defineAlias(alias, cell))
+    eval(expansion.expr, env)
 
   private def evalApplication(
     operator: Expr,

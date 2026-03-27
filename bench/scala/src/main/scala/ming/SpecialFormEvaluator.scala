@@ -57,6 +57,15 @@ private[ming] object SpecialFormEvaluator:
           position
         )
 
+  def evalDefineSyntax(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment
+  ): Value =
+    val (name, macroDefinition) = MacroExpander.parse(arguments, position, env)
+    env.defineMacro(name, macroDefinition)
+    VoidValue
+
   def evalIf(
     arguments: List[Expr],
     position: Position,
