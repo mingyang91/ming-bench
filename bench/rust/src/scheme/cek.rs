@@ -95,6 +95,30 @@ fn cek_define(args: &[Expr], env: Env, k: Rc<Kont>) -> Result<(Ctrl, Rc<Kont>), 
             env_define(&env, name, proc);
             Ok((Ctrl::Val(Value::Boolean(false)), k))
         }
+        ExprKind::DottedList(sig, tail) => {
+            if sig.is_empty() {
+                return Err(EvalError::Parse("define: empty signature".into()));
+            }
+            let name = match &sig[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Type("define: expected symbol as function name".into())),
+            };
+            let mut params = Vec::new();
+            for item in &sig[1..] {
+                match &item.kind {
+                    ExprKind::Symbol(s) => params.push(s.clone()),
+                    _ => return Err(EvalError::Type("define: parameter must be a symbol".into())),
+                }
+            }
+            let rest = match &tail.kind {
+                ExprKind::Symbol(s) => Some(s.clone()),
+                _ => return Err(EvalError::Type("define: rest parameter must be a symbol".into())),
+            };
+            let body = args[1..].to_vec();
+            let proc = Value::Procedure(params, rest, body, env.clone());
+            env_define(&env, name, proc);
+            Ok((Ctrl::Val(Value::Boolean(false)), k))
+        }
         _ => Err(EvalError::Type("define: expected symbol or list".into())),
     }
 }
@@ -480,6 +504,14 @@ fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String, 
                         }
                         Ok((Ctrl::Val(expr_to_value(&items[1])), k))
                     }
+                    "quasiquote" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity("quasiquote requires 1 argument".into()));
+                        }
+                        let mut env_mut = env;
+                        let val = super::eval_quasiquote(&items[1], &mut env_mut, output)?;
+                        Ok((Ctrl::Val(val), k))
+                    }
                     "lambda" => Ok((Ctrl::Val(eval_lambda(&items[1..], &env)?), k)),
                     "case-lambda" => Ok((Ctrl::Val(eval_case_lambda(&items[1..], &env)?), k)),
                     "begin" => cek_seq(&items[1..], env, k),
@@ -575,6 +607,7 @@ fn cek_step_eval_inner(expr: &Expr, env: Env, k: Rc<Kont>, output: &mut String, 
                 cek_call(items, env, k)
             }
         }
+        ExprKind::DottedList(..) => Err(EvalError::Type("improper list in expression context".into())),
     }
 }
 
@@ -700,6 +733,14 @@ fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec
         }
         Kont::CondK { body, rest, env, next } => {
             if is_truthy(&val) {
+                if body.len() == 2 {
+                    if let ExprKind::Symbol(s) = &body[0].kind {
+                        if s == "=>" {
+                            return Ok((Ctrl::Eval(body[1].clone(), env.clone()),
+                                Rc::new(Kont::CondArrow { test_val: val, next: next.clone() })));
+                        }
+                    }
+                }
                 if body.is_empty() {
                     Ok((Ctrl::Val(val), next.clone()))
                 } else {
@@ -772,6 +813,9 @@ fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec
                 other => vec![other],
             };
             Ok((Ctrl::Apply(consumer.clone(), args), next.clone()))
+        }
+        Kont::CondArrow { test_val, next } => {
+            Ok((Ctrl::Apply(val, vec![test_val.clone()]), next.clone()))
         }
     }
 }

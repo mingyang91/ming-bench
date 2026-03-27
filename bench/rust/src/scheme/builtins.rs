@@ -244,18 +244,23 @@ fn eval_arithmetic(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             Ok(result)
         }
         "<" | ">" | "=" | "<=" | ">=" => {
-            if args.len() != 2 {
-                return Err(EvalError::Arity(format!("{op} requires 2 arguments")));
+            if args.len() < 2 {
+                return Err(EvalError::Arity(format!("{op} requires at least 2 arguments")));
             }
-            let result = match op {
-                "=" => nums_equal(&args[0], &args[1]),
-                "<" => nums_less(&args[0], &args[1])?,
-                ">" => nums_less(&args[1], &args[0])?,
-                "<=" => !nums_less(&args[1], &args[0])?,
-                ">=" => !nums_less(&args[0], &args[1])?,
-                _ => unreachable!(),
-            };
-            Ok(Value::Boolean(result))
+            for i in 0..args.len() - 1 {
+                let cmp = match op {
+                    "=" => nums_equal(&args[i], &args[i + 1]),
+                    "<" => nums_less(&args[i], &args[i + 1])?,
+                    ">" => nums_less(&args[i + 1], &args[i])?,
+                    "<=" => !nums_less(&args[i + 1], &args[i])?,
+                    ">=" => !nums_less(&args[i], &args[i + 1])?,
+                    _ => unreachable!(),
+                };
+                if !cmp {
+                    return Ok(Value::Boolean(false));
+                }
+            }
+            Ok(Value::Boolean(true))
         }
         "abs" => {
             if args.len() != 1 {

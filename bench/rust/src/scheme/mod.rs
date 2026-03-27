@@ -5,6 +5,7 @@ mod display;
 mod let_forms;
 mod macros;
 mod numeric;
+mod quasiquote;
 mod records;
 
 pub use error::EvalError;
@@ -17,6 +18,7 @@ use macros::{
 };
 use display::display_value;
 use numeric::{f64_to_exact, is_number, make_rational, nums_equal, nums_less, value_to_f64, values_equal};
+use quasiquote::{eval_quasiquote, eval_quote, expr_to_value};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -233,6 +235,7 @@ pub(crate) enum ExprKind {
     Str(String),
     Symbol(String),
     List(Vec<Expr>),
+    DottedList(Vec<Expr>, Box<Expr>),
 }
 
 // ── Parser ──
@@ -293,6 +296,31 @@ impl<'a> Parser<'a> {
                     inner,
                 ]), span })
             }
+            Some(b'`') => {
+                self.pos += 1;
+                let inner = self.parse_expr()?;
+                Ok(Expr { kind: ExprKind::List(vec![
+                    Expr { kind: ExprKind::Symbol("quasiquote".into()), span },
+                    inner,
+                ]), span })
+            }
+            Some(b',') => {
+                self.pos += 1;
+                if self.pos < self.input.len() && self.input[self.pos] == b'@' {
+                    self.pos += 1;
+                    let inner = self.parse_expr()?;
+                    Ok(Expr { kind: ExprKind::List(vec![
+                        Expr { kind: ExprKind::Symbol("unquote-splicing".into()), span },
+                        inner,
+                    ]), span })
+                } else {
+                    let inner = self.parse_expr()?;
+                    Ok(Expr { kind: ExprKind::List(vec![
+                        Expr { kind: ExprKind::Symbol("unquote".into()), span },
+                        inner,
+                    ]), span })
+                }
+            }
             Some(b'(') => self.parse_list(span),
             Some(b'"') => self.parse_string(span),
             Some(b'#') => {
@@ -311,6 +339,17 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_dotted_tail(&mut self, items: Vec<Expr>, span: Span) -> Result<Expr, EvalError> {
+        let tail = self.parse_expr()?;
+        self.skip_whitespace_and_comments();
+        if self.peek() != Some(b')') {
+            let line = self.input[..self.pos].iter().filter(|&&b| b == b'\n').count() + 1;
+            return Err(EvalError::Parse(format!("expected ) after dotted pair tail at line {line}")));
+        }
+        self.pos += 1;
+        Ok(Expr { kind: ExprKind::DottedList(items, Box::new(tail)), span })
+    }
+
     fn parse_list(&mut self, span: Span) -> Result<Expr, EvalError> {
         self.pos += 1; // skip '('
         let mut items = Vec::new();
@@ -319,7 +358,13 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 None => return Err(EvalError::Parse("unterminated list".into())),
                 Some(b')') => { self.pos += 1; return Ok(Expr { kind: ExprKind::List(items), span }); }
-                _ => items.push(self.parse_expr()?),
+                _ => {
+                    let expr = self.parse_expr()?;
+                    if matches!(&expr.kind, ExprKind::Symbol(s) if s == ".") {
+                        return self.parse_dotted_tail(items, span);
+                    }
+                    items.push(expr);
+                }
             }
         }
     }
@@ -533,6 +578,12 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
                     }
                     "if" => return eval_if(&items[1..], env, output),
                     "quote" => return eval_quote(&items[1..]),
+                    "quasiquote" => {
+                        if items.len() != 2 {
+                            return Err(EvalError::Arity("quasiquote requires 1 argument".into()));
+                        }
+                        return eval_quasiquote(&items[1], env, output);
+                    }
                     "lambda" => return eval_lambda(&items[1..], env),
                     "case-lambda" => return eval_case_lambda(&items[1..], env),
                     "and" => return eval_and(&items[1..], env, output),
@@ -578,6 +629,7 @@ fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, 
             let args: Vec<Value> = items[1..].iter().map(|a| eval(a, env, output)).collect::<Result<_, _>>()?;
             apply_proc(&func, &args, output)
         }
+        ExprKind::DottedList(..) => Err(EvalError::Type("improper list in expression context".into())),
     }
 }
 
@@ -606,7 +658,7 @@ fn eval_tail_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Ta
                     "let" => return eval_let_tail(&items[1..], env, output),
                     "letrec" => return eval_letrec_tail(&items[1..], env, output),
                     "letrec*" => return eval_letrec_star_tail(&items[1..], env, output),
-                    "define" | "set!" | "quote" | "lambda" | "case-lambda" |
+                    "define" | "set!" | "quote" | "quasiquote" | "lambda" | "case-lambda" |
                     "define-syntax" | "define-record-type" | "case" | "do" | "let*" |
                     "call/cc" | "call-with-current-continuation" |
                     "syntax-case" | "syntax" | "with-syntax" => {
@@ -689,6 +741,10 @@ fn eval_cond_tail(args: &[Expr], env: &mut Env, output: &mut String) -> Result<T
                 if is_truthy(&test) {
                     if items.len() == 1 {
                         return Ok(TailResult::Done(test));
+                    }
+                    if items.len() == 3 && matches!(&items[1].kind, ExprKind::Symbol(s) if s == "=>") {
+                        let proc = eval(&items[2], env, output)?;
+                        return Ok(TailResult::TailCall(proc, vec![test]));
                     }
                     return eval_body_tail(&items[1..], env, output);
                 }
@@ -985,6 +1041,30 @@ fn eval_define(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Valu
             env_define(env, name, proc);
             Ok(Value::Boolean(false))
         }
+        ExprKind::DottedList(sig, tail) => {
+            if sig.is_empty() {
+                return Err(EvalError::Parse("define: empty signature".into()));
+            }
+            let name = match &sig[0].kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Type("define: expected symbol as function name".into())),
+            };
+            let mut params = Vec::new();
+            for item in &sig[1..] {
+                match &item.kind {
+                    ExprKind::Symbol(s) => params.push(s.clone()),
+                    _ => return Err(EvalError::Type("define: parameter must be a symbol".into())),
+                }
+            }
+            let rest = match &tail.kind {
+                ExprKind::Symbol(s) => Some(s.clone()),
+                _ => return Err(EvalError::Type("define: rest parameter must be a symbol".into())),
+            };
+            let body = args[1..].to_vec();
+            let proc = Value::Procedure(params, rest, body, env.clone());
+            env_define(env, name, proc);
+            Ok(Value::Boolean(false))
+        }
         _ => Err(EvalError::Type("define: expected symbol or list".into())),
     }
 }
@@ -1003,25 +1083,6 @@ fn eval_if(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value, E
     }
 }
 
-fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
-    if args.len() != 1 {
-        return Err(EvalError::Arity("quote requires 1 argument".into()));
-    }
-    Ok(expr_to_value(&args[0]))
-}
-
-pub(crate) fn expr_to_value(expr: &Expr) -> Value {
-    match &expr.kind {
-        ExprKind::Integer(n) => Value::Integer(*n),
-        ExprKind::Rational(n, d) => make_rational(*n, *d),
-        ExprKind::Float(f) => Value::Float(*f),
-        ExprKind::Boolean(b) => Value::Boolean(*b),
-        ExprKind::Char(c) => Value::Char(*c),
-        ExprKind::Str(s) => make_immutable_str(s.clone()),
-        ExprKind::Symbol(s) => Value::Symbol(s.clone()),
-        ExprKind::List(items) => Value::List(items.iter().map(expr_to_value).collect()),
-    }
-}
 
 pub(crate) fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.len() < 2 {
@@ -1029,6 +1090,20 @@ pub(crate) fn eval_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalError> 
     }
     let (params, rest) = match &args[0].kind {
         ExprKind::List(items) => parse_params(items)?,
+        ExprKind::DottedList(heads, tail) => {
+            let mut params = Vec::new();
+            for h in heads {
+                match &h.kind {
+                    ExprKind::Symbol(s) => params.push(s.clone()),
+                    _ => return Err(EvalError::Type("lambda: parameter must be a symbol".into())),
+                }
+            }
+            let rest_name = match &tail.kind {
+                ExprKind::Symbol(s) => s.clone(),
+                _ => return Err(EvalError::Type("lambda: rest parameter must be a symbol".into())),
+            };
+            (params, Some(rest_name))
+        }
         ExprKind::Symbol(s) => (vec![], Some(s.clone())),
         _ => return Err(EvalError::Type("lambda: expected parameter list".into())),
     };
@@ -1043,6 +1118,20 @@ pub(crate) fn eval_case_lambda(args: &[Expr], env: &Env) -> Result<Value, EvalEr
             ExprKind::List(items) if items.len() >= 2 => {
                 let (params, rest) = match &items[0].kind {
                     ExprKind::List(param_items) => parse_params(param_items)?,
+                    ExprKind::DottedList(heads, tail) => {
+                        let mut params = Vec::new();
+                        for h in heads {
+                            match &h.kind {
+                                ExprKind::Symbol(s) => params.push(s.clone()),
+                                _ => return Err(EvalError::Type("case-lambda: parameter must be a symbol".into())),
+                            }
+                        }
+                        let rest_name = match &tail.kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Type("case-lambda: rest parameter must be a symbol".into())),
+                        };
+                        (params, Some(rest_name))
+                    }
                     ExprKind::Symbol(s) => (vec![], Some(s.clone())),
                     _ => return Err(EvalError::Type("case-lambda: expected parameter list".into())),
                 };
@@ -1258,6 +1347,10 @@ fn eval_cond(args: &[Expr], env: &mut Env, output: &mut String) -> Result<Value,
                     if items.len() == 1 {
                         return Ok(test);
                     }
+                    if items.len() == 3 && matches!(&items[1].kind, ExprKind::Symbol(s) if s == "=>") {
+                        let proc = eval(&items[2], env, output)?;
+                        return apply_proc(&proc, &[test], output);
+                    }
                     let mut result = Value::Boolean(false);
                     for expr in &items[1..] {
                         result = eval(expr, env, output)?;
@@ -1302,6 +1395,7 @@ pub(crate) enum Kont {
     GuardTest { exn: Value, body: Vec<Expr>, rest_clauses: Vec<Expr>, guard_env: Env, guard_k: Rc<Kont>, guard_winders: Vec<Rc<(Value, Value)>> },
     GuardBody { body: Vec<Expr>, env: Env, next: Rc<Kont> },
     Cwv { consumer: Value, next: Rc<Kont> },
+    CondArrow { test_val: Value, next: Rc<Kont> },
 }
 
 impl fmt::Debug for Kont {

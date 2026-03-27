@@ -11,6 +11,23 @@ enum MacroBinding {
     Repeated(Vec<Expr>),
 }
 
+/// Recursively convert DottedList nodes back to flat lists with "." separator symbols.
+fn flatten_dotted(expr: &Expr) -> Expr {
+    match &expr.kind {
+        ExprKind::DottedList(heads, tail) => {
+            let mut items: Vec<Expr> = heads.iter().map(flatten_dotted).collect();
+            items.push(Expr { kind: ExprKind::Symbol(".".to_string()), span: expr.span });
+            items.push(flatten_dotted(tail));
+            Expr { kind: ExprKind::List(items), span: expr.span }
+        }
+        ExprKind::List(items) => Expr {
+            kind: ExprKind::List(items.iter().map(flatten_dotted).collect()),
+            span: expr.span,
+        },
+        _ => expr.clone(),
+    }
+}
+
 pub(crate) fn eval_define_syntax(
     args: &[Expr],
     env: &mut Env,
@@ -75,11 +92,12 @@ fn parse_syntax_rules(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     for clause in &items[2..] {
         match &clause.kind {
             ExprKind::List(parts) if parts.len() == 2 => {
-                let pattern = match &parts[0].kind {
+                let flat_pat = flatten_dotted(&parts[0]);
+                let pattern = match &flat_pat.kind {
                     ExprKind::List(p) => p.clone(),
                     _ => return Err(EvalError::Type("syntax-rules: pattern must be list".into())),
                 };
-                rules.push((pattern, parts[1].clone()));
+                rules.push((pattern, flatten_dotted(&parts[1])));
             }
             _ => return Err(EvalError::Type("syntax-rules: invalid rule".into())),
         }
@@ -100,6 +118,23 @@ fn match_pattern(
     let mut pi = 0;
     let mut ii = 0;
     while pi < pattern.len() {
+        // Check for dot rest pattern: (... . rest)
+        if let ExprKind::Symbol(s) = &pattern[pi].kind {
+            if s == "." && pi + 1 < pattern.len() {
+                // The next element is the rest variable
+                if let ExprKind::Symbol(rest_var) = &pattern[pi + 1].kind {
+                    let remaining: Vec<Expr> = input[ii..].to_vec();
+                    // Convert remaining to a single list expr
+                    let rest_expr = Expr {
+                        kind: ExprKind::List(remaining),
+                        span: pattern[pi + 1].span,
+                    };
+                    bindings.insert(rest_var.clone(), MacroBinding::Single(rest_expr));
+                    return true;
+                }
+                return false;
+            }
+        }
         // Check if next pattern element is ellipsis
         if pi + 1 < pattern.len() {
             if let ExprKind::Symbol(s) = &pattern[pi + 1].kind {
@@ -151,7 +186,7 @@ fn match_pattern(
                     return false;
                 }
             }
-            ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Char(_) => return false,
+            ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Char(_) | ExprKind::DottedList(..) => return false,
         }
         pi += 1;
         ii += 1;
@@ -183,7 +218,8 @@ fn find_ellipsis_var(template: &Expr, bindings: &HashMap<String, MacroBinding>) 
 fn is_special_form(s: &str) -> bool {
     matches!(
         s,
-        "define" | "set!" | "if" | "quote" | "lambda" | "case-lambda" | "and" | "or" | "let" | "let*" | "begin" | "cond"
+        "define" | "set!" | "if" | "quote" | "quasiquote" | "unquote" | "unquote-splicing"
+            | "lambda" | "case-lambda" | "and" | "or" | "let" | "let*" | "begin" | "cond"
             | "define-syntax" | "syntax-rules" | "define-record-type"
             | "letrec" | "letrec*" | "case" | "do"
             | "call/cc" | "call-with-current-continuation"
@@ -253,6 +289,21 @@ fn expand_template(
             let mut expanded = Vec::new();
             let mut i = 0;
             while i < items.len() {
+                // Handle dot rest: (... . rest)
+                if let ExprKind::Symbol(s) = &items[i].kind {
+                    if s == "." && i + 1 < items.len() {
+                        let tail = expand_template(&items[i + 1], bindings, pattern_vars, renames);
+                        // Splice the tail items into the expanded list
+                        if let ExprKind::List(tail_items) = tail.kind {
+                            expanded.extend(tail_items);
+                        } else {
+                            expanded.push(Expr { kind: ExprKind::Symbol(".".to_string()), span });
+                            expanded.push(tail);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
                 if i + 1 < items.len() {
                     if let ExprKind::Symbol(s) = &items[i + 1].kind {
                         if s == "..." {
@@ -376,6 +427,16 @@ fn expr_to_datum(expr: &Expr) -> Value {
         ExprKind::List(items) => {
             let vals: Vec<Value> = items.iter().map(expr_to_datum).collect();
             super::list_from_vec(&vals)
+        }
+        ExprKind::DottedList(heads, tail) => {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let tail_val = expr_to_datum(tail);
+            let mut result = tail_val;
+            for item in heads.iter().rev() {
+                result = Value::Pair(Rc::new(RefCell::new((expr_to_datum(item), result))));
+            }
+            result
         }
     }
 }
