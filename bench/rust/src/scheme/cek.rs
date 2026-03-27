@@ -296,7 +296,7 @@ fn try_eval_simple(expr: &Expr, env: &Env, output: &mut String) -> Option<Result
                 if op == "quote" && items.len() == 2 {
                     return Some(Ok(expr_to_value(&items[1])));
                 }
-                if is_builtin(op) && op != "dynamic-wind" && op != "raise" && op != "with-exception-handler" {
+                if is_builtin(op) && op != "dynamic-wind" && op != "raise" && op != "with-exception-handler" && op != "values" && op != "call-with-values" {
                     let mut args = Vec::with_capacity(items.len() - 1);
                     for item in &items[1..] {
                         match try_eval_simple(item, env, output)? {
@@ -754,6 +754,13 @@ fn cek_step_val(val: Value, k: Rc<Kont>, _output: &mut String, winders: &mut Vec
         Kont::GuardBody { body, env, next } => {
             cek_seq(body, env.clone(), next.clone())
         }
+        Kont::CWV { consumer, next } => {
+            let args = match val {
+                Value::Values(vals) => vals,
+                other => vec![other],
+            };
+            Ok((Ctrl::Apply(consumer.clone(), args), next.clone()))
+        }
     }
 }
 
@@ -849,6 +856,19 @@ fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut Strin
                 let thunk = args[1].clone();
                 handlers.push(Handler::Proc(handler));
                 Ok((Ctrl::Apply(thunk, vec![]), Rc::new(Kont::PopHandler { next: k })))
+            } else if name == "values" {
+                if args.len() == 1 {
+                    Ok((Ctrl::Val(args.into_iter().next().unwrap()), k))
+                } else {
+                    Ok((Ctrl::Val(Value::Values(args)), k))
+                }
+            } else if name == "call-with-values" {
+                if args.len() != 2 {
+                    return Err(EvalError::Arity("call-with-values requires 2 arguments".into()));
+                }
+                let producer = args[0].clone();
+                let consumer = args[1].clone();
+                Ok((Ctrl::Apply(producer, vec![]), Rc::new(Kont::CWV { consumer, next: k })))
             } else if name == "apply" {
                 if args.len() < 2 {
                     return Err(EvalError::Arity("apply requires at least 2 arguments".into()));

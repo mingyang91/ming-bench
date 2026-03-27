@@ -61,6 +61,7 @@ pub(crate) enum Value {
     CaseLambda(Vec<CaseClause>),
     Vector(Rc<RefCell<Vec<Value>>>),
     Continuation(Rc<Kont>, Vec<Rc<(Value, Value)>>),
+    Values(Vec<Value>),
 }
 
 
@@ -187,6 +188,13 @@ impl fmt::Display for Value {
             Value::Record { type_tag, .. } => write!(f, "#<record:{type_tag}>"),
             Value::CaseLambda(..) => write!(f, "#<procedure>"),
             Value::Continuation(..) => write!(f, "#<continuation>"),
+            Value::Values(vals) => {
+                if vals.is_empty() {
+                    write!(f, "")
+                } else {
+                    write!(f, "{}", vals[0])
+                }
+            }
             Value::Vector(v) => {
                 write!(f, "#(")?;
                 let items = v.borrow();
@@ -1059,7 +1067,8 @@ pub(crate) fn is_builtin(op: &str) -> bool {
         | "vector?" | "vector->list" | "list->vector"
         | "error"
         | "dynamic-wind"
-        | "raise" | "with-exception-handler")
+        | "raise" | "with-exception-handler"
+        | "values" | "call-with-values")
     || (op.len() > 2 && op.starts_with('c') && op.ends_with('r')
         && op[1..op.len()-1].bytes().all(|b| b == b'a' || b == b'd'))
 }
@@ -1417,6 +1426,7 @@ pub(crate) enum Kont {
     RaiseReturn,
     GuardTest { exn: Value, body: Vec<Expr>, rest_clauses: Vec<Expr>, guard_env: Env, guard_k: Rc<Kont>, guard_winders: Vec<Rc<(Value, Value)>> },
     GuardBody { body: Vec<Expr>, env: Env, next: Rc<Kont> },
+    CWV { consumer: Value, next: Rc<Kont> },
 }
 
 impl fmt::Debug for Kont {
