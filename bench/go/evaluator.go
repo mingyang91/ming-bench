@@ -99,6 +99,17 @@ func (e *Env) set(name string, val Value) {
 	e.bindings[name] = val
 }
 
+func (e *Env) setExisting(name string, val Value) bool {
+	if _, ok := e.bindings[name]; ok {
+		e.bindings[name] = val
+		return true
+	}
+	if e.parent != nil {
+		return e.parent.setExisting(name, val)
+	}
+	return false
+}
+
 // --------------- Tokenizer ---------------
 
 type Token struct {
@@ -341,6 +352,8 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 			return evalIf(list, env)
 		case "define":
 			return evalDefine(list, env)
+		case "set!":
+			return evalSetBang(list, env)
 		case "lambda":
 			return evalLambda(list, env)
 		case "and":
@@ -464,6 +477,25 @@ func evalDefine(list *ListExpr, env *Env) (Value, error) {
 		return nil, err
 	}
 	env.set(nameAtom.Token, val)
+	return &VoidVal{}, nil
+}
+
+func evalSetBang(list *ListExpr, env *Env) (Value, error) {
+	args := list.Items[1:]
+	if len(args) != 2 {
+		return nil, errAt(list, "set! requires exactly 2 arguments")
+	}
+	nameAtom, ok := args[0].(*AtomExpr)
+	if !ok {
+		return nil, errAt(list, "set!: expected symbol")
+	}
+	val, err := evalInEnv(args[1], env)
+	if err != nil {
+		return nil, err
+	}
+	if !env.setExisting(nameAtom.Token, val) {
+		return nil, errAt(list, fmt.Sprintf("set!: unbound variable '%s'", nameAtom.Token))
+	}
 	return &VoidVal{}, nil
 }
 
