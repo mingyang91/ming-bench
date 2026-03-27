@@ -90,6 +90,7 @@ enum Builtin {
     StringSet,
     CharPred,
     Apply,
+    Map,
 }
 
 impl Builtin {
@@ -131,6 +132,7 @@ impl Builtin {
             Self::StringSet => "string-set!",
             Self::CharPred => "char?",
             Self::Apply => "apply",
+            Self::Map => "map",
         }
     }
 }
@@ -147,6 +149,10 @@ enum Value {
     Void,
     Builtin(Builtin),
     Closure(Rc<Closure>),
+    Record(Rc<Record>),
+    RecordConstructor(Rc<RecordType>, String, Vec<usize>),
+    RecordPredicate(Rc<RecordType>, String),
+    RecordAccessor(Rc<RecordType>, usize, String),
 }
 
 struct SchemeString {
@@ -165,6 +171,16 @@ struct Closure {
     body: Vec<Expr>,
     env: Rc<Environment>,
     name: Option<String>,
+}
+
+struct RecordType {
+    name: String,
+    field_names: Vec<String>,
+}
+
+struct Record {
+    record_type: Rc<RecordType>,
+    fields: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -365,6 +381,12 @@ struct Binding {
     value_expr: Expr,
 }
 
+struct RecordAccessorSpec {
+    field_name: String,
+    accessor_name: String,
+    binding_name: String,
+}
+
 const BUILTINS: &[Builtin] = &[
     Builtin::Add,
     Builtin::Sub,
@@ -402,6 +424,7 @@ const BUILTINS: &[Builtin] = &[
     Builtin::StringSet,
     Builtin::CharPred,
     Builtin::Apply,
+    Builtin::Map,
 ];
 
 /// Evaluate one or more Scheme expressions and return the string
@@ -544,6 +567,9 @@ fn evaluate_list(
             "or" => return evaluate_or(argument_exprs, env, state),
             "if" => return evaluate_if(argument_exprs, env, operator_expr.pos(), state),
             "define" => return evaluate_define(argument_exprs, env, operator_expr.pos(), state),
+            "define-record-type" => {
+                return evaluate_define_record_type(argument_exprs, env, operator_expr.pos())
+            }
             "define-syntax" => {
                 return evaluate_define_syntax(argument_exprs, env, operator_expr.pos())
             }
@@ -733,6 +759,70 @@ fn evaluate_define_syntax(
     let binding_key = binding_name(&expressions[0], "define-syntax")?;
     let transformer = parse_syntax_rules(keyword, &expressions[1], Rc::clone(&env), pos)?;
     env.define_syntax(binding_key, transformer);
+    Ok(Value::Void)
+}
+
+fn evaluate_define_record_type(
+    expressions: &[Expr],
+    env: Rc<Environment>,
+    pos: Position,
+) -> EvalResult<Value> {
+    if expressions.len() < 3 {
+        return Err(error_at(
+            pos,
+            format!(
+                "define-record-type expected at least 3 argument(s), got {}",
+                expressions.len()
+            ),
+        ));
+    }
+
+    let type_name = expect_symbol_expr(&expressions[0], "define-record-type")?;
+    let (constructor_name, constructor_binding, constructor_fields) =
+        parse_record_constructor(&expressions[1])?;
+    let predicate_name = expect_symbol_expr(&expressions[2], "define-record-type")?;
+    let predicate_binding = binding_name(&expressions[2], "define-record-type")?;
+    let accessor_specs = parse_record_accessors(&expressions[3..])?;
+    let field_names: Vec<String> = accessor_specs
+        .iter()
+        .map(|spec| spec.field_name.clone())
+        .collect();
+    let field_indices = resolve_record_constructor_fields(
+        &type_name,
+        &constructor_fields,
+        &field_names,
+        expressions[1].pos(),
+    )?;
+
+    let record_type = Rc::new(RecordType {
+        name: type_name,
+        field_names,
+    });
+
+    env.define(
+        constructor_binding,
+        Value::RecordConstructor(
+            Rc::clone(&record_type),
+            constructor_name,
+            field_indices,
+        ),
+    );
+    env.define(
+        predicate_binding,
+        Value::RecordPredicate(Rc::clone(&record_type), predicate_name),
+    );
+
+    for (index, accessor_spec) in accessor_specs.into_iter().enumerate() {
+        env.define(
+            accessor_spec.binding_name,
+            Value::RecordAccessor(
+                Rc::clone(&record_type),
+                index,
+                accessor_spec.accessor_name,
+            ),
+        );
+    }
+
     Ok(Value::Void)
 }
 
@@ -927,6 +1017,34 @@ fn apply_procedure(
             }
 
             evaluate_sequence(&closure.body, call_env, state)
+        }
+        Value::RecordConstructor(record_type, name, field_indices) => {
+            if args.len() != field_indices.len() {
+                return Err(error_at(
+                    pos,
+                    format!(
+                        "{name} expected {} argument(s), got {}",
+                        field_indices.len(),
+                        args.len()
+                    ),
+                ));
+            }
+
+            let mut fields = vec![Value::Void; record_type.field_names.len()];
+            for (arg, field_index) in args.into_iter().zip(field_indices.into_iter()) {
+                fields[field_index] = arg;
+            }
+
+            Ok(Value::Record(Rc::new(Record { record_type, fields })))
+        }
+        Value::RecordPredicate(record_type, name) => {
+            expect_arity(&name, &args, 1, pos)?;
+            Ok(Value::Boolean(matches_record_type(&args[0], &record_type)))
+        }
+        Value::RecordAccessor(record_type, field_index, name) => {
+            expect_arity(&name, &args, 1, pos)?;
+            let record = expect_record_type(&args[0], &record_type, &name, pos)?;
+            Ok(record.fields[field_index].clone())
         }
         _ => Err(error_at(pos, "attempted to call a non-procedure value")),
     }
@@ -1127,6 +1245,7 @@ fn apply_builtin(
             flattened.extend(list_to_vec(&args[args.len() - 1], builtin.name(), pos)?);
             apply_procedure(procedure, flattened, pos, state)
         }
+        Builtin::Map => apply_map(args, pos, state),
     }
 }
 
@@ -2350,6 +2469,31 @@ fn expect_pair(value: &Value, name: &str, pos: Position) -> EvalResult<Rc<Pair>>
     }
 }
 
+fn matches_record_type(value: &Value, expected: &Rc<RecordType>) -> bool {
+    matches!(
+        value,
+        Value::Record(record) if Rc::ptr_eq(&record.record_type, expected)
+    )
+}
+
+fn expect_record_type(
+    value: &Value,
+    expected: &Rc<RecordType>,
+    name: &str,
+    pos: Position,
+) -> EvalResult<Rc<Record>> {
+    if let Value::Record(record) = value {
+        if Rc::ptr_eq(&record.record_type, expected) {
+            return Ok(Rc::clone(record));
+        }
+    }
+
+    Err(error_at(
+        pos,
+        format!("{name} expected a {} record", expected.name),
+    ))
+}
+
 fn expect_char(value: &Value, name: &str, pos: Position) -> EvalResult<char> {
     if let Value::Char(ch) = value {
         Ok(*ch)
@@ -2481,6 +2625,77 @@ fn parse_bindings(bindings_expr: &Expr, name: &str) -> EvalResult<Vec<Binding>> 
         .collect()
 }
 
+fn parse_record_constructor(expression: &Expr) -> EvalResult<(String, String, Vec<String>)> {
+    let elements = match expression {
+        Expr::List(elements, _) if !elements.is_empty() => elements,
+        _ => {
+            return Err(error_at(
+                expression.pos(),
+                "define-record-type expected a constructor specification",
+            ))
+        }
+    };
+
+    Ok((
+        expect_symbol_expr(&elements[0], "define-record-type")?,
+        binding_name(&elements[0], "define-record-type")?,
+        elements[1..]
+            .iter()
+            .map(|expr| expect_symbol_expr(expr, "define-record-type"))
+            .collect::<EvalResult<Vec<_>>>()?,
+    ))
+}
+
+fn parse_record_accessors(expressions: &[Expr]) -> EvalResult<Vec<RecordAccessorSpec>> {
+    let mut accessors = Vec::with_capacity(expressions.len());
+
+    for expression in expressions {
+        let elements = match expression {
+            Expr::List(elements, _) if elements.len() == 2 => elements,
+            _ => {
+                return Err(error_at(
+                    expression.pos(),
+                    "define-record-type expected field specifications of the form (field accessor)",
+                ))
+            }
+        };
+
+        accessors.push(RecordAccessorSpec {
+            field_name: expect_symbol_expr(&elements[0], "define-record-type")?,
+            accessor_name: expect_symbol_expr(&elements[1], "define-record-type")?,
+            binding_name: binding_name(&elements[1], "define-record-type")?,
+        });
+    }
+
+    Ok(accessors)
+}
+
+fn resolve_record_constructor_fields(
+    type_name: &str,
+    constructor_fields: &[String],
+    field_names: &[String],
+    pos: Position,
+) -> EvalResult<Vec<usize>> {
+    let mut indices = Vec::with_capacity(constructor_fields.len());
+
+    for field_name in constructor_fields {
+        let index = field_names
+            .iter()
+            .position(|candidate| candidate == field_name)
+            .ok_or_else(|| {
+                error_at(
+                    pos,
+                    format!(
+                        "define-record-type constructor field {field_name} is not declared for {type_name}"
+                    ),
+                )
+            })?;
+        indices.push(index);
+    }
+
+    Ok(indices)
+}
+
 fn evaluate_sequence(
     expressions: &[Expr],
     env: Rc<Environment>,
@@ -2532,6 +2747,36 @@ fn append_lists(args: &[Value], pos: Position) -> EvalResult<Value> {
     }
 
     Ok(list_to_pairs(elements))
+}
+
+fn apply_map(args: &[Value], pos: Position, state: &mut EvalState) -> EvalResult<Value> {
+    expect_at_least_arity("map", args, 2, pos)?;
+
+    let procedure = args[0].clone();
+    let lists = args[1..]
+        .iter()
+        .map(|arg| list_to_vec(arg, "map", pos))
+        .collect::<EvalResult<Vec<_>>>()?;
+
+    let expected_len = lists[0].len();
+    if lists
+        .iter()
+        .skip(1)
+        .any(|list| list.len() != expected_len)
+    {
+        return Err(error_at(pos, "map expected lists of equal length"));
+    }
+
+    let mut results = Vec::with_capacity(expected_len);
+    for index in 0..expected_len {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        results.push(apply_procedure(procedure.clone(), call_args, pos, state)?);
+    }
+
+    Ok(list_to_pairs(results))
 }
 
 fn sum(args: &[Value], name: &str, pos: Position) -> EvalResult<i64> {
@@ -2619,6 +2864,10 @@ fn format_value(value: &Value) -> String {
             Some(name) => format!("#<procedure:{name}>"),
             None => "#<procedure>".into(),
         },
+        Value::Record(record) => format!("#<record:{}>", record.record_type.name),
+        Value::RecordConstructor(_, name, _)
+        | Value::RecordPredicate(_, name)
+        | Value::RecordAccessor(_, _, name) => format!("#<procedure:{name}>"),
     }
 }
 

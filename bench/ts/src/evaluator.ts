@@ -45,6 +45,23 @@ type PairValue = {
   cdr: SchemeValue;
 };
 
+type RecordFieldDescriptor = {
+  name: string;
+  accessorName?: string;
+  mutatorName?: string;
+};
+
+type RecordTypeDescriptor = {
+  name: string;
+  fields: RecordFieldDescriptor[];
+};
+
+type RecordValue = {
+  kind: 'record';
+  type: RecordTypeDescriptor;
+  fields: SchemeValue[];
+};
+
 type CharValue = {
   kind: 'char';
   value: string;
@@ -85,6 +102,7 @@ type SchemeValue =
   | StringValue
   | SymbolValue
   | PairValue
+  | RecordValue
   | CharValue
   | EmptyListValue
   | VoidValue
@@ -859,6 +877,8 @@ function evaluateList(elements: Expr[], env: Environment, pos: SourcePosition): 
         return evaluateDefine(argumentExprs, env, operatorExpr.pos);
       case 'define-syntax':
         return evaluateDefineSyntax(argumentExprs, env, operatorExpr.pos);
+      case 'define-record-type':
+        return evaluateDefineRecordType(argumentExprs, env, operatorExpr.pos);
       case 'quote':
         return evaluateQuote(argumentExprs, operatorExpr.pos);
       case 'lambda':
@@ -987,6 +1007,143 @@ function evaluateDefineSyntax(expressions: Expr[], env: Environment, pos: Source
   const keyword = expectSymbolExpr(keywordExpr, 'define-syntax');
   env.defineSyntax(bindingName(keywordExpr, 'define-syntax'), parseSyntaxRules(keyword, transformerExpr, env));
   return VOID;
+}
+
+function evaluateDefineRecordType(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+  if (expressions.length < 3) {
+    throw new EvalError(
+      `define-record-type expected at least 3 argument(s), got ${expressions.length}`,
+      pos,
+    );
+  }
+
+  const [typeNameExpr, constructorExpr, predicateExpr, ...fieldExprs] = expressions;
+  const typeName = expectSymbolExpr(typeNameExpr, 'define-record-type');
+
+  if (constructorExpr.kind !== 'list' || constructorExpr.elements.length === 0) {
+    throw new EvalError('define-record-type expected a constructor specification', constructorExpr.pos);
+  }
+
+  const [constructorNameExpr, ...constructorFieldExprs] = constructorExpr.elements;
+  const constructorName = expectSymbolExpr(constructorNameExpr, 'define-record-type');
+  const constructorBinding = bindingName(constructorNameExpr, 'define-record-type');
+  const predicateName = expectSymbolExpr(predicateExpr, 'define-record-type');
+  const predicateBinding = bindingName(predicateExpr, 'define-record-type');
+  const constructorFields = constructorFieldExprs.map((fieldExpr) =>
+    expectSymbolExpr(fieldExpr, 'define-record-type'),
+  );
+  const fields = fieldExprs.map((fieldExpr) => parseRecordField(fieldExpr));
+  const recordType: RecordTypeDescriptor = {
+    name: typeName,
+    fields,
+  };
+  const fieldIndexes = new Map<string, number>();
+
+  for (let index = 0; index < fields.length; index += 1) {
+    if (fieldIndexes.has(fields[index].name)) {
+      throw new EvalError(`define-record-type duplicate field: ${fields[index].name}`, fieldExprs[index].pos);
+    }
+
+    fieldIndexes.set(fields[index].name, index);
+  }
+
+  for (const fieldName of constructorFields) {
+    if (!fieldIndexes.has(fieldName)) {
+      throw new EvalError(`define-record-type unknown constructor field: ${fieldName}`, constructorExpr.pos);
+    }
+  }
+
+  env.define(
+    constructorBinding,
+    builtin(constructorName, (args, callPos) => {
+      expectArity(constructorName, args, constructorFields.length, callPos);
+      const fieldValues = new Array<SchemeValue>(fields.length).fill(VOID);
+
+      for (let index = 0; index < constructorFields.length; index += 1) {
+        const fieldIndex = fieldIndexes.get(constructorFields[index]);
+        if (fieldIndex === undefined) {
+          throw new EvalError(`define-record-type unknown constructor field: ${constructorFields[index]}`, callPos);
+        }
+
+        fieldValues[fieldIndex] = args[index];
+      }
+
+      return {
+        kind: 'record',
+        type: recordType,
+        fields: fieldValues,
+      };
+    }),
+  );
+
+  env.define(
+    predicateBinding,
+    builtin(predicateName, (args, callPos) => {
+      expectArity(predicateName, args, 1, callPos);
+      return isRecordValue(args[0]) && args[0].type === recordType;
+    }),
+  );
+
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    const fieldExpr = fieldExprs[index];
+
+    if (field.accessorName !== undefined) {
+      const accessorName = field.accessorName;
+      const accessorExpr = fieldExpr.kind === 'list' ? fieldExpr.elements[1] : undefined;
+      if (accessorExpr === undefined) {
+        throw new EvalError('define-record-type expected an accessor name', fieldExpr.pos);
+      }
+
+      env.define(
+        bindingName(accessorExpr, 'define-record-type'),
+        builtin(accessorName, (args, callPos) => {
+          expectArity(accessorName, args, 1, callPos);
+          return expectRecordOfType(args[0], recordType, accessorName, callPos).fields[index];
+        }),
+      );
+    }
+
+    if (field.mutatorName !== undefined) {
+      const mutatorName = field.mutatorName;
+      const mutatorExpr = fieldExpr.kind === 'list' ? fieldExpr.elements[2] : undefined;
+      if (mutatorExpr === undefined) {
+        throw new EvalError('define-record-type expected a mutator name', fieldExpr.pos);
+      }
+
+      env.define(
+        bindingName(mutatorExpr, 'define-record-type'),
+        builtin(mutatorName, (args, callPos) => {
+          expectArity(mutatorName, args, 2, callPos);
+          expectRecordOfType(args[0], recordType, mutatorName, callPos).fields[index] = args[1];
+          return VOID;
+        }),
+      );
+    }
+  }
+
+  return VOID;
+}
+
+function parseRecordField(expression: Expr): RecordFieldDescriptor {
+  if (expression.kind === 'symbol' || expression.kind === 'resolved-symbol') {
+    return {
+      name: expectSymbolExpr(expression, 'define-record-type'),
+    };
+  }
+
+  if (expression.kind !== 'list' || expression.elements.length === 0 || expression.elements.length > 3) {
+    throw new EvalError('define-record-type expected field specs of the form name or (name accessor)', expression.pos);
+  }
+
+  const [nameExpr, accessorExpr, mutatorExpr] = expression.elements;
+  return {
+    name: expectSymbolExpr(nameExpr, 'define-record-type'),
+    accessorName:
+      accessorExpr === undefined ? undefined : expectSymbolExpr(accessorExpr, 'define-record-type'),
+    mutatorName:
+      mutatorExpr === undefined ? undefined : expectSymbolExpr(mutatorExpr, 'define-record-type'),
+  };
 }
 
 function evaluateQuote(expressions: Expr[], pos: SourcePosition): SchemeValue {
@@ -2177,6 +2334,10 @@ function isEmptyList(value: SchemeValue): value is EmptyListValue {
   return typeof value === 'object' && value !== null && value.kind === 'empty-list';
 }
 
+function isRecordValue(value: SchemeValue): value is RecordValue {
+  return typeof value === 'object' && value !== null && value.kind === 'record';
+}
+
 function sameNumberLiteral(left: NumberValue, right: NumberValue): boolean {
   if (left.exact && right.exact) {
     return left.numerator === right.numerator && left.denominator === right.denominator;
@@ -2316,6 +2477,19 @@ function expectChar(value: SchemeValue, name: string, pos: SourcePosition): Char
 function expectSymbolValue(value: SchemeValue, name: string, pos: SourcePosition): SymbolValue {
   if (!isSymbolValue(value)) {
     throw new EvalError(`${name} expected a symbol`, pos);
+  }
+
+  return value;
+}
+
+function expectRecordOfType(
+  value: SchemeValue,
+  recordType: RecordTypeDescriptor,
+  name: string,
+  pos: SourcePosition,
+): RecordValue {
+  if (!isRecordValue(value) || value.type !== recordType) {
+    throw new EvalError(`${name} expected a ${recordType.name} record`, pos);
   }
 
   return value;
@@ -3084,6 +3258,10 @@ function formatValue(value: SchemeValue): string {
 
   if (isClosure(value)) {
     return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+  }
+
+  if (isRecordValue(value)) {
+    return `#<record:${value.type.name}>`;
   }
 
   if (isPair(value)) {

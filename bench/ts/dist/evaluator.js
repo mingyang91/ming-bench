@@ -663,6 +663,8 @@ function evaluateList(elements, env, pos) {
                 return evaluateDefine(argumentExprs, env, operatorExpr.pos);
             case 'define-syntax':
                 return evaluateDefineSyntax(argumentExprs, env, operatorExpr.pos);
+            case 'define-record-type':
+                return evaluateDefineRecordType(argumentExprs, env, operatorExpr.pos);
             case 'quote':
                 return evaluateQuote(argumentExprs, operatorExpr.pos);
             case 'lambda':
@@ -766,6 +768,103 @@ function evaluateDefineSyntax(expressions, env, pos) {
     const keyword = expectSymbolExpr(keywordExpr, 'define-syntax');
     env.defineSyntax(bindingName(keywordExpr, 'define-syntax'), parseSyntaxRules(keyword, transformerExpr, env));
     return VOID;
+}
+function evaluateDefineRecordType(expressions, env, pos) {
+    if (expressions.length < 3) {
+        throw new EvalError(`define-record-type expected at least 3 argument(s), got ${expressions.length}`, pos);
+    }
+    const [typeNameExpr, constructorExpr, predicateExpr, ...fieldExprs] = expressions;
+    const typeName = expectSymbolExpr(typeNameExpr, 'define-record-type');
+    if (constructorExpr.kind !== 'list' || constructorExpr.elements.length === 0) {
+        throw new EvalError('define-record-type expected a constructor specification', constructorExpr.pos);
+    }
+    const [constructorNameExpr, ...constructorFieldExprs] = constructorExpr.elements;
+    const constructorName = expectSymbolExpr(constructorNameExpr, 'define-record-type');
+    const constructorBinding = bindingName(constructorNameExpr, 'define-record-type');
+    const predicateName = expectSymbolExpr(predicateExpr, 'define-record-type');
+    const predicateBinding = bindingName(predicateExpr, 'define-record-type');
+    const constructorFields = constructorFieldExprs.map((fieldExpr) => expectSymbolExpr(fieldExpr, 'define-record-type'));
+    const fields = fieldExprs.map((fieldExpr) => parseRecordField(fieldExpr));
+    const recordType = {
+        name: typeName,
+        fields,
+    };
+    const fieldIndexes = new Map();
+    for (let index = 0; index < fields.length; index += 1) {
+        if (fieldIndexes.has(fields[index].name)) {
+            throw new EvalError(`define-record-type duplicate field: ${fields[index].name}`, fieldExprs[index].pos);
+        }
+        fieldIndexes.set(fields[index].name, index);
+    }
+    for (const fieldName of constructorFields) {
+        if (!fieldIndexes.has(fieldName)) {
+            throw new EvalError(`define-record-type unknown constructor field: ${fieldName}`, constructorExpr.pos);
+        }
+    }
+    env.define(constructorBinding, builtin(constructorName, (args, callPos) => {
+        expectArity(constructorName, args, constructorFields.length, callPos);
+        const fieldValues = new Array(fields.length).fill(VOID);
+        for (let index = 0; index < constructorFields.length; index += 1) {
+            const fieldIndex = fieldIndexes.get(constructorFields[index]);
+            if (fieldIndex === undefined) {
+                throw new EvalError(`define-record-type unknown constructor field: ${constructorFields[index]}`, callPos);
+            }
+            fieldValues[fieldIndex] = args[index];
+        }
+        return {
+            kind: 'record',
+            type: recordType,
+            fields: fieldValues,
+        };
+    }));
+    env.define(predicateBinding, builtin(predicateName, (args, callPos) => {
+        expectArity(predicateName, args, 1, callPos);
+        return isRecordValue(args[0]) && args[0].type === recordType;
+    }));
+    for (let index = 0; index < fields.length; index += 1) {
+        const field = fields[index];
+        const fieldExpr = fieldExprs[index];
+        if (field.accessorName !== undefined) {
+            const accessorName = field.accessorName;
+            const accessorExpr = fieldExpr.kind === 'list' ? fieldExpr.elements[1] : undefined;
+            if (accessorExpr === undefined) {
+                throw new EvalError('define-record-type expected an accessor name', fieldExpr.pos);
+            }
+            env.define(bindingName(accessorExpr, 'define-record-type'), builtin(accessorName, (args, callPos) => {
+                expectArity(accessorName, args, 1, callPos);
+                return expectRecordOfType(args[0], recordType, accessorName, callPos).fields[index];
+            }));
+        }
+        if (field.mutatorName !== undefined) {
+            const mutatorName = field.mutatorName;
+            const mutatorExpr = fieldExpr.kind === 'list' ? fieldExpr.elements[2] : undefined;
+            if (mutatorExpr === undefined) {
+                throw new EvalError('define-record-type expected a mutator name', fieldExpr.pos);
+            }
+            env.define(bindingName(mutatorExpr, 'define-record-type'), builtin(mutatorName, (args, callPos) => {
+                expectArity(mutatorName, args, 2, callPos);
+                expectRecordOfType(args[0], recordType, mutatorName, callPos).fields[index] = args[1];
+                return VOID;
+            }));
+        }
+    }
+    return VOID;
+}
+function parseRecordField(expression) {
+    if (expression.kind === 'symbol' || expression.kind === 'resolved-symbol') {
+        return {
+            name: expectSymbolExpr(expression, 'define-record-type'),
+        };
+    }
+    if (expression.kind !== 'list' || expression.elements.length === 0 || expression.elements.length > 3) {
+        throw new EvalError('define-record-type expected field specs of the form name or (name accessor)', expression.pos);
+    }
+    const [nameExpr, accessorExpr, mutatorExpr] = expression.elements;
+    return {
+        name: expectSymbolExpr(nameExpr, 'define-record-type'),
+        accessorName: accessorExpr === undefined ? undefined : expectSymbolExpr(accessorExpr, 'define-record-type'),
+        mutatorName: mutatorExpr === undefined ? undefined : expectSymbolExpr(mutatorExpr, 'define-record-type'),
+    };
 }
 function evaluateQuote(expressions, pos) {
     if (expressions.length !== 1) {
@@ -1654,6 +1753,9 @@ function isChar(value) {
 function isEmptyList(value) {
     return typeof value === 'object' && value !== null && value.kind === 'empty-list';
 }
+function isRecordValue(value) {
+    return typeof value === 'object' && value !== null && value.kind === 'record';
+}
 function sameNumberLiteral(left, right) {
     if (left.exact && right.exact) {
         return left.numerator === right.numerator && left.denominator === right.denominator;
@@ -1754,6 +1856,12 @@ function expectChar(value, name, pos) {
 function expectSymbolValue(value, name, pos) {
     if (!isSymbolValue(value)) {
         throw new EvalError(`${name} expected a symbol`, pos);
+    }
+    return value;
+}
+function expectRecordOfType(value, recordType, name, pos) {
+    if (!isRecordValue(value) || value.type !== recordType) {
+        throw new EvalError(`${name} expected a ${recordType.name} record`, pos);
     }
     return value;
 }
@@ -2309,6 +2417,9 @@ function formatValue(value) {
     }
     if (isClosure(value)) {
         return value.name === undefined ? '#<procedure>' : `#<procedure:${value.name}>`;
+    }
+    if (isRecordValue(value)) {
+        return `#<record:${value.type.name}>`;
     }
     if (isPair(value)) {
         return formatPair(value);
