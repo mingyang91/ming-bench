@@ -17,9 +17,12 @@ type SchemeValBase =
   | { tag: 'macro'; transformer: MacroTransformer }
   | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal> }
   | { tag: 'vector'; val: SchemeVal[] }
-  | { tag: 'continuation'; k: Cont }
+  | { tag: 'continuation'; k: Cont; winders: Winder[] }
   | { tag: 'callcc' }
+  | { tag: 'dynamicWind' }
   | { tag: 'case-closure'; clauses: { params: string[]; rest: string | null; body: SchemeVal[] }[]; closedEnv: Env };
+
+type Winder = { inThunk: SchemeVal; outThunk: SchemeVal };
 
 type MacroTransformer = {
   literals: string[];
@@ -47,14 +50,41 @@ type Cont =
   | { tag: 'caseK'; clauses: SchemeVal[]; env: Env; epos: string; next: Cont }
   | { tag: 'andK'; rest: SchemeVal[]; env: Env; next: Cont }
   | { tag: 'orK'; rest: SchemeVal[]; env: Env; next: Cont }
+  | { tag: 'dwAfterInK'; bodyThunk: SchemeVal; outThunk: SchemeVal; inThunk: SchemeVal; epos: string; next: Cont }
+  | { tag: 'dwAfterBodyK'; outThunk: SchemeVal; winder: Winder; next: Cont }
+  | { tag: 'dwAfterOutK'; bodyVal: SchemeVal; next: Cont }
+  | { tag: 'dwWindK'; setWindersTo: Winder[]; remaining: { thunk: SchemeVal; setWindersTo: Winder[] }[]; val: SchemeVal; targetK: Cont }
   ;
 
-class ContinuationEscape { constructor(public k: Cont, public val: SchemeVal) {} }
+class ContinuationEscape { constructor(public k: Cont, public val: SchemeVal, public winders: Winder[]) {} }
 
 type Token = { text: string; pos: string };
 
 const NIL: SchemeVal = { tag: 'nil' };
 const VOID: SchemeVal = { tag: 'void' };
+
+// ── dynamic-wind state ──────────────────────────────────────────────────
+let currentWinders: Winder[] = [];
+
+type WindAction = { thunk: SchemeVal; setWindersTo: Winder[] };
+
+function computeWindActions(from: Winder[], to: Winder[]): WindAction[] {
+  let common = 0;
+  while (common < from.length && common < to.length && from[common] === to[common]) common++;
+  const actions: WindAction[] = [];
+  for (let i = from.length - 1; i >= common; i--)
+    actions.push({ thunk: from[i].outThunk, setWindersTo: from.slice(0, i) });
+  for (let i = common; i < to.length; i++)
+    actions.push({ thunk: to[i].inThunk, setWindersTo: to.slice(0, i + 1) });
+  return actions;
+}
+
+function initiateWinding(actions: WindAction[], val: SchemeVal, targetK: Cont): CEKState {
+  const first = actions[0];
+  const rest = actions.slice(1);
+  const k: Cont = { tag: 'dwWindK', setWindersTo: first.setWindersTo, remaining: rest, val, targetK };
+  return cekApply(first.thunk, [], '?', k);
+}
 
 // Unique identity for cycle detection
 let _nextId = 0;
@@ -583,7 +613,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
 
   envSet(env, 'procedure?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('procedure? requires 1 argument');
-    return { tag: 'boolean', val: args[0].tag === 'procedure' || args[0].tag === 'closure' || args[0].tag === 'continuation' || args[0].tag === 'callcc' || args[0].tag === 'case-closure' };
+    return { tag: 'boolean', val: args[0].tag === 'procedure' || args[0].tag === 'closure' || args[0].tag === 'continuation' || args[0].tag === 'callcc' || args[0].tag === 'dynamicWind' || args[0].tag === 'case-closure' };
   }});
 
   // I/O
@@ -600,6 +630,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
       case 'closure': return '#<procedure>';
       case 'continuation': return '#<procedure>';
       case 'callcc': return '#<procedure>';
+      case 'dynamicWind': return '#<procedure>';
       case 'case-closure': return '#<procedure>';
       case 'pair': {
         if (!seen) seen = new Set();
@@ -1160,6 +1191,9 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   envSet(env, 'call/cc', { tag: 'callcc' } as SchemeVal);
   envSet(env, 'call-with-current-continuation', { tag: 'callcc' } as SchemeVal);
 
+  // dynamic-wind
+  envSet(env, 'dynamic-wind', { tag: 'dynamicWind' } as SchemeVal);
+
   // apply
   envSet(env, 'apply', { tag: 'procedure', val: (args) => {
     if (args.length < 2) throw new EvalError('apply requires at least 2 arguments');
@@ -1306,7 +1340,7 @@ function callCaseClosure(cc: SchemeVal & { tag: 'case-closure' }, args: SchemeVa
 function callAny(proc: SchemeVal, args: SchemeVal[]): SchemeVal {
   if (proc.tag === 'closure') return callClosure(proc, args);
   if (proc.tag === 'case-closure') return callCaseClosure(proc, args);
-  if (proc.tag === 'continuation') throw new ContinuationEscape(proc.k, args[0] ?? VOID);
+  if (proc.tag === 'continuation') throw new ContinuationEscape(proc.k, args[0] ?? VOID, proc.winders);
   if (proc.tag === 'callcc') {
     if (args.length !== 1) throw new EvalError('call/cc requires 1 argument');
     // When call/cc is used as a first-class value via callAny (e.g. from apply/map),
@@ -1528,18 +1562,35 @@ function cekApply(proc: SchemeVal, args: SchemeVal[], epos: string, k: Cont): CE
     throw new EvalError(`${epos}: case-lambda: no matching clause for ${args.length} args`);
   }
   if (proc.tag === 'continuation') {
-    return { c: args.length > 0 ? args[0] : VOID, e: null as any, k: proc.k, m: 1 };
+    const val = args.length > 0 ? args[0] : VOID;
+    const targetWinders = proc.winders;
+    const actions = computeWindActions(currentWinders, targetWinders);
+    if (actions.length === 0) {
+      currentWinders = targetWinders;
+      return { c: val, e: null as any, k: proc.k, m: 1 };
+    }
+    return initiateWinding(actions, val, proc.k);
   }
   if (proc.tag === 'callcc') {
     if (args.length !== 1) throw new EvalError(`${epos}: call/cc requires 1 argument`);
-    const cont: SchemeVal = { tag: 'continuation', k };
+    const cont: SchemeVal = { tag: 'continuation', k, winders: [...currentWinders] };
     return cekApply(args[0], [cont], epos, k);
+  }
+  if (proc.tag === 'dynamicWind') {
+    if (args.length !== 3) throw new EvalError(`${epos}: dynamic-wind requires 3 arguments`);
+    const [inThunk, bodyThunk, outThunk] = args;
+    const nextK: Cont = { tag: 'dwAfterInK', bodyThunk, outThunk, inThunk, epos, next: k };
+    return cekApply(inThunk, [], epos, nextK);
   }
   if (proc.tag === 'procedure') {
     try {
       return { c: proc.val(args), e: null as any, k, m: 1 };
     } catch (err) {
-      if (err instanceof ContinuationEscape) return { c: err.val, e: null as any, k: err.k, m: 1 };
+      if (err instanceof ContinuationEscape) {
+        const actions = computeWindActions(currentWinders, err.winders);
+        if (actions.length === 0) { currentWinders = err.winders; return { c: err.val, e: null as any, k: err.k, m: 1 }; }
+        return initiateWinding(actions, err.val, err.k);
+      }
       if (err instanceof EvalError && !/^\d/.test(err.message)) throw new EvalError(`${epos}: ${err.message}`);
       throw err;
     }
@@ -1938,7 +1989,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         case 'callccK': {
           const f = k;
           const func = c;
-          const cont: SchemeVal = { tag: 'continuation', k: f.next };
+          const cont: SchemeVal = { tag: 'continuation', k: f.next, winders: [...currentWinders] };
           ({ c, e, k, m } = cekApply(func, [cont], '?', f.next));
           continue;
         }
@@ -2056,6 +2107,43 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           c = f.rest[0]; e = f.env; m = 0; continue;
         }
 
+        case 'dwAfterInK': {
+          const f = k;
+          const winder: Winder = { inThunk: f.inThunk, outThunk: f.outThunk };
+          currentWinders = [...currentWinders, winder];
+          k = { tag: 'dwAfterBodyK', outThunk: f.outThunk, winder, next: f.next };
+          ({ c, e, k, m } = cekApply(f.bodyThunk, [], f.epos, k));
+          continue;
+        }
+
+        case 'dwAfterBodyK': {
+          const f = k;
+          const bodyVal = c;
+          currentWinders = currentWinders.filter(w => w !== f.winder);
+          k = { tag: 'dwAfterOutK', bodyVal, next: f.next };
+          ({ c, e, k, m } = cekApply(f.outThunk, [], '?', k));
+          continue;
+        }
+
+        case 'dwAfterOutK': {
+          const f = k;
+          c = f.bodyVal;
+          k = f.next;
+          continue;
+        }
+
+        case 'dwWindK': {
+          const f = k;
+          currentWinders = f.setWindersTo;
+          if (f.remaining.length === 0) {
+            c = f.val; k = f.targetK; m = 1; continue;
+          }
+          const next = f.remaining[0];
+          k = { tag: 'dwWindK', setWindersTo: next.setWindersTo, remaining: f.remaining.slice(1), val: f.val, targetK: f.targetK };
+          ({ c, e, k, m } = cekApply(next.thunk, [], '?', k));
+          continue;
+        }
+
         default:
           throw new EvalError('unknown continuation frame');
       }
@@ -2109,6 +2197,7 @@ function display(val: SchemeVal, seen?: Set<SchemeVal>): string {
     case 'closure': return '#<procedure>';
     case 'continuation': return '#<procedure>';
     case 'callcc': return '#<procedure>';
+    case 'dynamicWind': return '#<procedure>';
     case 'case-closure': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'record': return '#<record>';
@@ -2121,6 +2210,7 @@ function display(val: SchemeVal, seen?: Set<SchemeVal>): string {
 export function evalStr(input: string): string {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  currentWinders = [];
   const env = makeGlobalEnv();
   // Evaluate all expressions in a single CEK run so continuations span forms
   const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
@@ -2132,6 +2222,7 @@ export function evalStr(input: string): string {
 export function evalStrWithOutput(input: string): { result: string; output: string } {
   const exprs = parseAll(input);
   if (exprs.length === 0) throw new EvalError('no expressions');
+  currentWinders = [];
   const outputBuf: string[] = [];
   const env = makeGlobalEnv(outputBuf);
   const beginExpr: SchemeVal = exprs.length === 1 ? exprs[0]
