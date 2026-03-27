@@ -67,6 +67,9 @@ pub enum EvalError {
     #[error("cannot mutate immutable string")]
     ImmutableString,
 
+    #[error("step limit exceeded: max {max_steps}")]
+    StepLimitExceeded { max_steps: usize },
+
     #[error("uncaught exception: {value}")]
     UncaughtException { value: String },
 }

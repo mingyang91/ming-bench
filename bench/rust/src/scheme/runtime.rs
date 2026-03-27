@@ -43,7 +43,34 @@ pub(super) type BindingRef = Rc<RefCell<Value>>;
 pub(super) type MacroRef = Rc<MacroTransformer>;
 pub(super) type SyntaxRef = Rc<SyntaxObject>;
 pub(super) type SyntaxContextRef = Rc<RefCell<MacroExpansionContext>>;
+pub(super) type StepBudgetRef = Rc<RefCell<StepBudget>>;
 pub(super) type BuiltinFn = fn(&[EvaluatedArg], &mut String) -> Result<Value, EvalError>;
+
+#[derive(Debug)]
+pub(super) struct StepBudget {
+    remaining: usize,
+    max_steps: usize,
+}
+
+impl StepBudget {
+    pub(super) fn new(max_steps: usize) -> StepBudgetRef {
+        Rc::new(RefCell::new(Self {
+            remaining: max_steps,
+            max_steps,
+        }))
+    }
+
+    fn consume(&mut self) -> Result<(), EvalError> {
+        if self.remaining == 0 {
+            return Err(EvalError::StepLimitExceeded {
+                max_steps: self.max_steps,
+            });
+        }
+
+        self.remaining -= 1;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct LambdaParams {
@@ -437,6 +464,7 @@ pub(super) struct Environment {
     bindings: RefCell<HashMap<String, BindingRef>>,
     macros: RefCell<HashMap<String, MacroRef>>,
     syntax_context: RefCell<Option<SyntaxContextRef>>,
+    step_budget: RefCell<Option<StepBudgetRef>>,
 }
 
 impl Environment {
@@ -445,6 +473,7 @@ impl Environment {
             syntax_context: RefCell::new(
                 parent.as_ref().and_then(|parent| parent.syntax_context()),
             ),
+            step_budget: RefCell::new(parent.as_ref().and_then(|parent| parent.step_budget())),
             parent,
             bindings: RefCell::new(HashMap::new()),
             macros: RefCell::new(HashMap::new()),
@@ -481,6 +510,26 @@ impl Environment {
 
     pub(super) fn set_syntax_context(&self, context: Option<SyntaxContextRef>) {
         *self.syntax_context.borrow_mut() = context;
+    }
+
+    pub(super) fn set_step_budget(&self, budget: Option<StepBudgetRef>) {
+        *self.step_budget.borrow_mut() = budget;
+    }
+
+    pub(super) fn step_budget(&self) -> Option<StepBudgetRef> {
+        self.step_budget.borrow().clone()
+    }
+
+    pub(super) fn charge_eval(&self, pos: Position) -> Result<(), EvalError> {
+        let Some(budget) = self.step_budget() else {
+            return Ok(());
+        };
+
+        let result = budget
+            .borrow_mut()
+            .consume()
+            .map_err(|error| error.with_position(pos.line, pos.col));
+        result
     }
 
     pub(super) fn set(&self, name: &str, value: Value) -> Result<(), EvalError> {

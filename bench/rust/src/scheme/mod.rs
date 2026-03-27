@@ -32,6 +32,21 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
     Ok(value.render())
 }
 
+/// Evaluate Scheme expressions with a maximum number of expression
+/// dispatches before aborting.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let exprs = parser::parse_program(input)?;
+    let env = builtins::default_env();
+    env.set_step_budget(Some(StepBudget::new(max_steps)));
+
+    let mut output = String::new();
+    let value = finalize_top_level_value(
+        eval_program_machine(&exprs, env, &mut output)?,
+        exprs.last().map(Expr::pos),
+    )?;
+    Ok(value.render())
+}
+
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
@@ -101,6 +116,8 @@ fn eval_machine(
     cont: ContinuationRef,
     output: &mut String,
 ) -> Result<MachineState, EvalError> {
+    env.charge_eval(expr.pos())?;
+
     match expr {
         Expr::Bool { value, .. } => Ok(MachineState::Return {
             value: Value::Bool(value),
@@ -1634,6 +1651,8 @@ fn eval_symbol(name: &str, pos: Position, env: &EnvRef) -> Result<Value, EvalErr
 }
 
 fn eval_tail(expr: &Expr, env: EnvRef, output: &mut String) -> Result<TailEvalResult, EvalError> {
+    env.charge_eval(expr.pos())?;
+
     match expr {
         Expr::Bool { value, .. } => Ok(TailEvalResult::Value(Value::Bool(*value))),
         Expr::Number { value, .. } => Ok(TailEvalResult::Value(Value::Number(*value))),
@@ -2094,6 +2113,8 @@ fn eval_tail_letrec(
 }
 
 fn eval(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    env.charge_eval(expr.pos())?;
+
     match expr {
         Expr::Bool { value, .. } => Ok(Value::Bool(*value)),
         Expr::Number { value, .. } => Ok(Value::Number(*value)),
