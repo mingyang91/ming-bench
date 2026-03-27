@@ -7,6 +7,8 @@ import (
 	"unicode"
 )
 
+// --------------- Values ---------------
+
 // Value represents a Scheme value.
 type Value interface {
 	String() string
@@ -15,23 +17,88 @@ type Value interface {
 type IntVal struct{ Val int64 }
 type BoolVal struct{ Val bool }
 type StringVal struct{ Val string }
+type SymbolVal struct{ Name string }
+type PairVal struct{ Car, Cdr Value }
+type NilVal struct{} // empty list
+type VoidVal struct{}
 
-func (v *IntVal) String() string {
-	return strconv.FormatInt(v.Val, 10)
+type LambdaVal struct {
+	Params []string
+	Body   []Expr
+	Env    *Env
 }
 
+type BuiltinVal struct {
+	Name string
+	Fn   func([]Value) (Value, error)
+}
+
+func (v *IntVal) String() string    { return strconv.FormatInt(v.Val, 10) }
 func (v *BoolVal) String() string {
 	if v.Val {
 		return "#t"
 	}
 	return "#f"
 }
+func (v *StringVal) String() string  { return fmt.Sprintf("%q", v.Val) }
+func (v *SymbolVal) String() string  { return v.Name }
+func (v *NilVal) String() string     { return "()" }
+func (v *VoidVal) String() string    { return "" }
+func (v *LambdaVal) String() string  { return "#<procedure>" }
+func (v *BuiltinVal) String() string { return "#<builtin:" + v.Name + ">" }
 
-func (v *StringVal) String() string {
-	return fmt.Sprintf("%q", v.Val)
+func (v *PairVal) String() string {
+	var buf strings.Builder
+	buf.WriteByte('(')
+	cur := Value(v)
+	first := true
+	for {
+		p, ok := cur.(*PairVal)
+		if !ok {
+			break
+		}
+		if !first {
+			buf.WriteByte(' ')
+		}
+		first = false
+		buf.WriteString(p.Car.String())
+		cur = p.Cdr
+	}
+	if _, ok := cur.(*NilVal); !ok {
+		buf.WriteString(" . ")
+		buf.WriteString(cur.String())
+	}
+	buf.WriteByte(')')
+	return buf.String()
 }
 
-// tokenize splits input into tokens.
+// --------------- Environment ---------------
+
+type Env struct {
+	bindings map[string]Value
+	parent   *Env
+}
+
+func newEnv(parent *Env) *Env {
+	return &Env{bindings: make(map[string]Value), parent: parent}
+}
+
+func (e *Env) get(name string) (Value, bool) {
+	if v, ok := e.bindings[name]; ok {
+		return v, true
+	}
+	if e.parent != nil {
+		return e.parent.get(name)
+	}
+	return nil, false
+}
+
+func (e *Env) set(name string, val Value) {
+	e.bindings[name] = val
+}
+
+// --------------- Tokenizer ---------------
+
 func tokenize(input string) []string {
 	var tokens []string
 	i := 0
@@ -40,10 +107,12 @@ func tokenize(input string) []string {
 		if unicode.IsSpace(rune(ch)) {
 			i++
 		} else if ch == ';' {
-			// line comment
 			for i < len(input) && input[i] != '\n' {
 				i++
 			}
+		} else if ch == '\'' {
+			tokens = append(tokens, "'")
+			i++
 		} else if ch == '(' || ch == ')' {
 			tokens = append(tokens, string(ch))
 			i++
@@ -56,7 +125,6 @@ func tokenize(input string) []string {
 				i++
 			}
 		} else if ch == '"' {
-			// string literal
 			j := i + 1
 			for j < len(input) && input[j] != '"' {
 				if input[j] == '\\' {
@@ -65,13 +133,13 @@ func tokenize(input string) []string {
 				j++
 			}
 			if j < len(input) {
-				j++ // closing quote
+				j++
 			}
 			tokens = append(tokens, input[i:j])
 			i = j
 		} else {
 			j := i
-			for j < len(input) && !unicode.IsSpace(rune(input[j])) && input[j] != '(' && input[j] != ')' && input[j] != '"' && input[j] != ';' {
+			for j < len(input) && !unicode.IsSpace(rune(input[j])) && input[j] != '(' && input[j] != ')' && input[j] != '"' && input[j] != ';' && input[j] != '\'' {
 				j++
 			}
 			tokens = append(tokens, input[i:j])
@@ -81,19 +149,27 @@ func tokenize(input string) []string {
 	return tokens
 }
 
-// Expr represents a parsed S-expression.
+// --------------- Parser ---------------
+
 type Expr interface{}
 
 type AtomExpr struct{ Token string }
 type ListExpr struct{ Items []Expr }
 
-// parse parses tokens into an Expr, returning the expr and remaining tokens.
 func parse(tokens []string) (Expr, []string, error) {
 	if len(tokens) == 0 {
 		return nil, nil, &EvalError{Message: "unexpected EOF"}
 	}
 	tok := tokens[0]
 	rest := tokens[1:]
+	if tok == "'" {
+		// 'x => (quote x)
+		inner, rest2, err := parse(rest)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &ListExpr{Items: []Expr{&AtomExpr{Token: "quote"}, inner}}, rest2, nil
+	}
 	if tok == "(" {
 		var items []Expr
 		for len(rest) > 0 && rest[0] != ")" {
@@ -108,7 +184,7 @@ func parse(tokens []string) (Expr, []string, error) {
 		if len(rest) == 0 {
 			return nil, nil, &EvalError{Message: "missing closing paren"}
 		}
-		rest = rest[1:] // skip ")"
+		rest = rest[1:]
 		return &ListExpr{Items: items}, rest, nil
 	} else if tok == ")" {
 		return nil, nil, &EvalError{Message: "unexpected )"}
@@ -116,219 +192,6 @@ func parse(tokens []string) (Expr, []string, error) {
 	return &AtomExpr{Token: tok}, rest, nil
 }
 
-// eval evaluates an Expr and returns a Value.
-func eval(expr Expr) (Value, error) {
-	switch e := expr.(type) {
-	case *AtomExpr:
-		return evalAtom(e.Token)
-	case *ListExpr:
-		return evalList(e)
-	}
-	return nil, &EvalError{Message: "unknown expression"}
-}
-
-func evalAtom(token string) (Value, error) {
-	if token == "#t" {
-		return &BoolVal{Val: true}, nil
-	}
-	if token == "#f" {
-		return &BoolVal{Val: false}, nil
-	}
-	if len(token) > 0 && token[0] == '"' {
-		// string literal - unescape
-		s, err := strconv.Unquote(token)
-		if err != nil {
-			return nil, &EvalError{Message: "bad string: " + token}
-		}
-		return &StringVal{Val: s}, nil
-	}
-	// try integer
-	n, err := strconv.ParseInt(token, 10, 64)
-	if err == nil {
-		return &IntVal{Val: n}, nil
-	}
-	return nil, &EvalError{Message: "unbound variable: " + token}
-}
-
-func evalList(list *ListExpr) (Value, error) {
-	if len(list.Items) == 0 {
-		return nil, &EvalError{Message: "empty application"}
-	}
-	// check for special forms
-	if atom, ok := list.Items[0].(*AtomExpr); ok {
-		switch atom.Token {
-		case "and":
-			return evalAnd(list.Items[1:])
-		case "or":
-			return evalOr(list.Items[1:])
-		}
-	}
-
-	// evaluate operator
-	op, err := eval(list.Items[0])
-	if err != nil {
-		return nil, err
-	}
-	// evaluate arguments
-	args := make([]Value, len(list.Items)-1)
-	for i, item := range list.Items[1:] {
-		args[i], err = eval(item)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return apply(op, args)
-}
-
-func isTruthy(v Value) bool {
-	if b, ok := v.(*BoolVal); ok {
-		return b.Val
-	}
-	return true // everything except #f is truthy
-}
-
-func evalAnd(exprs []Expr) (Value, error) {
-	var result Value = &BoolVal{Val: true}
-	for _, e := range exprs {
-		v, err := eval(e)
-		if err != nil {
-			return nil, err
-		}
-		if !isTruthy(v) {
-			return v, nil
-		}
-		result = v
-	}
-	return result, nil
-}
-
-func evalOr(exprs []Expr) (Value, error) {
-	var result Value = &BoolVal{Val: false}
-	for _, e := range exprs {
-		v, err := eval(e)
-		if err != nil {
-			return nil, err
-		}
-		if isTruthy(v) {
-			return v, nil
-		}
-		result = v
-	}
-	return result, nil
-}
-
-func apply(op Value, args []Value) (Value, error) {
-	// Built-in operator identification - for now op must be a symbol that we resolved
-	// But at L01 we handle builtins by name in evalList. Let me restructure.
-	return nil, &EvalError{Message: "not a procedure"}
-}
-
-func evalBuiltin(name string, args []Value) (Value, error) {
-	switch name {
-	case "+":
-		var sum int64
-		for _, a := range args {
-			n, ok := a.(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "expected number"}
-			}
-			sum += n.Val
-		}
-		return &IntVal{Val: sum}, nil
-	case "-":
-		if len(args) == 0 {
-			return nil, &EvalError{Message: "- requires at least 1 argument"}
-		}
-		if len(args) == 1 {
-			n, ok := args[0].(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "expected number"}
-			}
-			return &IntVal{Val: -n.Val}, nil
-		}
-		result, ok := args[0].(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: "expected number"}
-		}
-		val := result.Val
-		for _, a := range args[1:] {
-			n, ok := a.(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "expected number"}
-			}
-			val -= n.Val
-		}
-		return &IntVal{Val: val}, nil
-	case "*":
-		var prod int64 = 1
-		for _, a := range args {
-			n, ok := a.(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "expected number"}
-			}
-			prod *= n.Val
-		}
-		return &IntVal{Val: prod}, nil
-	case "/":
-		if len(args) < 2 {
-			return nil, &EvalError{Message: "/ requires at least 2 arguments"}
-		}
-		result, ok := args[0].(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: "expected number"}
-		}
-		val := result.Val
-		for _, a := range args[1:] {
-			n, ok := a.(*IntVal)
-			if !ok {
-				return nil, &EvalError{Message: "expected number"}
-			}
-			if n.Val == 0 {
-				return nil, &EvalError{Message: "division by zero"}
-			}
-			val /= n.Val
-		}
-		return &IntVal{Val: val}, nil
-	case "=":
-		return compareInts(args, func(a, b int64) bool { return a == b })
-	case "<":
-		return compareInts(args, func(a, b int64) bool { return a < b })
-	case ">":
-		return compareInts(args, func(a, b int64) bool { return a > b })
-	case "<=":
-		return compareInts(args, func(a, b int64) bool { return a <= b })
-	case ">=":
-		return compareInts(args, func(a, b int64) bool { return a >= b })
-	case "not":
-		if len(args) != 1 {
-			return nil, &EvalError{Message: "not requires 1 argument"}
-		}
-		return &BoolVal{Val: !isTruthy(args[0])}, nil
-	}
-	return nil, &EvalError{Message: "unknown procedure: " + name}
-}
-
-func compareInts(args []Value, cmp func(int64, int64) bool) (Value, error) {
-	if len(args) < 2 {
-		return nil, &EvalError{Message: "comparison requires at least 2 arguments"}
-	}
-	for i := 0; i < len(args)-1; i++ {
-		a, ok := args[i].(*IntVal)
-		if !ok {
-			return nil, &EvalError{Message: "expected number"}
-		}
-		b, ok2 := args[i+1].(*IntVal)
-		if !ok2 {
-			return nil, &EvalError{Message: "expected number"}
-		}
-		if !cmp(a.Val, b.Val) {
-			return &BoolVal{Val: false}, nil
-		}
-	}
-	return &BoolVal{Val: true}, nil
-}
-
-// parseAll parses all expressions from input.
 func parseAll(input string) ([]Expr, error) {
 	tokens := tokenize(input)
 	var exprs []Expr
@@ -343,68 +206,207 @@ func parseAll(input string) ([]Expr, error) {
 	return exprs, nil
 }
 
-// EvalStr evaluates one or more Scheme expressions and returns the string
-// representation of the last result.
-func EvalStr(input string) (string, error) {
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return "", nil
+// --------------- Evaluator ---------------
+
+func isTruthy(v Value) bool {
+	if b, ok := v.(*BoolVal); ok {
+		return b.Val
 	}
-	exprs, err := parseAll(input)
-	if err != nil {
-		return "", err
-	}
-	var result Value
-	for _, expr := range exprs {
-		result, err = evalExpr(expr)
-		if err != nil {
-			return "", err
-		}
-	}
-	return result.String(), nil
+	return true
 }
 
-// evalExpr evaluates an expression - main entry point for evaluation.
-func evalExpr(expr Expr) (Value, error) {
+func evalInEnv(expr Expr, env *Env) (Value, error) {
 	switch e := expr.(type) {
 	case *AtomExpr:
-		return evalAtom(e.Token)
+		return evalAtomInEnv(e.Token, env)
 	case *ListExpr:
-		return evalListExpr(e)
+		return evalListInEnv(e, env)
 	}
 	return nil, &EvalError{Message: "unknown expression"}
 }
 
-func evalListExpr(list *ListExpr) (Value, error) {
+func evalAtomInEnv(token string, env *Env) (Value, error) {
+	if token == "#t" {
+		return &BoolVal{Val: true}, nil
+	}
+	if token == "#f" {
+		return &BoolVal{Val: false}, nil
+	}
+	if len(token) > 0 && token[0] == '"' {
+		s, err := strconv.Unquote(token)
+		if err != nil {
+			return nil, &EvalError{Message: "bad string: " + token}
+		}
+		return &StringVal{Val: s}, nil
+	}
+	if n, err := strconv.ParseInt(token, 10, 64); err == nil {
+		return &IntVal{Val: n}, nil
+	}
+	// variable lookup
+	if v, ok := env.get(token); ok {
+		return v, nil
+	}
+	return nil, &EvalError{Message: "unbound variable: " + token}
+}
+
+func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 	if len(list.Items) == 0 {
 		return nil, &EvalError{Message: "empty application"}
 	}
-	// check for special forms first
+
+	// Check for special forms
 	if atom, ok := list.Items[0].(*AtomExpr); ok {
 		switch atom.Token {
+		case "quote":
+			if len(list.Items) != 2 {
+				return nil, &EvalError{Message: "quote requires 1 argument"}
+			}
+			return exprToValue(list.Items[1])
+		case "if":
+			return evalIf(list.Items[1:], env)
+		case "define":
+			return evalDefine(list.Items[1:], env)
+		case "lambda":
+			return evalLambda(list.Items[1:], env)
 		case "and":
-			return evalAndExpr(list.Items[1:])
+			return evalAnd(list.Items[1:], env)
 		case "or":
-			return evalOrExpr(list.Items[1:])
+			return evalOr(list.Items[1:], env)
 		}
-		// try as builtin
-		args := make([]Value, len(list.Items)-1)
-		var err error
-		for i, item := range list.Items[1:] {
-			args[i], err = evalExpr(item)
+	}
+
+	// Evaluate operator
+	op, err := evalInEnv(list.Items[0], env)
+	if err != nil {
+		return nil, err
+	}
+	// Evaluate arguments
+	args := make([]Value, len(list.Items)-1)
+	for i, item := range list.Items[1:] {
+		args[i], err = evalInEnv(item, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return applyProc(op, args)
+}
+
+func exprToValue(expr Expr) (Value, error) {
+	switch e := expr.(type) {
+	case *AtomExpr:
+		if e.Token == "#t" {
+			return &BoolVal{Val: true}, nil
+		}
+		if e.Token == "#f" {
+			return &BoolVal{Val: false}, nil
+		}
+		if len(e.Token) > 0 && e.Token[0] == '"' {
+			s, err := strconv.Unquote(e.Token)
+			if err != nil {
+				return nil, &EvalError{Message: "bad string: " + e.Token}
+			}
+			return &StringVal{Val: s}, nil
+		}
+		if n, err := strconv.ParseInt(e.Token, 10, 64); err == nil {
+			return &IntVal{Val: n}, nil
+		}
+		return &SymbolVal{Name: e.Token}, nil
+	case *ListExpr:
+		if len(e.Items) == 0 {
+			return &NilVal{}, nil
+		}
+		// Build list from items
+		var result Value = &NilVal{}
+		for i := len(e.Items) - 1; i >= 0; i-- {
+			car, err := exprToValue(e.Items[i])
 			if err != nil {
 				return nil, err
 			}
+			result = &PairVal{Car: car, Cdr: result}
 		}
-		return evalBuiltin(atom.Token, args)
+		return result, nil
 	}
-	return nil, &EvalError{Message: "not a procedure"}
+	return nil, &EvalError{Message: "unknown expression in quote"}
 }
 
-func evalAndExpr(exprs []Expr) (Value, error) {
+func evalIf(args []Expr, env *Env) (Value, error) {
+	if len(args) < 2 || len(args) > 3 {
+		return nil, &EvalError{Message: "if requires 2 or 3 arguments"}
+	}
+	cond, err := evalInEnv(args[0], env)
+	if err != nil {
+		return nil, err
+	}
+	if isTruthy(cond) {
+		return evalInEnv(args[1], env)
+	}
+	if len(args) == 3 {
+		return evalInEnv(args[2], env)
+	}
+	return &VoidVal{}, nil
+}
+
+func evalDefine(args []Expr, env *Env) (Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "define requires at least 2 arguments"}
+	}
+	// (define (f params...) body...)
+	if list, ok := args[0].(*ListExpr); ok {
+		if len(list.Items) == 0 {
+			return nil, &EvalError{Message: "define: empty name list"}
+		}
+		nameAtom, ok := list.Items[0].(*AtomExpr)
+		if !ok {
+			return nil, &EvalError{Message: "define: expected symbol"}
+		}
+		params := make([]string, len(list.Items)-1)
+		for i, item := range list.Items[1:] {
+			p, ok := item.(*AtomExpr)
+			if !ok {
+				return nil, &EvalError{Message: "define: expected parameter name"}
+			}
+			params[i] = p.Token
+		}
+		lambda := &LambdaVal{Params: params, Body: args[1:], Env: env}
+		env.set(nameAtom.Token, lambda)
+		return &VoidVal{}, nil
+	}
+	// (define x expr)
+	nameAtom, ok := args[0].(*AtomExpr)
+	if !ok {
+		return nil, &EvalError{Message: "define: expected symbol"}
+	}
+	val, err := evalInEnv(args[1], env)
+	if err != nil {
+		return nil, err
+	}
+	env.set(nameAtom.Token, val)
+	return &VoidVal{}, nil
+}
+
+func evalLambda(args []Expr, env *Env) (Value, error) {
+	if len(args) < 2 {
+		return nil, &EvalError{Message: "lambda requires params and body"}
+	}
+	paramList, ok := args[0].(*ListExpr)
+	if !ok {
+		return nil, &EvalError{Message: "lambda: expected parameter list"}
+	}
+	params := make([]string, len(paramList.Items))
+	for i, item := range paramList.Items {
+		p, ok := item.(*AtomExpr)
+		if !ok {
+			return nil, &EvalError{Message: "lambda: expected parameter name"}
+		}
+		params[i] = p.Token
+	}
+	return &LambdaVal{Params: params, Body: args[1:], Env: env}, nil
+}
+
+func evalAnd(exprs []Expr, env *Env) (Value, error) {
 	var result Value = &BoolVal{Val: true}
 	for _, e := range exprs {
-		v, err := evalExpr(e)
+		v, err := evalInEnv(e, env)
 		if err != nil {
 			return nil, err
 		}
@@ -416,10 +418,10 @@ func evalAndExpr(exprs []Expr) (Value, error) {
 	return result, nil
 }
 
-func evalOrExpr(exprs []Expr) (Value, error) {
+func evalOr(exprs []Expr, env *Env) (Value, error) {
 	var result Value = &BoolVal{Val: false}
 	for _, e := range exprs {
-		v, err := evalExpr(e)
+		v, err := evalInEnv(e, env)
 		if err != nil {
 			return nil, err
 		}
@@ -431,8 +433,177 @@ func evalOrExpr(exprs []Expr) (Value, error) {
 	return result, nil
 }
 
-// EvalStrWithOutput evaluates Scheme expressions and returns both the result
-// string and any captured output from display/write/newline.
+// --------------- Procedure application ---------------
+
+func applyProc(op Value, args []Value) (Value, error) {
+	switch fn := op.(type) {
+	case *BuiltinVal:
+		return fn.Fn(args)
+	case *LambdaVal:
+		if len(args) != len(fn.Params) {
+			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
+		}
+		callEnv := newEnv(fn.Env)
+		for i, p := range fn.Params {
+			callEnv.set(p, args[i])
+		}
+		var result Value
+		var err error
+		for _, bodyExpr := range fn.Body {
+			result, err = evalInEnv(bodyExpr, callEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+	return nil, &EvalError{Message: "not a procedure"}
+}
+
+// --------------- Builtins ---------------
+
+func makeBuiltinEnv() *Env {
+	env := newEnv(nil)
+
+	addBuiltin := func(name string, fn func([]Value) (Value, error)) {
+		env.set(name, &BuiltinVal{Name: name, Fn: fn})
+	}
+
+	addBuiltin("+", func(args []Value) (Value, error) {
+		var sum int64
+		for _, a := range args {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "expected number"}
+			}
+			sum += n.Val
+		}
+		return &IntVal{Val: sum}, nil
+	})
+
+	addBuiltin("-", func(args []Value) (Value, error) {
+		if len(args) == 0 {
+			return nil, &EvalError{Message: "- requires at least 1 argument"}
+		}
+		if len(args) == 1 {
+			n, ok := args[0].(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "expected number"}
+			}
+			return &IntVal{Val: -n.Val}, nil
+		}
+		first, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "expected number"}
+		}
+		val := first.Val
+		for _, a := range args[1:] {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "expected number"}
+			}
+			val -= n.Val
+		}
+		return &IntVal{Val: val}, nil
+	})
+
+	addBuiltin("*", func(args []Value) (Value, error) {
+		var prod int64 = 1
+		for _, a := range args {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "expected number"}
+			}
+			prod *= n.Val
+		}
+		return &IntVal{Val: prod}, nil
+	})
+
+	addBuiltin("/", func(args []Value) (Value, error) {
+		if len(args) < 2 {
+			return nil, &EvalError{Message: "/ requires at least 2 arguments"}
+		}
+		first, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "expected number"}
+		}
+		val := first.Val
+		for _, a := range args[1:] {
+			n, ok := a.(*IntVal)
+			if !ok {
+				return nil, &EvalError{Message: "expected number"}
+			}
+			if n.Val == 0 {
+				return nil, &EvalError{Message: "division by zero"}
+			}
+			val /= n.Val
+		}
+		return &IntVal{Val: val}, nil
+	})
+
+	cmpBuiltin := func(name string, cmp func(int64, int64) bool) {
+		addBuiltin(name, func(args []Value) (Value, error) {
+			if len(args) < 2 {
+				return nil, &EvalError{Message: name + " requires at least 2 arguments"}
+			}
+			for i := 0; i < len(args)-1; i++ {
+				a, ok := args[i].(*IntVal)
+				if !ok {
+					return nil, &EvalError{Message: "expected number"}
+				}
+				b, ok := args[i+1].(*IntVal)
+				if !ok {
+					return nil, &EvalError{Message: "expected number"}
+				}
+				if !cmp(a.Val, b.Val) {
+					return &BoolVal{Val: false}, nil
+				}
+			}
+			return &BoolVal{Val: true}, nil
+		})
+	}
+
+	cmpBuiltin("=", func(a, b int64) bool { return a == b })
+	cmpBuiltin("<", func(a, b int64) bool { return a < b })
+	cmpBuiltin(">", func(a, b int64) bool { return a > b })
+	cmpBuiltin("<=", func(a, b int64) bool { return a <= b })
+	cmpBuiltin(">=", func(a, b int64) bool { return a >= b })
+
+	addBuiltin("not", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "not requires 1 argument"}
+		}
+		return &BoolVal{Val: !isTruthy(args[0])}, nil
+	})
+
+	return env
+}
+
+// --------------- Public API ---------------
+
+func EvalStr(input string) (string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", nil
+	}
+	exprs, err := parseAll(input)
+	if err != nil {
+		return "", err
+	}
+	env := makeBuiltinEnv()
+	var result Value
+	for _, expr := range exprs {
+		result, err = evalInEnv(expr, env)
+		if err != nil {
+			return "", err
+		}
+	}
+	if _, ok := result.(*VoidVal); ok {
+		return "", nil
+	}
+	return result.String(), nil
+}
+
 func EvalStrWithOutput(input string) (result string, output string, err error) {
 	r, err := EvalStr(input)
 	return r, "", err
