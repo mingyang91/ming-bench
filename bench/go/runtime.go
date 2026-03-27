@@ -1,7 +1,6 @@
 package ming
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 )
@@ -35,13 +34,13 @@ type builtinProc struct {
 
 type closureValue struct {
 	params []string
-	body   []expr
+	body   []locatedExpr
 	env    *env
 }
 
 type letBinding struct {
 	name string
-	init expr
+	init locatedExpr
 }
 
 type env struct {
@@ -152,7 +151,7 @@ func (closureValue) isTruthy() bool {
 
 func (p closureValue) call(args []value) (value, error) {
 	if len(args) != len(p.params) {
-		return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(p.params), len(args))}
+		return nil, newCurrentEvalError("expected %d arguments, got %d", len(p.params), len(args))
 	}
 
 	callEnv := newEnv(p.env)
@@ -224,6 +223,9 @@ func evalInput(input string) (result string, output string, err error) {
 	}
 
 	env := newGlobalEnv()
+	restore := pushEvalPos(defaultSourcePos())
+	defer restore()
+
 	last := value(voidValue{})
 
 	for _, expr := range exprs {
@@ -236,7 +238,7 @@ func evalInput(input string) (result string, output string, err error) {
 	return last.schemeString(), "", nil
 }
 
-func evalSequence(exprs []expr, env *env) (value, error) {
+func evalSequence(exprs []locatedExpr, env *env) (value, error) {
 	last := value(voidValue{})
 	for _, expr := range exprs {
 		var err error
@@ -248,8 +250,11 @@ func evalSequence(exprs []expr, env *env) (value, error) {
 	return last, nil
 }
 
-func evalExpr(e expr, env *env) (value, error) {
-	switch expr := e.(type) {
+func evalExpr(e locatedExpr, env *env) (value, error) {
+	restore := pushEvalPos(e.pos)
+	defer restore()
+
+	switch expr := e.form.(type) {
 	case numberExpr:
 		return numberValue(expr), nil
 	case boolExpr:
@@ -259,22 +264,22 @@ func evalExpr(e expr, env *env) (value, error) {
 	case symbolExpr:
 		v, ok := env.lookup(string(expr))
 		if !ok {
-			return nil, &EvalError{Message: fmt.Sprintf("unbound variable: %s", string(expr))}
+			return nil, newCurrentEvalError("unbound variable: %s", string(expr))
 		}
 		return v, nil
 	case listExpr:
 		return evalList(expr, env)
 	default:
-		return nil, &EvalError{Message: "unknown expression"}
+		return nil, newCurrentEvalError("unknown expression")
 	}
 }
 
 func evalList(items listExpr, env *env) (value, error) {
 	if len(items) == 0 {
-		return nil, &EvalError{Message: "cannot evaluate empty list"}
+		return nil, newCurrentEvalError("cannot evaluate empty list")
 	}
 
-	if operator, ok := items[0].(symbolExpr); ok {
+	if operator, ok := items[0].form.(symbolExpr); ok {
 		switch string(operator) {
 		case "and":
 			return evalAnd(items[1:], env)
@@ -304,7 +309,9 @@ func evalList(items listExpr, env *env) (value, error) {
 
 	proc, ok := operator.(procedure)
 	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("attempt to call non-procedure: %s", operator.schemeString())}
+		restore := pushEvalPos(items[0].pos)
+		defer restore()
+		return nil, newCurrentEvalError("attempt to call non-procedure: %s", operator.schemeString())
 	}
 
 	args := make([]value, 0, len(items)-1)
@@ -316,10 +323,12 @@ func evalList(items listExpr, env *env) (value, error) {
 		args = append(args, arg)
 	}
 
+	restore := pushEvalPos(items[0].pos)
+	defer restore()
 	return proc.call(args)
 }
 
-func evalAnd(items []expr, env *env) (value, error) {
+func evalAnd(items []locatedExpr, env *env) (value, error) {
 	result := value(boolValue(true))
 	for _, item := range items {
 		next, err := evalExpr(item, env)
@@ -334,7 +343,7 @@ func evalAnd(items []expr, env *env) (value, error) {
 	return result, nil
 }
 
-func evalOr(items []expr, env *env) (value, error) {
+func evalOr(items []locatedExpr, env *env) (value, error) {
 	for _, item := range items {
 		next, err := evalExpr(item, env)
 		if err != nil {
@@ -347,9 +356,9 @@ func evalOr(items []expr, env *env) (value, error) {
 	return boolValue(false), nil
 }
 
-func evalIf(parts []expr, env *env) (value, error) {
+func evalIf(parts []locatedExpr, env *env) (value, error) {
 	if len(parts) != 2 && len(parts) != 3 {
-		return nil, &EvalError{Message: "'if' expects 2 or 3 arguments"}
+		return nil, newCurrentEvalError("'if' expects 2 or 3 arguments")
 	}
 
 	cond, err := evalExpr(parts[0], env)
@@ -368,15 +377,15 @@ func evalIf(parts []expr, env *env) (value, error) {
 	return voidValue{}, nil
 }
 
-func evalDefine(parts []expr, env *env) (value, error) {
+func evalDefine(parts []locatedExpr, env *env) (value, error) {
 	if len(parts) < 2 {
-		return nil, &EvalError{Message: "'define' expects at least 2 arguments"}
+		return nil, newCurrentEvalError("'define' expects at least 2 arguments")
 	}
 
-	switch target := parts[0].(type) {
+	switch target := parts[0].form.(type) {
 	case symbolExpr:
 		if len(parts) != 2 {
-			return nil, &EvalError{Message: "'define' expects exactly 2 arguments for variable definitions"}
+			return nil, newCurrentEvalError("'define' expects exactly 2 arguments for variable definitions")
 		}
 
 		v, err := evalExpr(parts[1], env)
@@ -387,12 +396,12 @@ func evalDefine(parts []expr, env *env) (value, error) {
 		return voidValue{}, nil
 	case listExpr:
 		if len(target) == 0 {
-			return nil, &EvalError{Message: "function name is required"}
+			return nil, newCurrentEvalError("function name is required")
 		}
 
-		name, ok := target[0].(symbolExpr)
+		name, ok := target[0].form.(symbolExpr)
 		if !ok {
-			return nil, &EvalError{Message: "function name must be a symbol"}
+			return nil, newEvalError(target[0].pos, "function name must be a symbol")
 		}
 
 		params, err := parseParams(target[1:])
@@ -408,25 +417,25 @@ func evalDefine(parts []expr, env *env) (value, error) {
 		env.define(string(name), proc)
 		return voidValue{}, nil
 	default:
-		return nil, &EvalError{Message: "invalid define target"}
+		return nil, newCurrentEvalError("invalid define target")
 	}
 }
 
-func evalQuote(parts []expr) (value, error) {
+func evalQuote(parts []locatedExpr) (value, error) {
 	if len(parts) != 1 {
-		return nil, &EvalError{Message: "'quote' expects exactly 1 argument"}
+		return nil, newCurrentEvalError("'quote' expects exactly 1 argument")
 	}
 	return quoteExpr(parts[0])
 }
 
-func evalLambda(parts []expr, env *env) (value, error) {
+func evalLambda(parts []locatedExpr, env *env) (value, error) {
 	if len(parts) < 2 {
-		return nil, &EvalError{Message: "'lambda' expects a parameter list and body"}
+		return nil, newCurrentEvalError("'lambda' expects a parameter list and body")
 	}
 
-	paramExprs, ok := parts[0].(listExpr)
+	paramExprs, ok := parts[0].form.(listExpr)
 	if !ok {
-		return nil, &EvalError{Message: "'lambda' parameter list must be a list"}
+		return nil, newEvalError(parts[0].pos, "'lambda' parameter list must be a list")
 	}
 
 	params, err := parseParams(paramExprs)
@@ -441,16 +450,16 @@ func evalLambda(parts []expr, env *env) (value, error) {
 	}, nil
 }
 
-func evalCond(clauses []expr, env *env) (value, error) {
+func evalCond(clauses []locatedExpr, env *env) (value, error) {
 	for i, clauseExpr := range clauses {
-		clause, ok := clauseExpr.(listExpr)
+		clause, ok := clauseExpr.form.(listExpr)
 		if !ok || len(clause) == 0 {
-			return nil, &EvalError{Message: "'cond' clauses must be non-empty lists"}
+			return nil, newEvalError(clauseExpr.pos, "'cond' clauses must be non-empty lists")
 		}
 
-		if keyword, ok := clause[0].(symbolExpr); ok && string(keyword) == "else" {
+		if keyword, ok := clause[0].form.(symbolExpr); ok && string(keyword) == "else" {
 			if i != len(clauses)-1 {
-				return nil, &EvalError{Message: "'cond' else clause must be last"}
+				return nil, newEvalError(clause[0].pos, "'cond' else clause must be last")
 			}
 			if len(clause) == 1 {
 				return voidValue{}, nil
@@ -473,19 +482,19 @@ func evalCond(clauses []expr, env *env) (value, error) {
 	return voidValue{}, nil
 }
 
-func evalLet(parts []expr, env *env) (value, error) {
+func evalLet(parts []locatedExpr, env *env) (value, error) {
 	if len(parts) < 2 {
-		return nil, &EvalError{Message: "'let' expects bindings and a body"}
+		return nil, newCurrentEvalError("'let' expects bindings and a body")
 	}
 
-	if name, ok := parts[0].(symbolExpr); ok {
+	if name, ok := parts[0].form.(symbolExpr); ok {
 		if len(parts) < 3 {
-			return nil, &EvalError{Message: "named 'let' expects bindings and a body"}
+			return nil, newCurrentEvalError("named 'let' expects bindings and a body")
 		}
 
-		bindingExprs, ok := parts[1].(listExpr)
+		bindingExprs, ok := parts[1].form.(listExpr)
 		if !ok {
-			return nil, &EvalError{Message: "'let' bindings must be a list"}
+			return nil, newEvalError(parts[1].pos, "'let' bindings must be a list")
 		}
 
 		bindings, err := parseLetBindings(bindingExprs)
@@ -514,9 +523,9 @@ func evalLet(parts []expr, env *env) (value, error) {
 		return proc.call(args)
 	}
 
-	bindingExprs, ok := parts[0].(listExpr)
+	bindingExprs, ok := parts[0].form.(listExpr)
 	if !ok {
-		return nil, &EvalError{Message: "'let' bindings must be a list"}
+		return nil, newEvalError(parts[0].pos, "'let' bindings must be a list")
 	}
 
 	bindings, err := parseLetBindings(bindingExprs)
@@ -536,16 +545,16 @@ func evalLet(parts []expr, env *env) (value, error) {
 	return evalSequence(parts[1:], letEnv)
 }
 
-func parseParams(items []expr) ([]string, error) {
+func parseParams(items []locatedExpr) ([]string, error) {
 	params := make([]string, 0, len(items))
 	seen := make(map[string]struct{}, len(items))
 	for _, item := range items {
-		name, ok := item.(symbolExpr)
+		name, ok := item.form.(symbolExpr)
 		if !ok {
-			return nil, &EvalError{Message: "parameter name must be a symbol"}
+			return nil, newEvalError(item.pos, "parameter name must be a symbol")
 		}
 		if _, exists := seen[string(name)]; exists {
-			return nil, &EvalError{Message: fmt.Sprintf("duplicate parameter: %s", string(name))}
+			return nil, newEvalError(item.pos, "duplicate parameter: %s", string(name))
 		}
 		seen[string(name)] = struct{}{}
 		params = append(params, string(name))
@@ -558,18 +567,18 @@ func parseLetBindings(items listExpr) ([]letBinding, error) {
 	seen := make(map[string]struct{}, len(items))
 
 	for _, item := range items {
-		binding, ok := item.(listExpr)
+		binding, ok := item.form.(listExpr)
 		if !ok || len(binding) != 2 {
-			return nil, &EvalError{Message: "'let' bindings must be (name value) pairs"}
+			return nil, newEvalError(item.pos, "'let' bindings must be (name value) pairs")
 		}
 
-		name, ok := binding[0].(symbolExpr)
+		name, ok := binding[0].form.(symbolExpr)
 		if !ok {
-			return nil, &EvalError{Message: "'let' binding names must be symbols"}
+			return nil, newEvalError(binding[0].pos, "'let' binding names must be symbols")
 		}
 
 		if _, exists := seen[string(name)]; exists {
-			return nil, &EvalError{Message: fmt.Sprintf("duplicate binding: %s", string(name))}
+			return nil, newEvalError(binding[0].pos, "duplicate binding: %s", string(name))
 		}
 		seen[string(name)] = struct{}{}
 
@@ -582,8 +591,8 @@ func parseLetBindings(items listExpr) ([]letBinding, error) {
 	return bindings, nil
 }
 
-func quoteExpr(e expr) (value, error) {
-	switch expr := e.(type) {
+func quoteExpr(e locatedExpr) (value, error) {
+	switch expr := e.form.(type) {
 	case numberExpr:
 		return numberValue(expr), nil
 	case boolExpr:
@@ -595,7 +604,7 @@ func quoteExpr(e expr) (value, error) {
 	case listExpr:
 		return quoteList(expr)
 	default:
-		return nil, &EvalError{Message: "unknown quoted expression"}
+		return nil, newEvalError(e.pos, "unknown quoted expression")
 	}
 }
 
@@ -628,7 +637,7 @@ func evalAdd(args []value) (value, error) {
 
 func evalSub(args []value) (value, error) {
 	if len(args) == 0 {
-		return nil, &EvalError{Message: "'-' expects at least 1 argument"}
+		return nil, newCurrentEvalError("'-' expects at least 1 argument")
 	}
 
 	first, err := expectNumber(args[0])
@@ -664,7 +673,7 @@ func evalMul(args []value) (value, error) {
 
 func evalDiv(args []value) (value, error) {
 	if len(args) < 2 {
-		return nil, &EvalError{Message: "'/' expects at least 2 arguments"}
+		return nil, newCurrentEvalError("'/' expects at least 2 arguments")
 	}
 
 	first, err := expectNumber(args[0])
@@ -679,7 +688,7 @@ func evalDiv(args []value) (value, error) {
 			return nil, err
 		}
 		if n == 0 {
-			return nil, &EvalError{Message: "division by zero"}
+			return nil, newCurrentEvalError("division by zero")
 		}
 		result /= n
 	}
@@ -688,7 +697,7 @@ func evalDiv(args []value) (value, error) {
 
 func evalCompare(args []value, name string, pred func(int, int) bool) (value, error) {
 	if len(args) < 2 {
-		return nil, &EvalError{Message: fmt.Sprintf("'%s' expects at least 2 arguments", name)}
+		return nil, newCurrentEvalError("'%s' expects at least 2 arguments", name)
 	}
 
 	prev, err := expectNumber(args[0])
@@ -712,26 +721,26 @@ func evalCompare(args []value, name string, pred func(int, int) bool) (value, er
 
 func evalNot(args []value) (value, error) {
 	if len(args) != 1 {
-		return nil, &EvalError{Message: "'not' expects exactly 1 argument"}
+		return nil, newCurrentEvalError("'not' expects exactly 1 argument")
 	}
 	return boolValue(!args[0].isTruthy()), nil
 }
 
 func evalCons(args []value) (value, error) {
 	if len(args) != 2 {
-		return nil, &EvalError{Message: "'cons' expects exactly 2 arguments"}
+		return nil, newCurrentEvalError("'cons' expects exactly 2 arguments")
 	}
 	return pairValue{car: args[0], cdr: args[1]}, nil
 }
 
 func evalCar(args []value) (value, error) {
 	if len(args) != 1 {
-		return nil, &EvalError{Message: "'car' expects exactly 1 argument"}
+		return nil, newCurrentEvalError("'car' expects exactly 1 argument")
 	}
 
 	pair, ok := args[0].(pairValue)
 	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("'car' expects a pair, got %s", args[0].schemeString())}
+		return nil, newCurrentEvalError("'car' expects a pair, got %s", args[0].schemeString())
 	}
 
 	return pair.car, nil
@@ -739,12 +748,12 @@ func evalCar(args []value) (value, error) {
 
 func evalCdr(args []value) (value, error) {
 	if len(args) != 1 {
-		return nil, &EvalError{Message: "'cdr' expects exactly 1 argument"}
+		return nil, newCurrentEvalError("'cdr' expects exactly 1 argument")
 	}
 
 	pair, ok := args[0].(pairValue)
 	if !ok {
-		return nil, &EvalError{Message: fmt.Sprintf("'cdr' expects a pair, got %s", args[0].schemeString())}
+		return nil, newCurrentEvalError("'cdr' expects a pair, got %s", args[0].schemeString())
 	}
 
 	return pair.cdr, nil
@@ -791,7 +800,7 @@ func evalListBuiltin(args []value) (value, error) {
 
 func evalLength(args []value) (value, error) {
 	if len(args) != 1 {
-		return nil, &EvalError{Message: "'length' expects exactly 1 argument"}
+		return nil, newCurrentEvalError("'length' expects exactly 1 argument")
 	}
 
 	length, err := properListLength(args[0])
@@ -846,7 +855,7 @@ func evalSymbolPred(args []value) (value, error) {
 
 func evalTypePredicate(args []value, name string, pred func(value) bool) (value, error) {
 	if len(args) != 1 {
-		return nil, &EvalError{Message: fmt.Sprintf("'%s' expects exactly 1 argument", name)}
+		return nil, newCurrentEvalError("'%s' expects exactly 1 argument", name)
 	}
 	return boolValue(pred(args[0])), nil
 }
@@ -863,7 +872,7 @@ func properListElements(v value) ([]value, error) {
 			elems = append(elems, list.car)
 			current = list.cdr
 		default:
-			return nil, &EvalError{Message: fmt.Sprintf("expected list, got %s", v.schemeString())}
+			return nil, newCurrentEvalError("expected list, got %s", v.schemeString())
 		}
 	}
 }
@@ -879,7 +888,7 @@ func properListLength(v value) (int, error) {
 func expectNumber(v value) (int, error) {
 	n, ok := v.(numberValue)
 	if !ok {
-		return 0, &EvalError{Message: fmt.Sprintf("expected number, got %s", v.schemeString())}
+		return 0, newCurrentEvalError("expected number, got %s", v.schemeString())
 	}
 	return int(n), nil
 }
