@@ -159,6 +159,7 @@ public class Evaluator {
             return switch (name) {
                 case "define" -> evalDefine(args, env);
                 case "define-syntax" -> evalDefineSyntax(args, env);
+                case "define-record-type" -> evalDefineRecordType(args, env);
                 case "set!" -> evalSet(args, env);
                 case "if" -> evalIf(args, env);
                 case "quote" -> evalQuote(args);
@@ -235,6 +236,107 @@ public class Evaluator {
         }
 
         macros.put(name.name(), parseMacro(name.name(), args.get(1), env));
+        return VoidValue.INSTANCE;
+    }
+
+    private Value evalDefineRecordType(List<Expr> args, Environment env) throws EvalError {
+        if (args.size() < 3) {
+            throw new EvalError("'define-record-type' expects a type, constructor, predicate, and fields");
+        }
+
+        if (!(args.getFirst() instanceof SymbolExpr typeNameExpr)) {
+            throw new EvalError("'define-record-type' expects a symbolic type name");
+        }
+
+        if (!(args.get(1) instanceof ListExpr constructorExpr)) {
+            throw new EvalError("'define-record-type' expects a constructor specification");
+        }
+
+        List<Expr> constructorParts = constructorExpr.elements();
+        if (constructorParts.isEmpty()) {
+            throw new EvalError("'define-record-type' constructor specification cannot be empty");
+        }
+        if (!(constructorParts.getFirst() instanceof SymbolExpr constructorNameExpr)) {
+            throw new EvalError("'define-record-type' constructor name must be a symbol");
+        }
+
+        if (!(args.get(2) instanceof SymbolExpr predicateNameExpr)) {
+            throw new EvalError("'define-record-type' predicate name must be a symbol");
+        }
+
+        List<String> fieldNames = new ArrayList<>(constructorParts.size() - 1);
+        for (int i = 1; i < constructorParts.size(); i++) {
+            Expr fieldExpr = constructorParts.get(i);
+            if (!(fieldExpr instanceof SymbolExpr fieldNameExpr)) {
+                throw new EvalError("'define-record-type' constructor fields must be symbols");
+            }
+            fieldNames.add(fieldNameExpr.name());
+        }
+
+        List<FieldSpec> fieldSpecs = new ArrayList<>(args.size() - 3);
+        for (int i = 3; i < args.size(); i++) {
+            Expr fieldExpr = args.get(i);
+            if (!(fieldExpr instanceof ListExpr fieldList)) {
+                throw new EvalError("'define-record-type' field specifications must be lists");
+            }
+
+            List<Expr> fieldParts = fieldList.elements();
+            if (fieldParts.size() != 2) {
+                throw new EvalError("'define-record-type' field specifications must have 2 parts");
+            }
+            if (!(fieldParts.getFirst() instanceof SymbolExpr fieldNameExpr)) {
+                throw new EvalError("'define-record-type' field name must be a symbol");
+            }
+            if (!(fieldParts.get(1) instanceof SymbolExpr accessorNameExpr)) {
+                throw new EvalError("'define-record-type' accessor name must be a symbol");
+            }
+
+            fieldSpecs.add(new FieldSpec(fieldNameExpr.name(), accessorNameExpr.name()));
+        }
+
+        if (fieldNames.size() != fieldSpecs.size()) {
+            throw new EvalError("'define-record-type' constructor and field count must match");
+        }
+
+        RecordType recordType = new RecordType(typeNameExpr.name());
+        String constructorName = constructorNameExpr.name();
+        env.define(constructorName, new BuiltinProcedure(
+                constructorName,
+                constructorArgs -> {
+                    requireArgCount(constructorArgs.size(), fieldSpecs.size(), constructorName);
+                    return new RecordValue(recordType, List.copyOf(constructorArgs));
+                }));
+
+        String predicateName = predicateNameExpr.name();
+        env.define(predicateName, new BuiltinProcedure(
+                predicateName,
+                predicateArgs -> {
+                    requireArgCount(predicateArgs.size(), 1, predicateName);
+                    return BoolValue.of(predicateArgs.getFirst() instanceof RecordValue recordValue
+                            && recordValue.type() == recordType);
+                }));
+
+        for (int i = 0; i < fieldSpecs.size(); i++) {
+            FieldSpec fieldSpec = fieldSpecs.get(i);
+            String expectedField = fieldNames.get(i);
+            if (!fieldSpec.fieldName().equals(expectedField)) {
+                throw new EvalError("'define-record-type' field order must match constructor fields");
+            }
+
+            int fieldIndex = i;
+            String accessorName = fieldSpec.accessorName();
+            env.define(accessorName, new BuiltinProcedure(
+                    accessorName,
+                    accessorArgs -> {
+                        requireArgCount(accessorArgs.size(), 1, accessorName);
+                        RecordValue recordValue = requireRecordOfType(
+                                accessorArgs.getFirst(),
+                                recordType,
+                                accessorName);
+                        return recordValue.fields().get(fieldIndex);
+                    }));
+        }
+
         return VoidValue.INSTANCE;
     }
 
@@ -981,8 +1083,8 @@ public class Evaluator {
 
     private boolean isSyntaxKeyword(String name) {
         return switch (name) {
-            case "define", "define-syntax", "set!", "if", "quote", "lambda", "begin", "let",
-                    "cond", "and", "or", "else", "." -> true;
+            case "define", "define-syntax", "define-record-type", "set!", "if", "quote",
+                    "lambda", "begin", "let", "cond", "and", "or", "else", "." -> true;
             default -> false;
         };
     }
@@ -1875,6 +1977,14 @@ public class Evaluator {
         throw new EvalError("'" + procedure + "' expects a non-empty list");
     }
 
+    private RecordValue requireRecordOfType(Value value, RecordType expectedType, String procedure)
+            throws EvalError {
+        if (value instanceof RecordValue recordValue && recordValue.type() == expectedType) {
+            return recordValue;
+        }
+        throw new EvalError("'" + procedure + "' expects a " + expectedType.name());
+    }
+
     private boolean isTruthy(Value value) {
         return !(value instanceof BoolValue boolValue) || boolValue.value();
     }
@@ -2161,6 +2271,9 @@ public class Evaluator {
     private record Binding(String name, Expr valueExpr) {
     }
 
+    private record FieldSpec(String fieldName, String accessorName) {
+    }
+
     private record Macro(
             String name,
             Set<String> literals,
@@ -2243,7 +2356,7 @@ public class Evaluator {
     }
 
     private sealed interface Value permits NumericValue, BoolValue, StringValue, SymbolValue,
-            CharValue, ListValue, PairValue, ProcedureValue, VoidValue {
+            CharValue, ListValue, PairValue, RecordValue, ProcedureValue, VoidValue {
         String toSchemeString();
 
         default String toDisplayString() {
@@ -2392,6 +2505,25 @@ public class Evaluator {
             appendPairContents(builder, this);
             builder.append(')');
             return builder.toString();
+        }
+    }
+
+    private static final class RecordType {
+        private final String name;
+
+        private RecordType(String name) {
+            this.name = name;
+        }
+
+        private String name() {
+            return name;
+        }
+    }
+
+    private record RecordValue(RecordType type, List<Value> fields) implements Value {
+        @Override
+        public String toSchemeString() {
+            return "#<record:" + type.name() + ">";
         }
     }
 
