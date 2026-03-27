@@ -12,7 +12,14 @@ type SchemeValBase =
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
   | { tag: 'nil' }
   | { tag: 'procedure'; val: (args: SchemeVal[]) => SchemeVal }
-  | { tag: 'void' };
+  | { tag: 'void' }
+  | { tag: 'macro'; transformer: MacroTransformer };
+
+type MacroTransformer = {
+  literals: string[];
+  rules: { pattern: SchemeVal[]; template: SchemeVal }[];
+  defEnv: Env;
+};
 
 type SchemeVal = SchemeValBase & { pos?: string };
 
@@ -360,6 +367,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
         return out + ')';
       }
       case 'list': return `(${v.val.map(displayVal).join(' ')})`;
+      case 'macro': return '#<macro>';
     }
   };
 
@@ -701,6 +709,172 @@ function makeVariadicClosure(fixed: string[], rest: string, body: SchemeVal[], c
   }};
 }
 
+// ── Macro expansion (syntax-rules) ─────────────────────────────────────
+
+const SPECIAL_FORMS = new Set([
+  'quote', 'if', 'define', 'set!', 'lambda', 'begin', 'let', 'let*', 'letrec',
+  'cond', 'and', 'or', 'define-syntax', 'syntax-rules',
+]);
+
+let gensymCounter = 0;
+function gensym(base: string): string {
+  return `__${base}_${++gensymCounter}`;
+}
+
+type Bindings = Map<string, SchemeVal | SchemeVal[]>;
+
+function matchSingle(pattern: SchemeVal, form: SchemeVal, bindings: Bindings, literals: string[]): boolean {
+  if (pattern.tag === 'symbol') {
+    if (pattern.val === '_') return true;
+    if (literals.includes(pattern.val)) {
+      return form.tag === 'symbol' && form.val === pattern.val;
+    }
+    bindings.set(pattern.val, form);
+    return true;
+  }
+  if (pattern.tag === 'list') {
+    if (form.tag !== 'list') return false;
+    return matchPattern(pattern.val, form.val, bindings, literals);
+  }
+  if (pattern.tag === 'number' && form.tag === 'number') return pattern.val === form.val;
+  if (pattern.tag === 'boolean' && form.tag === 'boolean') return pattern.val === form.val;
+  if (pattern.tag === 'string' && form.tag === 'string') return pattern.val === form.val;
+  return false;
+}
+
+function matchPattern(patternElems: SchemeVal[], formElems: SchemeVal[], bindings: Bindings, literals: string[]): boolean {
+  let ellipsisIdx = -1;
+  for (let i = 0; i < patternElems.length; i++) {
+    const pe = patternElems[i];
+    if (pe.tag === 'symbol' && pe.val === '...') {
+      ellipsisIdx = i;
+      break;
+    }
+  }
+
+  if (ellipsisIdx === -1) {
+    if (formElems.length !== patternElems.length) return false;
+    for (let i = 0; i < patternElems.length; i++) {
+      if (!matchSingle(patternElems[i], formElems[i], bindings, literals)) return false;
+    }
+    return true;
+  }
+
+  const fixedBefore = ellipsisIdx - 1;
+  const afterEllipsis = patternElems.length - ellipsisIdx - 1;
+  if (formElems.length < fixedBefore + afterEllipsis) return false;
+
+  for (let i = 0; i < fixedBefore; i++) {
+    if (!matchSingle(patternElems[i], formElems[i], bindings, literals)) return false;
+  }
+
+  const ellipsisPattern = patternElems[fixedBefore];
+  const ellipsisCount = formElems.length - fixedBefore - afterEllipsis;
+  if (ellipsisPattern.tag === 'symbol' && !literals.includes(ellipsisPattern.val)) {
+    const arr: SchemeVal[] = [];
+    for (let i = 0; i < ellipsisCount; i++) arr.push(formElems[fixedBefore + i]);
+    bindings.set(ellipsisPattern.val, arr);
+  }
+
+  for (let i = 0; i < afterEllipsis; i++) {
+    if (!matchSingle(patternElems[ellipsisIdx + 1 + i], formElems[formElems.length - afterEllipsis + i], bindings, literals)) return false;
+  }
+  return true;
+}
+
+function collectFreeSymbols(template: SchemeVal, patternVars: Set<string>, result: Set<string>): void {
+  if (template.tag === 'symbol') {
+    if (!patternVars.has(template.val) && !SPECIAL_FORMS.has(template.val) && template.val !== '...') {
+      result.add(template.val);
+    }
+  } else if (template.tag === 'list') {
+    for (const elem of template.val) collectFreeSymbols(elem, patternVars, result);
+  }
+}
+
+function findEllipsisVar(template: SchemeVal, bindings: Bindings): string | null {
+  if (template.tag === 'symbol') {
+    const bound = bindings.get(template.val);
+    if (Array.isArray(bound)) return template.val;
+    return null;
+  }
+  if (template.tag === 'list') {
+    for (const elem of template.val) {
+      const found = findEllipsisVar(elem, bindings);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function expandTemplate(template: SchemeVal, bindings: Bindings, renames: Map<string, string>): SchemeVal {
+  if (template.tag === 'symbol') {
+    const name = template.val;
+    if (name === '...') return template;
+    const bound = bindings.get(name);
+    if (bound !== undefined && !Array.isArray(bound)) return bound as SchemeVal;
+    const renamed = renames.get(name);
+    if (renamed) return { tag: 'symbol', val: renamed };
+    return template;
+  }
+  if (template.tag === 'list') {
+    const result: SchemeVal[] = [];
+    for (let i = 0; i < template.val.length; i++) {
+      const elem = template.val[i];
+      const next = i + 1 < template.val.length ? template.val[i + 1] : null;
+      if (next && next.tag === 'symbol' && next.val === '...') {
+        const ellipsisVar = findEllipsisVar(elem, bindings);
+        if (ellipsisVar) {
+          const values = bindings.get(ellipsisVar) as SchemeVal[];
+          for (const val of values) {
+            const singleBindings = new Map(bindings);
+            singleBindings.set(ellipsisVar, val);
+            result.push(expandTemplate(elem, singleBindings, renames));
+          }
+        }
+        i++; // skip ...
+        continue;
+      }
+      result.push(expandTemplate(elem, bindings, renames));
+    }
+    return { tag: 'list', val: result };
+  }
+  return template;
+}
+
+function expandMacro(transformer: MacroTransformer, form: SchemeVal, env: Env): SchemeVal {
+  if (form.tag !== 'list') throw new EvalError('macro application requires a list');
+  const formElems = form.val.slice(1);
+
+  for (const rule of transformer.rules) {
+    const bindings: Bindings = new Map();
+    if (matchPattern(rule.pattern, formElems, bindings, transformer.literals)) {
+      const patternVars = new Set(bindings.keys());
+      const freeSyms = new Set<string>();
+      collectFreeSymbols(rule.template, patternVars, freeSyms);
+
+      const renames = new Map<string, string>();
+      for (const sym of freeSyms) renames.set(sym, gensym(sym));
+
+      const expanded = expandTemplate(rule.template, bindings, renames);
+
+      // Inject def-env bindings for renamed symbols
+      const wrapperEnv = makeEnv(env);
+      for (const [original, gensymName] of renames) {
+        try {
+          const val = envLookup(transformer.defEnv, original);
+          envSet(wrapperEnv, gensymName, val);
+        } catch {
+          // Not in defEnv — newly introduced identifier, no pre-binding needed
+        }
+      }
+
+      return evaluate(expanded, wrapperEnv);
+    }
+  }
+  throw new EvalError('no matching pattern for macro');
+}
+
 function isFalsy(v: SchemeVal): boolean {
   return v.tag === 'boolean' && v.val === false;
 }
@@ -882,6 +1056,34 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           }};
         }
 
+        if (name === 'define-syntax') {
+          if (elems.length !== 3) throw new EvalError(`${epos}: define-syntax requires 2 arguments`);
+          if (elems[1].tag !== 'symbol') throw new EvalError(`${epos}: define-syntax: name must be a symbol`);
+          const macroName = elems[1].val;
+          const sr = elems[2];
+          if (sr.tag !== 'list' || sr.val.length < 2 ||
+              sr.val[0].tag !== 'symbol' || sr.val[0].val !== 'syntax-rules')
+            throw new EvalError(`${epos}: define-syntax: expected syntax-rules`);
+          const literalList = sr.val[1];
+          if (literalList.tag !== 'list') throw new EvalError(`${epos}: syntax-rules: literals must be a list`);
+          const literals = literalList.val.map(l => {
+            if (l.tag !== 'symbol') throw new EvalError(`${epos}: syntax-rules: literal must be a symbol`);
+            return l.val;
+          });
+          const rules: { pattern: SchemeVal[]; template: SchemeVal }[] = [];
+          for (let i = 2; i < sr.val.length; i++) {
+            const rule = sr.val[i];
+            if (rule.tag !== 'list' || rule.val.length !== 2)
+              throw new EvalError(`${epos}: syntax-rules: invalid rule`);
+            const pat = rule.val[0];
+            if (pat.tag !== 'list' || pat.val.length < 1)
+              throw new EvalError(`${epos}: syntax-rules: pattern must be a non-empty list`);
+            rules.push({ pattern: pat.val.slice(1), template: rule.val[1] });
+          }
+          envSet(env, macroName, { tag: 'macro', transformer: { literals, rules, defEnv: env } });
+          return { tag: 'void' };
+        }
+
         if (name === 'and') {
           if (elems.length === 1) return { tag: 'boolean', val: true };
           let result: SchemeVal = { tag: 'boolean', val: true };
@@ -900,6 +1102,15 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             if (isTruthy(result)) return result;
           }
           return result;
+        }
+      }
+
+      // Check for macro application
+      {
+        let headVal: SchemeVal | undefined;
+        try { if (elems[0].tag === 'symbol') headVal = envLookup(env, elems[0].val); } catch { /* not bound */ }
+        if (headVal && headVal.tag === 'macro') {
+          return expandMacro(headVal.transformer, expr, env);
         }
       }
 
@@ -945,6 +1156,7 @@ function display(val: SchemeVal): string {
     }
     case 'void': return '';
     case 'procedure': return '#<procedure>';
+    case 'macro': return '#<macro>';
   }
 }
 
