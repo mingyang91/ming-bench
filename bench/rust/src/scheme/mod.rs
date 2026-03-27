@@ -39,6 +39,7 @@ impl Expr {
 }
 
 type EnvRef = Rc<Environment>;
+type BindingRef = Rc<RefCell<Value>>;
 type BuiltinFn = fn(&[EvaluatedArg], &mut String) -> Result<Value, EvalError>;
 
 #[derive(Clone)]
@@ -121,7 +122,7 @@ impl fmt::Debug for Procedure {
 
 struct Environment {
     parent: Option<EnvRef>,
-    bindings: RefCell<HashMap<String, Value>>,
+    bindings: RefCell<HashMap<String, BindingRef>>,
 }
 
 impl Environment {
@@ -133,15 +134,40 @@ impl Environment {
     }
 
     fn define(&self, name: impl Into<String>, value: Value) {
-        self.bindings.borrow_mut().insert(name.into(), value);
+        let name = name.into();
+        let mut bindings = self.bindings.borrow_mut();
+        if let Some(binding) = bindings.get(&name) {
+            *binding.borrow_mut() = value;
+            return;
+        }
+
+        bindings.insert(name, Rc::new(RefCell::new(value)));
     }
 
     fn lookup(&self, name: &str) -> Option<Value> {
-        if let Some(value) = self.bindings.borrow().get(name).cloned() {
-            return Some(value);
+        self.lookup_binding(name)
+            .map(|binding| binding.borrow().clone())
+    }
+
+    fn set(&self, name: &str, value: Value) -> Result<(), EvalError> {
+        let Some(binding) = self.lookup_binding(name) else {
+            return Err(EvalError::UnboundSymbol {
+                name: name.to_string(),
+            });
+        };
+
+        *binding.borrow_mut() = value;
+        Ok(())
+    }
+
+    fn lookup_binding(&self, name: &str) -> Option<BindingRef> {
+        if let Some(binding) = self.bindings.borrow().get(name).cloned() {
+            return Some(binding);
         }
 
-        self.parent.as_ref().and_then(|parent| parent.lookup(name))
+        self.parent
+            .as_ref()
+            .and_then(|parent| parent.lookup_binding(name))
     }
 }
 
@@ -597,6 +623,9 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
         Expr::Symbol { name, .. } if name == "define" => {
             with_position(eval_define(args, env, output), head_pos)
         }
+        Expr::Symbol { name, .. } if name == "set!" => {
+            with_position(eval_set(args, env, output), head_pos)
+        }
         _ => {
             let procedure = eval(head, env.clone(), output)?;
             let values = args
@@ -828,6 +857,25 @@ fn eval_define(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value,
         }
         _ => Err(EvalError::ParseError {
             message: "invalid define form".to_string(),
+        }),
+    }
+}
+
+fn eval_set(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    match args {
+        [Expr::Symbol { name, pos }, value_expr] => {
+            let value = eval(value_expr, env.clone(), output)?;
+            env.set(name, value)
+                .map_err(|error| error.with_position(pos.line, pos.col))?;
+            Ok(Value::Void)
+        }
+        [_, _] => Err(EvalError::ParseError {
+            message: "set! target must be a symbol".to_string(),
+        }),
+        _ => Err(EvalError::WrongArgCount {
+            name: "set!",
+            expected: "exactly 2",
+            got: args.len(),
         }),
     }
 }
