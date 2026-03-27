@@ -17,7 +17,10 @@ type Value interface {
 
 type IntVal struct{ Val int64 }
 type BoolVal struct{ Val bool }
-type StringVal struct{ Val string }
+type StringVal struct {
+	Val       string
+	Immutable bool
+}
 type SymbolVal struct{ Name string }
 type PairVal struct{ Car, Cdr Value }
 type NilVal struct{} // empty list
@@ -584,7 +587,7 @@ func evalAtomInEnv(atom *AtomExpr, env *Env) (Value, error) {
 		if err != nil {
 			return nil, errAt(atom, "bad string: "+token)
 		}
-		return &StringVal{Val: s}, nil
+		return &StringVal{Val: s, Immutable: true}, nil
 	}
 	if n, err := strconv.ParseInt(token, 10, 64); err == nil {
 		return &IntVal{Val: n}, nil
@@ -710,7 +713,7 @@ func exprToValue(expr Expr) (Value, error) {
 			if err != nil {
 				return nil, &EvalError{Message: "bad string: " + e.Token}
 			}
-			return &StringVal{Val: s}, nil
+			return &StringVal{Val: s, Immutable: true}, nil
 		}
 		if n, err := strconv.ParseInt(e.Token, 10, 64); err == nil {
 			return &IntVal{Val: n}, nil
@@ -2228,22 +2231,87 @@ func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 		if !ok {
 			return nil, &EvalError{Message: "string-set!: expected string"}
 		}
+		if s.Immutable {
+			return nil, &EvalError{Message: "string-set!: strings are immutable"}
+		}
 		idx, ok := args[1].(*IntVal)
 		if !ok {
-			return nil, &EvalError{Message: "string-set!: expected number"}
+			return nil, &EvalError{Message: "string-set!: expected integer index"}
 		}
-		ch, ok := args[2].(*CharVal)
+		c, ok := args[2].(*CharVal)
 		if !ok {
 			return nil, &EvalError{Message: "string-set!: expected char"}
 		}
-		i := int(idx.Val)
-		if i < 0 || i >= len(s.Val) {
+		runes := []rune(s.Val)
+		if idx.Val < 0 || idx.Val >= int64(len(runes)) {
 			return nil, &EvalError{Message: "string-set!: index out of range"}
 		}
-		bs := []byte(s.Val)
-		bs[i] = byte(ch.Val)
-		s.Val = string(bs)
+		runes[idx.Val] = c.Val
+		s.Val = string(runes)
 		return &VoidVal{}, nil
+	})
+
+	// L15: string->list, list->string, char->integer, integer->char
+	addBuiltin("string->list", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->list requires 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string->list: expected string"}
+		}
+		runes := []rune(s.Val)
+		var result Value = &NilVal{}
+		for i := len(runes) - 1; i >= 0; i-- {
+			result = &PairVal{Car: &CharVal{Val: runes[i]}, Cdr: result}
+		}
+		return result, nil
+	})
+
+	addBuiltin("list->string", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "list->string requires 1 argument"}
+		}
+		var runes []rune
+		cur := args[0]
+		for {
+			if _, ok := cur.(*NilVal); ok {
+				break
+			}
+			p, ok := cur.(*PairVal)
+			if !ok {
+				return nil, &EvalError{Message: "list->string: expected proper list"}
+			}
+			ch, ok := p.Car.(*CharVal)
+			if !ok {
+				return nil, &EvalError{Message: "list->string: expected list of characters"}
+			}
+			runes = append(runes, ch.Val)
+			cur = p.Cdr
+		}
+		return &StringVal{Val: string(runes)}, nil
+	})
+
+	addBuiltin("char->integer", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char->integer requires 1 argument"}
+		}
+		ch, ok := args[0].(*CharVal)
+		if !ok {
+			return nil, &EvalError{Message: "char->integer: expected char"}
+		}
+		return &IntVal{Val: int64(ch.Val)}, nil
+	})
+
+	addBuiltin("integer->char", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "integer->char requires 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "integer->char: expected integer"}
+		}
+		return &CharVal{Val: rune(n.Val)}, nil
 	})
 
 	addBuiltin("string-ref", func(args []Value) (Value, error) {
