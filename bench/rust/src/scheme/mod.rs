@@ -581,6 +581,10 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                     "string-ref" => return eval_string_ref(&items[1..], env),
                     "string-copy" => return eval_string_copy(&items[1..], env),
                     "string-set!" => return eval_string_set(&items[1..], env),
+                    "string->list" => return eval_string_to_list(&items[1..], env),
+                    "list->string" => return eval_list_to_string(&items[1..], env),
+                    "char->integer" => return eval_char_to_integer(&items[1..], env),
+                    "integer->char" => return eval_integer_to_char(&items[1..], env),
                     "let*" => return eval_let_star(&items[1..], env),
                     "letrec" => return eval_letrec(&items[1..], env),
                     "letrec*" => return eval_letrec_star(&items[1..], env),
@@ -2195,10 +2199,10 @@ fn eval_string_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
     if args.len() != 3 {
         return Err(EvalError::Arity("string-set! requires exactly 3 arguments".into()));
     }
-    // First arg must be a variable name
+    // First arg must be a variable name (string literals are immutable)
     let var_name = match &args[0].kind {
         ExprKind::Symbol(s) => s.clone(),
-        _ => return Err(EvalError::Type("string-set!: first argument must be a variable".into())),
+        _ => return Err(EvalError::Type("string-set!: string is immutable".into())),
     };
     let idx = require_int(&eval(&args[1], env)?)? as usize;
     let ch = match eval(&args[2], env)? {
@@ -2220,6 +2224,59 @@ fn eval_string_set(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
         env.set(var_name, Value::Str(new_s));
     }
     Ok(Value::Void)
+}
+
+fn eval_string_to_list(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("string->list requires exactly 1 argument".into()));
+    }
+    match eval(&args[0], env)? {
+        Value::Str(s) => {
+            let chars: Vec<Value> = s.chars().map(Value::Char).collect();
+            Ok(Value::List(chars))
+        }
+        other => Err(EvalError::Type(format!("string->list: expected string, got {}", other))),
+    }
+}
+
+fn eval_list_to_string(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("list->string requires exactly 1 argument".into()));
+    }
+    let val = eval(&args[0], env)?;
+    let items = match val {
+        Value::List(items) => items,
+        other => return Err(EvalError::Type(format!("list->string: expected list, got {}", other))),
+    };
+    let mut s = String::new();
+    for item in &items {
+        match item {
+            Value::Char(c) => s.push(*c),
+            other => return Err(EvalError::Type(format!("list->string: expected char, got {}", other))),
+        }
+    }
+    Ok(Value::Str(s))
+}
+
+fn eval_char_to_integer(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("char->integer requires exactly 1 argument".into()));
+    }
+    match eval(&args[0], env)? {
+        Value::Char(c) => Ok(Value::Integer(c as i64)),
+        other => Err(EvalError::Type(format!("char->integer: expected char, got {}", other))),
+    }
+}
+
+fn eval_integer_to_char(args: &[Expr], env: &Env) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity("integer->char requires exactly 1 argument".into()));
+    }
+    let n = require_int(&eval(&args[0], env)?)?;
+    match char::from_u32(n as u32) {
+        Some(c) => Ok(Value::Char(c)),
+        None => Err(EvalError::Generic(format!("integer->char: invalid code point {}", n))),
+    }
 }
 
 // ── Macros (define-syntax / syntax-rules) ───────────────────────────
