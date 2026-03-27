@@ -34,6 +34,12 @@ private[ming] object SchemeRenderer:
         renderPair(pair, displayStrings, displayChars, path)
       case Value.VectorVal(instance) =>
         renderVector(instance, displayStrings, displayChars, path)
+      case Value.MultiValues(values) =>
+        values match
+          case value :: Nil =>
+            renderWithMode(value, displayStrings, displayChars, path)
+          case _ =>
+            "#<values>"
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
           Value.RecordAccessor(_, _, _) | _: Value.ContinuationVal | Value.CaseClosure(_, _, _) |
           Value.Closure(_, _, _, _, _) =>

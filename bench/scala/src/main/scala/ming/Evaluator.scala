@@ -21,5 +21,9 @@ object Evaluator:
 
     val globalEnv = Env.topLevel()
     val context   = new EvalContext
-    val result    = ExpressionEvaluator.evalSequence(expressions, globalEnv, context)
+    val result = MultiValueSupport.requireSingle(
+      ExpressionEvaluator.evalSequence(expressions, globalEnv, context),
+      expressions.last.pos,
+      "top-level expression"
+    )
     (result, context.capturedOutput)

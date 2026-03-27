@@ -22,6 +22,7 @@ private[ming] object ContinuationFrame:
   final case class DefineValue(name: String, env: Env)                        extends ContinuationFrame
   final case class SetValue(name: String, symbolPos: SourcePos, env: Env)     extends ContinuationFrame
   final case class CallHead(args: List[Expr], env: Env, pos: SourcePos)       extends ContinuationFrame
+  final case class CallWithValuesConsumer(consumer: Value, pos: SourcePos)    extends ContinuationFrame
 
   final case class CallArg(
     procedure: Value,

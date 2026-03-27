@@ -17,6 +17,8 @@ private[ming] object MachineContinuations:
         continueSetValue(machine, name, symbolPos, env, value)
       case CallHead(args, env, pos) =>
         continueCallHead(machine, args, env, pos, value)
+      case CallWithValuesConsumer(consumer, pos) =>
+        continueCallWithValuesConsumer(machine, consumer, pos, value)
       case CallArg(procedure, evaluatedRev, remaining, env, pos) =>
         continueCallArg(machine, procedure, evaluatedRev, remaining, env, pos, value)
       case And(remaining, env) =>
@@ -77,16 +79,26 @@ private[ming] object MachineContinuations:
     env: Env,
     value: Value
   ): Unit =
-    if env.assign(name, value) then machine.setValue(Value.Void)
+    val assignedValue = MultiValueSupport.requireSingle(value, symbolPos, "set!")
+    if env.assign(name, assignedValue) then machine.setValue(Value.Void)
     else throw EvalError.at(symbolPos, s"unbound variable: $name")
 
   private def continueCallHead(machine: Machine, args: List[Expr], env: Env, pos: SourcePos, value: Value): Unit =
+    val procedure = MultiValueSupport.requireSingle(value, pos, "procedure position")
     args match
       case Nil =>
-        machine.setInvoke(value, Nil, pos)
+        machine.setInvoke(procedure, Nil, pos)
       case _ =>
-        machine.push(CallArg(value, Nil, args.dropRight(1).reverse, env, pos))
+        machine.push(CallArg(procedure, Nil, args.dropRight(1).reverse, env, pos))
         machine.setExpr(args.last, env)
+
+  private def continueCallWithValuesConsumer(
+    machine: Machine,
+    consumer: Value,
+    pos: SourcePos,
+    value: Value
+  ): Unit =
+    machine.setInvoke(consumer, MultiValueSupport.unpack(value), pos)
 
   private def continueCallArg(
     machine: Machine,
@@ -97,7 +109,7 @@ private[ming] object MachineContinuations:
     pos: SourcePos,
     value: Value
   ): Unit =
-    val nextEvaluated = value :: evaluatedRev
+    val nextEvaluated = MultiValueSupport.requireSingle(value, pos, "procedure argument") :: evaluatedRev
     remaining match
       case Nil =>
         machine.setInvoke(procedure, nextEvaluated, pos)

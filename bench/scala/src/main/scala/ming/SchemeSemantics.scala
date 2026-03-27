@@ -29,6 +29,8 @@ private[ming] object ValueSemantics:
       case Value.EmptyList    => "null"
       case _: Value.PairVal   => "pair"
       case Value.VectorVal(_) => "vector"
+      case Value.MultiValues(_) =>
+        "values"
       case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
           Value.RecordAccessor(_, _, _) | _: Value.ContinuationVal | Value.CaseClosure(_, _, _) |
           Value.Closure(_, _, _, _, _) =>
@@ -102,6 +104,8 @@ private[ming] object ValueSemantics:
                 rightClosure @ Value.CaseClosure(_, _, _)
               ) =>
             leftClosure eq rightClosure
+          case (Value.MultiValues(left), Value.MultiValues(right)) =>
+            left == right
           case _ =>
             false
 

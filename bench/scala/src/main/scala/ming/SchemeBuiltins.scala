@@ -22,6 +22,8 @@ private[ming] object Builtins:
     "with-exception-handler",
     "map",
     "for-each",
+    "values",
+    "call-with-values",
     "apply",
     "dynamic-wind",
     "call/cc",
@@ -53,6 +55,8 @@ private[ming] object Builtins:
         Value.BoolVal(!ValueSemantics.isTruthy(requireSingleArg(name, args, pos)))
       case "eq?" | "eqv?" | "equal?" =>
         invokeEqualityBuiltin(name, args, pos)
+      case "values" =>
+        MultiValueSupport.pack(args)
       case builtin if NumericBuiltins.handlesUtility(builtin) =>
         NumericBuiltins.invokeUtility(builtin, args, pos)
       case builtin if NumericBuiltins.handlesPredicate(builtin) =>

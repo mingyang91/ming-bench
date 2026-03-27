@@ -17,6 +17,8 @@ private[ming] object MachineProcedures:
         prepareCallCc(machine, "call/cc", args, pos)
       case Value.BuiltinProc("call-with-current-continuation") =>
         prepareCallCc(machine, "call-with-current-continuation", args, pos)
+      case Value.BuiltinProc("call-with-values") =>
+        prepareCallWithValues(machine, args, pos)
       case Value.BuiltinProc("apply") =>
         prepareApply(machine, args, pos)
       case Value.BuiltinProc("map") =>
@@ -67,6 +69,11 @@ private[ming] object MachineProcedures:
     val procedure = requireSingleArg(name, args, pos)
     val captured  = new Value.ContinuationVal(new ContinuationSnapshot(machine.frames, machine.winds, machine.handlers))
     machine.setInvoke(procedure, List(captured), pos)
+
+  private def prepareCallWithValues(machine: Machine, args: List[Value], pos: SourcePos): Unit =
+    val List(producer, consumer) = requireArgCount("call-with-values", args, expected = 2, pos)
+    machine.push(CallWithValuesConsumer(consumer, pos))
+    machine.setInvoke(producer, Nil, pos)
 
   private def prepareDynamicWind(machine: Machine, args: List[Value], pos: SourcePos): Unit =
     val List(inThunk, bodyThunk, outThunk) = requireArgCount("dynamic-wind", args, expected = 3, pos)

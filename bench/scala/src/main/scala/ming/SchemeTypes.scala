@@ -59,6 +59,7 @@ private[ming] object Value:
   final case class RecordAccessor(recordType: RecordType, fieldIndex: Int, name: String)        extends Value
   final case class RecordVal(instance: RecordInstance)                                          extends Value
   final case class CaseClosure(name: Option[String], clauses: List[CaseLambdaClause], env: Env) extends Value
+  final case class MultiValues(values: List[Value])                                             extends Value
 
   final case class Closure(
     name: Option[String],
