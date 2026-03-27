@@ -133,6 +133,11 @@ type applyArgsContinuationFrame struct {
 	pos       position
 }
 
+type callWithValuesContinuationFrame struct {
+	consumer any
+	pos      position
+}
+
 type mapContinuationFrame struct {
 	procedure any
 	lists     [][]any
@@ -1161,6 +1166,9 @@ func (i *interpreter) resumeContinuationFrame(frame continuationFrame, value any
 		})
 		return newExpressionControl(frame.remaining[splitAt], frame.env), stack, nil
 
+	case callWithValuesContinuationFrame:
+		return i.applyContinuationProcedure(frame.consumer, explodeValuesResult(value), frame.pos, stack)
+
 	case mapContinuationFrame:
 		results := appendAnyValue(frame.results, value)
 		if frame.index+1 >= len(frame.lists[0]) {
@@ -1262,6 +1270,18 @@ func (i *interpreter) applyContinuationProcedure(operator any, args []any, pos p
 				return continuationControl{}, nil, err
 			}
 			return i.applyContinuationProcedure(args[0], callArgs, pos, stack)
+		case "call-with-values":
+			if len(args) != 2 {
+				return continuationControl{}, nil, newEvalError(pos, "call-with-values expects exactly 2 arguments")
+			}
+			if !isCallableValue(args[0]) || !isCallableValue(args[1]) {
+				return continuationControl{}, nil, newEvalError(pos, "attempt to call non-procedure")
+			}
+			stack = append(stack, callWithValuesContinuationFrame{
+				consumer: args[1],
+				pos:      pos,
+			})
+			return i.applyContinuationProcedure(args[0], nil, pos, stack)
 		case "map":
 			return i.applyContinuationMap(args, pos, stack)
 		case "for-each":

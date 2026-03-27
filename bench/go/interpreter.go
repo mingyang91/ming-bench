@@ -97,6 +97,9 @@ type symbolValue string
 type charValue rune
 type emptyList struct{}
 type voidValue struct{}
+type multiValueResult struct {
+	values []any
+}
 
 type mutableString struct {
 	runes []rune
@@ -424,7 +427,7 @@ func installBuiltins(env *environment) {
 		"cons", "car", "cdr", "set-car!", "set-cdr!", "null?", "list", "length", "append", "reverse",
 		"vector", "make-vector", "vector?", "vector-length", "vector-ref", "vector-set!", "vector->list", "list->vector",
 		"string?", "number?", "integer?", "rational?", "exact?", "inexact?", "boolean?", "pair?", "symbol?", "procedure?",
-		"apply", "eqv?", "eq?", "equal?", "call/cc", "call-with-current-continuation", "dynamic-wind", "raise", "with-exception-handler",
+		"apply", "values", "call-with-values", "eqv?", "eq?", "equal?", "call/cc", "call-with-current-continuation", "dynamic-wind", "raise", "with-exception-handler",
 		"display", "write", "newline", "error",
 		"string-append", "string-length", "substring", "make-string", "string",
 		"string->number", "number->string", "exact->inexact", "inexact->exact", "numerator", "denominator",
@@ -1400,6 +1403,19 @@ func applyProcedure(i *interpreter, operator any, args []any, pos position, tail
 			}
 			return applyProcedure(i, args[0], callArgs, pos, true)
 		}
+		if tail && procedure.name == "call-with-values" {
+			if len(args) != 2 {
+				return nil, newEvalError(pos, "%s expects exactly 2 arguments", procedure.name)
+			}
+			if !isCallableValue(args[0]) || !isCallableValue(args[1]) {
+				return nil, newEvalError(pos, "attempt to call non-procedure")
+			}
+			produced, err := applyProcedure(i, args[0], nil, pos, false)
+			if err != nil {
+				return nil, err
+			}
+			return applyProcedure(i, args[1], explodeValuesResult(produced), pos, true)
+		}
 
 		result, err := procedure.Call(i, args, pos)
 		if err != nil {
@@ -1439,6 +1455,23 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 			return nil, err
 		}
 		return applyProcedure(i, args[0], callArgs, pos, false)
+
+	case "values":
+		return packValuesResult(args), nil
+
+	case "call-with-values":
+		if len(args) != 2 {
+			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
+		}
+		if !isCallableValue(args[0]) || !isCallableValue(args[1]) {
+			return nil, newEvalError(pos, "attempt to call non-procedure")
+		}
+
+		produced, err := applyProcedure(i, args[0], nil, pos, false)
+		if err != nil {
+			return nil, err
+		}
+		return applyProcedure(i, args[1], explodeValuesResult(produced), pos, false)
 
 	case "dynamic-wind":
 		if len(args) != 3 {
@@ -3122,6 +3155,20 @@ func buildList(values []any) any {
 	return result
 }
 
+func packValuesResult(values []any) any {
+	if len(values) == 1 {
+		return values[0]
+	}
+	return &multiValueResult{values: append([]any(nil), values...)}
+}
+
+func explodeValuesResult(value any) []any {
+	if values, ok := value.(*multiValueResult); ok {
+		return append([]any(nil), values.values...)
+	}
+	return []any{value}
+}
+
 func isTruthy(value any) bool {
 	boolean, ok := value.(bool)
 	return !ok || boolean
@@ -3165,6 +3212,8 @@ func formatValueWithState(value any, state *formatState) string {
 		return formatPairWithState(v, state)
 	case *recordValue:
 		return fmt.Sprintf("#<record %s>", v.recordType.name)
+	case *multiValueResult:
+		return "#<values>"
 	case *continuationProcedure:
 		return "#<procedure>"
 	case callable:
