@@ -112,6 +112,71 @@ function idOf(obj: SchemeVal): number {
   return id;
 }
 
+// Expand quasiquote template into code using quote/cons/append/list
+function expandQuasiquote(tmpl: SchemeVal, pos: string): SchemeVal {
+  const sym = (s: string): SchemeVal => ({ tag: 'symbol', val: s, pos });
+  const lst = (...vals: SchemeVal[]): SchemeVal => ({ tag: 'list', val: vals, pos });
+
+  function qq(t: SchemeVal): SchemeVal {
+    if (t.tag === 'list') {
+      const elems = t.val;
+      // (unquote x) → x
+      if (elems.length === 2 && elems[0].tag === 'symbol' && elems[0].val === 'unquote') {
+        return elems[1];
+      }
+      // Check for splicing
+      const hasSplice = elems.some(e =>
+        e.tag === 'list' && e.val.length === 2 && e.val[0].tag === 'symbol' && e.val[0].val === 'unquote-splicing'
+      );
+      // Check for dot notation
+      const dotIdx = elems.findIndex(e => e.tag === 'symbol' && e.val === '.');
+      if (dotIdx !== -1 && dotIdx === elems.length - 2) {
+        // (a b . c) → build with cons
+        const head = elems.slice(0, dotIdx);
+        const tail = qq(elems[elems.length - 1]);
+        let result = tail;
+        for (let i = head.length - 1; i >= 0; i--) {
+          const el = head[i];
+          if (el.tag === 'list' && el.val.length === 2 && el.val[0].tag === 'symbol' && el.val[0].val === 'unquote-splicing') {
+            result = lst(sym('append'), el.val[1], result);
+          } else {
+            result = lst(sym('cons'), qq(el), result);
+          }
+        }
+        return result;
+      }
+      if (hasSplice) {
+        // Build with append
+        const parts: SchemeVal[] = [];
+        let current: SchemeVal[] = [];
+        for (const el of elems) {
+          if (el.tag === 'list' && el.val.length === 2 && el.val[0].tag === 'symbol' && el.val[0].val === 'unquote-splicing') {
+            if (current.length > 0) {
+              parts.push(lst(sym('list'), ...current.map(qq)));
+              current = [];
+            }
+            parts.push(el.val[1]);
+          } else {
+            current.push(el);
+          }
+        }
+        if (current.length > 0) {
+          parts.push(lst(sym('list'), ...current.map(qq)));
+        }
+        if (parts.length === 1) return parts[0];
+        return lst(sym('append'), ...parts);
+      }
+      // No splicing — use list/cons
+      if (elems.length === 0) return lst(sym('quote'), t);
+      return lst(sym('list'), ...elems.map(qq));
+    }
+    // Atom — quote it
+    return lst(sym('quote'), t);
+  }
+
+  return qq(tmpl);
+}
+
 function arrayToList(arr: SchemeVal[]): SchemeVal {
   let result: SchemeVal = NIL;
   for (let i = arr.length - 1; i >= 0; i--) {
@@ -122,7 +187,20 @@ function arrayToList(arr: SchemeVal[]): SchemeVal {
 
 function quoteSyntax(val: SchemeVal): SchemeVal {
   if (val.tag === 'list') {
-    return arrayToList(val.val.map(quoteSyntax));
+    const elems = val.val;
+    // Handle dotted pair notation: (a b . c) → proper pairs ending with c instead of nil
+    const dotIdx = elems.findIndex(e => e.tag === 'symbol' && e.val === '.');
+    if (dotIdx !== -1) {
+      if (dotIdx !== elems.length - 2) throw new EvalError('invalid dotted pair');
+      const head = elems.slice(0, dotIdx).map(quoteSyntax);
+      const tail = quoteSyntax(elems[elems.length - 1]);
+      let result: SchemeVal = tail;
+      for (let i = head.length - 1; i >= 0; i--) {
+        result = { tag: 'pair', car: head[i], cdr: result };
+      }
+      return result;
+    }
+    return arrayToList(elems.map(quoteSyntax));
   }
   return val;
 }
@@ -237,6 +315,18 @@ function tokenize(input: string): Token[] {
     const startPos = `${line}:${col}`;
     // quote shorthand
     if (ch === "'") { tokens.push({ text: "'", pos: startPos }); advance(); continue; }
+    // quasiquote
+    if (ch === '`') { tokens.push({ text: '`', pos: startPos }); advance(); continue; }
+    // unquote / unquote-splicing
+    if (ch === ',') {
+      advance();
+      if (i < input.length && input[i] === '@') {
+        tokens.push({ text: ',@', pos: startPos }); advance();
+      } else {
+        tokens.push({ text: ',', pos: startPos });
+      }
+      continue;
+    }
     // parens
     if (ch === '(' || ch === ')') { tokens.push({ text: ch, pos: startPos }); advance(); continue; }
     // string literal
@@ -285,6 +375,18 @@ function parse(tokens: Token[], pos: { i: number }): SchemeVal {
   if (tok.text === "#'") {
     const syntaxExpr = parse(tokens, pos);
     return { tag: 'list', val: [{ tag: 'symbol', val: 'syntax', pos: tok.pos }, syntaxExpr], pos: tok.pos };
+  }
+  if (tok.text === '`') {
+    const body = parse(tokens, pos);
+    return { tag: 'list', val: [{ tag: 'symbol', val: 'quasiquote', pos: tok.pos }, body], pos: tok.pos };
+  }
+  if (tok.text === ',') {
+    const body = parse(tokens, pos);
+    return { tag: 'list', val: [{ tag: 'symbol', val: 'unquote', pos: tok.pos }, body], pos: tok.pos };
+  }
+  if (tok.text === ',@') {
+    const body = parse(tokens, pos);
+    return { tag: 'list', val: [{ tag: 'symbol', val: 'unquote-splicing', pos: tok.pos }, body], pos: tok.pos };
   }
   if (tok.text === '(') {
     const elems: SchemeVal[] = [];
@@ -1227,6 +1329,14 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   envSet(env, 'with-exception-handler', { tag: 'withExceptionHandler' } as SchemeVal);
   envSet(env, 'raise', { tag: 'raiseProc' } as SchemeVal);
 
+  envSet(env, 'error', { tag: 'procedure', val: (args) => {
+    if (args.length === 0) throw new EvalError('error requires at least 1 argument');
+    const msg = args[0].tag === 'string' ? args[0].val : display(args[0]);
+    const parts = [msg];
+    for (let i = 1; i < args.length; i++) parts.push(display(args[i]));
+    throw new EvalError(parts.join(' '));
+  }});
+
   // values & call-with-values
   envSet(env, 'values', { tag: 'procedure', val: (args) => {
     if (args.length === 1) return args[0]; // single value is transparent
@@ -1417,6 +1527,7 @@ const SPECIAL_FORMS = new Set([
   'case-lambda', 'let*', 'letrec', 'letrec*', 'case', 'do',
   'call/cc', 'call-with-current-continuation', 'guard',
   'syntax-case', 'syntax', 'with-syntax',
+  'quasiquote', 'unquote', 'unquote-splicing',
 ]);
 
 let gensymCounter = 0;
@@ -1787,6 +1898,11 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             if (name === 'quote') {
               if (elems.length !== 2) throw new EvalError(`${epos}: quote requires 1 argument`);
               c = quoteSyntax(elems[1]); m = 1; continue;
+            }
+
+            if (name === 'quasiquote') {
+              if (elems.length !== 2) throw new EvalError(`${epos}: quasiquote requires 1 argument`);
+              c = expandQuasiquote(elems[1], epos); continue;
             }
 
             if (name === 'begin') {
