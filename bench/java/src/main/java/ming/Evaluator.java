@@ -32,13 +32,24 @@ public class Evaluator {
     // --- Trampoline ---
 
     private Object trampoline(Bounce b) throws EvalError {
-        try {
-            while (b instanceof BounceThunk bt) {
-                b = bt.thunk().get();
+        while (true) {
+            if (b instanceof BounceValue bv) {
+                return bv.value();
             }
-            return ((BounceValue) b).value();
-        } catch (SchemeRaisedException sre) {
-            throw new EvalError("unhandled exception: " + schemeToString(sre.value));
+            BounceThunk bt = (BounceThunk) b;
+            try {
+                b = bt.thunk().get();
+            } catch (SchemeRaisedException sre) {
+                if (exceptionHandlerStack.isEmpty()) {
+                    throw new EvalError("unhandled exception: " + schemeToString(sre.value));
+                }
+                ExceptionHandler eh = exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+                List<WindEntry> currentWinding = new ArrayList<>(windingStack);
+                // Wrap in bounce so any SchemeRaisedException thrown during
+                // wind transition or handler dispatch is caught by the next
+                // iteration of this loop, not lost in this catch block.
+                b = bounce(() -> doWindTransition(currentWinding, eh.savedWinding, sre.value, eh.onException));
+            }
         }
     }
 
@@ -198,13 +209,11 @@ public class Evaluator {
     private final List<Set<String>> syntaxCasePatVarStack = new ArrayList<>();
 
     static class ExceptionHandler {
-        final Object handler; // Scheme procedure
         final List<WindEntry> savedWinding;
-        final Cont returnK; // continuation to return to after handler (for with-exception-handler)
-        ExceptionHandler(Object handler, List<WindEntry> savedWinding, Cont returnK) {
-            this.handler = handler;
+        final Cont onException; // called with exception value after unwinding
+        ExceptionHandler(List<WindEntry> savedWinding, Cont onException) {
             this.savedWinding = savedWinding;
-            this.returnK = returnK;
+            this.onException = onException;
         }
     }
 
@@ -1085,109 +1094,33 @@ public class Evaluator {
     // --- Exception handling (raise/guard/with-exception-handler) ---
 
     private Bounce withExceptionHandlerK(Object handler, Object thunk, int el, int ec, Cont k) throws EvalError {
-        ExceptionHandler eh = new ExceptionHandler(handler, new ArrayList<>(windingStack), k);
+        int handlerStackSize = exceptionHandlerStack.size();
+        Cont onException = unwoundVal -> applyK(handler, List.of(unwoundVal), el, ec, handlerResult -> k.apply(handlerResult));
+        ExceptionHandler eh = new ExceptionHandler(new ArrayList<>(windingStack), onException);
         exceptionHandlerStack.add(eh);
-        try {
-            Bounce b = applyK(thunk, List.of(), el, ec, bodyResult -> {
-                exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
-                return k.apply(bodyResult);
-            });
-            // Trampoline within the handler scope
-            while (b instanceof BounceThunk bt) {
-                try {
-                    b = bt.thunk().get();
-                } catch (SchemeRaisedException sre) {
-                    b = handleRaise(sre.value, el, ec);
-                }
+        return applyK(thunk, List.of(), el, ec, bodyResult -> {
+            if (exceptionHandlerStack.size() > handlerStackSize) {
+                exceptionHandlerStack.remove(handlerStackSize);
             }
-            return b;
-        } catch (SchemeRaisedException sre) {
-            return handleRaise(sre.value, el, ec);
-        }
-    }
-
-    private Bounce handleRaise(Object value, int el, int ec) throws EvalError {
-        if (exceptionHandlerStack.isEmpty()) {
-            throw new EvalError("unhandled exception: " + schemeToString(value));
-        }
-        ExceptionHandler eh = exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
-        // Unwind dynamic-wind to handler's winding state
-        List<WindEntry> currentWinding = new ArrayList<>(windingStack);
-        Bounce unwindResult = doWindTransition(currentWinding, eh.savedWinding, value, unwoundVal -> {
-            // Call the handler procedure with the raised value
-            // If handler returns normally in with-exception-handler, that's an error per R7RS
-            // but for simplicity we let it return to the handler's return continuation
-            return applyK(eh.handler, List.of(unwoundVal), el, ec, handlerResult ->
-                eh.returnK.apply(handlerResult)
-            );
+            return k.apply(bodyResult);
         });
-        return unwindResult;
     }
 
     @SuppressWarnings("unchecked")
     private Bounce evalGuardK(String guardVar, List<Object> clauses, List<Object> body, Env env, int el, int ec, Cont k) throws EvalError {
-        // guard works by:
-        // 1. Install exception handler
-        // 2. Evaluate body
-        // 3. If exception raised, test clauses
-        // 4. If a clause matches, evaluate its body in the guard's continuation
-        // 5. If no clause matches and no else, re-raise
-
-        // Save handler stack size to restore on normal completion
         int handlerStackSize = exceptionHandlerStack.size();
 
-        // Create a handler that will test guard clauses
-        // We use SchemeRaisedException to escape and test clauses
-        ExceptionHandler eh = new ExceptionHandler(null, new ArrayList<>(windingStack), k);
+        Cont onException = unwoundVal -> evalGuardClausesK(guardVar, unwoundVal, clauses, 0, env, el, ec, k);
+        ExceptionHandler eh = new ExceptionHandler(new ArrayList<>(windingStack), onException);
         exceptionHandlerStack.add(eh);
 
-        try {
-            // Evaluate body sequence
-            Bounce b = evalSeqK(body, 0, env, bodyResult -> {
-                // Normal completion — remove our handler and return result
-                if (exceptionHandlerStack.size() > handlerStackSize) {
-                    exceptionHandlerStack.remove(handlerStackSize);
-                }
-                return k.apply(bodyResult);
-            });
-
-            // Trampoline within the guard scope
-            while (b instanceof BounceThunk bt) {
-                try {
-                    b = bt.thunk().get();
-                } catch (SchemeRaisedException sre) {
-                    // Remove our handler before testing clauses
-                    if (exceptionHandlerStack.size() > handlerStackSize) {
-                        exceptionHandlerStack.remove(handlerStackSize);
-                    }
-                    // Unwind dynamic-wind to guard's winding state
-                    List<WindEntry> currentWinding = new ArrayList<>(windingStack);
-                    b = doWindTransition(currentWinding, eh.savedWinding, sre.value, unwoundVal -> {
-                        // Test guard clauses
-                        return evalGuardClausesK(guardVar, unwoundVal, clauses, 0, env, el, ec, k);
-                    });
-                    // Continue trampolining
-                    while (b instanceof BounceThunk bt2) {
-                        b = bt2.thunk().get();
-                    }
-                }
-            }
-            return b;
-        } catch (SchemeRaisedException sre) {
-            // Remove our handler before testing clauses
+        return evalSeqK(body, 0, env, bodyResult -> {
+            // Normal completion — remove our handler and return result
             if (exceptionHandlerStack.size() > handlerStackSize) {
                 exceptionHandlerStack.remove(handlerStackSize);
             }
-            // Unwind dynamic-wind to guard's winding state
-            List<WindEntry> currentWinding = new ArrayList<>(windingStack);
-            Bounce b = doWindTransition(currentWinding, eh.savedWinding, sre.value, unwoundVal ->
-                evalGuardClausesK(guardVar, unwoundVal, clauses, 0, env, el, ec, k)
-            );
-            while (b instanceof BounceThunk bt) {
-                b = bt.thunk().get();
-            }
-            return b;
-        }
+            return bounce(() -> k.apply(bodyResult));
+        });
     }
 
     private Bounce evalGuardClausesK(String guardVar, Object exnVal, List<Object> clauses, int idx, Env env, int el, int ec, Cont k) throws EvalError {
@@ -1407,7 +1340,7 @@ public class Evaluator {
         // Continuation invocation — with dynamic-wind unwind/rewind
         if (proc instanceof SchemeContinuation sc) {
             if (args.isEmpty()) throw new EvalError("continuation: expected 1 argument");
-            Object val = args.get(0);
+            Object val = args.size() == 1 ? args.get(0) : new SchemeValues(args);
             return doWindTransition(windingStack, sc.savedWinding, val, sc.k);
         }
         // CaseLambda dispatch
@@ -1496,6 +1429,8 @@ public class Evaluator {
             try {
                 Object result = fn.apply(args);
                 return k.apply(result);
+            } catch (SchemeRaisedException sre) {
+                throw sre;
             } catch (RuntimeException e) {
                 throw new EvalError(e.getMessage());
             }
@@ -1566,10 +1501,18 @@ public class Evaluator {
                     try {
                         Object val = sr.defEnv().lookup(fv);
                         if (!overlayCreated) {
-                            evalEnv = new Env(useEnv);
+                            // Transparent overlay: lookups see overlay bindings, but
+                            // define goes to the use-site env so macros that expand
+                            // to (define ...) define in the correct scope.
+                            evalEnv = new Env(useEnv) {
+                                @Override
+                                void define(String name, Object value) {
+                                    parent.define(name, value);
+                                }
+                            };
                             overlayCreated = true;
                         }
-                        evalEnv.define(fv, val);
+                        evalEnv.bindings.put(fv, val);
                     } catch (EvalError ignored) {}
                 }
                 final Env finalEvalEnv = evalEnv;
