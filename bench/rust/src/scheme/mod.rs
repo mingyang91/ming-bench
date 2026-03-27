@@ -7,6 +7,42 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 type EnvRef = Rc<RefCell<Environment>>;
+type EvalResult = Result<Value, EvalError>;
+type ContRef = Rc<dyn Fn(Value) -> Action>;
+type ValuesContRef = Rc<dyn Fn(Vec<Value>) -> Action>;
+
+enum Action {
+    EvalExpr(Expr, EnvRef, ContRef),
+    EvalSequence(Rc<Vec<Expr>>, usize, EnvRef, ContRef),
+    EvalLetBindings {
+        bindings: Rc<Vec<(String, Expr)>>,
+        index: usize,
+        env: EnvRef,
+        evaluated: Vec<(String, Value)>,
+        body: Rc<Vec<Expr>>,
+        cont: ContRef,
+    },
+    EvalAnd(Rc<Vec<Expr>>, usize, EnvRef, ContRef),
+    EvalOr(Rc<Vec<Expr>>, usize, EnvRef, ContRef),
+    EvalCond(Rc<Vec<Expr>>, usize, EnvRef, ContRef),
+    EvalExprList {
+        expressions: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        evaluated: Vec<Value>,
+        cont: ValuesContRef,
+    },
+    Apply(Value, Vec<Value>, ContRef),
+    MapIter {
+        procedure: Value,
+        lists: Rc<Vec<Vec<Value>>>,
+        index: usize,
+        results: Vec<Value>,
+        cont: ContRef,
+    },
+    Continue(ContRef, Value),
+    Done(EvalResult),
+}
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -23,6 +59,16 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    let input = input.to_string();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || eval_str_with_output_inner(&input))
+        .map_err(|err| EvalError::Message(format!("failed to start evaluator thread: {err}")))?
+        .join()
+        .map_err(|_| EvalError::Message("evaluation panicked".to_string()))?
+}
+
+fn eval_str_with_output_inner(input: &str) -> Result<(String, String), EvalError> {
     let expressions = Parser::new(input).parse_program()?;
     if expressions.is_empty() {
         return Err(EvalError::EmptyInput);
@@ -30,13 +76,12 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
 
     let env = global_env();
     let mut interpreter = Interpreter::default();
-    let mut last = Value::Void;
-
-    for expr in &expressions {
-        last = interpreter.eval_expr(expr, env.clone())?;
-    }
-
+    let last = interpreter.run(Action::EvalSequence(Rc::new(expressions), 0, env, return_cont()))?;
     Ok((last.to_scheme_string(), interpreter.output))
+}
+
+fn return_cont() -> ContRef {
+    Rc::new(|value| Action::Done(Ok(value)))
 }
 
 #[derive(Default)]
@@ -45,241 +90,525 @@ struct Interpreter {
 }
 
 impl Interpreter {
-    fn eval_expr(&mut self, expr: &Expr, env: EnvRef) -> Result<Value, EvalError> {
-        match expr {
-            Expr::Int(value) => Ok(Value::Int(*value)),
-            Expr::Bool(value) => Ok(Value::Bool(*value)),
-            Expr::String(value) => Ok(Value::String(value.clone())),
-            Expr::Char(value) => Ok(Value::Char(*value)),
-            Expr::Symbol(name) => env
-                .borrow()
-                .lookup(name)
-                .ok_or_else(|| EvalError::UnboundVariable(name.clone())),
-            Expr::List(items) => self.eval_list(items, env),
+    fn run(&mut self, mut action: Action) -> EvalResult {
+        loop {
+            action = match action {
+                Action::EvalExpr(expr, env, cont) => self.step_eval_expr(expr, env, cont),
+                Action::EvalSequence(expressions, index, env, cont) => {
+                    self.step_eval_sequence(expressions, index, env, cont)
+                }
+                Action::EvalLetBindings {
+                    bindings,
+                    index,
+                    env,
+                    evaluated,
+                    body,
+                    cont,
+                } => self.step_eval_let_bindings(bindings, index, env, evaluated, body, cont),
+                Action::EvalAnd(expressions, index, env, cont) => {
+                    self.step_eval_and(expressions, index, env, cont)
+                }
+                Action::EvalOr(expressions, index, env, cont) => {
+                    self.step_eval_or(expressions, index, env, cont)
+                }
+                Action::EvalCond(clauses, index, env, cont) => {
+                    self.step_eval_cond(clauses, index, env, cont)
+                }
+                Action::EvalExprList {
+                    expressions,
+                    index,
+                    env,
+                    evaluated,
+                    cont,
+                } => self.step_eval_expr_list(expressions, index, env, evaluated, cont),
+                Action::Apply(procedure, args, cont) => self.step_apply(procedure, args, cont),
+                Action::MapIter {
+                    procedure,
+                    lists,
+                    index,
+                    results,
+                    cont,
+                } => self.step_builtin_map_iter(procedure, lists, index, results, cont),
+                Action::Continue(cont, value) => cont(value),
+                Action::Done(result) => return result,
+            };
         }
     }
 
-    fn eval_list(&mut self, items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    fn step_eval_expr(&mut self, expr: Expr, env: EnvRef, cont: ContRef) -> Action {
+        match expr {
+            Expr::Int(value) => Action::Continue(cont, Value::Int(value)),
+            Expr::Bool(value) => Action::Continue(cont, Value::Bool(value)),
+            Expr::String(value) => Action::Continue(cont, Value::String(value)),
+            Expr::Char(value) => Action::Continue(cont, Value::Char(value)),
+            Expr::Symbol(name) => match env.borrow().lookup(&name) {
+                Some(value) => Action::Continue(cont, value),
+                None => Action::Done(Err(EvalError::UnboundVariable(name))),
+            },
+            Expr::List(items) => self.step_eval_list(items, env, cont),
+        }
+    }
+
+    fn step_eval_list(&mut self, items: Vec<Expr>, env: EnvRef, cont: ContRef) -> Action {
         if items.is_empty() {
-            return Err(EvalError::InvalidForm(
+            return Action::Done(Err(EvalError::InvalidForm(
                 "cannot evaluate an empty list".to_string(),
-            ));
+            )));
         }
 
-        if let Expr::Symbol(name) = &items[0] {
+        if let Some(Expr::Symbol(name)) = items.first() {
             match name.as_str() {
-                "define" => return self.eval_define(&items[1..], env),
-                "lambda" => return self.eval_lambda(&items[1..], env),
-                "if" => return self.eval_if(&items[1..], env),
-                "let" => return self.eval_let(&items[1..], env),
-                "and" => return self.eval_and(&items[1..], env),
-                "or" => return self.eval_or(&items[1..], env),
-                "begin" => return self.eval_body(&items[1..], env),
+                "define" => return self.step_eval_define(&items[1..], env, cont),
+                "lambda" => return self.step_eval_lambda(&items[1..], env, cont),
+                "if" => return self.step_eval_if(&items[1..], env, cont),
+                "let" => return self.step_eval_let(&items[1..], env, cont),
+                "and" => return Action::EvalAnd(Rc::new(items[1..].to_vec()), 0, env, cont),
+                "or" => return Action::EvalOr(Rc::new(items[1..].to_vec()), 0, env, cont),
+                "begin" => {
+                    return Action::EvalSequence(Rc::new(items[1..].to_vec()), 0, env, cont);
+                }
+                "quote" => {
+                    if let Err(err) = require_exact_arity(items.len() - 1, 1, "quote") {
+                        return Action::Done(Err(err));
+                    }
+                    return Action::Continue(cont, quote_expr(&items[1]));
+                }
+                "cond" => return Action::EvalCond(Rc::new(items[1..].to_vec()), 0, env, cont),
+                "set!" => return self.step_eval_set(&items[1..], env, cont),
                 _ => {}
             }
         }
 
-        let operator = self.eval_expr(&items[0], env.clone())?;
-        let mut args = Vec::with_capacity(items.len().saturating_sub(1));
-        for expr in &items[1..] {
-            args.push(self.eval_expr(expr, env.clone())?);
-        }
-        self.apply(operator, args)
+        self.step_eval_application(items, env, cont)
     }
 
-    fn eval_define(&mut self, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    fn step_eval_application(&mut self, items: Vec<Expr>, env: EnvRef, cont: ContRef) -> Action {
+        let mut parts = items.into_iter();
+        let operator_expr = parts.next().expect("non-empty list");
+        let arg_exprs = Rc::new(parts.collect::<Vec<_>>());
+
+        Action::EvalExpr(
+            operator_expr,
+            env.clone(),
+            Rc::new(move |operator| {
+                let operator = operator.clone();
+                let cont = cont.clone();
+                Action::EvalExprList {
+                    expressions: arg_exprs.clone(),
+                    index: arg_exprs.len(),
+                    env: env.clone(),
+                    evaluated: Vec::new(),
+                    cont: Rc::new(move |args| Action::Apply(operator.clone(), args, cont.clone())),
+                }
+            }),
+        )
+    }
+
+    fn step_eval_define(&mut self, args: &[Expr], env: EnvRef, cont: ContRef) -> Action {
         if args.len() < 2 {
-            return Err(EvalError::InvalidForm(
+            return Action::Done(Err(EvalError::InvalidForm(
                 "define expects a target and at least one body expression".to_string(),
-            ));
+            )));
         }
 
         match &args[0] {
             Expr::Symbol(name) => {
                 if args.len() != 2 {
-                    return Err(EvalError::InvalidForm(
+                    return Action::Done(Err(EvalError::InvalidForm(
                         "variable define expects exactly one value expression".to_string(),
-                    ));
+                    )));
                 }
-                let value = self.eval_expr(&args[1], env.clone())?;
-                env.borrow_mut().define(name.clone(), value);
-                Ok(Value::Void)
+
+                let name = name.clone();
+                Action::EvalExpr(
+                    args[1].clone(),
+                    env.clone(),
+                    Rc::new(move |value| {
+                        env.borrow_mut().define(name.clone(), value);
+                        Action::Continue(cont.clone(), Value::Void)
+                    }),
+                )
             }
             Expr::List(signature) => {
                 if signature.is_empty() {
-                    return Err(EvalError::InvalidForm(
+                    return Action::Done(Err(EvalError::InvalidForm(
                         "function define requires a name".to_string(),
-                    ));
+                    )));
                 }
 
                 let name = match &signature[0] {
                     Expr::Symbol(name) => name.clone(),
                     _ => {
-                        return Err(EvalError::InvalidForm(
+                        return Action::Done(Err(EvalError::InvalidForm(
                             "function define requires a symbol name".to_string(),
-                        ));
+                        )));
                     }
                 };
 
-                let params = parse_parameters(&signature[1..])?;
-                let body = args[1..].to_vec();
+                let params = match parse_parameters(&signature[1..]) {
+                    Ok(params) => params,
+                    Err(err) => return Action::Done(Err(err)),
+                };
                 let procedure = Value::Procedure(Procedure::Lambda(Lambda {
                     name: Some(name.clone()),
                     params,
-                    body,
+                    body: args[1..].to_vec(),
                     env: env.clone(),
                 }));
                 env.borrow_mut().define(name, procedure);
-                Ok(Value::Void)
+                Action::Continue(cont, Value::Void)
             }
-            _ => Err(EvalError::InvalidForm("invalid define target".to_string())),
+            _ => Action::Done(Err(EvalError::InvalidForm("invalid define target".to_string()))),
         }
     }
 
-    fn eval_lambda(&mut self, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    fn step_eval_lambda(&mut self, args: &[Expr], env: EnvRef, cont: ContRef) -> Action {
         if args.len() < 2 {
-            return Err(EvalError::InvalidForm(
+            return Action::Done(Err(EvalError::InvalidForm(
                 "lambda expects parameters and at least one body expression".to_string(),
-            ));
+            )));
         }
 
         let params = match &args[0] {
-            Expr::List(items) => parse_parameters(items)?,
+            Expr::List(items) => match parse_parameters(items) {
+                Ok(params) => params,
+                Err(err) => return Action::Done(Err(err)),
+            },
             _ => {
-                return Err(EvalError::InvalidForm(
+                return Action::Done(Err(EvalError::InvalidForm(
                     "lambda parameters must be a list".to_string(),
-                ));
+                )));
             }
         };
 
-        Ok(Value::Procedure(Procedure::Lambda(Lambda {
-            name: None,
-            params,
-            body: args[1..].to_vec(),
-            env,
-        })))
+        Action::Continue(
+            cont,
+            Value::Procedure(Procedure::Lambda(Lambda {
+                name: None,
+                params,
+                body: args[1..].to_vec(),
+                env,
+            })),
+        )
     }
 
-    fn eval_if(&mut self, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    fn step_eval_if(&mut self, args: &[Expr], env: EnvRef, cont: ContRef) -> Action {
         if !(2..=3).contains(&args.len()) {
-            return Err(EvalError::WrongArity {
+            return Action::Done(Err(EvalError::WrongArity {
                 name: "if".to_string(),
                 expected: "2 or 3".to_string(),
                 got: args.len(),
-            });
+            }));
         }
 
-        let condition = self.eval_expr(&args[0], env.clone())?;
-        if is_truthy(&condition) {
-            self.eval_expr(&args[1], env)
-        } else if args.len() == 3 {
-            self.eval_expr(&args[2], env)
-        } else {
-            Ok(Value::Void)
-        }
+        let then_branch = args[1].clone();
+        let else_branch = args.get(2).cloned();
+        Action::EvalExpr(
+            args[0].clone(),
+            env.clone(),
+            Rc::new(move |condition| {
+                if is_truthy(&condition) {
+                    Action::EvalExpr(then_branch.clone(), env.clone(), cont.clone())
+                } else if let Some(else_branch) = &else_branch {
+                    Action::EvalExpr(else_branch.clone(), env.clone(), cont.clone())
+                } else {
+                    Action::Continue(cont.clone(), Value::Void)
+                }
+            }),
+        )
     }
 
-    fn eval_let(&mut self, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    fn step_eval_let(&mut self, args: &[Expr], env: EnvRef, cont: ContRef) -> Action {
         if args.len() < 2 {
-            return Err(EvalError::InvalidForm(
+            return Action::Done(Err(EvalError::InvalidForm(
                 "let expects bindings and at least one body expression".to_string(),
-            ));
+            )));
         }
 
         let bindings = match &args[0] {
             Expr::List(bindings) => bindings,
             _ => {
-                return Err(EvalError::InvalidForm(
+                return Action::Done(Err(EvalError::InvalidForm(
                     "let bindings must be a list".to_string(),
-                ));
+                )));
             }
         };
 
-        let mut evaluated = Vec::with_capacity(bindings.len());
+        let mut parsed = Vec::with_capacity(bindings.len());
         for binding in bindings {
             let pair = match binding {
                 Expr::List(pair) if pair.len() == 2 => pair,
                 _ => {
-                    return Err(EvalError::InvalidForm(
+                    return Action::Done(Err(EvalError::InvalidForm(
                         "let bindings must be (name value) pairs".to_string(),
-                    ));
+                    )));
                 }
             };
 
             let name = match &pair[0] {
                 Expr::Symbol(name) => name.clone(),
                 _ => {
-                    return Err(EvalError::InvalidForm(
+                    return Action::Done(Err(EvalError::InvalidForm(
                         "let binding names must be symbols".to_string(),
-                    ));
+                    )));
                 }
             };
 
-            let value = self.eval_expr(&pair[1], env.clone())?;
-            evaluated.push((name, value));
+            parsed.push((name, pair[1].clone()));
         }
 
-        let child = Environment::child(env);
-        {
-            let mut scope = child.borrow_mut();
-            for (name, value) in evaluated {
-                scope.define(name, value);
+        Action::EvalLetBindings {
+            bindings: Rc::new(parsed),
+            index: 0,
+            env,
+            evaluated: Vec::new(),
+            body: Rc::new(args[1..].to_vec()),
+            cont,
+        }
+    }
+
+    fn step_eval_let_bindings(
+        &mut self,
+        bindings: Rc<Vec<(String, Expr)>>,
+        index: usize,
+        env: EnvRef,
+        evaluated: Vec<(String, Value)>,
+        body: Rc<Vec<Expr>>,
+        cont: ContRef,
+    ) -> Action {
+        if index >= bindings.len() {
+            let child = Environment::child(env);
+            {
+                let mut scope = child.borrow_mut();
+                for (name, value) in evaluated {
+                    scope.define(name, value);
+                }
             }
+            return Action::EvalSequence(body, 0, child, cont);
         }
 
-        self.eval_body(&args[1..], child)
+        let (name, expr) = bindings[index].clone();
+        Action::EvalExpr(
+            expr,
+            env.clone(),
+            Rc::new(move |value| {
+                let mut next = evaluated.clone();
+                next.push((name.clone(), value));
+                Action::EvalLetBindings {
+                    bindings: bindings.clone(),
+                    index: index + 1,
+                    env: env.clone(),
+                    evaluated: next,
+                    body: body.clone(),
+                    cont: cont.clone(),
+                }
+            }),
+        )
     }
 
-    fn eval_and(&mut self, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-        let mut last = Value::Bool(true);
-        for expr in args {
-            last = self.eval_expr(expr, env.clone())?;
-            if !is_truthy(&last) {
-                return Ok(last);
+    fn step_eval_and(
+        &mut self,
+        expressions: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        cont: ContRef,
+    ) -> Action {
+        if index >= expressions.len() {
+            return Action::Continue(cont, Value::Bool(true));
+        }
+
+        let last = index + 1 == expressions.len();
+        Action::EvalExpr(
+            expressions[index].clone(),
+            env.clone(),
+            Rc::new(move |value| {
+                if !is_truthy(&value) || last {
+                    Action::Continue(cont.clone(), value)
+                } else {
+                    Action::EvalAnd(expressions.clone(), index + 1, env.clone(), cont.clone())
+                }
+            }),
+        )
+    }
+
+    fn step_eval_or(
+        &mut self,
+        expressions: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        cont: ContRef,
+    ) -> Action {
+        if index >= expressions.len() {
+            return Action::Continue(cont, Value::Bool(false));
+        }
+
+        Action::EvalExpr(
+            expressions[index].clone(),
+            env.clone(),
+            Rc::new(move |value| {
+                if is_truthy(&value) {
+                    Action::Continue(cont.clone(), value)
+                } else {
+                    Action::EvalOr(expressions.clone(), index + 1, env.clone(), cont.clone())
+                }
+            }),
+        )
+    }
+
+    fn step_eval_cond(
+        &mut self,
+        clauses: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        cont: ContRef,
+    ) -> Action {
+        if index >= clauses.len() {
+            return Action::Continue(cont, Value::Void);
+        }
+
+        let clause = match &clauses[index] {
+            Expr::List(items) if !items.is_empty() => items.clone(),
+            _ => {
+                return Action::Done(Err(EvalError::InvalidForm(
+                    "cond clauses must be non-empty lists".to_string(),
+                )));
             }
-        }
-        Ok(last)
-    }
+        };
 
-    fn eval_or(&mut self, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-        for expr in args {
-            let value = self.eval_expr(expr, env.clone())?;
-            if is_truthy(&value) {
-                return Ok(value);
+        if matches!(&clause[0], Expr::Symbol(name) if name == "else") {
+            if clause.len() == 1 {
+                return Action::Continue(cont, Value::Void);
             }
+            return Action::EvalSequence(Rc::new(clause[1..].to_vec()), 0, env, cont);
         }
-        Ok(Value::Bool(false))
+
+        let test_expr = clause[0].clone();
+        let body = clause[1..].to_vec();
+        Action::EvalExpr(
+            test_expr,
+            env.clone(),
+            Rc::new(move |test_value| {
+                if is_truthy(&test_value) {
+                    if body.is_empty() {
+                        Action::Continue(cont.clone(), test_value)
+                    } else {
+                        Action::EvalSequence(Rc::new(body.clone()), 0, env.clone(), cont.clone())
+                    }
+                } else {
+                    Action::EvalCond(clauses.clone(), index + 1, env.clone(), cont.clone())
+                }
+            }),
+        )
     }
 
-    fn eval_body(&mut self, expressions: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
-        if expressions.is_empty() {
-            return Ok(Value::Void);
+    fn step_eval_set(&mut self, args: &[Expr], env: EnvRef, cont: ContRef) -> Action {
+        if args.len() != 2 {
+            return Action::Done(Err(EvalError::WrongArity {
+                name: "set!".to_string(),
+                expected: "2".to_string(),
+                got: args.len(),
+            }));
         }
 
-        let mut last = Value::Void;
-        for expr in expressions {
-            last = self.eval_expr(expr, env.clone())?;
-        }
-        Ok(last)
+        let name = match &args[0] {
+            Expr::Symbol(name) => name.clone(),
+            _ => {
+                return Action::Done(Err(EvalError::InvalidForm(
+                    "set! target must be a symbol".to_string(),
+                )));
+            }
+        };
+
+        Action::EvalExpr(
+            args[1].clone(),
+            env.clone(),
+            Rc::new(move |value| {
+                if env.borrow_mut().set(&name, value) {
+                    Action::Continue(cont.clone(), Value::Void)
+                } else {
+                    Action::Done(Err(EvalError::UnboundVariable(name.clone())))
+                }
+            }),
+        )
     }
 
-    fn apply(&mut self, procedure: Value, args: Vec<Value>) -> Result<Value, EvalError> {
+    fn step_eval_sequence(
+        &mut self,
+        expressions: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        cont: ContRef,
+    ) -> Action {
+        if index >= expressions.len() {
+            return Action::Continue(cont, Value::Void);
+        }
+
+        if index + 1 == expressions.len() {
+            return Action::EvalExpr(expressions[index].clone(), env, cont);
+        }
+
+        Action::EvalExpr(
+            expressions[index].clone(),
+            env.clone(),
+            Rc::new(move |_| {
+                Action::EvalSequence(expressions.clone(), index + 1, env.clone(), cont.clone())
+            }),
+        )
+    }
+
+    fn step_eval_expr_list(
+        &mut self,
+        expressions: Rc<Vec<Expr>>,
+        index: usize,
+        env: EnvRef,
+        evaluated: Vec<Value>,
+        cont: ValuesContRef,
+    ) -> Action {
+        if index == 0 {
+            return cont(evaluated);
+        }
+
+        Action::EvalExpr(
+            expressions[index - 1].clone(),
+            env.clone(),
+            Rc::new(move |value| {
+                let mut next = evaluated.clone();
+                next.insert(0, value);
+                Action::EvalExprList {
+                    expressions: expressions.clone(),
+                    index: index - 1,
+                    env: env.clone(),
+                    evaluated: next,
+                    cont: cont.clone(),
+                }
+            }),
+        )
+    }
+
+    fn step_apply(&mut self, procedure: Value, args: Vec<Value>, cont: ContRef) -> Action {
         match procedure {
-            Value::Procedure(Procedure::Builtin(builtin)) => self.apply_builtin(builtin, args),
-            Value::Procedure(Procedure::Lambda(lambda)) => self.apply_lambda(lambda, args),
-            _ => Err(EvalError::Message(
+            Value::Procedure(Procedure::Builtin(builtin)) => self.step_apply_builtin(builtin, args, cont),
+            Value::Procedure(Procedure::Lambda(lambda)) => self.step_apply_lambda(lambda, args, cont),
+            Value::Procedure(Procedure::Continuation(saved)) => {
+                if let Err(err) = require_exact_arity(args.len(), 1, "continuation") {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(saved, args[0].clone())
+                }
+            }
+            _ => Action::Done(Err(EvalError::Message(
                 "attempted to call a non-procedure".to_string(),
-            )),
+            ))),
         }
     }
 
-    fn apply_lambda(&mut self, lambda: Lambda, args: Vec<Value>) -> Result<Value, EvalError> {
+    fn step_apply_lambda(&mut self, lambda: Lambda, args: Vec<Value>, cont: ContRef) -> Action {
         if lambda.params.len() != args.len() {
-            return Err(EvalError::WrongArity {
+            return Action::Done(Err(EvalError::WrongArity {
                 name: lambda.name.clone().unwrap_or_else(|| "lambda".to_string()),
                 expected: lambda.params.len().to_string(),
                 got: args.len(),
-            });
+            }));
         }
 
         let child = Environment::child(lambda.env);
@@ -290,140 +619,295 @@ impl Interpreter {
             }
         }
 
-        self.eval_body(&lambda.body, child)
+        Action::EvalSequence(Rc::new(lambda.body), 0, child, cont)
     }
 
-    fn apply_builtin(&mut self, builtin: Builtin, args: Vec<Value>) -> Result<Value, EvalError> {
+    fn step_apply_builtin(&mut self, builtin: Builtin, args: Vec<Value>, cont: ContRef) -> Action {
         match builtin {
             Builtin::Add => {
                 let mut total = 0_i64;
                 for arg in &args {
-                    total += expect_int(arg, builtin.name())?;
+                    match expect_int(arg, builtin.name()) {
+                        Ok(value) => total += value,
+                        Err(err) => return Action::Done(Err(err)),
+                    }
                 }
-                Ok(Value::Int(total))
+                Action::Continue(cont, Value::Int(total))
             }
             Builtin::Sub => {
-                require_at_least_arity(args.len(), 1, builtin.name())?;
-                let first = expect_int(&args[0], builtin.name())?;
+                if let Err(err) = require_at_least_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                let first = match expect_int(&args[0], builtin.name()) {
+                    Ok(value) => value,
+                    Err(err) => return Action::Done(Err(err)),
+                };
                 if args.len() == 1 {
-                    return Ok(Value::Int(-first));
+                    return Action::Continue(cont, Value::Int(-first));
                 }
 
                 let mut total = first;
                 for arg in &args[1..] {
-                    total -= expect_int(arg, builtin.name())?;
+                    match expect_int(arg, builtin.name()) {
+                        Ok(value) => total -= value,
+                        Err(err) => return Action::Done(Err(err)),
+                    }
                 }
-                Ok(Value::Int(total))
+                Action::Continue(cont, Value::Int(total))
             }
-            Builtin::Less => compare_numbers(&args, builtin.name(), |left, right| left < right),
+            Builtin::Less => match compare_numbers(&args, builtin.name(), |left, right| left < right) {
+                Ok(value) => Action::Continue(cont, value),
+                Err(err) => Action::Done(Err(err)),
+            },
             Builtin::LessEqual => {
-                compare_numbers(&args, builtin.name(), |left, right| left <= right)
+                match compare_numbers(&args, builtin.name(), |left, right| left <= right) {
+                    Ok(value) => Action::Continue(cont, value),
+                    Err(err) => Action::Done(Err(err)),
+                }
             }
-            Builtin::Greater => compare_numbers(&args, builtin.name(), |left, right| left > right),
+            Builtin::Greater => match compare_numbers(&args, builtin.name(), |left, right| left > right) {
+                Ok(value) => Action::Continue(cont, value),
+                Err(err) => Action::Done(Err(err)),
+            },
             Builtin::GreaterEqual => {
-                compare_numbers(&args, builtin.name(), |left, right| left >= right)
+                match compare_numbers(&args, builtin.name(), |left, right| left >= right) {
+                    Ok(value) => Action::Continue(cont, value),
+                    Err(err) => Action::Done(Err(err)),
+                }
             }
             Builtin::NumericEqual => {
-                compare_numbers(&args, builtin.name(), |left, right| left == right)
+                match compare_numbers(&args, builtin.name(), |left, right| left == right) {
+                    Ok(value) => Action::Continue(cont, value),
+                    Err(err) => Action::Done(Err(err)),
+                }
             }
-            Builtin::List => Ok(Value::List(args)),
-            Builtin::Map => self.builtin_map(args),
+            Builtin::List => Action::Continue(cont, Value::List(args)),
+            Builtin::Map => self.step_builtin_map(args, cont),
             Builtin::StringToList => {
-                require_exact_arity(args.len(), 1, builtin.name())?;
-                let value = expect_string(&args[0], builtin.name())?;
-                Ok(Value::List(value.chars().map(Value::Char).collect()))
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                match expect_string(&args[0], builtin.name()) {
+                    Ok(value) => {
+                        Action::Continue(cont, Value::List(value.chars().map(Value::Char).collect()))
+                    }
+                    Err(err) => Action::Done(Err(err)),
+                }
             }
             Builtin::ListToString => {
-                require_exact_arity(args.len(), 1, builtin.name())?;
-                let items = expect_list(&args[0], builtin.name())?;
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                let items = match expect_list(&args[0], builtin.name()) {
+                    Ok(items) => items,
+                    Err(err) => return Action::Done(Err(err)),
+                };
                 let mut value = String::new();
                 for item in items {
-                    value.push(expect_char(item, builtin.name())?);
+                    match expect_char(item, builtin.name()) {
+                        Ok(ch) => value.push(ch),
+                        Err(err) => return Action::Done(Err(err)),
+                    }
                 }
-                Ok(Value::String(value))
+                Action::Continue(cont, Value::String(value))
             }
             Builtin::StringSet => {
-                require_exact_arity(args.len(), 3, builtin.name())?;
-                Err(EvalError::ImmutableString)
+                if let Err(err) = require_exact_arity(args.len(), 3, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Done(Err(EvalError::ImmutableString))
+                }
             }
             Builtin::CharToInteger => {
-                require_exact_arity(args.len(), 1, builtin.name())?;
-                Ok(Value::Int(
-                    expect_char(&args[0], builtin.name())? as u32 as i64
-                ))
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                match expect_char(&args[0], builtin.name()) {
+                    Ok(ch) => Action::Continue(cont, Value::Int(ch as u32 as i64)),
+                    Err(err) => Action::Done(Err(err)),
+                }
             }
             Builtin::IntegerToChar => {
-                require_exact_arity(args.len(), 1, builtin.name())?;
-                let value = expect_int(&args[0], builtin.name())?;
-                if value < 0 {
-                    return Err(EvalError::Type(format!(
-                        "{0} expects a valid character code point",
-                        builtin.name()
-                    )));
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
                 }
-                let scalar = u32::try_from(value).map_err(|_| {
-                    EvalError::Type(format!(
+                let value = match expect_int(&args[0], builtin.name()) {
+                    Ok(value) => value,
+                    Err(err) => return Action::Done(Err(err)),
+                };
+                if value < 0 {
+                    return Action::Done(Err(EvalError::Type(format!(
                         "{0} expects a valid character code point",
                         builtin.name()
-                    ))
-                })?;
-                let ch = char::from_u32(scalar).ok_or_else(|| {
-                    EvalError::Type(format!(
+                    ))));
+                }
+                let scalar = match u32::try_from(value) {
+                    Ok(scalar) => scalar,
+                    Err(_) => {
+                        return Action::Done(Err(EvalError::Type(format!(
+                            "{0} expects a valid character code point",
+                            builtin.name()
+                        ))));
+                    }
+                };
+                match char::from_u32(scalar) {
+                    Some(ch) => Action::Continue(cont, Value::Char(ch)),
+                    None => Action::Done(Err(EvalError::Type(format!(
                         "{0} expects a valid character code point",
                         builtin.name()
-                    ))
-                })?;
-                Ok(Value::Char(ch))
+                    )))),
+                }
             }
             Builtin::StringCopy => {
-                require_exact_arity(args.len(), 1, builtin.name())?;
-                Ok(Value::String(
-                    expect_string(&args[0], builtin.name())?.to_string(),
-                ))
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                match expect_string(&args[0], builtin.name()) {
+                    Ok(value) => Action::Continue(cont, Value::String(value.to_string())),
+                    Err(err) => Action::Done(Err(err)),
+                }
             }
             Builtin::Display => {
-                require_exact_arity(args.len(), 1, builtin.name())?;
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
                 self.output.push_str(&args[0].to_display_string());
-                Ok(Value::Void)
+                Action::Continue(cont, Value::Void)
             }
             Builtin::Write => {
-                require_exact_arity(args.len(), 1, builtin.name())?;
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
                 self.output.push_str(&args[0].to_scheme_string());
-                Ok(Value::Void)
+                Action::Continue(cont, Value::Void)
             }
             Builtin::Newline => {
-                require_exact_arity(args.len(), 0, builtin.name())?;
+                if let Err(err) = require_exact_arity(args.len(), 0, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
                 self.output.push('\n');
-                Ok(Value::Void)
+                Action::Continue(cont, Value::Void)
+            }
+            Builtin::Not => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(cont, Value::Bool(!is_truthy(&args[0])))
+                }
+            }
+            Builtin::Null => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(
+                        cont,
+                        Value::Bool(matches!(&args[0], Value::List(items) if items.is_empty())),
+                    )
+                }
+            }
+            Builtin::Car => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                let items = match expect_list(&args[0], builtin.name()) {
+                    Ok(items) => items,
+                    Err(err) => return Action::Done(Err(err)),
+                };
+                match items.first().cloned() {
+                    Some(value) => Action::Continue(cont, value),
+                    None => Action::Done(Err(EvalError::Type(
+                        "car expects a non-empty list".to_string(),
+                    ))),
+                }
+            }
+            Builtin::Cdr => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                let items = match expect_list(&args[0], builtin.name()) {
+                    Ok(items) => items,
+                    Err(err) => return Action::Done(Err(err)),
+                };
+                if items.is_empty() {
+                    Action::Done(Err(EvalError::Type(
+                        "cdr expects a non-empty list".to_string(),
+                    )))
+                } else {
+                    Action::Continue(cont, Value::List(items[1..].to_vec()))
+                }
+            }
+            Builtin::CallCc => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                let captured = Value::Procedure(Procedure::Continuation(cont.clone()));
+                Action::Apply(args[0].clone(), vec![captured], cont)
             }
         }
     }
 
-    fn builtin_map(&mut self, args: Vec<Value>) -> Result<Value, EvalError> {
-        require_at_least_arity(args.len(), 2, "map")?;
+    fn step_builtin_map(&mut self, args: Vec<Value>, cont: ContRef) -> Action {
+        if let Err(err) = require_at_least_arity(args.len(), 2, "map") {
+            return Action::Done(Err(err));
+        }
         let procedure = args[0].clone();
-        let lists = args[1..]
+        let lists = match args[1..]
             .iter()
             .map(|value| expect_list(value, "map").map(|items| items.to_vec()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(lists) => lists,
+            Err(err) => return Action::Done(Err(err)),
+        };
 
         let expected_len = lists[0].len();
         if lists.iter().any(|items| items.len() != expected_len) {
-            return Err(EvalError::Message(
+            return Action::Done(Err(EvalError::Message(
                 "map expects lists with the same length".to_string(),
-            ));
+            )));
         }
 
-        let mut result = Vec::with_capacity(expected_len);
-        for index in 0..expected_len {
-            let mapped_args = lists
-                .iter()
-                .map(|items| items[index].clone())
-                .collect::<Vec<_>>();
-            result.push(self.apply(procedure.clone(), mapped_args)?);
+        Action::MapIter {
+            procedure,
+            lists: Rc::new(lists),
+            index: 0,
+            results: Vec::new(),
+            cont,
+        }
+    }
+
+    fn step_builtin_map_iter(
+        &mut self,
+        procedure: Value,
+        lists: Rc<Vec<Vec<Value>>>,
+        index: usize,
+        results: Vec<Value>,
+        cont: ContRef,
+    ) -> Action {
+        if index >= lists[0].len() {
+            return Action::Continue(cont, Value::List(results));
         }
 
-        Ok(Value::List(result))
+        let mapped_args = lists
+            .iter()
+            .map(|items| items[index].clone())
+            .collect::<Vec<_>>();
+
+        Action::Apply(
+            procedure.clone(),
+            mapped_args,
+            Rc::new(move |value| {
+                let mut next = results.clone();
+                next.push(value);
+                Action::MapIter {
+                    procedure: procedure.clone(),
+                    lists: lists.clone(),
+                    index: index + 1,
+                    results: next,
+                    cont: cont.clone(),
+                }
+            }),
+        )
     }
 }
 
@@ -443,6 +927,7 @@ enum Value {
     Bool(bool),
     String(String),
     Char(char),
+    Symbol(String),
     List(Vec<Value>),
     Procedure(Procedure),
     Void,
@@ -456,6 +941,7 @@ impl Value {
             Value::Bool(false) => "#f".to_string(),
             Value::String(value) => quote_string(value),
             Value::Char(value) => char_literal(*value),
+            Value::Symbol(value) => value.clone(),
             Value::List(items) => {
                 let parts = items
                     .iter()
@@ -482,6 +968,7 @@ impl Value {
             Value::Bool(_) => "boolean",
             Value::String(_) => "string",
             Value::Char(_) => "character",
+            Value::Symbol(_) => "symbol",
             Value::List(_) => "list",
             Value::Procedure(_) => "procedure",
             Value::Void => "void",
@@ -493,6 +980,7 @@ impl Value {
 enum Procedure {
     Builtin(Builtin),
     Lambda(Lambda),
+    Continuation(ContRef),
 }
 
 #[derive(Clone)]
@@ -523,6 +1011,11 @@ enum Builtin {
     Display,
     Write,
     Newline,
+    Not,
+    Null,
+    Car,
+    Cdr,
+    CallCc,
 }
 
 impl Builtin {
@@ -546,6 +1039,11 @@ impl Builtin {
             Builtin::Display => "display",
             Builtin::Write => "write",
             Builtin::Newline => "newline",
+            Builtin::Not => "not",
+            Builtin::Null => "null?",
+            Builtin::Car => "car",
+            Builtin::Cdr => "cdr",
+            Builtin::CallCc => "call/cc",
         }
     }
 }
@@ -578,6 +1076,17 @@ impl Environment {
                 .and_then(|parent| parent.borrow().lookup(name))
         })
     }
+
+    fn set(&mut self, name: &str, value: Value) -> bool {
+        if let Some(slot) = self.bindings.get_mut(name) {
+            *slot = value;
+            true
+        } else if let Some(parent) = &self.parent {
+            parent.borrow_mut().set(name, value)
+        } else {
+            false
+        }
+    }
 }
 
 fn global_env() -> EnvRef {
@@ -601,6 +1110,12 @@ fn global_env() -> EnvRef {
         ("display", Builtin::Display),
         ("write", Builtin::Write),
         ("newline", Builtin::Newline),
+        ("not", Builtin::Not),
+        ("null?", Builtin::Null),
+        ("car", Builtin::Car),
+        ("cdr", Builtin::Cdr),
+        ("call/cc", Builtin::CallCc),
+        ("call-with-current-continuation", Builtin::CallCc),
     ];
 
     {
@@ -633,6 +1148,17 @@ fn parse_parameters(items: &[Expr]) -> Result<Vec<String>, EvalError> {
         }
     }
     Ok(params)
+}
+
+fn quote_expr(expr: &Expr) -> Value {
+    match expr {
+        Expr::Int(value) => Value::Int(*value),
+        Expr::Bool(value) => Value::Bool(*value),
+        Expr::String(value) => Value::String(value.clone()),
+        Expr::Char(value) => Value::Char(*value),
+        Expr::Symbol(value) => Value::Symbol(value.clone()),
+        Expr::List(items) => Value::List(items.iter().map(quote_expr).collect()),
+    }
 }
 
 fn require_exact_arity(got: usize, expected: usize, name: &str) -> Result<(), EvalError> {
@@ -770,12 +1296,19 @@ impl Parser {
             Some('(') => self.parse_list(),
             Some('"') => self.parse_string(),
             Some(')') => Err(EvalError::Parse("unexpected ')'".to_string())),
-            Some('\'') => Err(EvalError::Parse(
-                "quote syntax is not supported in this level".to_string(),
-            )),
+            Some('\'') => self.parse_quote_shorthand(),
             Some(_) => self.parse_atom(),
             None => Err(EvalError::Parse("unexpected end of input".to_string())),
         }
+    }
+
+    fn parse_quote_shorthand(&mut self) -> Result<Expr, EvalError> {
+        self.consume('\'')?;
+        let quoted = self.parse_expr()?;
+        Ok(Expr::List(vec![
+            Expr::Symbol("quote".to_string()),
+            quoted,
+        ]))
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {
@@ -867,7 +1400,7 @@ impl Parser {
     fn read_token(&mut self) -> String {
         let start = self.pos;
         while let Some(ch) = self.peek() {
-            if ch.is_whitespace() || matches!(ch, '(' | ')' | ';') {
+            if ch.is_whitespace() || matches!(ch, '(' | ')' | ';' | '\'') {
                 break;
             }
             self.pos += 1;

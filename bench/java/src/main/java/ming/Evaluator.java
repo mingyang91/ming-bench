@@ -38,15 +38,50 @@ public class Evaluator {
         StringBuilder previousOutput = currentOutput;
         currentOutput = new StringBuilder();
         try {
-            Value last = VoidValue.INSTANCE;
-            for (Expr expr : program) {
-                last = eval(expr, globalEnv);
-            }
-
+            Value last = usesFirstClassContinuations(program)
+                    ? evalProgramWithContinuations(program)
+                    : evalProgramDirect(program);
             return new EvalResult(last.toSchemeString(), currentOutput.toString());
         } finally {
             currentOutput = previousOutput;
         }
+    }
+
+    private Value evalProgramDirect(List<Expr> program) throws EvalError {
+        Value last = VoidValue.INSTANCE;
+        for (Expr expr : program) {
+            last = eval(expr, globalEnv);
+        }
+        return last;
+    }
+
+    private boolean usesFirstClassContinuations(List<Expr> program) {
+        for (Expr expr : program) {
+            if (usesFirstClassContinuations(expr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean usesFirstClassContinuations(Expr expr) {
+        return switch (expr) {
+            case SymbolExpr symbolExpr ->
+                    symbolExpr.name().equals("call/cc")
+                            || symbolExpr.name().equals("call-with-current-continuation");
+            case CapturedSymbolExpr symbolExpr ->
+                    symbolExpr.name().equals("call/cc")
+                            || symbolExpr.name().equals("call-with-current-continuation");
+            case ListExpr listExpr -> {
+                for (Expr element : listExpr.elements()) {
+                    if (usesFirstClassContinuations(element)) {
+                        yield true;
+                    }
+                }
+                yield false;
+            }
+            default -> false;
+        };
     }
 
     private static int detectBenchLevel() {
@@ -111,6 +146,13 @@ public class Evaluator {
         env.define("append", new BuiltinProcedure("append", this::builtinAppend));
         env.define("reverse", new BuiltinProcedure("reverse", this::builtinReverse));
         env.define("apply", new BuiltinProcedure("apply", this::builtinApply));
+        env.define("call/cc", new BuiltinProcedure("call/cc", args -> {
+            throw new EvalError("'call/cc' requires continuation support");
+        }));
+        env.define("call-with-current-continuation",
+                new BuiltinProcedure("call-with-current-continuation", args -> {
+                    throw new EvalError("'call-with-current-continuation' requires continuation support");
+                }));
         env.define("list-ref", new BuiltinProcedure("list-ref", this::builtinListRef));
         env.define("list-tail", new BuiltinProcedure("list-tail", this::builtinListTail));
         env.define("list?", new BuiltinProcedure("list?", this::builtinListPredicate));
@@ -851,6 +893,841 @@ public class Evaluator {
         return continueWith(args.get(args.size() - 1), env);
     }
 
+    private Value evalProgramWithContinuations(List<Expr> program) throws EvalError {
+        return runContinuationMachine(stepEvalSequence(program, 0, globalEnv, DoneStep::new));
+    }
+
+    private Value runContinuationMachine(Step initialStep) throws EvalError {
+        Step current = initialStep;
+        while (true) {
+            switch (current) {
+                case EvalExprStep evalExprStep -> {
+                    try {
+                        current = stepEvalExpr(
+                                evalExprStep.expr(),
+                                evalExprStep.env(),
+                                evalExprStep.cont());
+                    } catch (EvalError err) {
+                        throw attachPosition(err, evalExprStep.expr());
+                    }
+                }
+                case ContinueStep continueStep ->
+                        current = continueStep.cont().apply(continueStep.value());
+                case ApplyStep applyStep ->
+                        current = stepApply(
+                                applyStep.operator(),
+                                applyStep.args(),
+                                applyStep.cont());
+                case DoneStep doneStep -> {
+                    return doneStep.value();
+                }
+            }
+        }
+    }
+
+    private Step stepEvalExpr(Expr expr, Environment env, Continuation cont) throws EvalError {
+        return switch (expr) {
+            case IntExpr intExpr -> new ContinueStep(cont, new IntValue(intExpr.value()));
+            case RationalExpr rationalExpr -> new ContinueStep(
+                    cont,
+                    exactFractionToValue(new ExactFraction(
+                            rationalExpr.numerator(),
+                            rationalExpr.denominator())));
+            case InexactExpr inexactExpr -> new ContinueStep(cont, new InexactValue(inexactExpr.value()));
+            case BoolExpr boolExpr -> new ContinueStep(cont, BoolValue.of(boolExpr.value()));
+            case StringExpr stringExpr -> new ContinueStep(cont, new StringValue(stringExpr.value()));
+            case CharExpr charExpr -> new ContinueStep(cont, new CharValue(charExpr.value()));
+            case SymbolExpr symbolExpr -> new ContinueStep(cont, env.lookup(symbolExpr.name()));
+            case CapturedSymbolExpr symbolExpr -> new ContinueStep(cont, symbolExpr.env().lookup(symbolExpr.name()));
+            case ListExpr listExpr -> stepEvalList(listExpr, env, cont);
+        };
+    }
+
+    private Step stepEvalList(ListExpr expr, Environment env, Continuation cont) throws EvalError {
+        List<Expr> elements = expr.elements();
+        if (elements.isEmpty()) {
+            throw new EvalError("cannot evaluate empty list");
+        }
+
+        Expr head = elements.getFirst();
+        List<Expr> args = elements.subList(1, elements.size());
+        if (head instanceof SymbolExpr symbol) {
+            String name = symbol.name();
+            return switch (name) {
+                case "define" -> stepEvalDefine(args, env, cont);
+                case "define-syntax" -> new ContinueStep(cont, evalDefineSyntax(args, env));
+                case "define-record-type" -> new ContinueStep(cont, evalDefineRecordType(args, env));
+                case "set!" -> stepEvalSet(args, env, cont);
+                case "if" -> stepEvalIf(args, env, cont);
+                case "quote" -> new ContinueStep(cont, evalQuote(args));
+                case "lambda" -> new ContinueStep(cont, evalLambda(args, env));
+                case "case-lambda" -> new ContinueStep(cont, evalCaseLambda(args, env));
+                case "begin" -> stepEvalSequence(args, 0, env, cont);
+                case "let" -> stepEvalLet(args, env, cont);
+                case "let*" -> stepEvalLetStar(args, env, cont);
+                case "letrec" -> stepEvalLetrec(args, env, cont, false);
+                case "letrec*" -> stepEvalLetrec(args, env, cont, true);
+                case "case" -> stepEvalCase(args, env, cont);
+                case "do" -> stepEvalDo(args, env, cont);
+                case "cond" -> stepEvalCond(args, 0, env, cont);
+                case "and" -> stepEvalAnd(args, 0, env, cont);
+                case "or" -> stepEvalOr(args, 0, env, cont);
+                default -> {
+                    Macro macro = macros.get(name);
+                    if (macro != null) {
+                        yield new EvalExprStep(expandMacro(macro, expr), env, cont);
+                    }
+                    yield stepEvalApplication(head, args, env, cont);
+                }
+            };
+        }
+
+        return stepEvalApplication(head, args, env, cont);
+    }
+
+    private Step stepEvalApplication(
+            Expr operatorExpr,
+            List<Expr> argExprs,
+            Environment env,
+            Continuation cont) {
+        return new EvalExprStep(
+                operatorExpr,
+                env,
+                operator -> stepEvalExprList(
+                        argExprs,
+                        argExprs.size(),
+                        env,
+                        List.of(),
+                        args -> new ApplyStep(operator, args, cont)));
+    }
+
+    private Step stepEvalDefine(List<Expr> args, Environment env, Continuation cont) throws EvalError {
+        if (args.size() < 2) {
+            throw new EvalError("'define' expects a target and a value");
+        }
+
+        Expr target = args.getFirst();
+        if (target instanceof SymbolExpr symbol) {
+            if (args.size() != 2) {
+                throw new EvalError("variable define expects exactly 2 arguments");
+            }
+            return new EvalExprStep(
+                    args.get(1),
+                    env,
+                    value -> {
+                        env.define(symbol.name(), value);
+                        return new ContinueStep(cont, VoidValue.INSTANCE);
+                    });
+        }
+
+        if (target instanceof ListExpr signature) {
+            List<Expr> signatureElements = signature.elements();
+            if (signatureElements.isEmpty()) {
+                throw new EvalError("function define requires a function name");
+            }
+
+            Expr nameExpr = signatureElements.getFirst();
+            if (!(nameExpr instanceof SymbolExpr functionName)) {
+                throw new EvalError("function define requires a symbol name");
+            }
+
+            ParameterSpec params = parseParameterSpec(
+                    signatureElements.subList(1, signatureElements.size()));
+            List<Expr> body = List.copyOf(args.subList(1, args.size()));
+            env.define(functionName.name(), new ClosureValue(functionName.name(), params, body, env));
+            return new ContinueStep(cont, VoidValue.INSTANCE);
+        }
+
+        throw new EvalError("invalid define target");
+    }
+
+    private Step stepEvalSet(List<Expr> args, Environment env, Continuation cont) throws EvalError {
+        requireArgCount(args.size(), 2, "set!");
+
+        Expr target = args.getFirst();
+        return new EvalExprStep(
+                args.get(1),
+                env,
+                value -> {
+                    if (target instanceof SymbolExpr symbol) {
+                        env.set(symbol.name(), value);
+                        return new ContinueStep(cont, VoidValue.INSTANCE);
+                    }
+                    if (target instanceof CapturedSymbolExpr symbol) {
+                        symbol.env().set(symbol.name(), value);
+                        return new ContinueStep(cont, VoidValue.INSTANCE);
+                    }
+                    throw new EvalError("'set!' expects a symbol target");
+                });
+    }
+
+    private Step stepEvalIf(List<Expr> args, Environment env, Continuation cont) throws EvalError {
+        if (args.size() != 2 && args.size() != 3) {
+            throw new EvalError("'if' expects exactly 2 or 3 arguments");
+        }
+        return new EvalExprStep(
+                args.getFirst(),
+                env,
+                condition -> {
+                    if (isTruthy(condition)) {
+                        return new EvalExprStep(args.get(1), env, cont);
+                    }
+                    if (args.size() == 2) {
+                        return new ContinueStep(cont, VoidValue.INSTANCE);
+                    }
+                    return new EvalExprStep(args.get(2), env, cont);
+                });
+    }
+
+    private Step stepEvalSequence(
+            List<Expr> expressions,
+            int index,
+            Environment env,
+            Continuation cont) {
+        if (index >= expressions.size()) {
+            return new ContinueStep(cont, VoidValue.INSTANCE);
+        }
+        if (index + 1 == expressions.size()) {
+            return new EvalExprStep(expressions.get(index), env, cont);
+        }
+        return new EvalExprStep(
+                expressions.get(index),
+                env,
+                ignored -> stepEvalSequence(expressions, index + 1, env, cont));
+    }
+
+    private Step stepEvalExprList(
+            List<Expr> expressions,
+            int index,
+            Environment env,
+            List<Value> evaluated,
+            ValuesContinuation cont) throws EvalError {
+        if (index == 0) {
+            return cont.apply(evaluated);
+        }
+
+        Expr expr = expressions.get(index - 1);
+        return new EvalExprStep(
+                expr,
+                env,
+                value -> {
+                    List<Value> next = new ArrayList<>(evaluated.size() + 1);
+                    next.add(value);
+                    next.addAll(evaluated);
+                    return stepEvalExprList(expressions, index - 1, env, next, cont);
+                });
+    }
+
+    private Step stepApply(Value operator, List<Value> args, Continuation cont) throws EvalError {
+        if (!(operator instanceof ProcedureValue procedure)) {
+            throw new EvalError("attempted to call non-procedure");
+        }
+
+        return switch (procedure) {
+            case BuiltinProcedure builtin -> stepApplyBuiltin(builtin, args, cont);
+            case ClosureValue closure -> stepApplyClosure(closure, args, cont);
+            case CaseLambdaValue caseLambda -> stepApplyCaseLambda(caseLambda, args, cont);
+            case ContinuationProcedure continuation -> {
+                requireArgCount(args.size(), 1, "continuation");
+                yield new ContinueStep(continuation.cont(), args.getFirst());
+            }
+        };
+    }
+
+    private Step stepApplyBuiltin(BuiltinProcedure builtin, List<Value> args, Continuation cont)
+            throws EvalError {
+        return switch (builtin.name()) {
+            case "call/cc", "call-with-current-continuation" -> stepApplyCallCc(args, cont);
+            case "apply" -> stepBuiltinApply(args, cont);
+            case "map" -> stepBuiltinMap(args, cont);
+            case "for-each" -> stepBuiltinForEach(args, cont);
+            default -> new ContinueStep(cont, builtin.fn().apply(args));
+        };
+    }
+
+    private Step stepApplyCallCc(List<Value> args, Continuation cont) throws EvalError {
+        requireArgCount(args.size(), 1, "call/cc");
+        Value captured = new ContinuationProcedure(cont);
+        return new ApplyStep(args.getFirst(), List.of(captured), cont);
+    }
+
+    private Step stepApplyClosure(ClosureValue closure, List<Value> args, Continuation cont)
+            throws EvalError {
+        return stepApplyProcedureClause(
+                closure.params(),
+                closure.body(),
+                closure.env(),
+                args,
+                "wrong number of arguments",
+                cont);
+    }
+
+    private Step stepApplyCaseLambda(CaseLambdaValue caseLambda, List<Value> args, Continuation cont)
+            throws EvalError {
+        for (CaseLambdaClause clause : caseLambda.clauses()) {
+            if (clause.params().accepts(args.size())) {
+                return stepApplyProcedureClause(
+                        clause.params(),
+                        clause.body(),
+                        caseLambda.env(),
+                        args,
+                        "wrong number of arguments",
+                        cont);
+            }
+        }
+
+        throw new EvalError("wrong number of arguments");
+    }
+
+    private Step stepApplyProcedureClause(
+            ParameterSpec params,
+            List<Expr> body,
+            Environment lexicalEnv,
+            List<Value> args,
+            String arityMessage,
+            Continuation cont) throws EvalError {
+        if (!params.accepts(args.size())) {
+            throw new EvalError(arityMessage);
+        }
+
+        Environment callEnv = new Environment(lexicalEnv);
+        for (int i = 0; i < params.fixedParams().size(); i++) {
+            callEnv.define(params.fixedParams().get(i), args.get(i));
+        }
+        if (params.restParam() != null) {
+            callEnv.define(
+                    params.restParam(),
+                    listFromElements(args.subList(params.fixedParams().size(), args.size())));
+        }
+
+        return stepEvalSequence(body, 0, callEnv, cont);
+    }
+
+    private Step stepBuiltinApply(List<Value> args, Continuation cont) throws EvalError {
+        requireAtLeastArgCount(args.size(), 2, "apply");
+
+        List<Value> appliedArgs = new ArrayList<>();
+        for (int i = 1; i < args.size() - 1; i++) {
+            appliedArgs.add(args.get(i));
+        }
+        appliedArgs.addAll(requireList(args.getLast(), "apply"));
+        return new ApplyStep(args.getFirst(), appliedArgs, cont);
+    }
+
+    private Step stepBuiltinMap(List<Value> args, Continuation cont) throws EvalError {
+        requireAtLeastArgCount(args.size(), 2, "map");
+        Value procedure = args.getFirst();
+        List<List<Value>> lists = new ArrayList<>(args.size() - 1);
+        int limit = Integer.MAX_VALUE;
+        for (int i = 1; i < args.size(); i++) {
+            List<Value> list = requireList(args.get(i), "map");
+            lists.add(list);
+            limit = Math.min(limit, list.size());
+        }
+        return stepBuiltinMapIter(procedure, lists, limit, 0, List.of(), cont);
+    }
+
+    private Step stepBuiltinMapIter(
+            Value procedure,
+            List<List<Value>> lists,
+            int limit,
+            int index,
+            List<Value> results,
+            Continuation cont) {
+        if (index >= limit) {
+            return new ContinueStep(cont, listFromElements(results));
+        }
+
+        List<Value> callArgs = new ArrayList<>(lists.size());
+        for (List<Value> list : lists) {
+            callArgs.add(list.get(index));
+        }
+        return new ApplyStep(
+                procedure,
+                callArgs,
+                value -> {
+                    List<Value> next = new ArrayList<>(results.size() + 1);
+                    next.addAll(results);
+                    next.add(value);
+                    return stepBuiltinMapIter(procedure, lists, limit, index + 1, next, cont);
+                });
+    }
+
+    private Step stepBuiltinForEach(List<Value> args, Continuation cont) throws EvalError {
+        requireAtLeastArgCount(args.size(), 2, "for-each");
+        Value procedure = args.getFirst();
+        List<List<Value>> lists = new ArrayList<>(args.size() - 1);
+        int limit = Integer.MAX_VALUE;
+        for (int i = 1; i < args.size(); i++) {
+            List<Value> list = requireList(args.get(i), "for-each");
+            lists.add(list);
+            limit = Math.min(limit, list.size());
+        }
+        return stepBuiltinForEachIter(procedure, lists, limit, 0, cont);
+    }
+
+    private Step stepBuiltinForEachIter(
+            Value procedure,
+            List<List<Value>> lists,
+            int limit,
+            int index,
+            Continuation cont) {
+        if (index >= limit) {
+            return new ContinueStep(cont, VoidValue.INSTANCE);
+        }
+
+        List<Value> callArgs = new ArrayList<>(lists.size());
+        for (List<Value> list : lists) {
+            callArgs.add(list.get(index));
+        }
+        return new ApplyStep(
+                procedure,
+                callArgs,
+                ignored -> stepBuiltinForEachIter(procedure, lists, limit, index + 1, cont));
+    }
+
+    private Step stepEvalLet(List<Expr> args, Environment env, Continuation cont) throws EvalError {
+        if (args.size() < 2) {
+            throw new EvalError("'let' expects bindings and a body");
+        }
+
+        Expr head = args.getFirst();
+        if (head instanceof SymbolExpr name) {
+            return stepEvalNamedLet(name.name(), args.subList(1, args.size()), env, cont);
+        }
+
+        List<Binding> bindings = parseBindings(head);
+        List<Expr> body = List.copyOf(args.subList(1, args.size()));
+        return stepEvalBindingValues(
+                bindings,
+                0,
+                env,
+                List.of(),
+                values -> {
+                    Environment letEnv = new Environment(env);
+                    for (int i = 0; i < bindings.size(); i++) {
+                        letEnv.define(bindings.get(i).name(), values.get(i));
+                    }
+                    return stepEvalSequence(body, 0, letEnv, cont);
+                });
+    }
+
+    private Step stepEvalNamedLet(
+            String name,
+            List<Expr> args,
+            Environment env,
+            Continuation cont) throws EvalError {
+        if (args.size() < 2) {
+            throw new EvalError("'let' expects bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(args.getFirst());
+        List<String> params = new ArrayList<>(bindings.size());
+        for (Binding binding : bindings) {
+            params.add(binding.name());
+        }
+
+        return stepEvalBindingValues(
+                bindings,
+                0,
+                env,
+                List.of(),
+                values -> {
+                    Environment closureEnv = new Environment(env);
+                    ClosureValue closure = new ClosureValue(
+                            name,
+                            new ParameterSpec(List.copyOf(params), null),
+                            List.copyOf(args.subList(1, args.size())),
+                            closureEnv);
+                    closureEnv.define(name, closure);
+                    return stepApplyClosure(closure, values, cont);
+                });
+    }
+
+    private Step stepEvalBindingValues(
+            List<Binding> bindings,
+            int index,
+            Environment env,
+            List<Value> values,
+            ValuesContinuation cont) throws EvalError {
+        if (index >= bindings.size()) {
+            return cont.apply(values);
+        }
+
+        Binding binding = bindings.get(index);
+        return new EvalExprStep(
+                binding.valueExpr(),
+                env,
+                value -> {
+                    List<Value> next = new ArrayList<>(values.size() + 1);
+                    next.addAll(values);
+                    next.add(value);
+                    return stepEvalBindingValues(bindings, index + 1, env, next, cont);
+                });
+    }
+
+    private Step stepEvalLetStar(List<Expr> args, Environment env, Continuation cont)
+            throws EvalError {
+        if (args.size() < 2) {
+            throw new EvalError("'let*' expects bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(args.getFirst());
+        Environment letStarEnv = new Environment(env);
+        return stepEvalLetStarBindings(
+                bindings,
+                0,
+                letStarEnv,
+                List.copyOf(args.subList(1, args.size())),
+                cont);
+    }
+
+    private Step stepEvalLetStarBindings(
+            List<Binding> bindings,
+            int index,
+            Environment letStarEnv,
+            List<Expr> body,
+            Continuation cont) throws EvalError {
+        if (index >= bindings.size()) {
+            return stepEvalSequence(body, 0, letStarEnv, cont);
+        }
+
+        Binding binding = bindings.get(index);
+        return new EvalExprStep(
+                binding.valueExpr(),
+                letStarEnv,
+                value -> {
+                    letStarEnv.define(binding.name(), value);
+                    return stepEvalLetStarBindings(bindings, index + 1, letStarEnv, body, cont);
+                });
+    }
+
+    private Step stepEvalLetrec(List<Expr> args, Environment env, Continuation cont, boolean sequential)
+            throws EvalError {
+        if (args.size() < 2) {
+            throw new EvalError("'" + (sequential ? "letrec*" : "letrec")
+                    + "' expects bindings and a body");
+        }
+
+        List<Binding> bindings = parseBindings(args.getFirst());
+        Environment letrecEnv = new Environment(env);
+        for (Binding binding : bindings) {
+            letrecEnv.define(binding.name(), null);
+        }
+
+        List<Expr> body = List.copyOf(args.subList(1, args.size()));
+        if (sequential) {
+            return stepEvalLetrecSequential(bindings, 0, letrecEnv, body, cont);
+        }
+        return stepEvalLetrecBindings(bindings, 0, letrecEnv, List.of(), body, cont);
+    }
+
+    private Step stepEvalLetrecBindings(
+            List<Binding> bindings,
+            int index,
+            Environment letrecEnv,
+            List<Value> values,
+            List<Expr> body,
+            Continuation cont) throws EvalError {
+        if (index >= bindings.size()) {
+            for (int i = 0; i < bindings.size(); i++) {
+                letrecEnv.set(bindings.get(i).name(), values.get(i));
+            }
+            return stepEvalSequence(body, 0, letrecEnv, cont);
+        }
+
+        Binding binding = bindings.get(index);
+        return new EvalExprStep(
+                binding.valueExpr(),
+                letrecEnv,
+                value -> {
+                    List<Value> next = new ArrayList<>(values.size() + 1);
+                    next.addAll(values);
+                    next.add(value);
+                    return stepEvalLetrecBindings(bindings, index + 1, letrecEnv, next, body, cont);
+                });
+    }
+
+    private Step stepEvalLetrecSequential(
+            List<Binding> bindings,
+            int index,
+            Environment letrecEnv,
+            List<Expr> body,
+            Continuation cont) throws EvalError {
+        if (index >= bindings.size()) {
+            return stepEvalSequence(body, 0, letrecEnv, cont);
+        }
+
+        Binding binding = bindings.get(index);
+        return new EvalExprStep(
+                binding.valueExpr(),
+                letrecEnv,
+                value -> {
+                    letrecEnv.set(binding.name(), value);
+                    return stepEvalLetrecSequential(bindings, index + 1, letrecEnv, body, cont);
+                });
+    }
+
+    private Step stepEvalCase(List<Expr> args, Environment env, Continuation cont) throws EvalError {
+        if (args.isEmpty()) {
+            throw new EvalError("'case' expects a key and clauses");
+        }
+
+        return new EvalExprStep(
+                args.getFirst(),
+                env,
+                key -> stepEvalCaseClauses(key, args, 1, env, cont));
+    }
+
+    private Step stepEvalCaseClauses(
+            Value key,
+            List<Expr> clauses,
+            int index,
+            Environment env,
+            Continuation cont) throws EvalError {
+        if (index >= clauses.size()) {
+            return new ContinueStep(cont, VoidValue.INSTANCE);
+        }
+
+        Expr clauseExpr = clauses.get(index);
+        if (!(clauseExpr instanceof ListExpr clause)) {
+            throw new EvalError("'case' clauses must be lists");
+        }
+
+        List<Expr> clauseElements = clause.elements();
+        if (clauseElements.isEmpty()) {
+            throw new EvalError("'case' clause cannot be empty");
+        }
+
+        Expr head = clauseElements.getFirst();
+        if (head instanceof SymbolExpr symbol && symbol.name().equals("else")) {
+            if (index != clauses.size() - 1) {
+                throw new EvalError("'case' else clause must be last");
+            }
+            return stepEvalSequence(clauseElements.subList(1, clauseElements.size()), 0, env, cont);
+        }
+
+        if (!(head instanceof ListExpr datums)) {
+            throw new EvalError("'case' clause datum list must be a list");
+        }
+
+        for (Expr datumExpr : datums.elements()) {
+            if (isEqv(key, quoteToValue(datumExpr))) {
+                return stepEvalSequence(clauseElements.subList(1, clauseElements.size()), 0, env, cont);
+            }
+        }
+        return stepEvalCaseClauses(key, clauses, index + 1, env, cont);
+    }
+
+    private Step stepEvalDo(List<Expr> args, Environment env, Continuation cont) throws EvalError {
+        if (args.size() < 2) {
+            throw new EvalError("'do' expects variable bindings and a test clause");
+        }
+
+        List<DoBinding> bindings = parseDoBindings(args.getFirst());
+        if (!(args.get(1) instanceof ListExpr testClause) || testClause.elements().isEmpty()) {
+            throw new EvalError("'do' expects a non-empty test clause");
+        }
+
+        return stepEvalDoInitBindings(
+                bindings,
+                0,
+                env,
+                List.of(),
+                testClause.elements(),
+                List.copyOf(args.subList(2, args.size())),
+                cont);
+    }
+
+    private Step stepEvalDoInitBindings(
+            List<DoBinding> bindings,
+            int index,
+            Environment env,
+            List<Value> initialValues,
+            List<Expr> testElements,
+            List<Expr> commands,
+            Continuation cont) throws EvalError {
+        if (index >= bindings.size()) {
+            Environment loopEnv = new Environment(env);
+            for (int i = 0; i < bindings.size(); i++) {
+                loopEnv.define(bindings.get(i).name(), initialValues.get(i));
+            }
+            return stepEvalDoLoop(bindings, testElements, commands, loopEnv, cont);
+        }
+
+        DoBinding binding = bindings.get(index);
+        return new EvalExprStep(
+                binding.initExpr(),
+                env,
+                value -> {
+                    List<Value> next = new ArrayList<>(initialValues.size() + 1);
+                    next.addAll(initialValues);
+                    next.add(value);
+                    return stepEvalDoInitBindings(
+                            bindings,
+                            index + 1,
+                            env,
+                            next,
+                            testElements,
+                            commands,
+                            cont);
+                });
+    }
+
+    private Step stepEvalDoLoop(
+            List<DoBinding> bindings,
+            List<Expr> testElements,
+            List<Expr> commands,
+            Environment loopEnv,
+            Continuation cont) {
+        return new EvalExprStep(
+                testElements.getFirst(),
+                loopEnv,
+                testValue -> {
+                    if (isTruthy(testValue)) {
+                        return stepEvalSequence(testElements.subList(1, testElements.size()), 0, loopEnv, cont);
+                    }
+                    return stepEvalSequence(
+                            commands,
+                            0,
+                            loopEnv,
+                            ignored -> stepEvalDoSteps(
+                                    bindings,
+                                    0,
+                                    loopEnv,
+                                    List.of(),
+                                    testElements,
+                                    commands,
+                                    cont));
+                });
+    }
+
+    private Step stepEvalDoSteps(
+            List<DoBinding> bindings,
+            int index,
+            Environment loopEnv,
+            List<Value> nextValues,
+            List<Expr> testElements,
+            List<Expr> commands,
+            Continuation cont) throws EvalError {
+        if (index >= bindings.size()) {
+            for (int i = 0; i < bindings.size(); i++) {
+                loopEnv.set(bindings.get(i).name(), nextValues.get(i));
+            }
+            return stepEvalDoLoop(bindings, testElements, commands, loopEnv, cont);
+        }
+
+        DoBinding binding = bindings.get(index);
+        if (binding.stepExpr() == null) {
+            List<Value> next = new ArrayList<>(nextValues.size() + 1);
+            next.addAll(nextValues);
+            next.add(loopEnv.lookup(binding.name()));
+            return stepEvalDoSteps(bindings, index + 1, loopEnv, next, testElements, commands, cont);
+        }
+
+        return new EvalExprStep(
+                binding.stepExpr(),
+                loopEnv,
+                value -> {
+                    List<Value> next = new ArrayList<>(nextValues.size() + 1);
+                    next.addAll(nextValues);
+                    next.add(value);
+                    return stepEvalDoSteps(
+                            bindings,
+                            index + 1,
+                            loopEnv,
+                            next,
+                            testElements,
+                            commands,
+                            cont);
+                });
+    }
+
+    private Step stepEvalCond(
+            List<Expr> clauses,
+            int index,
+            Environment env,
+            Continuation cont) throws EvalError {
+        if (index >= clauses.size()) {
+            return new ContinueStep(cont, VoidValue.INSTANCE);
+        }
+
+        Expr clauseExpr = clauses.get(index);
+        if (!(clauseExpr instanceof ListExpr clause)) {
+            throw new EvalError("'cond' clauses must be lists");
+        }
+
+        List<Expr> clauseElements = clause.elements();
+        if (clauseElements.isEmpty()) {
+            throw new EvalError("'cond' clause cannot be empty");
+        }
+
+        Expr testExpr = clauseElements.getFirst();
+        boolean isElseClause = testExpr instanceof SymbolExpr symbol
+                && symbol.name().equals("else");
+        if (isElseClause && index != clauses.size() - 1) {
+            throw new EvalError("'cond' else clause must be last");
+        }
+
+        if (isElseClause) {
+            return stepEvalSequence(clauseElements.subList(1, clauseElements.size()), 0, env, cont);
+        }
+
+        return new EvalExprStep(
+                testExpr,
+                env,
+                testResult -> {
+                    if (isTruthy(testResult)) {
+                        if (clauseElements.size() == 1) {
+                            return new ContinueStep(cont, testResult);
+                        }
+                        return stepEvalSequence(clauseElements.subList(1, clauseElements.size()), 0, env, cont);
+                    }
+                    return stepEvalCond(clauses, index + 1, env, cont);
+                });
+    }
+
+    private Step stepEvalAnd(
+            List<Expr> expressions,
+            int index,
+            Environment env,
+            Continuation cont) {
+        if (index >= expressions.size()) {
+            return new ContinueStep(cont, BoolValue.TRUE);
+        }
+
+        boolean last = index + 1 == expressions.size();
+        return new EvalExprStep(
+                expressions.get(index),
+                env,
+                value -> {
+                    if (!isTruthy(value) || last) {
+                        return new ContinueStep(cont, value);
+                    }
+                    return stepEvalAnd(expressions, index + 1, env, cont);
+                });
+    }
+
+    private Step stepEvalOr(
+            List<Expr> expressions,
+            int index,
+            Environment env,
+            Continuation cont) {
+        if (index >= expressions.size()) {
+            return new ContinueStep(cont, BoolValue.FALSE);
+        }
+
+        return new EvalExprStep(
+                expressions.get(index),
+                env,
+                value -> {
+                    if (isTruthy(value)) {
+                        return new ContinueStep(cont, value);
+                    }
+                    return stepEvalOr(expressions, index + 1, env, cont);
+                });
+    }
+
     private Macro parseMacro(String name, Expr transformerExpr, Environment env) throws EvalError {
         if (!(transformerExpr instanceof ListExpr transformer)) {
             throw new EvalError("'define-syntax' expects a syntax-rules transformer");
@@ -1422,6 +2299,8 @@ public class Evaluator {
             case BuiltinProcedure builtin -> returnValue(builtin.fn().apply(args));
             case ClosureValue closure -> applyClosure(closure, args);
             case CaseLambdaValue caseLambda -> applyCaseLambda(caseLambda, args);
+            case ContinuationProcedure ignored ->
+                    throw new EvalError("continuation application requires continuation support");
         };
     }
 
@@ -3030,6 +3909,21 @@ public class Evaluator {
     private record ContinueEvalAction(Expr expr, Environment env) implements EvalAction {
     }
 
+    private sealed interface Step permits EvalExprStep, ContinueStep, ApplyStep, DoneStep {
+    }
+
+    private record EvalExprStep(Expr expr, Environment env, Continuation cont) implements Step {
+    }
+
+    private record ContinueStep(Continuation cont, Value value) implements Step {
+    }
+
+    private record ApplyStep(Value operator, List<Value> args, Continuation cont) implements Step {
+    }
+
+    private record DoneStep(Value value) implements Step {
+    }
+
     private record FieldSpec(String fieldName, String accessorName) {
     }
 
@@ -3133,7 +4027,7 @@ public class Evaluator {
     }
 
     private sealed interface ProcedureValue extends Value
-            permits BuiltinProcedure, ClosureValue, CaseLambdaValue {
+            permits BuiltinProcedure, ClosureValue, CaseLambdaValue, ContinuationProcedure {
     }
 
     private record IntValue(long value) implements NumericValue {
@@ -3357,6 +4251,13 @@ public class Evaluator {
         }
     }
 
+    private record ContinuationProcedure(Continuation cont) implements ProcedureValue {
+        @Override
+        public String toSchemeString() {
+            return "#<procedure>";
+        }
+    }
+
     private enum VoidValue implements Value {
         INSTANCE;
 
@@ -3369,6 +4270,16 @@ public class Evaluator {
     @FunctionalInterface
     private interface BuiltinFn {
         Value apply(List<Value> args) throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface Continuation {
+        Step apply(Value value) throws EvalError;
+    }
+
+    @FunctionalInterface
+    private interface ValuesContinuation {
+        Step apply(List<Value> values) throws EvalError;
     }
 
     @FunctionalInterface
