@@ -250,6 +250,8 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
         return absNumber(expectNumber(args[0], 'abs', pos));
       }),
     ],
+    ['gcd', builtin('gcd', (args, pos) => gcdNumbers(args, pos))],
+    ['lcm', builtin('lcm', (args, pos) => lcmNumbers(args, pos))],
     [
       'modulo',
       builtin('modulo', (args, pos) => {
@@ -300,6 +302,20 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
         const base = expectNumber(args[0], 'expt', pos);
         const exponent = expectInteger(args[1], 'expt', pos);
         return exptNumber(base, exponent, pos);
+      }),
+    ],
+    [
+      'truncate',
+      builtin('truncate', (args, pos) => {
+        expectArity('truncate', args, 1, pos);
+        return truncateNumber(expectNumber(args[0], 'truncate', pos));
+      }),
+    ],
+    [
+      'round',
+      builtin('round', (args, pos) => {
+        expectArity('round', args, 1, pos);
+        return roundNumber(expectNumber(args[0], 'round', pos));
       }),
     ],
     [
@@ -356,6 +372,23 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
       builtin('cdr', (args, pos) => {
         expectArity('cdr', args, 1, pos);
         return expectPair(args[0], 'cdr', pos).cdr;
+      }),
+    ],
+    ...createPairAccessors(),
+    [
+      'set-car!',
+      builtin('set-car!', (args, pos) => {
+        expectArity('set-car!', args, 2, pos);
+        expectPair(args[0], 'set-car!', pos).car = args[1];
+        return VOID;
+      }),
+    ],
+    [
+      'set-cdr!',
+      builtin('set-cdr!', (args, pos) => {
+        expectArity('set-cdr!', args, 2, pos);
+        expectPair(args[0], 'set-cdr!', pos).cdr = args[1];
+        return VOID;
       }),
     ],
     [
@@ -466,6 +499,13 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
     ],
     ['append', builtin('append', (args, pos) => appendLists(args, pos))],
     [
+      'reverse',
+      builtin('reverse', (args, pos) => {
+        expectArity('reverse', args, 1, pos);
+        return listToPairs(listToArray(args[0], 'reverse', pos).slice().reverse());
+      }),
+    ],
+    [
       'assoc',
       builtin('assoc', (args, pos) => {
         expectArity('assoc', args, 2, pos);
@@ -473,10 +513,52 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
       }),
     ],
     [
+      'assq',
+      builtin('assq', (args, pos) => {
+        expectArity('assq', args, 2, pos);
+        return assocWithComparator(args[0], args[1], 'assq', pos, isEqValue);
+      }),
+    ],
+    [
+      'assv',
+      builtin('assv', (args, pos) => {
+        expectArity('assv', args, 2, pos);
+        return assocWithComparator(args[0], args[1], 'assv', pos, isEqValue);
+      }),
+    ],
+    [
+      'memq',
+      builtin('memq', (args, pos) => {
+        expectArity('memq', args, 2, pos);
+        return memberWithComparator(args[0], args[1], 'memq', pos, isEqValue);
+      }),
+    ],
+    [
+      'memv',
+      builtin('memv', (args, pos) => {
+        expectArity('memv', args, 2, pos);
+        return memberWithComparator(args[0], args[1], 'memv', pos, isEqValue);
+      }),
+    ],
+    [
+      'member',
+      builtin('member', (args, pos) => {
+        expectArity('member', args, 2, pos);
+        return memberWithComparator(args[0], args[1], 'member', pos, isEqualValue);
+      }),
+    ],
+    [
       'map',
       builtin('map', (args, pos) => {
         expectAtLeastArity('map', args, 2, pos);
         return mapLists(args[0], args.slice(1), pos);
+      }),
+    ],
+    [
+      'for-each',
+      builtin('for-each', (args, pos) => {
+        expectAtLeastArity('for-each', args, 2, pos);
+        return forEachLists(args[0], args.slice(1), pos);
       }),
     ],
     [
@@ -574,6 +656,13 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
       }),
     ],
     [
+      'error',
+      builtin('error', (args, pos) => {
+        expectAtLeastArity('error', args, 1, pos);
+        throw new EvalError(args.map((arg) => formatDisplayValue(arg)).join(' '), pos);
+      }),
+    ],
+    [
       'apply',
       builtin('apply', (args, pos) => {
         expectAtLeastArity('apply', args, 2, pos);
@@ -598,6 +687,24 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
         expectArity('string-length', args, 1, pos);
         return makeExactInteger(BigInt(expectStringValue(args[0], 'string-length', pos).chars.length));
       }),
+    ],
+    [
+      'make-string',
+      builtin('make-string', (args, pos) => {
+        if (args.length !== 1 && args.length !== 2) {
+          throw new EvalError(`make-string expected 1 or 2 argument(s), got ${args.length}`, pos);
+        }
+
+        const length = expectIndex(args[0], 'make-string', pos);
+        const fill = args[1] === undefined ? ' ' : expectChar(args[1], 'make-string', pos).value;
+        return makeString(Array.from({ length }, () => fill));
+      }),
+    ],
+    [
+      'string',
+      builtin('string', (args, pos) =>
+        makeString(args.map((arg) => expectChar(arg, 'string', pos).value)),
+      ),
     ],
     [
       'substring',
@@ -815,6 +922,24 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
       'string<?',
       builtin('string<?', (args, pos) =>
         compareStringChain('string<?', args, (left, right) => left < right, pos),
+      ),
+    ],
+    [
+      'string>?',
+      builtin('string>?', (args, pos) =>
+        compareStringChain('string>?', args, (left, right) => left > right, pos),
+      ),
+    ],
+    [
+      'string<=?',
+      builtin('string<=?', (args, pos) =>
+        compareStringChain('string<=?', args, (left, right) => left <= right, pos),
+      ),
+    ],
+    [
+      'string>=?',
+      builtin('string>=?', (args, pos) =>
+        compareStringChain('string>=?', args, (left, right) => left >= right, pos),
       ),
     ],
     [
@@ -1104,6 +1229,8 @@ function evaluateListStep(elements: Expr[], env: Environment, pos: SourcePositio
         return evaluateCaseStep(argumentExprs, env, operatorExpr.pos);
       case 'let':
         return evaluateLetStep(argumentExprs, env, operatorExpr.pos);
+      case 'let*':
+        return evaluateLetStarStep(argumentExprs, env, operatorExpr.pos);
       case 'letrec':
         return evaluateLetrecStep(argumentExprs, env, operatorExpr.pos, false);
       case 'letrec*':
@@ -1521,6 +1648,22 @@ function evaluateLetStep(expressions: Expr[], env: Environment, pos: SourcePosit
   }
 
   return evaluateSequenceStep(bodyExprs, letEnv);
+}
+
+function evaluateLetStarStep(expressions: Expr[], env: Environment, pos: SourcePosition): EvaluationStep {
+  if (expressions.length < 2) {
+    throw new EvalError(`let* expected at least 2 argument(s), got ${expressions.length}`, pos);
+  }
+
+  const [bindingsExpr, ...bodyExprs] = expressions;
+  const bindings = parseBindings(bindingsExpr, 'let*');
+  const letStarEnv = new Environment(env);
+
+  for (const binding of bindings) {
+    letStarEnv.define(binding.name, evaluate(binding.valueExpr, letStarEnv));
+  }
+
+  return evaluateSequenceStep(bodyExprs, letStarEnv);
 }
 
 function evaluateLetrecStep(
@@ -2663,6 +2806,40 @@ function builtin(
   return { kind: 'builtin', name, apply };
 }
 
+function createPairAccessors(): Array<[string, BuiltinValue]> {
+  const accessors: Array<[string, BuiltinValue]> = [];
+
+  for (let length = 2; length <= 4; length += 1) {
+    const combinations = 1 << length;
+
+    for (let mask = 0; mask < combinations; mask += 1) {
+      const operations: Array<'a' | 'd'> = [];
+
+      for (let bit = length - 1; bit >= 0; bit -= 1) {
+        operations.push(((mask >> bit) & 1) === 0 ? 'a' : 'd');
+      }
+
+      const name = `c${operations.join('')}r`;
+      accessors.push([
+        name,
+        builtin(name, (args, pos) => {
+          expectArity(name, args, 1, pos);
+          let current = args[0];
+
+          for (let index = operations.length - 1; index >= 0; index -= 1) {
+            const pair = expectPair(current, name, pos);
+            current = operations[index] === 'a' ? pair.car : pair.cdr;
+          }
+
+          return current;
+        }),
+      ]);
+    }
+  }
+
+  return accessors;
+}
+
 function errorWithPosition(error: unknown, pos: SourcePosition): EvalError {
   if (error instanceof EvalError) {
     return error.position === undefined ? new EvalError(error.message, pos) : error;
@@ -3090,8 +3267,14 @@ function listTail(value: SchemeValue, index: number, pos: SourcePosition): Schem
 function listToArray(value: SchemeValue, name: string, pos: SourcePosition): SchemeValue[] {
   const elements: SchemeValue[] = [];
   let current = value;
+  const seenPairs = new Set<PairValue>();
 
   while (isPair(current)) {
+    if (seenPairs.has(current)) {
+      throw new EvalError(`${name} expected a list`, pos);
+    }
+
+    seenPairs.add(current);
     elements.push(current.car);
     current = current.cdr;
   }
@@ -3115,8 +3298,14 @@ function appendLists(args: SchemeValue[], pos: SourcePosition): SchemeValue {
 
 function isProperList(value: SchemeValue): boolean {
   let current = value;
+  const seenPairs = new Set<PairValue>();
 
   while (isPair(current)) {
+    if (seenPairs.has(current)) {
+      return false;
+    }
+
+    seenPairs.add(current);
     current = current.cdr;
   }
 
@@ -3124,12 +3313,28 @@ function isProperList(value: SchemeValue): boolean {
 }
 
 function assoc(key: SchemeValue, value: SchemeValue, pos: SourcePosition): SchemeValue {
+  return assocWithComparator(key, value, 'assoc', pos, isEqualValue);
+}
+
+function assocWithComparator(
+  key: SchemeValue,
+  value: SchemeValue,
+  name: string,
+  pos: SourcePosition,
+  comparator: (left: SchemeValue, right: SchemeValue) => boolean,
+): SchemeValue {
   let current = value;
+  const seenPairs = new Set<PairValue>();
 
   while (isPair(current)) {
-    const entry = expectPair(current.car, 'assoc', pos);
+    if (seenPairs.has(current)) {
+      throw new EvalError(`${name} expected a list`, pos);
+    }
 
-    if (isEqualValue(key, entry.car)) {
+    seenPairs.add(current);
+    const entry = expectPair(current.car, name, pos);
+
+    if (comparator(key, entry.car)) {
       return entry;
     }
 
@@ -3137,21 +3342,59 @@ function assoc(key: SchemeValue, value: SchemeValue, pos: SourcePosition): Schem
   }
 
   if (!isEmptyList(current)) {
-    throw new EvalError('assoc expected a list', pos);
+    throw new EvalError(`${name} expected a list`, pos);
   }
 
   return false;
 }
 
-function mapLists(procedure: SchemeValue, lists: SchemeValue[], pos: SourcePosition): SchemeValue {
-  const arrays = lists.map((list) => listToArray(list, 'map', pos));
+function memberWithComparator(
+  key: SchemeValue,
+  value: SchemeValue,
+  name: string,
+  pos: SourcePosition,
+  comparator: (left: SchemeValue, right: SchemeValue) => boolean,
+): SchemeValue {
+  let current = value;
+  const seenPairs = new Set<PairValue>();
+
+  while (isPair(current)) {
+    if (seenPairs.has(current)) {
+      throw new EvalError(`${name} expected a list`, pos);
+    }
+
+    seenPairs.add(current);
+
+    if (comparator(key, current.car)) {
+      return current;
+    }
+
+    current = current.cdr;
+  }
+
+  if (!isEmptyList(current)) {
+    throw new EvalError(`${name} expected a list`, pos);
+  }
+
+  return false;
+}
+
+function listArgumentsToArrays(lists: SchemeValue[], name: string, pos: SourcePosition): SchemeValue[][] {
+  const arrays = lists.map((list) => listToArray(list, name, pos));
   const length = arrays[0].length;
 
   for (const array of arrays) {
     if (array.length !== length) {
-      throw new EvalError('map expected lists of equal length', pos);
+      throw new EvalError(`${name} expected lists of equal length`, pos);
     }
   }
+
+  return arrays;
+}
+
+function mapLists(procedure: SchemeValue, lists: SchemeValue[], pos: SourcePosition): SchemeValue {
+  const arrays = listArgumentsToArrays(lists, 'map', pos);
+  const length = arrays[0].length;
 
   const results: SchemeValue[] = [];
 
@@ -3160,6 +3403,17 @@ function mapLists(procedure: SchemeValue, lists: SchemeValue[], pos: SourcePosit
   }
 
   return listToPairs(results);
+}
+
+function forEachLists(procedure: SchemeValue, lists: SchemeValue[], pos: SourcePosition): SchemeValue {
+  const arrays = listArgumentsToArrays(lists, 'for-each', pos);
+  const length = arrays[0].length;
+
+  for (let index = 0; index < length; index += 1) {
+    applyProcedure(procedure, arrays.map((array) => array[index]), pos);
+  }
+
+  return VOID;
 }
 
 function numericToInexact(value: NumberValue): number {
@@ -3172,6 +3426,71 @@ function numericToInexact(value: NumberValue): number {
 
 function exactToInexact(value: NumberValue): NumberValue {
   return value.exact ? makeInexactNumber(numericToInexact(value)) : value;
+}
+
+function integerToBigInt(value: NumberValue, name: string, pos: SourcePosition): bigint {
+  return exactNumberParts(expectInteger(value, name, pos), name, pos).numerator;
+}
+
+function gcdNumbers(args: SchemeValue[], pos: SourcePosition): NumberValue {
+  if (args.length === 0) {
+    return EXACT_ZERO;
+  }
+
+  let result = 0n;
+
+  for (const arg of args) {
+    result = bigintGcd(result, integerToBigInt(expectNumber(arg, 'gcd', pos), 'gcd', pos));
+  }
+
+  return makeExactInteger(result);
+}
+
+function lcmNumbers(args: SchemeValue[], pos: SourcePosition): NumberValue {
+  if (args.length === 0) {
+    return EXACT_ONE;
+  }
+
+  let result = 1n;
+
+  for (const arg of args) {
+    const value = integerToBigInt(expectNumber(arg, 'lcm', pos), 'lcm', pos);
+    if (value === 0n || result === 0n) {
+      result = 0n;
+      continue;
+    }
+
+    result = bigintAbs((result / bigintGcd(result, value)) * value);
+  }
+
+  return makeExactInteger(result);
+}
+
+function truncateNumber(value: NumberValue): NumberValue {
+  if (value.exact) {
+    return makeExactInteger(value.numerator / value.denominator);
+  }
+
+  return makeInexactNumber(Math.trunc(value.value));
+}
+
+function roundNumber(value: NumberValue): NumberValue {
+  if (!value.exact) {
+    return makeInexactNumber(Math.round(value.value));
+  }
+
+  if (value.denominator === 1n) {
+    return value;
+  }
+
+  let rounded = value.numerator / value.denominator;
+  const remainder = bigintAbs(value.numerator % value.denominator);
+
+  if (remainder * 2n >= value.denominator) {
+    rounded += value.numerator >= 0n ? 1n : -1n;
+  }
+
+  return makeExactInteger(rounded);
 }
 
 function decimalStringToExact(raw: string): ExactNumberValue {
@@ -3671,6 +3990,14 @@ function isEqValue(left: SchemeValue, right: SchemeValue): boolean {
 }
 
 function isEqualValue(left: SchemeValue, right: SchemeValue): boolean {
+  return isEqualValueInternal(left, right, new WeakMap<object, WeakSet<object>>());
+}
+
+function isEqualValueInternal(
+  left: SchemeValue,
+  right: SchemeValue,
+  seenComparisons: WeakMap<object, WeakSet<object>>,
+): boolean {
   if (isEqValue(left, right)) {
     return true;
   }
@@ -3680,17 +4007,63 @@ function isEqualValue(left: SchemeValue, right: SchemeValue): boolean {
   }
 
   if (isPair(left) && isPair(right)) {
-    return isEqualValue(left.car, right.car) && isEqualValue(left.cdr, right.cdr);
+    if (hasSeenComparison(seenComparisons, left, right)) {
+      return true;
+    }
+
+    markSeenComparison(seenComparisons, left, right);
+    return (
+      isEqualValueInternal(left.car, right.car, seenComparisons) &&
+      isEqualValueInternal(left.cdr, right.cdr, seenComparisons)
+    );
   }
 
   if (isVectorValue(left) && isVectorValue(right)) {
+    if (hasSeenComparison(seenComparisons, left, right)) {
+      return true;
+    }
+
+    markSeenComparison(seenComparisons, left, right);
     return (
       left.elements.length === right.elements.length &&
-      left.elements.every((value, index) => isEqualValue(value, right.elements[index]))
+      left.elements.every((value, index) =>
+        isEqualValueInternal(value, right.elements[index], seenComparisons),
+      )
     );
   }
 
   return false;
+}
+
+function hasSeenComparison(
+  seenComparisons: WeakMap<object, WeakSet<object>>,
+  left: object,
+  right: object,
+): boolean {
+  return seenComparisons.get(left)?.has(right) ?? false;
+}
+
+function markSeenComparison(
+  seenComparisons: WeakMap<object, WeakSet<object>>,
+  left: object,
+  right: object,
+): void {
+  addSeenComparison(seenComparisons, left, right);
+  addSeenComparison(seenComparisons, right, left);
+}
+
+function addSeenComparison(
+  seenComparisons: WeakMap<object, WeakSet<object>>,
+  left: object,
+  right: object,
+): void {
+  let rightValues = seenComparisons.get(left);
+  if (rightValues === undefined) {
+    rightValues = new WeakSet<object>();
+    seenComparisons.set(left, rightValues);
+  }
+
+  rightValues.add(right);
 }
 
 function charCode(value: string): number {
@@ -3710,6 +4083,14 @@ function formatNumberValue(value: NumberValue): string {
 }
 
 function formatValue(value: SchemeValue): string {
+  return formatValueInternal(value, false, new Set<object>());
+}
+
+function formatDisplayValue(value: SchemeValue): string {
+  return formatValueInternal(value, true, new Set<object>());
+}
+
+function formatValueInternal(value: SchemeValue, display: boolean, path: Set<object>): string {
   if (isNumberValue(value)) {
     return formatNumberValue(value);
   }
@@ -3719,11 +4100,11 @@ function formatValue(value: SchemeValue): string {
   }
 
   if (isStringValue(value)) {
-    return JSON.stringify(value.chars.join(''));
+    return display ? value.chars.join('') : JSON.stringify(value.chars.join(''));
   }
 
   if (isChar(value)) {
-    return formatCharLiteral(value.value);
+    return display ? value.value : formatCharLiteral(value.value);
   }
 
   if (isBuiltin(value)) {
@@ -3743,11 +4124,11 @@ function formatValue(value: SchemeValue): string {
   }
 
   if (isVectorValue(value)) {
-    return formatVector(value, formatValue);
+    return formatVectorInternal(value, display, path);
   }
 
   if (isPair(value)) {
-    return formatPair(value);
+    return formatPairInternal(value, display, path);
   }
 
   if (isEmptyList(value)) {
@@ -3765,56 +4146,67 @@ function formatValue(value: SchemeValue): string {
   throw new EvalError('cannot format value');
 }
 
-function formatDisplayValue(value: SchemeValue): string {
-  if (isStringValue(value)) {
-    return value.chars.join('');
-  }
-
-  if (isChar(value)) {
-    return value.value;
-  }
-
-  if (isPair(value)) {
-    return formatDisplayPair(value);
-  }
-
-  if (isVectorValue(value)) {
-    return formatVector(value, formatDisplayValue);
-  }
-
-  return formatValue(value);
-}
-
 function formatPair(pair: PairValue): string {
-  const parts: string[] = [];
-  let current: SchemeValue = pair;
-
-  while (isPair(current)) {
-    parts.push(formatValue(current.car));
-    current = current.cdr;
-  }
-
-  if (isEmptyList(current)) {
-    return `(${parts.join(' ')})`;
-  }
-
-  return `(${parts.join(' ')} . ${formatValue(current)})`;
+  return formatPairInternal(pair, false, new Set<object>());
 }
 
 function formatDisplayPair(pair: PairValue): string {
+  return formatPairInternal(pair, true, new Set<object>());
+}
+
+function formatPairInternal(pair: PairValue, display: boolean, path: Set<object>): string {
+  if (path.has(pair)) {
+    return '#<cycle>';
+  }
+
   const parts: string[] = [];
-  let current: SchemeValue = pair;
+  let current = pair;
+  const pathEntries: object[] = [];
 
-  while (isPair(current)) {
-    parts.push(formatDisplayValue(current.car));
-    current = current.cdr;
+  path.add(pair);
+  pathEntries.push(pair);
+
+  try {
+    while (true) {
+      parts.push(formatValueInternal(current.car, display, path));
+      const next = current.cdr;
+
+      if (isPair(next)) {
+        if (path.has(next)) {
+          return `(${parts.join(' ')} . #<cycle>)`;
+        }
+
+        path.add(next);
+        pathEntries.push(next);
+        current = next;
+        continue;
+      }
+
+      if (isEmptyList(next)) {
+        return `(${parts.join(' ')})`;
+      }
+
+      return `(${parts.join(' ')} . ${formatValueInternal(next, display, path)})`;
+    }
+  } finally {
+    for (const entry of pathEntries) {
+      path.delete(entry);
+    }
+  }
+}
+
+function formatVectorInternal(vector: VectorValue, display: boolean, path: Set<object>): string {
+  if (path.has(vector)) {
+    return '#<cycle>';
   }
 
-  if (isEmptyList(current)) {
-    return `(${parts.join(' ')})`;
-  }
+  path.add(vector);
 
-  return `(${parts.join(' ')} . ${formatDisplayValue(current)})`;
+  try {
+    return formatVector(vector, (value) => formatValueInternal(value, display, path));
+  } finally {
+    path.delete(vector);
+  }
 }
 
 function formatVector(vector: VectorValue, formatter: (value: SchemeValue) => string): string {

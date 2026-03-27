@@ -66,6 +66,8 @@ function createBuiltins(context) {
                 return absNumber(expectNumber(args[0], 'abs', pos));
             }),
         ],
+        ['gcd', builtin('gcd', (args, pos) => gcdNumbers(args, pos))],
+        ['lcm', builtin('lcm', (args, pos) => lcmNumbers(args, pos))],
         [
             'modulo',
             builtin('modulo', (args, pos) => {
@@ -116,6 +118,20 @@ function createBuiltins(context) {
                 const base = expectNumber(args[0], 'expt', pos);
                 const exponent = expectInteger(args[1], 'expt', pos);
                 return exptNumber(base, exponent, pos);
+            }),
+        ],
+        [
+            'truncate',
+            builtin('truncate', (args, pos) => {
+                expectArity('truncate', args, 1, pos);
+                return truncateNumber(expectNumber(args[0], 'truncate', pos));
+            }),
+        ],
+        [
+            'round',
+            builtin('round', (args, pos) => {
+                expectArity('round', args, 1, pos);
+                return roundNumber(expectNumber(args[0], 'round', pos));
             }),
         ],
         [
@@ -172,6 +188,23 @@ function createBuiltins(context) {
             builtin('cdr', (args, pos) => {
                 expectArity('cdr', args, 1, pos);
                 return expectPair(args[0], 'cdr', pos).cdr;
+            }),
+        ],
+        ...createPairAccessors(),
+        [
+            'set-car!',
+            builtin('set-car!', (args, pos) => {
+                expectArity('set-car!', args, 2, pos);
+                expectPair(args[0], 'set-car!', pos).car = args[1];
+                return VOID;
+            }),
+        ],
+        [
+            'set-cdr!',
+            builtin('set-cdr!', (args, pos) => {
+                expectArity('set-cdr!', args, 2, pos);
+                expectPair(args[0], 'set-cdr!', pos).cdr = args[1];
+                return VOID;
             }),
         ],
         [
@@ -277,6 +310,13 @@ function createBuiltins(context) {
         ],
         ['append', builtin('append', (args, pos) => appendLists(args, pos))],
         [
+            'reverse',
+            builtin('reverse', (args, pos) => {
+                expectArity('reverse', args, 1, pos);
+                return listToPairs(listToArray(args[0], 'reverse', pos).slice().reverse());
+            }),
+        ],
+        [
             'assoc',
             builtin('assoc', (args, pos) => {
                 expectArity('assoc', args, 2, pos);
@@ -284,10 +324,52 @@ function createBuiltins(context) {
             }),
         ],
         [
+            'assq',
+            builtin('assq', (args, pos) => {
+                expectArity('assq', args, 2, pos);
+                return assocWithComparator(args[0], args[1], 'assq', pos, isEqValue);
+            }),
+        ],
+        [
+            'assv',
+            builtin('assv', (args, pos) => {
+                expectArity('assv', args, 2, pos);
+                return assocWithComparator(args[0], args[1], 'assv', pos, isEqValue);
+            }),
+        ],
+        [
+            'memq',
+            builtin('memq', (args, pos) => {
+                expectArity('memq', args, 2, pos);
+                return memberWithComparator(args[0], args[1], 'memq', pos, isEqValue);
+            }),
+        ],
+        [
+            'memv',
+            builtin('memv', (args, pos) => {
+                expectArity('memv', args, 2, pos);
+                return memberWithComparator(args[0], args[1], 'memv', pos, isEqValue);
+            }),
+        ],
+        [
+            'member',
+            builtin('member', (args, pos) => {
+                expectArity('member', args, 2, pos);
+                return memberWithComparator(args[0], args[1], 'member', pos, isEqualValue);
+            }),
+        ],
+        [
             'map',
             builtin('map', (args, pos) => {
                 expectAtLeastArity('map', args, 2, pos);
                 return mapLists(args[0], args.slice(1), pos);
+            }),
+        ],
+        [
+            'for-each',
+            builtin('for-each', (args, pos) => {
+                expectAtLeastArity('for-each', args, 2, pos);
+                return forEachLists(args[0], args.slice(1), pos);
             }),
         ],
         [
@@ -385,6 +467,13 @@ function createBuiltins(context) {
             }),
         ],
         [
+            'error',
+            builtin('error', (args, pos) => {
+                expectAtLeastArity('error', args, 1, pos);
+                throw new EvalError(args.map((arg) => formatDisplayValue(arg)).join(' '), pos);
+            }),
+        ],
+        [
             'apply',
             builtin('apply', (args, pos) => {
                 expectAtLeastArity('apply', args, 2, pos);
@@ -405,6 +494,21 @@ function createBuiltins(context) {
                 expectArity('string-length', args, 1, pos);
                 return makeExactInteger(BigInt(expectStringValue(args[0], 'string-length', pos).chars.length));
             }),
+        ],
+        [
+            'make-string',
+            builtin('make-string', (args, pos) => {
+                if (args.length !== 1 && args.length !== 2) {
+                    throw new EvalError(`make-string expected 1 or 2 argument(s), got ${args.length}`, pos);
+                }
+                const length = expectIndex(args[0], 'make-string', pos);
+                const fill = args[1] === undefined ? ' ' : expectChar(args[1], 'make-string', pos).value;
+                return makeString(Array.from({ length }, () => fill));
+            }),
+        ],
+        [
+            'string',
+            builtin('string', (args, pos) => makeString(args.map((arg) => expectChar(arg, 'string', pos).value))),
         ],
         [
             'substring',
@@ -599,6 +703,18 @@ function createBuiltins(context) {
         [
             'string<?',
             builtin('string<?', (args, pos) => compareStringChain('string<?', args, (left, right) => left < right, pos)),
+        ],
+        [
+            'string>?',
+            builtin('string>?', (args, pos) => compareStringChain('string>?', args, (left, right) => left > right, pos)),
+        ],
+        [
+            'string<=?',
+            builtin('string<=?', (args, pos) => compareStringChain('string<=?', args, (left, right) => left <= right, pos)),
+        ],
+        [
+            'string>=?',
+            builtin('string>=?', (args, pos) => compareStringChain('string>=?', args, (left, right) => left >= right, pos)),
         ],
         [
             'string-ci=?',
@@ -833,6 +949,8 @@ function evaluateListStep(elements, env, pos) {
                 return evaluateCaseStep(argumentExprs, env, operatorExpr.pos);
             case 'let':
                 return evaluateLetStep(argumentExprs, env, operatorExpr.pos);
+            case 'let*':
+                return evaluateLetStarStep(argumentExprs, env, operatorExpr.pos);
             case 'letrec':
                 return evaluateLetrecStep(argumentExprs, env, operatorExpr.pos, false);
             case 'letrec*':
@@ -1151,6 +1269,18 @@ function evaluateLetStep(expressions, env, pos) {
         letEnv.define(bindings[index].name, values[index]);
     }
     return evaluateSequenceStep(bodyExprs, letEnv);
+}
+function evaluateLetStarStep(expressions, env, pos) {
+    if (expressions.length < 2) {
+        throw new EvalError(`let* expected at least 2 argument(s), got ${expressions.length}`, pos);
+    }
+    const [bindingsExpr, ...bodyExprs] = expressions;
+    const bindings = parseBindings(bindingsExpr, 'let*');
+    const letStarEnv = new Environment(env);
+    for (const binding of bindings) {
+        letStarEnv.define(binding.name, evaluate(binding.valueExpr, letStarEnv));
+    }
+    return evaluateSequenceStep(bodyExprs, letStarEnv);
 }
 function evaluateLetrecStep(expressions, env, pos, sequential) {
     if (expressions.length < 2) {
@@ -1992,6 +2122,32 @@ class Parser {
 function builtin(name, apply) {
     return { kind: 'builtin', name, apply };
 }
+function createPairAccessors() {
+    const accessors = [];
+    for (let length = 2; length <= 4; length += 1) {
+        const combinations = 1 << length;
+        for (let mask = 0; mask < combinations; mask += 1) {
+            const operations = [];
+            for (let bit = length - 1; bit >= 0; bit -= 1) {
+                operations.push(((mask >> bit) & 1) === 0 ? 'a' : 'd');
+            }
+            const name = `c${operations.join('')}r`;
+            accessors.push([
+                name,
+                builtin(name, (args, pos) => {
+                    expectArity(name, args, 1, pos);
+                    let current = args[0];
+                    for (let index = operations.length - 1; index >= 0; index -= 1) {
+                        const pair = expectPair(current, name, pos);
+                        current = operations[index] === 'a' ? pair.car : pair.cdr;
+                    }
+                    return current;
+                }),
+            ]);
+        }
+    }
+    return accessors;
+}
 function errorWithPosition(error, pos) {
     if (error instanceof EvalError) {
         return error.position === undefined ? new EvalError(error.message, pos) : error;
@@ -2306,7 +2462,12 @@ function listTail(value, index, pos) {
 function listToArray(value, name, pos) {
     const elements = [];
     let current = value;
+    const seenPairs = new Set();
     while (isPair(current)) {
+        if (seenPairs.has(current)) {
+            throw new EvalError(`${name} expected a list`, pos);
+        }
+        seenPairs.add(current);
         elements.push(current.car);
         current = current.cdr;
     }
@@ -2324,38 +2485,82 @@ function appendLists(args, pos) {
 }
 function isProperList(value) {
     let current = value;
+    const seenPairs = new Set();
     while (isPair(current)) {
+        if (seenPairs.has(current)) {
+            return false;
+        }
+        seenPairs.add(current);
         current = current.cdr;
     }
     return isEmptyList(current);
 }
 function assoc(key, value, pos) {
+    return assocWithComparator(key, value, 'assoc', pos, isEqualValue);
+}
+function assocWithComparator(key, value, name, pos, comparator) {
     let current = value;
+    const seenPairs = new Set();
     while (isPair(current)) {
-        const entry = expectPair(current.car, 'assoc', pos);
-        if (isEqualValue(key, entry.car)) {
+        if (seenPairs.has(current)) {
+            throw new EvalError(`${name} expected a list`, pos);
+        }
+        seenPairs.add(current);
+        const entry = expectPair(current.car, name, pos);
+        if (comparator(key, entry.car)) {
             return entry;
         }
         current = current.cdr;
     }
     if (!isEmptyList(current)) {
-        throw new EvalError('assoc expected a list', pos);
+        throw new EvalError(`${name} expected a list`, pos);
     }
     return false;
 }
-function mapLists(procedure, lists, pos) {
-    const arrays = lists.map((list) => listToArray(list, 'map', pos));
+function memberWithComparator(key, value, name, pos, comparator) {
+    let current = value;
+    const seenPairs = new Set();
+    while (isPair(current)) {
+        if (seenPairs.has(current)) {
+            throw new EvalError(`${name} expected a list`, pos);
+        }
+        seenPairs.add(current);
+        if (comparator(key, current.car)) {
+            return current;
+        }
+        current = current.cdr;
+    }
+    if (!isEmptyList(current)) {
+        throw new EvalError(`${name} expected a list`, pos);
+    }
+    return false;
+}
+function listArgumentsToArrays(lists, name, pos) {
+    const arrays = lists.map((list) => listToArray(list, name, pos));
     const length = arrays[0].length;
     for (const array of arrays) {
         if (array.length !== length) {
-            throw new EvalError('map expected lists of equal length', pos);
+            throw new EvalError(`${name} expected lists of equal length`, pos);
         }
     }
+    return arrays;
+}
+function mapLists(procedure, lists, pos) {
+    const arrays = listArgumentsToArrays(lists, 'map', pos);
+    const length = arrays[0].length;
     const results = [];
     for (let index = 0; index < length; index += 1) {
         results.push(applyProcedure(procedure, arrays.map((array) => array[index]), pos));
     }
     return listToPairs(results);
+}
+function forEachLists(procedure, lists, pos) {
+    const arrays = listArgumentsToArrays(lists, 'for-each', pos);
+    const length = arrays[0].length;
+    for (let index = 0; index < length; index += 1) {
+        applyProcedure(procedure, arrays.map((array) => array[index]), pos);
+    }
+    return VOID;
 }
 function numericToInexact(value) {
     if (value.exact) {
@@ -2365,6 +2570,54 @@ function numericToInexact(value) {
 }
 function exactToInexact(value) {
     return value.exact ? makeInexactNumber(numericToInexact(value)) : value;
+}
+function integerToBigInt(value, name, pos) {
+    return exactNumberParts(expectInteger(value, name, pos), name, pos).numerator;
+}
+function gcdNumbers(args, pos) {
+    if (args.length === 0) {
+        return EXACT_ZERO;
+    }
+    let result = 0n;
+    for (const arg of args) {
+        result = bigintGcd(result, integerToBigInt(expectNumber(arg, 'gcd', pos), 'gcd', pos));
+    }
+    return makeExactInteger(result);
+}
+function lcmNumbers(args, pos) {
+    if (args.length === 0) {
+        return EXACT_ONE;
+    }
+    let result = 1n;
+    for (const arg of args) {
+        const value = integerToBigInt(expectNumber(arg, 'lcm', pos), 'lcm', pos);
+        if (value === 0n || result === 0n) {
+            result = 0n;
+            continue;
+        }
+        result = bigintAbs((result / bigintGcd(result, value)) * value);
+    }
+    return makeExactInteger(result);
+}
+function truncateNumber(value) {
+    if (value.exact) {
+        return makeExactInteger(value.numerator / value.denominator);
+    }
+    return makeInexactNumber(Math.trunc(value.value));
+}
+function roundNumber(value) {
+    if (!value.exact) {
+        return makeInexactNumber(Math.round(value.value));
+    }
+    if (value.denominator === 1n) {
+        return value;
+    }
+    let rounded = value.numerator / value.denominator;
+    const remainder = bigintAbs(value.numerator % value.denominator);
+    if (remainder * 2n >= value.denominator) {
+        rounded += value.numerator >= 0n ? 1n : -1n;
+    }
+    return makeExactInteger(rounded);
 }
 function decimalStringToExact(raw) {
     let text = raw;
@@ -2718,6 +2971,9 @@ function isEqValue(left, right) {
     return left === right;
 }
 function isEqualValue(left, right) {
+    return isEqualValueInternal(left, right, new WeakMap());
+}
+function isEqualValueInternal(left, right, seenComparisons) {
     if (isEqValue(left, right)) {
         return true;
     }
@@ -2725,13 +2981,37 @@ function isEqualValue(left, right) {
         return left.chars.join('') === right.chars.join('');
     }
     if (isPair(left) && isPair(right)) {
-        return isEqualValue(left.car, right.car) && isEqualValue(left.cdr, right.cdr);
+        if (hasSeenComparison(seenComparisons, left, right)) {
+            return true;
+        }
+        markSeenComparison(seenComparisons, left, right);
+        return (isEqualValueInternal(left.car, right.car, seenComparisons) &&
+            isEqualValueInternal(left.cdr, right.cdr, seenComparisons));
     }
     if (isVectorValue(left) && isVectorValue(right)) {
+        if (hasSeenComparison(seenComparisons, left, right)) {
+            return true;
+        }
+        markSeenComparison(seenComparisons, left, right);
         return (left.elements.length === right.elements.length &&
-            left.elements.every((value, index) => isEqualValue(value, right.elements[index])));
+            left.elements.every((value, index) => isEqualValueInternal(value, right.elements[index], seenComparisons)));
     }
     return false;
+}
+function hasSeenComparison(seenComparisons, left, right) {
+    return seenComparisons.get(left)?.has(right) ?? false;
+}
+function markSeenComparison(seenComparisons, left, right) {
+    addSeenComparison(seenComparisons, left, right);
+    addSeenComparison(seenComparisons, right, left);
+}
+function addSeenComparison(seenComparisons, left, right) {
+    let rightValues = seenComparisons.get(left);
+    if (rightValues === undefined) {
+        rightValues = new WeakSet();
+        seenComparisons.set(left, rightValues);
+    }
+    rightValues.add(right);
 }
 function charCode(value) {
     return value.codePointAt(0);
@@ -2747,6 +3027,12 @@ function formatNumberValue(value) {
     return Number.isInteger(normalized) ? `${rendered}.0` : rendered;
 }
 function formatValue(value) {
+    return formatValueInternal(value, false, new Set());
+}
+function formatDisplayValue(value) {
+    return formatValueInternal(value, true, new Set());
+}
+function formatValueInternal(value, display, path) {
     if (isNumberValue(value)) {
         return formatNumberValue(value);
     }
@@ -2754,10 +3040,10 @@ function formatValue(value) {
         return value ? '#t' : '#f';
     }
     if (isStringValue(value)) {
-        return JSON.stringify(value.chars.join(''));
+        return display ? value.chars.join('') : JSON.stringify(value.chars.join(''));
     }
     if (isChar(value)) {
-        return formatCharLiteral(value.value);
+        return display ? value.value : formatCharLiteral(value.value);
     }
     if (isBuiltin(value)) {
         return `#<procedure:${value.name}>`;
@@ -2772,10 +3058,10 @@ function formatValue(value) {
         return `#<record:${value.type.name}>`;
     }
     if (isVectorValue(value)) {
-        return formatVector(value, formatValue);
+        return formatVectorInternal(value, display, path);
     }
     if (isPair(value)) {
-        return formatPair(value);
+        return formatPairInternal(value, display, path);
     }
     if (isEmptyList(value)) {
         return '()';
@@ -2788,44 +3074,57 @@ function formatValue(value) {
     }
     throw new EvalError('cannot format value');
 }
-function formatDisplayValue(value) {
-    if (isStringValue(value)) {
-        return value.chars.join('');
-    }
-    if (isChar(value)) {
-        return value.value;
-    }
-    if (isPair(value)) {
-        return formatDisplayPair(value);
-    }
-    if (isVectorValue(value)) {
-        return formatVector(value, formatDisplayValue);
-    }
-    return formatValue(value);
-}
 function formatPair(pair) {
-    const parts = [];
-    let current = pair;
-    while (isPair(current)) {
-        parts.push(formatValue(current.car));
-        current = current.cdr;
-    }
-    if (isEmptyList(current)) {
-        return `(${parts.join(' ')})`;
-    }
-    return `(${parts.join(' ')} . ${formatValue(current)})`;
+    return formatPairInternal(pair, false, new Set());
 }
 function formatDisplayPair(pair) {
+    return formatPairInternal(pair, true, new Set());
+}
+function formatPairInternal(pair, display, path) {
+    if (path.has(pair)) {
+        return '#<cycle>';
+    }
     const parts = [];
     let current = pair;
-    while (isPair(current)) {
-        parts.push(formatDisplayValue(current.car));
-        current = current.cdr;
+    const pathEntries = [];
+    path.add(pair);
+    pathEntries.push(pair);
+    try {
+        while (true) {
+            parts.push(formatValueInternal(current.car, display, path));
+            const next = current.cdr;
+            if (isPair(next)) {
+                if (path.has(next)) {
+                    return `(${parts.join(' ')} . #<cycle>)`;
+                }
+                path.add(next);
+                pathEntries.push(next);
+                current = next;
+                continue;
+            }
+            if (isEmptyList(next)) {
+                return `(${parts.join(' ')})`;
+            }
+            return `(${parts.join(' ')} . ${formatValueInternal(next, display, path)})`;
+        }
     }
-    if (isEmptyList(current)) {
-        return `(${parts.join(' ')})`;
+    finally {
+        for (const entry of pathEntries) {
+            path.delete(entry);
+        }
     }
-    return `(${parts.join(' ')} . ${formatDisplayValue(current)})`;
+}
+function formatVectorInternal(vector, display, path) {
+    if (path.has(vector)) {
+        return '#<cycle>';
+    }
+    path.add(vector);
+    try {
+        return formatVector(vector, (value) => formatValueInternal(value, display, path));
+    }
+    finally {
+        path.delete(vector);
+    }
 }
 function formatVector(vector, formatter) {
     return `#(${vector.elements.map((element) => formatter(element)).join(' ')})`;
