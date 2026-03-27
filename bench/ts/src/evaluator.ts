@@ -22,6 +22,8 @@ function tokenize(input: string): string[] {
     if (/\s/.test(ch)) { i++; continue; }
     // comment
     if (ch === ';') { while (i < input.length && input[i] !== '\n') i++; continue; }
+    // quote shorthand
+    if (ch === "'") { tokens.push("'"); i++; continue; }
     // parens
     if (ch === '(' || ch === ')') { tokens.push(ch); i++; continue; }
     // string literal
@@ -55,6 +57,10 @@ function parse(tokens: string[], pos: { i: number }): SchemeVal {
   if (pos.i >= tokens.length) throw new EvalError('unexpected end of input');
   const tok = tokens[pos.i++];
 
+  if (tok === "'") {
+    const quoted = parse(tokens, pos);
+    return { tag: 'list', val: [{ tag: 'symbol', val: 'quote' }, quoted] };
+  }
   if (tok === '(') {
     const elems: SchemeVal[] = [];
     while (pos.i < tokens.length && tokens[pos.i] !== ')') {
@@ -89,10 +95,28 @@ function parseAll(input: string): SchemeVal[] {
 
 // ── Evaluator ──────────────────────────────────────────────────────────
 
-type Env = Map<string, SchemeVal>;
+type Env = { bindings: Map<string, SchemeVal>; parent: Env | null };
+
+function envLookup(env: Env, name: string): SchemeVal {
+  let cur: Env | null = env;
+  while (cur) {
+    const val = cur.bindings.get(name);
+    if (val !== undefined) return val;
+    cur = cur.parent;
+  }
+  throw new EvalError(`unbound variable: ${name}`);
+}
+
+function envSet(env: Env, name: string, val: SchemeVal): void {
+  env.bindings.set(name, val);
+}
+
+function makeEnv(parent: Env | null): Env {
+  return { bindings: new Map(), parent };
+}
 
 function makeGlobalEnv(): Env {
-  const env: Env = new Map();
+  const env = makeEnv(null);
 
   const numBinop = (fn: (a: number, b: number) => number | boolean) =>
     ({ tag: 'procedure' as const, val: (args: SchemeVal[]) => {
@@ -103,19 +127,19 @@ function makeGlobalEnv(): Env {
     }});
 
   // Arithmetic
-  env.set('+', { tag: 'procedure', val: (args) => {
+  envSet(env, '+', { tag: 'procedure', val: (args) => {
     for (const a of args) if (a.tag !== 'number') throw new EvalError('expected number');
     const nums = args.map(a => (a as { tag: 'number'; val: number }).val);
     return { tag: 'number', val: nums.reduce((a, b) => a + b, 0) };
   }});
 
-  env.set('*', { tag: 'procedure', val: (args) => {
+  envSet(env, '*', { tag: 'procedure', val: (args) => {
     for (const a of args) if (a.tag !== 'number') throw new EvalError('expected number');
     const nums = args.map(a => (a as { tag: 'number'; val: number }).val);
     return { tag: 'number', val: nums.reduce((a, b) => a * b, 1) };
   }});
 
-  env.set('-', { tag: 'procedure', val: (args) => {
+  envSet(env, '-', { tag: 'procedure', val: (args) => {
     if (args.length === 0) throw new EvalError('- requires at least 1 argument');
     for (const a of args) if (a.tag !== 'number') throw new EvalError('expected number');
     const nums = args.map(a => (a as { tag: 'number'; val: number }).val);
@@ -123,7 +147,7 @@ function makeGlobalEnv(): Env {
     return { tag: 'number', val: nums.slice(1).reduce((a, b) => a - b, nums[0]) };
   }});
 
-  env.set('/', { tag: 'procedure', val: (args) => {
+  envSet(env, '/', { tag: 'procedure', val: (args) => {
     if (args.length < 2) throw new EvalError('/ requires at least 2 arguments');
     for (const a of args) if (a.tag !== 'number') throw new EvalError('expected number');
     const nums = args.map(a => (a as { tag: 'number'; val: number }).val);
@@ -145,14 +169,14 @@ function makeGlobalEnv(): Env {
       return { tag: 'boolean' as const, val: true };
     }});
 
-  env.set('<', numCmp((a, b) => a < b));
-  env.set('>', numCmp((a, b) => a > b));
-  env.set('=', numCmp((a, b) => a === b));
-  env.set('<=', numCmp((a, b) => a <= b));
-  env.set('>=', numCmp((a, b) => a >= b));
+  envSet(env, '<', numCmp((a, b) => a < b));
+  envSet(env, '>', numCmp((a, b) => a > b));
+  envSet(env, '=', numCmp((a, b) => a === b));
+  envSet(env, '<=', numCmp((a, b) => a <= b));
+  envSet(env, '>=', numCmp((a, b) => a >= b));
 
   // not
-  env.set('not', { tag: 'procedure', val: (args) => {
+  envSet(env, 'not', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('not requires 1 argument');
     return { tag: 'boolean', val: isFalsy(args[0]) };
   }});
@@ -175,11 +199,8 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     case 'string':
       return expr;
 
-    case 'symbol': {
-      const val = env.get(expr.val);
-      if (val === undefined) throw new EvalError(`unbound variable: ${expr.val}`);
-      return val;
-    }
+    case 'symbol':
+      return envLookup(env, expr.val);
 
     case 'list': {
       const elems = expr.val;
@@ -188,6 +209,69 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
       // Special forms
       if (elems[0].tag === 'symbol') {
         const name = elems[0].val;
+
+        if (name === 'quote') {
+          if (elems.length !== 2) throw new EvalError('quote requires 1 argument');
+          return elems[1];
+        }
+
+        if (name === 'if') {
+          if (elems.length < 3 || elems.length > 4) throw new EvalError('if requires 2 or 3 arguments');
+          const cond = evaluate(elems[1], env);
+          if (isTruthy(cond)) return evaluate(elems[2], env);
+          if (elems.length === 4) return evaluate(elems[3], env);
+          return { tag: 'void' };
+        }
+
+        if (name === 'define') {
+          if (elems.length < 3) throw new EvalError('define requires at least 2 arguments');
+          if (elems[1].tag === 'symbol') {
+            // (define x expr)
+            const val = evaluate(elems[2], env);
+            envSet(env, elems[1].val, val);
+            return { tag: 'void' };
+          }
+          if (elems[1].tag === 'list' && elems[1].val.length > 0 && elems[1].val[0].tag === 'symbol') {
+            // (define (f params...) body...)
+            const fname = elems[1].val[0].val;
+            const params = elems[1].val.slice(1).map(p => {
+              if (p.tag !== 'symbol') throw new EvalError('parameter must be a symbol');
+              return p.val;
+            });
+            const body = elems.slice(2);
+            const closure: SchemeVal = { tag: 'procedure', val: (args: SchemeVal[]) => {
+              if (args.length !== params.length) throw new EvalError(`expected ${params.length} args, got ${args.length}`);
+              const local = makeEnv(env);
+              for (let i = 0; i < params.length; i++) envSet(local, params[i], args[i]);
+              let result: SchemeVal = { tag: 'void' };
+              for (const expr of body) result = evaluate(expr, local);
+              return result;
+            }};
+            envSet(env, fname, closure);
+            return { tag: 'void' };
+          }
+          throw new EvalError('invalid define');
+        }
+
+        if (name === 'lambda') {
+          if (elems.length < 3) throw new EvalError('lambda requires params and body');
+          const paramList = elems[1];
+          if (paramList.tag !== 'list') throw new EvalError('lambda params must be a list');
+          const params = paramList.val.map(p => {
+            if (p.tag !== 'symbol') throw new EvalError('parameter must be a symbol');
+            return p.val;
+          });
+          const body = elems.slice(2);
+          const closedEnv = env;
+          return { tag: 'procedure', val: (args: SchemeVal[]) => {
+            if (args.length !== params.length) throw new EvalError(`expected ${params.length} args, got ${args.length}`);
+            const local = makeEnv(closedEnv);
+            for (let i = 0; i < params.length; i++) envSet(local, params[i], args[i]);
+            let result: SchemeVal = { tag: 'void' };
+            for (const expr of body) result = evaluate(expr, local);
+            return result;
+          }};
+        }
 
         if (name === 'and') {
           if (elems.length === 1) return { tag: 'boolean', val: true };
