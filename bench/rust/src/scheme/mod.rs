@@ -3,8 +3,9 @@ pub mod error;
 pub use error::EvalError;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Evaluate one or more Scheme expressions and return the string
 /// representation of the last result.
@@ -44,9 +45,12 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
 }
 
 type EnvRef = Rc<RefCell<Environment>>;
+type CellRef = Rc<RefCell<Value>>;
 type OutputRef = Rc<RefCell<String>>;
 
-#[derive(Clone, Debug)]
+static MACRO_GENSYM_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug, PartialEq)]
 enum Expr {
     Number(i128),
     Bool(bool),
@@ -94,9 +98,30 @@ struct LambdaProcedure {
     env: EnvRef,
 }
 
+#[derive(Clone)]
+struct MacroRule {
+    pattern: Vec<Expr>,
+    template: Expr,
+}
+
+#[derive(Clone)]
+struct MacroDefinition {
+    name: String,
+    literals: HashSet<String>,
+    rules: Vec<MacroRule>,
+    env: EnvRef,
+}
+
+#[derive(Clone, PartialEq)]
+enum PatternBinding {
+    Single(Expr),
+    Sequence(Vec<Expr>),
+}
+
 struct Environment {
     parent: Option<EnvRef>,
-    bindings: HashMap<String, Value>,
+    bindings: HashMap<String, CellRef>,
+    macros: HashMap<String, Rc<MacroDefinition>>,
 }
 
 impl Environment {
@@ -104,28 +129,60 @@ impl Environment {
         Rc::new(RefCell::new(Self {
             parent,
             bindings: HashMap::new(),
+            macros: HashMap::new(),
         }))
     }
 
     fn define(env: &EnvRef, name: impl Into<String>, value: Value) {
-        env.borrow_mut().bindings.insert(name.into(), value);
+        Self::define_cell(env, name, Rc::new(RefCell::new(value)));
+    }
+
+    fn define_cell(env: &EnvRef, name: impl Into<String>, cell: CellRef) {
+        env.borrow_mut().bindings.insert(name.into(), cell);
+    }
+
+    fn define_macro(env: &EnvRef, name: impl Into<String>, definition: Rc<MacroDefinition>) {
+        env.borrow_mut().macros.insert(name.into(), definition);
+    }
+
+    fn lookup_cell(env: &EnvRef, name: &str) -> Option<CellRef> {
+        let (cell, parent) = {
+            let borrowed = env.borrow();
+            (borrowed.bindings.get(name).cloned(), borrowed.parent.clone())
+        };
+
+        if cell.is_some() {
+            return cell;
+        }
+
+        parent.and_then(|parent| Self::lookup_cell(&parent, name))
+    }
+
+    fn lookup_macro(env: &EnvRef, name: &str) -> Option<Rc<MacroDefinition>> {
+        let (definition, parent) = {
+            let borrowed = env.borrow();
+            (borrowed.macros.get(name).cloned(), borrowed.parent.clone())
+        };
+
+        if definition.is_some() {
+            return definition;
+        }
+
+        parent.and_then(|parent| Self::lookup_macro(&parent, name))
     }
 
     fn lookup(env: &EnvRef, name: &str) -> Result<Value, EvalError> {
-        let (value, parent) = {
-            let borrowed = env.borrow();
-            (
-                borrowed.bindings.get(name).cloned(),
-                borrowed.parent.clone(),
-            )
-        };
-
-        if let Some(value) = value {
-            return Ok(value);
+        if let Some(cell) = Self::lookup_cell(env, name) {
+            return Ok(cell.borrow().clone());
         }
 
-        if let Some(parent) = parent {
-            return Self::lookup(&parent, name);
+        Err(EvalError::msg(format!("unbound variable: {name}")))
+    }
+
+    fn set(env: &EnvRef, name: &str, value: Value) -> Result<(), EvalError> {
+        if let Some(cell) = Self::lookup_cell(env, name) {
+            *cell.borrow_mut() = value;
+            return Ok(());
         }
 
         Err(EvalError::msg(format!("unbound variable: {name}")))
@@ -208,6 +265,8 @@ fn default_env() -> EnvRef {
     define_builtin(&env, "=", builtin_numeric_equals);
     define_builtin(&env, "<=", builtin_less_equal);
     define_builtin(&env, "not", builtin_not);
+    define_builtin(&env, "cons", builtin_cons);
+    define_builtin(&env, "list", builtin_list);
     define_builtin(&env, "null?", builtin_null_predicate);
     define_builtin(&env, "car", builtin_car);
     define_builtin(&env, "cdr", builtin_cdr);
@@ -260,10 +319,18 @@ fn eval_list(items: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, 
             "or" => return eval_or(tail, env, output),
             "begin" => return eval_begin(tail, env, output),
             "define" => return eval_define(tail, env, output),
+            "define-syntax" => return eval_define_syntax(tail, env),
             "if" => return eval_if(tail, env, output),
+            "let" => return eval_let(tail, env, output),
             "quote" => return eval_quote(tail),
+            "set!" => return eval_set(tail, env, output),
             "lambda" => return eval_lambda(tail, env),
             _ => {}
+        }
+
+        if let Some(definition) = Environment::lookup_macro(env, name) {
+            let (expanded, expanded_env) = expand_macro_call(definition.as_ref(), tail, env)?;
+            return eval(&expanded, &expanded_env, output);
         }
     }
 
@@ -325,6 +392,49 @@ fn eval_if(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, Eva
     }
 }
 
+fn eval_let(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::msg("let requires bindings and body"));
+    }
+
+    let Expr::List(bindings) = &args[0] else {
+        return Err(EvalError::msg("let bindings must be a list"));
+    };
+
+    let let_env = Environment::new(Some(Rc::clone(env)));
+    for binding in bindings {
+        let Expr::List(parts) = binding else {
+            return Err(EvalError::msg("let bindings must be pairs"));
+        };
+        if parts.len() != 2 {
+            return Err(EvalError::msg("let bindings must be pairs"));
+        }
+
+        let Expr::Symbol(name) = &parts[0] else {
+            return Err(EvalError::msg("let binding names must be symbols"));
+        };
+
+        let value = eval(&parts[1], env, output)?;
+        Environment::define(&let_env, name.clone(), value);
+    }
+
+    eval_sequence(&args[1..], &let_env, output)
+}
+
+fn eval_set(args: &[Expr], env: &EnvRef, output: &OutputRef) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::msg("set! requires a target and value"));
+    }
+
+    let Expr::Symbol(name) = &args[0] else {
+        return Err(EvalError::msg("set! target must be a symbol"));
+    };
+
+    let value = eval(&args[1], env, output)?;
+    Environment::set(env, name, value)?;
+    Ok(Value::Void)
+}
+
 fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::msg("quote requires exactly one argument"));
@@ -343,6 +453,20 @@ fn eval_lambda(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     };
 
     build_lambda(params, &args[1..], env, None)
+}
+
+fn eval_define_syntax(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::msg("define-syntax requires a name and transformer"));
+    }
+
+    let Expr::Symbol(name) = &args[0] else {
+        return Err(EvalError::msg("define-syntax name must be a symbol"));
+    };
+
+    let definition = parse_syntax_rules(name, &args[1], env)?;
+    Environment::define_macro(env, name.clone(), Rc::new(definition));
+    Ok(Value::Void)
 }
 
 fn build_lambda(
@@ -404,6 +528,334 @@ fn parse_parameter_list(params: &[Expr]) -> Result<(Vec<String>, Option<String>)
     }
 
     Ok((param_names, rest_param))
+}
+
+fn parse_syntax_rules(
+    macro_name: &str,
+    expr: &Expr,
+    env: &EnvRef,
+) -> Result<MacroDefinition, EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::msg(
+            "define-syntax expects a syntax-rules transformer",
+        ));
+    };
+
+    let Some((head, tail)) = items.split_first() else {
+        return Err(EvalError::msg("syntax-rules form cannot be empty"));
+    };
+
+    let Expr::Symbol(name) = head else {
+        return Err(EvalError::msg("invalid syntax-rules transformer"));
+    };
+    if name != "syntax-rules" {
+        return Err(EvalError::msg(
+            "define-syntax expects a syntax-rules transformer",
+        ));
+    }
+    if tail.len() < 2 {
+        return Err(EvalError::msg("syntax-rules requires literals and rules"));
+    }
+
+    let Expr::List(literal_exprs) = &tail[0] else {
+        return Err(EvalError::msg("syntax-rules literals must be a list"));
+    };
+
+    let mut literals = HashSet::with_capacity(literal_exprs.len());
+    for literal in literal_exprs {
+        let Expr::Symbol(name) = literal else {
+            return Err(EvalError::msg("syntax-rules literals must be symbols"));
+        };
+        literals.insert(name.clone());
+    }
+
+    let mut rules = Vec::with_capacity(tail.len() - 1);
+    for rule_expr in &tail[1..] {
+        let Expr::List(rule_items) = rule_expr else {
+            return Err(EvalError::msg("syntax-rules rules must be lists"));
+        };
+        if rule_items.len() != 2 {
+            return Err(EvalError::msg(
+                "syntax-rules rules must contain a pattern and template",
+            ));
+        }
+
+        let Expr::List(pattern_items) = &rule_items[0] else {
+            return Err(EvalError::msg("syntax-rules patterns must be lists"));
+        };
+        let Some((keyword_expr, pattern_tail)) = pattern_items.split_first() else {
+            return Err(EvalError::msg("syntax-rules pattern cannot be empty"));
+        };
+        let Expr::Symbol(keyword) = keyword_expr else {
+            return Err(EvalError::msg("syntax-rules pattern must start with a symbol"));
+        };
+        if keyword != macro_name {
+            return Err(EvalError::msg(format!(
+                "syntax-rules pattern must start with {macro_name}"
+            )));
+        }
+
+        rules.push(MacroRule {
+            pattern: pattern_tail.to_vec(),
+            template: rule_items[1].clone(),
+        });
+    }
+
+    if rules.is_empty() {
+        return Err(EvalError::msg("syntax-rules requires at least one rule"));
+    }
+
+    Ok(MacroDefinition {
+        name: macro_name.to_string(),
+        literals,
+        rules,
+        env: Rc::clone(env),
+    })
+}
+
+fn expand_macro_call(
+    definition: &MacroDefinition,
+    arguments: &[Expr],
+    call_env: &EnvRef,
+) -> Result<(Expr, EnvRef), EvalError> {
+    for rule in &definition.rules {
+        let mut bindings = HashMap::new();
+        if match_list_pattern(&rule.pattern, arguments, &definition.literals, &mut bindings) {
+            let expansion_env = Environment::new(Some(Rc::clone(call_env)));
+            let mut expander = TemplateExpander::new(definition, &expansion_env, bindings);
+            let expanded = expander.expand(&rule.template)?;
+            return Ok((expanded, expansion_env));
+        }
+    }
+
+    Err(EvalError::msg(format!(
+        "no matching syntax-rules clause for {}",
+        definition.name
+    )))
+}
+
+fn match_list_pattern(
+    pattern_items: &[Expr],
+    input_items: &[Expr],
+    literals: &HashSet<String>,
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> bool {
+    if pattern_items.len() >= 2 && is_ellipsis(&pattern_items[pattern_items.len() - 1]) {
+        let repeat_pattern = &pattern_items[pattern_items.len() - 2];
+        let fixed = &pattern_items[..pattern_items.len() - 2];
+        if input_items.len() < fixed.len() {
+            return false;
+        }
+
+        for (pattern, input) in fixed.iter().zip(&input_items[..fixed.len()]) {
+            if !match_pattern(pattern, input, literals, bindings) {
+                return false;
+            }
+        }
+
+        return match_repeated_pattern(repeat_pattern, &input_items[fixed.len()..], literals, bindings);
+    }
+
+    if pattern_items.len() != input_items.len() {
+        return false;
+    }
+
+    for (pattern, input) in pattern_items.iter().zip(input_items) {
+        if !match_pattern(pattern, input, literals, bindings) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn match_pattern(
+    pattern: &Expr,
+    input: &Expr,
+    literals: &HashSet<String>,
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> bool {
+    match pattern {
+        Expr::Number(number) => matches!(input, Expr::Number(other) if other == number),
+        Expr::Bool(value) => matches!(input, Expr::Bool(other) if other == value),
+        Expr::String(value) => matches!(input, Expr::String(other) if other == value),
+        Expr::Symbol(name) => {
+            if name == "..." {
+                return false;
+            }
+            if literals.contains(name) {
+                return matches!(input, Expr::Symbol(other) if other == name);
+            }
+            bind_pattern_variable(name, PatternBinding::Single(input.clone()), bindings)
+        }
+        Expr::List(pattern_items) => match input {
+            Expr::List(input_items) => match_list_pattern(pattern_items, input_items, literals, bindings),
+            _ => false,
+        },
+    }
+}
+
+fn match_repeated_pattern(
+    pattern: &Expr,
+    inputs: &[Expr],
+    literals: &HashSet<String>,
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> bool {
+    match pattern {
+        Expr::Symbol(name) if name != "..." && !literals.contains(name) => {
+            bind_pattern_variable(name, PatternBinding::Sequence(inputs.to_vec()), bindings)
+        }
+        _ => false,
+    }
+}
+
+fn bind_pattern_variable(
+    name: &str,
+    binding: PatternBinding,
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> bool {
+    match bindings.get(name) {
+        Some(existing) => existing == &binding,
+        None => {
+            bindings.insert(name.to_string(), binding);
+            true
+        }
+    }
+}
+
+struct TemplateExpander<'a> {
+    definition: &'a MacroDefinition,
+    alias_env: EnvRef,
+    bindings: HashMap<String, PatternBinding>,
+    renamed: HashMap<String, String>,
+}
+
+impl<'a> TemplateExpander<'a> {
+    fn new(
+        definition: &'a MacroDefinition,
+        alias_env: &EnvRef,
+        bindings: HashMap<String, PatternBinding>,
+    ) -> Self {
+        Self {
+            definition,
+            alias_env: Rc::clone(alias_env),
+            bindings,
+            renamed: HashMap::new(),
+        }
+    }
+
+    fn expand(&mut self, expr: &Expr) -> Result<Expr, EvalError> {
+        match expr {
+            Expr::Number(_) | Expr::Bool(_) | Expr::String(_) => Ok(expr.clone()),
+            Expr::Symbol(name) => self.expand_symbol(name),
+            Expr::List(items) => self.expand_list(items),
+        }
+    }
+
+    fn expand_symbol(&mut self, name: &str) -> Result<Expr, EvalError> {
+        match self.bindings.get(name) {
+            Some(PatternBinding::Single(value)) => Ok(value.clone()),
+            Some(PatternBinding::Sequence(_)) => Err(EvalError::msg(format!(
+                "macro template used repeated variable {name} without ellipsis"
+            ))),
+            None => Ok(Expr::Symbol(self.hygienic_name(name))),
+        }
+    }
+
+    fn expand_list(&mut self, items: &[Expr]) -> Result<Expr, EvalError> {
+        let mut expanded = Vec::with_capacity(items.len());
+        let mut index = 0;
+
+        while index < items.len() {
+            if index + 1 < items.len() && is_ellipsis(&items[index + 1]) {
+                self.expand_repetition(&items[index], &mut expanded)?;
+                index += 2;
+                continue;
+            }
+
+            expanded.push(self.expand(&items[index])?);
+            index += 1;
+        }
+
+        Ok(Expr::List(expanded))
+    }
+
+    fn expand_repetition(
+        &mut self,
+        expr: &Expr,
+        expanded: &mut Vec<Expr>,
+    ) -> Result<(), EvalError> {
+        match expr {
+            Expr::Symbol(name) => match self.bindings.get(name) {
+                Some(PatternBinding::Sequence(values)) => {
+                    expanded.extend(values.iter().cloned());
+                    Ok(())
+                }
+                Some(PatternBinding::Single(_)) => Err(EvalError::msg(format!(
+                    "macro template repeated non-sequence variable {name}"
+                ))),
+                None => Err(EvalError::msg(format!(
+                    "macro template uses ellipsis with non-pattern variable {name}"
+                ))),
+            },
+            _ => Err(EvalError::msg(
+                "macro templates only support identifier ellipses at this level",
+            )),
+        }
+    }
+
+    fn hygienic_name(&mut self, name: &str) -> String {
+        if name == "..."
+            || name == "."
+            || name == self.definition.name
+            || is_core_syntax(name)
+            || Environment::lookup_macro(&self.definition.env, name).is_some()
+        {
+            return name.to_string();
+        }
+
+        if let Some(existing) = self.renamed.get(name) {
+            return existing.clone();
+        }
+
+        let fresh = fresh_macro_name(name);
+        if let Some(cell) = Environment::lookup_cell(&self.definition.env, name) {
+            Environment::define_cell(&self.alias_env, fresh.clone(), cell);
+        }
+        self.renamed.insert(name.to_string(), fresh.clone());
+        fresh
+    }
+}
+
+fn is_core_syntax(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "or"
+            | "begin"
+            | "define"
+            | "define-syntax"
+            | "if"
+            | "lambda"
+            | "let"
+            | "quote"
+            | "set!"
+            | "syntax-rules"
+    )
+}
+
+fn is_ellipsis(expr: &Expr) -> bool {
+    matches!(expr, Expr::Symbol(name) if name == "...")
+}
+
+fn fresh_macro_name(name: &str) -> String {
+    let counter = MACRO_GENSYM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sanitized: String = name
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    let suffix = if sanitized.is_empty() { "_" } else { &sanitized };
+    format!("__macro_{counter}_{suffix}")
 }
 
 fn eval_sequence(
@@ -573,6 +1025,23 @@ fn builtin_less_equal(arguments: &[Value], _output: &OutputRef) -> Result<Value,
 fn builtin_not(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
     ensure_exactly("not", arguments.len(), 1)?;
     Ok(Value::Bool(!arguments[0].is_truthy()))
+}
+
+fn builtin_cons(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    ensure_exactly("cons", arguments.len(), 2)?;
+    match &arguments[1] {
+        Value::List(values) => {
+            let mut list = Vec::with_capacity(values.len() + 1);
+            list.push(arguments[0].clone());
+            list.extend(values.iter().cloned());
+            Ok(Value::List(list))
+        }
+        _ => Err(EvalError::msg("cons expects a list as its second argument")),
+    }
+}
+
+fn builtin_list(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {
+    Ok(Value::List(arguments.to_vec()))
 }
 
 fn builtin_null_predicate(arguments: &[Value], _output: &OutputRef) -> Result<Value, EvalError> {

@@ -126,6 +126,9 @@ final class Interpreter {
             if ("define".equals(symbolName)) {
                 return evalDefine(listExpr, env);
             }
+            if ("define-syntax".equals(symbolName)) {
+                return evalDefineSyntax(listExpr, env);
+            }
             if ("if".equals(symbolName)) {
                 return evalIf(listExpr, env);
             }
@@ -152,6 +155,17 @@ final class Interpreter {
             }
             if ("or".equals(symbolName)) {
                 return evalOr(listExpr.elements().subList(1, listExpr.elements().size()), env);
+            }
+
+            SyntaxRulesMacro definition = env.lookupMacro(symbolName);
+            if (definition != null) {
+                MacroExpansion expansion = SyntaxRulesSupport.expandMacroCall(
+                        definition,
+                        listExpr.elements().subList(1, listExpr.elements().size()),
+                        env,
+                        listExpr.loc()
+                );
+                return eval(expansion.expression(), expansion.environment());
             }
         }
 
@@ -207,6 +221,23 @@ final class Interpreter {
         }
 
         throw error(target.loc(), "define requires a symbol or parameter list");
+    }
+
+    private Value evalDefineSyntax(ListExpr listExpr, Environment env) throws EvalError {
+        ensureExactlyExpressions("define-syntax", listExpr, 3);
+
+        Expr nameExpr = listExpr.elements().get(1);
+        if (!(nameExpr instanceof SymbolExpr nameSymbol)) {
+            throw error(nameExpr.loc(), "define-syntax name must be a symbol");
+        }
+
+        SyntaxRulesMacro definition = SyntaxRulesSupport.parseSyntaxRules(
+                nameSymbol.name(),
+                listExpr.elements().get(2),
+                env
+        );
+        env.defineMacro(nameSymbol.name(), definition);
+        return VOID;
     }
 
     private Value evalIf(ListExpr listExpr, Environment env) throws EvalError {
