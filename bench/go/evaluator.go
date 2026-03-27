@@ -21,6 +21,7 @@ type SymbolVal struct{ Name string }
 type PairVal struct{ Car, Cdr Value }
 type NilVal struct{} // empty list
 type VoidVal struct{}
+type CharVal struct{ Val rune }
 
 type LambdaVal struct {
 	Params []string
@@ -44,6 +45,7 @@ func (v *StringVal) String() string  { return fmt.Sprintf("%q", v.Val) }
 func (v *SymbolVal) String() string  { return v.Name }
 func (v *NilVal) String() string     { return "()" }
 func (v *VoidVal) String() string    { return "" }
+func (v *CharVal) String() string     { return fmt.Sprintf("#\\%c", v.Val) }
 func (v *LambdaVal) String() string  { return "#<procedure>" }
 func (v *BuiltinVal) String() string { return "#<builtin:" + v.Name + ">" }
 
@@ -632,7 +634,7 @@ func applyProcAt(op Value, args []Value, callSite Expr) (Value, error) {
 
 // --------------- Builtins ---------------
 
-func makeBuiltinEnv() *Env {
+func makeBuiltinEnv(outBuf *strings.Builder) *Env {
 	env := newEnv(nil)
 
 	addBuiltin := func(name string, fn func([]Value) (Value, error)) {
@@ -879,7 +881,190 @@ func makeBuiltinEnv() *Env {
 		return &BoolVal{Val: ok}, nil
 	})
 
+	addBuiltin("char?", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "char? requires 1 argument"}
+		}
+		_, ok := args[0].(*CharVal)
+		return &BoolVal{Val: ok}, nil
+	})
+
+	// L05: display, write, newline
+	addBuiltin("display", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "display requires 1 argument"}
+		}
+		if outBuf != nil {
+			outBuf.WriteString(displayValue(args[0]))
+		}
+		return &VoidVal{}, nil
+	})
+
+	addBuiltin("write", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "write requires 1 argument"}
+		}
+		if outBuf != nil {
+			outBuf.WriteString(args[0].String())
+		}
+		return &VoidVal{}, nil
+	})
+
+	addBuiltin("newline", func(args []Value) (Value, error) {
+		if len(args) != 0 {
+			return nil, &EvalError{Message: "newline requires 0 arguments"}
+		}
+		if outBuf != nil {
+			outBuf.WriteByte('\n')
+		}
+		return &VoidVal{}, nil
+	})
+
+	// L05: string operations
+	addBuiltin("string-append", func(args []Value) (Value, error) {
+		var buf strings.Builder
+		for _, a := range args {
+			s, ok := a.(*StringVal)
+			if !ok {
+				return nil, &EvalError{Message: "string-append: expected string"}
+			}
+			buf.WriteString(s.Val)
+		}
+		return &StringVal{Val: buf.String()}, nil
+	})
+
+	addBuiltin("string-length", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string-length requires 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-length: expected string"}
+		}
+		return &IntVal{Val: int64(len(s.Val))}, nil
+	})
+
+	addBuiltin("substring", func(args []Value) (Value, error) {
+		if len(args) != 3 {
+			return nil, &EvalError{Message: "substring requires 3 arguments"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "substring: expected string"}
+		}
+		start, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "substring: expected number"}
+		}
+		end, ok := args[2].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "substring: expected number"}
+		}
+		return &StringVal{Val: s.Val[start.Val:end.Val]}, nil
+	})
+
+	addBuiltin("string->number", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->number requires 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string->number: expected string"}
+		}
+		n, err := strconv.ParseInt(s.Val, 10, 64)
+		if err != nil {
+			return &BoolVal{Val: false}, nil
+		}
+		return &IntVal{Val: n}, nil
+	})
+
+	addBuiltin("number->string", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "number->string requires 1 argument"}
+		}
+		n, ok := args[0].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "number->string: expected number"}
+		}
+		return &StringVal{Val: strconv.FormatInt(n.Val, 10)}, nil
+	})
+
+	addBuiltin("symbol->string", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "symbol->string requires 1 argument"}
+		}
+		s, ok := args[0].(*SymbolVal)
+		if !ok {
+			return nil, &EvalError{Message: "symbol->string: expected symbol"}
+		}
+		return &StringVal{Val: s.Name}, nil
+	})
+
+	addBuiltin("string->symbol", func(args []Value) (Value, error) {
+		if len(args) != 1 {
+			return nil, &EvalError{Message: "string->symbol requires 1 argument"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string->symbol: expected string"}
+		}
+		return &SymbolVal{Name: s.Val}, nil
+	})
+
+	addBuiltin("string-ref", func(args []Value) (Value, error) {
+		if len(args) != 2 {
+			return nil, &EvalError{Message: "string-ref requires 2 arguments"}
+		}
+		s, ok := args[0].(*StringVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-ref: expected string"}
+		}
+		idx, ok := args[1].(*IntVal)
+		if !ok {
+			return nil, &EvalError{Message: "string-ref: expected number"}
+		}
+		if idx.Val < 0 || idx.Val >= int64(len(s.Val)) {
+			return nil, &EvalError{Message: "string-ref: index out of range"}
+		}
+		return &CharVal{Val: rune(s.Val[idx.Val])}, nil
+	})
+
 	return env
+}
+
+// displayValue formats a value for `display` (no quotes on strings).
+func displayValue(v Value) string {
+	switch val := v.(type) {
+	case *StringVal:
+		return val.Val
+	case *CharVal:
+		return string(val.Val)
+	case *PairVal:
+		var buf strings.Builder
+		buf.WriteByte('(')
+		cur := Value(val)
+		first := true
+		for {
+			p, ok := cur.(*PairVal)
+			if !ok {
+				break
+			}
+			if !first {
+				buf.WriteByte(' ')
+			}
+			first = false
+			buf.WriteString(displayValue(p.Car))
+			cur = p.Cdr
+		}
+		if _, ok := cur.(*NilVal); !ok {
+			buf.WriteString(" . ")
+			buf.WriteString(displayValue(cur))
+		}
+		buf.WriteByte(')')
+		return buf.String()
+	default:
+		return v.String()
+	}
 }
 
 // --------------- Public API ---------------
@@ -893,7 +1078,7 @@ func EvalStr(input string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	env := makeBuiltinEnv()
+	env := makeBuiltinEnv(nil)
 	var result Value
 	for _, expr := range exprs {
 		result, err = evalInEnv(expr, env)
@@ -908,6 +1093,26 @@ func EvalStr(input string) (string, error) {
 }
 
 func EvalStrWithOutput(input string) (result string, output string, err error) {
-	r, err := EvalStr(input)
-	return r, "", err
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", nil
+	}
+	exprs, parseErr := parseAll(input)
+	if parseErr != nil {
+		return "", "", parseErr
+	}
+	var outBuf strings.Builder
+	env := makeBuiltinEnv(&outBuf)
+	var res Value
+	for _, expr := range exprs {
+		res, err = evalInEnv(expr, env)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	var r string
+	if _, ok := res.(*VoidVal); !ok {
+		r = res.String()
+	}
+	return r, outBuf.String(), nil
 }
