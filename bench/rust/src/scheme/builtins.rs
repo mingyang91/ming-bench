@@ -31,6 +31,41 @@ pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Val
         "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?"
         | "char<?" => eval_char(op, args),
 
+        _ if op.starts_with("##record-ctor##") => {
+            let tag = &op["##record-ctor##".len()..];
+            let fields: Vec<String> = args.iter().enumerate().map(|(i, _)| format!("f{i}")).collect();
+            // We just store them positionally
+            Ok(Value::Record {
+                type_tag: tag.to_string(),
+                fields: fields.into_iter().zip(args.iter().cloned()).collect(),
+            })
+        }
+        _ if op.starts_with("##record-pred##") => {
+            let tag = &op["##record-pred##".len()..];
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record predicate requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Record { type_tag, .. } if type_tag == tag)))
+        }
+        _ if op.starts_with("##record-acc##") => {
+            let rest = &op["##record-acc##".len()..];
+            let parts: Vec<&str> = rest.splitn(2, "##").collect();
+            if parts.len() != 2 {
+                return Err(EvalError::Generic("invalid record accessor".into()));
+            }
+            let tag = parts[0];
+            let idx: usize = parts[1].parse().map_err(|_| EvalError::Generic("invalid field index".into()))?;
+            if args.len() != 1 {
+                return Err(EvalError::Arity("record accessor requires 1 argument".into()));
+            }
+            match &args[0] {
+                Value::Record { type_tag, fields } if type_tag == tag => {
+                    fields.get(idx).map(|(_, v)| v.clone())
+                        .ok_or_else(|| EvalError::Generic("record field index out of bounds".into()))
+                }
+                _ => Err(EvalError::Type(format!("expected record of type {tag}"))),
+            }
+        }
         _ => Err(EvalError::UnboundVariable(op.to_string())),
     }
 }
