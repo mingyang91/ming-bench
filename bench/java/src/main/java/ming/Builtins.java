@@ -163,7 +163,8 @@ final class Builtins {
         env.define("procedure?", new Evaluator.BuiltinProc("procedure?", args -> {
             if (args.size() != 1) throw new EvalError("procedure?: expected 1 arg");
             Object val = args.get(0);
-            return (val instanceof Evaluator.Lambda || val instanceof Evaluator.CaseLambda || val instanceof Evaluator.BuiltinProc)
+            return (val instanceof Evaluator.Lambda || val instanceof Evaluator.CaseLambda || val instanceof Evaluator.BuiltinProc
+                    || val instanceof Evaluator.Continuation)
                     ? Boolean.TRUE : Boolean.FALSE;
         }));
     }
