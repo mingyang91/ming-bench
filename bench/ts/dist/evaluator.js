@@ -1367,7 +1367,7 @@ function evaluateGuard(expressions, env, pos, continuation) {
         },
     };
     runtime.nextExceptionHandlerId += 1;
-    runtime.exceptionHandlerStack = [...runtime.exceptionHandlerStack, frame];
+    runtime.exceptionHandlerStack.push(frame);
     return evaluateSequenceCps(bodyExprs, env, (value) => {
         deactivateExceptionHandlerFrame(runtime, frame.id);
         return continueWith(continuation, value);
@@ -1593,8 +1593,7 @@ function applyProcedureCps(value, args, pos, continuation) {
         return value.apply(args, pos, continuation);
     }
     if (isContinuation(value)) {
-        expectArity(value.name ?? 'continuation', args, 1, pos);
-        return continueCapturedContinuationCps(value, args[0], pos);
+        return continueCapturedContinuationCps(value, packValues(args), pos);
     }
     if (isClosure(value)) {
         return applyProcedureClause(value, value.env, args, pos, value.name ?? 'lambda', continuation);
@@ -1965,6 +1964,8 @@ function expandTemplateList(template, bindings, definitionEnv, scope, path) {
         switch (headName) {
             case 'lambda':
                 return expandLambdaTemplate(template, bindings, definitionEnv, scope, path);
+            case 'guard':
+                return expandGuardTemplate(template, bindings, definitionEnv, scope, path);
             case 'let':
                 return expandLetTemplate(template, bindings, definitionEnv, scope, path);
             case 'define':
@@ -1974,6 +1975,64 @@ function expandTemplateList(template, bindings, definitionEnv, scope, path) {
     return {
         kind: 'list',
         elements: expandTemplateSequence(elements, bindings, definitionEnv, scope, path),
+        pos: template.pos,
+    };
+}
+function expandGuardTemplate(template, bindings, definitionEnv, scope, path) {
+    const { elements } = template;
+    if (elements.length < 3) {
+        return {
+            kind: 'list',
+            elements: expandTemplateSequence(elements, bindings, definitionEnv, scope, path),
+            pos: template.pos,
+        };
+    }
+    const head = expandTemplate(elements[0], bindings, definitionEnv, scope, path);
+    const specTemplate = elements[1];
+    const bodyTemplates = elements.slice(2);
+    if (specTemplate.kind !== 'list' || specTemplate.elements.length === 0) {
+        return {
+            kind: 'list',
+            elements: [
+                head,
+                expandTemplate(specTemplate, bindings, definitionEnv, scope, path),
+                ...expandTemplateSequence(bodyTemplates, bindings, definitionEnv, scope, path),
+            ],
+            pos: template.pos,
+        };
+    }
+    const [exceptionTemplate, ...clauseTemplates] = specTemplate.elements;
+    const exceptionName = symbolName(exceptionTemplate);
+    if (exceptionName === undefined || bindings.has(exceptionName)) {
+        return {
+            kind: 'list',
+            elements: [
+                head,
+                expandTemplate(specTemplate, bindings, definitionEnv, scope, path),
+                ...expandTemplateSequence(bodyTemplates, bindings, definitionEnv, scope, path),
+            ],
+            pos: template.pos,
+        };
+    }
+    const bindingKey = definitionEnv.freshBindingKey(exceptionName);
+    const guardScope = extendScope(scope, new Map([[exceptionName, bindingKey]]));
+    return {
+        kind: 'list',
+        elements: [
+            head,
+            {
+                kind: 'list',
+                elements: [
+                    makeResolvedSymbol(exceptionName, exceptionTemplate.pos, {
+                        kind: 'lexical',
+                        key: bindingKey,
+                    }),
+                    ...expandTemplateSequence(clauseTemplates, bindings, definitionEnv, guardScope, path),
+                ],
+                pos: specTemplate.pos,
+            },
+            ...expandTemplateSequence(bodyTemplates, bindings, definitionEnv, scope, path),
+        ],
         pos: template.pos,
     };
 }
@@ -2633,7 +2692,7 @@ function makeDynamicWindBuiltin(runtime) {
         };
         runtime.nextWindId += 1;
         return applyProcedureCps(inThunk, [], pos, () => {
-            runtime.dynamicWindStack = [...runtime.dynamicWindStack, frame];
+            runtime.dynamicWindStack.push(frame);
             return applyProcedureCps(bodyThunk, [], pos, (bodyValue) => {
                 deactivateDynamicWindFrame(runtime, frame.id);
                 return applyProcedureCps(outThunk, [], pos, () => continueWith(continuation, bodyValue));
@@ -2660,7 +2719,7 @@ function makeWithExceptionHandlerBuiltin(runtime) {
             }),
         };
         runtime.nextExceptionHandlerId += 1;
-        runtime.exceptionHandlerStack = [...runtime.exceptionHandlerStack, frame];
+        runtime.exceptionHandlerStack.push(frame);
         return applyProcedureCps(thunk, [], pos, (value) => {
             deactivateExceptionHandlerFrame(runtime, frame.id);
             return continueWith(continuation, value);
@@ -2671,8 +2730,10 @@ function raiseExceptionCps(runtime, value, pos) {
     if (runtime.exceptionHandlerStack.length === 0) {
         throw new EvalError(`uncaught exception: ${formatValue(value)}`, pos);
     }
-    const frame = runtime.exceptionHandlerStack[runtime.exceptionHandlerStack.length - 1];
-    runtime.exceptionHandlerStack = runtime.exceptionHandlerStack.slice(0, runtime.exceptionHandlerStack.length - 1);
+    const frame = runtime.exceptionHandlerStack.pop();
+    if (frame === undefined) {
+        throw new EvalError(`uncaught exception: ${formatValue(value)}`, pos);
+    }
     return transferDynamicWindCps(runtime, frame.dynamicWindStack, pos, () => {
         runtime.currentInvocationId = frame.invocationId;
         return frame.handle(value, pos);
@@ -2713,8 +2774,10 @@ function transferDynamicWindCps(runtime, targetStack, pos, continuation) {
 }
 function transferDynamicWindOutCps(runtime, targetStack, commonPrefix, pos, continuation) {
     if (runtime.dynamicWindStack.length > commonPrefix) {
-        const frame = runtime.dynamicWindStack[runtime.dynamicWindStack.length - 1];
-        runtime.dynamicWindStack = runtime.dynamicWindStack.slice(0, runtime.dynamicWindStack.length - 1);
+        const frame = runtime.dynamicWindStack.pop();
+        if (frame === undefined) {
+            return transferDynamicWindInCps(runtime, targetStack, commonPrefix, pos, continuation);
+        }
         return applyProcedureCps(frame.outThunk, [], pos, () => transferDynamicWindOutCps(runtime, targetStack, commonPrefix, pos, continuation));
     }
     return transferDynamicWindInCps(runtime, targetStack, commonPrefix, pos, continuation);
@@ -2723,7 +2786,7 @@ function transferDynamicWindInCps(runtime, targetStack, nextIndex, pos, continua
     if (nextIndex < targetStack.length) {
         const frame = targetStack[nextIndex];
         return applyProcedureCps(frame.inThunk, [], pos, () => {
-            runtime.dynamicWindStack = [...runtime.dynamicWindStack, frame];
+            runtime.dynamicWindStack.push(frame);
             return transferDynamicWindInCps(runtime, targetStack, nextIndex + 1, pos, continuation);
         });
     }
@@ -2731,23 +2794,27 @@ function transferDynamicWindInCps(runtime, targetStack, nextIndex, pos, continua
     return bounce(continuation);
 }
 function deactivateDynamicWindFrame(runtime, frameId) {
+    const topFrame = runtime.dynamicWindStack[runtime.dynamicWindStack.length - 1];
+    if (topFrame?.id === frameId) {
+        runtime.dynamicWindStack.pop();
+        return;
+    }
     for (let index = runtime.dynamicWindStack.length - 1; index >= 0; index -= 1) {
         if (runtime.dynamicWindStack[index].id === frameId) {
-            runtime.dynamicWindStack = [
-                ...runtime.dynamicWindStack.slice(0, index),
-                ...runtime.dynamicWindStack.slice(index + 1),
-            ];
+            runtime.dynamicWindStack.splice(index, 1);
             return;
         }
     }
 }
 function deactivateExceptionHandlerFrame(runtime, frameId) {
+    const topFrame = runtime.exceptionHandlerStack[runtime.exceptionHandlerStack.length - 1];
+    if (topFrame?.id === frameId) {
+        runtime.exceptionHandlerStack.pop();
+        return;
+    }
     for (let index = runtime.exceptionHandlerStack.length - 1; index >= 0; index -= 1) {
         if (runtime.exceptionHandlerStack[index].id === frameId) {
-            runtime.exceptionHandlerStack = [
-                ...runtime.exceptionHandlerStack.slice(0, index),
-                ...runtime.exceptionHandlerStack.slice(index + 1),
-            ];
+            runtime.exceptionHandlerStack.splice(index, 1);
             return;
         }
     }
