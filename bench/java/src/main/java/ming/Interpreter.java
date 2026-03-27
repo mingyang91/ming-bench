@@ -105,6 +105,9 @@ final class Interpreter {
             if ("lambda".equals(symbolName)) {
                 return evalLambda(listExpr, env);
             }
+            if ("set!".equals(symbolName)) {
+                return evalSet(listExpr, env);
+            }
             if ("begin".equals(symbolName)) {
                 return evalBegin(listExpr, env);
             }
@@ -192,6 +195,19 @@ final class Interpreter {
         List<String> parameters = parseParameters(parametersList.elements(), "lambda");
         List<Expr> body = List.copyOf(listExpr.elements().subList(2, listExpr.elements().size()));
         return new UserProcedure("lambda", parameters, body, env);
+    }
+
+    private Value evalSet(ListExpr listExpr, Environment env) throws EvalError {
+        ensureExactlyExpressions("set!", listExpr, 3);
+
+        Expr targetExpr = listExpr.elements().get(1);
+        if (!(targetExpr instanceof SymbolExpr symbolExpr)) {
+            throw error(targetExpr.loc(), "set! requires a symbol");
+        }
+
+        Value value = eval(listExpr.elements().get(2), env);
+        env.set(symbolExpr.name(), value, symbolExpr.loc());
+        return VOID;
     }
 
     private Value evalBegin(ListExpr listExpr, Environment env) throws EvalError {
@@ -1025,6 +1041,18 @@ final class Interpreter {
             }
             if (parent != null) {
                 return parent.lookup(name, loc);
+            }
+            throw error(loc, "unbound variable: " + name);
+        }
+
+        private void set(String name, Value value, SourceLoc loc) throws EvalError {
+            if (bindings.containsKey(name)) {
+                bindings.put(name, value);
+                return;
+            }
+            if (parent != null) {
+                parent.set(name, value, loc);
+                return;
             }
             throw error(loc, "unbound variable: " + name);
         }
