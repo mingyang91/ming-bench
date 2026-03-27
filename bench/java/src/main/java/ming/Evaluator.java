@@ -183,7 +183,8 @@ public class Evaluator {
         "gcd", "lcm", "truncate", "round",
         "make-string", "string",
         "string>?", "string<=?", "string>=?",
-        "call/cc", "call-with-current-continuation"
+        "call/cc", "call-with-current-continuation",
+        "dynamic-wind"
     };
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
@@ -1020,6 +1021,22 @@ public class Evaluator {
         }
     }
 
+    private Object doDynamicWind(Object inThunk, Object bodyThunk, Object outThunk) throws EvalError {
+        resolve(apply(inThunk, List.of()));
+        Object result;
+        try {
+            result = resolve(apply(bodyThunk, List.of()));
+        } catch (ContinuationEscape ce) {
+            resolve(apply(outThunk, List.of()));
+            throw ce;
+        } catch (ContinuationResume cr) {
+            resolve(apply(outThunk, List.of()));
+            throw cr;
+        }
+        resolve(apply(outThunk, List.of()));
+        return result;
+    }
+
     private Object apply(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof Continuation cont) {
             if (args.size() != 1) throw new EvalError("continuation: expected 1 argument");
@@ -1083,6 +1100,10 @@ public class Evaluator {
                     return v;
                 }
                 return doCallCC(args.get(0));
+            }
+            if (name.equals("dynamic-wind")) {
+                if (args.size() != 3) throw new EvalError("dynamic-wind: expected 3 arguments");
+                return doDynamicWind(args.get(0), args.get(1), args.get(2));
             }
             return applyBuiltin(name, args);
         }
