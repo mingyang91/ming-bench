@@ -102,7 +102,7 @@ type WindFrame = {
 type ExceptionHandlerFrame = {
   windStack: WindFrame[];
   procedureBoundaries: ProcedureBoundary[];
-  previousHandlers: ExceptionHandlerFrame[];
+  previousHandlerDepth: number;
   handle: (value: Value, position: SourcePosition) => MachineStep;
 };
 type ContinuationValue = {
@@ -149,6 +149,7 @@ type ProcedureValue = BuiltinProc | UserProc | CaseLambdaProc | ContinuationValu
 type MachineStep =
   | { kind: 'eval-step'; expr: Expr; env: Env; k: ContinuationFn }
   | { kind: 'apply-step'; proc: ProcedureValue; args: Value[]; position: SourcePosition; k: ContinuationFn }
+  | { kind: 'continue-step'; value: EvaluationResult; position?: SourcePosition; k: ContinuationFn }
   | { kind: 'done-step'; value: EvaluationResult };
 type EvalResult = Value | TailStep;
 
@@ -1397,8 +1398,15 @@ function isMachineStep(value: EvaluationResult | MachineStep): value is MachineS
   return (
     typeof value === 'object' &&
     value !== null &&
-    (value.kind === 'eval-step' || value.kind === 'apply-step' || value.kind === 'done-step')
+    (value.kind === 'eval-step' ||
+      value.kind === 'apply-step' ||
+      value.kind === 'continue-step' ||
+      value.kind === 'done-step')
   );
+}
+
+function continueStep(k: ContinuationFn, value: EvaluationResult, position?: SourcePosition): MachineStep {
+  return { kind: 'continue-step', k, value, position };
 }
 
 function makeProcedureReturnContinuation(k: ContinuationFn, previousProcedureBoundaries: ProcedureBoundary[]): ContinuationFn {
@@ -1408,6 +1416,13 @@ function makeProcedureReturnContinuation(k: ContinuationFn, previousProcedureBou
   };
   procedureReturnContinuations.add(returnContinuation);
   return returnContinuation;
+}
+
+function inheritProcedureReturnContinuation(source: ContinuationFn, target: ContinuationFn): ContinuationFn {
+  if (procedureReturnContinuations.has(source)) {
+    procedureReturnContinuations.add(target);
+  }
+  return target;
 }
 
 function runMachine(step: MachineStep, macroEnv: MacroEnv): EvaluationResult {
@@ -1442,6 +1457,23 @@ function runMachine(step: MachineStep, macroEnv: MacroEnv): EvaluationResult {
             break;
           }
           throw attachPosition(error, applyStep.position);
+        }
+        break;
+      }
+
+      case 'continue-step': {
+        const continueCurrent = current;
+        try {
+          current = continueCurrent.k(continueCurrent.value);
+        } catch (error) {
+          if (isSchemeExceptionSignal(error)) {
+            current = handleExceptionSignal(error, macroEnv);
+            break;
+          }
+          if (continueCurrent.position !== undefined) {
+            throw attachPosition(error, continueCurrent.position);
+          }
+          throw error;
         }
         break;
       }
@@ -2154,22 +2186,22 @@ function evalGuardStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: Continuati
   }
 
   const clauses = specExpr.items.slice(1);
-  const previousHandlers = currentExceptionHandlers.slice();
+  const previousHandlerDepth = currentExceptionHandlers.length;
   const handlerFrame: ExceptionHandlerFrame = {
     windStack: currentWindFrames.slice(),
     procedureBoundaries: currentProcedureBoundaries.slice(),
-    previousHandlers,
+    previousHandlerDepth,
     handle: (value, position) => {
-      currentExceptionHandlers = previousHandlers.slice();
+      currentExceptionHandlers.length = previousHandlerDepth;
       return evalGuardClausesStep(variableExpr.name, value, clauses, env, macroEnv, position, k);
     },
   };
 
-  currentExceptionHandlers = [...previousHandlers, handlerFrame];
-  return evalSequenceStep(args.slice(1), env, macroEnv, (value) => {
-    currentExceptionHandlers = previousHandlers.slice();
-    return k(value);
-  });
+  currentExceptionHandlers.push(handlerFrame);
+  return evalSequenceStep(args.slice(1), env, macroEnv, inheritProcedureReturnContinuation(k, (value) => {
+    currentExceptionHandlers.length = previousHandlerDepth;
+    return continueStep(k, value, specExpr.position);
+  }));
 }
 
 function evalDoLoopStep(
@@ -2801,8 +2833,7 @@ function applyProcedure(
   }
 
   if (proc.kind === 'continuation') {
-    assertExactArity('continuation', args, 1);
-    return resumeContinuation(proc, args[0]!, macroEnv);
+    return resumeContinuation(proc, makeEvaluationResult(args), macroEnv);
   }
 
   if (proc.kind === 'lambda') {
@@ -2965,13 +2996,13 @@ function withExceptionHandlerBuiltin(
 
   const handler = expectProcedureValue('with-exception-handler', args[0]!);
   const thunk = expectProcedureValue('with-exception-handler', args[1]!);
-  const previousHandlers = currentExceptionHandlers.slice();
+  const previousHandlerDepth = currentExceptionHandlers.length;
   const handlerFrame: ExceptionHandlerFrame = {
     windStack: currentWindFrames.slice(),
     procedureBoundaries: currentProcedureBoundaries.slice(),
-    previousHandlers,
+    previousHandlerDepth,
     handle: (value, signalPosition) => {
-      currentExceptionHandlers = previousHandlers.slice();
+      currentExceptionHandlers.length = previousHandlerDepth;
       return {
         kind: 'apply-step',
         proc: handler,
@@ -2984,16 +3015,16 @@ function withExceptionHandlerBuiltin(
     },
   };
 
-  currentExceptionHandlers = [...previousHandlers, handlerFrame];
+  currentExceptionHandlers.push(handlerFrame);
   return {
     kind: 'apply-step',
     proc: thunk,
     args: [],
     position,
-    k: (value) => {
-      currentExceptionHandlers = previousHandlers.slice();
-      return k(value);
-    },
+    k: inheritProcedureReturnContinuation(k, (value) => {
+      currentExceptionHandlers.length = previousHandlerDepth;
+      return continueStep(k, value, position);
+    }),
   };
 }
 
@@ -3011,7 +3042,7 @@ function handleExceptionSignal(signal: SchemeExceptionSignal, macroEnv: MacroEnv
   }
 
   return transitionWindFrames(handlerFrame.windStack, macroEnv, () => {
-    currentExceptionHandlers = handlerFrame.previousHandlers.slice();
+    currentExceptionHandlers.length = handlerFrame.previousHandlerDepth;
     currentProcedureBoundaries = handlerFrame.procedureBoundaries.slice();
     return handlerFrame.handle(signal.value, signal.position);
   });
