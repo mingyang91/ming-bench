@@ -107,6 +107,7 @@ public class Evaluator {
         if (head instanceof SymbolExpr symbol) {
             return switch (symbol.name()) {
                 case "define" -> evalDefine(args, env);
+                case "set!" -> evalSet(args, env);
                 case "if" -> evalIf(args, env);
                 case "quote" -> evalQuote(args);
                 case "lambda" -> evalLambda(args, env);
@@ -166,6 +167,19 @@ public class Evaluator {
         }
 
         throw new EvalError("invalid define target");
+    }
+
+    private Value evalSet(List<Expr> args, Environment env) throws EvalError {
+        requireArgCount(args.size(), 2, "set!");
+
+        Expr target = args.getFirst();
+        if (!(target instanceof SymbolExpr symbol)) {
+            throw new EvalError("'set!' expects a symbol target");
+        }
+
+        Value value = eval(args.get(1), env);
+        env.set(symbol.name(), value);
+        return VoidValue.INSTANCE;
     }
 
     private Value evalIf(List<Expr> args, Environment env) throws EvalError {
@@ -932,6 +946,18 @@ public class Evaluator {
             }
             if (parent != null) {
                 return parent.lookup(name);
+            }
+            throw new EvalError("unbound variable: " + name);
+        }
+
+        private void set(String name, Value value) throws EvalError {
+            if (bindings.containsKey(name)) {
+                bindings.put(name, value);
+                return;
+            }
+            if (parent != null) {
+                parent.set(name, value);
+                return;
             }
             throw new EvalError("unbound variable: " + name);
         }
