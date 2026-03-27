@@ -58,6 +58,9 @@ pub enum EvalError {
     #[error("invalid substring range: start {start}, end {end}, length {len}")]
     InvalidSubstringRange { start: i64, end: i64, len: usize },
 
+    #[error("invalid character code: {value}")]
+    InvalidCharCode { value: i64 },
+
     #[error("cannot mutate immutable string")]
     ImmutableString,
 }

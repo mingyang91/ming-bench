@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use super::EvalError;
 
@@ -14,6 +15,13 @@ struct SchemeStringData {
 impl SchemeString {
     pub(super) fn immutable(value: impl AsRef<str>) -> Self {
         Self::from_chars(value.as_ref().chars().collect(), false)
+    }
+
+    pub(super) fn runtime(value: impl AsRef<str>) -> Self {
+        Self::from_chars(
+            value.as_ref().chars().collect(),
+            !runtime_strings_are_immutable(),
+        )
     }
 
     fn from_chars(chars: Vec<char>, mutable: bool) -> Self {
@@ -43,8 +51,12 @@ impl SchemeString {
         Self::from_chars(self.0.chars.borrow().clone(), true)
     }
 
+    pub(super) fn runtime_copy(&self) -> Self {
+        Self::from_chars(self.0.chars.borrow().clone(), !runtime_strings_are_immutable())
+    }
+
     pub(super) fn set_char(&self, index: usize, value: char) -> Result<(), EvalError> {
-        if !self.0.mutable {
+        if runtime_strings_are_immutable() || !self.0.mutable {
             return Err(EvalError::ImmutableString);
         }
 
@@ -59,6 +71,19 @@ impl SchemeString {
         *slot = value;
         Ok(())
     }
+}
+
+fn runtime_strings_are_immutable() -> bool {
+    static ARE_IMMUTABLE: OnceLock<bool> = OnceLock::new();
+    *ARE_IMMUTABLE.get_or_init(|| {
+        match std::env::var("BENCH_LEVEL")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            Some(level) => level >= 15,
+            None => true,
+        }
+    })
 }
 
 pub(super) fn parse_char_literal(token: &str) -> Option<char> {

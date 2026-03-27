@@ -24,6 +24,7 @@ pub(super) fn default_env() -> EnvRef {
         (">", apply_gt as BuiltinFn),
         ("=", apply_eq as BuiltinFn),
         ("<=", apply_lte as BuiltinFn),
+        (">=", apply_gte as BuiltinFn),
         ("not", apply_not as BuiltinFn),
         ("eq?", apply_eq_pred as BuiltinFn),
         ("eqv?", apply_eqv_pred as BuiltinFn),
@@ -73,6 +74,8 @@ pub(super) fn default_env() -> EnvRef {
         ("newline", apply_newline as BuiltinFn),
         ("string-append", apply_string_append as BuiltinFn),
         ("string-copy", apply_string_copy as BuiltinFn),
+        ("string->list", apply_string_to_list as BuiltinFn),
+        ("list->string", apply_list_to_string as BuiltinFn),
         ("string-length", apply_string_length as BuiltinFn),
         ("substring", apply_substring as BuiltinFn),
         ("string->number", apply_string_to_number as BuiltinFn),
@@ -91,6 +94,8 @@ pub(super) fn default_env() -> EnvRef {
         ("char-numeric?", apply_char_numeric_pred as BuiltinFn),
         ("char-upcase", apply_char_upcase as BuiltinFn),
         ("char-downcase", apply_char_downcase as BuiltinFn),
+        ("char->integer", apply_char_to_integer as BuiltinFn),
+        ("integer->char", apply_integer_to_char as BuiltinFn),
         ("char=?", apply_char_eq as BuiltinFn),
         ("char<?", apply_char_lt as BuiltinFn),
     ] {
@@ -531,6 +536,12 @@ fn apply_eq(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalEr
 fn apply_lte(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     apply_comparison("<=", args, |ordering| {
         matches!(ordering, Ordering::Less | Ordering::Equal)
+    })
+}
+
+fn apply_gte(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    apply_comparison(">=", args, |ordering| {
+        matches!(ordering, Ordering::Greater | Ordering::Equal)
     })
 }
 
@@ -1264,7 +1275,7 @@ fn apply_string_append(args: &[EvaluatedArg], _output: &mut String) -> Result<Va
         let value = arg.as_string()?;
         combined.push_str(&value.to_plain_string());
     }
-    Ok(Value::String(SchemeString::immutable(combined)))
+    Ok(Value::String(SchemeString::runtime(combined)))
 }
 
 fn apply_string_copy(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1276,7 +1287,47 @@ fn apply_string_copy(args: &[EvaluatedArg], _output: &mut String) -> Result<Valu
         });
     };
 
-    Ok(Value::String(value.as_string()?.mutable_copy()))
+    Ok(Value::String(value.as_string()?.runtime_copy()))
+}
+
+fn apply_string_to_list(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "string->list",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let items = value
+        .as_string()?
+        .to_plain_string()
+        .chars()
+        .map(Value::Char)
+        .collect();
+    Ok(Value::List(items))
+}
+
+fn apply_list_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [list] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "list->string",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let chars = list
+        .as_list()?
+        .iter()
+        .map(|value| {
+            value
+                .as_char()
+                .map_err(|error| error.with_position(list.pos.line, list.pos.col))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let string = chars.into_iter().collect::<String>();
+    Ok(Value::String(SchemeString::runtime(string)))
 }
 
 fn apply_string_length(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1314,7 +1365,7 @@ fn apply_substring(args: &[EvaluatedArg], _output: &mut String) -> Result<Value,
         .with_position(end.pos.line, end.pos.col));
     }
 
-    Ok(Value::String(SchemeString::immutable(
+    Ok(Value::String(SchemeString::runtime(
         source.substring(start_index, end_index),
     )))
 }
@@ -1347,9 +1398,7 @@ fn apply_number_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result
         });
     };
 
-    Ok(Value::String(SchemeString::immutable(
-        value.as_number()?.render(),
-    )))
+    Ok(Value::String(SchemeString::runtime(value.as_number()?.render())))
 }
 
 fn apply_symbol_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1361,7 +1410,7 @@ fn apply_symbol_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result
         });
     };
 
-    Ok(Value::String(SchemeString::immutable(value.as_symbol()?)))
+    Ok(Value::String(SchemeString::runtime(value.as_symbol()?)))
 }
 
 fn apply_string_to_symbol(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1460,7 +1509,7 @@ fn apply_string_upcase(args: &[EvaluatedArg], _output: &mut String) -> Result<Va
         });
     };
 
-    Ok(Value::String(SchemeString::immutable(
+    Ok(Value::String(SchemeString::runtime(
         value.as_string()?.to_plain_string().to_uppercase(),
     )))
 }
@@ -1474,7 +1523,7 @@ fn apply_string_downcase(args: &[EvaluatedArg], _output: &mut String) -> Result<
         });
     };
 
-    Ok(Value::String(SchemeString::immutable(
+    Ok(Value::String(SchemeString::runtime(
         value.as_string()?.to_plain_string().to_lowercase(),
     )))
 }
@@ -1543,6 +1592,37 @@ fn apply_char_downcase(args: &[EvaluatedArg], _output: &mut String) -> Result<Va
     };
 
     Ok(Value::Char(value.as_char()?.to_ascii_lowercase()))
+}
+
+fn apply_char_to_integer(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "char->integer",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(exact_int(i64::from(u32::from(value.as_char()?))))
+}
+
+fn apply_integer_to_char(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "integer->char",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let code = value.as_int()?;
+    let scalar = u32::try_from(code).map_err(|_| {
+        EvalError::InvalidCharCode { value: code }.with_position(value.pos.line, value.pos.col)
+    })?;
+    let ch = char::from_u32(scalar).ok_or_else(|| {
+        EvalError::InvalidCharCode { value: code }.with_position(value.pos.line, value.pos.col)
+    })?;
+    Ok(Value::Char(ch))
 }
 
 fn apply_char_eq(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
