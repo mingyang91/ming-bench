@@ -19,12 +19,16 @@ type VoidValue = { kind: 'void' };
 type BuiltinProc = {
   kind: 'builtin';
   name: string;
-  apply: (args: Value[]) => Value;
+  apply: (args: Value[], position: SourcePosition) => Value;
+};
+type ParamSpec = {
+  required: string[];
+  rest?: string;
 };
 type UserProc = {
   kind: 'lambda';
   name?: string;
-  params: string[];
+  params: ParamSpec;
   body: Expr[];
   env: Env;
 };
@@ -308,6 +312,7 @@ function createBuiltins(output: OutputBuffer): Map<string, BuiltinProc> {
     builtin('>', (args) => compareNumbers('>', args, (left, right) => left > right)),
     builtin('=', (args) => compareNumbers('=', args, (left, right) => left === right)),
     builtin('<=', (args) => compareNumbers('<=', args, (left, right) => left <= right)),
+    builtin('apply', (args, position) => applyBuiltin(args, position)),
     builtin('append', (args) => appendValues(args)),
     builtin('boolean?', (args) => unaryPredicate('boolean?', args, (value) => typeof value === 'boolean')),
     builtin('car', (args) => {
@@ -590,7 +595,7 @@ function evalDefine(args: Expr[], env: Env): Value {
     env.define(nameExpr.name, {
       kind: 'lambda',
       name: nameExpr.name,
-      params: parseParams(target.items.slice(1)),
+      params: parseParamItems(target.items.slice(1)),
       body,
       env,
     });
@@ -612,13 +617,10 @@ function evalLambda(args: Expr[], env: Env): Value {
   assertAtLeastArity('lambda', args, 2);
 
   const paramsExpr = args[0]!;
-  if (paramsExpr.kind !== 'list') {
-    throw new EvalError('lambda expects a parameter list');
-  }
 
   return {
     kind: 'lambda',
-    params: parseParams(paramsExpr.items),
+    params: parseFormals(paramsExpr),
     body: args.slice(1),
     env,
   };
@@ -652,7 +654,7 @@ function evalNamedLet(name: string, bindingsExpr: Expr, body: Expr[], env: Env):
   const proc: UserProc = {
     kind: 'lambda',
     name,
-    params: bindings.map((binding) => binding.name),
+    params: { required: bindings.map((binding) => binding.name) },
     body,
     env: letEnv,
   };
@@ -678,13 +680,47 @@ function evalSet(args: Expr[], env: Env): Value {
   return VOID;
 }
 
-function parseParams(items: Expr[]): string[] {
-  return items.map((item) => {
+function parseFormals(expr: Expr): ParamSpec {
+  if (expr.kind === 'symbol') {
+    return { required: [], rest: expr.name };
+  }
+
+  if (expr.kind !== 'list') {
+    throw new EvalError('lambda expects a parameter list');
+  }
+
+  return parseParamItems(expr.items);
+}
+
+function parseParamItems(items: Expr[]): ParamSpec {
+  const required: string[] = [];
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]!;
     if (item.kind !== 'symbol') {
       throw new EvalError('lambda parameters must be symbols');
     }
-    return item.name;
-  });
+
+    if (item.name === '.') {
+      if (index !== items.length - 2) {
+        throw new EvalError('lambda expects a valid dotted parameter list');
+      }
+
+      const restExpr = items[index + 1]!;
+      if (restExpr.kind !== 'symbol' || restExpr.name === '.') {
+        throw new EvalError('lambda parameters must be symbols');
+      }
+
+      return {
+        required,
+        rest: restExpr.name,
+      };
+    }
+
+    required.push(item.name);
+  }
+
+  return { required };
 }
 
 function parseBindings(expr: Expr): BindingSpec[] {
@@ -730,15 +766,18 @@ function quoteExpr(expr: Expr): Value {
 function applyProcedure(proc: BuiltinProc | UserProc, args: Value[], position: SourcePosition): Value {
   try {
     if (proc.kind === 'builtin') {
-      return proc.apply(args);
+      return proc.apply(args, position);
     }
 
-    assertExactArity(proc.name ?? 'lambda', args, proc.params.length);
+    assertProcedureArity(proc.name ?? 'lambda', args, proc.params);
 
     const callEnv = new Env(proc.env);
-    proc.params.forEach((param, index) => {
+    proc.params.required.forEach((param, index) => {
       callEnv.define(param, args[index]!);
     });
+    if (proc.params.rest !== undefined) {
+      callEnv.define(proc.params.rest, makeList(args.slice(proc.params.required.length)));
+    }
 
     return evalSequence(proc.body, callEnv);
   } catch (error) {
@@ -746,8 +785,21 @@ function applyProcedure(proc: BuiltinProc | UserProc, args: Value[], position: S
   }
 }
 
-function builtin(name: string, apply: (args: Value[]) => Value): [string, BuiltinProc] {
+function builtin(name: string, apply: (args: Value[], position: SourcePosition) => Value): [string, BuiltinProc] {
   return [name, { kind: 'builtin', name, apply }];
+}
+
+function applyBuiltin(args: Value[], position: SourcePosition): Value {
+  assertAtLeastArity('apply', args, 2);
+
+  const proc = args[0]!;
+  if (!isProcedure(proc)) {
+    throw new EvalError('apply expects a procedure');
+  }
+
+  const prefixArgs = args.slice(1, -1);
+  const listArgs = expectProperList('apply', args[args.length - 1]!);
+  return applyProcedure(proc, [...prefixArgs, ...listArgs], position);
 }
 
 function unaryPredicate(name: string, args: Value[], predicate: (value: Value) => boolean): boolean {
@@ -955,6 +1007,15 @@ function assertAtLeastArity(name: string, args: readonly unknown[], minimum: num
   if (args.length < minimum) {
     throw new EvalError(`${name} expects at least ${minimum} argument(s)`);
   }
+}
+
+function assertProcedureArity(name: string, args: readonly unknown[], params: ParamSpec): void {
+  if (params.rest === undefined) {
+    assertExactArity(name, args, params.required.length);
+    return;
+  }
+
+  assertAtLeastArity(name, args, params.required.length);
 }
 
 function formatValue(value: Value): string {

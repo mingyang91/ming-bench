@@ -214,6 +214,7 @@ function createBuiltins(output) {
         builtin('>', (args) => compareNumbers('>', args, (left, right) => left > right)),
         builtin('=', (args) => compareNumbers('=', args, (left, right) => left === right)),
         builtin('<=', (args) => compareNumbers('<=', args, (left, right) => left <= right)),
+        builtin('apply', (args, position) => applyBuiltin(args, position)),
         builtin('append', (args) => appendValues(args)),
         builtin('boolean?', (args) => unaryPredicate('boolean?', args, (value) => typeof value === 'boolean')),
         builtin('car', (args) => {
@@ -465,7 +466,7 @@ function evalDefine(args, env) {
         env.define(nameExpr.name, {
             kind: 'lambda',
             name: nameExpr.name,
-            params: parseParams(target.items.slice(1)),
+            params: parseParamItems(target.items.slice(1)),
             body,
             env,
         });
@@ -483,12 +484,9 @@ function evalIf(args, env) {
 function evalLambda(args, env) {
     assertAtLeastArity('lambda', args, 2);
     const paramsExpr = args[0];
-    if (paramsExpr.kind !== 'list') {
-        throw new EvalError('lambda expects a parameter list');
-    }
     return {
         kind: 'lambda',
-        params: parseParams(paramsExpr.items),
+        params: parseFormals(paramsExpr),
         body: args.slice(1),
         env,
     };
@@ -516,7 +514,7 @@ function evalNamedLet(name, bindingsExpr, body, env) {
     const proc = {
         kind: 'lambda',
         name,
-        params: bindings.map((binding) => binding.name),
+        params: { required: bindings.map((binding) => binding.name) },
         body,
         env: letEnv,
     };
@@ -536,13 +534,38 @@ function evalSet(args, env) {
     env.set(target.name, evalExpr(args[1], env));
     return VOID;
 }
-function parseParams(items) {
-    return items.map((item) => {
+function parseFormals(expr) {
+    if (expr.kind === 'symbol') {
+        return { required: [], rest: expr.name };
+    }
+    if (expr.kind !== 'list') {
+        throw new EvalError('lambda expects a parameter list');
+    }
+    return parseParamItems(expr.items);
+}
+function parseParamItems(items) {
+    const required = [];
+    for (let index = 0; index < items.length; index += 1) {
+        const item = items[index];
         if (item.kind !== 'symbol') {
             throw new EvalError('lambda parameters must be symbols');
         }
-        return item.name;
-    });
+        if (item.name === '.') {
+            if (index !== items.length - 2) {
+                throw new EvalError('lambda expects a valid dotted parameter list');
+            }
+            const restExpr = items[index + 1];
+            if (restExpr.kind !== 'symbol' || restExpr.name === '.') {
+                throw new EvalError('lambda parameters must be symbols');
+            }
+            return {
+                required,
+                rest: restExpr.name,
+            };
+        }
+        required.push(item.name);
+    }
+    return { required };
 }
 function parseBindings(expr) {
     if (expr.kind !== 'list') {
@@ -579,13 +602,16 @@ function quoteExpr(expr) {
 function applyProcedure(proc, args, position) {
     try {
         if (proc.kind === 'builtin') {
-            return proc.apply(args);
+            return proc.apply(args, position);
         }
-        assertExactArity(proc.name ?? 'lambda', args, proc.params.length);
+        assertProcedureArity(proc.name ?? 'lambda', args, proc.params);
         const callEnv = new Env(proc.env);
-        proc.params.forEach((param, index) => {
+        proc.params.required.forEach((param, index) => {
             callEnv.define(param, args[index]);
         });
+        if (proc.params.rest !== undefined) {
+            callEnv.define(proc.params.rest, makeList(args.slice(proc.params.required.length)));
+        }
         return evalSequence(proc.body, callEnv);
     }
     catch (error) {
@@ -594,6 +620,16 @@ function applyProcedure(proc, args, position) {
 }
 function builtin(name, apply) {
     return [name, { kind: 'builtin', name, apply }];
+}
+function applyBuiltin(args, position) {
+    assertAtLeastArity('apply', args, 2);
+    const proc = args[0];
+    if (!isProcedure(proc)) {
+        throw new EvalError('apply expects a procedure');
+    }
+    const prefixArgs = args.slice(1, -1);
+    const listArgs = expectProperList('apply', args[args.length - 1]);
+    return applyProcedure(proc, [...prefixArgs, ...listArgs], position);
 }
 function unaryPredicate(name, args, predicate) {
     assertExactArity(name, args, 1);
@@ -752,6 +788,13 @@ function assertAtLeastArity(name, args, minimum) {
     if (args.length < minimum) {
         throw new EvalError(`${name} expects at least ${minimum} argument(s)`);
     }
+}
+function assertProcedureArity(name, args, params) {
+    if (params.rest === undefined) {
+        assertExactArity(name, args, params.required.length);
+        return;
+    }
+    assertAtLeastArity(name, args, params.required.length);
 }
 function formatValue(value) {
     return formatValueWithMode(value, 'write');
