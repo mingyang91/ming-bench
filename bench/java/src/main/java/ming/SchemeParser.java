@@ -105,6 +105,9 @@ class SchemeParser {
                             throw new EvalError("unknown character name: " + cn + " at " + line + ":" + startCol);
                         }
                         tokens.add(new Token(new SchemeChar(ch), line, startCol));
+                    } else if (next == '\'') {
+                        tokens.add(new Token("#'", line, startCol));
+                        i += 2; col += 2;
                     } else if (next == '(') {
                         tokens.add(new Token("#(", line, startCol));
                         i += 2; col += 2;
@@ -150,6 +153,14 @@ class SchemeParser {
             quoted.add("quote");
             quoted.add(datum instanceof Located loc ? loc.expr : datum);
             return new Located(quoted, tLine, tCol);
+        }
+        if (token.equals("#'")) {
+            pos[0]++;
+            Object datum = parse(tokens, pos);
+            List<Object> syntaxForm = new ArrayList<>();
+            syntaxForm.add("syntax");
+            syntaxForm.add(datum instanceof Located loc ? loc.expr : datum);
+            return new Located(syntaxForm, tLine, tCol);
         }
         if (token.equals("#(")) {
             pos[0]++;

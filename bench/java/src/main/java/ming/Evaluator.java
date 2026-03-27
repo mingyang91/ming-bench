@@ -151,16 +151,24 @@ public class Evaluator {
     private record WEHAfterFrame() {}
     private record RaiseReturnFrame() {}
     private record CallWithValuesFrame(Object consumer) {}
+    private record SyntaxCaseFrame(List<String> literals, List<Object> clauses, Env env) {}
+    private record WithSyntaxFrame(List<?> bindings, int index, List<Object> values,
+                                    List<Object> bodyExprs, Env env) {}
+
+    record SyntaxCaseTransformer(Object proc, Env defEnv) {}
+    record SyntaxTemplate(Object form, Map<String, Object> hygieneBindings) {}
 
     private static final Set<String> SPECIAL_FORMS = Set.of(
         "if", "begin", "let", "let*", "set!", "define", "quote", "lambda", "case-lambda",
         "and", "or", "cond", "case", "do", "letrec", "letrec*",
-        "define-syntax", "syntax-rules", "define-record-type", "guard"
+        "define-syntax", "syntax-rules", "syntax-case", "syntax", "with-syntax",
+        "define-record-type", "guard"
     );
 
     private int gensymCounter = 0;
     private int nextEvalId = 0;
     private StringBuilder outputBuffer;
+    private Env syntaxDefEnv;
     private final List<DynamicWindEntry> windStack = new ArrayList<>();
     private final List<Object> exceptionHandlers = new ArrayList<>();
 
@@ -208,6 +216,20 @@ public class Evaluator {
         env.define("with-exception-handler", WITH_EXCEPTION_HANDLER_PROC);
         env.define("values", VALUES_PROC);
         env.define("call-with-values", CALL_WITH_VALUES_PROC);
+        env.define("syntax->datum", new BuiltinProc("syntax->datum", args -> {
+            if (args.size() != 1) throw new EvalError("syntax->datum: expected 1 argument");
+            Object v = args.get(0);
+            if (v instanceof SyntaxObject so) {
+                Object d = so.datum;
+                if (d instanceof SchemeParser.Located loc) d = loc.expr;
+                return d;
+            }
+            return v;
+        }));
+        env.define("datum->syntax", new BuiltinProc("datum->syntax", args -> {
+            if (args.size() != 2) throw new EvalError("datum->syntax: expected 2 arguments");
+            return new SyntaxObject(args.get(1));
+        }));
         env.define("procedure?", new BuiltinProc("procedure?", args -> {
             if (args.size() != 1) throw new EvalError("procedure?: expected 1 arg");
             Object v = args.get(0);
@@ -255,208 +277,10 @@ public class Evaluator {
                 if (rawHead instanceof SchemeParser.Located loc) rawHead = loc.expr;
 
                 if (rawHead instanceof String op) {
-                    switch (op) {
-                    case "quote": {
-                        if (list.size() != 2) throw new EvalError("quote: expected 1 argument" + posStr);
-                        Object d = list.get(1);
-                        if (d instanceof SchemeParser.Located loc) d = loc.expr;
-                        current = quoteValue(d); evaluating = false; continue;
-                    }
-                    case "if": {
-                        if (list.size() < 3 || list.size() > 4) throw new EvalError("if: expected 2-3 arguments" + posStr);
-                        kont.add(new IfFrame(list, env));
-                        current = list.get(1); continue;
-                    }
-                    case "define": {
-                        if (list.size() < 3) throw new EvalError("define: too few arguments" + posStr);
-                        Object target = list.get(1);
-                        if (target instanceof SchemeParser.Located loc) target = loc.expr;
-                        if (target instanceof String name) {
-                            kont.add(new DefineFrame(name, env));
-                            current = list.get(2); continue;
-                        } else if (target instanceof List<?> sig) {
-                            if (sig.isEmpty()) throw new EvalError("define: invalid function signature");
-                            Object first = sig.get(0);
-                            if (first instanceof SchemeParser.Located loc) first = loc.expr;
-                            if (!(first instanceof String fname)) throw new EvalError("define: invalid function signature");
-                            List<String> params = new ArrayList<>();
-                            String restParam = parseParamList(sig, 1, params, "define");
-                            List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                            Lambda lambda = new Lambda(params, restParam, body, env);
-                            env.define(fname, lambda);
-                            current = lambda; evaluating = false; continue;
-                        } else throw new EvalError("define: invalid syntax");
-                    }
-                    case "set!": {
-                        if (list.size() != 3) throw new EvalError("set!: expected 2 arguments" + posStr);
-                        Object tgt = list.get(1);
-                        if (tgt instanceof SchemeParser.Located loc) tgt = loc.expr;
-                        if (!(tgt instanceof String name)) throw new EvalError("set!: target must be a symbol");
-                        kont.add(new SetFrame(name, env, new SchemeParser.Pos(eLine, eCol)));
-                        current = list.get(2); continue;
-                    }
-                    case "lambda": {
-                        current = makeLambda(list, env); evaluating = false; continue;
-                    }
-                    case "case-lambda": {
-                        current = makeCaseLambda(list, env); evaluating = false; continue;
-                    }
-                    case "begin": {
-                        if (list.size() == 1) { current = Boolean.FALSE; evaluating = false; continue; }
-                        if (list.size() > 2) kont.add(new BeginFrame(list, 2, env));
-                        current = list.get(1); continue;
-                    }
-                    case "and": {
-                        if (list.size() == 1) { current = Boolean.TRUE; evaluating = false; continue; }
-                        if (list.size() == 2) { current = list.get(1); continue; }
-                        kont.add(new AndFrame(list, 2, env));
-                        current = list.get(1); continue;
-                    }
-                    case "or": {
-                        if (list.size() == 1) { current = Boolean.FALSE; evaluating = false; continue; }
-                        if (list.size() == 2) { current = list.get(1); continue; }
-                        kont.add(new OrFrame(list, 2, env));
-                        current = list.get(1); continue;
-                    }
-                    case "cond": {
-                        boolean found = false;
-                        for (int i = 1; i < list.size(); i++) {
-                            Object co = unwrap(list.get(i));
-                            if (!(co instanceof List<?> clause) || clause.isEmpty())
-                                throw new EvalError("cond: invalid clause");
-                            Object test = unwrap(clause.get(0));
-                            if (test instanceof String s && s.equals("else")) {
-                                if (clause.size() == 1) { current = Boolean.TRUE; evaluating = false; }
-                                else {
-                                    Object first = pushBodyFrames(clause, 1, kont, env);
-                                    current = first; env = env;
-                                }
-                                found = true; break;
-                            }
-                            kont.add(new CondFrame(list, i, env));
-                            current = clause.get(0); found = true; break;
-                        }
-                        if (!found) { current = Boolean.FALSE; evaluating = false; }
+                    CekState sf = dispatchSpecialForm(op, list, env, kont, eLine, eCol, posStr);
+                    if (sf != null) {
+                        current = sf.current; env = sf.env; evaluating = sf.evaluating;
                         continue;
-                    }
-                    case "case": {
-                        if (list.size() < 3) throw new EvalError("case: too few arguments");
-                        kont.add(new CaseFrame(list, env));
-                        current = list.get(1); continue;
-                    }
-                    case "let": {
-                        int bidx = 1; String namedLetName = null;
-                        Object fa = list.get(1);
-                        if (fa instanceof SchemeParser.Located loc) fa = loc.expr;
-                        if (fa instanceof String nm) { namedLetName = nm; bidx = 2; }
-                        Object bo = list.get(bidx);
-                        if (bo instanceof SchemeParser.Located loc) bo = loc.expr;
-                        if (!(bo instanceof List<?> bl)) throw new EvalError("let: bindings must be a list");
-                        List<String> names = new ArrayList<>(); List<Object> inits = new ArrayList<>();
-                        parseBindings(bl, names, inits, "let");
-                        List<Object> bodyExprs = new ArrayList<>(list.subList(bidx + 1, list.size()));
-                        if (inits.isEmpty()) {
-                            Env le = new Env(env);
-                            if (namedLetName != null) {
-                                Lambda loop = new Lambda(names, null, bodyExprs, le);
-                                le.define(namedLetName, loop);
-                            }
-                            env = le;
-                            current = pushBodyFrames(bodyExprs, kont, env);
-                            if (current == null) { current = Boolean.FALSE; evaluating = false; }
-                        } else {
-                            kont.add(new LetBindFrame(names, inits, 0, new ArrayList<>(),
-                                    bodyExprs, env, namedLetName));
-                            current = inits.get(0);
-                        }
-                        continue;
-                    }
-                    case "let*": {
-                        Object bo = list.get(1);
-                        if (bo instanceof SchemeParser.Located loc) bo = loc.expr;
-                        if (!(bo instanceof List<?> bl)) throw new EvalError("let*: bindings must be a list");
-                        List<Object> bodyExprs = new ArrayList<>(list.subList(2, list.size()));
-                        Env le = new Env(env);
-                        if (bl.isEmpty()) {
-                            env = le;
-                            current = pushBodyFrames(bodyExprs, kont, env);
-                            if (current == null) { current = Boolean.FALSE; evaluating = false; }
-                        } else {
-                            kont.add(new LetStarBindFrame(bl, 0, bodyExprs, le));
-                            Object fb = unwrap(bl.get(0));
-                            current = ((List<?>) fb).get(1); env = le;
-                        }
-                        continue;
-                    }
-                    case "letrec": case "letrec*": {
-                        boolean isStar = op.equals("letrec*");
-                        Object bo = list.get(1);
-                        if (bo instanceof SchemeParser.Located loc) bo = loc.expr;
-                        if (!(bo instanceof List<?> bl)) throw new EvalError(op + ": bindings must be a list");
-                        List<String> names = new ArrayList<>(); List<Object> inits = new ArrayList<>();
-                        parseBindings(bl, names, inits, op);
-                        List<Object> bodyExprs = new ArrayList<>(list.subList(2, list.size()));
-                        Env le = new Env(env);
-                        for (String n : names) le.define(n, Boolean.FALSE);
-                        if (inits.isEmpty()) {
-                            env = le;
-                            current = pushBodyFrames(bodyExprs, kont, env);
-                            if (current == null) { current = Boolean.FALSE; evaluating = false; }
-                        } else {
-                            kont.add(new LetrecBindFrame(names, inits, 0, new ArrayList<>(),
-                                    bodyExprs, le, isStar));
-                            current = inits.get(0); env = le;
-                        }
-                        continue;
-                    }
-                    case "do": {
-                        current = desugarDo(list); continue;
-                    }
-                    case "define-syntax": {
-                        current = handleDefineSyntax(list, env); evaluating = false; continue;
-                    }
-                    case "define-record-type": {
-                        current = handleDefineRecordType(list, env); evaluating = false; continue;
-                    }
-                    case "guard": {
-                        // (guard (var clause ...) body ...)
-                        Object gs = unwrap(list.get(1));
-                        if (!(gs instanceof List<?> guardSpec) || guardSpec.isEmpty())
-                            throw new EvalError("guard: invalid syntax");
-                        String var = (String) unwrap(guardSpec.get(0));
-                        List<Object> clauses = new ArrayList<>();
-                        boolean hasElse = false;
-                        for (int ci = 1; ci < guardSpec.size(); ci++) {
-                            clauses.add(guardSpec.get(ci));
-                            Object cl = unwrap(guardSpec.get(ci));
-                            if (cl instanceof List<?> clList && !clList.isEmpty()) {
-                                Object test = unwrap(clList.get(0));
-                                if (test instanceof String s && s.equals("else")) hasElse = true;
-                            }
-                        }
-                        if (!hasElse) {
-                            List<Object> raiseExpr = List.of("raise", var);
-                            clauses.add(List.of("else", raiseExpr));
-                        }
-                        GuardHandler gh = new GuardHandler(kont, windStack, clauses, var, env, exceptionHandlers);
-                        exceptionHandlers.add(gh);
-                        kont.add(new GuardAfterFrame());
-                        if (list.size() == 2) { current = Boolean.FALSE; evaluating = false; }
-                        else if (list.size() == 3) { current = list.get(2); }
-                        else {
-                            List<Object> bodyExprs = new ArrayList<>(list.subList(2, list.size()));
-                            current = pushBodyFrames(bodyExprs, kont, env);
-                        }
-                        continue;
-                    }
-                    default: {
-                        Object mv = null;
-                        try { mv = env.lookup(op, new SchemeParser.Pos(eLine, eCol)); } catch (EvalError ignored) {}
-                        if (mv instanceof SyntaxRulesMacro macro) {
-                            Object[] expanded = expandMacro(macro, list, env);
-                            current = expanded[0]; env = (Env) expanded[1]; continue;
-                        }
-                    }
                     }
                 }
                 // Application
@@ -481,6 +305,255 @@ public class Evaluator {
                   current = ci.value; evaluating = false;
               } else throw ci;
           }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private CekState dispatchSpecialForm(String op, List<?> list, Env env,
+                                          List<Object> kont, int eLine, int eCol,
+                                          String posStr) throws EvalError {
+        switch (op) {
+        case "quote": {
+            if (list.size() != 2) throw new EvalError("quote: expected 1 argument" + posStr);
+            Object d = list.get(1);
+            if (d instanceof SchemeParser.Located loc) d = loc.expr;
+            return new CekState(quoteValue(d), env, false);
+        }
+        case "if": {
+            if (list.size() < 3 || list.size() > 4) throw new EvalError("if: expected 2-3 arguments" + posStr);
+            kont.add(new IfFrame(list, env));
+            return new CekState(list.get(1), env, true);
+        }
+        case "define": {
+            if (list.size() < 3) throw new EvalError("define: too few arguments" + posStr);
+            Object target = list.get(1);
+            if (target instanceof SchemeParser.Located loc) target = loc.expr;
+            if (target instanceof String name) {
+                kont.add(new DefineFrame(name, env));
+                return new CekState(list.get(2), env, true);
+            } else if (target instanceof List<?> sig) {
+                if (sig.isEmpty()) throw new EvalError("define: invalid function signature");
+                Object first = sig.get(0);
+                if (first instanceof SchemeParser.Located loc) first = loc.expr;
+                if (!(first instanceof String fname)) throw new EvalError("define: invalid function signature");
+                List<String> params = new ArrayList<>();
+                String restParam = parseParamList(sig, 1, params, "define");
+                List<Object> body = new ArrayList<>(list.subList(2, list.size()));
+                Lambda lambda = new Lambda(params, restParam, body, env);
+                env.define(fname, lambda);
+                return new CekState(lambda, env, false);
+            } else throw new EvalError("define: invalid syntax");
+        }
+        case "set!": {
+            if (list.size() != 3) throw new EvalError("set!: expected 2 arguments" + posStr);
+            Object tgt = list.get(1);
+            if (tgt instanceof SchemeParser.Located loc) tgt = loc.expr;
+            if (!(tgt instanceof String name)) throw new EvalError("set!: target must be a symbol");
+            kont.add(new SetFrame(name, env, new SchemeParser.Pos(eLine, eCol)));
+            return new CekState(list.get(2), env, true);
+        }
+        case "lambda":
+            return new CekState(makeLambda(list, env), env, false);
+        case "case-lambda":
+            return new CekState(makeCaseLambda(list, env), env, false);
+        case "begin": {
+            if (list.size() == 1) return new CekState(Boolean.FALSE, env, false);
+            if (list.size() > 2) kont.add(new BeginFrame(list, 2, env));
+            return new CekState(list.get(1), env, true);
+        }
+        case "and": {
+            if (list.size() == 1) return new CekState(Boolean.TRUE, env, false);
+            if (list.size() == 2) return new CekState(list.get(1), env, true);
+            kont.add(new AndFrame(list, 2, env));
+            return new CekState(list.get(1), env, true);
+        }
+        case "or": {
+            if (list.size() == 1) return new CekState(Boolean.FALSE, env, false);
+            if (list.size() == 2) return new CekState(list.get(1), env, true);
+            kont.add(new OrFrame(list, 2, env));
+            return new CekState(list.get(1), env, true);
+        }
+        case "cond": {
+            for (int i = 1; i < list.size(); i++) {
+                Object co = unwrap(list.get(i));
+                if (!(co instanceof List<?> clause) || clause.isEmpty())
+                    throw new EvalError("cond: invalid clause");
+                Object test = unwrap(clause.get(0));
+                if (test instanceof String s && s.equals("else")) {
+                    if (clause.size() == 1) return new CekState(Boolean.TRUE, env, false);
+                    Object first = pushBodyFrames(clause, 1, kont, env);
+                    return new CekState(first, env, true);
+                }
+                kont.add(new CondFrame(list, i, env));
+                return new CekState(clause.get(0), env, true);
+            }
+            return new CekState(Boolean.FALSE, env, false);
+        }
+        case "case": {
+            if (list.size() < 3) throw new EvalError("case: too few arguments");
+            kont.add(new CaseFrame(list, env));
+            return new CekState(list.get(1), env, true);
+        }
+        case "let": {
+            int bidx = 1; String namedLetName = null;
+            Object fa = list.get(1);
+            if (fa instanceof SchemeParser.Located loc) fa = loc.expr;
+            if (fa instanceof String nm) { namedLetName = nm; bidx = 2; }
+            Object bo = list.get(bidx);
+            if (bo instanceof SchemeParser.Located loc) bo = loc.expr;
+            if (!(bo instanceof List<?> bl)) throw new EvalError("let: bindings must be a list");
+            List<String> names = new ArrayList<>(); List<Object> inits = new ArrayList<>();
+            parseBindings(bl, names, inits, "let");
+            List<Object> bodyExprs = new ArrayList<>(list.subList(bidx + 1, list.size()));
+            if (inits.isEmpty()) {
+                Env le = new Env(env);
+                if (namedLetName != null) {
+                    Lambda loop = new Lambda(names, null, bodyExprs, le);
+                    le.define(namedLetName, loop);
+                }
+                Object first = pushBodyFrames(bodyExprs, kont, le);
+                if (first == null) return new CekState(Boolean.FALSE, le, false);
+                return new CekState(first, le, true);
+            } else {
+                kont.add(new LetBindFrame(names, inits, 0, new ArrayList<>(),
+                        bodyExprs, env, namedLetName));
+                return new CekState(inits.get(0), env, true);
+            }
+        }
+        case "let*": {
+            Object bo = list.get(1);
+            if (bo instanceof SchemeParser.Located loc) bo = loc.expr;
+            if (!(bo instanceof List<?> bl)) throw new EvalError("let*: bindings must be a list");
+            List<Object> bodyExprs = new ArrayList<>(list.subList(2, list.size()));
+            Env le = new Env(env);
+            if (bl.isEmpty()) {
+                Object first = pushBodyFrames(bodyExprs, kont, le);
+                if (first == null) return new CekState(Boolean.FALSE, le, false);
+                return new CekState(first, le, true);
+            } else {
+                kont.add(new LetStarBindFrame(bl, 0, bodyExprs, le));
+                Object fb = unwrap(bl.get(0));
+                return new CekState(((List<?>) fb).get(1), le, true);
+            }
+        }
+        case "letrec": case "letrec*": {
+            boolean isStar = op.equals("letrec*");
+            Object bo = list.get(1);
+            if (bo instanceof SchemeParser.Located loc) bo = loc.expr;
+            if (!(bo instanceof List<?> bl)) throw new EvalError(op + ": bindings must be a list");
+            List<String> names = new ArrayList<>(); List<Object> inits = new ArrayList<>();
+            parseBindings(bl, names, inits, op);
+            List<Object> bodyExprs = new ArrayList<>(list.subList(2, list.size()));
+            Env le = new Env(env);
+            for (String n : names) le.define(n, Boolean.FALSE);
+            if (inits.isEmpty()) {
+                Object first = pushBodyFrames(bodyExprs, kont, le);
+                if (first == null) return new CekState(Boolean.FALSE, le, false);
+                return new CekState(first, le, true);
+            } else {
+                kont.add(new LetrecBindFrame(names, inits, 0, new ArrayList<>(),
+                        bodyExprs, le, isStar));
+                return new CekState(inits.get(0), le, true);
+            }
+        }
+        case "do":
+            return new CekState(desugarDo(list), env, true);
+        case "define-syntax":
+            return new CekState(handleDefineSyntax(list, env), env, false);
+        case "define-record-type":
+            return new CekState(handleDefineRecordType(list, env), env, false);
+        case "guard": {
+            Object gs = unwrap(list.get(1));
+            if (!(gs instanceof List<?> guardSpec) || guardSpec.isEmpty())
+                throw new EvalError("guard: invalid syntax");
+            String var = (String) unwrap(guardSpec.get(0));
+            List<Object> clauses = new ArrayList<>();
+            boolean hasElse = false;
+            for (int ci = 1; ci < guardSpec.size(); ci++) {
+                clauses.add(guardSpec.get(ci));
+                Object cl = unwrap(guardSpec.get(ci));
+                if (cl instanceof List<?> clList && !clList.isEmpty()) {
+                    Object test = unwrap(clList.get(0));
+                    if (test instanceof String s && s.equals("else")) hasElse = true;
+                }
+            }
+            if (!hasElse) {
+                List<Object> raiseExpr = List.of("raise", var);
+                clauses.add(List.of("else", raiseExpr));
+            }
+            GuardHandler gh = new GuardHandler(kont, windStack, clauses, var, env, exceptionHandlers);
+            exceptionHandlers.add(gh);
+            kont.add(new GuardAfterFrame());
+            if (list.size() == 2) return new CekState(Boolean.FALSE, env, false);
+            else if (list.size() == 3) return new CekState(list.get(2), env, true);
+            else {
+                List<Object> bodyExprs = new ArrayList<>(list.subList(2, list.size()));
+                return new CekState(pushBodyFrames(bodyExprs, kont, env), env, true);
+            }
+        }
+        case "syntax-case": {
+            if (list.size() < 4) throw new EvalError("syntax-case: too few arguments" + posStr);
+            Object litsObj = unwrap(list.get(2));
+            List<String> scLits = new ArrayList<>();
+            if (litsObj instanceof List<?> ll) {
+                for (Object l : ll) { l = unwrap(l); if (l instanceof String s) scLits.add(s); }
+            }
+            List<Object> scClauses = new ArrayList<>();
+            for (int ci = 3; ci < list.size(); ci++) scClauses.add(list.get(ci));
+            kont.add(new SyntaxCaseFrame(scLits, scClauses, env));
+            return new CekState(list.get(1), env, true);
+        }
+        case "syntax": {
+            if (list.size() != 2) throw new EvalError("syntax: expected 1 argument" + posStr);
+            Object rawTmpl = unwrap(list.get(1));
+            if (rawTmpl instanceof String id) {
+                Object val = null;
+                try { val = env.lookup(id, new SchemeParser.Pos(eLine, eCol)); } catch (EvalError ignored) {}
+                if (val instanceof SyntaxObject) return new CekState(val, env, false);
+            }
+            Map<String, String> renameMap = new HashMap<>();
+            Map<String, Object> hygieneBindings = new HashMap<>();
+            Object expanded = expandSyntaxTemplate(list.get(1), env, renameMap, hygieneBindings);
+            return new CekState(new SyntaxTemplate(expanded, hygieneBindings), env, false);
+        }
+        case "with-syntax": {
+            if (list.size() < 3) throw new EvalError("with-syntax: too few arguments" + posStr);
+            Object bindingsObj = unwrap(list.get(1));
+            if (!(bindingsObj instanceof List<?> wsbl)) throw new EvalError("with-syntax: bindings must be a list");
+            List<Object> wsBody = new ArrayList<>(list.subList(2, list.size()));
+            if (wsbl.isEmpty()) {
+                Object first = pushBodyFrames(wsBody, kont, env);
+                if (first == null) return new CekState(Boolean.FALSE, env, false);
+                return new CekState(first, env, true);
+            }
+            kont.add(new WithSyntaxFrame(wsbl, 0, new ArrayList<>(), wsBody, env));
+            List<?> fb = (List<?>) unwrap(wsbl.get(0));
+            return new CekState(fb.get(1), env, true);
+        }
+        default: {
+            Object mv = null;
+            try { mv = env.lookup(op, new SchemeParser.Pos(eLine, eCol)); } catch (EvalError ignored) {}
+            if (mv instanceof SyntaxRulesMacro macro) {
+                Object[] expanded = expandMacro(macro, list, env);
+                return new CekState(expanded[0], (Env) expanded[1], true);
+            }
+            if (mv instanceof SyntaxCaseTransformer sct) {
+                Env oldDefEnv = syntaxDefEnv;
+                syntaxDefEnv = sct.defEnv;
+                SyntaxObject stx = new SyntaxObject(list);
+                Object result = applyProc(sct.proc, List.of(stx));
+                syntaxDefEnv = oldDefEnv;
+                if (result instanceof SyntaxTemplate st) {
+                    if (!st.hygieneBindings.isEmpty()) {
+                        for (var e : st.hygieneBindings.entrySet()) env.define(e.getKey(), e.getValue());
+                    }
+                    return new CekState(st.form, env, true);
+                }
+                if (result instanceof SyntaxObject so) return new CekState(so.datum, env, true);
+                return new CekState(result, env, true);
+            }
+            return null;
+        }
         }
     }
 
@@ -603,6 +676,12 @@ public class Evaluator {
             doApply(f.consumer, vals, kont, 0, 0, evalId);
             Env newEnv = applyResult[1] != null ? (Env) applyResult[1] : env;
             return new CekState(applyResult[0], newEnv, (Boolean) applyResult[2]);
+        }
+        if (frame instanceof SyntaxCaseFrame f) {
+            return processSyntaxCaseFrame(f, current, env);
+        }
+        if (frame instanceof WithSyntaxFrame f) {
+            return processWithSyntaxFrame(f, current, env, kont);
         }
         if (frame instanceof RaiseReturnFrame) {
             throw new EvalError("raise: handler returned");
@@ -1020,20 +1099,26 @@ public class Evaluator {
         Object no = list.get(1); if (no instanceof SchemeParser.Located loc) no = loc.expr;
         if (!(no instanceof String macroName)) throw new EvalError("define-syntax: name must be symbol");
         Object te = list.get(2); if (te instanceof SchemeParser.Located loc) te = loc.expr;
-        if (!(te instanceof List<?> tr)) throw new EvalError("define-syntax: expected syntax-rules");
-        Object sh = tr.get(0); if (sh instanceof SchemeParser.Located loc) sh = loc.expr;
-        if (!(sh instanceof String ss) || !ss.equals("syntax-rules"))
-            throw new EvalError("define-syntax: expected syntax-rules");
-        Object lo = tr.get(1); if (lo instanceof SchemeParser.Located loc) lo = loc.expr;
-        List<String> lits = new ArrayList<>();
-        if (lo instanceof List<?> ll) { for (Object l : ll) { l = unwrap(l); if (l instanceof String s) lits.add(s); } }
-        List<Object[]> rules = new ArrayList<>();
-        for (int ri = 2; ri < tr.size(); ri++) {
-            Object ro = tr.get(ri); if (ro instanceof SchemeParser.Located loc) ro = loc.expr;
-            if (!(ro instanceof List<?> rule) || rule.size() != 2) throw new EvalError("define-syntax: invalid rule");
-            rules.add(new Object[]{rule.get(0), rule.get(1)});
+        // Check if it's syntax-rules
+        if (te instanceof List<?> tr && !tr.isEmpty()) {
+            Object sh = tr.get(0); if (sh instanceof SchemeParser.Located loc) sh = loc.expr;
+            if (sh instanceof String ss && ss.equals("syntax-rules")) {
+                Object lo = tr.get(1); if (lo instanceof SchemeParser.Located loc) lo = loc.expr;
+                List<String> lits = new ArrayList<>();
+                if (lo instanceof List<?> ll) { for (Object l : ll) { l = unwrap(l); if (l instanceof String s) lits.add(s); } }
+                List<Object[]> rules = new ArrayList<>();
+                for (int ri = 2; ri < tr.size(); ri++) {
+                    Object ro = tr.get(ri); if (ro instanceof SchemeParser.Located loc) ro = loc.expr;
+                    if (!(ro instanceof List<?> rule) || rule.size() != 2) throw new EvalError("define-syntax: invalid rule");
+                    rules.add(new Object[]{rule.get(0), rule.get(1)});
+                }
+                env.define(macroName, new SyntaxRulesMacro(macroName, lits, rules, env));
+                return Boolean.FALSE;
+            }
         }
-        env.define(macroName, new SyntaxRulesMacro(macroName, lits, rules, env));
+        // Not syntax-rules — evaluate to get a transformer procedure
+        Object transformer = eval(te, env);
+        env.define(macroName, new SyntaxCaseTransformer(transformer, env));
         return Boolean.FALSE;
     }
 
@@ -1168,6 +1253,163 @@ public class Evaluator {
         if (template instanceof String s && bindings.get(s) instanceof List) return s;
         if (template instanceof List<?> list) {
             for (Object e : list) { String f = findEllipsisVar(e, bindings); if (f != null) return f; }
+        }
+        return null;
+    }
+
+    // --- syntax-case support ---
+
+    @SuppressWarnings("unchecked")
+    private CekState processSyntaxCaseFrame(SyntaxCaseFrame f, Object current, Env env) throws EvalError {
+        Object scrutinee;
+        if (current instanceof SyntaxObject so) scrutinee = so.datum;
+        else scrutinee = current;
+        if (!(scrutinee instanceof List<?> inputList))
+            throw new EvalError("syntax-case: scrutinee must be a list");
+        for (Object clauseObj : f.clauses) {
+            List<?> clause = (List<?>) unwrap(clauseObj);
+            Object pattern = clause.get(0);
+            Map<String, Object> bindings = matchSyntaxCasePattern(pattern, inputList, f.literals);
+            if (bindings != null) {
+                Env clauseEnv = new Env(f.env);
+                for (var e : bindings.entrySet()) {
+                    clauseEnv.define(e.getKey(), new SyntaxObject(e.getValue()));
+                }
+                Object body = clause.size() == 3 ? clause.get(2) : clause.get(1);
+                return new CekState(body, clauseEnv, true);
+            }
+        }
+        throw new EvalError("syntax-case: no matching pattern");
+    }
+
+    private CekState processWithSyntaxFrame(WithSyntaxFrame f, Object current, Env env,
+                                             List<Object> kont) {
+        List<Object> values = new ArrayList<>(f.values);
+        Object val = current instanceof SyntaxObject ? current : new SyntaxObject(current);
+        values.add(val);
+        int next = f.index + 1;
+        if (next < f.bindings.size()) {
+            kont.add(new WithSyntaxFrame(f.bindings, next, values, f.bodyExprs, f.env));
+            List<?> nb = (List<?>) unwrap(f.bindings.get(next));
+            return new CekState(nb.get(1), f.env, true);
+        }
+        Env wsEnv = new Env(f.env);
+        for (int i = 0; i < f.bindings.size(); i++) {
+            List<?> binding = (List<?>) unwrap(f.bindings.get(i));
+            String name = (String) unwrap(binding.get(0));
+            wsEnv.define(name, values.get(i));
+        }
+        Object first = pushBodyFrames(f.bodyExprs, kont, wsEnv);
+        return new CekState(first != null ? first : Boolean.FALSE, wsEnv, first != null);
+    }
+
+    private Map<String, Object> matchSyntaxCasePattern(Object pattern, List<?> input, List<String> literals) {
+        if (pattern instanceof SchemeParser.Located loc) pattern = loc.expr;
+        if (!(pattern instanceof List<?> patList)) return null;
+        Map<String, Object> bindings = new HashMap<>();
+        int pi = 0, ii = 0;
+        while (pi < patList.size()) {
+            Object pe = patList.get(pi);
+            if (pe instanceof SchemeParser.Located loc) pe = loc.expr;
+            boolean hasE = false;
+            if (pi + 1 < patList.size()) {
+                Object nx = patList.get(pi + 1);
+                if (nx instanceof SchemeParser.Located loc) nx = loc.expr;
+                if ("...".equals(nx)) hasE = true;
+            }
+            if (hasE) {
+                if (!(pe instanceof String vn)) return null;
+                List<Object> coll = new ArrayList<>();
+                while (ii < input.size()) { coll.add(input.get(ii)); ii++; }
+                bindings.put(vn, coll); pi += 2;
+            } else if (pe instanceof String s && s.equals("_")) {
+                if (ii >= input.size()) return null;
+                pi++; ii++;
+            } else if (pe instanceof String s && literals.contains(s)) {
+                if (ii >= input.size()) return null;
+                Object ie = input.get(ii);
+                if (ie instanceof SchemeParser.Located loc) ie = loc.expr;
+                if (!s.equals(ie)) return null;
+                pi++; ii++;
+            } else if (pe instanceof String vn) {
+                if (ii >= input.size()) return null;
+                bindings.put(vn, input.get(ii)); pi++; ii++;
+            } else return null;
+        }
+        return ii == input.size() ? bindings : null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object expandSyntaxTemplate(Object template, Env env,
+                                         Map<String, String> renameMap,
+                                         Map<String, Object> hygieneBindings) {
+        template = unwrap(template);
+        if (template instanceof String id) {
+            Object val = null;
+            try { val = env.lookup(id, new SchemeParser.Pos(0, 0)); } catch (EvalError ignored) {}
+            if (val instanceof SyntaxObject so) return so.datum;
+            if ("...".equals(id) || SPECIAL_FORMS.contains(id)) return id;
+            if (!renameMap.containsKey(id)) renameMap.put(id, "__" + id + "_" + (gensymCounter++));
+            String renamed = renameMap.get(id);
+            if (syntaxDefEnv != null && !hygieneBindings.containsKey(renamed)) {
+                try {
+                    hygieneBindings.put(renamed, syntaxDefEnv.lookup(id, new SchemeParser.Pos(0, 0)));
+                } catch (EvalError ignored) {}
+            }
+            return renamed;
+        }
+        if (template instanceof List<?> tl) {
+            if (!tl.isEmpty()) {
+                Object head = unwrap(tl.get(0));
+                if ("quote".equals(head)) return tl;
+            }
+            List<Object> result = new ArrayList<>();
+            for (int i = 0; i < tl.size(); i++) {
+                Object elem = tl.get(i);
+                Object raw = unwrap(elem);
+                boolean hasEllipsis = false;
+                if (i + 1 < tl.size()) {
+                    Object nx = unwrap(tl.get(i + 1));
+                    if ("...".equals(nx)) hasEllipsis = true;
+                }
+                if (hasEllipsis) {
+                    String ev = findSyntaxEllipsisVar(elem, env);
+                    if (ev != null) {
+                        Object evVal = null;
+                        try { evVal = env.lookup(ev, new SchemeParser.Pos(0, 0)); } catch (EvalError ignored) {}
+                        if (evVal instanceof SyntaxObject so && so.datum instanceof List<?> items) {
+                            for (Object item : items) {
+                                Env subEnv = new Env(env);
+                                subEnv.define(ev, new SyntaxObject(item));
+                                result.add(expandSyntaxTemplate(elem, subEnv, renameMap, hygieneBindings));
+                            }
+                        }
+                    }
+                    i++;
+                } else if ("...".equals(raw)) {
+                    // skip
+                } else {
+                    result.add(expandSyntaxTemplate(elem, env, renameMap, hygieneBindings));
+                }
+            }
+            return result;
+        }
+        return template;
+    }
+
+    private String findSyntaxEllipsisVar(Object template, Env env) {
+        template = unwrap(template);
+        if (template instanceof String id) {
+            Object val = null;
+            try { val = env.lookup(id, new SchemeParser.Pos(0, 0)); } catch (EvalError ignored) {}
+            if (val instanceof SyntaxObject so && so.datum instanceof List) return id;
+            return null;
+        }
+        if (template instanceof List<?> tl) {
+            for (Object e : tl) {
+                String found = findSyntaxEllipsisVar(e, env);
+                if (found != null) return found;
+            }
         }
         return null;
     }
