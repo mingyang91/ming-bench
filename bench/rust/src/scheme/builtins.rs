@@ -1,8 +1,10 @@
 use super::{
-    eval_program, is_integer_token, values_eq, values_equal, BuiltinFn, EnvRef, Environment,
-    EvalError, EvaluatedArg, Expr, PairValue, Procedure, SchemeString, Value,
+    eval_program,
+    number::{parse_number_token, Number, Rational},
+    values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg, Expr,
+    PairValue, Procedure, SchemeString, Value,
 };
-use std::rc::Rc;
+use std::{cmp::Ordering, rc::Rc};
 
 pub(super) fn default_env() -> EnvRef {
     let env = Environment::new(None);
@@ -44,6 +46,14 @@ pub(super) fn default_env() -> EnvRef {
         ("even?", apply_even_pred as BuiltinFn),
         ("string?", apply_string_pred as BuiltinFn),
         ("number?", apply_number_pred as BuiltinFn),
+        ("integer?", apply_integer_pred as BuiltinFn),
+        ("rational?", apply_rational_pred as BuiltinFn),
+        ("exact?", apply_exact_pred as BuiltinFn),
+        ("inexact?", apply_inexact_pred as BuiltinFn),
+        ("exact->inexact", apply_exact_to_inexact as BuiltinFn),
+        ("inexact->exact", apply_inexact_to_exact as BuiltinFn),
+        ("numerator", apply_numerator as BuiltinFn),
+        ("denominator", apply_denominator as BuiltinFn),
         ("boolean?", apply_boolean_pred as BuiltinFn),
         ("pair?", apply_pair_pred as BuiltinFn),
         ("symbol?", apply_symbol_pred as BuiltinFn),
@@ -85,7 +95,7 @@ pub(super) fn default_env() -> EnvRef {
 pub(super) fn quote_expr(expr: &Expr) -> Value {
     match expr {
         Expr::Bool { value, .. } => Value::Bool(*value),
-        Expr::Int { value, .. } => Value::Int(*value),
+        Expr::Number { value, .. } => Value::Number(*value),
         Expr::Char { value, .. } => Value::Char(*value),
         Expr::String { value, .. } => Value::String(SchemeString::immutable(value)),
         Expr::Symbol { name, .. } => Value::Symbol(name.clone()),
@@ -141,12 +151,26 @@ pub(super) fn apply_procedure(
     }
 }
 
+fn exact_int(value: i64) -> Value {
+    Value::Number(Number::exact_int(value))
+}
+
+fn extract_rational(arg: &EvaluatedArg) -> Result<Rational, EvalError> {
+    arg.as_number()?.as_rational().ok_or_else(|| {
+        EvalError::TypeMismatch {
+            expected: "exact number",
+            found: arg.value.render(),
+        }
+        .with_position(arg.pos.line, arg.pos.col)
+    })
+}
+
 fn apply_add(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let mut sum = 0_i64;
+    let mut sum = Number::exact_int(0);
     for arg in args {
-        sum += arg.as_int()?;
+        sum = sum.add(arg.as_number()?);
     }
-    Ok(Value::Int(sum))
+    Ok(Value::Number(sum))
 }
 
 fn apply_sub(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -156,23 +180,23 @@ fn apply_sub(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalE
             expected: "at least 1",
             got: 0,
         }),
-        [value] => Ok(Value::Int(-value.as_int()?)),
+        [value] => Ok(Value::Number(value.as_number()?.neg())),
         [first, rest @ ..] => {
-            let mut result = first.as_int()?;
+            let mut result = first.as_number()?;
             for arg in rest {
-                result -= arg.as_int()?;
+                result = result.sub(arg.as_number()?);
             }
-            Ok(Value::Int(result))
+            Ok(Value::Number(result))
         }
     }
 }
 
 fn apply_mul(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    let mut product = 1_i64;
+    let mut product = Number::exact_int(1);
     for arg in args {
-        product *= arg.as_int()?;
+        product = product.mul(arg.as_number()?);
     }
-    Ok(Value::Int(product))
+    Ok(Value::Number(product))
 }
 
 fn apply_div(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -192,15 +216,15 @@ fn apply_div(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalE
         });
     }
 
-    let mut result = first.as_int()?;
+    let mut result = first.as_number()?;
     for arg in rest {
-        let divisor = arg.as_int()?;
-        if divisor == 0 {
+        let divisor = arg.as_number()?;
+        if divisor.is_zero() {
             return Err(EvalError::DivisionByZero.with_position(arg.pos.line, arg.pos.col));
         }
-        result /= divisor;
+        result = result.div(divisor).expect("non-zero divisor must divide");
     }
-    Ok(Value::Int(result))
+    Ok(Value::Number(result))
 }
 
 fn apply_abs(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -212,7 +236,7 @@ fn apply_abs(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalE
         });
     };
 
-    Ok(Value::Int(value.as_int()?.abs()))
+    Ok(Value::Number(value.as_number()?.abs()))
 }
 
 fn apply_modulo(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -236,7 +260,7 @@ fn apply_modulo(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, Ev
     } else {
         remainder
     };
-    Ok(Value::Int(result))
+    Ok(exact_int(result))
 }
 
 fn apply_remainder(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -254,7 +278,7 @@ fn apply_remainder(args: &[EvaluatedArg], _output: &mut String) -> Result<Value,
         return Err(EvalError::DivisionByZero.with_position(divisor.pos.line, divisor.pos.col));
     }
 
-    Ok(Value::Int(left % right))
+    Ok(exact_int(left % right))
 }
 
 fn apply_quotient(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -272,7 +296,7 @@ fn apply_quotient(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, 
         return Err(EvalError::DivisionByZero.with_position(divisor.pos.line, divisor.pos.col));
     }
 
-    Ok(Value::Int(left / right))
+    Ok(exact_int(left / right))
 }
 
 fn apply_min(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -284,11 +308,14 @@ fn apply_min(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalE
         });
     };
 
-    let mut current = first.as_int()?;
+    let mut current = first.as_number()?;
     for arg in rest {
-        current = current.min(arg.as_int()?);
+        let candidate = arg.as_number()?;
+        if candidate.compare(current) == Some(Ordering::Less) {
+            current = candidate;
+        }
     }
-    Ok(Value::Int(current))
+    Ok(Value::Number(current))
 }
 
 fn apply_max(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -300,11 +327,14 @@ fn apply_max(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalE
         });
     };
 
-    let mut current = first.as_int()?;
+    let mut current = first.as_number()?;
     for arg in rest {
-        current = current.max(arg.as_int()?);
+        let candidate = arg.as_number()?;
+        if candidate.compare(current) == Some(Ordering::Greater) {
+            current = candidate;
+        }
     }
-    Ok(Value::Int(current))
+    Ok(Value::Number(current))
 }
 
 fn apply_expt(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -326,29 +356,31 @@ fn apply_expt(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, Eval
         .with_position(exponent.pos.line, exponent.pos.col));
     };
 
-    Ok(Value::Int(base.pow(exponent)))
+    Ok(exact_int(base.pow(exponent)))
 }
 
 fn apply_lt(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    apply_comparison("<", args, |left, right| left < right)
+    apply_comparison("<", args, |ordering| ordering == Ordering::Less)
 }
 
 fn apply_gt(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    apply_comparison(">", args, |left, right| left > right)
+    apply_comparison(">", args, |ordering| ordering == Ordering::Greater)
 }
 
 fn apply_eq(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    apply_comparison("=", args, |left, right| left == right)
+    apply_comparison("=", args, |ordering| ordering == Ordering::Equal)
 }
 
 fn apply_lte(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
-    apply_comparison("<=", args, |left, right| left <= right)
+    apply_comparison("<=", args, |ordering| {
+        matches!(ordering, Ordering::Less | Ordering::Equal)
+    })
 }
 
 fn apply_comparison(
     name: &'static str,
     args: &[EvaluatedArg],
-    predicate: impl Fn(i64, i64) -> bool,
+    predicate: impl Fn(Ordering) -> bool,
 ) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
@@ -360,9 +392,14 @@ fn apply_comparison(
 
     let numbers = args
         .iter()
-        .map(EvaluatedArg::as_int)
+        .map(EvaluatedArg::as_number)
         .collect::<Result<Vec<_>, _>>()?;
-    let is_match = numbers.windows(2).all(|pair| predicate(pair[0], pair[1]));
+    let is_match = numbers.windows(2).all(|pair| {
+        pair[0]
+            .compare(pair[1])
+            .map(&predicate)
+            .unwrap_or(false)
+    });
     Ok(Value::Bool(is_match))
 }
 
@@ -522,7 +559,7 @@ fn apply_length(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, Ev
         });
     };
 
-    Ok(Value::Int(value.as_list()?.len() as i64))
+    Ok(exact_int(value.as_list()?.len() as i64))
 }
 
 fn apply_list_ref(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -660,7 +697,112 @@ fn apply_number_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Valu
         });
     };
 
-    Ok(Value::Bool(matches!(&value.value, Value::Int(_))))
+    Ok(Value::Bool(matches!(&value.value, Value::Number(_))))
+}
+
+fn apply_integer_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "integer?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(value.as_number()?.is_integer()))
+}
+
+fn apply_rational_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "rational?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(value.as_number()?.is_rational()))
+}
+
+fn apply_exact_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "exact?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(value.as_number()?.is_exact()))
+}
+
+fn apply_inexact_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "inexact?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(value.as_number()?.is_inexact()))
+}
+
+fn apply_exact_to_inexact(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "exact->inexact",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Number(value.as_number()?.to_inexact()))
+}
+
+fn apply_inexact_to_exact(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "inexact->exact",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let number = value.as_number()?;
+    let Some(exact) = number.to_exact() else {
+        return Err(EvalError::TypeMismatch {
+            expected: "finite number",
+            found: value.value.render(),
+        }
+        .with_position(value.pos.line, value.pos.col));
+    };
+
+    Ok(Value::Number(exact))
+}
+
+fn apply_numerator(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "numerator",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(exact_int(extract_rational(value)?.numerator()))
+}
+
+fn apply_denominator(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "denominator",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(exact_int(extract_rational(value)?.denominator()))
 }
 
 fn apply_boolean_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -711,7 +853,7 @@ fn apply_zero_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value,
         });
     };
 
-    Ok(Value::Bool(value.as_int()? == 0))
+    Ok(Value::Bool(value.as_number()?.is_zero()))
 }
 
 fn apply_positive_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -723,7 +865,7 @@ fn apply_positive_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Va
         });
     };
 
-    Ok(Value::Bool(value.as_int()? > 0))
+    Ok(Value::Bool(value.as_number()?.is_positive()))
 }
 
 fn apply_negative_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -735,7 +877,7 @@ fn apply_negative_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Va
         });
     };
 
-    Ok(Value::Bool(value.as_int()? < 0))
+    Ok(Value::Bool(value.as_number()?.is_negative()))
 }
 
 fn apply_odd_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -862,7 +1004,7 @@ fn apply_string_length(args: &[EvaluatedArg], _output: &mut String) -> Result<Va
         });
     };
 
-    Ok(Value::Int(value.as_string()?.len() as i64))
+    Ok(exact_int(value.as_string()?.len() as i64))
 }
 
 fn apply_substring(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -905,10 +1047,8 @@ fn apply_string_to_number(args: &[EvaluatedArg], _output: &mut String) -> Result
     let source = value.as_string()?;
     let owned = source.to_plain_string();
     let candidate = owned.trim();
-    if is_integer_token(candidate) {
-        if let Ok(parsed) = candidate.parse::<i64>() {
-            return Ok(Value::Int(parsed));
-        }
+    if let Some(number) = parse_number_token(candidate) {
+        return Ok(Value::Number(number));
     }
 
     Ok(Value::Bool(false))
@@ -924,7 +1064,7 @@ fn apply_number_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result
     };
 
     Ok(Value::String(SchemeString::immutable(
-        value.as_int()?.to_string(),
+        value.as_number()?.render(),
     )))
 }
 

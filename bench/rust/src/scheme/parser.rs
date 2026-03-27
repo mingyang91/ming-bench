@@ -1,4 +1,4 @@
-use super::{is_integer_token, EvalError, Expr, Position};
+use super::{number::parse_number_token, EvalError, Expr, Position};
 use crate::scheme::text::parse_char_literal;
 
 pub(super) fn parse_program(input: &str) -> Result<Vec<Expr>, EvalError> {
@@ -152,18 +152,8 @@ impl<'a> Parser<'a> {
             };
             return Ok(Expr::Char { value, pos });
         }
-        if is_integer_token(token) {
-            return token
-                .parse::<i64>()
-                .map(|value| Expr::Int { value, pos })
-                .map_err(|_| {
-                    self.error_at(
-                        pos,
-                        EvalError::ParseError {
-                            message: format!("invalid integer literal: {token}"),
-                        },
-                    )
-                });
+        if let Some(value) = parse_number_token(token) {
+            return Ok(Expr::Number { value, pos });
         }
 
         Ok(Expr::Symbol {

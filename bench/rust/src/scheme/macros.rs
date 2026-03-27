@@ -326,8 +326,8 @@ fn match_single_pattern(
         Expr::Bool { value, .. } => {
             matches!(input, Expr::Bool { value: other, .. } if other == value)
         }
-        Expr::Int { value, .. } => {
-            matches!(input, Expr::Int { value: other, .. } if other == value)
+        Expr::Number { value, .. } => {
+            matches!(input, Expr::Number { value: other, .. } if other == value)
         }
         Expr::Char { value, .. } => {
             matches!(input, Expr::Char { value: other, .. } if other == value)
@@ -374,7 +374,7 @@ fn expand_macro_template_at(
     repetition_index: Option<usize>,
 ) -> Result<Expr, EvalError> {
     match expr {
-        Expr::Bool { .. } | Expr::Int { .. } | Expr::Char { .. } | Expr::String { .. } => {
+        Expr::Bool { .. } | Expr::Number { .. } | Expr::Char { .. } | Expr::String { .. } => {
             Ok(expr.clone())
         }
         Expr::Symbol { name, pos } => {

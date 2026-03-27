@@ -1,10 +1,12 @@
 mod builtins;
 pub mod error;
 mod macros;
+mod number;
 mod parser;
 mod text;
 
 pub use error::EvalError;
+use number::Number;
 use text::{escape_string, render_char, SchemeString};
 
 use std::cell::RefCell;
@@ -21,7 +23,7 @@ struct Position {
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
     Bool { value: bool, pos: Position },
-    Int { value: i64, pos: Position },
+    Number { value: Number, pos: Position },
     Char { value: char, pos: Position },
     String { value: String, pos: Position },
     Symbol { name: String, pos: Position },
@@ -32,7 +34,7 @@ impl Expr {
     fn pos(&self) -> Position {
         match self {
             Self::Bool { pos, .. }
-            | Self::Int { pos, .. }
+            | Self::Number { pos, .. }
             | Self::Char { pos, .. }
             | Self::String { pos, .. }
             | Self::Symbol { pos, .. }
@@ -75,6 +77,12 @@ impl EvaluatedArg {
             .map_err(|error| error.with_position(self.pos.line, self.pos.col))
     }
 
+    fn as_number(&self) -> Result<Number, EvalError> {
+        self.value
+            .as_number()
+            .map_err(|error| error.with_position(self.pos.line, self.pos.col))
+    }
+
     fn as_list(&self) -> Result<&[Value], EvalError> {
         self.value
             .as_list()
@@ -103,7 +111,7 @@ impl EvaluatedArg {
 #[derive(Clone)]
 enum Value {
     Bool(bool),
-    Int(i64),
+    Number(Number),
     Char(char),
     String(SchemeString),
     Symbol(String),
@@ -255,7 +263,20 @@ impl Value {
 
     fn as_int(&self) -> Result<i64, EvalError> {
         match self {
-            Self::Int(value) => Ok(*value),
+            Self::Number(value) => value.as_exact_i64().ok_or_else(|| EvalError::TypeMismatch {
+                expected: "number",
+                found: self.render(),
+            }),
+            _ => Err(EvalError::TypeMismatch {
+                expected: "number",
+                found: self.render(),
+            }),
+        }
+    }
+
+    fn as_number(&self) -> Result<Number, EvalError> {
+        match self {
+            Self::Number(value) => Ok(*value),
             _ => Err(EvalError::TypeMismatch {
                 expected: "number",
                 found: self.render(),
@@ -322,7 +343,7 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
     match value {
         Value::Bool(true) => "#t".to_string(),
         Value::Bool(false) => "#f".to_string(),
-        Value::Int(value) => value.to_string(),
+        Value::Number(value) => value.render(),
         Value::Char(value) => match mode {
             RenderMode::Write => render_char(*value),
             RenderMode::Display => value.to_string(),
@@ -372,7 +393,7 @@ fn render_pair(pair: &PairValue, mode: RenderMode) -> String {
 fn values_eq(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Bool(left), Value::Bool(right)) => left == right,
-        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::String(left), Value::String(right)) => {
             left.to_plain_string() == right.to_plain_string()
@@ -392,7 +413,7 @@ fn values_eq(left: &Value, right: &Value) -> bool {
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Bool(left), Value::Bool(right)) => left == right,
-        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.numeric_eq(*right),
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::String(left), Value::String(right)) => {
             left.to_plain_string() == right.to_plain_string()
@@ -477,7 +498,7 @@ fn eval_program(exprs: &[Expr], env: EnvRef, output: &mut String) -> Result<Valu
 fn eval(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
     match expr {
         Expr::Bool { value, .. } => Ok(Value::Bool(*value)),
-        Expr::Int { value, .. } => Ok(Value::Int(*value)),
+        Expr::Number { value, .. } => Ok(Value::Number(*value)),
         Expr::Char { value, .. } => Ok(Value::Char(*value)),
         Expr::String { value, .. } => Ok(Value::String(SchemeString::immutable(value))),
         Expr::Symbol { name, pos } => env
@@ -811,13 +832,4 @@ fn eval_set(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, Ev
             got: args.len(),
         }),
     }
-}
-
-fn is_integer_token(token: &str) -> bool {
-    let digits = token
-        .strip_prefix('+')
-        .or_else(|| token.strip_prefix('-'))
-        .unwrap_or(token);
-
-    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
