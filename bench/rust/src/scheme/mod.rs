@@ -483,6 +483,8 @@ enum Builtin {
     IntegerToChar,
     CallCc,
     DynamicWind,
+    Raise,
+    WithExceptionHandler,
     Apply,
     Map,
     ForEach,
@@ -1261,6 +1263,8 @@ fn root_env() -> EnvRef {
         ("call/cc", Builtin::CallCc),
         ("call-with-current-continuation", Builtin::CallCc),
         ("dynamic-wind", Builtin::DynamicWind),
+        ("raise", Builtin::Raise),
+        ("with-exception-handler", Builtin::WithExceptionHandler),
         ("apply", Builtin::Apply),
         ("map", Builtin::Map),
         ("for-each", Builtin::ForEach),
@@ -1680,6 +1684,14 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         Builtin::DynamicWind => Err(EvalError::InvalidArgument {
             name: "dynamic-wind".to_owned(),
             message: "internal dynamic-wind requires continuation-aware evaluation".to_owned(),
+        }),
+        Builtin::Raise => Err(EvalError::InvalidArgument {
+            name: "raise".to_owned(),
+            message: "internal raise requires continuation-aware evaluation".to_owned(),
+        }),
+        Builtin::WithExceptionHandler => Err(EvalError::InvalidArgument {
+            name: "with-exception-handler".to_owned(),
+            message: "internal exception handling requires continuation-aware evaluation".to_owned(),
         }),
         Builtin::Apply => eval_apply_builtin(values, env),
         Builtin::Map => eval_map_builtin(values, env),
@@ -2406,6 +2418,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "and"
             | "or"
             | "do"
+            | "guard"
             | "syntax-rules"
     )
 }
@@ -4800,6 +4813,11 @@ fn values_equal_inner(
 enum MachineState {
     Expr(Expr, EnvRef),
     Value(Value),
+    Raised {
+        value: Value,
+        env: EnvRef,
+        pos: Option<SourcePos>,
+    },
 }
 
 #[derive(Clone)]
@@ -4809,11 +4827,13 @@ enum EvalCont {
 }
 
 type EvalContRef = Rc<EvalCont>;
+type HandlerRef = Rc<ExceptionHandlerContext>;
 
 #[derive(Clone)]
 struct CapturedContinuation {
     cont: EvalContRef,
     winds: Vec<WindRef>,
+    handlers: Vec<HandlerRef>,
 }
 
 #[derive(Clone)]
@@ -4823,6 +4843,14 @@ struct DynamicWindContext {
 }
 
 type WindRef = Rc<DynamicWindContext>;
+
+#[derive(Clone)]
+struct ExceptionHandlerContext {
+    handler: Value,
+    winds: Vec<WindRef>,
+    handlers: Vec<HandlerRef>,
+    env: EnvRef,
+}
 
 #[derive(Clone)]
 enum WindAction {
@@ -4892,11 +4920,33 @@ enum EvalFrame {
         result: Value,
         wind: WindRef,
     },
+    WithExceptionHandlerEnter {
+        handler: HandlerRef,
+        thunk: Value,
+        env: EnvRef,
+    },
+    WithExceptionHandlerReturn {
+        previous_handlers: Vec<HandlerRef>,
+    },
+    EnterExceptionHandler {
+        handler: Value,
+        env: EnvRef,
+        pos: Option<SourcePos>,
+    },
+    RaiseHandlerReturned {
+        pos: Option<SourcePos>,
+    },
+    TransferState {
+        target_cont: EvalContRef,
+        target_winds: Vec<WindRef>,
+        target_handlers: Vec<HandlerRef>,
+    },
     WindTransition {
         current: WindAction,
         remaining: Vec<WindAction>,
         target_cont: EvalContRef,
         target_winds: Vec<WindRef>,
+        target_handlers: Vec<HandlerRef>,
         transfer_value: Value,
         env: EnvRef,
     },
@@ -4931,6 +4981,11 @@ fn capture_continuation(cont: &EvalContRef) -> EvalContRef {
                 | EvalFrame::DynamicWindBefore { .. }
                 | EvalFrame::DynamicWindAfterBody { .. }
                 | EvalFrame::DynamicWindAfterOut { .. }
+                | EvalFrame::WithExceptionHandlerEnter { .. }
+                | EvalFrame::WithExceptionHandlerReturn { .. }
+                | EvalFrame::EnterExceptionHandler { .. }
+                | EvalFrame::RaiseHandlerReturned { .. }
+                | EvalFrame::TransferState { .. }
                 | EvalFrame::WindTransition { .. } => frame.clone(),
                 EvalFrame::ApplyArgs {
                     operator_expr,
@@ -4984,12 +5039,24 @@ fn start_wind_transition(
     actions: Vec<WindAction>,
     target_cont: EvalContRef,
     target_winds: Vec<WindRef>,
+    target_handlers: Vec<HandlerRef>,
     transfer_value: Value,
     env: &EnvRef,
     winds: &[WindRef],
+    handlers: &[HandlerRef],
 ) -> Result<(MachineState, EvalContRef), EvalError> {
     let Some((current, remaining)) = actions.split_first() else {
-        return Ok((MachineState::Value(transfer_value), target_cont));
+        return Ok((
+            MachineState::Value(transfer_value),
+            push_cont(
+                EvalFrame::TransferState {
+                    target_cont,
+                    target_winds,
+                    target_handlers,
+                },
+                done_cont(),
+            ),
+        ));
     };
 
     let current = current.clone();
@@ -4999,6 +5066,7 @@ fn start_wind_transition(
             remaining: remaining.to_vec(),
             target_cont,
             target_winds,
+            target_handlers,
             transfer_value,
             env: env.clone(),
         },
@@ -5011,6 +5079,8 @@ fn start_wind_transition(
         env,
         continuation,
         winds,
+        handlers,
+        None,
     )
 }
 
@@ -5187,6 +5257,92 @@ fn expand_cond_expr(args: &[Expr], env: &EnvRef, pos: SourcePos) -> Result<Expr,
     }
 
     expand_cond_clauses(args, env, pos)
+}
+
+fn guard_has_else(clauses: &[Expr]) -> bool {
+    clauses.iter().any(|clause| {
+        matches!(
+            clause,
+            Expr::List(items, _) if matches!(items.first(), Some(Expr::Symbol(name, _)) if name == "else")
+        )
+    })
+}
+
+fn expand_guard_expr(args: &[Expr], env: &EnvRef, pos: SourcePos) -> Result<Expr, EvalError> {
+    let (spec, body) = args
+        .split_first()
+        .ok_or_else(|| EvalError::Parse("guard requires a clause list".to_owned()))?;
+    if body.is_empty() {
+        return Err(EvalError::Parse("guard requires a body".to_owned()));
+    }
+
+    let spec_items = match spec {
+        Expr::List(items, _) => items,
+        _ => return Err(EvalError::Parse("guard requires a clause list".to_owned())),
+    };
+
+    let (exception_var_expr, clauses) = spec_items
+        .split_first()
+        .ok_or_else(|| EvalError::Parse("guard requires an exception variable".to_owned()))?;
+    let exception_var = expect_symbol(exception_var_expr, "guard exception variable")?;
+    let escape_name = env.fresh_symbol("guard");
+
+    let mut cond_items = vec![symbol_expr("cond", pos)];
+    cond_items.extend(clauses.iter().cloned());
+    if !guard_has_else(clauses) {
+        cond_items.push(list_expr(
+            vec![
+                symbol_expr("else", pos),
+                list_expr(
+                    vec![
+                        symbol_expr("raise", pos),
+                        symbol_expr(exception_var.clone(), pos),
+                    ],
+                    pos,
+                ),
+            ],
+            pos,
+        ));
+    }
+
+    let handler_lambda = list_expr(
+        vec![
+            symbol_expr("lambda", pos),
+            list_expr(vec![symbol_expr(exception_var, pos)], pos),
+            list_expr(
+                vec![
+                    symbol_expr(escape_name.clone(), pos),
+                    list_expr(cond_items, pos),
+                ],
+                pos,
+            ),
+        ],
+        pos,
+    );
+
+    let mut thunk_items = vec![symbol_expr("lambda", pos), list_expr(Vec::new(), pos)];
+    thunk_items.extend(body.iter().cloned());
+
+    let outer_lambda = list_expr(
+        vec![
+            symbol_expr("lambda", pos),
+            list_expr(vec![symbol_expr(escape_name, pos)], pos),
+            list_expr(
+                vec![
+                    symbol_expr("with-exception-handler", pos),
+                    handler_lambda,
+                    list_expr(thunk_items, pos),
+                ],
+                pos,
+            ),
+        ],
+        pos,
+    );
+
+    Ok(list_expr(
+        vec![symbol_expr("call/cc", pos), outer_lambda],
+        pos,
+    ))
 }
 
 fn machine_start_define(
@@ -5369,6 +5525,11 @@ fn machine_enter_list(
                     expand_cond_expr(args, &env, pos).map_err(|err| err.with_position(pos))?;
                 return Ok((MachineState::Expr(expanded, env), cont));
             }
+            "guard" => {
+                let expanded =
+                    expand_guard_expr(args, &env, pos).map_err(|err| err.with_position(pos))?;
+                return Ok((MachineState::Expr(expanded, env), cont));
+            }
             "let" => {
                 let expanded = expand_let_expr(args, pos).map_err(|err| err.with_position(pos))?;
                 return Ok((MachineState::Expr(expanded, env), cont));
@@ -5455,6 +5616,8 @@ fn machine_apply(
     env: &EnvRef,
     cont: EvalContRef,
     winds: &[WindRef],
+    handlers: &[HandlerRef],
+    pos: Option<SourcePos>,
 ) -> Result<(MachineState, EvalContRef), EvalError> {
     match operator {
         Value::Procedure(procedure) => match procedure.as_ref() {
@@ -5471,8 +5634,17 @@ fn machine_apply(
                     Value::Procedure(Rc::new(Procedure::Continuation(CapturedContinuation {
                         cont: capture_continuation(&cont),
                         winds: winds.to_vec(),
+                        handlers: handlers.to_vec(),
                     })));
-                machine_apply(args[0].clone(), vec![continuation], env, cont, winds)
+                machine_apply(
+                    args[0].clone(),
+                    vec![continuation],
+                    env,
+                    cont,
+                    winds,
+                    handlers,
+                    pos,
+                )
             }
             Procedure::Builtin(Builtin::DynamicWind) => {
                 if args.len() != 3 {
@@ -5500,7 +5672,55 @@ fn machine_apply(
                         cont,
                     ),
                     winds,
+                    handlers,
+                    None,
                 )
+            }
+            Procedure::Builtin(Builtin::Raise) => {
+                if args.len() != 1 {
+                    return Err(EvalError::WrongArgCount {
+                        name: "raise".to_owned(),
+                        expected: "exactly 1 argument".to_owned(),
+                        got: args.len(),
+                    });
+                }
+
+                Ok((
+                    MachineState::Raised {
+                        value: args[0].clone(),
+                        env: env.clone(),
+                        pos,
+                    },
+                    cont,
+                ))
+            }
+            Procedure::Builtin(Builtin::WithExceptionHandler) => {
+                if args.len() != 2 {
+                    return Err(EvalError::WrongArgCount {
+                        name: "with-exception-handler".to_owned(),
+                        expected: "exactly 2 arguments".to_owned(),
+                        got: args.len(),
+                    });
+                }
+
+                let handler = Rc::new(ExceptionHandlerContext {
+                    handler: args[0].clone(),
+                    winds: winds.to_vec(),
+                    handlers: handlers.to_vec(),
+                    env: env.clone(),
+                });
+
+                Ok((
+                    MachineState::Value(Value::Void),
+                    push_cont(
+                        EvalFrame::WithExceptionHandlerEnter {
+                            handler,
+                            thunk: args[1].clone(),
+                            env: env.clone(),
+                        },
+                        cont,
+                    ),
+                ))
             }
             Procedure::Builtin(Builtin::Apply) => {
                 if args.len() < 2 {
@@ -5515,7 +5735,7 @@ fn machine_apply(
                 let mut applied_args = args[1..args.len() - 1].to_vec();
                 let tail = expect_list("apply", &args[args.len() - 1])?;
                 applied_args.extend(tail);
-                machine_apply(operator, applied_args, env, cont, winds)
+                machine_apply(operator, applied_args, env, cont, winds, handlers, pos)
             }
             Procedure::Builtin(builtin) => Ok((
                 MachineState::Value(apply_builtin(*builtin, &args, env)?),
@@ -5560,15 +5780,27 @@ fn machine_apply(
                 let actions = build_wind_transition(winds, &captured.winds);
 
                 if actions.is_empty() {
-                    Ok((MachineState::Value(transfer_value), captured.cont.clone()))
+                    Ok((
+                        MachineState::Value(transfer_value),
+                        push_cont(
+                            EvalFrame::TransferState {
+                                target_cont: captured.cont.clone(),
+                                target_winds: captured.winds.clone(),
+                                target_handlers: captured.handlers.clone(),
+                            },
+                            done_cont(),
+                        ),
+                    ))
                 } else {
                     start_wind_transition(
                         actions,
                         captured.cont.clone(),
                         captured.winds.clone(),
+                        captured.handlers.clone(),
                         transfer_value,
                         env,
                         winds,
+                        handlers,
                     )
                 }
             }
@@ -5587,6 +5819,7 @@ fn advance_apply_args(
     pos: SourcePos,
     next: EvalContRef,
     winds: &[WindRef],
+    handlers: &[HandlerRef],
 ) -> Result<(MachineState, EvalContRef), EvalError> {
     let mut remaining_iter = remaining.into_iter();
 
@@ -5617,7 +5850,8 @@ fn advance_apply_args(
         }
     }
 
-    machine_apply(operator, evaluated, &env, next, winds).map_err(|err| err.with_position(pos))
+    machine_apply(operator, evaluated, &env, next, winds, handlers, Some(pos))
+        .map_err(|err| err.with_position(pos))
 }
 
 fn run_with_continuations(
@@ -5627,6 +5861,7 @@ fn run_with_continuations(
     let mut state = initial;
     let mut cont = initial_cont;
     let mut winds = Vec::new();
+    let mut handlers: Vec<HandlerRef> = Vec::new();
 
     loop {
         match state {
@@ -5649,6 +5884,52 @@ fn run_with_continuations(
                     cont = next_cont;
                 }
             },
+            MachineState::Raised { value, env, pos } => {
+                let Some(handler_ctx) = handlers.last().cloned() else {
+                    let error = EvalError::UncaughtException {
+                        value: value.render(),
+                    };
+                    return Err(match pos {
+                        Some(pos) => error.with_position(pos),
+                        None => error,
+                    });
+                };
+
+                let handler_cont = push_cont(
+                    EvalFrame::EnterExceptionHandler {
+                        handler: handler_ctx.handler.clone(),
+                        env: handler_ctx.env.clone(),
+                        pos,
+                    },
+                    done_cont(),
+                );
+                let actions = build_wind_transition(&winds, &handler_ctx.winds);
+
+                if actions.is_empty() {
+                    state = MachineState::Value(value);
+                    cont = push_cont(
+                        EvalFrame::TransferState {
+                            target_cont: handler_cont,
+                            target_winds: handler_ctx.winds.clone(),
+                            target_handlers: handler_ctx.handlers.clone(),
+                        },
+                        done_cont(),
+                    );
+                } else {
+                    let (next_state, next_cont) = start_wind_transition(
+                        actions,
+                        handler_cont,
+                        handler_ctx.winds.clone(),
+                        handler_ctx.handlers.clone(),
+                        value,
+                        &env,
+                        &winds,
+                        &handlers,
+                    )?;
+                    state = next_state;
+                    cont = next_cont;
+                }
+            }
             MachineState::Value(value) => {
                 let (frame, next) = match cont.as_ref() {
                     EvalCont::Done => return Ok(value),
@@ -5706,6 +5987,7 @@ fn run_with_continuations(
                             pos,
                             next,
                             &winds,
+                            &handlers,
                         )?;
                         state = next_state;
                         cont = next_cont;
@@ -5732,6 +6014,7 @@ fn run_with_continuations(
                             pos,
                             next,
                             &winds,
+                            &handlers,
                         )?;
                         state = next_state;
                         cont = next_cont;
@@ -5774,6 +6057,8 @@ fn run_with_continuations(
                                 next,
                             ),
                             &winds,
+                            &handlers,
+                            None,
                         )?;
                         state = next_state;
                         cont = next_cont;
@@ -5792,6 +6077,8 @@ fn run_with_continuations(
                                 next,
                             ),
                             &winds,
+                            &handlers,
+                            None,
                         )?;
                         state = next_state;
                         cont = next_cont;
@@ -5804,11 +6091,65 @@ fn run_with_continuations(
                         state = MachineState::Value(result);
                         cont = next;
                     }
+                    EvalFrame::WithExceptionHandlerEnter { handler, thunk, env } => {
+                        let previous_handlers = handlers.clone();
+                        handlers.push(handler);
+                        let (next_state, next_cont) = machine_apply(
+                            thunk,
+                            Vec::new(),
+                            &env,
+                            push_cont(
+                                EvalFrame::WithExceptionHandlerReturn { previous_handlers },
+                                next,
+                            ),
+                            &winds,
+                            &handlers,
+                            None,
+                        )?;
+                        state = next_state;
+                        cont = next_cont;
+                    }
+                    EvalFrame::WithExceptionHandlerReturn { previous_handlers } => {
+                        handlers = previous_handlers;
+                        state = MachineState::Value(value);
+                        cont = next;
+                    }
+                    EvalFrame::EnterExceptionHandler { handler, env, pos } => {
+                        let (next_state, next_cont) = machine_apply(
+                            handler,
+                            vec![value],
+                            &env,
+                            push_cont(EvalFrame::RaiseHandlerReturned { pos }, done_cont()),
+                            &winds,
+                            &handlers,
+                            pos,
+                        )?;
+                        state = next_state;
+                        cont = next_cont;
+                    }
+                    EvalFrame::RaiseHandlerReturned { pos } => {
+                        let error = EvalError::HandlerReturned;
+                        return Err(match pos {
+                            Some(pos) => error.with_position(pos),
+                            None => error,
+                        });
+                    }
+                    EvalFrame::TransferState {
+                        target_cont,
+                        target_winds,
+                        target_handlers,
+                    } => {
+                        winds = target_winds;
+                        handlers = target_handlers;
+                        state = MachineState::Value(value);
+                        cont = target_cont;
+                    }
                     EvalFrame::WindTransition {
                         current,
                         remaining,
                         target_cont,
                         target_winds,
+                        target_handlers,
                         transfer_value,
                         env,
                     } => {
@@ -5824,6 +6165,7 @@ fn run_with_continuations(
 
                         if remaining.is_empty() {
                             winds = target_winds;
+                            handlers = target_handlers;
                             state = MachineState::Value(transfer_value);
                             cont = target_cont;
                         } else {
@@ -5831,9 +6173,11 @@ fn run_with_continuations(
                                 remaining,
                                 target_cont,
                                 target_winds,
+                                target_handlers,
                                 transfer_value,
                                 &env,
                                 &winds,
+                                &handlers,
                             )?;
                             state = next_state;
                             cont = next_cont;

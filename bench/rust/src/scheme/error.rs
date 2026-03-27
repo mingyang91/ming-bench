@@ -69,6 +69,10 @@ pub enum EvalError {
     InvalidCharacterCode { name: String, code: i64 },
     #[error("division by zero")]
     DivisionByZero,
+    #[error("uncaught exception: {value}")]
+    UncaughtException { value: String },
+    #[error("exception handler returned for a non-continuable raise")]
+    HandlerReturned,
     #[error("{pos}: {source}")]
     Positioned {
         pos: SourcePos,
