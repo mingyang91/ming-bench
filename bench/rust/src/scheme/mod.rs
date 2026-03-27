@@ -40,8 +40,10 @@ mod tests;
 #[derive(Clone, PartialEq, Eq)]
 enum Expr {
     Int(i64),
+    Rational(i64, i64),
     Bool(bool),
     String(String),
+    Char(char),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -56,20 +58,41 @@ enum Builtin {
     GreaterThan,
     NumericEq,
     LessEqual,
+    Eq,
+    Equal,
     Not,
     Map,
+    Apply,
+    Reverse,
     Cons,
     Car,
     Cdr,
+    SetCar,
+    SetCdr,
     NullPred,
     List,
     Length,
     Append,
+    ZeroPred,
+    Remainder,
     StringPred,
+    StringAppend,
+    NumberToString,
+    StringToSymbol,
+    SymbolToString,
+    StringRef,
     NumberPred,
     BooleanPred,
     PairPred,
     SymbolPred,
+    Vector,
+    VectorRef,
+    Values,
+    CallWithValues,
+    DynamicWind,
+    Raise,
+    WithExceptionHandler,
+    GuardProtect,
     CallCc,
 }
 
@@ -84,20 +107,41 @@ impl Builtin {
             ">" => Some(Self::GreaterThan),
             "=" => Some(Self::NumericEq),
             "<=" => Some(Self::LessEqual),
+            "eq?" => Some(Self::Eq),
+            "equal?" => Some(Self::Equal),
             "not" => Some(Self::Not),
             "map" => Some(Self::Map),
+            "apply" => Some(Self::Apply),
+            "reverse" => Some(Self::Reverse),
             "cons" => Some(Self::Cons),
             "car" => Some(Self::Car),
             "cdr" => Some(Self::Cdr),
+            "set-car!" => Some(Self::SetCar),
+            "set-cdr!" => Some(Self::SetCdr),
             "null?" => Some(Self::NullPred),
             "list" => Some(Self::List),
             "length" => Some(Self::Length),
             "append" => Some(Self::Append),
+            "zero?" => Some(Self::ZeroPred),
+            "remainder" => Some(Self::Remainder),
             "string?" => Some(Self::StringPred),
+            "string-append" => Some(Self::StringAppend),
+            "number->string" => Some(Self::NumberToString),
+            "string->symbol" => Some(Self::StringToSymbol),
+            "symbol->string" => Some(Self::SymbolToString),
+            "string-ref" => Some(Self::StringRef),
             "number?" => Some(Self::NumberPred),
             "boolean?" => Some(Self::BooleanPred),
             "pair?" => Some(Self::PairPred),
             "symbol?" => Some(Self::SymbolPred),
+            "vector" => Some(Self::Vector),
+            "vector-ref" => Some(Self::VectorRef),
+            "values" => Some(Self::Values),
+            "call-with-values" => Some(Self::CallWithValues),
+            "dynamic-wind" => Some(Self::DynamicWind),
+            "raise" => Some(Self::Raise),
+            "with-exception-handler" => Some(Self::WithExceptionHandler),
+            "__guard-protect" => Some(Self::GuardProtect),
             "call/cc" | "call-with-current-continuation" => Some(Self::CallCc),
             _ => None,
         }
@@ -113,20 +157,41 @@ impl Builtin {
             Self::GreaterThan => ">",
             Self::NumericEq => "=",
             Self::LessEqual => "<=",
+            Self::Eq => "eq?",
+            Self::Equal => "equal?",
             Self::Not => "not",
             Self::Map => "map",
+            Self::Apply => "apply",
+            Self::Reverse => "reverse",
             Self::Cons => "cons",
             Self::Car => "car",
             Self::Cdr => "cdr",
+            Self::SetCar => "set-car!",
+            Self::SetCdr => "set-cdr!",
             Self::NullPred => "null?",
             Self::List => "list",
             Self::Length => "length",
             Self::Append => "append",
+            Self::ZeroPred => "zero?",
+            Self::Remainder => "remainder",
             Self::StringPred => "string?",
+            Self::StringAppend => "string-append",
+            Self::NumberToString => "number->string",
+            Self::StringToSymbol => "string->symbol",
+            Self::SymbolToString => "symbol->string",
+            Self::StringRef => "string-ref",
             Self::NumberPred => "number?",
             Self::BooleanPred => "boolean?",
             Self::PairPred => "pair?",
             Self::SymbolPred => "symbol?",
+            Self::Vector => "vector",
+            Self::VectorRef => "vector-ref",
+            Self::Values => "values",
+            Self::CallWithValues => "call-with-values",
+            Self::DynamicWind => "dynamic-wind",
+            Self::Raise => "raise",
+            Self::WithExceptionHandler => "with-exception-handler",
+            Self::GuardProtect => "__guard-protect",
             Self::CallCc => "call/cc",
         }
     }
@@ -144,6 +209,9 @@ enum SpecialForm {
     Begin,
     Cond,
     Set,
+    Letrec,
+    Guard,
+    Do,
     DefineSyntax,
     DefineRecordType,
 }
@@ -161,6 +229,9 @@ impl SpecialForm {
             "begin" => Some(Self::Begin),
             "cond" => Some(Self::Cond),
             "set!" => Some(Self::Set),
+            "letrec" => Some(Self::Letrec),
+            "guard" => Some(Self::Guard),
+            "do" => Some(Self::Do),
             "define-syntax" => Some(Self::DefineSyntax),
             "define-record-type" => Some(Self::DefineRecordType),
             _ => None,
@@ -171,11 +242,14 @@ impl SpecialForm {
 #[derive(Clone)]
 enum Value {
     Int(i64),
+    Rational(i64, i64),
     Bool(bool),
     String(String),
+    Char(char),
     Symbol(String),
     EmptyList,
     Pair(Rc<Pair>),
+    Vector(Rc<RefCell<Vec<Value>>>),
     Builtin(Builtin),
     Closure(Rc<Closure>),
     Record(Rc<RecordInstance>),
@@ -183,13 +257,13 @@ enum Value {
     RecordPredicate(Rc<RecordPredicate>),
     RecordAccessor(Rc<RecordAccessor>),
     Continuation(Rc<Continuation>),
+    Multi(Vec<Value>),
     Void,
 }
 
-#[derive(Clone)]
 struct Pair {
-    car: Value,
-    cdr: Value,
+    car: RefCell<Value>,
+    cdr: RefCell<Value>,
 }
 
 #[derive(Clone)]
@@ -203,6 +277,21 @@ struct Closure {
 #[derive(Clone)]
 struct Continuation {
     frames: Vec<MachineFrame>,
+}
+
+#[derive(Clone)]
+struct DynamicWindContext {
+    in_thunk: Value,
+    out_thunk: Value,
+}
+
+#[derive(Clone)]
+struct ExceptionHandlerContext {
+    handler: Value,
+    outer_frame_len: usize,
+    outer_wind_len: usize,
+    outer_handler_len: usize,
+    allow_return: bool,
 }
 
 #[derive(Clone)]
@@ -241,6 +330,9 @@ struct RecordAccessor {
 enum MachineFrame {
     ProcedureBoundary,
     CallCcResult,
+    CallWithValuesConsumer {
+        consumer: Value,
+    },
     Sequence {
         remaining: Vec<Expr>,
         env: EnvRef,
@@ -287,6 +379,32 @@ enum MachineFrame {
         body: Vec<Expr>,
         remaining: Vec<Expr>,
         env: EnvRef,
+    },
+    DynamicWindEntered {
+        body_thunk: Value,
+        wind: Rc<DynamicWindContext>,
+    },
+    DynamicWindBodyResult {
+        wind: Rc<DynamicWindContext>,
+    },
+    DynamicWindOutResult {
+        body_result: Value,
+    },
+    WithExceptionHandlerResult {
+        handler: Rc<ExceptionHandlerContext>,
+    },
+    ExceptionHandlerReturned,
+    ExceptionWindExit {
+        remaining: Vec<Rc<DynamicWindContext>>,
+        entering: Vec<Rc<DynamicWindContext>>,
+        handler: Rc<ExceptionHandlerContext>,
+        exception: Value,
+    },
+    ExceptionWindEnter {
+        current: Rc<DynamicWindContext>,
+        remaining: Vec<Rc<DynamicWindContext>>,
+        handler: Rc<ExceptionHandlerContext>,
+        exception: Value,
     },
 }
 
@@ -481,9 +599,12 @@ fn eval_special_form(
         SpecialForm::And => eval_and(args, env),
         SpecialForm::Or => eval_or(args, env),
         SpecialForm::Let => eval_let(args, env),
+        SpecialForm::Letrec => eval_letrec(args, env),
         SpecialForm::Begin => eval_sequence(args, env),
         SpecialForm::Cond => eval_cond(args, env),
         SpecialForm::Set => eval_set(args, env),
+        SpecialForm::Guard => eval(&desugar_guard(args)?, env),
+        SpecialForm::Do => eval(&desugar_do(args)?, env),
         SpecialForm::DefineSyntax => eval_define_syntax(args, env),
         SpecialForm::DefineRecordType => eval_define_record_type(args, env),
     }
@@ -598,6 +719,30 @@ fn eval_let(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         }
         _ => Err(EvalError::message(
             "let expects bindings and at least one body expression",
+        )),
+    }
+}
+
+fn eval_letrec(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    match args {
+        [bindings_expr, body @ ..] if !body.is_empty() => {
+            let bindings = parse_bindings(bindings_expr)?;
+            let let_env = Env::new(Some(env));
+            let mut prepared = Vec::with_capacity(bindings.len());
+            for (name, expr) in bindings {
+                let cell = Rc::new(RefCell::new(Value::Void));
+                let_env.define_cell(name, cell.clone());
+                prepared.push((expr, cell));
+            }
+
+            for (expr, cell) in prepared {
+                *cell.borrow_mut() = eval(&expr, let_env.clone())?;
+            }
+
+            eval_sequence(body, let_env)
+        }
+        _ => Err(EvalError::message(
+            "letrec expects bindings and at least one body expression",
         )),
     }
 }
@@ -826,8 +971,12 @@ fn match_pattern(
 ) -> bool {
     match pattern {
         Expr::Int(value) => matches!(expr, Expr::Int(other) if value == other),
+        Expr::Rational(numerator, denominator) => {
+            matches!(expr, Expr::Rational(other_num, other_den) if numerator == other_num && denominator == other_den)
+        }
         Expr::Bool(value) => matches!(expr, Expr::Bool(other) if value == other),
         Expr::String(value) => matches!(expr, Expr::String(other) if value == other),
+        Expr::Char(value) => matches!(expr, Expr::Char(other) if value == other),
         Expr::Symbol(name) if name == "_" => true,
         Expr::Symbol(name) if is_literal_pattern_identifier(name, macro_def) => {
             literal_identifier_matches(name, expr, macro_def, env)
@@ -927,7 +1076,11 @@ fn expand_template(
     expansion_ctx: &mut ExpansionContext,
 ) -> Result<Expr, EvalError> {
     match template {
-        Expr::Int(_) | Expr::Bool(_) | Expr::String(_) => Ok(template.clone()),
+        Expr::Int(_)
+        | Expr::Rational(_, _)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Char(_) => Ok(template.clone()),
         Expr::Symbol(name) => {
             if let Some(value) = bindings.single.get(name) {
                 Ok(value.clone())
@@ -984,16 +1137,28 @@ fn is_ellipsis(expr: &Expr) -> bool {
 }
 
 fn apply(procedure: Value, args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let mut winds = Vec::new();
+    let mut handlers = Vec::new();
     run_machine(start_call_machine(
         procedure,
         args.to_vec(),
         env,
         Vec::new(),
+        &mut winds,
+        &mut handlers,
     )?)
 }
 
 fn apply_evaluated(procedure: Value, args: Vec<Value>) -> Result<Value, EvalError> {
-    run_machine(invoke_procedure_machine(procedure, args, Vec::new())?)
+    let mut winds = Vec::new();
+    let mut handlers = Vec::new();
+    run_machine(invoke_procedure_machine(
+        procedure,
+        args,
+        Vec::new(),
+        &mut winds,
+        &mut handlers,
+    )?)
 }
 
 fn call_closure(closure: Rc<Closure>, args: Vec<Value>) -> Result<Value, EvalError> {
@@ -1103,41 +1268,55 @@ fn apply_map(args: Vec<Value>) -> Result<Value, EvalError> {
 
 fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
     match builtin {
-        Builtin::Map => unreachable!("map is handled before apply_builtin"),
-        Builtin::Add => Ok(Value::Int(
-            collect_numbers(builtin.name(), args)?.into_iter().sum(),
-        )),
+        Builtin::Map
+        | Builtin::Apply
+        | Builtin::CallWithValues
+        | Builtin::DynamicWind
+        | Builtin::Raise
+        | Builtin::WithExceptionHandler
+        | Builtin::GuardProtect
+        | Builtin::CallCc => {
+            Err(EvalError::message(format!(
+                "{} requires the machine evaluator",
+                builtin.name()
+            )))
+        }
+        Builtin::Add => Ok(number_to_value(add_numbers(&collect_numbers(builtin.name(), args)?))),
         Builtin::Sub => {
             let numbers = collect_numbers(builtin.name(), args)?;
             let numbers = require_min_args(builtin.name(), &numbers, 1)?;
-            let result = if numbers.len() == 1 {
-                -numbers[0]
-            } else {
-                numbers[1..]
-                    .iter()
-                    .fold(numbers[0], |acc, value| acc - *value)
-            };
-            Ok(Value::Int(result))
+            Ok(number_to_value(sub_numbers(numbers)?))
         }
-        Builtin::Mul => Ok(Value::Int(
-            collect_numbers(builtin.name(), args)?.into_iter().product(),
-        )),
+        Builtin::Mul => Ok(number_to_value(mul_numbers(&collect_numbers(builtin.name(), args)?))),
         Builtin::Div => {
             let numbers = collect_numbers(builtin.name(), args)?;
             let numbers = require_min_args(builtin.name(), &numbers, 2)?;
-            let mut result = numbers[0];
-            for divisor in &numbers[1..] {
-                if *divisor == 0 {
-                    return Err(EvalError::message("division by zero"));
-                }
-                result /= *divisor;
-            }
-            Ok(Value::Int(result))
+            Ok(number_to_value(div_numbers(numbers)?))
         }
-        Builtin::LessThan => compare_numbers(builtin.name(), args, |left, right| left < right),
-        Builtin::GreaterThan => compare_numbers(builtin.name(), args, |left, right| left > right),
-        Builtin::NumericEq => compare_numbers(builtin.name(), args, |left, right| left == right),
-        Builtin::LessEqual => compare_numbers(builtin.name(), args, |left, right| left <= right),
+        Builtin::LessThan => compare_numbers(builtin.name(), args, |left, right| {
+            compare_number_values(left, right) < 0
+        }),
+        Builtin::GreaterThan => compare_numbers(builtin.name(), args, |left, right| {
+            compare_number_values(left, right) > 0
+        }),
+        Builtin::NumericEq => compare_numbers(builtin.name(), args, |left, right| {
+            compare_number_values(left, right) == 0
+        }),
+        Builtin::LessEqual => compare_numbers(builtin.name(), args, |left, right| {
+            compare_number_values(left, right) <= 0
+        }),
+        Builtin::Eq => {
+            let [left, right] = require_exact_args(builtin.name(), args, 2)? else {
+                unreachable!();
+            };
+            Ok(Value::Bool(is_eq(left, right)))
+        }
+        Builtin::Equal => {
+            let [left, right] = require_exact_args(builtin.name(), args, 2)? else {
+                unreachable!();
+            };
+            Ok(Value::Bool(is_equal(left, right)))
+        }
         Builtin::Not => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
                 unreachable!();
@@ -1149,21 +1328,35 @@ fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
                 unreachable!();
             };
             Ok(Value::Pair(Rc::new(Pair {
-                car: car.clone(),
-                cdr: cdr.clone(),
+                car: RefCell::new(car.clone()),
+                cdr: RefCell::new(cdr.clone()),
             })))
         }
         Builtin::Car => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
                 unreachable!();
             };
-            Ok(expect_pair(builtin.name(), value)?.car.clone())
+            Ok(expect_pair(builtin.name(), value)?.car.borrow().clone())
         }
         Builtin::Cdr => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
                 unreachable!();
             };
-            Ok(expect_pair(builtin.name(), value)?.cdr.clone())
+            Ok(expect_pair(builtin.name(), value)?.cdr.borrow().clone())
+        }
+        Builtin::SetCar => {
+            let [pair_value, new_value] = require_exact_args(builtin.name(), args, 2)? else {
+                unreachable!();
+            };
+            *expect_pair(builtin.name(), pair_value)?.car.borrow_mut() = new_value.clone();
+            Ok(Value::Void)
+        }
+        Builtin::SetCdr => {
+            let [pair_value, new_value] = require_exact_args(builtin.name(), args, 2)? else {
+                unreachable!();
+            };
+            *expect_pair(builtin.name(), pair_value)?.cdr.borrow_mut() = new_value.clone();
+            Ok(Value::Void)
         }
         Builtin::NullPred => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
@@ -1179,17 +1372,87 @@ fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
             Ok(Value::Int(proper_list_length(builtin.name(), value)? as i64))
         }
         Builtin::Append => append_lists(args),
+        Builtin::Reverse => {
+            let [value] = require_exact_args(builtin.name(), args, 1)? else {
+                unreachable!();
+            };
+            let mut items = collect_list_items(builtin.name(), value)?;
+            items.reverse();
+            Ok(make_proper_list(items))
+        }
+        Builtin::ZeroPred => {
+            let [value] = require_exact_args(builtin.name(), args, 1)? else {
+                unreachable!();
+            };
+            Ok(Value::Bool(number_is_zero(&expect_number(builtin.name(), value)?)))
+        }
+        Builtin::Remainder => {
+            let [left, right] = require_exact_args(builtin.name(), args, 2)? else {
+                unreachable!();
+            };
+            let dividend = expect_exact_int(builtin.name(), left)?;
+            let divisor = expect_exact_int(builtin.name(), right)?;
+            if divisor == 0 {
+                return Err(EvalError::message("division by zero"));
+            }
+            Ok(Value::Int(dividend % divisor))
+        }
         Builtin::StringPred => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
                 unreachable!();
             };
             Ok(Value::Bool(matches!(value, Value::String(_))))
         }
+        Builtin::StringAppend => {
+            let mut result = String::new();
+            for value in args {
+                result.push_str(expect_string(builtin.name(), value)?);
+            }
+            Ok(Value::String(result))
+        }
+        Builtin::NumberToString => {
+            let [value] = require_exact_args(builtin.name(), args, 1)? else {
+                unreachable!();
+            };
+            Ok(Value::String(render_number(&expect_number(builtin.name(), value)?)))
+        }
+        Builtin::StringToSymbol => {
+            let [value] = require_exact_args(builtin.name(), args, 1)? else {
+                unreachable!();
+            };
+            Ok(Value::Symbol(expect_string(builtin.name(), value)?.to_string()))
+        }
+        Builtin::SymbolToString => {
+            let [value] = require_exact_args(builtin.name(), args, 1)? else {
+                unreachable!();
+            };
+            Ok(Value::String(expect_symbol(builtin.name(), value)?.to_string()))
+        }
+        Builtin::StringRef => {
+            let [text, index] = require_exact_args(builtin.name(), args, 2)? else {
+                unreachable!();
+            };
+            let text = expect_string(builtin.name(), text)?;
+            let index = expect_exact_int(builtin.name(), index)?;
+            if index < 0 {
+                return Err(EvalError::message(format!(
+                    "{} index out of range",
+                    builtin.name()
+                )));
+            }
+            let Some(ch) = text.chars().nth(index as usize) else {
+                return Err(EvalError::message(format!(
+                    "{} index out of range",
+                    builtin.name()
+                )));
+            };
+            Ok(Value::Char(ch))
+        }
         Builtin::NumberPred => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
                 unreachable!();
             };
-            Ok(Value::Bool(matches!(value, Value::Int(_))))
+            Ok(Value::Bool(matches!(value, Value::Int(_) | Value::Rational(_, _))))
         }
         Builtin::BooleanPred => {
             let [value] = require_exact_args(builtin.name(), args, 1)? else {
@@ -1209,7 +1472,23 @@ fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
             };
             Ok(Value::Bool(matches!(value, Value::Symbol(_))))
         }
-        Builtin::CallCc => Err(EvalError::message("call/cc requires the machine evaluator")),
+        Builtin::Vector => Ok(Value::Vector(Rc::new(RefCell::new(args.to_vec())))),
+        Builtin::VectorRef => {
+            let [vector, index] = require_exact_args(builtin.name(), args, 2)? else {
+                unreachable!();
+            };
+            let vector = expect_vector(builtin.name(), vector)?;
+            let index = expect_exact_int(builtin.name(), index)?;
+            if index < 0 || index as usize >= vector.borrow().len() {
+                return Err(EvalError::message(format!(
+                    "{} index out of range",
+                    builtin.name()
+                )));
+            }
+            let value = vector.borrow()[index as usize].clone();
+            Ok(value)
+        }
+        Builtin::Values => Ok(pack_values(args.to_vec())),
     }
 }
 
@@ -1218,9 +1497,14 @@ fn eval_sequence(exprs: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
 }
 
 fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
+    let mut winds = Vec::new();
+    let mut handlers = Vec::new();
+
     loop {
         state = match state {
-            MachineState::Eval { expr, env, frames } => eval_expr_machine(expr, env, frames)?,
+            MachineState::Eval { expr, env, frames } => {
+                eval_expr_machine(expr, env, frames)?
+            }
             MachineState::Apply { value, mut frames } => {
                 let Some(frame) = frames.pop() else {
                     return Ok(value);
@@ -1229,11 +1513,20 @@ fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
                 match frame {
                     MachineFrame::ProcedureBoundary => MachineState::Apply { value, frames },
                     MachineFrame::CallCcResult => {
-                        if matches!(value, Value::Void) {
+                        if matches!(value, Value::Void) && winds.is_empty() && handlers.is_empty() {
                             suspend_current_procedure_machine(value, frames)
                         } else {
                             MachineState::Apply { value, frames }
                         }
+                    }
+                    MachineFrame::CallWithValuesConsumer { consumer } => {
+                        invoke_procedure_machine(
+                            consumer,
+                            unpack_values(value),
+                            frames,
+                            &mut winds,
+                            &mut handlers,
+                        )?
                     }
                     MachineFrame::Sequence { remaining, env } => {
                         start_sequence_machine(remaining, env, frames)
@@ -1273,14 +1566,14 @@ fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
                         }
                     }
                     MachineFrame::DefineValue { name, env } => {
-                        env.define(name, value);
+                        env.define(name, require_single_value("define", value)?);
                         MachineState::Apply {
                             value: Value::Void,
                             frames,
                         }
                     }
                     MachineFrame::SetValue { name, env } => {
-                        if env.set(&name, value) {
+                        if env.set(&name, require_single_value("set!", value)?) {
                             MachineState::Apply {
                                 value: Value::Void,
                                 frames,
@@ -1290,7 +1583,14 @@ fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
                         }
                     }
                     MachineFrame::CallHead { args, env } => {
-                        start_call_machine(value, args, env, frames)?
+                        start_call_machine(
+                            value,
+                            args,
+                            env,
+                            frames,
+                            &mut winds,
+                            &mut handlers,
+                        )?
                     }
                     MachineFrame::CallArgs {
                         procedure,
@@ -1298,9 +1598,15 @@ fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
                         remaining,
                         env,
                     } => {
-                        evaluated.push(value);
+                        evaluated.push(require_single_value("procedure argument", value)?);
                         if remaining.is_empty() {
-                            invoke_procedure_machine(procedure, evaluated, frames)?
+                            invoke_procedure_machine(
+                                procedure,
+                                evaluated,
+                                frames,
+                                &mut winds,
+                                &mut handlers,
+                            )?
                         } else {
                             continue_call_args_machine(
                                 procedure, evaluated, remaining, env, frames,
@@ -1336,6 +1642,70 @@ fn run_machine(mut state: MachineState) -> Result<Value, EvalError> {
                             eval_cond_machine(remaining, env, frames)?
                         }
                     }
+                    MachineFrame::DynamicWindEntered { body_thunk, wind } => {
+                        activate_wind(&mut winds, wind.clone());
+                        frames.push(MachineFrame::DynamicWindBodyResult { wind });
+                        invoke_procedure_machine(
+                            body_thunk,
+                            Vec::new(),
+                            frames,
+                            &mut winds,
+                            &mut handlers,
+                        )?
+                    }
+                    MachineFrame::DynamicWindBodyResult { wind } => {
+                        deactivate_wind(&mut winds, &wind);
+                        let body_result = value;
+                        frames.push(MachineFrame::DynamicWindOutResult { body_result });
+                        invoke_procedure_machine(
+                            wind.out_thunk.clone(),
+                            Vec::new(),
+                            frames,
+                            &mut winds,
+                            &mut handlers,
+                        )?
+                    }
+                    MachineFrame::DynamicWindOutResult { body_result } => MachineState::Apply {
+                        value: body_result,
+                        frames,
+                    },
+                    MachineFrame::WithExceptionHandlerResult { handler } => {
+                        deactivate_handler(&mut handlers, &handler);
+                        MachineState::Apply { value, frames }
+                    }
+                    MachineFrame::ExceptionHandlerReturned => {
+                        return Err(EvalError::message("raise handler returned"));
+                    }
+                    MachineFrame::ExceptionWindExit {
+                        remaining,
+                        entering,
+                        handler,
+                        exception,
+                    } => continue_raise_after_exit(
+                        remaining,
+                        entering,
+                        handler,
+                        exception,
+                        frames,
+                        &mut winds,
+                        &mut handlers,
+                    )?,
+                    MachineFrame::ExceptionWindEnter {
+                        current,
+                        remaining,
+                        handler,
+                        exception,
+                    } => {
+                        activate_wind(&mut winds, current);
+                        continue_raise_after_enter(
+                            remaining,
+                            handler,
+                            exception,
+                            frames,
+                            &mut winds,
+                            &mut handlers,
+                        )?
+                    }
                 }
             }
         };
@@ -1352,12 +1722,20 @@ fn eval_expr_machine(
             value: Value::Int(value),
             frames,
         }),
+        Expr::Rational(numerator, denominator) => Ok(MachineState::Apply {
+            value: Value::Rational(numerator, denominator),
+            frames,
+        }),
         Expr::Bool(value) => Ok(MachineState::Apply {
             value: Value::Bool(value),
             frames,
         }),
         Expr::String(value) => Ok(MachineState::Apply {
             value: Value::String(value),
+            frames,
+        }),
+        Expr::Char(value) => Ok(MachineState::Apply {
+            value: Value::Char(value),
             frames,
         }),
         Expr::Symbol(name) => Ok(MachineState::Apply {
@@ -1535,6 +1913,10 @@ fn handle_special_form_machine(
                 "let expects bindings and at least one body expression",
             )),
         },
+        SpecialForm::Letrec => Ok(MachineState::Apply {
+            value: eval_letrec(&args, env)?,
+            frames,
+        }),
         SpecialForm::Begin => Ok(start_sequence_machine(args, env, frames)),
         SpecialForm::Cond => eval_cond_machine(args, env, frames),
         SpecialForm::Set => match args.as_slice() {
@@ -1551,6 +1933,16 @@ fn handle_special_form_machine(
             }
             _ => Err(EvalError::message("set! expects a variable and a value")),
         },
+        SpecialForm::Guard => Ok(MachineState::Eval {
+            expr: desugar_guard(&args)?,
+            env,
+            frames,
+        }),
+        SpecialForm::Do => Ok(MachineState::Eval {
+            expr: desugar_do(&args)?,
+            env,
+            frames,
+        }),
         SpecialForm::DefineSyntax => {
             let value = eval_define_syntax(&args, env)?;
             Ok(MachineState::Apply { value, frames })
@@ -1618,9 +2010,12 @@ fn start_call_machine(
     args: Vec<Expr>,
     env: EnvRef,
     frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
 ) -> Result<MachineState, EvalError> {
+    let procedure = require_single_value("procedure position", procedure)?;
     if args.is_empty() {
-        invoke_procedure_machine(procedure, Vec::new(), frames)
+        invoke_procedure_machine(procedure, Vec::new(), frames, winds, handlers)
     } else {
         continue_call_args_machine(procedure, Vec::new(), args, env, frames)
     }
@@ -1770,9 +2165,25 @@ fn invoke_procedure_machine(
     procedure: Value,
     args: Vec<Value>,
     frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
 ) -> Result<MachineState, EvalError> {
     match procedure {
-        Value::Builtin(Builtin::CallCc) => invoke_callcc_machine(args, frames),
+        Value::Builtin(Builtin::CallCc) => invoke_callcc_machine(args, frames, winds, handlers),
+        Value::Builtin(Builtin::Apply) => invoke_apply_machine(args, frames, winds, handlers),
+        Value::Builtin(Builtin::CallWithValues) => {
+            invoke_call_with_values_machine(args, frames, winds, handlers)
+        }
+        Value::Builtin(Builtin::DynamicWind) => {
+            invoke_dynamic_wind_machine(args, frames, winds, handlers)
+        }
+        Value::Builtin(Builtin::Raise) => invoke_raise_machine(args, frames, winds, handlers),
+        Value::Builtin(Builtin::WithExceptionHandler) => {
+            invoke_with_exception_handler_machine(args, frames, winds, handlers)
+        }
+        Value::Builtin(Builtin::GuardProtect) => {
+            invoke_guard_protect_machine(args, frames, winds, handlers)
+        }
         Value::Builtin(Builtin::Map) => Ok(MachineState::Apply {
             value: apply_map(args)?,
             frames,
@@ -1802,6 +2213,8 @@ fn invoke_procedure_machine(
 fn invoke_callcc_machine(
     args: Vec<Value>,
     frames: Vec<MachineFrame>,
+    _winds: &mut Vec<Rc<DynamicWindContext>>,
+    _handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
 ) -> Result<MachineState, EvalError> {
     let [procedure] = require_exact_args("call/cc", &args, 1)? else {
         unreachable!();
@@ -1812,7 +2225,249 @@ fn invoke_callcc_machine(
     }));
     let mut callcc_frames = frames;
     callcc_frames.push(MachineFrame::CallCcResult);
-    invoke_procedure_machine(procedure.clone(), vec![continuation], callcc_frames)
+    invoke_procedure_machine(
+        procedure.clone(),
+        vec![continuation],
+        callcc_frames,
+        _winds,
+        _handlers,
+    )
+}
+
+fn invoke_apply_machine(
+    args: Vec<Value>,
+    frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::message(format!(
+            "apply expects at least 2 argument(s), got {}",
+            args.len()
+        )));
+    }
+
+    let procedure = args[0].clone();
+    let prefix_args = args[1..args.len() - 1].to_vec();
+    let list_args = collect_list_items("apply", args.last().unwrap())?;
+    let mut call_args = prefix_args;
+    call_args.extend(list_args);
+    invoke_procedure_machine(procedure, call_args, frames, winds, handlers)
+}
+
+fn invoke_call_with_values_machine(
+    args: Vec<Value>,
+    mut frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    let [producer, consumer] = require_exact_args("call-with-values", &args, 2)? else {
+        unreachable!();
+    };
+
+    frames.push(MachineFrame::CallWithValuesConsumer {
+        consumer: consumer.clone(),
+    });
+    invoke_procedure_machine(producer.clone(), Vec::new(), frames, winds, handlers)
+}
+
+fn invoke_dynamic_wind_machine(
+    args: Vec<Value>,
+    mut frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    let [in_thunk, body_thunk, out_thunk] = require_exact_args("dynamic-wind", &args, 3)? else {
+        unreachable!();
+    };
+
+    let wind = Rc::new(DynamicWindContext {
+        in_thunk: in_thunk.clone(),
+        out_thunk: out_thunk.clone(),
+    });
+    frames.push(MachineFrame::DynamicWindEntered {
+        body_thunk: body_thunk.clone(),
+        wind,
+    });
+    invoke_procedure_machine(in_thunk.clone(), Vec::new(), frames, winds, handlers)
+}
+
+fn invoke_raise_machine(
+    args: Vec<Value>,
+    frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    let [exception] = require_exact_args("raise", &args, 1)? else {
+        unreachable!();
+    };
+    raise_machine(exception.clone(), frames, winds, handlers)
+}
+
+fn invoke_with_exception_handler_machine(
+    args: Vec<Value>,
+    mut frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    let [handler_proc, thunk] = require_exact_args("with-exception-handler", &args, 2)? else {
+        unreachable!();
+    };
+
+    let handler = Rc::new(ExceptionHandlerContext {
+        handler: handler_proc.clone(),
+        outer_frame_len: frames.len(),
+        outer_wind_len: winds.len(),
+        outer_handler_len: handlers.len(),
+        allow_return: false,
+    });
+    handlers.push(handler.clone());
+    frames.push(MachineFrame::WithExceptionHandlerResult { handler });
+    invoke_procedure_machine(thunk.clone(), Vec::new(), frames, winds, handlers)
+}
+
+fn invoke_guard_protect_machine(
+    args: Vec<Value>,
+    mut frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    let [handler_proc, thunk] = require_exact_args("__guard-protect", &args, 2)? else {
+        unreachable!();
+    };
+
+    let handler = Rc::new(ExceptionHandlerContext {
+        handler: handler_proc.clone(),
+        outer_frame_len: frames.len(),
+        outer_wind_len: winds.len(),
+        outer_handler_len: handlers.len(),
+        allow_return: true,
+    });
+    handlers.push(handler.clone());
+    frames.push(MachineFrame::WithExceptionHandlerResult { handler });
+    invoke_procedure_machine(thunk.clone(), Vec::new(), frames, winds, handlers)
+}
+
+fn raise_machine(
+    exception: Value,
+    frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    let Some(handler) = handlers.last().cloned() else {
+        return Err(EvalError::message(format!(
+            "unhandled exception: {}",
+            render(&exception)
+        )));
+    };
+
+    handlers.truncate(handler.outer_handler_len);
+    let mut exiting = winds[handler.outer_wind_len..].to_vec();
+    exiting.reverse();
+    let entering = Vec::new();
+    continue_raise_after_exit(exiting, entering, handler, exception, frames, winds, handlers)
+}
+
+fn continue_raise_after_exit(
+    remaining: Vec<Rc<DynamicWindContext>>,
+    entering: Vec<Rc<DynamicWindContext>>,
+    handler: Rc<ExceptionHandlerContext>,
+    exception: Value,
+    mut frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    if remaining.is_empty() {
+        return continue_raise_after_enter(entering, handler, exception, frames, winds, handlers);
+    }
+
+    let current = remaining[0].clone();
+    let tail = remaining[1..].to_vec();
+    deactivate_wind(winds, &current);
+    frames.push(MachineFrame::ExceptionWindExit {
+        remaining: tail,
+        entering,
+        handler,
+        exception,
+    });
+    invoke_procedure_machine(current.out_thunk.clone(), Vec::new(), frames, winds, handlers)
+}
+
+fn continue_raise_after_enter(
+    remaining: Vec<Rc<DynamicWindContext>>,
+    handler: Rc<ExceptionHandlerContext>,
+    exception: Value,
+    mut frames: Vec<MachineFrame>,
+    winds: &mut Vec<Rc<DynamicWindContext>>,
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+) -> Result<MachineState, EvalError> {
+    if remaining.is_empty() {
+        frames.truncate(handler.outer_frame_len);
+        if !handler.allow_return {
+            frames.push(MachineFrame::ExceptionHandlerReturned);
+        }
+        winds.truncate(handler.outer_wind_len);
+        handlers.truncate(handler.outer_handler_len);
+        return invoke_procedure_machine(
+            handler.handler.clone(),
+            vec![exception],
+            frames,
+            winds,
+            handlers,
+        );
+    }
+
+    let current = remaining[0].clone();
+    let tail = remaining[1..].to_vec();
+    frames.push(MachineFrame::ExceptionWindEnter {
+        current: current.clone(),
+        remaining: tail,
+        handler,
+        exception,
+    });
+    invoke_procedure_machine(current.in_thunk.clone(), Vec::new(), frames, winds, handlers)
+}
+
+fn shared_wind_prefix(
+    current: &[Rc<DynamicWindContext>],
+    target: &[Rc<DynamicWindContext>],
+) -> usize {
+    current
+        .iter()
+        .zip(target.iter())
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count()
+}
+
+fn activate_wind(winds: &mut Vec<Rc<DynamicWindContext>>, wind: Rc<DynamicWindContext>) {
+    winds.push(wind);
+}
+
+fn deactivate_wind(winds: &mut Vec<Rc<DynamicWindContext>>, wind: &Rc<DynamicWindContext>) {
+    if winds
+        .last()
+        .map(|current| Rc::ptr_eq(current, wind))
+        .unwrap_or(false)
+    {
+        winds.pop();
+    } else {
+        winds.retain(|current| !Rc::ptr_eq(current, wind));
+    }
+}
+
+fn deactivate_handler(
+    handlers: &mut Vec<Rc<ExceptionHandlerContext>>,
+    handler: &Rc<ExceptionHandlerContext>,
+) {
+    if handlers
+        .last()
+        .map(|current| Rc::ptr_eq(current, handler))
+        .unwrap_or(false)
+    {
+        handlers.pop();
+    } else {
+        handlers.retain(|current| !Rc::ptr_eq(current, handler));
+    }
 }
 
 fn invoke_closure_machine(
@@ -1851,12 +2506,8 @@ fn invoke_continuation_machine(
     continuation: Rc<Continuation>,
     args: Vec<Value>,
 ) -> Result<MachineState, EvalError> {
-    let [value] = require_exact_args("continuation", &args, 1)? else {
-        unreachable!();
-    };
-
     Ok(MachineState::Apply {
-        value: value.clone(),
+        value: pack_values(args),
         frames: continuation.frames.clone(),
     })
 }
@@ -1871,10 +2522,16 @@ fn suspend_current_procedure_machine(value: Value, mut frames: Vec<MachineFrame>
     MachineState::Apply { value, frames }
 }
 
+#[derive(Clone, Copy)]
+enum Number {
+    Int(i64),
+    Rational(i64, i64),
+}
+
 fn compare_numbers(
     name: &str,
     args: &[Value],
-    predicate: impl Fn(i64, i64) -> bool,
+    predicate: impl Fn(Number, Number) -> bool,
 ) -> Result<Value, EvalError> {
     let numbers = collect_numbers(name, args)?;
     let numbers = require_min_args(name, &numbers, 2)?;
@@ -1883,13 +2540,251 @@ fn compare_numbers(
     ))
 }
 
-fn collect_numbers(name: &str, args: &[Value]) -> Result<Vec<i64>, EvalError> {
-    args.iter()
-        .map(|value| match value {
-            Value::Int(number) => Ok(*number),
-            other => Err(type_error(name, "number", other)),
-        })
-        .collect()
+fn collect_numbers(name: &str, args: &[Value]) -> Result<Vec<Number>, EvalError> {
+    args.iter().map(|value| expect_number(name, value)).collect()
+}
+
+fn expect_number(name: &str, value: &Value) -> Result<Number, EvalError> {
+    match value {
+        Value::Int(number) => Ok(Number::Int(*number)),
+        Value::Rational(numerator, denominator) => Ok(Number::Rational(*numerator, *denominator)),
+        other => Err(type_error(name, "number", other)),
+    }
+}
+
+fn expect_exact_int(name: &str, value: &Value) -> Result<i64, EvalError> {
+    match expect_number(name, value)? {
+        Number::Int(number) => Ok(number),
+        Number::Rational(_, _) => Err(EvalError::message(format!(
+            "{name} expected an exact integer"
+        ))),
+    }
+}
+
+fn expect_string<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError> {
+    match value {
+        Value::String(text) => Ok(text),
+        other => Err(type_error(name, "string", other)),
+    }
+}
+
+fn expect_symbol<'a>(name: &str, value: &'a Value) -> Result<&'a str, EvalError> {
+    match value {
+        Value::Symbol(text) => Ok(text),
+        other => Err(type_error(name, "symbol", other)),
+    }
+}
+
+fn expect_vector(
+    name: &str,
+    value: &Value,
+) -> Result<Rc<RefCell<Vec<Value>>>, EvalError> {
+    match value {
+        Value::Vector(vector) => Ok(vector.clone()),
+        other => Err(type_error(name, "vector", other)),
+    }
+}
+
+fn pack_values(values: Vec<Value>) -> Value {
+    match values.as_slice() {
+        [] => Value::Multi(Vec::new()),
+        [value] => value.clone(),
+        _ => Value::Multi(values),
+    }
+}
+
+fn unpack_values(value: Value) -> Vec<Value> {
+    match value {
+        Value::Multi(values) => values,
+        other => vec![other],
+    }
+}
+
+fn require_single_value(context: &str, value: Value) -> Result<Value, EvalError> {
+    match value {
+        Value::Multi(values) if values.len() == 1 => Ok(values.into_iter().next().unwrap()),
+        Value::Multi(values) => Err(EvalError::message(format!(
+            "{context} expected 1 value, got {}",
+            values.len()
+        ))),
+        other => Ok(other),
+    }
+}
+
+fn number_to_value(number: Number) -> Value {
+    match number {
+        Number::Int(value) => Value::Int(value),
+        Number::Rational(numerator, denominator) => Value::Rational(numerator, denominator),
+    }
+}
+
+fn render_number(number: &Number) -> String {
+    match number {
+        Number::Int(value) => value.to_string(),
+        Number::Rational(numerator, denominator) => format!("{numerator}/{denominator}"),
+    }
+}
+
+fn number_is_zero(number: &Number) -> bool {
+    match number {
+        Number::Int(value) => *value == 0,
+        Number::Rational(numerator, _) => *numerator == 0,
+    }
+}
+
+fn compare_number_values(left: Number, right: Number) -> i32 {
+    let (left_num, left_den) = number_fraction(left);
+    let (right_num, right_den) = number_fraction(right);
+    let lhs = left_num * right_den;
+    let rhs = right_num * left_den;
+    match lhs.cmp(&rhs) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+fn add_numbers(numbers: &[Number]) -> Number {
+    numbers.iter().copied().fold(Number::Int(0), |acc, value| {
+        let (left_num, left_den) = number_fraction(acc);
+        let (right_num, right_den) = number_fraction(value);
+        normalize_number(left_num * right_den + right_num * left_den, left_den * right_den)
+    })
+}
+
+fn sub_numbers(numbers: &[Number]) -> Result<Number, EvalError> {
+    let Some((first, rest)) = numbers.split_first() else {
+        return Ok(Number::Int(0));
+    };
+
+    if rest.is_empty() {
+        let (numerator, denominator) = number_fraction(*first);
+        return Ok(normalize_number(-numerator, denominator));
+    }
+
+    Ok(rest.iter().copied().fold(*first, |acc, value| {
+        let (left_num, left_den) = number_fraction(acc);
+        let (right_num, right_den) = number_fraction(value);
+        normalize_number(left_num * right_den - right_num * left_den, left_den * right_den)
+    }))
+}
+
+fn mul_numbers(numbers: &[Number]) -> Number {
+    numbers.iter().copied().fold(Number::Int(1), |acc, value| {
+        let (left_num, left_den) = number_fraction(acc);
+        let (right_num, right_den) = number_fraction(value);
+        normalize_number(left_num * right_num, left_den * right_den)
+    })
+}
+
+fn div_numbers(numbers: &[Number]) -> Result<Number, EvalError> {
+    let Some((first, rest)) = numbers.split_first() else {
+        return Ok(Number::Int(1));
+    };
+
+    let mut result = *first;
+    for divisor in rest {
+        if number_is_zero(divisor) {
+            return Err(EvalError::message("division by zero"));
+        }
+        let (left_num, left_den) = number_fraction(result);
+        let (right_num, right_den) = number_fraction(*divisor);
+        result = normalize_number(left_num * right_den, left_den * right_num);
+    }
+    Ok(result)
+}
+
+fn number_fraction(number: Number) -> (i128, i128) {
+    match number {
+        Number::Int(value) => (value as i128, 1),
+        Number::Rational(numerator, denominator) => (numerator as i128, denominator as i128),
+    }
+}
+
+fn normalize_number(numerator: i128, denominator: i128) -> Number {
+    assert!(denominator != 0);
+    let (numerator, denominator) = if denominator < 0 {
+        (-numerator, -denominator)
+    } else {
+        (numerator, denominator)
+    };
+    let divisor = gcd_i128(numerator, denominator);
+    let numerator = numerator / divisor;
+    let denominator = denominator / divisor;
+
+    if denominator == 1 {
+        Number::Int(numerator as i64)
+    } else {
+        Number::Rational(numerator as i64, denominator as i64)
+    }
+}
+
+fn gcd_i128(mut left: i128, mut right: i128) -> i128 {
+    left = left.abs();
+    right = right.abs();
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+    if left == 0 { 1 } else { left }
+}
+
+fn is_eq(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Rational(left_num, left_den), Value::Rational(right_num, right_den)) => {
+            left_num == right_num && left_den == right_den
+        }
+        (Value::Int(_), Value::Rational(_, _)) | (Value::Rational(_, _), Value::Int(_)) => {
+            compare_number_values(
+                expect_number("eq?", left).unwrap(),
+                expect_number("eq?", right).unwrap(),
+            ) == 0
+        }
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Symbol(left), Value::Symbol(right)) => left == right,
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
+        (Value::Builtin(left), Value::Builtin(right)) => left.name() == right.name(),
+        (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
+        (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
+        (Value::RecordConstructor(left), Value::RecordConstructor(right)) => Rc::ptr_eq(left, right),
+        (Value::RecordPredicate(left), Value::RecordPredicate(right)) => Rc::ptr_eq(left, right),
+        (Value::RecordAccessor(left), Value::RecordAccessor(right)) => Rc::ptr_eq(left, right),
+        (Value::Continuation(left), Value::Continuation(right)) => Rc::ptr_eq(left, right),
+        (Value::Multi(left), Value::Multi(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| is_eq(left, right))
+        }
+        (Value::Void, Value::Void) => true,
+        _ => false,
+    }
+}
+
+fn is_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Pair(left_pair), Value::Pair(right_pair)) => {
+            is_equal(&left_pair.car.borrow(), &right_pair.car.borrow())
+                && is_equal(&left_pair.cdr.borrow(), &right_pair.cdr.borrow())
+        }
+        (Value::Vector(left), Value::Vector(right)) => {
+            let left = left.borrow();
+            let right = right.borrow();
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| is_equal(left, right))
+        }
+        _ => is_eq(left, right),
+    }
 }
 
 fn require_exact_args<'a>(
@@ -1934,7 +2829,7 @@ fn proper_list_length(name: &str, value: &Value) -> Result<usize, EvalError> {
             Value::EmptyList => return Ok(count),
             Value::Pair(pair) => {
                 count += 1;
-                current = pair.cdr.clone();
+                current = pair.cdr.borrow().clone();
             }
             other => return Err(type_error(name, "list", &other)),
         }
@@ -1949,8 +2844,8 @@ fn collect_list_items(name: &str, value: &Value) -> Result<Vec<Value>, EvalError
         match current {
             Value::EmptyList => return Ok(items),
             Value::Pair(pair) => {
-                items.push(pair.car.clone());
-                current = pair.cdr.clone();
+                items.push(pair.car.borrow().clone());
+                current = pair.cdr.borrow().clone();
             }
             other => return Err(type_error(name, "list", &other)),
         }
@@ -1973,8 +2868,8 @@ fn append_front(list: &Value, tail: Value) -> Result<Value, EvalError> {
     match list {
         Value::EmptyList => Ok(tail),
         Value::Pair(pair) => Ok(Value::Pair(Rc::new(Pair {
-            car: pair.car.clone(),
-            cdr: append_front(&pair.cdr, tail)?,
+            car: RefCell::new(pair.car.borrow().clone()),
+            cdr: RefCell::new(append_front(&pair.cdr.borrow().clone(), tail)?),
         }))),
         other => Err(type_error("append", "list", other)),
     }
@@ -2012,6 +2907,145 @@ fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
             _ => Err(EvalError::message("invalid let binding")),
         })
         .collect()
+}
+
+fn parse_do_bindings(expr: &Expr) -> Result<Vec<(String, Expr, Option<Expr>)>, EvalError> {
+    let Expr::List(bindings) = expr else {
+        return Err(EvalError::message("do bindings must be a list"));
+    };
+
+    bindings
+        .iter()
+        .map(|binding| match binding {
+            Expr::List(items) => match items.as_slice() {
+                [Expr::Symbol(name), init] => Ok((name.clone(), init.clone(), None)),
+                [Expr::Symbol(name), init, step] => {
+                    Ok((name.clone(), init.clone(), Some(step.clone())))
+                }
+                _ => Err(EvalError::message("invalid do binding")),
+            },
+            _ => Err(EvalError::message("invalid do binding")),
+        })
+        .collect()
+}
+
+fn desugar_guard(args: &[Expr]) -> Result<Expr, EvalError> {
+    let [Expr::List(header), body @ ..] = args else {
+        return Err(EvalError::message("invalid guard"));
+    };
+    if body.is_empty() {
+        return Err(EvalError::message("invalid guard"));
+    }
+
+    let Some((Expr::Symbol(name), clauses)) = header.split_first() else {
+        return Err(EvalError::message("invalid guard"));
+    };
+
+    let exception_name = fresh_symbol("guard_exception");
+
+    let mut cond_clauses = clauses.to_vec();
+    if !cond_clauses.iter().any(is_else_clause) {
+        cond_clauses.push(Expr::List(vec![
+            Expr::Symbol("else".into()),
+            Expr::List(vec![
+                Expr::Symbol("raise".into()),
+                Expr::Symbol(name.clone()),
+            ]),
+        ]));
+    }
+
+    let mut cond_items = vec![Expr::Symbol("cond".into())];
+    cond_items.extend(cond_clauses);
+    let cond_expr = Expr::List(cond_items);
+
+    let let_expr = Expr::List(vec![
+        Expr::Symbol("let".into()),
+        Expr::List(vec![Expr::List(vec![
+            Expr::Symbol(name.clone()),
+            Expr::Symbol(exception_name.clone()),
+        ])]),
+        cond_expr,
+    ]);
+
+    let handler_lambda = Expr::List(vec![
+        Expr::Symbol("lambda".into()),
+        Expr::List(vec![Expr::Symbol(exception_name)]),
+        let_expr,
+    ]);
+
+    let mut thunk_items = vec![Expr::Symbol("lambda".into()), Expr::List(Vec::new())];
+    thunk_items.extend(body.iter().cloned());
+    let thunk_lambda = Expr::List(thunk_items);
+
+    Ok(Expr::List(vec![
+        Expr::Symbol("__guard-protect".into()),
+        handler_lambda,
+        thunk_lambda,
+    ]))
+}
+
+fn desugar_do(args: &[Expr]) -> Result<Expr, EvalError> {
+    let [bindings_expr, Expr::List(test_items), body @ ..] = args else {
+        return Err(EvalError::message("invalid do"));
+    };
+    let Some((test_expr, result_exprs)) = test_items.split_first() else {
+        return Err(EvalError::message("invalid do"));
+    };
+
+    let bindings = parse_do_bindings(bindings_expr)?;
+    let loop_name = fresh_symbol("do_loop");
+
+    let named_bindings = bindings
+        .iter()
+        .map(|(name, init_expr, _)| {
+            Expr::List(vec![Expr::Symbol(name.clone()), init_expr.clone()])
+        })
+        .collect::<Vec<_>>();
+
+    let loop_args = bindings
+        .iter()
+        .map(|(name, _, step_expr)| {
+            step_expr
+                .clone()
+                .unwrap_or_else(|| Expr::Symbol(name.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    let mut recurse_items = vec![Expr::Symbol(loop_name.clone())];
+    recurse_items.extend(loop_args);
+    let recurse_expr = Expr::List(recurse_items);
+
+    let false_branch = begin_expr(
+        body.iter()
+            .cloned()
+            .chain(std::iter::once(recurse_expr))
+            .collect(),
+    );
+    let true_branch = begin_expr(result_exprs.to_vec());
+
+    let loop_body = Expr::List(vec![
+        Expr::Symbol("if".into()),
+        test_expr.clone(),
+        true_branch,
+        false_branch,
+    ]);
+
+    Ok(Expr::List(vec![
+        Expr::Symbol("let".into()),
+        Expr::Symbol(loop_name),
+        Expr::List(named_bindings),
+        loop_body,
+    ]))
+}
+
+fn begin_expr(exprs: Vec<Expr>) -> Expr {
+    let mut items = vec![Expr::Symbol("begin".into())];
+    items.extend(exprs);
+    Expr::List(items)
+}
+
+fn is_else_clause(expr: &Expr) -> bool {
+    matches!(expr, Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(symbol)) if symbol == "else"))
 }
 
 fn parse_record_constructor_spec(expr: &Expr) -> Result<(String, Vec<String>), EvalError> {
@@ -2055,8 +3089,10 @@ fn eval_binding_values(bindings: &[(String, Expr)], env: EnvRef) -> Result<Vec<V
 fn quote(expr: &Expr) -> Value {
     match expr {
         Expr::Int(value) => Value::Int(*value),
+        Expr::Rational(numerator, denominator) => Value::Rational(*numerator, *denominator),
         Expr::Bool(value) => Value::Bool(*value),
         Expr::String(value) => Value::String(value.clone()),
+        Expr::Char(value) => Value::Char(*value),
         Expr::Symbol(name) => Value::Symbol(name.clone()),
         Expr::List(items) => make_proper_list(items.iter().map(quote)),
     }
@@ -2067,8 +3103,8 @@ fn make_proper_list(items: impl IntoIterator<Item = Value>) -> Value {
     let mut result = Value::EmptyList;
     while let Some(value) = values.pop() {
         result = Value::Pair(Rc::new(Pair {
-            car: value,
-            cdr: result,
+            car: RefCell::new(value),
+            cdr: RefCell::new(result),
         }));
     }
     result
@@ -2122,18 +3158,21 @@ fn type_error(name: &str, expected: &str, value: &Value) -> EvalError {
 
 fn value_type_name(value: &Value) -> &'static str {
     match value {
-        Value::Int(_) => "number",
+        Value::Int(_) | Value::Rational(_, _) => "number",
         Value::Bool(_) => "boolean",
         Value::String(_) => "string",
+        Value::Char(_) => "character",
         Value::Symbol(_) => "symbol",
         Value::EmptyList => "null",
         Value::Pair(_) => "pair",
+        Value::Vector(_) => "vector",
         Value::Builtin(_)
         | Value::Closure(_)
         | Value::Continuation(_)
         | Value::RecordConstructor(_)
         | Value::RecordPredicate(_)
         | Value::RecordAccessor(_) => "procedure",
+        Value::Multi(_) => "values",
         Value::Record(_) => "record",
         Value::Void => "void",
     }
@@ -2142,18 +3181,26 @@ fn value_type_name(value: &Value) -> &'static str {
 fn render(value: &Value) -> String {
     match value {
         Value::Int(number) => number.to_string(),
+        Value::Rational(numerator, denominator) => format!("{numerator}/{denominator}"),
         Value::Bool(true) => "#t".into(),
         Value::Bool(false) => "#f".into(),
         Value::String(text) => format!("\"{}\"", escape_string(text)),
+        Value::Char(ch) => render_char(*ch),
         Value::Symbol(name) => name.clone(),
         Value::EmptyList => "()".into(),
         Value::Pair(_) => render_pair(value),
+        Value::Vector(vector) => {
+            let items = vector.borrow();
+            let rendered = items.iter().map(render).collect::<Vec<_>>().join(" ");
+            format!("#({rendered})")
+        }
         Value::Builtin(_)
         | Value::Closure(_)
         | Value::Continuation(_)
         | Value::RecordConstructor(_)
         | Value::RecordPredicate(_)
         | Value::RecordAccessor(_) => "#<procedure>".into(),
+        Value::Multi(_) => "#<values>".into(),
         Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Void => String::new(),
     }
@@ -2170,20 +3217,21 @@ fn render_pair(value: &Value) -> String {
                 if !first {
                     output.push(' ');
                 }
-                output.push_str(&render(&pair.car));
+                output.push_str(&render(&pair.car.borrow()));
 
-                match &pair.cdr {
+                let cdr = pair.cdr.borrow().clone();
+                match cdr {
                     Value::EmptyList => {
                         output.push(')');
                         return output;
                     }
                     Value::Pair(_) => {
-                        current = pair.cdr.clone();
+                        current = cdr;
                         first = false;
                     }
                     other => {
                         output.push_str(" . ");
-                        output.push_str(&render(other));
+                        output.push_str(&render(&other));
                         output.push(')');
                         return output;
                     }
@@ -2191,6 +3239,14 @@ fn render_pair(value: &Value) -> String {
             }
             _ => unreachable!("render_pair called with non-pair value"),
         }
+    }
+}
+
+fn render_char(ch: char) -> String {
+    match ch {
+        ' ' => "#\\space".into(),
+        '\n' => "#\\newline".into(),
+        other => format!("#\\{other}"),
     }
 }
 
@@ -2318,6 +3374,8 @@ impl Parser {
         match token.as_str() {
             "#t" => Ok(Expr::Bool(true)),
             "#f" => Ok(Expr::Bool(false)),
+            _ if token.starts_with("#\\") => parse_char_token(&token),
+            _ if is_rational_token(&token) => parse_rational_token(&token),
             _ if is_integer_token(&token) => {
                 Ok(Expr::Int(token.parse().map_err(|_| {
                     EvalError::message(format!("invalid integer literal: {token}"))
@@ -2376,6 +3434,13 @@ fn is_delimiter(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '(' | ')' | '\'' | ';')
 }
 
+fn is_rational_token(token: &str) -> bool {
+    let Some((left, right)) = token.split_once('/') else {
+        return false;
+    };
+    is_integer_token(left) && !right.starts_with(['+', '-']) && is_integer_token(right)
+}
+
 fn is_integer_token(token: &str) -> bool {
     let digits = match token.chars().next() {
         Some('+') | Some('-') if token.len() > 1 => &token[1..],
@@ -2383,4 +3448,43 @@ fn is_integer_token(token: &str) -> bool {
     };
 
     !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn parse_rational_token(token: &str) -> Result<Expr, EvalError> {
+    let Some((left, right)) = token.split_once('/') else {
+        return Err(EvalError::message(format!("invalid rational literal: {token}")));
+    };
+    let numerator: i128 = left
+        .parse()
+        .map_err(|_| EvalError::message(format!("invalid rational literal: {token}")))?;
+    let denominator: i128 = right
+        .parse()
+        .map_err(|_| EvalError::message(format!("invalid rational literal: {token}")))?;
+    if denominator == 0 {
+        return Err(EvalError::message(format!("invalid rational literal: {token}")));
+    }
+
+    match normalize_number(numerator, denominator) {
+        Number::Int(value) => Ok(Expr::Int(value)),
+        Number::Rational(numerator, denominator) => Ok(Expr::Rational(numerator, denominator)),
+    }
+}
+
+fn parse_char_token(token: &str) -> Result<Expr, EvalError> {
+    let value = &token[2..];
+    let ch = match value {
+        "space" => ' ',
+        "newline" => '\n',
+        _ => {
+            let mut chars = value.chars();
+            let Some(ch) = chars.next() else {
+                return Err(EvalError::message(format!("invalid character literal: {token}")));
+            };
+            if chars.next().is_some() {
+                return Err(EvalError::message(format!("invalid character literal: {token}")));
+            }
+            ch
+        }
+    };
+    Ok(Expr::Char(ch))
 }

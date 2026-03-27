@@ -10,12 +10,18 @@ Canonical registry of extracted helpers (>= 5 ops).
 
 ## Rust Helpers (src/scheme/)
 
-### eval_sequence (src/scheme/mod.rs:515) — Evaluate a sequence of expressions in one environment and return the last value
-### proper_list_length (src/scheme/mod.rs:577) — Validate a proper list and count its elements for list primitives
-### append_lists (src/scheme/mod.rs:593) — Implement Scheme `append` over zero or more list arguments
-### parse_bindings (src/scheme/mod.rs:633) — Validate `let` binding syntax and extract name/expression pairs
-### eval_binding_values (src/scheme/mod.rs:650) — Evaluate `let` binding expressions in the outer environment
-### make_proper_list (src/scheme/mod.rs:667) — Build a Scheme list value from an iterator of already-evaluated items
+### eval_sequence (src/scheme/mod.rs:1495) — Evaluate a sequence of expressions in one environment and return the last value
+### continue_raise_after_exit (src/scheme/mod.rs:2371) — Unwind active dynamic-wind contexts while propagating an exception to the nearest handler
+### pack_values (src/scheme/mod.rs:2588) — Collapse zero, one, or many procedure results into the interpreter’s multi-value representation
+### normalize_number (src/scheme/mod.rs:2704) — Reduce an exact rational to lowest terms and collapse denominator-1 values back to integers
+### is_equal (src/scheme/mod.rs:2771) — Compare Scheme values structurally for the `equal?` builtin across pairs and vectors
+### proper_list_length (src/scheme/mod.rs:2823) — Validate a proper list and count its elements for list primitives
+### append_lists (src/scheme/mod.rs:2855) — Implement Scheme `append` over zero or more list arguments
+### parse_bindings (src/scheme/mod.rs:2895) — Validate `let` and `letrec` binding syntax and extract name/expression pairs
+### desugar_guard (src/scheme/mod.rs:2932) — Lower `guard` into an internal protected-thunk form that cooperates with the machine exception handler
+### desugar_do (src/scheme/mod.rs:2987) — Lower `do` into a named `let` loop with parallel step expressions
+### eval_binding_values (src/scheme/mod.rs:3082) — Evaluate `let` binding expressions in the outer environment
+### make_proper_list (src/scheme/mod.rs:3101) — Build a Scheme list value from an iterator of already-evaluated items
 
 ## Python Helpers (scripts/)
 
