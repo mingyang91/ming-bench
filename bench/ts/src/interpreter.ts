@@ -1,9 +1,10 @@
 import { EvalError, attachPosition, type SourcePosition } from './evalError.js';
+import * as num from './numbers.js';
 
 type ExprBase = { position: SourcePosition };
 
 type Expr =
-  | (ExprBase & { kind: 'number'; value: number })
+  | (ExprBase & { kind: 'number'; value: num.NumericValue })
   | (ExprBase & { kind: 'boolean'; value: boolean })
   | (ExprBase & { kind: 'char'; value: string })
   | (ExprBase & { kind: 'string'; value: string })
@@ -50,7 +51,7 @@ type UserProc = {
 };
 
 type Value =
-  | number
+  | num.NumericValue
   | boolean
   | string
   | CharValue
@@ -67,7 +68,6 @@ type Cell = { value: Value };
 
 const EMPTY_LIST: EmptyList = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
-const SCHEME_NUMBER_PATTERN = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 const CORE_SYNTAX = new Set([
   'and',
   'begin',
@@ -298,8 +298,9 @@ class Parser {
       return parseCharToken(token, position);
     }
 
-    if (/^[+-]?\d+$/.test(token) && token !== '+' && token !== '-') {
-      return { kind: 'number', value: Number.parseInt(token, 10), position };
+    const numericValue = num.parseNumberToken(token);
+    if (numericValue !== undefined) {
+      return { kind: 'number', value: numericValue, position };
     }
 
     return { kind: 'symbol', name: token, position };
@@ -600,7 +601,7 @@ function sameExpr(left: Expr, right: Expr): boolean {
 
   switch (left.kind) {
     case 'number':
-      return right.kind === 'number' && left.value === right.value;
+      return right.kind === 'number' && num.numericEqual(left.value, right.value);
     case 'boolean':
       return right.kind === 'boolean' && left.value === right.value;
     case 'char':
@@ -845,14 +846,14 @@ function captureDefinitionIdentifier(name: string, ctx: TemplateContext): string
 
 function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, BuiltinProc> {
   return new Map<string, BuiltinProc>([
-    builtin('+', (args) => sumNumbers('+', args, 0)),
-    builtin('*', (args) => productNumbers('*', args, 1)),
+    builtin('+', (args) => sumNumbers('+', args)),
+    builtin('*', (args) => productNumbers('*', args)),
     builtin('-', (args) => subtractNumbers(args)),
     builtin('/', (args) => divideNumbers(args)),
-    builtin('<', (args) => compareNumbers('<', args, (left, right) => left < right)),
-    builtin('>', (args) => compareNumbers('>', args, (left, right) => left > right)),
-    builtin('=', (args) => compareNumbers('=', args, (left, right) => left === right)),
-    builtin('<=', (args) => compareNumbers('<=', args, (left, right) => left <= right)),
+    builtin('<', (args) => compareNumbers('<', args, (left, right) => num.numericCompare(left, right) < 0)),
+    builtin('>', (args) => compareNumbers('>', args, (left, right) => num.numericCompare(left, right) > 0)),
+    builtin('=', (args) => compareNumbers('=', args, (left, right) => num.numericEqual(left, right))),
+    builtin('<=', (args) => compareNumbers('<=', args, (left, right) => num.numericCompare(left, right) <= 0)),
     builtin('abs', (args) => absoluteValue(args)),
     builtin('apply', (args, position) => applyBuiltin(args, position, macroEnv)),
     builtin('append', (args) => appendValues(args)),
@@ -902,11 +903,32 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       assertExactArity('equal?', args, 2);
       return equalValues(args[0]!, args[1]!);
     }),
-    builtin('even?', (args) => integerPredicate('even?', args, (value) => value % 2 === 0)),
+    builtin('denominator', (args) => {
+      assertExactArity('denominator', args, 1);
+      return num.denominatorOf(expectNumberValue('denominator', args[0]!));
+    }),
+    builtin('even?', (args) => integerPredicate('even?', args, (value) => num.numericIsEven(value))),
+    builtin('exact->inexact', (args) => {
+      assertExactArity('exact->inexact', args, 1);
+      return num.exactToInexact(expectNumberValue('exact->inexact', args[0]!));
+    }),
+    builtin('exact?', (args) =>
+      unaryPredicate('exact?', args, (value) => num.isNumericValue(value) && num.isExactNumeric(value)),
+    ),
     builtin('expt', (args) => exptNumbers(args)),
+    builtin('inexact->exact', (args) => {
+      assertExactArity('inexact->exact', args, 1);
+      return num.inexactToExact(expectNumberValue('inexact->exact', args[0]!));
+    }),
+    builtin('inexact?', (args) =>
+      unaryPredicate('inexact?', args, (value) => num.isNumericValue(value) && num.isInexactNumeric(value)),
+    ),
+    builtin('integer?', (args) =>
+      unaryPredicate('integer?', args, (value) => num.isNumericValue(value) && num.numericIsInteger(value)),
+    ),
     builtin('length', (args) => {
       assertExactArity('length', args, 1);
-      return expectProperList('length', args[0]!).length;
+      return num.exactIntegerFromNumber(expectProperList('length', args[0]!).length);
     }),
     builtin('list', (args) => makeList(args)),
     builtin('list-ref', (args) => listRefBuiltin(args)),
@@ -916,15 +938,19 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       return isProperListValue(args[0]!);
     }),
     builtin('map', (args, position) => mapBuiltin(args, position, macroEnv)),
-    builtin('max', (args) => extremum('max', args, (left, right) => (left >= right ? left : right))),
-    builtin('min', (args) => extremum('min', args, (left, right) => (left <= right ? left : right))),
+    builtin('max', (args) =>
+      extremum('max', args, (left, right) => (num.numericCompare(left, right) >= 0 ? left : right)),
+    ),
+    builtin('min', (args) =>
+      extremum('min', args, (left, right) => (num.numericCompare(left, right) <= 0 ? left : right)),
+    ),
     builtin('modulo', (args) => moduloNumbers(args)),
     builtin('newline', (args) => {
       assertExactArity('newline', args, 0);
       output.write('\n');
       return VOID;
     }),
-    builtin('negative?', (args) => numberPredicate('negative?', args, (value) => value < 0)),
+    builtin('negative?', (args) => numberPredicate('negative?', args, (value) => num.numericIsNegative(value))),
     builtin('not', (args) => {
       assertExactArity('not', args, 1);
       return !isTruthy(args[0]!);
@@ -932,17 +958,22 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('null?', (args) => unaryPredicate('null?', args, isEmptyList)),
     builtin('number->string', (args) => {
       assertExactArity('number->string', args, 1);
-      return makeMutableString(formatNumber(expectNumberValue('number->string', args[0]!)));
+      return makeMutableString(num.formatNumber(expectNumberValue('number->string', args[0]!)));
     }),
-    builtin('number?', (args) => unaryPredicate('number?', args, (value) => typeof value === 'number')),
-    builtin('odd?', (args) => integerPredicate('odd?', args, (value) => Math.abs(value % 2) === 1)),
+    builtin('number?', (args) => unaryPredicate('number?', args, (value) => num.isNumericValue(value))),
+    builtin('numerator', (args) => {
+      assertExactArity('numerator', args, 1);
+      return num.numeratorOf(expectNumberValue('numerator', args[0]!));
+    }),
+    builtin('odd?', (args) => integerPredicate('odd?', args, (value) => num.numericIsOdd(value))),
     builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
-    builtin('positive?', (args) => numberPredicate('positive?', args, (value) => value > 0)),
+    builtin('positive?', (args) => numberPredicate('positive?', args, (value) => num.numericIsPositive(value))),
     builtin('quotient', (args) => quotientNumbers(args)),
+    builtin('rational?', (args) => unaryPredicate('rational?', args, (value) => num.isNumericValue(value))),
     builtin('remainder', (args) => remainderNumbers(args)),
     builtin('string->number', (args) => {
       assertExactArity('string->number', args, 1);
-      return parseStringNumber(expectStringValue('string->number', args[0]!));
+      return num.parseStringNumber(expectStringValue('string->number', args[0]!));
     }),
     builtin('string->symbol', (args) => {
       assertExactArity('string->symbol', args, 1);
@@ -966,7 +997,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('string=?', (args) => compareStrings('string=?', args, (value) => value, (left, right) => left === right)),
     builtin('string-length', (args) => {
       assertExactArity('string-length', args, 1);
-      return stringChars(expectStringValue('string-length', args[0]!)).length;
+      return num.exactIntegerFromNumber(stringChars(expectStringValue('string-length', args[0]!)).length);
     }),
     builtin('string-ref', (args) => {
       assertExactArity('string-ref', args, 2);
@@ -1013,7 +1044,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       output.write(formatValue(args[0]!));
       return VOID;
     }),
-    builtin('zero?', (args) => numberPredicate('zero?', args, (value) => value === 0)),
+    builtin('zero?', (args) => numberPredicate('zero?', args, (value) => num.numericIsZero(value))),
   ]);
 }
 
@@ -1428,9 +1459,9 @@ function applyBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEn
   return applyProcedure(proc, [...prefixArgs, ...listArgs], position, macroEnv);
 }
 
-function absoluteValue(args: Value[]): number {
+function absoluteValue(args: Value[]): num.NumericValue {
   assertExactArity('abs', args, 1);
-  return normalizeNumber(Math.abs(expectNumberValue('abs', args[0]!)));
+  return num.absNumeric(expectNumberValue('abs', args[0]!));
 }
 
 function unaryPredicate(name: string, args: Value[], predicate: (value: Value) => boolean): boolean {
@@ -1438,12 +1469,12 @@ function unaryPredicate(name: string, args: Value[], predicate: (value: Value) =
   return predicate(args[0]!);
 }
 
-function numberPredicate(name: string, args: Value[], predicate: (value: number) => boolean): boolean {
+function numberPredicate(name: string, args: Value[], predicate: (value: num.NumericValue) => boolean): boolean {
   assertExactArity(name, args, 1);
   return predicate(expectNumberValue(name, args[0]!));
 }
 
-function integerPredicate(name: string, args: Value[], predicate: (value: number) => boolean): boolean {
+function integerPredicate(name: string, args: Value[], predicate: (value: num.NumericValue) => boolean): boolean {
   assertExactArity(name, args, 1);
   return predicate(expectIntegerValue(name, args[0]!));
 }
@@ -1489,54 +1520,30 @@ function compareStrings(
   return true;
 }
 
-function sumNumbers(name: string, args: Value[], initial: number): number {
-  const numbers = expectNumbers(name, args);
-  return normalizeNumber(numbers.reduce((sum, value) => sum + value, initial));
+function sumNumbers(name: string, args: Value[]): num.NumericValue {
+  return num.sumNumeric(expectNumbers(name, args));
 }
 
-function productNumbers(name: string, args: Value[], initial: number): number {
-  const numbers = expectNumbers(name, args);
-  return normalizeNumber(numbers.reduce((product, value) => product * value, initial));
+function productNumbers(name: string, args: Value[]): num.NumericValue {
+  return num.productNumeric(expectNumbers(name, args));
 }
 
-function subtractNumbers(args: Value[]): number {
+function subtractNumbers(args: Value[]): num.NumericValue {
   const numbers = expectNumbers('-', args);
   assertAtLeastArity('-', numbers, 1);
-
-  if (numbers.length === 1) {
-    return normalizeNumber(-numbers[0]!);
-  }
-
-  return normalizeNumber(numbers.slice(1).reduce((acc, value) => acc - value, numbers[0]!));
+  return num.subtractNumeric(numbers);
 }
 
-function divideNumbers(args: Value[]): number {
+function divideNumbers(args: Value[]): num.NumericValue {
   const numbers = expectNumbers('/', args);
   assertAtLeastArity('/', numbers, 1);
-
-  if (numbers.length === 1) {
-    if (numbers[0] === 0) {
-      throw new EvalError('division by zero');
-    }
-
-    return normalizeNumber(1 / numbers[0]!);
-  }
-
-  let result = numbers[0]!;
-  for (const divisor of numbers.slice(1)) {
-    if (divisor === 0) {
-      throw new EvalError('division by zero');
-    }
-    result /= divisor;
-  }
-
-  return normalizeNumber(result);
+  return num.divideNumeric(numbers);
 }
 
 function compareNumbers(
   name: string,
   args: Value[],
-  compare: (left: number, right: number) => boolean,
+  compare: (left: num.NumericValue, right: num.NumericValue) => boolean,
 ): boolean {
   const numbers = expectNumbers(name, args);
   assertAtLeastArity(name, numbers, 2);
@@ -1550,45 +1557,35 @@ function compareNumbers(
   return true;
 }
 
-function quotientNumbers(args: Value[]): number {
+function quotientNumbers(args: Value[]): num.NumericValue {
   assertExactArity('quotient', args, 2);
-  const dividend = expectIntegerValue('quotient', args[0]!);
-  const divisor = expectIntegerValue('quotient', args[1]!);
-  if (divisor === 0) {
-    throw new EvalError('division by zero');
-  }
-
-  return normalizeNumber(Math.trunc(dividend / divisor));
+  return num.quotientNumeric(
+    expectIntegerValue('quotient', args[0]!),
+    expectIntegerValue('quotient', args[1]!),
+  );
 }
 
-function remainderNumbers(args: Value[]): number {
+function remainderNumbers(args: Value[]): num.NumericValue {
   assertExactArity('remainder', args, 2);
-  const dividend = expectIntegerValue('remainder', args[0]!);
-  const divisor = expectIntegerValue('remainder', args[1]!);
-  if (divisor === 0) {
-    throw new EvalError('division by zero');
-  }
-
-  return normalizeNumber(dividend % divisor);
+  return num.remainderNumeric(
+    expectIntegerValue('remainder', args[0]!),
+    expectIntegerValue('remainder', args[1]!),
+  );
 }
 
-function moduloNumbers(args: Value[]): number {
+function moduloNumbers(args: Value[]): num.NumericValue {
   assertExactArity('modulo', args, 2);
-  const dividend = expectIntegerValue('modulo', args[0]!);
-  const divisor = expectIntegerValue('modulo', args[1]!);
-  if (divisor === 0) {
-    throw new EvalError('division by zero');
-  }
-
-  const remainder = dividend % divisor;
-  if (remainder === 0) {
-    return 0;
-  }
-
-  return normalizeNumber(Math.sign(remainder) === Math.sign(divisor) ? remainder : remainder + divisor);
+  return num.moduloNumeric(
+    expectIntegerValue('modulo', args[0]!),
+    expectIntegerValue('modulo', args[1]!),
+  );
 }
 
-function extremum(name: string, args: Value[], select: (left: number, right: number) => number): number {
+function extremum(
+  name: string,
+  args: Value[],
+  select: (left: num.NumericValue, right: num.NumericValue) => num.NumericValue,
+): num.NumericValue {
   const numbers = expectNumbers(name, args);
   assertAtLeastArity(name, numbers, 1);
 
@@ -1597,14 +1594,12 @@ function extremum(name: string, args: Value[], select: (left: number, right: num
     result = select(result, value);
   }
 
-  return normalizeNumber(result);
+  return result;
 }
 
-function exptNumbers(args: Value[]): number {
+function exptNumbers(args: Value[]): num.NumericValue {
   assertExactArity('expt', args, 2);
-  const base = expectNumberValue('expt', args[0]!);
-  const exponent = expectIntegerValue('expt', args[1]!);
-  return normalizeNumber(Math.pow(base, exponent));
+  return num.exptNumeric(expectNumberValue('expt', args[0]!), expectIntegerValue('expt', args[1]!));
 }
 
 function appendValues(args: Value[]): Value {
@@ -1674,30 +1669,30 @@ function expectProperList(name: string, value: Value): Value[] {
   return items;
 }
 
-function expectNumbers(name: string, args: Value[]): number[] {
+function expectNumbers(name: string, args: Value[]): num.NumericValue[] {
   return args.map((arg) => {
-    if (typeof arg !== 'number') {
+    if (!num.isNumericValue(arg)) {
       throw new EvalError(`${name} expects number arguments`);
     }
     return arg;
   });
 }
 
-function expectNumberValue(name: string, value: Value): number {
-  if (typeof value !== 'number') {
+function expectNumberValue(name: string, value: Value): num.NumericValue {
+  if (!num.isNumericValue(value)) {
     throw new EvalError(`${name} expects a number`);
   }
 
   return value;
 }
 
-function expectIntegerValue(name: string, value: Value): number {
-  const number = expectNumberValue(name, value);
-  if (!Number.isInteger(number)) {
+function expectIntegerValue(name: string, value: Value): num.NumericValue {
+  const numericValue = expectNumberValue(name, value);
+  if (!num.numericIsInteger(numericValue)) {
     throw new EvalError(`${name} expects an integer`);
   }
 
-  return number;
+  return numericValue;
 }
 
 function expectStringValue(name: string, value: Value): string {
@@ -1737,12 +1732,13 @@ function expectSymbolValue(name: string, value: Value): SchemeSymbol {
 }
 
 function expectIndex(name: string, value: Value): number {
-  const index = expectNumberValue(name, value);
-  if (!Number.isInteger(index) || index < 0) {
+  const index = expectIntegerValue(name, value);
+  const indexValue = num.numericToNumber(index);
+  if (indexValue < 0) {
     throw new EvalError(`${name} expects a non-negative integer index`);
   }
 
-  return index;
+  return indexValue;
 }
 
 function assertExactArity(name: string, args: readonly unknown[], expected: number): void {
@@ -1910,8 +1906,8 @@ function formatDisplayValue(value: Value): string {
 }
 
 function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
-  if (typeof value === 'number') {
-    return formatNumber(value);
+  if (num.isNumericValue(value)) {
+    return num.formatNumber(value);
   }
 
   if (typeof value === 'boolean') {
@@ -1972,20 +1968,6 @@ function formatCharLiteral(value: string): string {
   }
 }
 
-function formatNumber(value: number): string {
-  const normalized = normalizeNumber(value);
-  return Number.isInteger(normalized) ? normalized.toString() : String(normalized);
-}
-
-function parseStringNumber(value: string): number | boolean {
-  const trimmed = value.trim();
-  if (trimmed.length === 0 || !SCHEME_NUMBER_PATTERN.test(trimmed)) {
-    return false;
-  }
-
-  return normalizeNumber(Number(trimmed));
-}
-
 function stringChars(value: string): string[] {
   return Array.from(value);
 }
@@ -2019,12 +2001,12 @@ function parseCharToken(token: string, position: SourcePosition): Expr {
   return { kind: 'char', value: chars[0]!, position };
 }
 
-function normalizeNumber(value: number): number {
-  return Object.is(value, -0) ? 0 : value;
-}
-
 function eqValues(left: Value, right: Value): boolean {
-  if (typeof left === 'number' || typeof left === 'boolean' || typeof left === 'string') {
+  if (num.isNumericValue(left) && num.isNumericValue(right)) {
+    return num.numericEqual(left, right);
+  }
+
+  if (typeof left === 'boolean' || typeof left === 'string') {
     return typeof right === typeof left && left === right;
   }
 

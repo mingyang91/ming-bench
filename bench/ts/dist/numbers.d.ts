@@ -1,0 +1,45 @@
+export type ExactIntegerValue = {
+    kind: 'exact-integer';
+    value: bigint;
+};
+export type ExactRationalValue = {
+    kind: 'exact-rational';
+    numerator: bigint;
+    denominator: bigint;
+};
+export type InexactNumberValue = {
+    kind: 'inexact-number';
+    value: number;
+};
+export type NumericValue = ExactIntegerValue | ExactRationalValue | InexactNumberValue;
+type ExactNumericValue = ExactIntegerValue | ExactRationalValue;
+export declare function isNumericValue(value: unknown): value is NumericValue;
+export declare function isExactNumeric(value: NumericValue): value is ExactNumericValue;
+export declare function isInexactNumeric(value: NumericValue): value is InexactNumberValue;
+export declare function parseNumberToken(token: string): NumericValue | undefined;
+export declare function parseStringNumber(value: string): NumericValue | boolean;
+export declare function formatNumber(value: NumericValue): string;
+export declare function numericEqual(left: NumericValue, right: NumericValue): boolean;
+export declare function numericCompare(left: NumericValue, right: NumericValue): number;
+export declare function numericToNumber(value: NumericValue): number;
+export declare function numericIsInteger(value: NumericValue): boolean;
+export declare function exactIntegerFromNumber(value: number): NumericValue;
+export declare function numericIsOdd(value: NumericValue): boolean;
+export declare function numericIsEven(value: NumericValue): boolean;
+export declare function numericIsZero(value: NumericValue): boolean;
+export declare function numericIsPositive(value: NumericValue): boolean;
+export declare function numericIsNegative(value: NumericValue): boolean;
+export declare function absNumeric(value: NumericValue): NumericValue;
+export declare function sumNumeric(values: NumericValue[]): NumericValue;
+export declare function productNumeric(values: NumericValue[]): NumericValue;
+export declare function subtractNumeric(values: NumericValue[]): NumericValue;
+export declare function divideNumeric(values: NumericValue[]): NumericValue;
+export declare function quotientNumeric(dividend: NumericValue, divisor: NumericValue): NumericValue;
+export declare function remainderNumeric(dividend: NumericValue, divisor: NumericValue): NumericValue;
+export declare function moduloNumeric(dividend: NumericValue, divisor: NumericValue): NumericValue;
+export declare function exptNumeric(base: NumericValue, exponent: NumericValue): NumericValue;
+export declare function exactToInexact(value: NumericValue): NumericValue;
+export declare function inexactToExact(value: NumericValue): NumericValue;
+export declare function numeratorOf(value: NumericValue): NumericValue;
+export declare function denominatorOf(value: NumericValue): NumericValue;
+export {};
