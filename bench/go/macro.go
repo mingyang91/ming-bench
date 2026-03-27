@@ -131,6 +131,9 @@ func collectPatternVars(pattern expr, literals map[string]struct{}, vars map[str
 		for _, element := range p.elements {
 			collectPatternVars(element, literals, vars)
 		}
+		if p.tail != nil {
+			collectPatternVars(p.tail, literals, vars)
+		}
 	}
 }
 
@@ -174,15 +177,22 @@ func matchSyntaxPattern(pattern expr, input expr, literals map[string]struct{}) 
 		if !ok {
 			return nil, false
 		}
-		return matchSyntaxList(p.elements, other.elements, literals)
+		return matchSyntaxList(p, other, literals)
 	default:
 		return nil, false
 	}
 }
 
-func matchSyntaxList(patterns []expr, inputs []expr, literals map[string]struct{}) (map[string]syntaxCapture, bool) {
+func matchSyntaxList(pattern *listExpr, input *listExpr, literals map[string]struct{}) (map[string]syntaxCapture, bool) {
+	return matchSyntaxListParts(pattern.elements, pattern.tail, input.elements, input.tail, input.pos, literals)
+}
+
+func matchSyntaxListParts(patterns []expr, patternTail expr, inputs []expr, inputTail expr, inputPos position, literals map[string]struct{}) (map[string]syntaxCapture, bool) {
 	if len(patterns) == 0 {
-		if len(inputs) == 0 {
+		if patternTail != nil {
+			return matchSyntaxPattern(patternTail, syntaxListRemainderExpr(inputs, inputTail, inputPos), literals)
+		}
+		if len(inputs) == 0 && inputTail == nil {
 			return map[string]syntaxCapture{}, true
 		}
 		return nil, false
@@ -208,7 +218,7 @@ func matchSyntaxList(patterns []expr, inputs []expr, literals map[string]struct{
 				continue
 			}
 
-			restCaptures, matched := matchSyntaxList(patterns[2:], inputs[count:], literals)
+			restCaptures, matched := matchSyntaxListParts(patterns[2:], patternTail, inputs[count:], inputTail, inputPos, literals)
 			if !matched {
 				continue
 			}
@@ -235,12 +245,26 @@ func matchSyntaxList(patterns []expr, inputs []expr, literals map[string]struct{
 		return nil, false
 	}
 
-	restCaptures, matched := matchSyntaxList(patterns[1:], inputs[1:], literals)
+	restCaptures, matched := matchSyntaxListParts(patterns[1:], patternTail, inputs[1:], inputTail, inputPos, literals)
 	if !matched {
 		return nil, false
 	}
 
 	return mergeCaptureMaps(firstCaptures, restCaptures)
+}
+
+func syntaxListRemainderExpr(inputs []expr, inputTail expr, inputPos position) expr {
+	if len(inputs) == 0 {
+		if inputTail != nil {
+			return inputTail
+		}
+		return &listExpr{pos: inputPos}
+	}
+	return &listExpr{
+		elements: append([]expr(nil), inputs...),
+		tail:     inputTail,
+		pos:      inputPos,
+	}
 }
 
 func combineRepeatedCaptures(iterationCaptures []map[string]syntaxCapture, repeatedVars map[string]struct{}) (map[string]syntaxCapture, bool) {
@@ -327,7 +351,7 @@ func exprEqual(left expr, right expr) bool {
 				return false
 			}
 		}
-		return true
+		return exprEqual(l.tail, r.tail)
 	default:
 		return left == nil && right == nil
 	}
@@ -453,7 +477,16 @@ func (s *templateState) expandList(list *listExpr, path []int, renames map[strin
 		elements = append(elements, expanded)
 	}
 
-	return &listExpr{elements: elements, pos: list.pos}, nil
+	var tail expr
+	if list.tail != nil {
+		expandedTail, err := s.expand(list.tail, path, renames)
+		if err != nil {
+			return nil, err
+		}
+		tail = expandedTail
+	}
+
+	return &listExpr{elements: elements, tail: tail, pos: list.pos}, nil
 }
 
 func (s *templateState) expandLet(list *listExpr, path []int, renames map[string]string) (expr, error) {
@@ -604,7 +637,17 @@ func (s *templateState) expandLambdaParams(params expr, path []int, renames map[
 		}
 		elements = append(elements, binder)
 	}
-	return &listExpr{elements: elements, pos: list.pos}, nil
+
+	var tail expr
+	if list.tail != nil {
+		binder, err := s.expandBinder(list.tail, path, renames)
+		if err != nil {
+			return nil, err
+		}
+		tail = binder
+	}
+
+	return &listExpr{elements: elements, tail: tail, pos: list.pos}, nil
 }
 
 func (s *templateState) expandBinder(binder expr, path []int, renames map[string]string) (expr, error) {
@@ -647,7 +690,17 @@ func (s *templateState) expandPlainList(list *listExpr, path []int, renames map[
 		}
 		elements = append(elements, expanded)
 	}
-	return &listExpr{elements: elements, pos: list.pos}, nil
+
+	var tail expr
+	if list.tail != nil {
+		expandedTail, err := s.expand(list.tail, path, renames)
+		if err != nil {
+			return nil, err
+		}
+		tail = expandedTail
+	}
+
+	return &listExpr{elements: elements, tail: tail, pos: list.pos}, nil
 }
 
 func (s *templateState) repeatCount(template expr, path []int) (int, bool, error) {
@@ -707,6 +760,9 @@ func walkTemplate(template expr, visit func(*symbolExpr) bool) bool {
 			if !walkTemplate(t.elements[index], visit) {
 				return false
 			}
+		}
+		if t.tail != nil && !walkTemplate(t.tail, visit) {
+			return false
 		}
 	}
 	return true
@@ -774,7 +830,7 @@ func cloneExpr(expression expr) expr {
 		for _, element := range e.elements {
 			elements = append(elements, cloneExpr(element))
 		}
-		return &listExpr{elements: elements, pos: e.pos}
+		return &listExpr{elements: elements, tail: cloneExpr(e.tail), pos: e.pos}
 	default:
 		return nil
 	}

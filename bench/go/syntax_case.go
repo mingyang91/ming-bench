@@ -336,23 +336,52 @@ func exprFromDatum(value any, pos position) (expr, error) {
 	case emptyList:
 		return &listExpr{pos: pos}, nil
 	case *pairValue:
-		elements, err := listElements(datum, pos, "datum->syntax")
-		if err != nil {
-			return nil, err
-		}
-		exprs := make([]expr, 0, len(elements))
-		for _, element := range elements {
-			converted, err := exprFromDatum(element, pos)
-			if err != nil {
-				return nil, err
-			}
-			exprs = append(exprs, converted)
-		}
-		return &listExpr{elements: exprs, pos: pos}, nil
+		return exprFromPairDatum(datum, pos)
 	case *syntaxObject:
 		return cloneExpr(datum.expr), nil
 	default:
 		return nil, newEvalError(pos, "datum->syntax expects a datum")
+	}
+}
+
+func exprFromPairDatum(pair *pairValue, pos position) (expr, error) {
+	elements := []expr{}
+	seen := map[*pairValue]struct{}{}
+	current := any(pair)
+
+	for {
+		node, ok := current.(*pairValue)
+		if !ok {
+			tail, err := exprFromDatum(current, pos)
+			if err != nil {
+				return nil, err
+			}
+			return &listExpr{elements: elements, tail: tail, pos: pos}, nil
+		}
+
+		if _, ok := seen[node]; ok {
+			return nil, newEvalError(pos, "datum->syntax expects a finite datum")
+		}
+		seen[node] = struct{}{}
+
+		converted, err := exprFromDatum(node.car, pos)
+		if err != nil {
+			return nil, err
+		}
+		elements = append(elements, converted)
+
+		switch next := node.cdr.(type) {
+		case emptyList:
+			return &listExpr{elements: elements, pos: pos}, nil
+		case *pairValue:
+			current = next
+		default:
+			tail, err := exprFromDatum(next, pos)
+			if err != nil {
+				return nil, err
+			}
+			return &listExpr{elements: elements, tail: tail, pos: pos}, nil
+		}
 	}
 }
 

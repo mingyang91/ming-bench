@@ -21,6 +21,9 @@ const (
 	tokenRParen
 	tokenQuote
 	tokenSyntaxQuote
+	tokenQuasiQuote
+	tokenUnquote
+	tokenUnquoteSplicing
 	tokenAtom
 	tokenString
 )
@@ -88,6 +91,7 @@ func (e *symbolExpr) exprPos() position { return e.pos }
 
 type listExpr struct {
 	elements []expr
+	tail     expr
 	pos      position
 }
 
@@ -480,6 +484,9 @@ func exprRequiresContinuationEngine(expression expr) bool {
 				return true
 			}
 		}
+		if e.tail != nil && exprRequiresContinuationEngine(e.tail) {
+			return true
+		}
 	case *symbolExpr:
 		switch e.value {
 		case "call/cc", "call-with-current-continuation", "dynamic-wind":
@@ -518,7 +525,7 @@ func installBuiltins(env *environment) {
 		"string-ref", "string-copy", "string-set!", "string->list", "list->string", "char?", "char->integer", "integer->char",
 		"abs", "modulo", "remainder", "quotient", "min", "max", "expt", "gcd", "lcm", "truncate", "round",
 		"zero?", "positive?", "negative?", "odd?", "even?",
-		"list-ref", "list-tail", "list?", "assoc", "assv", "member", "map", "for-each",
+		"list-ref", "list-tail", "list?", "assq", "assv", "assoc", "memq", "memv", "member", "map", "for-each",
 		"char-alphabetic?", "char-numeric?", "char-upcase", "char-downcase", "char=?", "char<?",
 		"string=?", "string<?", "string>?", "string<=?", "string>=?", "string-ci=?", "string-upcase", "string-downcase",
 	} {
@@ -599,6 +606,9 @@ func (i *interpreter) evalList(list *listExpr, env *environment, tail bool) (any
 	if len(list.elements) == 0 {
 		return nil, newEvalError(list.pos, "cannot evaluate empty list")
 	}
+	if list.tail != nil {
+		return nil, newEvalError(list.pos, "cannot evaluate improper list")
+	}
 
 	if operator, ok := list.elements[0].(*symbolExpr); ok {
 		if operator.macro != nil {
@@ -654,6 +664,8 @@ func (i *interpreter) evalList(list *listExpr, env *environment, tail bool) (any
 				return i.evalLetRec(list.elements[1:], operator.pos, env, true, "letrec*", tail)
 			case "quote":
 				return i.evalQuote(list.elements[1:], operator.pos)
+			case "quasiquote":
+				return i.evalQuasiQuote(list.elements[1:], operator.pos, env)
 			case "syntax":
 				return i.evalSyntax(list.elements[1:], operator.pos, env)
 			case "syntax-case":
@@ -793,6 +805,17 @@ func (i *interpreter) evalCond(args []expr, pos position, env *environment, tail
 			return nil, err
 		}
 		if isTruthy(testValue) {
+			recipientExpr, arrowPos, isArrowClause, err := parseCondArrowClause(clause)
+			if err != nil {
+				return nil, err
+			}
+			if isArrowClause {
+				recipient, err := i.eval(recipientExpr, env)
+				if err != nil {
+					return nil, err
+				}
+				return applyProcedure(i, recipient, []any{testValue}, arrowPos, tail)
+			}
 			if len(clause.elements) == 1 {
 				return testValue, nil
 			}
@@ -973,7 +996,7 @@ func (i *interpreter) evalDefine(args []expr, pos position, env *environment) (a
 			return nil, newEvalError(target.elements[0].exprPos(), "define requires a symbol name")
 		}
 
-		params, err := parseParameterExprs(target.elements[1:])
+		params, err := parseParameterList(sliceListExpr(target, 1))
 		if err != nil {
 			return nil, err
 		}
@@ -1025,6 +1048,137 @@ func (i *interpreter) evalQuote(args []expr, pos position) (any, error) {
 		return nil, newEvalError(pos, "quote expects exactly 1 argument")
 	}
 	return datumFromExpr(args[0])
+}
+
+func (i *interpreter) evalQuasiQuote(args []expr, pos position, env *environment) (any, error) {
+	if len(args) != 1 {
+		return nil, newEvalError(pos, "quasiquote expects exactly 1 argument")
+	}
+	return i.evalQuasiQuoteExpr(args[0], env, 1)
+}
+
+func (i *interpreter) evalQuasiQuoteExpr(expression expr, env *environment, depth int) (any, error) {
+	switch e := expression.(type) {
+	case *listExpr:
+		if e.tail == nil && len(e.elements) == 2 {
+			if symbol, ok := e.elements[0].(*symbolExpr); ok {
+				switch symbol.value {
+				case "unquote":
+					if depth == 1 {
+						return i.eval(e.elements[1], env)
+					}
+					value, err := i.evalQuasiQuoteExpr(e.elements[1], env, depth-1)
+					if err != nil {
+						return nil, err
+					}
+					return buildQuasiQuoteForm("unquote", value), nil
+				case "unquote-splicing":
+					if depth == 1 {
+						return nil, newEvalError(symbol.pos, "unquote-splicing is only valid within a list")
+					}
+					value, err := i.evalQuasiQuoteExpr(e.elements[1], env, depth-1)
+					if err != nil {
+						return nil, err
+					}
+					return buildQuasiQuoteForm("unquote-splicing", value), nil
+				case "quasiquote":
+					value, err := i.evalQuasiQuoteExpr(e.elements[1], env, depth+1)
+					if err != nil {
+						return nil, err
+					}
+					return buildQuasiQuoteForm("quasiquote", value), nil
+				}
+			}
+		}
+		return i.evalQuasiQuoteList(e, env, depth)
+	default:
+		return datumFromExpr(expression)
+	}
+}
+
+func (i *interpreter) evalQuasiQuoteList(list *listExpr, env *environment, depth int) (any, error) {
+	result := any(emptyList{})
+	if list.tail != nil {
+		tail, err := i.evalQuasiQuoteTail(list.tail, env, depth)
+		if err != nil {
+			return nil, err
+		}
+		result = tail
+	}
+
+	for index := len(list.elements) - 1; index >= 0; index-- {
+		spliced, ok, err := i.evalQuasiQuoteSplice(list.elements[index], env, depth)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			for spliceIndex := len(spliced) - 1; spliceIndex >= 0; spliceIndex-- {
+				result = &pairValue{car: spliced[spliceIndex], cdr: result}
+			}
+			continue
+		}
+
+		value, err := i.evalQuasiQuoteExpr(list.elements[index], env, depth)
+		if err != nil {
+			return nil, err
+		}
+		result = &pairValue{car: value, cdr: result}
+	}
+
+	return result, nil
+}
+
+func (i *interpreter) evalQuasiQuoteTail(expression expr, env *environment, depth int) (any, error) {
+	if isUnquoteSplicingExpr(expression) && depth == 1 {
+		return nil, newEvalError(expression.exprPos(), "unquote-splicing is only valid within a list")
+	}
+	return i.evalQuasiQuoteExpr(expression, env, depth)
+}
+
+func (i *interpreter) evalQuasiQuoteSplice(expression expr, env *environment, depth int) ([]any, bool, error) {
+	if depth != 1 {
+		return nil, false, nil
+	}
+
+	form, ok := expression.(*listExpr)
+	if !ok || form.tail != nil || len(form.elements) != 2 {
+		return nil, false, nil
+	}
+
+	symbol, ok := form.elements[0].(*symbolExpr)
+	if !ok || symbol.value != "unquote-splicing" {
+		return nil, false, nil
+	}
+
+	value, err := i.eval(form.elements[1], env)
+	if err != nil {
+		return nil, false, err
+	}
+
+	elements, err := listElements(value, symbol.pos, "quasiquote")
+	if err != nil {
+		return nil, false, err
+	}
+	return elements, true, nil
+}
+
+func buildQuasiQuoteForm(name string, value any) any {
+	return &pairValue{
+		car: symbolValue(name),
+		cdr: &pairValue{
+			car: value,
+			cdr: emptyList{},
+		},
+	}
+}
+
+func isUnquoteSplicingExpr(expression expr) bool {
+	form, ok := expression.(*listExpr)
+	if !ok || form.tail != nil || len(form.elements) != 2 {
+		return false
+	}
+	symbol, ok := form.elements[0].(*symbolExpr)
+	return ok && symbol.value == "unquote-splicing"
 }
 
 func (i *interpreter) evalLet(args []expr, pos position, env *environment, tail bool) (any, error) {
@@ -1374,7 +1528,7 @@ func parseDoBindings(expression expr) ([]doBinding, error) {
 func parseLambdaParameters(expression expr) (parameterSpec, error) {
 	switch params := expression.(type) {
 	case *listExpr:
-		return parseParameterExprs(params.elements)
+		return parseParameterList(params)
 	case *symbolExpr:
 		return parameterSpec{
 			restName: params.value,
@@ -1386,19 +1540,44 @@ func parseLambdaParameters(expression expr) (parameterSpec, error) {
 }
 
 func parseParameterExprs(expressions []expr) (parameterSpec, error) {
+	return parseParameterList(&listExpr{elements: expressions})
+}
+
+func parseParameterList(params *listExpr) (parameterSpec, error) {
+	if params.tail != nil {
+		spec := parameterSpec{
+			required: make([]string, 0, len(params.elements)),
+		}
+		for _, expression := range params.elements {
+			symbol, ok := expression.(*symbolExpr)
+			if !ok || symbol.value == "." {
+				return parameterSpec{}, newEvalError(expression.exprPos(), "parameter name must be a symbol")
+			}
+			spec.required = append(spec.required, symbol.value)
+		}
+
+		symbol, ok := params.tail.(*symbolExpr)
+		if !ok || symbol.value == "." {
+			return parameterSpec{}, newEvalError(params.tail.exprPos(), "invalid dotted parameter list")
+		}
+		spec.restName = symbol.value
+		spec.hasRest = true
+		return spec, nil
+	}
+
 	spec := parameterSpec{
-		required: make([]string, 0, len(expressions)),
+		required: make([]string, 0, len(params.elements)),
 	}
 	sawDot := false
 
-	for index, expression := range expressions {
+	for index, expression := range params.elements {
 		symbol, ok := expression.(*symbolExpr)
 		if !ok {
 			return parameterSpec{}, newEvalError(expression.exprPos(), "parameter name must be a symbol")
 		}
 
 		if symbol.value == "." {
-			if sawDot || index == len(expressions)-1 {
+			if sawDot || index == len(params.elements)-1 {
 				return parameterSpec{}, newEvalError(symbol.pos, "invalid dotted parameter list")
 			}
 			sawDot = true
@@ -1406,7 +1585,7 @@ func parseParameterExprs(expressions []expr) (parameterSpec, error) {
 		}
 
 		if sawDot {
-			if index != len(expressions)-1 {
+			if index != len(params.elements)-1 {
 				return parameterSpec{}, newEvalError(expression.exprPos(), "invalid dotted parameter list")
 			}
 			spec.restName = symbol.value
@@ -1418,7 +1597,7 @@ func parseParameterExprs(expressions []expr) (parameterSpec, error) {
 	}
 
 	if sawDot && !spec.hasRest {
-		return parameterSpec{}, newEvalError(expressions[len(expressions)-1].exprPos(), "invalid dotted parameter list")
+		return parameterSpec{}, newEvalError(params.elements[len(params.elements)-1].exprPos(), "invalid dotted parameter list")
 	}
 
 	return spec, nil
@@ -1441,14 +1620,21 @@ func datumFromExpr(expression expr) (any, error) {
 	case *symbolExpr:
 		return symbolValue(e.value), nil
 	case *listExpr:
-		return datumList(e.elements)
+		return datumList(e.elements, e.tail)
 	default:
 		return nil, newEvalError(expression.exprPos(), "unsupported quoted form")
 	}
 }
 
-func datumList(elements []expr) (any, error) {
+func datumList(elements []expr, tail expr) (any, error) {
 	result := any(emptyList{})
+	if tail != nil {
+		value, err := datumFromExpr(tail)
+		if err != nil {
+			return nil, err
+		}
+		result = value
+	}
 	for index := len(elements) - 1; index >= 0; index-- {
 		value, err := datumFromExpr(elements[index])
 		if err != nil {
@@ -1457,6 +1643,17 @@ func datumList(elements []expr) (any, error) {
 		result = &pairValue{car: value, cdr: result}
 	}
 	return result, nil
+}
+
+func sliceListExpr(list *listExpr, start int) *listExpr {
+	if start > len(list.elements) {
+		start = len(list.elements)
+	}
+	return &listExpr{
+		elements: append([]expr(nil), list.elements[start:]...),
+		tail:     list.tail,
+		pos:      list.pos,
+	}
 }
 
 func expandApplyArgs(args []any, pos position, name string) ([]any, error) {
@@ -2040,9 +2237,6 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 	case "append":
 		result := any(emptyList{})
 		if len(args) > 0 {
-			if _, err := listElements(args[len(args)-1], pos, name); err != nil {
-				return nil, err
-			}
 			result = args[len(args)-1]
 		}
 
@@ -2105,74 +2299,17 @@ func applyBuiltin(i *interpreter, name string, args []any, pos position) (any, e
 		}
 		return isProperList(args[0]), nil
 
-	case "assoc":
+	case "assq", "assv", "assoc":
 		if len(args) != 2 {
 			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
 		}
-		elements, err := listElements(args[1], pos, name)
-		if err != nil {
-			return nil, err
-		}
-		for _, element := range elements {
-			pair, ok := element.(*pairValue)
-			if !ok {
-				return nil, newEvalError(pos, "%s expects an association list", name)
-			}
-			if equalValues(args[0], pair.car) {
-				return element, nil
-			}
-		}
-		return false, nil
+		return assocBuiltin(args[0], args[1], pos, name)
 
-	case "assv":
+	case "memq", "memv", "member":
 		if len(args) != 2 {
 			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
 		}
-		seen := map[*pairValue]struct{}{}
-		for current := args[1]; ; {
-			switch list := current.(type) {
-			case emptyList:
-				return false, nil
-			case *pairValue:
-				if _, ok := seen[list]; ok {
-					return nil, newEvalError(pos, "%s expects a proper list", name)
-				}
-				seen[list] = struct{}{}
-				entry, ok := list.car.(*pairValue)
-				if !ok {
-					return nil, newEvalError(pos, "%s expects an association list", name)
-				}
-				if eqValues(args[0], entry.car) {
-					return list.car, nil
-				}
-				current = list.cdr
-			default:
-				return nil, newEvalError(pos, "%s expects a proper list", name)
-			}
-		}
-
-	case "member":
-		if len(args) != 2 {
-			return nil, newEvalError(pos, "%s expects exactly 2 arguments", name)
-		}
-		seen := map[*pairValue]struct{}{}
-		for current := args[1]; ; {
-			switch list := current.(type) {
-			case emptyList:
-				return false, nil
-			case *pairValue:
-				if _, ok := seen[list]; ok {
-					return nil, newEvalError(pos, "%s expects a proper list", name)
-				}
-				seen[list] = struct{}{}
-				if equalValues(args[0], list.car) {
-					return list, nil
-				}
-				current = list.cdr
-			default:
-				return nil, newEvalError(pos, "%s expects a proper list", name)
-			}
-		}
+		return memberBuiltin(args[0], args[1], pos, name)
 
 	case "map":
 		if len(args) < 2 {
@@ -3299,6 +3436,83 @@ func isTruthy(value any) bool {
 	return !ok || boolean
 }
 
+func parseCondArrowClause(clause *listExpr) (expr, position, bool, error) {
+	if len(clause.elements) < 2 {
+		return nil, position{}, false, nil
+	}
+
+	symbol, ok := clause.elements[1].(*symbolExpr)
+	if !ok || symbol.value != "=>" {
+		return nil, position{}, false, nil
+	}
+
+	if len(clause.elements) != 3 {
+		return nil, position{}, false, newEvalError(symbol.pos, "cond => clauses must contain exactly 1 recipient")
+	}
+
+	return clause.elements[2], symbol.pos, true, nil
+}
+
+type valueComparator func(left, right any) bool
+
+func comparatorForBuiltin(name string) valueComparator {
+	switch name {
+	case "assq", "assv", "memq", "memv":
+		return eqValues
+	default:
+		return equalValues
+	}
+}
+
+func assocBuiltin(target, list any, pos position, procedure string) (any, error) {
+	compare := comparatorForBuiltin(procedure)
+	seen := map[*pairValue]struct{}{}
+	for current := list; ; {
+		switch pair := current.(type) {
+		case emptyList:
+			return false, nil
+		case *pairValue:
+			if _, ok := seen[pair]; ok {
+				return nil, newEvalError(pos, "%s expects a proper list", procedure)
+			}
+			seen[pair] = struct{}{}
+
+			entry, ok := pair.car.(*pairValue)
+			if !ok {
+				return nil, newEvalError(pos, "%s expects an association list", procedure)
+			}
+			if compare(target, entry.car) {
+				return pair.car, nil
+			}
+			current = pair.cdr
+		default:
+			return nil, newEvalError(pos, "%s expects a proper list", procedure)
+		}
+	}
+}
+
+func memberBuiltin(target, list any, pos position, procedure string) (any, error) {
+	compare := comparatorForBuiltin(procedure)
+	seen := map[*pairValue]struct{}{}
+	for current := list; ; {
+		switch pair := current.(type) {
+		case emptyList:
+			return false, nil
+		case *pairValue:
+			if _, ok := seen[pair]; ok {
+				return nil, newEvalError(pos, "%s expects a proper list", procedure)
+			}
+			seen[pair] = struct{}{}
+			if compare(target, pair.car) {
+				return pair, nil
+			}
+			current = pair.cdr
+		default:
+			return nil, newEvalError(pos, "%s expects a proper list", procedure)
+		}
+	}
+}
+
 func formatValue(value any) string {
 	return formatValueWithState(value, &formatState{
 		pairs:   map[*pairValue]struct{}{},
@@ -3511,6 +3725,20 @@ func lex(input string) ([]token, error) {
 			tokens = append(tokens, token{kind: tokenQuote, text: "'", pos: pos})
 			index++
 			column++
+		case '`':
+			tokens = append(tokens, token{kind: tokenQuasiQuote, text: "`", pos: pos})
+			index++
+			column++
+		case ',':
+			if index+1 < len(input) && input[index+1] == '@' {
+				tokens = append(tokens, token{kind: tokenUnquoteSplicing, text: ",@", pos: pos})
+				index += 2
+				column += 2
+				continue
+			}
+			tokens = append(tokens, token{kind: tokenUnquote, text: ",", pos: pos})
+			index++
+			column++
 		case '"':
 			text, width, err := lexString(input[index:], pos)
 			if err != nil {
@@ -3523,7 +3751,7 @@ func lex(input string) ([]token, error) {
 			start := index
 			for index < len(input) {
 				current := input[index]
-				if current == '(' || current == ')' || current == '\'' || current == '"' || current == ';' || unicode.IsSpace(rune(current)) {
+				if current == '(' || current == ')' || current == '\'' || current == '`' || current == ',' || current == '"' || current == ';' || unicode.IsSpace(rune(current)) {
 					break
 				}
 				index++
@@ -3630,6 +3858,42 @@ func (p *tokenParser) parseExpr() (expr, error) {
 			},
 			pos: current.pos,
 		}, nil
+	case tokenQuasiQuote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &listExpr{
+			elements: []expr{
+				&symbolExpr{value: "quasiquote", pos: current.pos},
+				quoted,
+			},
+			pos: current.pos,
+		}, nil
+	case tokenUnquote:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &listExpr{
+			elements: []expr{
+				&symbolExpr{value: "unquote", pos: current.pos},
+				quoted,
+			},
+			pos: current.pos,
+		}, nil
+	case tokenUnquoteSplicing:
+		quoted, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return &listExpr{
+			elements: []expr{
+				&symbolExpr{value: "unquote-splicing", pos: current.pos},
+				quoted,
+			},
+			pos: current.pos,
+		}, nil
 	case tokenString:
 		return &stringExpr{value: current.text, pos: current.pos}, nil
 	case tokenAtom:
@@ -3641,6 +3905,8 @@ func (p *tokenParser) parseExpr() (expr, error) {
 
 func (p *tokenParser) parseList(pos position) (expr, error) {
 	var elements []expr
+	var tail expr
+	dotted := false
 
 	for {
 		if p.index >= len(p.tokens) {
@@ -3648,7 +3914,35 @@ func (p *tokenParser) parseList(pos position) (expr, error) {
 		}
 		if p.tokens[p.index].kind == tokenRParen {
 			p.index++
-			return &listExpr{elements: elements, pos: pos}, nil
+			if dotted && tail == nil {
+				return nil, newEvalError(pos, "invalid dotted list")
+			}
+			return &listExpr{elements: elements, tail: tail, pos: pos}, nil
+		}
+		if !dotted && p.tokens[p.index].kind == tokenAtom && p.tokens[p.index].text == "." {
+			if len(elements) == 0 {
+				return nil, newEvalError(p.tokens[p.index].pos, "invalid dotted list")
+			}
+			dotted = true
+			p.index++
+			if p.index >= len(p.tokens) {
+				return nil, newEvalError(pos, "unterminated list")
+			}
+			if p.tokens[p.index].kind == tokenRParen {
+				return nil, newEvalError(p.tokens[p.index-1].pos, "invalid dotted list")
+			}
+			var err error
+			tail, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if p.index >= len(p.tokens) {
+				return nil, newEvalError(pos, "unterminated list")
+			}
+			if p.tokens[p.index].kind != tokenRParen {
+				return nil, newEvalError(p.tokens[p.index].pos, "invalid dotted list")
+			}
+			continue
 		}
 		element, err := p.parseExpr()
 		if err != nil {

@@ -49,6 +49,13 @@ type condContinuationFrame struct {
 	body      []expr
 	remaining []expr
 	env       *environment
+	recipient expr
+	arrowPos  position
+}
+
+type condArrowContinuationFrame struct {
+	value any
+	pos   position
 }
 
 type caseContinuationFrame struct {
@@ -496,10 +503,22 @@ func (i *interpreter) startCondControl(clauses []expr, env *environment, stack [
 		return control, nextStack, nil
 	}
 
+	recipientExpr, arrowPos, isArrowClause, err := parseCondArrowClause(clause)
+	if err != nil {
+		return continuationControl{}, nil, err
+	}
+
+	body := clause.elements[1:]
+	if isArrowClause {
+		body = nil
+	}
+
 	stack = append(stack, condContinuationFrame{
-		body:      clause.elements[1:],
+		body:      body,
 		remaining: clauses[1:],
 		env:       env,
+		recipient: recipientExpr,
+		arrowPos:  arrowPos,
 	})
 	return newExpressionControl(clause.elements[0], env), stack, nil
 }
@@ -722,6 +741,9 @@ func (i *interpreter) stepContinuationExpr(expression expr, env *environment, st
 		if len(e.elements) == 0 {
 			return continuationControl{}, nil, newEvalError(e.pos, "cannot evaluate empty list")
 		}
+		if e.tail != nil {
+			return continuationControl{}, nil, newEvalError(e.pos, "cannot evaluate improper list")
+		}
 
 		if operator, ok := e.elements[0].(*symbolExpr); ok {
 			if operator.macro != nil {
@@ -813,7 +835,7 @@ func (i *interpreter) stepContinuationExpr(expression expr, env *environment, st
 							return continuationControl{}, nil, newEvalError(target.elements[0].exprPos(), "define requires a symbol name")
 						}
 
-						params, err := parseParameterExprs(target.elements[1:])
+						params, err := parseParameterList(sliceListExpr(target, 1))
 						if err != nil {
 							return continuationControl{}, nil, err
 						}
@@ -862,6 +884,12 @@ func (i *interpreter) stepContinuationExpr(expression expr, env *environment, st
 					return i.startLetRecControl(e.elements[1:], operator.pos, env, true, "letrec*", stack)
 				case "quote":
 					value, err := i.evalQuote(e.elements[1:], operator.pos)
+					if err != nil {
+						return continuationControl{}, nil, err
+					}
+					return newValueControl(value), stack, nil
+				case "quasiquote":
+					value, err := i.evalQuasiQuote(e.elements[1:], operator.pos, env)
 					if err != nil {
 						return continuationControl{}, nil, err
 					}
@@ -982,6 +1010,13 @@ func (i *interpreter) resumeContinuationFrame(frame continuationFrame, value any
 
 	case condContinuationFrame:
 		if isTruthy(value) {
+			if frame.recipient != nil {
+				stack = append(stack, condArrowContinuationFrame{
+					value: value,
+					pos:   frame.arrowPos,
+				})
+				return newExpressionControl(frame.recipient, frame.env), stack, nil
+			}
 			if len(frame.body) == 0 {
 				return newValueControl(value), stack, nil
 			}
@@ -989,6 +1024,9 @@ func (i *interpreter) resumeContinuationFrame(frame continuationFrame, value any
 			return control, nextStack, nil
 		}
 		return i.startCondControl(frame.remaining, frame.env, stack)
+
+	case condArrowContinuationFrame:
+		return i.applyContinuationProcedure(value, []any{frame.value}, frame.pos, stack)
 
 	case caseContinuationFrame:
 		for index, clauseExpr := range frame.clauses {
