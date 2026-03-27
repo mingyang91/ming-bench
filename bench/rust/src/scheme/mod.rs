@@ -2201,7 +2201,7 @@ fn eval_syntax_case(
         };
 
         let (fender, body): (Option<&Expr>, &[Expr]) = match rest {
-            [body] => (None, rest),
+            [_body] => (None, rest),
             [fender, body] => (Some(fender), std::slice::from_ref(body)),
             _ => (None, rest),
         };
