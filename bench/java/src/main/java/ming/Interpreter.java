@@ -2,9 +2,8 @@ package ming;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Locale;
 
 final class Interpreter {
     private static final BooleanValue TRUE = new BooleanValue(true);
@@ -72,6 +71,36 @@ final class Interpreter {
         env.define("boolean?", new BuiltinProcedure("boolean?", this::applyBooleanPredicate));
         env.define("pair?", new BuiltinProcedure("pair?", this::applyPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::applySymbolPredicate));
+        env.define("eq?", new BuiltinProcedure("eq?", this::applyEq));
+        env.define("equal?", new BuiltinProcedure("equal?", this::applyEqual));
+        env.define("map", new BuiltinProcedure("map", this::applyMap));
+        env.define("abs", new BuiltinProcedure("abs", this::applyAbs));
+        env.define("modulo", new BuiltinProcedure("modulo", this::applyModulo));
+        env.define("remainder", new BuiltinProcedure("remainder", this::applyRemainder));
+        env.define("quotient", new BuiltinProcedure("quotient", this::applyQuotient));
+        env.define("min", new BuiltinProcedure("min", this::applyMin));
+        env.define("max", new BuiltinProcedure("max", this::applyMax));
+        env.define("expt", new BuiltinProcedure("expt", this::applyExpt));
+        env.define("zero?", new BuiltinProcedure("zero?", this::applyZeroPredicate));
+        env.define("positive?", new BuiltinProcedure("positive?", this::applyPositivePredicate));
+        env.define("negative?", new BuiltinProcedure("negative?", this::applyNegativePredicate));
+        env.define("odd?", new BuiltinProcedure("odd?", this::applyOddPredicate));
+        env.define("even?", new BuiltinProcedure("even?", this::applyEvenPredicate));
+        env.define("list-ref", new BuiltinProcedure("list-ref", this::applyListRef));
+        env.define("list-tail", new BuiltinProcedure("list-tail", this::applyListTail));
+        env.define("list?", new BuiltinProcedure("list?", this::applyListPredicate));
+        env.define("assoc", new BuiltinProcedure("assoc", this::applyAssoc));
+        env.define("char-alphabetic?", new BuiltinProcedure("char-alphabetic?", this::applyCharAlphabeticPredicate));
+        env.define("char-numeric?", new BuiltinProcedure("char-numeric?", this::applyCharNumericPredicate));
+        env.define("char-upcase", new BuiltinProcedure("char-upcase", this::applyCharUpcase));
+        env.define("char-downcase", new BuiltinProcedure("char-downcase", this::applyCharDowncase));
+        env.define("char=?", new BuiltinProcedure("char=?", this::applyCharEquals));
+        env.define("char<?", new BuiltinProcedure("char<?", this::applyCharLessThan));
+        env.define("string=?", new BuiltinProcedure("string=?", this::applyStringEquals));
+        env.define("string<?", new BuiltinProcedure("string<?", this::applyStringLessThan));
+        env.define("string-ci=?", new BuiltinProcedure("string-ci=?", this::applyStringCiEquals));
+        env.define("string-upcase", new BuiltinProcedure("string-upcase", this::applyStringUpcase));
+        env.define("string-downcase", new BuiltinProcedure("string-downcase", this::applyStringDowncase));
         return env;
     }
 
@@ -521,7 +550,7 @@ final class Interpreter {
     private Value applyStringToNumber(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("string->number", arguments, 1, callLoc);
         String value = requireString(arguments.getFirst(), "string->number", callLoc);
-        Rational parsed = parseNumberLiteral(value);
+        Rational parsed = Rational.parse(value);
         if (parsed == null) {
             return FALSE;
         }
@@ -583,6 +612,335 @@ final class Interpreter {
     private Value applyCharPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("char?", arguments, 1, callLoc);
         return arguments.getFirst() instanceof CharValue ? TRUE : FALSE;
+    }
+
+    private Value applyEq(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("eq?", arguments, 2, callLoc);
+        return eqValues(arguments.get(0), arguments.get(1)) ? TRUE : FALSE;
+    }
+
+    private Value applyEqual(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("equal?", arguments, 2, callLoc);
+        return equalValues(arguments.get(0), arguments.get(1)) ? TRUE : FALSE;
+    }
+
+    private Value applyMap(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("map", arguments, 2, callLoc);
+
+        Value procedureValue = arguments.getFirst();
+        if (!(procedureValue instanceof Procedure procedure)) {
+            throw error(callLoc, "map expects a procedure as its first argument");
+        }
+
+        List<List<Value>> lists = new ArrayList<>(arguments.size() - 1);
+        int expectedLength = -1;
+        for (int index = 1; index < arguments.size(); index++) {
+            List<Value> elements = requireProperList(arguments.get(index), "map", callLoc);
+            if (expectedLength == -1) {
+                expectedLength = elements.size();
+            } else if (elements.size() != expectedLength) {
+                throw error(callLoc, "map expects lists of equal length");
+            }
+            lists.add(elements);
+        }
+
+        List<Value> results = new ArrayList<>(Math.max(expectedLength, 0));
+        for (int elementIndex = 0; elementIndex < expectedLength; elementIndex++) {
+            List<Value> mappedArguments = new ArrayList<>(lists.size());
+            for (List<Value> list : lists) {
+                mappedArguments.add(list.get(elementIndex));
+            }
+            results.add(procedure.apply(mappedArguments, callLoc));
+        }
+        return buildList(results);
+    }
+
+    private Value applyAbs(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("abs", arguments, 1, callLoc);
+        Rational value = requireNumber(arguments.getFirst(), "abs", callLoc);
+        return new NumberValue(value.compareTo(Rational.ZERO) < 0 ? value.negate() : value);
+    }
+
+    private Value applyModulo(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("modulo", arguments, 2, callLoc);
+        BigInteger dividend = requireInteger(arguments.get(0), "modulo", callLoc);
+        BigInteger divisor = requireInteger(arguments.get(1), "modulo", callLoc);
+        if (divisor.signum() == 0) {
+            throw error(callLoc, "division by zero");
+        }
+
+        BigInteger remainder = dividend.remainder(divisor);
+        if (remainder.signum() != 0 && remainder.signum() != divisor.signum()) {
+            remainder = remainder.add(divisor);
+        }
+        return new NumberValue(Rational.integer(remainder));
+    }
+
+    private Value applyRemainder(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("remainder", arguments, 2, callLoc);
+        BigInteger dividend = requireInteger(arguments.get(0), "remainder", callLoc);
+        BigInteger divisor = requireInteger(arguments.get(1), "remainder", callLoc);
+        if (divisor.signum() == 0) {
+            throw error(callLoc, "division by zero");
+        }
+        return new NumberValue(Rational.integer(dividend.remainder(divisor)));
+    }
+
+    private Value applyQuotient(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("quotient", arguments, 2, callLoc);
+        BigInteger dividend = requireInteger(arguments.get(0), "quotient", callLoc);
+        BigInteger divisor = requireInteger(arguments.get(1), "quotient", callLoc);
+        if (divisor.signum() == 0) {
+            throw error(callLoc, "division by zero");
+        }
+        return new NumberValue(Rational.integer(dividend.divide(divisor)));
+    }
+
+    private Value applyMin(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("min", arguments, 1, callLoc);
+        Rational result = requireNumber(arguments.getFirst(), "min", callLoc);
+        for (int index = 1; index < arguments.size(); index++) {
+            Rational current = requireNumber(arguments.get(index), "min", callLoc);
+            if (current.compareTo(result) < 0) {
+                result = current;
+            }
+        }
+        return new NumberValue(result);
+    }
+
+    private Value applyMax(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("max", arguments, 1, callLoc);
+        Rational result = requireNumber(arguments.getFirst(), "max", callLoc);
+        for (int index = 1; index < arguments.size(); index++) {
+            Rational current = requireNumber(arguments.get(index), "max", callLoc);
+            if (current.compareTo(result) > 0) {
+                result = current;
+            }
+        }
+        return new NumberValue(result);
+    }
+
+    private Value applyExpt(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("expt", arguments, 2, callLoc);
+        Rational base = requireNumber(arguments.get(0), "expt", callLoc);
+        BigInteger exponent = requireInteger(arguments.get(1), "expt", callLoc);
+        return new NumberValue(pow(base, exponent, callLoc));
+    }
+
+    private Value applyZeroPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("zero?", arguments, 1, callLoc);
+        return requireNumber(arguments.getFirst(), "zero?", callLoc).compareTo(Rational.ZERO) == 0
+                ? TRUE
+                : FALSE;
+    }
+
+    private Value applyPositivePredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("positive?", arguments, 1, callLoc);
+        return requireNumber(arguments.getFirst(), "positive?", callLoc).compareTo(Rational.ZERO) > 0
+                ? TRUE
+                : FALSE;
+    }
+
+    private Value applyNegativePredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("negative?", arguments, 1, callLoc);
+        return requireNumber(arguments.getFirst(), "negative?", callLoc).compareTo(Rational.ZERO) < 0
+                ? TRUE
+                : FALSE;
+    }
+
+    private Value applyOddPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("odd?", arguments, 1, callLoc);
+        BigInteger value = requireInteger(arguments.getFirst(), "odd?", callLoc).abs();
+        return value.remainder(BigInteger.TWO).equals(BigInteger.ONE) ? TRUE : FALSE;
+    }
+
+    private Value applyEvenPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("even?", arguments, 1, callLoc);
+        BigInteger value = requireInteger(arguments.getFirst(), "even?", callLoc).abs();
+        return value.remainder(BigInteger.TWO).equals(BigInteger.ZERO) ? TRUE : FALSE;
+    }
+
+    private Value applyListRef(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("list-ref", arguments, 2, callLoc);
+        Value current = arguments.getFirst();
+        int index = requireIndex(arguments.get(1), "list-ref", callLoc);
+
+        for (int step = 0; step < index; step++) {
+            if (!(current instanceof PairValue pairValue)) {
+                if (current instanceof EmptyListValue) {
+                    throw error(callLoc, "list-ref index is out of bounds");
+                }
+                throw error(callLoc, "list-ref expects a proper list");
+            }
+            current = pairValue.cdr();
+        }
+
+        if (current instanceof PairValue pairValue) {
+            return pairValue.car();
+        }
+        if (current instanceof EmptyListValue) {
+            throw error(callLoc, "list-ref index is out of bounds");
+        }
+        throw error(callLoc, "list-ref expects a proper list");
+    }
+
+    private Value applyListTail(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("list-tail", arguments, 2, callLoc);
+        Value current = arguments.getFirst();
+        int index = requireIndex(arguments.get(1), "list-tail", callLoc);
+
+        for (int step = 0; step < index; step++) {
+            if (!(current instanceof PairValue pairValue)) {
+                if (current instanceof EmptyListValue) {
+                    throw error(callLoc, "list-tail index is out of bounds");
+                }
+                throw error(callLoc, "list-tail expects a proper list");
+            }
+            current = pairValue.cdr();
+        }
+
+        if (current instanceof PairValue || current instanceof EmptyListValue) {
+            return current;
+        }
+        throw error(callLoc, "list-tail expects a proper list");
+    }
+
+    private Value applyListPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("list?", arguments, 1, callLoc);
+        return isProperList(arguments.getFirst()) ? TRUE : FALSE;
+    }
+
+    private Value applyAssoc(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("assoc", arguments, 2, callLoc);
+        Value key = arguments.get(0);
+        Value current = arguments.get(1);
+
+        while (current instanceof PairValue pairValue) {
+            Value entry = pairValue.car();
+            PairValue association = requirePair(entry, "assoc", callLoc);
+            if (equalValues(key, association.car())) {
+                return entry;
+            }
+            current = pairValue.cdr();
+        }
+
+        if (!(current instanceof EmptyListValue)) {
+            throw error(callLoc, "assoc expects a proper list");
+        }
+        return FALSE;
+    }
+
+    private Value applyCharAlphabeticPredicate(List<Value> arguments, SourceLoc callLoc)
+            throws EvalError {
+        ensureExactly("char-alphabetic?", arguments, 1, callLoc);
+        return Character.isAlphabetic(requireChar(arguments.getFirst(), "char-alphabetic?", callLoc)
+                .codePoint())
+                ? TRUE
+                : FALSE;
+    }
+
+    private Value applyCharNumericPredicate(List<Value> arguments, SourceLoc callLoc)
+            throws EvalError {
+        ensureExactly("char-numeric?", arguments, 1, callLoc);
+        return Character.isDigit(requireChar(arguments.getFirst(), "char-numeric?", callLoc)
+                .codePoint())
+                ? TRUE
+                : FALSE;
+    }
+
+    private Value applyCharUpcase(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("char-upcase", arguments, 1, callLoc);
+        return new CharValue(Character.toUpperCase(
+                requireChar(arguments.getFirst(), "char-upcase", callLoc).codePoint()
+        ));
+    }
+
+    private Value applyCharDowncase(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("char-downcase", arguments, 1, callLoc);
+        return new CharValue(Character.toLowerCase(
+                requireChar(arguments.getFirst(), "char-downcase", callLoc).codePoint()
+        ));
+    }
+
+    private Value applyCharEquals(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("char=?", arguments, 2, callLoc);
+        int previous = requireChar(arguments.getFirst(), "char=?", callLoc).codePoint();
+        for (int index = 1; index < arguments.size(); index++) {
+            int current = requireChar(arguments.get(index), "char=?", callLoc).codePoint();
+            if (previous != current) {
+                return FALSE;
+            }
+            previous = current;
+        }
+        return TRUE;
+    }
+
+    private Value applyCharLessThan(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("char<?", arguments, 2, callLoc);
+        int previous = requireChar(arguments.getFirst(), "char<?", callLoc).codePoint();
+        for (int index = 1; index < arguments.size(); index++) {
+            int current = requireChar(arguments.get(index), "char<?", callLoc).codePoint();
+            if (previous >= current) {
+                return FALSE;
+            }
+            previous = current;
+        }
+        return TRUE;
+    }
+
+    private Value applyStringEquals(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("string=?", arguments, 2, callLoc);
+        String previous = requireString(arguments.getFirst(), "string=?", callLoc);
+        for (int index = 1; index < arguments.size(); index++) {
+            String current = requireString(arguments.get(index), "string=?", callLoc);
+            if (!previous.equals(current)) {
+                return FALSE;
+            }
+            previous = current;
+        }
+        return TRUE;
+    }
+
+    private Value applyStringLessThan(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("string<?", arguments, 2, callLoc);
+        String previous = requireString(arguments.getFirst(), "string<?", callLoc);
+        for (int index = 1; index < arguments.size(); index++) {
+            String current = requireString(arguments.get(index), "string<?", callLoc);
+            if (previous.compareTo(current) >= 0) {
+                return FALSE;
+            }
+            previous = current;
+        }
+        return TRUE;
+    }
+
+    private Value applyStringCiEquals(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureAtLeast("string-ci=?", arguments, 2, callLoc);
+        String previous = requireString(arguments.getFirst(), "string-ci=?", callLoc)
+                .toLowerCase(Locale.ROOT);
+        for (int index = 1; index < arguments.size(); index++) {
+            String current = requireString(arguments.get(index), "string-ci=?", callLoc)
+                    .toLowerCase(Locale.ROOT);
+            if (!previous.equals(current)) {
+                return FALSE;
+            }
+            previous = current;
+        }
+        return TRUE;
+    }
+
+    private Value applyStringUpcase(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string-upcase", arguments, 1, callLoc);
+        return new StringValue(
+                requireString(arguments.getFirst(), "string-upcase", callLoc).toUpperCase(Locale.ROOT)
+        );
+    }
+
+    private Value applyStringDowncase(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string-downcase", arguments, 1, callLoc);
+        return new StringValue(
+                requireString(arguments.getFirst(), "string-downcase", callLoc).toLowerCase(Locale.ROOT)
+        );
     }
 
     private Value applyComparison(
@@ -725,6 +1083,15 @@ final class Interpreter {
         throw error(callLoc, procedureName + " expects character arguments");
     }
 
+    private BigInteger requireInteger(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        Rational number = requireNumber(value, procedureName, callLoc);
+        if (!number.denominator().equals(BigInteger.ONE)) {
+            throw error(callLoc, procedureName + " expects integer arguments");
+        }
+        return number.numerator();
+    }
+
     private int requireIndex(Value value, String procedureName, SourceLoc callLoc)
             throws EvalError {
         Rational number = requireNumber(value, procedureName, callLoc);
@@ -761,6 +1128,67 @@ final class Interpreter {
             return elements;
         }
         throw error(callLoc, procedureName + " expects a proper list");
+    }
+
+    private boolean isProperList(Value value) {
+        Value current = value;
+        while (current instanceof PairValue pairValue) {
+            current = pairValue.cdr();
+        }
+        return current instanceof EmptyListValue;
+    }
+
+    private boolean eqValues(Value left, Value right) {
+        if (left == right) {
+            return true;
+        }
+        if (left instanceof NumberValue leftNumber && right instanceof NumberValue rightNumber) {
+            return leftNumber.value().equals(rightNumber.value());
+        }
+        if (left instanceof BooleanValue leftBoolean && right instanceof BooleanValue rightBoolean) {
+            return leftBoolean.value() == rightBoolean.value();
+        }
+        if (left instanceof CharValue leftChar && right instanceof CharValue rightChar) {
+            return leftChar.codePoint() == rightChar.codePoint();
+        }
+        if (left instanceof SymbolValue leftSymbol && right instanceof SymbolValue rightSymbol) {
+            return leftSymbol.name().equals(rightSymbol.name());
+        }
+        return false;
+    }
+
+    private boolean equalValues(Value left, Value right) {
+        if (eqValues(left, right)) {
+            return true;
+        }
+        if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
+            return leftString.text().equals(rightString.text());
+        }
+        if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
+            return equalValues(leftPair.car(), rightPair.car())
+                    && equalValues(leftPair.cdr(), rightPair.cdr());
+        }
+        return false;
+    }
+
+    private Rational pow(Rational base, BigInteger exponent, SourceLoc callLoc) throws EvalError {
+        if (exponent.signum() == 0) {
+            return Rational.ONE;
+        }
+
+        BigInteger magnitude = exponent.signum() < 0 ? exponent.negate() : exponent;
+        if (magnitude.compareTo(BigInteger.valueOf(Integer.MAX_VALUE)) > 0) {
+            throw error(callLoc, "expt exponent is too large");
+        }
+
+        Rational result = Rational.of(
+                base.numerator().pow(magnitude.intValueExact()),
+                base.denominator().pow(magnitude.intValueExact())
+        );
+        if (exponent.signum() < 0) {
+            return Rational.ONE.divide(result, callLoc);
+        }
+        return result;
     }
 
     private Value buildList(List<Value> elements) {
@@ -816,7 +1244,7 @@ final class Interpreter {
     }
 
     private static EvalError error(SourceLoc loc, String message) {
-        return new EvalError(message + " at " + loc.line() + ":" + loc.column());
+        return SchemeErrors.at(loc, message);
     }
 
     @FunctionalInterface
@@ -827,190 +1255,6 @@ final class Interpreter {
     @FunctionalInterface
     private interface RationalComparison {
         boolean test(Rational left, Rational right);
-    }
-
-    private interface Procedure {
-        Value apply(List<Value> arguments, SourceLoc callLoc) throws EvalError;
-    }
-
-    private sealed interface Expr permits NumberExpr, BooleanExpr, StringExpr, CharExpr, SymbolExpr, ListExpr {
-        SourceLoc loc();
-    }
-
-    private sealed interface Value permits NumberValue,
-            BooleanValue,
-            StringValue,
-            CharValue,
-            SymbolValue,
-            PairValue,
-            EmptyListValue,
-            BuiltinProcedure,
-            UserProcedure,
-            VoidValue {
-        String render();
-
-        default String displayRender() {
-            return render();
-        }
-
-        default boolean isTruthy() {
-            return true;
-        }
-    }
-
-    private record SourceLoc(int line, int column) { }
-
-    private record BindingParseResult(List<String> names, List<Value> values) { }
-
-    private record ParameterSpec(List<String> requiredParameters, String restParameter) { }
-
-    private record NumberExpr(SourceLoc loc, Rational value) implements Expr { }
-
-    private record BooleanExpr(SourceLoc loc, boolean value) implements Expr { }
-
-    private record StringExpr(SourceLoc loc, String value) implements Expr { }
-
-    private record CharExpr(SourceLoc loc, int codePoint) implements Expr { }
-
-    private record SymbolExpr(SourceLoc loc, String name) implements Expr { }
-
-    private record ListExpr(SourceLoc loc, List<Expr> elements) implements Expr { }
-
-    private record NumberValue(Rational value) implements Value {
-        @Override
-        public String render() {
-            return value.render();
-        }
-    }
-
-    private record BooleanValue(boolean value) implements Value {
-        @Override
-        public String render() {
-            return value ? "#t" : "#f";
-        }
-
-        @Override
-        public boolean isTruthy() {
-            return value;
-        }
-    }
-
-    private static final class StringValue implements Value {
-        private final StringBuilder contents;
-        private final boolean mutable;
-
-        private StringValue(String value) {
-            this(value, false);
-        }
-
-        private StringValue(String value, boolean mutable) {
-            this.contents = new StringBuilder(value);
-            this.mutable = mutable;
-        }
-
-        @Override
-        public String render() {
-            return renderString(text());
-        }
-
-        @Override
-        public String displayRender() {
-            return text();
-        }
-
-        private String text() {
-            return contents.toString();
-        }
-
-        private StringValue copy(boolean mutableCopy) {
-            return new StringValue(text(), mutableCopy);
-        }
-
-        private void setCodePoint(int index, int codePoint, SourceLoc callLoc) throws EvalError {
-            if (!mutable) {
-                throw error(callLoc, "string-set! expects a mutable string");
-            }
-
-            int length = contents.codePointCount(0, contents.length());
-            if (index >= length) {
-                throw error(callLoc, "string-set! index is out of bounds");
-            }
-
-            int startOffset = contents.offsetByCodePoints(0, index);
-            int endOffset = contents.offsetByCodePoints(startOffset, 1);
-            contents.replace(startOffset, endOffset, new String(Character.toChars(codePoint)));
-        }
-    }
-
-    private record CharValue(int codePoint) implements Value {
-        @Override
-        public String render() {
-            return renderChar(codePoint);
-        }
-
-        @Override
-        public String displayRender() {
-            return new String(Character.toChars(codePoint));
-        }
-    }
-
-    private record SymbolValue(String name) implements Value {
-        @Override
-        public String render() {
-            return name;
-        }
-    }
-
-    private record PairValue(Value car, Value cdr) implements Value {
-        @Override
-        public String render() {
-            return renderContents(false);
-        }
-
-        @Override
-        public String displayRender() {
-            return renderContents(true);
-        }
-
-        private String renderContents(boolean displayMode) {
-            StringBuilder builder = new StringBuilder();
-            builder.append('(');
-            appendPairContents(builder, this, displayMode);
-            builder.append(')');
-            return builder.toString();
-        }
-
-        private static void appendPairContents(StringBuilder builder, PairValue pair, boolean displayMode) {
-            builder.append(displayMode ? pair.car.displayRender() : pair.car.render());
-            if (pair.cdr instanceof EmptyListValue) {
-                return;
-            }
-            if (pair.cdr instanceof PairValue nextPair) {
-                builder.append(' ');
-                appendPairContents(builder, nextPair, displayMode);
-                return;
-            }
-            builder.append(" . ");
-            builder.append(displayMode ? pair.cdr.displayRender() : pair.cdr.render());
-        }
-    }
-
-    private enum EmptyListValue implements Value {
-        INSTANCE;
-
-        @Override
-        public String render() {
-            return "()";
-        }
-    }
-
-    private enum VoidValue implements Value {
-        INSTANCE;
-
-        @Override
-        public String render() {
-            return "";
-        }
     }
 
     private static final class BuiltinProcedure implements Value, Procedure {
@@ -1088,411 +1332,5 @@ final class Interpreter {
             }
             return evalSequence(body, callEnv);
         }
-    }
-
-    private static final class Environment {
-        private final Environment parent;
-        private final Map<String, Value> bindings;
-
-        private Environment(Environment parent) {
-            this.parent = parent;
-            this.bindings = new HashMap<>();
-        }
-
-        private void define(String name, Value value) {
-            bindings.put(name, value);
-        }
-
-        private Value lookup(String name, SourceLoc loc) throws EvalError {
-            Value value = bindings.get(name);
-            if (value != null) {
-                return value;
-            }
-            if (parent != null) {
-                return parent.lookup(name, loc);
-            }
-            throw error(loc, "unbound variable: " + name);
-        }
-
-        private void set(String name, Value value, SourceLoc loc) throws EvalError {
-            if (bindings.containsKey(name)) {
-                bindings.put(name, value);
-                return;
-            }
-            if (parent != null) {
-                parent.set(name, value, loc);
-                return;
-            }
-            throw error(loc, "unbound variable: " + name);
-        }
-    }
-
-    private static final class Parser {
-        private final String input;
-        private int index;
-        private int line;
-        private int column;
-
-        private Parser(String input) {
-            this.input = input;
-            this.index = 0;
-            this.line = 1;
-            this.column = 1;
-        }
-
-        private List<Expr> parseProgram() throws EvalError {
-            List<Expr> expressions = new ArrayList<>();
-            skipIgnored();
-            while (!isAtEnd()) {
-                expressions.add(parseExpression());
-                skipIgnored();
-            }
-            return List.copyOf(expressions);
-        }
-
-        private Expr parseExpression() throws EvalError {
-            skipIgnored();
-            if (isAtEnd()) {
-                throw new EvalError("unexpected end of input");
-            }
-
-            SourceLoc loc = currentLoc();
-            char ch = peek();
-            if (ch == '\'') {
-                return parseQuoteShorthand();
-            }
-            if (ch == '(') {
-                return parseList();
-            }
-            if (ch == ')') {
-                throw error(loc, "unexpected ')'");
-            }
-            if (ch == '"') {
-                return parseString();
-            }
-            return parseAtom();
-        }
-
-        private Expr parseList() throws EvalError {
-            SourceLoc start = currentLoc();
-            advance();
-
-            List<Expr> elements = new ArrayList<>();
-            skipIgnored();
-            while (!isAtEnd() && peek() != ')') {
-                elements.add(parseExpression());
-                skipIgnored();
-            }
-
-            if (isAtEnd()) {
-                throw error(start, "unterminated list");
-            }
-            advance();
-            return new ListExpr(start, List.copyOf(elements));
-        }
-
-        private Expr parseQuoteShorthand() throws EvalError {
-            SourceLoc start = currentLoc();
-            advance();
-            Expr quotedExpr = parseExpression();
-            return new ListExpr(
-                    start,
-                    List.of(
-                            new SymbolExpr(start, "quote"),
-                            quotedExpr
-                    )
-            );
-        }
-
-        private Expr parseString() throws EvalError {
-            SourceLoc start = currentLoc();
-            advance();
-
-            StringBuilder builder = new StringBuilder();
-            while (!isAtEnd()) {
-                char ch = advance();
-                if (ch == '"') {
-                    return new StringExpr(start, builder.toString());
-                }
-                if (ch == '\\') {
-                    if (isAtEnd()) {
-                        throw error(start, "unterminated string literal");
-                    }
-                    builder.append(parseEscape(advance()));
-                } else {
-                    builder.append(ch);
-                }
-            }
-
-            throw error(start, "unterminated string literal");
-        }
-
-        private char parseEscape(char escaped) {
-            return switch (escaped) {
-                case 'n' -> '\n';
-                case 'r' -> '\r';
-                case 't' -> '\t';
-                case '"' -> '"';
-                case '\\' -> '\\';
-                default -> escaped;
-            };
-        }
-
-        private Expr parseAtom() throws EvalError {
-            SourceLoc start = currentLoc();
-            StringBuilder builder = new StringBuilder();
-            while (!isAtEnd() && !isDelimiter(peek())) {
-                builder.append(advance());
-            }
-
-            String token = builder.toString();
-            if ("#t".equals(token)) {
-                return new BooleanExpr(start, true);
-            }
-            if ("#f".equals(token)) {
-                return new BooleanExpr(start, false);
-            }
-            if (token.startsWith("#\\")) {
-                return new CharExpr(start, parseCharacterLiteral(token, start));
-            }
-            if (isIntegerToken(token)) {
-                return new NumberExpr(start, Rational.integer(new BigInteger(token)));
-            }
-            return new SymbolExpr(start, token);
-        }
-
-        private void skipIgnored() {
-            while (!isAtEnd()) {
-                char ch = peek();
-                if (Character.isWhitespace(ch)) {
-                    advance();
-                    continue;
-                }
-                if (ch == ';') {
-                    skipComment();
-                    continue;
-                }
-                return;
-            }
-        }
-
-        private void skipComment() {
-            while (!isAtEnd() && peek() != '\n') {
-                advance();
-            }
-        }
-
-        private boolean isDelimiter(char ch) {
-            return Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == ';';
-        }
-
-        private boolean isAtEnd() {
-            return index >= input.length();
-        }
-
-        private char peek() {
-            return input.charAt(index);
-        }
-
-        private char advance() {
-            char ch = input.charAt(index);
-            index++;
-            if (ch == '\n') {
-                line++;
-                column = 1;
-            } else {
-                column++;
-            }
-            return ch;
-        }
-
-        private SourceLoc currentLoc() {
-            return new SourceLoc(line, column);
-        }
-
-        private boolean isIntegerToken(String token) {
-            if (token.isEmpty()) {
-                return false;
-            }
-
-            int start = 0;
-            char first = token.charAt(0);
-            if (first == '+' || first == '-') {
-                if (token.length() == 1) {
-                    return false;
-                }
-                start = 1;
-            }
-
-            for (int index = start; index < token.length(); index++) {
-                if (!Character.isDigit(token.charAt(index))) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private int parseCharacterLiteral(String token, SourceLoc loc) throws EvalError {
-            String literal = token.substring(2);
-            return switch (literal) {
-                case "space" -> ' ';
-                case "newline" -> '\n';
-                default -> {
-                    if (literal.codePointCount(0, literal.length()) != 1) {
-                        throw error(loc, "invalid character literal");
-                    }
-                    yield literal.codePointAt(0);
-                }
-            };
-        }
-    }
-
-    private record Rational(BigInteger numerator, BigInteger denominator) implements Comparable<Rational> {
-        private static final Rational ZERO = integer(BigInteger.ZERO);
-        private static final Rational ONE = integer(BigInteger.ONE);
-
-        private Rational {
-            if (denominator.signum() == 0) {
-                throw new IllegalArgumentException("denominator cannot be zero");
-            }
-        }
-
-        private static Rational integer(BigInteger value) {
-            return new Rational(value, BigInteger.ONE);
-        }
-
-        private static Rational of(BigInteger numerator, BigInteger denominator) {
-            if (denominator.signum() == 0) {
-                throw new IllegalArgumentException("denominator cannot be zero");
-            }
-
-            BigInteger normalizedNumerator = numerator;
-            BigInteger normalizedDenominator = denominator;
-            if (normalizedDenominator.signum() < 0) {
-                normalizedNumerator = normalizedNumerator.negate();
-                normalizedDenominator = normalizedDenominator.negate();
-            }
-
-            BigInteger gcd = normalizedNumerator.gcd(normalizedDenominator);
-            return new Rational(
-                    normalizedNumerator.divide(gcd),
-                    normalizedDenominator.divide(gcd)
-            );
-        }
-
-        private Rational add(Rational other) {
-            return of(
-                    numerator.multiply(other.denominator).add(other.numerator.multiply(denominator)),
-                    denominator.multiply(other.denominator)
-            );
-        }
-
-        private Rational subtract(Rational other) {
-            return of(
-                    numerator.multiply(other.denominator).subtract(other.numerator.multiply(denominator)),
-                    denominator.multiply(other.denominator)
-            );
-        }
-
-        private Rational multiply(Rational other) {
-            return of(numerator.multiply(other.numerator), denominator.multiply(other.denominator));
-        }
-
-        private Rational divide(Rational other, SourceLoc callLoc) throws EvalError {
-            if (other.numerator.signum() == 0) {
-                throw error(callLoc, "division by zero");
-            }
-            return of(numerator.multiply(other.denominator), denominator.multiply(other.numerator));
-        }
-
-        private Rational negate() {
-            return new Rational(numerator.negate(), denominator);
-        }
-
-        private String render() {
-            if (denominator.equals(BigInteger.ONE)) {
-                return numerator.toString();
-            }
-            return numerator + "/" + denominator;
-        }
-
-        @Override
-        public int compareTo(Rational other) {
-            return numerator.multiply(other.denominator)
-                    .compareTo(other.numerator.multiply(denominator));
-        }
-    }
-
-    private Rational parseNumberLiteral(String token) {
-        if (isIntegerToken(token)) {
-            return Rational.integer(new BigInteger(token));
-        }
-
-        int slashIndex = token.indexOf('/');
-        if (slashIndex <= 0 || slashIndex != token.lastIndexOf('/')) {
-            return null;
-        }
-
-        String numeratorToken = token.substring(0, slashIndex);
-        String denominatorToken = token.substring(slashIndex + 1);
-        if (!isIntegerToken(numeratorToken) || !isIntegerToken(denominatorToken)) {
-            return null;
-        }
-
-        BigInteger denominator = new BigInteger(denominatorToken);
-        if (denominator.signum() == 0) {
-            return null;
-        }
-        return Rational.of(new BigInteger(numeratorToken), denominator);
-    }
-
-    private static String renderString(String value) {
-        StringBuilder builder = new StringBuilder();
-        builder.append('"');
-        for (int index = 0; index < value.length(); index++) {
-            char ch = value.charAt(index);
-            switch (ch) {
-                case '\\' -> builder.append("\\\\");
-                case '"' -> builder.append("\\\"");
-                case '\n' -> builder.append("\\n");
-                case '\r' -> builder.append("\\r");
-                case '\t' -> builder.append("\\t");
-                default -> builder.append(ch);
-            }
-        }
-        builder.append('"');
-        return builder.toString();
-    }
-
-    private static String renderChar(int codePoint) {
-        if (codePoint == ' ') {
-            return "#\\space";
-        }
-        if (codePoint == '\n') {
-            return "#\\newline";
-        }
-        return "#\\" + new String(Character.toChars(codePoint));
-    }
-
-    private static boolean isIntegerToken(String token) {
-        if (token.isEmpty()) {
-            return false;
-        }
-
-        int start = 0;
-        char first = token.charAt(0);
-        if (first == '+' || first == '-') {
-            if (token.length() == 1) {
-                return false;
-            }
-            start = 1;
-        }
-
-        for (int index = start; index < token.length(); index++) {
-            if (!Character.isDigit(token.charAt(index))) {
-                return false;
-            }
-        }
-        return true;
     }
 }
