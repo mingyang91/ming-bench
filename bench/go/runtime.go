@@ -15,7 +15,6 @@ type procedure interface {
 	call(args []value) (value, error)
 }
 
-type numberValue int
 type boolValue bool
 type stringValue struct {
 	chars   []rune
@@ -83,14 +82,6 @@ func copyStringValue(s *stringValue, mutable bool) *stringValue {
 
 func (s *stringValue) text() string {
 	return string(s.chars)
-}
-
-func (n numberValue) schemeString() string {
-	return strconv.Itoa(int(n))
-}
-
-func (numberValue) isTruthy() bool {
-	return true
 }
 
 func (b boolValue) schemeString() string {
@@ -315,16 +306,16 @@ func newGlobalEnv() *env {
 	global.define("*", builtinProc{name: "*", fn: evalMul})
 	global.define("/", builtinProc{name: "/", fn: evalDiv})
 	global.define("<", builtinProc{name: "<", fn: func(args []value) (value, error) {
-		return evalCompare(args, "<", func(a, b int) bool { return a < b })
+		return evalCompare(args, "<", func(a, b numberValue) bool { return a.compare(b) < 0 })
 	}})
 	global.define(">", builtinProc{name: ">", fn: func(args []value) (value, error) {
-		return evalCompare(args, ">", func(a, b int) bool { return a > b })
+		return evalCompare(args, ">", func(a, b numberValue) bool { return a.compare(b) > 0 })
 	}})
 	global.define("=", builtinProc{name: "=", fn: func(args []value) (value, error) {
-		return evalCompare(args, "=", func(a, b int) bool { return a == b })
+		return evalCompare(args, "=", func(a, b numberValue) bool { return a.equal(b) })
 	}})
 	global.define("<=", builtinProc{name: "<=", fn: func(args []value) (value, error) {
-		return evalCompare(args, "<=", func(a, b int) bool { return a <= b })
+		return evalCompare(args, "<=", func(a, b numberValue) bool { return a.compare(b) <= 0 })
 	}})
 	global.define("not", builtinProc{name: "not", fn: evalNot})
 	global.define("cons", builtinProc{name: "cons", fn: evalCons})
@@ -355,6 +346,7 @@ func newGlobalEnv() *env {
 	global.define("string-copy", builtinProc{name: "string-copy", fn: evalStringCopy})
 	global.define("string-set!", builtinProc{name: "string-set!", fn: evalStringSet})
 	registerLevel09Builtins(global)
+	registerLevel11Builtins(global)
 	return global
 }
 
@@ -401,7 +393,7 @@ func evalExpr(e locatedExpr, env *env) (value, error) {
 
 	switch expr := e.form.(type) {
 	case numberExpr:
-		return numberValue(expr), nil
+		return expr, nil
 	case boolExpr:
 		return boolValue(expr), nil
 	case stringExpr:
@@ -824,7 +816,7 @@ func parseLetBindings(items listExpr) ([]letBinding, error) {
 func quoteExpr(e locatedExpr) (value, error) {
 	switch expr := e.form.(type) {
 	case numberExpr:
-		return numberValue(expr), nil
+		return expr, nil
 	case boolExpr:
 		return boolValue(expr), nil
 	case stringExpr:
@@ -856,15 +848,15 @@ func quoteList(items listExpr) (value, error) {
 }
 
 func evalAdd(args []value) (value, error) {
-	sum := 0
+	sum := newExactInteger(0)
 	for _, arg := range args {
 		n, err := expectNumber(arg)
 		if err != nil {
 			return nil, err
 		}
-		sum += n
+		sum = sum.add(n)
 	}
-	return numberValue(sum), nil
+	return sum, nil
 }
 
 func evalSub(args []value) (value, error) {
@@ -877,7 +869,7 @@ func evalSub(args []value) (value, error) {
 		return nil, err
 	}
 	if len(args) == 1 {
-		return numberValue(-first), nil
+		return first.negate(), nil
 	}
 
 	result := first
@@ -886,21 +878,21 @@ func evalSub(args []value) (value, error) {
 		if err != nil {
 			return nil, err
 		}
-		result -= n
+		result = result.sub(n)
 	}
-	return numberValue(result), nil
+	return result, nil
 }
 
 func evalMul(args []value) (value, error) {
-	product := 1
+	product := newExactInteger(1)
 	for _, arg := range args {
 		n, err := expectNumber(arg)
 		if err != nil {
 			return nil, err
 		}
-		product *= n
+		product = product.mul(n)
 	}
-	return numberValue(product), nil
+	return product, nil
 }
 
 func evalDiv(args []value) (value, error) {
@@ -919,15 +911,15 @@ func evalDiv(args []value) (value, error) {
 		if err != nil {
 			return nil, err
 		}
-		if n == 0 {
+		if n.numer == 0 {
 			return nil, newCurrentEvalError("division by zero")
 		}
-		result /= n
+		result = result.div(n)
 	}
-	return numberValue(result), nil
+	return result, nil
 }
 
-func evalCompare(args []value, name string, pred func(int, int) bool) (value, error) {
+func evalCompare(args []value, name string, pred func(numberValue, numberValue) bool) (value, error) {
 	if len(args) < 2 {
 		return nil, newCurrentEvalError("'%s' expects at least 2 arguments", name)
 	}
@@ -1040,7 +1032,7 @@ func evalLength(args []value) (value, error) {
 		return nil, err
 	}
 
-	return numberValue(length), nil
+	return newExactInteger(length), nil
 }
 
 func evalNullPred(args []value) (value, error) {
@@ -1160,7 +1152,7 @@ func evalStringLength(args []value) (value, error) {
 		return nil, err
 	}
 
-	return numberValue(len([]rune(s))), nil
+	return newExactInteger(len([]rune(s))), nil
 }
 
 func evalSubstring(args []value) (value, error) {
@@ -1173,11 +1165,11 @@ func evalSubstring(args []value) (value, error) {
 		return nil, err
 	}
 
-	start, err := expectNumber(args[1])
+	start, err := expectInteger(args[1])
 	if err != nil {
 		return nil, err
 	}
-	end, err := expectNumber(args[2])
+	end, err := expectInteger(args[2])
 	if err != nil {
 		return nil, err
 	}
@@ -1200,12 +1192,12 @@ func evalStringToNumber(args []value) (value, error) {
 		return nil, err
 	}
 
-	n, convErr := strconv.Atoi(s)
-	if convErr != nil {
+	n, ok, convErr := parseNumberLiteral(s)
+	if convErr != nil || !ok {
 		return boolValue(false), nil
 	}
 
-	return numberValue(n), nil
+	return n, nil
 }
 
 func evalNumberToString(args []value) (value, error) {
@@ -1218,7 +1210,7 @@ func evalNumberToString(args []value) (value, error) {
 		return nil, err
 	}
 
-	return newStringValue(strconv.Itoa(n)), nil
+	return newStringValue(n.schemeString()), nil
 }
 
 func evalSymbolToString(args []value) (value, error) {
@@ -1257,7 +1249,7 @@ func evalStringRef(args []value) (value, error) {
 		return nil, err
 	}
 
-	index, err := expectNumber(args[1])
+	index, err := expectInteger(args[1])
 	if err != nil {
 		return nil, err
 	}
@@ -1293,7 +1285,7 @@ func evalStringSet(args []value) (value, error) {
 		return nil, err
 	}
 
-	index, err := expectNumber(args[1])
+	index, err := expectInteger(args[1])
 	if err != nil {
 		return nil, err
 	}
@@ -1371,12 +1363,23 @@ func properListLength(v value) (int, error) {
 	return len(elems), nil
 }
 
-func expectNumber(v value) (int, error) {
+func expectNumber(v value) (numberValue, error) {
 	n, ok := v.(numberValue)
 	if !ok {
-		return 0, newCurrentEvalError("expected number, got %s", v.schemeString())
+		return numberValue{}, newCurrentEvalError("expected number, got %s", v.schemeString())
 	}
-	return int(n), nil
+	return n, nil
+}
+
+func expectInteger(v value) (int, error) {
+	n, err := expectNumber(v)
+	if err != nil {
+		return 0, err
+	}
+	if !n.isInteger() {
+		return 0, newCurrentEvalError("expected integer, got %s", v.schemeString())
+	}
+	return n.numer, nil
 }
 
 func expectStringValue(v value) (*stringValue, error) {

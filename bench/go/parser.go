@@ -1,7 +1,6 @@
 package ming
 
 import (
-	"strconv"
 	"strings"
 	"unicode"
 )
@@ -18,7 +17,6 @@ type symbolExpr string
 type stringExpr string
 type charExpr rune
 type boolExpr bool
-type numberExpr int
 
 type tokenKind int
 
@@ -217,7 +215,11 @@ func (p *parser) parseExpr() (locatedExpr, error) {
 	case tokenString:
 		return locatedExpr{form: stringExpr(tok.value), pos: tok.pos}, nil
 	case tokenAtom:
-		return locatedExpr{form: parseAtom(tok.value), pos: tok.pos}, nil
+		form, err := parseAtom(tok.value, tok.pos)
+		if err != nil {
+			return locatedExpr{}, err
+		}
+		return locatedExpr{form: form, pos: tok.pos}, nil
 	default:
 		return locatedExpr{}, newEvalError(tok.pos, "unknown token: %q", tok.value)
 	}
@@ -247,23 +249,25 @@ func (p *parser) hasNext() bool {
 	return p.pos < len(p.tokens)
 }
 
-func parseAtom(raw string) expr {
+func parseAtom(raw string, pos SourcePos) (expr, error) {
 	switch raw {
 	case "#t":
-		return boolExpr(true)
+		return boolExpr(true), nil
 	case "#f":
-		return boolExpr(false)
+		return boolExpr(false), nil
 	}
 
 	if ch, ok := parseCharLiteral(raw); ok {
-		return charExpr(ch)
+		return charExpr(ch), nil
 	}
 
-	if n, err := strconv.Atoi(raw); err == nil {
-		return numberExpr(n)
+	if n, ok, err := parseNumberLiteral(raw); err != nil {
+		return nil, newEvalError(pos, err.Error())
+	} else if ok {
+		return numberExpr(n), nil
 	}
 
-	return symbolExpr(raw)
+	return symbolExpr(raw), nil
 }
 
 func parseCharLiteral(raw string) (rune, bool) {

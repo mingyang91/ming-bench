@@ -47,10 +47,7 @@ func evalAbs(args []value) (value, error) {
 	if err != nil {
 		return nil, err
 	}
-	if n < 0 {
-		n = -n
-	}
-	return numberValue(n), nil
+	return n.abs(), nil
 }
 
 func evalAssoc(args []value) (value, error) {
@@ -119,11 +116,11 @@ func evalExpt(args []value) (value, error) {
 		return nil, newCurrentEvalError("'expt' expects exactly 2 arguments")
 	}
 
-	base, err := expectNumber(args[0])
+	base, err := expectInteger(args[0])
 	if err != nil {
 		return nil, err
 	}
-	exp, err := expectNumber(args[1])
+	exp, err := expectInteger(args[1])
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +138,7 @@ func evalExpt(args []value) (value, error) {
 			base *= base
 		}
 	}
-	return numberValue(result), nil
+	return newExactInteger(result), nil
 }
 
 func evalListPred(args []value) (value, error) {
@@ -252,11 +249,11 @@ func evalMapBuiltin(args []value) (value, error) {
 }
 
 func evalMax(args []value) (value, error) {
-	return evalMinMax(args, "max", func(best, next int) bool { return next > best })
+	return evalMinMax(args, "max", func(cmp int) bool { return cmp < 0 })
 }
 
 func evalMin(args []value) (value, error) {
-	return evalMinMax(args, "min", func(best, next int) bool { return next < best })
+	return evalMinMax(args, "min", func(cmp int) bool { return cmp > 0 })
 }
 
 func evalModulo(args []value) (value, error) {
@@ -269,23 +266,39 @@ func evalModulo(args []value) (value, error) {
 	if rem != 0 && ((rem < 0 && b > 0) || (rem > 0 && b < 0)) {
 		rem += b
 	}
-	return numberValue(rem), nil
+	return newExactInteger(rem), nil
 }
 
 func evalOddPred(args []value) (value, error) {
-	return evalUnaryNumberPredicate(args, "odd?", func(n int) bool { return n%2 != 0 })
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'odd?' expects exactly 1 argument")
+	}
+
+	n, err := expectInteger(args[0])
+	if err != nil {
+		return nil, err
+	}
+	return boolValue(n%2 != 0), nil
 }
 
 func evalEvenPred(args []value) (value, error) {
-	return evalUnaryNumberPredicate(args, "even?", func(n int) bool { return n%2 == 0 })
+	if len(args) != 1 {
+		return nil, newCurrentEvalError("'even?' expects exactly 1 argument")
+	}
+
+	n, err := expectInteger(args[0])
+	if err != nil {
+		return nil, err
+	}
+	return boolValue(n%2 == 0), nil
 }
 
 func evalPositivePred(args []value) (value, error) {
-	return evalUnaryNumberPredicate(args, "positive?", func(n int) bool { return n > 0 })
+	return evalUnaryNumberPredicate(args, "positive?", func(n numberValue) bool { return n.compare(newExactInteger(0)) > 0 })
 }
 
 func evalNegativePred(args []value) (value, error) {
-	return evalUnaryNumberPredicate(args, "negative?", func(n int) bool { return n < 0 })
+	return evalUnaryNumberPredicate(args, "negative?", func(n numberValue) bool { return n.compare(newExactInteger(0)) < 0 })
 }
 
 func evalQuotient(args []value) (value, error) {
@@ -293,7 +306,7 @@ func evalQuotient(args []value) (value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return numberValue(a / b), nil
+	return newExactInteger(a / b), nil
 }
 
 func evalRemainder(args []value) (value, error) {
@@ -301,7 +314,7 @@ func evalRemainder(args []value) (value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return numberValue(a % b), nil
+	return newExactInteger(a % b), nil
 }
 
 func evalStringEq(args []value) (value, error) {
@@ -325,10 +338,10 @@ func evalStringDowncase(args []value) (value, error) {
 }
 
 func evalZeroPred(args []value) (value, error) {
-	return evalUnaryNumberPredicate(args, "zero?", func(n int) bool { return n == 0 })
+	return evalUnaryNumberPredicate(args, "zero?", func(n numberValue) bool { return n.numer == 0 })
 }
 
-func evalUnaryNumberPredicate(args []value, name string, pred func(int) bool) (value, error) {
+func evalUnaryNumberPredicate(args []value, name string, pred func(numberValue) bool) (value, error) {
 	if len(args) != 1 {
 		return nil, newCurrentEvalError("'%s' expects exactly 1 argument", name)
 	}
@@ -424,7 +437,7 @@ func evalUnaryStringTransform(args []value, name string, transform func(string) 
 	return newStringValue(transform(s)), nil
 }
 
-func evalMinMax(args []value, name string, replace func(best, next int) bool) (value, error) {
+func evalMinMax(args []value, name string, replace func(cmp int) bool) (value, error) {
 	if len(args) == 0 {
 		return nil, newCurrentEvalError("'%s' expects at least 1 argument", name)
 	}
@@ -439,12 +452,12 @@ func evalMinMax(args []value, name string, replace func(best, next int) bool) (v
 		if err != nil {
 			return nil, err
 		}
-		if replace(best, next) {
+		if replace(best.compare(next)) {
 			best = next
 		}
 	}
 
-	return numberValue(best), nil
+	return best, nil
 }
 
 func evalDivisionOperands(args []value, name string) (int, int, error) {
@@ -452,11 +465,11 @@ func evalDivisionOperands(args []value, name string) (int, int, error) {
 		return 0, 0, newCurrentEvalError("'%s' expects exactly 2 arguments", name)
 	}
 
-	a, err := expectNumber(args[0])
+	a, err := expectInteger(args[0])
 	if err != nil {
 		return 0, 0, err
 	}
-	b, err := expectNumber(args[1])
+	b, err := expectInteger(args[1])
 	if err != nil {
 		return 0, 0, err
 	}
@@ -467,7 +480,7 @@ func evalDivisionOperands(args []value, name string) (int, int, error) {
 }
 
 func expectNonNegativeIndex(v value, name string) (int, error) {
-	index, err := expectNumber(v)
+	index, err := expectInteger(v)
 	if err != nil {
 		return 0, err
 	}
@@ -525,7 +538,7 @@ func schemeEqual(a, b value) bool {
 	switch av := a.(type) {
 	case numberValue:
 		bv, ok := b.(numberValue)
-		return ok && av == bv
+		return ok && av.equal(bv)
 	case boolValue:
 		bv, ok := b.(boolValue)
 		return ok && av == bv
