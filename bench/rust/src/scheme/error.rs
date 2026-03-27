@@ -87,6 +87,9 @@ pub enum EvalError {
     #[error("string is immutable")]
     ImmutableString,
 
+    #[error("expected {expected} record, got {found}")]
+    RecordTypeMismatch { expected: String, found: String },
+
     #[error("{inner} at {position}")]
     WithPosition {
         inner: Box<EvalError>,

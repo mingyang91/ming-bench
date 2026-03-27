@@ -2,10 +2,14 @@ mod builtins;
 pub mod error;
 mod macros;
 mod number;
+mod record;
 
 pub use error::{EvalError, SourcePos};
 use macros::{MacroEnvRef, MacroEnvironment};
 use number::{parse_number_token, Number};
+use record::{
+    define_record_type as eval_define_record_type, render_record, NativeProcedure, RecordRef,
+};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -51,7 +55,9 @@ enum Value {
     List(Vec<Value>),
     ImproperList(Vec<Value>, Box<Value>),
     Procedure(Rc<Procedure>),
+    NativeProcedure(Rc<NativeProcedure>),
     Builtin(Builtin),
+    Record(RecordRef),
     Void,
 }
 
@@ -167,7 +173,8 @@ impl Value {
             Self::Char(_) => "character",
             Self::List(_) => "list",
             Self::ImproperList(_, _) => "pair",
-            Self::Procedure(_) | Self::Builtin(_) => "procedure",
+            Self::Procedure(_) | Self::NativeProcedure(_) | Self::Builtin(_) => "procedure",
+            Self::Record(_) => "record",
             Self::Void => "void",
         }
     }
@@ -237,7 +244,10 @@ impl Value {
             Self::Char(value) => render_char(*value),
             Self::List(items) => render_list(items),
             Self::ImproperList(items, tail) => render_improper_list(items, tail),
-            Self::Procedure(_) | Self::Builtin(_) => "#<procedure>".into(),
+            Self::Procedure(_) | Self::NativeProcedure(_) | Self::Builtin(_) => {
+                "#<procedure>".into()
+            }
+            Self::Record(record) => render_record(record),
             Self::Void => "#<void>".into(),
         }
     }
@@ -682,6 +692,7 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
                     .all(|(lhs, rhs)| values_equal(lhs, rhs))
                 && values_equal(lhs_tail, rhs_tail)
         }
+        (Value::Record(lhs), Value::Record(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -801,6 +812,10 @@ fn eval_list(
             }
             "lambda" => {
                 return eval_lambda(&items[1..], env, macro_env)
+                    .map_err(|err| err.with_position(head_position))
+            }
+            "define-record-type" => {
+                return eval_define_record_type(&items[1..], env)
                     .map_err(|err| err.with_position(head_position))
             }
             "set!" => {
@@ -1045,6 +1060,7 @@ fn parse_param_name(item: &Expr) -> Result<String, EvalError> {
 fn apply_callable(callable: Value, args: &[Value]) -> Result<Value, EvalError> {
     match callable {
         Value::Procedure(procedure) => apply_procedure(&procedure, args),
+        Value::NativeProcedure(procedure) => procedure.apply(args),
         Value::Builtin(builtin) => builtin.apply(args),
         other => Err(EvalError::NotCallable {
             found: other.type_name().into(),

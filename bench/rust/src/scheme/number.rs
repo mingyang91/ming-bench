@@ -384,8 +384,7 @@ fn parse_decimal_token(token: &str) -> Option<Result<Number, ParseNumberError>> 
             .parse::<f64>()
             .map_err(|_| ParseNumberError::Inexact(token.into()))
             .and_then(|value| {
-                Number::from_inexact(value)
-                    .map_err(|_| ParseNumberError::Inexact(token.into()))
+                Number::from_inexact(value).map_err(|_| ParseNumberError::Inexact(token.into()))
             }),
     )
 }
