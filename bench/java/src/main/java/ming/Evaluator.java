@@ -66,7 +66,9 @@ public class Evaluator {
     private Env createGlobalEnv() {
         Env env = new Env(null);
         // Builtins are represented as their name strings with a "builtin:" prefix
-        for (String name : List.of("+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not")) {
+        for (String name : List.of("+", "-", "*", "/", "<", ">", "=", "<=", ">=", "not",
+                "cons", "car", "cdr", "null?", "list", "length",
+                "string?", "number?", "boolean?", "pair?", "symbol?", "append")) {
             env.define(name, "builtin:" + name);
         }
         return env;
@@ -278,6 +280,76 @@ public class Evaluator {
                         }
                         return result;
                     }
+                    case "begin" -> {
+                        Object result = VOID;
+                        for (int i = 1; i < list.size(); i++) {
+                            result = eval(list.get(i), env);
+                        }
+                        return result;
+                    }
+                    case "let" -> {
+                        if (list.size() < 3) throw new EvalError("let: bad syntax");
+                        Object second = list.get(1);
+                        // Named let: (let name ((var init) ...) body ...)
+                        if (second instanceof String loopName) {
+                            if (list.size() < 4) throw new EvalError("let: bad syntax");
+                            List<?> bindings = (List<?>) list.get(2);
+                            List<String> params = new ArrayList<>();
+                            List<Object> inits = new ArrayList<>();
+                            for (Object b : bindings) {
+                                List<?> binding = (List<?>) b;
+                                if (binding.size() != 2 || !(binding.get(0) instanceof String pname))
+                                    throw new EvalError("let: bad binding");
+                                params.add(pname);
+                                inits.add(eval(binding.get(1), env));
+                            }
+                            List<Object> body = new ArrayList<>();
+                            for (int i = 3; i < list.size(); i++) body.add(list.get(i));
+                            Env letEnv = new Env(env);
+                            Lambda loopLam = new Lambda(params, body, letEnv);
+                            letEnv.define(loopName, loopLam);
+                            List<Object> args = new ArrayList<>(inits);
+                            return apply(loopLam, args);
+                        }
+                        // Regular let
+                        List<?> bindings = (List<?>) second;
+                        Env letEnv = new Env(env);
+                        for (Object b : bindings) {
+                            List<?> binding = (List<?>) b;
+                            if (binding.size() != 2 || !(binding.get(0) instanceof String name))
+                                throw new EvalError("let: bad binding");
+                            letEnv.define(name, eval(binding.get(1), env));
+                        }
+                        Object result = VOID;
+                        for (int i = 2; i < list.size(); i++) {
+                            result = eval(list.get(i), letEnv);
+                        }
+                        return result;
+                    }
+                    case "cond" -> {
+                        for (int i = 1; i < list.size(); i++) {
+                            List<?> clause = (List<?>) list.get(i);
+                            if (clause.isEmpty()) throw new EvalError("cond: empty clause");
+                            Object test = clause.get(0);
+                            if (test instanceof String s && s.equals("else")) {
+                                Object result = VOID;
+                                for (int j = 1; j < clause.size(); j++) {
+                                    result = eval(clause.get(j), env);
+                                }
+                                return result;
+                            }
+                            Object val = eval(test, env);
+                            if (!isFalse(val)) {
+                                if (clause.size() == 1) return val;
+                                Object result = VOID;
+                                for (int j = 1; j < clause.size(); j++) {
+                                    result = eval(clause.get(j), env);
+                                }
+                                return result;
+                            }
+                        }
+                        return VOID;
+                    }
                     case "or" -> {
                         Object result = Boolean.FALSE;
                         for (int i = 1; i < list.size(); i++) {
@@ -390,6 +462,80 @@ public class Evaluator {
             case "not" -> {
                 checkMinArgs(args, 1, "not");
                 yield isFalse(args.get(0));
+            }
+            case "cons" -> {
+                checkMinArgs(args, 2, "cons");
+                yield new Pair(args.get(0), args.get(1));
+            }
+            case "car" -> {
+                checkMinArgs(args, 1, "car");
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError("car: expected pair");
+                yield p.car();
+            }
+            case "cdr" -> {
+                checkMinArgs(args, 1, "cdr");
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError("cdr: expected pair");
+                yield p.cdr();
+            }
+            case "null?" -> {
+                checkMinArgs(args, 1, "null?");
+                yield args.get(0) == Empty.NIL;
+            }
+            case "list" -> {
+                Object result = Empty.NIL;
+                for (int i = args.size() - 1; i >= 0; i--) {
+                    result = new Pair(args.get(i), result);
+                }
+                yield result;
+            }
+            case "length" -> {
+                checkMinArgs(args, 1, "length");
+                Object lst = args.get(0);
+                long len = 0;
+                while (lst instanceof Pair p) {
+                    len++;
+                    lst = p.cdr();
+                }
+                if (lst != Empty.NIL) throw new EvalError("length: not a proper list");
+                yield len;
+            }
+            case "string?" -> {
+                checkMinArgs(args, 1, "string?");
+                yield args.get(0) instanceof SchemeString;
+            }
+            case "number?" -> {
+                checkMinArgs(args, 1, "number?");
+                yield args.get(0) instanceof Long;
+            }
+            case "boolean?" -> {
+                checkMinArgs(args, 1, "boolean?");
+                yield args.get(0) instanceof Boolean;
+            }
+            case "pair?" -> {
+                checkMinArgs(args, 1, "pair?");
+                yield args.get(0) instanceof Pair;
+            }
+            case "symbol?" -> {
+                checkMinArgs(args, 1, "symbol?");
+                yield args.get(0) instanceof String && !((String) args.get(0)).startsWith("builtin:");
+            }
+            case "append" -> {
+                if (args.isEmpty()) yield Empty.NIL;
+                // Append all lists together; last arg can be anything
+                Object result = args.get(args.size() - 1);
+                for (int i = args.size() - 2; i >= 0; i--) {
+                    Object lst = args.get(i);
+                    // Collect elements of lst into a stack, then prepend to result
+                    List<Object> elems = new ArrayList<>();
+                    while (lst instanceof Pair p) {
+                        elems.add(p.car());
+                        lst = p.cdr();
+                    }
+                    for (int j = elems.size() - 1; j >= 0; j--) {
+                        result = new Pair(elems.get(j), result);
+                    }
+                }
+                yield result;
             }
             default -> throw new EvalError("unbound variable: " + name);
         };
