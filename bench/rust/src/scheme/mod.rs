@@ -123,6 +123,7 @@ enum Value {
         env: EnvRef,
         name: Option<String>,
     },
+    Continuation,
     RecordConstructor {
         name: String,
         record_type: Rc<RecordType>,
@@ -170,6 +171,7 @@ impl Value {
             Self::Builtin { .. }
             | Self::Closure { .. }
             | Self::CaseClosure { .. }
+            | Self::Continuation
             | Self::RecordConstructor { .. }
             | Self::RecordPredicate { .. }
             | Self::RecordAccessor { .. } => "procedure",
@@ -1193,6 +1195,7 @@ fn apply(
             env,
             name: _,
         } => apply_case_closure(&clauses, env, arguments, position, context),
+        Value::Continuation => apply_continuation(&arguments, position),
         Value::RecordConstructor {
             name,
             record_type,
@@ -1297,6 +1300,11 @@ fn apply_case_closure(
     ))
 }
 
+fn apply_continuation(arguments: &[Value], position: Position) -> EvalResult<Value> {
+    let value = expect_single_argument(arguments, "continuation", position)?;
+    Ok(value.clone())
+}
+
 fn apply_record_constructor(
     name: &str,
     record_type: Rc<RecordType>,
@@ -1359,6 +1367,11 @@ fn root_bindings() -> Vec<(String, Value)> {
         builtin("apply", apply_builtin),
         builtin("values", values),
         builtin("call-with-values", call_with_values),
+        builtin("call/cc", call_cc),
+        builtin(
+            "call-with-current-continuation",
+            call_with_current_continuation,
+        ),
         builtin("null?", is_null),
         builtin("list", list),
         builtin("length", length),
@@ -1586,6 +1599,24 @@ fn call_with_values(
     let (producer, consumer) = expect_two_arguments(arguments, "call-with-values", position)?;
     let produced = apply(producer.clone(), Vec::new(), position, context)?;
     apply(consumer.clone(), unpack_values_result(produced), position, context)
+}
+
+fn call_cc(
+    arguments: &[Value],
+    position: Position,
+    context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let function = expect_single_argument(arguments, "call/cc", position)?;
+    apply(function.clone(), vec![Value::Continuation], position, context)
+}
+
+fn call_with_current_continuation(
+    arguments: &[Value],
+    position: Position,
+    context: &mut EvalContext,
+) -> EvalResult<Value> {
+    let function = expect_single_argument(arguments, "call-with-current-continuation", position)?;
+    apply(function.clone(), vec![Value::Continuation], position, context)
 }
 
 fn is_null(
@@ -2587,6 +2618,7 @@ fn is_callable_value(value: &Value) -> bool {
         Value::Builtin { .. }
             | Value::Closure { .. }
             | Value::CaseClosure { .. }
+            | Value::Continuation
             | Value::RecordConstructor { .. }
             | Value::RecordPredicate { .. }
             | Value::RecordAccessor { .. }
@@ -2629,6 +2661,7 @@ fn render_value(value: &Value, display_mode: bool) -> String {
             Some(name) => format!("#<procedure:{name}>"),
             None => "#<procedure:lambda>".to_string(),
         },
+        Value::Continuation => "#<procedure:continuation>".to_string(),
         Value::Record(record) => format!("#<record:{}>", record.record_type.name),
         Value::RecordConstructor { name, .. }
         | Value::RecordPredicate { name, .. }
