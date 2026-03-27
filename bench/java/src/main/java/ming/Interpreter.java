@@ -45,6 +45,18 @@ final class Interpreter {
         env.define("=", new BuiltinProcedure("=", this::applyNumericEquals));
         env.define("<=", new BuiltinProcedure("<=", this::applyLessEqual));
         env.define("not", new BuiltinProcedure("not", this::applyNot));
+        env.define("cons", new BuiltinProcedure("cons", this::applyCons));
+        env.define("car", new BuiltinProcedure("car", this::applyCar));
+        env.define("cdr", new BuiltinProcedure("cdr", this::applyCdr));
+        env.define("null?", new BuiltinProcedure("null?", this::applyNullPredicate));
+        env.define("list", new BuiltinProcedure("list", this::applyList));
+        env.define("length", new BuiltinProcedure("length", this::applyLength));
+        env.define("append", new BuiltinProcedure("append", this::applyAppend));
+        env.define("string?", new BuiltinProcedure("string?", this::applyStringPredicate));
+        env.define("number?", new BuiltinProcedure("number?", this::applyNumberPredicate));
+        env.define("boolean?", new BuiltinProcedure("boolean?", this::applyBooleanPredicate));
+        env.define("pair?", new BuiltinProcedure("pair?", this::applyPairPredicate));
+        env.define("symbol?", new BuiltinProcedure("symbol?", this::applySymbolPredicate));
         return env;
     }
 
@@ -77,6 +89,15 @@ final class Interpreter {
             }
             if ("lambda".equals(symbolName)) {
                 return evalLambda(listExpr, env);
+            }
+            if ("begin".equals(symbolName)) {
+                return evalBegin(listExpr, env);
+            }
+            if ("let".equals(symbolName)) {
+                return evalLet(listExpr, env);
+            }
+            if ("cond".equals(symbolName)) {
+                return evalCond(listExpr, env);
             }
             if ("and".equals(symbolName)) {
                 return evalAnd(listExpr.elements().subList(1, listExpr.elements().size()), env);
@@ -156,6 +177,88 @@ final class Interpreter {
         List<String> parameters = parseParameters(parametersList.elements(), "lambda");
         List<Expr> body = List.copyOf(listExpr.elements().subList(2, listExpr.elements().size()));
         return new UserProcedure("lambda", parameters, body, env);
+    }
+
+    private Value evalBegin(ListExpr listExpr, Environment env) throws EvalError {
+        return evalSequence(listExpr.elements().subList(1, listExpr.elements().size()), env);
+    }
+
+    private Value evalLet(ListExpr listExpr, Environment env) throws EvalError {
+        ensureAtLeastExpressions("let", listExpr, 3);
+
+        Expr secondExpr = listExpr.elements().get(1);
+        if (secondExpr instanceof SymbolExpr nameSymbol) {
+            if (listExpr.elements().size() < 4) {
+                throw error(listExpr.loc(),
+                        "let expected at least 2 arguments but got "
+                                + (listExpr.elements().size() - 1));
+            }
+
+            Expr bindingExpr = listExpr.elements().get(2);
+            if (!(bindingExpr instanceof ListExpr bindingList)) {
+                throw error(bindingExpr.loc(), "let requires a binding list");
+            }
+
+            BindingParseResult bindings = parseBindings(bindingList, env);
+            List<Expr> body = List.copyOf(listExpr.elements().subList(3, listExpr.elements().size()));
+
+            Environment namedLetEnv = new Environment(env);
+            UserProcedure procedure = new UserProcedure(
+                    nameSymbol.name(),
+                    bindings.names(),
+                    body,
+                    namedLetEnv
+            );
+            namedLetEnv.define(nameSymbol.name(), procedure);
+            return procedure.apply(bindings.values(), listExpr.loc());
+        }
+
+        if (!(secondExpr instanceof ListExpr bindingList)) {
+            throw error(secondExpr.loc(), "let requires a binding list");
+        }
+
+        BindingParseResult bindings = parseBindings(bindingList, env);
+        Environment letEnv = new Environment(env);
+        for (int index = 0; index < bindings.names().size(); index++) {
+            letEnv.define(bindings.names().get(index), bindings.values().get(index));
+        }
+        return evalSequence(listExpr.elements().subList(2, listExpr.elements().size()), letEnv);
+    }
+
+    private Value evalCond(ListExpr listExpr, Environment env) throws EvalError {
+        ensureAtLeastExpressions("cond", listExpr, 2);
+
+        List<Expr> clauses = listExpr.elements().subList(1, listExpr.elements().size());
+        for (int clauseIndex = 0; clauseIndex < clauses.size(); clauseIndex++) {
+            Expr clauseExpr = clauses.get(clauseIndex);
+            if (!(clauseExpr instanceof ListExpr clauseList)) {
+                throw error(clauseExpr.loc(), "cond clauses must be lists");
+            }
+            if (clauseList.elements().isEmpty()) {
+                throw error(clauseExpr.loc(), "cond clauses cannot be empty");
+            }
+
+            Expr testExpr = clauseList.elements().getFirst();
+            boolean isElseClause = testExpr instanceof SymbolExpr symbolExpr
+                    && "else".equals(symbolExpr.name());
+            if (isElseClause) {
+                if (clauseIndex != clauses.size() - 1) {
+                    throw error(testExpr.loc(), "cond else clause must be last");
+                }
+                return evalSequence(clauseList.elements().subList(1, clauseList.elements().size()), env);
+            }
+
+            Value testValue = eval(testExpr, env);
+            if (!testValue.isTruthy()) {
+                continue;
+            }
+            if (clauseList.elements().size() == 1) {
+                return testValue;
+            }
+            return evalSequence(clauseList.elements().subList(1, clauseList.elements().size()), env);
+        }
+
+        return VOID;
     }
 
     private Value evalAnd(List<Expr> expressions, Environment env) throws EvalError {
@@ -243,6 +346,76 @@ final class Interpreter {
         return arguments.getFirst().isTruthy() ? FALSE : TRUE;
     }
 
+    private Value applyCons(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("cons", arguments, 2, callLoc);
+        return new PairValue(arguments.get(0), arguments.get(1));
+    }
+
+    private Value applyCar(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("car", arguments, 1, callLoc);
+        return requirePair(arguments.getFirst(), "car", callLoc).car();
+    }
+
+    private Value applyCdr(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("cdr", arguments, 1, callLoc);
+        return requirePair(arguments.getFirst(), "cdr", callLoc).cdr();
+    }
+
+    private Value applyNullPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("null?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof EmptyListValue ? TRUE : FALSE;
+    }
+
+    private Value applyList(List<Value> arguments, SourceLoc callLoc) {
+        return buildList(arguments);
+    }
+
+    private Value applyLength(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("length", arguments, 1, callLoc);
+        List<Value> elements = requireProperList(arguments.getFirst(), "length", callLoc);
+        return new NumberValue(Rational.integer(BigInteger.valueOf(elements.size())));
+    }
+
+    private Value applyAppend(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        if (arguments.isEmpty()) {
+            return EMPTY_LIST;
+        }
+
+        Value result = arguments.get(arguments.size() - 1);
+        for (int index = arguments.size() - 2; index >= 0; index--) {
+            List<Value> elements = requireProperList(arguments.get(index), "append", callLoc);
+            for (int elementIndex = elements.size() - 1; elementIndex >= 0; elementIndex--) {
+                result = new PairValue(elements.get(elementIndex), result);
+            }
+        }
+        return result;
+    }
+
+    private Value applyStringPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("string?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof StringValue ? TRUE : FALSE;
+    }
+
+    private Value applyNumberPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("number?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof NumberValue ? TRUE : FALSE;
+    }
+
+    private Value applyBooleanPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("boolean?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof BooleanValue ? TRUE : FALSE;
+    }
+
+    private Value applyPairPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("pair?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof PairValue ? TRUE : FALSE;
+    }
+
+    private Value applySymbolPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("symbol?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof SymbolValue ? TRUE : FALSE;
+    }
+
     private Value applyComparison(
             List<Value> arguments,
             SourceLoc callLoc,
@@ -291,6 +464,30 @@ final class Interpreter {
         return result;
     }
 
+    private BindingParseResult parseBindings(ListExpr bindingsList, Environment env) throws EvalError {
+        List<String> names = new ArrayList<>(bindingsList.elements().size());
+        List<Value> values = new ArrayList<>(bindingsList.elements().size());
+
+        for (Expr bindingExpr : bindingsList.elements()) {
+            if (!(bindingExpr instanceof ListExpr bindingList)) {
+                throw error(bindingExpr.loc(), "let bindings must be lists");
+            }
+            if (bindingList.elements().size() != 2) {
+                throw error(bindingExpr.loc(), "let bindings must contain a name and value");
+            }
+
+            Expr nameExpr = bindingList.elements().getFirst();
+            if (!(nameExpr instanceof SymbolExpr symbolExpr)) {
+                throw error(nameExpr.loc(), "let binding names must be symbols");
+            }
+
+            names.add(symbolExpr.name());
+            values.add(eval(bindingList.elements().get(1), env));
+        }
+
+        return new BindingParseResult(List.copyOf(names), List.copyOf(values));
+    }
+
     private List<String> parseParameters(List<Expr> parameterExprs, String formName)
             throws EvalError {
         List<String> parameters = new ArrayList<>(parameterExprs.size());
@@ -309,6 +506,36 @@ final class Interpreter {
             return numberValue.value();
         }
         throw error(callLoc, procedureName + " expects numeric arguments");
+    }
+
+    private PairValue requirePair(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        if (value instanceof PairValue pairValue) {
+            return pairValue;
+        }
+        throw error(callLoc, procedureName + " expects a pair");
+    }
+
+    private List<Value> requireProperList(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        List<Value> elements = new ArrayList<>();
+        Value current = value;
+        while (current instanceof PairValue pairValue) {
+            elements.add(pairValue.car());
+            current = pairValue.cdr();
+        }
+        if (current instanceof EmptyListValue) {
+            return elements;
+        }
+        throw error(callLoc, procedureName + " expects a proper list");
+    }
+
+    private Value buildList(List<Value> elements) {
+        Value result = EMPTY_LIST;
+        for (int index = elements.size() - 1; index >= 0; index--) {
+            result = new PairValue(elements.get(index), result);
+        }
+        return result;
     }
 
     private void ensureExactly(
@@ -394,6 +621,9 @@ final class Interpreter {
     }
 
     private record SourceLoc(int line, int column) {
+    }
+
+    private record BindingParseResult(List<String> names, List<Value> values) {
     }
 
     private record NumberExpr(SourceLoc loc, Rational value) implements Expr {
@@ -597,6 +827,9 @@ final class Interpreter {
 
             SourceLoc loc = currentLoc();
             char ch = peek();
+            if (ch == '\'') {
+                return parseQuoteShorthand();
+            }
             if (ch == '(') {
                 return parseList();
             }
@@ -625,6 +858,19 @@ final class Interpreter {
             }
             advance();
             return new ListExpr(start, List.copyOf(elements));
+        }
+
+        private Expr parseQuoteShorthand() throws EvalError {
+            SourceLoc start = currentLoc();
+            advance();
+            Expr quotedExpr = parseExpression();
+            return new ListExpr(
+                    start,
+                    List.of(
+                            new SymbolExpr(start, "quote"),
+                            quotedExpr
+                    )
+            );
         }
 
         private Expr parseString() throws EvalError {
