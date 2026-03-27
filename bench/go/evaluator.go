@@ -99,50 +99,77 @@ func (e *Env) set(name string, val Value) {
 
 // --------------- Tokenizer ---------------
 
-func tokenize(input string) []string {
-	var tokens []string
+type Token struct {
+	Val  string
+	Line int
+	Col  int
+}
+
+func tokenize(input string) []Token {
+	var tokens []Token
 	i := 0
+	line := 1
+	col := 1
 	for i < len(input) {
 		ch := input[i]
-		if unicode.IsSpace(rune(ch)) {
+		if ch == '\n' {
 			i++
+			line++
+			col = 1
+		} else if unicode.IsSpace(rune(ch)) {
+			i++
+			col++
 		} else if ch == ';' {
 			for i < len(input) && input[i] != '\n' {
 				i++
+				col++
 			}
 		} else if ch == '\'' {
-			tokens = append(tokens, "'")
+			tokens = append(tokens, Token{"'", line, col})
 			i++
+			col++
 		} else if ch == '(' || ch == ')' {
-			tokens = append(tokens, string(ch))
+			tokens = append(tokens, Token{string(ch), line, col})
 			i++
+			col++
 		} else if ch == '#' {
+			startCol := col
 			if i+1 < len(input) && (input[i+1] == 't' || input[i+1] == 'f') {
-				tokens = append(tokens, input[i:i+2])
+				tokens = append(tokens, Token{input[i : i+2], line, startCol})
 				i += 2
+				col += 2
 			} else {
-				tokens = append(tokens, string(ch))
+				tokens = append(tokens, Token{string(ch), line, startCol})
 				i++
+				col++
 			}
 		} else if ch == '"' {
+			startCol := col
 			j := i + 1
+			c := col + 1
 			for j < len(input) && input[j] != '"' {
 				if input[j] == '\\' {
 					j++
+					c++
 				}
 				j++
+				c++
 			}
 			if j < len(input) {
 				j++
+				c++
 			}
-			tokens = append(tokens, input[i:j])
+			tokens = append(tokens, Token{input[i:j], line, startCol})
 			i = j
+			col = c
 		} else {
+			startCol := col
 			j := i
 			for j < len(input) && !unicode.IsSpace(rune(input[j])) && input[j] != '(' && input[j] != ')' && input[j] != '"' && input[j] != ';' && input[j] != '\'' {
 				j++
+				col++
 			}
-			tokens = append(tokens, input[i:j])
+			tokens = append(tokens, Token{input[i:j], line, startCol})
 			i = j
 		}
 	}
@@ -151,28 +178,40 @@ func tokenize(input string) []string {
 
 // --------------- Parser ---------------
 
-type Expr interface{}
+type Expr interface {
+	Pos() (int, int)
+}
 
-type AtomExpr struct{ Token string }
-type ListExpr struct{ Items []Expr }
+type AtomExpr struct {
+	Token    string
+	Line, Col int
+}
 
-func parse(tokens []string) (Expr, []string, error) {
+type ListExpr struct {
+	Items     []Expr
+	Line, Col int
+}
+
+func (e *AtomExpr) Pos() (int, int) { return e.Line, e.Col }
+func (e *ListExpr) Pos() (int, int) { return e.Line, e.Col }
+
+func parse(tokens []Token) (Expr, []Token, error) {
 	if len(tokens) == 0 {
 		return nil, nil, &EvalError{Message: "unexpected EOF"}
 	}
 	tok := tokens[0]
 	rest := tokens[1:]
-	if tok == "'" {
+	if tok.Val == "'" {
 		// 'x => (quote x)
 		inner, rest2, err := parse(rest)
 		if err != nil {
 			return nil, nil, err
 		}
-		return &ListExpr{Items: []Expr{&AtomExpr{Token: "quote"}, inner}}, rest2, nil
+		return &ListExpr{Items: []Expr{&AtomExpr{Token: "quote", Line: tok.Line, Col: tok.Col}, inner}, Line: tok.Line, Col: tok.Col}, rest2, nil
 	}
-	if tok == "(" {
+	if tok.Val == "(" {
 		var items []Expr
-		for len(rest) > 0 && rest[0] != ")" {
+		for len(rest) > 0 && rest[0].Val != ")" {
 			var item Expr
 			var err error
 			item, rest, err = parse(rest)
@@ -182,14 +221,14 @@ func parse(tokens []string) (Expr, []string, error) {
 			items = append(items, item)
 		}
 		if len(rest) == 0 {
-			return nil, nil, &EvalError{Message: "missing closing paren"}
+			return nil, nil, &EvalError{Message: "missing closing paren", Line: tok.Line, Col: tok.Col}
 		}
 		rest = rest[1:]
-		return &ListExpr{Items: items}, rest, nil
-	} else if tok == ")" {
-		return nil, nil, &EvalError{Message: "unexpected )"}
+		return &ListExpr{Items: items, Line: tok.Line, Col: tok.Col}, rest, nil
+	} else if tok.Val == ")" {
+		return nil, nil, &EvalError{Message: "unexpected )", Line: tok.Line, Col: tok.Col}
 	}
-	return &AtomExpr{Token: tok}, rest, nil
+	return &AtomExpr{Token: tok.Val, Line: tok.Line, Col: tok.Col}, rest, nil
 }
 
 func parseAll(input string) ([]Expr, error) {
@@ -215,17 +254,23 @@ func isTruthy(v Value) bool {
 	return true
 }
 
+func errAt(expr Expr, msg string) error {
+	l, c := expr.Pos()
+	return &EvalError{Message: msg, Line: l, Col: c}
+}
+
 func evalInEnv(expr Expr, env *Env) (Value, error) {
 	switch e := expr.(type) {
 	case *AtomExpr:
-		return evalAtomInEnv(e.Token, env)
+		return evalAtomInEnv(e, env)
 	case *ListExpr:
 		return evalListInEnv(e, env)
 	}
-	return nil, &EvalError{Message: "unknown expression"}
+	return nil, errAt(expr, "unknown expression")
 }
 
-func evalAtomInEnv(token string, env *Env) (Value, error) {
+func evalAtomInEnv(atom *AtomExpr, env *Env) (Value, error) {
+	token := atom.Token
 	if token == "#t" {
 		return &BoolVal{Val: true}, nil
 	}
@@ -235,7 +280,7 @@ func evalAtomInEnv(token string, env *Env) (Value, error) {
 	if len(token) > 0 && token[0] == '"' {
 		s, err := strconv.Unquote(token)
 		if err != nil {
-			return nil, &EvalError{Message: "bad string: " + token}
+			return nil, errAt(atom, "bad string: "+token)
 		}
 		return &StringVal{Val: s}, nil
 	}
@@ -246,12 +291,12 @@ func evalAtomInEnv(token string, env *Env) (Value, error) {
 	if v, ok := env.get(token); ok {
 		return v, nil
 	}
-	return nil, &EvalError{Message: "unbound variable: " + token}
+	return nil, errAt(atom, "unbound variable: "+token)
 }
 
 func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 	if len(list.Items) == 0 {
-		return nil, &EvalError{Message: "empty application"}
+		return nil, errAt(list, "empty application")
 	}
 
 	// Check for special forms
@@ -259,21 +304,21 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 		switch atom.Token {
 		case "quote":
 			if len(list.Items) != 2 {
-				return nil, &EvalError{Message: "quote requires 1 argument"}
+				return nil, errAt(list, "quote requires 1 argument")
 			}
 			return exprToValue(list.Items[1])
 		case "if":
-			return evalIf(list.Items[1:], env)
+			return evalIf(list, env)
 		case "define":
-			return evalDefine(list.Items[1:], env)
+			return evalDefine(list, env)
 		case "lambda":
-			return evalLambda(list.Items[1:], env)
+			return evalLambda(list, env)
 		case "and":
 			return evalAnd(list.Items[1:], env)
 		case "or":
 			return evalOr(list.Items[1:], env)
 		case "let":
-			return evalLet(list.Items[1:], env)
+			return evalLet(list, env)
 		case "begin":
 			return evalBegin(list.Items[1:], env)
 		case "cond":
@@ -294,7 +339,7 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 			return nil, err
 		}
 	}
-	return applyProc(op, args)
+	return applyProcAt(op, args, list)
 }
 
 func exprToValue(expr Expr) (Value, error) {
@@ -335,9 +380,10 @@ func exprToValue(expr Expr) (Value, error) {
 	return nil, &EvalError{Message: "unknown expression in quote"}
 }
 
-func evalIf(args []Expr, env *Env) (Value, error) {
+func evalIf(list *ListExpr, env *Env) (Value, error) {
+	args := list.Items[1:]
 	if len(args) < 2 || len(args) > 3 {
-		return nil, &EvalError{Message: "if requires 2 or 3 arguments"}
+		return nil, errAt(list, "if requires 2 or 3 arguments")
 	}
 	cond, err := evalInEnv(args[0], env)
 	if err != nil {
@@ -352,24 +398,25 @@ func evalIf(args []Expr, env *Env) (Value, error) {
 	return &VoidVal{}, nil
 }
 
-func evalDefine(args []Expr, env *Env) (Value, error) {
+func evalDefine(list *ListExpr, env *Env) (Value, error) {
+	args := list.Items[1:]
 	if len(args) < 2 {
-		return nil, &EvalError{Message: "define requires at least 2 arguments"}
+		return nil, errAt(list, "define requires at least 2 arguments")
 	}
 	// (define (f params...) body...)
-	if list, ok := args[0].(*ListExpr); ok {
-		if len(list.Items) == 0 {
-			return nil, &EvalError{Message: "define: empty name list"}
+	if plist, ok := args[0].(*ListExpr); ok {
+		if len(plist.Items) == 0 {
+			return nil, errAt(list, "define: empty name list")
 		}
-		nameAtom, ok := list.Items[0].(*AtomExpr)
+		nameAtom, ok := plist.Items[0].(*AtomExpr)
 		if !ok {
-			return nil, &EvalError{Message: "define: expected symbol"}
+			return nil, errAt(list, "define: expected symbol")
 		}
-		params := make([]string, len(list.Items)-1)
-		for i, item := range list.Items[1:] {
+		params := make([]string, len(plist.Items)-1)
+		for i, item := range plist.Items[1:] {
 			p, ok := item.(*AtomExpr)
 			if !ok {
-				return nil, &EvalError{Message: "define: expected parameter name"}
+				return nil, errAt(list, "define: expected parameter name")
 			}
 			params[i] = p.Token
 		}
@@ -380,7 +427,7 @@ func evalDefine(args []Expr, env *Env) (Value, error) {
 	// (define x expr)
 	nameAtom, ok := args[0].(*AtomExpr)
 	if !ok {
-		return nil, &EvalError{Message: "define: expected symbol"}
+		return nil, errAt(list, "define: expected symbol")
 	}
 	val, err := evalInEnv(args[1], env)
 	if err != nil {
@@ -390,19 +437,20 @@ func evalDefine(args []Expr, env *Env) (Value, error) {
 	return &VoidVal{}, nil
 }
 
-func evalLambda(args []Expr, env *Env) (Value, error) {
+func evalLambda(list *ListExpr, env *Env) (Value, error) {
+	args := list.Items[1:]
 	if len(args) < 2 {
-		return nil, &EvalError{Message: "lambda requires params and body"}
+		return nil, errAt(list, "lambda requires params and body")
 	}
 	paramList, ok := args[0].(*ListExpr)
 	if !ok {
-		return nil, &EvalError{Message: "lambda: expected parameter list"}
+		return nil, errAt(list, "lambda: expected parameter list")
 	}
 	params := make([]string, len(paramList.Items))
 	for i, item := range paramList.Items {
 		p, ok := item.(*AtomExpr)
 		if !ok {
-			return nil, &EvalError{Message: "lambda: expected parameter name"}
+			return nil, errAt(list, "lambda: expected parameter name")
 		}
 		params[i] = p.Token
 	}
@@ -439,9 +487,10 @@ func evalOr(exprs []Expr, env *Env) (Value, error) {
 	return result, nil
 }
 
-func evalLet(args []Expr, env *Env) (Value, error) {
+func evalLet(list *ListExpr, env *Env) (Value, error) {
+	args := list.Items[1:]
 	if len(args) < 2 {
-		return nil, &EvalError{Message: "let requires bindings and body"}
+		return nil, errAt(list, "let requires bindings and body")
 	}
 	// Named let: (let name ((var init) ...) body...)
 	offset := 0
@@ -450,23 +499,23 @@ func evalLet(args []Expr, env *Env) (Value, error) {
 		loopName = atom.Token
 		offset = 1
 		if len(args) < 3 {
-			return nil, &EvalError{Message: "named let requires bindings and body"}
+			return nil, errAt(list, "named let requires bindings and body")
 		}
 	}
 	bindList, ok := args[offset].(*ListExpr)
 	if !ok {
-		return nil, &EvalError{Message: "let: expected binding list"}
+		return nil, errAt(list, "let: expected binding list")
 	}
 	names := make([]string, len(bindList.Items))
 	vals := make([]Value, len(bindList.Items))
 	for i, item := range bindList.Items {
 		pair, ok := item.(*ListExpr)
 		if !ok || len(pair.Items) != 2 {
-			return nil, &EvalError{Message: "let: bad binding"}
+			return nil, errAt(list, "let: bad binding")
 		}
 		nameAtom, ok := pair.Items[0].(*AtomExpr)
 		if !ok {
-			return nil, &EvalError{Message: "let: expected symbol in binding"}
+			return nil, errAt(list, "let: expected symbol in binding")
 		}
 		names[i] = nameAtom.Token
 		v, err := evalInEnv(pair.Items[1], env)
@@ -484,7 +533,6 @@ func evalLet(args []Expr, env *Env) (Value, error) {
 		// Named let: bind name to a lambda that recurses
 		lambda := &LambdaVal{Params: names, Body: body, Env: letEnv}
 		letEnv.set(loopName, lambda)
-		// The lambda's env is letEnv which contains itself
 	}
 	var result Value
 	var err error
@@ -547,13 +595,23 @@ func evalCond(clauses []Expr, env *Env) (Value, error) {
 
 // --------------- Procedure application ---------------
 
-func applyProc(op Value, args []Value) (Value, error) {
+func applyProcAt(op Value, args []Value, callSite Expr) (Value, error) {
 	switch fn := op.(type) {
 	case *BuiltinVal:
-		return fn.Fn(args)
+		val, err := fn.Fn(args)
+		if err != nil {
+			// Add position to builtin errors if they don't have one
+			if ee, ok := err.(*EvalError); ok && ee.Line == 0 {
+				l, c := callSite.Pos()
+				ee.Line = l
+				ee.Col = c
+			}
+			return nil, err
+		}
+		return val, nil
 	case *LambdaVal:
 		if len(args) != len(fn.Params) {
-			return nil, &EvalError{Message: fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args))}
+			return nil, errAt(callSite, fmt.Sprintf("expected %d arguments, got %d", len(fn.Params), len(args)))
 		}
 		callEnv := newEnv(fn.Env)
 		for i, p := range fn.Params {
@@ -569,7 +627,7 @@ func applyProc(op Value, args []Value) (Value, error) {
 		}
 		return result, nil
 	}
-	return nil, &EvalError{Message: "not a procedure"}
+	return nil, errAt(callSite, "not a procedure")
 }
 
 // --------------- Builtins ---------------
