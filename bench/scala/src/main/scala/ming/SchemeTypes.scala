@@ -6,13 +6,14 @@ private[ming] enum Expr:
   case IntLit(value: Int, pos: SourcePos)          extends Expr
   case BoolLit(value: Boolean, pos: SourcePos)     extends Expr
   case StringLit(value: String, pos: SourcePos)    extends Expr
+  case CharLit(value: Char, pos: SourcePos)        extends Expr
   case Symbol(name: String, pos: SourcePos)        extends Expr
   case ListExpr(items: List[Expr], pos: SourcePos) extends Expr
 
 private[ming] enum Value:
   case IntVal(value: Int)
   case BoolVal(value: Boolean)
-  case StringVal(value: String)
+  case StringVal(value: MutableString)
   case CharVal(value: Char)
   case SymbolVal(name: String)
   case EmptyList
@@ -20,3 +21,25 @@ private[ming] enum Value:
   case BuiltinProc(name: String)
   case Closure(name: Option[String], params: List[String], body: List[Expr], env: Env)
   case Void
+
+final private[ming] class MutableString private (private val builder: java.lang.StringBuilder):
+
+  def length: Int =
+    builder.length()
+
+  def charAt(index: Int): Char =
+    builder.charAt(index)
+
+  def setCharAt(index: Int, ch: Char): Unit =
+    builder.setCharAt(index, ch)
+
+  def text: String =
+    builder.toString
+
+  override def toString: String =
+    text
+
+object MutableString:
+
+  def from(text: String): MutableString =
+    new MutableString(new java.lang.StringBuilder(text))

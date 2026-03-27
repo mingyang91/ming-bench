@@ -10,7 +10,9 @@ private[ming] object StringBuiltins:
     "number->string",
     "symbol->string",
     "string->symbol",
-    "string-ref"
+    "string-ref",
+    "string-copy",
+    "string-set!"
   )
 
   def handles(name: String): Boolean =
@@ -19,7 +21,7 @@ private[ming] object StringBuiltins:
   def invoke(name: String, args: List[Value], pos: SourcePos): Value =
     name match
       case "string-append" =>
-        Value.StringVal(args.map(arg => requireString(name, arg, pos)).mkString)
+        Value.StringVal(MutableString.from(args.map(arg => requireString(name, arg, pos).text).mkString))
       case "string-length" =>
         Value.IntVal(requireString(name, requireSingleArg(name, args, pos), pos).length)
       case "substring" =>
@@ -27,13 +29,17 @@ private[ming] object StringBuiltins:
       case "string->number" =>
         stringToNumber(name, args, pos)
       case "number->string" =>
-        Value.StringVal(requireIndex(name, requireSingleArg(name, args, pos), pos).toString)
+        Value.StringVal(MutableString.from(requireIndex(name, requireSingleArg(name, args, pos), pos).toString))
       case "symbol->string" =>
-        Value.StringVal(requireSymbol(name, requireSingleArg(name, args, pos), pos))
+        Value.StringVal(MutableString.from(requireSymbol(name, requireSingleArg(name, args, pos), pos)))
       case "string->symbol" =>
-        Value.SymbolVal(requireString(name, requireSingleArg(name, args, pos), pos))
+        Value.SymbolVal(requireString(name, requireSingleArg(name, args, pos), pos).text)
       case "string-ref" =>
         stringRef(name, args, pos)
+      case "string-copy" =>
+        Value.StringVal(MutableString.from(requireString(name, requireSingleArg(name, args, pos), pos).text))
+      case "string-set!" =>
+        stringSet(name, args, pos)
       case _ =>
         unknownProcedure(name, pos)
 
@@ -43,11 +49,11 @@ private[ming] object StringBuiltins:
     val start  = requireIndex(name, values(1), pos)
     val end    = requireIndex(name, values(2), pos)
     if start < 0 || end < start || end > text.length then throw EvalError.at(pos, s"$name indices out of range")
-    Value.StringVal(text.substring(start, end))
+    Value.StringVal(MutableString.from(text.text.substring(start, end)))
 
   private def stringToNumber(name: String, args: List[Value], pos: SourcePos): Value =
     val text = requireString(name, requireSingleArg(name, args, pos), pos)
-    text.toIntOption match
+    text.text.toIntOption match
       case Some(number) =>
         Value.IntVal(number)
       case None =>
@@ -60,7 +66,16 @@ private[ming] object StringBuiltins:
     if index < 0 || index >= text.length then throw EvalError.at(pos, s"$name index out of range")
     Value.CharVal(text.charAt(index))
 
-  private def requireString(name: String, value: Value, pos: SourcePos): String =
+  private def stringSet(name: String, args: List[Value], pos: SourcePos): Value =
+    val values = requireArgCount(name, args, expected = 3, pos)
+    val text   = requireString(name, values.head, pos)
+    val index  = requireIndex(name, values(1), pos)
+    val ch     = requireChar(name, values(2), pos)
+    if index < 0 || index >= text.length then throw EvalError.at(pos, s"$name index out of range")
+    text.setCharAt(index, ch)
+    Value.Void
+
+  private def requireString(name: String, value: Value, pos: SourcePos): MutableString =
     value match
       case Value.StringVal(text) => text
       case other =>
@@ -77,6 +92,12 @@ private[ming] object StringBuiltins:
       case Value.IntVal(number) => number
       case other =>
         throw EvalError.at(pos, s"$name expected a number, got ${ValueSemantics.typeName(other)}")
+
+  private def requireChar(name: String, value: Value, pos: SourcePos): Char =
+    value match
+      case Value.CharVal(ch) => ch
+      case other =>
+        throw EvalError.at(pos, s"$name expected a character, got ${ValueSemantics.typeName(other)}")
 
   private def requireSingleArg(name: String, args: List[Value], pos: SourcePos): Value =
     requireArgCount(name, args, expected = 1, pos).head

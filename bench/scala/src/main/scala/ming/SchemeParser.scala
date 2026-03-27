@@ -82,6 +82,8 @@ private[ming] object SchemeParser:
       token match
         case "#t" => Expr.BoolLit(true, pos)
         case "#f" => Expr.BoolLit(false, pos)
+        case _ if isCharToken(token) =>
+          Expr.CharLit(parseCharToken(token, pos), pos)
         case _ if isIntegerToken(token) =>
           Expr.IntLit(token.toInt, pos)
         case _ if token.nonEmpty =>
@@ -124,6 +126,18 @@ private[ming] object SchemeParser:
           case '+' | '-' => token.drop(1)
           case _         => token
       digits.nonEmpty && digits.forall(_.isDigit)
+
+  private def isCharToken(token: String): Boolean =
+    token.startsWith("#\\") && token.length > 2
+
+  private def parseCharToken(token: String, pos: SourcePos): Char =
+    token.drop(2) match
+      case "space"   => ' '
+      case "newline" => '\n'
+      case value if value.length == 1 =>
+        value.charAt(0)
+      case _ =>
+        throw EvalError.at(pos, s"invalid character literal: $token")
 
   private def fail(cursor: Cursor, message: String): Nothing =
     throw EvalError.at(cursor.position, message)

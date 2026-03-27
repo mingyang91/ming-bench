@@ -24,7 +24,8 @@ private[ming] object ValueSemantics:
     expr match
       case Expr.IntLit(value, _)    => Value.IntVal(value)
       case Expr.BoolLit(value, _)   => Value.BoolVal(value)
-      case Expr.StringLit(value, _) => Value.StringVal(value)
+      case Expr.StringLit(value, _) => Value.StringVal(MutableString.from(value))
+      case Expr.CharLit(value, _)   => Value.CharVal(value)
       case Expr.Symbol(name, _)     => Value.SymbolVal(name)
       case Expr.ListExpr(items, _) =>
         items.foldRight[Value](Value.EmptyList) { (item, acc) =>

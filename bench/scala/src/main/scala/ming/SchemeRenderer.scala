@@ -14,8 +14,8 @@ private[ming] object SchemeRenderer:
       case Value.BoolVal(true)  => "#t"
       case Value.BoolVal(false) => "#f"
       case Value.StringVal(text) =>
-        if displayStrings then text
-        else s""""${escapeString(text)}""""
+        if displayStrings then text.text
+        else s""""${escapeString(text.text)}""""
       case Value.CharVal(ch) =>
         if displayChars then ch.toString
         else renderChar(ch)
