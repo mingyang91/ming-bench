@@ -1415,7 +1415,7 @@ const SPECIAL_FORMS = new Set([
   'quote', 'if', 'define', 'set!', 'lambda', 'begin', 'let', 'let*', 'letrec',
   'cond', 'and', 'or', 'define-syntax', 'syntax-rules', 'define-record-type',
   'case-lambda', 'let*', 'letrec', 'letrec*', 'case', 'do',
-  'call/cc', 'call-with-current-continuation',
+  'call/cc', 'call-with-current-continuation', 'guard',
   'syntax-case', 'syntax', 'with-syntax',
 ]);
 
@@ -1563,18 +1563,19 @@ function expandMacroToForm(transformer: MacroTransformer, form: SchemeVal, env: 
 
       const expanded = expandTemplate(rule.template, bindings, renames);
 
-      // Inject def-env bindings for renamed symbols
-      const wrapperEnv = makeEnv(env);
+      // Inject def-env bindings for renamed symbols directly into use-site env
+      // (gensym names are unique, so no clash risk; avoids wrapper env scoping
+      // issues where define inside macro expansion targets the wrong scope)
       for (const [original, gensymName] of renames) {
         try {
           const val = envLookup(transformer.defEnv, original);
-          envSet(wrapperEnv, gensymName, val);
+          envSet(env, gensymName, val);
         } catch {
           // Not in defEnv — newly introduced identifier, no pre-binding needed
         }
       }
 
-      return { form: expanded, env: wrapperEnv };
+      return { form: expanded, env };
     }
   }
   throw new EvalError('no matching pattern for macro');
@@ -1700,7 +1701,7 @@ function cekApply(proc: SchemeVal, args: SchemeVal[], epos: string, k: Cont): CE
     throw new EvalError(`${epos}: case-lambda: no matching clause for ${args.length} args`);
   }
   if (proc.tag === 'continuation') {
-    const val = args.length > 0 ? args[0] : VOID;
+    const val = args.length === 0 ? VOID : args.length === 1 ? args[0] : { tag: 'values', vals: args } as SchemeVal;
     const targetWinders = proc.winders;
     const actions = computeWindActions(currentWinders, targetWinders);
     if (actions.length === 0) {
