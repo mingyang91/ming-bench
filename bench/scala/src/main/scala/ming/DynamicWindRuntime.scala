@@ -51,7 +51,19 @@ private[ming] object DynamicWindRuntime:
   def transferToContinuation(
     value: Value,
     continuation: Continuation,
-    targetWindFrames: List[WindFrame]
+    targetWindFrames: List[WindFrame],
+    betweenExitAndEnter: () => Unit = () => ()
+  ): EvaluationStep =
+    transferToWindFrames(
+      targetWindFrames,
+      () => InterpreterEvaluator.done(value, continuation),
+      betweenExitAndEnter
+    )
+
+  def transferToWindFrames(
+    targetWindFrames: List[WindFrame],
+    next: () => EvaluationStep,
+    betweenExitAndEnter: () => Unit = () => ()
   ): EvaluationStep =
     val currentWindFrames  = captureWindFrames
     val sharedPrefixLength = commonWindPrefixLength(currentWindFrames, targetWindFrames)
@@ -61,10 +73,8 @@ private[ming] object DynamicWindRuntime:
     runExitThunks(
       exitingFrames,
       () =>
-        runEnterThunks(
-          enteringFrames,
-          () => InterpreterEvaluator.done(value, continuation)
-        )
+        betweenExitAndEnter()
+        runEnterThunks(enteringFrames, next)
     )
 
   private def windState: WindState =

@@ -7,13 +7,19 @@ private[ming] object InterpreterEvaluator:
   private val halt: Continuation = value => FinalStep(value)
 
   def evalSequence(expressions: List[Expr], env: Environment): Value =
-    DynamicWindRuntime.withWindState(run(deferSequence(expressions, env, halt)))
+    ExceptionRuntime.withExceptionState(
+      DynamicWindRuntime.withWindState(run(deferSequence(expressions, env, halt)))
+    )
 
   def eval(expression: Expr, env: Environment): Value =
-    DynamicWindRuntime.withWindState(run(deferExpr(expression, env, halt)))
+    ExceptionRuntime.withExceptionState(
+      DynamicWindRuntime.withWindState(run(deferExpr(expression, env, halt)))
+    )
 
   def applyFunction(function: Value, arguments: List[Value], position: Position): Value =
-    DynamicWindRuntime.withWindState(run(deferApplication(function, arguments, position, halt)))
+    ExceptionRuntime.withExceptionState(
+      DynamicWindRuntime.withWindState(run(deferApplication(function, arguments, position, halt)))
+    )
 
   def done(value: Value, continuation: Continuation): EvaluationStep =
     ReturnStep(value, continuation)
@@ -108,13 +114,14 @@ private[ming] object InterpreterEvaluator:
         applyClosure(parameters, restParameter, body, closureEnv, arguments, position, continuation)
       case CaseLambdaValue(clauses, _) =>
         applyCaseLambda(clauses, arguments, position, continuation)
-      case ContinuationValue(savedContinuation, savedWindFrames) =>
+      case ContinuationValue(savedContinuation, savedWindFrames, savedHandlerFrames) =>
         arguments match
           case value :: Nil =>
             DynamicWindRuntime.transferToContinuation(
               value,
               savedContinuation,
-              savedWindFrames
+              savedWindFrames,
+              () => ExceptionRuntime.restoreHandlerFrames(savedHandlerFrames)
             )
           case _ =>
             SchemeFailure.raise(
@@ -154,6 +161,8 @@ private[ming] object InterpreterEvaluator:
         done(RecordTypeEvaluator.evalDefineRecordType(rest, position, env), continuation)
       case SymbolExpr("define-syntax", _) :: rest =>
         SpecialFormEvaluator.evalDefineSyntax(rest, position, env, continuation)
+      case SymbolExpr("guard", _) :: rest =>
+        SpecialFormEvaluator.evalGuard(rest, position, env, continuation)
       case SymbolExpr("if", _) :: rest =>
         SpecialFormEvaluator.evalIf(rest, position, env, continuation)
       case SymbolExpr("case-lambda", _) :: rest =>

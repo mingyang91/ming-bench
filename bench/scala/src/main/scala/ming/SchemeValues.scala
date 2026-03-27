@@ -142,7 +142,8 @@ final private[ming] case class CaseLambdaValue(
 
 final private[ming] case class ContinuationValue(
   continuation: Continuation,
-  windFrames: List[WindFrame] = Nil
+  windFrames: List[WindFrame] = Nil,
+  handlerFrames: List[ExceptionHandlerFrame] = Nil
 ) extends ProcedureValue:
   override def render: String = "#<procedure:continuation>"
 

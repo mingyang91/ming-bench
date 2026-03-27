@@ -108,6 +108,14 @@ private[ming] object SpecialFormEvaluator:
       case _ =>
         SchemeFailure.raise("if expected 2 or 3 argument(s)", position)
 
+  def evalGuard(
+    arguments: List[Expr],
+    position: Position,
+    env: Environment,
+    continuation: Continuation
+  ): EvaluationStep =
+    SpecialFormGuardEvaluator.evalGuard(arguments, position, env, continuation)
+
   def evalLet(
     arguments: List[Expr],
     position: Position,
