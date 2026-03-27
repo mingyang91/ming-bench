@@ -12,6 +12,7 @@ type SchemeValBase =
   | { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }
   | { tag: 'nil' }
   | { tag: 'procedure'; val: (args: SchemeVal[]) => SchemeVal }
+  | { tag: 'closure'; params: string[]; rest: string | null; body: SchemeVal[]; closedEnv: Env }
   | { tag: 'void' }
   | { tag: 'macro'; transformer: MacroTransformer }
   | { tag: 'record'; type: symbol; fields: Map<string, SchemeVal> }
@@ -422,7 +423,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   envSet(env, 'map', { tag: 'procedure', val: (args) => {
     if (args.length < 2) throw new EvalError('map requires at least 2 arguments');
     const fn = args[0];
-    if (fn.tag !== 'procedure') throw new EvalError('map: first argument must be a procedure');
+    if (fn.tag !== 'procedure' && fn.tag !== 'closure') throw new EvalError('map: first argument must be a procedure');
     const lists = args.slice(1);
     const results: SchemeVal[] = [];
     const cursors = lists.map(l => l);
@@ -434,7 +435,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
         fnArgs.push((cursors[i] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).car);
       }
       if (done) break;
-      results.push(fn.val(fnArgs));
+      results.push(callAny(fn, fnArgs));
       for (let i = 0; i < cursors.length; i++) {
         cursors[i] = (cursors[i] as { tag: 'pair'; car: SchemeVal; cdr: SchemeVal }).cdr;
       }
@@ -479,7 +480,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
 
   envSet(env, 'procedure?', { tag: 'procedure', val: (args) => {
     if (args.length !== 1) throw new EvalError('procedure? requires 1 argument');
-    return { tag: 'boolean', val: args[0].tag === 'procedure' };
+    return { tag: 'boolean', val: args[0].tag === 'procedure' || args[0].tag === 'closure' };
   }});
 
   // I/O
@@ -493,6 +494,7 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
       case 'nil': return '()';
       case 'void': return '';
       case 'procedure': return '#<procedure>';
+      case 'closure': return '#<procedure>';
       case 'pair': {
         let out = '(' + displayVal(v.car);
         let cur: SchemeVal = v.cdr;
@@ -884,11 +886,11 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   envSet(env, 'apply', { tag: 'procedure', val: (args) => {
     if (args.length < 2) throw new EvalError('apply requires at least 2 arguments');
     const fn = args[0];
-    if (fn.tag !== 'procedure') throw new EvalError('apply: first argument must be a procedure');
+    if (fn.tag !== 'procedure' && fn.tag !== 'closure') throw new EvalError('apply: first argument must be a procedure');
     const lastArg = args[args.length - 1];
     const tailArgs = listToArray(lastArg);
     const prefixArgs = args.slice(1, -1);
-    return fn.val([...prefixArgs, ...tailArgs]);
+    return callAny(fn, [...prefixArgs, ...tailArgs]);
   }});
 
   // Symbol/string conversions
@@ -981,16 +983,28 @@ function parseParams(paramList: SchemeVal[], pos: string): { fixed: string[]; re
   return { fixed, rest: restParam.val };
 }
 
-function makeVariadicClosure(fixed: string[], rest: string, body: SchemeVal[], closedEnv: Env, pos: string): SchemeVal {
-  return { tag: 'procedure', val: (args: SchemeVal[]) => {
-    if (args.length < fixed.length) throw new EvalError(`${pos}: expected at least ${fixed.length} args, got ${args.length}`);
-    const local = makeEnv(closedEnv);
-    for (let i = 0; i < fixed.length; i++) envSet(local, fixed[i], args[i]);
-    envSet(local, rest, arrayToList(args.slice(fixed.length)));
-    let result: SchemeVal = { tag: 'void' };
-    for (const expr of body) result = evaluate(expr, local);
-    return result;
-  }};
+function makeVariadicClosure(fixed: string[], rest: string, body: SchemeVal[], closedEnv: Env, _pos: string): SchemeVal {
+  return { tag: 'closure', params: fixed, rest, body, closedEnv };
+}
+
+function callClosure(c: SchemeVal & { tag: 'closure' }, args: SchemeVal[]): SchemeVal {
+  if (c.rest === null) {
+    if (args.length !== c.params.length) throw new EvalError(`expected ${c.params.length} args, got ${args.length}`);
+  } else {
+    if (args.length < c.params.length) throw new EvalError(`expected at least ${c.params.length} args, got ${args.length}`);
+  }
+  const local = makeEnv(c.closedEnv);
+  for (let i = 0; i < c.params.length; i++) envSet(local, c.params[i], args[i]);
+  if (c.rest !== null) envSet(local, c.rest, arrayToList(args.slice(c.params.length)));
+  let result: SchemeVal = { tag: 'void' };
+  for (const expr of c.body) result = evaluate(expr, local);
+  return result;
+}
+
+function callAny(proc: SchemeVal, args: SchemeVal[]): SchemeVal {
+  if (proc.tag === 'closure') return callClosure(proc, args);
+  if (proc.tag === 'procedure') return proc.val(args);
+  throw new EvalError('not a procedure');
 }
 
 // ── Macro expansion (syntax-rules) ─────────────────────────────────────
@@ -1169,6 +1183,8 @@ function isTruthy(v: SchemeVal): boolean {
 }
 
 function evaluate(expr: SchemeVal, env: Env): SchemeVal {
+  // Trampoline loop for TCO
+  trampoline: while (true) {
   switch (expr.tag) {
     case 'number':
     case 'boolean':
@@ -1196,11 +1212,11 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         }
 
         if (name === 'begin') {
-          let result: SchemeVal = { tag: 'void' };
-          for (let i = 1; i < elems.length; i++) {
-            result = evaluate(elems[i], env);
+          if (elems.length === 1) return { tag: 'void' };
+          for (let i = 1; i < elems.length - 1; i++) {
+            evaluate(elems[i], env);
           }
-          return result;
+          expr = elems[elems.length - 1]; continue; // TCO
         }
 
         if (name === 'let') {
@@ -1219,16 +1235,13 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             }
             const body = elems.slice(3);
             const local = makeEnv(env);
-            const loopProc: SchemeVal = { tag: 'procedure', val: (args: SchemeVal[]) => {
-              if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
-              const inner = makeEnv(local);
-              for (let i = 0; i < params.length; i++) envSet(inner, params[i], args[i]);
-              let result: SchemeVal = { tag: 'void' };
-              for (const expr of body) result = evaluate(expr, inner);
-              return result;
-            }};
-            envSet(local, loopName, loopProc);
-            return loopProc.val(inits);
+            const loopClosure: SchemeVal = { tag: 'closure', params, rest: null, body, closedEnv: local };
+            envSet(local, loopName, loopClosure);
+            // Apply closure inline for TCO
+            const inner = makeEnv(local);
+            for (let i = 0; i < params.length; i++) envSet(inner, params[i], inits[i]);
+            for (let i = 0; i < body.length - 1; i++) evaluate(body[i], inner);
+            expr = body[body.length - 1]; env = inner; continue; // TCO
           }
           // Regular let
           if (elems.length < 3) throw new EvalError(`${epos}: let requires bindings and body`);
@@ -1240,11 +1253,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               throw new EvalError(`${epos}: invalid let binding`);
             envSet(local, b.val[0].val, evaluate(b.val[1], env));
           }
-          let result: SchemeVal = { tag: 'void' };
-          for (let i = 2; i < elems.length; i++) {
-            result = evaluate(elems[i], local);
+          for (let i = 2; i < elems.length - 1; i++) {
+            evaluate(elems[i], local);
           }
-          return result;
+          expr = elems[elems.length - 1]; env = local; continue; // TCO
         }
 
         if (name === 'let*') {
@@ -1257,11 +1269,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               throw new EvalError(`${epos}: invalid let* binding`);
             envSet(local, b.val[0].val, evaluate(b.val[1], local));
           }
-          let result: SchemeVal = { tag: 'void' };
-          for (let i = 2; i < elems.length; i++) {
-            result = evaluate(elems[i], local);
+          for (let i = 2; i < elems.length - 1; i++) {
+            evaluate(elems[i], local);
           }
-          return result;
+          expr = elems[elems.length - 1]; env = local; continue; // TCO
         }
 
         if (name === 'letrec') {
@@ -1269,21 +1280,18 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           const bindings = elems[1];
           if (bindings.tag !== 'list') throw new EvalError(`${epos}: letrec bindings must be a list`);
           const local = makeEnv(env);
-          // First pass: bind all names to undefined placeholder
           for (const b of bindings.val) {
             if (b.tag !== 'list' || b.val.length !== 2 || b.val[0].tag !== 'symbol')
               throw new EvalError(`${epos}: invalid letrec binding`);
             envSet(local, b.val[0].val, { tag: 'void' });
           }
-          // Second pass: evaluate init expressions in the local env and assign
           for (const b of bindings.val) {
             envSet(local, (b as any).val[0].val, evaluate((b as any).val[1], local));
           }
-          let result: SchemeVal = { tag: 'void' };
-          for (let i = 2; i < elems.length; i++) {
-            result = evaluate(elems[i], local);
+          for (let i = 2; i < elems.length - 1; i++) {
+            evaluate(elems[i], local);
           }
-          return result;
+          expr = elems[elems.length - 1]; env = local; continue; // TCO
         }
 
         if (name === 'letrec*') {
@@ -1296,11 +1304,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               throw new EvalError(`${epos}: invalid letrec* binding`);
             envSet(local, b.val[0].val, evaluate(b.val[1], local));
           }
-          let result: SchemeVal = { tag: 'void' };
-          for (let i = 2; i < elems.length; i++) {
-            result = evaluate(elems[i], local);
+          for (let i = 2; i < elems.length - 1; i++) {
+            evaluate(elems[i], local);
           }
-          return result;
+          expr = elems[elems.length - 1]; env = local; continue; // TCO
         }
 
         if (name === 'case') {
@@ -1310,18 +1317,16 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             const clause = elems[i];
             if (clause.tag !== 'list' || clause.val.length < 2) throw new EvalError(`${epos}: invalid case clause`);
             if (clause.val[0].tag === 'symbol' && clause.val[0].val === 'else') {
-              let result: SchemeVal = { tag: 'void' };
-              for (let j = 1; j < clause.val.length; j++) result = evaluate(clause.val[j], env);
-              return result;
+              for (let j = 1; j < clause.val.length - 1; j++) evaluate(clause.val[j], env);
+              expr = clause.val[clause.val.length - 1]; continue trampoline; // TCO
             }
             if (clause.val[0].tag !== 'list') throw new EvalError(`${epos}: case clause datums must be a list`);
             const datums = clause.val[0].val;
             for (const datum of datums) {
               const d = quoteSyntax(datum);
               if (schemeEqv(key, d)) {
-                let result: SchemeVal = { tag: 'void' };
-                for (let j = 1; j < clause.val.length; j++) result = evaluate(clause.val[j], env);
-                return result;
+                for (let j = 1; j < clause.val.length - 1; j++) evaluate(clause.val[j], env);
+                expr = clause.val[clause.val.length - 1]; continue trampoline; // TCO
               }
             }
           }
@@ -1337,7 +1342,6 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           if (testClause.tag !== 'list' || testClause.val.length < 1) throw new EvalError(`${epos}: do test clause must be a list`);
           const bodyExprs = elems.slice(3);
 
-          // Parse variable specs
           const vars: { name: string; hasStep: boolean; stepExpr: SchemeVal }[] = [];
           const local = makeEnv(env);
           for (const spec of varSpecs.val) {
@@ -1353,12 +1357,9 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             });
           }
 
-          // Iterate
           while (true) {
-            // Check test
             const testResult = evaluate(testClause.val[0], local);
             if (isTruthy(testResult)) {
-              // Evaluate result expressions
               if (testClause.val.length === 1) return { tag: 'void' };
               let result: SchemeVal = { tag: 'void' };
               for (let j = 1; j < testClause.val.length; j++) {
@@ -1366,9 +1367,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               }
               return result;
             }
-            // Evaluate body
-            for (const expr of bodyExprs) evaluate(expr, local);
-            // Parallel step: evaluate all step expressions using current values
+            for (const bexpr of bodyExprs) evaluate(bexpr, local);
             const newVals: SchemeVal[] = [];
             for (const v of vars) {
               if (v.hasStep) {
@@ -1377,7 +1376,6 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
                 newVals.push(envLookup(local, v.name));
               }
             }
-            // Assign new values
             for (let i = 0; i < vars.length; i++) {
               envSet(local, vars[i].name, newVals[i]);
             }
@@ -1389,15 +1387,13 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             const clause = elems[i];
             if (clause.tag !== 'list' || clause.val.length < 2) throw new EvalError(`${epos}: invalid cond clause`);
             if (clause.val[0].tag === 'symbol' && clause.val[0].val === 'else') {
-              let result: SchemeVal = { tag: 'void' };
-              for (let j = 1; j < clause.val.length; j++) result = evaluate(clause.val[j], env);
-              return result;
+              for (let j = 1; j < clause.val.length - 1; j++) evaluate(clause.val[j], env);
+              expr = clause.val[clause.val.length - 1]; continue trampoline; // TCO
             }
             const test = evaluate(clause.val[0], env);
             if (isTruthy(test)) {
-              let result: SchemeVal = { tag: 'void' };
-              for (let j = 1; j < clause.val.length; j++) result = evaluate(clause.val[j], env);
-              return result;
+              for (let j = 1; j < clause.val.length - 1; j++) evaluate(clause.val[j], env);
+              expr = clause.val[clause.val.length - 1]; continue trampoline; // TCO
             }
           }
           return { tag: 'void' };
@@ -1406,37 +1402,23 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         if (name === 'if') {
           if (elems.length < 3 || elems.length > 4) throw new EvalError(`${epos}: if requires 2 or 3 arguments`);
           const cond = evaluate(elems[1], env);
-          if (isTruthy(cond)) return evaluate(elems[2], env);
-          if (elems.length === 4) return evaluate(elems[3], env);
+          if (isTruthy(cond)) { expr = elems[2]; continue; } // TCO
+          if (elems.length === 4) { expr = elems[3]; continue; } // TCO
           return { tag: 'void' };
         }
 
         if (name === 'define') {
           if (elems.length < 3) throw new EvalError(`${epos}: define requires at least 2 arguments`);
           if (elems[1].tag === 'symbol') {
-            // (define x expr)
             const val = evaluate(elems[2], env);
             envSet(env, elems[1].val, val);
             return { tag: 'void' };
           }
           if (elems[1].tag === 'list' && elems[1].val.length > 0 && elems[1].val[0].tag === 'symbol') {
-            // (define (f params...) body...) or (define (f x . rest) body...)
             const fname = elems[1].val[0].val;
             const { fixed: params, rest } = parseParams(elems[1].val.slice(1), epos);
             const body = elems.slice(2);
-            let closure: SchemeVal;
-            if (rest !== null) {
-              closure = makeVariadicClosure(params, rest, body, env, epos);
-            } else {
-              closure = { tag: 'procedure', val: (args: SchemeVal[]) => {
-                if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
-                const local = makeEnv(env);
-                for (let i = 0; i < params.length; i++) envSet(local, params[i], args[i]);
-                let result: SchemeVal = { tag: 'void' };
-                for (const expr of body) result = evaluate(expr, local);
-                return result;
-              }};
-            }
+            const closure: SchemeVal = { tag: 'closure', params, rest, body, closedEnv: env };
             envSet(env, fname, closure);
             return { tag: 'void' };
           }
@@ -1455,31 +1437,17 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           if (elems.length < 3) throw new EvalError(`${epos}: lambda requires params and body`);
           const paramList = elems[1];
           if (paramList.tag === 'symbol') {
-            // (lambda args body...) — all args collected into one param
             const restName = paramList.val;
             const body = elems.slice(2);
-            const closedEnv = env;
-            return makeVariadicClosure([], restName, body, closedEnv, epos);
+            return { tag: 'closure', params: [], rest: restName, body, closedEnv: env };
           }
           if (paramList.tag !== 'list') throw new EvalError(`${epos}: lambda params must be a list or symbol`);
           const { fixed: params, rest } = parseParams(paramList.val, epos);
           const body = elems.slice(2);
-          const closedEnv = env;
-          if (rest !== null) {
-            return makeVariadicClosure(params, rest, body, closedEnv, epos);
-          }
-          return { tag: 'procedure', val: (args: SchemeVal[]) => {
-            if (args.length !== params.length) throw new EvalError(`${epos}: expected ${params.length} args, got ${args.length}`);
-            const local = makeEnv(closedEnv);
-            for (let i = 0; i < params.length; i++) envSet(local, params[i], args[i]);
-            let result: SchemeVal = { tag: 'void' };
-            for (const expr of body) result = evaluate(expr, local);
-            return result;
-          }};
+          return { tag: 'closure', params, rest, body, closedEnv: env };
         }
 
         if (name === 'case-lambda') {
-          // (case-lambda (params body...) ...)
           if (elems.length < 2) throw new EvalError(`${epos}: case-lambda requires at least one clause`);
           const clauses: { fixed: string[]; rest: string | null; body: SchemeVal[]; }[] = [];
           for (let i = 1; i < elems.length; i++) {
@@ -1488,7 +1456,6 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               throw new EvalError(`${epos}: case-lambda: invalid clause`);
             const paramList = clause.val[0];
             if (paramList.tag === 'symbol') {
-              // rest-only: (args body...)
               clauses.push({ fixed: [], rest: paramList.val, body: clause.val.slice(1) });
             } else if (paramList.tag !== 'list') {
               throw new EvalError(`${epos}: case-lambda: params must be a list or symbol`);
@@ -1506,7 +1473,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
                   for (let i = 0; i < c.fixed.length; i++) envSet(local, c.fixed[i], args[i]);
                   envSet(local, c.rest, arrayToList(args.slice(c.fixed.length)));
                   let result: SchemeVal = { tag: 'void' };
-                  for (const expr of c.body) result = evaluate(expr, local);
+                  for (const bexpr of c.body) result = evaluate(bexpr, local);
                   return result;
                 }
               } else {
@@ -1514,7 +1481,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
                   const local = makeEnv(closedEnv);
                   for (let i = 0; i < c.fixed.length; i++) envSet(local, c.fixed[i], args[i]);
                   let result: SchemeVal = { tag: 'void' };
-                  for (const expr of c.body) result = evaluate(expr, local);
+                  for (const bexpr of c.body) result = evaluate(bexpr, local);
                   return result;
                 }
               }
@@ -1552,7 +1519,6 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
         }
 
         if (name === 'define-record-type') {
-          // (define-record-type <name> (constructor field...) predicate (field accessor)...)
           if (elems.length < 4) throw new EvalError(`${epos}: define-record-type requires at least 3 arguments`);
           const typeName = elems[1];
           if (typeName.tag !== 'symbol') throw new EvalError(`${epos}: define-record-type: type name must be a symbol`);
@@ -1568,7 +1534,6 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
           const predSpec = elems[3];
           if (predSpec.tag !== 'symbol') throw new EvalError(`${epos}: define-record-type: predicate must be a symbol`);
           const predName = predSpec.val;
-          // Parse field accessors
           const fieldAccessors: { field: string; accessor: string }[] = [];
           for (let i = 4; i < elems.length; i++) {
             const fd = elems[i];
@@ -1576,7 +1541,6 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
               throw new EvalError(`${epos}: define-record-type: invalid field spec`);
             fieldAccessors.push({ field: fd.val[0].val, accessor: fd.val[1].val });
           }
-          // Define constructor
           envSet(env, ctorName, { tag: 'procedure', val: (args: SchemeVal[]) => {
             if (args.length !== ctorFields.length)
               throw new EvalError(`${epos}: ${ctorName}: expected ${ctorFields.length} args, got ${args.length}`);
@@ -1584,12 +1548,10 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
             for (let i = 0; i < ctorFields.length; i++) fields.set(ctorFields[i], args[i]);
             return { tag: 'record', type: typeTag, fields } as SchemeVal;
           }});
-          // Define predicate
           envSet(env, predName, { tag: 'procedure', val: (args: SchemeVal[]) => {
             if (args.length !== 1) throw new EvalError(`${epos}: ${predName}: expected 1 arg`);
             return { tag: 'boolean', val: args[0].tag === 'record' && (args[0] as any).type === typeTag };
           }});
-          // Define accessors
           for (const { field, accessor } of fieldAccessors) {
             const fName = field;
             const aName = accessor;
@@ -1606,22 +1568,20 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
 
         if (name === 'and') {
           if (elems.length === 1) return { tag: 'boolean', val: true };
-          let result: SchemeVal = { tag: 'boolean', val: true };
-          for (let i = 1; i < elems.length; i++) {
-            result = evaluate(elems[i], env);
+          for (let i = 1; i < elems.length - 1; i++) {
+            const result = evaluate(elems[i], env);
             if (isFalsy(result)) return result;
           }
-          return result;
+          expr = elems[elems.length - 1]; continue; // TCO
         }
 
         if (name === 'or') {
           if (elems.length === 1) return { tag: 'boolean', val: false };
-          let result: SchemeVal = { tag: 'boolean', val: false };
-          for (let i = 1; i < elems.length; i++) {
-            result = evaluate(elems[i], env);
+          for (let i = 1; i < elems.length - 1; i++) {
+            const result = evaluate(elems[i], env);
             if (isTruthy(result)) return result;
           }
-          return result;
+          expr = elems[elems.length - 1]; continue; // TCO
         }
       }
 
@@ -1636,8 +1596,22 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
 
       // Procedure application
       const proc = evaluate(elems[0], env);
-      if (proc.tag !== 'procedure') throw new EvalError(`${epos}: not a procedure`);
       const args = elems.slice(1).map(a => evaluate(a, env));
+      if (proc.tag === 'closure') {
+        // TCO: inline closure application
+        const c = proc;
+        if (c.rest === null) {
+          if (args.length !== c.params.length) throw new EvalError(`${epos}: expected ${c.params.length} args, got ${args.length}`);
+        } else {
+          if (args.length < c.params.length) throw new EvalError(`${epos}: expected at least ${c.params.length} args, got ${args.length}`);
+        }
+        const local = makeEnv(c.closedEnv);
+        for (let i = 0; i < c.params.length; i++) envSet(local, c.params[i], args[i]);
+        if (c.rest !== null) envSet(local, c.rest, arrayToList(args.slice(c.params.length)));
+        for (let i = 0; i < c.body.length - 1; i++) evaluate(c.body[i], local);
+        expr = c.body[c.body.length - 1]; env = local; continue; // TCO
+      }
+      if (proc.tag !== 'procedure') throw new EvalError(`${epos}: not a procedure`);
       try {
         return proc.val(args);
       } catch (e) {
@@ -1651,6 +1625,7 @@ function evaluate(expr: SchemeVal, env: Env): SchemeVal {
     default:
       throw new EvalError(`${expr.pos ?? '?'}: cannot evaluate`);
   }
+  } // end trampoline while
 }
 
 function displayNumber(val: SchemeVal & { tag: 'number' }): string {
@@ -1691,6 +1666,7 @@ function display(val: SchemeVal): string {
     }
     case 'void': return '';
     case 'procedure': return '#<procedure>';
+    case 'closure': return '#<procedure>';
     case 'macro': return '#<macro>';
     case 'record': return '#<record>';
     case 'vector': return '#(' + val.val.map(display).join(' ') + ')';
