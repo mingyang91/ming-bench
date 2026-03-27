@@ -12,7 +12,7 @@ mod value_ops;
 use continuation::{
     final_continuation, pop_wind_frame, push_wind_frame, reset_wind_stack,
     resume_continuation_jump, sequence_continuation, CapturedContinuation, Continuation,
-    ContinuationRef, EvalResult, EvalSignal,
+    ContinuationRef, EvalResult, EvalSignal, RaisedException,
 };
 pub use error::{EvalError, SourcePos};
 use macros::{MacroEnvRef, MacroEnvironment};
@@ -123,6 +123,8 @@ enum BuiltinKind {
     Reverse,
     Apply,
     CallCc,
+    Raise,
+    WithExceptionHandler,
     EqPred,
     EqvPred,
     EqualPred,
@@ -359,6 +361,8 @@ impl BuiltinKind {
             Self::Reverse => "reverse",
             Self::Apply => "apply",
             Self::CallCc => "call/cc",
+            Self::Raise => "raise",
+            Self::WithExceptionHandler => "with-exception-handler",
             Self::EqPred => "eq?",
             Self::EqvPred => "eqv?",
             Self::EqualPred => "equal?",
@@ -626,7 +630,7 @@ fn continue_with(mut continuation: ContinuationRef, mut value: Value) -> EvalRes
                 next,
             } => {
                 push_wind_frame(frame);
-                return run_callable_in_cont(
+                let body_result = run_callable_in_cont(
                     body.clone(),
                     &[],
                     *body_position,
@@ -635,6 +639,16 @@ fn continue_with(mut continuation: ContinuationRef, mut value: Value) -> EvalRes
                         next: Rc::clone(next),
                     }),
                 );
+
+                return match body_result {
+                    Ok(value) => Ok(value),
+                    Err(EvalSignal::Raise(exception)) => {
+                        pop_wind_frame(frame);
+                        apply_callable(frame.after.clone(), &[], next)?;
+                        Err(EvalSignal::Raise(exception))
+                    }
+                    Err(signal) => Err(signal),
+                };
             }
             Continuation::DynamicWind { frame, next } => {
                 pop_wind_frame(frame);
@@ -913,6 +927,7 @@ fn eval_program(exprs: &[Expr], output: OutputRef) -> Result<Value, EvalError> {
         match result {
             Ok(value) => return Ok(value),
             Err(EvalSignal::Error(error)) => return Err(error),
+            Err(EvalSignal::Raise(exception)) => return Err(uncaught_exception_error(exception)),
             Err(EvalSignal::Jump {
                 continuation,
                 wind_stack,
@@ -936,6 +951,17 @@ fn eval_sequence(
         Rc::clone(macro_env),
         continuation,
     )
+}
+
+fn uncaught_exception_error(exception: RaisedException) -> EvalError {
+    let error = EvalError::UncaughtException {
+        value: exception.value.render(),
+    };
+
+    match exception.position {
+        Some(position) => error.with_position(position),
+        None => error,
+    }
 }
 
 fn eval_expr(
@@ -1128,6 +1154,11 @@ fn eval_borrowed_list_step<'a>(
                     .map(EvalStep::Value)
                     .map_err(|signal| signal.with_position(head_position))
             }
+            "guard" => {
+                return special_forms::eval_guard(&items[1..], env, macro_env, continuation)
+                    .map(EvalStep::Value)
+                    .map_err(|signal| signal.with_position(head_position))
+            }
             "cond" => {
                 return special_forms::eval_cond(&items[1..], env, macro_env, continuation)
                     .map_err(|signal| signal.with_position(head_position))
@@ -1256,6 +1287,11 @@ fn eval_owned_list_step<'a>(
             }
             "dynamic-wind" => {
                 return special_forms::eval_dynamic_wind(&items[1..], env, macro_env, continuation)
+                    .map(EvalStep::Value)
+                    .map_err(|signal| signal.with_position(head_position))
+            }
+            "guard" => {
+                return special_forms::eval_guard(&items[1..], env, macro_env, continuation)
                     .map(EvalStep::Value)
                     .map_err(|signal| signal.with_position(head_position))
             }

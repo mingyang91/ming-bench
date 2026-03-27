@@ -3,7 +3,7 @@ use std::rc::Rc;
 use super::continuation::{
     define_continuation, invoke_continuation, make_dynamic_wind_frame, pop_wind_frame,
     push_wind_frame, sequence_continuation, set_captured_continuation, set_symbol_continuation,
-    Continuation, ContinuationRef, EvalResult,
+    Continuation, ContinuationRef, EvalResult, EvalSignal, RaisedException,
 };
 use super::macros::{MacroEnvRef, MacroEnvironment};
 use super::value_ops::{list_from_vec, values_eqv};
@@ -941,26 +941,128 @@ pub(super) fn eval_dynamic_wind(
     apply_callable(before, &[], &enter_continuation)?;
 
     push_wind_frame(&frame);
-    let body_value = apply_callable(
+    let body_result = apply_callable(
         body,
         &[],
         &Rc::new(Continuation::DynamicWind {
             frame: Rc::clone(&frame),
             next: Rc::clone(continuation),
         }),
-    )?;
-    pop_wind_frame(&frame);
+    );
 
-    apply_callable(
-        frame.after.clone(),
-        &[],
-        &Rc::new(Continuation::DynamicWindExit {
-            return_value: body_value.clone(),
-            next: Rc::clone(continuation),
-        }),
-    )?;
+    let body_value = match body_result {
+        Ok(body_value) => {
+            pop_wind_frame(&frame);
+            apply_callable(
+                frame.after.clone(),
+                &[],
+                &Rc::new(Continuation::DynamicWindExit {
+                    return_value: body_value.clone(),
+                    next: Rc::clone(continuation),
+                }),
+            )?;
+            body_value
+        }
+        Err(EvalSignal::Raise(exception)) => {
+            pop_wind_frame(&frame);
+            apply_callable(frame.after.clone(), &[], continuation)?;
+            return Err(EvalSignal::Raise(exception));
+        }
+        Err(signal) => return Err(signal),
+    };
 
     Ok(body_value)
+}
+
+pub(super) fn eval_guard(
+    args: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    let [Expr::List(spec, _), body @ ..] = args else {
+        return Err(EvalError::SyntaxError {
+            message: "invalid guard".into(),
+        }
+        .into());
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::SyntaxError {
+            message: "guard requires a body".into(),
+        }
+        .into());
+    }
+
+    let Some((Expr::Symbol(name, _), clauses)) = spec.split_first() else {
+        return Err(EvalError::SyntaxError {
+            message: "guard requires an exception variable".into(),
+        }
+        .into());
+    };
+
+    match eval_sequence(body, env, macro_env, continuation) {
+        Ok(value) => Ok(value),
+        Err(EvalSignal::Raise(exception)) => {
+            eval_guard_clauses(name, clauses, exception, env, macro_env, continuation)
+        }
+        Err(signal) => Err(signal),
+    }
+}
+
+fn eval_guard_clauses(
+    exception_name: &str,
+    clauses: &[Expr],
+    exception: RaisedException,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    let guard_env = Environment::new(Some(Rc::clone(env)));
+    env_define(&guard_env, exception_name.into(), exception.value.clone());
+    let guard_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
+
+    for (index, clause) in clauses.iter().enumerate() {
+        let Expr::List(items, _) = clause else {
+            return Err(EvalError::SyntaxError {
+                message: "guard clauses must be lists".into(),
+            }
+            .into());
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::SyntaxError {
+                message: "guard clause cannot be empty".into(),
+            }
+            .into());
+        };
+
+        if matches!(test, Expr::Symbol(symbol, _) if symbol == "else") {
+            if index + 1 != clauses.len() {
+                return Err(EvalError::SyntaxError {
+                    message: "else clause must be last".into(),
+                }
+                .into());
+            }
+
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_sequence(body, &guard_env, &guard_macro_env, continuation)
+            };
+        }
+
+        let test_value = eval_expr(test, &guard_env, &guard_macro_env, continuation)?;
+        if test_value.is_truthy() {
+            return if body.is_empty() {
+                Ok(test_value)
+            } else {
+                eval_sequence(body, &guard_env, &guard_macro_env, continuation)
+            };
+        }
+    }
+
+    Err(EvalSignal::Raise(exception))
 }
 
 pub(super) fn eval_cond<'a>(

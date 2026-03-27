@@ -99,6 +99,9 @@ pub enum EvalError {
     #[error("uninitialized binding: {name}")]
     UninitializedBinding { name: String },
 
+    #[error("uncaught exception: {value}")]
+    UncaughtException { value: String },
+
     #[error("{inner} at {position}")]
     WithPosition {
         inner: Box<EvalError>,

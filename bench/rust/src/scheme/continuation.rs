@@ -9,6 +9,12 @@ pub(super) type DynamicWindFrameRef = Rc<DynamicWindFrame>;
 pub(super) type EvalResult<T> = Result<T, EvalSignal>;
 
 #[derive(Clone)]
+pub(super) struct RaisedException {
+    pub(super) value: Value,
+    pub(super) position: Option<SourcePos>,
+}
+
+#[derive(Clone)]
 pub(super) struct CapturedContinuation {
     pub(super) continuation: ContinuationRef,
     pub(super) wind_stack: Vec<DynamicWindFrameRef>,
@@ -100,6 +106,7 @@ pub(super) enum Continuation {
 
 pub(super) enum EvalSignal {
     Error(EvalError),
+    Raise(RaisedException),
     Jump {
         continuation: ContinuationRef,
         wind_stack: Vec<DynamicWindFrameRef>,
@@ -117,6 +124,12 @@ impl EvalSignal {
     pub(super) fn with_position(self, position: SourcePos) -> Self {
         match self {
             Self::Error(error) => Self::Error(error.with_position(position)),
+            Self::Raise(mut exception) => {
+                if exception.position.is_none() {
+                    exception.position = Some(position);
+                }
+                Self::Raise(exception)
+            }
             Self::Jump {
                 continuation,
                 wind_stack,
@@ -126,6 +139,15 @@ impl EvalSignal {
                 wind_stack,
                 value,
             },
+        }
+    }
+}
+
+impl RaisedException {
+    pub(super) fn new(value: Value) -> Self {
+        Self {
+            value,
+            position: None,
         }
     }
 }

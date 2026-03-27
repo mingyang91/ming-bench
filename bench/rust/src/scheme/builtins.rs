@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
-use super::continuation::{current_continuation_value, ContinuationRef, EvalResult};
+use super::continuation::{
+    current_continuation_value, ContinuationRef, EvalResult, EvalSignal, RaisedException,
+};
 use super::number::{parse_number_string, Number};
 use super::value_ops::{
     collect_list_items, is_empty_list, is_proper_list, list_from_vec, pair_parts, values_eq,
@@ -38,6 +40,8 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::Reverse,
         BuiltinKind::Apply,
         BuiltinKind::CallCc,
+        BuiltinKind::Raise,
+        BuiltinKind::WithExceptionHandler,
         BuiltinKind::EqPred,
         BuiltinKind::EqvPred,
         BuiltinKind::EqualPred,
@@ -162,6 +166,8 @@ pub(super) fn apply_builtin(
     match kind {
         BuiltinKind::Apply => eval_apply(args, continuation),
         BuiltinKind::CallCc => eval_call_cc(args, continuation),
+        BuiltinKind::Raise => eval_raise(args),
+        BuiltinKind::WithExceptionHandler => eval_with_exception_handler(args, continuation),
         BuiltinKind::Map => eval_map(args, continuation),
         BuiltinKind::ForEach => eval_for_each(args, continuation),
         _ => apply_builtin_without_context(kind, args, output).map_err(Into::into),
@@ -207,6 +213,10 @@ fn apply_builtin_without_context(
         BuiltinKind::Reverse => eval_reverse(args),
         BuiltinKind::Apply => unreachable!("apply requires the current continuation"),
         BuiltinKind::CallCc => unreachable!("call/cc requires the current continuation"),
+        BuiltinKind::Raise => unreachable!("raise requires the current continuation"),
+        BuiltinKind::WithExceptionHandler => {
+            unreachable!("with-exception-handler requires the current continuation")
+        }
         BuiltinKind::EqPred => eval_eq_like("eq?", args, values_eq),
         BuiltinKind::EqvPred => eval_eq_like("eqv?", args, values_eqv),
         BuiltinKind::EqualPred => eval_equality("equal?", args),
@@ -673,6 +683,41 @@ fn eval_call_cc(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Va
         &[current_continuation_value(continuation)],
         continuation,
     )
+}
+
+fn eval_raise(args: &[Value]) -> EvalResult<Value> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "raise".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        }
+        .into());
+    };
+
+    Err(EvalSignal::Raise(RaisedException::new(value.clone())))
+}
+
+fn eval_with_exception_handler(
+    args: &[Value],
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    let [handler, thunk] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "with-exception-handler".into(),
+            expected: "exactly 2 arguments".into(),
+            got: args.len(),
+        }
+        .into());
+    };
+
+    match super::apply_callable(thunk.clone(), &[], continuation) {
+        Ok(value) => Ok(value),
+        Err(EvalSignal::Raise(exception)) => {
+            super::apply_callable(handler.clone(), &[exception.value], continuation)
+        }
+        Err(signal) => Err(signal),
+    }
 }
 
 fn eval_eq_like<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
