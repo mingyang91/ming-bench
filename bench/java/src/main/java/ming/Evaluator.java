@@ -80,7 +80,11 @@ public class Evaluator {
 
     private record BuiltinProc(String name, Builtin fn) {}
 
+    // Output buffer for display/write/newline
+    private StringBuilder outputBuffer;
+
     public String evalStr(String input) throws EvalError {
+        outputBuffer = new StringBuilder();
         List<Token> tokens = tokenize(input);
         int[] pos = {0};
         Object lastResult = null;
@@ -96,7 +100,19 @@ public class Evaluator {
     }
 
     public EvalResult evalStrWithOutput(String input) throws EvalError {
-        throw new EvalError("not implemented");
+        outputBuffer = new StringBuilder();
+        List<Token> tokens = tokenize(input);
+        int[] pos = {0};
+        Object lastResult = null;
+        Env env = createGlobalEnv();
+        while (pos[0] < tokens.size()) {
+            Object expr = parse(tokens, pos);
+            lastResult = eval(expr, env);
+        }
+        if (lastResult == null) {
+            throw new EvalError("no expression");
+        }
+        return new EvalResult(schemeToString(lastResult), outputBuffer.toString());
     }
 
     private Env createGlobalEnv() {
@@ -230,6 +246,76 @@ public class Evaluator {
         env.define("not", new BuiltinProc("not", args -> {
             if (args.size() != 1) throw new EvalError("not: expected 1 arg");
             return isTruthy(args.get(0)) ? Boolean.FALSE : Boolean.TRUE;
+        }));
+        // L05: display, write, newline
+        env.define("display", new BuiltinProc("display", args -> {
+            if (args.size() != 1) throw new EvalError("display: expected 1 arg");
+            outputBuffer.append(displayString(args.get(0)));
+            return Boolean.FALSE; // void
+        }));
+        env.define("write", new BuiltinProc("write", args -> {
+            if (args.size() != 1) throw new EvalError("write: expected 1 arg");
+            outputBuffer.append(schemeToString(args.get(0)));
+            return Boolean.FALSE; // void
+        }));
+        env.define("newline", new BuiltinProc("newline", args -> {
+            if (args.size() != 0) throw new EvalError("newline: expected 0 args");
+            outputBuffer.append("\n");
+            return Boolean.FALSE; // void
+        }));
+        // L05: string operations
+        env.define("string-append", new BuiltinProc("string-append", args -> {
+            StringBuilder sb = new StringBuilder();
+            for (Object a : args) {
+                if (!(a instanceof SchemeString s)) throw new EvalError("string-append: expected string");
+                sb.append(s.value());
+            }
+            return new SchemeString(sb.toString());
+        }));
+        env.define("string-length", new BuiltinProc("string-length", args -> {
+            if (args.size() != 1) throw new EvalError("string-length: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-length: expected string");
+            return (long) s.value().length();
+        }));
+        env.define("substring", new BuiltinProc("substring", args -> {
+            if (args.size() < 2 || args.size() > 3) throw new EvalError("substring: expected 2-3 args");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("substring: expected string");
+            int start = (int) asLong(args.get(1));
+            int end = args.size() == 3 ? (int) asLong(args.get(2)) : s.value().length();
+            return new SchemeString(s.value().substring(start, end));
+        }));
+        env.define("string->number", new BuiltinProc("string->number", args -> {
+            if (args.size() != 1) throw new EvalError("string->number: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->number: expected string");
+            try {
+                return Long.parseLong(s.value());
+            } catch (NumberFormatException e) {
+                return Boolean.FALSE;
+            }
+        }));
+        env.define("number->string", new BuiltinProc("number->string", args -> {
+            if (args.size() != 1) throw new EvalError("number->string: expected 1 arg");
+            return new SchemeString(Long.toString(asLong(args.get(0))));
+        }));
+        env.define("symbol->string", new BuiltinProc("symbol->string", args -> {
+            if (args.size() != 1) throw new EvalError("symbol->string: expected 1 arg");
+            if (!(args.get(0) instanceof String s)) throw new EvalError("symbol->string: expected symbol");
+            return new SchemeString(s);
+        }));
+        env.define("string->symbol", new BuiltinProc("string->symbol", args -> {
+            if (args.size() != 1) throw new EvalError("string->symbol: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->symbol: expected string");
+            return s.value();
+        }));
+        env.define("string-ref", new BuiltinProc("string-ref", args -> {
+            if (args.size() != 2) throw new EvalError("string-ref: expected 2 args");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-ref: expected string");
+            int idx = (int) asLong(args.get(1));
+            return new SchemeChar(s.value().charAt(idx));
+        }));
+        env.define("char?", new BuiltinProc("char?", args -> {
+            if (args.size() != 1) throw new EvalError("char?: expected 1 arg");
+            return args.get(0) instanceof SchemeChar ? Boolean.TRUE : Boolean.FALSE;
         }));
         return env;
     }
@@ -370,7 +456,7 @@ public class Evaluator {
         }
         final String posStr = eLine > 0 ? " at " + eLine + ":" + eCol : "";
 
-        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString) {
+        if (expr instanceof Long || expr instanceof Boolean || expr instanceof SchemeString || expr instanceof SchemeChar) {
             return expr;
         }
         if (expr instanceof String sym) {
@@ -640,12 +726,39 @@ public class Evaluator {
             sb.append(")");
             return sb.toString();
         }
+        if (val instanceof SchemeChar c) return "#\\" + c.value();
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         if (val instanceof String s) return s;
         return val.toString();
     }
 
+    private String displayString(Object val) {
+        if (val instanceof SchemeString s) return s.value(); // no quotes
+        if (val instanceof SchemeChar c) return String.valueOf(c.value());
+        if (val == EMPTY_LIST) return "()";
+        if (val instanceof Pair p) {
+            StringBuilder sb = new StringBuilder("(");
+            sb.append(displayString(p.car));
+            Object rest = p.cdr;
+            while (rest instanceof Pair rp) {
+                sb.append(" ");
+                sb.append(displayString(rp.car));
+                rest = rp.cdr;
+            }
+            if (rest != EMPTY_LIST) {
+                sb.append(" . ");
+                sb.append(displayString(rest));
+            }
+            sb.append(")");
+            return sb.toString();
+        }
+        return schemeToString(val);
+    }
+
     // Internal type to distinguish Scheme strings from symbols (Java Strings)
     record SchemeString(String value) {}
+
+    // Internal type for Scheme characters
+    record SchemeChar(char value) {}
 }
