@@ -21,4 +21,7 @@ pub enum EvalError {
 
     #[error("continuation escape")]
     ContinuationEscape(usize),
+
+    #[error("raised exception")]
+    RaisedException,
 }

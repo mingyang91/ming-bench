@@ -24,6 +24,8 @@ thread_local! {
     static RESUME_FRAMES: RefCell<Vec<ContinuationFrame>> = RefCell::new(Vec::new());
     static CONTINUATION_VALUE: RefCell<Option<Value>> = RefCell::new(None);
     static PENDING_CONTINUATION: RefCell<Option<Rc<ContinuationData>>> = RefCell::new(None);
+    static RAISED_VALUE: RefCell<Option<Value>> = RefCell::new(None);
+    static EXCEPTION_HANDLERS: RefCell<Vec<Value>> = RefCell::new(Vec::new());
 }
 
 #[derive(Debug, Clone)]
@@ -586,7 +588,7 @@ fn expr_to_value(expr: &Expr) -> Value {
 
 /// Wrap an error with span info if it doesn't already have position info.
 fn with_span(err: EvalError, span: Span) -> EvalError {
-    if matches!(&err, EvalError::ContinuationEscape(_)) {
+    if matches!(&err, EvalError::ContinuationEscape(_) | EvalError::RaisedException) {
         return err;
     }
     let msg = err.to_string();
@@ -784,6 +786,83 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         }
                         let proc = eval(&items[1], env)?;
                         return eval_callcc_with_proc(&proc);
+                    }
+                    "guard" => {
+                        // (guard (var clause ...) body ...)
+                        // clause = (test expr ...) or (test => expr) or (else expr ...)
+                        if items.len() < 3 {
+                            return Err(EvalError::Arity("guard requires clauses and body".into()));
+                        }
+                        let clauses_expr = match &items[1].kind {
+                            ExprKind::List(c) if c.len() >= 1 => c,
+                            _ => return Err(EvalError::Parse("guard: invalid clause form".into())),
+                        };
+                        let var_name = match &clauses_expr[0].kind {
+                            ExprKind::Symbol(s) => s.clone(),
+                            _ => return Err(EvalError::Parse("guard: first element must be variable name".into())),
+                        };
+                        let clauses = &clauses_expr[1..];
+                        let body = &items[2..];
+
+                        // Evaluate body, catching any raised exception
+                        let body_result = {
+                            let mut result = Ok(Value::Void);
+                            for expr in body {
+                                result = eval(expr, env);
+                                if result.is_err() {
+                                    break;
+                                }
+                            }
+                            result
+                        };
+
+                        match body_result {
+                            Ok(val) => return Ok(val),
+                            Err(EvalError::RaisedException) => {
+                                let exn = RAISED_VALUE.with(|r| r.borrow_mut().take())
+                                    .unwrap_or(Value::Void);
+                                // Bind exception to var and try clauses
+                                let guard_env = Env::with_parent(env);
+                                guard_env.set(var_name.clone(), exn.clone());
+
+                                let mut matched = false;
+                                for clause in clauses {
+                                    match &clause.kind {
+                                        ExprKind::List(parts) if !parts.is_empty() => {
+                                            if let ExprKind::Symbol(s) = &parts[0].kind {
+                                                if s == "else" {
+                                                    // else clause
+                                                    let mut val = Value::Void;
+                                                    for expr in &parts[1..] {
+                                                        val = eval(expr, &guard_env)?;
+                                                    }
+                                                    return Ok(val);
+                                                }
+                                            }
+                                            let test = eval(&parts[0], &guard_env)?;
+                                            if is_truthy(&test) {
+                                                if parts.len() == 1 {
+                                                    return Ok(test);
+                                                }
+                                                let mut val = Value::Void;
+                                                for expr in &parts[1..] {
+                                                    val = eval(expr, &guard_env)?;
+                                                }
+                                                return Ok(val);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if !matched {
+                                    // No clause matched, re-raise
+                                    RAISED_VALUE.with(|r| *r.borrow_mut() = Some(exn));
+                                    return Err(EvalError::RaisedException);
+                                }
+                                unreachable!()
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     "set-car!" | "set-cdr!" => {
                         if items.len() != 3 {
@@ -1713,6 +1792,49 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "procedure?" => {
             if args.len() != 1 { return Err(EvalError::Arity("procedure? requires 1 argument".into())); }
             Ok(Value::Boolean(matches!(&args[0], Value::Lambda(..) | Value::CaseLambda(..) | Value::Builtin(..) | Value::Continuation(..))))
+        }
+        "raise" => {
+            if args.len() != 1 { return Err(EvalError::Arity("raise requires exactly 1 argument".into())); }
+            let val = args[0].clone();
+            let handler = EXCEPTION_HANDLERS.with(|h| h.borrow().last().cloned());
+            if let Some(handler) = handler {
+                EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                let result = apply(&handler, &[val]);
+                EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(handler));
+                return result;
+            }
+            RAISED_VALUE.with(|r| *r.borrow_mut() = Some(val));
+            Err(EvalError::RaisedException)
+        }
+        "raise-continuable" => {
+            if args.len() != 1 { return Err(EvalError::Arity("raise-continuable requires exactly 1 argument".into())); }
+            let val = args[0].clone();
+            let handler = EXCEPTION_HANDLERS.with(|h| h.borrow().last().cloned());
+            if let Some(handler) = handler {
+                EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+                let result = apply(&handler, &[val]);
+                EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(handler));
+                return result;
+            }
+            RAISED_VALUE.with(|r| *r.borrow_mut() = Some(val));
+            Err(EvalError::RaisedException)
+        }
+        "with-exception-handler" => {
+            if args.len() != 2 { return Err(EvalError::Arity("with-exception-handler requires 2 arguments".into())); }
+            let handler = args[0].clone();
+            let thunk = args[1].clone();
+            EXCEPTION_HANDLERS.with(|h| h.borrow_mut().push(handler.clone()));
+            let result = apply(&thunk, &[]);
+            EXCEPTION_HANDLERS.with(|h| h.borrow_mut().pop());
+            match result {
+                Ok(val) => Ok(val),
+                Err(EvalError::RaisedException) => {
+                    let exn = RAISED_VALUE.with(|r| r.borrow_mut().take())
+                        .unwrap_or(Value::Void);
+                    apply(&handler, &[exn])
+                }
+                Err(e) => Err(e),
+            }
         }
         // ── L09: char operations ──
         "char-alphabetic?" => {
@@ -3385,6 +3507,7 @@ fn seed_builtins(env: &Env) {
         // L18
         "call/cc", "call-with-current-continuation",
         "dynamic-wind",
+        "raise", "raise-continuable", "with-exception-handler",
         // L17
         "set-car!", "set-cdr!",
         "caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr", "caddar",
