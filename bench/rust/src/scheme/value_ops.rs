@@ -53,6 +53,7 @@ pub(super) fn pair_parts(value: &Value) -> Option<(Value, Value)> {
         | Value::NativeProcedure(_)
         | Value::Builtin(_)
         | Value::Continuation(_)
+        | Value::Values(_)
         | Value::Record(_)
         | Value::Uninitialized
         | Value::Void => None,
@@ -113,6 +114,7 @@ pub(super) fn is_proper_list(value: &Value) -> bool {
             | Value::NativeProcedure(_)
             | Value::Builtin(_)
             | Value::Continuation(_)
+            | Value::Values(_)
             | Value::Record(_)
             | Value::Uninitialized
             | Value::Void => return false,
@@ -135,6 +137,13 @@ pub(super) fn values_eq(lhs: &Value, rhs: &Value) -> bool {
         (Value::Pair(lhs), Value::Pair(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Vector(lhs), Value::Vector(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
+        (Value::Values(lhs), Value::Values(rhs)) => {
+            lhs.len() == rhs.len()
+                && lhs
+                    .iter()
+                    .zip(rhs.iter())
+                    .all(|(lhs, rhs)| values_eq(lhs, rhs))
+        }
         (Value::List(lhs), Value::List(rhs)) => {
             lhs.len() == rhs.len()
                 && lhs
@@ -174,6 +183,13 @@ pub(super) fn values_equal(lhs: &Value, rhs: &Value) -> bool {
             (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
             (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
             (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
+            (Value::Values(lhs), Value::Values(rhs)) => {
+                lhs.len() == rhs.len()
+                    && lhs
+                        .iter()
+                        .zip(rhs.iter())
+                        .all(|(lhs, rhs)| values_equal_inner(lhs, rhs, seen_pairs, seen_vectors))
+            }
             (Value::List(lhs), Value::List(rhs)) => {
                 lhs.len() == rhs.len()
                     && lhs

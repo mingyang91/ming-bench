@@ -3,7 +3,8 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 use super::continuation::{
-    current_continuation_value, ContinuationRef, EvalResult, EvalSignal, RaisedException,
+    current_continuation_value, Continuation, ContinuationRef, EvalResult, EvalSignal,
+    RaisedException,
 };
 use super::number::{parse_number_string, Number};
 use super::value_ops::{
@@ -39,6 +40,8 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::Append,
         BuiltinKind::Reverse,
         BuiltinKind::Apply,
+        BuiltinKind::Values,
+        BuiltinKind::CallWithValues,
         BuiltinKind::CallCc,
         BuiltinKind::Raise,
         BuiltinKind::WithExceptionHandler,
@@ -165,6 +168,7 @@ pub(super) fn apply_builtin(
 ) -> EvalResult<Value> {
     match kind {
         BuiltinKind::Apply => eval_apply(args, continuation),
+        BuiltinKind::CallWithValues => eval_call_with_values(args, continuation),
         BuiltinKind::CallCc => eval_call_cc(args, continuation),
         BuiltinKind::Raise => eval_raise(args),
         BuiltinKind::WithExceptionHandler => eval_with_exception_handler(args, continuation),
@@ -212,6 +216,10 @@ fn apply_builtin_without_context(
         BuiltinKind::Append => eval_append(args),
         BuiltinKind::Reverse => eval_reverse(args),
         BuiltinKind::Apply => unreachable!("apply requires the current continuation"),
+        BuiltinKind::Values => eval_values(args),
+        BuiltinKind::CallWithValues => {
+            unreachable!("call-with-values requires the current continuation")
+        }
         BuiltinKind::CallCc => unreachable!("call/cc requires the current continuation"),
         BuiltinKind::Raise => unreachable!("raise requires the current continuation"),
         BuiltinKind::WithExceptionHandler => {
@@ -666,6 +674,28 @@ fn eval_apply(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Valu
     applied_args.extend(tail_args);
 
     super::apply_callable(callable, &applied_args, continuation)
+}
+
+fn eval_values(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(Value::from_values(args.to_vec()))
+}
+
+fn eval_call_with_values(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value> {
+    let [producer, consumer] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "call-with-values".into(),
+            expected: "exactly 2 arguments".into(),
+            got: args.len(),
+        }
+        .into());
+    };
+
+    let producer_continuation = Rc::new(Continuation::CallWithValues {
+        consumer: consumer.clone(),
+        next: Rc::clone(continuation),
+    });
+    let produced = super::apply_callable(producer.clone(), &[], &producer_continuation)?;
+    super::continue_with(producer_continuation, produced)
 }
 
 fn eval_call_cc(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value> {

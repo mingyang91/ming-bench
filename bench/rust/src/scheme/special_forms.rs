@@ -786,15 +786,7 @@ pub(super) fn apply_callable_result<'a>(
             .map_err(Into::into),
         Value::Builtin(builtin) => builtin.apply(args, continuation).map(EvalStep::Value),
         Value::Continuation(continuation) => {
-            let [value] = args else {
-                return Err(EvalError::WrongArgCount {
-                    name: "continuation".into(),
-                    expected: "exactly 1 argument".into(),
-                    got: args.len(),
-                }
-                .into());
-            };
-            Err(invoke_continuation(continuation, value.clone()))
+            Err(invoke_continuation(continuation, Value::from_values(args.to_vec())))
         }
         other => Err(EvalError::NotCallable {
             found: other.type_name().into(),

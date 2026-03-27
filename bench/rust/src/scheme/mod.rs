@@ -70,6 +70,7 @@ enum Value {
     NativeProcedure(Rc<NativeProcedure>),
     Builtin(Builtin),
     Continuation(Rc<CapturedContinuation>),
+    Values(Vec<Value>),
     Record(RecordRef),
     Uninitialized,
     Void,
@@ -122,6 +123,8 @@ enum BuiltinKind {
     Append,
     Reverse,
     Apply,
+    Values,
+    CallWithValues,
     CallCc,
     Raise,
     WithExceptionHandler,
@@ -256,6 +259,7 @@ impl Value {
             | Self::NativeProcedure(_)
             | Self::Builtin(_)
             | Self::Continuation(_) => "procedure",
+            Self::Values(_) => "values",
             Self::Record(_) => "record",
             Self::Uninitialized => "uninitialized",
             Self::Void => "void",
@@ -323,6 +327,21 @@ impl Value {
     fn render_display(&self) -> String {
         render_display_value(self)
     }
+
+    fn from_values(mut values: Vec<Value>) -> Self {
+        if values.len() == 1 {
+            values.pop().expect("single-value vector must contain a value")
+        } else {
+            Self::Values(values)
+        }
+    }
+
+    fn into_values(self) -> Vec<Value> {
+        match self {
+            Self::Values(values) => values,
+            other => vec![other],
+        }
+    }
 }
 
 impl Builtin {
@@ -360,6 +379,8 @@ impl BuiltinKind {
             Self::Append => "append",
             Self::Reverse => "reverse",
             Self::Apply => "apply",
+            Self::Values => "values",
+            Self::CallWithValues => "call-with-values",
             Self::CallCc => "call/cc",
             Self::Raise => "raise",
             Self::WithExceptionHandler => "with-exception-handler",
@@ -622,6 +643,11 @@ fn continue_with(mut continuation: ContinuationRef, mut value: Value) -> EvalRes
                     *head_position,
                     Rc::clone(next),
                 );
+            }
+            Continuation::CallWithValues { consumer, next } => {
+                let consumer_args = value.into_values();
+                let result = apply_callable(consumer.clone(), &consumer_args, next)?;
+                return continue_with(Rc::clone(next), result);
             }
             Continuation::DynamicWindEnter {
                 frame,

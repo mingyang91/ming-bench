@@ -76,6 +76,10 @@ pub(super) enum Continuation {
         head_position: SourcePos,
         next: ContinuationRef,
     },
+    CallWithValues {
+        consumer: Value,
+        next: ContinuationRef,
+    },
     DynamicWindEnter {
         frame: DynamicWindFrameRef,
         body: Value,
