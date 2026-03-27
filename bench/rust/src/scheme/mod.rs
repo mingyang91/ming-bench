@@ -317,14 +317,45 @@ impl SchemeVector {
 }
 
 #[derive(Clone)]
+struct PairCell {
+    car: RefCell<Value>,
+    cdr: RefCell<Value>,
+}
+
+impl PairCell {
+    fn new(car: Value, cdr: Value) -> Self {
+        Self {
+            car: RefCell::new(car),
+            cdr: RefCell::new(cdr),
+        }
+    }
+
+    fn car(&self) -> Value {
+        self.car.borrow().clone()
+    }
+
+    fn cdr(&self) -> Value {
+        self.cdr.borrow().clone()
+    }
+
+    fn set_car(&self, value: Value) {
+        *self.car.borrow_mut() = value;
+    }
+
+    fn set_cdr(&self, value: Value) {
+        *self.cdr.borrow_mut() = value;
+    }
+}
+
+#[derive(Clone)]
 enum Value {
     Number(Number),
     Boolean(bool),
     String(SchemeString),
     Symbol(String),
     Char(char),
-    List(Vec<Value>),
-    Pair(Box<Value>, Box<Value>),
+    EmptyList,
+    Pair(Rc<PairCell>),
     Vector(SchemeVector),
     Record(Rc<RecordInstance>),
     Procedure(Rc<Procedure>),
@@ -358,6 +389,11 @@ impl Value {
     }
 
     fn render(&self) -> String {
+        let mut active_pairs = HashSet::new();
+        self.render_with_cycles(&mut active_pairs)
+    }
+
+    fn render_with_cycles(&self, active_pairs: &mut HashSet<usize>) -> String {
         match self {
             Self::Number(number) => number.render(),
             Self::Boolean(true) => "#t".to_owned(),
@@ -365,9 +401,9 @@ impl Value {
             Self::String(value) => render_string(&value.contents()),
             Self::Symbol(value) => value.clone(),
             Self::Char(value) => render_char(*value),
-            Self::List(values) => render_list(values),
-            Self::Pair(car, cdr) => render_pair(car, cdr),
-            Self::Vector(values) => render_vector(values),
+            Self::EmptyList => "()".to_owned(),
+            Self::Pair(pair) => render_pair(pair, active_pairs),
+            Self::Vector(values) => render_vector(values, active_pairs),
             Self::Record(record) => format!("#<record {}>", record.record_type.name),
             Self::Procedure(_) => "#<procedure>".to_owned(),
             Self::Void => "#<void>".to_owned(),
@@ -401,6 +437,8 @@ enum Builtin {
     Cons,
     Car,
     Cdr,
+    SetCar,
+    SetCdr,
     Append,
     List,
     Length,
@@ -445,6 +483,7 @@ enum Builtin {
     IntegerToChar,
     Apply,
     Map,
+    ForEach,
     Abs,
     Modulo,
     Remainder,
@@ -693,56 +732,45 @@ fn render_string(value: &str) -> String {
     rendered
 }
 
-fn render_list(values: &[Value]) -> String {
+fn render_pair(pair: &Rc<PairCell>, active_pairs: &mut HashSet<usize>) -> String {
     let mut rendered = String::from("(");
+    render_pair_contents(pair, &mut rendered, active_pairs);
+    rendered.push(')');
+    rendered
+}
 
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            rendered.push(' ');
-        }
-        rendered.push_str(&value.render());
+fn render_pair_contents(pair: &Rc<PairCell>, rendered: &mut String, active_pairs: &mut HashSet<usize>) {
+    let id = pair_id(pair);
+    if !active_pairs.insert(id) {
+        rendered.push_str("#<cycle>");
+        return;
     }
 
-    rendered.push(')');
-    rendered
-}
+    rendered.push_str(&pair.car().render_with_cycles(active_pairs));
 
-fn render_pair(car: &Value, cdr: &Value) -> String {
-    let mut rendered = String::from("(");
-    render_pair_contents(car, cdr, &mut rendered);
-    rendered.push(')');
-    rendered
-}
-
-fn render_pair_contents(car: &Value, cdr: &Value, rendered: &mut String) {
-    rendered.push_str(&car.render());
-
-    match cdr {
-        Value::List(items) => {
-            for value in items {
-                rendered.push(' ');
-                rendered.push_str(&value.render());
-            }
-        }
-        Value::Pair(next_car, next_cdr) => {
+    match pair.cdr() {
+        Value::EmptyList => {}
+        Value::Pair(next_pair) => {
             rendered.push(' ');
-            render_pair_contents(next_car, next_cdr, rendered);
+            render_pair_contents(&next_pair, rendered, active_pairs);
         }
         other => {
             rendered.push_str(" . ");
-            rendered.push_str(&other.render());
+            rendered.push_str(&other.render_with_cycles(active_pairs));
         }
     }
+
+    active_pairs.remove(&id);
 }
 
-fn render_vector(values: &SchemeVector) -> String {
+fn render_vector(values: &SchemeVector, active_pairs: &mut HashSet<usize>) -> String {
     let mut rendered = String::from("#(");
 
     for (index, value) in values.contents().iter().enumerate() {
         if index > 0 {
             rendered.push(' ');
         }
-        rendered.push_str(&value.render());
+        rendered.push_str(&value.render_with_cycles(active_pairs));
     }
 
     rendered.push(')');
@@ -763,6 +791,59 @@ fn render_inexact(value: f64) -> String {
         rendered.push_str(".0");
     }
     rendered
+}
+
+fn empty_list() -> Value {
+    Value::EmptyList
+}
+
+fn cons_value(car: Value, cdr: Value) -> Value {
+    Value::Pair(Rc::new(PairCell::new(car, cdr)))
+}
+
+fn list_from_vec(items: Vec<Value>) -> Value {
+    items
+        .into_iter()
+        .rev()
+        .fold(empty_list(), |tail, item| cons_value(item, tail))
+}
+
+fn pair_id(pair: &Rc<PairCell>) -> usize {
+    Rc::as_ptr(pair) as usize
+}
+
+fn collect_proper_list(value: &Value) -> Option<Vec<Value>> {
+    let mut items = Vec::new();
+    let mut current = value.clone();
+    let mut seen = HashSet::new();
+
+    loop {
+        match current {
+            Value::EmptyList => return Some(items),
+            Value::Pair(pair) => {
+                let id = pair_id(&pair);
+                if !seen.insert(id) {
+                    return None;
+                }
+                items.push(pair.car());
+                current = pair.cdr();
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn is_proper_list(value: &Value) -> bool {
+    collect_proper_list(value).is_some()
+}
+
+fn expect_pair(name: &str, value: &Value) -> Result<Rc<PairCell>, EvalError> {
+    match value {
+        Value::Pair(pair) => Ok(pair.clone()),
+        _ => Err(EvalError::ExpectedPair {
+            name: name.to_owned(),
+        }),
+    }
 }
 
 fn gcd_i128(mut left: i128, mut right: i128) -> i128 {
@@ -1120,6 +1201,8 @@ fn root_env() -> EnvRef {
         ("cons", Builtin::Cons),
         ("car", Builtin::Car),
         ("cdr", Builtin::Cdr),
+        ("set-car!", Builtin::SetCar),
+        ("set-cdr!", Builtin::SetCdr),
         ("append", Builtin::Append),
         ("list", Builtin::List),
         ("length", Builtin::Length),
@@ -1170,6 +1253,7 @@ fn root_env() -> EnvRef {
         ("integer->char", Builtin::IntegerToChar),
         ("apply", Builtin::Apply),
         ("map", Builtin::Map),
+        ("for-each", Builtin::ForEach),
         ("abs", Builtin::Abs),
         ("modulo", Builtin::Modulo),
         ("remainder", Builtin::Remainder),
@@ -1197,7 +1281,103 @@ fn root_env() -> EnvRef {
         env.define(name, Value::Procedure(Rc::new(Procedure::Builtin(builtin))));
     }
 
+    install_prelude(&env);
     env
+}
+
+const STANDARD_PRELUDE: &str = r#"
+(define (caar x) (car (car x)))
+(define (cadr x) (car (cdr x)))
+(define (cdar x) (cdr (car x)))
+(define (cddr x) (cdr (cdr x)))
+(define (caaar x) (car (car (car x))))
+(define (caadr x) (car (car (cdr x))))
+(define (cadar x) (car (cdr (car x))))
+(define (caddr x) (car (cdr (cdr x))))
+(define (cdaar x) (cdr (car (car x))))
+(define (cdadr x) (cdr (car (cdr x))))
+(define (cddar x) (cdr (cdr (car x))))
+(define (cdddr x) (cdr (cdr (cdr x))))
+(define (caaaar x) (car (car (car (car x)))))
+(define (caaadr x) (car (car (car (cdr x)))))
+(define (caadar x) (car (car (cdr (car x)))))
+(define (caaddr x) (car (car (cdr (cdr x)))))
+(define (cadaar x) (car (cdr (car (car x)))))
+(define (cadadr x) (car (cdr (car (cdr x)))))
+(define (caddar x) (car (cdr (cdr (car x)))))
+(define (cadddr x) (car (cdr (cdr (cdr x)))))
+(define (cdaaar x) (cdr (car (car (car x)))))
+(define (cdaadr x) (cdr (car (car (cdr x)))))
+(define (cdadar x) (cdr (car (cdr (car x)))))
+(define (cdaddr x) (cdr (car (cdr (cdr x)))))
+(define (cddaar x) (cdr (cdr (car (car x)))))
+(define (cddadr x) (cdr (cdr (car (cdr x)))))
+(define (cdddar x) (cdr (cdr (cdr (car x)))))
+(define (cddddr x) (cdr (cdr (cdr (cdr x)))))
+
+(define (reverse xs)
+  (let loop ((rest xs) (acc '()))
+    (if (null? rest)
+        acc
+        (loop (cdr rest) (cons (car rest) acc)))))
+
+(define (member obj lst)
+  (cond ((null? lst) #f)
+        ((equal? obj (car lst)) lst)
+        (else (member obj (cdr lst)))))
+
+(define (assv key alist)
+  (cond ((null? alist) #f)
+        ((eqv? key (caar alist)) (car alist))
+        (else (assv key (cdr alist)))))
+
+(define (gcd . nums)
+  (define (gcd2 a b)
+    (let ((a (abs a)) (b (abs b)))
+      (if (= b 0)
+          a
+          (gcd2 b (modulo a b)))))
+  (if (null? nums)
+      0
+      (let loop ((acc (car nums)) (rest (cdr nums)))
+        (if (null? rest)
+            (abs acc)
+            (loop (gcd2 acc (car rest)) (cdr rest))))))
+
+(define (lcm . nums)
+  (define (lcm2 a b)
+    (if (or (= a 0) (= b 0))
+        0
+        (quotient (abs (* a b)) (gcd a b))))
+  (if (null? nums)
+      1
+      (let loop ((acc (car nums)) (rest (cdr nums)))
+        (if (null? rest)
+            (abs acc)
+            (loop (lcm2 acc (car rest)) (cdr rest))))))
+
+(define (truncate x) x)
+(define (round x) x)
+
+(define (make-string k . maybe-fill)
+  (let ((fill (if (null? maybe-fill) #\space (car maybe-fill))))
+    (let loop ((n k) (acc '()))
+      (if (= n 0)
+          (list->string acc)
+          (loop (- n 1) (cons fill acc))))))
+
+(define (string . chars) (list->string chars))
+(define (string>? a b) (string<? b a))
+(define (string<=? a b) (not (string<? b a)))
+(define (string>=? a b) (not (string<? a b)))
+"#;
+
+fn install_prelude(env: &EnvRef) {
+    let mut parser = Parser::new(STANDARD_PRELUDE);
+    let exprs = parser
+        .parse_program()
+        .expect("standard prelude must parse");
+    let _ = eval_sequence(&exprs, env).expect("standard prelude must evaluate");
 }
 
 fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
@@ -1232,6 +1412,7 @@ fn eval_list(items: &[Expr], list_pos: SourcePos, env: &EnvRef) -> Result<Value,
             "cond" => return eval_cond(args, env),
             "case" => return eval_case(args, env),
             "let" => return eval_let(args, env),
+            "let*" => return eval_let_star(args, env),
             "letrec" => return eval_letrec(args, env),
             "letrec*" => return eval_letrec_star(args, env),
             "and" => return eval_and(args, env),
@@ -1301,6 +1482,7 @@ fn eval_tail_list(items: &[Expr], list_pos: SourcePos, env: &EnvRef) -> Result<T
             "cond" => return eval_tail_cond(args, env),
             "case" => return eval_tail_case(args, env),
             "let" => return eval_tail_let(args, env),
+            "let*" => return eval_tail_let_star(args, env),
             "letrec" => return eval_tail_letrec(args, env),
             "letrec*" => return eval_tail_letrec_star(args, env),
             "and" => return eval_tail_and(args, env),
@@ -1389,7 +1571,7 @@ fn eval_tail_apply_builtin(args: &[Value], env: &EnvRef) -> Result<TailOutcome, 
     let operator = args[0].clone();
     let mut applied_args = args[1..args.len() - 1].to_vec();
     let tail = expect_list("apply", &args[args.len() - 1])?;
-    applied_args.extend(tail.iter().cloned());
+    applied_args.extend(tail);
 
     tail_apply_values(operator, &applied_args, env)
 }
@@ -1416,6 +1598,8 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         Builtin::Cons => eval_cons(values),
         Builtin::Car => eval_car(values),
         Builtin::Cdr => eval_cdr(values),
+        Builtin::SetCar => eval_set_car(values),
+        Builtin::SetCdr => eval_set_cdr(values),
         Builtin::Append => eval_append(values),
         Builtin::List => eval_list_builtin(values),
         Builtin::Length => eval_length(values),
@@ -1472,6 +1656,7 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         Builtin::IntegerToChar => eval_integer_to_char(values),
         Builtin::Apply => eval_apply_builtin(values, env),
         Builtin::Map => eval_map_builtin(values, env),
+        Builtin::ForEach => eval_for_each_builtin(values, env),
         Builtin::Abs => eval_abs(values),
         Builtin::Modulo => eval_modulo(values),
         Builtin::Remainder => eval_remainder(values),
@@ -1522,7 +1707,7 @@ fn prepare_lambda_call(lambda: &Lambda, args: &[Value], name: &str) -> Result<En
     if let Some(rest) = &lambda.params.rest {
         call_env.define(
             rest.clone(),
-            Value::List(args[lambda.params.fixed.len()..].to_vec()),
+            list_from_vec(args[lambda.params.fixed.len()..].to_vec()),
         );
     }
 
@@ -2188,6 +2373,7 @@ fn is_special_form_name(name: &str) -> bool {
             | "cond"
             | "case"
             | "let"
+            | "let*"
             | "letrec"
             | "letrec*"
             | "and"
@@ -2293,7 +2479,7 @@ fn quote_expr(expr: &Expr) -> Value {
         Expr::String(value, _) => Value::String(SchemeString::new(value.clone())),
         Expr::Char(value, _) => Value::Char(*value),
         Expr::Symbol(value, _) => Value::Symbol(value.clone()),
-        Expr::List(items, _) => Value::List(items.iter().map(quote_expr).collect()),
+        Expr::List(items, _) => list_from_vec(items.iter().map(quote_expr).collect()),
     }
 }
 
@@ -2600,6 +2786,52 @@ fn eval_tail_regular_let(
     let scope = Environment::new(Some(env.clone()));
 
     for ((name, _), value) in bindings.into_iter().zip(values) {
+        scope.define(name, value);
+    }
+
+    tail_sequence(body, &scope)
+}
+
+fn eval_let_star(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let (bindings_expr, body) = args
+        .split_first()
+        .ok_or_else(|| EvalError::Parse("let* requires bindings".to_owned()))?;
+    if body.is_empty() {
+        return Err(EvalError::Parse("let* requires a body".to_owned()));
+    }
+
+    let bindings = match bindings_expr {
+        Expr::List(bindings, _) => bindings,
+        _ => return Err(EvalError::Parse("let* bindings must be a list".to_owned())),
+    };
+    let bindings = parse_bindings(bindings, "let*")?;
+    let scope = Environment::new(Some(env.clone()));
+
+    for (name, expr) in bindings {
+        let value = eval_expr(&expr, &scope)?;
+        scope.define(name, value);
+    }
+
+    eval_sequence(body, &scope)
+}
+
+fn eval_tail_let_star(args: &[Expr], env: &EnvRef) -> Result<TailOutcome, EvalError> {
+    let (bindings_expr, body) = args
+        .split_first()
+        .ok_or_else(|| EvalError::Parse("let* requires bindings".to_owned()))?;
+    if body.is_empty() {
+        return Err(EvalError::Parse("let* requires a body".to_owned()));
+    }
+
+    let bindings = match bindings_expr {
+        Expr::List(bindings, _) => bindings,
+        _ => return Err(EvalError::Parse("let* bindings must be a list".to_owned())),
+    };
+    let bindings = parse_bindings(bindings, "let*")?;
+    let scope = Environment::new(Some(env.clone()));
+
+    for (name, expr) in bindings {
+        let value = eval_expr(&expr, &scope)?;
         scope.define(name, value);
     }
 
@@ -2978,7 +3210,7 @@ fn eval_apply_builtin(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> 
     let operator = args[0].clone();
     let mut applied_args = args[1..args.len() - 1].to_vec();
     let tail = expect_list("apply", &args[args.len() - 1])?;
-    applied_args.extend(tail.iter().cloned());
+    applied_args.extend(tail);
 
     apply_values(operator, &applied_args, env)
 }
@@ -3154,17 +3386,7 @@ fn eval_cons(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    match &args[1] {
-        Value::List(tail) => {
-            let mut tail = tail.clone();
-            tail.insert(0, args[0].clone());
-            Ok(Value::List(tail))
-        }
-        other => Ok(Value::Pair(
-            Box::new(args[0].clone()),
-            Box::new(other.clone()),
-        )),
-    }
+    Ok(cons_value(args[0].clone(), args[1].clone()))
 }
 
 fn eval_car(args: &[Value]) -> Result<Value, EvalError> {
@@ -3176,13 +3398,7 @@ fn eval_car(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    match &args[0] {
-        Value::List(items) if !items.is_empty() => Ok(items[0].clone()),
-        Value::Pair(car, _) => Ok((**car).clone()),
-        _ => Err(EvalError::ExpectedPair {
-            name: "car".to_owned(),
-        }),
-    }
+    Ok(expect_pair("car", &args[0])?.car())
 }
 
 fn eval_cdr(args: &[Value]) -> Result<Value, EvalError> {
@@ -3194,27 +3410,47 @@ fn eval_cdr(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    match &args[0] {
-        Value::List(items) if !items.is_empty() => Ok(Value::List(items[1..].to_vec())),
-        Value::Pair(_, cdr) => Ok((**cdr).clone()),
-        _ => Err(EvalError::ExpectedPair {
-            name: "cdr".to_owned(),
-        }),
+    Ok(expect_pair("cdr", &args[0])?.cdr())
+}
+
+fn eval_set_car(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "set-car!".to_owned(),
+            expected: "exactly 2 arguments".to_owned(),
+            got: args.len(),
+        });
     }
+
+    expect_pair("set-car!", &args[0])?.set_car(args[1].clone());
+    Ok(Value::Void)
+}
+
+fn eval_set_cdr(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "set-cdr!".to_owned(),
+            expected: "exactly 2 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    expect_pair("set-cdr!", &args[0])?.set_cdr(args[1].clone());
+    Ok(Value::Void)
 }
 
 fn eval_append(args: &[Value]) -> Result<Value, EvalError> {
     let mut combined = Vec::new();
 
     for value in args {
-        combined.extend(expect_list("append", value)?.iter().cloned());
+        combined.extend(expect_list("append", value)?);
     }
 
-    Ok(Value::List(combined))
+    Ok(list_from_vec(combined))
 }
 
 fn eval_list_builtin(args: &[Value]) -> Result<Value, EvalError> {
-    Ok(Value::List(args.to_vec()))
+    Ok(list_from_vec(args.to_vec()))
 }
 
 fn eval_length(args: &[Value]) -> Result<Value, EvalError> {
@@ -3239,20 +3475,15 @@ fn eval_null_pred(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    Ok(Value::Boolean(
-        matches!(&args[0], Value::List(items) if items.is_empty()),
-    ))
+    Ok(Value::Boolean(matches!(&args[0], Value::EmptyList)))
 }
 
 fn eval_pair_pred(args: &[Value]) -> Result<Value, EvalError> {
-    eval_type_predicate(args, "pair?", |value| {
-        matches!(value, Value::List(items) if !items.is_empty())
-            || matches!(value, Value::Pair(_, _))
-    })
+    eval_type_predicate(args, "pair?", |value| matches!(value, Value::Pair(_)))
 }
 
 fn eval_list_pred(args: &[Value]) -> Result<Value, EvalError> {
-    eval_type_predicate(args, "list?", |value| matches!(value, Value::List(_)))
+    eval_type_predicate(args, "list?", is_proper_list)
 }
 
 fn eval_symbol_pred(args: &[Value]) -> Result<Value, EvalError> {
@@ -3609,7 +3840,7 @@ fn eval_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    Ok(Value::List(
+    Ok(list_from_vec(
         expect_string("string->list", &args[0])?
             .contents()
             .chars()
@@ -3943,7 +4174,7 @@ fn eval_list_tail(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    Ok(Value::List(items[index as usize..].to_vec()))
+    Ok(list_from_vec(items[index as usize..].to_vec()))
 }
 
 fn eval_assoc(args: &[Value]) -> Result<Value, EvalError> {
@@ -3959,9 +4190,8 @@ fn eval_assoc(args: &[Value]) -> Result<Value, EvalError> {
     let entries = expect_list("assoc", &args[1])?;
 
     for entry in entries {
-        let candidate = match entry {
-            Value::List(items) if !items.is_empty() => &items[0],
-            Value::Pair(car, _) => car.as_ref(),
+        let candidate = match &entry {
+            Value::Pair(pair) => pair.car(),
             _ => {
                 return Err(EvalError::ExpectedPair {
                     name: "assoc".to_owned(),
@@ -3969,7 +4199,7 @@ fn eval_assoc(args: &[Value]) -> Result<Value, EvalError> {
             }
         };
 
-        if values_equal(candidate, key) {
+        if values_equal(&candidate, key) {
             return Ok(entry.clone());
         }
     }
@@ -4083,9 +4313,7 @@ fn eval_vector_to_list(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    Ok(Value::List(
-        expect_vector("vector->list", &args[0])?.contents(),
-    ))
+    Ok(list_from_vec(expect_vector("vector->list", &args[0])?.contents()))
 }
 
 fn eval_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
@@ -4097,9 +4325,10 @@ fn eval_list_to_vector(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    Ok(Value::Vector(SchemeVector::new(
-        expect_list("list->vector", &args[0])?.to_vec(),
-    )))
+    Ok(Value::Vector(SchemeVector::new(expect_list(
+        "list->vector",
+        &args[0],
+    )?)))
 }
 
 fn eval_map_builtin(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
@@ -4134,7 +4363,41 @@ fn eval_map_builtin(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
         results.push(apply_values(operator.clone(), &call_args, env)?);
     }
 
-    Ok(Value::List(results))
+    Ok(list_from_vec(results))
+}
+
+fn eval_for_each_builtin(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "for-each".to_owned(),
+            expected: "at least 2 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let operator = args[0].clone();
+    let lists = args[1..]
+        .iter()
+        .map(|value| expect_list("for-each", value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let len = lists.first().map_or(0, |list| list.len());
+
+    if lists.iter().any(|list| list.len() != len) {
+        return Err(EvalError::InvalidArgument {
+            name: "for-each".to_owned(),
+            message: "list arguments must have the same length".to_owned(),
+        });
+    }
+
+    for index in 0..len {
+        let call_args = lists
+            .iter()
+            .map(|list| list[index].clone())
+            .collect::<Vec<_>>();
+        let _ = apply_values(operator.clone(), &call_args, env)?;
+    }
+
+    Ok(Value::Void)
 }
 
 fn eval_number_args(name: &str, args: &[Value]) -> Result<Vec<Number>, EvalError> {
@@ -4393,13 +4656,10 @@ fn expect_symbol_value<'a>(name: &str, value: &'a Value) -> Result<&'a str, Eval
     }
 }
 
-fn expect_list<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EvalError> {
-    match value {
-        Value::List(items) => Ok(items),
-        _ => Err(EvalError::ExpectedList {
-            name: name.to_owned(),
-        }),
-    }
+fn expect_list(name: &str, value: &Value) -> Result<Vec<Value>, EvalError> {
+    collect_proper_list(value).ok_or_else(|| EvalError::ExpectedList {
+        name: name.to_owned(),
+    })
 }
 
 fn expect_vector<'a>(name: &str, value: &'a Value) -> Result<&'a SchemeVector, EvalError> {
@@ -4432,7 +4692,8 @@ fn values_eq(left: &Value, right: &Value) -> bool {
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
         (Value::String(left), Value::String(right)) => Rc::ptr_eq(&left.value, &right.value),
-        (Value::List(left), Value::List(right)) => left.is_empty() && right.is_empty(),
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
         (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(&left.values, &right.values),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
@@ -4446,30 +4707,49 @@ fn values_eqv(left: &Value, right: &Value) -> bool {
 }
 
 fn values_equal(left: &Value, right: &Value) -> bool {
+    let mut seen_pairs = HashSet::new();
+    let mut seen_vectors = HashSet::new();
+    values_equal_inner(left, right, &mut seen_pairs, &mut seen_vectors)
+}
+
+fn values_equal_inner(
+    left: &Value,
+    right: &Value,
+    seen_pairs: &mut HashSet<(usize, usize)>,
+    seen_vectors: &mut HashSet<(usize, usize)>,
+) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => numbers_equal(*left, *right),
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::String(left), Value::String(right)) => left.contents() == right.contents(),
         (Value::Symbol(left), Value::Symbol(right)) => left == right,
         (Value::Char(left), Value::Char(right)) => left == right,
-        (Value::List(left), Value::List(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| values_equal(left, right))
-        }
-        (Value::Pair(left_car, left_cdr), Value::Pair(right_car, right_cdr)) => {
-            values_equal(left_car, right_car) && values_equal(left_cdr, right_cdr)
+        (Value::EmptyList, Value::EmptyList) => true,
+        (Value::Pair(left_pair), Value::Pair(right_pair)) => {
+            let key = (pair_id(left_pair), pair_id(right_pair));
+            if !seen_pairs.insert(key) {
+                return true;
+            }
+
+            values_equal_inner(&left_pair.car(), &right_pair.car(), seen_pairs, seen_vectors)
+                && values_equal_inner(&left_pair.cdr(), &right_pair.cdr(), seen_pairs, seen_vectors)
         }
         (Value::Vector(left), Value::Vector(right)) => {
+            let key = (
+                Rc::as_ptr(&left.values) as usize,
+                Rc::as_ptr(&right.values) as usize,
+            );
+            if !seen_vectors.insert(key) {
+                return true;
+            }
+
             let left = left.contents();
             let right = right.contents();
             left.len() == right.len()
                 && left
                     .iter()
                     .zip(right.iter())
-                    .all(|(left, right)| values_equal(left, right))
+                    .all(|(left, right)| values_equal_inner(left, right, seen_pairs, seen_vectors))
         }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
