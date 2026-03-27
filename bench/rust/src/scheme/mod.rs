@@ -202,6 +202,20 @@ impl Environment {
 
         self.parent.as_ref().and_then(|parent| parent.lookup(name))
     }
+
+    fn set(&self, name: &str, value: Value) -> bool {
+        {
+            let mut bindings = self.bindings.borrow_mut();
+            if let Some(slot) = bindings.get_mut(name) {
+                *slot = value;
+                return true;
+            }
+        }
+
+        self.parent
+            .as_ref()
+            .is_some_and(|parent| parent.set(name, value))
+    }
 }
 
 fn render_string(value: &str) -> String {
@@ -532,6 +546,7 @@ fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => return eval_define(args, env),
+            "set!" => return eval_set(args, env),
             "if" => return eval_if(args, env),
             "quote" => return eval_quote(args),
             "lambda" => return eval_lambda(args, env),
@@ -664,6 +679,25 @@ fn eval_define(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
         _ => Err(EvalError::Parse(
             "define target must be a symbol".to_owned(),
         )),
+    }
+}
+
+fn eval_set(args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "set!".to_owned(),
+            expected: "exactly 2 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let name = expect_symbol(&args[0], "set! target")?;
+    let value = eval_expr(&args[1], env)?;
+
+    if env.set(&name, value) {
+        Ok(Value::Void)
+    } else {
+        Err(EvalError::UnboundSymbol(name))
     }
 }
 
@@ -1180,7 +1214,9 @@ fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
     }
 
     Ok(Value::String(SchemeString::new(
-        chars[start as usize..end as usize].iter().collect::<String>(),
+        chars[start as usize..end as usize]
+            .iter()
+            .collect::<String>(),
     )))
 }
 
@@ -1283,7 +1319,9 @@ fn eval_string_copy(args: &[Value]) -> Result<Value, EvalError> {
         });
     }
 
-    Ok(Value::String(expect_string("string-copy", &args[0])?.copy_string()))
+    Ok(Value::String(
+        expect_string("string-copy", &args[0])?.copy_string(),
+    ))
 }
 
 fn eval_string_set(args: &[Value]) -> Result<Value, EvalError> {
