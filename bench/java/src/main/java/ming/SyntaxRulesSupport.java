@@ -224,9 +224,9 @@ final class SyntaxRulesSupport {
 
     private static boolean isCoreSyntax(String name) {
         return switch (name) {
-            case "and", "or", "begin", "cond", "define", "define-record-type",
-                    "define-syntax", "if", "lambda", "let", "quote", "set!",
-                    "syntax-rules" -> true;
+            case "and", "or", "begin", "case", "case-lambda", "cond", "define",
+                    "define-record-type", "define-syntax", "do", "if", "lambda",
+                    "let", "letrec", "letrec*", "quote", "set!", "syntax-rules" -> true;
             default -> false;
         };
     }

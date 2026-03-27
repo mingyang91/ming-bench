@@ -14,10 +14,17 @@ final class Interpreter {
     private final Environment globalEnv;
     private final StringBuilder output;
     private final ProcedureRuntime procedureRuntime;
+    private final SpecialFormEvaluator specialFormEvaluator;
 
     Interpreter() {
         this.output = new StringBuilder();
         this.procedureRuntime = new ProcedureRuntime(this::evalSequence, this::buildList);
+        this.specialFormEvaluator = new SpecialFormEvaluator(new SpecialFormRuntime(
+                this::eval,
+                this::parseParameters,
+                this::eqvValues,
+                procedureRuntime
+        ));
         this.globalEnv = createGlobalEnv();
     }
 
@@ -83,7 +90,16 @@ final class Interpreter {
         env.define("pair?", new BuiltinProcedure("pair?", this::applyPairPredicate));
         env.define("symbol?", new BuiltinProcedure("symbol?", this::applySymbolPredicate));
         env.define("eq?", new BuiltinProcedure("eq?", this::applyEq));
+        env.define("eqv?", new BuiltinProcedure("eqv?", this::applyEqv));
         env.define("equal?", new BuiltinProcedure("equal?", this::applyEqual));
+        env.define("vector", new BuiltinProcedure("vector", this::applyVector));
+        env.define("make-vector", new BuiltinProcedure("make-vector", this::applyMakeVector));
+        env.define("vector-ref", new BuiltinProcedure("vector-ref", this::applyVectorRef));
+        env.define("vector-set!", new BuiltinProcedure("vector-set!", this::applyVectorSet));
+        env.define("vector-length", new BuiltinProcedure("vector-length", this::applyVectorLength));
+        env.define("vector?", new BuiltinProcedure("vector?", this::applyVectorPredicate));
+        env.define("vector->list", new BuiltinProcedure("vector->list", this::applyVectorToList));
+        env.define("list->vector", new BuiltinProcedure("list->vector", this::applyListToVector));
         env.define("map", new BuiltinProcedure("map", this::applyMap));
         env.define("abs", new BuiltinProcedure("abs", this::applyAbs));
         env.define("modulo", new BuiltinProcedure("modulo", this::applyModulo));
@@ -143,35 +159,9 @@ final class Interpreter {
             if ("define-record-type".equals(symbolName)) {
                 return evalDefineRecordType(listExpr, env);
             }
-            if ("if".equals(symbolName)) {
-                return evalIf(listExpr, env);
-            }
-            if ("quote".equals(symbolName)) {
-                return evalQuote(listExpr);
-            }
-            if ("lambda".equals(symbolName)) {
-                return evalLambda(listExpr, env);
-            }
-            if ("case-lambda".equals(symbolName)) {
-                return evalCaseLambda(listExpr, env);
-            }
-            if ("set!".equals(symbolName)) {
-                return evalSet(listExpr, env);
-            }
-            if ("begin".equals(symbolName)) {
-                return evalBegin(listExpr, env);
-            }
-            if ("let".equals(symbolName)) {
-                return evalLet(listExpr, env);
-            }
-            if ("cond".equals(symbolName)) {
-                return evalCond(listExpr, env);
-            }
-            if ("and".equals(symbolName)) {
-                return evalAnd(listExpr.elements().subList(1, listExpr.elements().size()), env);
-            }
-            if ("or".equals(symbolName)) {
-                return evalOr(listExpr.elements().subList(1, listExpr.elements().size()), env);
+            var specialFormValue = specialFormEvaluator.tryEval(symbolName, listExpr, env);
+            if (specialFormValue.isPresent()) {
+                return specialFormValue.get();
             }
 
             SyntaxRulesMacro definition = env.lookupMacro(symbolName);
@@ -335,190 +325,6 @@ final class Interpreter {
         }
 
         return VOID;
-    }
-
-    private Value evalIf(ListExpr listExpr, Environment env) throws EvalError {
-        ensureExactlyExpressions("if", listExpr, 4);
-        Value condition = eval(listExpr.elements().get(1), env);
-        Expr branch = condition.isTruthy() ? listExpr.elements().get(2) : listExpr.elements().get(3);
-        return eval(branch, env);
-    }
-
-    private Value evalQuote(ListExpr listExpr) throws EvalError {
-        ensureExactlyExpressions("quote", listExpr, 2);
-        return quoteToValue(listExpr.elements().get(1));
-    }
-
-    private Value evalLambda(ListExpr listExpr, Environment env) throws EvalError {
-        ensureAtLeastExpressions("lambda", listExpr, 3);
-        Expr parametersExpr = listExpr.elements().get(1);
-        if (!(parametersExpr instanceof ListExpr parametersList)) {
-            throw error(parametersExpr.loc(), "lambda requires a parameter list");
-        }
-
-        ParameterSpec parameters = parseParameters(parametersList.elements(), "lambda");
-        List<Expr> body = List.copyOf(listExpr.elements().subList(2, listExpr.elements().size()));
-        return new UserProcedure(
-                "lambda",
-                parameters.requiredParameters(),
-                parameters.restParameter(),
-                body,
-                env,
-                procedureRuntime
-        );
-    }
-
-    private Value evalCaseLambda(ListExpr listExpr, Environment env) throws EvalError {
-        ensureAtLeastExpressions("case-lambda", listExpr, 2);
-
-        List<CaseLambdaClause> clauses = new ArrayList<>(listExpr.elements().size() - 1);
-        for (int index = 1; index < listExpr.elements().size(); index++) {
-            Expr clauseExpr = listExpr.elements().get(index);
-            if (!(clauseExpr instanceof ListExpr clauseList)) {
-                throw error(clauseExpr.loc(), "case-lambda clauses must be lists");
-            }
-            if (clauseList.elements().isEmpty()) {
-                throw error(clauseExpr.loc(), "case-lambda clauses cannot be empty");
-            }
-
-            Expr parametersExpr = clauseList.elements().getFirst();
-            if (!(parametersExpr instanceof ListExpr parametersList)) {
-                throw error(parametersExpr.loc(), "case-lambda clauses require a parameter list");
-            }
-
-            ParameterSpec parameters = parseParameters(parametersList.elements(), "case-lambda");
-            List<Expr> body = List.copyOf(clauseList.elements().subList(1, clauseList.elements().size()));
-            if (body.isEmpty()) {
-                throw error(clauseExpr.loc(), "case-lambda clauses must have a body");
-            }
-
-            clauses.add(new CaseLambdaClause(
-                    parameters.requiredParameters(),
-                    parameters.restParameter(),
-                    body
-            ));
-        }
-
-        return new CaseLambdaProcedure(clauses, env, procedureRuntime);
-    }
-
-    private Value evalSet(ListExpr listExpr, Environment env) throws EvalError {
-        ensureExactlyExpressions("set!", listExpr, 3);
-
-        Expr targetExpr = listExpr.elements().get(1);
-        if (!(targetExpr instanceof SymbolExpr symbolExpr)) {
-            throw error(targetExpr.loc(), "set! requires a symbol");
-        }
-
-        Value value = eval(listExpr.elements().get(2), env);
-        env.set(symbolExpr.name(), value, symbolExpr.loc());
-        return VOID;
-    }
-
-    private Value evalBegin(ListExpr listExpr, Environment env) throws EvalError {
-        return evalSequence(listExpr.elements().subList(1, listExpr.elements().size()), env);
-    }
-
-    private Value evalLet(ListExpr listExpr, Environment env) throws EvalError {
-        ensureAtLeastExpressions("let", listExpr, 3);
-
-        Expr secondExpr = listExpr.elements().get(1);
-        if (secondExpr instanceof SymbolExpr nameSymbol) {
-            if (listExpr.elements().size() < 4) {
-                throw error(listExpr.loc(),
-                        "let expected at least 2 arguments but got "
-                                + (listExpr.elements().size() - 1));
-            }
-
-            Expr bindingExpr = listExpr.elements().get(2);
-            if (!(bindingExpr instanceof ListExpr bindingList)) {
-                throw error(bindingExpr.loc(), "let requires a binding list");
-            }
-
-            BindingParseResult bindings = parseBindings(bindingList, env);
-            List<Expr> body = List.copyOf(listExpr.elements().subList(3, listExpr.elements().size()));
-
-            Environment namedLetEnv = new Environment(env);
-            UserProcedure procedure = new UserProcedure(
-                    nameSymbol.name(),
-                    bindings.names(),
-                    null,
-                    body,
-                    namedLetEnv,
-                    procedureRuntime
-            );
-            namedLetEnv.define(nameSymbol.name(), procedure);
-            return procedure.apply(bindings.values(), listExpr.loc());
-        }
-
-        if (!(secondExpr instanceof ListExpr bindingList)) {
-            throw error(secondExpr.loc(), "let requires a binding list");
-        }
-
-        BindingParseResult bindings = parseBindings(bindingList, env);
-        Environment letEnv = new Environment(env);
-        for (int index = 0; index < bindings.names().size(); index++) {
-            letEnv.define(bindings.names().get(index), bindings.values().get(index));
-        }
-        return evalSequence(listExpr.elements().subList(2, listExpr.elements().size()), letEnv);
-    }
-
-    private Value evalCond(ListExpr listExpr, Environment env) throws EvalError {
-        ensureAtLeastExpressions("cond", listExpr, 2);
-
-        List<Expr> clauses = listExpr.elements().subList(1, listExpr.elements().size());
-        for (int clauseIndex = 0; clauseIndex < clauses.size(); clauseIndex++) {
-            Expr clauseExpr = clauses.get(clauseIndex);
-            if (!(clauseExpr instanceof ListExpr clauseList)) {
-                throw error(clauseExpr.loc(), "cond clauses must be lists");
-            }
-            if (clauseList.elements().isEmpty()) {
-                throw error(clauseExpr.loc(), "cond clauses cannot be empty");
-            }
-
-            Expr testExpr = clauseList.elements().getFirst();
-            boolean isElseClause = testExpr instanceof SymbolExpr symbolExpr
-                    && "else".equals(symbolExpr.name());
-            if (isElseClause) {
-                if (clauseIndex != clauses.size() - 1) {
-                    throw error(testExpr.loc(), "cond else clause must be last");
-                }
-                return evalSequence(clauseList.elements().subList(1, clauseList.elements().size()), env);
-            }
-
-            Value testValue = eval(testExpr, env);
-            if (!testValue.isTruthy()) {
-                continue;
-            }
-            if (clauseList.elements().size() == 1) {
-                return testValue;
-            }
-            return evalSequence(clauseList.elements().subList(1, clauseList.elements().size()), env);
-        }
-
-        return VOID;
-    }
-
-    private Value evalAnd(List<Expr> expressions, Environment env) throws EvalError {
-        Value lastValue = TRUE;
-        for (Expr expression : expressions) {
-            Value value = eval(expression, env);
-            if (!value.isTruthy()) {
-                return value;
-            }
-            lastValue = value;
-        }
-        return lastValue;
-    }
-
-    private Value evalOr(List<Expr> expressions, Environment env) throws EvalError {
-        for (Expr expression : expressions) {
-            Value value = eval(expression, env);
-            if (value.isTruthy()) {
-                return value;
-            }
-        }
-        return FALSE;
     }
 
     private Value applyAdd(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -836,12 +642,77 @@ final class Interpreter {
 
     private Value applyEq(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("eq?", arguments, 2, callLoc);
-        return eqValues(arguments.get(0), arguments.get(1)) ? TRUE : FALSE;
+        return eqvValues(arguments.get(0), arguments.get(1)) ? TRUE : FALSE;
+    }
+
+    private Value applyEqv(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("eqv?", arguments, 2, callLoc);
+        return eqvValues(arguments.get(0), arguments.get(1)) ? TRUE : FALSE;
     }
 
     private Value applyEqual(List<Value> arguments, SourceLoc callLoc) throws EvalError {
         ensureExactly("equal?", arguments, 2, callLoc);
         return equalValues(arguments.get(0), arguments.get(1)) ? TRUE : FALSE;
+    }
+
+    private Value applyVector(List<Value> arguments, SourceLoc callLoc) {
+        return new VectorValue(arguments);
+    }
+
+    private Value applyMakeVector(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        if (arguments.size() != 1 && arguments.size() != 2) {
+            throw error(callLoc,
+                    "make-vector expected 1 or 2 arguments but got " + arguments.size());
+        }
+
+        int length = requireIndex(arguments.getFirst(), "make-vector", callLoc);
+        Value fill = arguments.size() == 2 ? arguments.get(1) : VOID;
+        List<Value> elements = new ArrayList<>(length);
+        for (int index = 0; index < length; index++) {
+            elements.add(fill);
+        }
+        return new VectorValue(elements);
+    }
+
+    private Value applyVectorRef(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("vector-ref", arguments, 2, callLoc);
+        VectorValue vectorValue = requireVector(arguments.get(0), "vector-ref", callLoc);
+        int index = requireIndex(arguments.get(1), "vector-ref", callLoc);
+        if (index >= vectorValue.size()) {
+            throw error(callLoc, "vector-ref index is out of bounds");
+        }
+        return vectorValue.element(index);
+    }
+
+    private Value applyVectorSet(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("vector-set!", arguments, 3, callLoc);
+        VectorValue vectorValue = requireVector(arguments.get(0), "vector-set!", callLoc);
+        int index = requireIndex(arguments.get(1), "vector-set!", callLoc);
+        vectorValue.setElement(index, arguments.get(2), callLoc, "vector-set!");
+        return VOID;
+    }
+
+    private Value applyVectorLength(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("vector-length", arguments, 1, callLoc);
+        VectorValue vectorValue = requireVector(arguments.getFirst(), "vector-length", callLoc);
+        return new NumberValue(SchemeNumber.exact(
+                Rational.integer(BigInteger.valueOf(vectorValue.size()))
+        ));
+    }
+
+    private Value applyVectorPredicate(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("vector?", arguments, 1, callLoc);
+        return arguments.getFirst() instanceof VectorValue ? TRUE : FALSE;
+    }
+
+    private Value applyVectorToList(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("vector->list", arguments, 1, callLoc);
+        return buildList(requireVector(arguments.getFirst(), "vector->list", callLoc).elements());
+    }
+
+    private Value applyListToVector(List<Value> arguments, SourceLoc callLoc) throws EvalError {
+        ensureExactly("list->vector", arguments, 1, callLoc);
+        return new VectorValue(requireProperList(arguments.getFirst(), "list->vector", callLoc));
     }
 
     private Value applyMap(List<Value> arguments, SourceLoc callLoc) throws EvalError {
@@ -1186,50 +1057,6 @@ final class Interpreter {
         }
         return lastValue;
     }
-
-    private Value quoteToValue(Expr expression) throws EvalError {
-        return switch (expression) {
-            case NumberExpr numberExpr -> new NumberValue(numberExpr.value());
-            case BooleanExpr booleanExpr -> booleanExpr.value() ? TRUE : FALSE;
-            case StringExpr stringExpr -> new StringValue(stringExpr.value());
-            case CharExpr charExpr -> new CharValue(charExpr.codePoint());
-            case SymbolExpr symbolExpr -> new SymbolValue(symbolExpr.name());
-            case ListExpr listExpr -> quoteList(listExpr.elements());
-        };
-    }
-
-    private Value quoteList(List<Expr> expressions) throws EvalError {
-        Value result = EMPTY_LIST;
-        for (int index = expressions.size() - 1; index >= 0; index--) {
-            result = new PairValue(quoteToValue(expressions.get(index)), result);
-        }
-        return result;
-    }
-
-    private BindingParseResult parseBindings(ListExpr bindingsList, Environment env) throws EvalError {
-        List<String> names = new ArrayList<>(bindingsList.elements().size());
-        List<Value> values = new ArrayList<>(bindingsList.elements().size());
-
-        for (Expr bindingExpr : bindingsList.elements()) {
-            if (!(bindingExpr instanceof ListExpr bindingList)) {
-                throw error(bindingExpr.loc(), "let bindings must be lists");
-            }
-            if (bindingList.elements().size() != 2) {
-                throw error(bindingExpr.loc(), "let bindings must contain a name and value");
-            }
-
-            Expr nameExpr = bindingList.elements().getFirst();
-            if (!(nameExpr instanceof SymbolExpr symbolExpr)) {
-                throw error(nameExpr.loc(), "let binding names must be symbols");
-            }
-
-            names.add(symbolExpr.name());
-            values.add(eval(bindingList.elements().get(1), env));
-        }
-
-        return new BindingParseResult(List.copyOf(names), List.copyOf(values));
-    }
-
     private ParameterSpec parseParameters(List<Expr> parameterExprs, String formName)
             throws EvalError {
         List<String> parameters = new ArrayList<>(parameterExprs.size());
@@ -1330,6 +1157,14 @@ final class Interpreter {
         throw error(callLoc, procedureName + " expects a pair");
     }
 
+    private VectorValue requireVector(Value value, String procedureName, SourceLoc callLoc)
+            throws EvalError {
+        if (value instanceof VectorValue vectorValue) {
+            return vectorValue;
+        }
+        throw error(callLoc, procedureName + " expects a vector");
+    }
+
     private List<Value> requireProperList(Value value, String procedureName, SourceLoc callLoc)
             throws EvalError {
         List<Value> elements = new ArrayList<>();
@@ -1359,7 +1194,7 @@ final class Interpreter {
         return current instanceof EmptyListValue;
     }
 
-    private boolean eqValues(Value left, Value right) {
+    private boolean eqvValues(Value left, Value right) {
         if (left == right) {
             return true;
         }
@@ -1379,7 +1214,7 @@ final class Interpreter {
     }
 
     private boolean equalValues(Value left, Value right) {
-        if (eqValues(left, right)) {
+        if (eqvValues(left, right)) {
             return true;
         }
         if (left instanceof StringValue leftString && right instanceof StringValue rightString) {
@@ -1388,6 +1223,17 @@ final class Interpreter {
         if (left instanceof PairValue leftPair && right instanceof PairValue rightPair) {
             return equalValues(leftPair.car(), rightPair.car())
                     && equalValues(leftPair.cdr(), rightPair.cdr());
+        }
+        if (left instanceof VectorValue leftVector && right instanceof VectorValue rightVector) {
+            if (leftVector.size() != rightVector.size()) {
+                return false;
+            }
+            for (int index = 0; index < leftVector.size(); index++) {
+                if (!equalValues(leftVector.element(index), rightVector.element(index))) {
+                    return false;
+                }
+            }
+            return true;
         }
         return false;
     }

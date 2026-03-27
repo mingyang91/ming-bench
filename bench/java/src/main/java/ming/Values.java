@@ -1,5 +1,6 @@
 package ming;
 
+import java.util.ArrayList;
 import java.util.List;
 
 interface Procedure {
@@ -81,6 +82,47 @@ final class StringValue implements Value {
         int startOffset = contents.offsetByCodePoints(0, index);
         int endOffset = contents.offsetByCodePoints(startOffset, 1);
         contents.replace(startOffset, endOffset, new String(Character.toChars(codePoint)));
+    }
+}
+
+final class VectorValue implements Value {
+    private final List<Value> elements;
+
+    VectorValue(List<Value> elements) {
+        this.elements = new ArrayList<>(elements);
+    }
+
+    int size() {
+        return elements.size();
+    }
+
+    Value element(int index) {
+        return elements.get(index);
+    }
+
+    void setElement(int index, Value value, SourceLoc callLoc, String procedureName) throws EvalError {
+        if (index >= elements.size()) {
+            throw SchemeErrors.at(callLoc, procedureName + " index is out of bounds");
+        }
+        elements.set(index, value);
+    }
+
+    List<Value> elements() {
+        return List.copyOf(elements);
+    }
+
+    @Override
+    public String render() {
+        StringBuilder builder = new StringBuilder();
+        builder.append("#(");
+        for (int index = 0; index < elements.size(); index++) {
+            if (index > 0) {
+                builder.append(' ');
+            }
+            builder.append(elements.get(index).render());
+        }
+        builder.append(')');
+        return builder.toString();
     }
 }
 
