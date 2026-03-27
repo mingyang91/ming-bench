@@ -75,10 +75,16 @@ type WindFrame = {
   after: ProcedureValue;
   position: SourcePosition;
 };
+type ExceptionHandlerFrame = {
+  windStack: WindFrame[];
+  previousHandlers: ExceptionHandlerFrame[];
+  handle: (value: Value, position: SourcePosition) => MachineStep;
+};
 type ContinuationValue = {
   kind: 'continuation';
   resume: ContinuationFn;
   windStack: WindFrame[];
+  handlerStack: ExceptionHandlerFrame[];
 };
 type RecordFieldSpec = {
   name: string;
@@ -127,6 +133,7 @@ const VOID: VoidValue = { kind: 'void' };
 const UNINITIALIZED = Symbol('uninitialized');
 const STRING_IMMUTABILITY_LEVEL = 15;
 let currentWindFrames: WindFrame[] = [];
+let currentExceptionHandlers: ExceptionHandlerFrame[] = [];
 const CORE_SYNTAX = new Set([
   'and',
   'begin',
@@ -137,6 +144,7 @@ const CORE_SYNTAX = new Set([
   'define-record-type',
   'define-syntax',
   'do',
+  'guard',
   'if',
   'lambda',
   'let',
@@ -160,6 +168,13 @@ class OutputBuffer {
   toString(): string {
     return this.parts.join('');
   }
+}
+
+class SchemeExceptionSignal {
+  constructor(
+    readonly value: Value,
+    readonly position: SourcePosition,
+  ) {}
 }
 
 class Env {
@@ -1081,6 +1096,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
     builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
     builtin('positive?', (args) => numberPredicate('positive?', args, (value) => num.numericIsPositive(value))),
     builtin('procedure?', (args) => unaryPredicate('procedure?', args, isProcedure)),
+    builtin('raise', (args, position) => raiseBuiltin(args, position)),
     builtin('quotient', (args) => quotientNumbers(args)),
     builtin('rational?', (args) => unaryPredicate('rational?', args, (value) => num.isNumericValue(value))),
     builtin('remainder', (args) => remainderNumbers(args)),
@@ -1212,6 +1228,7 @@ function createBuiltins(output: OutputBuffer, macroEnv: MacroEnv): Map<string, B
       output.write(formatValue(args[0]!));
       return VOID;
     }),
+    builtin('with-exception-handler', (args, position, k) => withExceptionHandlerBuiltin(args, position, k)),
     builtin('zero?', (args) => numberPredicate('zero?', args, (value) => num.numericIsZero(value))),
   ]);
 }
@@ -1238,13 +1255,16 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
   const macroEnv = new MacroEnv();
   const env = createGlobalEnv(output, macroEnv);
   const previousWindFrames = currentWindFrames;
+  const previousExceptionHandlers = currentExceptionHandlers;
   currentWindFrames = [];
+  currentExceptionHandlers = [];
 
   let lastValue: Value;
   try {
     lastValue = evalSequence(program, env, macroEnv);
   } finally {
     currentWindFrames = previousWindFrames;
+    currentExceptionHandlers = previousExceptionHandlers;
   }
 
   return {
@@ -1286,6 +1306,10 @@ function runMachine(step: MachineStep, macroEnv: MacroEnv): Value {
         try {
           current = evalExprStep(evalStep.expr, evalStep.env, macroEnv, evalStep.k);
         } catch (error) {
+          if (isSchemeExceptionSignal(error)) {
+            current = handleExceptionSignal(error, macroEnv);
+            break;
+          }
           throw attachPosition(error, evalStep.expr.position);
         }
         break;
@@ -1296,6 +1320,10 @@ function runMachine(step: MachineStep, macroEnv: MacroEnv): Value {
         try {
           current = applyProcedure(applyStep.proc, applyStep.args, applyStep.position, macroEnv, applyStep.k);
         } catch (error) {
+          if (isSchemeExceptionSignal(error)) {
+            current = handleExceptionSignal(error, macroEnv);
+            break;
+          }
           throw attachPosition(error, applyStep.position);
         }
         break;
@@ -1423,6 +1451,8 @@ function evalListStep(
         return evalDefineSyntaxStep(items.slice(1), env, macroEnv, k);
       case 'do':
         return evalDoStep(items.slice(1), env, macroEnv, k);
+      case 'guard':
+        return evalGuardStep(items.slice(1), env, macroEnv, k);
       case 'if':
         return evalIfStep(items.slice(1), env, macroEnv, k);
       case 'lambda':
@@ -1927,6 +1957,37 @@ function evalDoStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationF
   );
 }
 
+function evalGuardStep(args: Expr[], env: Env, macroEnv: MacroEnv, k: ContinuationFn): MachineStep {
+  assertAtLeastArity('guard', args, 2);
+
+  const specExpr = args[0]!;
+  if (specExpr.kind !== 'list' || specExpr.items.length === 0) {
+    throw new EvalError('guard expects (variable clause ...)');
+  }
+
+  const variableExpr = specExpr.items[0]!;
+  if (variableExpr.kind !== 'symbol') {
+    throw new EvalError('guard expects an exception variable');
+  }
+
+  const clauses = specExpr.items.slice(1);
+  const previousHandlers = currentExceptionHandlers.slice();
+  const handlerFrame: ExceptionHandlerFrame = {
+    windStack: currentWindFrames.slice(),
+    previousHandlers,
+    handle: (value, position) => {
+      currentExceptionHandlers = previousHandlers.slice();
+      return evalGuardClausesStep(variableExpr.name, value, clauses, env, macroEnv, position, k);
+    },
+  };
+
+  currentExceptionHandlers = [...previousHandlers, handlerFrame];
+  return evalSequenceStep(args.slice(1), env, macroEnv, (value) => {
+    currentExceptionHandlers = previousHandlers.slice();
+    return k(value);
+  });
+}
+
 function evalDoLoopStep(
   bindings: readonly DoBindingSpec[],
   testClause: { test: Expr; results: Expr[] },
@@ -1944,6 +2005,58 @@ function evalDoLoopStep(
         ? evalSequenceStep(testClause.results, doEnv, macroEnv, k)
         : evalSequenceStep(body, doEnv, macroEnv, () =>
             evalDoNextValuesStep(bindings, 0, [], doEnv, testClause, body, macroEnv, k)),
+  };
+}
+
+function evalGuardClausesStep(
+  variableName: string,
+  exceptionValue: Value,
+  clauses: readonly Expr[],
+  env: Env,
+  macroEnv: MacroEnv,
+  position: SourcePosition,
+  k: ContinuationFn,
+): MachineStep {
+  const guardEnv = new Env(env);
+  guardEnv.define(variableName, exceptionValue);
+  return evalGuardClausesInEnvStep(exceptionValue, clauses, guardEnv, macroEnv, position, k);
+}
+
+function evalGuardClausesInEnvStep(
+  exceptionValue: Value,
+  clauses: readonly Expr[],
+  env: Env,
+  macroEnv: MacroEnv,
+  position: SourcePosition,
+  k: ContinuationFn,
+): MachineStep {
+  if (clauses.length === 0) {
+    throw new SchemeExceptionSignal(exceptionValue, position);
+  }
+
+  const [clauseExpr, ...restClauses] = clauses;
+  if (clauseExpr!.kind !== 'list' || clauseExpr.items.length === 0) {
+    throw new EvalError('guard expects non-empty clauses');
+  }
+
+  const [testExpr, ...body] = clauseExpr.items;
+  if (testExpr!.kind === 'symbol' && testExpr.name === 'else') {
+    if (restClauses.length !== 0) {
+      throw new EvalError('guard else clause must be last');
+    }
+    return evalSequenceStep(body, env, macroEnv, k);
+  }
+
+  return {
+    kind: 'eval-step',
+    expr: testExpr!,
+    env,
+    k: (testValue) =>
+      isTruthy(testValue)
+        ? body.length === 0
+          ? k(testValue)
+          : evalSequenceStep(body, env, macroEnv, k)
+        : evalGuardClausesInEnvStep(exceptionValue, restClauses, env, macroEnv, position, k),
   };
 }
 
@@ -2244,7 +2357,14 @@ function callCcBuiltin(args: Value[], position: SourcePosition, k: ContinuationF
   return {
     kind: 'apply-step',
     proc,
-    args: [{ kind: 'continuation', resume: k, windStack: currentWindFrames.slice() }],
+    args: [
+      {
+        kind: 'continuation',
+        resume: k,
+        windStack: currentWindFrames.slice(),
+        handlerStack: currentExceptionHandlers.slice(),
+      },
+    ],
     position,
     k,
   };
@@ -2289,7 +2409,55 @@ function invokeWindThunk(
 }
 
 function resumeContinuation(proc: ContinuationValue, value: Value, macroEnv: MacroEnv): MachineStep {
-  return transitionWindFrames(proc.windStack, macroEnv, () => proc.resume(value));
+  return transitionWindFrames(proc.windStack, macroEnv, () => {
+    currentExceptionHandlers = proc.handlerStack.slice();
+    return proc.resume(value);
+  });
+}
+
+function raiseBuiltin(args: Value[], position: SourcePosition): never {
+  assertExactArity('raise', args, 1);
+  throw new SchemeExceptionSignal(args[0]!, position);
+}
+
+function withExceptionHandlerBuiltin(
+  args: Value[],
+  position: SourcePosition,
+  k: ContinuationFn,
+): MachineStep {
+  assertExactArity('with-exception-handler', args, 2);
+
+  const handler = expectProcedureValue('with-exception-handler', args[0]!);
+  const thunk = expectProcedureValue('with-exception-handler', args[1]!);
+  const previousHandlers = currentExceptionHandlers.slice();
+  const handlerFrame: ExceptionHandlerFrame = {
+    windStack: currentWindFrames.slice(),
+    previousHandlers,
+    handle: (value, signalPosition) => {
+      currentExceptionHandlers = previousHandlers.slice();
+      return {
+        kind: 'apply-step',
+        proc: handler,
+        args: [value],
+        position: signalPosition,
+        k: () => {
+          throw new EvalError('raise: exception handler returned', signalPosition);
+        },
+      };
+    },
+  };
+
+  currentExceptionHandlers = [...previousHandlers, handlerFrame];
+  return {
+    kind: 'apply-step',
+    proc: thunk,
+    args: [],
+    position,
+    k: (value) => {
+      currentExceptionHandlers = previousHandlers.slice();
+      return k(value);
+    },
+  };
 }
 
 function transitionWindFrames(targetWindFrames: WindFrame[], macroEnv: MacroEnv, next: () => MachineStep): MachineStep {
@@ -2297,6 +2465,18 @@ function transitionWindFrames(targetWindFrames: WindFrame[], macroEnv: MacroEnv,
   return unwindWindFrames(currentWindFrames.slice(), sharedLength, macroEnv, () =>
     rewindWindFrames(targetWindFrames, sharedLength, macroEnv, next),
   );
+}
+
+function handleExceptionSignal(signal: SchemeExceptionSignal, macroEnv: MacroEnv): MachineStep {
+  const handlerFrame = currentExceptionHandlers[currentExceptionHandlers.length - 1];
+  if (handlerFrame === undefined) {
+    throw new EvalError(`uncaught exception: ${formatValue(signal.value)}`, signal.position);
+  }
+
+  return transitionWindFrames(handlerFrame.windStack, macroEnv, () => {
+    currentExceptionHandlers = handlerFrame.previousHandlers.slice();
+    return handlerFrame.handle(signal.value, signal.position);
+  });
 }
 
 function unwindWindFrames(
@@ -2359,6 +2539,10 @@ function applyBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEn
   const prefixArgs = args.slice(1, -1);
   const listArgs = expectProperList('apply', args[args.length - 1]!);
   return applyProcedure(proc, [...prefixArgs, ...listArgs], position, macroEnv, k);
+}
+
+function isSchemeExceptionSignal(error: unknown): error is SchemeExceptionSignal {
+  return error instanceof SchemeExceptionSignal;
 }
 
 function absoluteValue(args: Value[]): num.NumericValue {
