@@ -32,10 +32,14 @@ public class Evaluator {
     // --- Trampoline ---
 
     private Object trampoline(Bounce b) throws EvalError {
-        while (b instanceof BounceThunk bt) {
-            b = bt.thunk().get();
+        try {
+            while (b instanceof BounceThunk bt) {
+                b = bt.thunk().get();
+            }
+            return ((BounceValue) b).value();
+        } catch (SchemeRaisedException sre) {
+            throw new EvalError("unhandled exception: " + schemeToString(sre.value));
         }
-        return ((BounceValue) b).value();
     }
 
     private static Bounce bounce(BounceSupplier s) { return new BounceThunk(s); }
@@ -151,7 +155,8 @@ public class Evaluator {
         "quote", "if", "define", "lambda", "case-lambda", "and", "begin", "let", "let*", "cond", "set!", "or",
         "define-syntax", "syntax-rules", "letrec", "letrec*", "case", "do",
         "call/cc", "call-with-current-continuation",
-        "dynamic-wind"
+        "dynamic-wind",
+        "guard", "with-exception-handler"
     );
 
     // Source position-aware types
@@ -181,6 +186,29 @@ public class Evaluator {
     // dynamic-wind support
     record WindEntry(Object inThunk, Object outThunk) {}
     private final List<WindEntry> windingStack = new ArrayList<>();
+
+    // Exception handler stack for raise/guard/with-exception-handler
+    private final List<ExceptionHandler> exceptionHandlerStack = new ArrayList<>();
+
+    static class ExceptionHandler {
+        final Object handler; // Scheme procedure
+        final List<WindEntry> savedWinding;
+        final Cont returnK; // continuation to return to after handler (for with-exception-handler)
+        ExceptionHandler(Object handler, List<WindEntry> savedWinding, Cont returnK) {
+            this.handler = handler;
+            this.savedWinding = savedWinding;
+            this.returnK = returnK;
+        }
+    }
+
+    // Java exception used to propagate Scheme raise through the trampoline
+    static class SchemeRaisedException extends RuntimeException {
+        final Object value;
+        SchemeRaisedException(Object value) {
+            super("scheme raise", null, true, false);
+            this.value = value;
+        }
+    }
 
     static class SchemeContinuation {
         final Cont k;
@@ -231,7 +259,8 @@ public class Evaluator {
                 "string>?", "string<=?", "string>=?",
                 "caaar", "caadr", "cadar", "cdaar", "cdadr", "cddar",
                 "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
-                "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr")) {
+                "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr",
+                "raise")) {
             env.define(name, "builtin:" + name);
         }
         env.define("call/cc", CALLCC_PROC);
@@ -835,6 +864,29 @@ public class Evaluator {
                             ))
                         ));
                     }
+                    case "with-exception-handler" -> {
+                        if (list.size() != 3) throw errAt(eline, ecol, "with-exception-handler: expected 2 arguments");
+                        return bounce(() -> evalK(list.get(1), env, handler ->
+                            bounce(() -> evalK(list.get(2), env, thunk ->
+                                withExceptionHandlerK(handler, thunk, el, ec, k)
+                            ))
+                        ));
+                    }
+                    case "guard" -> {
+                        // (guard (var clause ...) body ...)
+                        if (list.size() < 3) throw errAt(eline, ecol, "guard: bad syntax");
+                        if (!(list.get(1) instanceof List<?> clauseList) || clauseList.isEmpty())
+                            throw errAt(eline, ecol, "guard: bad syntax");
+                        String guardVar = symName(clauseList.get(0));
+                        if (guardVar == null) throw errAt(eline, ecol, "guard: expected variable name");
+                        // clauses are clauseList[1..]
+                        List<Object> clauses = new ArrayList<>();
+                        for (int i = 1; i < clauseList.size(); i++) clauses.add(clauseList.get(i));
+                        // body is list[2..]
+                        List<Object> body = new ArrayList<>();
+                        for (int i = 2; i < list.size(); i++) body.add(list.get(i));
+                        return evalGuardK(guardVar, clauses, body, env, el, ec, k);
+                    }
                 }
 
                 // Check for macro expansion
@@ -946,6 +998,146 @@ public class Evaluator {
             windingStack.add(entry);
             return doRewind(to, idx + 1, val, k);
         });
+    }
+
+    // --- Exception handling (raise/guard/with-exception-handler) ---
+
+    private Bounce withExceptionHandlerK(Object handler, Object thunk, int el, int ec, Cont k) throws EvalError {
+        ExceptionHandler eh = new ExceptionHandler(handler, new ArrayList<>(windingStack), k);
+        exceptionHandlerStack.add(eh);
+        try {
+            Bounce b = applyK(thunk, List.of(), el, ec, bodyResult -> {
+                exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+                return k.apply(bodyResult);
+            });
+            // Trampoline within the handler scope
+            while (b instanceof BounceThunk bt) {
+                try {
+                    b = bt.thunk().get();
+                } catch (SchemeRaisedException sre) {
+                    b = handleRaise(sre.value, el, ec);
+                }
+            }
+            return b;
+        } catch (SchemeRaisedException sre) {
+            return handleRaise(sre.value, el, ec);
+        }
+    }
+
+    private Bounce handleRaise(Object value, int el, int ec) throws EvalError {
+        if (exceptionHandlerStack.isEmpty()) {
+            throw new EvalError("unhandled exception: " + schemeToString(value));
+        }
+        ExceptionHandler eh = exceptionHandlerStack.remove(exceptionHandlerStack.size() - 1);
+        // Unwind dynamic-wind to handler's winding state
+        List<WindEntry> currentWinding = new ArrayList<>(windingStack);
+        Bounce unwindResult = doWindTransition(currentWinding, eh.savedWinding, value, unwoundVal -> {
+            // Call the handler procedure with the raised value
+            // If handler returns normally in with-exception-handler, that's an error per R7RS
+            // but for simplicity we let it return to the handler's return continuation
+            return applyK(eh.handler, List.of(unwoundVal), el, ec, handlerResult ->
+                eh.returnK.apply(handlerResult)
+            );
+        });
+        return unwindResult;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Bounce evalGuardK(String guardVar, List<Object> clauses, List<Object> body, Env env, int el, int ec, Cont k) throws EvalError {
+        // guard works by:
+        // 1. Install exception handler
+        // 2. Evaluate body
+        // 3. If exception raised, test clauses
+        // 4. If a clause matches, evaluate its body in the guard's continuation
+        // 5. If no clause matches and no else, re-raise
+
+        // Save handler stack size to restore on normal completion
+        int handlerStackSize = exceptionHandlerStack.size();
+
+        // Create a handler that will test guard clauses
+        // We use SchemeRaisedException to escape and test clauses
+        ExceptionHandler eh = new ExceptionHandler(null, new ArrayList<>(windingStack), k);
+        exceptionHandlerStack.add(eh);
+
+        try {
+            // Evaluate body sequence
+            Bounce b = evalSeqK(body, 0, env, bodyResult -> {
+                // Normal completion — remove our handler and return result
+                if (exceptionHandlerStack.size() > handlerStackSize) {
+                    exceptionHandlerStack.remove(handlerStackSize);
+                }
+                return k.apply(bodyResult);
+            });
+
+            // Trampoline within the guard scope
+            while (b instanceof BounceThunk bt) {
+                try {
+                    b = bt.thunk().get();
+                } catch (SchemeRaisedException sre) {
+                    // Remove our handler before testing clauses
+                    if (exceptionHandlerStack.size() > handlerStackSize) {
+                        exceptionHandlerStack.remove(handlerStackSize);
+                    }
+                    // Unwind dynamic-wind to guard's winding state
+                    List<WindEntry> currentWinding = new ArrayList<>(windingStack);
+                    b = doWindTransition(currentWinding, eh.savedWinding, sre.value, unwoundVal -> {
+                        // Test guard clauses
+                        return evalGuardClausesK(guardVar, unwoundVal, clauses, 0, env, el, ec, k);
+                    });
+                    // Continue trampolining
+                    while (b instanceof BounceThunk bt2) {
+                        b = bt2.thunk().get();
+                    }
+                }
+            }
+            return b;
+        } catch (SchemeRaisedException sre) {
+            // Remove our handler before testing clauses
+            if (exceptionHandlerStack.size() > handlerStackSize) {
+                exceptionHandlerStack.remove(handlerStackSize);
+            }
+            // Unwind dynamic-wind to guard's winding state
+            List<WindEntry> currentWinding = new ArrayList<>(windingStack);
+            Bounce b = doWindTransition(currentWinding, eh.savedWinding, sre.value, unwoundVal ->
+                evalGuardClausesK(guardVar, unwoundVal, clauses, 0, env, el, ec, k)
+            );
+            while (b instanceof BounceThunk bt) {
+                b = bt.thunk().get();
+            }
+            return b;
+        }
+    }
+
+    private Bounce evalGuardClausesK(String guardVar, Object exnVal, List<Object> clauses, int idx, Env env, int el, int ec, Cont k) throws EvalError {
+        if (idx >= clauses.size()) {
+            // No clause matched, re-raise
+            throw new SchemeRaisedException(exnVal);
+        }
+        Object clause = clauses.get(idx);
+        if (!(clause instanceof List<?> clauseList) || clauseList.isEmpty())
+            throw errAt(el, ec, "guard: bad clause");
+
+        // Check for else clause
+        String testSym = symName(clauseList.get(0));
+        if ("else".equals(testSym)) {
+            Env clauseEnv = new Env(env);
+            clauseEnv.define(guardVar, exnVal);
+            if (clauseList.size() == 1) return k.apply(VOID);
+            return evalSeqK(clauseList, 1, clauseEnv, k);
+        }
+
+        // Evaluate test with guardVar bound to exception value
+        Env testEnv = new Env(env);
+        testEnv.define(guardVar, exnVal);
+        return bounce(() -> evalK(clauseList.get(0), testEnv, testResult -> {
+            if (!isFalse(testResult)) {
+                // Clause matched — if there's a body, evaluate it; otherwise return test result
+                if (clauseList.size() == 1) return k.apply(testResult);
+                return evalSeqK(clauseList, 1, testEnv, k);
+            }
+            // Try next clause
+            return evalGuardClausesK(guardVar, exnVal, clauses, idx + 1, env, el, ec, k);
+        }));
     }
 
     private Bounce evalListK(List<?> exprs, int start, Env env, List<Object> acc, Cont k) throws EvalError {
@@ -1190,6 +1382,10 @@ public class Evaluator {
             }
             if ("for-each".equals(name)) {
                 return forEachCpsK(args, k);
+            }
+            if ("raise".equals(name)) {
+                if (args.size() != 1) throw new EvalError("raise: expected 1 argument");
+                throw new SchemeRaisedException(args.get(0));
             }
             Object result = applyBuiltin(name, args);
             return k.apply(result);
