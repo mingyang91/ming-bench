@@ -10,6 +10,7 @@ type EnvRef = Rc<RefCell<Environment>>;
 type EvalResult = Result<Value, EvalError>;
 type ContRef = Rc<dyn Fn(Value) -> Action>;
 type ValuesContRef = Rc<dyn Fn(Vec<Value>) -> Action>;
+type WindFrameRef = Rc<DynamicWindFrame>;
 
 enum Action {
     EvalExpr(Expr, EnvRef, ContRef),
@@ -39,6 +40,25 @@ enum Action {
         index: usize,
         results: Vec<Value>,
         cont: ContRef,
+    },
+    EnterDynamicWind {
+        frame: WindFrameRef,
+        body: Value,
+        cont: ContRef,
+    },
+    ExitDynamicWind {
+        frame: WindFrameRef,
+        value: Value,
+        cont: ContRef,
+    },
+    SwitchContinuation {
+        continuation: CapturedContinuation,
+        value: Value,
+    },
+    ReenterDynamicWind {
+        frame: WindFrameRef,
+        continuation: CapturedContinuation,
+        value: Value,
     },
     Continue(ContRef, Value),
     Done(EvalResult),
@@ -76,7 +96,12 @@ fn eval_str_with_output_inner(input: &str) -> Result<(String, String), EvalError
 
     let env = global_env();
     let mut interpreter = Interpreter::default();
-    let last = interpreter.run(Action::EvalSequence(Rc::new(expressions), 0, env, return_cont()))?;
+    let last = interpreter.run(Action::EvalSequence(
+        Rc::new(expressions),
+        0,
+        env,
+        return_cont(),
+    ))?;
     Ok((last.to_scheme_string(), interpreter.output))
 }
 
@@ -87,6 +112,7 @@ fn return_cont() -> ContRef {
 #[derive(Default)]
 struct Interpreter {
     output: String,
+    dynamic_wind_stack: Vec<WindFrameRef>,
 }
 
 impl Interpreter {
@@ -129,6 +155,21 @@ impl Interpreter {
                     results,
                     cont,
                 } => self.step_builtin_map_iter(procedure, lists, index, results, cont),
+                Action::EnterDynamicWind { frame, body, cont } => {
+                    self.step_enter_dynamic_wind(frame, body, cont)
+                }
+                Action::ExitDynamicWind { frame, value, cont } => {
+                    self.step_exit_dynamic_wind(frame, value, cont)
+                }
+                Action::SwitchContinuation {
+                    continuation,
+                    value,
+                } => self.step_switch_continuation(continuation, value),
+                Action::ReenterDynamicWind {
+                    frame,
+                    continuation,
+                    value,
+                } => self.step_reenter_dynamic_wind(frame, continuation, value),
                 Action::Continue(cont, value) => cont(value),
                 Action::Done(result) => return result,
             };
@@ -258,7 +299,9 @@ impl Interpreter {
                 env.borrow_mut().define(name, procedure);
                 Action::Continue(cont, Value::Void)
             }
-            _ => Action::Done(Err(EvalError::InvalidForm("invalid define target".to_string()))),
+            _ => Action::Done(Err(EvalError::InvalidForm(
+                "invalid define target".to_string(),
+            ))),
         }
     }
 
@@ -587,13 +630,20 @@ impl Interpreter {
 
     fn step_apply(&mut self, procedure: Value, args: Vec<Value>, cont: ContRef) -> Action {
         match procedure {
-            Value::Procedure(Procedure::Builtin(builtin)) => self.step_apply_builtin(builtin, args, cont),
-            Value::Procedure(Procedure::Lambda(lambda)) => self.step_apply_lambda(lambda, args, cont),
+            Value::Procedure(Procedure::Builtin(builtin)) => {
+                self.step_apply_builtin(builtin, args, cont)
+            }
+            Value::Procedure(Procedure::Lambda(lambda)) => {
+                self.step_apply_lambda(lambda, args, cont)
+            }
             Value::Procedure(Procedure::Continuation(saved)) => {
                 if let Err(err) = require_exact_arity(args.len(), 1, "continuation") {
                     Action::Done(Err(err))
                 } else {
-                    Action::Continue(saved, args[0].clone())
+                    Action::SwitchContinuation {
+                        continuation: saved,
+                        value: args[0].clone(),
+                    }
                 }
             }
             _ => Action::Done(Err(EvalError::Message(
@@ -655,20 +705,24 @@ impl Interpreter {
                 }
                 Action::Continue(cont, Value::Int(total))
             }
-            Builtin::Less => match compare_numbers(&args, builtin.name(), |left, right| left < right) {
-                Ok(value) => Action::Continue(cont, value),
-                Err(err) => Action::Done(Err(err)),
-            },
+            Builtin::Less => {
+                match compare_numbers(&args, builtin.name(), |left, right| left < right) {
+                    Ok(value) => Action::Continue(cont, value),
+                    Err(err) => Action::Done(Err(err)),
+                }
+            }
             Builtin::LessEqual => {
                 match compare_numbers(&args, builtin.name(), |left, right| left <= right) {
                     Ok(value) => Action::Continue(cont, value),
                     Err(err) => Action::Done(Err(err)),
                 }
             }
-            Builtin::Greater => match compare_numbers(&args, builtin.name(), |left, right| left > right) {
-                Ok(value) => Action::Continue(cont, value),
-                Err(err) => Action::Done(Err(err)),
-            },
+            Builtin::Greater => {
+                match compare_numbers(&args, builtin.name(), |left, right| left > right) {
+                    Ok(value) => Action::Continue(cont, value),
+                    Err(err) => Action::Done(Err(err)),
+                }
+            }
             Builtin::GreaterEqual => {
                 match compare_numbers(&args, builtin.name(), |left, right| left >= right) {
                     Ok(value) => Action::Continue(cont, value),
@@ -681,16 +735,53 @@ impl Interpreter {
                     Err(err) => Action::Done(Err(err)),
                 }
             }
+            Builtin::Cons => {
+                if let Err(err) = require_exact_arity(args.len(), 2, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+
+                let tail = match expect_list(&args[1], builtin.name()) {
+                    Ok(items) => items,
+                    Err(err) => return Action::Done(Err(err)),
+                };
+                let mut items = Vec::with_capacity(tail.len() + 1);
+                items.push(args[0].clone());
+                items.extend_from_slice(tail);
+                Action::Continue(cont, Value::List(items))
+            }
             Builtin::List => Action::Continue(cont, Value::List(args)),
+            Builtin::Length => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                match expect_list(&args[0], builtin.name()) {
+                    Ok(items) => Action::Continue(cont, Value::Int(items.len() as i64)),
+                    Err(err) => Action::Done(Err(err)),
+                }
+            }
+            Builtin::Reverse => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+                match expect_list(&args[0], builtin.name()) {
+                    Ok(items) => {
+                        let mut reversed = items.to_vec();
+                        reversed.reverse();
+                        Action::Continue(cont, Value::List(reversed))
+                    }
+                    Err(err) => Action::Done(Err(err)),
+                }
+            }
             Builtin::Map => self.step_builtin_map(args, cont),
             Builtin::StringToList => {
                 if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
                     return Action::Done(Err(err));
                 }
                 match expect_string(&args[0], builtin.name()) {
-                    Ok(value) => {
-                        Action::Continue(cont, Value::List(value.chars().map(Value::Char).collect()))
-                    }
+                    Ok(value) => Action::Continue(
+                        cont,
+                        Value::List(value.chars().map(Value::Char).collect()),
+                    ),
                     Err(err) => Action::Done(Err(err)),
                 }
             }
@@ -836,11 +927,36 @@ impl Interpreter {
                     Action::Continue(cont, Value::List(items[1..].to_vec()))
                 }
             }
+            Builtin::DynamicWind => {
+                if let Err(err) = require_exact_arity(args.len(), 3, builtin.name()) {
+                    return Action::Done(Err(err));
+                }
+
+                let before = args[0].clone();
+                let body = args[1].clone();
+                let frame = Rc::new(DynamicWindFrame {
+                    before: before.clone(),
+                    after: args[2].clone(),
+                });
+
+                Action::Apply(
+                    before,
+                    vec![],
+                    Rc::new(move |_| Action::EnterDynamicWind {
+                        frame: frame.clone(),
+                        body: body.clone(),
+                        cont: cont.clone(),
+                    }),
+                )
+            }
             Builtin::CallCc => {
                 if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
                     return Action::Done(Err(err));
                 }
-                let captured = Value::Procedure(Procedure::Continuation(cont.clone()));
+                let captured = Value::Procedure(Procedure::Continuation(CapturedContinuation {
+                    cont: cont.clone(),
+                    wind_stack: self.dynamic_wind_stack.clone(),
+                }));
                 Action::Apply(args[0].clone(), vec![captured], cont)
             }
         }
@@ -908,6 +1024,107 @@ impl Interpreter {
                 }
             }),
         )
+    }
+
+    fn step_enter_dynamic_wind(
+        &mut self,
+        frame: WindFrameRef,
+        body: Value,
+        cont: ContRef,
+    ) -> Action {
+        self.dynamic_wind_stack.push(frame.clone());
+        Action::Apply(
+            body,
+            vec![],
+            Rc::new(move |value| Action::ExitDynamicWind {
+                frame: frame.clone(),
+                value,
+                cont: cont.clone(),
+            }),
+        )
+    }
+
+    fn step_exit_dynamic_wind(
+        &mut self,
+        frame: WindFrameRef,
+        value: Value,
+        cont: ContRef,
+    ) -> Action {
+        self.remove_dynamic_wind_frame(&frame);
+        Action::Apply(
+            frame.after.clone(),
+            vec![],
+            Rc::new(move |_| Action::Continue(cont.clone(), value.clone())),
+        )
+    }
+
+    fn step_switch_continuation(
+        &mut self,
+        continuation: CapturedContinuation,
+        value: Value,
+    ) -> Action {
+        let shared =
+            common_dynamic_wind_prefix_len(&self.dynamic_wind_stack, &continuation.wind_stack);
+
+        if self.dynamic_wind_stack.len() > shared {
+            let frame = self
+                .dynamic_wind_stack
+                .pop()
+                .expect("active dynamic-wind frame");
+            return Action::Apply(
+                frame.after.clone(),
+                vec![],
+                Rc::new(move |_| Action::SwitchContinuation {
+                    continuation: continuation.clone(),
+                    value: value.clone(),
+                }),
+            );
+        }
+
+        if continuation.wind_stack.len() > shared {
+            let frame = continuation.wind_stack[shared].clone();
+            return Action::Apply(
+                frame.before.clone(),
+                vec![],
+                Rc::new(move |_| Action::ReenterDynamicWind {
+                    frame: frame.clone(),
+                    continuation: continuation.clone(),
+                    value: value.clone(),
+                }),
+            );
+        }
+
+        Action::Continue(continuation.cont, value)
+    }
+
+    fn step_reenter_dynamic_wind(
+        &mut self,
+        frame: WindFrameRef,
+        continuation: CapturedContinuation,
+        value: Value,
+    ) -> Action {
+        self.dynamic_wind_stack.push(frame);
+        Action::SwitchContinuation {
+            continuation,
+            value,
+        }
+    }
+
+    fn remove_dynamic_wind_frame(&mut self, frame: &WindFrameRef) {
+        if let Some(active) = self.dynamic_wind_stack.last() {
+            if Rc::ptr_eq(active, frame) {
+                self.dynamic_wind_stack.pop();
+                return;
+            }
+        }
+
+        if let Some(index) = self
+            .dynamic_wind_stack
+            .iter()
+            .rposition(|active| Rc::ptr_eq(active, frame))
+        {
+            self.dynamic_wind_stack.remove(index);
+        }
     }
 }
 
@@ -980,7 +1197,18 @@ impl Value {
 enum Procedure {
     Builtin(Builtin),
     Lambda(Lambda),
-    Continuation(ContRef),
+    Continuation(CapturedContinuation),
+}
+
+#[derive(Clone)]
+struct CapturedContinuation {
+    cont: ContRef,
+    wind_stack: Vec<WindFrameRef>,
+}
+
+struct DynamicWindFrame {
+    before: Value,
+    after: Value,
 }
 
 #[derive(Clone)]
@@ -1000,7 +1228,10 @@ enum Builtin {
     Greater,
     GreaterEqual,
     NumericEqual,
+    Cons,
     List,
+    Length,
+    Reverse,
     Map,
     StringToList,
     ListToString,
@@ -1015,6 +1246,7 @@ enum Builtin {
     Null,
     Car,
     Cdr,
+    DynamicWind,
     CallCc,
 }
 
@@ -1028,7 +1260,10 @@ impl Builtin {
             Builtin::Greater => ">",
             Builtin::GreaterEqual => ">=",
             Builtin::NumericEqual => "=",
+            Builtin::Cons => "cons",
             Builtin::List => "list",
+            Builtin::Length => "length",
+            Builtin::Reverse => "reverse",
             Builtin::Map => "map",
             Builtin::StringToList => "string->list",
             Builtin::ListToString => "list->string",
@@ -1043,6 +1278,7 @@ impl Builtin {
             Builtin::Null => "null?",
             Builtin::Car => "car",
             Builtin::Cdr => "cdr",
+            Builtin::DynamicWind => "dynamic-wind",
             Builtin::CallCc => "call/cc",
         }
     }
@@ -1099,7 +1335,10 @@ fn global_env() -> EnvRef {
         (">", Builtin::Greater),
         (">=", Builtin::GreaterEqual),
         ("=", Builtin::NumericEqual),
+        ("cons", Builtin::Cons),
         ("list", Builtin::List),
+        ("length", Builtin::Length),
+        ("reverse", Builtin::Reverse),
         ("map", Builtin::Map),
         ("string->list", Builtin::StringToList),
         ("list->string", Builtin::ListToString),
@@ -1114,6 +1353,7 @@ fn global_env() -> EnvRef {
         ("null?", Builtin::Null),
         ("car", Builtin::Car),
         ("cdr", Builtin::Cdr),
+        ("dynamic-wind", Builtin::DynamicWind),
         ("call/cc", Builtin::CallCc),
         ("call-with-current-continuation", Builtin::CallCc),
     ];
@@ -1133,6 +1373,14 @@ fn global_env() -> EnvRef {
 
 fn is_truthy(value: &Value) -> bool {
     !matches!(value, Value::Bool(false))
+}
+
+fn common_dynamic_wind_prefix_len(current: &[WindFrameRef], target: &[WindFrameRef]) -> usize {
+    current
+        .iter()
+        .zip(target.iter())
+        .take_while(|(left, right)| Rc::ptr_eq(left, right))
+        .count()
 }
 
 fn parse_parameters(items: &[Expr]) -> Result<Vec<String>, EvalError> {
@@ -1305,10 +1553,7 @@ impl Parser {
     fn parse_quote_shorthand(&mut self) -> Result<Expr, EvalError> {
         self.consume('\'')?;
         let quoted = self.parse_expr()?;
-        Ok(Expr::List(vec![
-            Expr::Symbol("quote".to_string()),
-            quoted,
-        ]))
+        Ok(Expr::List(vec![Expr::Symbol("quote".to_string()), quoted]))
     }
 
     fn parse_list(&mut self) -> Result<Expr, EvalError> {

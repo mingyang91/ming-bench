@@ -17,6 +17,7 @@ public class Evaluator {
     private final Environment globalEnv = createGlobalEnv();
     private final Map<String, Macro> macros = new HashMap<>();
     private StringBuilder currentOutput;
+    private List<DynamicWindFrame> dynamicWindStack = new ArrayList<>();
     private long macroExpansionCounter;
     private final int benchLevel = detectBenchLevel();
 
@@ -36,7 +37,9 @@ public class Evaluator {
         }
 
         StringBuilder previousOutput = currentOutput;
+        List<DynamicWindFrame> previousWindStack = dynamicWindStack;
         currentOutput = new StringBuilder();
+        dynamicWindStack = new ArrayList<>();
         try {
             Value last = usesFirstClassContinuations(program)
                     ? evalProgramWithContinuations(program)
@@ -44,6 +47,7 @@ public class Evaluator {
             return new EvalResult(last.toSchemeString(), currentOutput.toString());
         } finally {
             currentOutput = previousOutput;
+            dynamicWindStack = previousWindStack;
         }
     }
 
@@ -66,12 +70,8 @@ public class Evaluator {
 
     private boolean usesFirstClassContinuations(Expr expr) {
         return switch (expr) {
-            case SymbolExpr symbolExpr ->
-                    symbolExpr.name().equals("call/cc")
-                            || symbolExpr.name().equals("call-with-current-continuation");
-            case CapturedSymbolExpr symbolExpr ->
-                    symbolExpr.name().equals("call/cc")
-                            || symbolExpr.name().equals("call-with-current-continuation");
+            case SymbolExpr symbolExpr -> requiresContinuationMachine(symbolExpr.name());
+            case CapturedSymbolExpr symbolExpr -> requiresContinuationMachine(symbolExpr.name());
             case ListExpr listExpr -> {
                 for (Expr element : listExpr.elements()) {
                     if (usesFirstClassContinuations(element)) {
@@ -82,6 +82,12 @@ public class Evaluator {
             }
             default -> false;
         };
+    }
+
+    private boolean requiresContinuationMachine(String name) {
+        return name.equals("call/cc")
+                || name.equals("call-with-current-continuation")
+                || name.equals("dynamic-wind");
     }
 
     private static int detectBenchLevel() {
@@ -146,6 +152,9 @@ public class Evaluator {
         env.define("append", new BuiltinProcedure("append", this::builtinAppend));
         env.define("reverse", new BuiltinProcedure("reverse", this::builtinReverse));
         env.define("apply", new BuiltinProcedure("apply", this::builtinApply));
+        env.define("dynamic-wind", new BuiltinProcedure("dynamic-wind", args -> {
+            throw new EvalError("'dynamic-wind' requires continuation support");
+        }));
         env.define("call/cc", new BuiltinProcedure("call/cc", args -> {
             throw new EvalError("'call/cc' requires continuation support");
         }));
@@ -1129,7 +1138,7 @@ public class Evaluator {
             case CaseLambdaValue caseLambda -> stepApplyCaseLambda(caseLambda, args, cont);
             case ContinuationProcedure continuation -> {
                 requireArgCount(args.size(), 1, "continuation");
-                yield new ContinueStep(continuation.cont(), args.getFirst());
+                yield stepSwitchContinuation(continuation, args.getFirst());
             }
         };
     }
@@ -1138,6 +1147,7 @@ public class Evaluator {
             throws EvalError {
         return switch (builtin.name()) {
             case "call/cc", "call-with-current-continuation" -> stepApplyCallCc(args, cont);
+            case "dynamic-wind" -> stepBuiltinDynamicWind(args, cont);
             case "apply" -> stepBuiltinApply(args, cont);
             case "map" -> stepBuiltinMap(args, cont);
             case "for-each" -> stepBuiltinForEach(args, cont);
@@ -1145,10 +1155,95 @@ public class Evaluator {
         };
     }
 
+    private Step stepBuiltinDynamicWind(List<Value> args, Continuation cont) throws EvalError {
+        requireArgCount(args.size(), 3, "dynamic-wind");
+
+        Value before = args.getFirst();
+        Value body = args.get(1);
+        DynamicWindFrame frame = new DynamicWindFrame(before, args.get(2));
+        return new ApplyStep(
+                before,
+                List.of(),
+                ignored -> stepEnterDynamicWind(frame, body, cont));
+    }
+
     private Step stepApplyCallCc(List<Value> args, Continuation cont) throws EvalError {
         requireArgCount(args.size(), 1, "call/cc");
-        Value captured = new ContinuationProcedure(cont);
+        Value captured = new ContinuationProcedure(cont, List.copyOf(dynamicWindStack));
         return new ApplyStep(args.getFirst(), List.of(captured), cont);
+    }
+
+    private Step stepEnterDynamicWind(DynamicWindFrame frame, Value body, Continuation cont) {
+        dynamicWindStack.add(frame);
+        return new ApplyStep(
+                body,
+                List.of(),
+                value -> stepExitDynamicWind(frame, value, cont));
+    }
+
+    private Step stepExitDynamicWind(DynamicWindFrame frame, Value value, Continuation cont) {
+        removeDynamicWindFrame(frame);
+        return new ApplyStep(
+                frame.after(),
+                List.of(),
+                ignored -> new ContinueStep(cont, value));
+    }
+
+    private Step stepSwitchContinuation(ContinuationProcedure continuation, Value value)
+            throws EvalError {
+        int shared = commonDynamicWindPrefixLen(dynamicWindStack, continuation.windStack());
+
+        if (dynamicWindStack.size() > shared) {
+            DynamicWindFrame frame = dynamicWindStack.remove(dynamicWindStack.size() - 1);
+            return new ApplyStep(
+                    frame.after(),
+                    List.of(),
+                    ignored -> stepSwitchContinuation(continuation, value));
+        }
+
+        if (continuation.windStack().size() > shared) {
+            DynamicWindFrame frame = continuation.windStack().get(shared);
+            return new ApplyStep(
+                    frame.before(),
+                    List.of(),
+                    ignored -> stepReenterDynamicWind(frame, continuation, value));
+        }
+
+        return new ContinueStep(continuation.cont(), value);
+    }
+
+    private Step stepReenterDynamicWind(
+            DynamicWindFrame frame,
+            ContinuationProcedure continuation,
+            Value value) throws EvalError {
+        dynamicWindStack.add(frame);
+        return stepSwitchContinuation(continuation, value);
+    }
+
+    private void removeDynamicWindFrame(DynamicWindFrame frame) {
+        int lastIndex = dynamicWindStack.size() - 1;
+        if (lastIndex >= 0 && dynamicWindStack.get(lastIndex) == frame) {
+            dynamicWindStack.remove(lastIndex);
+            return;
+        }
+
+        for (int i = dynamicWindStack.size() - 1; i >= 0; i--) {
+            if (dynamicWindStack.get(i) == frame) {
+                dynamicWindStack.remove(i);
+                return;
+            }
+        }
+    }
+
+    private int commonDynamicWindPrefixLen(
+            List<DynamicWindFrame> current,
+            List<DynamicWindFrame> target) {
+        int limit = Math.min(current.size(), target.size());
+        int shared = 0;
+        while (shared < limit && current.get(shared) == target.get(shared)) {
+            shared++;
+        }
+        return shared;
     }
 
     private Step stepApplyClosure(ClosureValue closure, List<Value> args, Continuation cont)
@@ -4251,7 +4346,11 @@ public class Evaluator {
         }
     }
 
-    private record ContinuationProcedure(Continuation cont) implements ProcedureValue {
+    private record DynamicWindFrame(Value before, Value after) {
+    }
+
+    private record ContinuationProcedure(Continuation cont, List<DynamicWindFrame> windStack)
+            implements ProcedureValue {
         @Override
         public String toSchemeString() {
             return "#<procedure>";
