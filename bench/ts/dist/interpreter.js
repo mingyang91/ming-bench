@@ -6,8 +6,10 @@ const UNINITIALIZED = Symbol('uninitialized');
 const STRING_IMMUTABILITY_LEVEL = 15;
 let currentWindFrames = [];
 let currentExceptionHandlers = [];
+let currentProcedureBoundaries = [];
 let currentProceduralMacroContexts = [];
 let currentSyntaxFrames = [];
+const procedureReturnContinuations = new WeakSet();
 const CORE_SYNTAX = new Set([
     'and',
     'begin',
@@ -1014,8 +1016,10 @@ export function evalStrWithOutput(input) {
     const env = createGlobalEnv(output, macroEnv);
     const previousWindFrames = currentWindFrames;
     const previousExceptionHandlers = currentExceptionHandlers;
+    const previousProcedureBoundaries = currentProcedureBoundaries;
     currentWindFrames = [];
     currentExceptionHandlers = [];
+    currentProcedureBoundaries = [];
     let lastValue;
     try {
         lastValue = evalSequence(program, env, macroEnv);
@@ -1023,6 +1027,7 @@ export function evalStrWithOutput(input) {
     finally {
         currentWindFrames = previousWindFrames;
         currentExceptionHandlers = previousExceptionHandlers;
+        currentProcedureBoundaries = previousProcedureBoundaries;
     }
     return {
         result: formatEvaluationResult(lastValue),
@@ -1043,6 +1048,14 @@ function isMachineStep(value) {
     return (typeof value === 'object' &&
         value !== null &&
         (value.kind === 'eval-step' || value.kind === 'apply-step' || value.kind === 'done-step'));
+}
+function makeProcedureReturnContinuation(k, previousProcedureBoundaries) {
+    const returnContinuation = (result) => {
+        currentProcedureBoundaries = previousProcedureBoundaries;
+        return k(result);
+    };
+    procedureReturnContinuations.add(returnContinuation);
+    return returnContinuation;
 }
 function runMachine(step, macroEnv) {
     let current = step;
@@ -1089,6 +1102,9 @@ function evalExpr(expr, env, macroEnv) {
 }
 function isMultipleValues(result) {
     return typeof result === 'object' && result !== null && result.kind === 'multiple-values';
+}
+function isVoidResult(result) {
+    return typeof result === 'object' && result !== null && result.kind === 'void';
 }
 function makeEvaluationResult(values) {
     return values.length === 1 ? values[0] : { kind: 'multiple-values', values: [...values] };
@@ -1625,6 +1641,7 @@ function evalGuardStep(args, env, macroEnv, k) {
     const previousHandlers = currentExceptionHandlers.slice();
     const handlerFrame = {
         windStack: currentWindFrames.slice(),
+        procedureBoundaries: currentProcedureBoundaries.slice(),
         previousHandlers,
         handle: (value, position) => {
             currentExceptionHandlers = previousHandlers.slice();
@@ -2094,7 +2111,7 @@ function datumValueToExpr(value, position) {
             throw new EvalError('datum->syntax expects a datum that can be converted to syntax');
     }
 }
-function applyProcedure(proc, args, position, macroEnv, k) {
+function applyProcedure(proc, args, position, macroEnv, k, allowVoidEscape = currentProcedureBoundaries[currentProcedureBoundaries.length - 1]?.allowVoidEscape ?? true) {
     if (proc.kind === 'builtin') {
         const result = proc.apply(args, position, k);
         return isMachineStep(result) ? result : k(result);
@@ -2104,15 +2121,15 @@ function applyProcedure(proc, args, position, macroEnv, k) {
         return resumeContinuation(proc, args[0], macroEnv);
     }
     if (proc.kind === 'lambda') {
-        return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv, k);
+        return applyProcedureClause(proc.name ?? 'lambda', proc.env, { params: proc.params, body: proc.body }, args, macroEnv, k, allowVoidEscape);
     }
     const clause = proc.clauses.find((candidate) => procedureArityMatches(args, candidate.params));
     if (clause === undefined) {
         throw new EvalError(`${proc.name ?? 'case-lambda'} has no matching clause for ${args.length} argument(s)`);
     }
-    return applyProcedureClause(proc.name ?? 'case-lambda', proc.env, clause, args, macroEnv, k);
+    return applyProcedureClause(proc.name ?? 'case-lambda', proc.env, clause, args, macroEnv, k, allowVoidEscape);
 }
-function applyProcedureClause(name, env, clause, args, macroEnv, k) {
+function applyProcedureClause(name, env, clause, args, macroEnv, k, allowVoidEscape) {
     assertProcedureArity(name, args, clause.params);
     const callEnv = new Env(env);
     clause.params.required.forEach((param, index) => {
@@ -2121,7 +2138,12 @@ function applyProcedureClause(name, env, clause, args, macroEnv, k) {
     if (clause.params.rest !== undefined) {
         callEnv.define(clause.params.rest, makeList(args.slice(clause.params.required.length)));
     }
-    return evalSequenceStep(clause.body, callEnv, macroEnv, k);
+    if (procedureReturnContinuations.has(k)) {
+        return evalSequenceStep(clause.body, callEnv, macroEnv, k);
+    }
+    const previousProcedureBoundaries = currentProcedureBoundaries;
+    currentProcedureBoundaries = [...previousProcedureBoundaries, { k, allowVoidEscape }];
+    return evalSequenceStep(clause.body, callEnv, macroEnv, makeProcedureReturnContinuation(k, previousProcedureBoundaries));
 }
 function builtin(name, apply) {
     return [name, { kind: 'builtin', name, apply }];
@@ -2132,6 +2154,8 @@ function callCcBuiltin(args, position, k) {
     if (!isProcedure(proc)) {
         throw new EvalError('call/cc expects a procedure');
     }
+    const procedureBoundary = currentProcedureBoundaries[currentProcedureBoundaries.length - 1];
+    const returnContinuation = (result) => isVoidResult(result) && procedureBoundary?.allowVoidEscape ? procedureBoundary.k(result) : k(result);
     return {
         kind: 'apply-step',
         proc,
@@ -2141,10 +2165,11 @@ function callCcBuiltin(args, position, k) {
                 resume: k,
                 windStack: currentWindFrames.slice(),
                 handlerStack: currentExceptionHandlers.slice(),
+                procedureBoundaries: currentProcedureBoundaries.slice(),
             },
         ],
         position,
-        k,
+        k: returnContinuation,
     };
 }
 function callWithValuesBuiltin(args, position, macroEnv, k) {
@@ -2165,7 +2190,7 @@ function dynamicWindBuiltin(args, position, macroEnv, k) {
         return applyProcedure(body, [], position, macroEnv, (value) => {
             currentWindFrames = outerWindFrames;
             return invokeWindThunk(after, position, outerWindFrames, macroEnv, () => k(value));
-        });
+        }, false);
     });
 }
 function invokeWindThunk(proc, position, windFrames, macroEnv, k) {
@@ -2173,11 +2198,12 @@ function invokeWindThunk(proc, position, windFrames, macroEnv, k) {
     return applyProcedure(proc, [], position, macroEnv, () => {
         currentWindFrames = windFrames;
         return k();
-    });
+    }, false);
 }
 function resumeContinuation(proc, value, macroEnv) {
     return transitionWindFrames(proc.windStack, macroEnv, () => {
         currentExceptionHandlers = proc.handlerStack.slice();
+        currentProcedureBoundaries = proc.procedureBoundaries.slice();
         return proc.resume(value);
     });
 }
@@ -2192,6 +2218,7 @@ function withExceptionHandlerBuiltin(args, position, k) {
     const previousHandlers = currentExceptionHandlers.slice();
     const handlerFrame = {
         windStack: currentWindFrames.slice(),
+        procedureBoundaries: currentProcedureBoundaries.slice(),
         previousHandlers,
         handle: (value, signalPosition) => {
             currentExceptionHandlers = previousHandlers.slice();
@@ -2229,6 +2256,7 @@ function handleExceptionSignal(signal, macroEnv) {
     }
     return transitionWindFrames(handlerFrame.windStack, macroEnv, () => {
         currentExceptionHandlers = handlerFrame.previousHandlers.slice();
+        currentProcedureBoundaries = handlerFrame.procedureBoundaries.slice();
         return handlerFrame.handle(signal.value, signal.position);
     });
 }

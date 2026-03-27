@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use super::advanced;
 use super::error::{EvalError, SourcePosition};
 
 type EvalResult<T> = Result<T, EvalError>;
@@ -498,6 +499,10 @@ pub fn eval_str(input: &str) -> Result<String, EvalError> {
 /// Evaluate Scheme expressions, returning both the result value and
 /// any output produced by `display`, `write`, or `newline`.
 pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> {
+    if needs_advanced_eval(input) {
+        return advanced::eval_str_with_output(input);
+    }
+
     let mut parser = Parser::new(input);
     let program = parser.parse_program()?;
     if program.is_empty() {
@@ -512,6 +517,12 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     let last_value = eval_sequence(&program, &env, &mut context)?;
 
     Ok((format_value(&last_value), context.output))
+}
+
+fn needs_advanced_eval(input: &str) -> bool {
+    input.contains("call/cc")
+        || input.contains("call-with-current-continuation")
+        || input.contains("define-syntax")
 }
 
 fn create_global_env() -> EnvRef {
