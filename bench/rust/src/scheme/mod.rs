@@ -1431,5 +1431,14 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     Ok((result.to_string(), output))
 }
 
+pub fn eval_str_with_limit(input: &str, max_steps: u64) -> Result<String, EvalError> {
+    let mut parser = Parser::new(input);
+    let exprs = parser.parse_all()?;
+    let env = vec![new_frame()];
+    let mut output = String::new();
+    let result = cek::cek_run_with_limit(exprs, env, &mut output, Some(max_steps))?;
+    Ok(result.to_string())
+}
+
 #[cfg(test)]
 mod tests;

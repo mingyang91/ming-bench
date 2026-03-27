@@ -12,4 +12,6 @@ pub enum EvalError {
     UnboundVariable(String),
     #[error("{0}")]
     Generic(String),
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }

@@ -984,6 +984,10 @@ fn cek_step_apply(func: Value, args: Vec<Value>, k: Rc<Kont>, output: &mut Strin
 }
 
 pub(crate) fn cek_run(exprs: Vec<Expr>, env: Env, output: &mut String) -> Result<Value, EvalError> {
+    cek_run_with_limit(exprs, env, output, None)
+}
+
+pub(crate) fn cek_run_with_limit(exprs: Vec<Expr>, env: Env, output: &mut String, max_steps: Option<u64>) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Err(EvalError::Parse("empty input".into()));
     }
@@ -1000,6 +1004,7 @@ pub(crate) fn cek_run(exprs: Vec<Expr>, env: Env, output: &mut String) -> Result
     let mut last_span = Span::default();
     let mut winders: Vec<Rc<(Value, Value)>> = Vec::new();
     let mut handlers: Vec<Handler> = Vec::new();
+    let mut steps: u64 = 0;
 
     loop {
         if let Ctrl::Val(ref v) = ctrl {
@@ -1007,6 +1012,12 @@ pub(crate) fn cek_run(exprs: Vec<Expr>, env: Env, output: &mut String) -> Result
                 return Ok(v.clone());
             }
         }
+        if let Some(limit) = max_steps {
+            if steps >= limit {
+                return Err(EvalError::StepLimitExceeded);
+            }
+        }
+        steps += 1;
         let (new_ctrl, new_k) = match ctrl {
             Ctrl::Eval(ref expr, _) => {
                 last_span = expr.span;
