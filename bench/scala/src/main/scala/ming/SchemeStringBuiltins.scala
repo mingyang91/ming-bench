@@ -123,7 +123,7 @@ private[ming] object StringBuiltins:
   private def integerToChar(name: String, args: List[Value], pos: SourcePos): Value =
     val codePoint = requireExactInteger(name, requireSingleArg(name, args, pos), pos)
     if codePoint < Character.MIN_VALUE.toLong ||
-        codePoint > Character.MAX_VALUE.toLong ||
-        Character.isSurrogate(codePoint.toChar)
+      codePoint > Character.MAX_VALUE.toLong ||
+      Character.isSurrogate(codePoint.toChar)
     then throw EvalError.at(pos, s"$name expected a valid character code")
     Value.CharVal(codePoint.toChar)
