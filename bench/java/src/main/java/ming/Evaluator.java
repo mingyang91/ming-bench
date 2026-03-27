@@ -93,7 +93,15 @@ public class Evaluator {
 
     sealed interface SchemeList permits Pair, Empty {}
 
-    record Pair(Object car, Object cdr) implements SchemeList {}
+    static final class Pair implements SchemeList {
+        private Object car;
+        private Object cdr;
+        Pair(Object car, Object cdr) { this.car = car; this.cdr = cdr; }
+        Object car() { return car; }
+        Object cdr() { return cdr; }
+        void setCar(Object v) { this.car = v; }
+        void setCdr(Object v) { this.cdr = v; }
+    }
 
     enum Empty implements SchemeList { NIL }
 
@@ -133,7 +141,7 @@ public class Evaluator {
     record SyntaxRules(List<String> literals, List<List<Object>> patterns, List<Object> templates, Env defEnv) {}
 
     private static final Set<String> MACRO_SPECIAL_FORMS = Set.of(
-        "quote", "if", "define", "lambda", "case-lambda", "and", "begin", "let", "cond", "set!", "or",
+        "quote", "if", "define", "lambda", "case-lambda", "and", "begin", "let", "let*", "cond", "set!", "or",
         "define-syntax", "syntax-rules", "letrec", "letrec*", "case", "do"
     );
 
@@ -173,7 +181,15 @@ public class Evaluator {
                 "procedure?",
                 "eqv?",
                 "vector", "make-vector", "vector-ref", "vector-set!", "vector-length", "vector?",
-                "vector->list", "list->vector")) {
+                "vector->list", "list->vector",
+                "set-car!", "set-cdr!",
+                "caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "caddar",
+                "for-each", "reverse", "memq", "memv", "member", "assq", "assv", "gcd", "lcm",
+                "truncate", "round", "make-string", "string",
+                "string>?", "string<=?", "string>=?",
+                "caaar", "caadr", "cadar", "cdaar", "cdadr", "cddar",
+                "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
+                "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr")) {
             env.define(name, "builtin:" + name);
         }
         return env;
@@ -234,11 +250,16 @@ public class Evaluator {
         StringBuilder sb = new StringBuilder("(");
         sb.append(writeMode ? schemeToString(p.car()) : displayToString(p.car()));
         Object rest = p.cdr();
+        Set<Pair> seen = new HashSet<>(Set.of(p));
         while (rest instanceof Pair pr) {
+            if (!seen.add(pr)) {
+                sb.append(" ...");
+                break;
+            }
             sb.append(" ").append(writeMode ? schemeToString(pr.car()) : displayToString(pr.car()));
             rest = pr.cdr();
         }
-        if (rest != Empty.NIL) {
+        if (rest != Empty.NIL && !(rest instanceof Pair)) {
             sb.append(" . ").append(writeMode ? schemeToString(rest) : displayToString(rest));
         }
         sb.append(")");
@@ -615,6 +636,22 @@ public class Evaluator {
                         }
                         expr = list.get(list.size() - 1); env = letEnv; continue TCO; // TCO
                     }
+                    case "let*" -> {
+                        if (list.size() < 3) throw errAt(eline, ecol, "let*: bad syntax");
+                        List<?> bindings = (List<?>) list.get(1);
+                        Env letEnv = new Env(env);
+                        for (Object b : bindings) {
+                            List<?> binding = (List<?>) b;
+                            String bname = symName(binding.size() >= 1 ? binding.get(0) : null);
+                            if (binding.size() != 2 || bname == null)
+                                throw errAt(eline, ecol, "let*: bad binding");
+                            letEnv.define(bname, eval(binding.get(1), letEnv));
+                        }
+                        for (int i = 2; i < list.size() - 1; i++) {
+                            eval(list.get(i), letEnv);
+                        }
+                        expr = list.get(list.size() - 1); env = letEnv; continue TCO;
+                    }
                     case "cond" -> {
                         for (int i = 1; i < list.size(); i++) {
                             List<?> clause = (List<?>) list.get(i);
@@ -978,6 +1015,10 @@ public class Evaluator {
     }
 
     private boolean schemeEqual(Object a, Object b) {
+        return schemeEqualRec(a, b, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+    }
+
+    private boolean schemeEqualRec(Object a, Object b, Set<Object> seen) {
         if (a == b) return true;
         if (isNumber(a) && isNumber(b)) {
             try { return compareNumbers(a, b, "equal?") == 0; } catch (EvalError e) { return false; }
@@ -988,12 +1029,14 @@ public class Evaluator {
         if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
         if (a == Empty.NIL && b == Empty.NIL) return true;
         if (a instanceof Pair pa && b instanceof Pair pb) {
-            return schemeEqual(pa.car(), pb.car()) && schemeEqual(pa.cdr(), pb.cdr());
+            // Use a composite key to track visited pair comparisons
+            if (!seen.add(pa)) return true; // already comparing this pair, assume equal
+            return schemeEqualRec(pa.car(), pb.car(), seen) && schemeEqualRec(pa.cdr(), pb.cdr(), seen);
         }
         if (a instanceof SchemeVector va && b instanceof SchemeVector vb) {
             if (va.data.length != vb.data.length) return false;
             for (int i = 0; i < va.data.length; i++) {
-                if (!schemeEqual(va.data[i], vb.data[i])) return false;
+                if (!schemeEqualRec(va.data[i], vb.data[i], seen)) return false;
             }
             return true;
         }
@@ -1348,6 +1391,173 @@ public class Evaluator {
                 if (!(args.get(0) instanceof Pair p)) throw new EvalError("cdr: expected pair");
                 yield p.cdr();
             }
+            case "set-car!" -> {
+                checkMinArgs(args, 2, "set-car!");
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError("set-car!: expected pair");
+                p.setCar(args.get(1));
+                yield VOID;
+            }
+            case "set-cdr!" -> {
+                checkMinArgs(args, 2, "set-cdr!");
+                if (!(args.get(0) instanceof Pair p)) throw new EvalError("set-cdr!: expected pair");
+                p.setCdr(args.get(1));
+                yield VOID;
+            }
+            case "caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "caddar",
+                 "caaar", "caadr", "cadar", "cdaar", "cdadr", "cddar",
+                 "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "cadddr",
+                 "cdaaar", "cdaadr", "cdadar", "cdaddr", "cddaar", "cddadr", "cdddar", "cddddr" -> {
+                checkMinArgs(args, 1, name);
+                yield applyCxr(args.get(0), name);
+            }
+            case "for-each" -> {
+                checkMinArgs(args, 2, "for-each");
+                Object fn = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    List<Object> fnArgs = new ArrayList<>();
+                    fnArgs.add(p.car());
+                    apply(fn, fnArgs);
+                    lst = p.cdr();
+                }
+                yield VOID;
+            }
+            case "reverse" -> {
+                checkMinArgs(args, 1, "reverse");
+                Object lst = args.get(0);
+                Object result = Empty.NIL;
+                while (lst instanceof Pair p) {
+                    result = new Pair(p.car(), result);
+                    lst = p.cdr();
+                }
+                yield result;
+            }
+            case "memq" -> {
+                checkMinArgs(args, 2, "memq");
+                Object obj = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (obj == p.car() || (obj instanceof String && obj.equals(p.car()))
+                        || (obj instanceof Long && obj.equals(p.car()))
+                        || (obj instanceof Boolean && obj.equals(p.car()))) {
+                        yield lst;
+                    }
+                    lst = p.cdr();
+                }
+                yield false;
+            }
+            case "gcd" -> {
+                checkMinArgs(args, 2, "gcd");
+                if (!(args.get(0) instanceof Long a)) throw new EvalError("gcd: expected integer");
+                if (!(args.get(1) instanceof Long b)) throw new EvalError("gcd: expected integer");
+                yield gcd(a, b);
+            }
+            case "lcm" -> {
+                checkMinArgs(args, 2, "lcm");
+                if (!(args.get(0) instanceof Long a)) throw new EvalError("lcm: expected integer");
+                if (!(args.get(1) instanceof Long b)) throw new EvalError("lcm: expected integer");
+                long g = gcd(a, b);
+                yield g == 0 ? 0L : Math.abs(a / g * b);
+            }
+            case "truncate" -> {
+                checkMinArgs(args, 1, "truncate");
+                Object v = args.get(0);
+                if (v instanceof Long) yield v;
+                if (v instanceof Double d) yield Long.valueOf((long) d.doubleValue());
+                throw new EvalError("truncate: expected number");
+            }
+            case "round" -> {
+                checkMinArgs(args, 1, "round");
+                Object v = args.get(0);
+                if (v instanceof Long) yield v;
+                if (v instanceof Double d) yield Math.round(d);
+                throw new EvalError("round: expected number");
+            }
+            case "make-string" -> {
+                checkMinArgs(args, 1, "make-string");
+                if (!(args.get(0) instanceof Long n)) throw new EvalError("make-string: expected integer");
+                char fill = args.size() > 1 && args.get(1) instanceof SchemeChar c ? c.value() : ' ';
+                char[] chars = new char[(int)(long)n];
+                java.util.Arrays.fill(chars, fill);
+                yield new SchemeString(new String(chars), false);
+            }
+            case "string" -> {
+                StringBuilder sb = new StringBuilder();
+                for (Object a : args) {
+                    if (!(a instanceof SchemeChar c)) throw new EvalError("string: expected char");
+                    sb.append(c.value());
+                }
+                yield new SchemeString(sb.toString(), false);
+            }
+            case "string>?" -> {
+                checkMinArgs(args, 2, "string>?");
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string>?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string>?: expected string");
+                yield a.value().compareTo(b.value()) > 0;
+            }
+            case "string<=?" -> {
+                checkMinArgs(args, 2, "string<=?");
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string<=?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string<=?: expected string");
+                yield a.value().compareTo(b.value()) <= 0;
+            }
+            case "string>=?" -> {
+                checkMinArgs(args, 2, "string>=?");
+                if (!(args.get(0) instanceof SchemeString a)) throw new EvalError("string>=?: expected string");
+                if (!(args.get(1) instanceof SchemeString b)) throw new EvalError("string>=?: expected string");
+                yield a.value().compareTo(b.value()) >= 0;
+            }
+            case "memv" -> {
+                checkMinArgs(args, 2, "memv");
+                Object obj = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (schemeEqv(obj, p.car())) yield lst;
+                    lst = p.cdr();
+                }
+                yield false;
+            }
+            case "assq" -> {
+                checkMinArgs(args, 2, "assq");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (p.car() instanceof Pair entry) {
+                        Object ek = entry.car();
+                        if (key == ek || (key instanceof String && key.equals(ek))
+                            || (key instanceof Long && key.equals(ek))
+                            || (key instanceof Boolean && key.equals(ek))) {
+                            yield entry;
+                        }
+                    }
+                    lst = p.cdr();
+                }
+                yield false;
+            }
+            case "assv" -> {
+                checkMinArgs(args, 2, "assv");
+                Object key = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (p.car() instanceof Pair entry) {
+                        if (schemeEqv(key, entry.car())) yield entry;
+                    }
+                    lst = p.cdr();
+                }
+                yield false;
+            }
+            case "member" -> {
+                checkMinArgs(args, 2, "member");
+                Object obj = args.get(0);
+                Object lst = args.get(1);
+                while (lst instanceof Pair p) {
+                    if (schemeEqual(obj, p.car())) {
+                        yield lst;
+                    }
+                    lst = p.cdr();
+                }
+                yield false;
+            }
             case "null?" -> {
                 checkMinArgs(args, 1, "null?");
                 yield args.get(0) == Empty.NIL;
@@ -1634,11 +1844,16 @@ public class Evaluator {
             }
             case "list?" -> {
                 checkMinArgs(args, 1, "list?");
-                Object lst = args.get(0);
-                while (lst instanceof Pair p) {
-                    lst = p.cdr();
+                Object slow = args.get(0);
+                Object fast = slow;
+                while (fast instanceof Pair fp) {
+                    fast = fp.cdr();
+                    if (!(fast instanceof Pair fp2)) break;
+                    fast = fp2.cdr();
+                    slow = ((Pair) slow).cdr();
+                    if (slow == fast) yield false; // cycle detected
                 }
-                yield lst == Empty.NIL;
+                yield fast == Empty.NIL;
             }
             case "assoc" -> {
                 checkMinArgs(args, 2, "assoc");
@@ -1884,6 +2099,15 @@ public class Evaluator {
             throw new EvalError(context + ": expected integer, got " + schemeToString(val));
         }
         throw new EvalError(context + ": expected number, got " + schemeToString(val));
+    }
+
+    private Object applyCxr(Object val, String name) throws EvalError {
+        // name is like "caar", "cddr", etc. — strip c and r, apply a/d from right to left
+        for (int i = name.length() - 2; i >= 1; i--) {
+            if (!(val instanceof Pair p)) throw new EvalError(name + ": expected pair");
+            val = (name.charAt(i) == 'a') ? p.car() : p.cdr();
+        }
+        return val;
     }
 
     private void checkMinArgs(List<Object> args, int min, String name) throws EvalError {
