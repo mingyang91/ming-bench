@@ -22,4 +22,6 @@ pub enum EvalError {
     },
     #[error("unhandled exception: {0}")]
     Raised(String),
+    #[error("step limit exceeded")]
+    StepLimitExceeded,
 }

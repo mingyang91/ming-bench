@@ -1,9 +1,28 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::scheme::env::Env;
 use crate::scheme::error::EvalError;
 use crate::scheme::value::{Value, ContData};
+
+// Thread-local step counter for eval_str_with_limit.
+// When Some(n), each eval dispatch decrements n; at 0 → StepLimitExceeded.
+thread_local! {
+    static STEP_BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[inline]
+fn check_step_budget() -> Result<(), EvalError> {
+    STEP_BUDGET.with(|b| {
+        if let Some(remaining) = b.get() {
+            if remaining == 0 {
+                return Err(EvalError::StepLimitExceeded);
+            }
+            b.set(Some(remaining - 1));
+        }
+        Ok(())
+    })
+}
 
 pub type Output = Rc<RefCell<String>>;
 
@@ -251,6 +270,13 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
 
 /// Evaluate a sequence of expressions in a single CEK machine pass.
 /// Continuations captured by call/cc span the entire sequence.
+pub fn eval_sequence_with_limit(exprs: &[Value], env: &Rc<RefCell<Env>>, out: &Output, max_steps: usize) -> Result<Value, EvalError> {
+    STEP_BUDGET.with(|b| b.set(Some(max_steps)));
+    let result = eval_sequence(exprs, env, out);
+    STEP_BUDGET.with(|b| b.set(None));
+    result
+}
+
 pub fn eval_sequence(exprs: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
     if exprs.is_empty() {
         return Ok(Value::Void);
@@ -513,6 +539,7 @@ fn cek_eval(
         // ===== EVAL PHASE: reduce ctrl to a value =====
         // Take ctrl by value to avoid deep-cloning expression trees.
         let mut val = loop {
+            check_step_budget()?;
             match std::mem::replace(&mut ctrl, Value::Void) {
                 Value::Symbol(name) => break env.borrow().get(&name)?,
                 Value::List(mut elems) => {

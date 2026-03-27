@@ -7,7 +7,7 @@ mod value;
 pub use error::EvalError;
 use env::Env;
 use parser::Parser;
-use eval::{eval_sequence, Output};
+use eval::{eval_sequence, eval_sequence_with_limit, Output};
 use value::Value;
 
 use std::cell::RefCell;
@@ -107,6 +107,24 @@ pub fn eval_str_with_output(input: &str) -> Result<(String, String), EvalError> 
     })?;
     let output = out.borrow().clone();
     Ok((result.to_display(), output))
+}
+
+/// Evaluate Scheme expressions with a step budget.
+/// Each eval dispatch counts as one step. Exceeding the budget returns an error.
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let exprs = Parser::new(input).parse_all()?;
+    let env = make_env();
+    let out: Output = Rc::new(RefCell::new(String::new()));
+    if exprs.is_empty() {
+        return Ok(Value::Boolean(false).to_display());
+    }
+    let positions: Vec<(usize, usize)> = exprs.iter().map(|(_, l, c)| (*l, *c)).collect();
+    let all_exprs: Vec<Value> = exprs.into_iter().map(|(e, _, _)| e).collect();
+    let result = eval_sequence_with_limit(&all_exprs, &env, &out, max_steps).map_err(|e| {
+        let (line, col) = positions.last().copied().unwrap_or((1, 1));
+        EvalError::WithPosition { error: Box::new(e), line, col }
+    })?;
+    Ok(result.to_display())
 }
 
 #[cfg(test)]
