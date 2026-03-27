@@ -738,6 +738,42 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         }).collect();
                         return Err(EvalError::Generic(format!("error: {}", msg.join(" "))));
                     }
+                    "dynamic-wind" => {
+                        if items.len() != 4 {
+                            return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into()));
+                        }
+                        let in_thunk = eval(&items[1], env)?;
+                        let body_thunk = eval(&items[2], env)?;
+                        let out_thunk = eval(&items[3], env)?;
+
+                        // Protect in-thunk from consuming continuation resume state
+                        let saved_resume = RESUME_FRAMES.with(|rf| std::mem::take(&mut *rf.borrow_mut()));
+                        let saved_callcc = CALLCC_RETURN.with(|r| r.borrow_mut().take());
+                        apply(&in_thunk, &[])?;
+                        RESUME_FRAMES.with(|rf| *rf.borrow_mut() = saved_resume);
+                        CALLCC_RETURN.with(|r| *r.borrow_mut() = saved_callcc);
+
+                        // Call body-thunk (may consume resume state)
+                        let body_result = apply(&body_thunk, &[]);
+
+                        match body_result {
+                            Ok(val) => {
+                                // Normal return: run out-thunk
+                                apply(&out_thunk, &[])?;
+                                return Ok(val);
+                            }
+                            Err(EvalError::ContinuationEscape(id)) => {
+                                // Non-local exit: run out-thunk then re-throw
+                                apply(&out_thunk, &[])?;
+                                return Err(EvalError::ContinuationEscape(id));
+                            }
+                            Err(e) => {
+                                // Other error: run out-thunk then re-throw
+                                let _ = apply(&out_thunk, &[]);
+                                return Err(e);
+                            }
+                        }
+                    }
                     "call/cc" | "call-with-current-continuation" => {
                         let override_val = CALLCC_RETURN.with(|r| r.borrow_mut().take());
                         if let Some(val) = override_val {
@@ -1645,6 +1681,33 @@ fn apply_builtin(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             match char::from_u32(n as u32) {
                 Some(c) => Ok(Value::Char(c)),
                 None => Err(EvalError::Generic(format!("integer->char: invalid code point {}", n))),
+            }
+        }
+        "dynamic-wind" => {
+            if args.len() != 3 { return Err(EvalError::Arity("dynamic-wind requires 3 arguments".into())); }
+            let in_thunk = &args[0];
+            let body_thunk = &args[1];
+            let out_thunk = &args[2];
+            // Protect in-thunk from consuming continuation resume state
+            let saved_resume = RESUME_FRAMES.with(|rf| std::mem::take(&mut *rf.borrow_mut()));
+            let saved_callcc = CALLCC_RETURN.with(|r| r.borrow_mut().take());
+            apply(in_thunk, &[])?;
+            RESUME_FRAMES.with(|rf| *rf.borrow_mut() = saved_resume);
+            CALLCC_RETURN.with(|r| *r.borrow_mut() = saved_callcc);
+            let body_result = apply(body_thunk, &[]);
+            match body_result {
+                Ok(val) => {
+                    apply(out_thunk, &[])?;
+                    Ok(val)
+                }
+                Err(EvalError::ContinuationEscape(id)) => {
+                    apply(out_thunk, &[])?;
+                    Err(EvalError::ContinuationEscape(id))
+                }
+                Err(e) => {
+                    let _ = apply(out_thunk, &[]);
+                    Err(e)
+                }
             }
         }
         "procedure?" => {
@@ -3321,6 +3384,7 @@ fn seed_builtins(env: &Env) {
         "vector?", "vector->list", "list->vector",
         // L18
         "call/cc", "call-with-current-continuation",
+        "dynamic-wind",
         // L17
         "set-car!", "set-cdr!",
         "caar", "cadr", "cdar", "cddr", "caddr", "cdddr", "cadddr", "caddar",
