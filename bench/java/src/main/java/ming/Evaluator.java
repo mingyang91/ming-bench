@@ -15,7 +15,7 @@ public class Evaluator {
         Parser parser = new Parser(input);
         List<Expr> program = parser.parseProgram();
         if (program.isEmpty()) {
-            throw new EvalError("empty input");
+            throw new EvalError("empty input", 1, 1);
         }
 
         Value last = VoidValue.INSTANCE;
@@ -57,13 +57,17 @@ public class Evaluator {
     }
 
     private Value eval(Expr expr, Environment env) throws EvalError {
-        return switch (expr) {
-            case IntExpr intExpr -> new IntValue(intExpr.value());
-            case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
-            case StringExpr stringExpr -> new StringValue(stringExpr.value());
-            case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
-            case ListExpr listExpr -> evalList(listExpr, env);
-        };
+        try {
+            return switch (expr) {
+                case IntExpr intExpr -> new IntValue(intExpr.value());
+                case BoolExpr boolExpr -> BoolValue.of(boolExpr.value());
+                case StringExpr stringExpr -> new StringValue(stringExpr.value());
+                case SymbolExpr symbolExpr -> env.lookup(symbolExpr.name());
+                case ListExpr listExpr -> evalList(listExpr, env);
+            };
+        } catch (EvalError err) {
+            throw attachPosition(err, expr);
+        }
     }
 
     private Value evalList(ListExpr expr, Environment env) throws EvalError {
@@ -496,6 +500,13 @@ public class Evaluator {
         return BoolValue.of(args.getFirst() instanceof SymbolValue);
     }
 
+    private EvalError attachPosition(EvalError err, Expr expr) {
+        if (err.hasPosition()) {
+            return err;
+        }
+        return err.withPosition(expr.loc().line(), expr.loc().column());
+    }
+
     private void requireArgCount(int actual, int expected, String procedure) throws EvalError {
         if (actual != expected) {
             throw new EvalError("'" + procedure + "' expects exactly "
@@ -558,22 +569,26 @@ public class Evaluator {
         abstract boolean test(long left, long right);
     }
 
+    private record SourcePos(int line, int column) {
+    }
+
     private sealed interface Expr permits IntExpr, BoolExpr, StringExpr, SymbolExpr, ListExpr {
+        SourcePos loc();
     }
 
-    private record IntExpr(long value) implements Expr {
+    private record IntExpr(long value, SourcePos loc) implements Expr {
     }
 
-    private record BoolExpr(boolean value) implements Expr {
+    private record BoolExpr(boolean value, SourcePos loc) implements Expr {
     }
 
-    private record StringExpr(String value) implements Expr {
+    private record StringExpr(String value, SourcePos loc) implements Expr {
     }
 
-    private record SymbolExpr(String name) implements Expr {
+    private record SymbolExpr(String name, SourcePos loc) implements Expr {
     }
 
-    private record ListExpr(List<Expr> elements) implements Expr {
+    private record ListExpr(List<Expr> elements, SourcePos loc) implements Expr {
     }
 
     private record Binding(String name, Expr valueExpr) {
@@ -718,6 +733,8 @@ public class Evaluator {
     private static final class Parser {
         private final String input;
         private int index;
+        private int line = 1;
+        private int column = 1;
 
         private Parser(String input) {
             this.input = input;
@@ -736,26 +753,27 @@ public class Evaluator {
         private Expr parseExpr() throws EvalError {
             skipIgnored();
             if (isAtEnd()) {
-                throw new EvalError("unexpected end of input");
+                throw new EvalError("unexpected end of input", line, column);
             }
 
+            SourcePos start = currentPosition();
             char ch = currentChar();
             return switch (ch) {
-                case '(' -> parseList();
-                case '\'' -> parseQuoteAbbreviation();
-                case '"' -> parseString();
-                case ')' -> throw new EvalError("unexpected ')'");
-                default -> parseAtom();
+                case '(' -> parseList(start);
+                case '\'' -> parseQuoteAbbreviation(start);
+                case '"' -> parseString(start);
+                case ')' -> throw new EvalError("unexpected ')'", start.line(), start.column());
+                default -> parseAtom(start);
             };
         }
 
-        private Expr parseQuoteAbbreviation() throws EvalError {
-            index++;
-            return new ListExpr(List.of(new SymbolExpr("quote"), parseExpr()));
+        private Expr parseQuoteAbbreviation(SourcePos start) throws EvalError {
+            advance();
+            return new ListExpr(List.of(new SymbolExpr("quote", start), parseExpr()), start);
         }
 
-        private Expr parseList() throws EvalError {
-            index++;
+        private Expr parseList(SourcePos start) throws EvalError {
+            advance();
             List<Expr> elements = new ArrayList<>();
             skipIgnored();
             while (!isAtEnd() && currentChar() != ')') {
@@ -763,25 +781,25 @@ public class Evaluator {
                 skipIgnored();
             }
             if (isAtEnd()) {
-                throw new EvalError("unterminated list");
+                throw new EvalError("unterminated list", start.line(), start.column());
             }
-            index++;
-            return new ListExpr(List.copyOf(elements));
+            advance();
+            return new ListExpr(List.copyOf(elements), start);
         }
 
-        private Expr parseString() throws EvalError {
-            index++;
+        private Expr parseString(SourcePos start) throws EvalError {
+            advance();
             StringBuilder builder = new StringBuilder();
             while (!isAtEnd()) {
-                char ch = input.charAt(index++);
+                char ch = advance();
                 if (ch == '"') {
-                    return new StringExpr(builder.toString());
+                    return new StringExpr(builder.toString(), start);
                 }
                 if (ch == '\\') {
                     if (isAtEnd()) {
-                        throw new EvalError("unterminated string");
+                        throw new EvalError("unterminated string", start.line(), start.column());
                     }
-                    char escaped = input.charAt(index++);
+                    char escaped = advance();
                     switch (escaped) {
                         case 'n' -> builder.append('\n');
                         case 'r' -> builder.append('\r');
@@ -794,37 +812,38 @@ public class Evaluator {
                     builder.append(ch);
                 }
             }
-            throw new EvalError("unterminated string");
+            throw new EvalError("unterminated string", start.line(), start.column());
         }
 
-        private Expr parseAtom() throws EvalError {
-            int start = index;
+        private Expr parseAtom(SourcePos start) throws EvalError {
+            int atomStartIndex = index;
             while (!isAtEnd()) {
                 char ch = currentChar();
                 if (Character.isWhitespace(ch) || ch == '(' || ch == ')' || ch == '\'' || ch == ';') {
                     break;
                 }
-                index++;
+                advance();
             }
 
-            String atom = input.substring(start, index);
+            String atom = input.substring(atomStartIndex, index);
             if (atom.isEmpty()) {
-                throw new EvalError("unexpected token");
+                throw new EvalError("unexpected token", start.line(), start.column());
             }
             if (atom.equals("#t")) {
-                return new BoolExpr(true);
+                return new BoolExpr(true, start);
             }
             if (atom.equals("#f")) {
-                return new BoolExpr(false);
+                return new BoolExpr(false, start);
             }
             if (isInteger(atom)) {
                 try {
-                    return new IntExpr(Long.parseLong(atom));
+                    return new IntExpr(Long.parseLong(atom), start);
                 } catch (NumberFormatException ex) {
-                    throw new EvalError("invalid integer literal: " + atom);
+                    throw new EvalError("invalid integer literal: " + atom,
+                            start.line(), start.column());
                 }
             }
-            return new SymbolExpr(atom);
+            return new SymbolExpr(atom, start);
         }
 
         private boolean isInteger(String text) {
@@ -847,17 +866,21 @@ public class Evaluator {
             while (!isAtEnd()) {
                 char ch = currentChar();
                 if (Character.isWhitespace(ch)) {
-                    index++;
+                    advance();
                     continue;
                 }
                 if (ch == ';') {
                     while (!isAtEnd() && currentChar() != '\n') {
-                        index++;
+                        advance();
                     }
                     continue;
                 }
                 break;
             }
+        }
+
+        private SourcePos currentPosition() {
+            return new SourcePos(line, column);
         }
 
         private boolean isAtEnd() {
@@ -866,6 +889,17 @@ public class Evaluator {
 
         private char currentChar() {
             return input.charAt(index);
+        }
+
+        private char advance() {
+            char ch = input.charAt(index++);
+            if (ch == '\n') {
+                line++;
+                column = 1;
+            } else {
+                column++;
+            }
+            return ch;
         }
     }
 }
