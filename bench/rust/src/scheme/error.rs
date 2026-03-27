@@ -20,6 +20,10 @@ pub enum EvalError {
     },
     #[error("{name} expects numeric arguments")]
     ExpectedNumber { name: String },
+    #[error("{name} expects a list")]
+    ExpectedList { name: String },
+    #[error("{name} expects a non-empty list")]
+    ExpectedPair { name: String },
     #[error("division by zero")]
     DivisionByZero,
 }
