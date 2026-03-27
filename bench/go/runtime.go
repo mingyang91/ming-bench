@@ -323,6 +323,7 @@ func newGlobalEnv() *env {
 	global.define("string-ref", builtinProc{name: "string-ref", fn: evalStringRef})
 	global.define("string-copy", builtinProc{name: "string-copy", fn: evalStringCopy})
 	global.define("string-set!", builtinProc{name: "string-set!", fn: evalStringSet})
+	registerLevel09Builtins(global)
 	return global
 }
 
