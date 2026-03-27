@@ -37,6 +37,7 @@ impl Expr {
 enum ExprKind {
     Int(i64),
     Bool(bool),
+    String(String),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -45,6 +46,7 @@ enum ExprKind {
 enum Value {
     Int(i64),
     Bool(bool),
+    String(String),
     Symbol(String),
     Pair(Rc<Pair>),
     EmptyList,
@@ -66,7 +68,17 @@ enum Procedure {
         body: Vec<Expr>,
         env: EnvRef,
     },
+    CaseLambda {
+        clauses: Vec<CaseLambdaClause>,
+        env: EnvRef,
+    },
     Continuation(Vec<Frame>),
+}
+
+#[derive(Clone)]
+struct CaseLambdaClause {
+    params: Vec<String>,
+    body: Vec<Expr>,
 }
 
 #[derive(Clone, Copy)]
@@ -76,10 +88,12 @@ enum Builtin {
     LessThan,
     NumericEqual,
     NullPredicate,
+    Cons,
     Car,
     Cdr,
     List,
     Not,
+    ProcedurePredicate,
     CallCc,
 }
 
@@ -143,6 +157,10 @@ enum Frame {
         remaining: Vec<Expr>,
         env: EnvRef,
     },
+    And {
+        rest: Vec<Expr>,
+        env: EnvRef,
+    },
     LetBindings {
         names: Vec<String>,
         remaining_exprs: Vec<Expr>,
@@ -169,6 +187,7 @@ enum TokenKind {
     LParen,
     RParen,
     Quote,
+    String(String),
     Atom(String),
 }
 
@@ -218,6 +237,10 @@ impl Parser {
                     kind: ExprKind::List(vec![Expr::symbol(token.pos, "quote"), quoted]),
                 })
             }
+            TokenKind::String(text) => Ok(Expr {
+                kind: ExprKind::String(text),
+                pos: token.pos,
+            }),
             TokenKind::Atom(text) => Ok(parse_atom(token.pos, text)),
         }
     }
@@ -343,6 +366,74 @@ fn lex(input: &str) -> Result<Vec<Token>, EvalError> {
                     pos,
                 });
             }
+            '"' => {
+                let pos = Position::new(line, column);
+                chars.next();
+                column += 1;
+
+                let mut text = String::new();
+                let mut terminated = false;
+                while let Some(string_ch) = chars.next() {
+                    match string_ch {
+                        '"' => {
+                            column += 1;
+                            terminated = true;
+                            break;
+                        }
+                        '\\' => {
+                            column += 1;
+                            let escaped = chars.next().ok_or_else(|| {
+                                EvalError::at(pos.line, pos.column, "unterminated string")
+                            })?;
+                            match escaped {
+                                '"' => {
+                                    column += 1;
+                                    text.push('"');
+                                }
+                                '\\' => {
+                                    column += 1;
+                                    text.push('\\');
+                                }
+                                'n' => {
+                                    column += 1;
+                                    text.push('\n');
+                                }
+                                't' => {
+                                    column += 1;
+                                    text.push('\t');
+                                }
+                                '\n' => {
+                                    line += 1;
+                                    column = 1;
+                                    text.push('\n');
+                                }
+                                other => {
+                                    column += 1;
+                                    text.push(other);
+                                }
+                            }
+                        }
+                        '\n' => {
+                            line += 1;
+                            column = 1;
+                            text.push('\n');
+                        }
+                        other => {
+                            column += 1;
+                            text.push(other);
+                        }
+                    }
+                }
+
+                if !terminated {
+                    return Err(EvalError::at(pos.line, pos.column, "unterminated string"));
+                }
+
+                tokens.push(Token {
+                    kind: TokenKind::String(text),
+                    pos,
+                });
+            }
             _ => {
                 let pos = Position::new(line, column);
                 let mut text = String::new();
@@ -351,6 +442,7 @@ fn lex(input: &str) -> Result<Vec<Token>, EvalError> {
                         || atom_ch == '('
                         || atom_ch == ')'
                         || atom_ch == '\''
+                        || atom_ch == '"'
                         || atom_ch == ';'
                     {
                         break;
@@ -424,10 +516,12 @@ fn install_builtins(env: &EnvRef) {
         ("<", Builtin::LessThan),
         ("=", Builtin::NumericEqual),
         ("null?", Builtin::NullPredicate),
+        ("cons", Builtin::Cons),
         ("car", Builtin::Car),
         ("cdr", Builtin::Cdr),
         ("list", Builtin::List),
         ("not", Builtin::Not),
+        ("procedure?", Builtin::ProcedurePredicate),
         ("call/cc", Builtin::CallCc),
         (
             "call-with-current-continuation",
@@ -502,11 +596,28 @@ fn start_cond(
     Ok((Control::Expr(elements[0].clone(), env), next_stack))
 }
 
+fn start_and(
+    expressions: &[Expr],
+    env: EnvRef,
+    mut stack: Vec<Frame>,
+) -> Result<(Control, Vec<Frame>), EvalError> {
+    if expressions.is_empty() {
+        return Ok((Control::Value(Value::Bool(true)), stack));
+    }
+
+    stack.push(Frame::And {
+        rest: expressions[1..].to_vec(),
+        env: env.clone(),
+    });
+    Ok((Control::Expr(expressions[0].clone(), env), stack))
+}
+
 fn step_expr(expr: Expr, env: EnvRef, mut stack: Vec<Frame>) -> Result<(Control, Vec<Frame>), EvalError> {
     let pos = expr.pos;
     match expr.kind {
         ExprKind::Int(value) => Ok((Control::Value(Value::Int(value)), stack)),
         ExprKind::Bool(value) => Ok((Control::Value(Value::Bool(value)), stack)),
+        ExprKind::String(value) => Ok((Control::Value(Value::String(value)), stack)),
         ExprKind::Symbol(name) => {
             let value = env.lookup(&name).ok_or_else(|| {
                 EvalError::at(pos.line, pos.column, format!("unbound variable: {name}"))
@@ -552,6 +663,9 @@ fn step_expr(expr: Expr, env: EnvRef, mut stack: Vec<Frame>) -> Result<(Control,
                     "begin" => {
                         return start_sequence(&elements[1..], env, stack);
                     }
+                    "and" => {
+                        return start_and(&elements[1..], env, stack);
+                    }
                     "lambda" => {
                         if elements.len() < 3 {
                             return Err(EvalError::at(
@@ -566,6 +680,44 @@ fn step_expr(expr: Expr, env: EnvRef, mut stack: Vec<Frame>) -> Result<(Control,
                             body: elements[2..].to_vec(),
                             env,
                         };
+                        return Ok((
+                            Control::Value(Value::Procedure(Rc::new(procedure))),
+                            stack,
+                        ));
+                    }
+                    "case-lambda" => {
+                        if elements.len() < 2 {
+                            return Err(EvalError::at(
+                                pos.line,
+                                pos.column,
+                                "case-lambda expects at least 1 clause",
+                            ));
+                        }
+
+                        let mut clauses = Vec::with_capacity(elements.len() - 1);
+                        for clause in &elements[1..] {
+                            let ExprKind::List(parts) = &clause.kind else {
+                                return Err(EvalError::at(
+                                    clause.pos.line,
+                                    clause.pos.column,
+                                    "case-lambda clauses must contain parameters and a body",
+                                ));
+                            };
+                            if parts.len() < 2 {
+                                return Err(EvalError::at(
+                                    clause.pos.line,
+                                    clause.pos.column,
+                                    "case-lambda clauses must contain parameters and a body",
+                                ));
+                            }
+
+                            clauses.push(CaseLambdaClause {
+                                params: parse_params(&parts[0])?,
+                                body: parts[1..].to_vec(),
+                            });
+                        }
+
+                        let procedure = Procedure::CaseLambda { clauses, env };
                         return Ok((
                             Control::Value(Value::Procedure(Rc::new(procedure))),
                             stack,
@@ -757,6 +909,17 @@ fn resume(frame: Frame, value: Value, mut stack: Vec<Frame>) -> Result<(Control,
                 start_cond(&remaining, env, stack)
             }
         }
+        Frame::And { rest, env } => {
+            if !is_truthy(&value) || rest.is_empty() {
+                Ok((Control::Value(value), stack))
+            } else {
+                stack.push(Frame::And {
+                    rest: rest[1..].to_vec(),
+                    env: env.clone(),
+                });
+                Ok((Control::Expr(rest[0].clone(), env), stack))
+            }
+        }
         Frame::LetBindings {
             names,
             remaining_exprs,
@@ -857,6 +1020,25 @@ fn apply_procedure(
             }
             start_sequence(body, call_env, stack)
         }
+        Procedure::CaseLambda { clauses, env } => {
+            let clause = clauses.iter().find(|clause| clause.params.len() == args.len());
+            let Some(clause) = clause else {
+                return Err(EvalError::at(
+                    pos.line,
+                    pos.column,
+                    format!(
+                        "wrong number of arguments: no matching case-lambda clause for {} argument(s)",
+                        args.len()
+                    ),
+                ));
+            };
+
+            let call_env = Environment::new(Some(env.clone()));
+            for (name, value) in clause.params.iter().cloned().zip(args.into_iter()) {
+                call_env.define(name, value);
+            }
+            start_sequence(&clause.body, call_env, stack)
+        }
         Procedure::Continuation(saved_stack) => {
             if args.len() != 1 {
                 return Err(EvalError::at(
@@ -914,6 +1096,19 @@ fn apply_builtin(
             }
             Value::Bool(matches!(args[0], Value::EmptyList))
         }
+        Builtin::Cons => {
+            if args.len() != 2 {
+                return Err(EvalError::at(
+                    pos.line,
+                    pos.column,
+                    "cons expects exactly 2 arguments",
+                ));
+            }
+            Value::Pair(Rc::new(Pair {
+                car: args[0].clone(),
+                cdr: args[1].clone(),
+            }))
+        }
         Builtin::Car => {
             if args.len() != 1 {
                 return Err(EvalError::at(
@@ -944,6 +1139,16 @@ fn apply_builtin(
                 ));
             }
             Value::Bool(!is_truthy(&args[0]))
+        }
+        Builtin::ProcedurePredicate => {
+            if args.len() != 1 {
+                return Err(EvalError::at(
+                    pos.line,
+                    pos.column,
+                    "procedure? expects exactly 1 argument",
+                ));
+            }
+            Value::Bool(matches!(args[0], Value::Procedure(_)))
         }
         Builtin::CallCc => {
             if args.len() != 1 {
@@ -1034,6 +1239,7 @@ fn datum_to_value(expr: &Expr) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Int(value) => Ok(Value::Int(*value)),
         ExprKind::Bool(value) => Ok(Value::Bool(*value)),
+        ExprKind::String(value) => Ok(Value::String(value.clone())),
         ExprKind::Symbol(name) => Ok(Value::Symbol(name.clone())),
         ExprKind::List(elements) => {
             let mut result = Value::EmptyList;
@@ -1119,6 +1325,7 @@ fn format_value(value: &Value) -> String {
         Value::Int(number) => number.to_string(),
         Value::Bool(true) => "#t".to_string(),
         Value::Bool(false) => "#f".to_string(),
+        Value::String(text) => format_string(text),
         Value::Symbol(name) => name.clone(),
         Value::Pair(pair) => format_pair(pair),
         Value::EmptyList => "()".to_string(),
@@ -1150,5 +1357,20 @@ fn format_pair(pair: &Rc<Pair>) -> String {
         }
     }
     out.push(')');
+    out
+}
+
+fn format_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
     out
 }
