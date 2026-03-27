@@ -9,6 +9,7 @@ type Expr =
   | (ExprBase & { kind: 'symbol'; name: string })
   | (ExprBase & { kind: 'list'; items: Expr[] });
 
+type CharValue = { kind: 'char'; value: string };
 type SchemeSymbol = { kind: 'symbol-value'; name: string };
 type EmptyList = { kind: 'empty-list' };
 type PairValue = { kind: 'pair'; car: Value; cdr: Value };
@@ -30,6 +31,7 @@ type Value =
   | number
   | boolean
   | string
+  | CharValue
   | SchemeSymbol
   | EmptyList
   | PairValue
@@ -41,6 +43,19 @@ type BindingSpec = { name: string; init: Expr };
 
 const EMPTY_LIST: EmptyList = { kind: 'empty-list' };
 const VOID: VoidValue = { kind: 'void' };
+const SCHEME_NUMBER_PATTERN = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+class OutputBuffer {
+  private readonly parts: string[] = [];
+
+  write(text: string): void {
+    this.parts.push(text);
+  }
+
+  toString(): string {
+    return this.parts.join('');
+  }
+}
 
 class Env {
   private readonly bindings = new Map<string, Value>();
@@ -259,44 +274,104 @@ class Parser {
   }
 }
 
-const BUILTINS = new Map<string, BuiltinProc>([
-  builtin('+', (args) => sumNumbers('+', args, 0)),
-  builtin('*', (args) => productNumbers('*', args, 1)),
-  builtin('-', (args) => subtractNumbers(args)),
-  builtin('/', (args) => divideNumbers(args)),
-  builtin('<', (args) => compareNumbers('<', args, (left, right) => left < right)),
-  builtin('>', (args) => compareNumbers('>', args, (left, right) => left > right)),
-  builtin('=', (args) => compareNumbers('=', args, (left, right) => left === right)),
-  builtin('<=', (args) => compareNumbers('<=', args, (left, right) => left <= right)),
-  builtin('append', (args) => appendValues(args)),
-  builtin('boolean?', (args) => unaryPredicate('boolean?', args, (value) => typeof value === 'boolean')),
-  builtin('car', (args) => {
-    assertExactArity('car', args, 1);
-    return expectPair('car', args[0]!).car;
-  }),
-  builtin('cdr', (args) => {
-    assertExactArity('cdr', args, 1);
-    return expectPair('cdr', args[0]!).cdr;
-  }),
-  builtin('cons', (args) => {
-    assertExactArity('cons', args, 2);
-    return { kind: 'pair', car: args[0]!, cdr: args[1]! };
-  }),
-  builtin('length', (args) => {
-    assertExactArity('length', args, 1);
-    return expectProperList('length', args[0]!).length;
-  }),
-  builtin('list', (args) => makeList(args)),
-  builtin('not', (args) => {
-    assertExactArity('not', args, 1);
-    return !isTruthy(args[0]!);
-  }),
-  builtin('null?', (args) => unaryPredicate('null?', args, isEmptyList)),
-  builtin('number?', (args) => unaryPredicate('number?', args, (value) => typeof value === 'number')),
-  builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
-  builtin('string?', (args) => unaryPredicate('string?', args, (value) => typeof value === 'string')),
-  builtin('symbol?', (args) => unaryPredicate('symbol?', args, isSymbolValue)),
-]);
+function createBuiltins(output: OutputBuffer): Map<string, BuiltinProc> {
+  return new Map<string, BuiltinProc>([
+    builtin('+', (args) => sumNumbers('+', args, 0)),
+    builtin('*', (args) => productNumbers('*', args, 1)),
+    builtin('-', (args) => subtractNumbers(args)),
+    builtin('/', (args) => divideNumbers(args)),
+    builtin('<', (args) => compareNumbers('<', args, (left, right) => left < right)),
+    builtin('>', (args) => compareNumbers('>', args, (left, right) => left > right)),
+    builtin('=', (args) => compareNumbers('=', args, (left, right) => left === right)),
+    builtin('<=', (args) => compareNumbers('<=', args, (left, right) => left <= right)),
+    builtin('append', (args) => appendValues(args)),
+    builtin('boolean?', (args) => unaryPredicate('boolean?', args, (value) => typeof value === 'boolean')),
+    builtin('car', (args) => {
+      assertExactArity('car', args, 1);
+      return expectPair('car', args[0]!).car;
+    }),
+    builtin('cdr', (args) => {
+      assertExactArity('cdr', args, 1);
+      return expectPair('cdr', args[0]!).cdr;
+    }),
+    builtin('char?', (args) => unaryPredicate('char?', args, isCharValue)),
+    builtin('cons', (args) => {
+      assertExactArity('cons', args, 2);
+      return { kind: 'pair', car: args[0]!, cdr: args[1]! };
+    }),
+    builtin('display', (args) => {
+      assertExactArity('display', args, 1);
+      output.write(formatDisplayValue(args[0]!));
+      return VOID;
+    }),
+    builtin('length', (args) => {
+      assertExactArity('length', args, 1);
+      return expectProperList('length', args[0]!).length;
+    }),
+    builtin('list', (args) => makeList(args)),
+    builtin('newline', (args) => {
+      assertExactArity('newline', args, 0);
+      output.write('\n');
+      return VOID;
+    }),
+    builtin('not', (args) => {
+      assertExactArity('not', args, 1);
+      return !isTruthy(args[0]!);
+    }),
+    builtin('null?', (args) => unaryPredicate('null?', args, isEmptyList)),
+    builtin('number->string', (args) => {
+      assertExactArity('number->string', args, 1);
+      return formatNumber(expectNumberValue('number->string', args[0]!));
+    }),
+    builtin('number?', (args) => unaryPredicate('number?', args, (value) => typeof value === 'number')),
+    builtin('pair?', (args) => unaryPredicate('pair?', args, isPair)),
+    builtin('string->number', (args) => {
+      assertExactArity('string->number', args, 1);
+      return parseStringNumber(expectStringValue('string->number', args[0]!));
+    }),
+    builtin('string->symbol', (args) => {
+      assertExactArity('string->symbol', args, 1);
+      return { kind: 'symbol-value', name: expectStringValue('string->symbol', args[0]!) };
+    }),
+    builtin('string-append', (args) =>
+      args.map((arg) => expectStringValue('string-append', arg)).join(''),
+    ),
+    builtin('string-length', (args) => {
+      assertExactArity('string-length', args, 1);
+      return stringChars(expectStringValue('string-length', args[0]!)).length;
+    }),
+    builtin('string-ref', (args) => {
+      assertExactArity('string-ref', args, 2);
+      const chars = stringChars(expectStringValue('string-ref', args[0]!));
+      const index = expectIndex('string-ref', args[1]!);
+      if (index >= chars.length) {
+        throw new EvalError('string-ref index out of bounds');
+      }
+      return { kind: 'char', value: chars[index]! };
+    }),
+    builtin('string?', (args) => unaryPredicate('string?', args, (value) => typeof value === 'string')),
+    builtin('substring', (args) => {
+      assertExactArity('substring', args, 3);
+      const chars = stringChars(expectStringValue('substring', args[0]!));
+      const start = expectIndex('substring', args[1]!);
+      const end = expectIndex('substring', args[2]!);
+      if (start > end || end > chars.length) {
+        throw new EvalError('substring expects valid start/end indices');
+      }
+      return chars.slice(start, end).join('');
+    }),
+    builtin('symbol->string', (args) => {
+      assertExactArity('symbol->string', args, 1);
+      return expectSymbolValue('symbol->string', args[0]!).name;
+    }),
+    builtin('symbol?', (args) => unaryPredicate('symbol?', args, isSymbolValue)),
+    builtin('write', (args) => {
+      assertExactArity('write', args, 1);
+      output.write(formatValue(args[0]!));
+      return VOID;
+    }),
+  ]);
+}
 
 /**
  * Evaluate one or more Scheme expressions and return the string
@@ -316,18 +391,19 @@ export function evalStrWithOutput(input: string): { result: string; output: stri
     throw new EvalError('empty input', { line: 1, column: 1 });
   }
 
-  const env = createGlobalEnv();
+  const output = new OutputBuffer();
+  const env = createGlobalEnv(output);
   const lastValue = evalSequence(program, env);
 
   return {
     result: formatValue(lastValue),
-    output: '',
+    output: output.toString(),
   };
 }
 
-function createGlobalEnv(): Env {
+function createGlobalEnv(output: OutputBuffer): Env {
   const env = new Env();
-  for (const [name, value] of BUILTINS) {
+  for (const [name, value] of createBuiltins(output)) {
     env.define(name, value);
   }
   return env;
@@ -757,6 +833,39 @@ function expectNumbers(name: string, args: Value[]): number[] {
   });
 }
 
+function expectNumberValue(name: string, value: Value): number {
+  if (typeof value !== 'number') {
+    throw new EvalError(`${name} expects a number`);
+  }
+
+  return value;
+}
+
+function expectStringValue(name: string, value: Value): string {
+  if (typeof value !== 'string') {
+    throw new EvalError(`${name} expects a string`);
+  }
+
+  return value;
+}
+
+function expectSymbolValue(name: string, value: Value): SchemeSymbol {
+  if (!isSymbolValue(value)) {
+    throw new EvalError(`${name} expects a symbol`);
+  }
+
+  return value;
+}
+
+function expectIndex(name: string, value: Value): number {
+  const index = expectNumberValue(name, value);
+  if (!Number.isInteger(index) || index < 0) {
+    throw new EvalError(`${name} expects a non-negative integer index`);
+  }
+
+  return index;
+}
+
 function assertExactArity(name: string, args: readonly unknown[], expected: number): void {
   if (args.length !== expected) {
     throw new EvalError(`${name} expects exactly ${expected} argument(s)`);
@@ -770,6 +879,14 @@ function assertAtLeastArity(name: string, args: readonly unknown[], minimum: num
 }
 
 function formatValue(value: Value): string {
+  return formatValueWithMode(value, 'write');
+}
+
+function formatDisplayValue(value: Value): string {
+  return formatValueWithMode(value, 'display');
+}
+
+function formatValueWithMode(value: Value, mode: 'display' | 'write'): string {
   if (typeof value === 'number') {
     return formatNumber(value);
   }
@@ -779,16 +896,18 @@ function formatValue(value: Value): string {
   }
 
   if (typeof value === 'string') {
-    return JSON.stringify(value);
+    return mode === 'display' ? value : JSON.stringify(value);
   }
 
   switch (value.kind) {
+    case 'char':
+      return mode === 'display' ? value.value : formatCharLiteral(value.value);
     case 'symbol-value':
       return value.name;
     case 'empty-list':
       return '()';
     case 'pair':
-      return `(${formatPairContents(value)})`;
+      return `(${formatPairContents(value, mode)})`;
     case 'void':
       return '';
     case 'builtin':
@@ -798,12 +917,12 @@ function formatValue(value: Value): string {
   }
 }
 
-function formatPairContents(pair: PairValue): string {
+function formatPairContents(pair: PairValue, mode: 'display' | 'write'): string {
   const parts: string[] = [];
   let current: Value = pair;
 
   while (isPair(current)) {
-    parts.push(formatValue(current.car));
+    parts.push(formatValueWithMode(current.car, mode));
     current = current.cdr;
   }
 
@@ -811,12 +930,36 @@ function formatPairContents(pair: PairValue): string {
     return parts.join(' ');
   }
 
-  return `${parts.join(' ')} . ${formatValue(current)}`;
+  return `${parts.join(' ')} . ${formatValueWithMode(current, mode)}`;
+}
+
+function formatCharLiteral(value: string): string {
+  switch (value) {
+    case ' ':
+      return '#\\space';
+    case '\n':
+      return '#\\newline';
+    default:
+      return `#\\${value}`;
+  }
 }
 
 function formatNumber(value: number): string {
   const normalized = normalizeNumber(value);
   return Number.isInteger(normalized) ? normalized.toString() : String(normalized);
+}
+
+function parseStringNumber(value: string): number | boolean {
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || !SCHEME_NUMBER_PATTERN.test(trimmed)) {
+    return false;
+  }
+
+  return normalizeNumber(Number(trimmed));
+}
+
+function stringChars(value: string): string[] {
+  return Array.from(value);
 }
 
 function normalizeNumber(value: number): number {
@@ -833,6 +976,10 @@ function isProcedure(value: Value): value is BuiltinProc | UserProc {
 
 function isPair(value: Value): value is PairValue {
   return typeof value === 'object' && value !== null && value.kind === 'pair';
+}
+
+function isCharValue(value: Value): value is CharValue {
+  return typeof value === 'object' && value !== null && value.kind === 'char';
 }
 
 function isEmptyList(value: Value): value is EmptyList {
