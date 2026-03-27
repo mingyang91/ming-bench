@@ -48,7 +48,10 @@ impl SchemeString {
     }
 
     pub(super) fn runtime_copy(&self) -> Self {
-        Self::from_chars(self.0.chars.borrow().clone(), !runtime_strings_are_immutable())
+        Self::from_chars(
+            self.0.chars.borrow().clone(),
+            !runtime_strings_are_immutable(),
+        )
     }
 
     pub(super) fn set_char(&self, index: usize, value: char) -> Result<(), EvalError> {

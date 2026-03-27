@@ -1,8 +1,9 @@
 use super::{
-    eval_program,
+    eval_program_tail,
     number::{parse_number_token, Number, Rational},
     values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg, Expr,
-    PairValue, Procedure, RecordType, RecordValue, SchemeString, Value, VectorValue,
+    PairValue, Position, Procedure, RecordType, RecordValue, SchemeString, TailEvalResult, Value,
+    VectorValue,
 };
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
@@ -123,65 +124,139 @@ pub(super) fn apply_procedure(
     args: &[EvaluatedArg],
     output: &mut String,
 ) -> Result<Value, EvalError> {
-    let Value::Procedure(procedure) = value else {
-        return Err(EvalError::NotAProcedure {
-            found: value.render(),
-        });
-    };
+    let mut current_value = value;
+    let mut current_args = args.to_vec();
+    let mut call_pos = None;
 
-    match procedure.as_ref() {
-        Procedure::Builtin { func, .. } => func(args, output),
-        Procedure::Lambda { params, body, env } => {
-            apply_lambda_procedure("lambda", params, body, env, args, output)
-        }
-        Procedure::CaseLambda { clauses, env } => {
-            let Some(clause) = clauses
-                .iter()
-                .find(|clause| clause.params.matches_arity(args.len()))
-            else {
-                return Err(EvalError::WrongArgCount {
-                    name: "case-lambda",
-                    expected: "matching clause",
-                    got: args.len(),
-                });
-            };
+    loop {
+        let procedure = match current_value {
+            Value::Procedure(ref procedure) => procedure.clone(),
+            _ => {
+                return Err(attach_call_position(
+                    EvalError::NotAProcedure {
+                        found: current_value.render(),
+                    },
+                    call_pos,
+                ));
+            }
+        };
 
-            apply_lambda_procedure(
-                "case-lambda",
-                &clause.params,
-                &clause.body,
-                env,
-                args,
-                output,
-            )
+        match procedure.as_ref() {
+            Procedure::Builtin { func, .. } => {
+                return with_call_position(func(&current_args, output), call_pos);
+            }
+            Procedure::Lambda { params, body, env } => {
+                let call_env = with_call_position(
+                    prepare_lambda_call_env("lambda", params, env, &current_args),
+                    call_pos,
+                )?;
+                match eval_program_tail(body, call_env, output)? {
+                    TailEvalResult::Value(value) => return Ok(value),
+                    TailEvalResult::Call {
+                        procedure,
+                        args,
+                        pos,
+                    } => {
+                        current_value = procedure;
+                        current_args = args;
+                        call_pos = Some(pos);
+                    }
+                }
+            }
+            Procedure::CaseLambda { clauses, env } => {
+                let clause = with_call_position(
+                    clauses
+                        .iter()
+                        .find(|clause| clause.params.matches_arity(current_args.len()))
+                        .ok_or(EvalError::WrongArgCount {
+                            name: "case-lambda",
+                            expected: "matching clause",
+                            got: current_args.len(),
+                        }),
+                    call_pos,
+                )?;
+
+                let call_env = with_call_position(
+                    prepare_lambda_call_env("case-lambda", &clause.params, env, &current_args),
+                    call_pos,
+                )?;
+
+                match eval_program_tail(&clause.body, call_env, output)? {
+                    TailEvalResult::Value(value) => return Ok(value),
+                    TailEvalResult::Call {
+                        procedure,
+                        args,
+                        pos,
+                    } => {
+                        current_value = procedure;
+                        current_args = args;
+                        call_pos = Some(pos);
+                    }
+                }
+            }
+            Procedure::RecordConstructor {
+                record_type,
+                field_count,
+                ..
+            } => {
+                return with_call_position(
+                    apply_record_constructor(record_type.clone(), *field_count, &current_args),
+                    call_pos,
+                );
+            }
+            Procedure::RecordPredicate { record_type, .. } => {
+                return with_call_position(
+                    apply_record_predicate(record_type, &current_args),
+                    call_pos,
+                );
+            }
+            Procedure::RecordAccessor {
+                record_type,
+                field_index,
+                ..
+            } => {
+                return with_call_position(
+                    apply_record_accessor(record_type, *field_index, &current_args),
+                    call_pos,
+                );
+            }
+            Procedure::RecordMutator {
+                record_type,
+                field_index,
+                ..
+            } => {
+                return with_call_position(
+                    apply_record_mutator(record_type, *field_index, &current_args),
+                    call_pos,
+                );
+            }
         }
-        Procedure::RecordConstructor {
-            record_type,
-            field_count,
-            ..
-        } => apply_record_constructor(record_type.clone(), *field_count, args),
-        Procedure::RecordPredicate { record_type, .. } => apply_record_predicate(record_type, args),
-        Procedure::RecordAccessor {
-            record_type,
-            field_index,
-            ..
-        } => apply_record_accessor(record_type, *field_index, args),
-        Procedure::RecordMutator {
-            record_type,
-            field_index,
-            ..
-        } => apply_record_mutator(record_type, *field_index, args),
     }
 }
 
-fn apply_lambda_procedure(
+fn with_call_position<T>(
+    result: Result<T, EvalError>,
+    pos: Option<Position>,
+) -> Result<T, EvalError> {
+    match pos {
+        Some(pos) => result.map_err(|error| error.with_position(pos.line, pos.col)),
+        None => result,
+    }
+}
+
+fn attach_call_position(error: EvalError, pos: Option<Position>) -> EvalError {
+    match pos {
+        Some(pos) => error.with_position(pos.line, pos.col),
+        None => error,
+    }
+}
+
+fn prepare_lambda_call_env(
     name: &'static str,
     params: &super::LambdaParams,
-    body: &[Expr],
     env: &EnvRef,
     args: &[EvaluatedArg],
-    output: &mut String,
-) -> Result<Value, EvalError> {
+) -> Result<EnvRef, EvalError> {
     if args.len() < params.fixed_arity() {
         return Err(EvalError::WrongArgCountAtLeast {
             name,
@@ -211,7 +286,7 @@ fn apply_lambda_procedure(
         call_env.define(rest_name.clone(), Value::List(rest_items));
     }
 
-    eval_program(body, call_env, output)
+    Ok(call_env)
 }
 
 fn exact_int(value: i64) -> Value {
@@ -1398,7 +1473,9 @@ fn apply_number_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result
         });
     };
 
-    Ok(Value::String(SchemeString::runtime(value.as_number()?.render())))
+    Ok(Value::String(SchemeString::runtime(
+        value.as_number()?.render(),
+    )))
 }
 
 fn apply_symbol_to_string(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {

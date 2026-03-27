@@ -80,6 +80,15 @@ struct EvaluatedArg {
     pos: Position,
 }
 
+enum TailEvalResult {
+    Value(Value),
+    Call {
+        procedure: Value,
+        args: Vec<EvaluatedArg>,
+        pos: Position,
+    },
+}
+
 impl EvaluatedArg {
     fn as_int(&self) -> Result<i64, EvalError> {
         self.value
@@ -593,11 +602,482 @@ fn with_position<T>(result: Result<T, EvalError>, pos: Position) -> Result<T, Ev
 }
 
 fn eval_program(exprs: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
-    let mut last = Value::Void;
-    for expr in exprs {
-        last = eval(expr, env.clone(), output)?;
+    match eval_program_tail(exprs, env, output)? {
+        TailEvalResult::Value(value) => Ok(value),
+        TailEvalResult::Call {
+            procedure,
+            args,
+            pos,
+        } => with_position(builtins::apply_procedure(procedure, &args, output), pos),
     }
-    Ok(last)
+}
+
+fn eval_program_tail(
+    exprs: &[Expr],
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    let Some((last, prefix)) = exprs.split_last() else {
+        return Ok(TailEvalResult::Value(Value::Void));
+    };
+
+    for expr in prefix {
+        let _ = eval(expr, env.clone(), output)?;
+    }
+
+    eval_tail(last, env, output)
+}
+
+fn eval_args(
+    args: &[Expr],
+    env: EnvRef,
+    output: &mut String,
+) -> Result<Vec<EvaluatedArg>, EvalError> {
+    args.iter()
+        .map(|expr| {
+            eval(expr, env.clone(), output).map(|value| EvaluatedArg {
+                value,
+                pos: expr.pos(),
+            })
+        })
+        .collect()
+}
+
+fn eval_symbol(name: &str, pos: Position, env: &EnvRef) -> Result<Value, EvalError> {
+    match env.lookup(name) {
+        Some(Value::Uninitialized) => Err(EvalError::UninitializedBinding {
+            name: name.to_string(),
+        }
+        .with_position(pos.line, pos.col)),
+        Some(value) => Ok(value),
+        None => Err(EvalError::UnboundSymbol {
+            name: name.to_string(),
+        }
+        .with_position(pos.line, pos.col)),
+    }
+}
+
+fn eval_tail(expr: &Expr, env: EnvRef, output: &mut String) -> Result<TailEvalResult, EvalError> {
+    match expr {
+        Expr::Bool { value, .. } => Ok(TailEvalResult::Value(Value::Bool(*value))),
+        Expr::Number { value, .. } => Ok(TailEvalResult::Value(Value::Number(*value))),
+        Expr::Char { value, .. } => Ok(TailEvalResult::Value(Value::Char(*value))),
+        Expr::String { value, .. } => Ok(TailEvalResult::Value(Value::String(
+            SchemeString::immutable(value),
+        ))),
+        Expr::Symbol { name, pos } => eval_symbol(name, *pos, &env).map(TailEvalResult::Value),
+        Expr::List { items, pos } => eval_tail_list(items, *pos, env, output),
+    }
+}
+
+fn eval_tail_list(
+    items: &[Expr],
+    pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    let Some((head, args)) = items.split_first() else {
+        return Err(EvalError::ParseError {
+            message: "cannot evaluate empty list".to_string(),
+        }
+        .with_position(pos.line, pos.col));
+    };
+
+    let head_pos = head.pos();
+    match head {
+        Expr::Symbol { name, .. } => {
+            eval_tail_named_head(name, items, args, pos, head_pos, env, output)
+        }
+        _ => eval_tail_application(head, args, head_pos, env, output),
+    }
+}
+
+fn eval_tail_named_head(
+    name: &str,
+    items: &[Expr],
+    args: &[Expr],
+    list_pos: Position,
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    match name {
+        "and" => eval_tail_and(args, env, output),
+        "or" => eval_tail_or(args, env, output),
+        "if" => eval_tail_if(args, head_pos, env, output),
+        "quote" => with_position(eval_quote(args).map(TailEvalResult::Value), head_pos),
+        "begin" => eval_program_tail(args, env, output),
+        "cond" => eval_tail_cond(args, head_pos, env, output),
+        "case" => eval_tail_case(args, head_pos, env, output),
+        "let" => eval_tail_let(args, head_pos, env, output),
+        "letrec" => eval_tail_letrec(args, head_pos, env, output, LetrecMode::Parallel),
+        "letrec*" => eval_tail_letrec(args, head_pos, env, output, LetrecMode::Sequential),
+        "lambda" | "case-lambda" | "define" | "define-record-type" | "define-syntax" | "set!"
+        | "do" => with_position(
+            eval_list(items, env, output).map(TailEvalResult::Value),
+            list_pos,
+        ),
+        _ => eval_tail_symbol_application(name, items, args, head_pos, env, output),
+    }
+}
+
+fn eval_tail_symbol_application(
+    name: &str,
+    items: &[Expr],
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    if let Some(transformer) = env.lookup_macro(name) {
+        let (expanded, macro_env) = with_position(
+            macros::expand_macro_call(items, env.clone(), transformer),
+            head_pos,
+        )?;
+        return eval_tail(&expanded, macro_env, output);
+    }
+
+    let procedure = eval_symbol(name, head_pos, &env)?;
+    eval_tail_call(procedure, args, head_pos, env, output)
+}
+
+fn eval_tail_application(
+    head: &Expr,
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    let procedure = eval(head, env.clone(), output)?;
+    eval_tail_call(procedure, args, head_pos, env, output)
+}
+
+fn eval_tail_call(
+    procedure: Value,
+    args: &[Expr],
+    pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    let values = eval_args(args, env, output)?;
+    Ok(TailEvalResult::Call {
+        procedure,
+        args: values,
+        pos,
+    })
+}
+
+fn eval_tail_and(
+    args: &[Expr],
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(TailEvalResult::Value(Value::Bool(true)));
+    };
+
+    for expr in prefix {
+        let value = eval(expr, env.clone(), output)?;
+        if !value.is_truthy() {
+            return Ok(TailEvalResult::Value(value));
+        }
+    }
+
+    eval_tail(last, env, output)
+}
+
+fn eval_tail_or(
+    args: &[Expr],
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    let Some((last, prefix)) = args.split_last() else {
+        return Ok(TailEvalResult::Value(Value::Bool(false)));
+    };
+
+    for expr in prefix {
+        let value = eval(expr, env.clone(), output)?;
+        if value.is_truthy() {
+            return Ok(TailEvalResult::Value(value));
+        }
+    }
+
+    eval_tail(last, env, output)
+}
+
+fn eval_tail_if(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    match args {
+        [condition, consequent] => {
+            if eval(condition, env.clone(), output)?.is_truthy() {
+                eval_tail(consequent, env, output)
+            } else {
+                Ok(TailEvalResult::Value(Value::Void))
+            }
+        }
+        [condition, consequent, alternate] => {
+            if eval(condition, env.clone(), output)?.is_truthy() {
+                eval_tail(consequent, env, output)
+            } else {
+                eval_tail(alternate, env, output)
+            }
+        }
+        _ => Err(EvalError::WrongArgCount {
+            name: "if",
+            expected: "2 or 3",
+            got: args.len(),
+        }
+        .with_position(head_pos.line, head_pos.col)),
+    }
+}
+
+fn eval_tail_cond(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    for clause in args {
+        let Expr::List { items, .. } = clause else {
+            return Err(EvalError::ParseError {
+                message: "cond clauses must be lists".to_string(),
+            }
+            .with_position(head_pos.line, head_pos.col));
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::ParseError {
+                message: "cond clauses cannot be empty".to_string(),
+            }
+            .with_position(head_pos.line, head_pos.col));
+        };
+
+        if matches!(test, Expr::Symbol { name, .. } if name == "else") {
+            return if body.is_empty() {
+                Ok(TailEvalResult::Value(Value::Void))
+            } else {
+                eval_program_tail(body, env.clone(), output)
+            };
+        }
+
+        let test_value = eval(test, env.clone(), output)?;
+        if test_value.is_truthy() {
+            return if body.is_empty() {
+                Ok(TailEvalResult::Value(test_value))
+            } else {
+                eval_program_tail(body, env.clone(), output)
+            };
+        }
+    }
+
+    Ok(TailEvalResult::Value(Value::Void))
+}
+
+fn eval_tail_case(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    let Some((key_expr, clauses)) = args.split_first() else {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name: "case",
+            min: 2,
+            got: 0,
+        }
+        .with_position(head_pos.line, head_pos.col));
+    };
+
+    if clauses.is_empty() {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name: "case",
+            min: 2,
+            got: 1,
+        }
+        .with_position(head_pos.line, head_pos.col));
+    }
+
+    let key = eval(key_expr, env.clone(), output)?;
+    for clause in clauses {
+        let Expr::List { items, .. } = clause else {
+            return Err(EvalError::ParseError {
+                message: "case clauses must be lists".to_string(),
+            }
+            .with_position(head_pos.line, head_pos.col));
+        };
+
+        let Some((datum_expr, body)) = items.split_first() else {
+            return Err(EvalError::ParseError {
+                message: "case clauses cannot be empty".to_string(),
+            }
+            .with_position(head_pos.line, head_pos.col));
+        };
+
+        if matches!(datum_expr, Expr::Symbol { name, .. } if name == "else") {
+            return if body.is_empty() {
+                Ok(TailEvalResult::Value(Value::Void))
+            } else {
+                eval_program_tail(body, env.clone(), output)
+            };
+        }
+
+        let Expr::List { items: datums, .. } = datum_expr else {
+            return Err(EvalError::ParseError {
+                message: "case clause datums must be a list".to_string(),
+            }
+            .with_position(head_pos.line, head_pos.col));
+        };
+
+        if datums
+            .iter()
+            .map(builtins::quote_expr)
+            .any(|datum| values_eq(&key, &datum))
+        {
+            return if body.is_empty() {
+                Ok(TailEvalResult::Value(Value::Void))
+            } else {
+                eval_program_tail(body, env.clone(), output)
+            };
+        }
+    }
+
+    Ok(TailEvalResult::Value(Value::Void))
+}
+
+fn eval_tail_let(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    match args {
+        [Expr::Symbol { name, .. }, bindings_expr, body @ ..] => {
+            eval_tail_named_let(name, bindings_expr, body, head_pos, env, output)
+        }
+        [bindings_expr, body @ ..] => {
+            eval_tail_plain_let(bindings_expr, body, head_pos, env, output)
+        }
+        [] => Err(EvalError::WrongArgCount {
+            name: "let",
+            expected: "at least 2",
+            got: 0,
+        }
+        .with_position(head_pos.line, head_pos.col)),
+    }
+}
+
+fn eval_tail_named_let(
+    name: &str,
+    bindings_expr: &Expr,
+    body: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "let",
+            expected: "at least 3",
+            got: 2,
+        }
+        .with_position(head_pos.line, head_pos.col));
+    }
+
+    let bindings = with_position(macros::parse_let_bindings(bindings_expr), head_pos)?;
+    let params = bindings
+        .iter()
+        .map(|(param, _)| param.clone())
+        .collect::<Vec<_>>();
+    let values = bindings
+        .iter()
+        .map(|(_, expr)| {
+            eval(expr, env.clone(), output).map(|value| EvaluatedArg {
+                value,
+                pos: expr.pos(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let closure_env = Environment::new(Some(env));
+    let procedure = Value::Procedure(Rc::new(Procedure::Lambda {
+        params: LambdaParams {
+            fixed: params,
+            rest: None,
+        },
+        body: body.to_vec(),
+        env: closure_env.clone(),
+    }));
+    closure_env.define(name.to_string(), procedure.clone());
+    Ok(TailEvalResult::Call {
+        procedure,
+        args: values,
+        pos: head_pos,
+    })
+}
+
+fn eval_tail_plain_let(
+    bindings_expr: &Expr,
+    body: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+) -> Result<TailEvalResult, EvalError> {
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "let",
+            expected: "at least 2",
+            got: 1,
+        }
+        .with_position(head_pos.line, head_pos.col));
+    }
+
+    let bindings = with_position(macros::parse_let_bindings(bindings_expr), head_pos)?;
+    let values = bindings
+        .iter()
+        .map(|(_, expr)| eval(expr, env.clone(), output))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let let_env = Environment::new(Some(env));
+    for ((name, _), value) in bindings.iter().zip(values) {
+        let_env.define(name.clone(), value);
+    }
+
+    eval_program_tail(body, let_env, output)
+}
+
+fn eval_tail_letrec(
+    args: &[Expr],
+    head_pos: Position,
+    env: EnvRef,
+    output: &mut String,
+    mode: LetrecMode,
+) -> Result<TailEvalResult, EvalError> {
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: letrec_form_name(mode),
+            expected: "at least 2",
+            got: args.len(),
+        }
+        .with_position(head_pos.line, head_pos.col));
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: letrec_form_name(mode),
+            expected: "at least 2",
+            got: 1,
+        }
+        .with_position(head_pos.line, head_pos.col));
+    }
+
+    let bindings = with_position(macros::parse_let_bindings(bindings_expr), head_pos)?;
+    let (letrec_env, binding_refs) = create_recursive_bindings(&bindings, env);
+    initialize_recursive_bindings(&bindings, &binding_refs, letrec_env.clone(), output, mode)?;
+    eval_program_tail(body, letrec_env, output)
 }
 
 fn eval(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
@@ -606,17 +1086,7 @@ fn eval(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalErro
         Expr::Number { value, .. } => Ok(Value::Number(*value)),
         Expr::Char { value, .. } => Ok(Value::Char(*value)),
         Expr::String { value, .. } => Ok(Value::String(SchemeString::immutable(value))),
-        Expr::Symbol { name, pos } => {
-            match env.lookup(name) {
-                Some(Value::Uninitialized) => {
-                    Err(EvalError::UninitializedBinding { name: name.clone() }
-                        .with_position(pos.line, pos.col))
-                }
-                Some(value) => Ok(value),
-                None => Err(EvalError::UnboundSymbol { name: name.clone() }
-                    .with_position(pos.line, pos.col)),
-            }
-        }
+        Expr::Symbol { name, pos } => eval_symbol(name, *pos, &env),
         Expr::List { items, pos } => with_position(eval_list(items, env, output), *pos),
     }
 }
@@ -653,12 +1123,14 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
         Expr::Symbol { name, .. } if name == "let" => {
             with_position(eval_let(args, env, output), head_pos)
         }
-        Expr::Symbol { name, .. } if name == "letrec" => {
-            with_position(eval_letrec(args, env, output, false), head_pos)
-        }
-        Expr::Symbol { name, .. } if name == "letrec*" => {
-            with_position(eval_letrec(args, env, output, true), head_pos)
-        }
+        Expr::Symbol { name, .. } if name == "letrec" => with_position(
+            eval_letrec(args, env, output, LetrecMode::Parallel),
+            head_pos,
+        ),
+        Expr::Symbol { name, .. } if name == "letrec*" => with_position(
+            eval_letrec(args, env, output, LetrecMode::Sequential),
+            head_pos,
+        ),
         Expr::Symbol { name, .. } if name == "lambda" => {
             with_position(eval_lambda(args, env), head_pos)
         }
@@ -689,15 +1161,7 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
                 eval(&expanded, macro_env, output)
             } else {
                 let procedure = eval(head, env.clone(), output)?;
-                let values = args
-                    .iter()
-                    .map(|expr| {
-                        eval(expr, env.clone(), output).map(|value| EvaluatedArg {
-                            value,
-                            pos: expr.pos(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let values = eval_args(args, env.clone(), output)?;
                 with_position(
                     builtins::apply_procedure(procedure, &values, output),
                     head_pos,
@@ -706,15 +1170,7 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
         }
         _ => {
             let procedure = eval(head, env.clone(), output)?;
-            let values = args
-                .iter()
-                .map(|expr| {
-                    eval(expr, env.clone(), output).map(|value| EvaluatedArg {
-                        value,
-                        pos: expr.pos(),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let values = eval_args(args, env.clone(), output)?;
             with_position(
                 builtins::apply_procedure(procedure, &values, output),
                 head_pos,
@@ -954,13 +1410,11 @@ fn eval_letrec(
     args: &[Expr],
     env: EnvRef,
     output: &mut String,
-    sequential: bool,
+    mode: LetrecMode,
 ) -> Result<Value, EvalError> {
-    let form_name = if sequential { "letrec*" } else { "letrec" };
-
     let [bindings_expr, body @ ..] = args else {
         return Err(EvalError::WrongArgCount {
-            name: form_name,
+            name: letrec_form_name(mode),
             expected: "at least 2",
             got: args.len(),
         });
@@ -968,13 +1422,36 @@ fn eval_letrec(
 
     if body.is_empty() {
         return Err(EvalError::WrongArgCount {
-            name: form_name,
+            name: letrec_form_name(mode),
             expected: "at least 2",
             got: 1,
         });
     }
 
     let bindings = macros::parse_let_bindings(bindings_expr)?;
+    let (letrec_env, binding_refs) = create_recursive_bindings(&bindings, env);
+    initialize_recursive_bindings(&bindings, &binding_refs, letrec_env.clone(), output, mode)?;
+
+    eval_program(body, letrec_env, output)
+}
+
+#[derive(Clone, Copy)]
+enum LetrecMode {
+    Parallel,
+    Sequential,
+}
+
+fn letrec_form_name(mode: LetrecMode) -> &'static str {
+    match mode {
+        LetrecMode::Parallel => "letrec",
+        LetrecMode::Sequential => "letrec*",
+    }
+}
+
+fn create_recursive_bindings(
+    bindings: &[(String, Expr)],
+    env: EnvRef,
+) -> (EnvRef, Vec<BindingRef>) {
     let letrec_env = Environment::new(Some(env));
     let binding_refs = bindings
         .iter()
@@ -985,22 +1462,35 @@ fn eval_letrec(
         })
         .collect::<Vec<_>>();
 
-    if sequential {
-        for ((_, expr), binding) in bindings.iter().zip(binding_refs.iter()) {
-            let value = eval(expr, letrec_env.clone(), output)?;
-            *binding.borrow_mut() = value;
+    (letrec_env, binding_refs)
+}
+
+fn initialize_recursive_bindings(
+    bindings: &[(String, Expr)],
+    binding_refs: &[BindingRef],
+    letrec_env: EnvRef,
+    output: &mut String,
+    mode: LetrecMode,
+) -> Result<(), EvalError> {
+    match mode {
+        LetrecMode::Parallel => {
+            let values = bindings
+                .iter()
+                .map(|(_, expr)| eval(expr, letrec_env.clone(), output))
+                .collect::<Result<Vec<_>, _>>()?;
+            for (binding, value) in binding_refs.iter().zip(values) {
+                *binding.borrow_mut() = value;
+            }
         }
-    } else {
-        let values = bindings
-            .iter()
-            .map(|(_, expr)| eval(expr, letrec_env.clone(), output))
-            .collect::<Result<Vec<_>, _>>()?;
-        for (binding, value) in binding_refs.iter().zip(values.into_iter()) {
-            *binding.borrow_mut() = value;
+        LetrecMode::Sequential => {
+            for ((_, expr), binding) in bindings.iter().zip(binding_refs.iter()) {
+                let value = eval(expr, letrec_env.clone(), output)?;
+                *binding.borrow_mut() = value;
+            }
         }
     }
 
-    eval_program(body, letrec_env, output)
+    Ok(())
 }
 
 fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
