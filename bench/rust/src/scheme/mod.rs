@@ -153,6 +153,7 @@ enum Builtin {
     StringCopy,
     StringSet,
     CharPred,
+    Apply,
 }
 
 #[derive(Clone)]
@@ -164,9 +165,24 @@ enum Procedure {
 #[derive(Clone)]
 struct Lambda {
     name: Option<String>,
-    params: Vec<String>,
+    params: LambdaParams,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct LambdaParams {
+    fixed: Vec<String>,
+    rest: Option<String>,
+}
+
+impl LambdaParams {
+    fn expected_args(&self) -> String {
+        match &self.rest {
+            Some(_) => format!("at least {} arguments", self.fixed.len()),
+            None => format!("exactly {} arguments", self.fixed.len()),
+        }
+    }
 }
 
 type EnvRef = Rc<Environment>;
@@ -518,6 +534,7 @@ fn root_env() -> EnvRef {
         ("string-copy", Builtin::StringCopy),
         ("string-set!", Builtin::StringSet),
         ("char?", Builtin::CharPred),
+        ("apply", Builtin::Apply),
     ] {
         env.define(name, Value::Procedure(Rc::new(Procedure::Builtin(builtin))));
     }
@@ -564,71 +581,89 @@ fn eval_list(items: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 }
 
 fn apply(operator: Value, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
+    let values = eval_args(args, env)?;
+    apply_values(operator, &values, env)
+}
+
+fn apply_values(operator: Value, args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
     match operator {
         Value::Procedure(procedure) => match procedure.as_ref() {
             Procedure::Builtin(builtin) => apply_builtin(*builtin, args, env),
-            Procedure::Lambda(lambda) => apply_lambda(lambda, args, env),
+            Procedure::Lambda(lambda) => apply_lambda(lambda, args),
         },
         _ => Err(EvalError::InvalidApplication),
     }
 }
 
-fn apply_builtin(builtin: Builtin, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    let values = eval_args(args, env)?;
-
+fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
     match builtin {
-        Builtin::Add => eval_add(&values),
-        Builtin::Sub => eval_sub(&values),
-        Builtin::Mul => eval_mul(&values),
-        Builtin::Div => eval_div(&values),
-        Builtin::LessThan => eval_compare("<", &values, |left, right| left < right),
-        Builtin::GreaterThan => eval_compare(">", &values, |left, right| left > right),
-        Builtin::Equal => eval_compare("=", &values, |left, right| left == right),
-        Builtin::LessThanOrEqual => eval_compare("<=", &values, |left, right| left <= right),
-        Builtin::Not => eval_not(&values),
-        Builtin::Cons => eval_cons(&values),
-        Builtin::Car => eval_car(&values),
-        Builtin::Cdr => eval_cdr(&values),
-        Builtin::Append => eval_append(&values),
-        Builtin::List => eval_list_builtin(&values),
-        Builtin::Length => eval_length(&values),
-        Builtin::NullPred => eval_null_pred(&values),
-        Builtin::PairPred => eval_pair_pred(&values),
-        Builtin::SymbolPred => eval_symbol_pred(&values),
-        Builtin::StringPred => eval_string_pred(&values),
-        Builtin::NumberPred => eval_number_pred(&values),
-        Builtin::BooleanPred => eval_boolean_pred(&values),
-        Builtin::Display => eval_display(&values, env),
-        Builtin::Write => eval_write(&values, env),
-        Builtin::Newline => eval_newline(&values, env),
-        Builtin::StringAppend => eval_string_append(&values),
-        Builtin::StringLength => eval_string_length(&values),
-        Builtin::Substring => eval_substring(&values),
-        Builtin::StringToNumber => eval_string_to_number(&values),
-        Builtin::NumberToString => eval_number_to_string(&values),
-        Builtin::SymbolToString => eval_symbol_to_string(&values),
-        Builtin::StringToSymbol => eval_string_to_symbol(&values),
-        Builtin::StringRef => eval_string_ref(&values),
-        Builtin::StringCopy => eval_string_copy(&values),
-        Builtin::StringSet => eval_string_set(&values),
-        Builtin::CharPred => eval_char_pred(&values),
+        Builtin::Add => eval_add(values),
+        Builtin::Sub => eval_sub(values),
+        Builtin::Mul => eval_mul(values),
+        Builtin::Div => eval_div(values),
+        Builtin::LessThan => eval_compare("<", values, |left, right| left < right),
+        Builtin::GreaterThan => eval_compare(">", values, |left, right| left > right),
+        Builtin::Equal => eval_compare("=", values, |left, right| left == right),
+        Builtin::LessThanOrEqual => eval_compare("<=", values, |left, right| left <= right),
+        Builtin::Not => eval_not(values),
+        Builtin::Cons => eval_cons(values),
+        Builtin::Car => eval_car(values),
+        Builtin::Cdr => eval_cdr(values),
+        Builtin::Append => eval_append(values),
+        Builtin::List => eval_list_builtin(values),
+        Builtin::Length => eval_length(values),
+        Builtin::NullPred => eval_null_pred(values),
+        Builtin::PairPred => eval_pair_pred(values),
+        Builtin::SymbolPred => eval_symbol_pred(values),
+        Builtin::StringPred => eval_string_pred(values),
+        Builtin::NumberPred => eval_number_pred(values),
+        Builtin::BooleanPred => eval_boolean_pred(values),
+        Builtin::Display => eval_display(values, env),
+        Builtin::Write => eval_write(values, env),
+        Builtin::Newline => eval_newline(values, env),
+        Builtin::StringAppend => eval_string_append(values),
+        Builtin::StringLength => eval_string_length(values),
+        Builtin::Substring => eval_substring(values),
+        Builtin::StringToNumber => eval_string_to_number(values),
+        Builtin::NumberToString => eval_number_to_string(values),
+        Builtin::SymbolToString => eval_symbol_to_string(values),
+        Builtin::StringToSymbol => eval_string_to_symbol(values),
+        Builtin::StringRef => eval_string_ref(values),
+        Builtin::StringCopy => eval_string_copy(values),
+        Builtin::StringSet => eval_string_set(values),
+        Builtin::CharPred => eval_char_pred(values),
+        Builtin::Apply => eval_apply_builtin(values, env),
     }
 }
 
-fn apply_lambda(lambda: &Lambda, args: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
-    if args.len() != lambda.params.len() {
+fn apply_lambda(lambda: &Lambda, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() < lambda.params.fixed.len()
+        || (lambda.params.rest.is_none() && args.len() != lambda.params.fixed.len())
+    {
         return Err(EvalError::WrongArgCount {
             name: lambda.name.clone().unwrap_or_else(|| "lambda".to_owned()),
-            expected: format!("exactly {} arguments", lambda.params.len()),
+            expected: lambda.params.expected_args(),
             got: args.len(),
         });
     }
 
-    let values = eval_args(args, env)?;
     let call_env = Environment::new(Some(lambda.env.clone()));
 
-    for (param, value) in lambda.params.iter().cloned().zip(values) {
+    for (param, value) in lambda
+        .params
+        .fixed
+        .iter()
+        .cloned()
+        .zip(args.iter().take(lambda.params.fixed.len()).cloned())
+    {
         call_env.define(param, value);
+    }
+
+    if let Some(rest) = &lambda.params.rest {
+        call_env.define(
+            rest.clone(),
+            Value::List(args[lambda.params.fixed.len()..].to_vec()),
+        );
     }
 
     eval_sequence(&lambda.body, &call_env)
@@ -860,6 +895,10 @@ fn eval_named_let(
         .iter()
         .map(|(param, _)| param.clone())
         .collect::<Vec<_>>();
+    let params = LambdaParams {
+        fixed: params,
+        rest: None,
+    };
     let recursive_env = Environment::new(Some(env.clone()));
 
     recursive_env.define(
@@ -873,18 +912,38 @@ fn eval_named_let(
     );
 
     let call_env = Environment::new(Some(recursive_env));
-    for (param, value) in params.into_iter().zip(values) {
+    for (param, value) in params.fixed.into_iter().zip(values) {
         call_env.define(param, value);
     }
 
     eval_sequence(body, &call_env)
 }
 
-fn parse_params(params: &[Expr], form: &str) -> Result<Vec<String>, EvalError> {
-    params
-        .iter()
-        .map(|expr| expect_symbol(expr, &format!("{form} parameter")))
-        .collect()
+fn parse_params(params: &[Expr], form: &str) -> Result<LambdaParams, EvalError> {
+    let mut fixed = Vec::new();
+    let mut rest = None;
+    let mut index = 0;
+
+    while index < params.len() {
+        match &params[index] {
+            Expr::Symbol(name, _) if name == "." => {
+                if rest.is_some() || index + 1 >= params.len() || index + 2 != params.len() {
+                    return Err(EvalError::Parse(format!(
+                        "{form} parameters use invalid dotted form"
+                    )));
+                }
+                rest = Some(expect_symbol(
+                    &params[index + 1],
+                    &format!("{form} rest parameter"),
+                )?);
+                break;
+            }
+            expr => fixed.push(expect_symbol(expr, &format!("{form} parameter"))?),
+        }
+        index += 1;
+    }
+
+    Ok(LambdaParams { fixed, rest })
 }
 
 fn parse_bindings(bindings: &[Expr], form: &str) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -929,6 +988,23 @@ fn eval_sequence(exprs: &[Expr], env: &EnvRef) -> Result<Value, EvalError> {
 
 fn eval_args(args: &[Expr], env: &EnvRef) -> Result<Vec<Value>, EvalError> {
     args.iter().map(|expr| eval_expr(expr, env)).collect()
+}
+
+fn eval_apply_builtin(args: &[Value], env: &EnvRef) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::WrongArgCount {
+            name: "apply".to_owned(),
+            expected: "at least 2 arguments".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let operator = args[0].clone();
+    let mut applied_args = args[1..args.len() - 1].to_vec();
+    let tail = expect_list("apply", &args[args.len() - 1])?;
+    applied_args.extend(tail.iter().cloned());
+
+    apply_values(operator, &applied_args, env)
 }
 
 fn eval_add(args: &[Value]) -> Result<Value, EvalError> {
