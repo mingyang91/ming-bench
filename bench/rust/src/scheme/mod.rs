@@ -656,6 +656,8 @@ struct Environment {
     macros: RefCell<HashMap<String, Rc<MacroTransformer>>>,
     output: Rc<RefCell<String>>,
     gensym_counter: Rc<Cell<usize>>,
+    step_limit: Rc<Cell<Option<usize>>>,
+    step_count: Rc<Cell<usize>>,
 }
 
 impl Environment {
@@ -667,6 +669,13 @@ impl Environment {
         let gensym_counter = parent
             .as_ref()
             .map_or_else(|| Rc::new(Cell::new(0)), |env| env.gensym_counter.clone());
+        let step_limit = parent.as_ref().map_or_else(
+            || Rc::new(Cell::new(None)),
+            |env| env.step_limit.clone(),
+        );
+        let step_count = parent
+            .as_ref()
+            .map_or_else(|| Rc::new(Cell::new(0)), |env| env.step_count.clone());
 
         Rc::new(Self {
             parent,
@@ -674,6 +683,8 @@ impl Environment {
             macros: RefCell::new(HashMap::new()),
             output,
             gensym_counter,
+            step_limit,
+            step_count,
         })
     }
 
@@ -730,6 +741,25 @@ impl Environment {
         }
 
         format!("__ming_{sanitized}_{next}")
+    }
+
+    fn set_step_limit(&self, max_steps: usize) {
+        self.step_limit.set(Some(max_steps));
+        self.step_count.set(0);
+    }
+
+    fn consume_eval_step(&self, pos: SourcePos) -> Result<(), EvalError> {
+        let Some(max_steps) = self.step_limit.get() else {
+            return Ok(());
+        };
+
+        let step_count = self.step_count.get();
+        if step_count >= max_steps {
+            return Err(EvalError::StepLimitExceeded { max_steps }.with_position(pos));
+        }
+
+        self.step_count.set(step_count + 1);
+        Ok(())
     }
 }
 
@@ -1268,7 +1298,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn root_env() -> EnvRef {
+fn root_env_with_limit(max_steps: Option<usize>) -> EnvRef {
     let env = Environment::new(None);
 
     for (name, builtin) in [
@@ -1379,7 +1409,14 @@ fn root_env() -> EnvRef {
     }
 
     install_prelude(&env);
+    if let Some(max_steps) = max_steps {
+        env.set_step_limit(max_steps);
+    }
     env
+}
+
+fn root_env() -> EnvRef {
+    root_env_with_limit(None)
 }
 
 const STANDARD_PRELUDE: &str = r#"
@@ -1492,6 +1529,7 @@ fn install_prelude(env: &EnvRef) {
 
 fn eval_expr(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
     let pos = expr.pos();
+    env.consume_eval_step(pos)?;
 
     match expr {
         Expr::Number(value, _) => Ok(Value::Number(*value)),
@@ -1552,6 +1590,7 @@ fn eval_expr_tco(expr: &Expr, env: &EnvRef) -> Result<Value, EvalError> {
 
     loop {
         let pos = current_expr.pos();
+        current_env.consume_eval_step(pos)?;
 
         match &current_expr {
             Expr::Number(value, _) => return Ok(Value::Number(*value)),
@@ -6771,26 +6810,30 @@ fn run_with_continuations(
 
     loop {
         match state {
-            MachineState::Expr(expr, env) => match expr {
-                Expr::Number(value, _) => state = machine_value(Value::Number(value)),
-                Expr::Boolean(value, _) => state = machine_value(Value::Boolean(value)),
-                Expr::String(value, _) => {
-                    state = machine_value(Value::String(SchemeString::new(value)))
+            MachineState::Expr(expr, env) => {
+                env.consume_eval_step(expr.pos())?;
+
+                match expr {
+                    Expr::Number(value, _) => state = machine_value(Value::Number(value)),
+                    Expr::Boolean(value, _) => state = machine_value(Value::Boolean(value)),
+                    Expr::String(value, _) => {
+                        state = machine_value(Value::String(SchemeString::new(value)))
+                    }
+                    Expr::Char(value, _) => state = machine_value(Value::Char(value)),
+                    Expr::Symbol(name, pos) => {
+                        let value = env
+                            .lookup(&name)
+                            .ok_or_else(|| EvalError::UnboundSymbol(name).with_position(pos))?;
+                        state = machine_value(value);
+                    }
+                    Expr::List(items, pos) => {
+                        let (next_state, next_cont) =
+                            machine_enter_list(items, pos, env, cont, &winds, &handlers)?;
+                        state = next_state;
+                        cont = next_cont;
+                    }
                 }
-                Expr::Char(value, _) => state = machine_value(Value::Char(value)),
-                Expr::Symbol(name, pos) => {
-                    let value = env
-                        .lookup(&name)
-                        .ok_or_else(|| EvalError::UnboundSymbol(name).with_position(pos))?;
-                    state = machine_value(value);
-                }
-                Expr::List(items, pos) => {
-                    let (next_state, next_cont) =
-                        machine_enter_list(items, pos, env, cont, &winds, &handlers)?;
-                    state = next_state;
-                    cont = next_cont;
-                }
-            },
+            }
             MachineState::Raised { value, env, pos } => {
                 let Some(handler_ctx) = handler_stack_last(&handlers) else {
                     let error = EvalError::UncaughtException {
@@ -7239,10 +7282,13 @@ fn expr_needs_continuation_machine(expr: &Expr) -> bool {
 /// use ming::scheme::eval_str;
 /// assert_eq!(eval_str("(+ 1 2)"), Ok("3".into()));
 /// ```
-fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
+fn eval_program_with_limit(
+    input: &str,
+    max_steps: Option<usize>,
+) -> Result<(Value, String), EvalError> {
     let mut parser = Parser::new(input);
     let exprs = parser.parse_program()?;
-    let env = root_env();
+    let env = root_env_with_limit(max_steps);
     let last = if needs_continuation_machine(&exprs) {
         eval_sequence_with_continuations(&exprs, &env)
     } else {
@@ -7253,8 +7299,17 @@ fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
     Ok((last, output))
 }
 
+fn eval_program(input: &str) -> Result<(Value, String), EvalError> {
+    eval_program_with_limit(input, None)
+}
+
 pub fn eval_str(input: &str) -> Result<String, EvalError> {
     let (last, _) = eval_program(input)?;
+    Ok(last.render())
+}
+
+pub fn eval_str_with_limit(input: &str, max_steps: usize) -> Result<String, EvalError> {
+    let (last, _) = eval_program_with_limit(input, Some(max_steps))?;
     Ok(last.render())
 }
 

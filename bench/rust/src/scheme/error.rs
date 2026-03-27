@@ -79,6 +79,8 @@ pub enum EvalError {
     UncaughtException { value: String },
     #[error("exception handler returned for a non-continuable raise")]
     HandlerReturned,
+    #[error("step limit exceeded after {max_steps} steps")]
+    StepLimitExceeded { max_steps: usize },
     #[error("{pos}: {source}")]
     Positioned {
         pos: SourcePos,
