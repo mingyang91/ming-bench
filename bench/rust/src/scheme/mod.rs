@@ -42,6 +42,22 @@ type EnvRef = Rc<Environment>;
 type BindingRef = Rc<RefCell<Value>>;
 type BuiltinFn = fn(&[EvaluatedArg], &mut String) -> Result<Value, EvalError>;
 
+#[derive(Clone, Debug)]
+struct LambdaParams {
+    fixed: Vec<String>,
+    rest: Option<String>,
+}
+
+impl LambdaParams {
+    fn fixed_arity(&self) -> usize {
+        self.fixed.len()
+    }
+
+    fn allows_rest(&self) -> bool {
+        self.rest.is_some()
+    }
+}
+
 #[derive(Clone)]
 struct EvaluatedArg {
     value: Value,
@@ -105,7 +121,7 @@ enum Procedure {
         func: BuiltinFn,
     },
     Lambda {
-        params: Vec<String>,
+        params: LambdaParams,
         body: Vec<Expr>,
         env: EnvRef,
     },
@@ -543,6 +559,7 @@ fn default_env() -> EnvRef {
         ("boolean?", apply_boolean_pred as BuiltinFn),
         ("pair?", apply_pair_pred as BuiltinFn),
         ("symbol?", apply_symbol_pred as BuiltinFn),
+        ("apply", apply_apply as BuiltinFn),
         ("display", apply_display as BuiltinFn),
         ("write", apply_write as BuiltinFn),
         ("newline", apply_newline as BuiltinFn),
@@ -760,7 +777,10 @@ fn eval_let(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, Ev
 
             let closure_env = Environment::new(Some(env));
             let procedure = Value::Procedure(Rc::new(Procedure::Lambda {
-                params,
+                params: LambdaParams {
+                    fixed: params,
+                    rest: None,
+                },
                 body: body.to_vec(),
                 env: closure_env.clone(),
             }));
@@ -814,7 +834,7 @@ fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         });
     }
 
-    let params = parse_param_list(params_expr)?;
+    let params = parse_lambda_params(params_expr)?;
     Ok(Value::Procedure(Rc::new(Procedure::Lambda {
         params,
         body: body.to_vec(),
@@ -844,7 +864,7 @@ fn eval_define(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value,
                 });
             };
 
-            let params = parse_param_names(params)?;
+            let params = parse_lambda_param_items(params)?;
             env.define(
                 name.clone(),
                 Value::Procedure(Rc::new(Procedure::Lambda {
@@ -880,25 +900,52 @@ fn eval_set(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, Ev
     }
 }
 
-fn parse_param_list(expr: &Expr) -> Result<Vec<String>, EvalError> {
+fn parse_lambda_params(expr: &Expr) -> Result<LambdaParams, EvalError> {
     match expr {
-        Expr::List { items, .. } => parse_param_names(items),
+        Expr::List { items, .. } => parse_lambda_param_items(items),
+        Expr::Symbol { name, .. } => Ok(LambdaParams {
+            fixed: Vec::new(),
+            rest: Some(name.clone()),
+        }),
         _ => Err(EvalError::ParseError {
-            message: "lambda parameters must be a list".to_string(),
+            message: "lambda parameters must be a list or symbol".to_string(),
         }),
     }
 }
 
-fn parse_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> {
-    items
-        .iter()
-        .map(|expr| match expr {
-            Expr::Symbol { name, .. } => Ok(name.clone()),
-            _ => Err(EvalError::ParseError {
-                message: "parameter names must be symbols".to_string(),
-            }),
-        })
-        .collect()
+fn parse_lambda_param_items(items: &[Expr]) -> Result<LambdaParams, EvalError> {
+    let mut fixed = Vec::new();
+
+    for (index, expr) in items.iter().enumerate() {
+        match expr {
+            Expr::Symbol { name, .. } if name == "." => {
+                let [rest] = &items[index + 1..] else {
+                    return Err(EvalError::ParseError {
+                        message: "invalid dotted parameter list".to_string(),
+                    });
+                };
+
+                let Expr::Symbol { name, .. } = rest else {
+                    return Err(EvalError::ParseError {
+                        message: "parameter names must be symbols".to_string(),
+                    });
+                };
+
+                return Ok(LambdaParams {
+                    fixed,
+                    rest: Some(name.clone()),
+                });
+            }
+            Expr::Symbol { name, .. } => fixed.push(name.clone()),
+            _ => {
+                return Err(EvalError::ParseError {
+                    message: "parameter names must be symbols".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(LambdaParams { fixed, rest: None })
 }
 
 fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
@@ -952,7 +999,15 @@ fn apply_procedure(
     match procedure.as_ref() {
         Procedure::Builtin { func, .. } => func(args, output),
         Procedure::Lambda { params, body, env } => {
-            if args.len() != params.len() {
+            if args.len() < params.fixed_arity() {
+                return Err(EvalError::WrongArgCountAtLeast {
+                    name: "lambda",
+                    min: params.fixed_arity(),
+                    got: args.len(),
+                });
+            }
+
+            if !params.allows_rest() && args.len() != params.fixed_arity() {
                 return Err(EvalError::WrongArgCount {
                     name: "lambda",
                     expected: "exact parameter count",
@@ -961,8 +1016,16 @@ fn apply_procedure(
             }
 
             let call_env = Environment::new(Some(env.clone()));
-            for (name, arg) in params.iter().zip(args.iter()) {
+            for (name, arg) in params.fixed.iter().zip(args.iter()) {
                 call_env.define(name.clone(), arg.value.clone());
+            }
+
+            if let Some(name) = &params.rest {
+                let rest_items = args[params.fixed_arity()..]
+                    .iter()
+                    .map(|arg| arg.value.clone())
+                    .collect();
+                call_env.define(name.clone(), Value::List(rest_items));
             }
 
             eval_program(body, call_env, output)
@@ -1237,6 +1300,37 @@ fn apply_symbol_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Valu
     };
 
     Ok(Value::Bool(matches!(&value.value, Value::Symbol(_))))
+}
+
+fn apply_apply(args: &[EvaluatedArg], output: &mut String) -> Result<Value, EvalError> {
+    let [procedure, rest @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "apply",
+            expected: "at least 2",
+            got: 0,
+        });
+    };
+
+    if rest.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: "apply",
+            expected: "at least 2",
+            got: 1,
+        });
+    }
+
+    let (tail, prefix) = rest.split_last().expect("checked for non-empty tail");
+    let tail_items = tail.as_list()?;
+
+    let mut applied_args = Vec::with_capacity(prefix.len() + tail_items.len());
+    applied_args.extend(prefix.iter().cloned());
+    applied_args.extend(tail_items.iter().cloned().map(|value| EvaluatedArg {
+        value,
+        pos: tail.pos,
+    }));
+
+    apply_procedure(procedure.value.clone(), &applied_args, output)
+        .map_err(|error| error.with_position(procedure.pos.line, procedure.pos.col))
 }
 
 fn apply_display(args: &[EvaluatedArg], output: &mut String) -> Result<Value, EvalError> {

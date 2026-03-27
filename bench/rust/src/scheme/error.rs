@@ -33,6 +33,13 @@ pub enum EvalError {
         got: usize,
     },
 
+    #[error("wrong argument count for {name}: expected at least {min}, got {got}")]
+    WrongArgCountAtLeast {
+        name: &'static str,
+        min: usize,
+        got: usize,
+    },
+
     #[error("type mismatch: expected {expected}, got {found}")]
     TypeMismatch {
         expected: &'static str,
