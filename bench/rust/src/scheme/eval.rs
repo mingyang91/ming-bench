@@ -34,6 +34,7 @@ pub fn eval(expr: &Value, env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value,
                     "let" => return eval_let(&elems[1..], env, out),
                     "begin" => return eval_begin(&elems[1..], env, out),
                     "cond" => return eval_cond(&elems[1..], env, out),
+                    "string-set!" => return eval_string_set(&elems[1..], env, out),
                     _ => {}
                 }
             }
@@ -385,6 +386,15 @@ fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalEr
                 _ => Err(EvalError::Type("string->symbol: expected string".into())),
             }
         }
+        "string-copy" => {
+            if vals.len() != 1 {
+                return Err(EvalError::Arity("string-copy requires 1 argument".into()));
+            }
+            match &vals[0] {
+                Value::String(s) => Ok(Value::String(s.clone())),
+                _ => Err(EvalError::Type("string-copy: expected string".into())),
+            }
+        }
         "string-ref" => {
             if vals.len() != 2 {
                 return Err(EvalError::Arity("string-ref requires 2 arguments".into()));
@@ -401,6 +411,33 @@ fn apply_builtin(op: &str, vals: &[Value], out: &Output) -> Result<Value, EvalEr
         }
         _ => Err(EvalError::UnboundVariable(op.into())),
     }
+}
+
+fn eval_string_set(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Arity("string-set! requires 3 arguments".into()));
+    }
+    let name = match &args[0] {
+        Value::Symbol(s) => s.clone(),
+        _ => return Err(EvalError::Type("string-set!: first argument must be a variable".into())),
+    };
+    let idx = expect_int(&eval(&args[1], env, out)?)? as usize;
+    let ch = match eval(&args[2], env, out)? {
+        Value::Char(c) => c,
+        _ => return Err(EvalError::Type("string-set!: third argument must be a char".into())),
+    };
+    let mut s = match env.borrow().get(&name)? {
+        Value::String(s) => s,
+        _ => return Err(EvalError::Type("string-set!: expected string".into())),
+    };
+    let mut chars: Vec<char> = s.chars().collect();
+    if idx >= chars.len() {
+        return Err(EvalError::Type("string-set!: index out of bounds".into()));
+    }
+    chars[idx] = ch;
+    s = chars.into_iter().collect();
+    env.borrow_mut().set(name, Value::String(s));
+    Ok(Value::Void)
 }
 
 fn eval_let(args: &[Value], env: &Rc<RefCell<Env>>, out: &Output) -> Result<Value, EvalError> {

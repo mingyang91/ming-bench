@@ -131,6 +131,30 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(Value::Boolean(false))
             }
+            b'\\' => {
+                self.pos += 1; // skip '\'
+                if self.pos >= self.input.len() {
+                    return Err(EvalError::Parse("unexpected end after #\\".into()));
+                }
+                // Named characters
+                let start = self.pos;
+                while self.pos < self.input.len() {
+                    match self.input[self.pos] {
+                        b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b'"' | b';' => break,
+                        _ => self.pos += 1,
+                    }
+                }
+                let name = std::str::from_utf8(&self.input[start..self.pos])
+                    .map_err(|_| EvalError::Parse("invalid utf8 in char literal".into()))?;
+                let ch = match name {
+                    "space" => ' ',
+                    "newline" => '\n',
+                    "tab" => '\t',
+                    s if s.chars().count() == 1 => s.chars().next().unwrap(),
+                    _ => return Err(EvalError::Parse(format!("unknown character name: {}", name))),
+                };
+                Ok(Value::Char(ch))
+            }
             c => Err(EvalError::Parse(format!("unknown # literal: #{}", c as char))),
         }
     }
