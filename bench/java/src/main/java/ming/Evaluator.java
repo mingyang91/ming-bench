@@ -54,6 +54,18 @@ public class Evaluator {
         void define(String name, Object val) {
             bindings.put(name, val);
         }
+
+        void set(String name, Object val, Pos pos) throws EvalError {
+            if (bindings.containsKey(name)) {
+                bindings.put(name, val);
+                return;
+            }
+            if (parent != null) {
+                parent.set(name, val, pos);
+                return;
+            }
+            throw new EvalError("set!: unbound variable: " + name + " at " + pos.fmt());
+        }
     }
 
     // --- Pair (cons cell) ---
@@ -561,6 +573,16 @@ public class Evaluator {
                         } else {
                             throw new EvalError("define: invalid syntax" + posStr);
                         }
+                    }
+                    case "set!" -> {
+                        if (list.size() != 3) throw new EvalError("set!: expected 2 arguments" + posStr);
+                        Object target = list.get(1);
+                        if (target instanceof Located loc) target = loc.expr;
+                        if (!(target instanceof String name))
+                            throw new EvalError("set!: target must be a symbol" + posStr);
+                        Object val = eval(list.get(2), env);
+                        env.set(name, val, new Pos(eLine, eCol));
+                        return val;
                     }
                     case "lambda" -> {
                         if (list.size() < 3) throw new EvalError("lambda: too few arguments" + posStr);
