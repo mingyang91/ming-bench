@@ -18,10 +18,11 @@ type EmptyList = { kind: 'empty-list' };
 type PairValue = { kind: 'pair'; car: Value; cdr: Value };
 type VectorValue = { kind: 'vector'; items: Value[] };
 type VoidValue = { kind: 'void' };
+type TailStep = { kind: 'tail-step'; expr: Expr; env: Env };
 type BuiltinProc = {
   kind: 'builtin';
   name: string;
-  apply: (args: Value[], position: SourcePosition) => Value;
+  apply: (args: Value[], position: SourcePosition) => EvalResult;
 };
 type PatternCapture =
   | { kind: 'single'; expr: Expr }
@@ -90,6 +91,7 @@ type Value =
   | BuiltinProc
   | UserProc
   | CaseLambdaProc;
+type EvalResult = Value | TailStep;
 
 type BindingSpec = { name: string; init: Expr };
 type DoBindingSpec = { name: string; init: Expr; step?: Expr };
@@ -1192,40 +1194,78 @@ function createGlobalEnv(output: OutputBuffer, macroEnv: MacroEnv): Env {
 }
 
 function evalSequence(exprs: Expr[], env: Env, macroEnv: MacroEnv): Value {
-  let result: Value = VOID;
-
-  for (const expr of exprs) {
-    result = evalExpr(expr, env, macroEnv);
+  if (exprs.length === 0) {
+    return VOID;
   }
 
-  return result;
+  for (const expr of exprs.slice(0, -1)) {
+    evalExpr(expr, env, macroEnv);
+  }
+
+  return evalExpr(exprs[exprs.length - 1]!, env, macroEnv);
+}
+
+function evalSequenceTail(exprs: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+  if (exprs.length === 0) {
+    return VOID;
+  }
+
+  for (const expr of exprs.slice(0, -1)) {
+    evalExpr(expr, env, macroEnv);
+  }
+
+  return { kind: 'tail-step', expr: exprs[exprs.length - 1]!, env };
+}
+
+function isTailStep(result: EvalResult): result is TailStep {
+  return typeof result === 'object' && result !== null && result.kind === 'tail-step';
+}
+
+function resolveEvalResult(result: EvalResult, macroEnv: MacroEnv): Value {
+  return isTailStep(result) ? evalExpr(result.expr, result.env, macroEnv) : result;
 }
 
 function evalExpr(expr: Expr, env: Env, macroEnv: MacroEnv): Value {
-  try {
-    switch (expr.kind) {
-      case 'number':
-      case 'boolean':
-        return expr.value;
+  let currentExpr = expr;
+  let currentEnv = env;
 
-      case 'string':
-        return makeRuntimeString(expr.value);
+  while (true) {
+    try {
+      const result = evalExprOnce(currentExpr, currentEnv, macroEnv);
+      if (isTailStep(result)) {
+        currentExpr = result.expr;
+        currentEnv = result.env;
+        continue;
+      }
 
-      case 'char':
-        return { kind: 'char', value: expr.value };
-
-      case 'symbol':
-        return env.lookup(expr.name);
-
-      case 'list':
-        return evalList(expr, env, macroEnv);
+      return result;
+    } catch (error) {
+      throw attachPosition(error, currentExpr.position);
     }
-  } catch (error) {
-    throw attachPosition(error, expr.position);
   }
 }
 
-function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, macroEnv: MacroEnv): Value {
+function evalExprOnce(expr: Expr, env: Env, macroEnv: MacroEnv): EvalResult {
+  switch (expr.kind) {
+    case 'number':
+    case 'boolean':
+      return expr.value;
+
+    case 'string':
+      return makeRuntimeString(expr.value);
+
+    case 'char':
+      return { kind: 'char', value: expr.value };
+
+    case 'symbol':
+      return env.lookup(expr.name);
+
+    case 'list':
+      return evalList(expr, env, macroEnv);
+  }
+}
+
+function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, macroEnv: MacroEnv): EvalResult {
   const { items } = expr;
   if (items.length === 0) {
     throw new EvalError('cannot evaluate empty list');
@@ -1237,7 +1277,7 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
       case 'and':
         return evalAnd(items.slice(1), env, macroEnv);
       case 'begin':
-        return evalSequence(items.slice(1), env, macroEnv);
+        return evalSequenceTail(items.slice(1), env, macroEnv);
       case 'case':
         return evalCase(items.slice(1), env, macroEnv);
       case 'case-lambda':
@@ -1272,7 +1312,7 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
 
     const macro = macroEnv.lookup(first.name);
     if (macro !== undefined) {
-      return evalExpr(expandMacroInvocation(macro, expr), env, macroEnv);
+      return { kind: 'tail-step', expr: expandMacroInvocation(macro, expr), env };
     }
   }
 
@@ -1285,20 +1325,22 @@ function evalList(expr: ExprBase & { kind: 'list'; items: Expr[] }, env: Env, ma
   return applyProcedure(proc, args, first.position, macroEnv);
 }
 
-function evalAnd(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
-  let result: Value = true;
+function evalAnd(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+  if (args.length === 0) {
+    return true;
+  }
 
-  for (const arg of args) {
-    result = evalExpr(arg, env, macroEnv);
-    if (!isTruthy(result)) {
-      return result;
+  for (const arg of args.slice(0, -1)) {
+    const value = evalExpr(arg, env, macroEnv);
+    if (!isTruthy(value)) {
+      return value;
     }
   }
 
-  return result;
+  return { kind: 'tail-step', expr: args[args.length - 1]!, env };
 }
 
-function evalCase(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalCase(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
   assertAtLeastArity('case', args, 1);
 
   const key = evalExpr(args[0]!, env, macroEnv);
@@ -1315,7 +1357,7 @@ function evalCase(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
       if (index !== clauses.length - 1) {
         throw new EvalError('case else clause must be last');
       }
-      return body.length === 0 ? VOID : evalSequence(body, env, macroEnv);
+      return evalSequenceTail(body, env, macroEnv);
     }
 
     if (headExpr!.kind !== 'list') {
@@ -1323,14 +1365,14 @@ function evalCase(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
     }
 
     if (headExpr.items.some((datumExpr) => eqvValues(key, quoteExpr(datumExpr)))) {
-      return body.length === 0 ? VOID : evalSequence(body, env, macroEnv);
+      return evalSequenceTail(body, env, macroEnv);
     }
   }
 
   return VOID;
 }
 
-function evalCond(clauses: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalCond(clauses: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
   for (let index = 0; index < clauses.length; index += 1) {
     const clauseExpr = clauses[index]!;
     if (clauseExpr.kind !== 'list' || clauseExpr.items.length === 0) {
@@ -1342,27 +1384,31 @@ function evalCond(clauses: Expr[], env: Env, macroEnv: MacroEnv): Value {
       if (index !== clauses.length - 1) {
         throw new EvalError('cond else clause must be last');
       }
-      return evalSequence(body, env, macroEnv);
+      return evalSequenceTail(body, env, macroEnv);
     }
 
     const testValue = evalExpr(testExpr!, env, macroEnv);
     if (isTruthy(testValue)) {
-      return body.length === 0 ? testValue : evalSequence(body, env, macroEnv);
+      return body.length === 0 ? testValue : evalSequenceTail(body, env, macroEnv);
     }
   }
 
   return VOID;
 }
 
-function evalOr(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
-  for (const arg of args) {
+function evalOr(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
+  if (args.length === 0) {
+    return false;
+  }
+
+  for (const arg of args.slice(0, -1)) {
     const value = evalExpr(arg, env, macroEnv);
     if (isTruthy(value)) {
       return value;
     }
   }
 
-  return false;
+  return { kind: 'tail-step', expr: args[args.length - 1]!, env };
 }
 
 function evalDefine(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
@@ -1486,17 +1532,17 @@ function evalDefineRecordType(args: Expr[], env: Env): Value {
   return VOID;
 }
 
-function evalIf(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalIf(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
   if (args.length !== 2 && args.length !== 3) {
     throw new EvalError('if expects 2 or 3 argument(s)');
   }
 
   const [conditionExpr, thenExpr, elseExpr] = args;
   return isTruthy(evalExpr(conditionExpr!, env, macroEnv))
-    ? evalExpr(thenExpr!, env, macroEnv)
+    ? { kind: 'tail-step', expr: thenExpr!, env }
     : elseExpr === undefined
       ? VOID
-      : evalExpr(elseExpr, env, macroEnv);
+      : { kind: 'tail-step', expr: elseExpr, env };
 }
 
 function evalCaseLambda(args: Expr[], env: Env): Value {
@@ -1522,7 +1568,7 @@ function evalLambda(args: Expr[], env: Env): Value {
   };
 }
 
-function evalLet(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalLet(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
   assertAtLeastArity('let', args, 2);
 
   const firstArg = args[0]!;
@@ -1540,10 +1586,10 @@ function evalLet(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
     letEnv.define(binding.name, values[index]!);
   });
 
-  return evalSequence(body, letEnv, macroEnv);
+  return evalSequenceTail(body, letEnv, macroEnv);
 }
 
-function evalLetRec(args: Expr[], env: Env, macroEnv: MacroEnv, sequential: boolean): Value {
+function evalLetRec(args: Expr[], env: Env, macroEnv: MacroEnv, sequential: boolean): EvalResult {
   const name = sequential ? 'letrec*' : 'letrec';
   assertAtLeastArity(name, args, 2);
 
@@ -1566,10 +1612,10 @@ function evalLetRec(args: Expr[], env: Env, macroEnv: MacroEnv, sequential: bool
     });
   }
 
-  return evalSequence(body, letEnv, macroEnv);
+  return evalSequenceTail(body, letEnv, macroEnv);
 }
 
-function evalNamedLet(name: string, bindingsExpr: Expr, body: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalNamedLet(name: string, bindingsExpr: Expr, body: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
   const bindings = parseBindings(bindingsExpr);
   const values = bindings.map((binding) => evalExpr(binding.init, env, macroEnv));
   const letEnv = new Env(env);
@@ -1585,7 +1631,7 @@ function evalNamedLet(name: string, bindingsExpr: Expr, body: Expr[], env: Env, 
   return applyProcedure(proc, values, bindingsExpr.position, macroEnv);
 }
 
-function evalDo(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
+function evalDo(args: Expr[], env: Env, macroEnv: MacroEnv): EvalResult {
   assertAtLeastArity('do', args, 2);
 
   const bindings = parseDoBindings(args[0]!);
@@ -1600,7 +1646,7 @@ function evalDo(args: Expr[], env: Env, macroEnv: MacroEnv): Value {
 
   while (true) {
     if (isTruthy(evalExpr(testClause.test, doEnv, macroEnv))) {
-      return testClause.results.length === 0 ? VOID : evalSequence(testClause.results, doEnv, macroEnv);
+      return evalSequenceTail(testClause.results, doEnv, macroEnv);
     }
 
     evalSequence(body, doEnv, macroEnv);
@@ -1812,7 +1858,7 @@ function applyProcedure(
   args: Value[],
   position: SourcePosition,
   macroEnv: MacroEnv,
-): Value {
+): EvalResult {
   try {
     if (proc.kind === 'builtin') {
       return proc.apply(args, position);
@@ -1839,7 +1885,7 @@ function applyProcedureClause(
   clause: ProcedureClause,
   args: Value[],
   macroEnv: MacroEnv,
-): Value {
+): EvalResult {
   assertProcedureArity(name, args, clause.params);
 
   const callEnv = new Env(env);
@@ -1850,14 +1896,14 @@ function applyProcedureClause(
     callEnv.define(clause.params.rest, makeList(args.slice(clause.params.required.length)));
   }
 
-  return evalSequence(clause.body, callEnv, macroEnv);
+  return evalSequenceTail(clause.body, callEnv, macroEnv);
 }
 
-function builtin(name: string, apply: (args: Value[], position: SourcePosition) => Value): [string, BuiltinProc] {
+function builtin(name: string, apply: (args: Value[], position: SourcePosition) => EvalResult): [string, BuiltinProc] {
   return [name, { kind: 'builtin', name, apply }];
 }
 
-function applyBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv): Value {
+function applyBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv): EvalResult {
   assertAtLeastArity('apply', args, 2);
 
   const proc = args[0]!;
@@ -2329,7 +2375,7 @@ function mapBuiltin(args: Value[], position: SourcePosition, macroEnv: MacroEnv)
       currentLists[index] = current.cdr;
     }
 
-    results.push(applyProcedure(proc, elementArgs, position, macroEnv));
+    results.push(resolveEvalResult(applyProcedure(proc, elementArgs, position, macroEnv), macroEnv));
   }
 }
 
