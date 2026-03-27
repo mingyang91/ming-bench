@@ -78,19 +78,19 @@ object TestRunner:
       kind match
         case "eval_str_ok" =>
           val expected = tc.get("expected").getAsString
-          val result   = Evaluator.evalStr(input)
+          val result   = evalInput(input, tc)
           if result == expected then TestResult(name, passed = true, "")
           else TestResult(name, passed = false, s"expected $expected got $result")
 
         case "eval_str_err" =>
           try
-            val result = Evaluator.evalStr(input)
+            val result = evalInput(input, tc)
             TestResult(name, passed = false, s"expected EvalError but got $result")
           catch case _: EvalError => TestResult(name, passed = true, "")
 
         case "eval_str_err_with_position" =>
           try
-            val result = Evaluator.evalStr(input)
+            val result = evalInput(input, tc)
             TestResult(name, passed = false, s"expected EvalError but got $result")
           catch
             case e: EvalError =>
@@ -113,3 +113,10 @@ object TestRunner:
     catch
       case e: Exception =>
         TestResult(name, passed = false, s"${e.getClass.getSimpleName}: ${e.getMessage}")
+
+  private def evalInput(input: String, tc: JsonObject): String =
+    Option.when(tc.has("max_steps"))(tc.get("max_steps").getAsInt) match
+      case Some(maxSteps) =>
+        Evaluator.evalStrWithLimit(input, maxSteps)
+      case None =>
+        Evaluator.evalStr(input)

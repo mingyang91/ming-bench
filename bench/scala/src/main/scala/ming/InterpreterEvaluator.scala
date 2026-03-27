@@ -70,6 +70,7 @@ private[ming] object InterpreterEvaluator:
     env: Environment,
     continuation: Continuation
   ): EvaluationStep =
+    StepLimitRuntime.consumeExpressionStep()
     expression match
       case IntExpr(value, _) =>
         done(IntValue(value), continuation)
