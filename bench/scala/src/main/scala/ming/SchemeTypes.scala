@@ -23,6 +23,10 @@ private[ming] enum Value:
   case EmptyList
   case PairVal(car: Value, cdr: Value)
   case BuiltinProc(name: String)
+  case RecordConstructor(recordType: RecordType)
+  case RecordPredicate(recordType: RecordType)
+  case RecordAccessor(recordType: RecordType, fieldIndex: Int, name: String)
+  case RecordVal(instance: RecordInstance)
 
   case Closure(
     name: Option[String],
@@ -54,3 +58,24 @@ object MutableString:
 
   def from(text: String): MutableString =
     new MutableString(new java.lang.StringBuilder(text))
+
+final private[ming] case class RecordFieldSpec(
+  fieldName: String,
+  accessorName: String
+)
+
+final private[ming] class RecordType(
+  val typeName: String,
+  val constructorName: String,
+  val predicateName: String,
+  val constructorFieldIndices: Vector[Int],
+  val fields: Vector[RecordFieldSpec]
+)
+
+final private[ming] class RecordInstance(
+  val recordType: RecordType,
+  private val storage: Array[Value]
+):
+
+  def field(index: Int): Value =
+    storage(index)

@@ -46,6 +46,8 @@ object Evaluator:
       case Nil => throw EvalError.at(pos, "cannot evaluate empty list")
       case Expr.Symbol("define-syntax", formPos) :: args =>
         evalDefineSyntax(args, env, formPos)
+      case Expr.Symbol("define-record-type", formPos) :: args =>
+        evalDefineRecordType(args, env, formPos)
       case Expr.Symbol("define", formPos) :: args =>
         evalDefine(args, env, formPos, context)
       case Expr.Symbol("if", formPos) :: args =>
@@ -79,6 +81,9 @@ object Evaluator:
         Value.Void
       case _ =>
         throw EvalError.at(pos, "invalid define-syntax")
+
+  private def evalDefineRecordType(args: List[Expr], env: Env, pos: SourcePos): Value =
+    SchemeRecords.defineRecordType(args, env, pos)
 
   private def evalDefine(args: List[Expr], env: Env, pos: SourcePos, context: EvalContext): Value =
     args match
@@ -203,6 +208,12 @@ object Evaluator:
         invokeMap(evaluatedArgs, pos, context)
       case Value.BuiltinProc(name) =>
         Builtins.invoke(name, evaluatedArgs, pos, context)
+      case Value.RecordConstructor(recordType) =>
+        SchemeRecords.construct(recordType, evaluatedArgs, pos)
+      case Value.RecordPredicate(recordType) =>
+        SchemeRecords.test(recordType, evaluatedArgs, pos)
+      case Value.RecordAccessor(recordType, fieldIndex, name) =>
+        SchemeRecords.access(recordType, fieldIndex, name, evaluatedArgs, pos)
       case Value.Closure(name, params, restParam, body, closureEnv) =>
         validateArity(name, params.length, restParam, evaluatedArgs.length, pos)
 

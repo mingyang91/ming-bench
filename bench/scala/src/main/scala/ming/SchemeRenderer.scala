@@ -25,8 +25,11 @@ private[ming] object SchemeRenderer:
       case Value.EmptyList       => "()"
       case pair @ Value.PairVal(_, _) =>
         renderPair(pair, displayStrings, displayChars)
-      case Value.BuiltinProc(_) | Value.Closure(_, _, _, _, _) =>
+      case Value.BuiltinProc(_) | Value.RecordConstructor(_) | Value.RecordPredicate(_) |
+          Value.RecordAccessor(_, _, _) | Value.Closure(_, _, _, _, _) =>
         "#<procedure>"
+      case Value.RecordVal(instance) =>
+        s"#<record ${instance.recordType.typeName}>"
       case Value.Void => ""
 
   private def renderPair(value: Value, displayStrings: Boolean, displayChars: Boolean): String =

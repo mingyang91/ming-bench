@@ -57,6 +57,7 @@ enum Builtin {
     NumericEq,
     LessEqual,
     Not,
+    Map,
     Cons,
     Car,
     Cdr,
@@ -83,6 +84,7 @@ impl Builtin {
             "=" => Some(Self::NumericEq),
             "<=" => Some(Self::LessEqual),
             "not" => Some(Self::Not),
+            "map" => Some(Self::Map),
             "cons" => Some(Self::Cons),
             "car" => Some(Self::Car),
             "cdr" => Some(Self::Cdr),
@@ -110,6 +112,7 @@ impl Builtin {
             Self::NumericEq => "=",
             Self::LessEqual => "<=",
             Self::Not => "not",
+            Self::Map => "map",
             Self::Cons => "cons",
             Self::Car => "car",
             Self::Cdr => "cdr",
@@ -139,6 +142,7 @@ enum SpecialForm {
     Cond,
     Set,
     DefineSyntax,
+    DefineRecordType,
 }
 
 impl SpecialForm {
@@ -155,6 +159,7 @@ impl SpecialForm {
             "cond" => Some(Self::Cond),
             "set!" => Some(Self::Set),
             "define-syntax" => Some(Self::DefineSyntax),
+            "define-record-type" => Some(Self::DefineRecordType),
             _ => None,
         }
     }
@@ -170,6 +175,10 @@ enum Value {
     Pair(Rc<Pair>),
     Builtin(Builtin),
     Closure(Rc<Closure>),
+    Record(Rc<RecordInstance>),
+    RecordConstructor(Rc<RecordConstructor>),
+    RecordPredicate(Rc<RecordPredicate>),
+    RecordAccessor(Rc<RecordAccessor>),
     Void,
 }
 
@@ -185,6 +194,38 @@ struct Closure {
     params: Vec<String>,
     body: Vec<Expr>,
     env: EnvRef,
+}
+
+#[derive(Clone)]
+struct RecordTypeDef {
+    name: String,
+    field_names: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RecordInstance {
+    record_type: Rc<RecordTypeDef>,
+    fields: Vec<Value>,
+}
+
+#[derive(Clone)]
+struct RecordConstructor {
+    name: String,
+    record_type: Rc<RecordTypeDef>,
+    field_order: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct RecordPredicate {
+    name: String,
+    record_type: Rc<RecordTypeDef>,
+}
+
+#[derive(Clone)]
+struct RecordAccessor {
+    name: String,
+    record_type: Rc<RecordTypeDef>,
+    field_index: usize,
 }
 
 type EnvRef = Rc<Env>;
@@ -363,6 +404,7 @@ fn eval_special_form(
         SpecialForm::Cond => eval_cond(args, env),
         SpecialForm::Set => eval_set(args, env),
         SpecialForm::DefineSyntax => eval_define_syntax(args, env),
+        SpecialForm::DefineRecordType => eval_define_record_type(args, env),
     }
 }
 
@@ -536,6 +578,67 @@ fn eval_define_syntax(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
             "define-syntax expects a name and a transformer",
         )),
     }
+}
+
+fn eval_define_record_type(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    let [Expr::Symbol(type_name), constructor_expr, Expr::Symbol(predicate_name), field_exprs @ ..] =
+        args
+    else {
+        return Err(EvalError::message("invalid define-record-type"));
+    };
+
+    let (constructor_name, constructor_fields) = parse_record_constructor_spec(constructor_expr)?;
+    let fields = parse_record_fields(field_exprs)?;
+
+    let field_index_by_name = fields
+        .iter()
+        .enumerate()
+        .map(|(index, (field_name, _))| (field_name.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    let mut field_order = Vec::with_capacity(constructor_fields.len());
+    for field_name in constructor_fields {
+        let Some(index) = field_index_by_name.get(&field_name) else {
+            return Err(EvalError::message(format!(
+                "constructor field {field_name} is not declared in {type_name}",
+            )));
+        };
+        field_order.push(*index);
+    }
+
+    let record_type = Rc::new(RecordTypeDef {
+        name: type_name.clone(),
+        field_names: fields.iter().map(|(field_name, _)| field_name.clone()).collect(),
+    });
+
+    env.define(
+        constructor_name.clone(),
+        Value::RecordConstructor(Rc::new(RecordConstructor {
+            name: constructor_name,
+            record_type: record_type.clone(),
+            field_order,
+        })),
+    );
+    env.define(
+        predicate_name.clone(),
+        Value::RecordPredicate(Rc::new(RecordPredicate {
+            name: predicate_name.clone(),
+            record_type: record_type.clone(),
+        })),
+    );
+
+    for (index, (_, accessor_name)) in fields.into_iter().enumerate() {
+        env.define(
+            accessor_name.clone(),
+            Value::RecordAccessor(Rc::new(RecordAccessor {
+                name: accessor_name,
+                record_type: record_type.clone(),
+                field_index: index,
+            })),
+        );
+    }
+
+    Ok(Value::Void)
 }
 
 fn parse_syntax_rules(name: String, expr: &Expr, env: EnvRef) -> Result<MacroDef, EvalError> {
@@ -803,9 +906,17 @@ fn apply(procedure: Value, args: &[Expr], env: EnvRef) -> Result<Value, EvalErro
         .map(|expr| eval(expr, env.clone()))
         .collect::<Result<Vec<_>, _>>()?;
 
+    apply_evaluated(procedure, evaluated_args)
+}
+
+fn apply_evaluated(procedure: Value, args: Vec<Value>) -> Result<Value, EvalError> {
     match procedure {
-        Value::Builtin(builtin) => apply_builtin(builtin, &evaluated_args),
-        Value::Closure(closure) => call_closure(closure, evaluated_args),
+        Value::Builtin(Builtin::Map) => apply_map(args),
+        Value::Builtin(builtin) => apply_builtin(builtin, &args),
+        Value::Closure(closure) => call_closure(closure, args),
+        Value::RecordConstructor(constructor) => call_record_constructor(constructor, args),
+        Value::RecordPredicate(predicate) => call_record_predicate(predicate, args),
+        Value::RecordAccessor(accessor) => call_record_accessor(accessor, args),
         _ => Err(EvalError::message("attempted to call a non-procedure")),
     }
 }
@@ -832,8 +943,101 @@ fn call_closure(closure: Rc<Closure>, args: Vec<Value>) -> Result<Value, EvalErr
     eval_sequence(&closure.body, call_env)
 }
 
+fn call_record_constructor(
+    constructor: Rc<RecordConstructor>,
+    args: Vec<Value>,
+) -> Result<Value, EvalError> {
+    if args.len() != constructor.field_order.len() {
+        return Err(EvalError::message(format!(
+            "{} expects {} argument(s), got {}",
+            constructor.name,
+            constructor.field_order.len(),
+            args.len()
+        )));
+    }
+
+    let mut fields = vec![Value::Void; constructor.record_type.field_names.len()];
+    for (value, field_index) in args.into_iter().zip(constructor.field_order.iter().copied()) {
+        fields[field_index] = value;
+    }
+
+    Ok(Value::Record(Rc::new(RecordInstance {
+        record_type: constructor.record_type.clone(),
+        fields,
+    })))
+}
+
+fn call_record_predicate(predicate: Rc<RecordPredicate>, args: Vec<Value>) -> Result<Value, EvalError> {
+    let actual_len = args.len();
+    let [value] = args.as_slice() else {
+        return Err(EvalError::message(format!(
+            "{} expects 1 argument(s), got {}",
+            predicate.name, actual_len
+        )));
+    };
+
+    let is_match = matches!(
+        value,
+        Value::Record(record) if Rc::ptr_eq(&record.record_type, &predicate.record_type)
+    );
+    Ok(Value::Bool(is_match))
+}
+
+fn call_record_accessor(accessor: Rc<RecordAccessor>, args: Vec<Value>) -> Result<Value, EvalError> {
+    let actual_len = args.len();
+    let [value] = args.as_slice() else {
+        return Err(EvalError::message(format!(
+            "{} expects 1 argument(s), got {}",
+            accessor.name, actual_len
+        )));
+    };
+
+    match value {
+        Value::Record(record) if Rc::ptr_eq(&record.record_type, &accessor.record_type) => {
+            Ok(record.fields[accessor.field_index].clone())
+        }
+        Value::Record(_) => Err(EvalError::message(format!(
+            "{} expected {}",
+            accessor.name, accessor.record_type.name
+        ))),
+        other => Err(type_error(&accessor.name, "record", other)),
+    }
+}
+
+fn apply_map(args: Vec<Value>) -> Result<Value, EvalError> {
+    if args.len() < 2 {
+        return Err(EvalError::message(format!(
+            "map expects at least 2 argument(s), got {}",
+            args.len()
+        )));
+    }
+
+    let procedure = args[0].clone();
+    let lists = args[1..]
+        .iter()
+        .map(|value| collect_list_items("map", value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let expected_len = lists[0].len();
+    if lists.iter().any(|items| items.len() != expected_len) {
+        return Err(EvalError::message("map expected lists of equal length"));
+    }
+
+    let mut results = Vec::with_capacity(expected_len);
+    for index in 0..expected_len {
+        let call_args = lists
+            .iter()
+            .map(|items| items[index].clone())
+            .collect::<Vec<_>>();
+        results.push(apply_evaluated(procedure.clone(), call_args)?);
+    }
+
+    Ok(make_proper_list(results))
+}
+
 fn apply_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, EvalError> {
     match builtin {
+        Builtin::Map => unreachable!("map is handled before apply_builtin"),
         Builtin::Add => Ok(Value::Int(
             collect_numbers(builtin.name(), args)?.into_iter().sum(),
         )),
@@ -1020,6 +1224,22 @@ fn proper_list_length(name: &str, value: &Value) -> Result<usize, EvalError> {
     }
 }
 
+fn collect_list_items(name: &str, value: &Value) -> Result<Vec<Value>, EvalError> {
+    let mut current = value.clone();
+    let mut items = Vec::new();
+
+    loop {
+        match current {
+            Value::EmptyList => return Ok(items),
+            Value::Pair(pair) => {
+                items.push(pair.car.clone());
+                current = pair.cdr.clone();
+            }
+            other => return Err(type_error(name, "list", &other)),
+        }
+    }
+}
+
 fn append_lists(args: &[Value]) -> Result<Value, EvalError> {
     let Some(last) = args.last() else {
         return Ok(Value::EmptyList);
@@ -1073,6 +1293,35 @@ fn parse_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
                 _ => Err(EvalError::message("invalid let binding")),
             },
             _ => Err(EvalError::message("invalid let binding")),
+        })
+        .collect()
+}
+
+fn parse_record_constructor_spec(expr: &Expr) -> Result<(String, Vec<String>), EvalError> {
+    let Expr::List(items) = expr else {
+        return Err(EvalError::message(
+            "define-record-type constructor spec must be a list",
+        ));
+    };
+
+    let Some((Expr::Symbol(name), fields)) = items.split_first() else {
+        return Err(EvalError::message("invalid define-record-type constructor spec"));
+    };
+
+    Ok((name.clone(), parse_param_names(fields)?))
+}
+
+fn parse_record_fields(field_exprs: &[Expr]) -> Result<Vec<(String, String)>, EvalError> {
+    field_exprs
+        .iter()
+        .map(|field_expr| match field_expr {
+            Expr::List(items) => match items.as_slice() {
+                [Expr::Symbol(field_name), Expr::Symbol(accessor_name)] => {
+                    Ok((field_name.clone(), accessor_name.clone()))
+                }
+                _ => Err(EvalError::message("invalid define-record-type field spec")),
+            },
+            _ => Err(EvalError::message("invalid define-record-type field spec")),
         })
         .collect()
 }
@@ -1162,7 +1411,12 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Symbol(_) => "symbol",
         Value::EmptyList => "null",
         Value::Pair(_) => "pair",
-        Value::Builtin(_) | Value::Closure(_) => "procedure",
+        Value::Builtin(_)
+        | Value::Closure(_)
+        | Value::RecordConstructor(_)
+        | Value::RecordPredicate(_)
+        | Value::RecordAccessor(_) => "procedure",
+        Value::Record(_) => "record",
         Value::Void => "void",
     }
 }
@@ -1176,7 +1430,12 @@ fn render(value: &Value) -> String {
         Value::Symbol(name) => name.clone(),
         Value::EmptyList => "()".into(),
         Value::Pair(_) => render_pair(value),
-        Value::Builtin(_) | Value::Closure(_) => "#<procedure>".into(),
+        Value::Builtin(_)
+        | Value::Closure(_)
+        | Value::RecordConstructor(_)
+        | Value::RecordPredicate(_)
+        | Value::RecordAccessor(_) => "#<procedure>".into(),
+        Value::Record(record) => format!("#<record {}>", record.record_type.name),
         Value::Void => String::new(),
     }
 }
