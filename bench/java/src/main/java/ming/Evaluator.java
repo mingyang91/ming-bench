@@ -150,7 +150,8 @@ public class Evaluator {
     private static final Set<String> MACRO_SPECIAL_FORMS = Set.of(
         "quote", "if", "define", "lambda", "case-lambda", "and", "begin", "let", "let*", "cond", "set!", "or",
         "define-syntax", "syntax-rules", "letrec", "letrec*", "case", "do",
-        "call/cc", "call-with-current-continuation"
+        "call/cc", "call-with-current-continuation",
+        "dynamic-wind"
     );
 
     // Source position-aware types
@@ -177,9 +178,17 @@ public class Evaluator {
         Bounce get() throws EvalError;
     }
 
+    // dynamic-wind support
+    record WindEntry(Object inThunk, Object outThunk) {}
+    private final List<WindEntry> windingStack = new ArrayList<>();
+
     static class SchemeContinuation {
         final Cont k;
-        SchemeContinuation(Cont k) { this.k = k; }
+        final List<WindEntry> savedWinding;
+        SchemeContinuation(Cont k, List<WindEntry> savedWinding) {
+            this.k = k;
+            this.savedWinding = savedWinding;
+        }
     }
 
     static final Object CALLCC_PROC = new Object() {
@@ -812,9 +821,19 @@ public class Evaluator {
                     case "call/cc", "call-with-current-continuation" -> {
                         if (list.size() != 2) throw errAt(eline, ecol, "call/cc: expected 1 argument");
                         return bounce(() -> evalK(list.get(1), env, proc -> {
-                            SchemeContinuation cont = new SchemeContinuation(k);
+                            SchemeContinuation cont = new SchemeContinuation(k, new ArrayList<>(windingStack));
                             return applyK(proc, List.of(cont), el, ec, k);
                         }));
+                    }
+                    case "dynamic-wind" -> {
+                        if (list.size() != 4) throw errAt(eline, ecol, "dynamic-wind: expected 3 arguments");
+                        return bounce(() -> evalK(list.get(1), env, inThunk ->
+                            bounce(() -> evalK(list.get(2), env, bodyThunk ->
+                                bounce(() -> evalK(list.get(3), env, outThunk ->
+                                    dynamicWindK(inThunk, bodyThunk, outThunk, el, ec, k)
+                                ))
+                            ))
+                        ));
                     }
                 }
 
@@ -871,6 +890,62 @@ public class Evaluator {
             newResults[idx - start] = val;
             return evalArgsRtoLK(list, idx - 1, start, env, newResults, k);
         }));
+    }
+
+    // --- dynamic-wind support ---
+
+    private Bounce dynamicWindK(Object inThunk, Object bodyThunk, Object outThunk, int el, int ec, Cont k) throws EvalError {
+        // Call in-thunk
+        return applyK(inThunk, List.of(), el, ec, _in -> {
+            // Push wind entry, call body
+            WindEntry entry = new WindEntry(inThunk, outThunk);
+            windingStack.add(entry);
+            return applyK(bodyThunk, List.of(), el, ec, bodyResult -> {
+                // Pop wind entry, call out-thunk, return body result
+                windingStack.remove(windingStack.size() - 1);
+                return applyK(outThunk, List.of(), el, ec, _out -> k.apply(bodyResult));
+            });
+        });
+    }
+
+    // Transition from current winding to target winding (for continuation invocation)
+    private Bounce doWindTransition(List<WindEntry> from, List<WindEntry> to, Object val, Cont k) throws EvalError {
+        // Find common prefix length (by identity)
+        int common = 0;
+        int minLen = Math.min(from.size(), to.size());
+        for (int i = 0; i < minLen; i++) {
+            if (from.get(i) == to.get(i)) common++;
+            else break;
+        }
+        // Unwind: call out-thunks from innermost to common prefix
+        // Then rewind: call in-thunks from common prefix to target
+        return doUnwind(from, common, from.size() - 1, to, val, k);
+    }
+
+    private Bounce doUnwind(List<WindEntry> from, int common, int idx, List<WindEntry> to, Object val, Cont k) throws EvalError {
+        if (idx < common) {
+            // Done unwinding, now rewind
+            windingStack.clear();
+            windingStack.addAll(to.subList(0, common));
+            return doRewind(to, common, val, k);
+        }
+        WindEntry entry = from.get(idx);
+        windingStack.remove(windingStack.size() - 1);
+        return applyK(entry.outThunk(), List.of(), 0, 0, _out ->
+            doUnwind(from, common, idx - 1, to, val, k)
+        );
+    }
+
+    private Bounce doRewind(List<WindEntry> to, int idx, Object val, Cont k) throws EvalError {
+        if (idx >= to.size()) {
+            // Done rewinding, invoke continuation
+            return k.apply(val);
+        }
+        WindEntry entry = to.get(idx);
+        return applyK(entry.inThunk(), List.of(), 0, 0, _in -> {
+            windingStack.add(entry);
+            return doRewind(to, idx + 1, val, k);
+        });
     }
 
     private Bounce evalListK(List<?> exprs, int start, Env env, List<Object> acc, Cont k) throws EvalError {
@@ -1052,13 +1127,14 @@ public class Evaluator {
         if (proc == CALLCC_PROC) {
             if (args.size() != 1) throw new EvalError("call/cc: expected 1 argument");
             Object fn = args.get(0);
-            SchemeContinuation cont = new SchemeContinuation(k);
+            SchemeContinuation cont = new SchemeContinuation(k, new ArrayList<>(windingStack));
             return applyK(fn, List.of(cont), eline, ecol, k);
         }
-        // Continuation invocation
+        // Continuation invocation — with dynamic-wind unwind/rewind
         if (proc instanceof SchemeContinuation sc) {
             if (args.isEmpty()) throw new EvalError("continuation: expected 1 argument");
-            return sc.k.apply(args.get(0));
+            Object val = args.get(0);
+            return doWindTransition(windingStack, sc.savedWinding, val, sc.k);
         }
         // CaseLambda dispatch
         if (proc instanceof CaseLambda cl) {
