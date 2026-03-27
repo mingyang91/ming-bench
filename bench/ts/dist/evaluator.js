@@ -3,6 +3,8 @@ const EMPTY_LIST = { kind: 'empty-list' };
 const VOID = { kind: 'void' };
 const EXACT_ZERO = { kind: 'number', exact: true, numerator: 0n, denominator: 1n };
 const EXACT_ONE = { kind: 'number', exact: true, numerator: 1n, denominator: 1n };
+const STRING_IMMUTABILITY_LEVEL = 15;
+const CURRENT_BENCH_LEVEL = parseBenchLevel();
 function createBuiltins(context) {
     return new Map([
         ['+', builtin('+', (args, pos) => sum(args, EXACT_ZERO, pos))],
@@ -24,6 +26,10 @@ function createBuiltins(context) {
         [
             '<=',
             builtin('<=', (args, pos) => compareChain('<=', args, (left, right) => left <= right, pos)),
+        ],
+        [
+            '>=',
+            builtin('>=', (args, pos) => compareChain('>=', args, (left, right) => left >= right, pos)),
         ],
         [
             'not',
@@ -489,7 +495,24 @@ function createBuiltins(context) {
             'string-copy',
             builtin('string-copy', (args, pos) => {
                 expectArity('string-copy', args, 1, pos);
-                return makeString(expectStringValue(args[0], 'string-copy', pos).chars, true);
+                return makeString(expectStringValue(args[0], 'string-copy', pos).chars);
+            }),
+        ],
+        [
+            'string->list',
+            builtin('string->list', (args, pos) => {
+                expectArity('string->list', args, 1, pos);
+                return listToPairs(expectStringValue(args[0], 'string->list', pos).chars.map((char) => ({
+                    kind: 'char',
+                    value: char,
+                })));
+            }),
+        ],
+        [
+            'list->string',
+            builtin('list->string', (args, pos) => {
+                expectArity('list->string', args, 1, pos);
+                return makeString(listToArray(args[0], 'list->string', pos).map((value) => expectChar(value, 'list->string', pos).value));
             }),
         ],
         [
@@ -511,6 +534,26 @@ function createBuiltins(context) {
             builtin('char?', (args, pos) => {
                 expectArity('char?', args, 1, pos);
                 return isChar(args[0]);
+            }),
+        ],
+        [
+            'char->integer',
+            builtin('char->integer', (args, pos) => {
+                expectArity('char->integer', args, 1, pos);
+                return makeExactInteger(BigInt(charCode(expectChar(args[0], 'char->integer', pos).value)));
+            }),
+        ],
+        [
+            'integer->char',
+            builtin('integer->char', (args, pos) => {
+                expectArity('integer->char', args, 1, pos);
+                const codePoint = integerToSafeNumber(expectInteger(args[0], 'integer->char', pos), 'integer->char', pos);
+                if (codePoint < 0 ||
+                    codePoint > 0x10ffff ||
+                    (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+                    throw new EvalError('integer->char expected a valid Unicode scalar value', pos);
+                }
+                return { kind: 'char', value: String.fromCodePoint(codePoint) };
             }),
         ],
         [
@@ -2556,6 +2599,17 @@ function isFalse(value) {
 function isWhitespace(value) {
     return /\s/.test(value);
 }
+function parseBenchLevel() {
+    const rawBenchLevel = globalThis.process?.env?.BENCH_LEVEL;
+    if (rawBenchLevel === undefined) {
+        return undefined;
+    }
+    const parsedLevel = Number.parseInt(rawBenchLevel, 10);
+    return Number.isNaN(parsedLevel) ? undefined : parsedLevel;
+}
+function stringsAreImmutable() {
+    return CURRENT_BENCH_LEVEL === undefined || CURRENT_BENCH_LEVEL >= STRING_IMMUTABILITY_LEVEL;
+}
 function stringToChars(value) {
     return Array.from(value);
 }
@@ -2565,7 +2619,7 @@ function makeVector(elements) {
         elements: [...elements],
     };
 }
-function makeString(value, mutable = true) {
+function makeString(value, mutable = !stringsAreImmutable()) {
     return {
         kind: 'string',
         chars: typeof value === 'string' ? stringToChars(value) : [...value],
