@@ -35,6 +35,17 @@ type BuiltinVal struct {
 	Fn   func([]Value) (Value, error)
 }
 
+type SyntaxRulesVal struct {
+	Literals []string
+	Rules    []syntaxRule
+	DefEnv   *Env
+}
+
+type syntaxRule struct {
+	Pattern  Expr
+	Template Expr
+}
+
 func (v *IntVal) String() string    { return strconv.FormatInt(v.Val, 10) }
 func (v *BoolVal) String() string {
 	if v.Val {
@@ -48,7 +59,15 @@ func (v *NilVal) String() string     { return "()" }
 func (v *VoidVal) String() string    { return "" }
 func (v *CharVal) String() string     { return fmt.Sprintf("#\\%c", v.Val) }
 func (v *LambdaVal) String() string  { return "#<procedure>" }
-func (v *BuiltinVal) String() string { return "#<builtin:" + v.Name + ">" }
+func (v *BuiltinVal) String() string      { return "#<builtin:" + v.Name + ">" }
+func (v *SyntaxRulesVal) String() string   { return "#<syntax>" }
+
+var gensymCounter int
+
+func gensym(base string) string {
+	gensymCounter++
+	return fmt.Sprintf("##%s~%d", base, gensymCounter)
+}
 
 func (v *PairVal) String() string {
 	var buf strings.Builder
@@ -367,6 +386,21 @@ func evalListInEnv(list *ListExpr, env *Env) (Value, error) {
 			return evalBegin(list.Items[1:], env)
 		case "cond":
 			return evalCond(list.Items[1:], env)
+		case "define-syntax":
+			return evalDefineSyntax(list, env)
+		}
+	}
+
+	// Check for macro expansion
+	if atom, ok := list.Items[0].(*AtomExpr); ok {
+		if v, found := env.get(atom.Token); found {
+			if macro, isMacro := v.(*SyntaxRulesVal); isMacro {
+				expanded, expandErr := expandMacro(macro, list, env)
+				if expandErr != nil {
+					return nil, expandErr
+				}
+				return evalInEnv(expanded, env)
+			}
 		}
 	}
 
@@ -699,6 +733,238 @@ func evalCond(clauses []Expr, env *Env) (Value, error) {
 		}
 	}
 	return &VoidVal{}, nil
+}
+
+// --------------- Macros (syntax-rules) ---------------
+
+func evalDefineSyntax(list *ListExpr, env *Env) (Value, error) {
+	if len(list.Items) != 3 {
+		return nil, errAt(list, "define-syntax requires 2 arguments")
+	}
+	nameAtom, ok := list.Items[1].(*AtomExpr)
+	if !ok {
+		return nil, errAt(list, "define-syntax: expected symbol")
+	}
+	sr, ok := list.Items[2].(*ListExpr)
+	if !ok || len(sr.Items) < 2 {
+		return nil, errAt(list, "define-syntax: expected syntax-rules")
+	}
+	srHead, ok := sr.Items[0].(*AtomExpr)
+	if !ok || srHead.Token != "syntax-rules" {
+		return nil, errAt(list, "define-syntax: expected syntax-rules")
+	}
+	litList, ok := sr.Items[1].(*ListExpr)
+	if !ok {
+		return nil, errAt(list, "syntax-rules: expected literal list")
+	}
+	var literals []string
+	for _, lit := range litList.Items {
+		a, ok := lit.(*AtomExpr)
+		if !ok {
+			return nil, errAt(list, "syntax-rules: expected symbol in literals")
+		}
+		literals = append(literals, a.Token)
+	}
+	var rules []syntaxRule
+	for _, ruleExpr := range sr.Items[2:] {
+		rule, ok := ruleExpr.(*ListExpr)
+		if !ok || len(rule.Items) != 2 {
+			return nil, errAt(list, "syntax-rules: bad rule")
+		}
+		rules = append(rules, syntaxRule{Pattern: rule.Items[0], Template: rule.Items[1]})
+	}
+	env.set(nameAtom.Token, &SyntaxRulesVal{Literals: literals, Rules: rules, DefEnv: env})
+	return &VoidVal{}, nil
+}
+
+type patternBindings struct {
+	singles map[string]Expr
+	lists   map[string][]Expr
+}
+
+func expandMacro(macro *SyntaxRulesVal, form *ListExpr, env *Env) (Expr, error) {
+	for _, rule := range macro.Rules {
+		bindings := &patternBindings{
+			singles: make(map[string]Expr),
+			lists:   make(map[string][]Expr),
+		}
+		if matchPatternList(rule.Pattern, form, macro.Literals, bindings) {
+			renames := make(map[string]string)
+			expanded := expandTemplate(rule.Template, bindings, macro, env, renames)
+			return expanded, nil
+		}
+	}
+	return nil, errAt(form, "no matching syntax-rules pattern")
+}
+
+func matchPatternList(pattern Expr, input *ListExpr, literals []string, bindings *patternBindings) bool {
+	patList, ok := pattern.(*ListExpr)
+	if !ok {
+		return false
+	}
+	// Skip first element (macro name)
+	return matchElements(patList.Items[1:], input.Items[1:], literals, bindings)
+}
+
+func matchElements(patElems, inElems []Expr, literals []string, bindings *patternBindings) bool {
+	pi := 0
+	ii := 0
+	for pi < len(patElems) {
+		// Check if current element is followed by ...
+		if pi+1 < len(patElems) {
+			if a, ok := patElems[pi+1].(*AtomExpr); ok && a.Token == "..." {
+				patVar, ok := patElems[pi].(*AtomExpr)
+				if !ok {
+					return false
+				}
+				remaining := len(patElems) - pi - 2
+				available := len(inElems) - ii - remaining
+				if available < 0 {
+					return false
+				}
+				collected := make([]Expr, available)
+				for j := 0; j < available; j++ {
+					collected[j] = inElems[ii+j]
+				}
+				bindings.lists[patVar.Token] = collected
+				ii += available
+				pi += 2
+				continue
+			}
+		}
+		if ii >= len(inElems) {
+			return false
+		}
+		patAtom, isAtom := patElems[pi].(*AtomExpr)
+		if isAtom {
+			isLiteral := false
+			for _, lit := range literals {
+				if patAtom.Token == lit {
+					isLiteral = true
+					break
+				}
+			}
+			if isLiteral {
+				inAtom, ok := inElems[ii].(*AtomExpr)
+				if !ok || inAtom.Token != patAtom.Token {
+					return false
+				}
+			} else if patAtom.Token == "_" {
+				// wildcard, matches anything
+			} else {
+				bindings.singles[patAtom.Token] = inElems[ii]
+			}
+		} else if patList, ok := patElems[pi].(*ListExpr); ok {
+			inList, ok := inElems[ii].(*ListExpr)
+			if !ok {
+				return false
+			}
+			if !matchElements(patList.Items, inList.Items, literals, bindings) {
+				return false
+			}
+		} else {
+			return false
+		}
+		pi++
+		ii++
+	}
+	return ii == len(inElems)
+}
+
+func expandTemplate(tmpl Expr, bindings *patternBindings, macro *SyntaxRulesVal, env *Env, renames map[string]string) Expr {
+	switch t := tmpl.(type) {
+	case *AtomExpr:
+		if _, ok := bindings.singles[t.Token]; ok {
+			return bindings.singles[t.Token]
+		}
+		if _, ok := bindings.lists[t.Token]; ok {
+			return t
+		}
+		if isSelfEvaluating(t.Token) || isSpecialForm(t.Token) {
+			return t
+		}
+		if newName, ok := renames[t.Token]; ok {
+			return &AtomExpr{Token: newName, Line: t.Line, Col: t.Col}
+		}
+		gs := gensym(t.Token)
+		renames[t.Token] = gs
+		if val, ok := macro.DefEnv.get(t.Token); ok {
+			env.set(gs, val)
+		}
+		return &AtomExpr{Token: gs, Line: t.Line, Col: t.Col}
+	case *ListExpr:
+		var items []Expr
+		for i := 0; i < len(t.Items); i++ {
+			if i+1 < len(t.Items) {
+				if a, ok := t.Items[i+1].(*AtomExpr); ok && a.Token == "..." {
+					vars := collectEllipsisVars(t.Items[i], bindings)
+					if len(vars) > 0 {
+						count := len(bindings.lists[vars[0]])
+						for j := 0; j < count; j++ {
+							iterBindings := &patternBindings{
+								singles: make(map[string]Expr),
+								lists:   bindings.lists,
+							}
+							for k, v := range bindings.singles {
+								iterBindings.singles[k] = v
+							}
+							for _, v := range vars {
+								if j < len(bindings.lists[v]) {
+									iterBindings.singles[v] = bindings.lists[v][j]
+								}
+							}
+							expanded := expandTemplate(t.Items[i], iterBindings, macro, env, renames)
+							items = append(items, expanded)
+						}
+					}
+					i++ // skip ...
+					continue
+				}
+			}
+			items = append(items, expandTemplate(t.Items[i], bindings, macro, env, renames))
+		}
+		return &ListExpr{Items: items, Line: t.Line, Col: t.Col}
+	}
+	return tmpl
+}
+
+func collectEllipsisVars(tmpl Expr, bindings *patternBindings) []string {
+	var vars []string
+	switch t := tmpl.(type) {
+	case *AtomExpr:
+		if _, ok := bindings.lists[t.Token]; ok {
+			vars = append(vars, t.Token)
+		}
+	case *ListExpr:
+		for _, item := range t.Items {
+			vars = append(vars, collectEllipsisVars(item, bindings)...)
+		}
+	}
+	return vars
+}
+
+func isSpecialForm(name string) bool {
+	switch name {
+	case "if", "let", "begin", "set!", "define", "lambda", "and", "or", "cond", "quote", "define-syntax", "syntax-rules":
+		return true
+	}
+	return false
+}
+
+func isSelfEvaluating(token string) bool {
+	if token == "#t" || token == "#f" {
+		return true
+	}
+	if _, err := strconv.ParseInt(token, 10, 64); err == nil {
+		return true
+	}
+	if len(token) > 0 && token[0] == '"' {
+		return true
+	}
+	if len(token) >= 2 && token[0] == '#' && token[1] == '\\' {
+		return true
+	}
+	return false
 }
 
 // --------------- Value comparison helpers ---------------
