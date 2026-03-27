@@ -229,12 +229,25 @@ impl Number {
 #[derive(Clone)]
 struct SchemeString {
     value: Rc<RefCell<String>>,
+    mutable: bool,
 }
 
 impl SchemeString {
     fn new(value: impl Into<String>) -> Self {
+        Self::new_immutable(value)
+    }
+
+    fn new_immutable(value: impl Into<String>) -> Self {
         Self {
             value: Rc::new(RefCell::new(value.into())),
+            mutable: false,
+        }
+    }
+
+    fn new_mutable(value: impl Into<String>) -> Self {
+        Self {
+            value: Rc::new(RefCell::new(value.into())),
+            mutable: true,
         }
     }
 
@@ -250,8 +263,12 @@ impl SchemeString {
         self.value.borrow().chars().nth(index)
     }
 
+    fn is_mutable(&self) -> bool {
+        self.mutable
+    }
+
     fn copy_string(&self) -> Self {
-        Self::new(self.contents())
+        Self::new_mutable(self.contents())
     }
 
     fn set_char(&self, index: usize, ch: char) -> bool {
@@ -379,6 +396,7 @@ enum Builtin {
     GreaterThan,
     Equal,
     LessThanOrEqual,
+    GreaterThanOrEqual,
     Not,
     Cons,
     Car,
@@ -414,6 +432,8 @@ enum Builtin {
     StringRef,
     StringCopy,
     StringSet,
+    StringToList,
+    ListToString,
     CharPred,
     CharAlphabeticPred,
     CharNumericPred,
@@ -421,6 +441,8 @@ enum Builtin {
     CharDowncase,
     CharEqual,
     CharLessThan,
+    CharToInteger,
+    IntegerToChar,
     Apply,
     Map,
     Abs,
@@ -1088,6 +1110,7 @@ fn root_env() -> EnvRef {
         (">", Builtin::GreaterThan),
         ("=", Builtin::Equal),
         ("<=", Builtin::LessThanOrEqual),
+        (">=", Builtin::GreaterThanOrEqual),
         ("not", Builtin::Not),
         ("cons", Builtin::Cons),
         ("car", Builtin::Car),
@@ -1129,6 +1152,8 @@ fn root_env() -> EnvRef {
         ("string-downcase", Builtin::StringDowncase),
         ("string-copy", Builtin::StringCopy),
         ("string-set!", Builtin::StringSet),
+        ("string->list", Builtin::StringToList),
+        ("list->string", Builtin::ListToString),
         ("char?", Builtin::CharPred),
         ("char-alphabetic?", Builtin::CharAlphabeticPred),
         ("char-numeric?", Builtin::CharNumericPred),
@@ -1136,6 +1161,8 @@ fn root_env() -> EnvRef {
         ("char-downcase", Builtin::CharDowncase),
         ("char=?", Builtin::CharEqual),
         ("char<?", Builtin::CharLessThan),
+        ("char->integer", Builtin::CharToInteger),
+        ("integer->char", Builtin::IntegerToChar),
         ("apply", Builtin::Apply),
         ("map", Builtin::Map),
         ("abs", Builtin::Abs),
@@ -1254,6 +1281,9 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         Builtin::LessThanOrEqual => {
             eval_compare("<=", values, |ordering| ordering != Ordering::Greater)
         }
+        Builtin::GreaterThanOrEqual => {
+            eval_compare(">=", values, |ordering| ordering != Ordering::Less)
+        }
         Builtin::Not => eval_not(values),
         Builtin::Cons => eval_cons(values),
         Builtin::Car => eval_car(values),
@@ -1301,6 +1331,8 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         Builtin::StringDowncase => eval_string_downcase(values),
         Builtin::StringCopy => eval_string_copy(values),
         Builtin::StringSet => eval_string_set(values),
+        Builtin::StringToList => eval_string_to_list(values),
+        Builtin::ListToString => eval_list_to_string(values),
         Builtin::CharPred => eval_char_pred(values),
         Builtin::CharAlphabeticPred => eval_char_alphabetic_pred(values),
         Builtin::CharNumericPred => eval_char_numeric_pred(values),
@@ -1308,6 +1340,8 @@ fn apply_builtin(builtin: Builtin, values: &[Value], env: &EnvRef) -> Result<Val
         Builtin::CharDowncase => eval_char_downcase(values),
         Builtin::CharEqual => eval_char_compare("char=?", values, |left, right| left == right),
         Builtin::CharLessThan => eval_char_compare("char<?", values, |left, right| left < right),
+        Builtin::CharToInteger => eval_char_to_integer(values),
+        Builtin::IntegerToChar => eval_integer_to_char(values),
         Builtin::Apply => eval_apply_builtin(values, env),
         Builtin::Map => eval_map_builtin(values, env),
         Builtin::Abs => eval_abs(values),
@@ -3155,8 +3189,14 @@ fn eval_string_set(args: &[Value]) -> Result<Value, EvalError> {
     let string = expect_string("string-set!", &args[0])?;
     let index = args[1].as_integer("string-set!")?;
     let ch = expect_char("string-set!", &args[2])?;
-    let len = string.len_chars();
 
+    if !string.is_mutable() {
+        return Err(EvalError::ImmutableString {
+            name: "string-set!".to_owned(),
+        });
+    }
+
+    let len = string.len_chars();
     if index < 0 || !string.set_char(index as usize, ch) {
         return Err(EvalError::IndexOutOfBounds {
             name: "string-set!".to_owned(),
@@ -3166,6 +3206,43 @@ fn eval_string_set(args: &[Value]) -> Result<Value, EvalError> {
     }
 
     Ok(Value::Void)
+}
+
+fn eval_string_to_list(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "string->list".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::List(
+        expect_string("string->list", &args[0])?
+            .contents()
+            .chars()
+            .map(Value::Char)
+            .collect(),
+    ))
+}
+
+fn eval_list_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "list->string".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let chars = expect_list("list->string", &args[0])?
+        .iter()
+        .map(|value| expect_char("list->string", value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Value::String(SchemeString::new(
+        chars.into_iter().collect::<String>(),
+    )))
 }
 
 fn eval_char_pred(args: &[Value]) -> Result<Value, EvalError> {
@@ -3763,6 +3840,41 @@ where
             .windows(2)
             .all(|window| predicate(window[0], window[1])),
     ))
+}
+
+fn eval_char_to_integer(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "char->integer".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    Ok(Value::Number(Number::Integer(
+        expect_char("char->integer", &args[0])? as i64,
+    )))
+}
+
+fn eval_integer_to_char(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::WrongArgCount {
+            name: "integer->char".to_owned(),
+            expected: "exactly 1 argument".to_owned(),
+            got: args.len(),
+        });
+    }
+
+    let code = args[0].as_integer("integer->char")?;
+    let ch = u32::try_from(code)
+        .ok()
+        .and_then(char::from_u32)
+        .ok_or_else(|| EvalError::InvalidCharacterCode {
+            name: "integer->char".to_owned(),
+            code,
+        })?;
+
+    Ok(Value::Char(ch))
 }
 
 fn eval_char_predicate<F>(args: &[Value], name: &str, predicate: F) -> Result<Value, EvalError>

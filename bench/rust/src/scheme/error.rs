@@ -48,6 +48,8 @@ pub enum EvalError {
     ExpectedVector { name: String },
     #[error("{name} expects a {record_type} record")]
     ExpectedRecord { name: String, record_type: String },
+    #[error("{name} cannot mutate immutable strings")]
+    ImmutableString { name: String },
     #[error("{name} index {index} out of bounds for length {len}")]
     IndexOutOfBounds {
         name: String,
@@ -63,6 +65,8 @@ pub enum EvalError {
     },
     #[error("{name} invalid argument: {message}")]
     InvalidArgument { name: String, message: String },
+    #[error("{name} invalid character code: {code}")]
+    InvalidCharacterCode { name: String, code: i64 },
     #[error("division by zero")]
     DivisionByZero,
     #[error("{pos}: {source}")]
