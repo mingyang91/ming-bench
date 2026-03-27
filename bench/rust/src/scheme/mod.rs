@@ -894,10 +894,16 @@ fn eval_inner(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
                         let body = &items[2..];
 
                         // Evaluate body, catching any raised exception
+                        // Last expression is in tail position (use eval_inner to preserve TCO)
                         let body_result = {
                             let mut result = Ok(Value::Void);
-                            for expr in body {
-                                result = eval(expr, env);
+                            let body_len = body.len();
+                            for (i, expr) in body.iter().enumerate() {
+                                if i == body_len - 1 {
+                                    result = eval_inner(expr, env);
+                                } else {
+                                    result = eval(expr, env);
+                                }
                                 if result.is_err() {
                                     break;
                                 }
@@ -1043,10 +1049,15 @@ fn parse_params(exprs: &[Expr]) -> Result<(Vec<String>, Option<String>), EvalErr
 fn apply_tail(func: &Value, args: &[Value]) -> Result<Value, EvalError> {
     match func {
         Value::Continuation(data) => {
-            if args.len() != 1 {
-                return Err(EvalError::Arity("continuation requires exactly 1 argument".into()));
+            if args.is_empty() {
+                return Err(EvalError::Arity("continuation requires at least 1 argument".into()));
             }
-            CONTINUATION_VALUE.with(|v| *v.borrow_mut() = Some(args[0].clone()));
+            let val = if args.len() == 1 {
+                args[0].clone()
+            } else {
+                Value::Values(args.to_vec())
+            };
+            CONTINUATION_VALUE.with(|v| *v.borrow_mut() = Some(val));
             PENDING_CONTINUATION.with(|pc| *pc.borrow_mut() = Some(data.clone()));
             Err(EvalError::ContinuationEscape(data.id))
         }
