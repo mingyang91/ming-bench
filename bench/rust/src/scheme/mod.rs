@@ -99,6 +99,16 @@ impl Value {
         }
     }
 
+    fn as_list(&self) -> Result<&[Value], EvalError> {
+        match self {
+            Self::List(items) => Ok(items),
+            _ => Err(EvalError::TypeMismatch {
+                expected: "list",
+                found: self.render(),
+            }),
+        }
+    }
+
     fn render(&self) -> String {
         match self {
             Self::Bool(true) => "#t".to_string(),
@@ -151,6 +161,14 @@ impl<'a> Parser<'a> {
 
         match self.peek_char() {
             Some('(') => self.parse_list(),
+            Some('\'') => {
+                self.bump_char();
+                let quoted = self.parse_expr()?;
+                Ok(Expr::List(vec![
+                    Expr::Symbol("quote".to_string()),
+                    quoted,
+                ]))
+            }
             Some('"') => self.parse_string(),
             Some(')') => Err(EvalError::ParseError {
                 message: "unexpected ')'".to_string(),
@@ -307,6 +325,18 @@ fn default_env() -> EnvRef {
         ("=", apply_eq as BuiltinFn),
         ("<=", apply_lte as BuiltinFn),
         ("not", apply_not as BuiltinFn),
+        ("cons", apply_cons as BuiltinFn),
+        ("car", apply_car as BuiltinFn),
+        ("cdr", apply_cdr as BuiltinFn),
+        ("null?", apply_null as BuiltinFn),
+        ("list", apply_list as BuiltinFn),
+        ("length", apply_length as BuiltinFn),
+        ("append", apply_append as BuiltinFn),
+        ("string?", apply_string_pred as BuiltinFn),
+        ("number?", apply_number_pred as BuiltinFn),
+        ("boolean?", apply_boolean_pred as BuiltinFn),
+        ("pair?", apply_pair_pred as BuiltinFn),
+        ("symbol?", apply_symbol_pred as BuiltinFn),
     ] {
         env.define(
             name,
@@ -348,6 +378,9 @@ fn eval_list(items: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
         Expr::Symbol(name) if name == "or" => eval_or(args, env),
         Expr::Symbol(name) if name == "if" => eval_if(args, env),
         Expr::Symbol(name) if name == "quote" => eval_quote(args),
+        Expr::Symbol(name) if name == "begin" => eval_begin(args, env),
+        Expr::Symbol(name) if name == "cond" => eval_cond(args, env),
+        Expr::Symbol(name) if name == "let" => eval_let(args, env),
         Expr::Symbol(name) if name == "lambda" => eval_lambda(args, env),
         Expr::Symbol(name) if name == "define" => eval_define(args, env),
         _ => {
@@ -410,6 +443,105 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
     };
 
     Ok(quote_expr(quoted))
+}
+
+fn eval_begin(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    eval_program(args, env)
+}
+
+fn eval_cond(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    for clause in args {
+        let Expr::List(items) = clause else {
+            return Err(EvalError::ParseError {
+                message: "cond clauses must be lists".to_string(),
+            });
+        };
+
+        let Some((test, body)) = items.split_first() else {
+            return Err(EvalError::ParseError {
+                message: "cond clauses cannot be empty".to_string(),
+            });
+        };
+
+        if matches!(test, Expr::Symbol(name) if name == "else") {
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_program(body, env.clone())
+            };
+        }
+
+        let test_value = eval(test, env.clone())?;
+        if test_value.is_truthy() {
+            return if body.is_empty() {
+                Ok(test_value)
+            } else {
+                eval_program(body, env.clone())
+            };
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_let(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
+    match args {
+        [Expr::Symbol(name), bindings_expr, body @ ..] => {
+            if body.is_empty() {
+                return Err(EvalError::WrongArgCount {
+                    name: "let",
+                    expected: "at least 3",
+                    got: 2,
+                });
+            }
+
+            let bindings = parse_let_bindings(bindings_expr)?;
+            let params = bindings
+                .iter()
+                .map(|(param, _)| param.clone())
+                .collect::<Vec<_>>();
+            let values = bindings
+                .iter()
+                .map(|(_, expr)| eval(expr, env.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let closure_env = Environment::new(Some(env));
+            let procedure = Value::Procedure(Rc::new(Procedure::Lambda {
+                params,
+                body: body.to_vec(),
+                env: closure_env.clone(),
+            }));
+            closure_env.define(name.clone(), procedure.clone());
+            apply_procedure(procedure, &values)
+        }
+        [bindings_expr, body @ ..] => {
+            if body.is_empty() {
+                return Err(EvalError::WrongArgCount {
+                    name: "let",
+                    expected: "at least 2",
+                    got: 1,
+                });
+            }
+
+            let bindings = parse_let_bindings(bindings_expr)?;
+            let values = bindings
+                .iter()
+                .map(|(_, expr)| eval(expr, env.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let let_env = Environment::new(Some(env));
+            for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
+                let_env.define(name.clone(), value);
+            }
+
+            eval_program(body, let_env)
+        }
+        [] => Err(EvalError::WrongArgCount {
+            name: "let",
+            expected: "at least 2",
+            got: 0,
+        }),
+    }
 }
 
 fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
@@ -490,6 +622,29 @@ fn parse_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> {
             Expr::Symbol(name) => Ok(name.clone()),
             _ => Err(EvalError::ParseError {
                 message: "parameter names must be symbols".to_string(),
+            }),
+        })
+        .collect()
+}
+
+fn parse_let_bindings(expr: &Expr) -> Result<Vec<(String, Expr)>, EvalError> {
+    let Expr::List(bindings) = expr else {
+        return Err(EvalError::ParseError {
+            message: "let bindings must be a list".to_string(),
+        });
+    };
+
+    bindings
+        .iter()
+        .map(|binding| match binding {
+            Expr::List(parts) => match parts.as_slice() {
+                [Expr::Symbol(name), value] => Ok((name.clone(), value.clone())),
+                _ => Err(EvalError::ParseError {
+                    message: "let bindings must be (name value) pairs".to_string(),
+                }),
+            },
+            _ => Err(EvalError::ParseError {
+                message: "let bindings must be (name value) pairs".to_string(),
             }),
         })
         .collect()
@@ -642,6 +797,154 @@ fn apply_not(args: &[Value]) -> Result<Value, EvalError> {
     };
 
     Ok(Value::Bool(!value.is_truthy()))
+}
+
+fn apply_cons(args: &[Value]) -> Result<Value, EvalError> {
+    let [head, tail] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "cons",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    };
+
+    let tail_items = tail.as_list()?;
+    let mut items = Vec::with_capacity(tail_items.len() + 1);
+    items.push(head.clone());
+    items.extend(tail_items.iter().cloned());
+    Ok(Value::List(items))
+}
+
+fn apply_car(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "car",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let items = value.as_list()?;
+    items.first().cloned().ok_or_else(|| EvalError::TypeMismatch {
+        expected: "non-empty list",
+        found: value.render(),
+    })
+}
+
+fn apply_cdr(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "cdr",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    let items = value.as_list()?;
+    if items.is_empty() {
+        return Err(EvalError::TypeMismatch {
+            expected: "non-empty list",
+            found: value.render(),
+        });
+    }
+
+    Ok(Value::List(items[1..].to_vec()))
+}
+
+fn apply_null(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "null?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(value, Value::List(items) if items.is_empty())))
+}
+
+fn apply_list(args: &[Value]) -> Result<Value, EvalError> {
+    Ok(Value::List(args.to_vec()))
+}
+
+fn apply_length(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "length",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Int(value.as_list()?.len() as i64))
+}
+
+fn apply_append(args: &[Value]) -> Result<Value, EvalError> {
+    let mut items = Vec::new();
+    for value in args {
+        items.extend(value.as_list()?.iter().cloned());
+    }
+    Ok(Value::List(items))
+}
+
+fn apply_string_pred(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "string?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(value, Value::String(_))))
+}
+
+fn apply_number_pred(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "number?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(value, Value::Int(_))))
+}
+
+fn apply_boolean_pred(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "boolean?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(value, Value::Bool(_))))
+}
+
+fn apply_pair_pred(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "pair?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(value, Value::List(items) if !items.is_empty())))
+}
+
+fn apply_symbol_pred(args: &[Value]) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "symbol?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(value, Value::Symbol(_))))
 }
 
 fn is_integer_token(token: &str) -> bool {
