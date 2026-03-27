@@ -63,6 +63,11 @@ type VectorValue = {
   elements: SchemeValue[];
 };
 
+type SyntaxValue = {
+  kind: 'syntax';
+  expr: Expr;
+};
+
 type RecordFieldDescriptor = {
   name: string;
   accessorName?: string;
@@ -154,6 +159,7 @@ type SchemeValue =
   | SymbolValue
   | PairValue
   | VectorValue
+  | SyntaxValue
   | RecordValue
   | CharValue
   | EmptyListValue
@@ -166,6 +172,7 @@ type Token =
   | { kind: 'lparen'; pos: SourcePosition }
   | { kind: 'rparen'; pos: SourcePosition }
   | { kind: 'quote'; pos: SourcePosition }
+  | { kind: 'syntax'; pos: SourcePosition }
   | { kind: 'number'; value: NumberValue; pos: SourcePosition }
   | { kind: 'boolean'; value: boolean; pos: SourcePosition }
   | { kind: 'string'; value: string; pos: SourcePosition }
@@ -182,12 +189,22 @@ type SyntaxRule = {
   template: Expr;
 };
 
-type SyntaxTransformer = {
+type SyntaxRulesTransformer = {
+  kind: 'syntax-rules';
   keyword: string;
   literals: Set<string>;
   rules: SyntaxRule[];
   definitionEnv: Environment;
 };
+
+type ProcedureSyntaxTransformer = {
+  kind: 'procedure';
+  keyword: string;
+  procedure: ProcedureValue;
+  definitionEnv: Environment;
+};
+
+type SyntaxTransformer = SyntaxRulesTransformer | ProcedureSyntaxTransformer;
 
 type PatternBindingValue =
   | { kind: 'expr'; value: Expr }
@@ -195,12 +212,22 @@ type PatternBindingValue =
 
 type PatternBindings = Map<string, PatternBindingValue>;
 
+type SyntaxContext = {
+  bindings: PatternBindings;
+  definitionEnv: Environment;
+};
+
 type RuntimeState = {
   nextHygieneId: number;
   nextWindId: number;
   nextExceptionHandlerId: number;
   dynamicWindStack: DynamicWindFrame[];
   exceptionHandlerStack: ExceptionHandlerFrame[];
+};
+
+type EnvironmentOptions = {
+  syntaxContext?: SyntaxContext;
+  transformerDefinitionEnv?: Environment;
 };
 
 type DoBinding = {
@@ -833,6 +860,21 @@ function createBuiltins(context: EvaluationContext, runtime: RuntimeState): Map<
       }),
     ],
     [
+      'syntax->datum',
+      builtin('syntax->datum', (args, pos) => {
+        expectArity('syntax->datum', args, 1, pos);
+        return quoteExpr(expectSyntaxValue(args[0], 'syntax->datum', pos).expr);
+      }),
+    ],
+    [
+      'datum->syntax',
+      builtin('datum->syntax', (args, pos) => {
+        expectArity('datum->syntax', args, 2, pos);
+        expectSyntaxValue(args[0], 'datum->syntax', pos);
+        return makeSyntax(datumToExpr(args[1], pos));
+      }),
+    ],
+    [
       'string-ref',
       builtin('string-ref', (args, pos) => {
         expectArity('string-ref', args, 2, pos);
@@ -1050,8 +1092,10 @@ class Environment {
   private readonly syntaxBindings = new Map<string, SyntaxTransformer>();
   private readonly parent?: Environment;
   private readonly runtime: RuntimeState;
+  private readonly syntaxContext?: SyntaxContext;
+  private readonly transformerDefinitionEnv?: Environment;
 
-  constructor(parent?: Environment) {
+  constructor(parent?: Environment, options?: EnvironmentOptions) {
     this.parent = parent;
     this.runtime =
       parent?.runtime ?? {
@@ -1061,6 +1105,9 @@ class Environment {
         dynamicWindStack: [],
         exceptionHandlerStack: [],
       };
+    this.syntaxContext = options?.syntaxContext ?? parent?.syntaxContext;
+    this.transformerDefinitionEnv =
+      options?.transformerDefinitionEnv ?? parent?.transformerDefinitionEnv;
   }
 
   define(name: string, value: SchemeValue): void {
@@ -1117,6 +1164,14 @@ class Environment {
 
   runtimeState(): RuntimeState {
     return this.runtime;
+  }
+
+  currentSyntaxContext(): SyntaxContext | undefined {
+    return this.syntaxContext;
+  }
+
+  currentTransformerDefinitionEnv(): Environment | undefined {
+    return this.transformerDefinitionEnv;
   }
 }
 
@@ -1303,6 +1358,8 @@ function evaluateListCps(
         return evaluateDefineRecordType(argumentExprs, env, operatorExpr.pos, continuation);
       case 'quote':
         return evaluateQuote(argumentExprs, operatorExpr.pos, continuation);
+      case 'syntax':
+        return evaluateSyntax(argumentExprs, env, operatorExpr.pos, continuation);
       case 'lambda':
         return evaluateLambda(argumentExprs, env, operatorExpr.pos, continuation);
       case 'case-lambda':
@@ -1327,11 +1384,15 @@ function evaluateListCps(
         return evaluateSet(argumentExprs, env, operatorExpr.pos, continuation);
       case 'guard':
         return evaluateGuard(argumentExprs, env, operatorExpr.pos, continuation);
+      case 'syntax-case':
+        return evaluateSyntaxCase(argumentExprs, env, operatorExpr.pos, continuation);
+      case 'with-syntax':
+        return evaluateWithSyntax(argumentExprs, env, operatorExpr.pos, continuation);
     }
 
     const transformer = lookupSyntax(operatorExpr, env);
     if (transformer !== undefined) {
-      return evaluateCps(expandMacro(transformer, { kind: 'list', elements, pos }), env, continuation);
+      return expandMacroCps(transformer, { kind: 'list', elements, pos }, env, continuation);
     }
   }
 
@@ -1467,8 +1528,26 @@ function evaluateDefineSyntax(
 
   const [keywordExpr, transformerExpr] = expressions;
   const keyword = expectSymbolExpr(keywordExpr, 'define-syntax');
-  env.defineSyntax(bindingName(keywordExpr, 'define-syntax'), parseSyntaxRules(keyword, transformerExpr, env));
-  return continueWith(continuation, VOID);
+  const transformer = tryParseSyntaxRules(keyword, transformerExpr, env);
+
+  if (transformer !== undefined) {
+    env.defineSyntax(bindingName(keywordExpr, 'define-syntax'), transformer);
+    return continueWith(continuation, VOID);
+  }
+
+  return evaluateCps(transformerExpr, env, (value) => {
+    if (!isProcedureValue(value)) {
+      throw new EvalError('define-syntax expected a syntax-rules transformer or transformer procedure', transformerExpr.pos);
+    }
+
+    env.defineSyntax(bindingName(keywordExpr, 'define-syntax'), {
+      kind: 'procedure',
+      keyword,
+      procedure: value,
+      definitionEnv: env,
+    });
+    return continueWith(continuation, VOID);
+  });
 }
 
 function evaluateDefineRecordType(
@@ -1623,6 +1702,150 @@ function evaluateQuote(
   }
 
   return continueWith(continuation, quoteExpr(expressions[0]));
+}
+
+function evaluateSyntax(
+  expressions: Expr[],
+  env: Environment,
+  pos: SourcePosition,
+  continuation: Continuation,
+): Bounce {
+  if (expressions.length !== 1) {
+    throw new EvalError(`syntax expected 1 argument(s), got ${expressions.length}`, pos);
+  }
+
+  const syntaxContext = env.currentSyntaxContext();
+  const definitionEnv = syntaxContext?.definitionEnv ?? env.currentTransformerDefinitionEnv() ?? env;
+  const bindings = syntaxContext?.bindings ?? new Map<string, PatternBindingValue>();
+
+  return continueWith(
+    continuation,
+    makeSyntax(expandTemplate(expressions[0], bindings, definitionEnv, new Map(), [])),
+  );
+}
+
+function evaluateSyntaxCase(
+  expressions: Expr[],
+  env: Environment,
+  pos: SourcePosition,
+  continuation: Continuation,
+): Bounce {
+  if (expressions.length < 3) {
+    throw new EvalError(`syntax-case expected at least 3 argument(s), got ${expressions.length}`, pos);
+  }
+
+  const [inputExpr, literalsExpr, ...clauseExprs] = expressions;
+  if (literalsExpr.kind !== 'list') {
+    throw new EvalError('syntax-case expected a literal identifier list', literalsExpr.pos);
+  }
+
+  const literals = new Set<string>();
+  for (const literalExpr of literalsExpr.elements) {
+    literals.add(expectSymbolExpr(literalExpr, 'syntax-case'));
+  }
+
+  return evaluateCps(inputExpr, env, (inputValue) => {
+    const syntaxValue = expectSyntaxValue(inputValue, 'syntax-case', inputExpr.pos);
+    return evaluateSyntaxCaseClauses(syntaxValue.expr, clauseExprs, literals, env, continuation);
+  });
+}
+
+function evaluateSyntaxCaseClauses(
+  expression: Expr,
+  clauses: Expr[],
+  literals: Set<string>,
+  env: Environment,
+  continuation: Continuation,
+  index = 0,
+): Bounce {
+  if (index >= clauses.length) {
+    throw new EvalError('syntax-case found no matching clause', expression.pos);
+  }
+
+  const clauseExpr = clauses[index];
+  if (clauseExpr.kind !== 'list' || (clauseExpr.elements.length !== 2 && clauseExpr.elements.length !== 3)) {
+    throw new EvalError('syntax-case expected clauses of the form (pattern template)', clauseExpr.pos);
+  }
+
+  const [patternExpr] = clauseExpr.elements;
+  const bodyExpr = (
+    clauseExpr.elements.length === 2 ? clauseExpr.elements[1] : clauseExpr.elements[2]
+  ) as Expr;
+  const fenderExpr = (clauseExpr.elements.length === 3 ? clauseExpr.elements[1] : undefined) as
+    | Expr
+    | undefined;
+  const bindings = matchPattern(patternExpr, expression, literals);
+  if (bindings === undefined) {
+    return bounce(() =>
+      evaluateSyntaxCaseClauses(expression, clauses, literals, env, continuation, index + 1),
+    );
+  }
+
+  const clauseEnv = bindSyntaxTemplateContext(env, bindings);
+
+  if (fenderExpr === undefined) {
+    return evaluateCps(bodyExpr, clauseEnv, continuation);
+  }
+
+  return evaluateCps(fenderExpr, clauseEnv, (fenderValue) =>
+    isFalse(fenderValue)
+      ? evaluateSyntaxCaseClauses(expression, clauses, literals, env, continuation, index + 1)
+      : evaluateCps(bodyExpr, clauseEnv, continuation),
+  );
+}
+
+function evaluateWithSyntax(
+  expressions: Expr[],
+  env: Environment,
+  pos: SourcePosition,
+  continuation: Continuation,
+): Bounce {
+  if (expressions.length < 2) {
+    throw new EvalError(`with-syntax expected at least 2 argument(s), got ${expressions.length}`, pos);
+  }
+
+  const [bindingsExpr, ...bodyExprs] = expressions;
+  if (bindingsExpr.kind !== 'list') {
+    throw new EvalError('with-syntax expected a binding list', bindingsExpr.pos);
+  }
+
+  return evaluateWithSyntaxBindingsCps(bindingsExpr.elements, env, (bindings) => {
+    const bodyEnv = bindSyntaxTemplateContext(env, bindings);
+    return evaluateSequenceCps(bodyExprs, bodyEnv, continuation);
+  });
+}
+
+function evaluateWithSyntaxBindingsCps(
+  bindingExprs: Expr[],
+  env: Environment,
+  continuation: (bindings: PatternBindings) => Bounce,
+  index = 0,
+  collected: PatternBindings = new Map(),
+): Bounce {
+  if (index >= bindingExprs.length) {
+    return bounce(() => continuation(collected));
+  }
+
+  const bindingExpr = bindingExprs[index];
+  if (bindingExpr.kind !== 'list' || bindingExpr.elements.length !== 2) {
+    throw new EvalError('with-syntax expected bindings of the form (pattern expr)', bindingExpr.pos);
+  }
+
+  const [patternExpr, valueExpr] = bindingExpr.elements;
+  return evaluateCps(valueExpr, env, (value) => {
+    const syntaxValue = expectSyntaxValue(value, 'with-syntax', valueExpr.pos);
+    const bindings = matchPattern(patternExpr, syntaxValue.expr, new Set());
+    if (bindings === undefined) {
+      throw new EvalError('with-syntax pattern did not match syntax value', bindingExpr.pos);
+    }
+
+    const merged = mergePatternBindings(collected, bindings);
+    if (merged === undefined) {
+      throw new EvalError('with-syntax produced incompatible bindings', bindingExpr.pos);
+    }
+
+    return evaluateWithSyntaxBindingsCps(bindingExprs, env, continuation, index + 1, merged);
+  });
 }
 
 function evaluateLambda(
@@ -2117,6 +2340,7 @@ function applyProcedureClause(
   pos: SourcePosition,
   name: string,
   continuation: Continuation,
+  options?: EnvironmentOptions,
 ): Bounce {
   if (clause.restParam === undefined && args.length !== clause.params.length) {
     throw new EvalError(
@@ -2132,7 +2356,7 @@ function applyProcedureClause(
     );
   }
 
-  const callEnv = new Environment(env);
+  const callEnv = new Environment(env, options);
 
   for (let index = 0; index < clause.params.length; index += 1) {
     callEnv.define(clause.params[index], args[index]);
@@ -2149,14 +2373,18 @@ function matchesClauseArity(clause: ProcedureClause, argCount: number): boolean 
   return clause.restParam === undefined ? argCount === clause.params.length : argCount >= clause.params.length;
 }
 
-function parseSyntaxRules(keyword: string, expression: Expr, env: Environment): SyntaxTransformer {
+function tryParseSyntaxRules(
+  keyword: string,
+  expression: Expr,
+  env: Environment,
+): SyntaxRulesTransformer | undefined {
   if (expression.kind !== 'list' || expression.elements.length < 2) {
-    throw new EvalError('define-syntax expected a syntax-rules transformer', expression.pos);
+    return undefined;
   }
 
   const [headExpr, literalsExpr, ...ruleExprs] = expression.elements;
-  if (expectSymbolExpr(headExpr, 'define-syntax') !== 'syntax-rules') {
-    throw new EvalError('define-syntax expected a syntax-rules transformer', headExpr.pos);
+  if (symbolName(headExpr) !== 'syntax-rules') {
+    return undefined;
   }
 
   if (literalsExpr.kind !== 'list') {
@@ -2184,6 +2412,7 @@ function parseSyntaxRules(keyword: string, expression: Expr, env: Environment): 
   });
 
   return {
+    kind: 'syntax-rules',
     keyword,
     literals,
     rules,
@@ -2191,7 +2420,20 @@ function parseSyntaxRules(keyword: string, expression: Expr, env: Environment): 
   };
 }
 
-function expandMacro(transformer: SyntaxTransformer, expression: Expr): Expr {
+function expandMacroCps(
+  transformer: SyntaxTransformer,
+  expression: Expr,
+  env: Environment,
+  continuation: Continuation,
+): Bounce {
+  if (transformer.kind === 'syntax-rules') {
+    return evaluateCps(expandSyntaxRulesMacro(transformer, expression), env, continuation);
+  }
+
+  return applyTransformerProcedureCps(transformer, expression, env, continuation);
+}
+
+function expandSyntaxRulesMacro(transformer: SyntaxRulesTransformer, expression: Expr): Expr {
   for (const rule of transformer.rules) {
     const bindings = matchMacroRule(rule.pattern, expression, transformer.literals);
     if (bindings !== undefined) {
@@ -2200,6 +2442,72 @@ function expandMacro(transformer: SyntaxTransformer, expression: Expr): Expr {
   }
 
   throw new EvalError(`no matching syntax-rules pattern for ${transformer.keyword}`, expression.pos);
+}
+
+function applyTransformerProcedureCps(
+  transformer: ProcedureSyntaxTransformer,
+  expression: Expr,
+  env: Environment,
+  continuation: Continuation,
+): Bounce {
+  const definitionEnv = transformer.definitionEnv;
+  const value = transformer.procedure;
+
+  if (isBuiltin(value)) {
+    return value.apply([makeSyntax(expression)], expression.pos, (expandedValue) =>
+      continueWithExpandedMacro(expandedValue, transformer.keyword, expression.pos, env, continuation),
+    );
+  }
+
+  if (isContinuation(value)) {
+    expectArity(value.name ?? 'continuation', [makeSyntax(expression)], 1, expression.pos);
+    return continueCapturedContinuationCps(value, makeSyntax(expression), expression.pos);
+  }
+
+  if (isClosure(value)) {
+    return applyProcedureClause(
+      value,
+      value.env,
+      [makeSyntax(expression)],
+      expression.pos,
+      value.name ?? transformer.keyword,
+      (expandedValue) =>
+        continueWithExpandedMacro(expandedValue, transformer.keyword, expression.pos, env, continuation),
+      { transformerDefinitionEnv: definitionEnv },
+    );
+  }
+
+  if (isCaseLambda(value)) {
+    const clause = value.clauses.find((candidate) => matchesClauseArity(candidate, 1));
+
+    if (clause === undefined) {
+      throw new EvalError(`case-lambda has no matching clause for 1 argument(s)`, expression.pos);
+    }
+
+    return applyProcedureClause(
+      clause,
+      value.env,
+      [makeSyntax(expression)],
+      expression.pos,
+      value.name ?? transformer.keyword,
+      (expandedValue) =>
+        continueWithExpandedMacro(expandedValue, transformer.keyword, expression.pos, env, continuation),
+      { transformerDefinitionEnv: definitionEnv },
+    );
+  }
+
+  throw new EvalError('attempted to call a non-procedure value', expression.pos);
+}
+
+function continueWithExpandedMacro(
+  value: SchemeValue,
+  keyword: string,
+  pos: SourcePosition,
+  env: Environment,
+  continuation: Continuation,
+): Bounce {
+  const syntaxValue = expectSyntaxValue(value, keyword, pos);
+  return evaluateCps(syntaxValue.expr, env, continuation);
 }
 
 function matchMacroRule(
@@ -2406,6 +2714,36 @@ function mergePatternBindings(
   return merged;
 }
 
+function bindSyntaxTemplateContext(env: Environment, additions: PatternBindings): Environment {
+  const currentContext = env.currentSyntaxContext();
+  const definitionEnv = currentContext?.definitionEnv ?? env.currentTransformerDefinitionEnv() ?? env;
+  const bindings = new Map(currentContext?.bindings ?? new Map<string, PatternBindingValue>());
+  for (const [name, value] of additions) {
+    bindings.set(name, value);
+  }
+
+  const scopedEnv = new Environment(env, {
+    syntaxContext: {
+      bindings,
+      definitionEnv,
+    },
+  });
+
+  for (const [name, value] of additions) {
+    scopedEnv.define(name, patternBindingToSchemeValue(value));
+  }
+
+  return scopedEnv;
+}
+
+function patternBindingToSchemeValue(value: PatternBindingValue): SchemeValue {
+  if (value.kind === 'expr') {
+    return makeSyntax(value.value);
+  }
+
+  return listToPairs(value.value.map((entry) => patternBindingToSchemeValue(entry)));
+}
+
 function patternBindingEquals(left: PatternBindingValue, right: PatternBindingValue): boolean {
   if (left.kind === 'expr' && right.kind === 'expr') {
     return syntaxEquals(left.value, right.value);
@@ -2581,7 +2919,53 @@ function expandDefineTemplate(
   }
 
   const head = expandTemplate(elements[0], bindings, definitionEnv, scope, path);
-  const targetName = symbolName(elements[1]);
+  const targetExpr = elements[1];
+  const targetName = symbolName(targetExpr);
+
+  if (targetExpr.kind === 'list' && targetExpr.elements.length > 0) {
+    const [nameTemplate, ...paramTemplates] = targetExpr.elements;
+    const functionName = symbolName(nameTemplate);
+    const definitionBindings = new Map<string, string>();
+    const expandedName =
+      functionName !== undefined && !bindings.has(functionName)
+        ? (() => {
+            const bindingKey = definitionEnv.freshBindingKey(functionName);
+            definitionBindings.set(functionName, bindingKey);
+            return makeResolvedSymbol(functionName, nameTemplate.pos, { kind: 'lexical', key: bindingKey });
+          })()
+        : expandTemplate(nameTemplate, bindings, definitionEnv, scope, path);
+    const [paramsExpr, parameterScope] = expandParameterBindings(
+      {
+        kind: 'list',
+        elements: paramTemplates,
+        pos: targetExpr.pos,
+      },
+      bindings,
+      definitionEnv,
+      scope,
+      path,
+    );
+    const paramsList = paramsExpr as Extract<Expr, { kind: 'list' }>;
+    const bodyScope = extendScope(extendScope(scope, definitionBindings), parameterScope);
+    const expanded = [
+      head,
+      {
+        kind: 'list' as const,
+        elements: [expandedName, ...paramsList.elements],
+        pos: targetExpr.pos,
+      },
+    ];
+
+    for (const valueTemplate of elements.slice(2)) {
+      expanded.push(expandTemplate(valueTemplate, bindings, definitionEnv, bodyScope, path));
+    }
+
+    return {
+      kind: 'list',
+      elements: expanded,
+      pos: template.pos,
+    };
+  }
 
   if (targetName !== undefined && !bindings.has(targetName)) {
     const bindingKey = definitionEnv.freshBindingKey(targetName);
@@ -2890,6 +3274,13 @@ function makeResolvedSymbol(name: string, pos: SourcePosition, binding: SymbolBi
   };
 }
 
+function makeSyntax(expr: Expr): SyntaxValue {
+  return {
+    kind: 'syntax',
+    expr,
+  };
+}
+
 function isEllipsisExpr(expression: Expr): boolean {
   return symbolName(expression) === '...';
 }
@@ -2909,6 +3300,66 @@ function quoteExpr(expression: Expr): SchemeValue {
     case 'list':
       return listToPairs(expression.elements.map((element) => quoteExpr(element)));
   }
+}
+
+function datumToExpr(value: SchemeValue, pos: SourcePosition): Expr {
+  if (isNumberValue(value)) {
+    return {
+      kind: 'number',
+      value,
+      pos,
+    };
+  }
+
+  if (typeof value === 'boolean') {
+    return {
+      kind: 'boolean',
+      value,
+      pos,
+    };
+  }
+
+  if (isStringValue(value)) {
+    return {
+      kind: 'string',
+      value: value.chars.join(''),
+      pos,
+    };
+  }
+
+  if (isChar(value)) {
+    return {
+      kind: 'char',
+      value: value.value,
+      pos,
+    };
+  }
+
+  if (isSymbolValue(value)) {
+    return {
+      kind: 'symbol',
+      name: value.name,
+      pos,
+    };
+  }
+
+  if (isEmptyList(value)) {
+    return {
+      kind: 'list',
+      elements: [],
+      pos,
+    };
+  }
+
+  if (isPair(value)) {
+    return {
+      kind: 'list',
+      elements: listToArray(value, 'datum->syntax', pos).map((element) => datumToExpr(element, pos)),
+      pos,
+    };
+  }
+
+  throw new EvalError('datum->syntax expected a datum', pos);
 }
 
 function listToPairs(elements: SchemeValue[]): SchemeValue {
@@ -2979,6 +3430,13 @@ function tokenize(input: string): TokenStream {
     if (char === '\'') {
       advanceChar();
       tokens.push({ kind: 'quote', pos });
+      continue;
+    }
+
+    if (char === '#' && input[index + 1] === '\'') {
+      advanceChar();
+      advanceChar();
+      tokens.push({ kind: 'syntax', pos });
       continue;
     }
 
@@ -3105,6 +3563,15 @@ class Parser {
           pos: token.pos,
           elements: [
             { kind: 'symbol', name: 'quote', pos: token.pos },
+            this.parseExpr(),
+          ],
+        };
+      case 'syntax':
+        return {
+          kind: 'list',
+          pos: token.pos,
+          elements: [
+            { kind: 'symbol', name: 'syntax', pos: token.pos },
             this.parseExpr(),
           ],
         };
@@ -3396,6 +3863,10 @@ function isBuiltin(value: SchemeValue): value is BuiltinValue {
   return typeof value === 'object' && value !== null && value.kind === 'builtin';
 }
 
+function isSyntaxValue(value: SchemeValue): value is SyntaxValue {
+  return typeof value === 'object' && value !== null && value.kind === 'syntax';
+}
+
 function isClosure(value: SchemeValue): value is ClosureValue {
   return typeof value === 'object' && value !== null && value.kind === 'closure';
 }
@@ -3606,6 +4077,14 @@ function expectChar(value: SchemeValue, name: string, pos: SourcePosition): Char
 function expectSymbolValue(value: SchemeValue, name: string, pos: SourcePosition): SymbolValue {
   if (!isSymbolValue(value)) {
     throw new EvalError(`${name} expected a symbol`, pos);
+  }
+
+  return value;
+}
+
+function expectSyntaxValue(value: SchemeValue, name: string, pos: SourcePosition): SyntaxValue {
+  if (!isSyntaxValue(value)) {
+    throw new EvalError(`${name} expected a syntax object`, pos);
   }
 
   return value;
@@ -4694,6 +5173,10 @@ function formatValueInternal(value: SchemeValue, display: boolean, path: Set<obj
 
   if (isChar(value)) {
     return display ? value.value : formatCharLiteral(value.value);
+  }
+
+  if (isSyntaxValue(value)) {
+    return '#<syntax>';
   }
 
   if (isMultipleValues(value)) {
