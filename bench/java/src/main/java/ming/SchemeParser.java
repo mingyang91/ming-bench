@@ -70,7 +70,7 @@ class SchemeParser {
                     i++; col++;
                 }
                 if (i < len) { i++; col++; }
-                tokens.add(new Token(new SchemeString(sb.toString()), startLine, startCol));
+                tokens.add(new Token(new SchemeString(sb.toString(), true), startLine, startCol));
             } else if (c == '#') {
                 int startCol = col;
                 if (i + 1 < len) {

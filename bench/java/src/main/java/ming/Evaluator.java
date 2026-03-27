@@ -351,10 +351,40 @@ public class Evaluator {
         env.define("string-set!", new BuiltinProc("string-set!", args -> {
             if (args.size() != 3) throw new EvalError("string-set!: expected 3 args");
             if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: expected string");
-            int idx = (int) asLong(args.get(1));
+            if (s.isImmutable()) throw new EvalError("string-set!: string is immutable");
+            if (!(args.get(1) instanceof Number n)) throw new EvalError("string-set!: expected integer index");
             if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: expected char");
-            s.setChar(idx, c.value());
+            s.setChar(n.intValue(), c.value());
             return Boolean.FALSE;
+        }));
+        env.define("string->list", new BuiltinProc("string->list", args -> {
+            if (args.size() != 1) throw new EvalError("string->list: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->list: expected string");
+            Object result = EMPTY_LIST;
+            for (int i = s.length() - 1; i >= 0; i--) {
+                result = new Pair(new SchemeChar(s.charAt(i)), result);
+            }
+            return result;
+        }));
+        env.define("list->string", new BuiltinProc("list->string", args -> {
+            if (args.size() != 1) throw new EvalError("list->string: expected 1 arg");
+            StringBuilder sb = new StringBuilder();
+            Object lst = args.get(0);
+            while (lst instanceof Pair p) {
+                if (!(p.car instanceof SchemeChar c)) throw new EvalError("list->string: expected list of chars");
+                sb.append(c.value());
+                lst = p.cdr;
+            }
+            return new SchemeString(sb.toString());
+        }));
+        env.define("char->integer", new BuiltinProc("char->integer", args -> {
+            if (args.size() != 1) throw new EvalError("char->integer: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char->integer: expected char");
+            return (long) c.value();
+        }));
+        env.define("integer->char", new BuiltinProc("integer->char", args -> {
+            if (args.size() != 1) throw new EvalError("integer->char: expected 1 arg");
+            return new SchemeChar((char) asLong(args.get(0)));
         }));
     }
 
