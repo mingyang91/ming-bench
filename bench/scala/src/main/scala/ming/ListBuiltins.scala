@@ -115,7 +115,7 @@ private[ming] object ListBuiltins:
     loop(alist)
 
   private def requireNonNegativeIndex(name: String, value: Value, pos: SourcePos): Int =
-    val index = requireNumber(name, value, pos)
+    val index = requireIndex(name, value, pos)
     if index < 0 then throw EvalError.at(pos, s"$name expected a non-negative index")
     index
 

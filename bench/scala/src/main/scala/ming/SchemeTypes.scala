@@ -3,15 +3,19 @@ package ming
 private[ming] enum Expr:
   def pos: SourcePos
 
-  case IntLit(value: Int, pos: SourcePos)          extends Expr
-  case BoolLit(value: Boolean, pos: SourcePos)     extends Expr
-  case StringLit(value: String, pos: SourcePos)    extends Expr
-  case CharLit(value: Char, pos: SourcePos)        extends Expr
-  case Symbol(name: String, pos: SourcePos)        extends Expr
-  case ListExpr(items: List[Expr], pos: SourcePos) extends Expr
+  case IntLit(value: Long, pos: SourcePos)                             extends Expr
+  case RationalLit(numerator: Long, denominator: Long, pos: SourcePos) extends Expr
+  case InexactLit(value: Double, pos: SourcePos)                       extends Expr
+  case BoolLit(value: Boolean, pos: SourcePos)                         extends Expr
+  case StringLit(value: String, pos: SourcePos)                        extends Expr
+  case CharLit(value: Char, pos: SourcePos)                            extends Expr
+  case Symbol(name: String, pos: SourcePos)                            extends Expr
+  case ListExpr(items: List[Expr], pos: SourcePos)                     extends Expr
 
 private[ming] enum Value:
-  case IntVal(value: Int)
+  case IntVal(value: Long)
+  case RationalVal(numerator: Long, denominator: Long)
+  case InexactVal(value: Double)
   case BoolVal(value: Boolean)
   case StringVal(value: MutableString)
   case CharVal(value: Char)

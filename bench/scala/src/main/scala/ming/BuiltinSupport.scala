@@ -15,11 +15,20 @@ private[ming] object BuiltinSupport:
   def requireSingleArg(name: String, args: List[Value], pos: SourcePos): Value =
     requireArgCount(name, args, expected = 1, pos).head
 
-  def requireNumber(name: String, value: Value, pos: SourcePos): Int =
-    value match
-      case Value.IntVal(number) => number
-      case other =>
-        throw EvalError.at(pos, s"$name expected a number, got ${ValueSemantics.typeName(other)}")
+  def requireNumber(name: String, value: Value, pos: SourcePos): SchemeNumber =
+    SchemeNumber
+      .fromValue(value)
+      .getOrElse(throw EvalError.at(pos, s"$name expected a number, got ${ValueSemantics.typeName(value)}"))
+
+  def requireExactInteger(name: String, value: Value, pos: SourcePos): Long =
+    requireNumber(name, value, pos) match
+      case SchemeNumber.ExactInt(number) => number
+      case _                             => throw EvalError.at(pos, s"$name expected an exact integer")
+
+  def requireIndex(name: String, value: Value, pos: SourcePos): Int =
+    val index = requireExactInteger(name, value, pos)
+    if !index.isValidInt then throw EvalError.at(pos, s"$name index out of range")
+    index.toInt
 
   def requireChar(name: String, value: Value, pos: SourcePos): Char =
     value match
@@ -45,11 +54,11 @@ private[ming] object BuiltinSupport:
       case other =>
         throw EvalError.at(pos, s"$name expected a pair, got ${ValueSemantics.typeName(other)}")
 
-  def requireBinaryNumbers(name: String, args: List[Value], pos: SourcePos): (Int, Int) =
+  def requireBinaryNumbers(name: String, args: List[Value], pos: SourcePos): (SchemeNumber, SchemeNumber) =
     val values = requireArgCount(name, args, expected = 2, pos)
     (requireNumber(name, values.head, pos), requireNumber(name, values(1), pos))
 
-  def evalNumbers(name: String, args: List[Value], pos: SourcePos): List[Int] =
+  def evalNumbers(name: String, args: List[Value], pos: SourcePos): List[SchemeNumber] =
     args.map(arg => requireNumber(name, arg, pos))
 
   def unaryPredicate(name: String, args: List[Value], pos: SourcePos)(predicate: Value => Boolean): Value =
@@ -59,7 +68,7 @@ private[ming] object BuiltinSupport:
     name: String,
     args: List[Value],
     pos: SourcePos
-  )(predicate: (Int, Int) => Boolean): Value =
+  )(predicate: (SchemeNumber, SchemeNumber) => Boolean): Value =
     compareAdjacent(requireMinArgs(name, evalNumbers(name, args, pos), min = 2, pos))(predicate)
 
   def compareChars(

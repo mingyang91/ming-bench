@@ -84,8 +84,11 @@ private[ming] object SchemeParser:
         case "#f" => Expr.BoolLit(false, pos)
         case _ if isCharToken(token) =>
           Expr.CharLit(parseCharToken(token, pos), pos)
-        case _ if isIntegerToken(token) =>
-          Expr.IntLit(token.toInt, pos)
+        case _ if SchemeNumber.isNumericToken(token) =>
+          SchemeNumber
+            .parseToken(token)
+            .map(_.toExpr(pos))
+            .getOrElse(throw EvalError.at(pos, s"invalid number literal: $token"))
         case _ if token.nonEmpty =>
           Expr.Symbol(token, pos)
         case _ =>
@@ -117,15 +120,6 @@ private[ming] object SchemeParser:
 
   private def isDelimiter(ch: Char): Boolean =
     ch.isWhitespace || ch == '(' || ch == ')' || ch == ';'
-
-  private def isIntegerToken(token: String): Boolean =
-    if token.isEmpty then false
-    else
-      val digits =
-        token.head match
-          case '+' | '-' => token.drop(1)
-          case _         => token
-      digits.nonEmpty && digits.forall(_.isDigit)
 
   private def isCharToken(token: String): Boolean =
     token.startsWith("#\\") && token.length > 2

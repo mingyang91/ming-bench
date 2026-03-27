@@ -33,11 +33,14 @@ private[ming] object MacroSyntax:
 
   def syntaxEquals(left: Expr, right: Expr): Boolean =
     (left, right) match
-      case (Expr.IntLit(leftValue, _), Expr.IntLit(rightValue, _))       => leftValue == rightValue
-      case (Expr.BoolLit(leftValue, _), Expr.BoolLit(rightValue, _))     => leftValue == rightValue
-      case (Expr.StringLit(leftValue, _), Expr.StringLit(rightValue, _)) => leftValue == rightValue
-      case (Expr.CharLit(leftValue, _), Expr.CharLit(rightValue, _))     => leftValue == rightValue
-      case (Expr.Symbol(leftName, _), Expr.Symbol(rightName, _))         => leftName == rightName
+      case (Expr.IntLit(leftValue, _), Expr.IntLit(rightValue, _)) => leftValue == rightValue
+      case (Expr.RationalLit(leftN, leftD, _), Expr.RationalLit(rightN, rightD, _)) =>
+        leftN == rightN && leftD == rightD
+      case (Expr.InexactLit(leftValue, _), Expr.InexactLit(rightValue, _)) => leftValue == rightValue
+      case (Expr.BoolLit(leftValue, _), Expr.BoolLit(rightValue, _))       => leftValue == rightValue
+      case (Expr.StringLit(leftValue, _), Expr.StringLit(rightValue, _))   => leftValue == rightValue
+      case (Expr.CharLit(leftValue, _), Expr.CharLit(rightValue, _))       => leftValue == rightValue
+      case (Expr.Symbol(leftName, _), Expr.Symbol(rightName, _))           => leftName == rightName
       case (Expr.ListExpr(leftItems, _), Expr.ListExpr(rightItems, _)) =>
         leftItems.lengthCompare(rightItems.length) == 0 &&
         leftItems.zip(rightItems).forall { case (leftItem, rightItem) =>

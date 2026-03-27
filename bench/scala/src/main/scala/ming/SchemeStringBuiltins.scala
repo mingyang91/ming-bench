@@ -38,7 +38,9 @@ private[ming] object StringBuiltins:
       case "string->number" =>
         stringToNumber(name, args, pos)
       case "number->string" =>
-        Value.StringVal(MutableString.from(requireNumber(name, requireSingleArg(name, args, pos), pos).toString))
+        Value.StringVal(
+          MutableString.from(SchemeNumber.render(requireNumber(name, requireSingleArg(name, args, pos), pos)))
+        )
       case "symbol->string" =>
         Value.StringVal(MutableString.from(requireSymbol(name, requireSingleArg(name, args, pos), pos)))
       case "string->symbol" =>
@@ -69,30 +71,26 @@ private[ming] object StringBuiltins:
   private def substring(name: String, args: List[Value], pos: SourcePos): Value =
     val values = requireArgCount(name, args, expected = 3, pos)
     val text   = requireString(name, values.head, pos)
-    val start  = requireNumber(name, values(1), pos)
-    val end    = requireNumber(name, values(2), pos)
+    val start  = requireIndex(name, values(1), pos)
+    val end    = requireIndex(name, values(2), pos)
     if start < 0 || end < start || end > text.length then throw EvalError.at(pos, s"$name indices out of range")
     Value.StringVal(MutableString.from(text.text.substring(start, end)))
 
   private def stringToNumber(name: String, args: List[Value], pos: SourcePos): Value =
     val text = requireString(name, requireSingleArg(name, args, pos), pos)
-    text.text.toIntOption match
-      case Some(number) =>
-        Value.IntVal(number)
-      case None =>
-        Value.BoolVal(false)
+    SchemeNumber.parseToken(text.text).map(_.toValue).getOrElse(Value.BoolVal(false))
 
   private def stringRef(name: String, args: List[Value], pos: SourcePos): Value =
     val values = requireArgCount(name, args, expected = 2, pos)
     val text   = requireString(name, values.head, pos)
-    val index  = requireNumber(name, values(1), pos)
+    val index  = requireIndex(name, values(1), pos)
     if index < 0 || index >= text.length then throw EvalError.at(pos, s"$name index out of range")
     Value.CharVal(text.charAt(index))
 
   private def stringSet(name: String, args: List[Value], pos: SourcePos): Value =
     val values = requireArgCount(name, args, expected = 3, pos)
     val text   = requireString(name, values.head, pos)
-    val index  = requireNumber(name, values(1), pos)
+    val index  = requireIndex(name, values(1), pos)
     val ch     = requireChar(name, values(2), pos)
     if index < 0 || index >= text.length then throw EvalError.at(pos, s"$name index out of range")
     text.setCharAt(index, ch)

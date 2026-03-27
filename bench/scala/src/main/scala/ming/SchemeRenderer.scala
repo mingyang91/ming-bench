@@ -10,9 +10,11 @@ private[ming] object SchemeRenderer:
 
   private def renderWithMode(value: Value, displayStrings: Boolean, displayChars: Boolean): String =
     value match
-      case Value.IntVal(number) => number.toString
-      case Value.BoolVal(true)  => "#t"
-      case Value.BoolVal(false) => "#f"
+      case Value.IntVal(number)                      => number.toString
+      case Value.RationalVal(numerator, denominator) => s"$numerator/$denominator"
+      case Value.InexactVal(number)                  => java.lang.Double.toString(number)
+      case Value.BoolVal(true)                       => "#t"
+      case Value.BoolVal(false)                      => "#f"
       case Value.StringVal(text) =>
         if displayStrings then text.text
         else s""""${escapeString(text.text)}""""

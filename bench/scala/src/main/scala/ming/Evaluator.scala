@@ -30,10 +30,12 @@ object Evaluator:
 
   private def eval(expr: Expr, env: Env, context: EvalContext): Value =
     expr match
-      case Expr.IntLit(value, _)    => Value.IntVal(value)
-      case Expr.BoolLit(value, _)   => Value.BoolVal(value)
-      case Expr.StringLit(value, _) => Value.StringVal(MutableString.from(value))
-      case Expr.CharLit(value, _)   => Value.CharVal(value)
+      case Expr.IntLit(value, _)                       => Value.IntVal(value)
+      case Expr.RationalLit(numerator, denominator, _) => Value.RationalVal(numerator, denominator)
+      case Expr.InexactLit(value, _)                   => Value.InexactVal(value)
+      case Expr.BoolLit(value, _)                      => Value.BoolVal(value)
+      case Expr.StringLit(value, _)                    => Value.StringVal(MutableString.from(value))
+      case Expr.CharLit(value, _)                      => Value.CharVal(value)
       case Expr.Symbol(name, pos) =>
         env.lookup(name).getOrElse(throw EvalError.at(pos, s"unbound variable: $name"))
       case Expr.ListExpr(items, pos) =>

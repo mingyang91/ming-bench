@@ -17,6 +17,10 @@ private[ming] object Builtins:
     "null?",
     "pair?",
     "number?",
+    "exact?",
+    "inexact?",
+    "integer?",
+    "rational?",
     "string?",
     "boolean?",
     "symbol?",
@@ -27,9 +31,13 @@ private[ming] object Builtins:
     "modulo",
     "remainder",
     "quotient",
+    "numerator",
+    "denominator",
     "min",
     "max",
     "expt",
+    "exact->inexact",
+    "inexact->exact",
     "zero?",
     "positive?",
     "negative?",
@@ -59,7 +67,8 @@ private[ming] object Builtins:
         Value.BoolVal(!ValueSemantics.isTruthy(requireSingleArg(name, args, pos)))
       case "eq?" | "equal?" =>
         invokeEqualityBuiltin(name, args, pos)
-      case "abs" | "modulo" | "remainder" | "quotient" | "min" | "max" | "expt" =>
+      case "abs" | "modulo" | "remainder" | "quotient" | "numerator" | "denominator" | "min" | "max" | "expt" |
+          "exact->inexact" | "inexact->exact" =>
         invokeNumericUtility(name, args, pos)
       case "zero?" | "positive?" | "negative?" | "odd?" | "even?" =>
         invokeNumericPredicate(name, args, pos)
@@ -69,7 +78,8 @@ private[ming] object Builtins:
         ListBuiltins.invokeUtility(builtin, args, pos)
       case "char-alphabetic?" | "char-numeric?" | "char-upcase" | "char-downcase" | "char=?" | "char<?" =>
         invokeCharBuiltin(name, args, pos)
-      case "null?" | "pair?" | "number?" | "string?" | "boolean?" | "symbol?" | "char?" =>
+      case "null?" | "pair?" | "number?" | "exact?" | "inexact?" | "integer?" | "rational?" | "string?" | "boolean?" |
+          "symbol?" | "char?" =>
         invokePredicateBuiltin(name, args, pos)
       case builtin if OutputBuiltins.handles(builtin) =>
         OutputBuiltins.invoke(builtin, args, pos, context)
@@ -81,11 +91,11 @@ private[ming] object Builtins:
   private def invokeArithmetic(name: String, args: List[Value], pos: SourcePos): Value =
     name match
       case "+" =>
-        Value.IntVal(evalNumbers(name, args, pos).sum)
+        SchemeNumber.add(evalNumbers(name, args, pos)).toValue
       case "-" =>
         subtract(name, args, pos)
       case "*" =>
-        Value.IntVal(evalNumbers(name, args, pos).product)
+        SchemeNumber.multiply(evalNumbers(name, args, pos)).toValue
       case "/" =>
         divide(name, args, pos)
       case _ =>
@@ -93,32 +103,22 @@ private[ming] object Builtins:
 
   private def subtract(name: String, args: List[Value], pos: SourcePos): Value =
     val numbers = requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos)
-    numbers match
-      case value :: Nil =>
-        Value.IntVal(-value)
-      case value :: rest =>
-        Value.IntVal(rest.foldLeft(value)(_ - _))
-      case Nil =>
-        throw EvalError.at(pos, s"$name expects at least 1 argument")
+    SchemeNumber.subtract(numbers).toValue
 
   private def divide(name: String, args: List[Value], pos: SourcePos): Value =
     val numbers = requireMinArgs(name, evalNumbers(name, args, pos), min = 2, pos)
-    val result = numbers.tail.foldLeft(numbers.head) { (acc, divisor) =>
-      if divisor == 0 then throw EvalError.at(pos, "division by zero")
-      acc / divisor
-    }
-    Value.IntVal(result)
+    SchemeNumber.divide(numbers, pos).toValue
 
   private def invokeComparison(name: String, args: List[Value], pos: SourcePos): Value =
     name match
       case "<" =>
-        compareNumbers(name, args, pos)(_ < _)
+        compareNumbers(name, args, pos)((left, right) => SchemeNumber.compare(left, right) < 0)
       case ">" =>
-        compareNumbers(name, args, pos)(_ > _)
+        compareNumbers(name, args, pos)((left, right) => SchemeNumber.compare(left, right) > 0)
       case "=" =>
-        compareNumbers(name, args, pos)(_ == _)
+        compareNumbers(name, args, pos)(SchemeNumber.areEqual)
       case "<=" =>
-        compareNumbers(name, args, pos)(_ <= _)
+        compareNumbers(name, args, pos)((left, right) => SchemeNumber.compare(left, right) <= 0)
       case _ =>
         unknownProcedure(name, pos)
 
@@ -135,26 +135,34 @@ private[ming] object Builtins:
   private def invokeNumericUtility(name: String, args: List[Value], pos: SourcePos): Value =
     name match
       case "abs" =>
-        Value.IntVal(math.abs(requireNumber(name, requireSingleArg(name, args, pos), pos)))
+        SchemeNumber.abs(requireNumber(name, requireSingleArg(name, args, pos), pos)).toValue
       case "modulo" =>
-        val (dividend, divisor) = requireBinaryNumbers(name, args, pos)
+        val (dividend, divisor) = requireBinaryExactIntegers(name, args, pos)
         Value.IntVal(modulo(dividend, divisor, pos))
       case "remainder" =>
-        val (dividend, divisor) = requireBinaryNumbers(name, args, pos)
+        val (dividend, divisor) = requireBinaryExactIntegers(name, args, pos)
         if divisor == 0 then throw EvalError.at(pos, "division by zero")
         Value.IntVal(dividend % divisor)
       case "quotient" =>
-        val (dividend, divisor) = requireBinaryNumbers(name, args, pos)
+        val (dividend, divisor) = requireBinaryExactIntegers(name, args, pos)
         if divisor == 0 then throw EvalError.at(pos, "division by zero")
         Value.IntVal(dividend / divisor)
+      case "numerator" =>
+        Value.IntVal(SchemeNumber.numerator(requireExactNumber(name, args, pos)))
+      case "denominator" =>
+        Value.IntVal(SchemeNumber.denominator(requireExactNumber(name, args, pos)))
       case "min" =>
-        Value.IntVal(requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos).min)
+        SchemeNumber.min(requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos)).toValue
       case "max" =>
-        Value.IntVal(requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos).max)
+        SchemeNumber.max(requireMinArgs(name, evalNumbers(name, args, pos), min = 1, pos)).toValue
       case "expt" =>
-        val (base, exponent) = requireBinaryNumbers(name, args, pos)
+        val (base, exponent) = requireBinaryExactIntegers(name, args, pos)
         if exponent < 0 then throw EvalError.at(pos, s"$name expected a non-negative exponent")
         Value.IntVal(expt(base, exponent))
+      case "exact->inexact" =>
+        SchemeNumber.exactToInexact(requireNumber(name, requireSingleArg(name, args, pos), pos)).toValue
+      case "inexact->exact" =>
+        SchemeNumber.inexactToExact(requireNumber(name, requireSingleArg(name, args, pos), pos)).toValue
       case _ =>
         unknownProcedure(name, pos)
 
@@ -162,15 +170,15 @@ private[ming] object Builtins:
     val number = requireNumber(name, requireSingleArg(name, args, pos), pos)
     name match
       case "zero?" =>
-        Value.BoolVal(number == 0)
+        Value.BoolVal(SchemeNumber.isZero(number))
       case "positive?" =>
-        Value.BoolVal(number > 0)
+        Value.BoolVal(SchemeNumber.compare(number, SchemeNumber.ExactInt(0L)) > 0)
       case "negative?" =>
-        Value.BoolVal(number < 0)
+        Value.BoolVal(SchemeNumber.compare(number, SchemeNumber.ExactInt(0L)) < 0)
       case "odd?" =>
-        Value.BoolVal(number % 2 != 0)
+        Value.BoolVal(requireExactInteger(name, requireSingleArg(name, args, pos), pos) % 2L != 0L)
       case "even?" =>
-        Value.BoolVal(number % 2 == 0)
+        Value.BoolVal(requireExactInteger(name, requireSingleArg(name, args, pos), pos) % 2L == 0L)
       case _ =>
         unknownProcedure(name, pos)
 
@@ -204,9 +212,24 @@ private[ming] object Builtins:
           case _                   => false
         }
       case "number?" =>
-        unaryPredicate(name, args, pos) {
-          case Value.IntVal(_) => true
-          case _               => false
+        unaryPredicate(name, args, pos) { case value =>
+          SchemeNumber.fromValue(value).isDefined
+        }
+      case "exact?" =>
+        unaryPredicate(name, args, pos) { case value =>
+          SchemeNumber.fromValue(value).exists(_.isExact)
+        }
+      case "inexact?" =>
+        unaryPredicate(name, args, pos) { case value =>
+          SchemeNumber.fromValue(value).exists(!_.isExact)
+        }
+      case "integer?" =>
+        unaryPredicate(name, args, pos) { case value =>
+          SchemeNumber.fromValue(value).exists(_.isInteger)
+        }
+      case "rational?" =>
+        unaryPredicate(name, args, pos) { case value =>
+          SchemeNumber.fromValue(value).exists(_.isRational)
         }
       case "string?" =>
         unaryPredicate(name, args, pos) {
@@ -231,17 +254,29 @@ private[ming] object Builtins:
       case _ =>
         unknownProcedure(name, pos)
 
-  private def modulo(dividend: Int, divisor: Int, pos: SourcePos): Int =
+  private def requireExactNumber(name: String, args: List[Value], pos: SourcePos): SchemeNumber =
+    requireNumber(name, requireSingleArg(name, args, pos), pos) match
+      case exact if exact.isExact => exact
+      case _                      => throw EvalError.at(pos, s"$name expected an exact number")
+
+  private def requireBinaryExactIntegers(name: String, args: List[Value], pos: SourcePos): (Long, Long) =
+    val values = requireArgCount(name, args, expected = 2, pos)
+    (
+      requireExactInteger(name, values.head, pos),
+      requireExactInteger(name, values(1), pos)
+    )
+
+  private def modulo(dividend: Long, divisor: Long, pos: SourcePos): Long =
     if divisor == 0 then throw EvalError.at(pos, "division by zero")
     val remainder = dividend % divisor
-    if remainder == 0 || Integer.signum(remainder) == Integer.signum(divisor) then remainder
+    if remainder == 0 || java.lang.Long.signum(remainder) == java.lang.Long.signum(divisor) then remainder
     else remainder + divisor
 
-  private def expt(base: Int, exponent: Int): Int =
+  private def expt(base: Long, exponent: Long): Long =
     @annotation.tailrec
-    def loop(factor: Int, power: Int, acc: Int): Int =
+    def loop(factor: Long, power: Long, acc: Long): Long =
       if power == 0 then acc
       else if (power & 1) == 1 then loop(factor * factor, power >>> 1, acc * factor)
       else loop(factor * factor, power >>> 1, acc)
 
-    loop(base, exponent, acc = 1)
+    loop(base, exponent, acc = 1L)
