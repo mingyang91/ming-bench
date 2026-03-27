@@ -58,6 +58,11 @@ type PairValue = {
   cdr: SchemeValue;
 };
 
+type VectorValue = {
+  kind: 'vector';
+  elements: SchemeValue[];
+};
+
 type RecordFieldDescriptor = {
   name: string;
   accessorName?: string;
@@ -103,6 +108,11 @@ type VoidValue = {
   kind: 'void';
 };
 
+type UninitializedValue = {
+  kind: 'uninitialized';
+  name: string;
+};
+
 type EvaluationContext = {
   output: string[];
 };
@@ -115,10 +125,12 @@ type SchemeValue =
   | StringValue
   | SymbolValue
   | PairValue
+  | VectorValue
   | RecordValue
   | CharValue
   | EmptyListValue
   | VoidValue
+  | UninitializedValue
   | ProcedureValue;
 
 type Token =
@@ -156,6 +168,13 @@ type PatternBindings = Map<string, PatternBindingValue>;
 
 type RuntimeState = {
   nextHygieneId: number;
+};
+
+type DoBinding = {
+  name: string;
+  initExpr: Expr;
+  stepExpr?: Expr;
+  pos: SourcePosition;
 };
 
 const EMPTY_LIST: EmptyListValue = { kind: 'empty-list' };
@@ -196,6 +215,13 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
       'eq?',
       builtin('eq?', (args, pos) => {
         expectArity('eq?', args, 2, pos);
+        return isEqValue(args[0], args[1]);
+      }),
+    ],
+    [
+      'eqv?',
+      builtin('eqv?', (args, pos) => {
+        expectArity('eqv?', args, 2, pos);
         return isEqValue(args[0], args[1]);
       }),
     ],
@@ -355,6 +381,76 @@ function createBuiltins(context: EvaluationContext): Map<string, BuiltinValue> {
       builtin('length', (args, pos) => {
         expectArity('length', args, 1, pos);
         return makeExactInteger(BigInt(listToArray(args[0], 'length', pos).length));
+      }),
+    ],
+    ['vector', builtin('vector', (args) => makeVector(args))],
+    [
+      'make-vector',
+      builtin('make-vector', (args, pos) => {
+        if (args.length !== 1 && args.length !== 2) {
+          throw new EvalError(`make-vector expected 1 or 2 argument(s), got ${args.length}`, pos);
+        }
+
+        const length = expectIndex(args[0], 'make-vector', pos);
+        const fill = args[1] ?? VOID;
+        return makeVector(Array.from({ length }, () => fill));
+      }),
+    ],
+    [
+      'vector-ref',
+      builtin('vector-ref', (args, pos) => {
+        expectArity('vector-ref', args, 2, pos);
+        const vector = expectVector(args[0], 'vector-ref', pos);
+        const index = expectIndex(args[1], 'vector-ref', pos);
+
+        if (index >= vector.elements.length) {
+          throw new EvalError('vector-ref index out of bounds', pos);
+        }
+
+        return vector.elements[index];
+      }),
+    ],
+    [
+      'vector-set!',
+      builtin('vector-set!', (args, pos) => {
+        expectArity('vector-set!', args, 3, pos);
+        const vector = expectVector(args[0], 'vector-set!', pos);
+        const index = expectIndex(args[1], 'vector-set!', pos);
+
+        if (index >= vector.elements.length) {
+          throw new EvalError('vector-set! index out of bounds', pos);
+        }
+
+        vector.elements[index] = args[2];
+        return VOID;
+      }),
+    ],
+    [
+      'vector-length',
+      builtin('vector-length', (args, pos) => {
+        expectArity('vector-length', args, 1, pos);
+        return makeExactInteger(BigInt(expectVector(args[0], 'vector-length', pos).elements.length));
+      }),
+    ],
+    [
+      'vector?',
+      builtin('vector?', (args, pos) => {
+        expectArity('vector?', args, 1, pos);
+        return isVectorValue(args[0]);
+      }),
+    ],
+    [
+      'vector->list',
+      builtin('vector->list', (args, pos) => {
+        expectArity('vector->list', args, 1, pos);
+        return listToPairs(expectVector(args[0], 'vector->list', pos).elements);
+      }),
+    ],
+    [
+      'list->vector',
+      builtin('list->vector', (args, pos) => {
+        expectArity('list->vector', args, 1, pos);
+        return makeVector(listToArray(args[0], 'list->vector', pos));
       }),
     ],
     ['append', builtin('append', (args, pos) => appendLists(args, pos))],
@@ -744,7 +840,12 @@ class Environment {
 
   lookup(name: string, pos: SourcePosition): SchemeValue {
     if (this.bindings.has(name)) {
-      return this.bindings.get(name) as SchemeValue;
+      const value = this.bindings.get(name) as SchemeValue;
+      if (typeof value === 'object' && value !== null && value.kind === 'uninitialized') {
+        throw new EvalError(`uninitialized binding: ${value.name}`, pos);
+      }
+
+      return value;
     }
 
     if (this.parent !== undefined) {
@@ -909,8 +1010,16 @@ function evaluateList(elements: Expr[], env: Environment, pos: SourcePosition): 
         return evaluateBegin(argumentExprs, env);
       case 'cond':
         return evaluateCond(argumentExprs, env, operatorExpr.pos);
+      case 'case':
+        return evaluateCase(argumentExprs, env, operatorExpr.pos);
       case 'let':
         return evaluateLet(argumentExprs, env, operatorExpr.pos);
+      case 'letrec':
+        return evaluateLetrec(argumentExprs, env, operatorExpr.pos, false);
+      case 'letrec*':
+        return evaluateLetrec(argumentExprs, env, operatorExpr.pos, true);
+      case 'do':
+        return evaluateDo(argumentExprs, env, operatorExpr.pos);
       case 'set!':
         return evaluateSet(argumentExprs, env, operatorExpr.pos);
     }
@@ -953,15 +1062,15 @@ function evaluateOr(expressions: Expr[], env: Environment): SchemeValue {
 }
 
 function evaluateIf(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
-  if (expressions.length !== 3) {
-    throw new EvalError(`if expected 3 argument(s), got ${expressions.length}`, pos);
+  if (expressions.length !== 2 && expressions.length !== 3) {
+    throw new EvalError(`if expected 2 or 3 argument(s), got ${expressions.length}`, pos);
   }
 
   const [conditionExpr, thenExpr, elseExpr] = expressions;
   const condition = evaluate(conditionExpr, env);
 
   if (isFalse(condition)) {
-    return evaluate(elseExpr, env);
+    return elseExpr === undefined ? VOID : evaluate(elseExpr, env);
   }
 
   return evaluate(thenExpr, env);
@@ -1241,6 +1350,46 @@ function evaluateCond(clauses: Expr[], env: Environment, pos: SourcePosition): S
   return VOID;
 }
 
+function evaluateCase(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+  if (expressions.length < 1) {
+    throw new EvalError('case expected at least 1 argument', pos);
+  }
+
+  const [keyExpr, ...clauses] = expressions;
+  const key = evaluate(keyExpr, env);
+
+  for (let index = 0; index < clauses.length; index += 1) {
+    const clause = clauses[index];
+
+    if (clause.kind !== 'list' || clause.elements.length === 0) {
+      throw new EvalError('case expected a non-empty clause', clause.pos);
+    }
+
+    const [datumExpr, ...bodyExprs] = clause.elements;
+    const isElseClause = symbolName(datumExpr) === 'else';
+
+    if (isElseClause) {
+      if (index !== clauses.length - 1) {
+        throw new EvalError('case else clause must be last', clause.pos);
+      }
+
+      return evaluateSequence(bodyExprs, env);
+    }
+
+    if (datumExpr.kind !== 'list') {
+      throw new EvalError('case expected a datum list or else clause', datumExpr.pos);
+    }
+
+    for (const datum of datumExpr.elements) {
+      if (isEqValue(key, quoteExpr(datum))) {
+        return evaluateSequence(bodyExprs, env);
+      }
+    }
+  }
+
+  return VOID;
+}
+
 function evaluateLet(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
   if (expressions.length < 2) {
     throw new EvalError(`let expected at least 2 argument(s), got ${expressions.length}`, pos);
@@ -1278,6 +1427,78 @@ function evaluateLet(expressions: Expr[], env: Environment, pos: SourcePosition)
   }
 
   return evaluateSequence(bodyExprs, letEnv);
+}
+
+function evaluateLetrec(
+  expressions: Expr[],
+  env: Environment,
+  pos: SourcePosition,
+  sequential: boolean,
+): SchemeValue {
+  if (expressions.length < 2) {
+    const name = sequential ? 'letrec*' : 'letrec';
+    throw new EvalError(`${name} expected at least 2 argument(s), got ${expressions.length}`, pos);
+  }
+
+  const [bindingsExpr, ...bodyExprs] = expressions;
+  const name = sequential ? 'letrec*' : 'letrec';
+  const bindings = parseBindings(bindingsExpr, name);
+  const letrecEnv = new Environment(env);
+
+  for (const binding of bindings) {
+    letrecEnv.define(binding.name, { kind: 'uninitialized', name: binding.name });
+  }
+
+  if (sequential) {
+    for (const binding of bindings) {
+      letrecEnv.define(binding.name, evaluate(binding.valueExpr, letrecEnv));
+    }
+  } else {
+    const values = bindings.map((binding) => evaluate(binding.valueExpr, letrecEnv));
+
+    for (let index = 0; index < bindings.length; index += 1) {
+      letrecEnv.define(bindings[index].name, values[index]);
+    }
+  }
+
+  return evaluateSequence(bodyExprs, letrecEnv);
+}
+
+function evaluateDo(expressions: Expr[], env: Environment, pos: SourcePosition): SchemeValue {
+  if (expressions.length < 2) {
+    throw new EvalError(`do expected at least 2 argument(s), got ${expressions.length}`, pos);
+  }
+
+  const [bindingsExpr, testClauseExpr, ...bodyExprs] = expressions;
+  const bindings = parseDoBindings(bindingsExpr);
+
+  if (testClauseExpr.kind !== 'list' || testClauseExpr.elements.length === 0) {
+    throw new EvalError('do expected a termination clause', testClauseExpr.pos);
+  }
+
+  const [testExpr, ...resultExprs] = testClauseExpr.elements;
+  const initValues = bindings.map((binding) => evaluate(binding.initExpr, env));
+  const doEnv = new Environment(env);
+
+  for (let index = 0; index < bindings.length; index += 1) {
+    doEnv.define(bindings[index].name, initValues[index]);
+  }
+
+  while (true) {
+    if (!isFalse(evaluate(testExpr, doEnv))) {
+      return resultExprs.length === 0 ? VOID : evaluateSequence(resultExprs, doEnv);
+    }
+
+    evaluateSequence(bodyExprs, doEnv);
+
+    const nextValues = bindings.map((binding) =>
+      binding.stepExpr === undefined ? doEnv.lookup(binding.name, binding.pos) : evaluate(binding.stepExpr, doEnv),
+    );
+
+    for (let index = 0; index < bindings.length; index += 1) {
+      doEnv.assign(bindings[index].name, nextValues[index], bindings[index].pos);
+    }
+  }
 }
 
 function applyProcedure(value: SchemeValue, args: SchemeValue[], pos: SourcePosition): SchemeValue {
@@ -2392,6 +2613,10 @@ function isPair(value: SchemeValue): value is PairValue {
   return typeof value === 'object' && value !== null && value.kind === 'pair';
 }
 
+function isVectorValue(value: SchemeValue): value is VectorValue {
+  return typeof value === 'object' && value !== null && value.kind === 'vector';
+}
+
 function isChar(value: SchemeValue): value is CharValue {
   return typeof value === 'object' && value !== null && value.kind === 'char';
 }
@@ -2527,6 +2752,14 @@ function expectMutableString(value: SchemeValue, name: string, pos: SourcePositi
 function expectPair(value: SchemeValue, name: string, pos: SourcePosition): PairValue {
   if (!isPair(value)) {
     throw new EvalError(`${name} expected a pair`, pos);
+  }
+
+  return value;
+}
+
+function expectVector(value: SchemeValue, name: string, pos: SourcePosition): VectorValue {
+  if (!isVectorValue(value)) {
+    throw new EvalError(`${name} expected a vector`, pos);
   }
 
   return value;
@@ -2672,6 +2905,30 @@ function parseBindings(bindingsExpr: Expr, name: string): Array<{ name: string; 
     return {
       name: bindingName(nameExpr, name),
       valueExpr,
+    };
+  });
+}
+
+function parseDoBindings(bindingsExpr: Expr): DoBinding[] {
+  if (bindingsExpr.kind !== 'list') {
+    throw new EvalError('do expected a bindings list', bindingsExpr.pos);
+  }
+
+  return bindingsExpr.elements.map((bindingExpr) => {
+    if (
+      bindingExpr.kind !== 'list' ||
+      bindingExpr.elements.length < 2 ||
+      bindingExpr.elements.length > 3
+    ) {
+      throw new EvalError('do expected bindings of the form (name init [step])', bindingExpr.pos);
+    }
+
+    const [nameExpr, initExpr, stepExpr] = bindingExpr.elements;
+    return {
+      name: bindingName(nameExpr, 'do'),
+      initExpr,
+      stepExpr,
+      pos: nameExpr.pos,
     };
   });
 }
@@ -3206,6 +3463,13 @@ function stringToChars(value: string): string[] {
   return Array.from(value);
 }
 
+function makeVector(elements: SchemeValue[]): VectorValue {
+  return {
+    kind: 'vector',
+    elements: [...elements],
+  };
+}
+
 function makeString(value: string | string[], mutable = true): StringValue {
   return {
     kind: 'string',
@@ -3296,6 +3560,13 @@ function isEqualValue(left: SchemeValue, right: SchemeValue): boolean {
     return isEqualValue(left.car, right.car) && isEqualValue(left.cdr, right.cdr);
   }
 
+  if (isVectorValue(left) && isVectorValue(right)) {
+    return (
+      left.elements.length === right.elements.length &&
+      left.elements.every((value, index) => isEqualValue(value, right.elements[index]))
+    );
+  }
+
   return false;
 }
 
@@ -3348,6 +3619,10 @@ function formatValue(value: SchemeValue): string {
     return `#<record:${value.type.name}>`;
   }
 
+  if (isVectorValue(value)) {
+    return formatVector(value, formatValue);
+  }
+
   if (isPair(value)) {
     return formatPair(value);
   }
@@ -3378,6 +3653,10 @@ function formatDisplayValue(value: SchemeValue): string {
 
   if (isPair(value)) {
     return formatDisplayPair(value);
+  }
+
+  if (isVectorValue(value)) {
+    return formatVector(value, formatDisplayValue);
   }
 
   return formatValue(value);
@@ -3413,6 +3692,10 @@ function formatDisplayPair(pair: PairValue): string {
   }
 
   return `(${parts.join(' ')} . ${formatDisplayValue(current)})`;
+}
+
+function formatVector(vector: VectorValue, formatter: (value: SchemeValue) => string): string {
+  return `#(${vector.elements.map((element) => formatter(element)).join(' ')})`;
 }
 
 function formatCharLiteral(value: string): string {
