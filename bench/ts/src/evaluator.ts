@@ -5,7 +5,7 @@ import { EvalError } from './evalError.js';
 type SchemeValBase =
   | { tag: 'number'; val: number; exact?: boolean; num?: number; den?: number }
   | { tag: 'boolean'; val: boolean }
-  | { tag: 'string'; val: string }
+  | { tag: 'string'; val: string; mutable?: boolean; chars?: string[] }
   | { tag: 'symbol'; val: string }
   | { tag: 'char'; val: string }
   | { tag: 'list'; val: SchemeVal[] }
@@ -67,6 +67,14 @@ function makeExactInt(n: number): SchemeVal {
 
 function makeInexact(n: number): SchemeVal {
   return { tag: 'number', val: n, exact: false };
+}
+
+function strChars(v: SchemeVal & { tag: 'string' }): string[] {
+  return v.chars ?? [...v.val];
+}
+
+function strVal(v: SchemeVal & { tag: 'string' }): string {
+  return v.chars ? v.chars.join('') : v.val;
 }
 
 function getNum(v: SchemeVal & { tag: 'number' }): number {
@@ -555,25 +563,61 @@ function makeGlobalEnv(outputBuf?: string[]): Env {
   envSet(env, 'string-ref', { tag: 'procedure', val: (args) => {
     if (args.length !== 2 || args[0].tag !== 'string' || args[1].tag !== 'number')
       throw new EvalError('string-ref: expected string and index');
-    const s = args[0].val;
+    const chars = strChars(args[0] as SchemeVal & { tag: 'string' });
     const i = args[1].val;
-    if (i < 0 || i >= s.length) throw new EvalError('string-ref: index out of range');
-    return { tag: 'char', val: s[i] };
+    if (i < 0 || i >= chars.length) throw new EvalError('string-ref: index out of range');
+    return { tag: 'char', val: chars[i] };
   }});
 
   envSet(env, 'string-copy', { tag: 'procedure', val: (args) => {
     if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string-copy: expected string');
-    return { tag: 'string', val: args[0].val };
+    const chars = strChars(args[0] as SchemeVal & { tag: 'string' });
+    return { tag: 'string', val: chars.join(''), mutable: true, chars: [...chars] };
   }});
 
   envSet(env, 'string-set!', { tag: 'procedure', val: (args) => {
     if (args.length !== 3 || args[0].tag !== 'string' || args[1].tag !== 'number' || args[2].tag !== 'char')
-      throw new EvalError('string-set!: expected string, index, char');
-    const s = args[0];
+      throw new EvalError('string-set!: expected mutable string, index, and char');
+    const s = args[0] as SchemeVal & { tag: 'string' };
+    if (!s.mutable) throw new EvalError('string-set!: strings are immutable');
     const i = args[1].val;
-    if (i < 0 || i >= s.val.length) throw new EvalError('string-set!: index out of range');
-    s.val = s.val.substring(0, i) + args[2].val + s.val.substring(i + 1);
+    if (!s.chars) s.chars = [...s.val];
+    if (i < 0 || i >= s.chars.length) throw new EvalError('string-set!: index out of range');
+    s.chars[i] = args[2].val;
+    s.val = s.chars.join('');
     return { tag: 'void' };
+  }});
+
+  envSet(env, 'string->list', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'string') throw new EvalError('string->list: expected string');
+    const chars = [...args[0].val].map(c => ({ tag: 'char' as const, val: c }));
+    let result: SchemeVal = { tag: 'nil' };
+    for (let i = chars.length - 1; i >= 0; i--) {
+      result = { tag: 'pair', car: chars[i], cdr: result };
+    }
+    return result;
+  }});
+
+  envSet(env, 'list->string', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1) throw new EvalError('list->string: expected list');
+    let node = args[0];
+    let s = '';
+    while (node.tag === 'pair') {
+      if (node.car.tag !== 'char') throw new EvalError('list->string: expected list of characters');
+      s += node.car.val;
+      node = node.cdr;
+    }
+    return { tag: 'string', val: s };
+  }});
+
+  envSet(env, 'char->integer', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'char') throw new EvalError('char->integer: expected char');
+    return { tag: 'number', val: args[0].val.codePointAt(0)! };
+  }});
+
+  envSet(env, 'integer->char', { tag: 'procedure', val: (args) => {
+    if (args.length !== 1 || args[0].tag !== 'number') throw new EvalError('integer->char: expected integer');
+    return { tag: 'char', val: String.fromCodePoint(args[0].val) };
   }});
 
   envSet(env, 'char?', { tag: 'procedure', val: (args) => {
