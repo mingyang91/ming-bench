@@ -1,5 +1,6 @@
 use super::{
-    apply_proc, display_value, expect_integer, is_truthy, make_str, values_equal, EvalError, Value,
+    apply_proc, display_value, expect_integer, f64_to_exact, is_number, is_truthy, make_rational,
+    make_str, nums_equal, nums_less, value_to_f64, values_equal, EvalError, Value,
 };
 
 pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Value, EvalError> {
@@ -14,7 +15,11 @@ pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Val
         "map" | "apply" => eval_higher_order(op, args, output),
 
         "not" | "eq?" | "equal?" | "string?" | "number?" | "boolean?" | "pair?" | "symbol?"
-        | "char?" => eval_predicate(op, args),
+        | "char?" | "integer?" | "rational?" | "exact?" | "inexact?" => eval_predicate(op, args),
+
+        "exact->inexact" | "inexact->exact" | "numerator" | "denominator" => {
+            eval_number_conversion(op, args)
+        }
 
         "display" | "write" | "newline" => eval_io(op, args, output),
 
@@ -30,69 +35,110 @@ pub fn eval_builtin(op: &str, args: &[Value], output: &mut String) -> Result<Val
     }
 }
 
+// Helper: extract (numerator, denominator) from a numeric Value
+fn to_rational_parts(v: &Value) -> Result<(i64, i64), EvalError> {
+    match v {
+        Value::Integer(n) => Ok((*n, 1)),
+        Value::Rational(n, d) => Ok((*n, *d)),
+        _ => Err(EvalError::Type(format!("expected exact number, got {v}"))),
+    }
+}
+
+fn num_add(a: &Value, b: &Value) -> Result<Value, EvalError> {
+    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+        return Ok(Value::Float(value_to_f64(a)? + value_to_f64(b)?));
+    }
+    let (n1, d1) = to_rational_parts(a)?;
+    let (n2, d2) = to_rational_parts(b)?;
+    Ok(make_rational(n1 * d2 + n2 * d1, d1 * d2))
+}
+
+fn num_sub(a: &Value, b: &Value) -> Result<Value, EvalError> {
+    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+        return Ok(Value::Float(value_to_f64(a)? - value_to_f64(b)?));
+    }
+    let (n1, d1) = to_rational_parts(a)?;
+    let (n2, d2) = to_rational_parts(b)?;
+    Ok(make_rational(n1 * d2 - n2 * d1, d1 * d2))
+}
+
+fn num_mul(a: &Value, b: &Value) -> Result<Value, EvalError> {
+    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+        return Ok(Value::Float(value_to_f64(a)? * value_to_f64(b)?));
+    }
+    let (n1, d1) = to_rational_parts(a)?;
+    let (n2, d2) = to_rational_parts(b)?;
+    Ok(make_rational(n1 * n2, d1 * d2))
+}
+
+fn num_div(a: &Value, b: &Value) -> Result<Value, EvalError> {
+    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+        let db = value_to_f64(b)?;
+        if db == 0.0 {
+            return Err(EvalError::DivisionByZero);
+        }
+        return Ok(Value::Float(value_to_f64(a)? / db));
+    }
+    let (n1, d1) = to_rational_parts(a)?;
+    let (n2, d2) = to_rational_parts(b)?;
+    if n2 == 0 {
+        return Err(EvalError::DivisionByZero);
+    }
+    Ok(make_rational(n1 * d2, d1 * n2))
+}
+
 fn eval_arithmetic(op: &str, args: &[Value]) -> Result<Value, EvalError> {
     match op {
         "+" => {
-            let mut sum: i64 = 0;
+            let mut result = Value::Integer(0);
             for a in args {
-                sum += expect_integer(a, "+")?;
+                result = num_add(&result, a)?;
             }
-            Ok(Value::Integer(sum))
+            Ok(result)
         }
         "-" => {
             if args.is_empty() {
                 return Err(EvalError::Arity("- requires at least 1 argument".into()));
             }
-            let first = expect_integer(&args[0], "-")?;
             if args.len() == 1 {
-                return Ok(Value::Integer(-first));
+                return num_sub(&Value::Integer(0), &args[0]);
             }
-            let mut result = first;
+            let mut result = args[0].clone();
             for a in &args[1..] {
-                result -= expect_integer(a, "-")?;
+                result = num_sub(&result, a)?;
             }
-            Ok(Value::Integer(result))
+            Ok(result)
         }
         "*" => {
-            let mut product: i64 = 1;
+            let mut result = Value::Integer(1);
             for a in args {
-                product *= expect_integer(a, "*")?;
+                result = num_mul(&result, a)?;
             }
-            Ok(Value::Integer(product))
+            Ok(result)
         }
         "/" => {
             if args.is_empty() {
                 return Err(EvalError::Arity("/ requires at least 1 argument".into()));
             }
-            let first = expect_integer(&args[0], "/")?;
             if args.len() == 1 {
-                if first == 0 {
-                    return Err(EvalError::DivisionByZero);
-                }
-                return Ok(Value::Integer(1 / first));
+                return num_div(&Value::Integer(1), &args[0]);
             }
-            let mut result = first;
+            let mut result = args[0].clone();
             for a in &args[1..] {
-                let d = expect_integer(a, "/")?;
-                if d == 0 {
-                    return Err(EvalError::DivisionByZero);
-                }
-                result /= d;
+                result = num_div(&result, a)?;
             }
-            Ok(Value::Integer(result))
+            Ok(result)
         }
         "<" | ">" | "=" | "<=" | ">=" => {
             if args.len() != 2 {
                 return Err(EvalError::Arity(format!("{op} requires 2 arguments")));
             }
-            let a = expect_integer(&args[0], op)?;
-            let b = expect_integer(&args[1], op)?;
             let result = match op {
-                "<" => a < b,
-                ">" => a > b,
-                "=" => a == b,
-                "<=" => a <= b,
-                ">=" => a >= b,
+                "=" => nums_equal(&args[0], &args[1]),
+                "<" => nums_less(&args[0], &args[1])?,
+                ">" => nums_less(&args[1], &args[0])?,
+                "<=" => !nums_less(&args[1], &args[0])?,
+                ">=" => !nums_less(&args[0], &args[1])?,
                 _ => unreachable!(),
             };
             Ok(Value::Boolean(result))
@@ -434,7 +480,43 @@ fn eval_predicate(op: &str, args: &[Value]) -> Result<Value, EvalError> {
             if args.len() != 1 {
                 return Err(EvalError::Arity("number? requires 1 argument".into()));
             }
-            Ok(Value::Boolean(matches!(&args[0], Value::Integer(_))))
+            Ok(Value::Boolean(is_number(&args[0])))
+        }
+        "integer?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("integer? requires 1 argument".into()));
+            }
+            let result = match &args[0] {
+                Value::Integer(_) => true,
+                Value::Rational(_, _) => false, // always simplified, so den != 1
+                Value::Float(f) => *f == f.floor() && f.is_finite(),
+                _ => false,
+            };
+            Ok(Value::Boolean(result))
+        }
+        "rational?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("rational? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::Integer(_) | Value::Rational(_, _)
+            )))
+        }
+        "exact?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("exact? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(
+                &args[0],
+                Value::Integer(_) | Value::Rational(_, _)
+            )))
+        }
+        "inexact?" => {
+            if args.len() != 1 {
+                return Err(EvalError::Arity("inexact? requires 1 argument".into()));
+            }
+            Ok(Value::Boolean(matches!(&args[0], Value::Float(_))))
         }
         "boolean?" => {
             if args.len() != 1 {
@@ -752,6 +834,34 @@ fn eval_char(op: &str, args: &[Value]) -> Result<Value, EvalError> {
                 _ => Err(EvalError::Type("char<?: expected chars".into())),
             }
         }
+        _ => unreachable!(),
+    }
+}
+
+fn eval_number_conversion(op: &str, args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Arity(format!("{op} requires 1 argument")));
+    }
+    match op {
+        "exact->inexact" => {
+            let f = value_to_f64(&args[0])?;
+            Ok(Value::Float(f))
+        }
+        "inexact->exact" => match &args[0] {
+            Value::Float(f) => Ok(f64_to_exact(*f)),
+            Value::Integer(_) | Value::Rational(_, _) => Ok(args[0].clone()),
+            _ => Err(EvalError::Type("inexact->exact: expected number".into())),
+        },
+        "numerator" => match &args[0] {
+            Value::Integer(n) => Ok(Value::Integer(*n)),
+            Value::Rational(n, _) => Ok(Value::Integer(*n)),
+            _ => Err(EvalError::Type("numerator: expected exact number".into())),
+        },
+        "denominator" => match &args[0] {
+            Value::Integer(_) => Ok(Value::Integer(1)),
+            Value::Rational(_, d) => Ok(Value::Integer(*d)),
+            _ => Err(EvalError::Type("denominator: expected exact number".into())),
+        },
         _ => unreachable!(),
     }
 }

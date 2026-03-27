@@ -30,6 +30,8 @@ struct Span {
 #[derive(Debug, Clone)]
 enum Value {
     Integer(i64),
+    Rational(i64, i64), // numerator, denominator (always simplified, den > 0)
+    Float(f64),
     Boolean(bool),
     Char(char),
     Str(Rc<RefCell<String>>),
@@ -45,6 +47,32 @@ enum Value {
     },
 }
 
+fn num_gcd(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+fn make_rational(num: i64, den: i64) -> Value {
+    assert!(den != 0, "division by zero in make_rational");
+    let sign = if den < 0 { -1 } else { 1 };
+    let num = num * sign;
+    let den = den.abs();
+    let g = num_gcd(num.abs(), den);
+    let num = num / g;
+    let den = den / g;
+    if den == 1 {
+        Value::Integer(num)
+    } else {
+        Value::Rational(num, den)
+    }
+}
+
 fn make_str(s: String) -> Value {
     Value::Str(Rc::new(RefCell::new(s)))
 }
@@ -53,6 +81,15 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Integer(n) => write!(f, "{n}"),
+            Value::Rational(n, d) => write!(f, "{n}/{d}"),
+            Value::Float(n) => {
+                let s = format!("{n}");
+                if s.contains('.') || s.contains('e') || s.contains('E') {
+                    write!(f, "{s}")
+                } else {
+                    write!(f, "{s}.0")
+                }
+            }
             Value::Boolean(true) => write!(f, "#t"),
             Value::Boolean(false) => write!(f, "#f"),
             Value::Char(c) => write!(f, "#\\{c}"),
@@ -83,6 +120,8 @@ struct Expr {
 #[derive(Debug, Clone)]
 enum ExprKind {
     Integer(i64),
+    Rational(i64, i64),
+    Float(f64),
     Boolean(bool),
     Char(char),
     Str(String),
@@ -247,6 +286,23 @@ impl<'a> Parser<'a> {
         if let Ok(n) = token.parse::<i64>() {
             return Ok(Expr { kind: ExprKind::Integer(n), span });
         }
+        // Rational literal: digits/digits (possibly with leading -)
+        if let Some(slash) = token.find('/') {
+            if slash > 0 || (token.starts_with('-') && slash > 1) {
+                let (num_s, den_s) = (&token[..slash], &token[slash + 1..]);
+                if let (Ok(num), Ok(den)) = (num_s.parse::<i64>(), den_s.parse::<i64>()) {
+                    if den != 0 {
+                        return Ok(Expr { kind: ExprKind::Rational(num, den), span });
+                    }
+                }
+            }
+        }
+        // Float literal
+        if token.contains('.') || token.contains('e') || token.contains('E') {
+            if let Ok(f) = token.parse::<f64>() {
+                return Ok(Expr { kind: ExprKind::Float(f), span });
+            }
+        }
         Ok(Expr { kind: ExprKind::Symbol(token.to_string()), span })
     }
 
@@ -310,6 +366,8 @@ fn eval(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalEr
 fn eval_inner(expr: &Expr, env: &mut Env, output: &mut String) -> Result<Value, EvalError> {
     match &expr.kind {
         ExprKind::Integer(n) => Ok(Value::Integer(*n)),
+        ExprKind::Rational(n, d) => Ok(make_rational(*n, *d)),
+        ExprKind::Float(f) => Ok(Value::Float(*f)),
         ExprKind::Boolean(b) => Ok(Value::Boolean(*b)),
         ExprKind::Char(c) => Ok(Value::Char(*c)),
         ExprKind::Str(s) => Ok(make_str(s.clone())),
@@ -493,6 +551,8 @@ fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
 fn expr_to_value(expr: &Expr) -> Value {
     match &expr.kind {
         ExprKind::Integer(n) => Value::Integer(*n),
+        ExprKind::Rational(n, d) => make_rational(*n, *d),
+        ExprKind::Float(f) => Value::Float(*f),
         ExprKind::Boolean(b) => Value::Boolean(*b),
         ExprKind::Char(c) => Value::Char(*c),
         ExprKind::Str(s) => make_str(s.clone()),
@@ -540,6 +600,9 @@ fn is_builtin(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/" | "<" | ">" | "=" | "<=" | ">=" | "not"
         | "cons" | "car" | "cdr" | "null?" | "list" | "length" | "append"
         | "string?" | "number?" | "boolean?" | "pair?" | "symbol?" | "char?"
+        | "integer?" | "rational?" | "exact?" | "inexact?"
+        | "exact->inexact" | "inexact->exact"
+        | "numerator" | "denominator"
         | "display" | "write" | "newline"
         | "string-append" | "string-length" | "substring"
         | "string->number" | "number->string"
@@ -575,9 +638,46 @@ fn display_value(v: &Value) -> String {
     }
 }
 
+fn value_to_f64(v: &Value) -> Result<f64, EvalError> {
+    match v {
+        Value::Integer(n) => Ok(*n as f64),
+        Value::Rational(n, d) => Ok(*n as f64 / *d as f64),
+        Value::Float(f) => Ok(*f),
+        _ => Err(EvalError::Type(format!("expected number, got {v}"))),
+    }
+}
+
+fn f64_to_exact(f: f64) -> Value {
+    if f == f.floor() && f.abs() < i64::MAX as f64 {
+        return Value::Integer(f as i64);
+    }
+    // Decompose IEEE 754 double to exact rational
+    let bits = f.to_bits();
+    let sign: i64 = if bits >> 63 == 1 { -1 } else { 1 };
+    let raw_exp = ((bits >> 52) & 0x7FF) as i64;
+    let mantissa = if raw_exp == 0 {
+        (bits & 0x000F_FFFF_FFFF_FFFF) as i64
+    } else {
+        (bits & 0x000F_FFFF_FFFF_FFFF | 0x0010_0000_0000_0000) as i64
+    };
+    let exp = raw_exp - 1023 - 52;
+    if exp >= 0 {
+        Value::Integer(sign * mantissa * (1i64 << exp as u32))
+    } else {
+        let den = 1i64 << ((-exp) as u32);
+        make_rational(sign * mantissa, den)
+    }
+}
+
+fn is_number(v: &Value) -> bool {
+    matches!(v, Value::Integer(_) | Value::Rational(_, _) | Value::Float(_))
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
+    if is_number(a) && is_number(b) {
+        return nums_equal(a, b);
+    }
     match (a, b) {
-        (Value::Integer(a), Value::Integer(b)) => a == b,
         (Value::Boolean(a), Value::Boolean(b)) => a == b,
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Str(a), Value::Str(b)) => *a.borrow() == *b.borrow(),
@@ -589,6 +689,36 @@ fn values_equal(a: &Value, b: &Value) -> bool {
             values_equal(a1, b1) && values_equal(a2, b2)
         }
         _ => false,
+    }
+}
+
+fn nums_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Integer(a), Value::Integer(b)) => a == b,
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => n1 == n2 && d1 == d2,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        _ => {
+            // Cross-tower: convert to f64
+            if let (Ok(a), Ok(b)) = (value_to_f64(a), value_to_f64(b)) {
+                a == b
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn nums_less(a: &Value, b: &Value) -> Result<bool, EvalError> {
+    match (a, b) {
+        (Value::Integer(a), Value::Integer(b)) => Ok(a < b),
+        (Value::Rational(n1, d1), Value::Rational(n2, d2)) => Ok(n1 * d2 < n2 * d1),
+        (Value::Integer(a), Value::Rational(n, d)) => Ok(*a * d < *n),
+        (Value::Rational(n, d), Value::Integer(b)) => Ok(*n < *b * d),
+        _ => {
+            let a = value_to_f64(a)?;
+            let b = value_to_f64(b)?;
+            Ok(a < b)
+        }
     }
 }
 
@@ -818,7 +948,12 @@ fn match_pattern(
                     return false;
                 }
             }
-            _ => return false,
+            ExprKind::Rational(n, d) => {
+                if !matches!(&input[ii].kind, ExprKind::Rational(n2, d2) if n2 == n && d2 == d) {
+                    return false;
+                }
+            }
+            ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Char(_) => return false,
         }
         pi += 1;
         ii += 1;
