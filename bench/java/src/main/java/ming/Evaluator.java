@@ -129,7 +129,20 @@ public class Evaluator {
 
     private Env createGlobalEnv() {
         Env env = new Env(null);
-        // List operations
+        registerListOps(env);
+        registerTypePredicates(env);
+        registerArithmetic(env);
+        registerIOOps(env);
+        registerStringOps(env);
+        registerNumericUtils(env);
+        registerListUtils(env);
+        registerCharOps(env);
+        registerStringComparisons(env);
+        registerHigherOrder(env);
+        return env;
+    }
+
+    private void registerListOps(Env env) {
         env.define("cons", new BuiltinProc("cons", args -> {
             if (args.size() != 2) throw new EvalError("cons: expected 2 args");
             return new Pair(args.get(0), args.get(1));
@@ -169,7 +182,6 @@ public class Evaluator {
         env.define("append", new BuiltinProc("append", args -> {
             if (args.size() == 0) return EMPTY_LIST;
             if (args.size() == 1) return args.get(0);
-            // For 2 args: copy first list, attach second
             Object a = args.get(0);
             Object b = args.get(1);
             if (a == EMPTY_LIST) return b;
@@ -185,7 +197,9 @@ public class Evaluator {
             }
             return result;
         }));
-        // Type predicates
+    }
+
+    private void registerTypePredicates(Env env) {
         env.define("number?", new BuiltinProc("number?", args -> {
             if (args.size() != 1) throw new EvalError("number?: expected 1 arg");
             return args.get(0) instanceof Long ? Boolean.TRUE : Boolean.FALSE;
@@ -206,7 +220,9 @@ public class Evaluator {
             if (args.size() != 1) throw new EvalError("symbol?: expected 1 arg");
             return args.get(0) instanceof String ? Boolean.TRUE : Boolean.FALSE;
         }));
-        // Arithmetic as builtins
+    }
+
+    private void registerArithmetic(Env env) {
         env.define("+", new BuiltinProc("+", args -> {
             long result = 0;
             for (Object a : args) result += asLong(a);
@@ -234,7 +250,6 @@ public class Evaluator {
             }
             return result;
         }));
-        // Comparisons
         for (String op : new String[]{"<", ">", "=", "<=", ">="}) {
             env.define(op, new BuiltinProc(op, args -> {
                 if (args.size() < 2) throw new EvalError(op + ": need at least 2 arguments");
@@ -259,23 +274,27 @@ public class Evaluator {
             if (args.size() != 1) throw new EvalError("not: expected 1 arg");
             return isTruthy(args.get(0)) ? Boolean.FALSE : Boolean.TRUE;
         }));
-        // L05: display, write, newline
+    }
+
+    private void registerIOOps(Env env) {
         env.define("display", new BuiltinProc("display", args -> {
             if (args.size() != 1) throw new EvalError("display: expected 1 arg");
             outputBuffer.append(displayString(args.get(0)));
-            return Boolean.FALSE; // void
+            return Boolean.FALSE;
         }));
         env.define("write", new BuiltinProc("write", args -> {
             if (args.size() != 1) throw new EvalError("write: expected 1 arg");
             outputBuffer.append(schemeToString(args.get(0)));
-            return Boolean.FALSE; // void
+            return Boolean.FALSE;
         }));
         env.define("newline", new BuiltinProc("newline", args -> {
             if (args.size() != 0) throw new EvalError("newline: expected 0 args");
             outputBuffer.append("\n");
-            return Boolean.FALSE; // void
+            return Boolean.FALSE;
         }));
-        // L05: string operations
+    }
+
+    private void registerStringOps(Env env) {
         env.define("string-append", new BuiltinProc("string-append", args -> {
             StringBuilder sb = new StringBuilder();
             for (Object a : args) {
@@ -329,7 +348,6 @@ public class Evaluator {
             if (args.size() != 1) throw new EvalError("char?: expected 1 arg");
             return args.get(0) instanceof SchemeChar ? Boolean.TRUE : Boolean.FALSE;
         }));
-        // L06: string-copy and string-set!
         env.define("string-copy", new BuiltinProc("string-copy", args -> {
             if (args.size() != 1) throw new EvalError("string-copy: expected 1 arg");
             if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: expected string");
@@ -341,19 +359,224 @@ public class Evaluator {
             int idx = (int) asLong(args.get(1));
             if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: expected char");
             s.setChar(idx, c.value());
-            return Boolean.FALSE; // void
+            return Boolean.FALSE;
         }));
-        // L08: apply
+    }
+
+    private void registerNumericUtils(Env env) {
+        env.define("abs", new BuiltinProc("abs", args -> {
+            if (args.size() != 1) throw new EvalError("abs: expected 1 arg");
+            return Math.abs(asLong(args.get(0)));
+        }));
+        env.define("modulo", new BuiltinProc("modulo", args -> {
+            if (args.size() != 2) throw new EvalError("modulo: expected 2 args");
+            long a = asLong(args.get(0)), b = asLong(args.get(1));
+            return Math.floorMod(a, b);
+        }));
+        env.define("remainder", new BuiltinProc("remainder", args -> {
+            if (args.size() != 2) throw new EvalError("remainder: expected 2 args");
+            long a = asLong(args.get(0)), b = asLong(args.get(1));
+            return a % b;
+        }));
+        env.define("quotient", new BuiltinProc("quotient", args -> {
+            if (args.size() != 2) throw new EvalError("quotient: expected 2 args");
+            long a = asLong(args.get(0)), b = asLong(args.get(1));
+            return a / b;
+        }));
+        env.define("min", new BuiltinProc("min", args -> {
+            if (args.isEmpty()) throw new EvalError("min: need at least 1 argument");
+            long result = asLong(args.get(0));
+            for (int i = 1; i < args.size(); i++) result = Math.min(result, asLong(args.get(i)));
+            return result;
+        }));
+        env.define("max", new BuiltinProc("max", args -> {
+            if (args.isEmpty()) throw new EvalError("max: need at least 1 argument");
+            long result = asLong(args.get(0));
+            for (int i = 1; i < args.size(); i++) result = Math.max(result, asLong(args.get(i)));
+            return result;
+        }));
+        env.define("expt", new BuiltinProc("expt", args -> {
+            if (args.size() != 2) throw new EvalError("expt: expected 2 args");
+            long base = asLong(args.get(0)), exp = asLong(args.get(1));
+            long result = 1;
+            for (long i = 0; i < exp; i++) result *= base;
+            return result;
+        }));
+        env.define("zero?", new BuiltinProc("zero?", args -> {
+            if (args.size() != 1) throw new EvalError("zero?: expected 1 arg");
+            return asLong(args.get(0)) == 0 ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("positive?", new BuiltinProc("positive?", args -> {
+            if (args.size() != 1) throw new EvalError("positive?: expected 1 arg");
+            return asLong(args.get(0)) > 0 ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("negative?", new BuiltinProc("negative?", args -> {
+            if (args.size() != 1) throw new EvalError("negative?: expected 1 arg");
+            return asLong(args.get(0)) < 0 ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("odd?", new BuiltinProc("odd?", args -> {
+            if (args.size() != 1) throw new EvalError("odd?: expected 1 arg");
+            return asLong(args.get(0)) % 2 != 0 ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("even?", new BuiltinProc("even?", args -> {
+            if (args.size() != 1) throw new EvalError("even?: expected 1 arg");
+            return asLong(args.get(0)) % 2 == 0 ? Boolean.TRUE : Boolean.FALSE;
+        }));
+    }
+
+    private void registerListUtils(Env env) {
+        env.define("list-ref", new BuiltinProc("list-ref", args -> {
+            if (args.size() != 2) throw new EvalError("list-ref: expected 2 args");
+            Object lst = args.get(0);
+            int idx = (int) asLong(args.get(1));
+            for (int i = 0; i < idx; i++) {
+                if (!(lst instanceof Pair p)) throw new EvalError("list-ref: index out of range");
+                lst = p.cdr;
+            }
+            if (!(lst instanceof Pair p)) throw new EvalError("list-ref: index out of range");
+            return p.car;
+        }));
+        env.define("list-tail", new BuiltinProc("list-tail", args -> {
+            if (args.size() != 2) throw new EvalError("list-tail: expected 2 args");
+            Object lst = args.get(0);
+            int idx = (int) asLong(args.get(1));
+            for (int i = 0; i < idx; i++) {
+                if (!(lst instanceof Pair p)) throw new EvalError("list-tail: index out of range");
+                lst = p.cdr;
+            }
+            return lst;
+        }));
+        env.define("list?", new BuiltinProc("list?", args -> {
+            if (args.size() != 1) throw new EvalError("list?: expected 1 arg");
+            Object obj = args.get(0);
+            while (obj instanceof Pair p) obj = p.cdr;
+            return obj == EMPTY_LIST ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("assoc", new BuiltinProc("assoc", args -> {
+            if (args.size() != 2) throw new EvalError("assoc: expected 2 args");
+            Object key = args.get(0);
+            Object alist = args.get(1);
+            while (alist instanceof Pair p) {
+                if (p.car instanceof Pair entry && schemeEqual(entry.car, key)) return entry;
+                alist = p.cdr;
+            }
+            return Boolean.FALSE;
+        }));
+    }
+
+    private void registerCharOps(Env env) {
+        env.define("char-alphabetic?", new BuiltinProc("char-alphabetic?", args -> {
+            if (args.size() != 1) throw new EvalError("char-alphabetic?: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-alphabetic?: expected char");
+            return Character.isLetter(c.value()) ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("char-numeric?", new BuiltinProc("char-numeric?", args -> {
+            if (args.size() != 1) throw new EvalError("char-numeric?: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-numeric?: expected char");
+            return Character.isDigit(c.value()) ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("char-upcase", new BuiltinProc("char-upcase", args -> {
+            if (args.size() != 1) throw new EvalError("char-upcase: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-upcase: expected char");
+            return new SchemeChar(Character.toUpperCase(c.value()));
+        }));
+        env.define("char-downcase", new BuiltinProc("char-downcase", args -> {
+            if (args.size() != 1) throw new EvalError("char-downcase: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char-downcase: expected char");
+            return new SchemeChar(Character.toLowerCase(c.value()));
+        }));
+        env.define("char=?", new BuiltinProc("char=?", args -> {
+            if (args.size() != 2) throw new EvalError("char=?: expected 2 args");
+            if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b))
+                throw new EvalError("char=?: expected chars");
+            return a.value() == b.value() ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("char<?", new BuiltinProc("char<?", args -> {
+            if (args.size() != 2) throw new EvalError("char<?: expected 2 args");
+            if (!(args.get(0) instanceof SchemeChar a) || !(args.get(1) instanceof SchemeChar b))
+                throw new EvalError("char<?: expected chars");
+            return a.value() < b.value() ? Boolean.TRUE : Boolean.FALSE;
+        }));
+    }
+
+    private void registerStringComparisons(Env env) {
+        env.define("string=?", new BuiltinProc("string=?", args -> {
+            if (args.size() != 2) throw new EvalError("string=?: expected 2 args");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string=?: expected strings");
+            return a.value().equals(b.value()) ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("string<?", new BuiltinProc("string<?", args -> {
+            if (args.size() != 2) throw new EvalError("string<?: expected 2 args");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string<?: expected strings");
+            return a.value().compareTo(b.value()) < 0 ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("string-ci=?", new BuiltinProc("string-ci=?", args -> {
+            if (args.size() != 2) throw new EvalError("string-ci=?: expected 2 args");
+            if (!(args.get(0) instanceof SchemeString a) || !(args.get(1) instanceof SchemeString b))
+                throw new EvalError("string-ci=?: expected strings");
+            return a.value().equalsIgnoreCase(b.value()) ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("string-upcase", new BuiltinProc("string-upcase", args -> {
+            if (args.size() != 1) throw new EvalError("string-upcase: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-upcase: expected string");
+            return new SchemeString(s.value().toUpperCase());
+        }));
+        env.define("string-downcase", new BuiltinProc("string-downcase", args -> {
+            if (args.size() != 1) throw new EvalError("string-downcase: expected 1 arg");
+            if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-downcase: expected string");
+            return new SchemeString(s.value().toLowerCase());
+        }));
+    }
+
+    private void registerHigherOrder(Env env) {
+        env.define("eq?", new BuiltinProc("eq?", args -> {
+            if (args.size() != 2) throw new EvalError("eq?: expected 2 args");
+            Object a = args.get(0), b = args.get(1);
+            if (a == b) return Boolean.TRUE;
+            if (a instanceof Long && b instanceof Long) return a.equals(b) ? Boolean.TRUE : Boolean.FALSE;
+            if (a instanceof Boolean && b instanceof Boolean) return a.equals(b) ? Boolean.TRUE : Boolean.FALSE;
+            if (a instanceof SchemeChar && b instanceof SchemeChar) return a.equals(b) ? Boolean.TRUE : Boolean.FALSE;
+            if (a instanceof String && b instanceof String) return a.equals(b) ? Boolean.TRUE : Boolean.FALSE;
+            return Boolean.FALSE;
+        }));
+        env.define("equal?", new BuiltinProc("equal?", args -> {
+            if (args.size() != 2) throw new EvalError("equal?: expected 2 args");
+            return schemeEqual(args.get(0), args.get(1)) ? Boolean.TRUE : Boolean.FALSE;
+        }));
+        env.define("map", new BuiltinProc("map", args -> {
+            if (args.size() < 2) throw new EvalError("map: expected at least 2 args");
+            Object proc = args.get(0);
+            int numLists = args.size() - 1;
+            Object[] currents = new Object[numLists];
+            for (int i = 0; i < numLists; i++) currents[i] = args.get(i + 1);
+            List<Object> results = new ArrayList<>();
+            while (true) {
+                boolean allPairs = true;
+                for (Object c : currents) {
+                    if (!(c instanceof Pair)) { allPairs = false; break; }
+                }
+                if (!allPairs) break;
+                List<Object> callArgs = new ArrayList<>();
+                for (int i = 0; i < numLists; i++) {
+                    callArgs.add(((Pair) currents[i]).car);
+                    currents[i] = ((Pair) currents[i]).cdr;
+                }
+                results.add(applyProc(proc, callArgs));
+            }
+            Object result = EMPTY_LIST;
+            for (int i = results.size() - 1; i >= 0; i--) result = new Pair(results.get(i), result);
+            return result;
+        }));
         env.define("apply", new BuiltinProc("apply", args -> {
             if (args.size() < 2) throw new EvalError("apply: expected at least 2 args");
             Object proc = args.get(0);
-            // Last arg must be a list; prefix args are prepended
             Object lastArg = args.get(args.size() - 1);
             List<Object> callArgs = new ArrayList<>();
             for (int i = 1; i < args.size() - 1; i++) {
                 callArgs.add(args.get(i));
             }
-            // Flatten the last argument (a list) into callArgs
             Object rest = lastArg;
             while (rest instanceof Pair p) {
                 callArgs.add(p.car);
@@ -361,7 +584,6 @@ public class Evaluator {
             }
             return applyProc(proc, callArgs);
         }));
-        return env;
     }
 
     // --- Tokenizer ---
@@ -815,6 +1037,18 @@ public class Evaluator {
         return datum;
     }
 
+    private boolean schemeEqual(Object a, Object b) {
+        if (a == b) return true;
+        if (a instanceof Long && b instanceof Long) return a.equals(b);
+        if (a instanceof Boolean && b instanceof Boolean) return a.equals(b);
+        if (a instanceof String && b instanceof String) return a.equals(b);
+        if (a instanceof SchemeString sa && b instanceof SchemeString sb) return sa.value().equals(sb.value());
+        if (a instanceof SchemeChar ca && b instanceof SchemeChar cb) return ca.value() == cb.value();
+        if (a == EMPTY_LIST && b == EMPTY_LIST) return true;
+        if (a instanceof Pair pa && b instanceof Pair pb) return schemeEqual(pa.car, pb.car) && schemeEqual(pa.cdr, pb.cdr);
+        return false;
+    }
+
     private boolean isTruthy(Object val) {
         return !(val instanceof Boolean b && !b);
     }
@@ -845,7 +1079,12 @@ public class Evaluator {
             sb.append(")");
             return sb.toString();
         }
-        if (val instanceof SchemeChar c) return "#\\" + c.value();
+        if (val instanceof SchemeChar c) {
+            if (c.value() == ' ') return "#\\space";
+            if (c.value() == '\n') return "#\\newline";
+            if (c.value() == '\t') return "#\\tab";
+            return "#\\" + c.value();
+        }
         if (val instanceof Lambda) return "#<procedure>";
         if (val instanceof BuiltinProc) return "#<procedure>";
         if (val instanceof String s) return s;
