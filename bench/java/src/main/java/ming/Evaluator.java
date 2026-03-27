@@ -81,7 +81,7 @@ public class Evaluator {
 
     // --- Lambda (closure) ---
 
-    private record Lambda(List<String> params, List<Object> body, Env closureEnv) {}
+    private record Lambda(List<String> params, String restParam, List<Object> body, Env closureEnv) {}
 
     // --- Builtin procedure ---
 
@@ -343,6 +343,24 @@ public class Evaluator {
             s.setChar(idx, c.value());
             return Boolean.FALSE; // void
         }));
+        // L08: apply
+        env.define("apply", new BuiltinProc("apply", args -> {
+            if (args.size() < 2) throw new EvalError("apply: expected at least 2 args");
+            Object proc = args.get(0);
+            // Last arg must be a list; prefix args are prepended
+            Object lastArg = args.get(args.size() - 1);
+            List<Object> callArgs = new ArrayList<>();
+            for (int i = 1; i < args.size() - 1; i++) {
+                callArgs.add(args.get(i));
+            }
+            // Flatten the last argument (a list) into callArgs
+            Object rest = lastArg;
+            while (rest instanceof Pair p) {
+                callArgs.add(p.car);
+                rest = p.cdr;
+            }
+            return applyProc(proc, callArgs);
+        }));
         return env;
     }
 
@@ -559,15 +577,26 @@ public class Evaluator {
                             if (!(first instanceof String fname))
                                 throw new EvalError("define: invalid function signature" + posStr);
                             List<String> params = new ArrayList<>();
+                            String restParam = null;
                             for (int i = 1; i < sig.size(); i++) {
                                 Object p = sig.get(i);
                                 if (p instanceof Located loc) p = loc.expr;
+                                if (p instanceof String pname && pname.equals(".")) {
+                                    if (i + 1 >= sig.size())
+                                        throw new EvalError("define: missing rest parameter after dot" + posStr);
+                                    Object rp = sig.get(i + 1);
+                                    if (rp instanceof Located loc) rp = loc.expr;
+                                    if (!(rp instanceof String rpname))
+                                        throw new EvalError("define: rest parameter must be symbol" + posStr);
+                                    restParam = rpname;
+                                    break;
+                                }
                                 if (!(p instanceof String pname))
                                     throw new EvalError("define: parameter must be symbol" + posStr);
                                 params.add(pname);
                             }
                             List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                            Lambda lambda = new Lambda(params, body, env);
+                            Lambda lambda = new Lambda(params, restParam, body, env);
                             env.define(fname, lambda);
                             return lambda;
                         } else {
@@ -591,14 +620,27 @@ public class Evaluator {
                         if (!(paramSpec instanceof List<?> paramList))
                             throw new EvalError("lambda: params must be a list" + posStr);
                         List<String> params = new ArrayList<>();
-                        for (Object p : paramList) {
+                        String restParam = null;
+                        for (int pi = 0; pi < paramList.size(); pi++) {
+                            Object p = paramList.get(pi);
                             if (p instanceof Located loc) p = loc.expr;
+                            if (p instanceof String pname && pname.equals(".")) {
+                                // Next element is rest param
+                                if (pi + 1 >= paramList.size())
+                                    throw new EvalError("lambda: missing rest parameter after dot" + posStr);
+                                Object rp = paramList.get(pi + 1);
+                                if (rp instanceof Located loc) rp = loc.expr;
+                                if (!(rp instanceof String rpname))
+                                    throw new EvalError("lambda: rest parameter must be symbol" + posStr);
+                                restParam = rpname;
+                                break;
+                            }
                             if (!(p instanceof String pname))
                                 throw new EvalError("lambda: parameter must be symbol" + posStr);
                             params.add(pname);
                         }
                         List<Object> body = new ArrayList<>(list.subList(2, list.size()));
-                        return new Lambda(params, body, env);
+                        return new Lambda(params, restParam, body, env);
                     }
                     case "and" -> {
                         Object result = Boolean.TRUE;
@@ -679,7 +721,7 @@ public class Evaluator {
                         Env letEnv = new Env(env);
                         if (namedLetName != null) {
                             List<Object> bodyExprs = new ArrayList<>(list.subList(bindingsIdx + 1, list.size()));
-                            Lambda loopLambda = new Lambda(varNames, bodyExprs, letEnv);
+                            Lambda loopLambda = new Lambda(varNames, null, bodyExprs, letEnv);
                             letEnv.define(namedLetName, loopLambda);
                             for (int i = 0; i < varNames.size(); i++) {
                                 letEnv.define(varNames.get(i), eval(initExprs.get(i), env));
@@ -716,13 +758,28 @@ public class Evaluator {
 
     private Object applyProc(Object proc, List<Object> args) throws EvalError {
         if (proc instanceof Lambda lambda) {
-            if (args.size() != lambda.params.size()) {
-                throw new EvalError("wrong number of arguments: expected " +
-                        lambda.params.size() + ", got " + args.size());
+            if (lambda.restParam != null) {
+                if (args.size() < lambda.params.size()) {
+                    throw new EvalError("wrong number of arguments: expected at least " +
+                            lambda.params.size() + ", got " + args.size());
+                }
+            } else {
+                if (args.size() != lambda.params.size()) {
+                    throw new EvalError("wrong number of arguments: expected " +
+                            lambda.params.size() + ", got " + args.size());
+                }
             }
             Env callEnv = new Env(lambda.closureEnv);
             for (int i = 0; i < lambda.params.size(); i++) {
                 callEnv.define(lambda.params.get(i), args.get(i));
+            }
+            if (lambda.restParam != null) {
+                // Build list from remaining args
+                Object rest = EMPTY_LIST;
+                for (int i = args.size() - 1; i >= lambda.params.size(); i--) {
+                    rest = new Pair(args.get(i), rest);
+                }
+                callEnv.define(lambda.restParam, rest);
             }
             return evalBody(lambda.body, callEnv);
         }
