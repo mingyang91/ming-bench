@@ -2,7 +2,7 @@ use super::{
     eval_program,
     number::{parse_number_token, Number, Rational},
     values_eq, values_equal, BuiltinFn, EnvRef, Environment, EvalError, EvaluatedArg, Expr,
-    PairValue, Procedure, RecordType, RecordValue, SchemeString, Value,
+    PairValue, Procedure, RecordType, RecordValue, SchemeString, Value, VectorValue,
 };
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
@@ -26,6 +26,7 @@ pub(super) fn default_env() -> EnvRef {
         ("<=", apply_lte as BuiltinFn),
         ("not", apply_not as BuiltinFn),
         ("eq?", apply_eq_pred as BuiltinFn),
+        ("eqv?", apply_eqv_pred as BuiltinFn),
         ("equal?", apply_equal_pred as BuiltinFn),
         ("cons", apply_cons as BuiltinFn),
         ("car", apply_car as BuiltinFn),
@@ -39,6 +40,14 @@ pub(super) fn default_env() -> EnvRef {
         ("assoc", apply_assoc as BuiltinFn),
         ("append", apply_append as BuiltinFn),
         ("map", apply_map as BuiltinFn),
+        ("vector", apply_vector as BuiltinFn),
+        ("make-vector", apply_make_vector as BuiltinFn),
+        ("vector-ref", apply_vector_ref as BuiltinFn),
+        ("vector-set!", apply_vector_set as BuiltinFn),
+        ("vector-length", apply_vector_length as BuiltinFn),
+        ("vector?", apply_vector_pred as BuiltinFn),
+        ("vector->list", apply_vector_to_list as BuiltinFn),
+        ("list->vector", apply_list_to_vector as BuiltinFn),
         ("zero?", apply_zero_pred as BuiltinFn),
         ("positive?", apply_positive_pred as BuiltinFn),
         ("negative?", apply_negative_pred as BuiltinFn),
@@ -572,6 +581,18 @@ fn apply_eq_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, E
     Ok(Value::Bool(values_eq(&left.value, &right.value)))
 }
 
+fn apply_eqv_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [left, right] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "eqv?",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(values_eq(&left.value, &right.value)))
+}
+
 fn apply_equal_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
     let [left, right] = args else {
         return Err(EvalError::WrongArgCount {
@@ -819,6 +840,112 @@ fn apply_map(args: &[EvaluatedArg], output: &mut String) -> Result<Value, EvalEr
     }
 
     Ok(Value::List(results))
+}
+
+fn apply_vector(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    Ok(Value::Vector(Rc::new(VectorValue {
+        elements: RefCell::new(args.iter().map(|arg| arg.value.clone()).collect()),
+    })))
+}
+
+fn apply_make_vector(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let (size_arg, fill) = match args {
+        [size] => (size, Value::Void),
+        [size, fill] => (size, fill.value.clone()),
+        _ => {
+            return Err(EvalError::WrongArgCount {
+                name: "make-vector",
+                expected: "1 or 2",
+                got: args.len(),
+            });
+        }
+    };
+
+    let len = parse_length_arg(size_arg)?;
+    Ok(Value::Vector(Rc::new(VectorValue {
+        elements: RefCell::new(vec![fill; len]),
+    })))
+}
+
+fn apply_vector_ref(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [vector, index] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-ref",
+            expected: "exactly 2",
+            got: args.len(),
+        });
+    };
+
+    let vector = vector.as_vector()?;
+    let elements = vector.elements.borrow();
+    let index = parse_index_arg(index, elements.len())?;
+    Ok(elements[index].clone())
+}
+
+fn apply_vector_set(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [vector, index, value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-set!",
+            expected: "exactly 3",
+            got: args.len(),
+        });
+    };
+
+    let vector = vector.as_vector()?;
+    let mut elements = vector.elements.borrow_mut();
+    let index = parse_index_arg(index, elements.len())?;
+    elements[index] = value.value.clone();
+    Ok(Value::Void)
+}
+
+fn apply_vector_length(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [vector] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector-length",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(exact_int(vector.as_vector()?.elements.borrow().len() as i64))
+}
+
+fn apply_vector_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [value] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector?",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Bool(matches!(&value.value, Value::Vector(_))))
+}
+
+fn apply_vector_to_list(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [vector] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "vector->list",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::List(vector.as_vector()?.elements.borrow().clone()))
+}
+
+fn apply_list_to_vector(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
+    let [list] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "list->vector",
+            expected: "exactly 1",
+            got: args.len(),
+        });
+    };
+
+    Ok(Value::Vector(Rc::new(VectorValue {
+        elements: RefCell::new(list.as_list()?.to_vec()),
+    })))
 }
 
 fn apply_string_pred(args: &[EvaluatedArg], _output: &mut String) -> Result<Value, EvalError> {
@@ -1449,6 +1576,17 @@ fn apply_char_comparison(
 
 fn parse_index_arg(arg: &EvaluatedArg, len: usize) -> Result<usize, EvalError> {
     parse_index_bound(arg, len, false)
+}
+
+fn parse_length_arg(arg: &EvaluatedArg) -> Result<usize, EvalError> {
+    let len = arg.as_int()?;
+    usize::try_from(len).map_err(|_| {
+        EvalError::TypeMismatch {
+            expected: "non-negative integer",
+            found: arg.value.render(),
+        }
+        .with_position(arg.pos.line, arg.pos.col)
+    })
 }
 
 fn parse_index_bound(arg: &EvaluatedArg, len: usize, allow_end: bool) -> Result<usize, EvalError> {

@@ -116,6 +116,12 @@ impl EvaluatedArg {
             .as_char()
             .map_err(|error| error.with_position(self.pos.line, self.pos.col))
     }
+
+    fn as_vector(&self) -> Result<Rc<VectorValue>, EvalError> {
+        self.value
+            .as_vector()
+            .map_err(|error| error.with_position(self.pos.line, self.pos.col))
+    }
 }
 
 #[derive(Clone)]
@@ -127,8 +133,10 @@ enum Value {
     Symbol(String),
     List(Vec<Value>),
     Pair(Rc<PairValue>),
+    Vector(Rc<VectorValue>),
     Record(Rc<RecordValue>),
     Procedure(Rc<Procedure>),
+    Uninitialized,
     Void,
 }
 
@@ -136,6 +144,10 @@ enum Value {
 struct PairValue {
     head: Value,
     tail: Value,
+}
+
+struct VectorValue {
+    elements: RefCell<Vec<Value>>,
 }
 
 struct RecordType {
@@ -379,6 +391,16 @@ impl Value {
         }
     }
 
+    fn as_vector(&self) -> Result<Rc<VectorValue>, EvalError> {
+        match self {
+            Self::Vector(value) => Ok(value.clone()),
+            _ => Err(EvalError::TypeMismatch {
+                expected: "vector",
+                found: self.render(),
+            }),
+        }
+    }
+
     fn render(&self) -> String {
         render_value(self, RenderMode::Write)
     }
@@ -410,8 +432,10 @@ fn render_value(value: &Value, mode: RenderMode) -> String {
         Value::Symbol(value) => value.clone(),
         Value::List(items) => render_list(items, mode),
         Value::Pair(pair) => render_pair(pair, mode),
+        Value::Vector(vector) => render_vector(vector, mode),
         Value::Record(record) => format!("#<record:{}>", record.record_type.name),
         Value::Procedure(_) => "#<procedure>".to_string(),
+        Value::Uninitialized => "#<uninitialized>".to_string(),
         Value::Void => "#<void>".to_string(),
     }
 }
@@ -446,6 +470,17 @@ fn render_pair(pair: &PairValue, mode: RenderMode) -> String {
     }
 }
 
+fn render_vector(vector: &VectorValue, mode: RenderMode) -> String {
+    let rendered = vector
+        .elements
+        .borrow()
+        .iter()
+        .map(|value| render_value(value, mode))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("#({rendered})")
+}
+
 fn values_eq(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Bool(left), Value::Bool(right)) => left == right,
@@ -460,8 +495,10 @@ fn values_eq(left: &Value, right: &Value) -> bool {
                 || (left.len() == right.len() && left.as_ptr() == right.as_ptr())
         }
         (Value::Pair(left), Value::Pair(right)) => Rc::ptr_eq(left, right),
+        (Value::Vector(left), Value::Vector(right)) => Rc::ptr_eq(left, right),
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -488,8 +525,18 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Pair(left), Value::Pair(right)) => {
             values_equal(&left.head, &right.head) && values_equal(&left.tail, &right.tail)
         }
+        (Value::Vector(left), Value::Vector(right)) => {
+            let left_items = left.elements.borrow();
+            let right_items = right.elements.borrow();
+            left_items.len() == right_items.len()
+                && left_items
+                    .iter()
+                    .zip(right_items.iter())
+                    .all(|(left, right)| values_equal(left, right))
+        }
         (Value::Record(left), Value::Record(right)) => Rc::ptr_eq(left, right),
         (Value::Procedure(left), Value::Procedure(right)) => Rc::ptr_eq(left, right),
+        (Value::Uninitialized, Value::Uninitialized) => true,
         (Value::Void, Value::Void) => true,
         _ => false,
     }
@@ -559,10 +606,17 @@ fn eval(expr: &Expr, env: EnvRef, output: &mut String) -> Result<Value, EvalErro
         Expr::Number { value, .. } => Ok(Value::Number(*value)),
         Expr::Char { value, .. } => Ok(Value::Char(*value)),
         Expr::String { value, .. } => Ok(Value::String(SchemeString::immutable(value))),
-        Expr::Symbol { name, pos } => env
-            .lookup(name)
-            .ok_or_else(|| EvalError::UnboundSymbol { name: name.clone() })
-            .map_err(|error| error.with_position(pos.line, pos.col)),
+        Expr::Symbol { name, pos } => {
+            match env.lookup(name) {
+                Some(Value::Uninitialized) => {
+                    Err(EvalError::UninitializedBinding { name: name.clone() }
+                        .with_position(pos.line, pos.col))
+                }
+                Some(value) => Ok(value),
+                None => Err(EvalError::UnboundSymbol { name: name.clone() }
+                    .with_position(pos.line, pos.col)),
+            }
+        }
         Expr::List { items, pos } => with_position(eval_list(items, env, output), *pos),
     }
 }
@@ -593,8 +647,17 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
         Expr::Symbol { name, .. } if name == "cond" => {
             with_position(eval_cond(args, env, output), head_pos)
         }
+        Expr::Symbol { name, .. } if name == "case" => {
+            with_position(eval_case(args, env, output), head_pos)
+        }
         Expr::Symbol { name, .. } if name == "let" => {
             with_position(eval_let(args, env, output), head_pos)
+        }
+        Expr::Symbol { name, .. } if name == "letrec" => {
+            with_position(eval_letrec(args, env, output, false), head_pos)
+        }
+        Expr::Symbol { name, .. } if name == "letrec*" => {
+            with_position(eval_letrec(args, env, output, true), head_pos)
         }
         Expr::Symbol { name, .. } if name == "lambda" => {
             with_position(eval_lambda(args, env), head_pos)
@@ -613,6 +676,9 @@ fn eval_list(items: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, 
         }
         Expr::Symbol { name, .. } if name == "set!" => {
             with_position(eval_set(args, env, output), head_pos)
+        }
+        Expr::Symbol { name, .. } if name == "do" => {
+            with_position(eval_do(args, env, output), head_pos)
         }
         Expr::Symbol { name, .. } => {
             if let Some(transformer) = env.lookup_macro(name) {
@@ -681,18 +747,26 @@ fn eval_or(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, Eva
 }
 
 fn eval_if(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
-    let [condition, consequent, alternate] = args else {
-        return Err(EvalError::WrongArgCount {
+    match args {
+        [condition, consequent] => {
+            if eval(condition, env.clone(), output)?.is_truthy() {
+                eval(consequent, env, output)
+            } else {
+                Ok(Value::Void)
+            }
+        }
+        [condition, consequent, alternate] => {
+            if eval(condition, env.clone(), output)?.is_truthy() {
+                eval(consequent, env, output)
+            } else {
+                eval(alternate, env, output)
+            }
+        }
+        _ => Err(EvalError::WrongArgCount {
             name: "if",
-            expected: "exactly 3",
+            expected: "2 or 3",
             got: args.len(),
-        });
-    };
-
-    if eval(condition, env.clone(), output)?.is_truthy() {
-        eval(consequent, env, output)
-    } else {
-        eval(alternate, env, output)
+        }),
     }
 }
 
@@ -738,6 +812,67 @@ fn eval_cond(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, E
         if test_value.is_truthy() {
             return if body.is_empty() {
                 Ok(test_value)
+            } else {
+                eval_program(body, env.clone(), output)
+            };
+        }
+    }
+
+    Ok(Value::Void)
+}
+
+fn eval_case(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    let Some((key_expr, clauses)) = args.split_first() else {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name: "case",
+            min: 2,
+            got: 0,
+        });
+    };
+
+    if clauses.is_empty() {
+        return Err(EvalError::WrongArgCountAtLeast {
+            name: "case",
+            min: 2,
+            got: 1,
+        });
+    }
+
+    let key = eval(key_expr, env.clone(), output)?;
+    for clause in clauses {
+        let Expr::List { items, .. } = clause else {
+            return Err(EvalError::ParseError {
+                message: "case clauses must be lists".to_string(),
+            });
+        };
+
+        let Some((datum_expr, body)) = items.split_first() else {
+            return Err(EvalError::ParseError {
+                message: "case clauses cannot be empty".to_string(),
+            });
+        };
+
+        if matches!(datum_expr, Expr::Symbol { name, .. } if name == "else") {
+            return if body.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_program(body, env.clone(), output)
+            };
+        }
+
+        let Expr::List { items: datums, .. } = datum_expr else {
+            return Err(EvalError::ParseError {
+                message: "case clause datums must be a list".to_string(),
+            });
+        };
+
+        if datums
+            .iter()
+            .map(builtins::quote_expr)
+            .any(|datum| values_eq(&key, &datum))
+        {
+            return if body.is_empty() {
+                Ok(Value::Void)
             } else {
                 eval_program(body, env.clone(), output)
             };
@@ -815,6 +950,59 @@ fn eval_let(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, Ev
     }
 }
 
+fn eval_letrec(
+    args: &[Expr],
+    env: EnvRef,
+    output: &mut String,
+    sequential: bool,
+) -> Result<Value, EvalError> {
+    let form_name = if sequential { "letrec*" } else { "letrec" };
+
+    let [bindings_expr, body @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: form_name,
+            expected: "at least 2",
+            got: args.len(),
+        });
+    };
+
+    if body.is_empty() {
+        return Err(EvalError::WrongArgCount {
+            name: form_name,
+            expected: "at least 2",
+            got: 1,
+        });
+    }
+
+    let bindings = macros::parse_let_bindings(bindings_expr)?;
+    let letrec_env = Environment::new(Some(env));
+    let binding_refs = bindings
+        .iter()
+        .map(|(name, _)| {
+            let binding = Rc::new(RefCell::new(Value::Uninitialized));
+            letrec_env.define_alias(name.clone(), binding.clone());
+            binding
+        })
+        .collect::<Vec<_>>();
+
+    if sequential {
+        for ((_, expr), binding) in bindings.iter().zip(binding_refs.iter()) {
+            let value = eval(expr, letrec_env.clone(), output)?;
+            *binding.borrow_mut() = value;
+        }
+    } else {
+        let values = bindings
+            .iter()
+            .map(|(_, expr)| eval(expr, letrec_env.clone(), output))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (binding, value) in binding_refs.iter().zip(values.into_iter()) {
+            *binding.borrow_mut() = value;
+        }
+    }
+
+    eval_program(body, letrec_env, output)
+}
+
 fn eval_lambda(args: &[Expr], env: EnvRef) -> Result<Value, EvalError> {
     let Some((params_expr, body)) = args.split_first() else {
         return Err(EvalError::WrongArgCount {
@@ -882,6 +1070,122 @@ fn parse_case_lambda_clause(clause_expr: &Expr) -> Result<CaseLambdaClause, Eval
         params: macros::parse_lambda_params(params_expr)?,
         body: body.to_vec(),
     })
+}
+
+struct DoBinding {
+    name: String,
+    init: Expr,
+    step: Option<Expr>,
+}
+
+fn eval_do(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {
+    let [bindings_expr, end_expr, body @ ..] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "do",
+            expected: "at least 2",
+            got: args.len(),
+        });
+    };
+
+    let bindings = parse_do_bindings(bindings_expr)?;
+    let (test_expr, result_exprs) = parse_do_end_clause(end_expr)?;
+
+    let init_values = bindings
+        .iter()
+        .map(|binding| eval(&binding.init, env.clone(), output))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let do_env = Environment::new(Some(env));
+    let binding_refs = bindings
+        .iter()
+        .zip(init_values)
+        .map(|(binding, value)| {
+            let cell = Rc::new(RefCell::new(value));
+            do_env.define_alias(binding.name.clone(), cell.clone());
+            cell
+        })
+        .collect::<Vec<_>>();
+
+    loop {
+        if eval(&test_expr, do_env.clone(), output)?.is_truthy() {
+            return if result_exprs.is_empty() {
+                Ok(Value::Void)
+            } else {
+                eval_program(&result_exprs, do_env.clone(), output)
+            };
+        }
+
+        if !body.is_empty() {
+            let _ = eval_program(body, do_env.clone(), output)?;
+        }
+
+        let next_values = bindings
+            .iter()
+            .zip(binding_refs.iter())
+            .map(|(binding, current)| match &binding.step {
+                Some(step_expr) => eval(step_expr, do_env.clone(), output),
+                None => Ok(current.borrow().clone()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (binding, value) in binding_refs.iter().zip(next_values.into_iter()) {
+            *binding.borrow_mut() = value;
+        }
+    }
+}
+
+fn parse_do_bindings(expr: &Expr) -> Result<Vec<DoBinding>, EvalError> {
+    let Expr::List {
+        items: bindings, ..
+    } = expr
+    else {
+        return Err(EvalError::ParseError {
+            message: "do bindings must be a list".to_string(),
+        });
+    };
+
+    bindings
+        .iter()
+        .map(|binding| {
+            let Expr::List { items, .. } = binding else {
+                return Err(EvalError::ParseError {
+                    message: "do bindings must be (name init [step]) lists".to_string(),
+                });
+            };
+
+            match items.as_slice() {
+                [Expr::Symbol { name, .. }, init] => Ok(DoBinding {
+                    name: name.clone(),
+                    init: init.clone(),
+                    step: None,
+                }),
+                [Expr::Symbol { name, .. }, init, step] => Ok(DoBinding {
+                    name: name.clone(),
+                    init: init.clone(),
+                    step: Some(step.clone()),
+                }),
+                _ => Err(EvalError::ParseError {
+                    message: "do bindings must be (name init [step]) lists".to_string(),
+                }),
+            }
+        })
+        .collect()
+}
+
+fn parse_do_end_clause(expr: &Expr) -> Result<(Expr, Vec<Expr>), EvalError> {
+    let Expr::List { items, .. } = expr else {
+        return Err(EvalError::ParseError {
+            message: "do termination clause must be a list".to_string(),
+        });
+    };
+
+    let Some((test, result_exprs)) = items.split_first() else {
+        return Err(EvalError::ParseError {
+            message: "do termination clause cannot be empty".to_string(),
+        });
+    };
+
+    Ok((test.clone(), result_exprs.to_vec()))
 }
 
 fn eval_define(args: &[Expr], env: EnvRef, output: &mut String) -> Result<Value, EvalError> {

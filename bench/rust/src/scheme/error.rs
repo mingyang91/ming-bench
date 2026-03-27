@@ -23,6 +23,9 @@ pub enum EvalError {
     #[error("unbound symbol: {name}")]
     UnboundSymbol { name: String },
 
+    #[error("uninitialized binding: {name}")]
+    UninitializedBinding { name: String },
+
     #[error("not a procedure: {found}")]
     NotAProcedure { found: String },
 
