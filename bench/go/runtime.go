@@ -37,9 +37,11 @@ type builtinProc struct {
 }
 
 type closureValue struct {
-	params []string
-	body   []locatedExpr
-	env    *env
+	params    []string
+	restParam string
+	hasRest   bool
+	body      []locatedExpr
+	env       *env
 }
 
 type letBinding struct {
@@ -226,13 +228,20 @@ func (closureValue) isTruthy() bool {
 }
 
 func (p closureValue) call(args []value) (value, error) {
-	if len(args) != len(p.params) {
+	if p.hasRest {
+		if len(args) < len(p.params) {
+			return nil, newCurrentEvalError("expected at least %d arguments, got %d", len(p.params), len(args))
+		}
+	} else if len(args) != len(p.params) {
 		return nil, newCurrentEvalError("expected %d arguments, got %d", len(p.params), len(args))
 	}
 
 	callEnv := newEnv(p.env)
 	for i, name := range p.params {
 		callEnv.define(name, args[i])
+	}
+	if p.hasRest {
+		callEnv.define(p.restParam, listFromValues(args[len(p.params):]))
 	}
 
 	return evalSequence(p.body, callEnv)
@@ -303,6 +312,7 @@ func newGlobalEnv() *env {
 	global.define("display", builtinProc{name: "display", fn: evalDisplay})
 	global.define("write", builtinProc{name: "write", fn: evalWrite})
 	global.define("newline", builtinProc{name: "newline", fn: evalNewline})
+	global.define("apply", builtinProc{name: "apply", fn: evalApply})
 	global.define("string-append", builtinProc{name: "string-append", fn: evalStringAppend})
 	global.define("string-length", builtinProc{name: "string-length", fn: evalStringLength})
 	global.define("substring", builtinProc{name: "substring", fn: evalSubstring})
@@ -511,15 +521,17 @@ func evalDefine(parts []locatedExpr, env *env) (value, error) {
 			return nil, newEvalError(target[0].pos, "function name must be a symbol")
 		}
 
-		params, err := parseParams(target[1:])
+		formals, err := parseFormalsList(target[1:])
 		if err != nil {
 			return nil, err
 		}
 
 		proc := closureValue{
-			params: params,
-			body:   parts[1:],
-			env:    env,
+			params:    formals.params,
+			restParam: formals.restParam,
+			hasRest:   formals.hasRest,
+			body:      parts[1:],
+			env:       env,
 		}
 		env.define(string(name), proc)
 		return voidValue{}, nil
@@ -562,20 +574,17 @@ func evalLambda(parts []locatedExpr, env *env) (value, error) {
 		return nil, newCurrentEvalError("'lambda' expects a parameter list and body")
 	}
 
-	paramExprs, ok := parts[0].form.(listExpr)
-	if !ok {
-		return nil, newEvalError(parts[0].pos, "'lambda' parameter list must be a list")
-	}
-
-	params, err := parseParams(paramExprs)
+	formals, err := parseFormalsExpr(parts[0])
 	if err != nil {
 		return nil, err
 	}
 
 	return closureValue{
-		params: params,
-		body:   parts[1:],
-		env:    env,
+		params:    formals.params,
+		restParam: formals.restParam,
+		hasRest:   formals.hasRest,
+		body:      parts[1:],
+		env:       env,
 	}, nil
 }
 
@@ -674,21 +683,71 @@ func evalLet(parts []locatedExpr, env *env) (value, error) {
 	return evalSequence(parts[1:], letEnv)
 }
 
-func parseParams(items []locatedExpr) ([]string, error) {
-	params := make([]string, 0, len(items))
+type formalsSpec struct {
+	params    []string
+	restParam string
+	hasRest   bool
+}
+
+func parseFormalsExpr(e locatedExpr) (formalsSpec, error) {
+	switch formals := e.form.(type) {
+	case listExpr:
+		return parseFormalsList(formals)
+	case symbolExpr:
+		if string(formals) == "." {
+			return formalsSpec{}, newEvalError(e.pos, "parameter name must be a symbol")
+		}
+		return formalsSpec{
+			restParam: string(formals),
+			hasRest:   true,
+		}, nil
+	default:
+		return formalsSpec{}, newEvalError(e.pos, "'lambda' parameter list must be a list or symbol")
+	}
+}
+
+func parseFormalsList(items []locatedExpr) (formalsSpec, error) {
+	formals := formalsSpec{
+		params: make([]string, 0, len(items)),
+	}
 	seen := make(map[string]struct{}, len(items))
-	for _, item := range items {
+
+	addName := func(item locatedExpr) (string, error) {
 		name, ok := item.form.(symbolExpr)
-		if !ok {
-			return nil, newEvalError(item.pos, "parameter name must be a symbol")
+		if !ok || string(name) == "." {
+			return "", newEvalError(item.pos, "parameter name must be a symbol")
 		}
 		if _, exists := seen[string(name)]; exists {
-			return nil, newEvalError(item.pos, "duplicate parameter: %s", string(name))
+			return "", newEvalError(item.pos, "duplicate parameter: %s", string(name))
 		}
 		seen[string(name)] = struct{}{}
-		params = append(params, string(name))
+		return string(name), nil
 	}
-	return params, nil
+
+	for i, item := range items {
+		name, ok := item.form.(symbolExpr)
+		if ok && string(name) == "." {
+			if formals.hasRest || i != len(items)-2 {
+				return formalsSpec{}, newEvalError(item.pos, "invalid dotted parameter list")
+			}
+
+			restName, err := addName(items[i+1])
+			if err != nil {
+				return formalsSpec{}, err
+			}
+			formals.restParam = restName
+			formals.hasRest = true
+			return formals, nil
+		}
+
+		paramName, err := addName(item)
+		if err != nil {
+			return formalsSpec{}, err
+		}
+		formals.params = append(formals.params, paramName)
+	}
+
+	return formals, nil
 }
 
 func parseLetBindings(items listExpr) ([]letBinding, error) {
@@ -1015,6 +1074,28 @@ func evalNewline(args []value) (value, error) {
 	return voidValue{}, nil
 }
 
+func evalApply(args []value) (value, error) {
+	if len(args) < 2 {
+		return nil, newCurrentEvalError("'apply' expects at least 2 arguments")
+	}
+
+	proc, ok := args[0].(procedure)
+	if !ok {
+		return nil, newCurrentEvalError("'apply' expects a procedure, got %s", args[0].schemeString())
+	}
+
+	tailArgs, err := properListElements(args[len(args)-1])
+	if err != nil {
+		return nil, err
+	}
+
+	flatArgs := make([]value, 0, len(args)-2+len(tailArgs))
+	flatArgs = append(flatArgs, args[1:len(args)-1]...)
+	flatArgs = append(flatArgs, tailArgs...)
+
+	return proc.call(flatArgs)
+}
+
 func evalStringAppend(args []value) (value, error) {
 	var builder strings.Builder
 	for _, arg := range args {
@@ -1210,6 +1291,17 @@ func appendOutput(text string) {
 	if currentOutput != nil {
 		currentOutput.WriteString(text)
 	}
+}
+
+func listFromValues(items []value) value {
+	result := value(emptyList)
+	for i := len(items) - 1; i >= 0; i-- {
+		result = pairValue{
+			car: items[i],
+			cdr: result,
+		}
+	}
+	return result
 }
 
 func properListElements(v value) ([]value, error) {
