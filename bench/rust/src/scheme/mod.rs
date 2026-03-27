@@ -1,4 +1,5 @@
 mod builtins;
+mod continuation;
 pub mod error;
 mod macros;
 mod number;
@@ -13,6 +14,10 @@ use number::Number;
 use parser::Parser;
 use record::{define_record_type as eval_define_record_type, NativeProcedure, RecordRef};
 use render::{render_display_value, render_value};
+use continuation::{
+    final_continuation, sequence_continuation, Continuation, ContinuationRef, EvalResult,
+    EvalSignal,
+};
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -62,6 +67,7 @@ enum Value {
     Procedure(Rc<Procedure>),
     NativeProcedure(Rc<NativeProcedure>),
     Builtin(Builtin),
+    Continuation(ContinuationRef),
     Record(RecordRef),
     Uninitialized,
     Void,
@@ -114,6 +120,7 @@ enum BuiltinKind {
     Append,
     Reverse,
     Apply,
+    CallCc,
     EqPred,
     EqvPred,
     EqualPred,
@@ -241,7 +248,10 @@ impl Value {
             Self::Pair(_) => "pair",
             Self::List(_) => "list",
             Self::Vector(_) => "vector",
-            Self::Procedure(_) | Self::NativeProcedure(_) | Self::Builtin(_) => "procedure",
+            Self::Procedure(_)
+            | Self::NativeProcedure(_)
+            | Self::Builtin(_)
+            | Self::Continuation(_) => "procedure",
             Self::Record(_) => "record",
             Self::Uninitialized => "uninitialized",
             Self::Void => "void",
@@ -405,8 +415,8 @@ impl Builtin {
         Self { kind, output }
     }
 
-    fn apply(&self, args: &[Value]) -> Result<Value, EvalError> {
-        builtins::apply_builtin(self.kind, args, &self.output)
+    fn apply(&self, args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value> {
+        builtins::apply_builtin(self.kind, args, &self.output, continuation)
     }
 }
 
@@ -435,6 +445,7 @@ impl BuiltinKind {
             Self::Append => "append",
             Self::Reverse => "reverse",
             Self::Apply => "apply",
+            Self::CallCc => "call/cc",
             Self::EqPred => "eq?",
             Self::EqvPred => "eqv?",
             Self::EqualPred => "equal?",
@@ -585,6 +596,152 @@ impl OwnedExprRef {
     }
 }
 
+fn run_expr_in_cont(
+    expr: &Expr,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    continuation: ContinuationRef,
+) -> EvalResult<Value> {
+    eval_expr(expr, env, macro_env, &continuation)
+}
+
+fn run_sequence_in_cont(
+    exprs: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    continuation: ContinuationRef,
+) -> EvalResult<Value> {
+    let Some((last, prefix)) = exprs.split_last() else {
+        return continue_with(continuation, Value::Void);
+    };
+
+    for (index, expr) in prefix.iter().enumerate() {
+        run_expr_in_cont(
+            expr,
+            env,
+            macro_env,
+            sequence_continuation(&exprs[index + 1..], env, macro_env, &continuation),
+        )?;
+    }
+
+    let value = eval_expr(last, env, macro_env, &continuation)?;
+    continue_with(continuation, value)
+}
+
+fn run_callable_in_cont(
+    callable: Value,
+    args: &[Value],
+    head_position: SourcePos,
+    continuation: ContinuationRef,
+) -> EvalResult<Value> {
+    let value =
+        apply_callable(callable, args, &continuation).map_err(|signal| signal.with_position(head_position))?;
+    continue_with(continuation, value)
+}
+
+fn continue_with(mut continuation: ContinuationRef, mut value: Value) -> EvalResult<Value> {
+    loop {
+        match continuation.as_ref() {
+            Continuation::Final => return Ok(value),
+            Continuation::Define { env, name, next } => {
+                env_define(env, name.clone(), value);
+                value = Value::Void;
+                continuation = Rc::clone(next);
+            }
+            Continuation::SetSymbol { env, name, next } => {
+                if !env_set(env, name, value) {
+                    return Err(EvalError::UnboundVariable { name: name.clone() }.into());
+                }
+                value = Value::Void;
+                continuation = Rc::clone(next);
+            }
+            Continuation::SetCaptured { binding, next } => {
+                *binding.borrow_mut() = value;
+                value = Value::Void;
+                continuation = Rc::clone(next);
+            }
+            Continuation::Sequence {
+                remaining,
+                env,
+                macro_env,
+                next,
+            } => {
+                return run_sequence_in_cont(remaining, env, macro_env, Rc::clone(next));
+            }
+            Continuation::Application {
+                callable,
+                pending_args,
+                evaluated_suffix,
+                env,
+                macro_env,
+                head_position,
+                next,
+            } => {
+                let mut args = Vec::with_capacity(pending_args.len() + evaluated_suffix.len() + 1);
+                args.push(value);
+                args.extend(evaluated_suffix.iter().cloned());
+
+                for index in (0..pending_args.len()).rev() {
+                    let arg = run_expr_in_cont(
+                        &pending_args[index],
+                        env,
+                        macro_env,
+                        Rc::new(Continuation::Application {
+                            callable: callable.clone(),
+                            pending_args: pending_args[..index].to_vec(),
+                            evaluated_suffix: args.clone(),
+                            env: Rc::clone(env),
+                            macro_env: Rc::clone(macro_env),
+                            head_position: *head_position,
+                            next: Rc::clone(next),
+                        }),
+                    )?;
+                    args.insert(0, arg);
+                }
+
+                return run_callable_in_cont(
+                    callable.clone(),
+                    &args,
+                    *head_position,
+                    Rc::clone(next),
+                );
+            }
+        }
+    }
+}
+
+fn eval_application_step<'a>(
+    callable: Value,
+    arg_exprs: &[Expr],
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    head_position: SourcePos,
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
+    let mut args = Vec::with_capacity(arg_exprs.len());
+
+    for index in (0..arg_exprs.len()).rev() {
+        let arg = run_expr_in_cont(
+            &arg_exprs[index],
+            env,
+            macro_env,
+            Rc::new(Continuation::Application {
+                callable: callable.clone(),
+                pending_args: arg_exprs[..index].to_vec(),
+                evaluated_suffix: args.clone(),
+                env: Rc::clone(env),
+                macro_env: Rc::clone(macro_env),
+                head_position,
+                next: Rc::clone(continuation),
+            }),
+        )?;
+        args.insert(0, arg);
+    }
+
+    special_forms::apply_callable_result(callable, &args, continuation)
+        .map_err(|signal| signal.with_position(head_position))
+}
+
 fn wrap_procedure_body(body: Vec<Expr>) -> Rc<Expr> {
     match body.len() {
         0 => unreachable!("procedure bodies must not be empty"),
@@ -621,8 +778,12 @@ fn single_clause_procedure(
     )
 }
 
-fn apply_callable(callable: Value, args: &[Value]) -> Result<Value, EvalError> {
-    special_forms::apply_callable(callable, args)
+fn apply_callable(
+    callable: Value,
+    args: &[Value],
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    special_forms::apply_callable(callable, args, continuation)
 }
 
 fn parse_required_param_names(items: &[Expr]) -> Result<Vec<String>, EvalError> {
@@ -643,6 +804,7 @@ fn values_eq(lhs: &Value, rhs: &Value) -> bool {
         (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
         (Value::Pair(lhs), Value::Pair(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::Vector(lhs), Value::Vector(rhs)) => Rc::ptr_eq(lhs, rhs),
+        (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
         (Value::List(lhs), Value::List(rhs)) => {
             lhs.len() == rhs.len()
                 && lhs
@@ -681,6 +843,7 @@ fn values_equal(lhs: &Value, rhs: &Value) -> bool {
             }
             (Value::Symbol(lhs), Value::Symbol(rhs)) => lhs == rhs,
             (Value::Char(lhs), Value::Char(rhs)) => lhs == rhs,
+            (Value::Continuation(lhs), Value::Continuation(rhs)) => Rc::ptr_eq(lhs, rhs),
             (Value::List(lhs), Value::List(rhs)) => {
                 lhs.len() == rhs.len()
                     && lhs
@@ -802,12 +965,15 @@ fn eval_target<'a>(
     mut target: EvalTarget<'a>,
     mut env: EnvRef,
     mut macro_env: MacroEnvRef,
-) -> Result<Value, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
     loop {
         let step = match &target {
-            EvalTarget::BorrowedExpr(expr) => eval_expr_step(expr, &env, &macro_env)?,
-            EvalTarget::BorrowedSequence(exprs) => eval_sequence_step(exprs, &env, &macro_env)?,
-            EvalTarget::OwnedExpr(expr) => eval_owned_expr_step(expr, &env, &macro_env)?,
+            EvalTarget::BorrowedExpr(expr) => eval_expr_step(expr, &env, &macro_env, continuation)?,
+            EvalTarget::BorrowedSequence(exprs) => {
+                eval_sequence_step(exprs, &env, &macro_env, continuation)?
+            }
+            EvalTarget::OwnedExpr(expr) => eval_owned_expr_step(expr, &env, &macro_env, continuation)?,
         };
 
         match step {
@@ -832,26 +998,53 @@ fn eval_program(exprs: &[Expr], output: OutputRef) -> Result<Value, EvalError> {
 
     let env = builtins::default_env(output);
     let macro_env = MacroEnvironment::new(None);
-    eval_sequence(exprs, &env, &macro_env)
+    let root = final_continuation();
+    let mut pending_resume: Option<(ContinuationRef, Value)> = None;
+
+    loop {
+        let result = match pending_resume.take() {
+            Some((continuation, value)) => continue_with(continuation, value),
+            None => run_sequence_in_cont(exprs, &env, &macro_env, Rc::clone(&root)),
+        };
+
+        match result {
+            Ok(value) => return Ok(value),
+            Err(EvalSignal::Error(error)) => return Err(error),
+            Err(EvalSignal::Jump {
+                continuation,
+                value,
+            }) => {
+                pending_resume = Some((continuation, value));
+            }
+        }
+    }
 }
 
 fn eval_sequence(
     exprs: &[Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<Value, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
     eval_target(
         EvalTarget::BorrowedSequence(exprs),
         Rc::clone(env),
         Rc::clone(macro_env),
+        continuation,
     )
 }
 
-fn eval_expr(expr: &Expr, env: &EnvRef, macro_env: &MacroEnvRef) -> Result<Value, EvalError> {
+fn eval_expr(
+    expr: &Expr,
+    env: &EnvRef,
+    macro_env: &MacroEnvRef,
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
     eval_target(
         EvalTarget::BorrowedExpr(expr),
         Rc::clone(env),
         Rc::clone(macro_env),
+        continuation,
     )
 }
 
@@ -859,13 +1052,19 @@ fn eval_sequence_step<'a>(
     exprs: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Some((last, prefix)) = exprs.split_last() else {
         return Ok(EvalStep::Value(Value::Void));
     };
 
-    for expr in prefix {
-        eval_expr(expr, env, macro_env)?;
+    for (index, expr) in prefix.iter().enumerate() {
+        run_expr_in_cont(
+            expr,
+            env,
+            macro_env,
+            sequence_continuation(&exprs[index + 1..], env, macro_env, continuation),
+        )?;
     }
 
     Ok(tail_borrowed_expr(last, env, macro_env))
@@ -875,7 +1074,8 @@ fn eval_expr_step<'a>(
     expr: &'a Expr,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     match expr {
         Expr::Number(value, _) => Ok(EvalStep::Value(Value::Number(*value))),
         Expr::Boolean(value, _) => Ok(EvalStep::Value(Value::Boolean(*value))),
@@ -886,7 +1086,11 @@ fn eval_expr_step<'a>(
                 EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
             })?;
             if matches!(value, Value::Uninitialized) {
-                Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
+                Err(
+                    EvalError::UninitializedBinding { name: name.clone() }
+                        .with_position(*position)
+                        .into(),
+                )
             } else {
                 Ok(EvalStep::Value(value))
             }
@@ -894,13 +1098,19 @@ fn eval_expr_step<'a>(
         Expr::CapturedSymbol(name, binding, position) => {
             let value = binding.borrow().clone();
             if matches!(value, Value::Uninitialized) {
-                Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
+                Err(
+                    EvalError::UninitializedBinding { name: name.clone() }
+                        .with_position(*position)
+                        .into(),
+                )
             } else {
                 Ok(EvalStep::Value(value))
             }
         }
-        Expr::List(items, position) => eval_borrowed_list_step(items, *position, env, macro_env)
-            .map_err(|err| err.with_position(*position)),
+        Expr::List(items, position) => {
+            eval_borrowed_list_step(items, *position, env, macro_env, continuation)
+                .map_err(|signal| signal.with_position(*position))
+        }
     }
 }
 
@@ -908,7 +1118,8 @@ fn eval_owned_expr_step<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     match expr.current() {
         Expr::Number(value, _) => Ok(EvalStep::Value(Value::Number(*value))),
         Expr::Boolean(value, _) => Ok(EvalStep::Value(Value::Boolean(*value))),
@@ -919,7 +1130,11 @@ fn eval_owned_expr_step<'a>(
                 EvalError::UnboundVariable { name: name.clone() }.with_position(*position)
             })?;
             if matches!(value, Value::Uninitialized) {
-                Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
+                Err(
+                    EvalError::UninitializedBinding { name: name.clone() }
+                        .with_position(*position)
+                        .into(),
+                )
             } else {
                 Ok(EvalStep::Value(value))
             }
@@ -927,13 +1142,24 @@ fn eval_owned_expr_step<'a>(
         Expr::CapturedSymbol(name, binding, position) => {
             let value = binding.borrow().clone();
             if matches!(value, Value::Uninitialized) {
-                Err(EvalError::UninitializedBinding { name: name.clone() }.with_position(*position))
+                Err(
+                    EvalError::UninitializedBinding { name: name.clone() }
+                        .with_position(*position)
+                        .into(),
+                )
             } else {
                 Ok(EvalStep::Value(value))
             }
         }
-        Expr::List(items, position) => eval_owned_list_step(expr, items, *position, env, macro_env)
-            .map_err(|err| err.with_position(*position)),
+        Expr::List(items, position) => eval_owned_list_step(
+            expr,
+            items,
+            *position,
+            env,
+            macro_env,
+            continuation,
+        )
+        .map_err(|signal| signal.with_position(*position)),
     }
 }
 
@@ -942,11 +1168,13 @@ fn eval_borrowed_list_step<'a>(
     position: SourcePos,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Some(head) = items.first() else {
         return Err(EvalError::SyntaxError {
             message: "cannot evaluate empty list".into(),
-        });
+        }
+        .into());
     };
 
     let head_position = head.position();
@@ -954,84 +1182,84 @@ fn eval_borrowed_list_step<'a>(
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => {
-                return special_forms::eval_define(&items[1..], env, macro_env)
+                return special_forms::eval_define(&items[1..], env, macro_env, continuation)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "define-syntax" => {
                 return macros::eval_define_syntax(&items[1..], env, macro_env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "if" => {
-                return special_forms::eval_if(&items[1..], env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_if(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "quote" => {
                 return special_forms::eval_quote(&items[1..])
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "lambda" => {
                 return special_forms::eval_lambda(&items[1..], env, macro_env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "case-lambda" => {
                 return special_forms::eval_case_lambda(&items[1..], env, macro_env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "define-record-type" => {
                 return eval_define_record_type(&items[1..], env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "set!" => {
-                return special_forms::eval_set(&items[1..], env, macro_env)
+                return special_forms::eval_set(&items[1..], env, macro_env, continuation)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "and" => {
-                return special_forms::eval_and(&items[1..], env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_and(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "or" => {
-                return special_forms::eval_or(&items[1..], env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_or(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "begin" => {
-                return special_forms::eval_begin(&items[1..], env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_begin(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "cond" => {
-                return special_forms::eval_cond(&items[1..], env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_cond(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "let" => {
-                return special_forms::eval_let(&items[1..], env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_let(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "let*" => {
-                return special_forms::eval_let_star(&items[1..], env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_let_star(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "letrec" => {
-                return special_forms::eval_letrec(&items[1..], env, macro_env, false)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_letrec(&items[1..], env, macro_env, false, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "letrec*" => {
-                return special_forms::eval_letrec(&items[1..], env, macro_env, true)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_letrec(&items[1..], env, macro_env, true, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "case" => {
-                return special_forms::eval_case(&items[1..], env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_case(&items[1..], env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "do" => {
-                return special_forms::eval_do(&items[1..], env, macro_env)
+                return special_forms::eval_do(&items[1..], env, macro_env, continuation)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|signal| signal.with_position(head_position))
             }
             _ => {}
         }
@@ -1040,23 +1268,24 @@ fn eval_borrowed_list_step<'a>(
     if let Some(expanded) = macros::expand_macro_call(items, position, macro_env)
         .map_err(|err| err.with_position(head_position))?
     {
-        return eval_expr(&expanded, env, macro_env).map(EvalStep::Value);
+        return eval_expr(&expanded, env, macro_env, continuation).map(EvalStep::Value);
     }
 
     let callable = match head {
         Expr::Symbol(name, position) => env_lookup(env, name).ok_or_else(|| {
             EvalError::UnknownOperator { name: name.clone() }.with_position(*position)
         })?,
-        _ => eval_expr(head, env, macro_env)?,
+        _ => eval_expr(head, env, macro_env, continuation)?,
     };
 
-    let mut args = Vec::with_capacity(items.len().saturating_sub(1));
-    for expr in &items[1..] {
-        args.push(eval_expr(expr, env, macro_env)?);
-    }
-
-    special_forms::apply_callable_result(callable, &args)
-        .map_err(|err| err.with_position(head_position))
+    eval_application_step(
+        callable,
+        &items[1..],
+        env,
+        macro_env,
+        head_position,
+        continuation,
+    )
 }
 
 fn eval_owned_list_step<'a>(
@@ -1065,11 +1294,13 @@ fn eval_owned_list_step<'a>(
     position: SourcePos,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Some(head) = items.first() else {
         return Err(EvalError::SyntaxError {
             message: "cannot evaluate empty list".into(),
-        });
+        }
+        .into());
     };
 
     let head_position = head.position();
@@ -1077,84 +1308,96 @@ fn eval_owned_list_step<'a>(
     if let Expr::Symbol(name, _) = head {
         match name.as_str() {
             "define" => {
-                return special_forms::eval_define(&items[1..], env, macro_env)
+                return special_forms::eval_define(&items[1..], env, macro_env, continuation)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "define-syntax" => {
                 return macros::eval_define_syntax(&items[1..], env, macro_env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "if" => {
-                return special_forms::eval_owned_if(expr, env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_if(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "quote" => {
                 return special_forms::eval_quote(&items[1..])
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "lambda" => {
                 return special_forms::eval_lambda(&items[1..], env, macro_env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "case-lambda" => {
                 return special_forms::eval_case_lambda(&items[1..], env, macro_env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "define-record-type" => {
                 return eval_define_record_type(&items[1..], env)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|err| err.with_position(head_position).into())
             }
             "set!" => {
-                return special_forms::eval_set(&items[1..], env, macro_env)
+                return special_forms::eval_set(&items[1..], env, macro_env, continuation)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "and" => {
-                return special_forms::eval_owned_and(expr, env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_and(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "or" => {
-                return special_forms::eval_owned_or(expr, env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_or(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "begin" => {
-                return special_forms::eval_owned_begin(expr, env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_begin(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "cond" => {
-                return special_forms::eval_owned_cond(expr, env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_cond(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "let" => {
-                return special_forms::eval_owned_let(expr, env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_let(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "let*" => {
-                return special_forms::eval_owned_let_star(expr, env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_let_star(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "letrec" => {
-                return special_forms::eval_owned_letrec(expr, env, macro_env, false)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_letrec(
+                    expr,
+                    env,
+                    macro_env,
+                    false,
+                    continuation,
+                )
+                .map_err(|signal| signal.with_position(head_position))
             }
             "letrec*" => {
-                return special_forms::eval_owned_letrec(expr, env, macro_env, true)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_letrec(
+                    expr,
+                    env,
+                    macro_env,
+                    true,
+                    continuation,
+                )
+                .map_err(|signal| signal.with_position(head_position))
             }
             "case" => {
-                return special_forms::eval_owned_case(expr, env, macro_env)
-                    .map_err(|err| err.with_position(head_position))
+                return special_forms::eval_owned_case(expr, env, macro_env, continuation)
+                    .map_err(|signal| signal.with_position(head_position))
             }
             "do" => {
-                return special_forms::eval_do(&items[1..], env, macro_env)
+                return special_forms::eval_do(&items[1..], env, macro_env, continuation)
                     .map(EvalStep::Value)
-                    .map_err(|err| err.with_position(head_position))
+                    .map_err(|signal| signal.with_position(head_position))
             }
             _ => {}
         }
@@ -1163,23 +1406,24 @@ fn eval_owned_list_step<'a>(
     if let Some(expanded) = macros::expand_macro_call(items, position, macro_env)
         .map_err(|err| err.with_position(head_position))?
     {
-        return eval_expr(&expanded, env, macro_env).map(EvalStep::Value);
+        return eval_expr(&expanded, env, macro_env, continuation).map(EvalStep::Value);
     }
 
     let callable = match head {
         Expr::Symbol(name, position) => env_lookup(env, name).ok_or_else(|| {
             EvalError::UnknownOperator { name: name.clone() }.with_position(*position)
         })?,
-        _ => eval_expr(head, env, macro_env)?,
+        _ => eval_expr(head, env, macro_env, continuation)?,
     };
 
-    let mut args = Vec::with_capacity(items.len().saturating_sub(1));
-    for expr in &items[1..] {
-        args.push(eval_expr(expr, env, macro_env)?);
-    }
-
-    special_forms::apply_callable_result(callable, &args)
-        .map_err(|err| err.with_position(head_position))
+    eval_application_step(
+        callable,
+        &items[1..],
+        env,
+        macro_env,
+        head_position,
+        continuation,
+    )
 }
 
 /// Evaluate one or more Scheme expressions and return the string

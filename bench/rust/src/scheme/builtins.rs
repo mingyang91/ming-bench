@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+use super::continuation::{current_continuation_value, ContinuationRef, EvalResult};
 use super::number::{parse_number_string, Number};
 use super::{
     collect_list_items, env_define, is_empty_list, is_proper_list, list_from_vec, pair_parts,
@@ -33,6 +34,7 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         BuiltinKind::Append,
         BuiltinKind::Reverse,
         BuiltinKind::Apply,
+        BuiltinKind::CallCc,
         BuiltinKind::EqPred,
         BuiltinKind::EqvPred,
         BuiltinKind::EqualPred,
@@ -124,6 +126,12 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
         );
     }
 
+    env_define(
+        &env,
+        "call-with-current-continuation".into(),
+        Value::Builtin(Builtin::new(BuiltinKind::CallCc, Rc::clone(&output))),
+    );
+
     for accessor in [
         "caar", "cadr", "cdar", "cddr", "caaar", "caadr", "cadar", "caddr", "cdaar", "cdadr",
         "cddar", "cdddr", "caaaar", "caaadr", "caadar", "caaddr", "cadaar", "cadadr", "caddar",
@@ -143,6 +151,21 @@ pub(super) fn default_env(output: OutputRef) -> EnvRef {
 }
 
 pub(super) fn apply_builtin(
+    kind: BuiltinKind,
+    args: &[Value],
+    output: &OutputRef,
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    match kind {
+        BuiltinKind::Apply => eval_apply(args, continuation),
+        BuiltinKind::CallCc => eval_call_cc(args, continuation),
+        BuiltinKind::Map => eval_map(args, continuation),
+        BuiltinKind::ForEach => eval_for_each(args, continuation),
+        _ => apply_builtin_without_context(kind, args, output).map_err(Into::into),
+    }
+}
+
+fn apply_builtin_without_context(
     kind: BuiltinKind,
     args: &[Value],
     output: &OutputRef,
@@ -179,12 +202,13 @@ pub(super) fn apply_builtin(
         BuiltinKind::Length => eval_length(args),
         BuiltinKind::Append => eval_append(args),
         BuiltinKind::Reverse => eval_reverse(args),
-        BuiltinKind::Apply => eval_apply(args),
+        BuiltinKind::Apply => unreachable!("apply requires the current continuation"),
+        BuiltinKind::CallCc => unreachable!("call/cc requires the current continuation"),
         BuiltinKind::EqPred => eval_eq_like("eq?", args, super::values_eq),
         BuiltinKind::EqvPred => eval_eq_like("eqv?", args, super::values_eqv),
         BuiltinKind::EqualPred => eval_equality("equal?", args),
-        BuiltinKind::Map => eval_map(args),
-        BuiltinKind::ForEach => eval_for_each(args),
+        BuiltinKind::Map => unreachable!("map requires the current continuation"),
+        BuiltinKind::ForEach => unreachable!("for-each requires the current continuation"),
         BuiltinKind::StringPred => eval_predicate("string?", args, |value| {
             matches!(value, Value::String(_) | Value::MutableString(_))
         }),
@@ -221,7 +245,10 @@ pub(super) fn apply_builtin(
         BuiltinKind::ProcedurePred => eval_predicate("procedure?", args, |value| {
             matches!(
                 value,
-                Value::Procedure(_) | Value::NativeProcedure(_) | Value::Builtin(_)
+                Value::Procedure(_)
+                    | Value::NativeProcedure(_)
+                    | Value::Builtin(_)
+                    | Value::Continuation(_)
             )
         }),
         BuiltinKind::Display => eval_display(args, output),
@@ -608,13 +635,14 @@ fn eval_reverse(args: &[Value]) -> Result<Value, EvalError> {
     Ok(list_from_vec(items))
 }
 
-fn eval_apply(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_apply(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             name: "apply".into(),
             expected: "at least 2 arguments".into(),
             got: args.len(),
-        });
+        }
+        .into());
     }
 
     let callable = args[0].clone();
@@ -624,7 +652,24 @@ fn eval_apply(args: &[Value]) -> Result<Value, EvalError> {
     applied_args.extend(args[1..args.len() - 1].iter().cloned());
     applied_args.extend(tail_args);
 
-    super::apply_callable(callable, &applied_args)
+    super::apply_callable(callable, &applied_args, continuation)
+}
+
+fn eval_call_cc(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value> {
+    let [callable] = args else {
+        return Err(EvalError::WrongArgCount {
+            name: "call/cc".into(),
+            expected: "exactly 1 argument".into(),
+            got: args.len(),
+        }
+        .into());
+    };
+
+    super::apply_callable(
+        callable.clone(),
+        &[current_continuation_value(continuation)],
+        continuation,
+    )
 }
 
 fn eval_eq_like<F>(name: &str, args: &[Value], compare: F) -> Result<Value, EvalError>
@@ -646,13 +691,14 @@ fn eval_equality(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     eval_eq_like(name, args, super::values_equal)
 }
 
-fn eval_map(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_map(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             name: "map".into(),
             expected: "at least 2 arguments".into(),
             got: args.len(),
-        });
+        }
+        .into());
     }
 
     let callable = args[0].clone();
@@ -668,7 +714,8 @@ fn eval_map(args: &[Value]) -> Result<Value, EvalError> {
                 name: "map".into(),
                 expected: expected_len,
                 got: list.len(),
-            });
+            }
+            .into());
         }
     }
 
@@ -678,19 +725,20 @@ fn eval_map(args: &[Value]) -> Result<Value, EvalError> {
             .iter()
             .map(|list| list[index].clone())
             .collect::<Vec<_>>();
-        result.push(super::apply_callable(callable.clone(), &call_args)?);
+        result.push(super::apply_callable(callable.clone(), &call_args, continuation)?);
     }
 
     Ok(list_from_vec(result))
 }
 
-fn eval_for_each(args: &[Value]) -> Result<Value, EvalError> {
+fn eval_for_each(args: &[Value], continuation: &ContinuationRef) -> EvalResult<Value> {
     if args.len() < 2 {
         return Err(EvalError::WrongArgCount {
             name: "for-each".into(),
             expected: "at least 2 arguments".into(),
             got: args.len(),
-        });
+        }
+        .into());
     }
 
     let callable = args[0].clone();
@@ -706,7 +754,8 @@ fn eval_for_each(args: &[Value]) -> Result<Value, EvalError> {
                 name: "for-each".into(),
                 expected: expected_len,
                 got: list.len(),
-            });
+            }
+            .into());
         }
     }
 
@@ -715,7 +764,7 @@ fn eval_for_each(args: &[Value]) -> Result<Value, EvalError> {
             .iter()
             .map(|list| list[index].clone())
             .collect::<Vec<_>>();
-        super::apply_callable(callable.clone(), &call_args)?;
+        super::apply_callable(callable.clone(), &call_args, continuation)?;
     }
 
     Ok(Value::Void)

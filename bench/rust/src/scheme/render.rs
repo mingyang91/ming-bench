@@ -50,7 +50,10 @@ impl RenderContext {
             },
             Value::Pair(_) | Value::List(_) => self.render_list_like(value),
             Value::Vector(items) => self.render_vector(items),
-            Value::Procedure(_) | Value::NativeProcedure(_) | Value::Builtin(_) => {
+            Value::Procedure(_)
+            | Value::NativeProcedure(_)
+            | Value::Builtin(_)
+            | Value::Continuation(_) => {
                 "#<procedure>".into()
             }
             Value::Record(record) => render_record(record),

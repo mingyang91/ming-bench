@@ -1,20 +1,30 @@
 use std::rc::Rc;
 
+use super::continuation::{
+    define_continuation, invoke_continuation, sequence_continuation, set_captured_continuation,
+    set_symbol_continuation, ContinuationRef, EvalResult,
+};
 use super::macros::{MacroEnvRef, MacroEnvironment};
 use super::{
     env_define, env_lookup, env_set, eval_expr, eval_sequence, eval_target, list_from_vec,
-    make_procedure, single_clause_procedure, tail_borrowed_expr, tail_borrowed_sequence,
-    tail_owned_expr, values_eqv, EnvRef, Environment, EvalError, EvalStep, Expr, OwnedExprRef,
-    Procedure, ProcedureClause, Value,
+    make_procedure, run_expr_in_cont, single_clause_procedure, tail_borrowed_expr,
+    tail_borrowed_sequence, tail_owned_expr, values_eqv, EnvRef, Environment, EvalError,
+    EvalStep, Expr, OwnedExprRef, Procedure, ProcedureClause, Value,
 };
 
 pub(super) fn eval_define(
     args: &[Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<Value, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
     if let [Expr::Symbol(name, _), value_expr] = args {
-        let value = eval_expr(value_expr, env, macro_env)?;
+        let value = run_expr_in_cont(
+            value_expr,
+            env,
+            macro_env,
+            define_continuation(env, name.clone(), continuation),
+        )?;
         env_define(env, name.clone(), value);
         return Ok(Value::Void);
     }
@@ -23,13 +33,15 @@ pub(super) fn eval_define(
         let Some((Expr::Symbol(name, _), params)) = signature.split_first() else {
             return Err(EvalError::SyntaxError {
                 message: "invalid function definition".into(),
-            });
+            }
+            .into());
         };
 
         if body.is_empty() {
             return Err(EvalError::SyntaxError {
                 message: "function definition requires a body".into(),
-            });
+            }
+            .into());
         }
 
         let (params, rest_param) = parse_param_list_items(params)?;
@@ -41,24 +53,26 @@ pub(super) fn eval_define(
 
     Err(EvalError::SyntaxError {
         message: "invalid define".into(),
-    })
+    }
+    .into())
 }
 
 pub(super) fn eval_if<'a>(
     args: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     match args {
         [condition, consequent] => {
-            if eval_expr(condition, env, macro_env)?.is_truthy() {
+            if eval_expr(condition, env, macro_env, continuation)?.is_truthy() {
                 Ok(tail_borrowed_expr(consequent, env, macro_env))
             } else {
                 Ok(EvalStep::Value(Value::Void))
             }
         }
         [condition, consequent, alternate] => {
-            if eval_expr(condition, env, macro_env)?.is_truthy() {
+            if eval_expr(condition, env, macro_env, continuation)?.is_truthy() {
                 Ok(tail_borrowed_expr(consequent, env, macro_env))
             } else {
                 Ok(tail_borrowed_expr(alternate, env, macro_env))
@@ -68,7 +82,8 @@ pub(super) fn eval_if<'a>(
             name: "if".into(),
             expected: "2 or 3 arguments".into(),
             got: args.len(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -77,7 +92,8 @@ fn eval_owned_list_sequence<'a>(
     start: usize,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned list sequence helper requires a list");
     };
@@ -87,8 +103,13 @@ fn eval_owned_list_sequence<'a>(
     }
 
     let last_index = items.len() - 1;
-    for item in &items[start..last_index] {
-        eval_expr(item, env, macro_env)?;
+    for index in start..last_index {
+        run_expr_in_cont(
+            &items[index],
+            env,
+            macro_env,
+            sequence_continuation(&items[index + 1..], env, macro_env, continuation),
+        )?;
     }
 
     Ok(tail_owned_expr(expr.child(last_index), env, macro_env))
@@ -100,7 +121,8 @@ fn eval_owned_nested_list_sequence<'a>(
     start: usize,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let child = expr.child(child_index);
     let Expr::List(items, _) = child.current() else {
         unreachable!("owned nested list sequence helper requires a list");
@@ -111,8 +133,13 @@ fn eval_owned_nested_list_sequence<'a>(
     }
 
     let last_index = items.len() - 1;
-    for item in &items[start..last_index] {
-        eval_expr(item, env, macro_env)?;
+    for index in start..last_index {
+        run_expr_in_cont(
+            &items[index],
+            env,
+            macro_env,
+            sequence_continuation(&items[index + 1..], env, macro_env, continuation),
+        )?;
     }
 
     Ok(tail_owned_expr(child.child(last_index), env, macro_env))
@@ -122,21 +149,22 @@ pub(super) fn eval_owned_if<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned if helper requires a list");
     };
 
     match items.as_slice() {
         [_, condition, _] => {
-            if eval_expr(condition, env, macro_env)?.is_truthy() {
+            if eval_expr(condition, env, macro_env, continuation)?.is_truthy() {
                 Ok(tail_owned_expr(expr.child(2), env, macro_env))
             } else {
                 Ok(EvalStep::Value(Value::Void))
             }
         }
         [_, condition, _, _] => {
-            if eval_expr(condition, env, macro_env)?.is_truthy() {
+            if eval_expr(condition, env, macro_env, continuation)?.is_truthy() {
                 Ok(tail_owned_expr(expr.child(2), env, macro_env))
             } else {
                 Ok(tail_owned_expr(expr.child(3), env, macro_env))
@@ -146,7 +174,8 @@ pub(super) fn eval_owned_if<'a>(
             name: "if".into(),
             expected: "2 or 3 arguments".into(),
             got: items.len().saturating_sub(1),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -154,7 +183,8 @@ pub(super) fn eval_owned_and<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned and helper requires a list");
     };
@@ -164,7 +194,7 @@ pub(super) fn eval_owned_and<'a>(
     }
 
     for item in &items[1..items.len() - 1] {
-        let value = eval_expr(item, env, macro_env)?;
+        let value = eval_expr(item, env, macro_env, continuation)?;
         if !value.is_truthy() {
             return Ok(EvalStep::Value(value));
         }
@@ -177,7 +207,8 @@ pub(super) fn eval_owned_or<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned or helper requires a list");
     };
@@ -187,7 +218,7 @@ pub(super) fn eval_owned_or<'a>(
     }
 
     for item in &items[1..items.len() - 1] {
-        let value = eval_expr(item, env, macro_env)?;
+        let value = eval_expr(item, env, macro_env, continuation)?;
         if value.is_truthy() {
             return Ok(EvalStep::Value(value));
         }
@@ -200,15 +231,17 @@ pub(super) fn eval_owned_begin<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
-    eval_owned_list_sequence(expr, 1, env, macro_env)
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
+    eval_owned_list_sequence(expr, 1, env, macro_env, continuation)
 }
 
 pub(super) fn eval_owned_cond<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned cond helper requires a list");
     };
@@ -217,35 +250,52 @@ pub(super) fn eval_owned_cond<'a>(
         let Expr::List(clause_items, _) = &items[clause_index] else {
             return Err(EvalError::SyntaxError {
                 message: "cond clauses must be lists".into(),
-            });
+            }
+            .into());
         };
 
         let Some((test, body)) = clause_items.split_first() else {
             return Err(EvalError::SyntaxError {
                 message: "cond clause cannot be empty".into(),
-            });
+            }
+            .into());
         };
 
         if matches!(test, Expr::Symbol(symbol, _) if symbol == "else") {
             if clause_index + 1 != items.len() {
                 return Err(EvalError::SyntaxError {
                     message: "else clause must be last".into(),
-                });
+                }
+                .into());
             }
 
             return if body.is_empty() {
                 Ok(EvalStep::Value(Value::Void))
             } else {
-                eval_owned_nested_list_sequence(expr, clause_index, 1, env, macro_env)
+                eval_owned_nested_list_sequence(
+                    expr,
+                    clause_index,
+                    1,
+                    env,
+                    macro_env,
+                    continuation,
+                )
             };
         }
 
-        let test_value = eval_expr(test, env, macro_env)?;
+        let test_value = eval_expr(test, env, macro_env, continuation)?;
         if test_value.is_truthy() {
             return if body.is_empty() {
                 Ok(EvalStep::Value(test_value))
             } else {
-                eval_owned_nested_list_sequence(expr, clause_index, 1, env, macro_env)
+                eval_owned_nested_list_sequence(
+                    expr,
+                    clause_index,
+                    1,
+                    env,
+                    macro_env,
+                    continuation,
+                )
             };
         }
     }
@@ -257,21 +307,23 @@ pub(super) fn eval_owned_let<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned let helper requires a list");
     };
 
     match items.as_slice() {
         [_, Expr::List(bindings, _), _body @ ..] => {
-            eval_owned_plain_let(expr, bindings, 2, env, macro_env)
+            eval_owned_plain_let(expr, bindings, 2, env, macro_env, continuation)
         }
         [_, Expr::Symbol(name, _), Expr::List(bindings, _), _body @ ..] => {
-            eval_owned_named_let(expr, name, bindings, 3, env, macro_env)
+            eval_owned_named_let(expr, name, bindings, 3, env, macro_env, continuation)
         }
         _ => Err(EvalError::SyntaxError {
             message: "invalid let".into(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -279,7 +331,8 @@ pub(super) fn eval_owned_let_star<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned let* helper requires a list");
     };
@@ -287,13 +340,15 @@ pub(super) fn eval_owned_let_star<'a>(
     let [_, Expr::List(bindings, _), body @ ..] = items.as_slice() else {
         return Err(EvalError::SyntaxError {
             message: "invalid let*".into(),
-        });
+        }
+        .into());
     };
 
     if body.is_empty() {
         return Err(EvalError::SyntaxError {
             message: "let* requires a body".into(),
-        });
+        }
+        .into());
     }
 
     let bindings = parse_binding_exprs(bindings, "let*")?;
@@ -301,11 +356,11 @@ pub(super) fn eval_owned_let_star<'a>(
     let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
 
     for (name, value_expr) in bindings {
-        let value = eval_expr(value_expr, &let_env, &let_macro_env)?;
+        let value = eval_expr(value_expr, &let_env, &let_macro_env, continuation)?;
         env_define(&let_env, name, value);
     }
 
-    eval_owned_list_sequence(expr, 2, &let_env, &let_macro_env)
+    eval_owned_list_sequence(expr, 2, &let_env, &let_macro_env, continuation)
 }
 
 pub(super) fn eval_owned_letrec<'a>(
@@ -313,7 +368,8 @@ pub(super) fn eval_owned_letrec<'a>(
     env: &EnvRef,
     macro_env: &MacroEnvRef,
     sequential: bool,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned letrec helper requires a list");
     };
@@ -325,7 +381,8 @@ pub(super) fn eval_owned_letrec<'a>(
             } else {
                 "invalid letrec".into()
             },
-        });
+        }
+        .into());
     };
 
     if body.is_empty() {
@@ -335,7 +392,8 @@ pub(super) fn eval_owned_letrec<'a>(
             } else {
                 "letrec requires a body".into()
             },
-        });
+        }
+        .into());
     }
 
     let bindings = parse_binding_exprs(bindings, if sequential { "letrec*" } else { "letrec" })?;
@@ -348,13 +406,13 @@ pub(super) fn eval_owned_letrec<'a>(
 
     if sequential {
         for (name, value_expr) in &bindings {
-            let value = eval_expr(value_expr, &let_env, &let_macro_env)?;
+            let value = eval_expr(value_expr, &let_env, &let_macro_env, continuation)?;
             env_set(&let_env, name, value);
         }
     } else {
         let mut values = Vec::with_capacity(bindings.len());
         for (_, value_expr) in &bindings {
-            values.push(eval_expr(value_expr, &let_env, &let_macro_env)?);
+            values.push(eval_expr(value_expr, &let_env, &let_macro_env, continuation)?);
         }
 
         for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
@@ -362,14 +420,15 @@ pub(super) fn eval_owned_letrec<'a>(
         }
     }
 
-    eval_owned_list_sequence(expr, 2, &let_env, &let_macro_env)
+    eval_owned_list_sequence(expr, 2, &let_env, &let_macro_env, continuation)
 }
 
 pub(super) fn eval_owned_case<'a>(
     expr: &OwnedExprRef,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned case helper requires a list");
     };
@@ -379,42 +438,54 @@ pub(super) fn eval_owned_case<'a>(
             name: "case".into(),
             expected: "at least 1 argument".into(),
             got: 0,
-        });
+        }
+        .into());
     }
 
-    let key = eval_expr(&items[1], env, macro_env)?;
+    let key = eval_expr(&items[1], env, macro_env, continuation)?;
 
     for clause_index in 2..items.len() {
         let Expr::List(clause_items, _) = &items[clause_index] else {
             return Err(EvalError::SyntaxError {
                 message: "case clauses must be lists".into(),
-            });
+            }
+            .into());
         };
 
         let Some((datums, body)) = clause_items.split_first() else {
             return Err(EvalError::SyntaxError {
                 message: "case clause cannot be empty".into(),
-            });
+            }
+            .into());
         };
 
         if matches!(datums, Expr::Symbol(symbol, _) if symbol == "else") {
             if clause_index + 1 != items.len() {
                 return Err(EvalError::SyntaxError {
                     message: "else clause must be last".into(),
-                });
+                }
+                .into());
             }
 
             return if body.is_empty() {
                 Ok(EvalStep::Value(Value::Void))
             } else {
-                eval_owned_nested_list_sequence(expr, clause_index, 1, env, macro_env)
+                eval_owned_nested_list_sequence(
+                    expr,
+                    clause_index,
+                    1,
+                    env,
+                    macro_env,
+                    continuation,
+                )
             };
         }
 
         let Expr::List(datums, _) = datums else {
             return Err(EvalError::SyntaxError {
                 message: "case clause datums must be in a list".into(),
-            });
+            }
+            .into());
         };
 
         for datum in datums {
@@ -423,7 +494,14 @@ pub(super) fn eval_owned_case<'a>(
                 return if body.is_empty() {
                     Ok(EvalStep::Value(Value::Void))
                 } else {
-                    eval_owned_nested_list_sequence(expr, clause_index, 1, env, macro_env)
+                    eval_owned_nested_list_sequence(
+                        expr,
+                        clause_index,
+                        1,
+                        env,
+                        macro_env,
+                        continuation,
+                    )
                 };
             }
         }
@@ -438,7 +516,8 @@ fn eval_owned_plain_let<'a>(
     body_start: usize,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned plain let helper requires a list");
     };
@@ -446,17 +525,18 @@ fn eval_owned_plain_let<'a>(
     if body_start >= items.len() {
         return Err(EvalError::SyntaxError {
             message: "let requires a body".into(),
-        });
+        }
+        .into());
     }
 
-    let bindings = parse_let_bindings(bindings, env, macro_env)?;
+    let bindings = parse_let_bindings(bindings, env, macro_env, continuation)?;
     let let_env = Environment::new(Some(Rc::clone(env)));
     for (name, value) in bindings {
         env_define(&let_env, name, value);
     }
 
     let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
-    eval_owned_list_sequence(expr, body_start, &let_env, &let_macro_env)
+    eval_owned_list_sequence(expr, body_start, &let_env, &let_macro_env, continuation)
 }
 
 fn eval_owned_named_let<'a>(
@@ -466,7 +546,8 @@ fn eval_owned_named_let<'a>(
     body_start: usize,
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Expr::List(items, _) = expr.current() else {
         unreachable!("owned named let helper requires a list");
     };
@@ -474,10 +555,11 @@ fn eval_owned_named_let<'a>(
     if body_start >= items.len() {
         return Err(EvalError::SyntaxError {
             message: "let requires a body".into(),
-        });
+        }
+        .into());
     }
 
-    let bindings = parse_let_bindings(bindings, env, macro_env)?;
+    let bindings = parse_let_bindings(bindings, env, macro_env, continuation)?;
     let params = bindings
         .iter()
         .map(|(param, _)| param.clone())
@@ -497,7 +579,7 @@ fn eval_owned_named_let<'a>(
     );
     env_define(&let_env, name.to_string(), procedure.clone());
 
-    apply_callable_result(procedure, &args)
+    apply_callable_result(procedure, &args, continuation)
 }
 
 pub(super) fn eval_quote(args: &[Expr]) -> Result<Value, EvalError> {
@@ -598,29 +680,46 @@ pub(super) fn eval_set(
     args: &[Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<Value, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
     match args {
         [Expr::Symbol(name, position), value_expr] => {
-            let value = eval_expr(value_expr, env, macro_env)?;
+            let value = run_expr_in_cont(
+                value_expr,
+                env,
+                macro_env,
+                set_symbol_continuation(env, name.clone(), continuation),
+            )?;
             if env_set(env, name, value) {
                 Ok(Value::Void)
             } else {
-                Err(EvalError::UnboundVariable { name: name.clone() }.with_position(*position))
+                Err(
+                    EvalError::UnboundVariable { name: name.clone() }
+                        .with_position(*position)
+                        .into(),
+                )
             }
         }
         [Expr::CapturedSymbol(_, binding, _), value_expr] => {
-            let value = eval_expr(value_expr, env, macro_env)?;
+            let value = run_expr_in_cont(
+                value_expr,
+                env,
+                macro_env,
+                set_captured_continuation(binding, continuation),
+            )?;
             *binding.borrow_mut() = value;
             Ok(Value::Void)
         }
         [_, _] => Err(EvalError::SyntaxError {
             message: "set! target must be a symbol".into(),
-        }),
+        }
+        .into()),
         _ => Err(EvalError::WrongArgCount {
             name: "set!".into(),
             expected: "exactly 2 arguments".into(),
             got: args.len(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -675,28 +774,47 @@ fn parse_param_name(item: &Expr) -> Result<String, EvalError> {
     }
 }
 
-pub(super) fn apply_callable(callable: Value, args: &[Value]) -> Result<Value, EvalError> {
-    match apply_callable_result(callable, args)? {
+pub(super) fn apply_callable(
+    callable: Value,
+    args: &[Value],
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
+    match apply_callable_result(callable, args, continuation)? {
         EvalStep::Value(value) => Ok(value),
         EvalStep::Tail {
             target,
             env,
             macro_env,
-        } => eval_target(target, env, macro_env),
+        } => eval_target(target, env, macro_env, continuation),
     }
 }
 
 pub(super) fn apply_callable_result<'a>(
     callable: Value,
     args: &[Value],
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     match callable {
-        Value::Procedure(procedure) => apply_procedure_result(&procedure, args),
-        Value::NativeProcedure(procedure) => procedure.apply(args).map(EvalStep::Value),
-        Value::Builtin(builtin) => builtin.apply(args).map(EvalStep::Value),
+        Value::Procedure(procedure) => apply_procedure_result(&procedure, args).map_err(Into::into),
+        Value::NativeProcedure(procedure) => {
+            procedure.apply(args).map(EvalStep::Value).map_err(Into::into)
+        }
+        Value::Builtin(builtin) => builtin.apply(args, continuation).map(EvalStep::Value),
+        Value::Continuation(continuation) => {
+            let [value] = args else {
+                return Err(EvalError::WrongArgCount {
+                    name: "continuation".into(),
+                    expected: "exactly 1 argument".into(),
+                    got: args.len(),
+                }
+                .into());
+            };
+            Err(invoke_continuation(continuation, value.clone()))
+        }
         other => Err(EvalError::NotCallable {
             found: other.type_name().into(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -759,13 +877,14 @@ pub(super) fn eval_and<'a>(
     args: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Some((last, prefix)) = args.split_last() else {
         return Ok(EvalStep::Value(Value::Boolean(true)));
     };
 
     for expr in prefix {
-        let value = eval_expr(expr, env, macro_env)?;
+        let value = eval_expr(expr, env, macro_env, continuation)?;
         if !value.is_truthy() {
             return Ok(EvalStep::Value(value));
         }
@@ -778,13 +897,14 @@ pub(super) fn eval_or<'a>(
     args: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Some((last, prefix)) = args.split_last() else {
         return Ok(EvalStep::Value(Value::Boolean(false)));
     };
 
     for expr in prefix {
-        let value = eval_expr(expr, env, macro_env)?;
+        let value = eval_expr(expr, env, macro_env, continuation)?;
         if value.is_truthy() {
             return Ok(EvalStep::Value(value));
         }
@@ -797,7 +917,8 @@ pub(super) fn eval_begin<'a>(
     args: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    _continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     Ok(tail_borrowed_sequence(args, env, macro_env))
 }
 
@@ -805,25 +926,29 @@ pub(super) fn eval_cond<'a>(
     args: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     for (index, clause) in args.iter().enumerate() {
         let Expr::List(items, _) = clause else {
             return Err(EvalError::SyntaxError {
                 message: "cond clauses must be lists".into(),
-            });
+            }
+            .into());
         };
 
         let Some((test, body)) = items.split_first() else {
             return Err(EvalError::SyntaxError {
                 message: "cond clause cannot be empty".into(),
-            });
+            }
+            .into());
         };
 
         if matches!(test, Expr::Symbol(symbol, _) if symbol == "else") {
             if index + 1 != args.len() {
                 return Err(EvalError::SyntaxError {
                     message: "else clause must be last".into(),
-                });
+                }
+                .into());
             }
 
             return if body.is_empty() {
@@ -833,7 +958,7 @@ pub(super) fn eval_cond<'a>(
             };
         }
 
-        let test_value = eval_expr(test, env, macro_env)?;
+        let test_value = eval_expr(test, env, macro_env, continuation)?;
         if test_value.is_truthy() {
             return if body.is_empty() {
                 Ok(EvalStep::Value(test_value))
@@ -850,15 +975,19 @@ pub(super) fn eval_let<'a>(
     args: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     match args {
-        [Expr::List(bindings, _), body @ ..] => eval_plain_let(bindings, body, env, macro_env),
+        [Expr::List(bindings, _), body @ ..] => {
+            eval_plain_let(bindings, body, env, macro_env, continuation)
+        }
         [Expr::Symbol(name, _), Expr::List(bindings, _), body @ ..] => {
-            eval_named_let(name, bindings, body, env, macro_env)
+            eval_named_let(name, bindings, body, env, macro_env, continuation)
         }
         _ => Err(EvalError::SyntaxError {
             message: "invalid let".into(),
-        }),
+        }
+        .into()),
     }
 }
 
@@ -866,17 +995,20 @@ pub(super) fn eval_let_star<'a>(
     args: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let [Expr::List(bindings, _), body @ ..] = args else {
         return Err(EvalError::SyntaxError {
             message: "invalid let*".into(),
-        });
+        }
+        .into());
     };
 
     if body.is_empty() {
         return Err(EvalError::SyntaxError {
             message: "let* requires a body".into(),
-        });
+        }
+        .into());
     }
 
     let bindings = parse_binding_exprs(bindings, "let*")?;
@@ -884,7 +1016,7 @@ pub(super) fn eval_let_star<'a>(
     let let_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
 
     for (name, value_expr) in bindings {
-        let value = eval_expr(value_expr, &let_env, &let_macro_env)?;
+        let value = eval_expr(value_expr, &let_env, &let_macro_env, continuation)?;
         env_define(&let_env, name, value);
     }
 
@@ -896,7 +1028,8 @@ pub(super) fn eval_letrec<'a>(
     env: &EnvRef,
     macro_env: &MacroEnvRef,
     sequential: bool,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let [Expr::List(bindings, _), body @ ..] = args else {
         return Err(EvalError::SyntaxError {
             message: if sequential {
@@ -904,7 +1037,8 @@ pub(super) fn eval_letrec<'a>(
             } else {
                 "invalid letrec".into()
             },
-        });
+        }
+        .into());
     };
 
     if body.is_empty() {
@@ -914,7 +1048,8 @@ pub(super) fn eval_letrec<'a>(
             } else {
                 "letrec requires a body".into()
             },
-        });
+        }
+        .into());
     }
 
     let bindings = parse_binding_exprs(bindings, if sequential { "letrec*" } else { "letrec" })?;
@@ -927,13 +1062,13 @@ pub(super) fn eval_letrec<'a>(
 
     if sequential {
         for (name, value_expr) in &bindings {
-            let value = eval_expr(value_expr, &let_env, &let_macro_env)?;
+            let value = eval_expr(value_expr, &let_env, &let_macro_env, continuation)?;
             env_set(&let_env, name, value);
         }
     } else {
         let mut values = Vec::with_capacity(bindings.len());
         for (_, value_expr) in &bindings {
-            values.push(eval_expr(value_expr, &let_env, &let_macro_env)?);
+            values.push(eval_expr(value_expr, &let_env, &let_macro_env, continuation)?);
         }
 
         for ((name, _), value) in bindings.iter().zip(values.into_iter()) {
@@ -948,35 +1083,40 @@ pub(super) fn eval_case<'a>(
     args: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     let Some((key_expr, clauses)) = args.split_first() else {
         return Err(EvalError::WrongArgCount {
             name: "case".into(),
             expected: "at least 1 argument".into(),
             got: 0,
-        });
+        }
+        .into());
     };
 
-    let key = eval_expr(key_expr, env, macro_env)?;
+    let key = eval_expr(key_expr, env, macro_env, continuation)?;
 
     for (index, clause) in clauses.iter().enumerate() {
         let Expr::List(items, _) = clause else {
             return Err(EvalError::SyntaxError {
                 message: "case clauses must be lists".into(),
-            });
+            }
+            .into());
         };
 
         let Some((datums, body)) = items.split_first() else {
             return Err(EvalError::SyntaxError {
                 message: "case clause cannot be empty".into(),
-            });
+            }
+            .into());
         };
 
         if matches!(datums, Expr::Symbol(symbol, _) if symbol == "else") {
             if index + 1 != clauses.len() {
                 return Err(EvalError::SyntaxError {
                     message: "else clause must be last".into(),
-                });
+                }
+                .into());
             }
 
             return if body.is_empty() {
@@ -989,7 +1129,8 @@ pub(super) fn eval_case<'a>(
         let Expr::List(datums, _) = datums else {
             return Err(EvalError::SyntaxError {
                 message: "case clause datums must be in a list".into(),
-            });
+            }
+            .into());
         };
 
         for datum in datums {
@@ -1011,17 +1152,20 @@ pub(super) fn eval_do(
     args: &[Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<Value, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<Value> {
     let [Expr::List(bindings, _), Expr::List(test_clause, _), body @ ..] = args else {
         return Err(EvalError::SyntaxError {
             message: "invalid do".into(),
-        });
+        }
+        .into());
     };
 
     let Some((test_expr, result_exprs)) = test_clause.split_first() else {
         return Err(EvalError::SyntaxError {
             message: "do test clause cannot be empty".into(),
-        });
+        }
+        .into());
     };
 
     let bindings = parse_do_bindings(bindings)?;
@@ -1029,27 +1173,27 @@ pub(super) fn eval_do(
     let do_macro_env = MacroEnvironment::new(Some(Rc::clone(macro_env)));
 
     for binding in &bindings {
-        let value = eval_expr(binding.init_expr, env, macro_env)?;
+        let value = eval_expr(binding.init_expr, env, macro_env, continuation)?;
         env_define(&do_env, binding.name.clone(), value);
     }
 
     loop {
-        if eval_expr(test_expr, &do_env, &do_macro_env)?.is_truthy() {
+        if eval_expr(test_expr, &do_env, &do_macro_env, continuation)?.is_truthy() {
             return if result_exprs.is_empty() {
                 Ok(Value::Void)
             } else {
-                eval_sequence(result_exprs, &do_env, &do_macro_env)
+                eval_sequence(result_exprs, &do_env, &do_macro_env, continuation)
             };
         }
 
         if !body.is_empty() {
-            eval_sequence(body, &do_env, &do_macro_env)?;
+            eval_sequence(body, &do_env, &do_macro_env, continuation)?;
         }
 
         let mut updates = Vec::with_capacity(bindings.len());
         for binding in &bindings {
             let value = if let Some(step_expr) = binding.step_expr {
-                eval_expr(step_expr, &do_env, &do_macro_env)?
+                eval_expr(step_expr, &do_env, &do_macro_env, continuation)?
             } else {
                 env_lookup(&do_env, &binding.name).ok_or_else(|| EvalError::UnboundVariable {
                     name: binding.name.clone(),
@@ -1069,14 +1213,16 @@ fn eval_plain_let<'a>(
     body: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     if body.is_empty() {
         return Err(EvalError::SyntaxError {
             message: "let requires a body".into(),
-        });
+        }
+        .into());
     }
 
-    let bindings = parse_let_bindings(bindings, env, macro_env)?;
+    let bindings = parse_let_bindings(bindings, env, macro_env, continuation)?;
     let let_env = Environment::new(Some(Rc::clone(env)));
     for (name, value) in bindings {
         env_define(&let_env, name, value);
@@ -1092,14 +1238,16 @@ fn eval_named_let<'a>(
     body: &'a [Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<EvalStep<'a>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<EvalStep<'a>> {
     if body.is_empty() {
         return Err(EvalError::SyntaxError {
             message: "let requires a body".into(),
-        });
+        }
+        .into());
     }
 
-    let bindings = parse_let_bindings(bindings, env, macro_env)?;
+    let bindings = parse_let_bindings(bindings, env, macro_env, continuation)?;
     let params = bindings
         .iter()
         .map(|(param, _)| param.clone())
@@ -1113,30 +1261,33 @@ fn eval_named_let<'a>(
     let procedure = single_clause_procedure(params, None, body.to_vec(), &let_env, macro_env);
     env_define(&let_env, name.to_string(), procedure.clone());
 
-    apply_callable_result(procedure, &args)
+    apply_callable_result(procedure, &args, continuation)
 }
 
 fn parse_let_bindings(
     bindings: &[Expr],
     env: &EnvRef,
     macro_env: &MacroEnvRef,
-) -> Result<Vec<(String, Value)>, EvalError> {
+    continuation: &ContinuationRef,
+) -> EvalResult<Vec<(String, Value)>> {
     let mut parsed = Vec::with_capacity(bindings.len());
 
     for binding in bindings {
         let Expr::List(items, _) = binding else {
             return Err(EvalError::SyntaxError {
                 message: "let bindings must be lists".into(),
-            });
+            }
+            .into());
         };
 
         let [Expr::Symbol(name, _), value_expr] = items.as_slice() else {
             return Err(EvalError::SyntaxError {
                 message: "let bindings must be (name value) pairs".into(),
-            });
+            }
+            .into());
         };
 
-        parsed.push((name.clone(), eval_expr(value_expr, env, macro_env)?));
+        parsed.push((name.clone(), eval_expr(value_expr, env, macro_env, continuation)?));
     }
 
     Ok(parsed)
