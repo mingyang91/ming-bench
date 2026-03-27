@@ -234,6 +234,7 @@ impl Interpreter {
             match name.as_str() {
                 "define" => return self.step_eval_define(&items[1..], env, cont),
                 "lambda" => return self.step_eval_lambda(&items[1..], env, cont),
+                "case-lambda" => return self.step_eval_case_lambda(&items[1..], env, cont),
                 "if" => return self.step_eval_if(&items[1..], env, cont),
                 "let" => return self.step_eval_let(&items[1..], env, cont),
                 "and" => return Action::EvalAnd(Rc::new(items[1..].to_vec()), 0, env, cont),
@@ -367,6 +368,50 @@ impl Interpreter {
                 env,
             })),
         )
+    }
+
+    fn step_eval_case_lambda(&mut self, args: &[Expr], env: EnvRef, cont: ContRef) -> Action {
+        if args.is_empty() {
+            return Action::Done(Err(EvalError::InvalidForm(
+                "case-lambda expects at least one clause".to_string(),
+            )));
+        }
+
+        let mut clauses = Vec::with_capacity(args.len());
+        for clause in args {
+            let Expr::List(items) = clause else {
+                return Action::Done(Err(EvalError::InvalidForm(
+                    "case-lambda clauses must be lists".to_string(),
+                )));
+            };
+
+            if items.len() < 2 {
+                return Action::Done(Err(EvalError::InvalidForm(
+                    "case-lambda clauses require parameters and a body".to_string(),
+                )));
+            }
+
+            let params = match &items[0] {
+                Expr::List(items) => match parse_parameters(items) {
+                    Ok(params) => params,
+                    Err(err) => return Action::Done(Err(err)),
+                },
+                _ => {
+                    return Action::Done(Err(EvalError::InvalidForm(
+                        "case-lambda parameters must be a list".to_string(),
+                    )));
+                }
+            };
+
+            clauses.push(Lambda {
+                name: None,
+                params,
+                body: items[1..].to_vec(),
+                env: env.clone(),
+            });
+        }
+
+        Action::Continue(cont, Value::Procedure(Procedure::CaseLambda(clauses)))
     }
 
     fn step_eval_if(&mut self, args: &[Expr], env: EnvRef, cont: ContRef) -> Action {
@@ -771,6 +816,9 @@ impl Interpreter {
             Value::Procedure(Procedure::Lambda(lambda)) => {
                 self.step_apply_lambda(lambda, args, cont)
             }
+            Value::Procedure(Procedure::CaseLambda(clauses)) => {
+                self.step_apply_case_lambda(clauses, args, cont)
+            }
             Value::Procedure(Procedure::Continuation(saved)) => {
                 if let Err(err) = require_exact_arity(args.len(), 1, "continuation") {
                     Action::Done(Err(err))
@@ -805,6 +853,25 @@ impl Interpreter {
         }
 
         Action::EvalSequence(Rc::new(lambda.body), 0, child, cont)
+    }
+
+    fn step_apply_case_lambda(
+        &mut self,
+        clauses: Vec<Lambda>,
+        args: Vec<Value>,
+        cont: ContRef,
+    ) -> Action {
+        for clause in clauses {
+            if clause.params.len() == args.len() {
+                return self.step_apply_lambda(clause, args, cont);
+            }
+        }
+
+        Action::Done(Err(EvalError::WrongArity {
+            name: "case-lambda".to_string(),
+            expected: "matching clause".to_string(),
+            got: args.len(),
+        }))
     }
 
     fn step_apply_builtin(&mut self, builtin: Builtin, args: Vec<Value>, cont: ContRef) -> Action {
@@ -1084,6 +1151,13 @@ impl Interpreter {
                     Action::Done(Err(err))
                 } else {
                     Action::Continue(cont, Value::Bool(matches!(&args[0], Value::List(_))))
+                }
+            }
+            Builtin::ProcedurePredicate => {
+                if let Err(err) = require_exact_arity(args.len(), 1, builtin.name()) {
+                    Action::Done(Err(err))
+                } else {
+                    Action::Continue(cont, Value::Bool(matches!(&args[0], Value::Procedure(_))))
                 }
             }
             Builtin::CharPredicate => {
@@ -1514,6 +1588,7 @@ impl Value {
 enum Procedure {
     Builtin(Builtin),
     Lambda(Lambda),
+    CaseLambda(Vec<Lambda>),
     Continuation(CapturedContinuation),
 }
 
@@ -1588,6 +1663,7 @@ enum Builtin {
     SymbolPredicate,
     PairPredicate,
     ListPredicate,
+    ProcedurePredicate,
     CharPredicate,
     Car,
     Cdr,
@@ -1630,6 +1706,7 @@ impl Builtin {
             Builtin::SymbolPredicate => "symbol?",
             Builtin::PairPredicate => "pair?",
             Builtin::ListPredicate => "list?",
+            Builtin::ProcedurePredicate => "procedure?",
             Builtin::CharPredicate => "char?",
             Builtin::Car => "car",
             Builtin::Cdr => "cdr",
@@ -1715,6 +1792,7 @@ fn global_env() -> EnvRef {
         ("symbol?", Builtin::SymbolPredicate),
         ("pair?", Builtin::PairPredicate),
         ("list?", Builtin::ListPredicate),
+        ("procedure?", Builtin::ProcedurePredicate),
         ("char?", Builtin::CharPredicate),
         ("car", Builtin::Car),
         ("cdr", Builtin::Cdr),
