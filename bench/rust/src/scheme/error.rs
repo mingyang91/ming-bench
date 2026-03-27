@@ -36,6 +36,8 @@ pub enum EvalError {
     ExpectedNumber { name: String },
     #[error("{name} expects string arguments")]
     ExpectedString { name: String },
+    #[error("{name} expects character arguments")]
+    ExpectedChar { name: String },
     #[error("{name} expects symbol arguments")]
     ExpectedSymbol { name: String },
     #[error("{name} expects a list")]
