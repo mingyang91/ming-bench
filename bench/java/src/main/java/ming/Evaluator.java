@@ -62,10 +62,13 @@ public class Evaluator {
 
     static class SchemeString {
         private char[] chars;
-        SchemeString(String value) { this.chars = value.toCharArray(); }
+        private boolean immutable;
+        SchemeString(String value) { this.chars = value.toCharArray(); this.immutable = true; }
+        SchemeString(String value, boolean immutable) { this.chars = value.toCharArray(); this.immutable = immutable; }
         String value() { return new String(chars); }
         char charAt(int i) { return chars[i]; }
         void setChar(int i, char c) { chars[i] = c; }
+        boolean isImmutable() { return immutable; }
         int length() { return chars.length; }
     }
 
@@ -155,6 +158,7 @@ public class Evaluator {
                 "symbol->string", "string->symbol",
                 "string-ref", "char?",
                 "string-copy", "string-set!",
+                "string->list", "list->string", "char->integer", "integer->char",
                 "apply",
                 "abs", "modulo", "remainder", "quotient", "min", "max", "expt",
                 "zero?", "positive?", "negative?", "odd?", "even?",
@@ -1437,7 +1441,7 @@ public class Evaluator {
             case "string-copy" -> {
                 checkMinArgs(args, 1, "string-copy");
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-copy: expected string");
-                yield new SchemeString(s.value());
+                yield new SchemeString(s.value(), false);
             }
             case "apply" -> {
                 if (args.size() < 2) throw new EvalError("apply: expected at least 2 arguments");
@@ -1459,10 +1463,43 @@ public class Evaluator {
             case "string-set!" -> {
                 checkMinArgs(args, 3, "string-set!");
                 if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string-set!: expected string");
-                long idx = asLong(args.get(1), "string-set!");
+                if (s.isImmutable()) throw new EvalError("string-set!: strings are immutable");
+                if (!(args.get(1) instanceof Long idx)) throw new EvalError("string-set!: expected integer index");
                 if (!(args.get(2) instanceof SchemeChar c)) throw new EvalError("string-set!: expected char");
-                s.setChar((int) idx, c.value());
-                yield VOID;
+                int i = idx.intValue();
+                if (i < 0 || i >= s.length()) throw new EvalError("string-set!: index out of range");
+                s.setChar(i, c.value());
+                yield Empty.NIL;
+            }
+            case "string->list" -> {
+                checkMinArgs(args, 1, "string->list");
+                if (!(args.get(0) instanceof SchemeString s)) throw new EvalError("string->list: expected string");
+                Object result = Empty.NIL;
+                for (int i = s.length() - 1; i >= 0; i--) {
+                    result = new Pair(new SchemeChar(s.charAt(i)), result);
+                }
+                yield result;
+            }
+            case "list->string" -> {
+                checkMinArgs(args, 1, "list->string");
+                StringBuilder sb = new StringBuilder();
+                Object lst = args.get(0);
+                while (lst instanceof Pair p) {
+                    if (!(p.car() instanceof SchemeChar c)) throw new EvalError("list->string: expected char in list");
+                    sb.append(c.value());
+                    lst = p.cdr();
+                }
+                yield new SchemeString(sb.toString());
+            }
+            case "char->integer" -> {
+                checkMinArgs(args, 1, "char->integer");
+                if (!(args.get(0) instanceof SchemeChar c)) throw new EvalError("char->integer: expected char");
+                yield (long) c.value();
+            }
+            case "integer->char" -> {
+                checkMinArgs(args, 1, "integer->char");
+                long code = asLong(args.get(0), "integer->char");
+                yield new SchemeChar((char) code);
             }
             case "abs" -> {
                 checkMinArgs(args, 1, "abs");
